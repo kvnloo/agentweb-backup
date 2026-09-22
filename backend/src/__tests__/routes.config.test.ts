@@ -72,12 +72,13 @@ describe('Config Routes', () => {
         { configId: '2', userId: 'test-user-id', website: 'test.com', password: 'p2', encryptedPassword: 'enc2', sharedConfigIds: ['shared-1'] }
       ];
 
+      // No password/encryptedPassword here: the shared-config branch only ever
+      // reads .userId off this object (for the getUserById lookup below) and
+      // never serializes it into the response, so there's nothing to assert.
       const mockSharedConfig = {
         configId: 'shared-1',
         userId: 'other-user',
-        website: 'shared.com',
-        password: 'p3',
-        encryptedPassword: 'enc3'
+        website: 'shared.com'
       };
 
       // Mock query response for user configs
