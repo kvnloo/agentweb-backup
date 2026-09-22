@@ -100,6 +100,21 @@ export const FIELD_GROUPS: Record<string, FieldGroupConfig> = {
     ttlDays: 180,
   },
 
+  // Enigma card revenue (ENG-1388). Filled ONLY by the Enigma tier in
+  // runWaterfall, which returns before any web/LLM tier can run, and only for
+  // runs that explicitly opted in. Kept after company_firmographic so an
+  // industry filled earlier in the same run can gate the call. `sources` is
+  // informational only (never read), hence empty. 30d TTL: Enigma publishes
+  // card data monthly with a ~3-month lag.
+  company_card_revenue: {
+    entityType: 'company',
+    version: 1,
+    fields: ['card_revenue_12m', 'card_revenue_period_end', 'card_revenue_yoy_growth'],
+    sources: [],
+    searchTemplate: '',
+    ttlDays: 30,
+  },
+
   company_technographic: {
     entityType: 'company',
     version: 5,
@@ -198,6 +213,18 @@ export function buildPersonCanonicalKey(lead: LeadInfo): string | null {
   if (domain && name) return `person:${domain}:${name}`;
 
   return null;
+}
+
+export const CARD_REVENUE_GROUP = 'company_card_revenue';
+const CARD_REVENUE_FIELD_SET = new Set(FIELD_GROUPS[CARD_REVENUE_GROUP].fields);
+
+/**
+ * Enigma card-revenue fields (ENG-1388) cost money per value and must only be
+ * bought when a user explicitly asks for them by name — never through alias
+ * inference, smart-field dependencies, sibling copy, cron, or web/LLM fill.
+ */
+export function isCardRevenueField(name: string | null | undefined): boolean {
+  return !!name && CARD_REVENUE_FIELD_SET.has(name);
 }
 
 export function toCanonicalId(canonicalKey: string): string {

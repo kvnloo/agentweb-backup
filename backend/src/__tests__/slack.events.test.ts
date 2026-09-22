@@ -66,6 +66,11 @@ jest.mock('../services/slackService', () => {
   };
 });
 
+jest.mock('../services/loopSlackApprovalDispatcher', () => ({
+  getEmmaBotUserId: jest.fn().mockResolvedValue(null),
+  handleLoopApprovalReaction: jest.fn().mockResolvedValue(undefined),
+}));
+
 jest.mock('../utils/s3Utils', () => ({
   uploadFileToS3: jest.fn().mockResolvedValue({ success: true, url: 'https://s3.example.com/file.png', key: 'file.png' }),
 }));
@@ -1133,7 +1138,12 @@ describe('Slack Events API', () => {
           if (key === 'slack_admin_channels') return { settingValue: JSON.stringify(['C_ADMIN']) };
           return null;
         });
-        chatbotDb.getChatSession.mockResolvedValue({ sessionId: 'delegated-session', userId: 'customer-user', llmModel: 'gpt-4o' });
+        chatbotDb.getChatSession.mockResolvedValue({
+          sessionId: 'delegated-session',
+          userId: 'customer-user',
+          llmModel: 'gpt-4o',
+          delegateInfo: { isDelegated: true, adminUserId: 'admin-user' },
+        });
         userDb.getUserById.mockResolvedValue({ userId: 'customer-user', slackChannel: 'C_CUSTOMER' });
         getSlackUserEmail.mockResolvedValue('admin@agentweb.pro');
         userDb.getUserByEmail.mockResolvedValue({ userId: 'admin-user', slackChannel: 'C_ADMIN' });
@@ -1569,6 +1579,94 @@ describe('Slack Events API', () => {
 
         // No Emma response should be generated for untracked threads
         expect(generateSessionResponse).not.toHaveBeenCalled();
+      });
+
+      it('should start a session from a 1:1 DM without an @mention', async () => {
+        // Cached DM mapping resolves directly (first DM caches via Slack identity)
+        settingsService.getSetting.mockResolvedValue({
+          settingValue: 'user-123',
+        });
+        userDb.getUserById.mockResolvedValue({
+          userId: 'user-123',
+          email: 'operator@agentweb.pro',
+        });
+        chatbotDb.createChatSession.mockResolvedValue({
+          sessionId: 'session-dm-1',
+          userId: 'user-123',
+          messages: [],
+          llmModel: 'gpt-4o',
+        });
+        generateSessionResponse.mockResolvedValue({
+          content: 'DM reply here.',
+          toolCalls: [],
+        });
+
+        const response = await request(app)
+          .post('/api/slack/events')
+          .send({
+            type: 'event_callback',
+            event: {
+              type: 'message',
+              user: 'U12345',
+              text: 'help me draft a post',
+              channel: 'D12345',
+              channel_type: 'im',
+              ts: '1234567895.000000',
+            },
+          });
+
+        expect(response.status).toBe(200);
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        expect(userDb.getUserById).toHaveBeenCalledWith('user-123');
+        expect(chatbotDb.createChatSession).toHaveBeenCalledWith(
+          'user-123',
+          undefined,
+          'agent',
+          'slack-dm',
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          'regular',
+          undefined
+        );
+        expect(generateSessionResponse).toHaveBeenCalledWith(
+          'session-dm-1',
+          'John Doe: help me draft a post',
+          'user-123',
+          'gpt-4o',
+          []
+        );
+      });
+
+      it('should reject a DM from an unknown identity with a helpful error', async () => {
+        settingsService.getSetting.mockResolvedValue(null);
+        userDb.getUserByEmail.mockResolvedValue(null);
+        getSlackUserEmail.mockResolvedValue('stranger@example.com');
+
+        const response = await request(app)
+          .post('/api/slack/events')
+          .send({
+            type: 'event_callback',
+            event: {
+              type: 'message',
+              user: 'U99999',
+              text: 'hello?',
+              channel: 'D99999',
+              channel_type: 'im',
+              ts: '1234567896.000000',
+            },
+          });
+
+        expect(response.status).toBe(200);
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        expect(chatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(generateSessionResponse).not.toHaveBeenCalled();
+        expect(mockPostMessage).toHaveBeenCalledWith(
+          expect.objectContaining({ channel: 'D99999' })
+        );
       });
     });
   });

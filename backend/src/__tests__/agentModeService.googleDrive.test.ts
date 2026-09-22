@@ -176,6 +176,12 @@ function makeApiErrorWithReason(code: number, reason: string, message = 'API err
 
 describe('AgentModeService - Google Drive methods', () => {
   let service: AgentModeService;
+
+  it('offers user-OAuth Drive tools as foundation tools', () => {
+    expect(AgentModeService.DEFAULT_FOUNDATION_TOOLS).toEqual(
+      expect.arrayContaining(['google_drive', 'read_google_doc'])
+    );
+  });
   let connectedAccountsDb: any;
   let secretsManager: any;
 
@@ -2593,6 +2599,64 @@ describe('AgentModeService - Google Drive methods', () => {
 
       expect(result.success).toBe(true);
       expect(result.content).toContain('hello world');
+    });
+
+    it('resolves a Drive shortcut and reads the target file content', async () => {
+      mockDriveFiles.list.mockImplementation(({ q, fields }: { q: string; fields: string }) => {
+        if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+          return Promise.resolve({ data: { files: [] } });
+        }
+        if (q.includes("name = 'Quarterly plan'")) {
+          expect(fields).toContain('shortcutDetails');
+          return Promise.resolve({
+            data: {
+              files: [{
+                id: 'shortcut-1',
+                name: 'Quarterly plan',
+                mimeType: 'application/vnd.google-apps.shortcut',
+                shortcutDetails: {
+                  targetId: 'target-doc-1',
+                  targetMimeType: 'application/vnd.google-apps.document',
+                },
+                modifiedTime: '2026-08-01T00:00:00Z',
+              }],
+            },
+          });
+        }
+        return Promise.resolve({ data: { files: [] } });
+      });
+      mockDriveFiles.get.mockResolvedValue({
+        data: {
+          id: 'target-doc-1',
+          name: 'Quarterly plan target',
+          mimeType: 'application/vnd.google-apps.document',
+          size: '24',
+          modifiedTime: '2026-08-02T00:00:00Z',
+        },
+      });
+      mockDriveFiles.export.mockResolvedValue({ data: Buffer.from('shortcut target content') });
+      mockDriveComments.list.mockResolvedValue({ data: { comments: [] } });
+
+      const result = await service.readSingleKnowledgeBaseFile(
+        `gdrive:${ROOT}`,
+        'Quarterly plan',
+        USER_ID
+      );
+
+      expect(mockDriveFiles.get).toHaveBeenCalledWith(expect.objectContaining({
+        fileId: 'target-doc-1',
+        fields: expect.stringContaining('mimeType'),
+      }));
+      expect(mockDriveFiles.export).toHaveBeenCalledWith(
+        { fileId: 'target-doc-1', mimeType: 'text/plain' },
+        { responseType: 'arraybuffer' }
+      );
+      expect(result).toMatchObject({
+        success: true,
+        content: 'shortcut target content',
+        size: 24,
+        modifiedTime: '2026-08-02T00:00:00Z',
+      });
     });
 
     it('names the sub-folder that needs sharing when it cannot be listed, instead of a bare "not found"', async () => {

@@ -12,7 +12,7 @@ import {
   isLinkedInCacheEligible,
   splitFieldsByGroup,
 } from './enrichmentCacheService';
-import { FIELD_GROUPS } from './enrichmentGroups';
+import { FIELD_GROUPS, isCardRevenueField } from './enrichmentGroups';
 import type { RawWebResult, RawCacheData } from './enrichmentGroups';
 import {
   buildDataExtractionSystemPrompt,
@@ -178,6 +178,23 @@ export interface LoadAndFilterResult {
   storedSourcesPerField: Record<string, EnrichmentSource[]>;
   storedWebSearchTemplate: string;
   storedLinkedinSearchTemplate: string;
+}
+
+/**
+ * Fields the LLM extraction units may fill: everything a specialist did not
+ * already resolve, minus Enigma card revenue.
+ *
+ * ENG-1388 AC7: no web or LLM tier may ever fill a card-revenue field — those
+ * values are measured or absent. Filtering here covers every unit built below,
+ * including the linkedin and no_context fallbacks that never pass through
+ * splitFieldsByGroup, and the per-field refresh route that reaches them with
+ * forceOverwrite on.
+ */
+export function llmEligibleFields(
+  outputFields: string[],
+  specialistFields: Record<string, unknown>,
+): string[] {
+  return outputFields.filter(f => !(f in specialistFields) && !isCardRevenueField(f));
 }
 
 export class CrmEnrichmentService {
@@ -1210,7 +1227,7 @@ export class CrmEnrichmentService {
     const specialistFields = specialistOut.resolvedFields;
     const specialistMeta = specialistOut.resolvedMeta;
     const specialistSourceContexts = specialistOut.sourceContexts;
-    const fieldsForLLM = spec.outputFields.filter(f => !(f in specialistFields));
+    const fieldsForLLM = llmEligibleFields(spec.outputFields, specialistFields);
     if (Object.keys(specialistFields).length > 0) {
       console.log(`[CrmEnrichment][enrichLead] specialists resolved ${Object.keys(specialistFields).length} fields lead=${lead.leadId}: ${Object.keys(specialistFields).join(',')}`);
     }

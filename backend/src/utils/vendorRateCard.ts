@@ -33,6 +33,7 @@ export type VendorRateProvider =
   | "google_cse"
   | "apollo"
   | "enrich.so"
+  | "enigma"
   | "2captcha"
   | "elevenlabs"
   | "placid"
@@ -55,7 +56,7 @@ interface VendorRateEntry {
  * different prices share one version and a historical event can no longer be
  * re-derived from the card that produced it.
  */
-export const VENDOR_RATE_CARD_VERSION = "2026-09-02";
+export const VENDOR_RATE_CARD_VERSION = "2026-09-14";
 
 const RATE_CARD: Record<VendorRateProvider, Record<string, VendorRateEntry>> = {
   v0: {
@@ -95,6 +96,18 @@ const RATE_CARD: Record<VendorRateProvider, Record<string, VendorRateEntry>> = {
     // no-profile-found response since recordVendorUsage only fires on the
     // successful-call path.
     reverse_lookup: { recordingUnit: "lookup", usdPerUnit: 0.05 },
+  },
+  // ENG-1388 — PLACEHOLDERS at Enigma's public list price (enigma.com/pricing/
+  // rate-card, pricing effective 2026-08-10, checked 2026-09-14; 1 credit =
+  // $0.01). Enigma bills per value returned ("per fill"), not per request, so
+  // each key is one billed value: Brand 12M Card Revenue Amount = 10 credits,
+  // Brand 12M Card Revenue YoY Growth = 10, Brand Name / Website = 2 each.
+  // Pending Harsha's allocation confirmation (ENG-1706 pattern) before any
+  // call site goes live — Phase 1 ships the adapter with no caller.
+  enigma: {
+    card_revenue_12m: { recordingUnit: "fill", usdPerUnit: 0.1 },
+    card_revenue_yoy_growth_12m: { recordingUnit: "fill", usdPerUnit: 0.1 },
+    brand_attribute: { recordingUnit: "fill", usdPerUnit: 0.02 },
   },
   "2captcha": {
     solve: { recordingUnit: "solve", usdPerUnit: 0.00725 },

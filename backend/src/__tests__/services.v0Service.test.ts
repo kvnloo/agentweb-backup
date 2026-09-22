@@ -5492,6 +5492,83 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       expect(capturedContent).toContain('"/features": "list_features"');
     });
 
+    it("ENG-449: smoke test waits for the capture-route sync BUILD, not just its commit", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Items: [existingSiteRecord] }),
+      });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+
+      // The sync commit's OWN Vercel build, held open so this asserts ordering rather
+      // than luck. A new sub-page's path only enters the DEPLOYED LIST_BY_PATH when this
+      // second build lands; before ENG-449 this poll's promise was dropped on the floor
+      // and the smoke test fired immediately, submitting the page's form to a route that
+      // did not yet know its path — a guaranteed 422, surfaced as a false `ok: false`
+      // on every newly-added sub-page.
+      let releaseSyncBuild: (v: unknown) => void = () => {};
+      mockAxiosGet.mockReturnValueOnce(
+        new Promise((resolve) => {
+          releaseSyncBuild = resolve;
+        })
+      );
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create pricing page with a lead form",
+        "Pricing",
+        {},
+        "list_pricing"
+      );
+
+      // The page is returned as deployed with the build still in flight: the gate is on
+      // the detached smoke dispatch only, never on the request path.
+      expect(result.status).toBe("deployed");
+      expect(mockRunGenerationSmokeTest).not.toHaveBeenCalled();
+
+      releaseSyncBuild({
+        data: {
+          deployments: [
+            { uid: "dpl_sync", readyState: "READY", meta: { githubCommitSha: "sync_commit_sha" } },
+          ],
+        },
+      });
+      await new Promise((r) => setImmediate(r));
+
+      expect(mockRunGenerationSmokeTest).toHaveBeenCalledTimes(1);
+    });
+
+    it("ENG-449: a capture-route sync that never commits does not strand the smoke test", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      // Sibling lookup throws, so the sync bails before pushing anything and there is no
+      // build to wait for. The gate must stay resolved: a page whose sync failed still
+      // deserves the smoke test that tells us its form is broken.
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.reject(new Error("DynamoDB unavailable")),
+      });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a newsletter signup page",
+        "Newsletter",
+        {},
+        "list_newsletter"
+      );
+
+      expect(result.status).toBe("deployed");
+      await new Promise((r) => setImmediate(r));
+      expect(mockRunGenerationSmokeTest).toHaveBeenCalledTimes(1);
+    });
+
     it("SUCCESS: new sub-page has no leadListId → sync still commits siblings, new page's own path stays absent", async () => {
       setupSiteRecordMock();
       await setupV0Mocks();

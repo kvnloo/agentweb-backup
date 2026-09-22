@@ -98,6 +98,7 @@ export async function runLoop(
     const proposals = allProposals.slice(0, cap);
     result.proposals = proposals;
     result.proposalsTruncated = allProposals.length - proposals.length;
+    if (result.proposalsTruncated > 0) result.uncappedProposals = allProposals;
     ports.logger.log('debug', '[loops] policy fired rules', {
       loopId: manifest.loopId,
       proposals: proposals.length,

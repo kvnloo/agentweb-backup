@@ -18,7 +18,8 @@ import {
   type EnrichSoFetchContext,
 } from './enrichmentGroupWaterfall';
 import { normalizeFills } from './enrichmentNormalizer';
-import { FIELD_GROUPS } from './enrichmentGroups';
+import { FIELD_GROUPS, isCardRevenueField } from './enrichmentGroups';
+import type { EnigmaRunSummary } from './enigmaCardRevenueEnrichment';
 import type { LeadRecord, SocketEmitFn } from './crmEnrichmentService';
 import type { EnrichedFieldMeta } from '../utils/enrichedFieldValue';
 import type { ResolveIdentityResult } from './enrichmentIdentityResolver';
@@ -135,6 +136,8 @@ interface TierCount {
   unipile: number;
   web: number;
   missing: number;
+  /** ENG-1388: fields filled by Enigma card revenue. */
+  enigma?: number;
 }
 
 export interface RunEnrichmentResult {
@@ -149,6 +152,9 @@ export interface RunEnrichmentResult {
   };
   tierFillBreakdown: { total: TierCount } & Record<string, TierCount>;
   durationMs: number;
+  /** ENG-1388: present only when this run was allowed to use Enigma. Skips
+   *  and provider failures here never count toward `failed`. */
+  enigma?: EnigmaRunSummary;
   preview?: Array<{
     leadId: string;
     extractedFields: Record<string, string>;
@@ -239,6 +245,10 @@ export interface OrchestratorDeps {
      *  and the lead's existing field data. */
     depValues: Record<string, string>;
   }): Promise<{ value: string | null; reasoning: string; model?: string }>;
+
+  /** ENG-1388: per-run Enigma card-revenue summary. Absent when the run was
+   *  not allowed to buy Enigma data. */
+  enigmaSummary?(): EnigmaRunSummary;
 }
 
 /** Standard CRM lead columns — values for these field names go to top-level
@@ -255,7 +265,7 @@ const IDENTITY_PERSIST_FIELDS = new Set<string>([
   'firstName', 'lastName', 'email', 'linkedin', 'company', 'website', 'title',
 ]);
 
-type SourceKey = 'apollo' | 'unipile' | 'enrichSo' | 'webSearch' | 'sibling' | 'llm';
+type SourceKey = 'apollo' | 'unipile' | 'enrichSo' | 'webSearch' | 'sibling' | 'llm' | 'enigma';
 
 function providerToSourceKey(meta: EnrichedFieldMeta): SourceKey | null {
   if (meta.source === 'llm') return 'llm';
@@ -263,6 +273,7 @@ function providerToSourceKey(meta: EnrichedFieldMeta): SourceKey | null {
     case 'apollo': return 'apollo';
     case 'unipile': return 'unipile';
     case 'enrich.so': return 'enrichSo';
+    case 'enigma': return 'enigma';
     case 'llm_web_search': return 'webSearch';
     case 'agentweb': return 'sibling';
     default: return null;
@@ -317,7 +328,7 @@ function emptyTierCount(): TierCount {
 }
 
 function addTierCounts(a: TierCount, b: TierCount): TierCount {
-  return {
+  const sum: TierCount = {
     crm: a.crm + b.crm,
     apollo: a.apollo + b.apollo,
     enrichSo: a.enrichSo + b.enrichSo,
@@ -325,6 +336,11 @@ function addTierCounts(a: TierCount, b: TierCount): TierCount {
     web: a.web + b.web,
     missing: a.missing + b.missing,
   };
+  // Only runs that used Enigma carry the key, so every other run's breakdown
+  // keeps its existing shape.
+  const enigma = (a.enigma ?? 0) + (b.enigma ?? 0);
+  if (enigma > 0) sum.enigma = enigma;
+  return sum;
 }
 
 interface FieldRouting {
@@ -949,6 +965,9 @@ export async function runEnrichment(
   const injectedDeps: EnrichmentFieldConfig[] = [];
   for (const sf of smartFields) {
     for (const dep of sf.smartDependencies ?? []) {
+      // Card revenue is bought per value, so a smart field may read an existing
+      // value but never trigger an Enigma purchase (ENG-1388).
+      if (isCardRevenueField(dep)) continue;
       if (!existingCanonicals.has(dep) && !injectedDepNames.has(dep)) {
         injectedDeps.push({
           name: dep,
@@ -1023,13 +1042,15 @@ export async function runEnrichment(
   let llmOrParseFailed = 0;
   let updateFailed = 0;
 
-  const sourceBreakdown = {
+  type SourceCounts = { live: number; cached: number };
+  const sourceBreakdown: Record<Exclude<SourceKey, 'enigma'>, SourceCounts> & { enigma?: SourceCounts } = {
     apollo:    { live: 0, cached: 0 },
     unipile:   { live: 0, cached: 0 },
     enrichSo:  { live: 0, cached: 0 },
     webSearch: { live: 0, cached: 0 },
     sibling:   { live: 0, cached: 0 },
     llm:       { live: 0, cached: 0 },
+    // `enigma` is added on first use so non-Enigma job records keep their shape.
   };
 
   emitToRooms(progressEvent, {
@@ -1169,8 +1190,9 @@ export async function runEnrichment(
         if (writeResult.ok) {
           processed += 1;
           for (const { key, fromCache } of leadBreakdown) {
-            if (fromCache) sourceBreakdown[key].cached++;
-            else sourceBreakdown[key].live++;
+            const counts = (sourceBreakdown[key] ??= { live: 0, cached: 0 });
+            if (fromCache) counts.cached++;
+            else counts.live++;
           }
         } else {
           updateFailed += 1;
@@ -1218,6 +1240,11 @@ export async function runEnrichment(
     tierFillBreakdown: { total, ...tierBreakdown },
     durationMs: Date.now() - startedAt,
   };
+  const enigmaSummary = deps.enigmaSummary?.();
+  if (enigmaSummary) {
+    result.enigma = enigmaSummary;
+    console.log(`[v3] enigma runId=${runId} ${JSON.stringify(enigmaSummary)}`);
+  }
 
   if (input.mode === 'preview') {
     result.preview = previewSamples;
@@ -1237,6 +1264,7 @@ export async function runEnrichment(
     failureBreakdown: result.failed,
     tierFillBreakdown: result.tierFillBreakdown,
     durationMs: result.durationMs,
+    ...(result.enigma ? { enigma: result.enigma } : {}),
   });
 
   const attemptedLeadIds = leads.map((l: LeadRecord) => l.leadId);

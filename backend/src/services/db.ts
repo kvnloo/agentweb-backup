@@ -431,6 +431,34 @@ export interface User {
    * per request. Only consulted when DURABLE_LANDING_GENERATION is on.
    */
   landingSiteMode?: "unified" | "separate";
+  /**
+   * ENG-328 — mandatory onboarding design-system scrape, async status.
+   * Same idle|running|ready|failed shape as the Onboarding Epic axes above,
+   * but — like brandGuidelines below — resolved org-first via
+   * resolveOrgProfileField, since a design system is an ORG/account-level
+   * artifact (one website per account) and a second org member joining an
+   * already-onboarded account must never re-trigger it (ProtectedRoute
+   * already skips onboarding entirely for any user with orgId set; this axis
+   * follows the same convention rather than introducing a new one).
+   */
+  designSystem?: {
+    status: "idle" | "running" | "ready" | "failed";
+    startedAt?: string;
+    completedAt?: string;
+    durationMs?: number;
+    error?: string;
+    /**
+     * Whether design.md came from a real scrape or the manual-fallback path
+     * (built from brandGuidelines when the scrape genuinely couldn't
+     * succeed — no website, site down, bot-walled). Both terminal states set
+     * status: 'ready', matching how brandGuidelines makes no distinction
+     * between a scraped and a manually-typed brand.
+     */
+    source?: "scrape" | "manual_fallback";
+    /** KB task holding design.md — set on first successful write so re-runs
+     * upsert in place instead of creating a duplicate-named entry. */
+    kbTaskId?: string;
+  };
   brandGuidelines?: {
     brandData: {
       brandName: string;
@@ -788,6 +816,7 @@ export interface Organization {
   name: string;
   ownerUserId: string;
   brandGuidelines?: User["brandGuidelines"];
+  designSystem?: User["designSystem"];
   marketStrategy?: User["marketStrategy"];
   startupProfiles?: User["startupProfiles"];
   connected_accounts?: User["connected_accounts"];
@@ -3398,6 +3427,11 @@ const reportedUnsupportedLegacyScheduleIds = new Set<string>();
 // against different history would clobber whatever landed in between.
 const MAX_RUN_RESULT_SHED_ATTEMPTS = 3;
 
+// ENG-1552: an entry is ~200 bytes plus its recipient lists. 30 keeps the log to a few
+// KB of the row's 400KB budget (the ENG-1048 shed logic counts it but never trims it)
+// while still covering two weeks of a daily schedule at two entries per run.
+const MAX_DELIVERY_LOG_ENTRIES = 30;
+
 /**
  * ENG-1048: the run history this row can hold WITH one more result on the end, and
  * the history that was derived from. Returns null when even the incoming result
@@ -3857,6 +3891,72 @@ export const scheduleDb = {
     }
   },
 
+
+  /**
+   * ENG-1552: append one delivery-state transition to the schedule's `deliveryLog`,
+   * optionally refreshing the `lastKnownSensitive` breadcrumb in the same write.
+   *
+   * Conditioned on the row still existing: an unconditional UpdateItem on a schedule
+   * deleted mid-run would recreate it as an orphan holding nothing but this log.
+   * The log is capped at MAX_DELIVERY_LOG_ENTRIES by removing the oldest entries
+   * after the append; that trim is bound to the length it measured, so a concurrent
+   * append can at worst leave the log briefly over the cap, never drop a fresh entry.
+   */
+  async appendDeliveryLogEntry(
+    scheduleId: string,
+    entry: Record<string, any>,
+    extra?: { lastKnownSensitive?: boolean }
+  ) {
+    const tableName = `${TABLE_PREFIX}AW-TaskSchedules`;
+    const names: Record<string, string> = { '#deliveryLog': 'deliveryLog', '#scheduleId': 'scheduleId' };
+    const values: Record<string, any> = { ':entry': [entry], ':emptyList': [] };
+    const sets = ['#deliveryLog = list_append(if_not_exists(#deliveryLog, :emptyList), :entry)'];
+    if (typeof extra?.lastKnownSensitive === 'boolean') {
+      names['#lastKnownSensitive'] = 'lastKnownSensitive';
+      names['#lastKnownSensitiveAt'] = 'lastKnownSensitiveAt';
+      values[':lastKnownSensitive'] = extra.lastKnownSensitive;
+      values[':lastKnownSensitiveAt'] = entry.at || new Date().toISOString();
+      sets.push('#lastKnownSensitive = :lastKnownSensitive', '#lastKnownSensitiveAt = :lastKnownSensitiveAt');
+    }
+    let length = 0;
+    try {
+      const result = await dynamodb.update({
+        TableName: tableName,
+        Key: { scheduleId },
+        UpdateExpression: `SET ${sets.join(', ')}`,
+        ConditionExpression: 'attribute_exists(#scheduleId)',
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+        ReturnValues: 'UPDATED_NEW',
+      }).promise();
+      length = Array.isArray(result.Attributes?.deliveryLog) ? result.Attributes!.deliveryLog.length : 0;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException' || error?.name === 'ConditionalCheckFailedException') {
+        return; // schedule deleted — nothing to record against
+      }
+      handleDynamoDbError(error, 'appendDeliveryLogEntry');
+      throw error;
+    }
+
+    const excess = length - MAX_DELIVERY_LOG_ENTRIES;
+    if (excess <= 0) return;
+    try {
+      await dynamodb.update({
+        TableName: tableName,
+        Key: { scheduleId },
+        UpdateExpression: `REMOVE ${Array.from({ length: excess }, (_, i) => `#deliveryLog[${i}]`).join(', ')}`,
+        ConditionExpression: 'size(#deliveryLog) = :measured',
+        ExpressionAttributeNames: { '#deliveryLog': 'deliveryLog' },
+        ExpressionAttributeValues: { ':measured': length },
+      }).promise();
+    } catch (error: any) {
+      // Raced by another append — that writer's own trim takes over. Anything else
+      // is logged only: an over-long log is harmless, a thrown error is not.
+      if (!(error?.code === 'ConditionalCheckFailedException' || error?.name === 'ConditionalCheckFailedException')) {
+        console.error(`DynamoDB appendDeliveryLogEntry: could not trim delivery log on schedule ${scheduleId}:`, error);
+      }
+    }
+  },
 
   async getRunResults(scheduleId: string) {
     try {
@@ -9160,6 +9260,7 @@ export const crmDb = {
       webSearch: { live: number; cached: number };
       sibling:   { live: number; cached: number };
       llm:       { live: number; cached: number };
+      enigma?:   { live: number; cached: number };
     };
   }): Promise<void> {
     try {
@@ -9417,7 +9518,7 @@ export const crmDb = {
     // owns this row, so a future caller cannot silently mislabel an enrich.so
     // row as a field-group row (or vice versa). Note: this used to be optional
     // with a 'field_group' default — review C1 flagged that as fragile.
-    cacheType: 'field_group' | 'enrichso' | 'unipile' | 'unipile_company' | 'unipile_search_param' | 'apollo';
+    cacheType: 'field_group' | 'enrichso' | 'unipile' | 'unipile_company' | 'unipile_search_param' | 'apollo' | 'enigma';
     // Marks a cached payload with no usable signal — written with a short
     // negative TTL so it doesn't lock a lead out of re-enrichment. (WS4)
     negative?: boolean;
