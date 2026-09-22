@@ -6325,6 +6325,13 @@ export class AgentModeService {
     // "these skills are currently unavailable to install" (ENG-1867).
     'convert_to_pdf',
 
+    // User-authenticated Drive discovery and direct document reads are basic
+    // file-access primitives. Keep them out of the subscription-gated
+    // __other_skills__ catch-all so connected Drive accounts work without a
+    // skill install.
+    'google_drive',
+    'read_google_doc',
+
     // Work Plans (Emma's execution planning system)
     'create_work_plan',
     'modify_work_plan',
@@ -25875,7 +25882,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           drive,
           folderIds,
           `name = '${escapeDriveQueryValue(fileName)}' and trashed = false`,
-          'files(id, name, mimeType, size, modifiedTime, parents)',
+          'files(id, name, mimeType, size, modifiedTime, parents, shortcutDetails)',
           2
         );
       const files = Array.from(filesMap.values());
@@ -25979,8 +25986,25 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         };
       }
 
-      const file = files[0];
-      const isGoogleDoc = file.mimeType === 'application/vnd.google-apps.document' || file.mimeType === 'application/vnd.google-apps.spreadsheet';
+      const matchedFile = files[0];
+      let file = matchedFile;
+      if (matchedFile.mimeType === 'application/vnd.google-apps.shortcut') {
+        const targetId = matchedFile.shortcutDetails?.targetId;
+        if (!targetId) {
+          throw new Error(`Google Drive shortcut "${fileName}" has no target`);
+        }
+        const targetMeta = await drive.files.get({
+          fileId: targetId,
+          fields: 'id,name,mimeType,size,modifiedTime',
+          supportsAllDrives: true,
+        });
+        file = targetMeta.data;
+      }
+
+      const isGoogleDoc =
+        file.mimeType === 'application/vnd.google-apps.document' ||
+        file.mimeType === 'application/vnd.google-apps.spreadsheet' ||
+        file.mimeType === 'application/vnd.google-apps.presentation';
       const [contentStr, commentsStr] = await Promise.all([
         this.readGoogleDriveFileContent(drive, file.id!, file.name || fileName, file.mimeType || ''),
         isGoogleDoc ? this.fetchDriveFileComments(drive, file.id!) : Promise.resolve(''),
