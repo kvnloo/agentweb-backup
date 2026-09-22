@@ -1107,9 +1107,14 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
 
         try {
           let execution: Promise<any>;
+          // ENG-2072: a live voice call is a real person talking to Emma right now,
+          // even if it's attached to a session originally created by a schedule —
+          // never let create_work_plan/modify_work_plan/launch_predefined_work_plan
+          // fall back to session.sessionType and force hands-off autocomplete.
+          const liveVoiceToolContext = { isUnattendedRun: false };
           if (isOnboardingSafe) {
             execution = agentModeService.executeTool(
-              LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false,
+              LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false, liveVoiceToolContext,
             );
           } else {
             const executionKey = stableToolExecutionKey(toolName, toolArgs);
@@ -1117,7 +1122,7 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
             if (!trackedExecution) {
               trackedExecution = {
                 promise: Promise.resolve().then(() => agentModeService.executeTool(
-                  LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false,
+                  LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false, liveVoiceToolContext,
                 )),
                 settled: false,
               };

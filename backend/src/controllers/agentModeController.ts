@@ -8129,12 +8129,16 @@ export async function generateSessionResponse(
   // own clientId, only messageIndex (assigned server-side) needs to come back.
   clientId?: string,
   // ENG-2072: tri-state per-turn "is this an unattended scheduled/test run" signal
-  // — see ToolContext.isUnattendedRun in mcp/client/toolRegistry.ts. Supplied ONLY
-  // by runVerifiedChatInner's calls (true from runScheduledChat, false from the
-  // interactive verifiedGenerate endpoint). Every other caller — the live /generate
-  // route, Slack, chatbot replies — is attended and leaves this undefined, which
-  // falls back to session.sessionType (unchanged prior behavior) inside
-  // createWorkPlan/modifyWorkPlan/applyPredefinedWorkPlan.
+  // — see ToolContext.isUnattendedRun in mcp/client/toolRegistry.ts. `true` only
+  // from runVerifiedChatInner's calls sourced from runScheduledChat. `false` from
+  // every attended entry point that can land on a session originally created by a
+  // schedule — the interactive verifiedGenerate endpoint, the live /generate route
+  // (generateResponse), and the share/ishare route (generateSharedResponse), since
+  // interactive sharing can be enabled on ANY session including a scheduled one.
+  // Left undefined by callers not yet migrated to the new signal (Slack, chatbot
+  // replies, GTM plan turns, onboarding) — those fall back to session.sessionType
+  // (unchanged prior behavior) inside createWorkPlan/modifyWorkPlan/
+  // applyPredefinedWorkPlan, same as before this fix.
   isUnattendedRun?: boolean,
 ): Promise<{
   content: string;
@@ -9453,6 +9457,11 @@ export const agentModeController = {
         undefined, // userMessageKind
         Boolean(questionAnswer || workPlanInputAnswer),
         typeof clientId === 'string' ? clientId : undefined, // ENG-1495
+        // ENG-2072: this IS the live /generate route useAgentModeChat.tsx hits —
+        // a real person is watching this turn, even if it lands on a session
+        // reopened from the "Scheduled" sidebar tab. Never fall back to
+        // session.sessionType here.
+        false,
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
@@ -10673,6 +10682,9 @@ export const agentModeController = {
           undefined, // userMessageKind
           Boolean(workPlanInputAnswer),
           typeof clientId === 'string' ? clientId : undefined, // ENG-1495
+          // ENG-2072: a real person (the share-link viewer) is typing this turn —
+          // never fall back to session.sessionType here either.
+          false,
         ),
         session.sessionId
       );
