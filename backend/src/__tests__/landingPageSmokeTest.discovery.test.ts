@@ -28,6 +28,10 @@ type Discovered = {
     required: boolean;
     viaLabel: boolean;
     checked: boolean;
+    // Mirrors the DiscoveredCheckable shape in landingPageSmokeTest.ts, which has carried
+    // isAria since role=checkbox support landed. Omitting it here broke `tsc --noEmit` on
+    // the two assertions that read it, while `toMatchObject` hid the same drift elsewhere.
+    isAria: boolean;
   }[];
   submitSelector: string | null;
   disclosureTriggers: string[];

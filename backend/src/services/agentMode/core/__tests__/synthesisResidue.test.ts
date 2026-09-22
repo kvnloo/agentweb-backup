@@ -13,6 +13,7 @@ import {
   detectFalseCompletionClaim,
   buildFalseClaimCorrectionFooter,
   extractProducedAssetCount,
+  assetProducingToolsInPlay,
 } from '../synthesisResidue';
 import { SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE } from '../termination';
 import { buildTurnTimeBudgetNudge, type TurnTimeBudgetState } from '../../../../utils/turnTimeBudget';
@@ -593,6 +594,34 @@ describe('detectFalseCompletionClaim', () => {
       [{ name: 'playwright_browser_take_screenshot', result: { success: true } }],
     );
     expect(claim).toEqual({ claimed: 12, actual: 1 });
+  });
+});
+
+describe('assetProducingToolsInPlay', () => {
+  it('is true when the ledger contains an asset-producing tool call', () => {
+    expect(assetProducingToolsInPlay([{ name: 'generate_image', result: { success: true } }])).toBe(true);
+  });
+
+  it('is false for an empty ledger', () => {
+    expect(assetProducingToolsInPlay([])).toBe(false);
+  });
+
+  // ENG-2076 live repro: a Meta Ads turn's ledger has real tool calls, just none of
+  // them in ASSET_PRODUCING_TOOL_NAMES (which has no Meta Ads vocabulary and never
+  // will). Distinguishes "no asset-producing call" from "no call at all" — the
+  // guard's domain gate must treat both the same way (skip), but this is the shape
+  // that actually broke production.
+  it('is false when the ledger has calls, but none in ASSET_PRODUCING_TOOL_NAMES', () => {
+    expect(
+      assetProducingToolsInPlay([
+        { name: 'call_meta_marketing_api', result: { success: true } },
+        { name: 'list_meta_ads_campaigns', result: { success: true } },
+      ]),
+    ).toBe(false);
+  });
+
+  it('ignores a ledger entry with no name', () => {
+    expect(assetProducingToolsInPlay([{ result: { success: true } }])).toBe(false);
   });
 });
 

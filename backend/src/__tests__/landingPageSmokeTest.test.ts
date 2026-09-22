@@ -426,6 +426,15 @@ describe("runGenerationSmokeTest", () => {
     expect(v("first_name")).toBe("Smoke");
     expect(v("last_name")).toBe("Test");
     expect(v("full_name")).toBe("Smoke Test");
+    // Regression, found on a live generated lander: "fullname" contains the substring
+    // "lname" ("ful|lname"), so the surname branch claimed it and a combined name field
+    // was filled with just "Test". The real POST body read {"fullName":"Test",...}.
+    expect(v("fullname")).toBe("Smoke Test");
+    expect(v("fullName")).toBe("Smoke Test");
+    expect(v("your name")).toBe("Smoke Test");
+    // the short aliases still work as their own word
+    expect(v("lname")).toBe("Test");
+    expect(v("fname")).toBe("Smoke");
     expect(v("company")).toBe("Smoke Test");
     // autocomplete tokens are part of the hint and must route the same way
     expect(v("postal-code")).toBe("94025");

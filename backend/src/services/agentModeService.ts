@@ -71,7 +71,7 @@ import {
   assertOpenRouterResponseHasChoices,
   isMalformedOpenRouterResponseError,
 } from './agentMode/openRouterResponseValidation';
-import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice, buildAcceptanceFailureNotice } from './agentMode/core/synthesisResidue';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice, buildAcceptanceFailureNotice, assetProducingToolsInPlay } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoAssetUrl,
@@ -3463,6 +3463,7 @@ export class AgentModeService {
       const hasAdminAccess = (isAdmin || isDelegatedAccess) && !isInteractiveShare;
 
       const workPlan = currentSession?.workPlan;
+      const openResearchRequests = currentSession?.openResearchRequests;
       const workPlanTurnBefore = snapshotWorkPlanTurn(currentSession);
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
 
@@ -3490,7 +3491,7 @@ export class AgentModeService {
           console.warn('[AgentMode] H-VOICE prompt inject skipped (non-fatal):', voiceInjectErr);
         }
       }
-      const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations);
+      const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
@@ -4604,7 +4605,20 @@ export class AgentModeService {
           // rendered, QA'd, and saved" when only 4 screenshots succeeded). It reads
           // as a normal answer, so `isUnusableSynthesis` never flags it; this checks
           // the claim's numbers against `toolCalls` instead of the text's shape.
-          if (falseClaimGuardEnabled && content) {
+          //
+          // ENG-2076: gated on `assetProducingToolsInPlay` — this guard only
+          // understands image/video/HTML-template generation tools, so a turn that
+          // never called one of them (e.g. a Meta Ads turn built entirely on
+          // `call_meta_marketing_api`, or ANY turn that merely RECAPPED an earlier
+          // turn's true results with no new tool calls of its own) is outside its
+          // domain: `actual` is computed from THIS turn's ledger only, so running
+          // the check anyway always reads "0 of N produced" and appends a false
+          // correction — exactly what derailed a live Meta Ads session right before
+          // its publish-confirmation step. Deliberately turn-scoped, not
+          // session-history-scoped — see the function's own doc comment for why a
+          // session-wide check reintroduces the same bug for any session that mixes
+          // media generation with a later, unrelated recap turn.
+          if (falseClaimGuardEnabled && content && assetProducingToolsInPlay(toolCalls)) {
             const falseClaim = detectFalseCompletionClaim(content, toolCalls);
             if (falseClaim) {
               console.warn(
@@ -4912,6 +4926,22 @@ export class AgentModeService {
           } catch (counterError) {
             console.error('AgentMode: Failed to batch update function call counters:', counterError);
             // Don't fail the whole iteration if counter update fails
+          }
+        }
+
+        // ENG-738: track research/lookup requests that timed out this iteration (and
+        // clear any earlier open entry a now-successful call just resolved) so a later
+        // turn doesn't silently drop — or misremember — a request the user is still owed.
+        {
+          const { additions, resolvedTools } = AgentModeService.detectOpenResearchRequestChanges(
+            toolCalls.slice(toolCallsLengthBeforeIteration)
+          );
+          if (additions.length > 0 || resolvedTools.length > 0) {
+            try {
+              await chatbotDb.recordOpenResearchRequests(sessionId, additions, resolvedTools);
+            } catch (openRequestError) {
+              console.error('AgentMode: Failed to update open research requests:', openRequestError);
+            }
           }
         }
 
@@ -5823,6 +5853,108 @@ export class AgentModeService {
     return [{ role: 'assistant', content: workPlanContent.trim() }];
   }
 
+  // ENG-738: how long an open research request keeps being surfaced as a reminder
+  // before it silently ages out. Bounds the nag lifetime without needing a
+  // separate "dismiss" action — the primary incident session's user asked about
+  // the dropped request ~1h45m after the timeout, well inside this window.
+  private static readonly OPEN_RESEARCH_REQUEST_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+  /**
+   * From one iteration's tool-call entries, work out which RESEARCH_LOOKUP_TOOLS
+   * calls newly timed out (still owed to the user) and which succeeded (clearing
+   * any earlier open entry for that tool). Pure — no I/O — so this is fully
+   * covered by unit tests instead of only exercised through a live session.
+   *
+   * A call only counts as "resolved" on a genuine success — a soft failure
+   * (e.g. perform_deep_research's `{success:false}` after a timeout, ENG-738)
+   * must NOT clear the open entry it's reporting. A non-timeout failure
+   * (invalid args, service unavailable, …) is left alone
+   * entirely: it doesn't add a new open entry (retrying won't fix it, so it's
+   * not "still owed" in the same sense) and doesn't resolve an existing one
+   * (the underlying ask still isn't done).
+   */
+  private static detectOpenResearchRequestChanges(
+    toolCallEntries: Array<{ name: string; arguments?: any; error?: string; result?: any }>,
+    nowIso: string = new Date().toISOString(),
+  ): { additions: Array<{ tool: string; topic: string; failedAt: string; errorSummary: string }>; resolvedTools: string[] } {
+    const additions: Array<{ tool: string; topic: string; failedAt: string; errorSummary: string }> = [];
+    const resolvedTools: string[] = [];
+
+    for (const entry of toolCallEntries || []) {
+      if (!AgentModeService.RESEARCH_LOOKUP_TOOLS.has(entry.name)) continue;
+
+      const softFailure = Boolean(entry.result) && typeof entry.result === 'object' && entry.result.success === false;
+      const failed = Boolean(entry.error) || softFailure;
+
+      if (!failed) {
+        resolvedTools.push(entry.name);
+        continue;
+      }
+
+      const errorText = entry.error || (softFailure ? String(entry.result?.error || entry.result?.message || '') : '');
+      if (classifyToolErrorClass(errorText) === 'timeout') {
+        additions.push({
+          tool: entry.name,
+          topic: AgentModeService.summarizeResearchTopic(entry.arguments),
+          failedAt: nowIso,
+          errorSummary: errorText.slice(0, 200),
+        });
+      }
+    }
+
+    return { additions, resolvedTools };
+  }
+
+  /** Best-effort short human-readable topic from a research-lookup tool's call args. */
+  private static summarizeResearchTopic(args: any): string {
+    if (!args || typeof args !== 'object') return 'unspecified topic';
+    const candidate = args.topic || args.query || args.profile_url || args.q;
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim().slice(0, 150);
+    }
+    try {
+      const serialized = JSON.stringify(args);
+      return serialized && serialized !== '{}' ? serialized.slice(0, 150) : 'unspecified topic';
+    } catch {
+      return 'unspecified topic';
+    }
+  }
+
+  /**
+   * ENG-738: a research/lookup request that timed out and was never retried to
+   * success must not be silently dropped (or misremembered) once the
+   * conversation moves on to something else — this re-injects it as an
+   * authoritative reminder on later turns, the same way buildWorkPlanContextMessages
+   * keeps an active plan visible. Filtered by age so a session that lives for
+   * days doesn't nag about a request from a week ago forever (see
+   * OPEN_RESEARCH_REQUEST_MAX_AGE_MS) — persistence-layer capping (chatbotDb.
+   * recordOpenResearchRequests) additionally bounds the list size.
+   */
+  public static buildOpenResearchRequestReminder(
+    openResearchRequests: Array<{ tool: string; topic: string; failedAt: string; errorSummary: string }> | undefined,
+    nowMs: number = Date.now(),
+  ): any[] {
+    if (!Array.isArray(openResearchRequests) || openResearchRequests.length === 0) {
+      return [];
+    }
+
+    const recent = openResearchRequests.filter((r) => {
+      const failedAtMs = Date.parse(r.failedAt);
+      return Number.isFinite(failedAtMs) && nowMs - failedAtMs <= AgentModeService.OPEN_RESEARCH_REQUEST_MAX_AGE_MS;
+    });
+    if (recent.length === 0) {
+      return [];
+    }
+
+    let content = '⚠️ UNRESOLVED REQUEST(S) FROM EARLIER IN THIS SESSION:\n';
+    recent.forEach((r) => {
+      content += `- ${r.tool} on "${r.topic}" failed with a timeout at ${r.failedAt} and was never completed.\n`;
+    });
+    content += '\nDo NOT silently leave these dropped, and do NOT claim you never attempted them — the record above is authoritative, not your recollection of the conversation. At a natural point in this response (after handling what the user is asking now), either proactively retry the ones you have enough context to retry, or tell the user plainly that they are still outstanding and ask whether to continue now or later.';
+
+    return [{ role: 'assistant', content }];
+  }
+
   /**
    * ENG-1974. "Keep chatting" on a workplan recommendation card leaves no
    * trace anywhere in the conversation — the recommendation's tool-call
@@ -5920,7 +6052,7 @@ export class AgentModeService {
     return text;
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>, declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>, declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>, openResearchRequests?: any[]): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -6099,6 +6231,11 @@ export class AgentModeService {
     // have nothing active at all.
     messages.push(...AgentModeService.buildDeclinedWorkPlanRecommendationContextMessages(declinedWorkPlanRecommendations));
 
+    // ENG-738: surface any research/lookup request that timed out earlier in this
+    // session and was never retried to success — independent of whether a work
+    // plan exists, since the incident this fixes was a plain conversational ask.
+    messages.push(...AgentModeService.buildOpenResearchRequestReminder(openResearchRequests));
+
     // Append the current user message at the end (with vision if a screenshot URL was provided)
     if (screenshotUrl) {
       messages.push({
@@ -6191,6 +6328,13 @@ export class AgentModeService {
     // could still have install_skills(["__other_skills__"]) refused with
     // "these skills are currently unavailable to install" (ENG-1867).
     'convert_to_pdf',
+
+    // User-authenticated Drive discovery and direct document reads are basic
+    // file-access primitives. Keep them out of the subscription-gated
+    // __other_skills__ catch-all so connected Drive accounts work without a
+    // skill install.
+    'google_drive',
+    'read_google_doc',
 
     // Work Plans (Emma's execution planning system)
     'create_work_plan',
@@ -7377,6 +7521,21 @@ export class AgentModeService {
         processedCount: result?.processedCount,
         failedCount: result?.failedCount,
         failureBreakdown: result?.failureBreakdown,
+      };
+    }
+
+    // ENG-738: previously fell through to the generic `{}` fallback below, which
+    // dropped success/error — the open-research-request tracker
+    // (detectOpenResearchRequestChanges) needs these on the MINIMIZED entry to
+    // tell a real success from a still-unresolved timeout result, since only
+    // this minimized form (not the full result) reaches toolCalls.
+    if (toolName === 'perform_deep_research') {
+      const r = result || {};
+      return {
+        ...(r.success !== undefined ? { success: r.success } : {}),
+        ...(typeof r.error === 'string' && r.error ? { error: r.error.slice(0, 200) } : {}),
+        ...(r.data?.research_url ? { research_url: r.data.research_url } : {}),
+        ...(r.data?.research_depth ? { research_depth: r.data.research_depth } : {}),
       };
     }
 
@@ -25727,7 +25886,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           drive,
           folderIds,
           `name = '${escapeDriveQueryValue(fileName)}' and trashed = false`,
-          'files(id, name, mimeType, size, modifiedTime, parents)',
+          'files(id, name, mimeType, size, modifiedTime, parents, shortcutDetails)',
           2
         );
       const files = Array.from(filesMap.values());
@@ -25831,8 +25990,25 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         };
       }
 
-      const file = files[0];
-      const isGoogleDoc = file.mimeType === 'application/vnd.google-apps.document' || file.mimeType === 'application/vnd.google-apps.spreadsheet';
+      const matchedFile = files[0];
+      let file = matchedFile;
+      if (matchedFile.mimeType === 'application/vnd.google-apps.shortcut') {
+        const targetId = matchedFile.shortcutDetails?.targetId;
+        if (!targetId) {
+          throw new Error(`Google Drive shortcut "${fileName}" has no target`);
+        }
+        const targetMeta = await drive.files.get({
+          fileId: targetId,
+          fields: 'id,name,mimeType,size,modifiedTime',
+          supportsAllDrives: true,
+        });
+        file = targetMeta.data;
+      }
+
+      const isGoogleDoc =
+        file.mimeType === 'application/vnd.google-apps.document' ||
+        file.mimeType === 'application/vnd.google-apps.spreadsheet' ||
+        file.mimeType === 'application/vnd.google-apps.presentation';
       const [contentStr, commentsStr] = await Promise.all([
         this.readGoogleDriveFileContent(drive, file.id!, file.name || fileName, file.mimeType || ''),
         isGoogleDoc ? this.fetchDriveFileComments(drive, file.id!) : Promise.resolve(''),
@@ -30149,6 +30325,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       });
 
       if (!researchResult.success || !researchResult.markdownContent) {
+        // ENG-738: deepResearchService already retried once at a reduced depth
+        // internally if the first attempt timed out (see DEPTH_DEGRADE there);
+        // a failure reaching here means that already happened and still didn't
+        // produce content, so tell the model plainly rather than inviting an
+        // identical, doomed-to-repeat retry of the same call.
         return {
           success: false,
           message: researchResult.error || 'Deep research failed',
@@ -30181,15 +30362,24 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
       console.log('AgentMode: Deep research uploaded to S3:', uploadResult.url);
 
+      // ENG-738: a success that only landed after an automatic depth downgrade
+      // must report the depth actually delivered, not the one originally
+      // requested — reporting the request depth here would misrepresent the
+      // result (e.g. claiming "comprehensive" when the agent produced "overview").
+      const actualDepth = researchResult.actualDepth || depth;
+      const successDepthNote = researchResult.degradedFrom
+        ? ` at "${actualDepth}" depth (automatically reduced from "${researchResult.degradedFrom}" after the first attempt timed out)`
+        : '';
+
       return {
         success: true,
-        message: `Deep research completed successfully. Generated ${wordCount} words of content and saved to S3.`,
+        message: `Deep research completed successfully${successDepthNote}. Generated ${wordCount} words of content and saved to S3.`,
         data: {
           research_url: uploadResult.url,
           title: researchResult.title,
           summary: researchResult.researchSummary,
           word_count: wordCount,
-          research_depth: depth,
+          research_depth: actualDepth,
           topic: topic
         }
       };
@@ -30257,16 +30447,17 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           userId
         });
 
-        if (!researchResult.success || !researchResult.markdownContent) {
+        const researchContent = researchResult.markdownContent;
+        if (!researchResult.success || !researchContent) {
           throw new Error(researchResult.error || 'Deep research failed');
         }
 
-        console.log('AgentMode: Deep research complete. Length:', researchResult.markdownContent.length);
+        console.log('AgentMode: Deep research complete. Length:', researchContent.length);
         console.log('AgentMode: Restyling research content with style:', style);
 
         // Restyle with inline image placeholders
         blogData = await restyleContent(
-          researchResult.markdownContent,
+          researchContent,
           titleDraft,
           'professional',
           style,

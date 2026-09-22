@@ -774,8 +774,13 @@ function chooseSyntheticValue(field: SmokeField, email: string, phone: string): 
   if (field.kind === "tel" || /phone|\btel\b|mobile|cell/.test(hint)) return phone;
   if (/zip|postal|postcode/.test(hint)) return "94025";
   if (field.kind === "url" || /url|website|web[-_\s]*site|domain/.test(hint)) return "https://example.com";
-  if (/last[-_\s]*name|family[-_\s]*name|surname|lname/.test(hint)) return "Test";
-  if (/first[-_\s]*name|given[-_\s]*name|fname/.test(hint)) return "Smoke";
+  // A combined name field takes the whole name. Checked FIRST because "fullname" contains
+  // the substring "lname" ("ful|lname"), so the surname branch below used to claim it and a
+  // full-name input was filled with just "Test" — observed live on a generated lander.
+  if (/full[-_\s]*name|your[-_\s]*name|contact[-_\s]*name/.test(hint)) return "Smoke Test";
+  // The short aliases need a boundary for the same reason; only match them as their own word.
+  if (/last[-_\s]*name|family[-_\s]*name|surname|(?:^|[^a-z])lname(?:[^a-z]|$)/.test(hint)) return "Test";
+  if (/first[-_\s]*name|given[-_\s]*name|(?:^|[^a-z])fname(?:[^a-z]|$)/.test(hint)) return "Smoke";
   if (/name/.test(hint)) return "Smoke Test";
   if (field.kind === "number") return "5";
   if (field.kind === "date") return "2030-01-01";

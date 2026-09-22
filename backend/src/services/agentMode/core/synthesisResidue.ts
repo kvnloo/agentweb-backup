@@ -704,6 +704,34 @@ export function detectFalseCompletionClaim(
 }
 
 /**
+ * ENG-2076: whether `detectFalseCompletionClaim`'s domain (image/video/HTML-template
+ * generation) is actually in play THIS turn — i.e. whether `toolCalls` contains at
+ * least one call to `ASSET_PRODUCING_TOOL_NAMES`. Callers should skip the guard
+ * entirely when this is false.
+ *
+ * Deliberately turn-scoped only — an earlier revision of this fix also treated a
+ * session's persisted `calledFunctions` (an asset tool used in a PRIOR turn) as
+ * enough to let the guard run, on the theory that it would widen coverage. It does
+ * the opposite: `detectFalseCompletionClaim`'s `actual` is unconditionally computed
+ * from `toolCalls` (this turn only — see `countProducedAssets` above), never from
+ * history. So gating on session history while still computing `actual` from an empty
+ * this-turn ledger reproduces the exact ENG-2076 bug one level up: a session that
+ * generated real images earlier and later TRUTHFULLY recaps that true count on a
+ * turn with no new tool calls (a normal "what's next" follow-up) would get told
+ * "0 of N were actually produced" again — just gated to media-generating sessions
+ * instead of firing on every session. Turn-scoped-only avoids that: a recap turn
+ * with zero matching tool calls skips the check entirely, exactly as it does for the
+ * live ENG-2076 repro (a Meta Ads session recapping "3 creatives created" on a turn
+ * that made no tool calls at all — a clarifying question, not new work), while a
+ * turn that DOES call an asset-producing tool (the original ENG-1188/ENG-1331
+ * same-turn shortfall: N screenshots claimed, fewer actually taken) still runs the
+ * check exactly as before.
+ */
+export function assetProducingToolsInPlay(toolCalls: ExecutedToolCall[]): boolean {
+  return toolCalls.some((call) => typeof call.name === 'string' && ASSET_PRODUCING_TOOL_NAMES.has(call.name));
+}
+
+/**
  * Correction to APPEND when `detectFalseCompletionClaim` finds a claim the ledger
  * cannot back up. Keeps the model's original prose (it may still hold other real,
  * useful detail) but states the real count and the named shortfall right underneath
