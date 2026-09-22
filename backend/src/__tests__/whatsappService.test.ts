@@ -18,6 +18,7 @@
 
 import {
   sendMessage,
+  sendText,
   sendTemplate,
   toTemplateParam,
   redactPhone,
@@ -202,6 +203,31 @@ describe('opt-out (STOP)', () => {
     // phone is the only thing that works when the sender is not a known contact.
     await expect(recordOptOut('+19999999999')).resolves.toBeUndefined();
     expect(settingsService.setSetting).toHaveBeenCalled();
+  });
+});
+
+// ── sendText enforces the window itself, not just via sendMessage's caller-side check ──
+
+describe('sendText — direct callers are still bound by the window', () => {
+  it('refuses a direct call outside the window, without reaching Meta', async () => {
+    // sendText's own doc comment says "Only legal inside the 24-hour service window" —
+    // a caller that reaches it WITHOUT going through sendMessage (which checks first)
+    // must still be refused locally, rather than discovering 131047 from Meta.
+    await expect(sendText('+14155550123', 'hi')).rejects.toBeInstanceOf(WhatsAppWindowClosedError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('sends when called directly while the window happens to be open', async () => {
+    settingsService.getSetting.mockImplementation(async (k: string) =>
+      k.startsWith('whatsapp:window:') ? { settingValue: new Date().toISOString() } : null,
+    );
+    await expect(sendText('+14155550123', 'hi')).resolves.toEqual({ messageId: 'wamid.TEST1' });
+  });
+
+  it('does not put the raw phone number in its own window-closed error message', async () => {
+    const err: any = await sendText('+14155550123', 'hi').catch((e) => e);
+    expect(err.message).not.toContain('4155550123');
+    expect(err.message).toContain('0123');
   });
 });
 
