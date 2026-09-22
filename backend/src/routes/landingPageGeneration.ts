@@ -722,7 +722,15 @@ router.post("/generated/:id/deploy", rateLimiter, async (req, res: Response) => 
     res.json(result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error deploying:", error);
-    const status = error.message?.includes("not found") ? 404 : 500;
+    // ENG-2083: a page that is already deployed (or otherwise in a non-deployable state) is
+    // a 409, not a 500 — the request is invalid, the server is fine, and retrying it can
+    // never succeed. Checked by `code` rather than `instanceof` so it survives re-wrapping.
+    const status =
+      error?.code === "LP_NOT_DEPLOYABLE"
+        ? 409
+        : error.message?.includes("not found")
+        ? 404
+        : 500;
     res.status(status).json({ error: error.message || "Failed to deploy" });
   }
 });

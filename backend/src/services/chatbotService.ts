@@ -5664,6 +5664,12 @@ export async function generateChatResponse(
           if (socketId) extraContext.socketId = socketId;
           if (isDelegatedAdmin) extraContext.isDelegatedAdmin = true;
           if (isDelegatedAdmin && adminEmail) extraContext.adminEmail = adminEmail;
+          // ENG-2072: this is the Emma-sidebar chat turn — a real person is
+          // present (see the ENG-803 comment above in getEmmaSystemContext),
+          // so never let createWorkPlan/modifyWorkPlan/applyPredefinedWorkPlan
+          // fall back to session.sessionType==='scheduled' and force hands-off
+          // work-plan autocomplete on an attended turn.
+          extraContext.isUnattendedRun = false;
           const result = await agentModeService.executeTool(activeModel, toolCall.function.name, functionArgs, userId!, sessionId, false, Object.keys(extraContext).length ? extraContext : undefined);
           console.log(`[generateChatResponse] Tool ${toolCall.function.name} executed successfully`);
           // ENG-351: harvest web-search sources into the citation registry.
