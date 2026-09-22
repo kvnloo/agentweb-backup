@@ -56,7 +56,7 @@ phone. Multi-tenant onboarding was evaluated and deferred — see "Deferred" bel
 | Send free-form text | Yes | `services/whatsappService.ts` `sendText` | Only inside the 24h window. |
 | Send template | Yes | `services/whatsappService.ts` `sendTemplate` | Required outside the window. |
 | Window-aware send | Yes | `services/whatsappService.ts` `sendMessage` | Picks text vs template; this is what callers should use. |
-| Webhooks | Yes | `routes/whatsappWebhook.ts` | Inbound messages, delivery statuses, STOP/UNSTOP. |
+| Webhooks | Yes | `routes/whatsappWebhook.ts` | Inbound messages and STOP/UNSTOP. Delivery-status events are acknowledged but ignored and not persisted. |
 | Read history | **No** | — | Cloud API has no history endpoint. We know only what the webhook delivered. |
 | Edit / delete a sent message | **No** | — | Not supported by the API at all. Callers send a follow-up. |
 | Threads | **No** | — | Quoted replies only. |
