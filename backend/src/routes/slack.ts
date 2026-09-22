@@ -592,8 +592,6 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
   try {
     if (!verifySlackRequest(req)) return res.status(401).json({ error: 'Unauthorized Slack request' });
     if (Buffer.isBuffer(req.body)) req.body = JSON.parse(req.body.toString('utf8'));
-    console.log('📥 Slack event received:', JSON.stringify(req.body, null, 2));
-    console.log('📥 Request headers:', JSON.stringify(req.headers, null, 2));
     const { type, challenge, event } = req.body;
 
     // Handle URL verification challenge
@@ -639,7 +637,7 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
         console.log('👋 Emma bot mentioned in Slack:', {
           channel,
           user: slackUserId,
-          text
+          ts
         });
 
         try {
