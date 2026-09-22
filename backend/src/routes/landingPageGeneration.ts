@@ -2012,6 +2012,27 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
     } catch (mergeErr: any) {
       if (mergeErr.response?.status !== 409) throw mergeErr;
 
+      // Force-advancing main to the draft tip is only safe when the draft already
+      // contains every main commit. If main moved on since the draft was cut, a force
+      // update silently reverts those commits (other pages, manual PRs) in production.
+      try {
+        const cmp = await axios.get<any>(
+          `${repoBase}/compare/${draftSha}...main`,
+          { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+        );
+        if (Number(cmp.data?.ahead_by) > 0) {
+          return res.status(409).json({
+            error: "draft_behind_main",
+            message: `The draft is missing ${cmp.data.ahead_by} commit(s) that are already on main and conflicts with them. Publishing would revert live changes. Re-run the edit so it is rebuilt on current main.`,
+          });
+        }
+      } catch (cmpErr: any) {
+        return res.status(409).json({
+          error: "draft_divergence_unknown",
+          message: "Could not confirm the draft contains main; refusing to force-publish.",
+        });
+      }
+
       console.warn(`[LP GENERATION] Standard merge returned 409; force-advancing main to draft branch tip`);
 
       // The post-Tests ref read above proved that this exact SHA is still the

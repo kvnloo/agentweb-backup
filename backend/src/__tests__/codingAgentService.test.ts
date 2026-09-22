@@ -1,4 +1,4 @@
-import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, LANDING_PAGE_PREVIEW_BRANCH, _isMissingGithubRefError, _describeGithubError, _previewBranchCommitsAheadOfMain, _setOpenRouterClientForTest, _setDeploymentSleepForTest, _rollbackEditedFiles } from '../services/codingAgentService';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, LANDING_PAGE_PREVIEW_BRANCH, _isMissingGithubRefError, _describeGithubError, _previewBranchCommitsAheadOfMain, _previewBranchDivergence, _setOpenRouterClientForTest, _setDeploymentSleepForTest, _rollbackEditedFiles } from '../services/codingAgentService';
 import { agentModeService } from '../services/agentModeService';
 import Anthropic from '@anthropic-ai/sdk';
 import { getSecret } from '../utils/secretsManager';
@@ -2603,5 +2603,18 @@ describe('_rollbackEditedFiles (Greptile: new files must be deleted, not "revert
     const secondCall = mockedMcpFetch.mock.calls[1][0] as any;
     expect(secondCall.path).toBe('/api/landing-pages/v0/generated/test-page-123/github-edit');
     expect(secondCall.body.content).toBe('');
+  });
+});
+
+describe('_previewBranchDivergence', () => {
+  const repoBase = 'https://api.github.com/repos/AgentWebPro/lp-example';
+  beforeEach(() => { mockedAxios.get.mockReset(); });
+  test('reports behind_by so a stale draft is detected', async () => {
+    mockedAxios.get.mockResolvedValueOnce({ data: { ahead_by: 20, behind_by: 11 } } as any);
+    await expect(_previewBranchDivergence(repoBase, {})).resolves.toEqual({ aheadBy: 20, behindBy: 11 });
+  });
+  test('returns null on error', async () => {
+    mockedAxios.get.mockRejectedValueOnce(new Error('boom'));
+    await expect(_previewBranchDivergence(repoBase, {})).resolves.toBeNull();
   });
 });
