@@ -4607,14 +4607,18 @@ export class AgentModeService {
           // the claim's numbers against `toolCalls` instead of the text's shape.
           //
           // ENG-2076: gated on `assetProducingToolsInPlay` — this guard only
-          // understands image/video/HTML-template generation tools, so a session
-          // that never touched any of them (e.g. a Meta Ads session built entirely
-          // on `call_meta_marketing_api`) is outside its domain. Without this gate a
-          // turn that merely RECAPPED an earlier turn's true results (own ledger
-          // empty — it did no new tool calls) always read as "0 of N produced" and
-          // appended a false correction, which is exactly what derailed a live Meta
-          // Ads session right before its publish-confirmation step.
-          if (falseClaimGuardEnabled && content && assetProducingToolsInPlay(toolCalls, currentSession?.calledFunctions)) {
+          // understands image/video/HTML-template generation tools, so a turn that
+          // never called one of them (e.g. a Meta Ads turn built entirely on
+          // `call_meta_marketing_api`, or ANY turn that merely RECAPPED an earlier
+          // turn's true results with no new tool calls of its own) is outside its
+          // domain: `actual` is computed from THIS turn's ledger only, so running
+          // the check anyway always reads "0 of N produced" and appends a false
+          // correction — exactly what derailed a live Meta Ads session right before
+          // its publish-confirmation step. Deliberately turn-scoped, not
+          // session-history-scoped — see the function's own doc comment for why a
+          // session-wide check reintroduces the same bug for any session that mixes
+          // media generation with a later, unrelated recap turn.
+          if (falseClaimGuardEnabled && content && assetProducingToolsInPlay(toolCalls)) {
             const falseClaim = detectFalseCompletionClaim(content, toolCalls);
             if (falseClaim) {
               console.warn(
@@ -6324,6 +6328,13 @@ export class AgentModeService {
     // could still have install_skills(["__other_skills__"]) refused with
     // "these skills are currently unavailable to install" (ENG-1867).
     'convert_to_pdf',
+
+    // User-authenticated Drive discovery and direct document reads are basic
+    // file-access primitives. Keep them out of the subscription-gated
+    // __other_skills__ catch-all so connected Drive accounts work without a
+    // skill install.
+    'google_drive',
+    'read_google_doc',
 
     // Work Plans (Emma's execution planning system)
     'create_work_plan',
@@ -25875,7 +25886,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           drive,
           folderIds,
           `name = '${escapeDriveQueryValue(fileName)}' and trashed = false`,
-          'files(id, name, mimeType, size, modifiedTime, parents)',
+          'files(id, name, mimeType, size, modifiedTime, parents, shortcutDetails)',
           2
         );
       const files = Array.from(filesMap.values());
@@ -25979,8 +25990,25 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         };
       }
 
-      const file = files[0];
-      const isGoogleDoc = file.mimeType === 'application/vnd.google-apps.document' || file.mimeType === 'application/vnd.google-apps.spreadsheet';
+      const matchedFile = files[0];
+      let file = matchedFile;
+      if (matchedFile.mimeType === 'application/vnd.google-apps.shortcut') {
+        const targetId = matchedFile.shortcutDetails?.targetId;
+        if (!targetId) {
+          throw new Error(`Google Drive shortcut "${fileName}" has no target`);
+        }
+        const targetMeta = await drive.files.get({
+          fileId: targetId,
+          fields: 'id,name,mimeType,size,modifiedTime',
+          supportsAllDrives: true,
+        });
+        file = targetMeta.data;
+      }
+
+      const isGoogleDoc =
+        file.mimeType === 'application/vnd.google-apps.document' ||
+        file.mimeType === 'application/vnd.google-apps.spreadsheet' ||
+        file.mimeType === 'application/vnd.google-apps.presentation';
       const [contentStr, commentsStr] = await Promise.all([
         this.readGoogleDriveFileContent(drive, file.id!, file.name || fileName, file.mimeType || ''),
         isGoogleDoc ? this.fetchDriveFileComments(drive, file.id!) : Promise.resolve(''),
