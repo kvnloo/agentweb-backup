@@ -389,6 +389,13 @@ export interface ExecutePreparedToolsInput {
   isDelegatedAccess: boolean;
   hasAdminAccess: boolean;
   isInteractiveShare: boolean;
+  /**
+   * ENG-2072: tri-state — see ToolContext.isUnattendedRun in mcp/client/toolRegistry.ts.
+   * Forwarded verbatim to executePreparedAgentTool so it survives into the tool
+   * dispatch context; an explicit `false` (attended) must not collapse to
+   * `undefined` on the way through.
+   */
+  isUnattendedRun?: boolean;
   // ---- skill/tool gating (read-only) ----
   adminSkillToolNames: string[];
   excludeTools?: string[];
@@ -580,6 +587,7 @@ export async function executePreparedTools(
     isDelegatedAccess,
     hasAdminAccess,
     isInteractiveShare,
+    isUnattendedRun,
     adminSkillToolNames,
     excludeTools,
     publishedSkillsCount,
@@ -882,6 +890,7 @@ export async function executePreparedTools(
               sessionId,
               mockMode,
               isDelegatedAccess,
+              isUnattendedRun,
             }),
           });
           endExecuteToolSpan(span, outcome.status === 'error'
@@ -1038,6 +1047,7 @@ export async function executePreparedTools(
           socketEmit: ports.socketEmit,
           screenshotUrl,
           isDelegatedAccess,
+          isUnattendedRun,
           // Long-render tools (compose_video) read this to hand off before the run's hard
           // wall-clock timeout rather than blocking until killed with no asset (ENG-123).
           renderDeadlineMs: mediaGenerationDeadlineMs,

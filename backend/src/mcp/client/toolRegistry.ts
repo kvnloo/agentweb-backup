@@ -11,7 +11,19 @@ export interface ToolContext {
    * Reference to the AgentModeService to access its helper methods
    * during the transition period.
    */
-  service: any; 
+  service: any;
+  /**
+   * ENG-2072: is THIS TURN an unattended scheduled/test run, as opposed to an
+   * attended interactive turn (which can still land on a scheduled session — a
+   * user can reopen a schedule-created session from the "Scheduled" sidebar tab
+   * and keep chatting in it). Populated from runVerifiedChatInner/runScheduledChat
+   * — never inferred from session.sessionType, which only records how the session
+   * was CREATED. Undefined when the caller has not resolved a per-turn value.
+   * Consumed by createWorkPlan/modifyWorkPlan/applyPredefinedWorkPlan to decide
+   * whether to force hands-off autocomplete — see
+   * AgentModeService.shouldForceScheduledAutocomplete.
+   */
+  isUnattendedRun?: boolean;
 }
 
 export interface AgentTool {

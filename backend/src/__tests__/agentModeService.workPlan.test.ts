@@ -273,6 +273,84 @@ describe('AgentModeService - Work Plan', () => {
         expect.objectContaining({ autocomplete: true })
       );
     });
+
+    it('ENG-2072: does NOT force autocomplete on a scheduled session reopened for a live, attended turn (isUnattendedRun: false)', async () => {
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        // sessionType records how the session was CREATED, not whether a human is
+        // present now — the user reopened this schedule-created session from the
+        // "Scheduled" sidebar tab and is chatting into it live.
+        sessionType: 'scheduled',
+        messages: [],
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).createWorkPlan(
+        'Client Onboarding',
+        [{ stepCount: 1, title: 'Step 1' }],
+        mockSessionId,
+        false,
+        false // isUnattendedRun — a real person is watching this turn
+      );
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        mockSessionId,
+        expect.objectContaining({ autocomplete: false })
+      );
+    });
+
+    it('ENG-2072: still forces autocomplete on a scheduled session when the turn is genuinely unattended (isUnattendedRun: true)', async () => {
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        sessionType: 'scheduled',
+        messages: [],
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).createWorkPlan(
+        'Luma Event Lead Engagement',
+        [{ stepCount: 1, title: 'Step 1' }],
+        mockSessionId,
+        false,
+        true // isUnattendedRun — the real runScheduledChat/test-run path
+      );
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        mockSessionId,
+        expect.objectContaining({ autocomplete: true })
+      );
+    });
+
+    it('ENG-2072: falls back to sessionType when isUnattendedRun is not threaded by the caller (zero regression for un-migrated callers)', async () => {
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        sessionType: 'scheduled',
+        messages: [],
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).createWorkPlan(
+        'Luma Event Lead Engagement',
+        [{ stepCount: 1, title: 'Step 1' }],
+        mockSessionId,
+        false
+        // isUnattendedRun omitted entirely — e.g. the direct emmaApi.ts HTTP route
+      );
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        mockSessionId,
+        expect.objectContaining({ autocomplete: true })
+      );
+    });
   });
 
   describe('modifyWorkPlan', () => {
@@ -440,6 +518,34 @@ describe('AgentModeService - Work Plan', () => {
       expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
         mockSessionId,
         expect.objectContaining({ autocomplete: true })
+      );
+    });
+
+    it('ENG-2072: does NOT force autocomplete when a scheduled session is reopened for a live, attended turn (isUnattendedRun: false)', async () => {
+      const freshWorkPlan = JSON.parse(JSON.stringify({ ...existingWorkPlan, autocomplete: false }));
+
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        sessionType: 'scheduled',
+        messages: [],
+        workPlan: freshWorkPlan,
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).modifyWorkPlan(
+        [],
+        [],
+        mockSessionId,
+        false,
+        false // isUnattendedRun — a real person is watching this turn
+      );
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        mockSessionId,
+        expect.objectContaining({ autocomplete: false })
       );
     });
   });
