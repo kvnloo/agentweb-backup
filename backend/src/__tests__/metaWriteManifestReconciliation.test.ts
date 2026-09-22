@@ -443,7 +443,7 @@ describe('ENG-1635/1644 reconciliation — Vincent Hu partial-failure regression
     expect(write1Checkpoint.verifiedFields.appliedObjectId).toBe('id-AS_94041-prior');
   });
 
-  it('ENG-1635/1644: a stuck in-progress run from a CRASHED prior submission no longer permanently blocks every later deck in the session', async () => {
+  it('ENG-1635/1644: resumeStuckApprovalDeckWorkflowRun\'s message-history fallback correctly resumes a crashed deck IF a reply message for it exists (defensive depth, not the primary guarantee — see next test)', async () => {
     // Fresh-mind PR review finding (2026-09-22): advanceIndependentWorkflow
     // has no caller anywhere except submitApprovalDeckAnswers, and an
     // independent-step run never reaches 'failed' — only 'completed' (every
@@ -453,12 +453,24 @@ describe('ENG-1635/1644 reconciliation — Vincent Hu partial-failure regression
     // 'conflict', even one that has nothing to do with the crashed batch —
     // a variant of the exact Vincent Hu incident (stuck batch, manual
     // rebuild needed) this ticket exists to prevent, just triggered by infra
-    // instead of a Meta API error. This proves resumeStuckApprovalDeckWorkflowRun
-    // actually closes it: the crashed deck's un-checkpointed writes drain
-    // BEFORE the new deck's own workflow starts, using ONLY message history
-    // to reconstruct the crashed deck (the harder, more realistic path — a
-    // later deck has already overwritten session.pendingApprovalDeck, same
-    // as a real crash-then-later-turn scenario would look like).
+    // instead of a Meta API error.
+    //
+    // A SECOND fresh-mind review (same session, later pass) found this
+    // exact test's own scenario — reconstructing from message history once
+    // a later deck has already overwritten session.pendingApprovalDeck — is
+    // not actually reachable in real production: a reply message
+    // (metadata.approvalDeckAnswer) is only ever persisted AFTER
+    // submitApprovalDeckAnswers returns 'submitted', which requires the run
+    // to have already reached 'completed' — a run stuck 'in_progress' from a
+    // crash can therefore never have one. This test still proves the
+    // reconstruction function's own logic is correct (real value: defensive
+    // depth for any future/unanticipated path that DOES leave such a
+    // message), but the REAL fix for "a later deck has already overwritten
+    // pendingApprovalDeck" is a second call site — resumeStuckApprovalDeckWorkflowRun
+    // is now ALSO called right before a fresh deck is persisted in the main
+    // iteration loop, so the crashed deck gets resumed while it's still
+    // guaranteed to be pendingApprovalDeck, before the overwrite ever
+    // happens. See the next test for that realistic, always-reachable path.
     const createCalls: string[] = [];
     jest.spyOn(service as any, 'manageMetaAdsAdSets').mockImplementation((async (..._args: unknown[]) => {
       const params: any = _args[5];
@@ -515,6 +527,72 @@ describe('ENG-1635/1644 reconciliation — Vincent Hu partial-failure regression
     // ...AND the new deck's own write also went through, not silently dropped
     // behind a misleading 'conflict'.
     expect(createCalls).toContain('AS_10001');
+  });
+
+  it('ENG-1635/1644: the REAL fix — resumeStuckApprovalDeckWorkflowRun called right before a new deck is persisted, while the crashed deck is still pendingApprovalDeck', async () => {
+    // Second fresh-mind review's actual fix: agentModeService.ts's main
+    // iteration loop now calls resumeStuckApprovalDeckWorkflowRun immediately
+    // before persisting a freshly-built approval deck — the one moment a new
+    // deck is about to overwrite session.pendingApprovalDeck. This mirrors
+    // that exact sequence directly (fetch fresh session, resume, THEN
+    // persist the new deck) using ONLY the live pendingApprovalDeck field —
+    // no message-history mock needed, because this is the path that's
+    // ALWAYS reachable: the crashed deck is still pendingApprovalDeck at
+    // this point in every real crash, by construction (submitApprovalDeckAnswers
+    // durably persists the answered deck to pendingApprovalDeck BEFORE the
+    // crash-prone drain loop even starts).
+    const createCalls: string[] = [];
+    jest.spyOn(service as any, 'manageMetaAdsAdSets').mockImplementation((async (..._args: unknown[]) => {
+      const params: any = _args[5];
+      createCalls.push(params?.name);
+      return { success: true, message: 'created', adSet: { id: `id-${params?.name}` } };
+    }) as any);
+
+    const oldDeckId = 'deck-vincent-1';
+    const oldAnsweredDeck = applyDeckAnswers(answeredDeckFixture(), approveAll(), 'user', '2026-09-14T23:59:00.000Z');
+
+    // Crashed run: write-1 verified pre-crash, write-2/write-3 never attempted.
+    const priorVerifiedAt = '2026-09-15T00:00:00.000Z';
+    sessionState.workflowRun = {
+      runId: 'run-1',
+      workflowId: `approval-deck-${oldDeckId}`,
+      status: 'in_progress',
+      checkpoints: [
+        { stepId: 'write-1', status: 'verified', entityIds: {}, verifiedFields: { appliedObjectId: 'id-AS_94041-prior' }, verifiedAt: priorVerifiedAt },
+      ],
+      resolvedParameters: {},
+      version: 1,
+      createdAt: priorVerifiedAt,
+      updatedAt: priorVerifiedAt,
+    };
+    sessionState.consumedMetaWriteManifestDigests = { [digestFor('94041')]: priorVerifiedAt };
+    // The crashed deck IS still pendingApprovalDeck — the realistic
+    // immediately-post-crash state, before any new deck has been built.
+    sessionState.pendingApprovalDeck = oldAnsweredDeck;
+
+    // Exactly what the chokepoint does: fetch fresh session, resume, THEN persist a new deck.
+    const freshSession = await chatbotDb.getChatSession(SESSION_ID);
+    await (service as any).resumeStuckApprovalDeckWorkflowRun(SESSION_ID, freshSession);
+
+    expect(createCalls).toEqual(expect.arrayContaining(['AS_94043', 'AS_94536']));
+    expect(createCalls).not.toContain('AS_94041');
+    expect(sessionState.workflowRun.status).toBe('completed');
+
+    const newDeck = {
+      deckId: 'deck-new-1', status: 'awaiting' as const, createdAt: '2026-09-16T00:00:00.000Z',
+      items: [{
+        itemId: 'write-new-1', kind: 'meta_write', question: 'Create ad set AS_10001?', allowFreeText: true,
+        metaWriteManifestDigest: digestFor('10001'), metaWriteDispatch: writeDispatchFor('10001'),
+      }],
+    };
+    const posted = await chatbotDb.updateSessionApprovalDeck(SESSION_ID, newDeck, { failIfAwaitingExists: true });
+    // The overwrite is no longer blocked by anything — resuming the stuck
+    // run first didn't touch pendingApprovalDeck's status guard at all, and
+    // the old deck was never 'awaiting' in the first place (it was
+    // 'answered'), so this was never actually the thing that could have
+    // blocked it — the real point is the OLD run's writes above already
+    // dispatched for real BEFORE this overwrite happened, not after.
+    expect(posted).not.toBeNull();
   });
 
   it('reject-with-correction: approve 2 of 3, reject the third with a correction — only the 2 approved ever get a workflow step, the correction is captured, never auto-applied', async () => {

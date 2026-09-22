@@ -5060,6 +5060,20 @@ export class AgentModeService {
             ? this.buildApprovalDeckForIteration(writeHalts, questionDeckHalts)
             : null;
         if (approvalDeck) {
+          // Found by fresh-mind review: resumeStuckApprovalDeckWorkflowRun's
+          // message-history fallback (see its own header) can only ever find
+          // a reply message for a deck whose run already reached 'completed'
+          // — a run stuck mid-crash never gets one, so that fallback can
+          // never actually fire for the exact case it exists for. THIS is
+          // the real fix: this is the one place a new deck is about to
+          // overwrite session.pendingApprovalDeck — if an older deck is
+          // still sitting there, still fully answered, with its workflow
+          // run stuck 'in_progress' from a prior crash, this is the LAST
+          // moment its items/answers are durably available anywhere. Resume
+          // it here, before the overwrite, not after.
+          const sessionForResume = await chatbotDb.getChatSession(sessionId as string);
+          if (sessionForResume) await this.resumeStuckApprovalDeckWorkflowRun(sessionId as string, sessionForResume);
+
           const posted = await chatbotDb.updateSessionApprovalDeck(sessionId as string, approvalDeck, {
             failIfAwaitingExists: true,
           });
@@ -22169,16 +22183,29 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * batch, manual rebuild needed) this ticket exists to prevent, just
    * triggered by infra instead of a Meta API error.
    *
-   * Runs opportunistically before handling a NEW answer; a no-op when
-   * nothing is stuck. The stuck run's own workflowId encodes its deckId
-   * (`approval-deck-<deckId>`, see submitApprovalDeckAnswers below) — if
-   * that deck is still `session.pendingApprovalDeck` (the common case: no
-   * later deck has been built since the crash), its items are read directly;
-   * otherwise they're rebuilt from message history the same way
-   * findAnsweredDeckItemByKind already does. If neither source has it,
-   * there's nothing more this can do — leaves the run stuck rather than
-   * guessing, same as any other unreconstructable-state fallback in this
-   * file.
+   * Called from two places: here (before handling a NEW deck ANSWER), and —
+   * this is the one that actually matters — right before a fresh deck is
+   * about to be PERSISTED and overwrite `session.pendingApprovalDeck` (see
+   * the call site right before `updateSessionApprovalDeck(..., approvalDeck,
+   * ...)` in the main iteration loop). A no-op when nothing is stuck.
+   *
+   * The stuck run's own workflowId encodes its deckId
+   * (`approval-deck-<deckId>`, see submitApprovalDeckAnswers below). If that
+   * deck is still `session.pendingApprovalDeck`, its items are read
+   * directly — this is the ONLY path that can actually succeed, and it's
+   * why the second call site above is load-bearing: it's the last point in
+   * the whole turn where that's still guaranteed true, before a new deck
+   * would silently take the slot. The message-history fallback below is
+   * defensive depth only, not a real second path in practice — a reply
+   * message (`metadata.approvalDeckAnswer`) is only ever persisted AFTER
+   * `submitApprovalDeckAnswers` returns `'submitted'`, which requires the
+   * run to have already reached `'completed'`; a run stuck `'in_progress'`
+   * from a crash therefore can never have one. Found by a second fresh-mind
+   * review: the original design leaned on this fallback as the answer for
+   * "a later deck has already overwritten pendingApprovalDeck," but that's
+   * exactly the state combination that can't occur. Real fix was adding the
+   * earlier call site, not improving this fallback — kept here anyway in
+   * case some future/unanticipated path does leave such a message behind.
    */
   private async resumeStuckApprovalDeckWorkflowRun(sessionId: string, session: ChatSession): Promise<void> {
     const run = session.workflowRun;
