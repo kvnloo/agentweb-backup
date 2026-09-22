@@ -40,7 +40,9 @@ process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS = '';
 // local .env still carrying the unfilled '.env.example' placeholder text
 // (e.g. 'your_slack_signing_secret', a truthy string) defeats that check and
 // makes every unsigned test request 401 in that dev's own runs, though not
-// in CI (a clean checkout's local .env may not define this key at all).
+// in CI (a clean checkout's local .env may not define this key at all). Same
+// dotenv-refill hazard as above applies too — set to '' (not delete) for the
+// same hasOwnProperty reason documented there.
 process.env.SLACK_SIGNING_SECRET = '';
 
 // Set Azure OpenAI embeddings environment variables for tests

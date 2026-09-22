@@ -20,6 +20,13 @@ jest.mock('../services/chatbotService', () => ({
   }
 }));
 
+jest.mock('../services/deepResearchService', () => ({
+  deepResearchService: {
+    isAvailable: jest.fn(),
+    performDeepResearch: jest.fn()
+  }
+}));
+
 describe('AgentModeService - create_blog_article function', () => {
   let agentModeService: AgentModeService;
   let mockGenerateBlogContent: jest.Mock;
@@ -27,22 +34,25 @@ describe('AgentModeService - create_blog_article function', () => {
   let mockGenerateBlogHtml: jest.Mock;
   let mockRestyleContent: jest.Mock;
   let mockUploadFileToS3: jest.Mock;
+  let mockDeepResearchService: { isAvailable: jest.Mock; performDeepResearch: jest.Mock };
 
   beforeEach(() => {
     jest.clearAllMocks();
-    
+
     // Create AgentModeService instance
     agentModeService = new AgentModeService();
 
     // Get mocked functions
     const blogModule = require('../controllers/blog');
     const s3UtilsModule = require('../utils/s3Utils');
-    
+    const deepResearchModule = require('../services/deepResearchService');
+
     mockGenerateBlogContent = blogModule.generateBlogContent;
     mockGenerateBlogImage = blogModule.generateBlogImage;
     mockGenerateBlogHtml = blogModule.generateBlogHtml;
     mockRestyleContent = blogModule.restyleContent;
     mockUploadFileToS3 = s3UtilsModule.uploadFileToS3;
+    mockDeepResearchService = deepResearchModule.deepResearchService;
   });
 
   describe('Default Style', () => {
@@ -720,6 +730,34 @@ describe('AgentModeService - create_blog_article function', () => {
 
       expect(result.success).toBe(true);
       expect(result.data.deepResearchUsed).toBe(false);
+    });
+
+    // ENG-738: deepResearchService.performDeepResearch already retries once at
+    // a cheaper depth internally when its own call times out. A failure
+    // reaching createBlogArticle means that already happened and still didn't
+    // produce content, so the whole article request fails with the real
+    // reason rather than shipping a restyled draft built from nothing.
+    it('fails with the underlying reason when deep research fails', async () => {
+      mockDeepResearchService.performDeepResearch.mockResolvedValue({
+        success: false,
+        error: 'Deep research failed: Request timed out',
+      });
+
+      const result = await (agentModeService as any).createBlogArticle(
+        'Test Title Draft',
+        '# Test Content Draft',
+        'medium',
+        '',
+        '',
+        'user123',
+        'session123',
+        'default',
+        true
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('timed out');
+      expect(mockRestyleContent).not.toHaveBeenCalled();
     });
   });
 });

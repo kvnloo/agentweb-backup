@@ -199,6 +199,37 @@ describe('AgentModeService - perform_deep_research tool', () => {
           'text/markdown'
         );
       });
+
+      // ENG-738: a successful result that only completed after an internal
+      // depth downgrade must say so — reporting the originally-requested
+      // depth here would silently misrepresent what was actually delivered.
+      it('reports the actual (downgraded) depth honestly when the service succeeded after a retry', async () => {
+        mockDeepResearchService.isAvailable.mockResolvedValue(true);
+        mockDeepResearchService.performDeepResearch.mockResolvedValue({
+          success: true,
+          markdownContent: '# Research\n\nContent produced at reduced depth.',
+          title: 'Research',
+          researchSummary: 'Summary',
+          degradedFrom: 'comprehensive',
+          actualDepth: 'detailed',
+        });
+        mockUploadFileToS3.mockResolvedValue({
+          success: true,
+          url: 'https://s3.amazonaws.com/bucket/test.md'
+        });
+
+        const result = await (agentModeService as any).performDeepResearchTool(
+          'Test topic',
+          undefined,
+          'professional',
+          'comprehensive'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.data.research_depth).toBe('detailed');
+        expect(result.message).toContain('detailed');
+        expect(result.message).toContain('comprehensive');
+      });
     });
 
     describe('Service Unavailable', () => {

@@ -6488,7 +6488,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createWorkPlan(args.title, args.steps, context?.sessionId, args.autocomplete);
+    return await agentModeService.createWorkPlan(args.title, args.steps, context?.sessionId, args.autocomplete, context?.isUnattendedRun);
   }
 });
 
@@ -6524,6 +6524,7 @@ emmaToolRegistry.register({
     return await agentModeService.applyPredefinedWorkPlan(args.planTitle, context?.sessionId, context?.userId, {
       force: args.force === true,
       confirmedDeclinedPlan: args.confirmedDeclinedPlan === true,
+      isUnattendedRun: context?.isUnattendedRun,
     });
   }
 });
@@ -6628,7 +6629,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.modifyWorkPlan(args.steps, args.removeStepCounts || [], context?.sessionId, args.autocomplete);
+    return await agentModeService.modifyWorkPlan(args.steps, args.removeStepCounts || [], context?.sessionId, args.autocomplete, context?.isUnattendedRun);
   }
 });
 

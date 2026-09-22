@@ -209,6 +209,8 @@ describe('generateChatResponse — shared interactive gateway', () => {
       model: 'gpt-5.4',
     });
 
+    // ENG-2072: extraContext always carries isUnattendedRun: false for this
+    // attended sidebar turn, so it's never the bare `undefined` it used to be.
     expect(mockExecuteTool).toHaveBeenCalledWith(
       'gpt-5.4',
       'search_user_guide',
@@ -216,7 +218,7 @@ describe('generateChatResponse — shared interactive gateway', () => {
       'user-1',
       'sess-1',
       false,
-      undefined,
+      { isUnattendedRun: false },
     );
     expect(mockCallLLM).toHaveBeenCalledTimes(2);
   });

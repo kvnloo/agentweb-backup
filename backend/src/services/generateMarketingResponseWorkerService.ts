@@ -40,6 +40,9 @@ interface GenerateMarketingResponseParams {
   // any unapproved source image for this run.
   approvedRevisionImageSources?: string[];
   requireWorkPlanDisposition?: boolean;
+  // ENG-2072: tri-state — see ToolContext.isUnattendedRun in mcp/client/toolRegistry.ts.
+  // Plain boolean, so it survives the IPC serialization to the worker process.
+  isUnattendedRun?: boolean;
 }
 
 interface GenerateMarketingResponseResult {

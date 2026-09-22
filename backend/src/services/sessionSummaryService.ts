@@ -1,5 +1,5 @@
 import { chatbotDb, ChatSession } from "./chatbotService";
-import { detectFalseCompletionClaim, ExecutedToolCall } from "./agentMode/core/synthesisResidue";
+import { detectFalseCompletionClaim, ExecutedToolCall, assetProducingToolsInPlay } from "./agentMode/core/synthesisResidue";
 import { meteringFeature } from "./llmUsageAttributionService";
 import { extractScheduleId } from "../utils/schedulePublishApproval";
 import type { LLMUsageContext } from "../utils/llmService";
@@ -130,7 +130,24 @@ export async function summarizeSessionIfNeeded(
   // call, which is correct for a single closing turn but would misread a truthful
   // claim about several completed steps' assets as false the moment the currently
   // -open step hasn't produced anything of its own yet.
-  const falseClaim = detectFalseCompletionClaim(summaryText, toolCallLedger, false);
+  //
+  // ENG-2076: gated on `assetProducingToolsInPlay(toolCallLedger)` — this check only
+  // understands image/video/HTML-template tools (`ASSET_PRODUCING_TOOL_NAMES`), so a
+  // session built entirely on a different domain (Meta Ads, CRM, LinkedIn outreach,
+  // etc.) always reads `actual: 0` here regardless of what really happened. Without
+  // this gate, a Meta Ads session whose LLM-written summary happens to phrase a true
+  // result with a digit near an asset noun (the summarizer's own system prompt
+  // models exactly that: `"Created 3 LinkedIn posts..."`) would have its accurate
+  // summary silently REPLACED by a false "0 of 3... not yet complete" line — worse
+  // than the inline chat correction this same bug caused elsewhere, since this one
+  // persists to `session.sessionSummary` and is served verbatim by the
+  // `account_summary` Emma tool. Unlike the per-turn call site in
+  // agentModeService.ts, gating on this SAME whole-session `toolCallLedger` (not a
+  // narrower per-turn one) is correct here: `actual` is computed from this identical
+  // ledger, so the gate and the count never disagree on scope.
+  const falseClaim = assetProducingToolsInPlay(toolCallLedger)
+    ? detectFalseCompletionClaim(summaryText, toolCallLedger, false)
+    : null;
   if (falseClaim) {
     console.warn(
       `SessionSummary: generated summary for session ${session.sessionId} claims ${falseClaim.claimed} completed ` +
