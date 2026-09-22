@@ -120,15 +120,25 @@ describe('Slack Events API', () => {
 
   describe('POST /api/slack/events', () => {
     it('should handle URL verification challenge', async () => {
-      const response = await request(app)
-        .post('/api/slack/events')
-        .send({
-          type: 'url_verification',
-          challenge: 'test-challenge-string',
-        });
+      // A locally configured SLACK_SIGNING_SECRET (e.g. picked up from a real dev .env)
+      // would otherwise make this unsigned request 401 instead of exercising the
+      // no-secret/test-env pass-through path this test targets.
+      const previousSecret = process.env.SLACK_SIGNING_SECRET;
+      delete process.env.SLACK_SIGNING_SECRET;
+      try {
+        const response = await request(app)
+          .post('/api/slack/events')
+          .send({
+            type: 'url_verification',
+            challenge: 'test-challenge-string',
+          });
 
-      expect(response.status).toBe(200);
-      expect(response.body).toEqual({ challenge: 'test-challenge-string' });
+        expect(response.status).toBe(200);
+        expect(response.body).toEqual({ challenge: 'test-challenge-string' });
+      } finally {
+        if (previousSecret === undefined) delete process.env.SLACK_SIGNING_SECRET;
+        else process.env.SLACK_SIGNING_SECRET = previousSecret;
+      }
     });
 
     it('rejects unsigned event callbacks before mapped-session execution', async () => {
@@ -183,9 +193,17 @@ describe('Slack Events API', () => {
     });
 
     it('ENG-2054: never logs the raw request headers or body, which can carry third-party tokens and customer message content', async () => {
+      // A locally configured SLACK_SIGNING_SECRET (e.g. a real value picked up from a
+      // dev .env) would make verifySlackRequest reject this unsigned request with 401
+      // before the handler ever reaches the log statements under test, letting this
+      // test pass vacuously even if the leak reappears. Force the unsigned/test-env
+      // pass-through path so the assertions below only pass if the event was actually
+      // processed.
+      const previousSecret = process.env.SLACK_SIGNING_SECRET;
+      delete process.env.SLACK_SIGNING_SECRET;
       const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
       try {
-        await request(app)
+        const response = await request(app)
           .post('/api/slack/events')
           .set('cookie', 'super-secret-session-cookie-should-not-be-logged')
           .send({
@@ -199,13 +217,19 @@ describe('Slack Events API', () => {
             },
           });
 
+        expect(response.status).toBe(200);
         const loggedText = logSpy.mock.calls
           .map((args) => args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '))
           .join('\n');
+        // Confirms the request was actually processed (not short-circuited before the
+        // handler's own logging), so the absence checks below are meaningful.
+        expect(loggedText).toContain('Event callback received');
         expect(loggedText).not.toContain('super-secret-session-cookie-should-not-be-logged');
         expect(loggedText).not.toContain('confidential-customer-message-content');
       } finally {
         logSpy.mockRestore();
+        if (previousSecret === undefined) delete process.env.SLACK_SIGNING_SECRET;
+        else process.env.SLACK_SIGNING_SECRET = previousSecret;
       }
     });
 
