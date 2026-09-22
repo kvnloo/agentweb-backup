@@ -704,6 +704,50 @@ export function detectFalseCompletionClaim(
 }
 
 /**
+ * ENG-2076: whether `detectFalseCompletionClaim`'s domain (image/video/HTML-template
+ * generation) is actually in play — either THIS turn's own ledger already called one
+ * of `ASSET_PRODUCING_TOOL_NAMES`, or the session's persisted `calledFunctions` shows
+ * one was used in an earlier turn. Callers should skip the guard entirely when both
+ * are false.
+ *
+ * Both signals are needed, not just one:
+ *  - `calledFunctions` alone misses a turn that is ITSELF the first to call an
+ *    asset-producing tool — it's a snapshot of prior turns, not this in-flight one,
+ *    so the original ENG-1188/ENG-1331 same-turn shortfall (N screenshots claimed,
+ *    fewer actually taken, all within one turn) would go undetected if this were the
+ *    only check.
+ *  - `toolCalls` alone misses the live ENG-2076 repro: a Meta Ads session
+ *    (`call_meta_marketing_api` only, never touching an asset-producing tool) had an
+ *    assistant turn truthfully recap "3 creatives created" from an EARLIER turn. That
+ *    turn's own ledger was empty (a clarifying question, not new work), so checking
+ *    only `toolCalls` would still let the guard fire, read "0 of 3 produced", and
+ *    append a false correction — derailing the user right before the
+ *    publish-confirmation step that would have made the ads go live.
+ *
+ * The guard was built for image-generation work-plan steps; it has no vocabulary for
+ * Meta Ads (or any other non-media) tools and never will, so `actual` is
+ * unconditionally 0 for a session that never touches its domain. Gating on whether
+ * EITHER the session ever, or this turn specifically, used one of these tools
+ * confines the guard to the domain it can actually reason about, without touching
+ * `detectFalseCompletionClaim`'s existing turn-scoped math (and its ENG-1188/ENG-1331
+ * test coverage, which intentionally still flags a same-turn claim backed by zero
+ * tool calls at all when the domain gate is bypassed by calling it directly).
+ */
+export function assetProducingToolsInPlay(
+  toolCalls: ExecutedToolCall[],
+  calledFunctions: Record<string, number> | undefined | null,
+): boolean {
+  if (toolCalls.some((call) => typeof call.name === 'string' && ASSET_PRODUCING_TOOL_NAMES.has(call.name))) {
+    return true;
+  }
+  if (!calledFunctions) return false;
+  for (const name of ASSET_PRODUCING_TOOL_NAMES) {
+    if ((calledFunctions[name] || 0) > 0) return true;
+  }
+  return false;
+}
+
+/**
  * Correction to APPEND when `detectFalseCompletionClaim` finds a claim the ledger
  * cannot back up. Keeps the model's original prose (it may still hold other real,
  * useful detail) but states the real count and the named shortfall right underneath
