@@ -26,6 +26,7 @@ jest.mock('../services/slackService', () => ({
 jest.mock('../services/whatsappService', () => ({
   // The real registry constant — a stub here would let a template rename pass.
   TEMPLATES: jest.requireActual('../services/whatsappService').TEMPLATES,
+  redactPhone: jest.requireActual('../services/whatsappService').redactPhone,
   sendMessage: jest.fn(),
 }));
 
@@ -191,14 +192,42 @@ describe('Slack and WhatsApp as peers', () => {
     expect(whatsapp.sendMessage).not.toHaveBeenCalled();
   });
 
-  it('honors the ship-notify opt-out for every channel, not just Slack', async () => {
+  it('does not apply the Slack-only opt-out flag to WhatsApp', async () => {
+    // slackShipNotifyDisabled suppresses only the SLACK ping — its own doc comment on
+    // the User model says so. A user who turned that off but verified WhatsApp must
+    // still get the WhatsApp notification. This reproduces a real bug: the flag used
+    // to return 'opted_out' before channel resolution ran at all, silencing WhatsApp
+    // for anyone who had only ever meant to quiet Slack.
     userDb.getUserByEmail.mockResolvedValue({
       userId: 'u1',
       messagingChannels: [WA],
       slackShipNotifyDisabled: true,
     });
+    await expect(notifyReporterShipped(base)).resolves.toBe('sent');
+    expect(whatsapp.sendMessage).toHaveBeenCalledTimes(1);
+    expect(postSlackMessage).not.toHaveBeenCalled();
+  });
+
+  it('still reports opted_out when Slack — the only channel that would have fired — is disabled', async () => {
+    // The other half of the same fix: the flag must still mean something when Slack
+    // really was the only option, rather than degrading to a bare "nothing configured".
+    userDb.getUserByEmail.mockResolvedValue({
+      userId: 'u1',
+      slackChannels: ['C1'],
+      slackShipNotifyDisabled: true,
+    });
     await expect(notifyReporterShipped(base)).resolves.toBe('opted_out');
     expect(whatsapp.sendMessage).not.toHaveBeenCalled();
+    expect(postSlackMessage).not.toHaveBeenCalled();
+  });
+
+  it('reports no_channel, not opted_out, when Slack was never reachable to begin with', async () => {
+    // Disabling a channel that was never configured is not an opt-out from anything.
+    userDb.getUserByEmail.mockResolvedValue({
+      userId: 'u1',
+      slackShipNotifyDisabled: true,
+    });
+    await expect(notifyReporterShipped(base)).resolves.toBe('no_channel');
   });
 
   it('skips a disabled WhatsApp entry', async () => {
@@ -232,5 +261,21 @@ describe('unverified WhatsApp entry', () => {
     });
     await expect(notifyReporterShipped(base)).resolves.toBe('no_channel');
     expect(whatsapp.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe('WhatsApp send-failure logging', () => {
+  it('does not put the raw phone number or the reporter email in the log line', async () => {
+    userDb.getUserByEmail.mockResolvedValue({ userId: 'u1', messagingChannels: [WA] });
+    whatsapp.sendMessage.mockRejectedValue(new Error('wa down'));
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await notifyReporterShipped(base);
+
+    const logged = warnSpy.mock.calls.map((c) => c.map(String).join(' ')).join('\n');
+    expect(logged).not.toContain('+14155550123');
+    expect(logged).not.toContain(base.email);
+    expect(logged).toContain(base.itemId);
+    warnSpy.mockRestore();
   });
 });
