@@ -184,6 +184,7 @@ import {
   validateCaptureFormHasContactField,
   LandingPageNotDeployableError,
   findUnparseableModule,
+  setCaptureRouteGateConfig,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord, getVercelBuildErrors, isNonErrorBuildLine } from "../services/v0Service";
@@ -238,6 +239,9 @@ beforeEach(() => {
   // Use zero-delay poll intervals in tests to avoid waiting ~2.5 min
   setV0PollIntervals([0, 0, 0, 0, 0]);
   setVercelPollConfig(0, 30);
+  // Cap high enough that the held-open gate test still gates on its poll, settle at 0 so a
+  // non-ready build outcome does not spend its real 45s settle window in unit tests.
+  setCaptureRouteGateConfig(60_000, 0);
 });
 
 // =============================================================================
@@ -5876,6 +5880,8 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       // later test in the file.
       mockChatsGetById.mockReset();
       mockChatsDownloadVersion.mockReset();
+      // Persistent too — jest.clearAllMocks() clears calls, not implementations.
+      mockChatsSendMessage.mockReset();
 
       // A missing Lead event is degraded, not broken: the page must still ship, and the
       // tracking gap must be reported rather than swallowed.
@@ -6456,6 +6462,33 @@ export default function SyntheticV0PageForDeployment() {
     ).toBeNull();
   });
 
+  it("does not throw on a declaration file — transpileModule cannot emit for one", () => {
+    // ts.transpileModule hits an internal Debug.assert for a .d.ts and throws a BARE Error,
+    // not a diagnostic. A bare Error is not a V0OutputValidationError, so it would skip the
+    // correction retry entirely and fail the page with "Debug Failure. Output generation
+    // failed". v0 zips do carry these — remapFilesForSubPage's own skip list names
+    // next-env.d.ts.
+    const page = f("app/page.tsx", 'export default function P(){ return <div>hello there</div>; }');
+    expect(() =>
+      findUnparseableModule([page, f("next-env.d.ts", '/// <reference types="next" />\n')])
+    ).not.toThrow();
+    expect(
+      findUnparseableModule([page, f("types/index.d.ts", 'declare module "*.svg";\n')])
+    ).toBeNull();
+  });
+
+  it("fails OPEN if the parser throws unexpectedly, rather than failing the page", () => {
+    // This check exists to stop unparseable code reaching a commit. It must never be the
+    // thing that fails a generation, so any compiler-internal surprise is treated as fine.
+    const boom = {
+      path: "app/page.tsx",
+      get content(): Buffer {
+        throw new Error("Debug Failure. Output generation failed");
+      },
+    } as unknown as { path: string; content: Buffer };
+    expect(() => findUnparseableModule([boom])).not.toThrow();
+  });
+
   it("validateV0Output rejects it, so the retry loop asks v0 to regenerate", () => {
     expect(() =>
       validateV0Output([f("app/page.tsx", POISONED)])
@@ -6478,6 +6511,35 @@ export default function SyntheticV0PageForDeployment() {
     const r = detectIncompleteSyntheticPage([
       f("app/page.tsx", 'import { Hero } from "./_components/hero";\nexport default function Page(){ return <Hero />; }'),
       f("app/_components/hero.tsx", "export function Hero(){ return <div/>; }"),
+    ]);
+    expect(r).toBeNull();
+  });
+
+  it("does not flag a MARKER page that reaches a component the section filter cannot see", () => {
+    // The previous test returns at gate 1 (no marker) and so never exercises the zero-section
+    // logic at all. This one does: the marker IS present, and the one component it renders is
+    // invisible to isSectionComponent — `app/components/…` starts with neither "components/"
+    // nor "/_components/". Without the reachability conjunct this is reported as a stub and
+    // the generation can be failed over a page that is perfectly healthy.
+    const r = detectIncompleteSyntheticPage([
+      f(
+        "app/page.tsx",
+        'import { Hero } from "./components/hero";\nexport default function SyntheticV0PageForDeployment(){ return <Hero />; }'
+      ),
+      f("app/components/hero.tsx", "export function Hero(){ return <div/>; }"),
+    ]);
+    expect(r).toBeNull();
+  });
+
+  it("does not flag a MARKER page whose only component has a name the filter excludes", () => {
+    // NON_SECTION_COMPONENT_NAME is unanchored, so "service-types" matches `types?` as a
+    // substring and the component is counted as a non-section.
+    const r = detectIncompleteSyntheticPage([
+      f(
+        "app/page.tsx",
+        'import { X } from "./_components/service-types";\nexport default function SyntheticV0PageForDeployment(){ return <X />; }'
+      ),
+      f("app/_components/service-types.tsx", "export function X(){ return <div/>; }"),
     ]);
     expect(r).toBeNull();
   });

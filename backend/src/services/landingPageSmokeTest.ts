@@ -1124,6 +1124,15 @@ async function runGenerationSmokeTestNow(
     const testPhone = buildSmokeTestPhone();
     const email = buildSmokeTestEmail();
     const fillOutcome = await fillAllRequiredFields(browserPage, email, testPhone);
+    // ENG-2081: captured HERE, not at the end of the try block. Everything between this
+    // point and there — submit, the waitForURL, handoff analysis, pollForLead (which does
+    // not catch DynamoDB errors), deleteLead — can throw, and the outer catch would then
+    // persist `ok:false, leadCaptured:false` with these still at their defaults. That reads
+    // as a CRM fault on a page that never had a form to submit, which is precisely the
+    // confusion this field exists to remove. The classification is known now; record it now.
+    noFormOnPage = fillOutcome.noFormOnPage;
+    authFormOnly = fillOutcome.authFormOnly;
+    iframeCount = fillOutcome.iframeCount;
     const {
       lastTextSelector,
       emailFilled,
@@ -1321,9 +1330,6 @@ async function runGenerationSmokeTestNow(
     // Every non-error failure used to report the same "lead did not land in the CRM"
     // string, which is what made the 2026-09-18 false-negatives so hard to diagnose:
     // it cannot distinguish "never submitted" from "submitted and the lead was lost".
-    noFormOnPage = fillOutcome.noFormOnPage;
-    authFormOnly = fillOutcome.authFormOnly;
-    iframeCount = fillOutcome.iframeCount;
     diagnostics = [
       `filled ${fillOutcome.filled}/${fillOutcome.attempted} field(s)`,
       ...(fillOutcome.alreadySatisfied > 0

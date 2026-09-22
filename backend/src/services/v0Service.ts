@@ -239,6 +239,13 @@ async function awaitOptionalV0Correction(
   try {
     return await wait();
   } catch (err: any) {
+    // A DEAD-END failure is not "v0 declined to answer" — it is v0 marking the version
+    // failed, or the whole build budget expiring. isDeadEndV0Failure exists so the caller
+    // frees the route identity and the retry mints a FRESH chat; swallowing it here would
+    // leave the dead chat on the record, let the remaining corrections each send another
+    // billed message to a chat that can never answer, and ship a page whose deadline was
+    // already blown. ENG-2079 targets the benign case only.
+    if (isDeadEndV0Failure(err)) throw err;
     console.warn(
       `[V0 SERVICE] ${label}: no corrected version arrived (${err?.message || err}). ` +
         `Shipping the page without this correction rather than failing it.`
@@ -349,6 +356,26 @@ async function waitForCompletedV0Version(
 }
 
 // Vercel deployment polling config
+// ENG-2078 follow-up: the capture-route gate must be bounded independently of
+// pollVercelDeployment, which is bounded by ATTEMPT COUNT (60 x 5s) and not by wall clock —
+// with axios timeouts a superseded commit that never gets its own deployment can hold the
+// gate far longer than the ~30-40s the gate is documented to cost.
+let captureRouteGateMaxMs = 90_000;
+// And when the poll comes back anything other than READY-for-our-commit, the route is NOT
+// known to be live: Vercel auto-cancels a superseded deployment, and pollVercelDeployment
+// maps CANCELED to `error` and returns on its FIRST tick. Resolving there would reopen the
+// exact race ENG-2078 closed, so a non-ready outcome buys a bounded settle window instead.
+let captureRouteSettleMs = 45_000;
+
+/** Test hook: keeps the gate's waits out of unit-test wall-clock. */
+export function setCaptureRouteGateConfig(maxMs: number, settleMs: number): void {
+  captureRouteGateMaxMs = maxMs;
+  captureRouteSettleMs = settleMs;
+}
+
+const sleepMs = (ms: number): Promise<void> =>
+  ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
+
 let vercelPollIntervalMs = 5_000;
 let vercelPollMaxAttempts = 60;
 
@@ -2647,6 +2674,19 @@ async function addPageToExistingRepo(
         // lands means submitting to a route that does not yet know this page's path.
         const { pushedCommitSha, pushTimestampMs } = syncResult;
         captureRouteBuild = pollVercelDeployment(existingPage.vercelProjectId!, vercelToken, pushTimestampMs, pushedCommitSha)
+          .then(async (syncDeployResult) => {
+            // Only a READY build for THIS commit proves the route now carries this page's
+            // path. Anything else — ERROR, CANCELED (auto-cancel on supersession, returned
+            // on the first tick), or the attempt budget running out — means we do not know,
+            // and proceeding immediately is how the original race behaved. Wait out a
+            // bounded settle window so a superseding build has a chance to land, then run
+            // the smoke test regardless; a late smoke test is recoverable, a false
+            // `ok: false` on every page is not.
+            if (syncDeployResult.buildStatus !== "ready") {
+              await sleepMs(captureRouteSettleMs);
+            }
+            return syncDeployResult;
+          })
           .then((syncDeployResult) => {
             if (syncDeployResult.buildStatus === "error") {
               console.error(
@@ -2669,6 +2709,12 @@ async function addPageToExistingRepo(
               pollErr?.message || pollErr
             );
           });
+
+        // Independent wall-clock cap. pollVercelDeployment is bounded by attempt count, not
+        // time, so without this the detached smoke dispatch can sit far past the gate's
+        // documented cost. Whichever finishes first wins; the smoke test then runs either
+        // way, because a delayed check beats a check that never happens.
+        captureRouteBuild = Promise.race([captureRouteBuild, sleepMs(captureRouteGateMaxMs)]);
       }
     } catch (syncErr: any) {
       console.error(
@@ -4050,15 +4096,35 @@ export function findUnparseableModule(
 ): { path: string; reason: string } | null {
   for (const file of files) {
     if (!/\.(tsx|ts|jsx|js)$/.test(file.path)) continue;
-    const result = ts.transpileModule(file.content.toString("utf-8"), {
-      fileName: file.path,
-      reportDiagnostics: true,
-      compilerOptions: {
-        jsx: ts.JsxEmit.Preserve,
-        target: ts.ScriptTarget.ESNext,
-        module: ts.ModuleKind.ESNext,
-      },
-    });
+    // A declaration file emits nothing, and transpileModule treats "nothing to emit" as an
+    // internal Debug.assert — it throws a bare Error rather than returning a diagnostic.
+    // v0 zips do carry these (remapFilesForSubPage's own skip list names next-env.d.ts), and
+    // a bare Error is not a V0OutputValidationError, so it would bypass the correction retry
+    // and fail the page outright with "Debug Failure. Output generation failed".
+    if (/\.d\.ts$/.test(file.path)) continue;
+
+    let result: ReturnType<typeof ts.transpileModule>;
+    try {
+      result = ts.transpileModule(file.content.toString("utf-8"), {
+        fileName: file.path,
+        reportDiagnostics: true,
+        compilerOptions: {
+          jsx: ts.JsxEmit.Preserve,
+          target: ts.ScriptTarget.ESNext,
+          module: ts.ModuleKind.ESNext,
+        },
+      });
+    } catch (err: any) {
+      // FAIL OPEN, deliberately. This check exists to stop unparseable code reaching a
+      // commit; it must never be the thing that fails a generation. Any throw here is a
+      // compiler-internal surprise, not evidence about the customer's code, so treat the
+      // file as fine and let the remaining checks (and the build itself) speak.
+      console.warn(
+        `[V0 SERVICE] ENG-2087: parse check could not run on ${file.path} (${err?.message || err}) — treating as parseable.`
+      );
+      continue;
+    }
+
     const error = (result.diagnostics || []).find((d) => d.category === ts.DiagnosticCategory.Error);
     if (error) {
       return {
@@ -4142,7 +4208,18 @@ export function detectIncompleteSyntheticPage(
   // A synthetic stub with no sections at all has nothing to orphan, so the gate below could
   // never fire for it (ENG-2087). Report it with an empty `orphaned` list — the caller's message
   // already names the entry, which is the actionable part.
-  if (sectionCount === 0) return { entryPath, orphaned: [] };
+  // ENG-2087 follow-up: `sectionCount` uses the orphan loop's filter, which is much narrower
+  // than "a section" — it misses .jsx, `app/components/hero.tsx` (starts with neither
+  // `components/` nor `/_components/`), and any basename the UNANCHORED
+  // NON_SECTION_COMPONENT_NAME matches as a substring (`service-types`, `config-panel`).
+  // In the orphan loop that narrowness is harmless: an invisible file simply is not reported.
+  // Here it inverts — invisible means FAIL — so a healthy marker page that renders one
+  // legitimately-named component would be rejected and could fail the generation.
+  //
+  // The reachability conjunct is what actually separates the two: a stub has nothing behind
+  // it, while a healthy marker page reaches its component no matter where that component
+  // lives or what it is called.
+  if (sectionCount === 0 && reachable.size <= 1) return { entryPath, orphaned: [] };
 
   return orphaned.length > 0 ? { entryPath, orphaned } : null;
 }
@@ -4462,7 +4539,17 @@ export function hasLeadCaptureForm(files: Array<{ path: string; content: Buffer 
     .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
-  return /fetch\(\s*["'`]\/api\/capture/.test(source);
+  // Any reference to the path in shipped source, not only the prescribed
+  // `fetch('/api/capture', …)` idiom. A false NEGATIVE here silently disables all three
+  // enhancement corrections AND the ENG-2082 contact-field warning on a page that really
+  // does capture — so a customer paying for conversion tracking would ship without it,
+  // recorded only as a console.warn. Probed misses for the narrow form: axios.post(),
+  // a template literal (`${base}/api/capture`), a hoisted const, and <form action=…>.
+  // `}` covers a template literal that interpolates a base (`${base}/api/capture`). A bare
+  // occurrence is deliberately NOT matched: lib/agentweb-track.ts ships with every page and
+  // mentions the path twice in COMMENTS, so matching unquoted text would make every page
+  // look like it captures and would silently undo the gate above.
+  return /["'`}]\/api\/capture\b/.test(source);
 }
 
 /**

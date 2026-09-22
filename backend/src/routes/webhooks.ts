@@ -835,8 +835,73 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         // (sequence enrolment, auto-draft/auto-send, owner notify, CAPI) fire a second time
         // for one person — which is the whole reason the number is keyed deterministically.
         if (!createErr?.leadAlreadyExists) throw createErr;
-        lead = await crmDb.getLeadById(leadList.listId, deterministicLeadId);
-        if (!lead) throw createErr;
+        // Consistent read: the conditional write just told us this exact key exists, so an
+        // eventually-consistent miss here would be a lie, not an answer.
+        lead = await crmDb.getLeadById(leadList.listId, deterministicLeadId, { consistentRead: true });
+        if (!lead) {
+          // Still nothing — the winner's row was deleted between its write and this read, or
+          // the read failed in a way that returned empty. Do NOT throw: throwing reaches the
+          // handler's catch and returns 500 to the lander for a submission that was, from
+          // the visitor's point of view, accepted. Degrade to the id we know, the same way
+          // linkedInInviteCrmMirror does on this identical race.
+          console.warn(
+            `[webhooks] ENG-2082: adopted lead ${deterministicLeadId} not readable after a ` +
+              `losing conditional create in ${leadList.listId} — reporting the duplicate anyway.`
+          );
+          lead = { leadId: deterministicLeadId, listId: leadList.listId, ...leadData };
+        }
+
+        // ENG-2082 follow-up: this path is not only the concurrent race. A deterministic id
+        // plus failIfExists means EVERY repeat submission from the same number lands here,
+        // forever. Without a merge the second submission returns success and silently drops
+        // whatever it carried — the exact failure this file documents for flat custom fields
+        // ("a 201 and a visible lead row with the data gone"), reproduced for a multi-step
+        // phone-only lander whose step 2 posts the qualification answers.
+        //
+        // Mirrors the existingLead branch's rules deliberately rather than sharing them:
+        // that branch is the well-trodden email path and is not worth destabilising here.
+        const normalizeAdopted = (value: any): string =>
+          value === null || value === undefined ? '' : String(value).trim();
+        const adoptedUpdates: any = {};
+        let adoptedChanged = false;
+
+        for (const field of ['firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'] as const) {
+          const newValue = normalizeAdopted(leadData[field]);
+          if (newValue && normalizeAdopted(lead[field]) !== newValue) {
+            adoptedUpdates[field] = newValue;
+            adoptedChanged = true;
+          }
+        }
+
+        const adoptedExistingCustom = lead.customFields || {};
+        const adoptedIncomingCustom = leadData.customFields || {};
+        const adoptedMergedCustom: Record<string, any> = { ...adoptedExistingCustom };
+        let customChanged = false;
+        // Stamped by this handler rather than sent by the visitor: `forwardedAt` is minted
+        // fresh on every submission because this branch builds leadData as if creating, and
+        // `source` defaults to 'api' when the caller sends none (see the destructure above).
+        // Neither is visitor data, and letting either mark a resubmission as a real update
+        // would drive CRM sync and owner alerts off a duplicate that carried nothing new.
+        // They are still merged through — they just do not, alone, constitute a change.
+        const SYSTEM_CUSTOM_KEYS = new Set(['forwardedAt', 'source']);
+        for (const [key, value] of Object.entries(adoptedIncomingCustom)) {
+          if (value === undefined || value === null || value === '') continue;
+          if (normalizeAdopted(adoptedExistingCustom[key]) !== normalizeAdopted(value)) {
+            adoptedMergedCustom[key] = value;
+            if (!SYSTEM_CUSTOM_KEYS.has(key)) customChanged = true;
+          }
+        }
+        if (customChanged) {
+          adoptedUpdates.customFields = adoptedMergedCustom;
+          adoptedChanged = true;
+        }
+
+        if (adoptedChanged) {
+          await crmDb.updateLead(leadList.listId, lead.leadId, adoptedUpdates);
+          lead = { ...lead, ...adoptedUpdates };
+          // A real, user-visible change — same meaning the email branch gives isUpdated.
+          isUpdated = true;
+        }
       }
     }
 

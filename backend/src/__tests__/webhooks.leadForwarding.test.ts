@@ -318,8 +318,59 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
         .post('/api/webhooks/forward-lead')
         .send({ listId: 'list_123', phone: '4155550142' });
 
-      expect(response.status).not.toBe(500);
-      expect(crmDb.getLeadById).toHaveBeenCalled();
+      // `not.toBe(500)` would pass on a 400 or a 404 too. The contract is specific: the
+      // duplicate is reported as a success, the row is read CONSISTENTLY (the conditional
+      // write just proved it exists, so an eventually-consistent miss would be a lie), and
+      // isNew stays false so the new-lead side effects do not fire twice for one person.
+      expect(response.status).toBe(200);
+      expect(response.body.event).toBe('lead.unchanged');
+      expect(crmDb.getLeadById).toHaveBeenCalledWith(
+        'list_123',
+        expect.stringMatching(/^lead_ph_[0-9a-f]{24}$/),
+        { consistentRead: true }
+      );
+    });
+
+    it('ENG-2082: a lead captured by the winner is never reported as a 500 to the visitor', async () => {
+      // A double-click on a phone-only lander. The loser's consistent read can still come
+      // back empty if the winning row was removed in between; throwing there would return a
+      // 500 for a submission that WAS captured, and fire a false api.lead_failed alert.
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      const race: any = new Error('Lead already exists for this deterministic key');
+      race.leadAlreadyExists = true;
+      (crmDb.createLead as jest.Mock).mockRejectedValueOnce(race);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(null);
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', phone: '4155550142' });
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+    });
+
+    it('ENG-2082: a repeat phone submission merges its new data instead of discarding it', async () => {
+      // failIfExists + a deterministic id means every later submission from the same number
+      // lands on the adopt path, not just the concurrent race. A multi-step lander posts the
+      // phone first and the qualification answers second; without a merge the second call
+      // returns success and the answers vanish.
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      const race: any = new Error('Lead already exists for this deterministic key');
+      race.leadAlreadyExists = true;
+      (crmDb.createLead as jest.Mock).mockRejectedValueOnce(race);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead_ph_existing', listId: 'list_123', phone: '4155550142',
+        firstName: '', customFields: {},
+      });
+
+      await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', phone: '4155550142', firstName: 'Dana', qualified: 'yes' });
+
+      expect(crmDb.updateLead).toHaveBeenCalled();
+      const [, , updates] = (crmDb.updateLead as jest.Mock).mock.calls[0];
+      expect(updates.firstName).toBe('Dana');
+      expect(updates.customFields.qualified).toBe('yes');
     });
 
     it('should successfully forward a lead with minimal data', async () => {

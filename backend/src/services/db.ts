@@ -6762,14 +6762,19 @@ export const crmDb = {
     }
   },
 
-  async getLeadById(listId: string, leadId: string) {
+  async getLeadById(listId: string, leadId: string, opts?: { consistentRead?: boolean }) {
     try {
-      const params = {
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Key: {
           listId,
           leadId,
         },
+        // ENG-2082: opt-in, because the default eventually-consistent read is fine for the
+        // ordinary "fetch a lead" callers and half the price. It is NOT fine for a read that
+        // immediately follows a failed conditional write on the same key — the row is known
+        // to exist, and a stale miss there is indistinguishable from "no such lead".
+        ...(opts?.consistentRead ? { ConsistentRead: true } : {}),
       };
 
       const result = await dynamodb.get(params).promise();
