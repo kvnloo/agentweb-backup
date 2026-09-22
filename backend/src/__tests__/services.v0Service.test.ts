@@ -5549,6 +5549,46 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       expect(mockRunGenerationSmokeTest).toHaveBeenCalledTimes(1);
     });
 
+    it("a SUCCESSFUL sync build releases the gate immediately, with no settle wait", async () => {
+      // The settle window exists only for outcomes that do NOT prove the route is live.
+      // pollVercelDeployment returns success | error | timeout — never "ready" — so a
+      // comparison against "ready" is always true and makes every build, including the
+      // clean ones, pay the settle. With settleMs well above a microtask here, the smoke
+      // test must already have run by the next tick; if the settle fires, it has not.
+      setCaptureRouteGateConfig(60_000, 5_000);
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Items: [existingSiteRecord] }),
+      });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+
+      // The sync commit's own build, READY for our exact commit — the proof-of-live case.
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          deployments: [
+            { uid: "dpl_sync", readyState: "READY", meta: { githubCommitSha: "sync_commit_sha" } },
+          ],
+        },
+      });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create pricing page with a lead form",
+        "Pricing",
+        {},
+        "list_pricing"
+      );
+
+      expect(result.status).toBe("deployed");
+      await new Promise((r) => setImmediate(r));
+      expect(mockRunGenerationSmokeTest).toHaveBeenCalledTimes(1);
+    });
+
     it("ENG-449: a capture-route sync that never commits does not strand the smoke test", async () => {
       setupSiteRecordMock();
       await setupV0Mocks();

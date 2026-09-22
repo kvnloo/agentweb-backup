@@ -234,18 +234,29 @@ function startBuildHeartbeat(id: string): () => void {
  */
 async function awaitOptionalV0Correction(
   label: string,
-  wait: () => Promise<string | undefined>
+  wait: () => Promise<string | undefined>,
+  state?: { chatDead: boolean }
 ): Promise<string | undefined> {
   try {
     return await wait();
   } catch (err: any) {
-    // A DEAD-END failure is not "v0 declined to answer" — it is v0 marking the version
-    // failed, or the whole build budget expiring. isDeadEndV0Failure exists so the caller
-    // frees the route identity and the retry mints a FRESH chat; swallowing it here would
-    // leave the dead chat on the record, let the remaining corrections each send another
-    // billed message to a chat that can never answer, and ship a page whose deadline was
-    // already blown. ENG-2079 targets the benign case only.
-    if (isDeadEndV0Failure(err)) throw err;
+    // Never rethrow. The page's own output has already been downloaded and passed
+    // validateV0Output by this point; the only thing that failed is an OPTIONAL enhancement
+    // (a Lead event, a conversion call, a redirect). Rethrowing reaches the outer catch and
+    // marks the whole page `failed`, so the customer gets no page at all and the retry pays
+    // for a fresh generation — which is precisely the behaviour ENG-2079 was opened to stop.
+    //
+    // A dead-end failure (v0 marked the version failed) still matters, just not enough to
+    // discard a working page: it is reported so the remaining corrections skip rather than
+    // spend more billed messages on a chat that can never answer.
+    if (state && isDeadEndV0Failure(err)) {
+      state.chatDead = true;
+      console.error(
+        `[V0 SERVICE] ${label}: v0 reported a DEAD-END failure (${err?.message || err}). ` +
+          `Shipping the page and skipping the remaining corrections for this chat.`
+      );
+      return undefined;
+    }
     console.warn(
       `[V0 SERVICE] ${label}: no corrected version arrived (${err?.message || err}). ` +
         `Shipping the page without this correction rather than failing it.`
@@ -360,7 +371,13 @@ async function waitForCompletedV0Version(
 // pollVercelDeployment, which is bounded by ATTEMPT COUNT (60 x 5s) and not by wall clock —
 // with axios timeouts a superseded commit that never gets its own deployment can hold the
 // gate far longer than the ~30-40s the gate is documented to cost.
-let captureRouteGateMaxMs = 90_000;
+// Sized to pollVercelDeployment's OWN budget (vercelPollMaxAttempts x
+// vercelPollIntervalMs = 300s), deliberately, not to an optimistic guess at build time. A
+// cap below the real build time does not bound a wait — it re-opens the ENG-2078 race by
+// releasing the smoke test before the capture route is live, which is the bug this gate
+// exists to prevent. This is a backstop for the pathological case only: the poll is bounded
+// by ATTEMPT COUNT, so axios timeouts can stretch it far past its nominal 300s.
+let captureRouteGateMaxMs = 300_000;
 // And when the poll comes back anything other than READY-for-our-commit, the route is NOT
 // known to be live: Vercel auto-cancels a superseded deployment, and pollVercelDeployment
 // maps CANCELED to `error` and returns on its FIRST tick. Resolving there would reopen the
@@ -373,8 +390,19 @@ export function setCaptureRouteGateConfig(maxMs: number, settleMs: number): void
   captureRouteSettleMs = settleMs;
 }
 
-const sleepMs = (ms: number): Promise<void> =>
-  ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
+/**
+ * unref()'d on purpose: this timer must never be the reason the process stays alive. The
+ * module already sets that precedent twice — withTimeout clears and unrefs, and
+ * startBuildHeartbeat unrefs. Without it each sub-page add leaves a live 300s timer, which
+ * is benign on a long-lived server but leaks on shutdown and makes jest force-exit workers.
+ */
+const sleepMs = (ms: number): Promise<void> => {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (typeof timer.unref === "function") timer.unref();
+  });
+};
 
 let vercelPollIntervalMs = 5_000;
 let vercelPollMaxAttempts = 60;
@@ -2062,6 +2090,7 @@ async function addPageToExistingRepo(
         // form". On a page that has none, that request can never be satisfied, v0 returns no
         // new version, and each correction burns its full ~17-minute wait for nothing. Skip
         // them and fall straight to the existing "proceeding without it" reporting.
+        const correctionState = { chatDead: false };
         const shippedHasCaptureForm = hasLeadCaptureForm(remapFilesForSubPage(previewFiles, slug, name));
 
         // ENG-2082: the most basic completeness check of all, and the one that was missing.
@@ -2090,7 +2119,7 @@ async function addPageToExistingRepo(
           // contain something matching the fbq('track','Lead') regex, which used to make
           // this check pass against code that never reaches the deployed site at all.
           const pixelCheck = validatePixelLeadEvent(remapFilesForSubPage(previewFiles, slug, name));
-          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
+          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
             console.warn(`[V0 SERVICE] Meta Pixel Lead event missing for /${slug} (attempt ${validationAttempt + 1}): ${pixelCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -2122,7 +2151,9 @@ async function addPageToExistingRepo(
                   deadline: buildDeadline,
                   afterVersionId: versionId,
                 })
-            );
+            ,
+      correctionState
+    );
             // undefined = v0 never produced a corrected version. Fall through to the
             // `proceeding without it` path below instead of failing the whole page.
             if (correctedVersionId) {
@@ -2147,7 +2178,7 @@ async function addPageToExistingRepo(
         // which would satisfy the inline-pattern arm against code the site never sees.
         if (subPageGoogleAds) {
           const adsCheck = validateGoogleAdsConversion(remapFilesForSubPage(previewFiles, slug, name));
-          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
+          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
             console.warn(`[V0 SERVICE] Google Ads conversion call missing for /${slug} (attempt ${validationAttempt + 1}): ${adsCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -2180,7 +2211,9 @@ async function addPageToExistingRepo(
                   deadline: buildDeadline,
                   afterVersionId: versionId,
                 })
-            );
+            ,
+      correctionState
+    );
             // undefined = v0 never produced a corrected version. Fall through to the
             // `proceeding without it` path below instead of failing the whole page.
             if (correctedVersionId) {
@@ -2196,7 +2229,7 @@ async function addPageToExistingRepo(
         if (leadListId && bridgeOutUrl) {
           // Same post-remap file set rationale as the pixel check above (ENG-482).
           const bridgeCheck = validateBridgeOutRedirect(remapFilesForSubPage(previewFiles, slug, name), bridgeOutUrl);
-          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
+          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
             console.warn(`[V0 SERVICE] Bridge-out redirect missing for /${slug} (attempt ${validationAttempt + 1}): ${bridgeCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -2227,7 +2260,9 @@ async function addPageToExistingRepo(
                   deadline: buildDeadline,
                   afterVersionId: versionId,
                 })
-            );
+            ,
+      correctionState
+    );
             // undefined = v0 never produced a corrected version. Fall through to the
             // `proceeding without it` path below instead of failing the whole page.
             if (correctedVersionId) {
@@ -2682,7 +2717,11 @@ async function addPageToExistingRepo(
             // bounded settle window so a superseding build has a chance to land, then run
             // the smoke test regardless; a late smoke test is recoverable, a false
             // `ok: false` on every page is not.
-            if (syncDeployResult.buildStatus !== "ready") {
+            // "success" — NOT "ready". pollVercelDeployment returns exactly
+            // success | error | timeout, so comparing against "ready" was always true and
+            // this settle fired on every build, including the ones that proved the route
+            // live. Every other comparison in this file uses "success".
+            if (syncDeployResult.buildStatus !== "success") {
               await sleepMs(captureRouteSettleMs);
             }
             return syncDeployResult;
@@ -3285,6 +3324,7 @@ export async function deployLandingPage(
         // form". On a page that has none, that request can never be satisfied, v0 returns no
         // new version, and each correction burns its full ~17-minute wait for nothing. Skip
         // them and fall straight to the existing "proceeding without it" reporting.
+        const correctionState = { chatDead: false };
         const shippedHasCaptureForm = hasLeadCaptureForm(previewFiles);
 
         // ENG-2082: the most basic completeness check of all, and the one that was missing.
@@ -3310,7 +3350,7 @@ export async function deployLandingPage(
         // missing. Exhausted retries must NOT fail generation — just record the miss.
         if (record.metaPixelId) {
           const pixelCheck = validatePixelLeadEvent(previewFiles);
-          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
+          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
             console.warn(`[V0 SERVICE] Meta Pixel Lead event missing (attempt ${validationAttempt + 1}): ${pixelCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -3342,7 +3382,9 @@ export async function deployLandingPage(
                   deadline: buildDeadline,
                   afterVersionId: versionId,
                 })
-            );
+            ,
+      correctionState
+    );
             // undefined = v0 never produced a corrected version. Fall through to the
             // `proceeding without it` path below instead of failing the whole page.
             if (correctedVersionId) {
@@ -3362,7 +3404,7 @@ export async function deployLandingPage(
         // something that does nothing.
         if (record.googleAdsConversionId && record.googleAdsConversionLabel) {
           const adsCheck = validateGoogleAdsConversion(previewFiles);
-          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
+          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
             console.warn(`[V0 SERVICE] Google Ads conversion call missing (attempt ${validationAttempt + 1}): ${adsCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -3395,7 +3437,9 @@ export async function deployLandingPage(
                   deadline: buildDeadline,
                   afterVersionId: versionId,
                 })
-            );
+            ,
+      correctionState
+    );
             // undefined = v0 never produced a corrected version. Fall through to the
             // `proceeding without it` path below instead of failing the whole page.
             if (correctedVersionId) {
@@ -3413,7 +3457,7 @@ export async function deployLandingPage(
 
         if (record.leadListId && record.bridgeOutUrl) {
           const bridgeCheck = validateBridgeOutRedirect(previewFiles, record.bridgeOutUrl);
-          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
+          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
             console.warn(`[V0 SERVICE] Bridge-out redirect missing (attempt ${validationAttempt + 1}): ${bridgeCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -3444,7 +3488,9 @@ export async function deployLandingPage(
                   deadline: buildDeadline,
                   afterVersionId: versionId,
                 })
-            );
+            ,
+      correctionState
+    );
             // undefined = v0 never produced a corrected version. Fall through to the
             // `proceeding without it` path below instead of failing the whole page.
             if (correctedVersionId) {
@@ -4219,6 +4265,19 @@ export function detectIncompleteSyntheticPage(
   // The reachability conjunct is what actually separates the two: a stub has nothing behind
   // it, while a healthy marker page reaches its component no matter where that component
   // lives or what it is called.
+  // KNOWN GAP, accepted deliberately. A stub that imports exactly one non-section file (a
+  // theme provider, a context) still escapes this, because it is statically
+  // indistinguishable from a healthy marker page rendering one real component whose name
+  // merely happens to match the UNANCHORED NON_SECTION_COMPONENT_NAME — `service-types.tsx`
+  // matches `types?` as a substring but is almost certainly a real "service types" section.
+  // Both live in a components dir, both are rendered in JSX by the entry; no heuristic here
+  // separates them.
+  //
+  // So the choice is which way to be wrong. Flagging throws V0OutputValidationError, which
+  // burns two correction rounds and can FAIL the generation outright — the customer gets no
+  // page. Missing one ships a page that renders thin, which the parse gate and the remaining
+  // checks may still catch and which a human can see. The cheap failure is the right one to
+  // prefer, so this stays as the narrow "reaches nothing at all" test.
   if (sectionCount === 0 && reachable.size <= 1) return { entryPath, orphaned: [] };
 
   return orphaned.length > 0 ? { entryPath, orphaned } : null;
@@ -4536,7 +4595,10 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
  */
 export function hasLeadCaptureForm(files: Array<{ path: string; content: Buffer }>): boolean {
   const source = files
-    .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
+    // .jsx/.js included: MODULE_EXTENSIONS and findUnparseableModule both handle them, and
+    // a page v0 emitted as app/page.jsx was invisible here — silently disabling the gate
+    // (and with it all three corrections) on a page that really does capture.
+    .filter((f) => /\.(tsx|ts|jsx|js)$/.test(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
   // Any reference to the path in shipped source, not only the prescribed
@@ -4568,7 +4630,10 @@ export function hasLeadCaptureForm(files: Array<{ path: string; content: Buffer 
  */
 export function validateCaptureFormHasContactField(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
   const source = files
-    .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
+    // .jsx/.js included: MODULE_EXTENSIONS and findUnparseableModule both handle them, and
+    // a page v0 emitted as app/page.jsx was invisible here — silently disabling the gate
+    // (and with it all three corrections) on a page that really does capture.
+    .filter((f) => /\.(tsx|ts|jsx|js)$/.test(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
 

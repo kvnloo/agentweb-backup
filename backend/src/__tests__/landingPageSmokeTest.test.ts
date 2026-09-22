@@ -1117,6 +1117,26 @@ describe("runGenerationSmokeTest", () => {
     expect(persisted.noFormOnPage).toBe(true);
   });
 
+  it("ENG-2081: the classification survives a throw AFTER the fill", async () => {
+    // The three fields used to be copied out at the END of the try block — after submit, the
+    // URL wait, the lead poll and the delete. pollForLead does not catch DynamoDB errors, so
+    // a throttle there sent execution to the outer catch with the fields still at their
+    // defaults: the record then read `ok:false, leadCaptured:false` with no classification,
+    // which is a CRM fault to whoever reads it. They are captured right after the fill now.
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD,
+      iframeCount: 2,
+    });
+    mockGetLeadByEmail.mockRejectedValue(new Error("ProvisionedThroughputExceeded"));
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    const persisted = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(persisted.ok).toBe(false);
+    // The evidence that explains the failure must outlive the failure itself.
+    expect(persisted.iframeCount).toBe(2);
+  });
+
   it("DIAGNOSIS: an auth-only page says so, instead of blaming the CRM", async () => {
     (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
       scope: "", fields: [], selects: [], checkables: [], submitSelector: null,

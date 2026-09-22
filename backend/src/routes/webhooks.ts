@@ -892,6 +892,17 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           }
         }
         if (customChanged) {
+          // Put the STORED system values back before writing. `forwardedAt` is minted fresh
+          // on this branch (existingLead is null, so line ~700 stamps a new one), and the
+          // merged object would otherwise carry it — overwriting the lead's real capture
+          // time whenever anything else changed. That contradicts the invariant stated at
+          // the stamp site ("for existing leads, preserve the original timestamp") and is
+          // customer-visible: forwardedAt is what the owner alert renders as the received
+          // time. The email branch avoids this by omitting the key entirely; this branch
+          // cannot, so it restores it.
+          for (const key of SYSTEM_CUSTOM_KEYS) {
+            if (key in adoptedExistingCustom) adoptedMergedCustom[key] = adoptedExistingCustom[key];
+          }
           adoptedUpdates.customFields = adoptedMergedCustom;
           adoptedChanged = true;
         }
@@ -1010,7 +1021,13 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     }
 
     // After response is sent: auto-draft, auto-send, and alert (fire-and-forget, fully awaited internally)
-    if (isNew && isSmokeTestLead(lead)) {
+    // Deliberately not `isNew &&`. Before the phone-only adopt path existed, a synthetic
+    // lead could only arrive as a new row, so gating on isNew was equivalent. That path can
+    // now set isUpdated, which reaches the side-effect cascade below — HubSpot/Attio sync,
+    // sequence enrolment, an agent-mode draft — for a lead in the reserved smoke-test range.
+    // `leadData` is checked too: on the adopt path `lead` may be the stored row, whose phone
+    // formatting can differ from the synthetic value this submission actually carried.
+    if (isSmokeTestLead(lead) || isSmokeTestLead(leadData)) {
       // ENG-449 gap #3: the automated post-deploy smoke test submits a REAL lead through a
       // customer's real form to verify the pipeline works, then deletes the row. But deleting
       // the row doesn't undo an already-fired side effect — HubSpot/Attio sync, drip-sequence
