@@ -183,6 +183,7 @@ import {
   buildTrackingHelper,
   validateCaptureFormHasContactField,
   LandingPageNotDeployableError,
+  findUnparseableModule,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord, getVercelBuildErrors, isNonErrorBuildLine } from "../services/v0Service";
@@ -6415,5 +6416,69 @@ describe("ENG-2083: refusing an already-deployed page is a 409, not a 500", () =
     expect(err.httpStatus).toBe(409);
     // Message text is deliberately unchanged — callers and existing tests match on it.
     expect(err.message).toBe("Cannot deploy a landing page with status: deployed");
+  });
+});
+
+describe("ENG-2087: a synthetic stub that does not parse must never reach a commit", () => {
+  // The exact file that was committed to a live site repo. It satisfies every shape check —
+  // it has `export`, a `function`, no markdown, an import that looks resolvable — and it is
+  // not valid JavaScript.
+  const POISONED = `"use client"
+
+import  from ".."
+
+export default function SyntheticV0PageForDeployment() {
+  return < />
+`;
+  const f = (path: string, src: string) => ({ path, content: Buffer.from(src) });
+
+  it("findUnparseableModule flags it, and names the file", () => {
+    const r = findUnparseableModule([f("app/page.tsx", POISONED)]);
+    expect(r).not.toBeNull();
+    expect(r!.path).toBe("app/page.tsx");
+    expect(r!.reason).toBeTruthy();
+  });
+
+  it("does not flag valid TSX, including generics — the classic false positive", () => {
+    expect(
+      findUnparseableModule([
+        f("app/page.tsx", 'export default function P(){ return <div className="a">hi</div>; }'),
+        f("lib/x.ts", "export function id<T,>(x: T): T { return x; }"),
+      ])
+    ).toBeNull();
+  });
+
+  it("does not flag an import of a dependency this check cannot resolve", () => {
+    // Syntax-only: transpileModule reports no type/resolution errors, so an unresolved
+    // module specifier must not be mistaken for broken source.
+    expect(
+      findUnparseableModule([f("app/page.tsx", 'import x from "some-package-we-do-not-install";\nexport default function P(){ return <div>{x}</div>; }')])
+    ).toBeNull();
+  });
+
+  it("validateV0Output rejects it, so the retry loop asks v0 to regenerate", () => {
+    expect(() =>
+      validateV0Output([f("app/page.tsx", POISONED)])
+    ).toThrow(/not valid TypeScript\/JSX/);
+  });
+
+  it("detectIncompleteSyntheticPage flags a marker page with no sections at all", () => {
+    // Gate 2 asks "did the stub orphan a section?". With zero sections generated that
+    // question has no answer, and the page used to pass silently.
+    const r = detectIncompleteSyntheticPage([
+      f("app/page.tsx", "export default function SyntheticV0PageForDeployment() { return <div />; }"),
+      f("app/_components/theme-provider.tsx", "export function ThemeProvider() { return null; }"),
+    ]);
+    expect(r).not.toBeNull();
+    expect(r!.entryPath).toBe("app/page.tsx");
+    expect(r!.orphaned).toEqual([]);
+  });
+
+  it("still does not flag a healthy page that composes its sections", () => {
+    const r = detectIncompleteSyntheticPage([
+      f("app/page.tsx", 'import { Hero } from "./_components/hero";\nexport default function Page(){ return <Hero />; }'),
+      f("app/_components/hero.tsx", "export function Hero(){ return <div/>; }"),
+    ]);
+    expect(r).toBeNull();
   });
 });

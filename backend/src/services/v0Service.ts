@@ -22,6 +22,9 @@ import { STUCK_CEILING_MS } from "./durableLandingService";
 import { enqueueAutoHumanEval } from "./autoHumanEvalService";
 import { getPersistedBrandLogoUrl } from "./agentMode/brandLogo";
 import { getLandingPageLaunchReadiness } from "../utils/landingPageLaunchReadiness";
+// ENG-2087: syntax-only validation of generated modules (see findUnparseableModule).
+// Already a runtime dependency, not a devDependency.
+import * as ts from "typescript";
 export { getLandingPageLaunchReadiness } from "../utils/landingPageLaunchReadiness";
 
 // Note: global fetch (undici) timeouts are managed by httpClient.ts (15 min headersTimeout/bodyTimeout).
@@ -4034,6 +4037,39 @@ function resolveInternalImportFile(
  * false-positive on a real, well-named page that merely leaves a stray component unused. Together
  * they fire only on the actual blank-page bug. Pure and exported for direct unit testing.
  */
+/**
+ * ENG-2087: the first generated module that does not parse, or null when they all do.
+ *
+ * Deliberately syntax-only. `transpileModule` reports parse diagnostics and never type errors,
+ * so an import of a dependency this function cannot resolve is not an error here — only source
+ * that no compiler could read. Every file is parsed as TSX, which is a superset of what v0 emits
+ * for these paths.
+ */
+export function findUnparseableModule(
+  files: Array<{ path: string; content: Buffer }>
+): { path: string; reason: string } | null {
+  for (const file of files) {
+    if (!/\.(tsx|ts|jsx|js)$/.test(file.path)) continue;
+    const result = ts.transpileModule(file.content.toString("utf-8"), {
+      fileName: file.path,
+      reportDiagnostics: true,
+      compilerOptions: {
+        jsx: ts.JsxEmit.Preserve,
+        target: ts.ScriptTarget.ESNext,
+        module: ts.ModuleKind.ESNext,
+      },
+    });
+    const error = (result.diagnostics || []).find((d) => d.category === ts.DiagnosticCategory.Error);
+    if (error) {
+      return {
+        path: file.path,
+        reason: ts.flattenDiagnosticMessageText(error.messageText, " "),
+      };
+    }
+  }
+  return null;
+}
+
 export function detectIncompleteSyntheticPage(
   files: Array<{ path: string; content: Buffer }>
 ): { entryPath: string; orphaned: string[] } | null {
@@ -4074,6 +4110,23 @@ export function detectIncompleteSyntheticPage(
   // primitives (leaf building blocks legitimately imported by sections, not by the page), and
   // provider/util-ish files are not sections — both are excluded so only real orphaned content
   // (hero, features, pricing, …) counts.
+  // ENG-2087: gate 2 below asks "did the stub orphan a section?". When the generation
+  // produced NO section components at all, that question has no answer and the page silently
+  // passed — which is how a stub with nothing behind it reached a live repo. A synthetic
+  // marker with zero sections is not the healthy single-component case this gate was relaxed
+  // for; it is the stub, with nothing to compose. Flag it.
+  // Counted with the SAME exclusions the orphan loop below applies — shadcn primitives under
+  // ui/ and provider/util-ish files are not sections. The live case had exactly one component,
+  // `_components/theme-provider.tsx`, which is excluded there and so must be excluded here too;
+  // counting it as a section is what let the stub through.
+  const isSectionComponent = (p: string): boolean => {
+    if (!p.endsWith(".tsx")) return false;
+    if (!p.startsWith("components/") && !/\/_components\//.test(p)) return false;
+    if (/(^|\/)ui\//.test(p)) return false;
+    return !NON_SECTION_COMPONENT_NAME.test(path.posix.basename(p).replace(/\.tsx$/, ""));
+  };
+  const sectionCount = files.filter((f) => isSectionComponent(f.path)).length;
+
   const orphaned: string[] = [];
   for (const file of files) {
     const p = file.path;
@@ -4085,6 +4138,11 @@ export function detectIncompleteSyntheticPage(
     if (NON_SECTION_COMPONENT_NAME.test(base)) continue;
     orphaned.push(p);
   }
+
+  // A synthetic stub with no sections at all has nothing to orphan, so the gate below could
+  // never fire for it (ENG-2087). Report it with an empty `orphaned` list — the caller's message
+  // already names the entry, which is the actionable part.
+  if (sectionCount === 0) return { entryPath, orphaned: [] };
 
   return orphaned.length > 0 ? { entryPath, orphaned } : null;
 }
@@ -4337,11 +4395,36 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
   // for the top bar. Detect the stub + orphaned sections and reject so the retry loop asks v0 to
   // compose the real page. Distinct failure class from ENG-374/384 (both build FAILURES); this
   // one deploys silently, which is exactly why it recurs unnoticed.
+  // ENG-2087: does every generated module actually PARSE?
+  //
+  // Checks 1-7 are all shape heuristics — they ask whether the text looks like React, not
+  // whether it is syntactically valid. A stub of the form `import  from ".."` / `return < />`
+  // satisfies every one of them (it has `export`, a `function`, no markdown, resolvable-looking
+  // imports) and was committed to a live site repo. It does not merely render blank: it fails
+  // `npm run build`, so EVERY subsequent deploy of that site fails — for every sibling page —
+  // until somebody deletes it. Observed live: one bad generation, then an unrelated page two
+  // minutes later failing with a syntax error pointing at a file its author never touched.
+  //
+  // Syntactic diagnostics only (transpileModule reports no type errors), so this cannot reject
+  // code that merely fails to typecheck against deps we do not resolve here — verified against
+  // TSX generics, the classic false-positive for a hand-rolled parser.
+  const unparseable = findUnparseableModule(files);
+  if (unparseable) {
+    throw new V0OutputValidationError(
+      `${unparseable.path} is not valid TypeScript/JSX and would fail the build for the whole ` +
+      `site, not just this page: ${unparseable.reason}. Regenerate the file as complete, ` +
+      `syntactically valid React.`
+    );
+  }
+
   const incomplete = detectIncompleteSyntheticPage(files);
   if (incomplete) {
     throw new V0OutputValidationError(
       `${incomplete.entryPath} is a placeholder page (${SYNTHETIC_V0_PAGE_MARKER}) that renders only one ` +
-      `component; these generated section components are never rendered: ${incomplete.orphaned.join(", ")}. ` +
+      (incomplete.orphaned.length > 0
+        ? `component; these generated section components are never rendered: ${incomplete.orphaned.join(", ")}. `
+        // ENG-2087: no sections were generated at all, so there is nothing orphaned to name.
+        : `component, and no page sections were generated at all. `) +
       `Rewrite ${incomplete.entryPath} to import and render the full page — compose ALL generated sections ` +
       `(e.g. hero, features, how-it-works, testimonials, pricing, signup, footer), not just the nav.`
     );
