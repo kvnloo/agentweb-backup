@@ -20,6 +20,7 @@ import {
   sendMessage,
   sendTemplate,
   toTemplateParam,
+  redactPhone,
   getDisplayPhoneNumber,
   __resetDisplayPhoneNumberCache,
   toE164,
@@ -349,6 +350,26 @@ describe('template parameter hygiene', () => {
   });
 });
 
+describe('redactPhone', () => {
+  it('keeps only the last 4 digits', () => {
+    expect(redactPhone('+14155550123')).toBe('*******0123');
+  });
+
+  it('strips formatting characters before counting digits', () => {
+    expect(redactPhone('+1 (415) 555-0123')).toBe('*******0123');
+  });
+
+  it('masks entirely rather than throwing on 4 or fewer digits', () => {
+    expect(redactPhone('123')).toBe('***');
+    expect(redactPhone('')).toBe('');
+  });
+
+  it('never contains the un-redacted middle digits', () => {
+    const out = redactPhone('+14155550123');
+    expect(out).not.toContain('4155550123'.slice(0, 6));
+  });
+});
+
 // ── Display number ─────────────────────────────────────────────────────────
 
 describe('getDisplayPhoneNumber', () => {
@@ -503,6 +524,11 @@ describe('Meta error mapping', () => {
 });
 
 // ── Request shape ──────────────────────────────────────────────────────────
+
+  it('bounds the send with a timeout, so a hung Graph request cannot hang the caller', async () => {
+    await sendTemplate('+14155550123', TEMPLATES.SHIP_NOTIFY, ['a', 'b']);
+    expect(fetchMock.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+  });
 
 describe('Graph request shape', () => {
   it('posts to the configured phone number id with a bearer token', async () => {
