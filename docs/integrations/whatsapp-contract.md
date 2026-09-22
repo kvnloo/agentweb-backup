@@ -68,7 +68,7 @@ phone. Multi-tenant onboarding was evaluated and deferred — see "Deferred" bel
 
 | Area | Path | Purpose |
 | --- | --- | --- |
-| Credentials | `backend/src/utils/secretsManager.ts` `getWhatsAppCredentials` | `dev|prod/AgentWeb/WhatsApp` |
+| Credentials | `backend/src/utils/secretsManager.ts` `getWhatsAppCredentials` | `WHATSAPP_*` env vars, else `dev` or `prod` + `/AgentWeb/WhatsApp`, cached 5 min |
 | Service | `backend/src/services/whatsappService.ts` | Send, window, consent, error mapping, template registry |
 | Channel adapter | `backend/src/services/whatsappChannelAdapter.ts` | `IMessagingChannel` impl + capability record |
 | Channel registry | `backend/src/services/messagingChannelService.ts` | Provider-neutral seam shared with Slack |
