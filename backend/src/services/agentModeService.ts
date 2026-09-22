@@ -35,6 +35,7 @@ import {
   snapshotWorkPlanTurn,
   type WorkPlanTurnDisposition,
 } from './agentMode/core/workPlanTurnDisposition';
+import { shouldForceScheduledAutocomplete } from './agentMode/core/scheduledAutocomplete';
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
@@ -33675,33 +33676,6 @@ ${strippedHtml}`;
 
   // Work Plan Management Methods
 
-  /**
-   * ENG-2072: whether THIS TURN must force hands-off autocomplete on a work plan.
-   *
-   * `session.sessionType === 'scheduled'` records how the session was CREATED, not
-   * whether a human is present now — a user can reopen a schedule-created session
-   * from the customer-portal "Scheduled" sidebar tab and keep chatting in it
-   * (useAgentModeChat reuses the existing sessionId), and that turn is genuinely
-   * ATTENDED. ENG-803 hit the identical confusion for the publish-approval prompt
-   * block and fixed it the same way: prefer a real per-turn signal over inferring
-   * attendance from sessionType alone.
-   *
-   * `isUnattendedRun` is threaded from runScheduledChat (and the "Test run" path,
-   * which shares it) all the way through the tool-dispatch context — see
-   * ToolContext in mcp/client/toolRegistry.ts. It is TRI-STATE:
-   *   true      -> the real unattended scheduled/test-run path. Force autocomplete.
-   *   false     -> an attended turn (interactive /generate, Emma sidebar, etc.),
-   *                even if it lands on a scheduled session. Never force.
-   *   undefined -> the caller has not been migrated to the new signal (e.g. the
-   *                direct emmaApi.ts HTTP route, or an older test). Fall back to
-   *                the original sessionType-only behavior so those callers see no
-   *                change.
-   */
-  private shouldForceScheduledAutocomplete(session: any, isUnattendedRun?: boolean): boolean {
-    if (isUnattendedRun !== undefined) return isUnattendedRun;
-    return session?.sessionType === 'scheduled';
-  }
-
   public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, sessionId: string, autocomplete?: boolean, isUnattendedRun?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
@@ -33736,7 +33710,7 @@ ${strippedHtml}`;
         // results and asking for approval, then records a deferredUnresolved failure. Force
         // hands-off mode whenever this turn is genuinely unattended — see
         // shouldForceScheduledAutocomplete (ENG-2072).
-        autocomplete: this.shouldForceScheduledAutocomplete(session, isUnattendedRun) ? true : (autocomplete || false),
+        autocomplete: shouldForceScheduledAutocomplete(session, isUnattendedRun) ? true : (autocomplete || false),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
@@ -33920,7 +33894,7 @@ ${strippedHtml}`;
         // run has no user to approve an interactive step, so a template's own
         // autocomplete (or lack of one) is overridden hands-off. ENG-2072: gated on
         // shouldForceScheduledAutocomplete, not sessionType alone — see its doc comment.
-        autocomplete: this.shouldForceScheduledAutocomplete(session, options?.isUnattendedRun) ? true : (predefinedPlan.autocomplete || false),
+        autocomplete: shouldForceScheduledAutocomplete(session, options?.isUnattendedRun) ? true : (predefinedPlan.autocomplete || false),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         // ENG-1472: which predefined template this session's plan was launched
@@ -34381,7 +34355,7 @@ Reply with ONLY one word: yes or no.`;
       // before this fix) rather than only applying when the caller passed a value.
       // ENG-2072: gated on shouldForceScheduledAutocomplete, not sessionType alone —
       // see its doc comment.
-      if (this.shouldForceScheduledAutocomplete(session, isUnattendedRun)) {
+      if (shouldForceScheduledAutocomplete(session, isUnattendedRun)) {
         workPlan.autocomplete = true;
       } else if (autocomplete !== undefined) {
         workPlan.autocomplete = autocomplete;
