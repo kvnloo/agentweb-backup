@@ -33,8 +33,8 @@ router.get('/', authenticateToken, async (req, res) => {
 
     // Process user's own configs and add sharedWith information
     const configs = await Promise.all((result.Items || []).map(async (config) => {
-      // Remove password from config object
-      const { password, ...configWithoutPassword } = config;
+      // Remove password and encryptedPassword from config object
+      const { password, encryptedPassword, ...configWithoutPassword } = config;
 
       if (config.sharedConfigIds?.length > 0) {
         // Get shared configs using the GSI
@@ -48,7 +48,7 @@ router.get('/', authenticateToken, async (req, res) => {
             }
           }).promise();
           if (result.Items?.[0]) {
-            const { password, ...sharedConfigWithoutPassword } = result.Items[0];
+            const { password, encryptedPassword, ...sharedConfigWithoutPassword } = result.Items[0];
             return sharedConfigWithoutPassword;
           }
           return null;
@@ -316,7 +316,7 @@ router.get('/shared', authenticateToken, async (req, res) => {
     const allSharedConfigs = [...(directlySharedResult.Items || []), ...(publiclySharedResult.Items || [])];
     
     const sharedConfigs = await Promise.all(allSharedConfigs.map(async (config) => {
-      const { password, ...configWithoutPassword } = config;
+      const { password, encryptedPassword, ...configWithoutPassword } = config;
       const sharer = await userDb.getUserById(config.sharedBy || config.userId);
       
       // Determine if this is an API configuration
@@ -374,7 +374,7 @@ router.get('/api/:appName', authenticateToken, async (req, res) => {
     if (userConfigs.Items && userConfigs.Items.length > 0) {
       // Return user's own config (without password)
       const config = userConfigs.Items[0];
-      const { password, ...configWithoutPassword } = config;
+      const { password, encryptedPassword, ...configWithoutPassword } = config;
       return res.json(configWithoutPassword);
     }
 
@@ -395,7 +395,7 @@ router.get('/api/:appName', authenticateToken, async (req, res) => {
     if (publicConfigs.Items && publicConfigs.Items.length > 0) {
       // Return the publicly shared config (without password)
       const config = publicConfigs.Items[0];
-      const { password, ...configWithoutPassword } = config;
+      const { password, encryptedPassword, ...configWithoutPassword } = config;
       return res.json(configWithoutPassword);
     }
 
