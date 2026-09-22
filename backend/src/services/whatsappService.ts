@@ -408,6 +408,16 @@ export async function sendText(
   text: string,
 ): Promise<{ messageId: string | null }> {
   const phone = await assertSendable(destination);
+  // Enforced HERE, not only by sendMessage's caller-side check before it calls this —
+  // sendText is exported, and a direct caller that skips sendMessage would otherwise
+  // discover the window is shut as Meta's 131047, far from the call site, instead of a
+  // clear local refusal. sendMessage already checked this immediately before calling
+  // in; the extra read here is a settings-table lookup, not a network call to Meta.
+  if (!(await isServiceWindowOpen(phone))) {
+    throw new WhatsAppWindowClosedError(
+      `${redactPhone(phone)} is outside the 24-hour service window.`,
+    );
+  }
   return postToGraph({
     messaging_product: 'whatsapp',
     to: phone,
