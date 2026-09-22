@@ -23,6 +23,7 @@ jest.mock('../services/whatsappService', () => ({
   recordInboundMessage: jest.fn(),
   recordOptOut: jest.fn(),
   recordOptIn: jest.fn(),
+  redactPhone: jest.requireActual('../services/whatsappService').redactPhone,
 }));
 jest.mock('../services/whatsappVerificationService', () => ({
   handleVerificationMessage: jest.fn(),
@@ -220,6 +221,16 @@ describe('POST — inbound messages', () => {
   it('records an opt-in on UNSTOP', async () => {
     await post(inboundPayload('UNSTOP'));
     expect(recordOptIn).toHaveBeenCalledWith('+14155550123', 'unstop_keyword');
+  });
+
+  it('never puts the raw phone number in a STOP/START log line', async () => {
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    await post(inboundPayload('STOP'));
+    await post(inboundPayload('UNSTOP'));
+    const logged = logSpy.mock.calls.map((c) => c.map(String).join(' ')).join('\n');
+    expect(logged).not.toContain('14155550123');
+    expect(logged).toContain('0123'); // still correlatable via the last 4 digits
+    logSpy.mockRestore();
   });
 
   it('does not treat a message merely containing "stop" as an opt-out', async () => {
