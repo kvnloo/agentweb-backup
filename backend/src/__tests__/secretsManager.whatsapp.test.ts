@@ -162,4 +162,83 @@ describe('secretsManager.getWhatsAppCredentials', () => {
     mod = require('../utils/secretsManager');
     await expect(mod.getWhatsAppCredentials()).rejects.toThrow(/WHATSAPP_\* env vars/);
   });
+
+  describe('caching the Secrets Manager result', () => {
+    // The webhook calls this on EVERY inbound POST (signature verification needs
+    // appSecret) and every outbound send calls it too — uncached, that is one
+    // GetSecretValue request per request. These pin the fix.
+
+    it('serves a second call from cache rather than fetching again', async () => {
+      mockGetSecretValue.mockResolvedValue({ SecretString: JSON.stringify(secretCreds) });
+      const { getWhatsAppCredentials } = require('../utils/secretsManager');
+
+      await expect(getWhatsAppCredentials()).resolves.toEqual(secretCreds);
+      await expect(getWhatsAppCredentials()).resolves.toEqual(secretCreds);
+
+      expect(mockGetSecretValue).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not cache a failure — the next call retries against Secrets Manager', async () => {
+      mockGetSecretValue.mockResolvedValueOnce({ SecretString: '' }); // empty -> throws
+      const { getWhatsAppCredentials } = require('../utils/secretsManager');
+
+      await expect(getWhatsAppCredentials()).rejects.toThrow('Failed to fetch WhatsApp credentials');
+
+      mockGetSecretValue.mockResolvedValueOnce({ SecretString: JSON.stringify(secretCreds) });
+      await expect(getWhatsAppCredentials()).resolves.toEqual(secretCreds);
+      expect(mockGetSecretValue).toHaveBeenCalledTimes(2);
+    });
+
+    it('re-fetches once the cache entry expires', async () => {
+      let now = 1_700_000_000_000;
+      jest.spyOn(Date, 'now').mockImplementation(() => now);
+      mockGetSecretValue.mockResolvedValue({ SecretString: JSON.stringify(secretCreds) });
+      const { getWhatsAppCredentials } = require('../utils/secretsManager');
+
+      await getWhatsAppCredentials();
+      now += 5 * 60 * 1000 - 1; // just under the 5-minute TTL
+      await getWhatsAppCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledTimes(1);
+
+      now += 2; // now just past it
+      await getWhatsAppCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledTimes(2);
+
+      jest.spyOn(Date, 'now').mockRestore();
+    });
+
+    it('shares one in-flight lookup across concurrent callers, so a cold cache does not fan out', async () => {
+      let resolveSecret!: (v: { SecretString: string }) => void;
+      mockGetSecretValue.mockReturnValue(new Promise((resolve) => { resolveSecret = resolve; }));
+      const { getWhatsAppCredentials } = require('../utils/secretsManager');
+
+      const a = getWhatsAppCredentials();
+      const b = getWhatsAppCredentials();
+      resolveSecret({ SecretString: JSON.stringify(secretCreds) });
+
+      await expect(Promise.all([a, b])).resolves.toEqual([secretCreds, secretCreds]);
+      expect(mockGetSecretValue).toHaveBeenCalledTimes(1);
+    });
+
+    it('__resetWhatsAppCredentialsCache forces the next call to fetch again', async () => {
+      mockGetSecretValue.mockResolvedValue({ SecretString: JSON.stringify(secretCreds) });
+      const { getWhatsAppCredentials, __resetWhatsAppCredentialsCache } = require('../utils/secretsManager');
+
+      await getWhatsAppCredentials();
+      __resetWhatsAppCredentialsCache();
+      await getWhatsAppCredentials();
+
+      expect(mockGetSecretValue).toHaveBeenCalledTimes(2);
+    });
+
+    it('never caches the env path — a live env change takes effect on the next call', async () => {
+      setFullEnv();
+      const { getWhatsAppCredentials } = require('../utils/secretsManager');
+
+      await expect(getWhatsAppCredentials()).resolves.toMatchObject({ phoneNumberId: 'env-phone' });
+      process.env.WHATSAPP_PHONE_NUMBER_ID = 'env-phone-2';
+      await expect(getWhatsAppCredentials()).resolves.toMatchObject({ phoneNumberId: 'env-phone-2' });
+      expect(mockGetSecretValue).not.toHaveBeenCalled();
+    });
+  });
 });
