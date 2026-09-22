@@ -480,6 +480,31 @@ export function findAnsweredDeckItemByKind(
 }
 
 /**
+ * Rebuilds a fully 'answered' PendingApprovalDeck for `deckId` purely from
+ * message history — for the ONE case where a deck's own session field no
+ * longer holds it: resuming a workflow run whose steps were built from a
+ * deck that a LATER deck has since overwritten in `session.pendingApprovalDeck`
+ * (see agentModeService.ts's stuck-run resume, ENG-1635/1644). Same
+ * halt-message/reply-message pairing as findAnsweredDeckItemByKind, just
+ * returning the whole deck instead of one item. Returns null if no such
+ * answered deck is found in this history (the caller has no fallback at that
+ * point — it means the deck genuinely isn't reconstructable, not that it's
+ * safe to skip).
+ */
+export function reconstructApprovalDeckFromHistory(
+  messages: ApprovalDeckHistoryMessage[],
+  deckId: string,
+): PendingApprovalDeck | null {
+  const halt = messages.find((message) => message.metadata?.pendingApprovalDeckId === deckId);
+  const items = halt?.metadata?.approvalDeckItems;
+  if (!Array.isArray(items) || items.length === 0) return null;
+  const reply = messages.find((message) => message.metadata?.approvalDeckAnswer?.deckId === deckId);
+  const answers = reply?.metadata?.approvalDeckAnswer?.answers;
+  if (!Array.isArray(answers) || answers.length !== items.length) return null;
+  return { deckId, items, status: 'answered', answers, createdAt: new Date(0).toISOString() };
+}
+
+/**
  * Render the deck as a plain-text prompt — the accessible/non-card mirror,
  * same role as askUserQuestion's renderQuestionPrompt. Carries no instruction
  * on how to answer; only an inbound structured submission can resolve a deck.

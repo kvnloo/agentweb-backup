@@ -44,6 +44,7 @@ jest.mock('../services/chatbotService', () => {
       updateSessionApprovalDeck: jest.fn(),
       updateSessionWorkflowRun: jest.fn(),
       updateSessionLastFailedMetaWrite: jest.fn(),
+      getMessagesFromMessagesTable: jest.fn(),
     },
   };
 });
@@ -440,6 +441,80 @@ describe('ENG-1635/1644 reconciliation — Vincent Hu partial-failure regression
     const write1Checkpoint = sessionState.workflowRun.checkpoints.find((c: any) => c.stepId === 'write-1');
     expect(write1Checkpoint.verifiedAt).toBe(priorVerifiedAt);
     expect(write1Checkpoint.verifiedFields.appliedObjectId).toBe('id-AS_94041-prior');
+  });
+
+  it('ENG-1635/1644: a stuck in-progress run from a CRASHED prior submission no longer permanently blocks every later deck in the session', async () => {
+    // Fresh-mind PR review finding (2026-09-22): advanceIndependentWorkflow
+    // has no caller anywhere except submitApprovalDeckAnswers, and an
+    // independent-step run never reaches 'failed' — only 'completed' (every
+    // step attempted) or stuck 'in_progress' forever if the process dies
+    // mid-drain. Left unresumed, startWorkflow's failIfActiveExists guard
+    // then refuses EVERY later deck in this session with a misleading
+    // 'conflict', even one that has nothing to do with the crashed batch —
+    // a variant of the exact Vincent Hu incident (stuck batch, manual
+    // rebuild needed) this ticket exists to prevent, just triggered by infra
+    // instead of a Meta API error. This proves resumeStuckApprovalDeckWorkflowRun
+    // actually closes it: the crashed deck's un-checkpointed writes drain
+    // BEFORE the new deck's own workflow starts, using ONLY message history
+    // to reconstruct the crashed deck (the harder, more realistic path — a
+    // later deck has already overwritten session.pendingApprovalDeck, same
+    // as a real crash-then-later-turn scenario would look like).
+    const createCalls: string[] = [];
+    jest.spyOn(service as any, 'manageMetaAdsAdSets').mockImplementation((async (..._args: unknown[]) => {
+      const params: any = _args[5];
+      createCalls.push(params?.name);
+      return { success: true, message: 'created', adSet: { id: `id-${params?.name}` } };
+    }) as any);
+
+    const oldDeckId = 'deck-vincent-1';
+    const oldAnsweredDeck = applyDeckAnswers(answeredDeckFixture(), approveAll(), 'user', '2026-09-14T23:59:00.000Z');
+
+    // The stuck run died after write-1 verified, before write-2/write-3 ever ran.
+    const priorVerifiedAt = '2026-09-15T00:00:00.000Z';
+    sessionState.workflowRun = {
+      runId: 'run-1',
+      workflowId: `approval-deck-${oldDeckId}`,
+      status: 'in_progress',
+      checkpoints: [
+        { stepId: 'write-1', status: 'verified', entityIds: {}, verifiedFields: { appliedObjectId: 'id-AS_94041-prior' }, verifiedAt: priorVerifiedAt },
+      ],
+      resolvedParameters: {},
+      version: 1,
+      createdAt: priorVerifiedAt,
+      updatedAt: priorVerifiedAt,
+    };
+    sessionState.consumedMetaWriteManifestDigests = { [digestFor('94041')]: priorVerifiedAt };
+
+    // A NEW, unrelated deck has since been built and is now the live slot —
+    // the old (already-answered, now stuck) deck only survives in message
+    // history.
+    sessionState.pendingApprovalDeck = {
+      deckId: 'deck-new-1',
+      status: 'awaiting' as const,
+      createdAt: '2026-09-16T00:00:00.000Z',
+      items: [{
+        itemId: 'write-new-1', kind: 'meta_write', question: 'Create ad set AS_10001?', allowFreeText: true,
+        metaWriteManifestDigest: digestFor('10001'),
+        metaWriteDispatch: writeDispatchFor('10001'),
+      }],
+    };
+
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
+      { metadata: { pendingApprovalDeckId: oldDeckId, approvalDeckItems: oldAnsweredDeck.items } },
+      { metadata: { approvalDeckAnswer: { deckId: oldDeckId, answers: oldAnsweredDeck.answers } } },
+    ]);
+
+    const result = await service.submitApprovalDeckAnswers(
+      SESSION_ID, 'deck-new-1', [{ itemId: 'write-new-1', verdict: 'approve' }], 'user',
+    );
+
+    expect(result.outcome).toBe('submitted');
+    // The stuck deck's two never-attempted writes were drained first...
+    expect(createCalls).toEqual(expect.arrayContaining(['AS_94043', 'AS_94536']));
+    expect(createCalls).not.toContain('AS_94041'); // already verified pre-crash, never re-dispatched
+    // ...AND the new deck's own write also went through, not silently dropped
+    // behind a misleading 'conflict'.
+    expect(createCalls).toContain('AS_10001');
   });
 
   it('reject-with-correction: approve 2 of 3, reject the third with a correction — only the 2 approved ever get a workflow step, the correction is captured, never auto-applied', async () => {

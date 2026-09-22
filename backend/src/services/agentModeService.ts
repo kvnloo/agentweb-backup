@@ -118,6 +118,7 @@ import {
   finalizeApprovalDeck,
   findApprovalDeckAnswerForDigest,
   findAnsweredDeckItemByKind,
+  reconstructApprovalDeckFromHistory,
   applyDeckAnswers,
   approvedWriteItems,
   renderApprovalDeckPrompt,
@@ -20857,6 +20858,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     ad_set_id: string | undefined,
     ad_id: string | undefined,
     params: any,
+    grantSourceDeck?: PendingApprovalDeck,
   ): Promise<{ granted: boolean; digest: string }> {
     const digest = await this.resolveMetaWriteManifestDigest(
       userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
@@ -20872,7 +20874,17 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // the ONLY path a Meta write may be granted through; `params.confirm`
     // alone is never sufficient (see the gate below, which no longer reads
     // it at all before calling this).
-    const outcome = findApprovalDeckAnswerForDigest(session?.pendingApprovalDeck, digest);
+    //
+    // `grantSourceDeck` is an explicit override for resumeStuckApprovalDeckWorkflowRun's
+    // benefit ONLY: `session.pendingApprovalDeck` is whatever deck is
+    // CURRENTLY live, which for a step being resumed after a crash may
+    // already have been overwritten by a later, unrelated deck — reading it
+    // here would make every one of the crashed deck's still-approved writes
+    // fail closed as "no longer authorized," permanently losing them instead
+    // of resuming them. The normal (non-resume) call path never passes this,
+    // so its behavior is unchanged: it still reads the live session field,
+    // which IS the deck that was just answered.
+    const outcome = findApprovalDeckAnswerForDigest(grantSourceDeck ?? session?.pendingApprovalDeck, digest);
     if (!outcome.granted) return { granted: false, digest };
     const granted = await chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
     return { granted, digest };
@@ -22066,6 +22078,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     sessionId: string,
     userId: string,
     approved: Array<{ item: ApprovalDeckItem }>,
+    // Passed by resumeStuckApprovalDeckWorkflowRun only — see
+    // claimMetaWriteManifestGrant's own header for why a resumed step must
+    // NOT rely on session.pendingApprovalDeck for its grant check.
+    grantSourceDeck?: PendingApprovalDeck,
   ): WorkflowStepDefinition[] {
     return approved.map(({ item }) => {
       const dispatch = item.metaWriteDispatch!;
@@ -22078,6 +22094,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           const grant = await this.claimMetaWriteManifestGrant(
             userId, sessionId, dispatch.entity_type, dispatch.action, dispatch.account_id,
             dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
+            grantSourceDeck,
           );
           if (!grant.granted) {
             throw new Error(
@@ -22137,6 +22154,70 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   }
 
   /**
+   * Self-heal for a real gap found by fresh-mind PR review, not the original
+   * plan: advanceIndependentWorkflow (workflowRunner.ts) has no caller
+   * anywhere except submitApprovalDeckAnswers below, and an independent-step
+   * run never reaches 'failed' — only 'completed' (every step attempted) or
+   * stuck 'in_progress' forever if the process dies mid-drain (core/
+   * workflow.ts's own header on findNextIndependentStep explains why). Left
+   * unresumed, that stuck run also permanently blocks startWorkflow's
+   * failIfActiveExists guard for EVERY later deck in this session
+   * (updateSessionWorkflowRun only allows a new run once the prior one is
+   * 'completed'/'failed') — so the next unrelated deck this session ever
+   * answers would silently fail with a misleading 'conflict' outcome and
+   * dispatch nothing, a variant of the exact Vincent Hu incident (stuck
+   * batch, manual rebuild needed) this ticket exists to prevent, just
+   * triggered by infra instead of a Meta API error.
+   *
+   * Runs opportunistically before handling a NEW answer; a no-op when
+   * nothing is stuck. The stuck run's own workflowId encodes its deckId
+   * (`approval-deck-<deckId>`, see submitApprovalDeckAnswers below) — if
+   * that deck is still `session.pendingApprovalDeck` (the common case: no
+   * later deck has been built since the crash), its items are read directly;
+   * otherwise they're rebuilt from message history the same way
+   * findAnsweredDeckItemByKind already does. If neither source has it,
+   * there's nothing more this can do — leaves the run stuck rather than
+   * guessing, same as any other unreconstructable-state fallback in this
+   * file.
+   */
+  private async resumeStuckApprovalDeckWorkflowRun(sessionId: string, session: ChatSession): Promise<void> {
+    const run = session.workflowRun;
+    if (!run || run.status !== 'in_progress') return;
+    const prefix = 'approval-deck-';
+    if (!run.workflowId.startsWith(prefix)) return; // not one of ours — leave it alone
+    const stuckDeckId = run.workflowId.slice(prefix.length);
+
+    let stuckDeck: PendingApprovalDeck | null = null;
+    if (session.pendingApprovalDeck?.deckId === stuckDeckId && session.pendingApprovalDeck.status === 'answered') {
+      stuckDeck = session.pendingApprovalDeck;
+    } else {
+      const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
+      stuckDeck = reconstructApprovalDeckFromHistory(messages as any, stuckDeckId);
+    }
+    if (!stuckDeck) return;
+
+    const approved = approvedWriteItems(stuckDeck);
+    if (approved.length === 0) return;
+    // Explicit grantSourceDeck: this deck may no longer be
+    // session.pendingApprovalDeck (a later deck can have overwritten it) —
+    // claimMetaWriteManifestGrant must check authorization against THIS
+    // deck's own recorded answers, not whatever deck is live now.
+    const steps = this.buildMetaWriteWorkflowSteps(sessionId, session.userId, approved, stuckDeck);
+    const definition = { workflowId: run.workflowId, steps };
+    const stepIdToDispatch = new Map(approved.map(({ item }) => [item.itemId, item.metaWriteDispatch!] as const));
+
+    let outcome = await advanceIndependentWorkflow(sessionId, definition);
+    while (outcome.kind === 'step_verified' || outcome.kind === 'step_failed') {
+      outcome = await advanceIndependentWorkflow(sessionId, definition);
+    }
+    if (outcome.kind !== 'completed') return; // conflict/no_active_run — another request already resolved it
+    const summary = this.summarizeApprovalDeckRun(outcome.run);
+    if (summary) {
+      await this.applyMetaWriteRetryBackstop(sessionId, session, summary, stepIdToDispatch);
+    }
+  }
+
+  /**
    * ENG-1635/1644: resolve a full submission of deck answers, and — for every
    * item the user approved — drive it to completion via the independent-step
    * workflow engine before returning. This is what actually executes a deck's
@@ -22159,6 +22240,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     | { outcome: 'submitted'; run: WorkflowRunState | null; summary: ApprovalDeckExecutionSummary | null; answeredDeck: PendingApprovalDeck }
   > {
     const session = await chatbotDb.getChatSession(sessionId);
+    if (session) await this.resumeStuckApprovalDeckWorkflowRun(sessionId, session);
     const deck = session?.pendingApprovalDeck;
     if (!deck) return { outcome: 'invalid', reason: 'No pending approval deck in this session.' };
     // Stale-card guard, same shape as askUserQuestion.ts's resolveInboundAnswer
