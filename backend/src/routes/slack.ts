@@ -637,7 +637,7 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
         console.log('👋 Emma bot mentioned in Slack:', {
           channel,
           user: slackUserId,
-          text
+          ts
         });
 
         try {
