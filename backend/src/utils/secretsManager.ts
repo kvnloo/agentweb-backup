@@ -1182,6 +1182,39 @@ const WHATSAPP_ENV_VARS = {
   webhookVerifyToken: 'WHATSAPP_WEBHOOK_VERIFY_TOKEN',
 } as const satisfies Record<keyof WhatsAppCredentials, string>;
 
+let whatsappCredsCache: { value: WhatsAppCredentials; expiresAt: number } | null = null;
+let whatsappCredsInFlight: Promise<WhatsAppCredentials> | null = null;
+const WHATSAPP_CREDS_TTL_MS = 5 * 60 * 1000;
+
+/** Test hook: forget any cached or in-flight Secrets-Manager-backed WhatsApp credentials. */
+export function __resetWhatsAppCredentialsCache(): void {
+  whatsappCredsCache = null;
+  whatsappCredsInFlight = null;
+}
+
+async function fetchWhatsAppCredentialsFromSecretsManager(): Promise<WhatsAppCredentials> {
+  const environment = process.env.NODE_ENV || 'development';
+  const secretName = environment === 'production'
+    ? 'prod/AgentWeb/WhatsApp'
+    : 'dev/AgentWeb/WhatsApp';
+
+  const secretString = await getSecret(secretName);
+
+  if (!secretString || secretString.trim() === '') {
+    throw new Error('WhatsApp credentials secret is empty');
+  }
+
+  const credentials = JSON.parse(secretString) as WhatsAppCredentials;
+
+  const missing = (['phoneNumberId', 'wabaId', 'accessToken', 'appSecret', 'webhookVerifyToken'] as const)
+    .filter((k) => !credentials[k]);
+  if (missing.length > 0) {
+    throw new Error(`WhatsApp credentials missing: ${missing.join(', ')}`);
+  }
+
+  return credentials;
+}
+
 export async function getWhatsAppCredentials(): Promise<WhatsAppCredentials> {
   const fromEnv = {} as WhatsAppCredentials;
   const missingEnv: string[] = [];
@@ -1190,6 +1223,9 @@ export async function getWhatsAppCredentials(): Promise<WhatsAppCredentials> {
     if (value) fromEnv[field as keyof WhatsAppCredentials] = value;
     else missingEnv.push(envName);
   }
+  // The env path is a synchronous, in-memory lookup — free, and re-reading it live
+  // (rather than caching) means a changed env var takes effect immediately. Nothing
+  // below this point needs caching UNTIL it is Secrets Manager, which is a network call.
   if (missingEnv.length === 0) return fromEnv;
   if (missingEnv.length < Object.keys(WHATSAPP_ENV_VARS).length) {
     // Some but not all set: almost certainly a forgotten variable, not an intent to
@@ -1200,31 +1236,37 @@ export async function getWhatsAppCredentials(): Promise<WhatsAppCredentials> {
     );
   }
 
-  try {
-    const environment = process.env.NODE_ENV || 'development';
-    const secretName = environment === 'production'
-      ? 'prod/AgentWeb/WhatsApp'
-      : 'dev/AgentWeb/WhatsApp';
-
-    const secretString = await getSecret(secretName);
-
-    if (!secretString || secretString.trim() === '') {
-      throw new Error('WhatsApp credentials secret is empty');
-    }
-
-    const credentials = JSON.parse(secretString) as WhatsAppCredentials;
-
-    const missing = (['phoneNumberId', 'wabaId', 'accessToken', 'appSecret', 'webhookVerifyToken'] as const)
-      .filter((k) => !credentials[k]);
-    if (missing.length > 0) {
-      throw new Error(`WhatsApp credentials missing: ${missing.join(', ')}`);
-    }
-
-    return credentials;
-  } catch (error) {
-    console.error('Error fetching WhatsApp credentials from Secrets Manager:', error);
-    throw new Error(
-      'Failed to fetch WhatsApp credentials. Set all of the WHATSAPP_* env vars or store them in Secrets Manager.',
-    );
+  // Secrets Manager sits on the path of EVERY inbound webhook POST (signature
+  // verification needs appSecret) and every outbound send — uncached, that is one
+  // GetSecretValue call per request, adding latency before the signature check and
+  // exposing the path to throttling under real traffic. Cached with a TTL, the same
+  // shape as getPlacidPrivateToken's cache below.
+  //
+  // Only a SUCCESS is cached. Placid's cache also caches an absent secret, because
+  // that is an expected, stable state in dev — a WhatsApp credentials fetch failing is
+  // much more likely a real outage or misconfiguration, and caching THAT would turn one
+  // bad Secrets Manager call into five minutes of every inbound STOP silently failing
+  // to record. Concurrent callers share one in-flight lookup so a cold cache under a
+  // burst of webhook traffic does not fan out into one Secrets Manager call each.
+  const now = Date.now();
+  if (whatsappCredsCache && whatsappCredsCache.expiresAt > now) {
+    return whatsappCredsCache.value;
   }
+  if (!whatsappCredsInFlight) {
+    whatsappCredsInFlight = fetchWhatsAppCredentialsFromSecretsManager()
+      .then((value) => {
+        whatsappCredsCache = { value, expiresAt: Date.now() + WHATSAPP_CREDS_TTL_MS };
+        return value;
+      })
+      .catch((error) => {
+        console.error('Error fetching WhatsApp credentials from Secrets Manager:', error);
+        throw new Error(
+          'Failed to fetch WhatsApp credentials. Set all of the WHATSAPP_* env vars or store them in Secrets Manager.',
+        );
+      })
+      .finally(() => {
+        whatsappCredsInFlight = null;
+      });
+  }
+  return whatsappCredsInFlight;
 }
