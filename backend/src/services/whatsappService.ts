@@ -181,13 +181,25 @@ export async function recordOptOut(phone: string): Promise<void> {
 export async function recordOptIn(phone: string, source: string): Promise<void> {
   // Clearing the blocklist row IS the opt-in for messaging purposes; the durable
   // consent record with its source lives on the user's messagingChannels entry.
-  console.log(`[whatsapp] opt-in for ${phone} via ${source}`);
+  console.log(`[whatsapp] opt-in for ${redactPhone(phone)} via ${source}`);
   await settingsService.deleteSetting(optOutKey(phone));
 }
 
 export async function isOptedOut(phone: string): Promise<boolean> {
   const row = await settingsService.getSetting(optOutKey(phone));
   return !!row?.settingValue;
+}
+
+/**
+ * A phone number safe to put in a log line.
+ *
+ * A WhatsApp destination is someone's personal number — cleartext PII in application
+ * logs (CWE-532) — so only the last 4 digits survive, which is enough to correlate a
+ * log line with a support ticket without exposing the number itself.
+ */
+export function redactPhone(phone: string): string {
+  const digits = phone.replace(/\D/g, '');
+  return digits.length <= 4 ? '*'.repeat(digits.length) : `${'*'.repeat(digits.length - 4)}${digits.slice(-4)}`;
 }
 
 // ── Graph transport ────────────────────────────────────────────────────────
@@ -226,6 +238,11 @@ async function postToGraph(body: Record<string, unknown>): Promise<{ messageId: 
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
+      // Without this, a Graph request that stops responding can hang for as long as the
+      // process's global fetch dispatcher allows — up to 15 minutes on this codebase's
+      // MCP HTTP client. shipNotifyService releases the failed channel's claim once this
+      // eventually rejects, but every later send queues up behind it until then.
+      signal: AbortSignal.timeout(10_000),
     },
   );
 
