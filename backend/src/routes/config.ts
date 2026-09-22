@@ -16,7 +16,16 @@ const dynamodb = new DynamoDB.DocumentClient();
 // Get table prefix based on NODE_ENV
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 
-
+// Single source of truth for which config fields never leave the server. Every
+// response builder in this file must route through this instead of destructuring
+// fields inline — a per-callsite deny-list is exactly how encryptedPassword shipped
+// to the browser for years after password was stripped (ENG-2056).
+export function omitSensitiveConfigFields<T extends Record<string, any>>(
+  config: T
+): Omit<T, 'password' | 'encryptedPassword'> {
+  const { password, encryptedPassword, ...rest } = config;
+  return rest;
+}
 
 // Get user's saved configurations
 router.get('/', authenticateToken, async (req, res) => {
@@ -33,8 +42,7 @@ router.get('/', authenticateToken, async (req, res) => {
 
     // Process user's own configs and add sharedWith information
     const configs = await Promise.all((result.Items || []).map(async (config) => {
-      // Remove password and encryptedPassword from config object
-      const { password, encryptedPassword, ...configWithoutPassword } = config;
+      const configWithoutPassword = omitSensitiveConfigFields(config);
 
       if (config.sharedConfigIds?.length > 0) {
         // Get shared configs using the GSI
@@ -48,8 +56,7 @@ router.get('/', authenticateToken, async (req, res) => {
             }
           }).promise();
           if (result.Items?.[0]) {
-            const { password, encryptedPassword, ...sharedConfigWithoutPassword } = result.Items[0];
-            return sharedConfigWithoutPassword;
+            return omitSensitiveConfigFields(result.Items[0]);
           }
           return null;
         });
@@ -316,7 +323,7 @@ router.get('/shared', authenticateToken, async (req, res) => {
     const allSharedConfigs = [...(directlySharedResult.Items || []), ...(publiclySharedResult.Items || [])];
     
     const sharedConfigs = await Promise.all(allSharedConfigs.map(async (config) => {
-      const { password, encryptedPassword, ...configWithoutPassword } = config;
+      const configWithoutPassword = omitSensitiveConfigFields(config);
       const sharer = await userDb.getUserById(config.sharedBy || config.userId);
       
       // Determine if this is an API configuration
@@ -372,10 +379,9 @@ router.get('/api/:appName', authenticateToken, async (req, res) => {
     }).promise();
 
     if (userConfigs.Items && userConfigs.Items.length > 0) {
-      // Return user's own config (without password)
+      // Return user's own config (without sensitive fields)
       const config = userConfigs.Items[0];
-      const { password, encryptedPassword, ...configWithoutPassword } = config;
-      return res.json(configWithoutPassword);
+      return res.json(omitSensitiveConfigFields(config));
     }
 
     // If no user configs, check publicly shared API configs
@@ -393,10 +399,9 @@ router.get('/api/:appName', authenticateToken, async (req, res) => {
     }).promise();
 
     if (publicConfigs.Items && publicConfigs.Items.length > 0) {
-      // Return the publicly shared config (without password)
+      // Return the publicly shared config (without sensitive fields)
       const config = publicConfigs.Items[0];
-      const { password, encryptedPassword, ...configWithoutPassword } = config;
-      return res.json(configWithoutPassword);
+      return res.json(omitSensitiveConfigFields(config));
     }
 
     // No configs found for this app name

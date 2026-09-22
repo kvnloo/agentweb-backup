@@ -38,7 +38,7 @@ jest.mock('../services/db', () => ({
 // Import the router and encryption functions
 // We need to use require to ensure mocks are applied first, or just standard import is fine since jest hoists mocks.
 // However, since we're testing the router attached to an express app, we'll set that up.
-import configRouter, { encryptPassword, decryptPassword } from '../routes/config';
+import configRouter, { encryptPassword, decryptPassword, omitSensitiveConfigFields } from '../routes/config';
 
 const app = express();
 app.use(express.json());
@@ -54,14 +54,34 @@ describe('Config Routes', () => {
     it('should encrypt and decrypt a password correctly', () => {
       const originalPassword = 'my-secret-password';
       const userId = 'user-123';
-      
+
       const encrypted = encryptPassword(originalPassword, userId);
       expect(encrypted).toBeDefined();
       expect(typeof encrypted).toBe('string');
-      
+
       const decrypted = decryptPassword(encrypted);
       expect(decrypted.password).toBe(originalPassword);
       expect(decrypted.userId).toBe(userId);
+    });
+  });
+
+  describe('omitSensitiveConfigFields', () => {
+    it('strips both password and encryptedPassword and keeps everything else', () => {
+      const result = omitSensitiveConfigFields({
+        configId: '1',
+        website: 'example.com',
+        password: 'plain',
+        encryptedPassword: 'enc'
+      });
+
+      expect(result).toEqual({ configId: '1', website: 'example.com' });
+      expect(result).not.toHaveProperty('password');
+      expect(result).not.toHaveProperty('encryptedPassword');
+    });
+
+    it('is a no-op when neither sensitive field is present', () => {
+      const config = { configId: '2', appName: 'GitHub' };
+      expect(omitSensitiveConfigFields(config)).toEqual(config);
     });
   });
 
