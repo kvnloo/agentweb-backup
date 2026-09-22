@@ -626,4 +626,100 @@ describe('ENG-1635/1644 reconciliation — Vincent Hu partial-failure regression
     expect(rejectedAnswer.verdict).toBe('reject');
     expect(rejectedAnswer.freeText).toBe('Wrong optimization goal — use LINK_CLICKS instead.');
   });
+
+  it('ENG-1635/1644: two drivers racing the SAME step — the loser gets \'contended\' with NO checkpoint, never a false \'failed\' that could clobber the winner\'s real success', async () => {
+    // Fresh-mind review (round 3, same session): a step's execute() throwing
+    // "no longer authorized" used to ALWAYS record a 'failed' checkpoint —
+    // including when the real reason was "lost the digest claim race to a
+    // concurrent driver of this SAME run," not a genuine Meta-side failure.
+    // The loser's false 'failed' checkpoint could win the whole-run version
+    // race over the winner's real 'verified' one, permanently mis-recording
+    // a write that actually succeeded as failed — a real exposure, widened
+    // (not created) by this session's own crash-jam self-heal adding a
+    // second call site that can trigger a resume on the same stuck run.
+    //
+    // Deterministic, not relying on real async timing: the loser is driven
+    // FIRST, with the digest already pre-consumed (exactly what a winning
+    // concurrent claim would have already done on a real DynamoDB
+    // conditional write) — proving the loser gets 'contended' and writes NO
+    // checkpoint at all. The digest is then released and the real winner
+    // runs normally, proving its genuine success is what actually lands.
+    const createCalls: string[] = [];
+    jest.spyOn(service as any, 'manageMetaAdsAdSets').mockImplementation((async (..._args: unknown[]) => {
+      const params: any = _args[5];
+      createCalls.push(params?.name);
+      return { success: true, message: 'created', adSet: { id: `id-${params?.name}` } };
+    }) as any);
+
+    const oneItemDeck = {
+      deckId: 'race-test-deck',
+      status: 'awaiting' as const,
+      createdAt: '2026-09-22T00:00:00.000Z',
+      items: [{
+        itemId: 'write-1', kind: 'meta_write', question: 'Create ad set AS_94041?', allowFreeText: true,
+        metaWriteManifestDigest: digestFor('94041'), metaWriteDispatch: writeDispatchFor('94041'),
+      }],
+    };
+    sessionState.pendingApprovalDeck = applyDeckAnswers(
+      oneItemDeck, [{ itemId: 'write-1', verdict: 'approve' }], 'user', '2026-09-22T00:00:01.000Z',
+    );
+
+    const approved = [{ item: sessionState.pendingApprovalDeck.items[0] }];
+    const steps = (service as any).buildMetaWriteWorkflowSteps(SESSION_ID, 'user-1', approved);
+    const definition = { workflowId: 'approval-deck-race-test', steps };
+
+    sessionState.workflowRun = {
+      runId: 'run-race', workflowId: definition.workflowId, status: 'in_progress',
+      checkpoints: [], resolvedParameters: {}, version: 1,
+      createdAt: '2026-09-22T00:00:02.000Z', updatedAt: '2026-09-22T00:00:02.000Z',
+    };
+
+    // Simulate the loser's attempt: someone else already won the claim.
+    sessionState.consumedMetaWriteManifestDigests = { [digestFor('94041')]: '2026-09-22T00:00:03.000Z' };
+    const loserOutcome = await advanceIndependentWorkflow(SESSION_ID, definition);
+    expect(loserOutcome.kind).toBe('contended');
+    expect(sessionState.workflowRun.checkpoints).toHaveLength(0); // no checkpoint written at all
+    expect(sessionState.workflowRun.version).toBe(1); // run genuinely untouched
+    expect(createCalls).toHaveLength(0); // never even called Meta
+
+    // Now the real winner runs — release the digest and drive again.
+    delete sessionState.consumedMetaWriteManifestDigests[digestFor('94041')];
+    const winnerOutcome = await advanceIndependentWorkflow(SESSION_ID, definition);
+    expect(winnerOutcome.kind).toBe('completed');
+    expect(createCalls).toEqual(['AS_94041']);
+    expect(sessionState.workflowRun.checkpoints).toHaveLength(1);
+    expect(sessionState.workflowRun.checkpoints[0].status).toBe('verified');
+  });
+
+  it('ENG-1635/1644: driveIndependentWorkflowToCompletion keeps advancing through \'contended\' outcomes and still reaches completed', async () => {
+    // Regression for the shared helper's own retry loop — proves 'contended'
+    // doesn't stop the drive (unlike 'conflict'/'no_active_run'), by forcing
+    // exactly one contended attempt before the real claim succeeds.
+    let createCalls = 0;
+    jest.spyOn(service as any, 'manageMetaAdsAdSets').mockImplementation((async (..._args: unknown[]) => {
+      createCalls++;
+      const params: any = _args[5];
+      return { success: true, message: 'created', adSet: { id: `id-${params?.name}` } };
+    }) as any);
+
+    let claimAttempts = 0;
+    const claimMock = chatbotDb.claimMetaWriteManifestDigest as jest.Mock;
+    claimMock.mockImplementation(async (_sid: string, digest: string) => {
+      claimAttempts++;
+      if (claimAttempts === 1) return false; // first attempt loses the race
+      if (sessionState.consumedMetaWriteManifestDigests?.[digest]) return false;
+      sessionState.consumedMetaWriteManifestDigests = {
+        ...(sessionState.consumedMetaWriteManifestDigests || {}), [digest]: new Date().toISOString(),
+      };
+      return true; // second attempt (the actual driver) wins
+    });
+
+    const result = await service.submitApprovalDeckAnswers(SESSION_ID, 'deck-vincent-1', approveAll(), 'user');
+
+    expect(result.outcome).toBe('submitted');
+    if (result.outcome !== 'submitted') throw new Error('unreachable');
+    expect(claimAttempts).toBeGreaterThan(1); // the helper really did retry past the contended attempt
+    expect(createCalls).toBe(3); // all 3 approved writes still went through for real
+    expect(result.summary?.status).toBe('fully_applied');
+  });
 });

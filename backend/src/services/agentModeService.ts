@@ -135,8 +135,9 @@ import {
   type WorkflowRunState,
   type WorkflowVerificationMismatch,
   summarizeIndependentStepBatch,
+  StepContendedError,
 } from './agentMode/core/workflow';
-import { startWorkflow, advanceIndependentWorkflow } from './agentMode/workflowRunner';
+import { startWorkflow, advanceIndependentWorkflow, type AdvanceIndependentOutcome } from './agentMode/workflowRunner';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
 import { settingsService } from './settingsService';
 import {
@@ -21051,7 +21052,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     ad_id: string | undefined,
     params: any,
     grantSourceDeck?: PendingApprovalDeck,
-  ): Promise<{ granted: boolean; digest: string }> {
+  ): Promise<
+    | { granted: true; digest: string }
+    // `reason` distinguishes two genuinely different cases a caller needs to
+    // treat differently (see buildMetaWriteWorkflowSteps's own use of it):
+    // 'not_approved' — this digest was never authorized at all (rejected,
+    // never in any deck, or a genuine client-side forgery attempt) — a real
+    // failure. 'already_consumed' — this digest WAS authorized and has
+    // already been (or is concurrently being) claimed by ANOTHER caller —
+    // not a failure of THIS attempt, just a lost race for an at-most-once
+    // resource; the write may well be succeeding right now via whoever won.
+    | { granted: false; digest: string; reason: 'not_approved' | 'already_consumed' }
+  > {
     const digest = await this.resolveMetaWriteManifestDigest(
       userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
     );
@@ -21059,7 +21071,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // Session already recorded this exact digest consumed — a repeat of the
     // same call re-confirms rather than executing again (acceptance
     // criterion 3).
-    if (session?.consumedMetaWriteManifestDigests?.[digest]) return { granted: false, digest };
+    if (session?.consumedMetaWriteManifestDigests?.[digest]) return { granted: false, digest, reason: 'already_consumed' };
     // ENG-1635/1644 gap 5 (plan's Migration note): sourced from the answered
     // approval deck now, not a `meta_write_manifest`-kind AskUserQuestion —
     // see approvalDeck.ts's findApprovalDeckAnswerForDigest header. This is
@@ -21077,9 +21089,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // so its behavior is unchanged: it still reads the live session field,
     // which IS the deck that was just answered.
     const outcome = findApprovalDeckAnswerForDigest(grantSourceDeck ?? session?.pendingApprovalDeck, digest);
-    if (!outcome.granted) return { granted: false, digest };
+    if (!outcome.granted) return { granted: false, digest, reason: 'not_approved' };
     const granted = await chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
-    return { granted, digest };
+    return granted ? { granted: true, digest } : { granted: false, digest, reason: 'already_consumed' };
   }
 
   /**
@@ -22289,6 +22301,19 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
             grantSourceDeck,
           );
           if (!grant.granted) {
+            if (grant.reason === 'already_consumed') {
+              // Found by review: a concurrent driver of the SAME run (e.g.
+              // two overlapping resumeStuckApprovalDeckWorkflowRun calls)
+              // could already be dispatching, or have already dispatched,
+              // this exact write. This is not a real failure — throwing a
+              // plain Error here would let advanceIndependentWorkflow record
+              // a 'failed' checkpoint that could win the version race over
+              // the OTHER driver's real 'verified' one, permanently
+              // mis-recording a successful write as failed.
+              throw new StepContendedError(
+                'This write is already being handled by a concurrent request.',
+              );
+            }
             throw new Error(
               'This write is no longer authorized — its approval was not found or was already consumed.',
             );
@@ -22343,6 +22368,39 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         },
       };
     });
+  }
+
+  /**
+   * Drives an independent-step workflow run to a terminal state, shared by
+   * both callers of advanceIndependentWorkflow (submitApprovalDeckAnswers'
+   * own drive, and resumeStuckApprovalDeckWorkflowRun below). Treats
+   * 'step_verified'/'step_failed'/'contended' identically as "keep going" —
+   * see AdvanceIndependentOutcome's own header for why 'contended' belongs
+   * in that set: it means a concurrent driver of this SAME run already
+   * claimed the step's real side effect, not that anything actually failed.
+   *
+   * Bounded: a run stuck emitting 'contended' past MAX_CONTENDED_RETRIES
+   * (the other driver never finishing, e.g. it crashed too) stops rather
+   * than spinning forever — the caller treats that exactly like 'conflict'/
+   * 'no_active_run' (give up cleanly; a later call gets another chance).
+   */
+  private async driveIndependentWorkflowToCompletion(
+    sessionId: string,
+    definition: { workflowId: string; steps: WorkflowStepDefinition[] },
+  ): Promise<AdvanceIndependentOutcome> {
+    const MAX_CONTENDED_RETRIES = 20;
+    let contendedStreak = 0;
+    let outcome = await advanceIndependentWorkflow(sessionId, definition);
+    while (outcome.kind === 'step_verified' || outcome.kind === 'step_failed' || outcome.kind === 'contended') {
+      if (outcome.kind === 'contended') {
+        contendedStreak++;
+        if (contendedStreak > MAX_CONTENDED_RETRIES) break;
+      } else {
+        contendedStreak = 0;
+      }
+      outcome = await advanceIndependentWorkflow(sessionId, definition);
+    }
+    return outcome;
   }
 
   /**
@@ -22411,11 +22469,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     const definition = { workflowId: run.workflowId, steps };
     const stepIdToDispatch = new Map(approved.map(({ item }) => [item.itemId, item.metaWriteDispatch!] as const));
 
-    let outcome = await advanceIndependentWorkflow(sessionId, definition);
-    while (outcome.kind === 'step_verified' || outcome.kind === 'step_failed') {
-      outcome = await advanceIndependentWorkflow(sessionId, definition);
-    }
-    if (outcome.kind !== 'completed') return; // conflict/no_active_run — another request already resolved it
+    const outcome = await this.driveIndependentWorkflowToCompletion(sessionId, definition);
+    if (outcome.kind !== 'completed') return; // conflict/no_active_run/contended-exhausted — another request already resolved it (or is still resolving it)
     const summary = this.summarizeApprovalDeckRun(outcome.run);
     if (summary) {
       await this.applyMetaWriteRetryBackstop(sessionId, session, summary, stepIdToDispatch);
@@ -22493,14 +22548,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     const started = await startWorkflow(sessionId, definition, undefined).catch(() => null);
     if (!started) return { outcome: 'conflict' };
 
-    let outcome = await advanceIndependentWorkflow(sessionId, definition);
     // Keep advancing until every step has been attempted — step_verified/
-    // step_failed both mean "keep going" here, UNLIKE the sequential engine's
-    // advanceWorkflow (see advanceIndependentWorkflow's own header).
-    while (outcome.kind === 'step_verified' || outcome.kind === 'step_failed') {
-      outcome = await advanceIndependentWorkflow(sessionId, definition);
-    }
-    if (outcome.kind === 'conflict' || outcome.kind === 'no_active_run') {
+    // step_failed/contended all mean "keep going" here, UNLIKE the
+    // sequential engine's advanceWorkflow (see advanceIndependentWorkflow's
+    // own header, and driveIndependentWorkflowToCompletion's for 'contended').
+    const outcome = await this.driveIndependentWorkflowToCompletion(sessionId, definition);
+    if (outcome.kind === 'conflict' || outcome.kind === 'no_active_run' || outcome.kind === 'contended') {
       return { outcome: 'conflict' };
     }
     const summary = this.summarizeApprovalDeckRun(outcome.run);

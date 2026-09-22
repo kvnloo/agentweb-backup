@@ -77,6 +77,24 @@ export interface WorkflowStepDefinition {
   ) => Promise<WorkflowStepVerification>;
 }
 
+/**
+ * A step's `execute()` MAY throw this instead of a plain Error to signal a
+ * SPECIFIC, engine-recognized condition: another concurrent driver of this
+ * SAME run already claimed this step's real side effect (an at-most-once
+ * resource, e.g. a Meta write digest) and may already be dispatching or have
+ * already succeeded — this attempt never touched the real side effect at
+ * all. This is NOT a failure of the step itself, domain-agnostic on purpose
+ * (this file has no Meta-specific knowledge) — the independent-step driver
+ * (workflowRunner.ts's advanceIndependentWorkflow) treats it as "back off,
+ * write no checkpoint" rather than recording a false 'failed' outcome for a
+ * write that may actually succeed via the other driver. Found by review: two
+ * concurrent drivers of the same stuck run could otherwise both attempt the
+ * same step, the loser's false 'failed' checkpoint could win the version
+ * race over the winner's real 'verified' one, permanently mis-recording a
+ * genuinely successful write as failed.
+ */
+export class StepContendedError extends Error {}
+
 export interface WorkflowDefinition {
   workflowId: string;
   /** Order is the workflow order. */

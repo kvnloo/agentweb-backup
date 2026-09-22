@@ -27,6 +27,7 @@ import {
   findConflictingGatedParameterKeys,
   findNextIndependentStep,
   recordIndependentStepOutcome,
+  StepContendedError,
 } from './core/workflow';
 
 export async function startWorkflow(
@@ -222,7 +223,14 @@ export type AdvanceIndependentOutcome =
   | { kind: 'step_failed'; run: WorkflowRunState }
   | { kind: 'completed'; run: WorkflowRunState }
   // Optimistic-lock loss — caller must re-read and retry rather than trust `run`.
-  | { kind: 'conflict'; run: WorkflowRunState };
+  | { kind: 'conflict'; run: WorkflowRunState }
+  // A concurrent driver of this SAME run already claimed this step's real
+  // side effect (StepContendedError) — no checkpoint was written, `run` is
+  // unchanged (the pre-attempt snapshot). Caller should keep advancing, same
+  // as 'step_verified'/'step_failed' — a later call will either find the
+  // other driver's checkpoint already landed (move on) or the step still
+  // unattempted (retry it).
+  | { kind: 'contended'; run: WorkflowRunState };
 
 /**
  * Advance the session's active workflow run by exactly one step, using
@@ -274,6 +282,13 @@ export async function advanceIndependentWorkflow(
   try {
     executeResult = await step.execute(executionInput);
   } catch (err: any) {
+    if (err instanceof StepContendedError) {
+      // Another driver already claimed this step's real side effect and may
+      // be dispatching or have already succeeded — write NO checkpoint (a
+      // 'failed' one here could permanently mis-record a write that actually
+      // goes on to succeed via the other driver). Caller retries.
+      return { kind: 'contended', run };
+    }
     const failedRun = recordIndependentStepOutcome(
       definition, run, step, { status: 'failed', discrepancy: { error: err?.message || 'execute failed' } }, at(),
     );
