@@ -386,7 +386,7 @@ let captureRouteGateMaxMsOverride: number | null = null;
  * headroom keeps the cap a backstop for the pathological case rather than a truncation, and
  * recomputing it means setVercelPollConfig cannot silently falsify it.
  */
-const captureRouteGateMaxMs = (): number =>
+export const captureRouteGateMaxMs = (): number =>
   captureRouteGateMaxMsOverride ??
   vercelPollMaxAttempts * vercelPollIntervalMs + captureRouteSettleMs + 60_000;
 // And when the poll comes back anything other than READY-for-our-commit, the route is NOT
@@ -396,7 +396,9 @@ const captureRouteGateMaxMs = (): number =>
 let captureRouteSettleMs = 45_000;
 
 /** Test hook: keeps the gate's waits out of unit-test wall-clock. */
-export function setCaptureRouteGateConfig(maxMs: number, settleMs: number): void {
+export function setCaptureRouteGateConfig(maxMs: number | null, settleMs: number): void {
+  // null clears the override so the derived value is used — without this a test can never
+  // observe the derivation, which is how the cap came to be a literal nobody checked.
   captureRouteGateMaxMsOverride = maxMs;
   captureRouteSettleMs = settleMs;
 }

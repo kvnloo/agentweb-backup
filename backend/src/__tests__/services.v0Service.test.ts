@@ -187,6 +187,8 @@ import {
   setCaptureRouteGateConfig,
   validatePixelLeadEvent,
   validateBridgeOutRedirect,
+  captureRouteGateMaxMs,
+  buildLandingPageMiddleware,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord, getVercelBuildErrors, isNonErrorBuildLine } from "../services/v0Service";
@@ -5589,6 +5591,71 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       expect(result.status).toBe("deployed");
       await new Promise((r) => setImmediate(r));
       expect(mockRunGenerationSmokeTest).toHaveBeenCalledTimes(1);
+    });
+
+    it("an 'up-to-date' sync does NOT prove the route is deployed, so the gate still settles", async () => {
+      // The concurrent sub-page add this gate exists for: a sibling committed the identical
+      // LIST_BY_PATH moments earlier, so our sync finds nothing to do and returns
+      // { committed: false, reason: "up-to-date" }. That proves the map is in the REPO, not
+      // that it is DEPLOYED — the sibling's build is typically still running. "up-to-date"
+      // matched neither branch of the if/else, so the gate stayed Promise.resolve() and the
+      // smoke test fired against a route that did not yet carry this page's path.
+      setCaptureRouteGateConfig(60_000, 5_000);
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Items: [existingSiteRecord] }),
+      });
+
+      // All four reads match what the sync would write, so it no-ops. The capture route is
+      // deliberately present-but-unparseable, which satisfies captureRouteUpToDate via the
+      // `captureRouteUnreadable` arm and also sets captureRouteSkipped.
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from(buildLandingPageMiddleware()).toString("base64") },
+      });
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          content: Buffer.from(
+            "const LIST_BY_PATH: Record<string, string> = /* corrupted by hand"
+          ).toString("base64"),
+        },
+      });
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from("{}").toString("base64") },
+      });
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from(buildTrackingHelper()).toString("base64") },
+      });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create pricing page with a lead form",
+        "Pricing",
+        {},
+        "list_pricing"
+      );
+
+      expect(result.status).toBe("deployed");
+      // Nothing was committed, so there is no build to poll — but the settle must still run.
+      await new Promise((r) => setImmediate(r));
+      expect(mockRunGenerationSmokeTest).not.toHaveBeenCalled();
+    });
+
+    it("the gate cap is derived from the poll's real budget, not a frozen literal", () => {
+      // A literal exactly equal to vercelPollMaxAttempts * vercelPollIntervalMs is always
+      // slightly short of the poll's real wall clock (it does an axios round trip per
+      // attempt), which made the settle on the timeout branch unreachable — the cap always
+      // won that race. Deriving it also means setVercelPollConfig cannot silently falsify it.
+      setCaptureRouteGateConfig(null, 1_000);
+      setVercelPollConfig(5_000, 60);
+      expect(captureRouteGateMaxMs()).toBe(60 * 5_000 + 1_000 + 60_000);
+
+      setVercelPollConfig(1_000, 10);
+      expect(captureRouteGateMaxMs()).toBe(10 * 1_000 + 1_000 + 60_000);
     });
 
     it("ENG-449: a capture-route sync that never commits does not strand the smoke test", async () => {
