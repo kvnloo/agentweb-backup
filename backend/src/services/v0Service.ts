@@ -2508,6 +2508,16 @@ async function addPageToExistingRepo(
     // lookup or GitHub sync fails must still keep its just-deployed page. Reuses the
     // exact ENG-310 mechanism (`syncLeadCaptureForPage` in routes/landingPageGeneration.ts)
     // which does this same thing when a lead list is attached after the fact.
+    //
+    // ENG-449: the smoke test dispatched at the end of this function submits this page's
+    // OWN form, and that form cannot capture until the sync commit pushed below has
+    // actually BUILT — the new page's path only enters the deployed LIST_BY_PATH in that
+    // second build. Gating the (already-detached) smoke dispatch on this promise is what
+    // stops every newly-added sub-page from reporting a false `ok: false`. Resolves as
+    // soon as the build outcome is known (ready, error, timeout or superseded) and never
+    // rejects, so a sync that fails or never commits leaves the smoke test running exactly
+    // as it did before.
+    let captureRouteBuild: Promise<void> = Promise.resolve();
     try {
       // ENG-485: re-derived FRESH by syncLeadCaptureFilesToRepo on every retry attempt, not
       // just once here — see that function's own doc comment on why a static snapshot isn't
@@ -2543,16 +2553,21 @@ async function addPageToExistingRepo(
           `[V0 SERVICE] ENG-483: lead-capture route sync did not commit for new page /${slug}: ${syncResult.reason}`
         );
       } else if (syncResult.committed && syncResult.pushedCommitSha) {
-        // Fire-and-forget: never block returning this page as deployed on a SECOND
-        // Vercel build. A concurrent sub-page add is the common case ENG-483 exists
-        // for, and it routinely supersedes this exact commit before Vercel ever
-        // finishes building it — awaiting this poll here would hang every bulk/rapid
-        // page add for up to the full poll window (production: up to 5 minutes) for a
-        // build result that, in the common case, will never resolve to this commit at
-        // all. Visibility only: the page's OWN content already deployed successfully
-        // above, so nothing here can change this page's outcome, only get logged.
+        // Still never blocks returning this page as deployed on a SECOND Vercel build.
+        // A concurrent sub-page add is the common case ENG-483 exists for, and it
+        // routinely supersedes this exact commit before Vercel ever finishes building it —
+        // awaiting this poll HERE would hang every bulk/rapid page add for up to the full
+        // poll window (production: up to 5 minutes) for a build result that, in the common
+        // case, will never resolve to this commit at all. So the result is still not
+        // awaited on the request path; the page's OWN content already deployed above and
+        // nothing here can change this page's outcome.
+        //
+        // ENG-449: the promise is now RETAINED rather than dropped, so the detached smoke
+        // dispatch below can await it. That costs the request nothing (it is already off
+        // the response path) and is the whole fix: submitting the form before this build
+        // lands means submitting to a route that does not yet know this page's path.
         const { pushedCommitSha, pushTimestampMs } = syncResult;
-        void pollVercelDeployment(existingPage.vercelProjectId!, vercelToken, pushTimestampMs, pushedCommitSha)
+        captureRouteBuild = pollVercelDeployment(existingPage.vercelProjectId!, vercelToken, pushTimestampMs, pushedCommitSha)
           .then((syncDeployResult) => {
             if (syncDeployResult.buildStatus === "error") {
               console.error(
@@ -2616,7 +2631,15 @@ async function addPageToExistingRepo(
     // Dynamic import: landingPageSmokeTest.ts imports FROM this module (GeneratedLandingPage,
     // updateLandingPageSmokeTestResult), so a static import here would be circular.
     void import("./landingPageSmokeTest")
-      .then((m) => m.runGenerationSmokeTest(deployedSubPage))
+      .then(async (m) => {
+        // ENG-449: wait for the capture-route sync build (above) before submitting this
+        // page's form. Without this the smoke test races that build and every newly-added
+        // sub-page reports a false `ok: false` — the submit 422s because the deployed
+        // route has no entry for this page's path yet. Already resolved when no sync was
+        // needed, and never rejects, so the no-sync path is unchanged.
+        await captureRouteBuild;
+        return m.runGenerationSmokeTest(deployedSubPage);
+      })
       .catch((err) => console.warn(`[V0 SERVICE] Smoke test dispatch failed: ${err?.message}`));
 
     return deployedSubPage;
