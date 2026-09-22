@@ -322,12 +322,15 @@ export async function getDisplayPhoneNumber(): Promise<string> {
 async function assertSendable(destination: string): Promise<string> {
   const phone = toE164(destination);
   if (!phone) {
+    // Redacted even though this is the raw, not-yet-validated input: it is very
+    // likely a real attempted phone number, and this error's .message ends up in
+    // application logs at every catch site up the call chain — see redactPhone.
     throw new WhatsAppError(
-      `"${destination}" is not a valid phone number in E.164 form — refusing to send.`,
+      `"${redactPhone(destination)}" is not a valid phone number in E.164 form — refusing to send.`,
     );
   }
   if (await isOptedOut(phone)) {
-    throw new WhatsAppOptedOutError(`${phone} has opted out of WhatsApp messages (STOP).`);
+    throw new WhatsAppOptedOutError(`${redactPhone(phone)} has opted out of WhatsApp messages (STOP).`);
   }
   return phone;
 }
@@ -439,7 +442,7 @@ export async function sendMessage(
 
   if (!params.template) {
     throw new WhatsAppWindowClosedError(
-      `${phone} is outside the 24-hour service window and no template was supplied. ` +
+      `${redactPhone(phone)} is outside the 24-hour service window and no template was supplied. ` +
         'Free-form text cannot be delivered — pass a pre-approved template.',
     );
   }
