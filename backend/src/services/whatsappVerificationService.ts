@@ -36,7 +36,7 @@ import crypto from 'crypto';
 import { settingsService } from './settingsService';
 import { userDb } from './db';
 import { explicitChannels, type UserMessagingChannelConfig } from './messagingChannelService';
-import { isOptedOut, sendMessage, toE164 } from './whatsappService';
+import { isOptedOut, redactPhone, sendMessage, toE164 } from './whatsappService';
 
 // ── Tunables ───────────────────────────────────────────────────────────────
 
@@ -334,7 +334,7 @@ export async function handleVerificationMessage(text: string, phone: string): Pr
       await sendMessage({ destination: phone, text: reply });
     } catch (e) {
       console.warn(
-        `[whatsapp-verify] ${outcome} reply to ${phone} failed:`,
+        `[whatsapp-verify] ${outcome} reply to ${redactPhone(phone)} failed:`,
         e instanceof Error ? e.message : e,
       );
     }
