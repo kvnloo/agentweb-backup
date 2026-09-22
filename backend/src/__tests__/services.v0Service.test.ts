@@ -5782,7 +5782,18 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       const zip = new AdmZip();
       zip.addFile(
         "app/page.tsx",
-        Buffer.from('export default function Page() { return <div>No form here</div>; }')
+        Buffer.from(
+          // A REAL capture form, minus the Lead event — that is the actual production
+          // scenario. ENG-2080 skips the correction on a page with no capture form at all,
+          // so a form-less fixture would no longer exercise the retry loop this asserts on.
+          `export default function Page() {
+             const submit = async (e: any) => {
+               e.preventDefault();
+               await fetch("/api/capture", { method: "POST", body: "{}" });
+             };
+             return <form onSubmit={submit}><input name="email" /><button>Go</button></form>;
+           }`
+        )
       );
       zip.addFile(
         "app/layout.tsx",
@@ -5856,6 +5867,13 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
         "list_signup"
       );
 
+      // These two needed persistent (not -Once) implementations so the correction poll could
+      // spin to its deadline. jest.clearAllMocks() in beforeEach clears calls but NOT
+      // implementations, so drop them here or they become the default zip/version for every
+      // later test in the file.
+      mockChatsGetById.mockReset();
+      mockChatsDownloadVersion.mockReset();
+
       // A missing Lead event is degraded, not broken: the page must still ship, and the
       // tracking gap must be reported rather than swallowed.
       expect(result.status).toBe("deployed");
@@ -5893,6 +5911,44 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       expect(mockChatsSendMessage).not.toHaveBeenCalled();
       expect(result.pixelLeadEventVerified).toBe(true);
     });
+
+    it("ENG-2080: a page with no lead-capture form never sends the correction, so there is no wait to burn", async () => {
+      setupSiteRecordWithPixelMock();
+      const AdmZip = (await import("adm-zip")).default;
+      const zip = new AdmZip();
+      // Informational page: no form, no /api/capture, and therefore nothing a Lead-event
+      // correction could ever attach to. Asking v0 to "fix the lead capture form" here is
+      // unsatisfiable — it answers with no new version and the poll burns its full ~17-minute
+      // budget before ENG-2079's fallthrough can ship the page. Don't ask.
+      zip.addFile(
+        "app/page.tsx",
+        Buffer.from(
+          'export default function Page() { return <div><h1>Thanks</h1><a href="tel:5551234">Call us</a></div>; }'
+        )
+      );
+      const noFormZip = zip.toBuffer();
+
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "v1" } });
+      mockChatsDownloadVersion.mockResolvedValueOnce(noFormZip);
+
+      setupGitHubMocks(1);
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a thank-you page",
+        "Thanks Page",
+        {},
+        "list_thanks"
+      );
+
+      expect(result.status).toBe("deployed");
+      // The whole point: not one correction round-trip, so not one deadline to wait out.
+      expect(mockChatsSendMessage).not.toHaveBeenCalled();
+      // Still reported honestly — the Lead event genuinely is not there.
+      expect(result.pixelLeadEventVerified).toBe(false);
+    });
   });
 
   // ENG-449 (Harsha's bridge-out requirement): validateBridgeOutRedirect mirrors
@@ -5922,7 +5978,18 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       const zip = new AdmZip();
       zip.addFile(
         "app/page.tsx",
-        Buffer.from('export default function Page() { return <div>No redirect here</div>; }')
+        Buffer.from(
+          // Carries a real capture form so ENG-2080's gate does not (correctly) skip the
+          // correction this test exists to exercise — it is the redirect that is missing here,
+          // not the form.
+          `export default function Page() {
+             const submit = async (e: any) => {
+               e.preventDefault();
+               await fetch("/api/capture", { method: "POST", body: "{}" });
+             };
+             return <form onSubmit={submit}><input name="email" /><button>Go</button></form>;
+           }`
+        )
       );
       const buggyZip = zip.toBuffer();
 
@@ -5963,7 +6030,14 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       zip.addFile(
         "app/page.tsx",
         Buffer.from(
-          `export default function Page() { return <button onClick={() => { window.location.href = \`${BRIDGE_URL}?email=\${encodeURIComponent(email)}\`; }}>Submit</button>; }`
+`export default function Page() {
+             const submit = async (e: any) => {
+               e.preventDefault();
+               await fetch("/api/capture", { method: "POST", body: "{}" });
+               window.location.href = \`${BRIDGE_URL}?email=\${encodeURIComponent(email)}\`;
+             };
+             return <form onSubmit={submit}><input name="email" /><button>Submit</button></form>;
+           }`
         )
       );
       const goodZip = zip.toBuffer();

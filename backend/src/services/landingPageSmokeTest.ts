@@ -1362,6 +1362,14 @@ async function runGenerationSmokeTestNow(
     // the handoff can be verified against the chat/handoff backend. Absent unless the
     // redirect-with-handoff-id path fired.
     ...(handoffId ? { handoffId } : {}),
+    // ENG-2081: persist the classification, don't leave it only in the alert text below.
+    // `ok:false, leadCaptured:false` cannot on its own tell "this page has no lead form"
+    // (the PAGE is broken, capture is fine) from "a form submitted and no row landed" (a
+    // real capture/CRM fault) — and those call for opposite responses. Only emitted when
+    // true/non-zero so an ordinary healthy result keeps its current shape.
+    ...(noFormOnPage ? { noFormOnPage } : {}),
+    ...(authFormOnly ? { authFormOnly } : {}),
+    ...(iframeCount ? { iframeCount } : {}),
   };
 
   await updateLandingPageSmokeTestResult(page.id, result);

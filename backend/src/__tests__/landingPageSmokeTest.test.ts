@@ -1108,6 +1108,13 @@ describe("runGenerationSmokeTest", () => {
     const reason = mockSendLandingPageSmokeTestAlert.mock.calls[0][2];
     expect(reason).toContain("no lead form");
     expect(reason).not.toContain("CRM within the timeout");
+
+    // ENG-2081: the alert is ephemeral — and its Slack transport can be down, which is how
+    // this gap surfaced. The persisted record has to carry the same distinction, or all
+    // anyone can see later is `ok:false, leadCaptured:false`, which reads as a capture fault
+    // on a page that never had a form to submit.
+    const persisted = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(persisted.noFormOnPage).toBe(true);
   });
 
   it("DIAGNOSIS: an auth-only page says so, instead of blaming the CRM", async () => {
@@ -1121,6 +1128,10 @@ describe("runGenerationSmokeTest", () => {
     const reason = mockSendLandingPageSmokeTestAlert.mock.calls[0][2];
     expect(reason).toContain("authentication form");
     expect(reason).not.toContain("CRM within the timeout");
+
+    // ENG-2081, as above: persisted, not alert-only.
+    const persisted = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(persisted.authFormOnly).toBe(true);
   });
 
   it("CHECKABLES: a deferred-state control is not clicked again after check() already toggled it", async () => {

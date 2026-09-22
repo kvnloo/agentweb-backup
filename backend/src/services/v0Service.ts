@@ -622,6 +622,16 @@ export interface GeneratedLandingPage {
     pixelFired?: boolean;
     checkedAt: string;
     error?: string;
+    /**
+     * ENG-2081: why the submit produced no lead, persisted rather than left only in the
+     * Slack alert text. `ok:false, leadCaptured:false` alone cannot distinguish "this page
+     * has no lead form at all" (nothing to fix in capture — the PAGE is the problem) from
+     * "a form submitted and the row never landed" (a real capture/CRM problem). Those need
+     * opposite responses, and the alert that carried the difference is ephemeral.
+     */
+    noFormOnPage?: boolean;
+    authFormOnly?: boolean;
+    iframeCount?: number;
     /** ENG-449: handoff id extracted from a cross-origin chat-handoff redirect
      * (chat.waterheater.app/text?handoff_id=...) accepted in place of a CRM row.
      * Persisted so the handoff can be verified against the chat/handoff backend. */
@@ -2017,6 +2027,12 @@ async function addPageToExistingRepo(
 
       try {
         validateV0Output(previewFiles);
+        
+        // ENG-2080: the enhancement corrections below all ask v0 to fix "the lead capture
+        // form". On a page that has none, that request can never be satisfied, v0 returns no
+        // new version, and each correction burns its full ~17-minute wait for nothing. Skip
+        // them and fall straight to the existing "proceeding without it" reporting.
+        const shippedHasCaptureForm = hasLeadCaptureForm(remapFilesForSubPage(previewFiles, slug, name));
 
         // Same verify-and-retry as deployLandingPage — a sub-page has its OWN form
         // component, so the Lead event must be checked here too, not just on the first page.
@@ -2027,7 +2043,7 @@ async function addPageToExistingRepo(
           // contain something matching the fbq('track','Lead') regex, which used to make
           // this check pass against code that never reaches the deployed site at all.
           const pixelCheck = validatePixelLeadEvent(remapFilesForSubPage(previewFiles, slug, name));
-          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
             console.warn(`[V0 SERVICE] Meta Pixel Lead event missing for /${slug} (attempt ${validationAttempt + 1}): ${pixelCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -2084,7 +2100,7 @@ async function addPageToExistingRepo(
         // which would satisfy the inline-pattern arm against code the site never sees.
         if (subPageGoogleAds) {
           const adsCheck = validateGoogleAdsConversion(remapFilesForSubPage(previewFiles, slug, name));
-          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
             console.warn(`[V0 SERVICE] Google Ads conversion call missing for /${slug} (attempt ${validationAttempt + 1}): ${adsCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -2133,7 +2149,7 @@ async function addPageToExistingRepo(
         if (leadListId && bridgeOutUrl) {
           // Same post-remap file set rationale as the pixel check above (ENG-482).
           const bridgeCheck = validateBridgeOutRedirect(remapFilesForSubPage(previewFiles, slug, name), bridgeOutUrl);
-          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
             console.warn(`[V0 SERVICE] Bridge-out redirect missing for /${slug} (attempt ${validationAttempt + 1}): ${bridgeCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -3198,6 +3214,12 @@ export async function deployLandingPage(
 
       try {
         validateV0Output(previewFiles);
+        
+        // ENG-2080: the enhancement corrections below all ask v0 to fix "the lead capture
+        // form". On a page that has none, that request can never be satisfied, v0 returns no
+        // new version, and each correction burns its full ~17-minute wait for nothing. Skip
+        // them and fall straight to the existing "proceeding without it" reporting.
+        const shippedHasCaptureForm = hasLeadCaptureForm(previewFiles);
 
         // v0 authors the form component freeform — there's no platform-owned seam
         // to guarantee the Lead event the way layout.tsx injection guarantees the base pixel.
@@ -3205,7 +3227,7 @@ export async function deployLandingPage(
         // missing. Exhausted retries must NOT fail generation — just record the miss.
         if (record.metaPixelId) {
           const pixelCheck = validatePixelLeadEvent(previewFiles);
-          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
             console.warn(`[V0 SERVICE] Meta Pixel Lead event missing (attempt ${validationAttempt + 1}): ${pixelCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -3257,7 +3279,7 @@ export async function deployLandingPage(
         // something that does nothing.
         if (record.googleAdsConversionId && record.googleAdsConversionLabel) {
           const adsCheck = validateGoogleAdsConversion(previewFiles);
-          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
             console.warn(`[V0 SERVICE] Google Ads conversion call missing (attempt ${validationAttempt + 1}): ${adsCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -3308,7 +3330,7 @@ export async function deployLandingPage(
 
         if (record.leadListId && record.bridgeOutUrl) {
           const bridgeCheck = validateBridgeOutRedirect(previewFiles, record.bridgeOutUrl);
-          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
             console.warn(`[V0 SERVICE] Bridge-out redirect missing (attempt ${validationAttempt + 1}): ${bridgeCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -4283,6 +4305,28 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
  * whether to send a correction message and retry; if retries are exhausted, generation must
  * still proceed (AC3 — never fail generation over a missing client-side event).
  */
+/**
+ * ENG-2080: does this page actually have a lead-capture form?
+ *
+ * Keyed on the POST to /api/capture, which is the platform-owned contract every generated
+ * capture form uses — not on the presence of a <form> tag, which a login form or a search
+ * box would also satisfy.
+ *
+ * Used to skip the enhancement corrections (Meta Pixel Lead event, Google Ads conversion,
+ * bridge-out redirect) on a page that has no form for them to attach to. Those corrections
+ * ask v0 to "fix the lead capture form"; with no such form the request is unsatisfiable,
+ * v0 returns no new version, and the wait burns its whole ~17-minute budget before the
+ * caller can fall through. ENG-2079 stopped that from FAILING the page; this stops the
+ * pointless wait from happening at all.
+ */
+export function hasLeadCaptureForm(files: Array<{ path: string; content: Buffer }>): boolean {
+  const source = files
+    .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
+    .map((f) => f.content.toString("utf-8"))
+    .join("\n");
+  return /fetch\(\s*["'`]\/api\/capture/.test(source);
+}
+
 export function validatePixelLeadEvent(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
   const tsxSource = files
     .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
