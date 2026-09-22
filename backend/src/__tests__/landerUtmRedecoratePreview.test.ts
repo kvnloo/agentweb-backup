@@ -155,6 +155,7 @@ describe("UTM redecorate dry-run preview (ENG-728)", () => {
   it.each([
     ["missing", null],
     ["corrupt", [{ location: "app/page.tsx:1", href: "not a url" }]],
+    ["blank location", [{ location: "   ", href: "https://customer.example/demo" }]],
   ])("reports a %s deployed record as an error row", async (_label, links) => {
     const deps = dependencies({ readDeployedLinks: jest.fn().mockResolvedValue(links as any) });
 

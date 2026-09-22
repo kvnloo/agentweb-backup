@@ -181,7 +181,12 @@ export async function previewLanderUtmRedecoration(
       }).params;
       const changes = links
         .map((link) => {
-          if (!link || typeof link.location !== "string" || typeof link.href !== "string") {
+          if (
+            !link ||
+            typeof link.location !== "string" ||
+            link.location.trim() === "" ||
+            typeof link.href !== "string"
+          ) {
             throw new Error("deployed artifact contains a corrupt link record");
           }
           return diffLink(link.href, link.location, desired);
