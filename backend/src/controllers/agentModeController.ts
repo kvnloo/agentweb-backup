@@ -3804,6 +3804,21 @@ async function runVerifiedChatInner(
     // rather than dropped into a void no one will ever action. Fail-safe default
     // means a NEW headless caller is covered automatically (no drift).
     parkNotifiable?: boolean;
+    // ENG-2072: is this run genuinely unattended, as opposed to the interactive
+    // verifiedGenerate endpoint reusing this same loop for a live, attended user
+    // turn? Threaded all the way into the tool-dispatch context (see
+    // ToolContext.isUnattendedRun in mcp/client/toolRegistry.ts) so
+    // createWorkPlan/modifyWorkPlan/applyPredefinedWorkPlan can force hands-off
+    // autocomplete only on a REAL unattended turn, never merely because the
+    // session happens to have been created by a schedule.
+    //
+    // Default TRUE, mirroring parkNotifiable's fail-safe reasoning in reverse:
+    // every caller of runVerifiedChat EXCEPT the interactive verifiedGenerate
+    // endpoint is headless/fire-and-forget (runScheduledChat, imageReports,
+    // slack revisions, humanEvalActionService, resultEndpointController) — a NEW
+    // headless caller is covered automatically without having to remember to opt
+    // in. Only the interactive endpoint explicitly passes `false`.
+    isUnattendedRun?: boolean;
     // ENG-803: reads this run's publish authorization AS IT IS NOW. Used ONLY to
     // decide whether the model's publish-withheld marker may be believed — see
     // withholdIsGenuine. Deliberately a resolver rather than a value: the owner can
@@ -3892,6 +3907,7 @@ async function runVerifiedChatInner(
     completionGateMaxContinuations = 2,
     fullAutonomy = false,
     parkNotifiable = false,
+    isUnattendedRun = true,
     publishAuthorization,
     refreshPublishAuthorization,
     publishAuthorized,
@@ -4335,7 +4351,11 @@ async function runVerifiedChatInner(
           undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
           livePublishAuthorization,
-          approvedRevisionImageSources
+          approvedRevisionImageSources,
+          undefined, undefined, undefined, // userMessageKind, requireWorkPlanDisposition, clientId
+          // ENG-2072: propagate this run's unattended status into the continuation
+          // turn's tool-dispatch context, same as the main attempt below.
+          isUnattendedRun
         );
         if (continuationResponse.content) {
           allContent += (allContent ? '\n\n' : '') + continuationResponse.content;
@@ -4466,7 +4486,12 @@ async function runVerifiedChatInner(
         undefined, undefined, undefined, undefined, undefined, undefined,
         undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
         livePublishAuthorization,
-        approvedRevisionImageSources
+        approvedRevisionImageSources,
+        undefined, undefined, undefined, // userMessageKind, requireWorkPlanDisposition, clientId
+        // ENG-2072: true only for runScheduledChat's call (and the "Test run" path
+        // that shares it); false for the interactive verifiedGenerate endpoint —
+        // see ToolContext.isUnattendedRun.
+        isUnattendedRun
       );
 
       if (!hasAssistantOutput(response)) {
@@ -6536,6 +6561,10 @@ export async function runScheduledChat(
       // Deterministic backstop for multi-entity scheduled runs (PR #1941 follow-up):
       // if the run admits it left work unfinished, auto-continue before finishing.
       completionGate: true,
+      // ENG-2072: explicit for clarity — this is THE unattended scheduled/test-run
+      // path (also true by default, since every other caller besides the
+      // interactive verifiedGenerate endpoint is headless too).
+      isUnattendedRun: true,
       // ENG-396: opt-in per-schedule full autonomy — auto-take Emma's recommended
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions; default off).
@@ -8099,6 +8128,14 @@ export async function generateSessionResponse(
   // message and echoed back nowhere else needed -- the caller already knows its
   // own clientId, only messageIndex (assigned server-side) needs to come back.
   clientId?: string,
+  // ENG-2072: tri-state per-turn "is this an unattended scheduled/test run" signal
+  // — see ToolContext.isUnattendedRun in mcp/client/toolRegistry.ts. Supplied ONLY
+  // by runVerifiedChatInner's calls (true from runScheduledChat, false from the
+  // interactive verifiedGenerate endpoint). Every other caller — the live /generate
+  // route, Slack, chatbot replies — is attended and leaves this undefined, which
+  // falls back to session.sessionType (unchanged prior behavior) inside
+  // createWorkPlan/modifyWorkPlan/applyPredefinedWorkPlan.
+  isUnattendedRun?: boolean,
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -8436,6 +8473,7 @@ export async function generateSessionResponse(
       turnStartMs,
       approvedRevisionImageSources,
       requireWorkPlanDisposition: enforceWorkPlanDisposition,
+      isUnattendedRun,
     },
     (progress) => {
       // Emit progress updates via SSE
@@ -14699,7 +14737,10 @@ export const agentModeController = {
         attachments: attachmentsArray,
         // ENG-636: interactive endpoint — the user's live session renders the
         // pendingUserQuestion card, so a park reaches a human who can answer.
-        parkNotifiable: true
+        parkNotifiable: true,
+        // ENG-2072: a real person is watching this turn — never force hands-off
+        // work-plan autocomplete, even if this session happens to be scheduled.
+        isUnattendedRun: false
       }));
 
       // If client disconnected, don't try to send response
