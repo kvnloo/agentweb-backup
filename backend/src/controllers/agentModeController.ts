@@ -11299,7 +11299,9 @@ export const agentModeController = {
         return res.status(200).json({ success: true, alreadyApplied: true, workPlan: existing });
       }
 
-      const result = await agentModeService.applyPredefinedWorkPlan(planId, sessionId, user.userId);
+      // ENG-2072: a real person just clicked this button — never force
+      // hands-off work-plan autocomplete, even if this session is scheduled.
+      const result = await agentModeService.applyPredefinedWorkPlan(planId, sessionId, user.userId, { isUnattendedRun: false });
       if (!result.success) {
         return res.status(result.requiresConfirmation ? 409 : 404).json({
           error: result.requiresConfirmation ? 'ACTIVE_WORK_PLAN' : 'WORKPLAN_UNAVAILABLE',
@@ -11400,7 +11402,9 @@ export const agentModeController = {
       // ENG-1974: this endpoint IS the user's explicit accept — it must never
       // be blocked by an earlier decline of any recommendation (this one or
       // another), so it always bypasses applyPredefinedWorkPlan's decline gate.
-      const result = await agentModeService.applyPredefinedWorkPlan(planId, sessionId, user.userId, { skipDeclineGate: true });
+      // ENG-2072: a real person just clicked this button — never force
+      // hands-off work-plan autocomplete, even if this session is scheduled.
+      const result = await agentModeService.applyPredefinedWorkPlan(planId, sessionId, user.userId, { skipDeclineGate: true, isUnattendedRun: false });
       if (!result.success) {
         // Defensive backstop for a race between our pre-check above and this
         // call (e.g. a concurrent accept/launch landed in between) — never a
