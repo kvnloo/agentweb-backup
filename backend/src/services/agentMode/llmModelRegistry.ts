@@ -254,6 +254,24 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   // cost caps already exist and apply automatically to every model priced
   // in llmPricing.ts, this one included.
   'openrouter/anthropic/claude-fable-5.1': { name: 'Claude Fable 5.1', family: 'claude-fable', provider: 'anthropic', tier: 'ultra_premium', description: 'Anthropic\'s top-ranked model for coding & agentic work', client: null, supportsTemperature: false, supportsToolChoice: false, supportsVision: true, qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Claude Fable 5.1, Adaptive Reasoning, Max Effort' },
+  // Claude Opus 5.5 (Anthropic, released 2026-09-22) — first of the 5.5 family;
+  // Sonnet 5.5 / Haiku 5.5 are announced "in the coming weeks" and do NOT exist
+  // yet, so there is nothing to wire for them today. Same OpenRouter convention
+  // as Fable 5.1 above (id = openrouter/<upstream-provider>/<upstream-model>,
+  // no new routing code). Unlike Fable 5.1, every OpenRouter endpoint for this
+  // model lists `tool_choice`, so no supportsToolChoice override is needed.
+  // supportsReasoningEfforts from the live OpenRouter model record
+  // (reasoning.mandatory, supported [max, xhigh, high, medium, low],
+  // default high) — documents capability only; no reasoningEffort default is
+  // set, so callLLM sends no `reasoning` param (same posture as GPT-6 Astra).
+  // supportsVision per OpenRouter architecture.modality (text+image+file
+  // input) — same bar Fable 5.1 used, not yet empirically probed on
+  // describe_image. qualityScore OMITTED deliberately: no benchmark index has
+  // published an Opus 5.5 score yet, and this file never estimates. That also
+  // keeps it out of the same-family dominance computation until a real score
+  // lands (deriveDominanceLegacyIds skips scoreless rows both ways), so Opus 5
+  // is NOT auto-flagged legacy by this add.
+  'openrouter/anthropic/claude-opus-5.5': { supportedReasoningEfforts: ['max', 'xhigh', 'high', 'medium', 'low'], name: 'Claude Opus 5.5', family: 'claude-opus', provider: 'anthropic', tier: 'ultra_premium', description: 'Anthropic\'s flagship model for coding & agentic work', client: null, supportsTemperature: false, supportsVision: true },
   'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 51, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Grok 4.6, high' },
   'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, qualityScore: 42, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, DeepSeek V4 Pro 0813, Reasoning, Max Effort' },
   // ENG-1786 research uses AA's canonical DeepSeek V4 Flash 0731,

@@ -160,6 +160,60 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       });
 
       /*
+       * Claude Opus 5.5 (released 2026-09-22) — first of the 5.5 family,
+       * routed through OpenRouter like Fable 5.1 (ENG-199), NOT the direct
+       * Bedrock path: Bedrock serves it as `anthropic.claude-opus-5-5` from
+       * the bearer-token account, which this stack only reaches via the
+       * invoke endpoint — OpenRouter already fronts that. Sonnet 5.5 /
+       * Haiku 5.5 are announced but unreleased, so nothing is wired for them.
+       */
+      describe('Claude Opus 5.5 (2026-09-22)', () => {
+        const OPUS_5_5 = 'openrouter/anthropic/claude-opus-5.5';
+
+        it('offers Opus 5.5 to non-admins (added, not admin-gated)', async () => {
+          const models = await agentModeService.getSupportedModels(false);
+          expect(models).toContain(OPUS_5_5);
+        });
+
+        it('offers Opus 5.5 to admins', async () => {
+          const models = await agentModeService.getSupportedModels(true);
+          expect(models).toContain(OPUS_5_5);
+        });
+
+        it('lazy-loads the client for Opus 5.5', () => {
+          expect((agentModeService as any).llmModels[OPUS_5_5].client).toBeNull();
+        });
+
+        it('rejects temperature for Opus 5.5 (reasoning model, like Opus 5)', () => {
+          expect((agentModeService as any).llmModels[OPUS_5_5].supportsTemperature).toBe(false);
+        });
+
+        it('marks Opus 5.5 as vision-capable', () => {
+          expect((agentModeService as any).llmModels[OPUS_5_5].supportsVision).toBe(true);
+        });
+
+        it('prices Opus 5.5 at $4/$20 with the $0.20 cache-read override (costScore 67, Flagship band)', async () => {
+          const models = await agentModeService.getSupportedModelsWithMetadata(false);
+          const info = models.find((m) => m.id === OPUS_5_5)!;
+          expect(info.costScore).toBe(67); // $4/$20 blended 75:25 -> $8.00/1M, log-normalized
+          expect(info.tier).toBe('ultra_premium');
+        });
+
+        it('does NOT auto-flag Opus 5 legacy: 5.5 has no quality score yet, so dominance skips both ways', async () => {
+          const models = await agentModeService.getSupportedModelsWithMetadata(true);
+          expect(models.find((m) => m.id === 'anthropic.claude-opus-5')!.legacy).toBeUndefined();
+          expect(models.find((m) => m.id === OPUS_5_5)!.legacy).toBeUndefined();
+        });
+
+        it('matches "opus 5.5" mentions without stealing bare "opus 5"', async () => {
+          const index = agentModeService.getModelMentionIndex();
+          const { findModelMention } = await import('../utils/modelMentionRequest');
+          expect(findModelMention('run this on opus 5.5', index)?.modelId).toBe(OPUS_5_5);
+          expect(findModelMention('run this on opus 5', index)?.modelId).toBe('anthropic.claude-opus-5');
+        });
+      });
+
+      /*
        * SUPERSEDED again 2026-09-02 (Harsha, in-session approval: Gemini 3.8
        * Flash landed in the same family/tier as Gemini 3.7 Flash and beat it
        * on quality, dominance correctly flagged 3.7 legacy, and leaving the
