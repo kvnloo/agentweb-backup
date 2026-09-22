@@ -377,7 +377,18 @@ async function waitForCompletedV0Version(
 // releasing the smoke test before the capture route is live, which is the bug this gate
 // exists to prevent. This is a backstop for the pathological case only: the poll is bounded
 // by ATTEMPT COUNT, so axios timeouts can stretch it far past its nominal 300s.
-let captureRouteGateMaxMs = 300_000;
+let captureRouteGateMaxMsOverride: number | null = null;
+/**
+ * Derived, not frozen. pollVercelDeployment is bounded by ATTEMPT COUNT
+ * (vercelPollMaxAttempts x vercelPollIntervalMs) plus an axios round trip per attempt, so a
+ * literal equal to the nominal budget is always slightly short — which made the settle on the
+ * `timeout` branch unreachable, the cap always winning that race. Adding the settle plus
+ * headroom keeps the cap a backstop for the pathological case rather than a truncation, and
+ * recomputing it means setVercelPollConfig cannot silently falsify it.
+ */
+const captureRouteGateMaxMs = (): number =>
+  captureRouteGateMaxMsOverride ??
+  vercelPollMaxAttempts * vercelPollIntervalMs + captureRouteSettleMs + 60_000;
 // And when the poll comes back anything other than READY-for-our-commit, the route is NOT
 // known to be live: Vercel auto-cancels a superseded deployment, and pollVercelDeployment
 // maps CANCELED to `error` and returns on its FIRST tick. Resolving there would reopen the
@@ -386,7 +397,7 @@ let captureRouteSettleMs = 45_000;
 
 /** Test hook: keeps the gate's waits out of unit-test wall-clock. */
 export function setCaptureRouteGateConfig(maxMs: number, settleMs: number): void {
-  captureRouteGateMaxMs = maxMs;
+  captureRouteGateMaxMsOverride = maxMs;
   captureRouteSettleMs = settleMs;
 }
 
@@ -2094,8 +2105,8 @@ async function addPageToExistingRepo(
         const shippedHasCaptureForm = hasLeadCaptureForm(remapFilesForSubPage(previewFiles, slug, name));
 
         // ENG-2082: the most basic completeness check of all, and the one that was missing.
-        // /api/capture rejects any submission without an email (routes/webhooks.ts returns
-        // 400 "Email is required" before a lead row is ever built), so a form that collects
+        // /api/capture rejects a submission carrying neither an email nor a phone (webhooks.ts returns
+        // 400 "Email or phone is required" before a lead row is ever built), so a form collecting
         // only, say, a phone number is structurally incapable of producing a lead — and the
         // generator will build one whenever asked. Reported loudly here rather than corrected:
         // making v0 add a field the user did not ask for is a product decision, and the
@@ -2689,7 +2700,27 @@ async function addPageToExistingRepo(
         pixelOverrideAbandoned ? existingPage.metaPixelId : effectivePixelId,
         pixelOverrideAbandoned ? existingPage.metaAdAccountId : effectiveMetaAccountId,
       );
-      if (!syncResult.committed && syncResult.reason !== "up-to-date") {
+      // syncLeadCaptureFilesToRepo documents captureRouteSkipped as mandatory reading: it
+      // means the deployed LIST_BY_PATH could not be parsed, so route.ts was left out of the
+      // commit and neither `committed` nor `up-to-date` implies this page's path is in the
+      // deployed route. Surfaced here rather than discarded, because the gate below would
+      // otherwise poll a commit that never contained the route and log a clean sync.
+      if (syncResult.captureRouteSkipped) {
+        console.error(
+          `[V0 SERVICE] ENG-483: capture route was NOT written for /${slug} in ${repoFullName} ` +
+            `(its deployed LIST_BY_PATH could not be parsed). This page's path is not in the ` +
+            `live route, so its form will 422 until the route is repaired by hand.`
+        );
+      }
+      if (!syncResult.committed && syncResult.reason === "up-to-date") {
+        // "up-to-date" means OUR commit added nothing — almost always because a concurrent
+        // sibling add already wrote the identical map moments ago. That proves the map is in
+        // the repo, NOT that it is deployed: the sibling's build is typically still running.
+        // Treating it as proven-live is how the concurrent sub-page add — the case ENG-483
+        // exists for — still produced a false `ok: false`. There is no commit of our own to
+        // poll, so buy the same bounded settle window a non-success poll outcome gets.
+        captureRouteBuild = sleepMs(captureRouteSettleMs);
+      } else if (!syncResult.committed) {
         console.warn(
           `[V0 SERVICE] ENG-483: lead-capture route sync did not commit for new page /${slug}: ${syncResult.reason}`
         );
@@ -2753,7 +2784,7 @@ async function addPageToExistingRepo(
         // time, so without this the detached smoke dispatch can sit far past the gate's
         // documented cost. Whichever finishes first wins; the smoke test then runs either
         // way, because a delayed check beats a check that never happens.
-        captureRouteBuild = Promise.race([captureRouteBuild, sleepMs(captureRouteGateMaxMs)]);
+        captureRouteBuild = Promise.race([captureRouteBuild, sleepMs(captureRouteGateMaxMs())]);
       }
     } catch (syncErr: any) {
       console.error(
@@ -3328,8 +3359,8 @@ export async function deployLandingPage(
         const shippedHasCaptureForm = hasLeadCaptureForm(previewFiles);
 
         // ENG-2082: the most basic completeness check of all, and the one that was missing.
-        // /api/capture rejects any submission without an email (routes/webhooks.ts returns
-        // 400 "Email is required" before a lead row is ever built), so a form that collects
+        // /api/capture rejects a submission carrying neither an email nor a phone (webhooks.ts returns
+        // 400 "Email or phone is required" before a lead row is ever built), so a form collecting
         // only, say, a phone number is structurally incapable of producing a lead — and the
         // generator will build one whenever asked. Reported loudly here rather than corrected:
         // making v0 add a field the user did not ask for is a product decision, and the
@@ -4652,7 +4683,11 @@ export function validateCaptureFormHasContactField(files: Array<{ path: string; 
 
 export function validatePixelLeadEvent(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
   const tsxSource = files
-    .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
+    // Same extension set as hasLeadCaptureForm. Leaving these narrow while the ENG-2080
+    // gate reads .jsx/.js is worse than leaving both narrow: the gate opens on a page
+    // whose form these validators cannot see, so each fires a BILLED correction asking
+    // v0 to add tracking that is already there, and re-fails identically on every retry.
+    .filter((f) => /\.(tsx|ts|jsx|js)$/.test(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
 
@@ -4697,7 +4732,11 @@ export function validatePixelLeadEvent(files: Array<{ path: string; content: Buf
  */
 export function validateGoogleAdsConversion(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
   const tsxSource = files
-    .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
+    // Same extension set as hasLeadCaptureForm. Leaving these narrow while the ENG-2080
+    // gate reads .jsx/.js is worse than leaving both narrow: the gate opens on a page
+    // whose form these validators cannot see, so each fires a BILLED correction asking
+    // v0 to add tracking that is already there, and re-fails identically on every retry.
+    .filter((f) => /\.(tsx|ts|jsx|js)$/.test(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
 
@@ -4736,7 +4775,11 @@ export function validateGoogleAdsConversion(files: Array<{ path: string; content
  */
 export function validateBridgeOutRedirect(files: Array<{ path: string; content: Buffer }>, bridgeOutUrl: string): { ok: boolean; reason?: string } {
   const tsxSource = files
-    .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
+    // Same extension set as hasLeadCaptureForm. Leaving these narrow while the ENG-2080
+    // gate reads .jsx/.js is worse than leaving both narrow: the gate opens on a page
+    // whose form these validators cannot see, so each fires a BILLED correction asking
+    // v0 to add tracking that is already there, and re-fails identically on every retry.
+    .filter((f) => /\.(tsx|ts|jsx|js)$/.test(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
 

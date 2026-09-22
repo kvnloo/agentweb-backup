@@ -349,6 +349,33 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       expect(response.body.success).toBe(true);
     });
 
+    it('ENG-2082: a repeat submission keeps the ORIGINAL forwardedAt but takes the NEW source', async () => {
+      // Two system-stamped keys, opposite handling. forwardedAt is minted by this handler on
+      // every submission (existingLead is null on the adopt path), so the merged copy is
+      // never the visitor's data and the stored one must win — it is the lead's capture time
+      // and the owner alert renders it. `source` IS caller-supplied when the lander sends
+      // one, so reverting it would silently discard step 2 of a multi-step form, which is the
+      // data-loss incident this file documents.
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      const race: any = new Error('Lead already exists for this deterministic key');
+      race.leadAlreadyExists = true;
+      (crmDb.createLead as jest.Mock).mockRejectedValueOnce(race);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead_ph_existing', listId: 'list_123', phone: '4155550142', firstName: '',
+        customFields: { forwardedAt: '2020-01-01T00:00:00.000Z', source: 'hero-form' },
+      });
+
+      await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', phone: '4155550142', source: 'qualify-form', qualified: 'yes' });
+
+      expect(crmDb.updateLead).toHaveBeenCalled();
+      const [, , updates] = (crmDb.updateLead as jest.Mock).mock.calls[0];
+      expect(updates.customFields.forwardedAt).toBe('2020-01-01T00:00:00.000Z');
+      expect(updates.customFields.source).toBe('qualify-form');
+      expect(updates.customFields.qualified).toBe('yes');
+    });
+
     it('ENG-2082: a repeat phone submission merges its new data instead of discarding it', async () => {
       // failIfExists + a deterministic id means every later submission from the same number
       // lands on the adopt path, not just the concurrent race. A multi-step lander posts the

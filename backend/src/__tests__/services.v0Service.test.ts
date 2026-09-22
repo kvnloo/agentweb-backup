@@ -185,6 +185,8 @@ import {
   LandingPageNotDeployableError,
   findUnparseableModule,
   setCaptureRouteGateConfig,
+  validatePixelLeadEvent,
+  validateBridgeOutRedirect,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord, getVercelBuildErrors, isNonErrorBuildLine } from "../services/v0Service";
@@ -6582,5 +6584,30 @@ export default function SyntheticV0PageForDeployment() {
       f("app/_components/service-types.tsx", "export function X(){ return <div/>; }"),
     ]);
     expect(r).toBeNull();
+  });
+});
+
+describe("the enhancement validators must read the same files the ENG-2080 gate does", () => {
+  const f = (path: string, src: string) => [{ path, content: Buffer.from(src) }];
+
+  it("validatePixelLeadEvent sees a form emitted as .jsx", () => {
+    // hasLeadCaptureForm was widened to .jsx/.js. Leaving these three narrow is worse than
+    // leaving both narrow: the gate opens on a page whose form the validator cannot read, so
+    // it fires a BILLED correction asking v0 to add tracking that is already present, and
+    // re-fails identically every retry.
+    expect(
+      validatePixelLeadEvent(
+        f("components/lead-form.jsx", `fbq('track', 'Lead', {}, { eventID: id });`)
+      ).ok
+    ).toBe(true);
+  });
+
+  it("validateBridgeOutRedirect sees a redirect emitted as .jsx", () => {
+    expect(
+      validateBridgeOutRedirect(
+        f("components/lead-form.jsx", 'window.location.href = `https://x.test/book?email=${encodeURIComponent(e)}`;'),
+        "https://x.test/book"
+      ).ok
+    ).toBe(true);
   });
 });

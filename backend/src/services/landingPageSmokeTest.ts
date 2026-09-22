@@ -21,7 +21,9 @@
  */
 import { chromium } from "playwright";
 import { findChromeExecutable, PUPPETEER_LAUNCH_ARGS } from "../utils/browserUtils";
-import { buildSmokeTestEmail, buildSmokeTestPhone, isSmokeTestLead, phoneDigits } from "../utils/smokeTestLead";
+import { buildSmokeTestEmail, buildSmokeTestPhone, isSmokeTestLead, phoneDigits,
+  phoneLeadId,
+} from "../utils/smokeTestLead";
 import { crmDb } from "./db";
 import { sendLandingPageSmokeTestAlert } from "./slackService";
 import { updateLandingPageSmokeTestResult, GeneratedLandingPage } from "./v0Service";
@@ -158,10 +160,34 @@ async function pollForLeadByPhone(
   // miss in the other.
   const wanted = phoneDigits(phone);
   if (!wanted) return null;
+  // The id webhooks.ts writes a phone-only capture under. Looking it up directly is exact
+  // and O(1); the page scan below is only a fallback for rows that predate ENG-2082.
+  const deterministicId = phoneLeadId(phone);
+
   for (let attempt = 0; attempt < pollMaxAttempts; attempt++) {
     try {
-      // ScanIndexForward:false — newest first, so our row is at the top of page one.
-      const page = await crmDb.getLeadsByListId(listId, 25);
+      // Its OWN guard, deliberately. Sharing the outer try means a failing point lookup
+      // silently skips the scan below as well, turning a cheap optimisation into the reason
+      // the row is never found at all.
+      if (deterministicId && typeof (crmDb as any).getLeadById === "function") {
+        try {
+          const direct = await crmDb.getLeadById(listId, deterministicId);
+          if (direct && String((direct as any).createdAt || "") >= submittedAtIso) {
+            return { leadId: deterministicId };
+          }
+        } catch {
+          // fall through to the scan
+        }
+      }
+
+      // Fallback, and NOT order-dependent any more. getLeadsByListId sorts on leadId — the
+      // table's RANGE key — so "newest first" only ever held because createLead mints
+      // `lead_<timestamp>_<rand>`. ENG-2082 introduced a second shape, `lead_ph_<sha256>`,
+      // whose 'p' sorts above every digit: on a phone-only lander EVERY row is lead_ph_*,
+      // ordered by random hash, so our row is very often not on page one. Missing it strands
+      // the synthetic row in a customer's CRM — the incident sweepStrandedSmokeLeads exists
+      // for — so scan a real window rather than trusting position.
+      const page = await crmDb.getLeadsByListId(listId, 300);
       const hit = (page?.items || []).find(
         (lead: any) =>
           phoneDigits(lead?.phone) === wanted &&

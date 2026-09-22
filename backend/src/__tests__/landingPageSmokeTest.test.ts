@@ -101,9 +101,11 @@ jest.mock("../utils/browserUtils", () => ({
 const mockGetLeadByEmail = jest.fn();
 const mockDeleteLead = jest.fn();
 const mockGetLeadsByListId = jest.fn();
+const mockGetLeadById = jest.fn();
 jest.mock("../services/db", () => ({
   crmDb: {
     getLeadByEmail: (...args: any[]) => mockGetLeadByEmail(...args),
+    getLeadById: (...args: any[]) => mockGetLeadById(...args),
     deleteLead: (...args: any[]) => mockDeleteLead(...args),
     getLeadsByListId: (...args: any[]) => mockGetLeadsByListId(...args),
   },
@@ -144,6 +146,10 @@ describe("runGenerationSmokeTest", () => {
     jest.clearAllMocks();
     mockGetLeadByEmail.mockReset();
     mockGetLeadByEmail.mockResolvedValue(null);
+    // Persistent implementations survive jest.clearAllMocks(), which clears calls only —
+    // the leak this file has been bitten by more than once. Reset it with the others.
+    mockGetLeadById.mockReset();
+    mockGetLeadById.mockResolvedValue(null);
     mockGetLeadsByListId.mockReset();
     mockGetLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false });
     (mockPage.evaluate as jest.Mock).mockResolvedValue(SINGLE_EMAIL_FIELD);
@@ -759,6 +765,36 @@ describe("runGenerationSmokeTest", () => {
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
     expect(mockUpdateLandingPageSmokeTestResult.mock.calls[0][1].ok).toBe(true);
+  });
+
+  it("finds the phone-only lead by its deterministic id, not by hoping it is on page one", async () => {
+    // getLeadsByListId sorts on leadId, the table's RANGE key, so "newest first" only ever
+    // held because createLead mints `lead_<timestamp>_<rand>`. ENG-2082 added a second shape,
+    // `lead_ph_<sha256>`, whose 'p' sorts above every digit — so on a phone-only lander EVERY
+    // row is lead_ph_*, ordered by random hash, and ours is frequently not on page one.
+    // Missing it reports a false ok:false AND strands the synthetic row in a real CRM.
+    // Here the page deliberately does NOT contain our row; only the point lookup finds it.
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD,
+      fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+    });
+    mockGetLeadsByListId.mockResolvedValue({ items: [] });
+    mockGetLeadById.mockImplementation(async (_listId: string, leadId: string) => ({
+      leadId,
+      createdAt: new Date(Date.now() + 60_000).toISOString(),
+    }));
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockGetLeadById).toHaveBeenCalledWith(
+      BASE_PAGE.leadListId,
+      expect.stringMatching(/^lead_ph_[0-9a-f]{24}$/)
+    );
+    // Found means cleaned up — the whole point is not leaving it in the customer's CRM.
+    expect(mockDeleteLead).toHaveBeenCalledWith(
+      BASE_PAGE.leadListId,
+      expect.stringMatching(/^lead_ph_[0-9a-f]{24}$/)
+    );
   });
 
   it("CLEANUP: a lander with no email field still gets its synthetic lead deleted, by phone", async () => {

@@ -26,7 +26,7 @@ import { normalizeAttribution, promoteAttributionFromCustomFields } from '../typ
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
-import { isSmokeTestLead, phoneDigits } from '../utils/smokeTestLead';
+import { isSmokeTestLead, phoneDigits, phoneLeadId } from '../utils/smokeTestLead';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from '../services/asyncJobQueue';
 import { handleHardBounceRecipients } from '../services/emailDeliverabilityService';
 // ENG-926 §C: the per-list budget and the per-account BUC pause used to live here as
@@ -816,10 +816,10 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // deduping — the ENG-787 mechanism createLead already exposes for exactly this
       // ("a caller that keys a lead on a stable identity"). phoneDigits is the shared
       // normalizer, so +1 (415) 555-0142 and 4155550142 resolve to the same row.
-      const phoneOnlyKey = !normalizedEmail ? phoneDigits(normalizedPhone) : '';
-      const deterministicLeadId = phoneOnlyKey
-        ? `lead_ph_${crypto.createHash('sha256').update(phoneOnlyKey).digest('hex').slice(0, 24)}`
-        : '';
+      // Derived by the shared helper, never inline: the smoke test reads this id back to
+      // find the row it just created, and a drift between the two would make it silently
+      // miss every phone-only capture.
+      const deterministicLeadId = !normalizedEmail ? phoneLeadId(normalizedPhone) : '';
       try {
         lead = await crmDb.createLead(
           leadList.listId,
@@ -900,8 +900,14 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           // customer-visible: forwardedAt is what the owner alert renders as the received
           // time. The email branch avoids this by omitting the key entirely; this branch
           // cannot, so it restores it.
-          for (const key of SYSTEM_CUSTOM_KEYS) {
-            if (key in adoptedExistingCustom) adoptedMergedCustom[key] = adoptedExistingCustom[key];
+          // ONLY forwardedAt. `source` is caller-supplied when the lander sends one, so
+          // restoring it would silently revert a real value: a multi-step lander posting
+          // source "hero-form" then "qualify-form" would have step 2's overwritten with
+          // step 1's. The email branch overwrites `source`, and this branch mirrors it.
+          // forwardedAt is different — it is minted by THIS handler on every submission
+          // (existingLead is null here), so the merged copy is never the visitor's data.
+          if ('forwardedAt' in adoptedExistingCustom) {
+            adoptedMergedCustom.forwardedAt = adoptedExistingCustom.forwardedAt;
           }
           adoptedUpdates.customFields = adoptedMergedCustom;
           adoptedChanged = true;

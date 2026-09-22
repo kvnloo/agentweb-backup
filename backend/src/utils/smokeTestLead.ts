@@ -1,3 +1,5 @@
+import * as crypto from "crypto";
+
 /**
  * ENG-449 gap #3: the automated post-deploy smoke test (landingPageSmokeTest.ts) submits a
  * REAL lead through a customer's REAL lead-capture form to verify the pipeline actually
@@ -68,8 +70,28 @@ const PHONE_PATTERN = new RegExp(`^${PHONE_AREA}${PHONE_EXCHANGE}${PHONE_BLOCK}\
 
 /** Builds the synthetic phone. Only the low two digits vary — the CRM key is never the phone. */
 export function buildSmokeTestPhone(): string {
-  const tail = String(Date.now() % 100).padStart(2, "0");
+  // Random, not Date.now() % 100. The reserved block gives 100 numbers either way, but a
+  // clock-derived tail collides with itself on a 100 ms cycle, and a collision here is not
+  // harmless: the colliding row already exists, so the conditional create loses, the adopt
+  // path returns no new row, and `createdAt >= submittedAtIso` can never hold — a permanent
+  // false `ok: false` for that list.
+  const tail = String(Math.floor(Math.random() * 100)).padStart(2, "0");
   return `${PHONE_AREA}${PHONE_EXCHANGE}${PHONE_BLOCK}${tail}`;
+}
+
+/**
+ * The deterministic lead id a phone-only capture is written under.
+ *
+ * Lives here, beside phoneDigits, for the same reason phoneDigits does: webhooks.ts MINTS
+ * this id and landingPageSmokeTest.ts must READ it back, and if the two ever derive it
+ * differently the smoke test silently stops finding the row it just created. Returns "" when
+ * the phone carries no digits, which is the caller's signal that there is no deterministic
+ * id to use.
+ */
+export function phoneLeadId(phone: unknown): string {
+  const digits = phoneDigits(phone);
+  if (!digits) return "";
+  return `lead_ph_${crypto.createHash("sha256").update(digits).digest("hex").slice(0, 24)}`;
 }
 
 export function isSmokeTestPhone(phone: string | undefined | null): boolean {
