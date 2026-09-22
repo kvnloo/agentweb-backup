@@ -181,6 +181,8 @@ import {
   injectLeadCaptureAttribution,
   assertNoDuplicateInjectedRoutes,
   buildTrackingHelper,
+  validateCaptureFormHasEmail,
+  LandingPageNotDeployableError,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord, getVercelBuildErrors, isNonErrorBuildLine } from "../services/v0Service";
@@ -6368,5 +6370,46 @@ describe("isNonErrorBuildLine", () => {
     expect(isNonErrorBuildLine("▲ Next.js 16.2.6")).toBe(true);
     expect(isNonErrorBuildLine("▲ Error: Build script exited with non-zero exit code")).toBe(false);
     expect(isNonErrorBuildLine("▲ ENOENT: no such file or directory")).toBe(false);
+  });
+});
+
+describe("ENG-2082: capture form must collect an email", () => {
+  const f = (src: string) => [{ path: "app/page.tsx", content: Buffer.from(src) }];
+
+  it("accepts an <input type=\"email\">", () => {
+    expect(validateCaptureFormHasEmail(f('<input type="email" />')).ok).toBe(true);
+  });
+
+  it("accepts a field named email", () => {
+    expect(validateCaptureFormHasEmail(f('<input name="email" />')).ok).toBe(true);
+  });
+
+  it("rejects a phone-only form, and says why", () => {
+    // The real shape: /api/capture returns 400 "Email is required" before a lead row is
+    // built, so this page captures nothing no matter how correct everything downstream is.
+    const r = validateCaptureFormHasEmail(f('<input type="tel" name="phone" required />'));
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain("no email field");
+  });
+
+  it("only reads shipped .ts/.tsx, not other files", () => {
+    expect(
+      validateCaptureFormHasEmail([
+        { path: "README.md", content: Buffer.from('name="email"') },
+        { path: "app/page.tsx", content: Buffer.from('<input type="tel" />') },
+      ]).ok
+    ).toBe(false);
+  });
+});
+
+describe("ENG-2083: refusing an already-deployed page is a 409, not a 500", () => {
+  it("carries the code and status the route maps on", () => {
+    const err = new LandingPageNotDeployableError("deployed");
+    // `code` rather than instanceof: it has to survive being re-wrapped across a throw
+    // boundary, same reason V0OutputValidationError carries one.
+    expect(err.code).toBe("LP_NOT_DEPLOYABLE");
+    expect(err.httpStatus).toBe(409);
+    // Message text is deliberately unchanged — callers and existing tests match on it.
+    expect(err.message).toBe("Cannot deploy a landing page with status: deployed");
   });
 });

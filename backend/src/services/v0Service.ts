@@ -2034,6 +2034,23 @@ async function addPageToExistingRepo(
         // them and fall straight to the existing "proceeding without it" reporting.
         const shippedHasCaptureForm = hasLeadCaptureForm(remapFilesForSubPage(previewFiles, slug, name));
 
+        // ENG-2082: the most basic completeness check of all, and the one that was missing.
+        // /api/capture rejects any submission without an email (routes/webhooks.ts returns
+        // 400 "Email is required" before a lead row is ever built), so a form that collects
+        // only, say, a phone number is structurally incapable of producing a lead — and the
+        // generator will build one whenever asked. Reported loudly here rather than corrected:
+        // making v0 add a field the user did not ask for is a product decision, and the
+        // correction round-trip needs fixture work across this suite. Tracked on ENG-2082.
+        if (shippedHasCaptureForm) {
+          const emailCheck = validateCaptureFormHasEmail(remapFilesForSubPage(previewFiles, slug, name));
+          if (!emailCheck.ok) {
+            console.error(
+              `[V0 SERVICE] ENG-2082: capture form for /${slug} collects NO email field — ` +
+                `every submission will be rejected and this page will capture zero leads: ${emailCheck.reason}`
+            );
+          }
+        }
+
         // Same verify-and-retry as deployLandingPage — a sub-page has its OWN form
         // component, so the Lead event must be checked here too, not just on the first page.
         if (effectivePixelId) {
@@ -3148,7 +3165,7 @@ export async function deployLandingPage(
       ? ["generating", "draft", "failed", "deploying"]
       : ["draft", "failed", "deploying"];
   if (!deployableStatuses.includes(record.status)) {
-    throw new Error(`Cannot deploy a landing page with status: ${record.status}`);
+    throw new LandingPageNotDeployableError(record.status);
   }
 
   // Sub-pages (those with a slug) are always added to the existing repo — they must
@@ -3220,6 +3237,23 @@ export async function deployLandingPage(
         // new version, and each correction burns its full ~17-minute wait for nothing. Skip
         // them and fall straight to the existing "proceeding without it" reporting.
         const shippedHasCaptureForm = hasLeadCaptureForm(previewFiles);
+
+        // ENG-2082: the most basic completeness check of all, and the one that was missing.
+        // /api/capture rejects any submission without an email (routes/webhooks.ts returns
+        // 400 "Email is required" before a lead row is ever built), so a form that collects
+        // only, say, a phone number is structurally incapable of producing a lead — and the
+        // generator will build one whenever asked. Reported loudly here rather than corrected:
+        // making v0 add a field the user did not ask for is a product decision, and the
+        // correction round-trip needs fixture work across this suite. Tracked on ENG-2082.
+        if (shippedHasCaptureForm) {
+          const emailCheck = validateCaptureFormHasEmail(previewFiles);
+          if (!emailCheck.ok) {
+            console.error(
+              `[V0 SERVICE] ENG-2082: capture form for the root page collects NO email field — ` +
+                `every submission will be rejected and this page will capture zero leads: ${emailCheck.reason}`
+            );
+          }
+        }
 
         // v0 authors the form component freeform — there's no platform-owned seam
         // to guarantee the Lead event the way layout.tsx injection guarantees the base pixel.
@@ -3781,6 +3815,27 @@ export function autoFixV0Files(files: Array<{ path: string; content: Buffer }>):
 // v0 output validation — catches "prompts instead of code", empty files, garbage
 // ---------------------------------------------------------------------------
 
+/**
+ * ENG-2083: refusing to redeploy a page that is already `deployed` is a PRECONDITION
+ * failure, not a server fault. It was a bare Error, and the route's only classifier is
+ * `error.message?.includes("not found") ? 404 : 500` — so a deliberate, well-understood
+ * refusal came back as a 500. That lands in error monitoring as a crash, and tells callers
+ * (and their retry logic) that the server broke and the request is worth repeating, when
+ * in fact repeating it can never succeed.
+ *
+ * Message text is deliberately unchanged — callers and tests already match on it.
+ */
+export class LandingPageNotDeployableError extends Error {
+  /** Same rationale as V0OutputValidationError.code: survives re-wrapping across a throw
+   *  boundary, where `instanceof` does not. */
+  readonly code = "LP_NOT_DEPLOYABLE";
+  readonly httpStatus = 409;
+  constructor(public readonly pageStatus: string) {
+    super(`Cannot deploy a landing page with status: ${pageStatus}`);
+    this.name = "LandingPageNotDeployableError";
+  }
+}
+
 export class V0OutputValidationError extends Error {
   /**
    * Carried as a `code` (not just a prototype) so it survives being re-wrapped across a
@@ -4325,6 +4380,41 @@ export function hasLeadCaptureForm(files: Array<{ path: string; content: Buffer 
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
   return /fetch\(\s*["'`]\/api\/capture/.test(source);
+}
+
+/**
+ * ENG-2082: does the capture form actually collect an email?
+ *
+ * /api/capture rejects any submission without one — `routes/webhooks.ts` returns
+ * 400 "Email is required" before a lead row is ever built. So a generated form that asks
+ * only for, say, a phone number is structurally incapable of producing a lead, no matter
+ * how correct everything downstream is. The generator will happily build one when asked,
+ * and nothing warned the user: they find out when the leads never arrive, potentially
+ * after spending on ads pointed at it.
+ *
+ * Mirrors validatePixelLeadEvent's contract: verified, not guaranteed. Callers send a
+ * correction and retry; exhausted retries record the miss and still ship, because a page
+ * that captures nothing is still better delivered than silently failed.
+ *
+ * Only meaningful on a page that HAS a capture form — see hasLeadCaptureForm.
+ */
+export function validateCaptureFormHasEmail(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
+  const source = files
+    .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
+    .map((f) => f.content.toString("utf-8"))
+    .join("\n");
+
+  // Either an <input type="email"> or a field named email. Both are how v0 emits it, and
+  // the name is what the capture route reads off the JSON body.
+  const hasEmailInput = /type\s*=\s*["'`]email["'`]/.test(source);
+  const hasEmailName = /name\s*=\s*["'`]email["'`]/.test(source);
+  if (!hasEmailInput && !hasEmailName) {
+    return {
+      ok: false,
+      reason: "capture form collects no email field, and /api/capture rejects every submission without one (400 \"Email is required\")",
+    };
+  }
+  return { ok: true };
 }
 
 export function validatePixelLeadEvent(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
