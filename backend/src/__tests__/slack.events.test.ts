@@ -182,6 +182,37 @@ describe('Slack Events API', () => {
       }
     });
 
+    it('ENG-2054: never logs the raw request headers or body, which can carry third-party tokens and customer message content', async () => {
+      const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+      try {
+        const response = await request(app)
+          .post('/api/slack/events')
+          .set('cookie', 'super-secret-session-cookie-should-not-be-logged')
+          .send({
+            type: 'event_callback',
+            event: {
+              type: 'app_mention',
+              user: 'U12345',
+              text: '<@UEMMA123> here is my confidential-customer-message-content',
+              channel: 'C12345',
+              ts: '1234567890.123456',
+            },
+          });
+
+        expect(response.status).toBe(200);
+        const loggedText = logSpy.mock.calls
+          .map((args) => args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '))
+          .join('\n');
+        // Confirms the request was actually processed (not short-circuited before the
+        // handler's own logging), so the absence checks below are meaningful.
+        expect(loggedText).toContain('Event callback received');
+        expect(loggedText).not.toContain('super-secret-session-cookie-should-not-be-logged');
+        expect(loggedText).not.toContain('confidential-customer-message-content');
+      } finally {
+        logSpy.mockRestore();
+      }
+    });
+
     it('should reply in-thread when Emma is mentioned in Slack', async () => {
       // Mock user lookup from cache
       settingsService.getSetting.mockResolvedValue({
