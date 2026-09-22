@@ -71,7 +71,7 @@ import {
   assertOpenRouterResponseHasChoices,
   isMalformedOpenRouterResponseError,
 } from './agentMode/openRouterResponseValidation';
-import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice, buildAcceptanceFailureNotice } from './agentMode/core/synthesisResidue';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice, buildAcceptanceFailureNotice, assetProducingToolsInPlay } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoAssetUrl,
@@ -4605,7 +4605,16 @@ export class AgentModeService {
           // rendered, QA'd, and saved" when only 4 screenshots succeeded). It reads
           // as a normal answer, so `isUnusableSynthesis` never flags it; this checks
           // the claim's numbers against `toolCalls` instead of the text's shape.
-          if (falseClaimGuardEnabled && content) {
+          //
+          // ENG-2076: gated on `assetProducingToolsInPlay` — this guard only
+          // understands image/video/HTML-template generation tools, so a session
+          // that never touched any of them (e.g. a Meta Ads session built entirely
+          // on `call_meta_marketing_api`) is outside its domain. Without this gate a
+          // turn that merely RECAPPED an earlier turn's true results (own ledger
+          // empty — it did no new tool calls) always read as "0 of N produced" and
+          // appended a false correction, which is exactly what derailed a live Meta
+          // Ads session right before its publish-confirmation step.
+          if (falseClaimGuardEnabled && content && assetProducingToolsInPlay(toolCalls, currentSession?.calledFunctions)) {
             const falseClaim = detectFalseCompletionClaim(content, toolCalls);
             if (falseClaim) {
               console.warn(
