@@ -299,6 +299,30 @@ export async function _previewBranchCommitsAheadOfMain(
   }
 }
 
+/**
+ * ENG stale-draft: ahead/behind counts for the preview branch vs main. `behindBy > 0`
+ * means main moved on (other merges / manual PRs) since the draft was cut. Building on
+ * such a branch and publishing it later reverts every one of those main commits.
+ * Returns null on any error so the caller can fall back to the ahead-only guard.
+ */
+export async function _previewBranchDivergence(
+  repoBase: string,
+  headers: Record<string, string>,
+): Promise<{ aheadBy: number; behindBy: number } | null> {
+  try {
+    const res = await axios.get<any>(
+      `${repoBase}/compare/main...${encodeURIComponent(LANDING_PAGE_PREVIEW_BRANCH)}`,
+      { headers, timeout: GITHUB_API_TIMEOUT_MS },
+    );
+    const aheadBy = Number(res?.data?.ahead_by);
+    const behindBy = Number(res?.data?.behind_by);
+    if (!Number.isFinite(aheadBy) || !Number.isFinite(behindBy)) return null;
+    return { aheadBy, behindBy };
+  } catch {
+    return null;
+  }
+}
+
 async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Promise<void> {
   if (context.draftBranch !== LANDING_PAGE_PREVIEW_BRANCH) return;
 
@@ -352,6 +376,34 @@ async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Pr
   // (not ahead of main) — the case the reusable branch was designed for.
   const aheadBy = await _previewBranchCommitsAheadOfMain(repoBase, headers);
   if (aheadBy > 0) {
+    // Unpublished edits exist. Only layer on top if the draft still contains main;
+    // otherwise sync main in first (or back up + reset if that conflicts), so a later
+    // publish cannot silently revert commits that landed on main after the draft was cut.
+    const divergence = await _previewBranchDivergence(repoBase, headers);
+    if (divergence && divergence.behindBy > 0) {
+      try {
+        await axios.post(
+          `${repoBase}/merges`,
+          { base: LANDING_PAGE_PREVIEW_BRANCH, head: mainSha, commit_message: 'Sync main into draft/agentweb-preview' },
+          { headers, timeout: GITHUB_API_TIMEOUT_MS },
+        );
+        console.log(`[CODING AGENT] Draft was ${divergence.behindBy} behind main; merged main into it`);
+        return;
+      } catch (mergeErr: any) {
+        // Only a confirmed merge conflict (409) justifies backup + reset. Timeouts,
+        // rate limits, or auth failures leave the merge result unknown, so keep the draft.
+        if (mergeErr?.response?.status !== 409) {
+          throw new Error(`Cannot prepare preview branch: ${_describeGithubError(mergeErr, 'sync main into the draft')}`);
+        }
+        const draftRef = await axios.get<any>(`${repoBase}/git/ref/heads/${LANDING_PAGE_PREVIEW_BRANCH}`, { headers, timeout: GITHUB_API_TIMEOUT_MS });
+        const draftSha = draftRef.data?.object?.sha;
+        const backup = `refs/heads/backup/agentweb-preview-${Date.now()}`;
+        await axios.post(`${repoBase}/git/refs`, { ref: backup, sha: draftSha }, { headers, timeout: GITHUB_API_TIMEOUT_MS });
+        await axios.patch(`${repoBase}/git/refs/heads/${LANDING_PAGE_PREVIEW_BRANCH}`, { sha: mainSha, force: true }, { headers, timeout: GITHUB_API_TIMEOUT_MS });
+        console.warn(`[CODING AGENT] Stale draft conflicted with main; backed up to ${backup} and reset to main (${mainSha.substring(0, 7)})`);
+        return;
+      }
+    }
     console.log(
       `[CODING AGENT] ${LANDING_PAGE_PREVIEW_BRANCH} has ${aheadBy} unpublished commit(s) ahead of main; ` +
         `layering new edit on top instead of resetting (ENG-176)`,
