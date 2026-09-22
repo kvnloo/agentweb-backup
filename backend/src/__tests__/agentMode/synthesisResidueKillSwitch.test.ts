@@ -125,3 +125,55 @@ describe('AgentMode — false-completion-claim guard kill switch (ENG-1331)', ()
     expect(snapshot.content).not.toContain('Correction');
   });
 });
+
+/**
+ * ENG-2076 production repro (session 65abb8aa-3732-4be0-9281-edf28de3027c): a Meta
+ * Ads session built entirely on `call_meta_marketing_api` — a tool
+ * ASSET_PRODUCING_TOOL_NAMES has no vocabulary for and never will. Earlier in the
+ * session, 3 real ad creatives were created (verified against the live Meta Ads
+ * ledger). The turn below is a LATER, separate turn: the user asked to "report a
+ * bug", and the assistant's answer truthfully recapped "3 creative creates" while
+ * asking which bug to file — a single terminal text turn with NO tool calls of its
+ * own (matches the real session's `iterationTimings: [{ toolNames: [] }]` exactly).
+ *
+ * Pre-fix, this always read `actual: 0` (the ledger has no calls in
+ * ASSET_PRODUCING_TOOL_NAMES, and the guard had no way to tell "wrong domain" apart
+ * from "fabricated") and appended a false "0 of 3 were actually produced"
+ * correction — the exact confusion that derailed the user right before the
+ * publish-confirmation step that would have made the ads go live.
+ */
+const META_ADS_RECAP_SCENARIO = {
+  message: 'Report bug to engineering',
+  transcript: [
+    {
+      content:
+        'I can file that — but I hit two distinct anomalies this session and want to file the right one(s): ' +
+        'All 3 creative creates returned "Ad creative \\"undefined\\" created successfully" instead of echoing ' +
+        'back the actual creative name I passed — the creative IDs were still returned correctly. ' +
+        'Should I file both, just one, or something else you noticed?',
+    },
+  ],
+};
+
+describe('AgentMode — false-completion-claim guard stays out of non-media domains (ENG-2076)', () => {
+  let service: AgentModeService;
+  const original = process.env.AGENT_FALSE_CLAIM_GUARD;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new AgentModeService();
+    installStandardMockDeps();
+  });
+  afterEach(() => {
+    if (original === undefined) delete process.env.AGENT_FALSE_CLAIM_GUARD;
+    else process.env.AGENT_FALSE_CLAIM_GUARD = original;
+  });
+
+  it('does NOT append a false correction to a truthful recap turn with no tool calls of its own', async () => {
+    delete process.env.AGENT_FALSE_CLAIM_GUARD; // guard ON (default) — must still stay out of this domain
+    const snapshot = await runScenario(service, META_ADS_RECAP_SCENARIO);
+    expect(snapshot.content).not.toContain('Correction');
+    expect(snapshot.content).not.toContain('were actually produced');
+    expect(snapshot.content).toContain('All 3 creative creates returned');
+  });
+});
