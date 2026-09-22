@@ -199,9 +199,16 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
           expect(info.tier).toBe('ultra_premium');
         });
 
-        it('does NOT auto-flag Opus 5 legacy: 5.5 has no quality score yet, so dominance skips both ways', async () => {
+        it('reports the AA Intelligence Index v4.3.2 quality score (58, #1)', async () => {
+          const models = await agentModeService.getSupportedModelsWithMetadata(false);
+          const info = models.find((m) => m.id === OPUS_5_5)!;
+          expect(info.qualityScore).toBe(58);
+          expect(info.qualityScoreSource).toBe('Artificial Analysis Intelligence Index v4.3.2, 2026-09-22, Claude Opus 5.5, Adaptive Reasoning, Max Effort');
+        });
+
+        it('Opus 5.5 supersedes Opus 5: same cost band, higher quality, so dominance flags Opus 5 legacy', async () => {
           const models = await agentModeService.getSupportedModelsWithMetadata(true);
-          expect(models.find((m) => m.id === 'anthropic.claude-opus-5')!.legacy).toBeUndefined();
+          expect(models.find((m) => m.id === 'anthropic.claude-opus-5')!.legacy).toBe(true);
           expect(models.find((m) => m.id === OPUS_5_5)!.legacy).toBeUndefined();
         });
 
@@ -454,8 +461,15 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       it('ENG-1786: every scored registry row names an index version and uses the v4.2 snapshot', () => {
         const registry = (agentModeService as any).llmModels;
         const scoredIds = Object.keys(registry).filter((id) => typeof registry[id].qualityScore === 'number');
-        expect(scoredIds.sort()).toEqual([...SCORED_IDS].sort());
+        // Opus 5.5 is deliberately excluded: it launched after the v4.2
+        // snapshot (2026-09-05), so its score comes from the newer v4.3.2
+        // index — see its registry comment and its own dedicated quality test.
+        expect(scoredIds.sort()).toEqual([...SCORED_IDS, 'openrouter/anthropic/claude-opus-5.5'].sort());
         for (const id of scoredIds) {
+          if (id === 'openrouter/anthropic/claude-opus-5.5') {
+            expect(registry[id].qualityScoreSource).toBe('Artificial Analysis Intelligence Index v4.3.2, 2026-09-22, Claude Opus 5.5, Adaptive Reasoning, Max Effort');
+            continue;
+          }
           expect(registry[id].qualityScoreSource).toMatch(/Intelligence Index v\d+\.\d+(?:\.\d+)?\b/);
           expect(registry[id].qualityScoreSource).toMatch(/^Artificial Analysis Intelligence Index v4\.2, snapshot 2026-09-05, .+/);
         }
@@ -470,15 +484,18 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect([fable, astra, sol]).toEqual([57, 55, 51]);
         expect(fable).toBeGreaterThan(astra);
         expect(astra).toBeGreaterThan(sol);
+        // Opus 5.5 (58, v4.3.2) sits above Astra too — the ENG-1786 pin is
+        // about the v4.2 trio's ORDER, not the full above-Astra set.
+        expect(quality('openrouter/anthropic/claude-opus-5.5')).toBe(58);
         expect(models.filter((model) => model.qualityScore! > astra).map((model) => model.id))
-          .toEqual(['openrouter/anthropic/claude-fable-5.1']);
+          .toEqual(['openrouter/anthropic/claude-fable-5.1', 'openrouter/anthropic/claude-opus-5.5']);
       });
 
       it.each<[string | undefined, string[]]>([
         ['gpt5-chat', ['gpt-5.5']],
         ['gpt5-nano', ['gpt-5.4-nano', 'openrouter/openai/gpt-4o-mini']],
         ['gemini-flash', ['gemini-3.5-flash', 'gemini-3.7-flash']],
-        ['claude-opus', []],
+        ['claude-opus', ['anthropic.claude-opus-5']],
         ['claude-sonnet', []],
         ['claude-fable', []],
         [undefined, []],

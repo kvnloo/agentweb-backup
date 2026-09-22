@@ -267,12 +267,19 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   // supportsVision per OpenRouter architecture.modality (text+image+file
   // input) — verified LIVE 2026-09-22 on the exact describe_image shape (a
   // base64 data-URI JPEG through OpenRouter): correct scene description, so
-  // the flag meets this file's empirical bar, not just metadata. qualityScore OMITTED deliberately: no benchmark index has
-  // published an Opus 5.5 score yet, and this file never estimates. That also
-  // keeps it out of the same-family dominance computation until a real score
-  // lands (deriveDominanceLegacyIds skips scoreless rows both ways), so Opus 5
-  // is NOT auto-flagged legacy by this add.
-  'openrouter/anthropic/claude-opus-5.5': { supportedReasoningEfforts: ['max', 'xhigh', 'high', 'medium', 'low'], name: 'Claude Opus 5.5', family: 'claude-opus', provider: 'anthropic', tier: 'ultra_premium', description: 'Anthropic\'s flagship model for coding & agentic work', client: null, supportsTemperature: false, supportsVision: true },
+  // the flag meets this file's empirical bar, not just metadata.
+  // qualityScore: AA Intelligence Index v4.3.2 (artificialanalysis.ai/models/
+  // claude-opus-5-5, 2026-09-22): 58, Adaptive Reasoning, Max Effort, #1 of
+  // 206 — the highest measured by several points. NOTE the index version
+  // differs from the rest of this file (v4.2, snapshot 2026-09-05): Opus 5.5
+  // launched after that snapshot, so its score comes from the newer index.
+  // Kept explicit rather than held back so the picker shows a real quality
+  // signal from day one; ENG-1786's v4.2-uniformity test is scoped to the
+  // older rows (see the test) and does not cover this entry. Consequence,
+  // verified 2026-09-22: at 58 vs Opus 5's 54 in the same cost band, the
+  // existing dominance rule correctly flags Opus 5 legacy (Show more) — a
+  // genuine supersede, not a promo-price accident like the Terra case.
+  'openrouter/anthropic/claude-opus-5.5': { supportedReasoningEfforts: ['max', 'xhigh', 'high', 'medium', 'low'], name: 'Claude Opus 5.5', family: 'claude-opus', provider: 'anthropic', tier: 'ultra_premium', description: 'Anthropic\'s flagship model for coding & agentic work', client: null, supportsTemperature: false, supportsVision: true, qualityScore: 58, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.3.2, 2026-09-22, Claude Opus 5.5, Adaptive Reasoning, Max Effort' },
   'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 51, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Grok 4.6, high' },
   'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, qualityScore: 42, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, DeepSeek V4 Pro 0813, Reasoning, Max Effort' },
   // ENG-1786 research uses AA's canonical DeepSeek V4 Flash 0731,
