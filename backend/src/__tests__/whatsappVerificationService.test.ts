@@ -41,6 +41,7 @@ jest.mock('../services/db', () => ({
 }));
 jest.mock('../services/whatsappService', () => ({
   toE164: jest.requireActual('../services/whatsappService').toE164,
+  redactPhone: jest.requireActual('../services/whatsappService').redactPhone,
   isOptedOut: jest.fn(),
   sendMessage: jest.fn(),
 }));
@@ -567,6 +568,18 @@ describe('handleVerificationMessage', () => {
   it('still propagates a storage failure, so Meta retries the delivery', async () => {
     settingsService.getSetting.mockRejectedValue(new Error('dynamo down'));
     await expect(handleVerificationMessage('Verify K7Q2M9XA', PHONE)).rejects.toThrow('dynamo down');
+  });
+
+  it('never puts the raw phone number in the reply-failure log', async () => {
+    // beforeEach already spies on console.warn (logSpies[1]) — reuse it rather than
+    // layering a second spy on top, which would restore to the wrong thing on cleanup.
+    const code = await begin();
+    whatsapp.sendMessage.mockRejectedValueOnce(new Error('Meta is down'));
+
+    await handleVerificationMessage(`Verify ${code}`, PHONE);
+
+    const logged = logSpies[1].mock.calls.map((c) => c.map(String).join(' ')).join('\n');
+    expect(logged).not.toContain('14155550123');
   });
 });
 
