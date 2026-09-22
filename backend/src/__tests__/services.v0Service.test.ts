@@ -5831,6 +5831,37 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       expect(result.pixelLeadEventVerified).toBe(false);
     });
 
+    it("ENG-2079: a correction v0 never answers ships the page degraded, it does not fail it", async () => {
+      setupSiteRecordWithPixelMock();
+
+      const buggyZip = await createZipWithFbqOnlyInLayout();
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      // v0 acknowledges the correction but produces NO new version — latestVersion never
+      // advances past v1, so waitForCompletedV0Version(afterVersionId: "v1") burns its whole
+      // budget and throws. Live, that threw straight past the "proceeding without it"
+      // fallback below it and the outer catch marked the page `failed` after ~17 minutes,
+      // with an error blaming v0 for stalling on a page that had already validated fine.
+      mockChatsGetById.mockResolvedValue({ latestVersion: { id: "v1" } });
+      mockChatsDownloadVersion.mockResolvedValue(buggyZip);
+      mockChatsSendMessage.mockResolvedValue({});
+
+      setupGitHubMocks(1);
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a signup page",
+        "Signup Page",
+        {},
+        "list_signup"
+      );
+
+      // A missing Lead event is degraded, not broken: the page must still ship, and the
+      // tracking gap must be reported rather than swallowed.
+      expect(result.status).toBe("deployed");
+      expect(result.pixelLeadEventVerified).toBe(false);
+    });
+
     it("SUCCESS: reports pixelLeadEventVerified:true when the fbq call is in the file that actually ships (app/page.tsx)", async () => {
       setupSiteRecordWithPixelMock();
       const AdmZip = (await import("adm-zip")).default;

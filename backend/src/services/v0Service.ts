@@ -211,6 +211,40 @@ function startBuildHeartbeat(id: string): () => void {
 }
 
 /**
+ * ENG-2079: await a correction we are allowed to ship WITHOUT, and never let it fail the page.
+ *
+ * The enhancement corrections (Meta Pixel Lead event, Google Ads conversion, bridge-out
+ * redirect) each end in an explicit "still missing after retries — proceeding without it"
+ * fallback: a page that lacks them is degraded, not broken, and must still deploy. That
+ * fallback was unreachable whenever v0 answered the correction with no new version at all,
+ * because the failure happened at the AWAIT rather than at the check — waitForCompletedV0Version
+ * throws on deadline, and the outer catch marks the whole page `failed`.
+ *
+ * Observed live: a page whose form v0 could not attach a Lead event to (no lead-capture form
+ * on it) burned the full 34-attempt / ~17-minute budget and failed with "v0 is still generating
+ * or has stalled" — blaming v0 for a page that had already generated and validated fine.
+ *
+ * Returns the corrected version id, or undefined when no new version arrived. Undefined means
+ * "fall through and ship what we already validated"; the caller's existing `proceeding without
+ * it` path then runs unchanged. Deliberately NOT used for the validateV0Output correction,
+ * where un-correctable output genuinely must not ship.
+ */
+async function awaitOptionalV0Correction(
+  label: string,
+  wait: () => Promise<string | undefined>
+): Promise<string | undefined> {
+  try {
+    return await wait();
+  } catch (err: any) {
+    console.warn(
+      `[V0 SERVICE] ${label}: no corrected version arrived (${err?.message || err}). ` +
+        `Shipping the page without this correction rather than failing it.`
+    );
+    return undefined;
+  }
+}
+
+/**
  * Poll a v0 chat until its latest version reaches a terminal state and return the
  * completed version id.
  *
@@ -2017,18 +2051,21 @@ async function addPageToExistingRepo(
               ),
             });
 
-            versionId = await waitForCompletedV0Version(
-              v0,
-              chatId,
+            const correctedVersionId = await awaitOptionalV0Correction(
               `v0 correction (pixel lead event) for /${slug}`,
-              {
-                heartbeat: () => touchLandingPageRecord(id),
-                deadline: buildDeadline,
-                afterVersionId: versionId,
-              }
+              () =>
+                waitForCompletedV0Version(v0, chatId, `v0 correction (pixel lead event) for /${slug}`, {
+                  heartbeat: () => touchLandingPageRecord(id),
+                  deadline: buildDeadline,
+                  afterVersionId: versionId,
+                })
             );
-
-            continue;
+            // undefined = v0 never produced a corrected version. Fall through to the
+            // `proceeding without it` path below instead of failing the whole page.
+            if (correctedVersionId) {
+              versionId = correctedVersionId;
+              continue;
+            }
           }
           pixelLeadEventVerified = pixelCheck.ok;
           if (!pixelCheck.ok) {
@@ -2072,18 +2109,21 @@ async function addPageToExistingRepo(
               ),
             });
 
-            versionId = await waitForCompletedV0Version(
-              v0,
-              chatId!,
+            const correctedVersionId = await awaitOptionalV0Correction(
               "v0 correction (google ads conversion, sub-page)",
-              {
-                heartbeat: () => touchLandingPageRecord(id),
-                deadline: buildDeadline,
-                afterVersionId: versionId,
-              }
+              () =>
+                waitForCompletedV0Version(v0, chatId!, "v0 correction (google ads conversion, sub-page)", {
+                  heartbeat: () => touchLandingPageRecord(id),
+                  deadline: buildDeadline,
+                  afterVersionId: versionId,
+                })
             );
-
-            continue;
+            // undefined = v0 never produced a corrected version. Fall through to the
+            // `proceeding without it` path below instead of failing the whole page.
+            if (correctedVersionId) {
+              versionId = correctedVersionId;
+              continue;
+            }
           }
           if (!adsCheck.ok) {
             console.warn(`[V0 SERVICE] Google Ads conversion call still missing for /${slug} after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
@@ -2116,18 +2156,21 @@ async function addPageToExistingRepo(
               ),
             });
 
-            versionId = await waitForCompletedV0Version(
-              v0,
-              chatId,
+            const correctedVersionId = await awaitOptionalV0Correction(
               `v0 correction (bridge-out redirect) for /${slug}`,
-              {
-                heartbeat: () => touchLandingPageRecord(id),
-                deadline: buildDeadline,
-                afterVersionId: versionId,
-              }
+              () =>
+                waitForCompletedV0Version(v0, chatId, `v0 correction (bridge-out redirect) for /${slug}`, {
+                  heartbeat: () => touchLandingPageRecord(id),
+                  deadline: buildDeadline,
+                  afterVersionId: versionId,
+                })
             );
-
-            continue;
+            // undefined = v0 never produced a corrected version. Fall through to the
+            // `proceeding without it` path below instead of failing the whole page.
+            if (correctedVersionId) {
+              versionId = correctedVersionId;
+              continue;
+            }
           }
           bridgeOutVerified = bridgeCheck.ok;
           if (!bridgeCheck.ok) {
@@ -3186,18 +3229,21 @@ export async function deployLandingPage(
               ),
             });
 
-            versionId = await waitForCompletedV0Version(
-              v0,
-              record.v0ChatId!,
+            const correctedVersionId = await awaitOptionalV0Correction(
               "v0 correction (pixel lead event)",
-              {
-                heartbeat: () => touchLandingPageRecord(id),
-                deadline: buildDeadline,
-                afterVersionId: versionId,
-              }
+              () =>
+                waitForCompletedV0Version(v0, record.v0ChatId!, "v0 correction (pixel lead event)", {
+                  heartbeat: () => touchLandingPageRecord(id),
+                  deadline: buildDeadline,
+                  afterVersionId: versionId,
+                })
             );
-
-            continue;
+            // undefined = v0 never produced a corrected version. Fall through to the
+            // `proceeding without it` path below instead of failing the whole page.
+            if (correctedVersionId) {
+              versionId = correctedVersionId;
+              continue;
+            }
           }
           pixelLeadEventVerified = pixelCheck.ok;
           if (!pixelCheck.ok) {
@@ -3236,18 +3282,21 @@ export async function deployLandingPage(
               ),
             });
 
-            versionId = await waitForCompletedV0Version(
-              v0,
-              record.v0ChatId!,
+            const correctedVersionId = await awaitOptionalV0Correction(
               "v0 correction (google ads conversion)",
-              {
-                heartbeat: () => touchLandingPageRecord(id),
-                deadline: buildDeadline,
-                afterVersionId: versionId,
-              }
+              () =>
+                waitForCompletedV0Version(v0, record.v0ChatId!, "v0 correction (google ads conversion)", {
+                  heartbeat: () => touchLandingPageRecord(id),
+                  deadline: buildDeadline,
+                  afterVersionId: versionId,
+                })
             );
-
-            continue;
+            // undefined = v0 never produced a corrected version. Fall through to the
+            // `proceeding without it` path below instead of failing the whole page.
+            if (correctedVersionId) {
+              versionId = correctedVersionId;
+              continue;
+            }
           }
           if (!adsCheck.ok) {
             // Never fails generation, same as the pixel path: a lander that captures leads
@@ -3282,18 +3331,21 @@ export async function deployLandingPage(
               ),
             });
 
-            versionId = await waitForCompletedV0Version(
-              v0,
-              record.v0ChatId!,
+            const correctedVersionId = await awaitOptionalV0Correction(
               "v0 correction (bridge-out redirect)",
-              {
-                heartbeat: () => touchLandingPageRecord(id),
-                deadline: buildDeadline,
-                afterVersionId: versionId,
-              }
+              () =>
+                waitForCompletedV0Version(v0, record.v0ChatId!, "v0 correction (bridge-out redirect)", {
+                  heartbeat: () => touchLandingPageRecord(id),
+                  deadline: buildDeadline,
+                  afterVersionId: versionId,
+                })
             );
-
-            continue;
+            // undefined = v0 never produced a corrected version. Fall through to the
+            // `proceeding without it` path below instead of failing the whole page.
+            if (correctedVersionId) {
+              versionId = correctedVersionId;
+              continue;
+            }
           }
           bridgeOutVerified = bridgeCheck.ok;
           if (!bridgeCheck.ok) {
