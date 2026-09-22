@@ -66,6 +66,11 @@ jest.mock('../services/slackService', () => {
   };
 });
 
+jest.mock('../services/loopSlackApprovalDispatcher', () => ({
+  getEmmaBotUserId: jest.fn().mockResolvedValue(null),
+  handleLoopApprovalReaction: jest.fn().mockResolvedValue(undefined),
+}));
+
 jest.mock('../utils/s3Utils', () => ({
   uploadFileToS3: jest.fn().mockResolvedValue({ success: true, url: 'https://s3.example.com/file.png', key: 'file.png' }),
 }));
@@ -174,6 +179,37 @@ describe('Slack Events API', () => {
         expect(response.status).toBe(401);
       } finally {
         delete process.env.SLACK_SIGNING_SECRET;
+      }
+    });
+
+    it('ENG-2054: never logs the raw request headers or body, which can carry third-party tokens and customer message content', async () => {
+      const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+      try {
+        const response = await request(app)
+          .post('/api/slack/events')
+          .set('cookie', 'super-secret-session-cookie-should-not-be-logged')
+          .send({
+            type: 'event_callback',
+            event: {
+              type: 'app_mention',
+              user: 'U12345',
+              text: '<@UEMMA123> here is my confidential-customer-message-content',
+              channel: 'C12345',
+              ts: '1234567890.123456',
+            },
+          });
+
+        expect(response.status).toBe(200);
+        const loggedText = logSpy.mock.calls
+          .map((args) => args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '))
+          .join('\n');
+        // Confirms the request was actually processed (not short-circuited before the
+        // handler's own logging), so the absence checks below are meaningful.
+        expect(loggedText).toContain('Event callback received');
+        expect(loggedText).not.toContain('super-secret-session-cookie-should-not-be-logged');
+        expect(loggedText).not.toContain('confidential-customer-message-content');
+      } finally {
+        logSpy.mockRestore();
       }
     });
 
@@ -1574,6 +1610,94 @@ describe('Slack Events API', () => {
 
         // No Emma response should be generated for untracked threads
         expect(generateSessionResponse).not.toHaveBeenCalled();
+      });
+
+      it('should start a session from a 1:1 DM without an @mention', async () => {
+        // Cached DM mapping resolves directly (first DM caches via Slack identity)
+        settingsService.getSetting.mockResolvedValue({
+          settingValue: 'user-123',
+        });
+        userDb.getUserById.mockResolvedValue({
+          userId: 'user-123',
+          email: 'operator@agentweb.pro',
+        });
+        chatbotDb.createChatSession.mockResolvedValue({
+          sessionId: 'session-dm-1',
+          userId: 'user-123',
+          messages: [],
+          llmModel: 'gpt-4o',
+        });
+        generateSessionResponse.mockResolvedValue({
+          content: 'DM reply here.',
+          toolCalls: [],
+        });
+
+        const response = await request(app)
+          .post('/api/slack/events')
+          .send({
+            type: 'event_callback',
+            event: {
+              type: 'message',
+              user: 'U12345',
+              text: 'help me draft a post',
+              channel: 'D12345',
+              channel_type: 'im',
+              ts: '1234567895.000000',
+            },
+          });
+
+        expect(response.status).toBe(200);
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        expect(userDb.getUserById).toHaveBeenCalledWith('user-123');
+        expect(chatbotDb.createChatSession).toHaveBeenCalledWith(
+          'user-123',
+          undefined,
+          'agent',
+          'slack-dm',
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          'regular',
+          undefined
+        );
+        expect(generateSessionResponse).toHaveBeenCalledWith(
+          'session-dm-1',
+          'John Doe: help me draft a post',
+          'user-123',
+          'gpt-4o',
+          []
+        );
+      });
+
+      it('should reject a DM from an unknown identity with a helpful error', async () => {
+        settingsService.getSetting.mockResolvedValue(null);
+        userDb.getUserByEmail.mockResolvedValue(null);
+        getSlackUserEmail.mockResolvedValue('stranger@example.com');
+
+        const response = await request(app)
+          .post('/api/slack/events')
+          .send({
+            type: 'event_callback',
+            event: {
+              type: 'message',
+              user: 'U99999',
+              text: 'hello?',
+              channel: 'D99999',
+              channel_type: 'im',
+              ts: '1234567896.000000',
+            },
+          });
+
+        expect(response.status).toBe(200);
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        expect(chatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(generateSessionResponse).not.toHaveBeenCalled();
+        expect(mockPostMessage).toHaveBeenCalledWith(
+          expect.objectContaining({ channel: 'D99999' })
+        );
       });
     });
   });

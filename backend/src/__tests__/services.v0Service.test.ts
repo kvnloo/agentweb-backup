@@ -181,6 +181,10 @@ import {
   injectLeadCaptureAttribution,
   assertNoDuplicateInjectedRoutes,
   buildTrackingHelper,
+  validateCaptureFormHasContactField,
+  LandingPageNotDeployableError,
+  findUnparseableModule,
+  setCaptureRouteGateConfig,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord, getVercelBuildErrors, isNonErrorBuildLine } from "../services/v0Service";
@@ -235,6 +239,9 @@ beforeEach(() => {
   // Use zero-delay poll intervals in tests to avoid waiting ~2.5 min
   setV0PollIntervals([0, 0, 0, 0, 0]);
   setVercelPollConfig(0, 30);
+  // Cap high enough that the held-open gate test still gates on its poll, settle at 0 so a
+  // non-ready build outcome does not spend its real 45s settle window in unit tests.
+  setCaptureRouteGateConfig(60_000, 0);
 });
 
 // =============================================================================
@@ -5492,6 +5499,83 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       expect(capturedContent).toContain('"/features": "list_features"');
     });
 
+    it("ENG-449: smoke test waits for the capture-route sync BUILD, not just its commit", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Items: [existingSiteRecord] }),
+      });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+
+      // The sync commit's OWN Vercel build, held open so this asserts ordering rather
+      // than luck. A new sub-page's path only enters the DEPLOYED LIST_BY_PATH when this
+      // second build lands; before ENG-449 this poll's promise was dropped on the floor
+      // and the smoke test fired immediately, submitting the page's form to a route that
+      // did not yet know its path — a guaranteed 422, surfaced as a false `ok: false`
+      // on every newly-added sub-page.
+      let releaseSyncBuild: (v: unknown) => void = () => {};
+      mockAxiosGet.mockReturnValueOnce(
+        new Promise((resolve) => {
+          releaseSyncBuild = resolve;
+        })
+      );
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create pricing page with a lead form",
+        "Pricing",
+        {},
+        "list_pricing"
+      );
+
+      // The page is returned as deployed with the build still in flight: the gate is on
+      // the detached smoke dispatch only, never on the request path.
+      expect(result.status).toBe("deployed");
+      expect(mockRunGenerationSmokeTest).not.toHaveBeenCalled();
+
+      releaseSyncBuild({
+        data: {
+          deployments: [
+            { uid: "dpl_sync", readyState: "READY", meta: { githubCommitSha: "sync_commit_sha" } },
+          ],
+        },
+      });
+      await new Promise((r) => setImmediate(r));
+
+      expect(mockRunGenerationSmokeTest).toHaveBeenCalledTimes(1);
+    });
+
+    it("ENG-449: a capture-route sync that never commits does not strand the smoke test", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      // Sibling lookup throws, so the sync bails before pushing anything and there is no
+      // build to wait for. The gate must stay resolved: a page whose sync failed still
+      // deserves the smoke test that tells us its form is broken.
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.reject(new Error("DynamoDB unavailable")),
+      });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a newsletter signup page",
+        "Newsletter",
+        {},
+        "list_newsletter"
+      );
+
+      expect(result.status).toBe("deployed");
+      await new Promise((r) => setImmediate(r));
+      expect(mockRunGenerationSmokeTest).toHaveBeenCalledTimes(1);
+    });
+
     it("SUCCESS: new sub-page has no leadListId → sync still commits siblings, new page's own path stays absent", async () => {
       setupSiteRecordMock();
       await setupV0Mocks();
@@ -5705,7 +5789,18 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       const zip = new AdmZip();
       zip.addFile(
         "app/page.tsx",
-        Buffer.from('export default function Page() { return <div>No form here</div>; }')
+        Buffer.from(
+          // A REAL capture form, minus the Lead event — that is the actual production
+          // scenario. ENG-2080 skips the correction on a page with no capture form at all,
+          // so a form-less fixture would no longer exercise the retry loop this asserts on.
+          `export default function Page() {
+             const submit = async (e: any) => {
+               e.preventDefault();
+               await fetch("/api/capture", { method: "POST", body: "{}" });
+             };
+             return <form onSubmit={submit}><input name="email" /><button>Go</button></form>;
+           }`
+        )
       );
       zip.addFile(
         "app/layout.tsx",
@@ -5754,6 +5849,46 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       expect(result.pixelLeadEventVerified).toBe(false);
     });
 
+    it("ENG-2079: a correction v0 never answers ships the page degraded, it does not fail it", async () => {
+      setupSiteRecordWithPixelMock();
+
+      const buggyZip = await createZipWithFbqOnlyInLayout();
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      // v0 acknowledges the correction but produces NO new version — latestVersion never
+      // advances past v1, so waitForCompletedV0Version(afterVersionId: "v1") burns its whole
+      // budget and throws. Live, that threw straight past the "proceeding without it"
+      // fallback below it and the outer catch marked the page `failed` after ~17 minutes,
+      // with an error blaming v0 for stalling on a page that had already validated fine.
+      mockChatsGetById.mockResolvedValue({ latestVersion: { id: "v1" } });
+      mockChatsDownloadVersion.mockResolvedValue(buggyZip);
+      mockChatsSendMessage.mockResolvedValue({});
+
+      setupGitHubMocks(1);
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a signup page",
+        "Signup Page",
+        {},
+        "list_signup"
+      );
+
+      // These two needed persistent (not -Once) implementations so the correction poll could
+      // spin to its deadline. jest.clearAllMocks() in beforeEach clears calls but NOT
+      // implementations, so drop them here or they become the default zip/version for every
+      // later test in the file.
+      mockChatsGetById.mockReset();
+      mockChatsDownloadVersion.mockReset();
+      // Persistent too — jest.clearAllMocks() clears calls, not implementations.
+      mockChatsSendMessage.mockReset();
+
+      // A missing Lead event is degraded, not broken: the page must still ship, and the
+      // tracking gap must be reported rather than swallowed.
+      expect(result.status).toBe("deployed");
+      expect(result.pixelLeadEventVerified).toBe(false);
+    });
+
     it("SUCCESS: reports pixelLeadEventVerified:true when the fbq call is in the file that actually ships (app/page.tsx)", async () => {
       setupSiteRecordWithPixelMock();
       const AdmZip = (await import("adm-zip")).default;
@@ -5785,6 +5920,44 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       expect(mockChatsSendMessage).not.toHaveBeenCalled();
       expect(result.pixelLeadEventVerified).toBe(true);
     });
+
+    it("ENG-2080: a page with no lead-capture form never sends the correction, so there is no wait to burn", async () => {
+      setupSiteRecordWithPixelMock();
+      const AdmZip = (await import("adm-zip")).default;
+      const zip = new AdmZip();
+      // Informational page: no form, no /api/capture, and therefore nothing a Lead-event
+      // correction could ever attach to. Asking v0 to "fix the lead capture form" here is
+      // unsatisfiable — it answers with no new version and the poll burns its full ~17-minute
+      // budget before ENG-2079's fallthrough can ship the page. Don't ask.
+      zip.addFile(
+        "app/page.tsx",
+        Buffer.from(
+          'export default function Page() { return <div><h1>Thanks</h1><a href="tel:5551234">Call us</a></div>; }'
+        )
+      );
+      const noFormZip = zip.toBuffer();
+
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "v1" } });
+      mockChatsDownloadVersion.mockResolvedValueOnce(noFormZip);
+
+      setupGitHubMocks(1);
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a thank-you page",
+        "Thanks Page",
+        {},
+        "list_thanks"
+      );
+
+      expect(result.status).toBe("deployed");
+      // The whole point: not one correction round-trip, so not one deadline to wait out.
+      expect(mockChatsSendMessage).not.toHaveBeenCalled();
+      // Still reported honestly — the Lead event genuinely is not there.
+      expect(result.pixelLeadEventVerified).toBe(false);
+    });
   });
 
   // ENG-449 (Harsha's bridge-out requirement): validateBridgeOutRedirect mirrors
@@ -5814,7 +5987,18 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       const zip = new AdmZip();
       zip.addFile(
         "app/page.tsx",
-        Buffer.from('export default function Page() { return <div>No redirect here</div>; }')
+        Buffer.from(
+          // Carries a real capture form so ENG-2080's gate does not (correctly) skip the
+          // correction this test exists to exercise — it is the redirect that is missing here,
+          // not the form.
+          `export default function Page() {
+             const submit = async (e: any) => {
+               e.preventDefault();
+               await fetch("/api/capture", { method: "POST", body: "{}" });
+             };
+             return <form onSubmit={submit}><input name="email" /><button>Go</button></form>;
+           }`
+        )
       );
       const buggyZip = zip.toBuffer();
 
@@ -5855,7 +6039,14 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       zip.addFile(
         "app/page.tsx",
         Buffer.from(
-          `export default function Page() { return <button onClick={() => { window.location.href = \`${BRIDGE_URL}?email=\${encodeURIComponent(email)}\`; }}>Submit</button>; }`
+`export default function Page() {
+             const submit = async (e: any) => {
+               e.preventDefault();
+               await fetch("/api/capture", { method: "POST", body: "{}" });
+               window.location.href = \`${BRIDGE_URL}?email=\${encodeURIComponent(email)}\`;
+             };
+             return <form onSubmit={submit}><input name="email" /><button>Submit</button></form>;
+           }`
         )
       );
       const goodZip = zip.toBuffer();
@@ -6186,5 +6377,170 @@ describe("isNonErrorBuildLine", () => {
     expect(isNonErrorBuildLine("▲ Next.js 16.2.6")).toBe(true);
     expect(isNonErrorBuildLine("▲ Error: Build script exited with non-zero exit code")).toBe(false);
     expect(isNonErrorBuildLine("▲ ENOENT: no such file or directory")).toBe(false);
+  });
+});
+
+describe("ENG-2082: capture form must collect something contactable", () => {
+  const f = (src: string) => [{ path: "app/page.tsx", content: Buffer.from(src) }];
+
+  it("accepts an <input type=\"email\">", () => {
+    expect(validateCaptureFormHasContactField(f('<input type="email" />')).ok).toBe(true);
+  });
+
+  it("accepts a field named email", () => {
+    expect(validateCaptureFormHasContactField(f('<input name="email" />')).ok).toBe(true);
+  });
+
+  it("accepts a phone-only form — that is a legitimate lander, not a broken one", () => {
+    // The point of the ENG-2082 capture change: requiring an email specifically is what
+    // made an ordinary phone-only lander impossible to build.
+    expect(validateCaptureFormHasContactField(f('<input type="tel" name="phone" required />')).ok).toBe(true);
+  });
+
+  it("rejects a form that collects neither, and says why", () => {
+    const r = validateCaptureFormHasContactField(f('<input type="text" name="firstName" />'));
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain("neither an email nor a phone");
+  });
+
+  it("only reads shipped .ts/.tsx, not other files", () => {
+    expect(
+      validateCaptureFormHasContactField([
+        { path: "README.md", content: Buffer.from('name="email"') },
+        { path: "app/page.tsx", content: Buffer.from('<input type="text" />') },
+      ]).ok
+    ).toBe(false);
+  });
+});
+
+describe("ENG-2083: refusing an already-deployed page is a 409, not a 500", () => {
+  it("carries the code and status the route maps on", () => {
+    const err = new LandingPageNotDeployableError("deployed");
+    // `code` rather than instanceof: it has to survive being re-wrapped across a throw
+    // boundary, same reason V0OutputValidationError carries one.
+    expect(err.code).toBe("LP_NOT_DEPLOYABLE");
+    expect(err.httpStatus).toBe(409);
+    // Message text is deliberately unchanged — callers and existing tests match on it.
+    expect(err.message).toBe("Cannot deploy a landing page with status: deployed");
+  });
+});
+
+describe("ENG-2087: a synthetic stub that does not parse must never reach a commit", () => {
+  // The exact file that was committed to a live site repo. It satisfies every shape check —
+  // it has `export`, a `function`, no markdown, an import that looks resolvable — and it is
+  // not valid JavaScript.
+  const POISONED = `"use client"
+
+import  from ".."
+
+export default function SyntheticV0PageForDeployment() {
+  return < />
+`;
+  const f = (path: string, src: string) => ({ path, content: Buffer.from(src) });
+
+  it("findUnparseableModule flags it, and names the file", () => {
+    const r = findUnparseableModule([f("app/page.tsx", POISONED)]);
+    expect(r).not.toBeNull();
+    expect(r!.path).toBe("app/page.tsx");
+    expect(r!.reason).toBeTruthy();
+  });
+
+  it("does not flag valid TSX, including generics — the classic false positive", () => {
+    expect(
+      findUnparseableModule([
+        f("app/page.tsx", 'export default function P(){ return <div className="a">hi</div>; }'),
+        f("lib/x.ts", "export function id<T,>(x: T): T { return x; }"),
+      ])
+    ).toBeNull();
+  });
+
+  it("does not flag an import of a dependency this check cannot resolve", () => {
+    // Syntax-only: transpileModule reports no type/resolution errors, so an unresolved
+    // module specifier must not be mistaken for broken source.
+    expect(
+      findUnparseableModule([f("app/page.tsx", 'import x from "some-package-we-do-not-install";\nexport default function P(){ return <div>{x}</div>; }')])
+    ).toBeNull();
+  });
+
+  it("does not throw on a declaration file — transpileModule cannot emit for one", () => {
+    // ts.transpileModule hits an internal Debug.assert for a .d.ts and throws a BARE Error,
+    // not a diagnostic. A bare Error is not a V0OutputValidationError, so it would skip the
+    // correction retry entirely and fail the page with "Debug Failure. Output generation
+    // failed". v0 zips do carry these — remapFilesForSubPage's own skip list names
+    // next-env.d.ts.
+    const page = f("app/page.tsx", 'export default function P(){ return <div>hello there</div>; }');
+    expect(() =>
+      findUnparseableModule([page, f("next-env.d.ts", '/// <reference types="next" />\n')])
+    ).not.toThrow();
+    expect(
+      findUnparseableModule([page, f("types/index.d.ts", 'declare module "*.svg";\n')])
+    ).toBeNull();
+  });
+
+  it("fails OPEN if the parser throws unexpectedly, rather than failing the page", () => {
+    // This check exists to stop unparseable code reaching a commit. It must never be the
+    // thing that fails a generation, so any compiler-internal surprise is treated as fine.
+    const boom = {
+      path: "app/page.tsx",
+      get content(): Buffer {
+        throw new Error("Debug Failure. Output generation failed");
+      },
+    } as unknown as { path: string; content: Buffer };
+    expect(() => findUnparseableModule([boom])).not.toThrow();
+  });
+
+  it("validateV0Output rejects it, so the retry loop asks v0 to regenerate", () => {
+    expect(() =>
+      validateV0Output([f("app/page.tsx", POISONED)])
+    ).toThrow(/not valid TypeScript\/JSX/);
+  });
+
+  it("detectIncompleteSyntheticPage flags a marker page with no sections at all", () => {
+    // Gate 2 asks "did the stub orphan a section?". With zero sections generated that
+    // question has no answer, and the page used to pass silently.
+    const r = detectIncompleteSyntheticPage([
+      f("app/page.tsx", "export default function SyntheticV0PageForDeployment() { return <div />; }"),
+      f("app/_components/theme-provider.tsx", "export function ThemeProvider() { return null; }"),
+    ]);
+    expect(r).not.toBeNull();
+    expect(r!.entryPath).toBe("app/page.tsx");
+    expect(r!.orphaned).toEqual([]);
+  });
+
+  it("still does not flag a healthy page that composes its sections", () => {
+    const r = detectIncompleteSyntheticPage([
+      f("app/page.tsx", 'import { Hero } from "./_components/hero";\nexport default function Page(){ return <Hero />; }'),
+      f("app/_components/hero.tsx", "export function Hero(){ return <div/>; }"),
+    ]);
+    expect(r).toBeNull();
+  });
+
+  it("does not flag a MARKER page that reaches a component the section filter cannot see", () => {
+    // The previous test returns at gate 1 (no marker) and so never exercises the zero-section
+    // logic at all. This one does: the marker IS present, and the one component it renders is
+    // invisible to isSectionComponent — `app/components/…` starts with neither "components/"
+    // nor "/_components/". Without the reachability conjunct this is reported as a stub and
+    // the generation can be failed over a page that is perfectly healthy.
+    const r = detectIncompleteSyntheticPage([
+      f(
+        "app/page.tsx",
+        'import { Hero } from "./components/hero";\nexport default function SyntheticV0PageForDeployment(){ return <Hero />; }'
+      ),
+      f("app/components/hero.tsx", "export function Hero(){ return <div/>; }"),
+    ]);
+    expect(r).toBeNull();
+  });
+
+  it("does not flag a MARKER page whose only component has a name the filter excludes", () => {
+    // NON_SECTION_COMPONENT_NAME is unanchored, so "service-types" matches `types?` as a
+    // substring and the component is counted as a non-section.
+    const r = detectIncompleteSyntheticPage([
+      f(
+        "app/page.tsx",
+        'import { X } from "./_components/service-types";\nexport default function SyntheticV0PageForDeployment(){ return <X />; }'
+      ),
+      f("app/_components/service-types.tsx", "export function X(){ return <div/>; }"),
+    ]);
+    expect(r).toBeNull();
   });
 });

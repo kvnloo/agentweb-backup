@@ -157,6 +157,7 @@ process.on('message', async (message: any) => {
         turnStartMs,
         approvedRevisionImageSources,
         requireWorkPlanDisposition,
+        isUnattendedRun,
       } = message.params;
 
       // Progress callback to forward progress updates to parent process
@@ -204,6 +205,9 @@ process.on('message', async (message: any) => {
         publishAuthorizationOverride,
         approvedRevisionImageSources,
         requireWorkPlanDisposition,
+        // ENG-2072: see the "Keep this list in the same order" note above — this
+        // must stay LAST, matching generateMarketingResponse's own final parameter.
+        isUnattendedRun,
       );
 
       // Clean up cancelled flag

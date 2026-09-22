@@ -479,8 +479,10 @@ describe('generateChatResponse — ENG-1222 hard gate, retry, and skill-prompt i
     });
 
     expect(mockCallLLM).toHaveBeenCalledTimes(3);
+    // ENG-2072: extraContext always carries isUnattendedRun: false for this
+    // attended sidebar turn, so it's never the bare `undefined` it used to be.
     expect(mockExecuteTool).toHaveBeenCalledWith(
-      'anthropic.claude-opus-5', 'list_connected_accounts', expect.anything(), 'user-1', 'sess-1', false, undefined,
+      'anthropic.claude-opus-5', 'list_connected_accounts', expect.anything(), 'user-1', 'sess-1', false, { isUnattendedRun: false },
     );
     const content = typeof response === 'string' ? response : response.content;
     expect(content).toContain('Real Customer LLC');

@@ -138,6 +138,7 @@ const VENDOR_SIGNATURES: VendorSignature[] = [
   { vendor: 'Google Custom Search', re: /google\.customsearch\(/ },
   { vendor: 'Apollo', re: /api\.apollo\.io/ },
   { vendor: 'enrich.so', re: /dev\.enrich\.so/ },
+  { vendor: 'Enigma', re: /api\.enigma\.com/ },
   { vendor: 'ElevenLabs', re: /api\.elevenlabs\.io/ },
   { vendor: '2captcha', re: /2captcha\.com/ },
   { vendor: 'Placid', re: /api\.placid\.app/ },

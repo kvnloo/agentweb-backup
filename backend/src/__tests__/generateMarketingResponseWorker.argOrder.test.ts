@@ -97,10 +97,32 @@ describe('ENG-827 — the worker forwards the publish authorization in the right
     // The trailing arguments, in the order generateMarketingResponse declares them.
     // Asserted by VALUE SHAPE as well as position, so a swap cannot pass: a number is
     // never an authorization, and an authorization is never a deadline.
-    expect(args[args.length - 4]).toBe(turnStartMs);
-    expect(args[args.length - 3]).toEqual(authorization);
-    expect(args[args.length - 2]).toBeUndefined();
+    // ENG-2072: isUnattendedRun is now the LAST declared parameter — see that ticket's
+    // note in generateMarketingResponseWorker.ts about keeping this list in sync.
+    expect(args[args.length - 5]).toBe(turnStartMs);
+    expect(args[args.length - 4]).toEqual(authorization);
+    expect(args[args.length - 3]).toBeUndefined();
+    expect(args[args.length - 2]).toBe(true);
+    expect(args[args.length - 1]).toBeUndefined(); // isUnattendedRun, not supplied by this test
+    expect(typeof args[args.length - 5]).toBe('number');
+  });
+
+  it('ENG-2072: passes isUnattendedRun as the last declared argument', async () => {
+    await handleMessage({
+      type: 'generateMarketingResponse',
+      requestId: 'req-2',
+      params: {
+        messageContent: 'go',
+        sessionHistory: [],
+        userId: 'user-1',
+        llmModel: 'gpt-5-chat-2',
+        sessionId: 'sess-1',
+        isUnattendedRun: true,
+      },
+    });
+
+    expect(generateMarketingResponse).toHaveBeenCalledTimes(1);
+    const args = generateMarketingResponse.mock.calls[0];
     expect(args[args.length - 1]).toBe(true);
-    expect(typeof args[args.length - 4]).toBe('number');
   });
 });

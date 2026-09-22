@@ -150,6 +150,17 @@ export interface ChatMessage {
   };
 }
 
+// ENG-738: a RESEARCH_LOOKUP_TOOLS call (perform_deep_research, you_search_web,
+// google_search_web, you_search_news, linkedin_outreach) that timed out and was
+// never retried to success. See AgentModeService.detectOpenResearchRequestChanges
+// / buildOpenResearchRequestReminder and chatbotDb.recordOpenResearchRequests.
+export interface OpenResearchRequest {
+  tool: string;
+  topic: string;
+  failedAt: string; // ISO timestamp
+  errorSummary: string;
+}
+
 // Interface for chat sessions
 export interface ChatSession {
   sessionId: string;
@@ -288,6 +299,12 @@ export interface ChatSession {
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
   calledFunctionsVersion?: number; // Optimistic-lock counter guarding calledFunctions read-modify-write races
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
+  // ENG-738: RESEARCH_LOOKUP_TOOLS calls that timed out and were never retried
+  // to success — kept so a later turn doesn't silently drop (or misremember)
+  // a request the user is still owed once the conversation moves on to
+  // something else. Capped/FIFO by chatbotDb.recordOpenResearchRequests and
+  // age-filtered at read time by AgentModeService.buildOpenResearchRequestReminder.
+  openResearchRequests?: OpenResearchRequest[];
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
   archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
   feedbacks?: Record<string, MessageFeedback>; // Track image feedback by URL (key: imageUrl, value: feedback)
@@ -3983,6 +4000,55 @@ export class ChatbotDB {
     }
   }
 
+  // ENG-738: cap so a very long-lived session (the incident session ran 534
+  // messages / ~2M tokens over two days) can't grow this list unboundedly —
+  // FIFO eviction of the oldest entries once the cap is exceeded.
+  private static readonly MAX_OPEN_RESEARCH_REQUESTS = 5;
+
+  /**
+   * Add newly-timed-out research/lookup requests and clear ones that were
+   * just resolved by a later successful call of the same tool (ENG-738).
+   * Uses getChatSessionRecord (metadata only) rather than getChatSession —
+   * this field never depends on message history, so there's no reason to pay
+   * for hydrating it on every timeout.
+   */
+  async recordOpenResearchRequests(
+    sessionId: string,
+    additions: OpenResearchRequest[],
+    resolvedTools: string[]
+  ): Promise<void> {
+    if (additions.length === 0 && resolvedTools.length === 0) return;
+
+    const record = await this.getChatSessionRecord(sessionId);
+    if (!record) return; // session gone — nothing to track
+
+    const resolvedSet = new Set(resolvedTools);
+    const additionTools = new Set(additions.map((a) => a.tool));
+    // A fresh failure for a tool supersedes any earlier open entry for that
+    // tool (avoid nagging about the same tool with a stale topic), and a
+    // resolution clears it outright.
+    let updated = (record.openResearchRequests || []).filter(
+      (r) => !resolvedSet.has(r.tool) && !additionTools.has(r.tool)
+    );
+    updated = [...updated, ...additions].slice(-ChatbotDB.MAX_OPEN_RESEARCH_REQUESTS);
+
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: "SET openResearchRequests = :openResearchRequests",
+      ExpressionAttributeValues: {
+        ":openResearchRequests": updated,
+      },
+    };
+
+    try {
+      await dynamodb.update(params).promise();
+    } catch (error) {
+      console.error("Error recording open research requests:", error);
+      throw error;
+    }
+  }
+
   async decrementCalledFunctions(
     sessionId: string,
     functionCounts: Record<string, number>
@@ -5598,6 +5664,12 @@ export async function generateChatResponse(
           if (socketId) extraContext.socketId = socketId;
           if (isDelegatedAdmin) extraContext.isDelegatedAdmin = true;
           if (isDelegatedAdmin && adminEmail) extraContext.adminEmail = adminEmail;
+          // ENG-2072: this is the Emma-sidebar chat turn — a real person is
+          // present (see the ENG-803 comment above in getEmmaSystemContext),
+          // so never let createWorkPlan/modifyWorkPlan/applyPredefinedWorkPlan
+          // fall back to session.sessionType==='scheduled' and force hands-off
+          // work-plan autocomplete on an attended turn.
+          extraContext.isUnattendedRun = false;
           const result = await agentModeService.executeTool(activeModel, toolCall.function.name, functionArgs, userId!, sessionId, false, Object.keys(extraContext).length ? extraContext : undefined);
           console.log(`[generateChatResponse] Tool ${toolCall.function.name} executed successfully`);
           // ENG-351: harvest web-search sources into the citation registry.

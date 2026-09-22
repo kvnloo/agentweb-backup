@@ -26,7 +26,7 @@ import { normalizeAttribution, promoteAttributionFromCustomFields } from '../typ
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
-import { isSmokeTestEmail } from '../utils/smokeTestLead';
+import { isSmokeTestLead, phoneDigits } from '../utils/smokeTestLead';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from '../services/asyncJobQueue';
 import { handleHardBounceRecipients } from '../services/emailDeliverabilityService';
 // ENG-926 §C: the per-list budget and the per-account BUC pause used to live here as
@@ -529,20 +529,31 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       visitorUserAgent: declaredClientUserAgent,
     } = req.body;
 
-    // Validate required field (email)
-    if (!email || typeof email !== 'string' || !email.trim()) {
+    // ENG-2082: a contactable lead needs an email OR a phone, not specifically an email.
+    // Requiring an email made a phone-only lander — an ordinary thing to want, and something
+    // the generator will happily build — structurally incapable of ever producing a lead:
+    // every submission was rejected here before a row was even constructed, with nothing
+    // upstream warning the owner. Everything downstream already tolerated the absence:
+    // createLead dedupes only "if email is provided", autoEnrollLeadInSequences returns
+    // early on a falsy address, auto-send reports skipped_no_email, and Meta CAPI already
+    // normalises `ph` as a first-class match key. This gate was the only thing requiring one.
+    const normalizedEmail = typeof email === 'string' ? email.trim() : '';
+    const normalizedPhone = typeof phone === 'string' ? phone.trim() : '';
+    if (!normalizedEmail && !normalizedPhone) {
       return res.status(400).json({
         success: false,
-        message: 'Email is required'
+        message: 'Email or phone is required'
       });
     }
 
     // Prepare lead data
     const leadData: any = {
-      email: email.trim(),
+      // Omitted entirely rather than written as '' when absent: `email` is the key of the
+      // email-index GSI, and DynamoDB rejects an empty string for an index key attribute.
+      ...(normalizedEmail ? { email: normalizedEmail } : {}),
       firstName: firstName?.trim() || '',
       lastName: lastName?.trim() || '',
-      phone: phone?.trim() || '',
+      phone: normalizedPhone,
       company: company?.trim() || '',
       title: title?.trim() || '',
       notes: notes?.trim() || '',
@@ -673,8 +684,15 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       leadData.lastTouch = normalizeAttribution(incomingLastTouch) ?? touch;
     }
 
-    // Check if lead already exists by email - merge instead of dropping
-    const existingLead = await crmDb.getLeadByEmail(leadList.listId, email.trim().toLowerCase());
+    // Check if lead already exists by email - merge instead of dropping.
+    // ENG-2082: email is the only identity with an index to look it up by (email-index).
+    // A phone-only lead is instead deduped at write time by a deterministic leadId below,
+    // so two submissions of the same number collapse onto one row without needing a second
+    // GSI. A phone-only lead that later submits WITH an email becomes its own row, which is
+    // the same thing that already happens for two different emails.
+    const existingLead = normalizedEmail
+      ? await crmDb.getLeadByEmail(leadList.listId, normalizedEmail.toLowerCase())
+      : null;
 
     // Only stamp forwardedAt for new leads; for existing leads, preserve the original timestamp
     const mergedCustomFields: Record<string, any> = existingLead
@@ -792,9 +810,99 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
       lead = { ...existingLead, ...updates };
     } else {
-      // Create a new lead
-      lead = await crmDb.createLead(leadList.listId, leadData);
-      isNew = true;
+      // Create a new lead.
+      // ENG-2082: with no email there is nothing to query on beforehand, so a phone-only
+      // lead keys on its own normalized number and lets the conditional create do the
+      // deduping — the ENG-787 mechanism createLead already exposes for exactly this
+      // ("a caller that keys a lead on a stable identity"). phoneDigits is the shared
+      // normalizer, so +1 (415) 555-0142 and 4155550142 resolve to the same row.
+      const phoneOnlyKey = !normalizedEmail ? phoneDigits(normalizedPhone) : '';
+      const deterministicLeadId = phoneOnlyKey
+        ? `lead_ph_${crypto.createHash('sha256').update(phoneOnlyKey).digest('hex').slice(0, 24)}`
+        : '';
+      try {
+        lead = await crmDb.createLead(
+          leadList.listId,
+          deterministicLeadId
+            ? { ...leadData, leadId: deterministicLeadId, failIfExists: true }
+            : leadData
+        );
+        isNew = true;
+      } catch (createErr: any) {
+        // The conditional create lost to an earlier submission of the same number. That is
+        // this path's DEDUPE succeeding, not a fault: adopt the row that already exists and
+        // report it as a duplicate. isNew stays false, so none of the new-lead side effects
+        // (sequence enrolment, auto-draft/auto-send, owner notify, CAPI) fire a second time
+        // for one person — which is the whole reason the number is keyed deterministically.
+        if (!createErr?.leadAlreadyExists) throw createErr;
+        // Consistent read: the conditional write just told us this exact key exists, so an
+        // eventually-consistent miss here would be a lie, not an answer.
+        lead = await crmDb.getLeadById(leadList.listId, deterministicLeadId, { consistentRead: true });
+        if (!lead) {
+          // Still nothing — the winner's row was deleted between its write and this read, or
+          // the read failed in a way that returned empty. Do NOT throw: throwing reaches the
+          // handler's catch and returns 500 to the lander for a submission that was, from
+          // the visitor's point of view, accepted. Degrade to the id we know, the same way
+          // linkedInInviteCrmMirror does on this identical race.
+          console.warn(
+            `[webhooks] ENG-2082: adopted lead ${deterministicLeadId} not readable after a ` +
+              `losing conditional create in ${leadList.listId} — reporting the duplicate anyway.`
+          );
+          lead = { leadId: deterministicLeadId, listId: leadList.listId, ...leadData };
+        }
+
+        // ENG-2082 follow-up: this path is not only the concurrent race. A deterministic id
+        // plus failIfExists means EVERY repeat submission from the same number lands here,
+        // forever. Without a merge the second submission returns success and silently drops
+        // whatever it carried — the exact failure this file documents for flat custom fields
+        // ("a 201 and a visible lead row with the data gone"), reproduced for a multi-step
+        // phone-only lander whose step 2 posts the qualification answers.
+        //
+        // Mirrors the existingLead branch's rules deliberately rather than sharing them:
+        // that branch is the well-trodden email path and is not worth destabilising here.
+        const normalizeAdopted = (value: any): string =>
+          value === null || value === undefined ? '' : String(value).trim();
+        const adoptedUpdates: any = {};
+        let adoptedChanged = false;
+
+        for (const field of ['firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'] as const) {
+          const newValue = normalizeAdopted(leadData[field]);
+          if (newValue && normalizeAdopted(lead[field]) !== newValue) {
+            adoptedUpdates[field] = newValue;
+            adoptedChanged = true;
+          }
+        }
+
+        const adoptedExistingCustom = lead.customFields || {};
+        const adoptedIncomingCustom = leadData.customFields || {};
+        const adoptedMergedCustom: Record<string, any> = { ...adoptedExistingCustom };
+        let customChanged = false;
+        // Stamped by this handler rather than sent by the visitor: `forwardedAt` is minted
+        // fresh on every submission because this branch builds leadData as if creating, and
+        // `source` defaults to 'api' when the caller sends none (see the destructure above).
+        // Neither is visitor data, and letting either mark a resubmission as a real update
+        // would drive CRM sync and owner alerts off a duplicate that carried nothing new.
+        // They are still merged through — they just do not, alone, constitute a change.
+        const SYSTEM_CUSTOM_KEYS = new Set(['forwardedAt', 'source']);
+        for (const [key, value] of Object.entries(adoptedIncomingCustom)) {
+          if (value === undefined || value === null || value === '') continue;
+          if (normalizeAdopted(adoptedExistingCustom[key]) !== normalizeAdopted(value)) {
+            adoptedMergedCustom[key] = value;
+            if (!SYSTEM_CUSTOM_KEYS.has(key)) customChanged = true;
+          }
+        }
+        if (customChanged) {
+          adoptedUpdates.customFields = adoptedMergedCustom;
+          adoptedChanged = true;
+        }
+
+        if (adoptedChanged) {
+          await crmDb.updateLead(leadList.listId, lead.leadId, adoptedUpdates);
+          lead = { ...lead, ...adoptedUpdates };
+          // A real, user-visible change — same meaning the email branch gives isUpdated.
+          isUpdated = true;
+        }
+      }
     }
 
     // Send API response immediately so caller is not blocked
@@ -832,7 +940,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // synthetic lead — CAPI's correctness is already covered by unit tests (metaService.capi
     // .test.ts) and doesn't depend on v0-authored code, so there's nothing extra to verify
     // live here, only real-ad-account conversion data to needlessly pollute.
-    if (pixelId && metaAccountId && eventId && !isSmokeTestEmail(leadData.email) && shouldAttemptCapiSend(leadList.listId) && !isCapiAccountPaused(metaAccountId)) {
+    if (pixelId && metaAccountId && eventId && !isSmokeTestLead(leadData) && shouldAttemptCapiSend(leadList.listId) && !isCapiAccountPaused(metaAccountId)) {
       void (async () => {
         try {
           const owner = await userDb.getUserById(leadList.userId);
@@ -902,7 +1010,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     }
 
     // After response is sent: auto-draft, auto-send, and alert (fire-and-forget, fully awaited internally)
-    if (isNew && isSmokeTestEmail(lead.email)) {
+    if (isNew && isSmokeTestLead(lead)) {
       // ENG-449 gap #3: the automated post-deploy smoke test submits a REAL lead through a
       // customer's real form to verify the pipeline works, then deletes the row. But deleting
       // the row doesn't undo an already-fired side effect — HubSpot/Attio sync, drip-sequence

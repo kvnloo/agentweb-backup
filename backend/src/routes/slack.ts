@@ -592,8 +592,6 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
   try {
     if (!verifySlackRequest(req)) return res.status(401).json({ error: 'Unauthorized Slack request' });
     if (Buffer.isBuffer(req.body)) req.body = JSON.parse(req.body.toString('utf8'));
-    console.log('📥 Slack event received:', JSON.stringify(req.body, null, 2));
-    console.log('📥 Request headers:', JSON.stringify(req.headers, null, 2));
     const { type, challenge, event } = req.body;
 
     // Handle URL verification challenge
@@ -639,7 +637,7 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
         console.log('👋 Emma bot mentioned in Slack:', {
           channel,
           user: slackUserId,
-          text
+          ts
         });
 
         try {
@@ -971,6 +969,119 @@ router.post("/events", express.raw({ type: 'application/json', limit: '1mb' }), 
       // Allow file_share subtype so that Slack file uploads are also processed
       // Skip messages that @mention Emma — those trigger an app_mention event that Emma handles
       // directly, so processing them here too would cause Emma to answer twice.
+      // Direct-message handling: a 1:1 DM to Emma (channel_type 'im', no
+      // thread) starts/continues a conversation without requiring an
+      // @mention — Slack never emits app_mention for DM text, so without
+      // this branch DMs were silently ignored. Threaded DM replies ride the
+      // thread handler below via the saved thread mapping.
+      if (event.type === 'message' && !event.thread_ts && !event.bot_id
+        && (!event.subtype || event.subtype === 'file_share')
+        && (event.channel_type === 'im' || String(event.channel || '').startsWith('D'))) {
+        const { text, user: slackUserId, channel, ts: messageTs, files } = event;
+        try {
+          const { userDb } = await import('../services/db');
+          const { chatbotDb } = await import('../services/chatbotService');
+          const { WebClient } = await import('@slack/web-api');
+          const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+
+          const botId = await getEmmaBotUserId();
+          const textWithoutBotMention = botId
+            ? String(text || '').replace(new RegExp(`<@${botId}>`, 'g'), '')
+            : String(text || '');
+          const rawMessage = (await resolveSlackMentionsInText(textWithoutBotMention))
+            .replace(/<mailto:([^|>]+)\|[^>]+>/g, '$1')
+            .replace(/<mailto:([^|>]+)>/g, '$1')
+            .trim();
+
+          if (!rawMessage && !(files && files.length > 0)) {
+            await slackClient.chat.postMessage({
+              channel,
+              text: '👋 Hi! Send me a message and I\'ll get started.',
+            });
+            return;
+          }
+
+          // DM identity: resolve the sender's verified Slack email to an
+          // AgentWeb user (exact email match only — never fuzzy, so a DM
+          // sender can never resolve to someone else's account). Cache the
+          // DM-channel mapping: a 1:1 DM channel has exactly one human side.
+          let user = null;
+          const mappingKey = `slack_channel_mapping_${channel}`;
+          const cachedMapping = await settingsService.getSetting(mappingKey);
+          if (cachedMapping?.settingValue) {
+            const cachedUser = await userDb.getUserById(cachedMapping.settingValue);
+            if (cachedUser && !cachedUser.userId?.startsWith('deleted_')) {
+              user = cachedUser;
+            }
+          }
+          let requesterEmail: string | null = null;
+          if (!user) {
+            requesterEmail = await getSlackUserEmail(slackUserId);
+            if (requesterEmail) {
+              const identityUser = await userDb.getUserByEmail(requesterEmail);
+              if (identityUser && !identityUser.userId?.startsWith('deleted_')) {
+                user = identityUser;
+                await settingsService.setSetting(
+                  mappingKey,
+                  user.userId,
+                  `Slack DM channel to userId mapping for channel ${channel}`,
+                  'system'
+                );
+                console.log(`📝 [slack-dm] resolved via Slack identity (${requesterEmail})`);
+              }
+            }
+          }
+
+          if (!user) {
+            const text = requesterEmail
+              ? `❌ Sorry, there's no AgentWeb user with the email ${requesterEmail}. Ask an AgentWeb admin to create/link your account, then DM me again.`
+              : `❌ Sorry, I couldn't verify a Slack email for you to match an AgentWeb account. Ask an AgentWeb admin for help.`;
+            await slackClient.chat.postMessage({ channel, text });
+            return;
+          }
+
+          const displayName = await getSlackUserDisplayName(slackUserId);
+          const userMessage = `${displayName}: ${rawMessage}`;
+          console.log('📝 Creating Agent Mode session for DM user:', user.userId);
+          const session = await chatbotDb.createChatSession(
+            user.userId,
+            undefined, // pageContent
+            'agent', // portalType
+            'slack-dm', // pageIdentifier
+            undefined, // selectedStartupId
+            undefined, // workflowId
+            undefined, // executionId
+            undefined, // emailCampaignTaskId
+            'regular', // sessionType
+            undefined // delegateInfo
+          );
+          console.log('✅ Agent Mode DM session created:', session.sessionId);
+          await handleSlackSessionResponse({
+            session,
+            user,
+            channel,
+            ts: messageTs,
+            rawMessage,
+            userMessage,
+            files,
+          });
+          console.log('✅ Emma Slack DM handled successfully');
+        } catch (error) {
+          console.error('❌ Error handling Emma Slack DM:', error);
+          try {
+            const { WebClient } = await import('@slack/web-api');
+            const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+            await slackClient.chat.postMessage({
+              channel,
+              text: '❌ Sorry, something went wrong while processing your request. Please try again or contact support.',
+            });
+          } catch (slackError) {
+            console.error('❌ Error sending DM error message to Slack:', slackError);
+          }
+        }
+        return;
+      }
+
       if (event.type === 'message' && event.thread_ts && !event.bot_id && (!event.subtype || event.subtype === 'file_share')) {
         const { text, user: slackUserId, channel, thread_ts: threadTs, ts: messageTs } = event;
 

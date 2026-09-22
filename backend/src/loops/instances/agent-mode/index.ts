@@ -20,13 +20,13 @@ import { postLoopDigest, type LoopDigestTemplate } from '../../core/digest/loopD
 import { claimLoopDailyDigestPost } from '../../core/digest/dailyDigestClaim';
 import { createInstanceRunner } from '../../core/instanceRunner';
 import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
-import { CooldownRuleSet } from '../../core/policy/cooldownRuleSet';
 import { EventTableEventSource } from '../../core/sensors/eventTableEventSource';
 import { SpecOutputTool } from '../../core/tools/specOutputTool';
 import { productionLoopPorts } from '../../adapters/awsAdapters';
 import type { LoopRunResult } from '../../core/types';
 import { AGENT_MODE_LOOP_ID } from './eventTypes';
 import { AgentFailureRuleSet } from './failureRuleSet';
+import { withLegacyToolCooldown } from './legacyToolCooldown';
 import { agentModeManifest } from './manifest';
 import { AgentRunRecorder } from './runRecorder';
 
@@ -45,7 +45,7 @@ const runner = createInstanceRunner({
     const learning = new DynamoLearningStore(ports.dynamo);
     return {
       sensor: new EventTableEventSource(ports.dynamo, AGENT_MODE_LOOP_ID),
-      ruleSet: new CooldownRuleSet(new AgentFailureRuleSet(), learning, AGENT_MODE_LOOP_ID),
+      ruleSet: withLegacyToolCooldown(new AgentFailureRuleSet(), learning),
       tools: new SpecOutputTool(AGENT_MODE_LOOP_ID, ['cloud-dev', 'auto-loop', 'agent-mode']),
       learning,
     };
@@ -163,18 +163,14 @@ const agentModeDigestTemplate: LoopDigestTemplate<number> = {
   logTag: '[agent-mode-loop]',
   header: (date) => `*🤖 Agent Mode — tool reliability ${date}*`,
   counts: (result) => {
-    // ENG-820: never render a capped slice as if it were the whole set.
-    const truncated = (result as { proposalsTruncated?: number }).proposalsTruncated ?? 0;
-    // Count TOOL proposals only. The claim-mismatch proposal is a whole-run
-    // verdict, not a failing tool, and counting it made both numbers wrong
-    // (ENG-820 review). It also always survives the cap — it carries no
-    // `failures` and so sorts first — which is why every truncated proposal is
-    // a tool proposal and this arithmetic holds.
-    const shown = result.proposals.filter(
-      (p) => typeof (p.payload as { toolName?: unknown })?.toolName === 'string',
-    ).length;
-    const failing = truncated > 0
-      ? `Failing tools: showing ${shown} of ${shown + truncated}`
+    const toolCount = (proposals: LoopRunResult['proposals']) => new Set(proposals.flatMap((p) => {
+      const name = (p.payload as { toolName?: unknown })?.toolName;
+      return typeof name === 'string' ? [name] : [];
+    })).size;
+    const shown = toolCount(result.proposals);
+    const total = toolCount(result.uncappedProposals ?? result.proposals);
+    const failing = shown < total
+      ? `Failing tools: showing ${shown} of ${total}`
       : `Failing tools: ${shown}`;
     return `Tool events scanned: ${result.eventsScanned}  |  ${failing}`;
   },

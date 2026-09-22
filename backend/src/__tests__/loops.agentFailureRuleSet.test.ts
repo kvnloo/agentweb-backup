@@ -71,7 +71,7 @@ describe('AgentFailureRuleSet', () => {
     expect(proposals).toHaveLength(1);
     const p = proposals[0];
     expect(p.kind).toBe('code_change');
-    expect(p.sourceRuleId).toBe('tool-failure:generate_image');
+    expect(p.sourceRuleId).toBe('tool-failure:generate_image:unclassified');
     expect(p.payload).toEqual(
       expect.objectContaining({ toolName: 'generate_image', failures: 4, invocations: 10 }),
     );
@@ -187,7 +187,7 @@ describe('AgentFailureRuleSet — claim_mismatch clustering (ENG-143)', () => {
     ];
     const proposals = await policy.evaluate(events, WINDOW);
     expect(proposals.map((p) => p.sourceRuleId).sort()).toEqual(
-      ['claim-mismatch:truthfulness', 'tool-failure:generate_image'].sort(),
+      ['claim-mismatch:truthfulness', 'tool-failure:generate_image:unclassified'].sort(),
     );
   });
 
@@ -202,7 +202,7 @@ describe('AgentFailureRuleSet — claim_mismatch clustering (ENG-143)', () => {
     const proposals = await policy.evaluate(events, WINDOW);
     expect(proposals.map((p) => p.sourceRuleId)).toEqual([
       'claim-mismatch:truthfulness',
-      'tool-failure:generate_image',
+      'tool-failure:generate_image:unclassified',
     ]);
   });
 });
