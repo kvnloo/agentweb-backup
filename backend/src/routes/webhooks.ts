@@ -26,7 +26,7 @@ import { normalizeAttribution, promoteAttributionFromCustomFields } from '../typ
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
-import { isSmokeTestLead } from '../utils/smokeTestLead';
+import { isSmokeTestLead, phoneDigits } from '../utils/smokeTestLead';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from '../services/asyncJobQueue';
 import { handleHardBounceRecipients } from '../services/emailDeliverabilityService';
 // ENG-926 §C: the per-list budget and the per-account BUC pause used to live here as
@@ -529,20 +529,31 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       visitorUserAgent: declaredClientUserAgent,
     } = req.body;
 
-    // Validate required field (email)
-    if (!email || typeof email !== 'string' || !email.trim()) {
+    // ENG-2082: a contactable lead needs an email OR a phone, not specifically an email.
+    // Requiring an email made a phone-only lander — an ordinary thing to want, and something
+    // the generator will happily build — structurally incapable of ever producing a lead:
+    // every submission was rejected here before a row was even constructed, with nothing
+    // upstream warning the owner. Everything downstream already tolerated the absence:
+    // createLead dedupes only "if email is provided", autoEnrollLeadInSequences returns
+    // early on a falsy address, auto-send reports skipped_no_email, and Meta CAPI already
+    // normalises `ph` as a first-class match key. This gate was the only thing requiring one.
+    const normalizedEmail = typeof email === 'string' ? email.trim() : '';
+    const normalizedPhone = typeof phone === 'string' ? phone.trim() : '';
+    if (!normalizedEmail && !normalizedPhone) {
       return res.status(400).json({
         success: false,
-        message: 'Email is required'
+        message: 'Email or phone is required'
       });
     }
 
     // Prepare lead data
     const leadData: any = {
-      email: email.trim(),
+      // Omitted entirely rather than written as '' when absent: `email` is the key of the
+      // email-index GSI, and DynamoDB rejects an empty string for an index key attribute.
+      ...(normalizedEmail ? { email: normalizedEmail } : {}),
       firstName: firstName?.trim() || '',
       lastName: lastName?.trim() || '',
-      phone: phone?.trim() || '',
+      phone: normalizedPhone,
       company: company?.trim() || '',
       title: title?.trim() || '',
       notes: notes?.trim() || '',
@@ -673,8 +684,15 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       leadData.lastTouch = normalizeAttribution(incomingLastTouch) ?? touch;
     }
 
-    // Check if lead already exists by email - merge instead of dropping
-    const existingLead = await crmDb.getLeadByEmail(leadList.listId, email.trim().toLowerCase());
+    // Check if lead already exists by email - merge instead of dropping.
+    // ENG-2082: email is the only identity with an index to look it up by (email-index).
+    // A phone-only lead is instead deduped at write time by a deterministic leadId below,
+    // so two submissions of the same number collapse onto one row without needing a second
+    // GSI. A phone-only lead that later submits WITH an email becomes its own row, which is
+    // the same thing that already happens for two different emails.
+    const existingLead = normalizedEmail
+      ? await crmDb.getLeadByEmail(leadList.listId, normalizedEmail.toLowerCase())
+      : null;
 
     // Only stamp forwardedAt for new leads; for existing leads, preserve the original timestamp
     const mergedCustomFields: Record<string, any> = existingLead
@@ -792,9 +810,34 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
       lead = { ...existingLead, ...updates };
     } else {
-      // Create a new lead
-      lead = await crmDb.createLead(leadList.listId, leadData);
-      isNew = true;
+      // Create a new lead.
+      // ENG-2082: with no email there is nothing to query on beforehand, so a phone-only
+      // lead keys on its own normalized number and lets the conditional create do the
+      // deduping — the ENG-787 mechanism createLead already exposes for exactly this
+      // ("a caller that keys a lead on a stable identity"). phoneDigits is the shared
+      // normalizer, so +1 (415) 555-0142 and 4155550142 resolve to the same row.
+      const phoneOnlyKey = !normalizedEmail ? phoneDigits(normalizedPhone) : '';
+      const deterministicLeadId = phoneOnlyKey
+        ? `lead_ph_${crypto.createHash('sha256').update(phoneOnlyKey).digest('hex').slice(0, 24)}`
+        : '';
+      try {
+        lead = await crmDb.createLead(
+          leadList.listId,
+          deterministicLeadId
+            ? { ...leadData, leadId: deterministicLeadId, failIfExists: true }
+            : leadData
+        );
+        isNew = true;
+      } catch (createErr: any) {
+        // The conditional create lost to an earlier submission of the same number. That is
+        // this path's DEDUPE succeeding, not a fault: adopt the row that already exists and
+        // report it as a duplicate. isNew stays false, so none of the new-lead side effects
+        // (sequence enrolment, auto-draft/auto-send, owner notify, CAPI) fire a second time
+        // for one person — which is the whole reason the number is keyed deterministically.
+        if (!createErr?.leadAlreadyExists) throw createErr;
+        lead = await crmDb.getLeadById(leadList.listId, deterministicLeadId);
+        if (!lead) throw createErr;
+      }
     }
 
     // Send API response immediately so caller is not blocked

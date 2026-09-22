@@ -259,7 +259,67 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
-      expect(response.body.message).toBe('Email is required');
+      // ENG-2082: a lead needs SOMETHING contactable, not an email specifically. This
+      // payload carries neither, so it is still refused.
+      expect(response.body.message).toBe('Email or phone is required');
+    });
+
+    it('ENG-2082: accepts a phone-only lead and keys it deterministically on the number', async () => {
+      // A phone-only lander used to be impossible: this route required an email, so every
+      // submission was refused before a row was built and the page captured nothing.
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.createLead as jest.Mock).mockResolvedValue({
+        leadId: 'lead_ph_abc', listId: 'list_123', phone: '4155550142', customFields: {},
+      });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', phone: '+1 (415) 555-0142' });
+
+      expect(response.status).toBe(201);
+      // No email lookup is possible, so none is attempted — the deterministic leadId is
+      // what dedupes instead.
+      expect(crmDb.getLeadByEmail).not.toHaveBeenCalled();
+
+      const [, created] = (crmDb.createLead as jest.Mock).mock.calls[0];
+      expect(created.failIfExists).toBe(true);
+      expect(created.leadId).toMatch(/^lead_ph_[0-9a-f]{24}$/);
+      // `email` is omitted entirely, never written as '': it keys the email-index GSI and
+      // DynamoDB rejects an empty string for an index key attribute.
+      expect('email' in created).toBe(false);
+    });
+
+    it('ENG-2082: the same number in a different format collapses onto the same row', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.createLead as jest.Mock).mockResolvedValue({ leadId: 'x', listId: 'list_123', customFields: {} });
+
+      await request(app).post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', phone: '+1 (415) 555-0142' });
+      await request(app).post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', phone: '4155550142' });
+
+      const first = (crmDb.createLead as jest.Mock).mock.calls[0][1].leadId;
+      const second = (crmDb.createLead as jest.Mock).mock.calls[1][1].leadId;
+      expect(second).toBe(first);
+    });
+
+    it('ENG-2082: losing the conditional create adopts the winning row instead of 500ing', async () => {
+      // The dedupe succeeding, not a fault. isNew must stay false so the new-lead side
+      // effects do not fire twice for one person.
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      const race: any = new Error('Lead already exists for this deterministic key');
+      race.leadAlreadyExists = true;
+      (crmDb.createLead as jest.Mock).mockRejectedValueOnce(race);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead_ph_existing', listId: 'list_123', phone: '4155550142', customFields: {},
+      });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', phone: '4155550142' });
+
+      expect(response.status).not.toBe(500);
+      expect(crmDb.getLeadById).toHaveBeenCalled();
     });
 
     it('should successfully forward a lead with minimal data', async () => {

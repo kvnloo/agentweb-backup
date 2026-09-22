@@ -2042,11 +2042,11 @@ async function addPageToExistingRepo(
         // making v0 add a field the user did not ask for is a product decision, and the
         // correction round-trip needs fixture work across this suite. Tracked on ENG-2082.
         if (shippedHasCaptureForm) {
-          const emailCheck = validateCaptureFormHasEmail(remapFilesForSubPage(previewFiles, slug, name));
-          if (!emailCheck.ok) {
+          const contactCheck = validateCaptureFormHasContactField(remapFilesForSubPage(previewFiles, slug, name));
+          if (!contactCheck.ok) {
             console.error(
-              `[V0 SERVICE] ENG-2082: capture form for /${slug} collects NO email field — ` +
-                `every submission will be rejected and this page will capture zero leads: ${emailCheck.reason}`
+              `[V0 SERVICE] ENG-2082: capture form for /${slug} collects NO email and NO phone — ` +
+                `every submission will be rejected and this page will capture zero leads: ${contactCheck.reason}`
             );
           }
         }
@@ -3246,11 +3246,11 @@ export async function deployLandingPage(
         // making v0 add a field the user did not ask for is a product decision, and the
         // correction round-trip needs fixture work across this suite. Tracked on ENG-2082.
         if (shippedHasCaptureForm) {
-          const emailCheck = validateCaptureFormHasEmail(previewFiles);
-          if (!emailCheck.ok) {
+          const contactCheck = validateCaptureFormHasContactField(previewFiles);
+          if (!contactCheck.ok) {
             console.error(
-              `[V0 SERVICE] ENG-2082: capture form for the root page collects NO email field — ` +
-                `every submission will be rejected and this page will capture zero leads: ${emailCheck.reason}`
+              `[V0 SERVICE] ENG-2082: capture form for the root page collects NO email and NO phone — ` +
+                `every submission will be rejected and this page will capture zero leads: ${contactCheck.reason}`
             );
           }
         }
@@ -4383,35 +4383,33 @@ export function hasLeadCaptureForm(files: Array<{ path: string; content: Buffer 
 }
 
 /**
- * ENG-2082: does the capture form actually collect an email?
+ * ENG-2082: does the capture form collect anything we can actually contact the lead by?
  *
- * /api/capture rejects any submission without one — `routes/webhooks.ts` returns
- * 400 "Email is required" before a lead row is ever built. So a generated form that asks
- * only for, say, a phone number is structurally incapable of producing a lead, no matter
- * how correct everything downstream is. The generator will happily build one when asked,
- * and nothing warned the user: they find out when the leads never arrive, potentially
- * after spending on ads pointed at it.
+ * /api/capture accepts a submission carrying an email OR a phone and rejects one carrying
+ * neither, because a lead nobody can reach is not a lead. A generated form that asks only
+ * for, say, a name is therefore structurally incapable of producing one — and the generator
+ * will build it whenever asked, with nothing telling the owner until the leads never arrive.
  *
- * Mirrors validatePixelLeadEvent's contract: verified, not guaranteed. Callers send a
- * correction and retry; exhausted retries record the miss and still ship, because a page
- * that captures nothing is still better delivered than silently failed.
+ * This deliberately accepts phone-only: requiring an email specifically is what made an
+ * ordinary phone-only lander impossible, and the capture route no longer does.
  *
- * Only meaningful on a page that HAS a capture form — see hasLeadCaptureForm.
+ * Mirrors validatePixelLeadEvent's contract — verified, not guaranteed. Only meaningful on a
+ * page that HAS a capture form; see hasLeadCaptureForm.
  */
-export function validateCaptureFormHasEmail(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
+export function validateCaptureFormHasContactField(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
   const source = files
     .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
 
-  // Either an <input type="email"> or a field named email. Both are how v0 emits it, and
+  // Either an input of that type or a field of that name — both are how v0 emits them, and
   // the name is what the capture route reads off the JSON body.
-  const hasEmailInput = /type\s*=\s*["'`]email["'`]/.test(source);
-  const hasEmailName = /name\s*=\s*["'`]email["'`]/.test(source);
-  if (!hasEmailInput && !hasEmailName) {
+  const hasEmail = /type\s*=\s*["'`]email["'`]/.test(source) || /name\s*=\s*["'`]email["'`]/.test(source);
+  const hasPhone = /type\s*=\s*["'`]tel["'`]/.test(source) || /name\s*=\s*["'`]phone["'`]/.test(source);
+  if (!hasEmail && !hasPhone) {
     return {
       ok: false,
-      reason: "capture form collects no email field, and /api/capture rejects every submission without one (400 \"Email is required\")",
+      reason: "capture form collects neither an email nor a phone, and /api/capture rejects a submission carrying neither",
     };
   }
   return { ok: true };

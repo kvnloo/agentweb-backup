@@ -181,7 +181,7 @@ import {
   injectLeadCaptureAttribution,
   assertNoDuplicateInjectedRoutes,
   buildTrackingHelper,
-  validateCaptureFormHasEmail,
+  validateCaptureFormHasContactField,
   LandingPageNotDeployableError,
 } from "../services/v0Service";
 
@@ -6373,30 +6373,34 @@ describe("isNonErrorBuildLine", () => {
   });
 });
 
-describe("ENG-2082: capture form must collect an email", () => {
+describe("ENG-2082: capture form must collect something contactable", () => {
   const f = (src: string) => [{ path: "app/page.tsx", content: Buffer.from(src) }];
 
   it("accepts an <input type=\"email\">", () => {
-    expect(validateCaptureFormHasEmail(f('<input type="email" />')).ok).toBe(true);
+    expect(validateCaptureFormHasContactField(f('<input type="email" />')).ok).toBe(true);
   });
 
   it("accepts a field named email", () => {
-    expect(validateCaptureFormHasEmail(f('<input name="email" />')).ok).toBe(true);
+    expect(validateCaptureFormHasContactField(f('<input name="email" />')).ok).toBe(true);
   });
 
-  it("rejects a phone-only form, and says why", () => {
-    // The real shape: /api/capture returns 400 "Email is required" before a lead row is
-    // built, so this page captures nothing no matter how correct everything downstream is.
-    const r = validateCaptureFormHasEmail(f('<input type="tel" name="phone" required />'));
+  it("accepts a phone-only form — that is a legitimate lander, not a broken one", () => {
+    // The point of the ENG-2082 capture change: requiring an email specifically is what
+    // made an ordinary phone-only lander impossible to build.
+    expect(validateCaptureFormHasContactField(f('<input type="tel" name="phone" required />')).ok).toBe(true);
+  });
+
+  it("rejects a form that collects neither, and says why", () => {
+    const r = validateCaptureFormHasContactField(f('<input type="text" name="firstName" />'));
     expect(r.ok).toBe(false);
-    expect(r.reason).toContain("no email field");
+    expect(r.reason).toContain("neither an email nor a phone");
   });
 
   it("only reads shipped .ts/.tsx, not other files", () => {
     expect(
-      validateCaptureFormHasEmail([
+      validateCaptureFormHasContactField([
         { path: "README.md", content: Buffer.from('name="email"') },
-        { path: "app/page.tsx", content: Buffer.from('<input type="tel" />') },
+        { path: "app/page.tsx", content: Buffer.from('<input type="text" />') },
       ]).ok
     ).toBe(false);
   });
