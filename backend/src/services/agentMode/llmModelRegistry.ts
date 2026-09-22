@@ -265,8 +265,9 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   // default high) — documents capability only; no reasoningEffort default is
   // set, so callLLM sends no `reasoning` param (same posture as GPT-6 Astra).
   // supportsVision per OpenRouter architecture.modality (text+image+file
-  // input) — same bar Fable 5.1 used, not yet empirically probed on
-  // describe_image. qualityScore OMITTED deliberately: no benchmark index has
+  // input) — verified LIVE 2026-09-22 on the exact describe_image shape (a
+  // base64 data-URI JPEG through OpenRouter): correct scene description, so
+  // the flag meets this file's empirical bar, not just metadata. qualityScore OMITTED deliberately: no benchmark index has
   // published an Opus 5.5 score yet, and this file never estimates. That also
   // keeps it out of the same-family dominance computation until a real score
   // lands (deriveDominanceLegacyIds skips scoreless rows both ways), so Opus 5
