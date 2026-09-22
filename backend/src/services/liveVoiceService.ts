@@ -43,6 +43,15 @@ export const LIVE_MODEL = 'models/gemini-3.1-flash-live-preview';
 const LIVE_VOICE_NAME = 'Kore';
 const LIVE_TOOL_TIMEOUT_MS = 12_000;
 const LIVE_TOOL_SUMMARY_TIMEOUT_MS = 5_000;
+// ENG-2072: a live voice call is always a real person talking to Emma right now,
+// even if it's attached to a session originally created by a schedule — never let
+// create_work_plan/modify_work_plan/launch_predefined_work_plan fall back to
+// session.sessionType and force hands-off autocomplete. Frozen because this one
+// object is reused across every concurrent tool call this process handles —
+// executeTool only ever reads or spreads it today, but a future accidental
+// `context.foo = ...` on a shared reference would silently corrupt every other
+// in-flight live voice call instead of just this one.
+const ATTENDED_TOOL_CONTEXT = Object.freeze({ isUnattendedRun: false });
 export type LiveToolProfile = 'default' | 'onboarding';
 
 const ONBOARDING_LIVE_TOOLS = new Set([
@@ -1107,14 +1116,9 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
 
         try {
           let execution: Promise<any>;
-          // ENG-2072: a live voice call is a real person talking to Emma right now,
-          // even if it's attached to a session originally created by a schedule —
-          // never let create_work_plan/modify_work_plan/launch_predefined_work_plan
-          // fall back to session.sessionType and force hands-off autocomplete.
-          const liveVoiceToolContext = { isUnattendedRun: false };
           if (isOnboardingSafe) {
             execution = agentModeService.executeTool(
-              LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false, liveVoiceToolContext,
+              LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false, ATTENDED_TOOL_CONTEXT,
             );
           } else {
             const executionKey = stableToolExecutionKey(toolName, toolArgs);
@@ -1122,7 +1126,7 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
             if (!trackedExecution) {
               trackedExecution = {
                 promise: Promise.resolve().then(() => agentModeService.executeTool(
-                  LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false, liveVoiceToolContext,
+                  LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false, ATTENDED_TOOL_CONTEXT,
                 )),
                 settled: false,
               };
