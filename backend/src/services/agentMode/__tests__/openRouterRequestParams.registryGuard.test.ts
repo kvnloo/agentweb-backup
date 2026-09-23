@@ -98,9 +98,16 @@ describe('model registry vs OpenRouter supported_parameters (ENG-1831)', () => {
     const sonar = registry.find(([modelId]) => modelId === 'openrouter/perplexity/sonar-deep-research');
 
     it('ENG-199: Claude Fable 5.1 without supportsToolChoice: false', () => {
+      // OpenRouter has since added `tool_choice` to Fable 5.1's endpoints
+      // (verified 2026-09-22: all four list it), so the original routing
+      // failure no longer reproduces — the flag is now conservative, not
+      // load-bearing. The drill is kept live on Sonar (below) instead of
+      // deleted: the flag itself still exists in the registry and this
+      // asserts it remains harmless rather than silently rotting.
       expect(fable).toBeDefined();
       expect(routingViolation(fable![0], { ...fable![1], supportsToolChoice: undefined }))
-        .toMatch(/unsupported everywhere: \[tool_choice\]/);
+        .toBeNull();
+      expect(fable![1].supportsToolChoice).toBe(false);
     });
 
     it('Sonar Deep Research without supportsTools: false', () => {

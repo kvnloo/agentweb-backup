@@ -204,6 +204,16 @@ export interface User {
   slackChannel?: string; // @deprecated — use slackChannels. Kept for backward-compat reads.
   slackChannels?: string[]; // Slack channels configured for this user (agent tools are restricted to these)
   slackShipNotifyDisabled?: boolean; // When true, suppress the Slack ping when an item this user reported ships (shipNotifyService). Absent/false = enabled (default).
+  // Channel-neutral messaging configuration (ENG-273). ADDITIVE — the slack* fields
+  // above stay authoritative for users who have never configured a second channel,
+  // and messagingChannelService.normalizeUserChannels() folds them in at READ time.
+  // There is deliberately no migration or backfill: see that function's doc comment.
+  messagingChannels?: Array<{
+    channel: 'slack' | 'whatsapp';
+    destination: string; // Slack channel id, or E.164 phone for WhatsApp
+    enabled: boolean;
+    optIn?: { at: string; source: string; verifiedAt?: string }; // Required before first send where the channel demands it; verifiedAt = proved control of the number
+  }>;
   secrets?: Record<string, string>; // Encrypted per-user secrets (key → encrypted value)
   landerUtmDefault?: import("../utils/landerUtm").UtmConfig; // Customer-level UTM default for generated landers (ENG-724); read/write only via landerUtmStore
   seoDomains?: string[]; // SEO domains to track (e.g., ["example.com", "subdomain.example.com"])
@@ -463,6 +473,7 @@ export interface User {
     brandData: {
       brandName: string;
       tagline: string;
+      valueProposition?: string;
       domain?: string;
       primaryColor: string;
       primaryColorEnd: string;
@@ -490,8 +501,8 @@ export interface User {
     createdAt: string;
     updatedAt: string;
     /**
-     * Opaque identity of the write that produced this value, stamped only by
-     * the asset-delete path's conditional writes. `updatedAt` is millisecond
+     * Opaque identity of the write that produced this value, stamped by
+     * the asset-delete, brand-route and fill-only population writes. `updatedAt` is millisecond
      * granular and every other brand writer mints its own, so two writes can
      * share a stamp; pairing it with a revision lets a conditional write
      * identify the exact value it read. Absent on anything written by another
@@ -6762,14 +6773,19 @@ export const crmDb = {
     }
   },
 
-  async getLeadById(listId: string, leadId: string) {
+  async getLeadById(listId: string, leadId: string, opts?: { consistentRead?: boolean }) {
     try {
-      const params = {
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Key: {
           listId,
           leadId,
         },
+        // ENG-2082: opt-in, because the default eventually-consistent read is fine for the
+        // ordinary "fetch a lead" callers and half the price. It is NOT fine for a read that
+        // immediately follows a failed conditional write on the same key — the row is known
+        // to exist, and a stale miss there is indistinguishable from "no such lead".
+        ...(opts?.consistentRead ? { ConsistentRead: true } : {}),
       };
 
       const result = await dynamodb.get(params).promise();

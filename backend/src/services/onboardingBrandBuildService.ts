@@ -1,3 +1,4 @@
+import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 /**
  * Onboarding brand-build service.
  *
@@ -409,6 +410,7 @@ export async function triggerBrandBuildForUser(
   // ready-patch hook in agentModeService) and marketStrategy. Re-read the
   // user record and mirror marketStrategy → icpResult/competitorResult so
   // downstream UI + services hydrate.
+  await populateEmptyBrandGuidelines(userId);
   const updated = (await userDb.getUserById(userId)) as any;
   if (!updated) return;
 

@@ -1,3 +1,4 @@
+jest.mock('../services/brandGuidelinesPopulation', () => ({ populateEmptyBrandGuidelines: jest.fn().mockResolvedValue(undefined) }));
 /**
  * Onboarding Epic Phase 2 — ICP discovery service tests.
  *

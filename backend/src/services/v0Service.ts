@@ -22,6 +22,9 @@ import { STUCK_CEILING_MS } from "./durableLandingService";
 import { enqueueAutoHumanEval } from "./autoHumanEvalService";
 import { getPersistedBrandLogoUrl } from "./agentMode/brandLogo";
 import { getLandingPageLaunchReadiness } from "../utils/landingPageLaunchReadiness";
+// ENG-2087: syntax-only validation of generated modules (see findUnparseableModule).
+// Already a runtime dependency, not a devDependency.
+import * as ts from "typescript";
 export { getLandingPageLaunchReadiness } from "../utils/landingPageLaunchReadiness";
 
 // Note: global fetch (undici) timeouts are managed by httpClient.ts (15 min headersTimeout/bodyTimeout).
@@ -211,6 +214,47 @@ function startBuildHeartbeat(id: string): () => void {
 }
 
 /**
+ * ENG-2079: await a correction we are allowed to ship WITHOUT, and never let it fail the page.
+ *
+ * The enhancement corrections (Meta Pixel Lead event, Google Ads conversion, bridge-out
+ * redirect) each end in an explicit "still missing after retries — proceeding without it"
+ * fallback: a page that lacks them is degraded, not broken, and must still deploy. That
+ * fallback was unreachable whenever v0 answered the correction with no new version at all,
+ * because the failure happened at the AWAIT rather than at the check — waitForCompletedV0Version
+ * throws on deadline, and the outer catch marks the whole page `failed`.
+ *
+ * Observed live: a page whose form v0 could not attach a Lead event to (no lead-capture form
+ * on it) burned the full 34-attempt / ~17-minute budget and failed with "v0 is still generating
+ * or has stalled" — blaming v0 for a page that had already generated and validated fine.
+ *
+ * Returns the corrected version id, or undefined when no new version arrived. Undefined means
+ * "fall through and ship what we already validated"; the caller's existing `proceeding without
+ * it` path then runs unchanged. Deliberately NOT used for the validateV0Output correction,
+ * where un-correctable output genuinely must not ship.
+ */
+async function awaitOptionalV0Correction(
+  label: string,
+  wait: () => Promise<string | undefined>
+): Promise<string | undefined> {
+  try {
+    return await wait();
+  } catch (err: any) {
+    // A DEAD-END failure is not "v0 declined to answer" — it is v0 marking the version
+    // failed, or the whole build budget expiring. isDeadEndV0Failure exists so the caller
+    // frees the route identity and the retry mints a FRESH chat; swallowing it here would
+    // leave the dead chat on the record, let the remaining corrections each send another
+    // billed message to a chat that can never answer, and ship a page whose deadline was
+    // already blown. ENG-2079 targets the benign case only.
+    if (isDeadEndV0Failure(err)) throw err;
+    console.warn(
+      `[V0 SERVICE] ${label}: no corrected version arrived (${err?.message || err}). ` +
+        `Shipping the page without this correction rather than failing it.`
+    );
+    return undefined;
+  }
+}
+
+/**
  * Poll a v0 chat until its latest version reaches a terminal state and return the
  * completed version id.
  *
@@ -312,6 +356,26 @@ async function waitForCompletedV0Version(
 }
 
 // Vercel deployment polling config
+// ENG-2078 follow-up: the capture-route gate must be bounded independently of
+// pollVercelDeployment, which is bounded by ATTEMPT COUNT (60 x 5s) and not by wall clock —
+// with axios timeouts a superseded commit that never gets its own deployment can hold the
+// gate far longer than the ~30-40s the gate is documented to cost.
+let captureRouteGateMaxMs = 90_000;
+// And when the poll comes back anything other than READY-for-our-commit, the route is NOT
+// known to be live: Vercel auto-cancels a superseded deployment, and pollVercelDeployment
+// maps CANCELED to `error` and returns on its FIRST tick. Resolving there would reopen the
+// exact race ENG-2078 closed, so a non-ready outcome buys a bounded settle window instead.
+let captureRouteSettleMs = 45_000;
+
+/** Test hook: keeps the gate's waits out of unit-test wall-clock. */
+export function setCaptureRouteGateConfig(maxMs: number, settleMs: number): void {
+  captureRouteGateMaxMs = maxMs;
+  captureRouteSettleMs = settleMs;
+}
+
+const sleepMs = (ms: number): Promise<void> =>
+  ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
+
 let vercelPollIntervalMs = 5_000;
 let vercelPollMaxAttempts = 60;
 
@@ -588,6 +652,16 @@ export interface GeneratedLandingPage {
     pixelFired?: boolean;
     checkedAt: string;
     error?: string;
+    /**
+     * ENG-2081: why the submit produced no lead, persisted rather than left only in the
+     * Slack alert text. `ok:false, leadCaptured:false` alone cannot distinguish "this page
+     * has no lead form at all" (nothing to fix in capture — the PAGE is the problem) from
+     * "a form submitted and the row never landed" (a real capture/CRM problem). Those need
+     * opposite responses, and the alert that carried the difference is ephemeral.
+     */
+    noFormOnPage?: boolean;
+    authFormOnly?: boolean;
+    iframeCount?: number;
     /** ENG-449: handoff id extracted from a cross-origin chat-handoff redirect
      * (chat.waterheater.app/text?handoff_id=...) accepted in place of a CRM row.
      * Persisted so the handoff can be verified against the chat/handoff backend. */
@@ -1983,6 +2057,29 @@ async function addPageToExistingRepo(
 
       try {
         validateV0Output(previewFiles);
+        
+        // ENG-2080: the enhancement corrections below all ask v0 to fix "the lead capture
+        // form". On a page that has none, that request can never be satisfied, v0 returns no
+        // new version, and each correction burns its full ~17-minute wait for nothing. Skip
+        // them and fall straight to the existing "proceeding without it" reporting.
+        const shippedHasCaptureForm = hasLeadCaptureForm(remapFilesForSubPage(previewFiles, slug, name));
+
+        // ENG-2082: the most basic completeness check of all, and the one that was missing.
+        // /api/capture rejects any submission without an email (routes/webhooks.ts returns
+        // 400 "Email is required" before a lead row is ever built), so a form that collects
+        // only, say, a phone number is structurally incapable of producing a lead — and the
+        // generator will build one whenever asked. Reported loudly here rather than corrected:
+        // making v0 add a field the user did not ask for is a product decision, and the
+        // correction round-trip needs fixture work across this suite. Tracked on ENG-2082.
+        if (shippedHasCaptureForm) {
+          const contactCheck = validateCaptureFormHasContactField(remapFilesForSubPage(previewFiles, slug, name));
+          if (!contactCheck.ok) {
+            console.error(
+              `[V0 SERVICE] ENG-2082: capture form for /${slug} collects NO email and NO phone — ` +
+                `every submission will be rejected and this page will capture zero leads: ${contactCheck.reason}`
+            );
+          }
+        }
 
         // Same verify-and-retry as deployLandingPage — a sub-page has its OWN form
         // component, so the Lead event must be checked here too, not just on the first page.
@@ -1993,7 +2090,7 @@ async function addPageToExistingRepo(
           // contain something matching the fbq('track','Lead') regex, which used to make
           // this check pass against code that never reaches the deployed site at all.
           const pixelCheck = validatePixelLeadEvent(remapFilesForSubPage(previewFiles, slug, name));
-          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
             console.warn(`[V0 SERVICE] Meta Pixel Lead event missing for /${slug} (attempt ${validationAttempt + 1}): ${pixelCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -2017,18 +2114,21 @@ async function addPageToExistingRepo(
               ),
             });
 
-            versionId = await waitForCompletedV0Version(
-              v0,
-              chatId,
+            const correctedVersionId = await awaitOptionalV0Correction(
               `v0 correction (pixel lead event) for /${slug}`,
-              {
-                heartbeat: () => touchLandingPageRecord(id),
-                deadline: buildDeadline,
-                afterVersionId: versionId,
-              }
+              () =>
+                waitForCompletedV0Version(v0, chatId, `v0 correction (pixel lead event) for /${slug}`, {
+                  heartbeat: () => touchLandingPageRecord(id),
+                  deadline: buildDeadline,
+                  afterVersionId: versionId,
+                })
             );
-
-            continue;
+            // undefined = v0 never produced a corrected version. Fall through to the
+            // `proceeding without it` path below instead of failing the whole page.
+            if (correctedVersionId) {
+              versionId = correctedVersionId;
+              continue;
+            }
           }
           pixelLeadEventVerified = pixelCheck.ok;
           if (!pixelCheck.ok) {
@@ -2047,7 +2147,7 @@ async function addPageToExistingRepo(
         // which would satisfy the inline-pattern arm against code the site never sees.
         if (subPageGoogleAds) {
           const adsCheck = validateGoogleAdsConversion(remapFilesForSubPage(previewFiles, slug, name));
-          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
             console.warn(`[V0 SERVICE] Google Ads conversion call missing for /${slug} (attempt ${validationAttempt + 1}): ${adsCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -2072,18 +2172,21 @@ async function addPageToExistingRepo(
               ),
             });
 
-            versionId = await waitForCompletedV0Version(
-              v0,
-              chatId!,
+            const correctedVersionId = await awaitOptionalV0Correction(
               "v0 correction (google ads conversion, sub-page)",
-              {
-                heartbeat: () => touchLandingPageRecord(id),
-                deadline: buildDeadline,
-                afterVersionId: versionId,
-              }
+              () =>
+                waitForCompletedV0Version(v0, chatId!, "v0 correction (google ads conversion, sub-page)", {
+                  heartbeat: () => touchLandingPageRecord(id),
+                  deadline: buildDeadline,
+                  afterVersionId: versionId,
+                })
             );
-
-            continue;
+            // undefined = v0 never produced a corrected version. Fall through to the
+            // `proceeding without it` path below instead of failing the whole page.
+            if (correctedVersionId) {
+              versionId = correctedVersionId;
+              continue;
+            }
           }
           if (!adsCheck.ok) {
             console.warn(`[V0 SERVICE] Google Ads conversion call still missing for /${slug} after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
@@ -2093,7 +2196,7 @@ async function addPageToExistingRepo(
         if (leadListId && bridgeOutUrl) {
           // Same post-remap file set rationale as the pixel check above (ENG-482).
           const bridgeCheck = validateBridgeOutRedirect(remapFilesForSubPage(previewFiles, slug, name), bridgeOutUrl);
-          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
             console.warn(`[V0 SERVICE] Bridge-out redirect missing for /${slug} (attempt ${validationAttempt + 1}): ${bridgeCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -2116,18 +2219,21 @@ async function addPageToExistingRepo(
               ),
             });
 
-            versionId = await waitForCompletedV0Version(
-              v0,
-              chatId,
+            const correctedVersionId = await awaitOptionalV0Correction(
               `v0 correction (bridge-out redirect) for /${slug}`,
-              {
-                heartbeat: () => touchLandingPageRecord(id),
-                deadline: buildDeadline,
-                afterVersionId: versionId,
-              }
+              () =>
+                waitForCompletedV0Version(v0, chatId, `v0 correction (bridge-out redirect) for /${slug}`, {
+                  heartbeat: () => touchLandingPageRecord(id),
+                  deadline: buildDeadline,
+                  afterVersionId: versionId,
+                })
             );
-
-            continue;
+            // undefined = v0 never produced a corrected version. Fall through to the
+            // `proceeding without it` path below instead of failing the whole page.
+            if (correctedVersionId) {
+              versionId = correctedVersionId;
+              continue;
+            }
           }
           bridgeOutVerified = bridgeCheck.ok;
           if (!bridgeCheck.ok) {
@@ -2568,6 +2674,19 @@ async function addPageToExistingRepo(
         // lands means submitting to a route that does not yet know this page's path.
         const { pushedCommitSha, pushTimestampMs } = syncResult;
         captureRouteBuild = pollVercelDeployment(existingPage.vercelProjectId!, vercelToken, pushTimestampMs, pushedCommitSha)
+          .then(async (syncDeployResult) => {
+            // Only a READY build for THIS commit proves the route now carries this page's
+            // path. Anything else — ERROR, CANCELED (auto-cancel on supersession, returned
+            // on the first tick), or the attempt budget running out — means we do not know,
+            // and proceeding immediately is how the original race behaved. Wait out a
+            // bounded settle window so a superseding build has a chance to land, then run
+            // the smoke test regardless; a late smoke test is recoverable, a false
+            // `ok: false` on every page is not.
+            if (syncDeployResult.buildStatus !== "ready") {
+              await sleepMs(captureRouteSettleMs);
+            }
+            return syncDeployResult;
+          })
           .then((syncDeployResult) => {
             if (syncDeployResult.buildStatus === "error") {
               console.error(
@@ -2590,6 +2709,12 @@ async function addPageToExistingRepo(
               pollErr?.message || pollErr
             );
           });
+
+        // Independent wall-clock cap. pollVercelDeployment is bounded by attempt count, not
+        // time, so without this the detached smoke dispatch can sit far past the gate's
+        // documented cost. Whichever finishes first wins; the smoke test then runs either
+        // way, because a delayed check beats a check that never happens.
+        captureRouteBuild = Promise.race([captureRouteBuild, sleepMs(captureRouteGateMaxMs)]);
       }
     } catch (syncErr: any) {
       console.error(
@@ -3089,7 +3214,7 @@ export async function deployLandingPage(
       ? ["generating", "draft", "failed", "deploying"]
       : ["draft", "failed", "deploying"];
   if (!deployableStatuses.includes(record.status)) {
-    throw new Error(`Cannot deploy a landing page with status: ${record.status}`);
+    throw new LandingPageNotDeployableError(record.status);
   }
 
   // Sub-pages (those with a slug) are always added to the existing repo — they must
@@ -3155,6 +3280,29 @@ export async function deployLandingPage(
 
       try {
         validateV0Output(previewFiles);
+        
+        // ENG-2080: the enhancement corrections below all ask v0 to fix "the lead capture
+        // form". On a page that has none, that request can never be satisfied, v0 returns no
+        // new version, and each correction burns its full ~17-minute wait for nothing. Skip
+        // them and fall straight to the existing "proceeding without it" reporting.
+        const shippedHasCaptureForm = hasLeadCaptureForm(previewFiles);
+
+        // ENG-2082: the most basic completeness check of all, and the one that was missing.
+        // /api/capture rejects any submission without an email (routes/webhooks.ts returns
+        // 400 "Email is required" before a lead row is ever built), so a form that collects
+        // only, say, a phone number is structurally incapable of producing a lead — and the
+        // generator will build one whenever asked. Reported loudly here rather than corrected:
+        // making v0 add a field the user did not ask for is a product decision, and the
+        // correction round-trip needs fixture work across this suite. Tracked on ENG-2082.
+        if (shippedHasCaptureForm) {
+          const contactCheck = validateCaptureFormHasContactField(previewFiles);
+          if (!contactCheck.ok) {
+            console.error(
+              `[V0 SERVICE] ENG-2082: capture form for the root page collects NO email and NO phone — ` +
+                `every submission will be rejected and this page will capture zero leads: ${contactCheck.reason}`
+            );
+          }
+        }
 
         // v0 authors the form component freeform — there's no platform-owned seam
         // to guarantee the Lead event the way layout.tsx injection guarantees the base pixel.
@@ -3162,7 +3310,7 @@ export async function deployLandingPage(
         // missing. Exhausted retries must NOT fail generation — just record the miss.
         if (record.metaPixelId) {
           const pixelCheck = validatePixelLeadEvent(previewFiles);
-          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
             console.warn(`[V0 SERVICE] Meta Pixel Lead event missing (attempt ${validationAttempt + 1}): ${pixelCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -3186,18 +3334,21 @@ export async function deployLandingPage(
               ),
             });
 
-            versionId = await waitForCompletedV0Version(
-              v0,
-              record.v0ChatId!,
+            const correctedVersionId = await awaitOptionalV0Correction(
               "v0 correction (pixel lead event)",
-              {
-                heartbeat: () => touchLandingPageRecord(id),
-                deadline: buildDeadline,
-                afterVersionId: versionId,
-              }
+              () =>
+                waitForCompletedV0Version(v0, record.v0ChatId!, "v0 correction (pixel lead event)", {
+                  heartbeat: () => touchLandingPageRecord(id),
+                  deadline: buildDeadline,
+                  afterVersionId: versionId,
+                })
             );
-
-            continue;
+            // undefined = v0 never produced a corrected version. Fall through to the
+            // `proceeding without it` path below instead of failing the whole page.
+            if (correctedVersionId) {
+              versionId = correctedVersionId;
+              continue;
+            }
           }
           pixelLeadEventVerified = pixelCheck.ok;
           if (!pixelCheck.ok) {
@@ -3211,7 +3362,7 @@ export async function deployLandingPage(
         // something that does nothing.
         if (record.googleAdsConversionId && record.googleAdsConversionLabel) {
           const adsCheck = validateGoogleAdsConversion(previewFiles);
-          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
             console.warn(`[V0 SERVICE] Google Ads conversion call missing (attempt ${validationAttempt + 1}): ${adsCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -3236,18 +3387,21 @@ export async function deployLandingPage(
               ),
             });
 
-            versionId = await waitForCompletedV0Version(
-              v0,
-              record.v0ChatId!,
+            const correctedVersionId = await awaitOptionalV0Correction(
               "v0 correction (google ads conversion)",
-              {
-                heartbeat: () => touchLandingPageRecord(id),
-                deadline: buildDeadline,
-                afterVersionId: versionId,
-              }
+              () =>
+                waitForCompletedV0Version(v0, record.v0ChatId!, "v0 correction (google ads conversion)", {
+                  heartbeat: () => touchLandingPageRecord(id),
+                  deadline: buildDeadline,
+                  afterVersionId: versionId,
+                })
             );
-
-            continue;
+            // undefined = v0 never produced a corrected version. Fall through to the
+            // `proceeding without it` path below instead of failing the whole page.
+            if (correctedVersionId) {
+              versionId = correctedVersionId;
+              continue;
+            }
           }
           if (!adsCheck.ok) {
             // Never fails generation, same as the pixel path: a lander that captures leads
@@ -3259,7 +3413,7 @@ export async function deployLandingPage(
 
         if (record.leadListId && record.bridgeOutUrl) {
           const bridgeCheck = validateBridgeOutRedirect(previewFiles, record.bridgeOutUrl);
-          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm) {
             console.warn(`[V0 SERVICE] Bridge-out redirect missing (attempt ${validationAttempt + 1}): ${bridgeCheck.reason}`);
 
             await guardedV0CorrectionMessage({
@@ -3282,18 +3436,21 @@ export async function deployLandingPage(
               ),
             });
 
-            versionId = await waitForCompletedV0Version(
-              v0,
-              record.v0ChatId!,
+            const correctedVersionId = await awaitOptionalV0Correction(
               "v0 correction (bridge-out redirect)",
-              {
-                heartbeat: () => touchLandingPageRecord(id),
-                deadline: buildDeadline,
-                afterVersionId: versionId,
-              }
+              () =>
+                waitForCompletedV0Version(v0, record.v0ChatId!, "v0 correction (bridge-out redirect)", {
+                  heartbeat: () => touchLandingPageRecord(id),
+                  deadline: buildDeadline,
+                  afterVersionId: versionId,
+                })
             );
-
-            continue;
+            // undefined = v0 never produced a corrected version. Fall through to the
+            // `proceeding without it` path below instead of failing the whole page.
+            if (correctedVersionId) {
+              versionId = correctedVersionId;
+              continue;
+            }
           }
           bridgeOutVerified = bridgeCheck.ok;
           if (!bridgeCheck.ok) {
@@ -3707,6 +3864,27 @@ export function autoFixV0Files(files: Array<{ path: string; content: Buffer }>):
 // v0 output validation — catches "prompts instead of code", empty files, garbage
 // ---------------------------------------------------------------------------
 
+/**
+ * ENG-2083: refusing to redeploy a page that is already `deployed` is a PRECONDITION
+ * failure, not a server fault. It was a bare Error, and the route's only classifier is
+ * `error.message?.includes("not found") ? 404 : 500` — so a deliberate, well-understood
+ * refusal came back as a 500. That lands in error monitoring as a crash, and tells callers
+ * (and their retry logic) that the server broke and the request is worth repeating, when
+ * in fact repeating it can never succeed.
+ *
+ * Message text is deliberately unchanged — callers and tests already match on it.
+ */
+export class LandingPageNotDeployableError extends Error {
+  /** Same rationale as V0OutputValidationError.code: survives re-wrapping across a throw
+   *  boundary, where `instanceof` does not. */
+  readonly code = "LP_NOT_DEPLOYABLE";
+  readonly httpStatus = 409;
+  constructor(public readonly pageStatus: string) {
+    super(`Cannot deploy a landing page with status: ${pageStatus}`);
+    this.name = "LandingPageNotDeployableError";
+  }
+}
+
 export class V0OutputValidationError extends Error {
   /**
    * Carried as a `code` (not just a prototype) so it survives being re-wrapped across a
@@ -3905,6 +4083,59 @@ function resolveInternalImportFile(
  * false-positive on a real, well-named page that merely leaves a stray component unused. Together
  * they fire only on the actual blank-page bug. Pure and exported for direct unit testing.
  */
+/**
+ * ENG-2087: the first generated module that does not parse, or null when they all do.
+ *
+ * Deliberately syntax-only. `transpileModule` reports parse diagnostics and never type errors,
+ * so an import of a dependency this function cannot resolve is not an error here — only source
+ * that no compiler could read. Every file is parsed as TSX, which is a superset of what v0 emits
+ * for these paths.
+ */
+export function findUnparseableModule(
+  files: Array<{ path: string; content: Buffer }>
+): { path: string; reason: string } | null {
+  for (const file of files) {
+    if (!/\.(tsx|ts|jsx|js)$/.test(file.path)) continue;
+    // A declaration file emits nothing, and transpileModule treats "nothing to emit" as an
+    // internal Debug.assert — it throws a bare Error rather than returning a diagnostic.
+    // v0 zips do carry these (remapFilesForSubPage's own skip list names next-env.d.ts), and
+    // a bare Error is not a V0OutputValidationError, so it would bypass the correction retry
+    // and fail the page outright with "Debug Failure. Output generation failed".
+    if (/\.d\.ts$/.test(file.path)) continue;
+
+    let result: ReturnType<typeof ts.transpileModule>;
+    try {
+      result = ts.transpileModule(file.content.toString("utf-8"), {
+        fileName: file.path,
+        reportDiagnostics: true,
+        compilerOptions: {
+          jsx: ts.JsxEmit.Preserve,
+          target: ts.ScriptTarget.ESNext,
+          module: ts.ModuleKind.ESNext,
+        },
+      });
+    } catch (err: any) {
+      // FAIL OPEN, deliberately. This check exists to stop unparseable code reaching a
+      // commit; it must never be the thing that fails a generation. Any throw here is a
+      // compiler-internal surprise, not evidence about the customer's code, so treat the
+      // file as fine and let the remaining checks (and the build itself) speak.
+      console.warn(
+        `[V0 SERVICE] ENG-2087: parse check could not run on ${file.path} (${err?.message || err}) — treating as parseable.`
+      );
+      continue;
+    }
+
+    const error = (result.diagnostics || []).find((d) => d.category === ts.DiagnosticCategory.Error);
+    if (error) {
+      return {
+        path: file.path,
+        reason: ts.flattenDiagnosticMessageText(error.messageText, " "),
+      };
+    }
+  }
+  return null;
+}
+
 export function detectIncompleteSyntheticPage(
   files: Array<{ path: string; content: Buffer }>
 ): { entryPath: string; orphaned: string[] } | null {
@@ -3945,6 +4176,23 @@ export function detectIncompleteSyntheticPage(
   // primitives (leaf building blocks legitimately imported by sections, not by the page), and
   // provider/util-ish files are not sections — both are excluded so only real orphaned content
   // (hero, features, pricing, …) counts.
+  // ENG-2087: gate 2 below asks "did the stub orphan a section?". When the generation
+  // produced NO section components at all, that question has no answer and the page silently
+  // passed — which is how a stub with nothing behind it reached a live repo. A synthetic
+  // marker with zero sections is not the healthy single-component case this gate was relaxed
+  // for; it is the stub, with nothing to compose. Flag it.
+  // Counted with the SAME exclusions the orphan loop below applies — shadcn primitives under
+  // ui/ and provider/util-ish files are not sections. The live case had exactly one component,
+  // `_components/theme-provider.tsx`, which is excluded there and so must be excluded here too;
+  // counting it as a section is what let the stub through.
+  const isSectionComponent = (p: string): boolean => {
+    if (!p.endsWith(".tsx")) return false;
+    if (!p.startsWith("components/") && !/\/_components\//.test(p)) return false;
+    if (/(^|\/)ui\//.test(p)) return false;
+    return !NON_SECTION_COMPONENT_NAME.test(path.posix.basename(p).replace(/\.tsx$/, ""));
+  };
+  const sectionCount = files.filter((f) => isSectionComponent(f.path)).length;
+
   const orphaned: string[] = [];
   for (const file of files) {
     const p = file.path;
@@ -3956,6 +4204,22 @@ export function detectIncompleteSyntheticPage(
     if (NON_SECTION_COMPONENT_NAME.test(base)) continue;
     orphaned.push(p);
   }
+
+  // A synthetic stub with no sections at all has nothing to orphan, so the gate below could
+  // never fire for it (ENG-2087). Report it with an empty `orphaned` list — the caller's message
+  // already names the entry, which is the actionable part.
+  // ENG-2087 follow-up: `sectionCount` uses the orphan loop's filter, which is much narrower
+  // than "a section" — it misses .jsx, `app/components/hero.tsx` (starts with neither
+  // `components/` nor `/_components/`), and any basename the UNANCHORED
+  // NON_SECTION_COMPONENT_NAME matches as a substring (`service-types`, `config-panel`).
+  // In the orphan loop that narrowness is harmless: an invisible file simply is not reported.
+  // Here it inverts — invisible means FAIL — so a healthy marker page that renders one
+  // legitimately-named component would be rejected and could fail the generation.
+  //
+  // The reachability conjunct is what actually separates the two: a stub has nothing behind
+  // it, while a healthy marker page reaches its component no matter where that component
+  // lives or what it is called.
+  if (sectionCount === 0 && reachable.size <= 1) return { entryPath, orphaned: [] };
 
   return orphaned.length > 0 ? { entryPath, orphaned } : null;
 }
@@ -4208,11 +4472,36 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
   // for the top bar. Detect the stub + orphaned sections and reject so the retry loop asks v0 to
   // compose the real page. Distinct failure class from ENG-374/384 (both build FAILURES); this
   // one deploys silently, which is exactly why it recurs unnoticed.
+  // ENG-2087: does every generated module actually PARSE?
+  //
+  // Checks 1-7 are all shape heuristics — they ask whether the text looks like React, not
+  // whether it is syntactically valid. A stub of the form `import  from ".."` / `return < />`
+  // satisfies every one of them (it has `export`, a `function`, no markdown, resolvable-looking
+  // imports) and was committed to a live site repo. It does not merely render blank: it fails
+  // `npm run build`, so EVERY subsequent deploy of that site fails — for every sibling page —
+  // until somebody deletes it. Observed live: one bad generation, then an unrelated page two
+  // minutes later failing with a syntax error pointing at a file its author never touched.
+  //
+  // Syntactic diagnostics only (transpileModule reports no type errors), so this cannot reject
+  // code that merely fails to typecheck against deps we do not resolve here — verified against
+  // TSX generics, the classic false-positive for a hand-rolled parser.
+  const unparseable = findUnparseableModule(files);
+  if (unparseable) {
+    throw new V0OutputValidationError(
+      `${unparseable.path} is not valid TypeScript/JSX and would fail the build for the whole ` +
+      `site, not just this page: ${unparseable.reason}. Regenerate the file as complete, ` +
+      `syntactically valid React.`
+    );
+  }
+
   const incomplete = detectIncompleteSyntheticPage(files);
   if (incomplete) {
     throw new V0OutputValidationError(
       `${incomplete.entryPath} is a placeholder page (${SYNTHETIC_V0_PAGE_MARKER}) that renders only one ` +
-      `component; these generated section components are never rendered: ${incomplete.orphaned.join(", ")}. ` +
+      (incomplete.orphaned.length > 0
+        ? `component; these generated section components are never rendered: ${incomplete.orphaned.join(", ")}. `
+        // ENG-2087: no sections were generated at all, so there is nothing orphaned to name.
+        : `component, and no page sections were generated at all. `) +
       `Rewrite ${incomplete.entryPath} to import and render the full page — compose ALL generated sections ` +
       `(e.g. hero, features, how-it-works, testimonials, pricing, signup, footer), not just the nav.`
     );
@@ -4231,6 +4520,71 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
  * whether to send a correction message and retry; if retries are exhausted, generation must
  * still proceed (AC3 — never fail generation over a missing client-side event).
  */
+/**
+ * ENG-2080: does this page actually have a lead-capture form?
+ *
+ * Keyed on the POST to /api/capture, which is the platform-owned contract every generated
+ * capture form uses — not on the presence of a <form> tag, which a login form or a search
+ * box would also satisfy.
+ *
+ * Used to skip the enhancement corrections (Meta Pixel Lead event, Google Ads conversion,
+ * bridge-out redirect) on a page that has no form for them to attach to. Those corrections
+ * ask v0 to "fix the lead capture form"; with no such form the request is unsatisfiable,
+ * v0 returns no new version, and the wait burns its whole ~17-minute budget before the
+ * caller can fall through. ENG-2079 stopped that from FAILING the page; this stops the
+ * pointless wait from happening at all.
+ */
+export function hasLeadCaptureForm(files: Array<{ path: string; content: Buffer }>): boolean {
+  const source = files
+    .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
+    .map((f) => f.content.toString("utf-8"))
+    .join("\n");
+  // Any reference to the path in shipped source, not only the prescribed
+  // `fetch('/api/capture', …)` idiom. A false NEGATIVE here silently disables all three
+  // enhancement corrections AND the ENG-2082 contact-field warning on a page that really
+  // does capture — so a customer paying for conversion tracking would ship without it,
+  // recorded only as a console.warn. Probed misses for the narrow form: axios.post(),
+  // a template literal (`${base}/api/capture`), a hoisted const, and <form action=…>.
+  // `}` covers a template literal that interpolates a base (`${base}/api/capture`). A bare
+  // occurrence is deliberately NOT matched: lib/agentweb-track.ts ships with every page and
+  // mentions the path twice in COMMENTS, so matching unquoted text would make every page
+  // look like it captures and would silently undo the gate above.
+  return /["'`}]\/api\/capture\b/.test(source);
+}
+
+/**
+ * ENG-2082: does the capture form collect anything we can actually contact the lead by?
+ *
+ * /api/capture accepts a submission carrying an email OR a phone and rejects one carrying
+ * neither, because a lead nobody can reach is not a lead. A generated form that asks only
+ * for, say, a name is therefore structurally incapable of producing one — and the generator
+ * will build it whenever asked, with nothing telling the owner until the leads never arrive.
+ *
+ * This deliberately accepts phone-only: requiring an email specifically is what made an
+ * ordinary phone-only lander impossible, and the capture route no longer does.
+ *
+ * Mirrors validatePixelLeadEvent's contract — verified, not guaranteed. Only meaningful on a
+ * page that HAS a capture form; see hasLeadCaptureForm.
+ */
+export function validateCaptureFormHasContactField(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
+  const source = files
+    .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
+    .map((f) => f.content.toString("utf-8"))
+    .join("\n");
+
+  // Either an input of that type or a field of that name — both are how v0 emits them, and
+  // the name is what the capture route reads off the JSON body.
+  const hasEmail = /type\s*=\s*["'`]email["'`]/.test(source) || /name\s*=\s*["'`]email["'`]/.test(source);
+  const hasPhone = /type\s*=\s*["'`]tel["'`]/.test(source) || /name\s*=\s*["'`]phone["'`]/.test(source);
+  if (!hasEmail && !hasPhone) {
+    return {
+      ok: false,
+      reason: "capture form collects neither an email nor a phone, and /api/capture rejects a submission carrying neither",
+    };
+  }
+  return { ok: true };
+}
+
 export function validatePixelLeadEvent(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
   const tsxSource = files
     .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))

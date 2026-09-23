@@ -217,6 +217,16 @@ describe('apiTools', () => {
   });
 
   describe('manage_brand - update', () => {
+    it.each([
+      [{ mission: 'Make IT easy' }, { valueProposition: 'Make IT easy' }],
+      [{ tone_of_voice: 'Direct', target_audience: 'IT teams', key_messages: ['Simplify IT'] },
+       { toneOfVoice: 'Direct', targetAudience: 'IT teams', keyMessages: ['Simplify IT'] }],
+    ])('maps persisted brand fields %j', async (input, expected) => {
+      mockMcpFetch.mockResolvedValue({ success: true });
+      await mcpToolRegistry.execute('manage_brand', { action: 'update', ...input }, context);
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({ body: expected }));
+    });
+
     it('should call POST /api/brand/guidelines with body', async () => {
       mockMcpFetch.mockResolvedValue({ success: true });
 
@@ -227,7 +237,7 @@ describe('apiTools', () => {
       expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
         method: 'POST',
         path: '/api/brand/guidelines',
-        body: { company_name: 'New Corp' },
+        body: { brandName: 'New Corp' },
       }));
     });
   });

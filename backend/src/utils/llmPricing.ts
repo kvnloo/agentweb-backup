@@ -26,7 +26,7 @@
  * pins a fingerprint of the tables to this version, so a price change that
  * forgets the bump fails the build instead of silently sharing a version.
  */
-export const LLM_PRICE_BOOK_VERSION = "2026-09-10";
+export const LLM_PRICE_BOOK_VERSION = "2026-09-22";
 
 /** The rate provenance a spend event carries when this book priced it. */
 export const LLM_PRICE_BOOK_PROVENANCE = `llm-price-book:${LLM_PRICE_BOOK_VERSION}`;
@@ -121,6 +121,13 @@ const HAIKU_4_5_PRICE = withDerivedCache(1, 5);
 // over-bills 4x. cacheWritePerM is left on the standard 125%-of-input
 // convention (Anthropic did not publish a changed write rate).
 const FABLE_5_1_PRICE: ModelPrice = { ...withDerivedCache(10, 50), cacheReadPerM: 0.25 };
+// Claude Opus 5.5 (released 2026-09-22): Anthropic list $4/$20 per 1M
+// in/out (20% below Opus 5), cache-read $0.20/1M (60% below Opus 5,
+// openrouter.ai/anthropic/claude-opus-5.5 live 2026-09-22). The 5%-of-input
+// read rate breaks withDerivedCache's 10% convention, so it is overridden
+// explicitly — same pattern as FABLE_5_1_PRICE above. Write stays on the
+// standard 125% convention (Anthropic published no changed write rate).
+const OPUS_5_5_PRICE: ModelPrice = { ...withDerivedCache(4, 20), cacheReadPerM: 0.2 };
 // Gemini 3.8 Flash (released 2026-09-02): same $0.75/$3.75 base rate as
 // Gemini 3.7 Flash, confirmed live on openrouter.ai 2026-09-02. Cache-read
 // follows the standard 10%-of-input convention ($0.075/1M — matches live).
@@ -276,6 +283,17 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // mode's default provider). FABLE_5_1_PRICE already encodes the override;
   // reused here (not re-derived) so the two ids can never drift on price.
   'openrouter/anthropic/claude-fable-5.1': FABLE_5_1_PRICE,
+  // Claude Opus 5.5 (released 2026-09-22), OpenRouter-routed per ENG-9 —
+  // same pattern as Fable 5.1 above. OpenRouter `usage.cost` remains the
+  // per-call authority; this entry is the pre-call estimate + BYOK fallback.
+  'openrouter/anthropic/claude-opus-5.5': OPUS_5_5_PRICE,
+  // 2026-09-22 adds, live-verified against openrouter.ai model pricing.
+  // Sol/Luna cache rates match the 10%/125% convention exactly. Grok 4.7's
+  // cache read is 25% of input ($0.40), so it is overridden. None model the
+  // >272k (OpenAI) / >200k (xAI) long-context 2x tier — same gap as ENG-1774.
+  'openrouter/openai/gpt-6-sol': withDerivedCache(2.0, 10.0),
+  'openrouter/openai/gpt-6-luna': withDerivedCache(0.1, 0.5),
+  'openrouter/x-ai/grok-4.7': { ...withDerivedCache(1.6, 4.8), cacheReadPerM: 0.4 },
   'openrouter/x-ai/grok-4.6': withDerivedCache(2.0, 6.0), // was $3/$15 — stale, ~2x over live
   'openrouter/deepseek/deepseek-v4-pro': withDerivedCache(0.657, 1.315), // live "62% off" promo; lowest-confidence entry in this batch — the promo makes list price hard to reconstruct cleanly, re-verify if this model becomes cost-sensitive
   'openrouter/deepseek/deepseek-v4-flash': withDerivedCache(0.068, 0.168), // was ~2x over live

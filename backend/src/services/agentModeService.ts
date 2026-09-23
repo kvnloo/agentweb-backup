@@ -1,3 +1,4 @@
+import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
@@ -60,6 +61,7 @@ import {
 import {
   assertOpenRouterToolsSupported,
   openRouterIgnoredProviders,
+  openRouterPreferredProviders,
   selectOpenRouterSamplingParams,
 } from './agentMode/openRouterRequestParams';
 import {
@@ -1059,21 +1061,21 @@ export function tierFromCostScore(costScore: number): ModelTier {
  * Quality-score band boundaries backing the picker's quality tier grouping
  * (ENG-1789, 2026-09-06). Independent axis from TIER_COST_SCORE_BANDS above:
  * that one groups by costScore (what we charge), this one groups by
- * qualityScore (AA Intelligence Index v4.2, re-snapshotted ENG-1786).
+ * qualityScore (AA Intelligence Index v4.3.2, re-snapshotted 2026-09-22).
  * Harsha's directive: "fable + astra are flagship, opus + 5.6 sol are pro,
- * sonnet + 5.6 terra are mid, haiku + 5.6 luna are low." Solved for
- * thresholds against the live v4.2 scores (Fable 57, Astra 55, Opus 5 54,
- * Sol 51, Sonnet 5 45, Terra 47, Haiku 17, Luna 43) with ties resolving to
- * the higher band (Harsha, 2026-09-06): ultra_premium >=55, pro >=51,
- * medium >=45, cheap >=17, ultra_cheap below. Same ModelTier union and
- * >= / highest-band-first shape as the cost bands so the two stay
- * structurally identical even though they measure different things.
+ * sonnet + 5.6 terra are mid, haiku + 5.6 luna are low." Re-solved against
+ * the v4.3.2 scores (Fable 53, Astra 53, Opus 5 51, Sol 47, Terra 42,
+ * Sonnet 5 38, Luna 38, Haiku 15), which run ~5-8 points below v4.2. One
+ * conflict is unavoidable: Sonnet 5 and GPT-5.6 Luna now tie at 38, so ties
+ * resolve to the higher band (Harsha, 2026-09-06) and Luna moves up to mid.
+ * ultra_premium >=53, pro >=47, medium >=38, cheap >=15, ultra_cheap below.
+ * Same ModelTier union and >= / highest-band-first shape as the cost bands.
  */
 export const QUALITY_SCORE_BANDS: ReadonlyArray<{ tier: ModelTier; minQualityScore: number }> = [
-  { tier: 'ultra_premium', minQualityScore: 55 },
-  { tier: 'pro', minQualityScore: 51 },
-  { tier: 'medium', minQualityScore: 45 },
-  { tier: 'cheap', minQualityScore: 17 },
+  { tier: 'ultra_premium', minQualityScore: 53 },
+  { tier: 'pro', minQualityScore: 47 },
+  { tier: 'medium', minQualityScore: 38 },
+  { tier: 'cheap', minQualityScore: 15 },
   { tier: 'ultra_cheap', minQualityScore: 0 },
 ];
 
@@ -2907,6 +2909,8 @@ export class AgentModeService {
     }
 
     params.provider = { allow_fallbacks: true, require_parameters: true };
+    const preferredProviders = openRouterPreferredProviders(upstreamModel);
+    if (preferredProviders.length > 0) params.provider.order = preferredProviders;
     const ignoredProviders = openRouterIgnoredProviders(upstreamModel);
     if (ignoredProviders.length > 0) {
       // Stopgap for ENG-1702 (parent: ENG-753). Our BYOK Google credential is
@@ -11622,6 +11626,8 @@ export class AgentModeService {
       // Prepare market strategy data - merge with existing if available
       const updateTimestamp = new Date().toISOString();
       const marketStrategyData = {
+        ...existingMarketStrategy,
+        ...otherFields,
         businessOverview: businessOverview !== undefined ? businessOverview : (existingMarketStrategy?.businessOverview || ''),
         competitors: mergedCompetitors,
         icp: mergedICP,
@@ -11640,6 +11646,8 @@ export class AgentModeService {
       } else {
         await userDb.updateUser(userId, { marketStrategy: marketStrategyData });
       }
+
+      await populateEmptyBrandGuidelines(userId);
 
       // Track what was updated vs added
       const updatedEntries: string[] = [];
