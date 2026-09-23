@@ -3253,6 +3253,18 @@ async function syncLeadCaptureForPage(
       rootRecord?.metaPixelId,
       rootRecord?.metaAdAccountId,
     );
+    // captureRouteSkipped first: its contract states that NEITHER `committed` nor
+    // `up-to-date` implies the route carries this page's path — when the deployed
+    // LIST_BY_PATH could not be parsed, route.ts is left out of the commit entirely.
+    // Returning "saved" over that reports success for a list attachment whose leads will
+    // still 422, which is the one outcome the flag exists to prevent.
+    if (result.captureRouteSkipped) {
+      return (
+        `The lead list was saved, but this site's capture route could not be updated — its ` +
+        `deployed route file could not be parsed, so it was left untouched. Submissions from ` +
+        `this page will not be filed until the route is repaired.`
+      );
+    }
     if (result.committed || result.reason === "up-to-date") return undefined;
     // Attaching and DETACHING both come through here; "saved" is wrong for a removal.
     const lead = leadListId === null ? "Lead list removed" : "Lead list saved";
