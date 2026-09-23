@@ -1503,18 +1503,23 @@ export async function executePreparedTools(
       // (this branch is on the hot path to the next request, not just persistence),
       // and OpenRouter/Gemini 400'd on the oversized request — surfaced to the user
       // as an opaque "please rephrase" (prod session d02669e9-c3b8-4b65-ab51-a9c045c63b65,
-      // 2026-09-22). Cap it the same way the success path caps `toolContent`.
-      const rawErrMsg = error instanceof Error ? error.message : String(error);
-      const errMsg = rawErrMsg.length > maxToolContentSize
-        ? sealTruncatedPayloadWithNotice(
-          rawErrMsg.substring(0, maxToolContentSize),
-          `[Error message truncated for size — original length: ${rawErrMsg.length} chars]`,
-        )
-        : rawErrMsg;
-      const errorContent = appendRetryabilityGuidance(
+      // 2026-09-22).
+      //
+      // Cap the FINAL assembled content, not the raw message: formatToolError's
+      // per-tool fix text and appendRetryabilityGuidance's verdict line are each
+      // appended AFTER this point, so bounding only the raw message would still
+      // let their added text push the actual wire content past maxToolContentSize.
+      const errMsg = error instanceof Error ? error.message : String(error);
+      const formattedError = appendRetryabilityGuidance(
         ports.formatToolError(toolCall.function.name, errMsg),
         classifyToolErrorClass(error),
       );
+      const errorContent = formattedError.length > maxToolContentSize
+        ? sealTruncatedPayloadWithNotice(
+          formattedError.substring(0, maxToolContentSize),
+          `[Error message truncated for size — original length: ${formattedError.length} chars]`,
+        )
+        : formattedError;
       messages.push({
         tool_call_id: toolCall.id,
         role: 'tool',
