@@ -877,16 +877,18 @@ describe('MetaService', () => {
 
                 const [, firstParams] = mockCreateUser.mock.calls[0];
                 expect(firstParams.payload.data).toHaveLength(10000);
-                expect(firstParams.payload.session.batch_seq).toBe(1);
-                expect(firstParams.payload.session.last_batch_flag).toBe(false);
-                expect(typeof firstParams.payload.session.session_id).toBe('number');
+                expect(firstParams.payload.session).toBeUndefined();
+                expect(firstParams.session.batch_seq).toBe(1);
+                expect(firstParams.session.last_batch_flag).toBe(false);
+                expect(typeof firstParams.session.session_id).toBe('number');
 
                 const [, secondParams] = mockCreateUser.mock.calls[1];
                 expect(secondParams.payload.data).toHaveLength(500);
-                expect(secondParams.payload.session.batch_seq).toBe(2);
-                expect(secondParams.payload.session.last_batch_flag).toBe(true);
+                expect(secondParams.payload.session).toBeUndefined();
+                expect(secondParams.session.batch_seq).toBe(2);
+                expect(secondParams.session.last_batch_flag).toBe(true);
                 // Same session_id across all batches in the upload.
-                expect(secondParams.payload.session.session_id).toBe(firstParams.payload.session.session_id);
+                expect(secondParams.session.session_id).toBe(firstParams.session.session_id);
             });
 
             it('surfaces a mid-upload batch failure (throws) without silently dropping it', async () => {
@@ -960,14 +962,16 @@ describe('MetaService', () => {
                 expect(mockDeleteUsers).toHaveBeenCalledTimes(2);
                 const [firstParams] = mockDeleteUsers.mock.calls[0];
                 expect(firstParams.payload.data).toHaveLength(10000);
-                expect(firstParams.payload.session.batch_seq).toBe(1);
-                expect(firstParams.payload.session.last_batch_flag).toBe(false);
+                expect(firstParams.payload.session).toBeUndefined();
+                expect(firstParams.session.batch_seq).toBe(1);
+                expect(firstParams.session.last_batch_flag).toBe(false);
 
                 const [secondParams] = mockDeleteUsers.mock.calls[1];
                 expect(secondParams.payload.data).toHaveLength(500);
-                expect(secondParams.payload.session.batch_seq).toBe(2);
-                expect(secondParams.payload.session.last_batch_flag).toBe(true);
-                expect(secondParams.payload.session.session_id).toBe(firstParams.payload.session.session_id);
+                expect(secondParams.payload.session).toBeUndefined();
+                expect(secondParams.session.batch_seq).toBe(2);
+                expect(secondParams.session.last_batch_flag).toBe(true);
+                expect(secondParams.session.session_id).toBe(firstParams.session.session_id);
             });
 
             it('surfaces a mid-delete batch failure (throws) without silently dropping it', async () => {
@@ -996,8 +1000,8 @@ describe('MetaService', () => {
         // usersreplace edge atomically sets the exact membership in one
         // operation, eliminating the need for a diff baseline in that case.
         describe('replaceCustomAudienceUsers', () => {
-            // Live-test finding against real Meta: unlike createUser/deleteUsers
-            // (session nested inside `payload`), /usersreplace requires
+            // Live-test finding against real Meta: like createUser/deleteUsers
+            // multi-batch (ENG-1343), /usersreplace requires
             // `session` as a TOP-LEVEL param sibling to `payload`, always —
             // nesting it inside `payload` still produced "(#100) The
             // parameter session is required" against the real Graph API.
@@ -1047,6 +1051,7 @@ describe('MetaService', () => {
 
                 const [, secondParams] = mockCreateUsersReplace.mock.calls[1];
                 expect(secondParams.payload.data).toHaveLength(500);
+                expect(secondParams.payload.session).toBeUndefined();
                 expect(secondParams.session.batch_seq).toBe(2);
                 expect(secondParams.session.last_batch_flag).toBe(true);
                 expect(secondParams.session.session_id).toBe(firstParams.session.session_id);
