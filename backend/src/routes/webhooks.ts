@@ -1042,7 +1042,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // the instant the lead is created. Skip the whole cascade for a recognized synthetic
       // lead; the lead row itself is still created/returned normally above so the smoke
       // test's CRM-landing check still works.
-      console.log(`[webhooks] Synthetic smoke-test lead (${lead.email}) — skipping CRM sync/sequence enrollment/auto-draft/auto-send/owner-notify side effects`);
+      console.log(`[webhooks] Synthetic smoke-test lead (${lead.email || lead.phone || lead.leadId}) — skipping CRM sync/sequence enrollment/auto-draft/auto-send/owner-notify side effects`);
     } else if (isNew || isUpdated) {
       // Real-time push to any connected external CRM (HubSpot / Attio). The
       // authenticated UI create/update routes do this inline; inbound capture

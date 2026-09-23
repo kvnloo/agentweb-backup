@@ -132,6 +132,34 @@ describe('POST /:sequenceId/enrollments/by-list — variable-warning gating', ()
     expect(dripSequenceDb.bulkEnroll).toHaveBeenCalled();
   });
 
+  it('never enrols a lead with no email address', async () => {
+    // leadEmail feeds sendAsSender({ to }) in dripSequenceWorker, which RETHROWS on failure,
+    // so an undefined address makes the enrollment retry forever. It is also the
+    // leadEmail-index partition key, so the row is invisible to getActiveEnrollment and is
+    // re-created on every run. Email-less leads were already reachable (LinkedIn imports,
+    // the invite mirror); ENG-2082 made a whole list type produce them. crm.ts's identical
+    // mapper has always filtered — this one did not.
+    dripSequenceDb.getSequence.mockResolvedValue(seqWith([
+      { stepId: 's1', stepNumber: 1, name: 'Intro', delayDays: 0, channel: 'email',
+        subject: 'Hi', bodyHtml: 'Hello' },
+    ]));
+    crmDb.getAllLeadsByListId.mockResolvedValue([
+      { leadId: 'l1', email: 'a@example.com', firstName: 'A' },
+      { leadId: 'l2', phone: '4155550142', firstName: 'PhoneOnly' },
+      { leadId: 'l3', email: '', firstName: 'Empty' },
+    ]);
+
+    const res = await request(app)
+      .post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1', confirm: true });
+
+    expect(res.status).toBe(200);
+    const [inputs] = dripSequenceDb.bulkEnroll.mock.calls[0];
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0].leadId).toBe('l1');
+    expect(inputs.every((i: any) => !!i.leadEmail)).toBe(true);
+  });
+
   it('with confirm:true and gaps: enrolls and returns the bulkEnroll result', async () => {
     dripSequenceDb.getSequence.mockResolvedValue(seqWith([emailStepWithGaps]));
     crmDb.getAllLeadsByListId.mockResolvedValue(threeLeads);

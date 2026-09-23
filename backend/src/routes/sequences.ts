@@ -253,14 +253,25 @@ router.post(
         });
       }
 
-      const inputs = leads.map((l: any) => ({
-        sequenceId: req.params.sequenceId,
-        userId: authReq.user!.userId,
-        listId,
-        leadId: l.leadId,
-        leadEmail: l.email,
-        startAt: startAt ?? undefined,
-      }));
+      // Mirrors the identical mapper in crm.ts, which has always filtered. Without it an
+      // email-less lead enrols with leadEmail undefined, and dripSequenceWorker then calls
+      // sendAsSender({ to: undefined }) and RETHROWS on failure — so the enrollment retries
+      // forever. leadEmail is also the leadEmail-index partition key, so the row is
+      // invisible to getActiveEnrollment and is re-created on every run.
+      //
+      // Email-less leads are a designed-for state (LinkedIn imports, the invite mirror), so
+      // this was already reachable — but ENG-2082 made a whole new list type produce them,
+      // which is why it is being closed here rather than left for later.
+      const inputs = leads
+        .filter((l: any) => l.email)
+        .map((l: any) => ({
+          sequenceId: req.params.sequenceId,
+          userId: authReq.user!.userId,
+          listId,
+          leadId: l.leadId,
+          leadEmail: l.email,
+          startAt: startAt ?? undefined,
+        }));
 
       const result = await dripSequenceDb.bulkEnroll(inputs);
 
