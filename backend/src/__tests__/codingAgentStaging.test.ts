@@ -175,3 +175,11 @@ test('an error report discards uncommitted edits', async () => {
   expect((await runCodingAgent('Edit', context, 2)).success).toBe(false);
   expect(writes()).toHaveLength(0);
 });
+
+test('main-branch status without a Vercel project remains readable', async () => {
+  fetchMock.mockResolvedValue({ status: 'generated', launchReadiness: { ready: false, reasons: ['Not deployed'] } });
+  model.mockResolvedValueOnce(call('check_deployment')).mockResolvedValueOnce(report());
+  await runCodingAgent('Check status', { ...context, draftBranch: undefined }, 2);
+  expect(feedback()).toContain('Not deployed');
+  expect(feedback()).not.toContain('Invalid deployment status');
+});

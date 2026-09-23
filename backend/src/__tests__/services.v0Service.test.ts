@@ -6568,9 +6568,9 @@ describe('getPreviewDeploymentUrl commit matching', () => {
     setup([{ ...deployment('new'), meta: { githubCommitRef: 'draft/agentweb-preview', gitCommitSha: 'new' } }]);
     await expect(getPreviewDeploymentUrl('project', 'draft/agentweb-preview', 'new')).resolves.toMatchObject({ buildStatus: 'success' });
   });
-  it('retains draft PR creation when the branch has never deployed', async () => {
+  it.each([{ deployments: [] }, { deployments: [deployment('old')] }])('ensures an open draft PR while waiting for a commit (%j)', async ({ deployments }) => {
     mockAxiosGet.mockResolvedValueOnce({ data: { link: { type: 'github', org: 'o', repo: 'r' } } })
-      .mockResolvedValueOnce({ data: { deployments: [] } }).mockResolvedValueOnce({ data: [] });
+      .mockResolvedValueOnce({ data: { deployments } }).mockResolvedValueOnce({ data: [] });
     mockAxiosPatch.mockResolvedValue({ status: 200 });
     mockAxiosPost.mockResolvedValueOnce({ data: { number: 1, html_url: 'https://github.com/o/r/pull/1' } });
     await expect(getPreviewDeploymentUrl('project', 'draft/agentweb-preview', 'new')).resolves.toMatchObject({ buildStatus: 'building', prUrl: 'https://github.com/o/r/pull/1' });

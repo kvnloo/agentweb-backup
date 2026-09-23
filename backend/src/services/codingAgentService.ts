@@ -1491,8 +1491,9 @@ async function executeTool(
         path: `${basePath}/deployment-status`,
         context: { userId: context.userId }
       });
-      if (!data || typeof data.buildStatus !== 'string') throw new Error('Invalid deployment status response');
-      workspace.deploymentStatus = data.buildStatus;
+      // A page without a Vercel project returns only its lifecycle status.
+      if (!data || typeof (data.buildStatus ?? data.status) !== 'string') throw new Error('Invalid deployment status response');
+      workspace.deploymentStatus = data.buildStatus ?? 'no_deployment';
       return JSON.stringify(data, null, 2);
     }
 

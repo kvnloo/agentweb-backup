@@ -5972,11 +5972,6 @@ export async function getPreviewDeploymentUrl(
   );
 
   if (!branchDeployment) {
-    // A push may not have appeared in Vercel yet. An older READY/ERROR on this
-    // reusable branch is not evidence for the commit the agent just published.
-    if (commitSha && deployments.some((d: any) => d.meta?.githubCommitRef === branch)) {
-      return { buildStatus: 'building', previewUrl: undefined };
-    }
     // No deployment found — Vercel deploys on PRs, not branch pushes.
     // Create a draft PR to trigger the Vercel preview deployment.
     const repoLink = projRes?.data?.link;
@@ -5990,7 +5985,9 @@ export async function getPreviewDeploymentUrl(
         console.warn(`[V0 SERVICE] Failed to create draft PR for branch "${branch}": ${prErr.response?.data?.message || prErr.message}`);
       }
     }
-    return { buildStatus: "not_found", previewUrl: undefined };
+    // A push may not have appeared yet; older builds cannot verify this SHA.
+    // Retain PR creation above even if an older deployment exists (its PR may be closed).
+    return { buildStatus: commitSha ? "building" : "not_found", previewUrl: undefined };
   }
 
   const state = branchDeployment.readyState || branchDeployment.state;
