@@ -464,6 +464,62 @@ describe('executePreparedTools', () => {
     expect(result.pendingCounterUpdates).toEqual({});
   });
 
+  // ENG-2086: a tool can fail by echoing its own (unbounded) result back inside
+  // `error` — call_google_ads_reporting_api's serving_chain mode JSON.stringifies
+  // the full campaign/ad-group/keyword tree into `error` whenever the account
+  // isn't fully READY/DELIVERING. Unlike the success path (which offloads/caps
+  // `toolContent` above), this error branch had NO size guard at all, so a
+  // multi-MB error message went out to the LLM provider unbounded and
+  // OpenRouter/Gemini 400'd on the oversized request (prod session
+  // d02669e9-c3b8-4b65-ab51-a9c045c63b65, surfaced as an opaque "please
+  // rephrase" to the user). This pins that the error branch is capped the same
+  // way the success branch caps `toolContent`.
+  it('caps an oversized error message before it reaches the LLM', async () => {
+    const huge = 'X'.repeat(400_000);
+    const ports = makePorts({
+      executePreparedAgentTool: async () => {
+        throw new Error(huge);
+      },
+    });
+    const input = makeInput([toolCall('a', 'call_google_ads_reporting_api', '{}')], ports);
+    await executePreparedTools(input);
+
+    const stored = input.messages[0].content as string;
+    // The cap reserves room for the notice before slicing, so the final sealed
+    // result never exceeds maxToolContentSize (300_000) — not "roughly", exactly.
+    expect(stored.length).toBeLessThanOrEqual(300_000);
+    expect(stored).toContain('[Error message truncated for size — original length:');
+  });
+
+  // ENG-2086 follow-up (CodeRabbit): the FINAL assembled content must be capped,
+  // not just the raw message. formatToolError's per-tool fix text and
+  // appendRetryabilityGuidance's verdict line are appended AFTER the raw
+  // message — a raw-message-only cap could still let their added text push the
+  // actual wire content past maxToolContentSize. Construct a raw message that
+  // is UNDER the cap by itself but pushes over it once wrapped, and confirm the
+  // final content is still bounded.
+  it('caps the fully-formatted error content even when the raw message alone is under the limit', async () => {
+    // 'ERR: ' (the fake formatToolError prefix) + this message is exactly
+    // maxToolContentSize; appendRetryabilityGuidance's non-empty verdict line
+    // then pushes the assembled content over.
+    const justUnderCap = 'X'.repeat(300_000 - 'ERR: '.length);
+    const ports = makePorts({
+      executePreparedAgentTool: async () => {
+        throw new Error(justUnderCap);
+      },
+    });
+    const input = makeInput([toolCall('a', 'call_google_ads_reporting_api', '{}')], ports);
+    await executePreparedTools(input);
+
+    const stored = input.messages[0].content as string;
+    // Proves the fix: the raw message (299,995 chars) is UNDER maxToolContentSize
+    // on its own, so a raw-message-only cap would have left this untouched. The
+    // assembled content (300,000+ once formatted and retryability-guided) must
+    // still come out capped — exactly, notice included.
+    expect(stored.length).toBeLessThanOrEqual(300_000);
+    expect(stored).toContain('[Error message truncated for size — original length:');
+  });
+
   // ENG-1626: a ToolResultPolicyBlockedError is a tool refusing BY DESIGN (e.g.
   // set_work_plan_status's out-of-order/missing-calls gates, which return
   // {success:false, blocked:true, reason:'...'} without throwing). It downgrades
