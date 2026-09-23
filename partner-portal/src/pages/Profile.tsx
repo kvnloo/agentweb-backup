@@ -117,6 +117,7 @@ export default function Profile() {
         <Typography variant="h4" gutterBottom>
           {userId && userId !== user?.userId ? 'User Profile' : 'My Profile'}
         </Typography>
+        {(!userId || userId === user?.userId) && <a href="/source-access">Organization source access (admins)</a>}
         <Divider sx={{ mb: 4 }} />
         
         <Grid container spacing={4}>
