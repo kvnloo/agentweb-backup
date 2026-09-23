@@ -1,3 +1,4 @@
+import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
@@ -11379,6 +11380,8 @@ export class AgentModeService {
       // Prepare market strategy data - merge with existing if available
       const updateTimestamp = new Date().toISOString();
       const marketStrategyData = {
+        ...existingMarketStrategy,
+        ...otherFields,
         businessOverview: businessOverview !== undefined ? businessOverview : (existingMarketStrategy?.businessOverview || ''),
         competitors: mergedCompetitors,
         icp: mergedICP,
@@ -11397,6 +11400,8 @@ export class AgentModeService {
       } else {
         await userDb.updateUser(userId, { marketStrategy: marketStrategyData });
       }
+
+      await populateEmptyBrandGuidelines(userId);
 
       // Track what was updated vs added
       const updatedEntries: string[] = [];

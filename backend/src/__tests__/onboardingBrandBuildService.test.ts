@@ -1,3 +1,4 @@
+jest.mock('../services/brandGuidelinesPopulation', () => ({ populateEmptyBrandGuidelines: jest.fn().mockResolvedValue(undefined) }));
 /**
  * Onboarding brand-build service tests.
  *
@@ -333,6 +334,7 @@ describe("onboardingBrandBuildService", () => {
       // Mirror write: icpResult + competitorResult + statuses
       const writes = userDb.updateUser.mock.calls.map((c: any[]) => c[1]);
       const mirror = writes.find((w: any) => w.icpResult);
+      expect(require('../services/brandGuidelinesPopulation').populateEmptyBrandGuidelines).toHaveBeenCalledWith('u1');
       expect(mirror).toBeTruthy();
       expect(mirror.icpResult[0].name).toBe("Coyotes with grudges");
       expect(mirror.competitorResult.competitors[0].name).toBe("Looney Inc");
