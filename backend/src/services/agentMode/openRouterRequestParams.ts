@@ -57,6 +57,20 @@ export function openRouterIgnoredProviders(upstreamModel: string): string[] {
 }
 
 /**
+ * Cloud-credit routing policy (Harsha, 2026-09-22): Anthropic drains AWS,
+ * OpenAI drains Azure, everything else (Grok, open models) uses OpenRouter's
+ * default routing. Returned as OpenRouter `provider.order`; callLLM keeps
+ * `allow_fallbacks: true`, so if our BYOK cloud is down or not yet
+ * provisioned for a model, the request still succeeds on another provider
+ * rather than failing the customer's turn. Matches endpoint `provider_name`.
+ */
+export function openRouterPreferredProviders(upstreamModel: string): string[] {
+  if (upstreamModel.startsWith('anthropic/')) return ['Amazon Bedrock'];
+  if (upstreamModel.startsWith('openai/')) return ['Azure'];
+  return [];
+}
+
+/**
  * Decide `tool_choice` and `temperature` for one OpenRouter request. A field is
  * sent only when the primary model AND every fallback accept it, because the
  * whole chain receives one parameter set.

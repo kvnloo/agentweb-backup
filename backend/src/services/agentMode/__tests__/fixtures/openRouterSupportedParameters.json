@@ -1,5 +1,5 @@
 {
-  "fetchedAt": "2026-09-22T18:32:42.683Z",
+  "fetchedAt": "2026-09-23T00:39:44.967Z",
   "source": "https://openrouter.ai/api/v1/models/{id}/endpoints",
   "models": {
     "anthropic/claude-fable-5.1": {
@@ -367,8 +367,27 @@
     "openai/gpt-6-astra": {
       "resolvedId": "openai/gpt-6-astra",
       "endpoints": [
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","tool_choice","tools"]},
         {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
         {"provider":"Azure","supported_parameters":["include_reasoning","max_completion_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]}
+      ]
+    },
+    "openai/gpt-6-luna": {
+      "resolvedId": "openai/gpt-6-luna",
+      "endpoints": [
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","tool_choice","tools"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
+        {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]}
+      ]
+    },
+    "openai/gpt-6-sol": {
+      "resolvedId": "openai/gpt-6-sol",
+      "endpoints": [
+        {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","tool_choice","tools"]},
         {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
         {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]},
         {"provider":"OpenAI","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","tool_choice","tools"]}
@@ -417,6 +436,15 @@
       "resolvedId": "x-ai/grok-4.6",
       "endpoints": [
         {"provider":"Amazon Bedrock","supported_parameters":["include_reasoning","max_tokens","reasoning","reasoning_effort","response_format","stop","structured_outputs","temperature","tool_choice","tools","top_k","top_p"]},
+        {"provider":"xAI","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"xAI","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"xAI","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
+        {"provider":"xAI","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]}
+      ]
+    },
+    "x-ai/grok-4.7": {
+      "resolvedId": "x-ai/grok-4.7",
+      "endpoints": [
         {"provider":"xAI","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"xAI","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
         {"provider":"xAI","supported_parameters":["include_reasoning","logprobs","max_tokens","reasoning","reasoning_effort","response_format","seed","structured_outputs","temperature","tool_choice","tools","top_logprobs","top_p"]},
