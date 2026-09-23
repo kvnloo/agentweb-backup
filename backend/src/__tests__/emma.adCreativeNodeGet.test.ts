@@ -84,7 +84,10 @@ describe('ENG-471 AC1 — AD_CREATIVE GET is exposed to the model', () => {
 
     it('requires independent gated writes to be emitted in one model message', () => {
       expect(metaToolDescription()).toContain('emit ALL of those calls in ONE message');
-      expect(metaToolDescription()).toContain('as a single round');
+      // ENG-1635/1644 (44b8d4f6a) reworded the old "so they confirm as a single
+      // round" shorthand — written before the approval-deck UI existed — into an
+      // accurate description of the actual mechanism now that it does.
+      expect(metaToolDescription()).toContain('front-loaded into ONE deck the user answers once');
     });
 
     it('allows separate messages only for real data dependencies', () => {

@@ -68,7 +68,7 @@ describe('apiTools', () => {
     it('should register API-wrapping tools', () => {
       const names = mcpToolRegistry.getToolNames();
       const expectedTools = [
-        'emma_create_session', 'emma_send_message', 'emma_answer_question', 'emma_get_session', 'emma_list_sessions',
+        'emma_create_session', 'emma_send_message', 'emma_answer_question_deck', 'emma_get_session', 'emma_list_sessions',
         'list_tasks', 'manage_task', 'execute_task', 'list_task_executions',
         'list_schedules', 'manage_schedule',
         'list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat',
@@ -217,6 +217,16 @@ describe('apiTools', () => {
   });
 
   describe('manage_brand - update', () => {
+    it.each([
+      [{ mission: 'Make IT easy' }, { valueProposition: 'Make IT easy' }],
+      [{ tone_of_voice: 'Direct', target_audience: 'IT teams', key_messages: ['Simplify IT'] },
+       { toneOfVoice: 'Direct', targetAudience: 'IT teams', keyMessages: ['Simplify IT'] }],
+    ])('maps persisted brand fields %j', async (input, expected) => {
+      mockMcpFetch.mockResolvedValue({ success: true });
+      await mcpToolRegistry.execute('manage_brand', { action: 'update', ...input }, context);
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({ body: expected }));
+    });
+
     it('should call POST /api/brand/guidelines with body', async () => {
       mockMcpFetch.mockResolvedValue({ success: true });
 
@@ -227,7 +237,7 @@ describe('apiTools', () => {
       expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
         method: 'POST',
         path: '/api/brand/guidelines',
-        body: { company_name: 'New Corp' },
+        body: { brandName: 'New Corp' },
       }));
     });
   });
@@ -314,15 +324,22 @@ describe('apiTools', () => {
 
   });
 
-  // ─── emma_answer_question (ENG-400: MCP transport for the AskUserQuestion primitive) ───
+  // ENG-1635/1644 PR2: the emma_answer_question tool + its whole describe
+  // block are deleted — the tool itself is deleted (nothing populates
+  // session.pendingUserQuestion anymore), emma_answer_question_deck below is
+  // the sole MCP transport for every producer that used to reach it.
 
-  describe('emma_answer_question', () => {
-    it('posts a direct pick through the structured questionAnswer channel, using option_id as the default label', async () => {
+  // ─── emma_answer_question_deck (ENG-1635/1644: MCP transport for the deck-of-one
+  // ask_user_question/objective-gate build) ───
+
+  describe('emma_answer_question_deck', () => {
+    it('posts a direct pick through the structured deckAnswer channel, using option_id as the default label', async () => {
       mockMcpFetch.mockResolvedValue({ response: 'OK' });
 
-      await mcpToolRegistry.execute('emma_answer_question', {
+      await mcpToolRegistry.execute('emma_answer_question_deck', {
         session_id: 'sess-1',
-        question_id: 'q-1',
+        deck_id: 'deck-1',
+        item_id: 'item-1',
         option_id: 'leads',
       }, context);
 
@@ -332,7 +349,7 @@ describe('apiTools', () => {
         body: {
           sessionId: 'sess-1',
           userMessage: 'leads',
-          questionAnswer: { questionId: 'q-1', optionId: 'leads', delegated: false },
+          deckAnswer: { deckId: 'deck-1', answers: [{ itemId: 'item-1', verdict: 'leads', delegated: false }] },
         },
       }));
     });
@@ -340,9 +357,10 @@ describe('apiTools', () => {
     it('uses a provided label as the human-readable chat message instead of the raw option_id', async () => {
       mockMcpFetch.mockResolvedValue({ response: 'OK' });
 
-      await mcpToolRegistry.execute('emma_answer_question', {
+      await mcpToolRegistry.execute('emma_answer_question_deck', {
         session_id: 'sess-1',
-        question_id: 'q-1',
+        deck_id: 'deck-1',
+        item_id: 'item-1',
         option_id: 'leads',
         label: 'Leads',
       }, context);
@@ -354,9 +372,10 @@ describe('apiTools', () => {
     it('posts a delegation ("Let Emma decide") with delegated:true and no option_id required', async () => {
       mockMcpFetch.mockResolvedValue({ response: 'OK' });
 
-      await mcpToolRegistry.execute('emma_answer_question', {
+      await mcpToolRegistry.execute('emma_answer_question_deck', {
         session_id: 'sess-1',
-        question_id: 'q-1',
+        deck_id: 'deck-1',
+        item_id: 'item-1',
         delegate: true,
       }, context);
 
@@ -364,26 +383,27 @@ describe('apiTools', () => {
         body: {
           sessionId: 'sess-1',
           userMessage: 'Let Emma decide',
-          questionAnswer: { questionId: 'q-1', optionId: undefined, delegated: true },
+          deckAnswer: { deckId: 'deck-1', answers: [{ itemId: 'item-1', verdict: '', delegated: true }] },
         },
       }));
     });
 
     it('refuses (without calling the API) a direct pick missing option_id', async () => {
-      const result = await mcpToolRegistry.execute('emma_answer_question', {
+      const result = await mcpToolRegistry.execute('emma_answer_question_deck', {
         session_id: 'sess-1',
-        question_id: 'q-1',
+        deck_id: 'deck-1',
+        item_id: 'item-1',
       }, context);
 
       expect(mockMcpFetch).not.toHaveBeenCalled();
       expect(JSON.parse(result.content[0].text).success).toBe(false);
     });
 
-    it('is registered with session_id and question_id required', () => {
+    it('is registered with session_id, deck_id and item_id required', () => {
       const defs = mcpToolRegistry.getToolDefinitions();
-      const answerQuestion = defs.find((d: any) => d.name === 'emma_answer_question');
-      expect(answerQuestion).toBeDefined();
-      expect(answerQuestion.inputSchema.required).toEqual(['session_id', 'question_id']);
+      const answerDeck = defs.find((d: any) => d.name === 'emma_answer_question_deck');
+      expect(answerDeck).toBeDefined();
+      expect(answerDeck.inputSchema.required).toEqual(['session_id', 'deck_id', 'item_id']);
     });
   });
 

@@ -186,26 +186,44 @@ describe('AgentModeController - ishare Model Selection', () => {
       );
     });
 
-    it('should expose pendingUserQuestion so a shared read-only card can show the answered option (ENG-396)', async () => {
-      const answeredQuestion = {
-        questionId: 'q-objective-1',
-        question: 'Which Meta campaign objective?',
-        options: [
-          { id: 'leads', label: 'Leads', consequence: 'Optimizes for leads', recommended: true, why: 'pixel fires LEAD events' },
-          { id: 'traffic', label: 'Traffic', consequence: 'Optimizes for clicks' },
+    // ENG-1635/1644 PR2: the pendingUserQuestion-exposure test that lived here
+    // (ENG-396) is deleted — getSharedConversation no longer sends that field
+    // at all, since nothing ever populates session.pendingUserQuestion anymore
+    // (see the dedicated pendingApprovalDeck coverage right below, its
+    // deck-of-one successor).
+
+    // ENG-1635/1644 (ask_user_question retirement): found live, driving a real
+    // deck-of-one through an interactive share link on env1 — this field was
+    // missing entirely (pendingUserQuestion/pendingWorkPlanInput above were both
+    // already exposed; pendingApprovalDeck, their sibling, was not). Without it,
+    // a migrated ask_user_question/objective-gate halt (which no longer
+    // populates pendingUserQuestion at all) rendered as the plain-text fallback
+    // in ishare instead of a real card — the exact regression this migration's
+    // own ishare-parity fix (useAgentModeSessions.ts) was supposed to prevent,
+    // just one layer further back (the backend never sent the field the
+    // frontend fix was reading).
+    it('should expose pendingApprovalDeck so a shared card can render a deck-of-one halt (ENG-1635/1644)', async () => {
+      const awaitingDeck = {
+        deckId: 'deck-objective-1',
+        status: 'awaiting',
+        items: [
+          {
+            itemId: 'item-1',
+            kind: 'meta_objective',
+            question: 'Which Meta campaign objective should this campaign use?',
+            options: [
+              { id: 'leads', label: 'Leads', consequence: 'Optimizes for leads', recommended: true, why: 'pixel fires LEAD events' },
+              { id: 'traffic', label: 'Traffic', consequence: 'Optimizes for clicks' },
+            ],
+            allowEmmaDecide: true,
+            immutable: true,
+          },
         ],
-        recommendedOptionId: 'leads',
-        immutable: true,
-        allowEmmaDecide: true,
-        status: 'answered',
         createdAt: new Date().toISOString(),
-        answer: { optionId: 'leads', delegated: false, answeredBy: 'user', at: new Date().toISOString() },
       };
       mockChatbotDb.getChatSession.mockResolvedValue({
         ...mockSessionWithModel,
-        // string-literal fields (status/answeredBy) widen in a plain object literal;
-        // cast for the mock rather than hand-annotate the whole PendingUserQuestion.
-        pendingUserQuestion: answeredQuestion as any,
+        pendingApprovalDeck: awaitingDeck as any,
       });
 
       const mockReq = {
@@ -213,7 +231,6 @@ describe('AgentModeController - ishare Model Selection', () => {
         query: { conversable: mockConversableToken },
         on: jest.fn(),
       } as unknown as Request;
-
       const mockRes = {
         status: jest.fn().mockReturnThis(),
         json: jest.fn(),
@@ -224,13 +241,15 @@ describe('AgentModeController - ishare Model Selection', () => {
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
           session: expect.objectContaining({
-            pendingUserQuestion: expect.objectContaining({
-              questionId: 'q-objective-1',
-              status: 'answered',
-              answer: expect.objectContaining({ optionId: 'leads' }),
+            pendingApprovalDeck: expect.objectContaining({
+              deckId: 'deck-objective-1',
+              status: 'awaiting',
+              items: expect.arrayContaining([
+                expect.objectContaining({ itemId: 'item-1', kind: 'meta_objective', immutable: true }),
+              ]),
             }),
           }),
-        })
+        }),
       );
     });
 

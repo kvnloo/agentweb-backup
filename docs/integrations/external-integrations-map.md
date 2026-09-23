@@ -19,6 +19,7 @@ integration changes.
 | Stripe Connect | Connected account service + Stripe Connect account IDs | `backend/src/services/stripeConnectService.ts`, `backend/src/routes/stripeConnect.ts` | Partner/payment flows | Crypto/storage of connected account data and account lifecycle states. |
 | Gmail/Calendar | `connected_accounts[].platform=gmail`, `config.account_type=gmail` | `backend/src/services/gmailService.ts`, `backend/src/config/integrations.ts` | Email/calendar tools | Granted scopes may differ from requested scopes; calendar access requires persisted granted scope. |
 | Fathom | `connected_accounts[].platform=fathom`, OAuth/API key config | `backend/src/config/integrations.ts`, Fathom integration tests | Meeting/video workflows | OAuth/API key dual shape and webhook/account availability. |
+| WhatsApp Business Platform | NOT a connected account — `user.messagingChannels[]` + `AW-Settings` window/opt-out rows keyed on the phone | `backend/src/services/whatsappService.ts`, `backend/src/routes/whatsappWebhook.ts` | `shipNotifyService`, `leadListAlertService` via `messagingChannelService` | 24-hour service window, US marketing-template pause (131049), positional template variables, AI-assistant ToS. Full contract: [whatsapp-contract.md](./whatsapp-contract.md). |
 
 ## High-Risk Patterns Across Integrations
 

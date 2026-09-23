@@ -95,7 +95,7 @@ import { scheduleDb, userDb } from '../services/db';
 import { emailService } from '../services/emailService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { runScheduledChat } from '../controllers/agentModeController';
-import { buildPendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
+import { createApprovalDeck, appendApprovalDeckItem, finalizeApprovalDeck, type PendingApprovalDeck } from '../services/agentMode/core/approvalDeck';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -113,21 +113,35 @@ const schedule = {
   emailNotifications: [], // forces fallback to the owner's account email
 };
 
-function awaitingQuestion() {
-  return buildPendingUserQuestion({
-    questionId: 'q-objective-1',
+// ENG-1635/1644 PR2: the legacy "headless park + notify (ENG-396)" describe
+// block (pendingUserQuestion-based) is deleted — nothing populates that slot
+// anymore, and its own tests exercised the exact auto-take/park branch
+// removed from resolveAwaitingUserQuestion. Its invariants (keeps browser,
+// notifies owner, warns with no recipient, does not park when nothing is
+// awaiting) are re-covered below in the deck-of-one describe block, the slot
+// that's actually live now.
+
+// ENG-1635/1644 (ask_user_question retirement): ask_user_question and the Meta
+// objective gate no longer populate pendingUserQuestion at all — they build a
+// single-item pendingApprovalDeck instead. runScheduledChat's notify-and-record
+// block must give this new slot the exact same guarantees.
+function awaitingDeck(): PendingApprovalDeck {
+  let deck = createApprovalDeck('deck-objective-1', '2026-07-21T00:00:00.000Z');
+  deck = appendApprovalDeckItem(deck, {
+    itemId: 'item-1',
+    kind: 'meta_objective',
     question: 'Which Meta campaign objective? It cannot be changed after launch.',
     options: [
       { id: 'leads', label: 'Leads', consequence: 'Books demos.', recommended: true, why: '162 LEAD events fired.' },
       { id: 'traffic', label: 'Traffic', consequence: 'Cheap clicks, not leads.' },
     ],
-    immutable: true,
     allowEmmaDecide: true,
-    createdAt: '2026-07-21T00:00:00.000Z',
+    immutable: true,
   });
+  return finalizeApprovalDeck(deck, '2026-07-21T00:00:01.000Z');
 }
 
-const parkedSession = {
+const parkedDeckSession = {
   sessionId: 'test-session-123',
   userId: 'test-user-123',
   title: 'Scheduled: Launch my Meta campaigns',
@@ -136,18 +150,18 @@ const parkedSession = {
   messages: [],
   createdAt: '2026-07-21T00:00:00.000Z',
   updatedAt: '2026-07-21T00:00:00.000Z',
-  pendingUserQuestion: awaitingQuestion(),
+  pendingApprovalDeck: awaitingDeck(),
 };
 
-describe('runScheduledChat — headless park + notify (ENG-396)', () => {
+describe('runScheduledChat — headless park + notify on the deck-of-one slot (ENG-1635/1644)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockChatbotDb.createChatSession.mockResolvedValue(parkedSession as any);
-    mockChatbotDb.getChatSession.mockResolvedValue(parkedSession as any);
+    mockChatbotDb.createChatSession.mockResolvedValue(parkedDeckSession as any);
+    mockChatbotDb.getChatSession.mockResolvedValue(parkedDeckSession as any);
     (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
-    mockChatbotDb.updateSessionLlmModel.mockResolvedValue(parkedSession as any);
-    mockChatbotDb.updateSessionTitle.mockResolvedValue(parkedSession as any);
-    mockChatbotDb.addMessageToSession.mockResolvedValue(parkedSession as any);
+    mockChatbotDb.updateSessionLlmModel.mockResolvedValue(parkedDeckSession as any);
+    mockChatbotDb.updateSessionTitle.mockResolvedValue(parkedDeckSession as any);
+    mockChatbotDb.addMessageToSession.mockResolvedValue(parkedDeckSession as any);
     mockAgentModeService.getDefaultModel.mockResolvedValue('gpt-5-chat-2' as any);
     mockAgentModeService.getScheduledChatsDefaultModel.mockResolvedValue('gpt-5-chat-2' as any);
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt' as any);
@@ -156,7 +170,7 @@ describe('runScheduledChat — headless park + notify (ENG-396)', () => {
     mockScheduleDb.addRunResult.mockResolvedValue(undefined as any);
     mockWorker.runInWorker.mockResolvedValue({
       content: 'Which objective should I optimize for?',
-      toolCalls: [{ name: 'ask_user_question', result: { awaitingUserConfirmation: true } }],
+      toolCalls: [{ name: 'present_question_deck', result: { awaitingUserConfirmation: true } }],
       knowledgeBaseQueries: [],
       sources: [],
       responseMessages: [],
@@ -166,7 +180,7 @@ describe('runScheduledChat — headless park + notify (ENG-396)', () => {
   // ENG-1118: a parked run is not a finished one — it resumes into the SAME session, so
   // keep its browser rather than handing the resume a blank page. The idle sweep still
   // reclaims it if the human never answers.
-  it('keeps the session\'s browser when the run parks on a user question', async () => {
+  it('keeps the session\'s browser when the run parks on a deck-of-one', async () => {
     await runScheduledChat(schedule, 'test-user-123', false);
 
     expect(generateMarketingResponseWorkerService.releaseSessionClients).not.toHaveBeenCalled();
@@ -177,27 +191,22 @@ describe('runScheduledChat — headless park + notify (ENG-396)', () => {
 
     expect(result.status).toBe('pending_user_input');
     expect(result.passed).toBe(false);
-    expect((result as any).pendingQuestionId).toBe('q-objective-1');
-    // sessionId cleared so the orchestrator/callers skip their normal result email.
+    expect((result as any).pendingQuestionId).toBeUndefined();
+    expect((result as any).pendingApprovalDeckId).toBe('deck-objective-1');
     expect(result.sessionId).toBe('');
 
-    // Owner notified via the dedicated paused-for-input email (fell back to account email).
     expect(mockEmail.sendScheduledChatPausedForInputEmail).toHaveBeenCalledTimes(1);
     const args = mockEmail.sendScheduledChatPausedForInputEmail.mock.calls[0];
     expect(args[0]).toEqual(['owner@example.com']);
     expect(args[1]).toBe('Launch my Meta campaigns');
     expect(args[3]).toContain('objective'); // the question text
-    expect(args[4]).toBe('test-session-123'); // session link
+    expect(args[4]).toBe('test-session-123');
 
-    // NOT a normal result email (that's the completion path, not a park).
     expect(mockEmail.sendScheduledChatResultEmail).not.toHaveBeenCalled();
-    // Recorded in history.
-    expect(mockScheduleDb.addRunResult).toHaveBeenCalledWith('sched-1', expect.objectContaining({ status: 'pending_user_input' }));
+    expect(mockScheduleDb.addRunResult).toHaveBeenCalledWith('sched-1', expect.objectContaining({ status: 'pending_user_input', pendingApprovalDeckId: 'deck-objective-1' }));
   });
 
   it('parks but WARNS (never silently) when there is no notification recipient', async () => {
-    // No emailNotifications on the schedule AND no account email → nobody to notify.
-    // getUserById is called more than once in the flow, so override ALL calls.
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'test-user-123', email: undefined, isAdmin: false });
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
 
@@ -207,12 +216,11 @@ describe('runScheduledChat — headless park + notify (ENG-396)', () => {
     expect(mockEmail.sendScheduledChatPausedForInputEmail).not.toHaveBeenCalled();
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('NO notification recipient'));
     warnSpy.mockRestore();
-    // Restore the default so later tests still see an account email.
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'test-user-123', email: 'owner@example.com', isAdmin: false });
   });
 
-  it('does NOT park (normal success) when the session has no awaiting question', async () => {
-    mockChatbotDb.getChatSession.mockResolvedValue({ ...parkedSession, pendingUserQuestion: undefined } as any);
+  it('does NOT park (normal success) when the session has no awaiting deck', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue({ ...parkedDeckSession, pendingApprovalDeck: undefined } as any);
     mockWorker.runInWorker.mockResolvedValue({
       content: 'All done — here is your weekly summary.',
       toolCalls: [],

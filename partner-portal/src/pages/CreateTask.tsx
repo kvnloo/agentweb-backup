@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Container,
@@ -80,11 +80,7 @@ export default function CreateTask() {
   const { token } = useAuth();
   const navigate = useNavigate();
 
-  useEffect(() => {
-    fetchTemplates();
-  }, [token]);
-
-  const fetchTemplates = async () => {
+  const fetchTemplates = useCallback(async () => {
     setLoadingTemplates(true);
     try {
       const response = await axios.get<Template[]>(
@@ -99,7 +95,11 @@ export default function CreateTask() {
     } finally {
       setLoadingTemplates(false);
     }
-  };
+  }, [token]);
+
+  useEffect(() => {
+    fetchTemplates();
+  }, [fetchTemplates]);
 
   const handleTemplateChange = (templateId: string) => {
     // If selecting the same template, deselect it

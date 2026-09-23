@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   Alert,
   Autocomplete,
@@ -56,12 +56,13 @@ export default function ContractorsTab() {
 
   const headers = { Authorization: `Bearer ${token}` };
 
-  const fetchData = async () => {
+  const fetchData = useCallback(async () => {
     try {
       setLoading(true);
+      const requestHeaders = { Authorization: `Bearer ${token}` };
       const [contractorsRes, usersRes] = await Promise.all([
-        axios.get(buildApiUrl('/api/contractor/contractors'), { headers }),
-        axios.get(buildApiUrl('/api/admin/users'), { headers }),
+        axios.get(buildApiUrl('/api/contractor/contractors'), { headers: requestHeaders }),
+        axios.get(buildApiUrl('/api/admin/users'), { headers: requestHeaders }),
       ]);
       setContractors(contractorsRes.data.contractors || []);
       setAllUsers(usersRes.data || []);
@@ -70,11 +71,11 @@ export default function ContractorsTab() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [token]);
 
   useEffect(() => {
     fetchData();
-  }, []);
+  }, [fetchData]);
 
   const handleAssign = async (contractorId: string) => {
     const user = selectedUsers[contractorId];

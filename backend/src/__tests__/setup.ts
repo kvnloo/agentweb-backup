@@ -34,11 +34,15 @@ process.env.AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION || '
 process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE = '';
 process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS = '';
 
-// Same dotenv-refill hazard as above: a real SLACK_SIGNING_SECRET in a dev's local
-// .env would make verifySlackRequest (routes/slack.ts) demand a valid HMAC signature
-// on every /api/slack/events test request, causing 401s instead of exercising the
-// no-secret/test-env pass-through path most Slack event tests rely on. Set to ''
-// (not delete) for the same hasOwnProperty reason documented above.
+// Same placeholder-leak class as above: routes/slack.ts's verifySlackRequest
+// deliberately treats an ABSENT SLACK_SIGNING_SECRET as "tests intentionally
+// omit Slack credentials" and skips verification when NODE_ENV==='test'. A
+// local .env still carrying the unfilled '.env.example' placeholder text
+// (e.g. 'your_slack_signing_secret', a truthy string) defeats that check and
+// makes every unsigned test request 401 in that dev's own runs, though not
+// in CI (a clean checkout's local .env may not define this key at all). Same
+// dotenv-refill hazard as above applies too — set to '' (not delete) for the
+// same hasOwnProperty reason documented there.
 process.env.SLACK_SIGNING_SECRET = '';
 
 // Set Azure OpenAI embeddings environment variables for tests

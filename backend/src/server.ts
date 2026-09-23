@@ -521,6 +521,20 @@ createTestAccount().then(async () => {
     console.warn('Apollo service not initialized — Apollo specialists will be inert:', (err as Error).message);
   }
 
+  // Load the Okareo trace-exporter key from Secrets Manager (ENG-2070). It was an
+  // 856-char EB env var that pushed the env past CloudFormation's 4096-char
+  // limit. An explicit OKAREO_API_KEY env still wins; a missing secret leaves
+  // the Okareo exporter off, exactly as before (config gating, not a crash).
+  if (!process.env.OKAREO_API_KEY) {
+    try {
+      const { getOkareoApiKey } = await import('./utils/secretsManager');
+      process.env.OKAREO_API_KEY = await getOkareoApiKey();
+      console.log('Okareo API key loaded from Secrets Manager');
+    } catch (err) {
+      console.warn('Okareo API key not loaded — Okareo trace export disabled:', (err as Error).message);
+    }
+  }
+
   // Initialize Enigma card-revenue lookups (ENG-1388). Defensive like Apollo —
   // without the Secrets Manager key getEnigmaService() stays null and nothing
   // calls Enigma.
@@ -977,7 +991,9 @@ createTestAccount().then(async () => {
       // is a trust break (ThinkingAI, TransAmerica — Aug 2026 audit, both caught
       // manually). Flags active-subscription users renewing within the lookahead
       // window whose ad integration is missing/expired via a deduped oncall alert.
-      try {
+      // Disabled by default: per-customer "Renewal at risk" oncall emails were flooding the team inbox.
+      // Opt back in with RENEWAL_HEALTH_ALERTS_ENABLED=true. The read-only admin evaluation route is unaffected.
+      if (process.env.RENEWAL_HEALTH_ALERTS_ENABLED === 'true') try {
         const { runRenewalIntegrationHealthCheck } = await import('./cron/renewalIntegrationHealthCron');
         const RENEWAL_HEALTH_INTERVAL_MS = 24 * 60 * 60 * 1000;
         cronJobRegistry.track('renewalIntegrationHealthCron', runRenewalIntegrationHealthCheck())

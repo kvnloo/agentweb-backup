@@ -77,6 +77,24 @@ export interface WorkflowStepDefinition {
   ) => Promise<WorkflowStepVerification>;
 }
 
+/**
+ * A step's `execute()` MAY throw this instead of a plain Error to signal a
+ * SPECIFIC, engine-recognized condition: another concurrent driver of this
+ * SAME run already claimed this step's real side effect (an at-most-once
+ * resource, e.g. a Meta write digest) and may already be dispatching or have
+ * already succeeded — this attempt never touched the real side effect at
+ * all. This is NOT a failure of the step itself, domain-agnostic on purpose
+ * (this file has no Meta-specific knowledge) — the independent-step driver
+ * (workflowRunner.ts's advanceIndependentWorkflow) treats it as "back off,
+ * write no checkpoint" rather than recording a false 'failed' outcome for a
+ * write that may actually succeed via the other driver. Found by review: two
+ * concurrent drivers of the same stuck run could otherwise both attempt the
+ * same step, the loser's false 'failed' checkpoint could win the version
+ * race over the winner's real 'verified' one, permanently mis-recording a
+ * genuinely successful write as failed.
+ */
+export class StepContendedError extends Error {}
+
 export interface WorkflowDefinition {
   workflowId: string;
   /** Order is the workflow order. */
@@ -393,6 +411,102 @@ export function recordStepFailure(
     version: run.version + 1,
     updatedAt: at,
   };
+}
+
+/**
+ * Independent-step batch semantics (ENG-1635/1644) — a sibling to the
+ * sequential findNextStep/recordStepSuccess/recordStepFailure trio above,
+ * for exactly the case those three do not fit: N steps with NO dependency
+ * on each other (e.g. N approved Meta writes from one approval deck), where
+ * one step failing must never prevent an independent sibling from being
+ * attempted.
+ *
+ * Reusing the sequential trio here would be wrong on both ends: findNextStep
+ * returns null forever once ANY step sets run.status='failed' (by design,
+ * for the SEQUENTIAL case — see its own docstring: "that single fact is
+ * what guarantees AC4's 'subsequent steps do not run'"), so one failed item
+ * in a 12-item independent batch would silently strand the other 11
+ * un-attempted. And recordStepSuccess only reaches 'completed' once EVERY
+ * step is verified, so a single failure among N independent steps would
+ * leave the run permanently 'in_progress', never reaching a terminal state
+ * at all. Both are correct for a dependency chain (ENG-397's original
+ * sequential campaign-build use case) and wrong for an independent batch —
+ * this is that second shape, not a replacement for the first. The
+ * sequential trio above is untouched; existing/future sequential consumers
+ * are unaffected.
+ *
+ * A run driven by these functions only ever reaches 'completed' (every step
+ * has been attempted — verified or failed, doesn't matter which) or stays
+ * 'in_progress' (steps remain unattempted). It never reaches 'failed' — the
+ * per-step outcome lives in run.checkpoints, not run.status; turning those
+ * into one fully_applied/partially_applied/unapplied result is a separate,
+ * later pass (see agentModeService.ts's checkpoint-scanning summary) over
+ * exactly this same checkpoints array.
+ */
+export function findNextIndependentStep(
+  definition: WorkflowDefinition,
+  run: WorkflowRunState,
+): WorkflowStepDefinition | null {
+  if (run.status === 'completed') return null;
+  for (const step of definition.steps) {
+    const checkpoint = findCheckpoint(run, step.id);
+    if (!checkpoint) return step;
+  }
+  return null;
+}
+
+/**
+ * Records this step's outcome (verified or failed — both are terminal for
+ * THIS step; an independent step is never retried once attempted, same as
+ * the sequential engine's per-step contract) and marks the run 'completed'
+ * once every step in the definition has SOME checkpoint. Unlike
+ * recordStepFailure, never changes any OTHER step's eligibility — see file
+ * header.
+ */
+export function recordIndependentStepOutcome(
+  definition: WorkflowDefinition,
+  run: WorkflowRunState,
+  step: WorkflowStepDefinition,
+  outcome:
+    | { status: 'verified'; entityIds: Record<string, string>; verifiedFields: Record<string, unknown> }
+    | { status: 'failed'; discrepancy: WorkflowVerificationMismatch[] | { error: string } },
+  at: string,
+): WorkflowRunState {
+  const checkpoint: WorkflowStepCheckpoint =
+    outcome.status === 'verified'
+      ? { stepId: step.id, status: 'verified', entityIds: outcome.entityIds, verifiedFields: outcome.verifiedFields, verifiedAt: at }
+      : { stepId: step.id, status: 'failed', discrepancy: outcome.discrepancy, failedAt: at };
+  const checkpoints = [...run.checkpoints.filter((c) => c.stepId !== step.id), checkpoint];
+  const everyStepAttempted = definition.steps.every((s) => checkpoints.some((c) => c.stepId === s.id));
+
+  return {
+    ...run,
+    status: everyStepAttempted ? 'completed' : 'in_progress',
+    checkpoints,
+    version: run.version + 1,
+    updatedAt: at,
+  };
+}
+
+export type WorkflowBatchOutcome = 'fully_applied' | 'partially_applied' | 'unapplied';
+
+/**
+ * Three-way outcome for an independent-step batch (ENG-1635/1644) — scans a
+ * COMPLETED run's checkpoints (recordIndependentStepOutcome's own header:
+ * this driver's run only reaches 'completed' once every step has been
+ * attempted, success or failure — never 'failed') and classifies the whole
+ * batch. Returns null while the run has not reached that terminal state —
+ * there is nothing to summarize while steps remain unattempted. Deliberately
+ * domain-agnostic (no Meta-specific field names) — a consumer wanting
+ * per-item detail (e.g. which Meta object each step applied) reads
+ * run.checkpoints itself; this only answers the roll-up question.
+ */
+export function summarizeIndependentStepBatch(run: WorkflowRunState): WorkflowBatchOutcome | null {
+  if (run.status !== 'completed') return null;
+  const failedCount = run.checkpoints.filter((c) => c.status === 'failed').length;
+  if (failedCount === 0) return 'fully_applied';
+  if (failedCount === run.checkpoints.length) return 'unapplied';
+  return 'partially_applied';
 }
 
 /** Human/log-facing rendering of "failed-at-step-N". Uses the step's 1-based

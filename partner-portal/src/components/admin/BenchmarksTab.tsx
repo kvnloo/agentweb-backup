@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   Box,
   Typography,
@@ -123,43 +123,7 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
   });
   const [newKeyword, setNewKeyword] = useState('');
 
-  useEffect(() => {
-    if (open) {
-      loadAvailableFunctionCalls();
-      loadSupportedModels();
-      if (editTest) {
-        // Populate form with existing test data
-        setFormData({
-          testName: editTest.testName,
-          description: editTest.description || '',
-          keywords: editTest.expectedOutput.keywords || [],
-          functionCalls: editTest.expectedOutput.functionCalls || [],
-          status: editTest.status || 'draft',
-        });
-        // Load session messages if available
-        if (editTest.conversationHistory?.messages) {
-          setSessionMessages(editTest.conversationHistory.messages);
-        }
-      } else if (sessionId) {
-        loadSessionMessages();
-      }
-    }
-  }, [open, sessionId, editTest]);
-
-  // Set selected model when supportedModels are loaded and editTest is available
-  useEffect(() => {
-    if (editTest && supportedModels.length > 0) {
-      // Set selected model from test if available and valid
-      if (editTest.llmModel && supportedModels.includes(editTest.llmModel)) {
-        setSelectedModel(editTest.llmModel);
-      } else if (!selectedModel) {
-        // If test has no model or model is not supported, use first available
-        setSelectedModel(supportedModels[0]);
-      }
-    }
-  }, [supportedModels, editTest]);
-
-  const loadAvailableFunctionCalls = async () => {
+  const loadAvailableFunctionCalls = useCallback(async () => {
     if (!token) return;
     
     try {
@@ -175,9 +139,9 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
       console.error('Error loading function calls:', err);
       // Don't show error for function calls as it's not critical
     }
-  };
+  }, [token]);
 
-  const loadSupportedModels = async () => {
+  const loadSupportedModels = useCallback(async () => {
     try {
       const response = await axios.get(
         buildApiUrl('/api/agent-mode/public/llm-models'),
@@ -195,9 +159,9 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
       console.error('Error loading supported models:', err);
       // Don't show error for models as it's not critical
     }
-  };
+  }, [token, selectedModel, editTest]);
 
-  const loadSessionMessages = async () => {
+  const loadSessionMessages = useCallback(async () => {
     if (!sessionId || !token) return;
     
     try {
@@ -231,7 +195,43 @@ const CreateBenchmarkDialog: React.FC<CreateBenchmarkDialogProps> = ({
     } finally {
       setLoading(false);
     }
-  };
+  }, [sessionId, token]);
+
+  useEffect(() => {
+    if (open) {
+      loadAvailableFunctionCalls();
+      loadSupportedModels();
+      if (editTest) {
+        // Populate form with existing test data
+        setFormData({
+          testName: editTest.testName,
+          description: editTest.description || '',
+          keywords: editTest.expectedOutput.keywords || [],
+          functionCalls: editTest.expectedOutput.functionCalls || [],
+          status: editTest.status || 'draft',
+        });
+        // Load session messages if available
+        if (editTest.conversationHistory?.messages) {
+          setSessionMessages(editTest.conversationHistory.messages);
+        }
+      } else if (sessionId) {
+        loadSessionMessages();
+      }
+    }
+  }, [open, sessionId, editTest, loadAvailableFunctionCalls, loadSessionMessages, loadSupportedModels]);
+
+  // Set selected model when supportedModels are loaded and editTest is available
+  useEffect(() => {
+    if (editTest && supportedModels.length > 0) {
+      // Set selected model from test if available and valid
+      if (editTest.llmModel && supportedModels.includes(editTest.llmModel)) {
+        setSelectedModel(editTest.llmModel);
+      } else if (!selectedModel) {
+        // If test has no model or model is not supported, use first available
+        setSelectedModel(supportedModels[0]);
+      }
+    }
+  }, [supportedModels, editTest, selectedModel]);
 
   const addKeyword = () => {
     if (newKeyword.trim() && !formData.keywords.includes(newKeyword.trim())) {
@@ -623,25 +623,15 @@ const BenchmarksTab: React.FC = () => {
   const [runningTests, setRunningTests] = useState<Set<string>>(new Set());
   const [runningAllTests, setRunningAllTests] = useState(false);
 
-  useEffect(() => {
-    loadBenchmarks();
-    
-    // Check if we should open create dialog from URL params
-    const createFromSession = searchParams.get('createFromSession');
-    if (createFromSession) {
-      setCreateDialogOpen(true);
-    }
-  }, [searchParams]);
-
-  const loadBenchmarks = async () => {
+  const loadBenchmarks = useCallback(async () => {
     try {
       setLoading(true);
       setError('');
-      
+
       const response = await axios.get(buildApiUrl('/api/benchmark'), {
         headers: { Authorization: `Bearer ${token}` },
       });
-      
+
       // The API returns { tests: [...], count: ... }
       const benchmarksData = response.data;
       if (benchmarksData && Array.isArray(benchmarksData.tests)) {
@@ -659,7 +649,17 @@ const BenchmarksTab: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [token]);
+
+  useEffect(() => {
+    loadBenchmarks();
+
+    // Check if we should open create dialog from URL params
+    const createFromSession = searchParams.get('createFromSession');
+    if (createFromSession) {
+      setCreateDialogOpen(true);
+    }
+  }, [searchParams, loadBenchmarks]);
 
   const handleEdit = (benchmark: BenchmarkTest) => {
     setSelectedBenchmark(benchmark);
