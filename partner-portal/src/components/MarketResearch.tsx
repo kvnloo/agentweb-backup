@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { createMarketResearch, getMarketResearch, getAllMarketResearch } from '../services/marketingService';
 
@@ -34,17 +34,13 @@ const MarketResearch = () => {
   const [taskId, setTaskId] = useState<string | null>(null);
   const [view, setView] = useState('form');
   
-  useEffect(() => {
-    loadRecentTasks();
-  }, [token]);
-  
-  const loadRecentTasks = async () => {
+  const loadRecentTasks = useCallback(async () => {
     if (!token) return;
-    
+
     try {
       setIsLoading(true);
       setError(null);
-      
+
       const tasks = await getAllMarketResearch(token);
       setRecentTasks(tasks);
     } catch (err) {
@@ -53,7 +49,11 @@ const MarketResearch = () => {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [token]);
+
+  useEffect(() => {
+    loadRecentTasks();
+  }, [token, loadRecentTasks]);
   
   const loadTask = async (id: string) => {
     if (!token) return;

@@ -521,6 +521,20 @@ createTestAccount().then(async () => {
     console.warn('Apollo service not initialized — Apollo specialists will be inert:', (err as Error).message);
   }
 
+  // Load the Okareo trace-exporter key from Secrets Manager (ENG-2070). It was an
+  // 856-char EB env var that pushed the env past CloudFormation's 4096-char
+  // limit. An explicit OKAREO_API_KEY env still wins; a missing secret leaves
+  // the Okareo exporter off, exactly as before (config gating, not a crash).
+  if (!process.env.OKAREO_API_KEY) {
+    try {
+      const { getOkareoApiKey } = await import('./utils/secretsManager');
+      process.env.OKAREO_API_KEY = await getOkareoApiKey();
+      console.log('Okareo API key loaded from Secrets Manager');
+    } catch (err) {
+      console.warn('Okareo API key not loaded — Okareo trace export disabled:', (err as Error).message);
+    }
+  }
+
   // Initialize Enigma card-revenue lookups (ENG-1388). Defensive like Apollo —
   // without the Secrets Manager key getEnigmaService() stays null and nothing
   // calls Enigma.

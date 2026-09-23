@@ -17,13 +17,8 @@ import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
 import { enqueueAutoHumanEval, claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
-import { v4 as uuidv4 } from 'uuid';
-import {
-  buildPendingUserQuestion,
-  renderQuestionPrompt,
-  AskUserQuestionError,
-  type AskUserQuestionOption,
-} from '../services/agentMode/core/askUserQuestion';
+import { type AskUserQuestionOption } from '../services/agentMode/core/askUserQuestion';
+import type { QuestionDeckQuestionInput } from '../services/agentMode/core/approvalDeck';
 import { CLIENT_ID_SCHEMA_PROPERTY } from '../mcp/server/toolHelpers';
 
 // Register browser cookie persistence tools
@@ -124,35 +119,38 @@ emmaToolRegistry.register({
 // ENG-396: AskUserQuestion — a structured, BLOCKING option-select prompt. Emma
 // emits it to force a human choice on an immutable/irreversible parameter
 // before building. It returns awaitingUserConfirmation:true so the agent loop
-// HALTS (see collectConfirmationPrompt); the answer is persisted structurally
-// on the session and only an inbound USER selection resolves it — the model
-// cannot self-answer.
+// HALTS (see collectConfirmationPrompt); only an inbound USER selection
+// resolves it — the model cannot self-answer.
+//
+// ENG-1635/1644 (retirement of this tool's OWN UI/persistence, not the tool
+// itself): execute() no longer builds a PendingUserQuestion or writes
+// session.pendingUserQuestion directly. It returns the same bare halt marker
+// present_question_deck's execute() does (a 1-entry questionDeckPayload) and
+// renders through the SAME deck-of-one seam — AskUserQuestionCard's own UI is
+// retired in favor of the deck's chrome (Cancel, Chat-about-this, confirm
+// slide, Prev/Next). The calling convention (tool name, when Emma should
+// reach for it vs present_question_deck) is unchanged — see the description
+// below. `resolveCampaignObjectiveGate` (agentModeService.ts) is migrated the
+// same way, onto the same deck-of-one halt shape — no longer a separate
+// pendingUserQuestion producer.
 //
 // META-SCOPED, NOT OBJECTIVE-SCOPED (2026-07-25): originally restricted to
 // "Meta campaign objective only." That was narrower than intended — the
 // restriction is meant to bound the DOMAIN (Meta Ads), not the specific field
 // within it. Widened to any high-stakes/irreversible Meta Ads decision (e.g.
 // objective, special ad category), still explicitly NOT general-purpose across
-// other domains/platforms. Every part of the underlying mechanism (persistence,
-// the real UI card, the answer channel, headless park, full-autonomy
-// auto-take, delegation, archive, MCP wiring) is fully generic with zero
-// Meta-specific logic and was proven working end-to-end live before this was
-// widened — only the description below is what keeps this Meta-bounded, and
-// that's a prompt-level restriction, not code-enforced.
-//
-// The Meta objective write gate (agentModeService.ts,
-// resolveCampaignObjectiveGate) is UNCHANGED and independent of this — it
-// still enforces the objective deterministically at CAMPAIGN CREATE
-// regardless of whether Emma calls this tool voluntarily for anything else
-// within Meta. This only widens Emma's OWN judgment-based use of the card
-// within Meta; it does not add a new hard-enforced gate for other Meta
-// entities — that requires its own dedicated gate, built the same way
-// ENG-400 was, per irreversible action.
+// other domains/platforms. Only the description below is what keeps this
+// Meta-bounded, and that's a prompt-level restriction, not code-enforced. This
+// only widens Emma's OWN judgment-based use of the card within Meta; it does
+// not add a new hard-enforced gate for other Meta entities — that requires its
+// own dedicated gate, built the same way ENG-400 was, per irreversible action.
 emmaToolRegistry.register({
   name: 'ask_user_question',
   definition: {
     name: 'ask_user_question',
-    description: `Ask the user a structured, blocking multiple-choice question and STOP until they pick. SCOPE: Meta Ads only — do NOT use this for Google Ads, LinkedIn, or any other platform/domain decision, no matter how high-stakes. Within Meta Ads, use this ONLY for a decision that is high-stakes or IRREVERSIBLE and that the user (not you) must own — e.g. the immutable campaign objective, a special ad category with legal/compliance implications, or a similarly consequential Meta-specific choice. Do NOT use it for routine confirmations or reversible Meta choices — those are yours to make with your own best judgment (the existing target-confirmation flow on writes still applies where it already does).
+    description: `Ask the user a structured, blocking multiple-choice question and STOP until they pick. SCOPE: Meta Ads only — do NOT use this for Google Ads, LinkedIn, or any other platform/domain decision, no matter how high-stakes. Within Meta Ads, use this ONLY for a decision that is high-stakes or IRREVERSIBLE and that the user (not you) must own — e.g. a special ad category with legal/compliance implications, or a similarly consequential Meta-specific choice. Do NOT use it for routine confirmations or reversible Meta choices — those are yours to make with your own best judgment (the existing target-confirmation flow on writes still applies where it already does).
+
+NEVER ask about the Meta campaign objective here (or via present_question_deck) — call_meta_marketing_api's own CAMPAIGN CREATE call already has a hardened, automatic confirmation gate for it (see that tool's description). Asking about it yourself first only produces a second, uncorrelated question the user answers twice — attempt the CREATE call directly instead and let its own gate ask if it's genuinely unsettled.
 
 Provide 2–4 options, each with a one-line \`consequence\`. EXACTLY ONE option must be marked recommended:true with a one-line \`why\` grounded in real signal from this session (e.g. "162 LEAD events fired on your pixel in the last 30d") — the recommendation is the point. Optionally set allow_emma_decide:true to offer a "Let Emma decide" delegation button (proceeds with the recommended option, logged).
 
@@ -164,7 +162,7 @@ If the user replies with a TYPED message instead of clicking an option, that ope
     inputSchema: {
       type: 'object',
       properties: {
-        question: { type: 'string', description: 'The question to ask, e.g. "Which Meta campaign objective? It cannot be changed after launch."' },
+        question: { type: 'string', description: 'The question to ask, e.g. "Which special ad category applies to this campaign?" Never a Meta campaign objective question — see this tool\'s own description.' },
         intro: { type: 'string', description: 'Optional one- or two-sentence lead-in shown ABOVE the question on the card (e.g. context you just gathered). A card may come with text — use this instead of separate prose. Do NOT restate the options here.' },
         options: {
           type: 'array',
@@ -184,19 +182,31 @@ If the user replies with a TYPED message instead of clicking an option, that ope
             required: ['label', 'consequence'],
           },
         },
-        immutable: { type: 'boolean', description: 'True if the parameter is irreversible (e.g. Meta objective). Immutable questions never auto-resolve in headless runs.' },
+        immutable: { type: 'boolean', description: 'True if the parameter is irreversible (e.g. a Special Ad Category selection). Immutable questions never auto-resolve in headless runs. Not for Meta objective — that has its own dedicated gate, never asked via this tool.' },
         allow_emma_decide: { type: 'boolean', description: 'Offer a "Let Emma decide" delegation button that takes the recommended option.' },
         kind: { type: 'string', description: 'Optional consumer tag (e.g. "meta_objective") identifying which class of decision this is, for a write gate to correlate against without inspecting question text.' },
       },
       required: ['question', 'options'],
     },
   },
+  // ENG-1635/1644 (ask_user_question retirement): execute() no longer does a
+  // synchronous DB write or builds its own PendingUserQuestion/card. It
+  // mirrors present_question_deck's execute() exactly — a bare halt marker
+  // (questionDeckPayload, one entry), no persistence here — so this question
+  // renders through the SAME deck-of-one seam a real present_question_deck
+  // call already uses (buildQuestionApprovalDeckFromHalts at iteration end),
+  // getting the deck's full chrome (Prev/Next disabled at 1 item, Cancel,
+  // Chat-about-this, confirm slide) for free instead of AskUserQuestionCard's
+  // now-retired bespoke UI. `kind`/`immutable` are carried on the payload so
+  // the deck item preserves the same write-gate correlation and no-auto-take
+  // guarantee the old PendingUserQuestion.immutable had.
   execute: async (args: any, context: any) => {
     const sessionId = context?.sessionId;
     if (!sessionId) {
       return { success: false, message: 'ask_user_question requires an active session.' };
     }
-    // Normalize incoming options: assign a stable id when the model omitted one.
+    // Normalize incoming options: assign a stable id when the model omitted one —
+    // same normalization present_question_deck's execute() applies.
     const options: AskUserQuestionOption[] = Array.isArray(args.options)
       ? args.options.map((o: any, i: number) => ({
           id: typeof o?.id === 'string' && o.id.trim() !== '' ? o.id : `option-${i + 1}`,
@@ -208,57 +218,139 @@ If the user replies with a TYPED message instead of clicking an option, that ope
         }))
       : [];
 
-    let question;
-    try {
-      question = buildPendingUserQuestion({
-        questionId: uuidv4(),
-        question: args.question,
-        intro: typeof args.intro === 'string' ? args.intro : undefined,
-        options,
-        immutable: args.immutable === true,
-        allowEmmaDecide: args.allow_emma_decide === true,
-        kind: typeof args.kind === 'string' ? args.kind : undefined,
-        createdAt: new Date().toISOString(),
-      });
-    } catch (err) {
-      if (err instanceof AskUserQuestionError) {
-        // Surface the validation problem so the model can fix and re-emit.
-        return { success: false, message: `Invalid ask_user_question: ${err.message}` };
-      }
-      throw err;
-    }
+    const questionDeckPayload: QuestionDeckQuestionInput[] = [{
+      question: args.question,
+      options,
+      allowEmmaDecide: args.allow_emma_decide === true,
+      kind: typeof args.kind === 'string' ? args.kind : undefined,
+      immutable: args.immutable === true,
+    }];
 
-    // Persist as the single active question. The guard enforces one live question
-    // at a time: if a question is already awaiting, the write is refused (null) and
-    // we tell the model to ask this one later — questions are asked ONE AT A TIME,
-    // never batched, so a second call can't overwrite the pending one's slot.
-    const posted = await chatbotDb.updateSessionAskUserQuestion(sessionId, question, {
-      failIfAwaitingExists: true,
-    });
-    if (!posted) {
-      return {
-        success: false,
-        message:
-          'A question is already waiting for the user to answer. Only ONE question can be open at a time — do not ask another now. Wait until the current question is answered, then ask this one in a later turn (one question per turn).',
-      };
-    }
-
-    const prompt = renderQuestionPrompt(question);
-    // awaitingUserConfirmation halts the loop; type + options let the chat card
-    // render and the frontend post back a structured selection. No field tells
-    // the model how to answer — only a user selection can resolve it.
+    const summary = typeof args.question === 'string' && args.question.trim() !== ''
+      ? args.question
+      : 'Please answer the following question.';
+    // awaitingUserConfirmation halts the loop, exactly like present_question_deck's
+    // halt — no DB write, no deck built here; the iteration-end seam builds and
+    // persists the real deck-of-one.
     return {
       success: true,
       awaitingUserConfirmation: true,
       type: 'ask_user_question',
-      questionId: question.questionId,
-      question: question.question,
-      ...(question.intro ? { intro: question.intro } : {}),
-      options: question.options,
-      recommendedOptionId: question.recommendedOptionId,
-      allowEmmaDecide: question.allowEmmaDecide,
-      confirmationPrompt: prompt,
-      summary: prompt,
+      questionDeckPayload,
+      confirmationPrompt: summary,
+      summary,
+    };
+  },
+});
+
+// ENG-1635/1644 Phase 2: front-load MULTIPLE planning questions into one
+// swipeable deck instead of ask_user_question's one-per-turn serial
+// round-trips. Unlike ask_user_question, execute() does NO DB write and
+// builds NO deck — it returns a bare halt marker (questionDeckPayload),
+// mirroring exactly how a Meta write's halt works (call_meta_marketing_api's
+// awaitingUserConfirmation + metaWriteManifestDigest, no persistence at
+// execute time). The actual deck gets built at the SAME generalized
+// iteration-end seam that already builds write-decks (agentModeService.ts,
+// buildMetaWriteApprovalDeckFromHalts / buildQuestionApprovalDeckFromHalts),
+// so a question-deck renders through the identical pendingApprovalDeckId-
+// tagged message mechanism a write-deck already uses — not a separate,
+// unspecified rendering path (the gap that made an earlier version of this
+// design unshippable).
+emmaToolRegistry.register({
+  name: 'present_question_deck',
+  definition: {
+    name: 'present_question_deck',
+    description: `Ask the user 1-6 structured, blocking multiple-choice questions AT ONCE, front-loaded into a single swipeable deck the user fills and submits together — instead of one ask_user_question call per question (which is one-per-turn by design and forces N serial round-trips). Use this whenever you have MORE THAN ONE predictable planning question determinable right now (e.g. budget + audience + creative direction) — front-load everything you can into ONE call rather than spacing them across turns. A single genuine question is also valid (a "deck of one") when that's all you have right now.
+
+NEVER include a Meta campaign objective question here (or via ask_user_question) — call_meta_marketing_api's own CAMPAIGN CREATE call already has a hardened, automatic confirmation gate for it, uncorrelated with anything asked here. Asking about it yourself first only produces a second question the user answers twice; leave it out of this deck and attempt the CREATE call directly once everything else is settled.
+
+Each question needs 2-4 options, each with a one-line consequence. EXACTLY ONE option per question must be marked recommended:true with a one-line why grounded in real signal from this session (e.g. "162 LEAD events fired on your pixel in the last 30d"). Optionally set allow_emma_decide:true on a question to offer a "Let Emma decide" delegation button for THAT question specifically (takes its recommended option).
+
+Do NOT call call_meta_marketing_api (or any other Meta write) in the SAME turn as this tool. If a write and a question-deck both halt in one turn, the write wins the turn (security-critical — a write must never dead-loop behind a lower-stakes planning question) and this question-deck is silently dropped, then re-asked automatically on a LATER turn once the write-deck is resolved — wasting a round-trip, not catastrophic, but avoidable. Front-load your questions on their own turn, before any write.
+
+After you call this the run BLOCKS until the user submits the whole deck — you will NOT be able to answer it yourself and no further action executes until they do. Do not restate the questions as prose asking for answers; emit this tool instead.
+
+ask_user_question remains available, unchanged, as a narrow escape hatch for a genuinely unpredictable question that only came up mid-execution — it is NOT the default path for planning questions determinable up front; use this tool for those.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        questions: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 6,
+          description: '1-6 questions to front-load into one deck. A single question is valid — front-load whatever you actually have determinable right now.',
+          items: {
+            type: 'object',
+            properties: {
+              question: { type: 'string', description: 'The question to ask, e.g. "What daily budget should this campaign use?"' },
+              options: {
+                type: 'array',
+                minItems: 2,
+                maxItems: 4,
+                description: '2-4 options; exactly one with recommended:true and a one-line why.',
+                items: {
+                  type: 'object',
+                  properties: {
+                    id: { type: 'string', description: 'Optional stable id; auto-generated from position if omitted.' },
+                    label: { type: 'string', description: 'Short button label, e.g. "$50/day".' },
+                    consequence: { type: 'string', description: 'One-line consequence of choosing this option.' },
+                    recommended: { type: 'boolean', description: 'Set true on EXACTLY ONE option.' },
+                    why: { type: 'string', description: 'One-line justification. REQUIRED on the recommended option.' },
+                    payload: { type: 'object', description: 'The concrete machine parameters this option implies (applied verbatim by the consumer — no re-inference).' },
+                  },
+                  required: ['label', 'consequence'],
+                },
+              },
+              allow_emma_decide: { type: 'boolean', description: 'Offer a "Let Emma decide" delegation button for THIS question (takes its recommended option).' },
+            },
+            required: ['question', 'options'],
+          },
+        },
+      },
+      required: ['questions'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const sessionId = context?.sessionId;
+    if (!sessionId) {
+      return { success: false, message: 'present_question_deck requires an active session.' };
+    }
+    const rawQuestions = Array.isArray(args.questions) ? args.questions : [];
+    if (rawQuestions.length === 0) {
+      return { success: false, message: 'present_question_deck requires at least 1 question.' };
+    }
+
+    // Normalize each question's options the same way ask_user_question does
+    // (stable id assigned from position when the model omitted one) — the
+    // seam that builds the actual deck later trusts this shape as-is; full
+    // structural validation (exactly-one-recommended, no duplicate/reserved
+    // ids) happens once, at deck construction (approvalDeck.ts's
+    // validateItemShape), not duplicated here.
+    const questionDeckPayload = rawQuestions.map((q: any) => ({
+      question: q?.question,
+      options: Array.isArray(q?.options)
+        ? q.options.map((o: any, i: number) => ({
+            id: typeof o?.id === 'string' && o.id.trim() !== '' ? o.id : `option-${i + 1}`,
+            label: o?.label,
+            consequence: o?.consequence,
+            recommended: o?.recommended === true,
+            why: o?.why,
+            payload: o?.payload,
+          }))
+        : [],
+      allow_emma_decide: q?.allow_emma_decide === true,
+    }));
+
+    const summary = `Review the following ${questionDeckPayload.length} question(s) and submit your answers for all of them at once.`;
+    // awaitingUserConfirmation halts the loop, exactly like a Meta write's halt
+    // — no DB write, no deck built here (see the block comment above).
+    return {
+      success: true,
+      awaitingUserConfirmation: true,
+      type: 'present_question_deck',
+      questionDeckPayload,
+      confirmationPrompt: summary,
+      summary,
     };
   },
 });
@@ -955,24 +1047,30 @@ LAUNCH GATE: setting a CAMPAIGN, AD_SET or AD to status=ACTIVE starts paid deliv
   it on your own initiative, and never to work around a block you cannot explain. A failure to VERIFY (Meta API
   or fetch error) also blocks: unverified is treated as unmeasured, never as measured.
   The override only takes effect once the user has SEEN it: put params.override_tracking_check=true on the
-  unconfirmed preview call, show the user the WARNING line that comes back in the summary, and on the confirmed
-  call pass params.tracking_override_token exactly as the preview returned it, alongside params.confirm=true.
-  Adding the override only to the confirmed call, or changing any other argument after the preview, invalidates
-  it — the API returns a fresh preview instead of launching. There is no way to waive the check without the user
-  being shown that it is being waived.
+  unconfirmed preview call and show the user the WARNING line that comes back in the summary. NOTE: the
+  override-waiver replay described elsewhere in this codebase (a second call carrying
+  params.tracking_override_token) is not currently supported for a write routed through the approval-deck
+  flow below — if the user explicitly wants to waive the tracking check, say so plainly rather than promising
+  a mechanism that isn't wired through yet, and flag it for a human rather than guessing a workaround.
 
 ⚠️ MANDATORY TARGET CONFIRMATION (publish/change/delete actions):
   CAMPAIGN/AD_SET/AD with CREATE, UPDATE, DELETE, or COPY_AD are write actions that publish, change, or
-  destroy live entities. For these, the API runs a two-phase confirmation:
-    1. Call normally (without params.confirm). The API does NOT execute — it returns requiresConfirmation:true
-       with a "target" object naming the exact campaign + ad set + asset that will be affected.
-    2. Show the user that resolved target verbatim (campaign name + ID, ad set name + ID, ad name, and any
-       content/budget/status changes) and get EXPLICIT approval before proceeding.
-    3. Only after the user approves, re-call with the SAME arguments plus params.confirm=true to execute.
-    4. When one user directive covers multiple gated writes with no data dependency between them (for example,
-       status changes across AD, AD_SET, and CAMPAIGN), emit ALL of those calls in ONE message so they confirm
-       as a single round. Split only on a real data dependency, such as creating a creative before an ad can
-       reference its creative_id.
+  destroy live entities. For these, the API halts before ever writing — it does NOT execute on the first call:
+    1. Call normally (without params.confirm — this flag does nothing on its own; see its own parameter
+       description below). The API returns awaitingUserConfirmation:true with a "target" object naming the
+       exact campaign + ad set + asset that will be affected, and adds the write to an approval deck the user
+       answers directly in the UI with real approve/reject controls — not a typed reply you relay for them.
+    2. Do NOT re-call this tool for the SAME write after this halt, with or without params.confirm=true.
+       There is no flag or retry on your end that makes this execute — the only thing that authorizes it is
+       the user's own answer, submitted through the deck UI, which the backend then executes automatically.
+       Treat the halt as the end of your turn for that write. A later turn will tell you the outcome (applied,
+       failed, or rejected) once the user has answered — do not assume success and do not ask the user to
+       confirm again via chat text.
+    3. When one user directive covers multiple gated writes with no data dependency between them (for example,
+       status changes across AD, AD_SET, and CAMPAIGN), emit ALL of those calls in ONE message — every halted
+       write from that one message is front-loaded into ONE deck the user answers once, instead of one prompt
+       per write. Split only on a real data dependency, such as creating a creative before an ad can reference
+       its creative_id.
   If the user's request could map to MORE THAN ONE campaign, ad set, or asset, do NOT guess — list the
   candidates and ask the user to disambiguate BEFORE calling. Never publish an ad into a campaign/ad set the
   user did not explicitly name, and never regenerate/edit an asset set without confirming which assets.
@@ -986,12 +1084,16 @@ LAUNCH GATE: setting a CAMPAIGN, AD_SET or AD to status=ACTIVE starts paid deliv
   by guessing an objective or retrying.
 
   If the user asks you to confirm the objective (or any other setting) via a structured card BEFORE you
-  build anything: you have NO way to render an interactive card yourself — do not fabricate one out of HTML,
-  markdown tables, or styled text in your reply; a hand-written "card" you write is not real and answering
-  it does nothing. Just attempt the CAMPAIGN CREATE call directly (with your real name/budget/targeting
-  params, omitting objective if it isn't explicitly confirmed) — if the objective truly isn't settled, the
-  call itself returns the real blocking question, which the platform renders as an actual clickable card.
-  Do not stall in prose waiting to "ask first"; attempting the call is how the real card appears.
+  build anything: do NOT use ask_user_question or present_question_deck to ask about the objective
+  yourself — both tools explicitly exclude it for this exact reason, and doing so anyway produces a
+  SECOND, uncorrelated question on top of this gate's own, meaning the user answers the same question
+  twice. You also have no way to render an interactive card any other way — do not fabricate one out of
+  HTML, markdown tables, or styled text in your reply; a hand-written "card" you write is not real and
+  answering it does nothing. Just attempt the CAMPAIGN CREATE call directly (with your real name/budget/
+  targeting params, omitting objective if it isn't explicitly confirmed) — if the objective truly isn't
+  settled, the call itself returns the real blocking question, which the platform renders as an actual
+  clickable card. Do not stall in prose waiting to "ask first"; attempting the call is how the real card
+  appears.
 
 ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
@@ -1204,7 +1306,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
           description: "Action-specific parameters. Required fields depend on entity_type + action (see tool description for the full matrix).",
           properties: {
             // --- Confirmation gate (write actions) ---
-            confirm: { type: "boolean", description: "Set to true ONLY after showing the user the resolved target (campaign/ad set/asset) returned by the first call and getting explicit approval. Required to actually execute CAMPAIGN/AD_SET/AD CREATE/UPDATE/DELETE/COPY_AD/RETAG_UTM. Omit (or false) on the first call to preview the target." },
+            confirm: { type: "boolean", description: "Does nothing on its own — kept only so existing calls that still set it don't error. A CAMPAIGN/AD_SET/AD CREATE/UPDATE/DELETE/COPY_AD write only ever executes once the user has approved it through the approval-deck UI; this flag cannot authorize a write by itself, and re-calling with it set to true after a halt will NOT make the write execute. See MANDATORY TARGET CONFIRMATION above." },
 
             // --- Common ---
             name: { type: "string", description: "Entity name." },
@@ -1337,7 +1439,7 @@ emmaToolRegistry.register({
   name: "launch_targeted_audience_campaign",
   definition: {
     name: "launch_targeted_audience_campaign",
-    description: "Launch a Meta campaign targeted at a Custom Audience sourced from a HubSpot list or a CSV, optionally via a Lookalike built from that seed. Creates or reuses (by name) the Custom Audience, optionally creates a Lookalike from it, and attaches it to a NEW ad set under an existing campaign (kept separate from any broad/control campaign). Two-phase like call_meta_marketing_api writes: call once without confirm to get a preview (awaitingUserConfirmation), show it to the user, then call again with confirm=true to execute. Returns a completion ledger (source, audience, lookalike, campaign/ad set, any failures). Distinct from launch_retargeting_campaign, which requires exclude_audience_id.",
+    description: "Launch a Meta campaign targeted at a Custom Audience sourced from a HubSpot list or a CSV, optionally via a Lookalike built from that seed. Creates or reuses (by name) the Custom Audience, optionally creates a Lookalike from it, and attaches it to a NEW ad set under an existing campaign (kept separate from any broad/control campaign). Two-phase, gated by its own preview token (distinct from call_meta_marketing_api's approval-deck flow): call once without confirm to get a preview (awaitingUserConfirmation) plus a preview_token, show it to the user, then call again with confirm=true and that same preview_token to execute. Returns a completion ledger (source, audience, lookalike, campaign/ad set, any failures). Distinct from launch_retargeting_campaign, which requires exclude_audience_id.",
     inputSchema: {
       type: "object",
       properties: {

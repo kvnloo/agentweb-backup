@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from "react";
+import React, { useEffect, useState, useRef, useCallback } from "react";
 import { useAdmin } from "../contexts/AdminContext";
 import { Link as RouterLink, useSearchParams } from "react-router-dom";
 import {
@@ -1053,6 +1053,57 @@ export default function AdminDashboard() {
   const [crmSyncForceFull, setCrmSyncForceFull] = useState(false);
   const [crmSyncAutoSync, setCrmSyncAutoSync] = useState(false);
 
+  // Moved up from further below and wrapped in useCallback: the two effects right after this
+  // read them, and referencing a `const` in a dependency array before its declaration is a
+  // temporal-dead-zone error, not just a stale closure.
+  const loadSubscriptionTypes = useCallback(async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/admin/subscription-types'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const types = response.data;
+      // Extract type names, including "Basic" as default
+      const typeNames = types.length > 0
+        ? types.map((t: any) => t.name)
+        : ['Basic'];
+      setAvailableSubscriptionTypes(typeNames);
+      const allowanceMap: Record<string, number | null> = {};
+      const costAllowanceMap: Record<string, number | null> = {};
+      types.forEach((t: any) => {
+        allowanceMap[t.name] = t.monthlyTokenAllowance ?? null;
+        costAllowanceMap[t.name] = t.llmUsagePolicy?.hardCostThresholdMicroUsd != null
+          ? t.llmUsagePolicy.hardCostThresholdMicroUsd / 1_000_000
+          : (t.monthlyCostAllowance ?? null);
+      });
+      setSubscriptionTypeAllowanceMap(allowanceMap);
+      setSubscriptionTypeCostAllowanceMap(costAllowanceMap);
+    } catch (error) {
+      console.error('Error loading subscription types:', error);
+      // Default to Basic if loading fails
+      setAvailableSubscriptionTypes(['Basic']);
+    }
+  }, [token]);
+
+  const resolveSlackChannelNames = useCallback(async (channelIds: string[]) => {
+    const unresolved = channelIds.filter((id) => !slackChannelNames[id]);
+    if (unresolved.length === 0) return;
+    const results: Record<string, string> = {};
+    await Promise.all(
+      unresolved.map(async (id) => {
+        try {
+          const res = await axios.get(
+            buildApiUrl(`/api/admin/slack/channel-info?channelId=${encodeURIComponent(id)}`),
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          results[id] = res.data.displayName || res.data.name || id;
+        } catch {
+          results[id] = id;
+        }
+      })
+    );
+    setSlackChannelNames((prev) => ({ ...prev, ...results }));
+  }, [slackChannelNames, token]);
+
   // Load users data only when Users tab (2) is selected
   useEffect(() => {
     if (tabValue === 2) {
@@ -1085,7 +1136,7 @@ export default function AdminDashboard() {
         setAvailableSlackChannelsLoading(false);
       });
     }
-  }, [tabValue]);
+  }, [tabValue, loadSubscriptionTypes, loadUsers, token, userFilterHideBotLike]);
 
   // Resolve Slack channel names for all users whenever users list loads
   useEffect(() => {
@@ -1099,36 +1150,8 @@ export default function AdminDashboard() {
     if (allChannelIds.length > 0) {
       resolveSlackChannelNames(allChannelIds);
     }
-  }, [contextUsers]);
+  }, [contextUsers, resolveSlackChannelNames]);
 
-  // Load subscription types
-  const loadSubscriptionTypes = async () => {
-    try {
-      const response = await axios.get(buildApiUrl('/api/admin/subscription-types'), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const types = response.data;
-      // Extract type names, including "Basic" as default
-      const typeNames = types.length > 0
-        ? types.map((t: any) => t.name)
-        : ['Basic'];
-      setAvailableSubscriptionTypes(typeNames);
-      const allowanceMap: Record<string, number | null> = {};
-      const costAllowanceMap: Record<string, number | null> = {};
-      types.forEach((t: any) => {
-        allowanceMap[t.name] = t.monthlyTokenAllowance ?? null;
-        costAllowanceMap[t.name] = t.llmUsagePolicy?.hardCostThresholdMicroUsd != null
-          ? t.llmUsagePolicy.hardCostThresholdMicroUsd / 1_000_000
-          : (t.monthlyCostAllowance ?? null);
-      });
-      setSubscriptionTypeAllowanceMap(allowanceMap);
-      setSubscriptionTypeCostAllowanceMap(costAllowanceMap);
-    } catch (error) {
-      console.error('Error loading subscription types:', error);
-      // Default to Basic if loading fails
-      setAvailableSubscriptionTypes(['Basic']);
-    }
-  };
 
   // Fetch the per-model LLM cost burn for a user over a calendar month (YYYY-MM).
   const fetchCostBreakdown = async (userId: string, month: string) => {
@@ -1256,7 +1279,7 @@ export default function AdminDashboard() {
       loadWaitlist();
       loadUsers(userFilterHideBotLike); // Also load users to check if waitlist entries are registered
     }
-  }, [tabValue]);
+  }, [tabValue, loadUsers, loadWaitlist, userFilterHideBotLike]);
 
   // Handle URL parameter changes
   useEffect(() => {
@@ -1267,7 +1290,7 @@ export default function AdminDashboard() {
     }
     setSearchParams({ tab: "users" });
     setTabValue(TAB_MAP.users);
-  }, [searchParams, setSearchParams]);
+  }, [searchParams, setSearchParams, TAB_MAP]);
 
   // Track last loaded dates to prevent unnecessary reloads
   const lastLoadedDatesRef = React.useRef<{ startDate: string; endDate: string } | null>(null);
@@ -1309,7 +1332,7 @@ export default function AdminDashboard() {
     if (tabValue === 4 && tasks.length === 0) {
       loadTasks();
     }
-  }, [tabValue, token]);
+  }, [tabValue, token, tasks.length]);
 
   useEffect(() => {
     const loadWorkflows = async () => {
@@ -1329,7 +1352,7 @@ export default function AdminDashboard() {
     if (tabValue === 5 && workflows.length === 0) {
       loadWorkflows();
     }
-  }, [tabValue, token]);
+  }, [tabValue, token, workflows.length]);
 
   const loadChatSessions = React.useCallback(
     async (options?: { reset?: boolean; sessionIdOverride?: string; userFilterOverride?: string }) => {
@@ -1423,7 +1446,7 @@ export default function AdminDashboard() {
         setScoringJudges(res.data.judges || []);
       }).catch(() => {});
     }
-  }, [tabValue, chatSessionsInitialized, loadChatSessions]);
+  }, [tabValue, chatSessionsInitialized, loadChatSessions, scoringJudges.length, token]);
 
   useEffect(() => {
     if (tabValue !== 6 || !chatSessionsHasMore) {
@@ -1578,7 +1601,7 @@ export default function AdminDashboard() {
     if (tabValue === 7 && !knowledgeBaseMetrics) {
       loadKnowledgeBaseMetrics();
     }
-  }, [tabValue, token]);
+  }, [tabValue, token, knowledgeBaseMetrics]);
 
   const handleTabChange = (_event: React.SyntheticEvent, newValue: number) => {
     setTabValue(newValue);
@@ -2644,25 +2667,6 @@ export default function AdminDashboard() {
     }
   };
 
-  const resolveSlackChannelNames = async (channelIds: string[]) => {
-    const unresolved = channelIds.filter((id) => !slackChannelNames[id]);
-    if (unresolved.length === 0) return;
-    const results: Record<string, string> = {};
-    await Promise.all(
-      unresolved.map(async (id) => {
-        try {
-          const res = await axios.get(
-            buildApiUrl(`/api/admin/slack/channel-info?channelId=${encodeURIComponent(id)}`),
-            { headers: { Authorization: `Bearer ${token}` } }
-          );
-          results[id] = res.data.displayName || res.data.name || id;
-        } catch {
-          results[id] = id;
-        }
-      })
-    );
-    setSlackChannelNames((prev) => ({ ...prev, ...results }));
-  };
 
   const handleSaveSlackChannel = async () => {
     if (!editingSlackChannelUserId) return;

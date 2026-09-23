@@ -197,7 +197,7 @@ export default function ExecutionDetails() {
         setIsAutoRefreshing(false);
       }
     };
-  }, [execution?.status, fetchExecution]);
+  }, [execution, fetchExecution]);
 
   const handleKillClick = () => {
     setKillError('');

@@ -33,6 +33,7 @@ import { computeCostMicroUsd } from './usageRecorderService';
 import type { CacheWriteByTtl } from '../utils/llmPricing';
 import { approvalDb } from './approvalDb';
 import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
+import { PendingApprovalDeck } from './agentMode/core/approvalDeck';
 import { WorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import { WorkflowRunState } from './agentMode/core/workflow';
 // Load environment variables from .env file
@@ -256,27 +257,69 @@ export interface ChatSession {
     pendingRequiredFunctionCalls?: string[];
   };
   contextLimitReported?: boolean; // True once a context-limit issue report has been auto-filed
-  // ENG-396: the single structured question Emma is currently blocked on (if any).
-  // Persisted so the answer is read STRUCTURALLY by the next tool call (never
-  // re-parsed from prose) and so an unanswered gate survives run boundaries as a
-  // parked pending_user_input state. Mirrors the workPlan persistence pattern.
+  // ENG-1635/1644 PR2: dead going forward — updateSessionAskUserQuestion (the
+  // only writer) is deleted, and the pre-migration stale records were drained
+  // (eng1635-null-stale-pending-user-questions.ts). Left declared, not
+  // removed, only because agentMode/workflowRunner.ts's resolveStepParameters
+  // still reads it to gate a WorkflowStepDefinition's requiredParameters —
+  // confirmed that mechanism's only real caller (createCampaignStep.ts's
+  // buildCreateCampaignStep, ENG-397's demonstrative example) is itself never
+  // invoked anywhere in production, so this is safe dead weight, not a live
+  // regression risk. Out of scope for this pass to also touch workflowRunner.ts.
   pendingUserQuestion?: PendingUserQuestion;
-  // ENG-400: answered questions archived by questionId when they roll off the
-  // live pendingUserQuestion slot (a later question replaced them). Lets a
-  // write gate (checkQuestionGate) still find an earlier human answer even
-  // after Emma has moved on to asking something else in the same session.
+  // See pendingUserQuestion above — same PR2 status (dead writer, kept only
+  // for workflowRunner.ts's still-live but practically-unreachable read).
   answeredQuestions?: Record<string, PendingUserQuestion>;
   // One channel-neutral information request emitted by the current work-plan
-  // step. It is intentionally separate from pendingUserQuestion because it
-  // carries typed values rather than an option selection; the write guard
-  // still makes the two mutually exclusive while either is awaiting.
+  // step. It carries typed values rather than an option selection; the write
+  // guard makes it and pendingApprovalDeck mutually exclusive while either is
+  // awaiting (2-way, ENG-1635/1644 PR2 — pendingUserQuestion dropped out of
+  // this cross-slot guard once nothing could populate it anymore).
   pendingWorkPlanInput?: WorkPlanInputRequest;
+  // ENG-1635/1644: the compound multi-item approval deck Emma is currently
+  // blocked on (if any) — see agentMode/core/approvalDeck.ts's file header.
+  // The other live human-interrupt slot alongside pendingWorkPlanInput;
+  // updateSessionApprovalDeck's guard and updateSessionWorkPlanInputRequest's
+  // guard cross-check each other so at most one is ever 'awaiting' at once.
+  pendingApprovalDeck?: PendingApprovalDeck;
   // ENG-1642: canonical digests (computeMetaWriteManifestDigest) of manifest-
   // approved Meta writes already executed confirmation-free in this session.
   // A digest present here has been consumed — the SAME write may not execute
   // again without a fresh confirmation. Map value is the consumption
   // timestamp (kept, not just a boolean, purely for audit/debugging).
   consumedMetaWriteManifestDigests?: Record<string, string>;
+  // ENG-1635/1644 follow-up: tracks a per-target consecutive-failure streak for
+  // a Meta write, purely so the failure history can be surfaced on the NEXT
+  // approval card for the same target — found live, a write that failed 3x in
+  // a row got silently re-proposed identically each time with zero explanation,
+  // because nothing surfaced the failure independent of the model's own prose.
+  // Deliberately NOT used to block or gate dispatch (an earlier version did —
+  // reverted live, since blocking by target identity alone can silently refuse
+  // a genuinely corrected, would-succeed attempt too, which is worse than the
+  // bug it was fixing). `signature` identifies the TARGET (entity_type+action+
+  // account/campaign/ad_set/ad id), not exact params, so a genuinely corrected
+  // retry (different params, same target) still counts toward the same streak
+  // for warning purposes — never for permission. Cleared to null the moment a
+  // write against the same signature succeeds.
+  lastFailedMetaWrite?: { signature: string; error: string; count: number; at: string } | null;
+  // ENG-1635/1644 PR2: durable record of a Meta campaign objective already
+  // confirmed by the user's own words (or a prior answered card), keyed by
+  // the objectiveKind correlator resolveCampaignObjectiveGate computes
+  // (account+name+budget+categories) — lets a same-turn write-gate retry, or
+  // a later campaign in the same session, find it already settled without
+  // re-deriving it. Deliberately a plain map field (mirrors
+  // lastFailedMetaWrite/consumedMetaWriteManifestDigests above), NOT the
+  // deck/message-history mechanism: this record is never shown to the user
+  // as a card (the objective was already stated in their own words, no card
+  // was needed), and synthesizing a fake halt+answer message pair into the
+  // real chat transcript would risk it actually rendering. Written only by
+  // persistExplicitObjectiveConfirmation — not a general-purpose setter.
+  objectiveConfirmations?: Record<string, {
+    objective: string;
+    answeredBy: 'user' | 'delegation';
+    at: string;
+    quote?: string;
+  }>;
   // ENG-1974: workplan recommendations the user explicitly declined via "Keep
   // chatting" this session, keyed by recommendationId (the deterministic
   // sha256(sessionId:planId) hash recommendPredefinedWorkPlan already
@@ -3160,121 +3203,6 @@ export class ChatbotDB {
   }
 
   /**
-   * ENG-396/400: persist (or clear) the session's blocking AskUserQuestion.
-   * Pass a PendingUserQuestion to set it (status 'awaiting' when posed,
-   * 'answered' once the user selects); pass null to clear it after the
-   * consumer has read the answer. Mirrors updateSessionWorkPlan — a targeted
-   * SET/REMOVE so subsequent tool calls read session.pendingUserQuestion
-   * directly rather than parsing prose.
-   *
-   * ENG-400: when posting a NEW question, if the CURRENT live slot is already
-   * 'answered' (a different, earlier question), it is archived into
-   * session.answeredQuestions[questionId] before being overwritten — so
-   * checkQuestionGate can still find that earlier human answer by id even
-   * after Emma has moved on to asking something else in the same session.
-   */
-  async updateSessionAskUserQuestion(
-    sessionId: string,
-    pendingUserQuestion: PendingUserQuestion | null,
-    opts?: { failIfAwaitingExists?: boolean; requireStillAwaiting?: string },
-  ): Promise<ChatSession | null> {
-    // ENG-396: the one-live-question invariant. When posing a NEW awaiting question,
-    // `failIfAwaitingExists` gates the write on there being no question already
-    // awaiting — a settled 'answered' slot may be replaced (that's the normal
-    // turn-by-turn next question). Enforced atomically so two ask_user_question
-    // calls in the same turn can never both take the single slot; the loser is
-    // refused (returns null) and the model asks it in a later turn.
-    const guard = opts?.failIfAwaitingExists === true && pendingUserQuestion !== null;
-
-    // Greptile P1 ("Concurrent answers overwrite selections" / "Typed messages
-    // bypass answer lock"): persisting an ANSWER, or clearing an abandoned
-    // question (the typed-past-a-card path), previously had no guard at all —
-    // two concurrent requests (a card answer racing a typed message, or two
-    // answer submissions) could both read the same 'awaiting' snapshot and the
-    // later unconditional write would silently clobber or erase the earlier
-    // one's result. `requireStillAwaiting` makes EITHER write (SET an answer,
-    // or REMOVE/clear) optimistic-locked: it only succeeds if the question is
-    // STILL exactly this one, STILL 'awaiting', at the moment of write — the
-    // loser of the race gets null (refused) instead of corrupting the winner.
-    const requireStillAwaiting =
-      typeof opts?.requireStillAwaiting === 'string' ? opts.requireStillAwaiting : undefined;
-
-    let updatedArchive: Record<string, PendingUserQuestion> | undefined;
-    if (pendingUserQuestion !== null) {
-      // A lightweight, PROJECTED read (not getChatSession — that also loads/migrates
-      // messages, which this write doesn't need) of just the two fields this
-      // archiving decision depends on.
-      const existing = await dynamodb
-        .get({
-          TableName: this.tableName,
-          Key: { sessionId },
-          ProjectionExpression: "pendingUserQuestion, answeredQuestions",
-        })
-        .promise();
-      const current: PendingUserQuestion | undefined = existing?.Item?.pendingUserQuestion;
-      if (current && current.status === 'answered' && current.questionId !== pendingUserQuestion.questionId) {
-        updatedArchive = { ...(existing?.Item?.answeredQuestions || {}), [current.questionId]: current };
-      }
-    }
-
-    const params: any = pendingUserQuestion
-      ? {
-          TableName: this.tableName,
-          Key: { sessionId },
-          UpdateExpression: updatedArchive
-            ? "SET pendingUserQuestion = :pendingUserQuestion, adminListPartition = :adminListPartition, answeredQuestions = :answeredQuestions"
-            : "SET pendingUserQuestion = :pendingUserQuestion, adminListPartition = :adminListPartition",
-          ExpressionAttributeValues: {
-            ":pendingUserQuestion": pendingUserQuestion,
-            ":adminListPartition": "all",
-            ...(updatedArchive ? { ":answeredQuestions": updatedArchive } : {}),
-          },
-          ReturnValues: "ALL_NEW",
-        }
-      : {
-          TableName: this.tableName,
-          Key: { sessionId },
-          UpdateExpression: "REMOVE pendingUserQuestion",
-          ReturnValues: "ALL_NEW",
-        };
-
-    if (guard) {
-      params.ConditionExpression =
-        "attribute_not_exists(pendingUserQuestion) OR pendingUserQuestion.#pStatus <> :awaitingStatus";
-      params.ExpressionAttributeNames = { "#pStatus": "status" };
-      params.ExpressionAttributeValues[":awaitingStatus"] = "awaiting";
-    } else if (requireStillAwaiting) {
-      params.ConditionExpression =
-        "pendingUserQuestion.questionId = :requireQuestionId AND pendingUserQuestion.#pStatus = :awaitingStatus";
-      params.ExpressionAttributeNames = { "#pStatus": "status" };
-      // The REMOVE branch's params literal has no ExpressionAttributeValues at
-      // all (nothing to reference) until a guard needs one — create it here
-      // rather than assuming it exists, so a plain unconditional REMOVE keeps
-      // its existing (undefined) shape when no guard applies.
-      params.ExpressionAttributeValues = {
-        ...(params.ExpressionAttributeValues || {}),
-        ":requireQuestionId": requireStillAwaiting,
-        ":awaitingStatus": "awaiting",
-      };
-    }
-
-    try {
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes as ChatSession;
-    } catch (error) {
-      // A guarded write that fails the condition means either a question is
-      // already awaiting (posting a new one) or this answer lost a race to a
-      // concurrent one (persisting an answer) — an expected outcome, not an
-      // error. Signal it with null either way.
-      if ((guard || requireStillAwaiting) && (error as any)?.code === "ConditionalCheckFailedException") {
-        return null;
-      }
-      console.error("Error updating session AskUserQuestion:", error);
-      throw error;
-    }
-  }
-
-  /**
    * ENG-1642: atomically claim a manifest-granted Meta write digest for
    * confirmation-free execution, at most once. A digest already present in
    * `consumedMetaWriteManifestDigests` means that exact write already ran
@@ -3475,8 +3403,11 @@ export class ChatbotDB {
         };
 
     if (guard) {
-      params.ConditionExpression = '(attribute_not_exists(pendingWorkPlanInput) OR pendingWorkPlanInput.#inputStatus <> :awaitingStatus) AND (attribute_not_exists(pendingUserQuestion) OR pendingUserQuestion.#questionStatus <> :awaitingStatus)';
-      params.ExpressionAttributeNames = { '#inputStatus': 'status', '#questionStatus': 'status' };
+      // ENG-1635/1644 PR2: collapsed from 3-way to 2-way — pendingUserQuestion
+      // is no longer a live slot anything can populate (updateSessionAskUserQuestion
+      // is deleted), so cross-checking it here would always be vacuously true.
+      params.ConditionExpression = '(attribute_not_exists(pendingWorkPlanInput) OR pendingWorkPlanInput.#inputStatus <> :awaitingStatus) AND (attribute_not_exists(pendingApprovalDeck) OR pendingApprovalDeck.#deckStatus <> :awaitingStatus)';
+      params.ExpressionAttributeNames = { '#inputStatus': 'status', '#deckStatus': 'status' };
       params.ExpressionAttributeValues[':awaitingStatus'] = 'awaiting';
     } else if (requireStillAwaiting) {
       params.ConditionExpression = 'pendingWorkPlanInput.requestId = :requestId AND pendingWorkPlanInput.#inputStatus = :awaitingStatus';
@@ -3496,6 +3427,189 @@ export class ChatbotDB {
         return null;
       }
       console.error('Error updating session work-plan input request:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-1635/1644: persist (or clear) the session's pending approval deck.
+   * Unlike the two guards above, the deck has a 3-state lifecycle
+   * (building -> awaiting -> answered), so its guards compose rather than
+   * branch exclusively — pass any combination that applies to a given call
+   * and the clauses AND together:
+   *  - failIfAwaitingExists: the cross-slot guard (gap 6; collapsed from 3-way
+   *    to 2-way, PR2) — refuses the write while pendingApprovalDeck OR
+   *    pendingWorkPlanInput is already 'awaiting'. Used when FINALIZING a
+   *    deck (building -> awaiting) — a deck still 'building' is not yet
+   *    blocking anyone, so plain create/append calls never need this.
+   *  - requireStillBuilding: optimistic-locked on the deck still being
+   *    exactly this deckId and still 'building' — used by append (refuses a
+   *    stale append after the deck was already finalized/cleared) and
+   *    combined with failIfAwaitingExists for finalize (refuses a stale
+   *    finalize of a deck that was already finalized or cleared out from
+   *    under it).
+   *  - requireStillAwaiting: optimistic-locked on the deck still being
+   *    exactly this deckId and still 'awaiting' — used when persisting
+   *    answers or clearing an abandoned deck, same shape as the other two
+   *    updateSession* methods' identically-named option.
+   */
+  async updateSessionApprovalDeck(
+    sessionId: string,
+    pendingApprovalDeck: PendingApprovalDeck | null,
+    opts?: { failIfAwaitingExists?: boolean; requireStillBuilding?: string; requireStillAwaiting?: string },
+  ): Promise<ChatSession | null> {
+    const crossSlotGuard = opts?.failIfAwaitingExists === true && pendingApprovalDeck !== null;
+    const requireStillBuilding =
+      typeof opts?.requireStillBuilding === 'string' ? opts.requireStillBuilding : undefined;
+    const requireStillAwaiting =
+      typeof opts?.requireStillAwaiting === 'string' ? opts.requireStillAwaiting : undefined;
+    const anyGuard = crossSlotGuard || requireStillBuilding !== undefined || requireStillAwaiting !== undefined;
+
+    const params: any = pendingApprovalDeck
+      ? {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET pendingApprovalDeck = :pendingApprovalDeck, adminListPartition = :adminListPartition',
+          ExpressionAttributeValues: {
+            ':pendingApprovalDeck': pendingApprovalDeck,
+            ':adminListPartition': 'all',
+          },
+          ReturnValues: 'ALL_NEW',
+        }
+      : {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'REMOVE pendingApprovalDeck',
+          ReturnValues: 'ALL_NEW',
+        };
+
+    const clauses: string[] = [];
+    const names: Record<string, string> = {};
+    const values: Record<string, any> = params.ExpressionAttributeValues || {};
+
+    if (crossSlotGuard) {
+      // ENG-1635/1644 PR2: collapsed from 3-way to 2-way — pendingUserQuestion
+      // is no longer a live slot anything can populate.
+      clauses.push('(attribute_not_exists(pendingApprovalDeck) OR pendingApprovalDeck.#dStatus <> :awaitingStatus)');
+      clauses.push('(attribute_not_exists(pendingWorkPlanInput) OR pendingWorkPlanInput.#iStatus <> :awaitingStatus)');
+      names['#dStatus'] = 'status';
+      names['#iStatus'] = 'status';
+      values[':awaitingStatus'] = 'awaiting';
+    }
+    if (requireStillBuilding) {
+      clauses.push('pendingApprovalDeck.deckId = :requireBuildingDeckId');
+      clauses.push('pendingApprovalDeck.#dStatus = :buildingStatus');
+      names['#dStatus'] = 'status';
+      values[':requireBuildingDeckId'] = requireStillBuilding;
+      values[':buildingStatus'] = 'building';
+    }
+    if (requireStillAwaiting) {
+      clauses.push('pendingApprovalDeck.deckId = :requireAwaitingDeckId');
+      clauses.push('pendingApprovalDeck.#dStatus = :requireAwaitingStatus');
+      names['#dStatus'] = 'status';
+      values[':requireAwaitingDeckId'] = requireStillAwaiting;
+      values[':requireAwaitingStatus'] = 'awaiting';
+    }
+    if (clauses.length > 0) {
+      params.ConditionExpression = clauses.join(' AND ');
+      params.ExpressionAttributeNames = names;
+      params.ExpressionAttributeValues = values;
+    }
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      if (anyGuard && (error as any)?.code === 'ConditionalCheckFailedException') {
+        return null;
+      }
+      console.error('Error updating session approval deck:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-1635/1644 follow-up: persist (or clear) the retry-backstop counter for a
+   * repeatedly-failing Meta write. Unconditional (no guard/condition) — this is
+   * advisory bookkeeping for a UX backstop, not a security invariant, so a lost
+   * race under last-write-wins is an acceptable tradeoff against the complexity
+   * a real lock would add here.
+   */
+  async updateSessionLastFailedMetaWrite(
+    sessionId: string,
+    value: { signature: string; error: string; count: number; at: string } | null,
+  ): Promise<ChatSession | null> {
+    const params: any = value
+      ? {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET lastFailedMetaWrite = :lastFailedMetaWrite',
+          ExpressionAttributeValues: { ':lastFailedMetaWrite': value },
+          ReturnValues: 'ALL_NEW',
+        }
+      : {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'REMOVE lastFailedMetaWrite',
+          ReturnValues: 'ALL_NEW',
+        };
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error('Error updating session lastFailedMetaWrite:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-1635/1644 PR2: persist one entry in objectiveConfirmations, keyed by
+   * objectiveKind. Unconditional SET (no attribute_not_exists guard, unlike
+   * claimMetaWriteManifestDigest's at-most-once claim below) — two racing
+   * legitimate human confirmations of the same objective are both valid, so
+   * last-write-wins is a non-issue here, same reasoning
+   * updateSessionLastFailedMetaWrite already relies on. Mirrors
+   * claimMetaWriteManifestDigest's two-step "SET map.key, on
+   * ValidationException init the map then retry" shape for a session with
+   * no existing objectiveConfirmations map at all.
+   */
+  async updateSessionObjectiveConfirmation(
+    sessionId: string,
+    objectiveKind: string,
+    value: { objective: string; answeredBy: 'user' | 'delegation'; at: string; quote?: string },
+  ): Promise<void> {
+    try {
+      await dynamodb
+        .update({
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET objectiveConfirmations.#kind = :value',
+          ExpressionAttributeNames: { '#kind': objectiveKind },
+          ExpressionAttributeValues: { ':value': value },
+        })
+        .promise();
+    } catch (error: any) {
+      if (error?.code === 'ValidationException') {
+        await dynamodb
+          .update({
+            TableName: this.tableName,
+            Key: { sessionId },
+            UpdateExpression: 'SET objectiveConfirmations = if_not_exists(objectiveConfirmations, :empty)',
+            ExpressionAttributeValues: { ':empty': {} },
+          })
+          .promise();
+        await dynamodb
+          .update({
+            TableName: this.tableName,
+            Key: { sessionId },
+            UpdateExpression: 'SET objectiveConfirmations.#kind = :value',
+            ExpressionAttributeNames: { '#kind': objectiveKind },
+            ExpressionAttributeValues: { ':value': value },
+          })
+          .promise();
+        return;
+      }
+      console.error('Error updating session objectiveConfirmations:', error);
       throw error;
     }
   }

@@ -114,4 +114,41 @@ describe('ENG-1331 — a fluent final answer cannot claim more assets than the l
     expect(result.content).toBe('All 4 sizes have been rendered, QA\'d, and saved.');
     expect(result.content).not.toContain('Correction');
   });
+
+  it('ENG-1635/1644: does NOT correct a closing message that narrates an approval-deck outcome, even with zero tool calls this turn', async () => {
+    // Deck-approved writes dispatch via buildMetaWriteWorkflowSteps().execute() in
+    // the controller, BEFORE generateMarketingResponse (and its own toolCalls
+    // ledger) ever runs. A turn that just narrates the already-injected
+    // "[Approval deck outcome: ...]" note has a genuinely empty toolCalls ledger
+    // for THIS turn even though 6 real creatives were dispatched moments earlier —
+    // found live-driving env1 (2026-09-16): this guard fired a false "0 of 6 were
+    // actually produced" correction directly under a summary table of 6 real,
+    // verified creative IDs.
+    const DECK_OUTCOME_CLAIM =
+      'All 6 ad creatives have been successfully created and verified across the 3 image variants and 2 headline angles.';
+    const messageWithDeckOutcome =
+      'Now create 6 ad creatives for that ad set.\n\n[Approval deck outcome: ' +
+      '{"status":"fully_applied","items":[{"stepId":"write-1","status":"verified"},{"stepId":"write-2","status":"verified"},' +
+      '{"stepId":"write-3","status":"verified"},{"stepId":"write-4","status":"verified"},{"stepId":"write-5","status":"verified"},' +
+      '{"stepId":"write-6","status":"verified"}]}]';
+
+    const executeToolMock = jest.fn();
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async () => {
+      return buildLLMResponse({ content: DECK_OUTCOME_CLAIM });
+    });
+    jest.spyOn(service as any, 'executeTool').mockImplementation(executeToolMock);
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    const result = (await service.generateMarketingResponse(
+      messageWithDeckOutcome,
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+    )) as any;
+
+    expect(result.content).toBe(DECK_OUTCOME_CLAIM);
+    expect(result.content).not.toContain('Correction');
+    expect(executeToolMock).not.toHaveBeenCalled();
+  });
 });

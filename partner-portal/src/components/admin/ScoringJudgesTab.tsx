@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   Box,
   Button,
@@ -65,12 +65,13 @@ export default function ScoringJudgesTab() {
 
   const headers = { Authorization: `Bearer ${token}` };
 
-  const fetchJudges = async () => {
+  const fetchJudges = useCallback(async () => {
     try {
       setLoading(true);
+      const requestHeaders = { Authorization: `Bearer ${token}` };
       const [judgesRes, defaultRes] = await Promise.all([
-        axios.get(buildApiUrl('/api/settings/scoring-judges'), { headers }),
-        axios.get(buildApiUrl('/api/settings/scoring-judges/default-prompt'), { headers }),
+        axios.get(buildApiUrl('/api/settings/scoring-judges'), { headers: requestHeaders }),
+        axios.get(buildApiUrl('/api/settings/scoring-judges/default-prompt'), { headers: requestHeaders }),
       ]);
       setJudges(judgesRes.data.judges || []);
       setAvailableModels(judgesRes.data.availableModels || []);
@@ -83,11 +84,11 @@ export default function ScoringJudgesTab() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [token]);
 
   useEffect(() => {
     if (token) fetchJudges();
-  }, [token]);
+  }, [token, fetchJudges]);
 
   const handleOpenCreate = () => {
     setEditingJudge(null);
