@@ -36,6 +36,7 @@ import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/age
 import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/finalAnswer';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
+import { resolveRunFunding } from '../services/funding/runFunding';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
@@ -8490,6 +8491,13 @@ export async function generateSessionResponse(
     if (result) screenshotUrl = result.url;
   }
 
+  // ENG-1816 F1: resolved once here — this is the single choke point every entry
+  // path (interactive, scheduled via runVerifiedChat, work-plan continuation, API/
+  // MCP) already converges on before crossing the worker fork, so no other call site
+  // needs its own resolveRunFunding call. F1 always resolves 'agentweb'; A1+/B1+ make
+  // the result meaningful once a real connection exists to route to.
+  const runFunding = await resolveRunFunding({ userId });
+
   // Generate AI response using worker process to prevent blocking the main event loop
   // This allows health checks to continue working during long-running operations
   const response = await generateMarketingResponseWorkerService.runInWorker(
@@ -8518,6 +8526,9 @@ export async function generateSessionResponse(
       approvedRevisionImageSources,
       requireWorkPlanDisposition: enforceWorkPlanDisposition,
       isUnattendedRun,
+      // ENG-1816 F1: plain data across the fork boundary, same shape as
+      // publishAuthorizationOverride above — never a positional argument.
+      runFunding,
     },
     (progress) => {
       // Emit progress updates via SSE

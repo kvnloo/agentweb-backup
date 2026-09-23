@@ -7,6 +7,7 @@ import { agentModeService } from '../services/agentModeService';
 import { installWorkerShutdownGuards } from './workerShutdownGuards';
 import { installSandboxMetaInterceptorAtBoot } from '../services/sandbox/bootstrap';
 import { shouldBootstrapBackgroundJobs } from '../utils/instanceState';
+import { withRunFunding, noteRunFundingUnset, type RunFunding } from '../services/funding/runFunding';
 
 // Survive the OS process-group/cgroup SIGTERM on deploy so an in-flight scheduled run
 // isn't aborted before the parent's drain can let it finish (ENG-201). The parent is the
@@ -158,7 +159,26 @@ process.on('message', async (message: any) => {
         approvedRevisionImageSources,
         requireWorkPlanDisposition,
         isUnattendedRun,
+        runFunding,
       } = message.params;
+
+      // ENG-1816 F1: enter the ambient store BEFORE calling into agentModeService, so
+      // every nested callLLM call in this turn (including tool-internal ones) reads
+      // the same funding without any of those ~50 call sites being edited. A caller
+      // that hasn't been updated to send `runFunding` falls back to today's behavior
+      // (agentweb) rather than failing closed, but is counted so unwrapped paths are
+      // discoverable before a customer route depends on them.
+      let effectiveRunFunding: RunFunding = runFunding;
+      if (!effectiveRunFunding) {
+        noteRunFundingUnset('generateMarketingResponseWorker');
+        effectiveRunFunding = {
+          route: 'agentweb',
+          fallback: 'agentweb',
+          ownerUserId: userId,
+          billingUserId: userId,
+          resolvedAt: new Date().toISOString(),
+        };
+      }
 
       // Progress callback to forward progress updates to parent process
       const onProgress = (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[]; suggestions?: string[] }) => {
@@ -177,37 +197,39 @@ process.on('message', async (message: any) => {
 
       const isCancelled = () => cancelledRequestIds.has(requestId);
 
-      const result = await agentModeService.generateMarketingResponse(
-        messageContent,
-        sessionHistory,
-        userId,
-        llmModel,
-        sessionId,
-        mockMode,
-        onProgress,
-        socketEmit,
-        isInteractiveShare,
-        isCancelled,
-        excludeTools,
-        screenshotUrl,
-        isDelegatedAccess,
-        persistIncrementally,
-        // ENG-907: the caller's whole-turn deadline stamp, so the loop's time budget
-        // measures against the same cap (the fork/IPC hop happens before we get here).
-        turnStartMs,
-        // ENG-827: the authorization the CALLER resolved, so the system prompt is built
-        // from the same value the required-function checker holds.
-        //
-        // Both of these arrive off `message.params` and are therefore `any`, so their
-        // order is NOT type-checked here — passing them the wrong way round compiles
-        // clean and silently swaps a deadline for an authorization. Keep this list in
-        // the same order as generateMarketingResponse's signature.
-        publishAuthorizationOverride,
-        approvedRevisionImageSources,
-        requireWorkPlanDisposition,
-        // ENG-2072: see the "Keep this list in the same order" note above — this
-        // must stay LAST, matching generateMarketingResponse's own final parameter.
-        isUnattendedRun,
+      const result = await withRunFunding(effectiveRunFunding, () =>
+        agentModeService.generateMarketingResponse(
+          messageContent,
+          sessionHistory,
+          userId,
+          llmModel,
+          sessionId,
+          mockMode,
+          onProgress,
+          socketEmit,
+          isInteractiveShare,
+          isCancelled,
+          excludeTools,
+          screenshotUrl,
+          isDelegatedAccess,
+          persistIncrementally,
+          // ENG-907: the caller's whole-turn deadline stamp, so the loop's time budget
+          // measures against the same cap (the fork/IPC hop happens before we get here).
+          turnStartMs,
+          // ENG-827: the authorization the CALLER resolved, so the system prompt is built
+          // from the same value the required-function checker holds.
+          //
+          // Both of these arrive off `message.params` and are therefore `any`, so their
+          // order is NOT type-checked here — passing them the wrong way round compiles
+          // clean and silently swaps a deadline for an authorization. Keep this list in
+          // the same order as generateMarketingResponse's signature.
+          publishAuthorizationOverride,
+          approvedRevisionImageSources,
+          requireWorkPlanDisposition,
+          // ENG-2072: see the "Keep this list in the same order" note above — this
+          // must stay LAST, matching generateMarketingResponse's own final parameter.
+          isUnattendedRun,
+        ),
       );
 
       // Clean up cancelled flag
