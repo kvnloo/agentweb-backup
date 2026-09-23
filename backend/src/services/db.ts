@@ -6337,6 +6337,12 @@ export const crmDb = {
     lastName?: string;
     phone?: string;
     company?: string;
+    /** Top-level AW-Leads attribute (LeadRecord.website), read directly by
+     *  domain resolution for enrichment (resolveApolloMatchDomain). Was
+     *  accepted nowhere on write, so a caller-supplied website was always
+     *  silently dropped — only the Tier 0.5 enrichment resolver could ever
+     *  populate it. */
+    website?: string;
     title?: string;
     notes?: string;
     linkedin?: string;
@@ -6431,6 +6437,7 @@ export const crmDb = {
         lastName: leadData.lastName || '',
         phone: leadData.phone || '',
         company: leadData.company || '',
+        website: leadData.website || '',
         title: leadData.title || '',
         notes: leadData.notes || '',
         companyLinkedin: leadData.companyLinkedin?.trim() || '',
@@ -7363,6 +7370,9 @@ export const crmDb = {
     lastName?: string;
     phone?: string;
     company?: string;
+    /** Top-level AW-Leads attribute (LeadRecord.website) — see createLead's
+     *  matching field for why this was missing. */
+    website?: string;
     title?: string;
     notes?: string;
     linkedin?: string;
@@ -7539,6 +7549,15 @@ export const crmDb = {
           expressionAttributeValues[':company'] = updates.company;
         } else {
           removeExpressions.push('company');
+        }
+      }
+
+      if (updates.website !== undefined) {
+        if (updates.website) {
+          setExpressions.push('website = :website');
+          expressionAttributeValues[':website'] = updates.website;
+        } else {
+          removeExpressions.push('website');
         }
       }
 
@@ -8050,6 +8069,9 @@ export const crmDb = {
     lastName?: string;
     phone?: string;
     company?: string;
+    /** Top-level AW-Leads attribute (LeadRecord.website) — see db.createLead's
+     *  matching field for why this was missing. */
+    website?: string;
     title?: string;
     notes?: string;
     linkedin?: string;
@@ -8336,6 +8358,7 @@ export const crmDb = {
             lastName: lead.lastName || '',
             phone: lead.phone || '',
             company: lead.company || '',
+            website: lead.website || '',
             title: lead.title || '',
             notes: lead.notes || '',
             companyLinkedin: lead.companyLinkedin?.trim() || '',
