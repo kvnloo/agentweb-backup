@@ -3264,14 +3264,28 @@ async function syncLeadCaptureForPage(
       // carries the old mapping: an attach's leads are not filed yet, while a detach's leads
       // keep being filed into the list the user just removed. Saying "will not be filed" on
       // a detach tells the user the opposite of what happens.
-      return leadListId === null
-        ? `Lead list removed, but this site's capture route could not be updated — its ` +
-          `deployed route file could not be parsed, so it was left untouched. Submissions ` +
-          `from this page will KEEP being filed into the list you just removed until the ` +
-          `route is repaired.`
-        : `The lead list was saved, but this site's capture route could not be updated — its ` +
-          `deployed route file could not be parsed, so it was left untouched. Submissions ` +
-          `from this page will not be filed until the route is repaired.`;
+      const untouched =
+        `capture route could not be updated — its deployed route file could not be parsed, ` +
+        `so it was left untouched.`;
+      if (leadListId === null) {
+        return (
+          `Lead list removed, but this site's ${untouched} Submissions from this page will ` +
+          `KEEP being filed into the list you just removed until the route is repaired.`
+        );
+      }
+      // A SWITCH is not a first attach. The deployed route still carries the old mapping, so
+      // submissions keep arriving — into the PREVIOUS list, silently. "Will not be filed"
+      // would be wrong in the same direction the detach arm above was wrong.
+      if (page.leadListId && page.leadListId !== leadListId) {
+        return (
+          `The lead list was saved, but this site's ${untouched} Submissions from this page ` +
+          `will KEEP being filed into the previously attached list until the route is repaired.`
+        );
+      }
+      return (
+        `The lead list was saved, but this site's ${untouched} Submissions from this page ` +
+        `will not be filed until the route is repaired.`
+      );
     }
     if (result.committed || result.reason === "up-to-date") return undefined;
     // Attaching and DETACHING both come through here; "saved" is wrong for a removal.

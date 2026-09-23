@@ -6716,6 +6716,25 @@ describe("the enhancement validators must read the same files the ENG-2080 gate 
     expect(validateCaptureFormHasContactField(page).ok).toBe(true);
   });
 
+  it("the exclusion is *.config.*, not a list of six names", () => {
+    // The first version named next/tailwind/postcss/eslint/vite/jest. v0 also emits sanity,
+    // contentlayer and playwright configs, and a name list silently readmits each new one —
+    // the same false positive, one release later.
+    for (const path of ["sanity.config.js", "contentlayer.config.js", "playwright.config.ts", "next.config.mjs"]) {
+      expect(hasLeadCaptureForm(f(path, `module.exports = { proxy: "/api/capture" };`))).toBe(false);
+    }
+    // A file merely NAMED config.js is page source, not configuration.
+    expect(hasLeadCaptureForm(f("app/config.js", `fetch("/api/capture")`))).toBe(true);
+  });
+
+  it("a service worker is not page source wherever it is emitted", () => {
+    // `public/` is the conventional home and is start-anchored, so a worker at the repo root
+    // or under a sub-app slipped through the path check.
+    for (const path of ["sw.js", "service-worker.js", "my-app/public/sw.js"]) {
+      expect(hasLeadCaptureForm(f(path, `self.addEventListener('fetch', e => { /* "/api/capture" */ });`))).toBe(false);
+    }
+  });
+
   it("validateBridgeOutRedirect sees a redirect emitted as .jsx", () => {
     expect(
       validateBridgeOutRedirect(

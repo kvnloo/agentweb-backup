@@ -10,6 +10,8 @@ const mockUpdateLeadListRecord = jest.fn();
 const mockGetUserById = jest.fn();
 const mockGetOrgById = jest.fn();
 const mockCanEditItem = jest.fn();
+const mockSyncLeadCapture = jest.fn();
+const mockGetPagesByOwner = jest.fn();
 
 jest.mock('../services/v0Service', () => {
   const actual = jest.requireActual('../services/v0Service');
@@ -17,6 +19,8 @@ jest.mock('../services/v0Service', () => {
     ...actual,
     getLandingPageById: (...a: any[]) => mockGetLandingPageById(...a),
     updateLandingPageLeadList: (...a: any[]) => mockUpdateLeadList(...a),
+    syncLeadCaptureFilesToRepo: (...a: any[]) => mockSyncLeadCapture(...a),
+    getLandingPagesByOwner: (...a: any[]) => mockGetPagesByOwner(...a),
   };
 });
 
@@ -175,5 +179,84 @@ describe('PATCH /generated/:id/lead-list — public submissions on the attached 
 
     expect(res.status).toBe(200);
     expect(mockUpdateLeadListRecord).not.toHaveBeenCalled();
+  });
+});
+
+
+// ─── ENG-449: the captureRouteSkipped warning ────────────────────────────────
+//
+// `captureRouteSkipped` means the deployed LIST_BY_PATH could not be parsed, so route.ts was
+// left out of the commit ENTIRELY — it still carries the OLD mapping. What that means for the
+// owner depends on what they just did, and the three cases are opposites. Untested until now:
+// disabling the whole branch left 255 tests green.
+describe('PATCH /generated/:id/lead-list — captureRouteSkipped warning (ENG-449)', () => {
+  const deployedPage = {
+    id: 'p1',
+    userId: 'u1',
+    slug: 'pricing',
+    githubRepoUrl: 'https://github.com/AgentWebPro/lp-site-abc',
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetUserById.mockResolvedValue({ userId: 'u1' });
+    mockUpdateLeadList.mockResolvedValue(undefined);
+    mockUpdateLeadListRecord.mockResolvedValue(undefined);
+    mockGetLeadListById.mockResolvedValue({ listId: 'l2', userId: 'u1' });
+    mockGetPagesByOwner.mockResolvedValue([]);
+    mockSyncLeadCapture.mockResolvedValue({
+      committed: true,
+      captureRouteSkipped: true,
+      pushedCommitSha: 'abc1234',
+    });
+  });
+
+  it('DETACH: says leads KEEP being filed into the list just removed', async () => {
+    mockGetLandingPageById.mockResolvedValue({ ...deployedPage, leadListId: 'l1' });
+    const res = await request(app)
+      .patch('/api/landing-pages/v0/generated/p1/lead-list')
+      .send({ leadListId: null });
+
+    expect(res.status).toBe(200);
+    expect(res.body.captureSyncWarning).toMatch(/Lead list removed/);
+    expect(res.body.captureSyncWarning).toMatch(/KEEP being filed into the list you just removed/);
+    expect(res.body.captureSyncWarning).not.toMatch(/will not be filed/);
+  });
+
+  it('FIRST ATTACH: says leads will not be filed until the route is repaired', async () => {
+    mockGetLandingPageById.mockResolvedValue({ ...deployedPage, leadListId: undefined });
+    const res = await request(app)
+      .patch('/api/landing-pages/v0/generated/p1/lead-list')
+      .send({ leadListId: 'l2' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.captureSyncWarning).toMatch(/lead list was saved/i);
+    expect(res.body.captureSyncWarning).toMatch(/will not be filed until the route is repaired/);
+    expect(res.body.captureSyncWarning).not.toMatch(/KEEP being filed/);
+  });
+
+  // The case the detach fix originally missed. A switch is not a first attach: the deployed
+  // route still maps this path to list A, so submissions keep arriving — into the WRONG list,
+  // silently. "Will not be filed" is wrong in the same direction the detach arm was wrong.
+  it('RE-ATTACH: says leads KEEP being filed into the PREVIOUS list', async () => {
+    mockGetLandingPageById.mockResolvedValue({ ...deployedPage, leadListId: 'l1' });
+    const res = await request(app)
+      .patch('/api/landing-pages/v0/generated/p1/lead-list')
+      .send({ leadListId: 'l2' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.captureSyncWarning).toMatch(/KEEP being filed into the previously attached list/);
+    expect(res.body.captureSyncWarning).not.toMatch(/will not be filed/);
+  });
+
+  it('no warning when the capture route was written', async () => {
+    mockGetLandingPageById.mockResolvedValue({ ...deployedPage, leadListId: 'l1' });
+    mockSyncLeadCapture.mockResolvedValue({ committed: true, pushedCommitSha: 'abc1234' });
+    const res = await request(app)
+      .patch('/api/landing-pages/v0/generated/p1/lead-list')
+      .send({ leadListId: 'l2' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.captureSyncWarning).toBeUndefined();
   });
 });

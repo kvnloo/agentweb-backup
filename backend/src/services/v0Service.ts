@@ -4639,12 +4639,16 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
  */
 const isScannableSource = (path: string): boolean =>
   /\.(tsx|ts|jsx|js)$/.test(path) &&
-  !/(^|\/)(next|tailwind|postcss|eslint|vite|jest)\.config\./.test(path) &&
-  !/^public\//.test(path);
+  // Any *.config.*, not a list of the six we happened to have seen: v0 ships sanity,
+  // contentlayer and playwright configs too, and a name list silently readmits each new one.
+  !/(^|\/)[^/]+\.config\.[cm]?[jt]sx?$/.test(path) &&
+  // Service workers are not page source wherever they are emitted. `public/` is the
+  // conventional home and is never compiled by Next, but the root is just as common.
+  !/^public\//.test(path) &&
+  !/(^|\/)(sw|service-worker)\.[cm]?[jt]s$/.test(path);
 
 export function hasLeadCaptureForm(files: Array<{ path: string; content: Buffer }>): boolean {
   const source = files
-
     .filter((f) => isScannableSource(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
@@ -4696,9 +4700,10 @@ export function validateCaptureFormHasContactField(files: Array<{ path: string; 
 
 export function validatePixelLeadEvent(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
   const tsxSource = files
-    // gate reads .jsx/.js is worse than leaving both narrow: the gate opens on a page
-    // whose form these validators cannot see, so each fires a BILLED correction asking
-    // v0 to add tracking that is already there, and re-fails identically on every retry.
+    // Must match the set hasLeadCaptureForm scans. A validator narrower than that gate is
+    // worse than either one alone: the gate opens on a page whose form these validators
+    // cannot see, so each fires a BILLED correction asking v0 to add tracking that is
+    // already there, and re-fails identically on every retry.
     .filter((f) => isScannableSource(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
@@ -4744,9 +4749,10 @@ export function validatePixelLeadEvent(files: Array<{ path: string; content: Buf
  */
 export function validateGoogleAdsConversion(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
   const tsxSource = files
-    // gate reads .jsx/.js is worse than leaving both narrow: the gate opens on a page
-    // whose form these validators cannot see, so each fires a BILLED correction asking
-    // v0 to add tracking that is already there, and re-fails identically on every retry.
+    // Must match the set hasLeadCaptureForm scans. A validator narrower than that gate is
+    // worse than either one alone: the gate opens on a page whose form these validators
+    // cannot see, so each fires a BILLED correction asking v0 to add tracking that is
+    // already there, and re-fails identically on every retry.
     .filter((f) => isScannableSource(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
@@ -4786,9 +4792,10 @@ export function validateGoogleAdsConversion(files: Array<{ path: string; content
  */
 export function validateBridgeOutRedirect(files: Array<{ path: string; content: Buffer }>, bridgeOutUrl: string): { ok: boolean; reason?: string } {
   const tsxSource = files
-    // gate reads .jsx/.js is worse than leaving both narrow: the gate opens on a page
-    // whose form these validators cannot see, so each fires a BILLED correction asking
-    // v0 to add tracking that is already there, and re-fails identically on every retry.
+    // Must match the set hasLeadCaptureForm scans. A validator narrower than that gate is
+    // worse than either one alone: the gate opens on a page whose form these validators
+    // cannot see, so each fires a BILLED correction asking v0 to add tracking that is
+    // already there, and re-fails identically on every retry.
     .filter((f) => isScannableSource(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");

@@ -168,31 +168,35 @@ async function sweepStrandedSmokeLeads(listId: string, beforeIso: string): Promi
  * previous run failed. A false pass is the expensive direction; the whole gate exists to
  * avoid one.
  *
- * `claimed: false` means we could not check (the list was unreadable). The caller then keeps
- * the stricter freshness rule rather than trusting the id.
+ * `claimed: false` means we did NOT prove the id free — the list was unreadable, the number
+ * produced no id, or every draw was taken. The caller then keeps the stricter freshness rule
+ * rather than trusting the id.
  */
 async function claimSmokeTestPhone(listId: string): Promise<{ phone: string; claimed: boolean }> {
-  let lastCandidate = buildSmokeTestPhone();
   for (let attempt = 0; attempt < 8; attempt++) {
-    lastCandidate = buildSmokeTestPhone();
-    const id = phoneLeadId(lastCandidate);
-    if (!id) return { phone: lastCandidate, claimed: false };
+    const candidate = buildSmokeTestPhone();
+    const id = phoneLeadId(candidate);
+    if (!id) return { phone: candidate, claimed: false };
     try {
       const occupied = await crmDb.getLeadById(listId, id, { consistentRead: true });
-      if (!occupied) return { phone: lastCandidate, claimed: true };
+      if (!occupied) return { phone: candidate, claimed: true };
     } catch (err: any) {
       console.warn(
         `[smokeTest] could not check whether ${id} is free in list ${listId}: ${err?.message || err}`
       );
-      return { phone: lastCandidate, claimed: false };
+      return { phone: candidate, claimed: false };
     }
   }
-  // Every draw was taken — the list is saturated with stranded rows. Proceed unclaimed so
-  // the poll stays strict, and say so: this is worth seeing in the logs.
+  // Every draw was taken — the list is saturated with stranded rows. Return a FRESH draw
+  // rather than `lastCandidate`, which we just proved occupied: submitting a known-collided
+  // number guarantees webhooks.ts adopts the existing row without rewriting createdAt, so
+  // the freshness rule below can never match and the run is a certain false FAIL that
+  // strands yet another row. An unproven draw is only ~1% likely to collide. Unclaimed
+  // either way, so the poll stays strict — and say so: this is worth seeing in the logs.
   console.warn(
     `[smokeTest] every synthetic phone id is already occupied in list ${listId} — the sweep is not keeping up`
   );
-  return { phone: lastCandidate, claimed: false };
+  return { phone: buildSmokeTestPhone(), claimed: false };
 }
 
 async function pollForLeadByPhone(
@@ -218,18 +222,23 @@ async function pollForLeadByPhone(
       if (deterministicId && typeof (crmDb as any).getLeadById === "function") {
         try {
           const direct = await crmDb.getLeadById(listId, deterministicId, { consistentRead: true });
-          // No createdAt comparison on this branch, deliberately. The id is a hash of OUR
-          // synthetic number, so a row under it can only be ours. Requiring a fresh
-          // createdAt made the adopted-row case permanently unfindable: on a phone
-          // collision the conditional create loses, webhooks.ts adopts the existing row
-          // WITHOUT rewriting createdAt, and the test then reports a false `ok: false` and
-          // strands the row — which raises the collision surface for the next run.
           // Two ways to know the row is OURS. If we claimed the id before submitting, the
-          // list had nothing there, so anything under it now arrived from this submission —
+          // list had nothing there, so anything under it now arrived after the claim —
           // including the adopted-row case, where webhooks.ts reuses a row without
           // rewriting createdAt and a freshness test would reject it forever. If we could
           // NOT claim it, fall back to freshness: accepting any synthetic row there would
           // turn a stranded row from a previous run into a false pass.
+          //
+          // What the claim does NOT prove, so that nobody re-derives the retracted argument
+          // that "a hash of OUR number can only be ours": it is a read, not a lock. A row
+          // that predates the claim cannot reach here — the claim saw it occupied (strongly
+          // consistent) and redrew — but a CONCURRENT run that drew the same number from the
+          // 100-value block can still land its capture inside our claim→submit→poll window
+          // and be accepted as ours. Adding `createdAt >= claimedAt` does not close that:
+          // the colliding row is newer than the claim too. Closing it needs a second
+          // identifier, and there is none — the deterministic id is used only for captures
+          // that carry NO email (webhooks.ts), so the phone IS the whole identity. Bounded
+          // by a ~1% draw collision inside a ~10s window, and left open knowingly.
           const isOurs = idWasClaimed
             ? isSmokeTestLead(direct)
             : isSmokeTestLead(direct) && String((direct as any).createdAt || "") >= submittedAtIso;

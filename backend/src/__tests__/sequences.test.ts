@@ -256,6 +256,35 @@ describe('POST /:sequenceId/enrollments - bulk enroll', () => {
     expect(res.body.skipped).toBe(0);
   });
 
+  // ENG-2083: leadEmail is the leadEmail-index partition key AND what the worker passes to
+  // sendAsSender. An address-less enrollment therefore retries forever and stays invisible
+  // to getActiveEnrollment. This route takes an explicit array, so the rows are dropped from
+  // the enrol call and the count is REPORTED rather than silently swallowed.
+  it('drops address-less leads from the enrol call and reports the count', async () => {
+    const res = await request(app)
+      .post('/seq_1/enrollments')
+      .send({
+        leads: [
+          { listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@example.com' },
+          { listId: 'list-1', leadId: 'lead-2' },
+          { listId: 'list-1', leadId: 'lead-3', leadEmail: '' },
+        ],
+      });
+    expect(res.status).toBe(200);
+    expect(res.body.skippedNoEmail).toBe(2);
+    const enrolled = dripSequenceDb.bulkEnroll.mock.calls.at(-1)![0];
+    expect(enrolled).toHaveLength(1);
+    expect(enrolled[0].leadId).toBe('lead-1');
+  });
+
+  it('omits skippedNoEmail when every lead has an address', async () => {
+    const res = await request(app)
+      .post('/seq_1/enrollments')
+      .send({ leads: [{ listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@example.com' }] });
+    expect(res.status).toBe(200);
+    expect(res.body).not.toHaveProperty('skippedNoEmail');
+  });
+
   it('rejects empty leads array', async () => {
     const res = await request(app).post('/seq_1/enrollments').send({ leads: [] });
     expect(res.status).toBe(400);

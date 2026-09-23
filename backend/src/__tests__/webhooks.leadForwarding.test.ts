@@ -394,6 +394,26 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       expect(updates.customFields.source).toBe('hero-form');
     });
 
+    it('the EMAIL path still lets a submission that NAMES a source overwrite the stored one', async () => {
+      // The other direction of the same guard, and the one a blanket restore would break:
+      // the adopt path has both directions covered, the email path only had the omitted
+      // case. Without `callerSuppliedSource` this reverts to 'hero-form' and a multi-step
+      // lander can never record which step converted.
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+        leadId: 'lead_existing', listId: 'list_123', email: 'x@example.com', firstName: '',
+        customFields: { forwardedAt: '2020-01-01T00:00:00.000Z', source: 'hero-form' },
+      });
+
+      await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', email: 'x@example.com', source: 'qualify-form', qualified: 'yes' });
+
+      const [, , updates] = (crmDb.updateLead as jest.Mock).mock.calls[0];
+      expect(updates.customFields.source).toBe('qualify-form');
+      expect(updates.customFields.forwardedAt).toBe('2020-01-01T00:00:00.000Z');
+    });
+
     it('ENG-2082: a repeat submission that omits source must not clobber the stored one', async () => {
       // `source` is never absent from incomingCustomFields — the destructure defaults it to
       // 'api'. So restoring only forwardedAt means that synthesized default overwrites a
