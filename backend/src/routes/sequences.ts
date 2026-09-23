@@ -246,7 +246,13 @@ router.post(
       //
       // Email-less leads were already reachable (LinkedIn imports, the invite mirror);
       // ENG-2082 made a whole new list type produce them.
+      // Both counts, deliberately. Filtering silently would shrink leadCount from 100 to 20
+      // with nothing on screen to explain where 80 went — the dialog would look like leads
+      // had vanished. Reporting the population AND the enrollable subset lets the caller say
+      // "20 of 100 leads can be emailed", which is the true statement.
+      const totalLeads = leads.length;
       leads = leads.filter((l: any) => l.email);
+      const enrollableLeads = leads.length;
 
       // Variable coverage across all steps + channels (email subject/body + LinkedIn
       // messageText). Warn — but allow override via `confirm` — when a supported
@@ -274,6 +280,9 @@ router.post(
           enrolled: false,
           needsConfirmation: true,
           leadCount: leads.length,
+          totalLeads,
+          enrollableLeads,
+          ...(totalLeads > enrollableLeads ? { skippedNoEmail: totalLeads - enrollableLeads } : {}),
           warnings: { unsupported, missing },
         });
       }
@@ -289,6 +298,11 @@ router.post(
         }));
 
       const result = await dripSequenceDb.bulkEnroll(inputs);
+      const counts = {
+        totalLeads,
+        enrollableLeads,
+        ...(totalLeads > enrollableLeads ? { skippedNoEmail: totalLeads - enrollableLeads } : {}),
+      };
 
       // Auto-enroll is on by default: add listId to sequence's autoEnrollListIds
       // unless it's already there. This means new leads added to this list later
@@ -300,7 +314,7 @@ router.post(
         }).catch((e) => console.error('[sequences] autoEnrollListIds update error:', e));
       }
 
-      res.json(result);
+      res.json({ ...result, ...counts });
     } catch (err: any) {
       if (err instanceof SequenceNotFoundError) return res.status(404).json({ error: err.message });
       if (err instanceof SequenceAuthError) return res.status(403).json({ error: err.message });

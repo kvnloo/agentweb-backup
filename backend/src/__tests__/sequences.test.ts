@@ -365,6 +365,47 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     );
   });
 
+  // ENG-2083: the filter that drops address-less leads used to live at the mapper, so
+  // leadCount reported the whole list and then a smaller number was enrolled. Hoisting it
+  // made leadCount truthful but silent — a 100-lead list would report 20 with nothing
+  // saying where 80 went, which reads as leads having vanished. Report both.
+  it('reports the full population AND the enrollable subset', async () => {
+    const crmDbMock = require('../services/db').crmDb;
+    crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+      { leadId: 'lead-1', email: 'a@example.com' },
+      { leadId: 'lead-2' },
+      { leadId: 'lead-3', email: '' },
+      { leadId: 'lead-4', email: 'd@example.com' },
+    ]);
+
+    const res = await request(app)
+      .post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.totalLeads).toBe(4);
+    expect(res.body.enrollableLeads).toBe(2);
+    expect(res.body.skippedNoEmail).toBe(2);
+    // and only the addressable ones actually went to bulkEnroll
+    const inputs = dripSequenceDb.bulkEnroll.mock.calls.at(-1)![0];
+    expect(inputs.map((i: any) => i.leadId)).toEqual(['lead-1', 'lead-4']);
+  });
+
+  it('omits skippedNoEmail when every lead is addressable', async () => {
+    const crmDbMock = require('../services/db').crmDb;
+    crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+      { leadId: 'lead-1', email: 'a@example.com' },
+    ]);
+
+    const res = await request(app)
+      .post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1' });
+
+    expect(res.body.totalLeads).toBe(1);
+    expect(res.body.enrollableLeads).toBe(1);
+    expect(res.body).not.toHaveProperty('skippedNoEmail');
+  });
+
   it('does not call updateSequence again if listId is already in autoEnrollListIds', async () => {
     dripSequenceDb.getSequence.mockResolvedValueOnce({
       ...mockSequence,
