@@ -287,6 +287,13 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // same pattern as Fable 5.1 above. OpenRouter `usage.cost` remains the
   // per-call authority; this entry is the pre-call estimate + BYOK fallback.
   'openrouter/anthropic/claude-opus-5.5': OPUS_5_5_PRICE,
+  // 2026-09-22 adds, live-verified against openrouter.ai model pricing.
+  // Sol/Luna cache rates match the 10%/125% convention exactly. Grok 4.7's
+  // cache read is 25% of input ($0.40), so it is overridden. None model the
+  // >272k (OpenAI) / >200k (xAI) long-context 2x tier — same gap as ENG-1774.
+  'openrouter/openai/gpt-6-sol': withDerivedCache(2.0, 10.0),
+  'openrouter/openai/gpt-6-luna': withDerivedCache(0.1, 0.5),
+  'openrouter/x-ai/grok-4.7': { ...withDerivedCache(1.6, 4.8), cacheReadPerM: 0.4 },
   'openrouter/x-ai/grok-4.6': withDerivedCache(2.0, 6.0), // was $3/$15 — stale, ~2x over live
   'openrouter/deepseek/deepseek-v4-pro': withDerivedCache(0.657, 1.315), // live "62% off" promo; lowest-confidence entry in this batch — the promo makes list price hard to reconstruct cleanly, re-verify if this model becomes cost-sensitive
   'openrouter/deepseek/deepseek-v4-flash': withDerivedCache(0.068, 0.168), // was ~2x over live

@@ -280,6 +280,22 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   // existing dominance rule correctly flags Opus 5 legacy (Show more) — a
   // genuine supersede, not a promo-price accident like the Terra case.
   'openrouter/anthropic/claude-opus-5.5': { supportedReasoningEfforts: ['max', 'xhigh', 'high', 'medium', 'low'], name: 'Claude Opus 5.5', family: 'claude-opus', provider: 'anthropic', tier: 'ultra_premium', description: 'Anthropic\'s flagship model for coding & agentic work', client: null, supportsTemperature: false, supportsVision: true, qualityScore: 58, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.3.2, 2026-09-22, Claude Opus 5.5, Adaptive Reasoning, Max Effort' },
+  // 2026-09-22: GPT-6 Sol / GPT-6 Luna (OpenAI, released 2026-09-22) and
+  // Grok 4.7 (SpaceXAI). Scores are AA Intelligence Index v4.3.2 (newer than
+  // the v4.2 snapshot most rows use — same caveat as Opus 5.5). Deliberately
+  // NO `family` on any of them: the obvious siblings (GPT-5.6 Luna in
+  // gpt5-nano, Grok 4.6) carry v4.2 scores, and dominance across index
+  // versions is not a like-for-like comparison. supportsVision verified live
+  // with a base64 data-URI JPEG (the describe_image shape) the same day.
+  // Sol/Luna: no OpenRouter endpoint lists `temperature`. Routing: OpenRouter
+  // prefers our BYOK Bedrock key automatically; the Bedrock Marketplace
+  // subscription for both was still "being set up" at add time, so calls fell
+  // back to OpenAI direct (OpenRouter credits) until it completes.
+  'openrouter/openai/gpt-6-sol': { supportedReasoningEfforts: ['max', 'xhigh', 'high', 'medium', 'low', 'none'], name: 'GPT-6 Sol', provider: 'openai', tier: 'pro', description: 'Strong reasoning at half the price of GPT-5.6 Sol', client: null, supportsTemperature: false, supportsVision: true, qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.3.2, 2026-09-22, GPT-6 Sol, max' },
+  'openrouter/openai/gpt-6-luna': { supportedReasoningEfforts: ['max', 'xhigh', 'high', 'medium', 'low', 'none'], name: 'GPT-6 Luna', provider: 'openai', tier: 'ultra_cheap', description: 'Fast and very inexpensive GPT-6 reasoning', client: null, supportsTemperature: false, supportsVision: true, qualityScore: 37, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.3.2, 2026-09-22, GPT-6 Luna, max' },
+  // Grok 4.7: served only by xAI on OpenRouter (no Bedrock/Azure endpoint), so
+  // it runs on OpenRouter credits until an xAI BYOK key is attached.
+  'openrouter/x-ai/grok-4.7': { supportedReasoningEfforts: ['xhigh', 'high', 'medium', 'low'], name: 'Grok 4.7', provider: 'xai', tier: 'pro', description: 'SpaceXAI\'s latest, strong at agentic coding', client: null, supportsTemperature: true, supportsVision: true, qualityScore: 46, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.3.2, 2026-09-22, Grok 4.7, xhigh' },
   'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 51, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, Grok 4.6, high' },
   'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, qualityScore: 42, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.2, snapshot 2026-09-05, DeepSeek V4 Pro 0813, Reasoning, Max Effort' },
   // ENG-1786 research uses AA's canonical DeepSeek V4 Flash 0731,

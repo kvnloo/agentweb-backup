@@ -464,10 +464,11 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         // Opus 5.5 is deliberately excluded: it launched after the v4.2
         // snapshot (2026-09-05), so its score comes from the newer v4.3.2
         // index — see its registry comment and its own dedicated quality test.
-        expect(scoredIds.sort()).toEqual([...SCORED_IDS, 'openrouter/anthropic/claude-opus-5.5'].sort());
+        const V43: Record<string, string> = {"openrouter/anthropic/claude-opus-5.5": "Artificial Analysis Intelligence Index v4.3.2, 2026-09-22, Claude Opus 5.5, Adaptive Reasoning, Max Effort", "openrouter/openai/gpt-6-sol": "Artificial Analysis Intelligence Index v4.3.2, 2026-09-22, GPT-6 Sol, max", "openrouter/openai/gpt-6-luna": "Artificial Analysis Intelligence Index v4.3.2, 2026-09-22, GPT-6 Luna, max", "openrouter/x-ai/grok-4.7": "Artificial Analysis Intelligence Index v4.3.2, 2026-09-22, Grok 4.7, xhigh"};
+        expect(scoredIds.sort()).toEqual([...SCORED_IDS, ...Object.keys(V43)].sort());
         for (const id of scoredIds) {
-          if (id === 'openrouter/anthropic/claude-opus-5.5') {
-            expect(registry[id].qualityScoreSource).toBe('Artificial Analysis Intelligence Index v4.3.2, 2026-09-22, Claude Opus 5.5, Adaptive Reasoning, Max Effort');
+          if (V43[id]) {
+            expect(registry[id].qualityScoreSource).toBe(V43[id]);
             continue;
           }
           expect(registry[id].qualityScoreSource).toMatch(/Intelligence Index v\d+\.\d+(?:\.\d+)?\b/);
