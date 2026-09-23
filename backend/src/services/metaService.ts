@@ -2994,15 +2994,15 @@ export class MetaService {
         const isLastBatch = batchSeq === totalBatches;
         this.log(`Uploading batch ${batchSeq}/${totalBatches} to custom audience: ${audienceId}`, { session_id: sessionId, rows: chunk.length });
         const result = await audience.createUser([], {
-          payload: {
-            schema,
-            data: chunk,
-            session: {
-              session_id: sessionId,
-              batch_seq: batchSeq,
-              last_batch_flag: isLastBatch,
-              estimated_num_total: rows.length,
-            },
+          // ENG-1343: Meta rejects `session` nested in `payload` ("(#100)
+          // Invalid keys \"session\" were found in param \"payload\"") — it
+          // must be a top-level sibling param, same as /usersreplace.
+          payload: { schema, data: chunk },
+          session: {
+            session_id: sessionId,
+            batch_seq: batchSeq,
+            last_batch_flag: isLastBatch,
+            estimated_num_total: rows.length,
           },
         });
         lastResult = result._data || result;
@@ -3050,15 +3050,15 @@ export class MetaService {
         const isLastBatch = batchSeq === totalBatches;
         this.log(`Deleting batch ${batchSeq}/${totalBatches} from custom audience: ${audienceId}`, { session_id: sessionId, rows: chunk.length });
         const result = await audience.deleteUsers({
-          payload: {
-            schema,
-            data: chunk,
-            session: {
-              session_id: sessionId,
-              batch_seq: batchSeq,
-              last_batch_flag: isLastBatch,
-              estimated_num_total: rows.length,
-            },
+          // ENG-1343: Meta rejects `session` nested in `payload` ("(#100)
+          // Invalid keys \"session\" were found in param \"payload\"") — it
+          // must be a top-level sibling param, same as /usersreplace.
+          payload: { schema, data: chunk },
+          session: {
+            session_id: sessionId,
+            batch_seq: batchSeq,
+            last_batch_flag: isLastBatch,
+            estimated_num_total: rows.length,
           },
         });
         lastResult = result._data || result;
@@ -3087,11 +3087,10 @@ export class MetaService {
 
       this.log(`Replacing users in custom audience: ${audienceId}`, { schema, payloadType: typeof payload });
 
-      // Live-test finding: unlike createUser/deleteUsers (session nested
-      // inside `payload`), Meta's /usersreplace edge requires `session` as a
-      // TOP-LEVEL param sibling to `payload`, always — even for a single
-      // batch. Nesting it inside `payload` (mirroring the /users edges)
-      // still produces "(#100) The parameter session is required", confirmed
+      // Live-test finding: Meta's /usersreplace edge requires `session` as a
+      // TOP-LEVEL param sibling to `payload` (as the /users edges do for
+      // multi-batch, ENG-1343), always — even for a single batch. Nesting it
+      // inside `payload` produces "(#100) The parameter session is required", confirmed
       // live against the real Graph API.
       const rows = payload;
       const sessionId = Math.floor(Math.random() * 1_000_000_000);
