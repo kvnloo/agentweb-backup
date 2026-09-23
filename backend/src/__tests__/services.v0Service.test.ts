@@ -6551,7 +6551,7 @@ export default function SyntheticV0PageForDeployment() {
 
 
 describe('getPreviewDeploymentUrl commit matching', () => {
-  beforeEach(() => { mockAxiosGet.mockReset(); mockAxiosPatch.mockReset(); });
+  beforeEach(() => { mockAxiosGet.mockReset(); mockAxiosPatch.mockReset(); mockAxiosPost.mockReset(); });
   const deployment = (sha: string, state = 'READY') => ({
     meta: { githubCommitRef: 'draft/agentweb-preview', githubCommitSha: sha },
     readyState: state, uid: 'deploy', url: `${sha}.vercel.app`,
