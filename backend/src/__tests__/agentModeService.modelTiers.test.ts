@@ -31,24 +31,27 @@ describe('tierFromCostScore', () => {
 // Sol 51, Sonnet 5 45, Terra 47, Haiku 17, Luna 43); ties resolve to the
 // higher band (Harsha, 2026-09-06).
 describe('tierFromQualityScore', () => {
-  it('matches the documented thresholds: 55/51/45/17/0', () => {
+  // Re-cut 2026-09-22 for AA v4.3.2 (scores run ~5-8 points below v4.2).
+  it('matches the documented thresholds: 53/47/38/15/0', () => {
     expect(tierFromQualityScore(100)).toBe('ultra_premium');
-    expect(tierFromQualityScore(57)).toBe('ultra_premium'); // Claude Fable 5.1
-    expect(tierFromQualityScore(55)).toBe('ultra_premium'); // GPT-6 Astra
-    expect(tierFromQualityScore(54)).toBe('pro'); // Claude Opus 5
-    expect(tierFromQualityScore(51)).toBe('pro'); // GPT-5.6 Sol
-    expect(tierFromQualityScore(47)).toBe('medium'); // GPT-5.6 Terra
-    expect(tierFromQualityScore(45)).toBe('medium'); // Claude Sonnet 5
-    expect(tierFromQualityScore(43)).toBe('cheap'); // GPT-5.6 Luna
-    expect(tierFromQualityScore(17)).toBe('cheap'); // Claude Haiku 4.5
-    expect(tierFromQualityScore(16)).toBe('ultra_cheap');
+    expect(tierFromQualityScore(58)).toBe('ultra_premium'); // Claude Opus 5.5
+    expect(tierFromQualityScore(53)).toBe('ultra_premium'); // Claude Fable 5.1 / GPT-6 Astra
+    expect(tierFromQualityScore(52)).toBe('pro');
+    expect(tierFromQualityScore(51)).toBe('pro'); // Claude Opus 5
+    expect(tierFromQualityScore(47)).toBe('pro'); // GPT-5.6 Sol
+    expect(tierFromQualityScore(46)).toBe('medium');
+    expect(tierFromQualityScore(42)).toBe('medium'); // GPT-5.6 Terra
+    expect(tierFromQualityScore(38)).toBe('medium'); // Claude Sonnet 5 / GPT-5.6 Luna (tie -> higher band)
+    expect(tierFromQualityScore(37)).toBe('cheap');
+    expect(tierFromQualityScore(15)).toBe('cheap'); // Claude Haiku 4.5
+    expect(tierFromQualityScore(14)).toBe('ultra_cheap');
     expect(tierFromQualityScore(0)).toBe('ultra_cheap');
   });
 
   it('resolves a tie at the boundary to the higher band', () => {
-    // Grok 4.6 ties GPT-5.6 Sol at 51 — both go to 'pro', not the 'medium'
-    // one boundary down would suggest.
-    expect(tierFromQualityScore(51)).toBe('pro');
+    // v4.3.2: GPT-5.6 Luna ties Claude Sonnet 5 at 38 — both go to
+    // 'medium', not the 'cheap' band one boundary down.
+    expect(tierFromQualityScore(38)).toBe('medium');
   });
 });
 

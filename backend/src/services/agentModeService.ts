@@ -1,3 +1,4 @@
+import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
 import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
@@ -35,6 +36,7 @@ import {
   snapshotWorkPlanTurn,
   type WorkPlanTurnDisposition,
 } from './agentMode/core/workPlanTurnDisposition';
+import { shouldForceScheduledAutocomplete } from './agentMode/core/scheduledAutocomplete';
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
@@ -59,6 +61,7 @@ import {
 import {
   assertOpenRouterToolsSupported,
   openRouterIgnoredProviders,
+  openRouterPreferredProviders,
   selectOpenRouterSamplingParams,
 } from './agentMode/openRouterRequestParams';
 import {
@@ -1026,21 +1029,21 @@ export function tierFromCostScore(costScore: number): ModelTier {
  * Quality-score band boundaries backing the picker's quality tier grouping
  * (ENG-1789, 2026-09-06). Independent axis from TIER_COST_SCORE_BANDS above:
  * that one groups by costScore (what we charge), this one groups by
- * qualityScore (AA Intelligence Index v4.2, re-snapshotted ENG-1786).
+ * qualityScore (AA Intelligence Index v4.3.2, re-snapshotted 2026-09-22).
  * Harsha's directive: "fable + astra are flagship, opus + 5.6 sol are pro,
- * sonnet + 5.6 terra are mid, haiku + 5.6 luna are low." Solved for
- * thresholds against the live v4.2 scores (Fable 57, Astra 55, Opus 5 54,
- * Sol 51, Sonnet 5 45, Terra 47, Haiku 17, Luna 43) with ties resolving to
- * the higher band (Harsha, 2026-09-06): ultra_premium >=55, pro >=51,
- * medium >=45, cheap >=17, ultra_cheap below. Same ModelTier union and
- * >= / highest-band-first shape as the cost bands so the two stay
- * structurally identical even though they measure different things.
+ * sonnet + 5.6 terra are mid, haiku + 5.6 luna are low." Re-solved against
+ * the v4.3.2 scores (Fable 53, Astra 53, Opus 5 51, Sol 47, Terra 42,
+ * Sonnet 5 38, Luna 38, Haiku 15), which run ~5-8 points below v4.2. One
+ * conflict is unavoidable: Sonnet 5 and GPT-5.6 Luna now tie at 38, so ties
+ * resolve to the higher band (Harsha, 2026-09-06) and Luna moves up to mid.
+ * ultra_premium >=53, pro >=47, medium >=38, cheap >=15, ultra_cheap below.
+ * Same ModelTier union and >= / highest-band-first shape as the cost bands.
  */
 export const QUALITY_SCORE_BANDS: ReadonlyArray<{ tier: ModelTier; minQualityScore: number }> = [
-  { tier: 'ultra_premium', minQualityScore: 55 },
-  { tier: 'pro', minQualityScore: 51 },
-  { tier: 'medium', minQualityScore: 45 },
-  { tier: 'cheap', minQualityScore: 17 },
+  { tier: 'ultra_premium', minQualityScore: 53 },
+  { tier: 'pro', minQualityScore: 47 },
+  { tier: 'medium', minQualityScore: 38 },
+  { tier: 'cheap', minQualityScore: 15 },
   { tier: 'ultra_cheap', minQualityScore: 0 },
 ];
 
@@ -2874,6 +2877,8 @@ export class AgentModeService {
     }
 
     params.provider = { allow_fallbacks: true, require_parameters: true };
+    const preferredProviders = openRouterPreferredProviders(upstreamModel);
+    if (preferredProviders.length > 0) params.provider.order = preferredProviders;
     const ignoredProviders = openRouterIgnoredProviders(upstreamModel);
     if (ignoredProviders.length > 0) {
       // Stopgap for ENG-1702 (parent: ENG-753). Our BYOK Google credential is
@@ -3345,6 +3350,12 @@ export class AgentModeService {
     // Workplan progression turns must end in persisted structured state rather
     // than a provider-dependent prose question buried at the end of a response.
     requireWorkPlanDisposition: boolean = false,
+    // ENG-2072: tri-state per-turn signal for "is this an unattended scheduled/
+    // test run" — see ToolContext.isUnattendedRun in mcp/client/toolRegistry.ts.
+    // Supplied by runVerifiedChatInner (true only from runScheduledChat's call,
+    // false/undefined otherwise); every other caller of generateMarketingResponse
+    // is an attended interactive path and leaves this undefined.
+    isUnattendedRun?: boolean,
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
@@ -4825,6 +4836,7 @@ export class AgentModeService {
           isDelegatedAccess,
           hasAdminAccess,
           isInteractiveShare,
+          isUnattendedRun,
           adminSkillToolNames: ADMIN_SKILL_TOOL_NAMES,
           excludeTools,
           publishedSkillsCount: publishedSkills.length,
@@ -9052,11 +9064,17 @@ export class AgentModeService {
     runBudgetDeadlineMs?: number;
     turnHardCapMs?: number;
     agentRuntimeRunId?: string;
+    // ENG-2072: tri-state — see ToolContext.isUnattendedRun. Threaded through
+    // as-is (not coerced to a truthy check like isDelegatedAccess below) because
+    // an explicit `false` (attended) must survive distinctly from `undefined`
+    // (caller has not resolved a value, fall back to session.sessionType).
+    isUnattendedRun?: boolean;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
     if (input.screenshotUrl) toolOptions.screenshotUrl = input.screenshotUrl;
     if (input.isDelegatedAccess) toolOptions.isDelegatedAccess = true;
+    if (input.isUnattendedRun !== undefined) toolOptions.isUnattendedRun = input.isUnattendedRun;
     // ENG-1945 follow-up: the SERVER's own id for the run this tool call is executing
     // within — never something the model supplies or can even see elsewhere, unlike the
     // `run_id` argument report_product_issues accepts (that one is for citing a DIFFERENT,
@@ -11362,6 +11380,8 @@ export class AgentModeService {
       // Prepare market strategy data - merge with existing if available
       const updateTimestamp = new Date().toISOString();
       const marketStrategyData = {
+        ...existingMarketStrategy,
+        ...otherFields,
         businessOverview: businessOverview !== undefined ? businessOverview : (existingMarketStrategy?.businessOverview || ''),
         competitors: mergedCompetitors,
         icp: mergedICP,
@@ -11380,6 +11400,8 @@ export class AgentModeService {
       } else {
         await userDb.updateUser(userId, { marketStrategy: marketStrategyData });
       }
+
+      await populateEmptyBrandGuidelines(userId);
 
       // Track what was updated vs added
       const updatedEntries: string[] = [];
@@ -33662,7 +33684,7 @@ ${strippedHtml}`;
 
   // Work Plan Management Methods
 
-  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, sessionId: string, autocomplete?: boolean, isUnattendedRun?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -33694,8 +33716,9 @@ ${strippedHtml}`;
         // forever — the "wait for the user to approve each step" contract has no user
         // to ask, so the run just burns its completion-gate continuation budget presenting
         // results and asking for approval, then records a deferredUnresolved failure. Force
-        // hands-off mode on every scheduled session regardless of what the model passed.
-        autocomplete: session.sessionType === 'scheduled' ? true : (autocomplete || false),
+        // hands-off mode whenever this turn is genuinely unattended — see
+        // shouldForceScheduledAutocomplete (ENG-2072).
+        autocomplete: shouldForceScheduledAutocomplete(session, isUnattendedRun) ? true : (autocomplete || false),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
@@ -33748,7 +33771,7 @@ ${strippedHtml}`;
    *
    * Refuses to overwrite an existing active (non-empty) work plan unless force=true.
    */
-  public async applyPredefinedWorkPlan(planTitleOrId: string, sessionId: string, userId?: string, options?: { force?: boolean; confirmedDeclinedPlan?: boolean; skipDeclineGate?: boolean }): Promise<any> {
+  public async applyPredefinedWorkPlan(planTitleOrId: string, sessionId: string, userId?: string, options?: { force?: boolean; confirmedDeclinedPlan?: boolean; skipDeclineGate?: boolean; isUnattendedRun?: boolean }): Promise<any> {
     try {
       const { getAccessiblePredefinedWorkPlanCandidates } = await import('./predefinedWorkPlanResolver');
 
@@ -33875,10 +33898,11 @@ ${strippedHtml}`;
           ...(step.inputRequest !== undefined && { inputRequest: step.inputRequest }),
         })),
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
-        // ENG-2058: same rationale as createWorkPlan above — a scheduled session has no
-        // user to approve an interactive step, so a template's own autocomplete (or lack
-        // of one) is overridden hands-off whenever this launch lands on a scheduled run.
-        autocomplete: session.sessionType === 'scheduled' ? true : (predefinedPlan.autocomplete || false),
+        // ENG-2058: same rationale as createWorkPlan above — an unattended scheduled
+        // run has no user to approve an interactive step, so a template's own
+        // autocomplete (or lack of one) is overridden hands-off. ENG-2072: gated on
+        // shouldForceScheduledAutocomplete, not sessionType alone — see its doc comment.
+        autocomplete: shouldForceScheduledAutocomplete(session, options?.isUnattendedRun) ? true : (predefinedPlan.autocomplete || false),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         // ENG-1472: which predefined template this session's plan was launched
@@ -34225,7 +34249,7 @@ Reply with ONLY one word: yes or no.`;
     }
   }
 
-  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean, isUnattendedRun?: boolean): Promise<any> {
     try {
       // ENG-1793: consistentRead=true so this read of session.workPlan /
       // calledFunctions / failedFunctions / calledFunctionsVersion -- the fields
@@ -34333,11 +34357,13 @@ Reply with ONLY one word: yes or no.`;
         workPlan.pendingRequiredFunctionCalls = Array.from(newlyUnresolved);
       }
 
-      // Update autocomplete if explicitly provided. ENG-2058: a scheduled session
-      // always stays hands-off — there is no user to approve an interactive step —
-      // so this overrides any explicit `false` (or a plan created before this fix)
-      // rather than only applying when the caller passed a value.
-      if (session.sessionType === 'scheduled') {
+      // Update autocomplete if explicitly provided. ENG-2058: a genuinely unattended
+      // scheduled run always stays hands-off — there is no user to approve an
+      // interactive step — so this overrides any explicit `false` (or a plan created
+      // before this fix) rather than only applying when the caller passed a value.
+      // ENG-2072: gated on shouldForceScheduledAutocomplete, not sessionType alone —
+      // see its doc comment.
+      if (shouldForceScheduledAutocomplete(session, isUnattendedRun)) {
         workPlan.autocomplete = true;
       } else if (autocomplete !== undefined) {
         workPlan.autocomplete = autocomplete;

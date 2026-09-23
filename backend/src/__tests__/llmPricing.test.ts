@@ -56,8 +56,8 @@ describe('price book version (ENG-1250 §5, ENG-1934)', () => {
 
   it('matches the prices it versions — bump LLM_PRICE_BOOK_VERSION and this pin together', () => {
     expect({ version: LLM_PRICE_BOOK_VERSION, fingerprint: fingerprint() }).toEqual({
-      version: '2026-09-10',
-      fingerprint: 'a271b4b8838a9308',
+      version: '2026-09-22',
+      fingerprint: '3d3cfd20d704772f', // 2026-09-22 second pin: additive rows only (GPT-6 Sol/Luna, Grok 4.7), no existing rate changed, so events already stamped 2026-09-22 still re-derive exactly,
     });
   });
 });
@@ -241,7 +241,7 @@ describe('llmPricing', () => {
       // Models whose provider publishes an explicit cache rate that differs from the
       // 10%/125% convention (see the ModelPrice cache-price docs). gpt-4o's real
       // cached-input rate is $1.25 (50% of input), not the derived 10%.
-      const explicitCacheOverrides = new Set(['gpt-4o', 'openrouter/anthropic/claude-fable-5.1', 'gemini-3.8-flash']);
+      const explicitCacheOverrides = new Set(['gpt-4o', 'openrouter/anthropic/claude-fable-5.1', 'gemini-3.8-flash', 'openrouter/anthropic/claude-opus-5.5', 'openrouter/x-ai/grok-4.7']);
       for (const [model, price] of Object.entries(MODEL_PRICING)) {
         if (price.outPerM === 0) continue; // embeddings have no cache convention
         if (explicitCacheOverrides.has(model)) continue;

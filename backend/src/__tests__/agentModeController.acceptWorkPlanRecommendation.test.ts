@@ -139,8 +139,10 @@ describe('agentModeController.acceptWorkPlanRecommendation', () => {
     // Never trusts a planId from the request body — only what the persisted
     // recommendation itself named. ENG-1974: always passes skipDeclineGate —
     // the user's own explicit accept click must never be blocked by an
-    // earlier decline of any recommendation.
-    expect(mockAgentModeService.applyPredefinedWorkPlan).toHaveBeenCalledWith('plan-onboard', 'sess-1', 'user-1', { skipDeclineGate: true });
+    // earlier decline of any recommendation. ENG-2072: always passes
+    // isUnattendedRun: false — this is a live, owner-clicked accept, so it
+    // must never force hands-off work-plan autocomplete via sessionType.
+    expect(mockAgentModeService.applyPredefinedWorkPlan).toHaveBeenCalledWith('plan-onboard', 'sess-1', 'user-1', { skipDeclineGate: true, isUnattendedRun: false });
     expect(res.status).toHaveBeenCalledWith(200);
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
       success: true,
@@ -232,7 +234,9 @@ describe('agentModeController.launchWorkPlan', () => {
 
     await agentModeController.launchWorkPlan(launchRequest(authedUser), res);
 
-    expect(mockAgentModeService.applyPredefinedWorkPlan).toHaveBeenCalledWith('plan-onboard', 'sess-1', 'user-1');
+    // ENG-2072: a live, owner-clicked launch must never force hands-off
+    // work-plan autocomplete via sessionType.
+    expect(mockAgentModeService.applyPredefinedWorkPlan).toHaveBeenCalledWith('plan-onboard', 'sess-1', 'user-1', { isUnattendedRun: false });
     expect(res.status).toHaveBeenCalledWith(200);
   });
 

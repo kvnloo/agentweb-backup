@@ -977,7 +977,9 @@ createTestAccount().then(async () => {
       // is a trust break (ThinkingAI, TransAmerica — Aug 2026 audit, both caught
       // manually). Flags active-subscription users renewing within the lookahead
       // window whose ad integration is missing/expired via a deduped oncall alert.
-      try {
+      // Disabled by default: per-customer "Renewal at risk" oncall emails were flooding the team inbox.
+      // Opt back in with RENEWAL_HEALTH_ALERTS_ENABLED=true. The read-only admin evaluation route is unaffected.
+      if (process.env.RENEWAL_HEALTH_ALERTS_ENABLED === 'true') try {
         const { runRenewalIntegrationHealthCheck } = await import('./cron/renewalIntegrationHealthCron');
         const RENEWAL_HEALTH_INTERVAL_MS = 24 * 60 * 60 * 1000;
         cronJobRegistry.track('renewalIntegrationHealthCron', runRenewalIntegrationHealthCheck())

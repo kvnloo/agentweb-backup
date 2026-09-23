@@ -1,3 +1,4 @@
+import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 /**
  * Onboarding Epic Phase 2 — ICP discovery service.
  *
@@ -384,6 +385,7 @@ async function mirrorIcpsToMarketStrategy(
       icpUpdatedAt?: string;
     };
     const merged = {
+      ...existing,
       businessOverview: existing.businessOverview ?? "",
       competitors: existing.competitors ?? [],
       icp: mapIcpResultToMarketStrategy(personas),
@@ -400,6 +402,7 @@ async function mirrorIcpsToMarketStrategy(
       icpUpdatedAt: completedAt,
     };
     await userDb.updateUser(userId, { marketStrategy: merged } as any);
+    await populateEmptyBrandGuidelines(userId);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(

@@ -140,6 +140,36 @@ describe('AgentModeService - predefined work plan templates', () => {
       );
     });
 
+    it('ENG-2072: does NOT force autocomplete when a scheduled session is reopened for a live, attended turn (isUnattendedRun: false)', async () => {
+      const interactiveTemplate = { ...systemTemplate, planId: 'plan-interactive', title: 'Interactive Plan', autocomplete: false };
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [interactiveTemplate] : []
+      );
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId, sessionType: 'scheduled', messages: [] });
+
+      await service.applyPredefinedWorkPlan('Interactive Plan', sessionId, 'user-1', { isUnattendedRun: false });
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ autocomplete: false })
+      );
+    });
+
+    it('ENG-2072: falls back to sessionType when isUnattendedRun is not threaded by the caller (zero regression for un-migrated callers)', async () => {
+      const interactiveTemplate = { ...systemTemplate, planId: 'plan-interactive', title: 'Interactive Plan', autocomplete: false };
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [interactiveTemplate] : []
+      );
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId, sessionType: 'scheduled', messages: [] });
+
+      await service.applyPredefinedWorkPlan('Interactive Plan', sessionId, 'user-1');
+
+      expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ autocomplete: true })
+      );
+    });
+
     it('ENG-1765: copies inputRequest onto the instantiated step instead of dropping it', async () => {
       mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
         v === 'system' ? [templateWithInputRequest] : []

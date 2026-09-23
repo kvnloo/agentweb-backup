@@ -473,6 +473,7 @@ export interface User {
     brandData: {
       brandName: string;
       tagline: string;
+      valueProposition?: string;
       domain?: string;
       primaryColor: string;
       primaryColorEnd: string;
@@ -500,8 +501,8 @@ export interface User {
     createdAt: string;
     updatedAt: string;
     /**
-     * Opaque identity of the write that produced this value, stamped only by
-     * the asset-delete path's conditional writes. `updatedAt` is millisecond
+     * Opaque identity of the write that produced this value, stamped by
+     * the asset-delete, brand-route and fill-only population writes. `updatedAt` is millisecond
      * granular and every other brand writer mints its own, so two writes can
      * share a stamp; pairing it with a revision lets a conditional write
      * identify the exact value it read. Absent on anything written by another
@@ -6772,14 +6773,19 @@ export const crmDb = {
     }
   },
 
-  async getLeadById(listId: string, leadId: string) {
+  async getLeadById(listId: string, leadId: string, opts?: { consistentRead?: boolean }) {
     try {
-      const params = {
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Key: {
           listId,
           leadId,
         },
+        // ENG-2082: opt-in, because the default eventually-consistent read is fine for the
+        // ordinary "fetch a lead" callers and half the price. It is NOT fine for a read that
+        // immediately follows a failed conditional write on the same key — the row is known
+        // to exist, and a stale miss there is indistinguishable from "no such lead".
+        ...(opts?.consistentRead ? { ConsistentRead: true } : {}),
       };
 
       const result = await dynamodb.get(params).promise();
