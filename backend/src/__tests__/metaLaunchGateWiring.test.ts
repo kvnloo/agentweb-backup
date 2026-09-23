@@ -42,6 +42,14 @@ beforeEach(() => {
   manageCampaignsSpy = jest
     .spyOn(service as any, 'manageMetaAdsCampaigns')
     .mockResolvedValue({ success: true, message: 'campaign updated' });
+  // ENG-1635/1644 gap 5: params.confirm=true is no longer independently
+  // sufficient to reach dispatch — the grant check now always decides. This
+  // file is entirely about the ENG-941 tracking gate and override binding,
+  // both of which run AFTER authorization and are untouched by gap 5, so
+  // stubbing the grant itself (rather than building real approval-deck
+  // fixtures per test) keeps every existing assertion exercising exactly
+  // what it always did.
+  jest.spyOn(service as any, 'claimMetaWriteManifestGrant').mockResolvedValue({ granted: true, digest: 'stub-digest' });
 });
 
 describe('callMetaMarketingApi — ENG-941 gate wiring', () => {

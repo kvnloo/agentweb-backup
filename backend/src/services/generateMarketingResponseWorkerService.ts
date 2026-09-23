@@ -8,6 +8,7 @@ import path from 'path';
 import { clearTerminalProgress } from '../utils/sseProgress';
 import { DRAIN_CEILING_MS, DRAIN_POLL_INTERVAL_MS } from '../utils/shutdownConstants';
 import type { WorkPlanTurnDisposition } from './agentMode/core/workPlanTurnDisposition';
+import type { PendingApprovalDeck } from './agentMode/core/approvalDeck';
 
 interface GenerateMarketingResponseParams {
   messageContent: string;
@@ -55,6 +56,9 @@ interface GenerateMarketingResponseResult {
   // run, so the caller's final batch persists only the remaining tail.
   persistedResponseCount?: number;
   workPlanTurnDisposition?: WorkPlanTurnDisposition;
+  // ENG-1635/1644: the deck built this turn, when present — plain data, survives
+  // the fork IPC boundary like publishAuthorizationOverride above.
+  pendingApprovalDeck?: PendingApprovalDeck;
 }
 
 export class GenerateMarketingResponseWorkerService {

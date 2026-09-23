@@ -181,26 +181,57 @@ describe('ENG-982: one call completes the job', () => {
     }
   });
 
-  it('emma_run_marketing_task confirms a blocking question against the SESSION, not the generate reply', async () => {
-    // The generate response does not carry pendingUserQuestion — no res.json in
-    // agentModeController includes it. Reading it off the reply was dead code,
-    // so a run blocked on a question reported "complete" and the caller walked
-    // away from work waiting on them.
+  // ENG-1635/1644 PR2: the pendingUserQuestion-recognition test that lived
+  // here is deleted — nothing ever populates that field anymore, and the
+  // status-check function no longer reads it at all (only pendingApprovalDeck
+  // below). Confirming "the SESSION, not the generate reply" is what's
+  // checked is now covered by the deck-of-one test right below.
+
+  // ENG-1635/1644 (ask_user_question retirement): ask_user_question and the
+  // Meta objective gate no longer populate pendingUserQuestion at all — they
+  // build a single-item pendingApprovalDeck instead. This tool must recognize
+  // that slot too, or a caller sees "complete" on a run that's actually stuck.
+  it('emma_run_marketing_task confirms a blocking deck-of-one against the SESSION, not the generate reply', async () => {
     mockMcpFetch
       .mockResolvedValueOnce({ sessionId: 'task-42' })
       .mockResolvedValueOnce({ content: 'which audience?' }) // generate: no pending field
-      .mockResolvedValueOnce({ pendingUserQuestion: { question: 'which audience?' } }); // session GET
+      .mockResolvedValueOnce({
+        pendingApprovalDeck: {
+          deckId: 'deck-1',
+          status: 'awaiting',
+          items: [{ itemId: 'item-1', kind: 'meta_objective', question: 'Which objective?' }],
+        },
+      }); // session GET
 
     const res: any = await tool('emma_run_marketing_task').execute({ goal: 'launch' }, CALLER);
     const body = JSON.parse(res.content[0].text);
 
-    expect(paths()).toEqual([
-      '/api/agent-mode/sessions',
-      '/api/agent-mode/generate',
-      '/api/agent-mode/session/task-42',
-    ]);
     expect(body.status).toBe('awaiting_input');
-    expect(body.next).toMatch(/emma_answer_question/);
+    expect(body.awaiting_question).toBeNull();
+    expect(body.awaiting_question_deck).toMatchObject({ deckId: 'deck-1', status: 'awaiting' });
+    expect(body.next).toMatch(/emma_answer_question_deck/);
+  });
+
+  it('emma_run_marketing_task does NOT treat a genuine multi-item deck as a blocking single-question halt', async () => {
+    mockMcpFetch
+      .mockResolvedValueOnce({ sessionId: 'task-42' })
+      .mockResolvedValueOnce({ content: 'here is your plan' })
+      .mockResolvedValueOnce({
+        pendingApprovalDeck: {
+          deckId: 'deck-1',
+          status: 'awaiting',
+          items: [
+            { itemId: 'item-1', kind: 'plan_choice', question: 'Budget?' },
+            { itemId: 'item-2', kind: 'plan_choice', question: 'Audience?' },
+          ],
+        },
+      });
+
+    const res: any = await tool('emma_run_marketing_task').execute({ goal: 'launch' }, CALLER);
+    const body = JSON.parse(res.content[0].text);
+
+    expect(body.status).toBe('complete');
+    expect(body.awaiting_question_deck).toBeNull();
   });
 
   it('emma_run_marketing_task does not spend a confirmation read when the run detached', async () => {

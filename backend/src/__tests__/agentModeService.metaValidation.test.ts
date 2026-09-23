@@ -56,7 +56,7 @@ jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getMessagesFromMessagesTable: jest.fn().mockResolvedValue([]),
     getChatSession: jest.fn().mockResolvedValue(null),
-    updateSessionAskUserQuestion: jest.fn().mockResolvedValue({}),
+    updateSessionObjectiveConfirmation: jest.fn().mockResolvedValue(undefined),
     createChatSession: jest.fn().mockResolvedValue({ sessionId: 'auto-created-session' }),
   },
 }));
@@ -109,6 +109,13 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
     service = new AgentModeService();
     jest.clearAllMocks();
     (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+    // ENG-1635/1644 gap 5: params.confirm=true is no longer independently
+    // sufficient to pass the write-confirmation gate — a real grant is
+    // required. This file is about param validation/error enrichment, not
+    // the grant mechanism itself (that's metaWriteManifestConsent.test.ts),
+    // so stub the grant true by default; the two tests that specifically
+    // exercise the gate's own confirm=true behavior override this locally.
+    jest.spyOn(service as any, 'claimMetaWriteManifestGrant').mockResolvedValue({ granted: true, digest: 'stub-digest' });
   });
 
   // ==================== Pre-validation via callMetaMarketingApi ====================
@@ -312,26 +319,29 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
 
       expect(result.success).toBe(true); // halting-card responses use success:true (see ask_user_question tool)
       expect(result.awaitingUserConfirmation).toBe(true);
-      expect(result.type).toBe('ask_user_question');
-      expect(result.recommendedOptionId).toBe('leads'); // OUTCOME_LEADS default, no account preference set
+      expect(result.type).toBe('ask_user_question'); // legacy tag kept for calling-convention continuity (ENG-1635/1644)
+      // ENG-1635/1644: the gate no longer writes pendingUserQuestion synchronously or
+      // returns a top-level recommendedOptionId — it returns a bare halt marker
+      // (questionDeckPayload) built through the same deck-of-one mechanism
+      // present_question_deck uses; see agentModeService.metaObjectiveGate.test.ts's
+      // dedicated coverage of this shape for the full picture.
+      expect(result.questionDeckPayload).toHaveLength(1);
+      const leadsOption = result.questionDeckPayload[0].options.find((o: any) => o.id === 'leads');
+      expect(leadsOption?.recommended).toBe(true); // OUTCOME_LEADS default, no account preference set
       expect(metaService.createCampaign).not.toHaveBeenCalled();
-      expect(chatbotDb.updateSessionAskUserQuestion).toHaveBeenCalled();
+      // PR2: updateSessionAskUserQuestion (the old sync-persist method this
+      // once asserted "not called" against) is deleted entirely now.
     });
 
-    it('ALLOWS a CAMPAIGN CREATE whose objective was already answered via ask_user_question (kind meta_objective)', async () => {
+    it('ALLOWS a CAMPAIGN CREATE whose objective was already confirmed this session (ENG-1635/1644 PR2: objectiveConfirmations)', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
         sessionId: 'session-1',
-        pendingUserQuestion: {
-          questionId: 'q-1',
-          question: 'Which objective?',
-          options: [{ id: 'sales', label: 'Sales', consequence: 'x', recommended: true, why: 'y', payload: { objective: 'OUTCOME_SALES' } }],
-          recommendedOptionId: 'sales',
-          immutable: true,
-          allowEmmaDecide: true,
-          kind: 'meta_objective:123456789|test|||NONE',
-          status: 'answered',
-          createdAt: '2026-07-24T00:00:00.000Z',
-          answer: { optionId: 'sales', delegated: false, answeredBy: 'user', at: '2026-07-24T00:01:00.000Z' },
+        objectiveConfirmations: {
+          'meta_objective:123456789|test|||NONE': {
+            objective: 'OUTCOME_SALES',
+            answeredBy: 'user',
+            at: '2026-07-24T00:01:00.000Z',
+          },
         },
       });
       (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_456', name: 'Test' });
@@ -374,10 +384,18 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(result.target.ad_set).toContain('Maintenance Ad Set');
     });
 
-    it('executes AD CREATE when confirm=true and strips the flag before dispatch', async () => {
+    it('a granted AD CREATE executes and strips confirm before dispatch — confirm itself grants nothing (gap 5)', async () => {
+      // ENG-1635/1644 gap 5: confirm=true is included here to prove it is
+      // stripped and inert, NOT because it is what authorizes this call —
+      // the top-level beforeEach's claimMetaWriteManifestGrant stub is what
+      // actually grants it. See the next test for confirm=true with no grant.
       (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad_new', name: 'New Maintenance Ad' });
 
       const result = await callApi(service, 'AD', 'CREATE', {
+        // ENG-1635/1644 gap 5: the grant check only runs at all when a
+        // sessionId is present (no session -> always halt, fail-closed) — a
+        // stubbed-granted spy that's never reached still halts.
+        sessionId: 'session-1',
         ad_set_id: 'adset_1',
         params: { name: 'New Maintenance Ad', creative_id: 'creative_1', confirm: true }
       });
@@ -388,6 +406,20 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       // confirm must never leak into the params passed to metaService.
       const paramsArg = (metaService.createAd as jest.Mock).mock.calls[0][2];
       expect(paramsArg.confirm).toBeUndefined();
+    });
+
+    it('gap 5: confirm=true with NO grant still halts — the raw flag is never independently sufficient', async () => {
+      jest.spyOn(service as any, 'claimMetaWriteManifestGrant').mockResolvedValue({ granted: false, digest: 'stub-digest' });
+      (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad_new', name: 'New Maintenance Ad' });
+
+      const result = await callApi(service, 'AD', 'CREATE', {
+        sessionId: 'session-1', // with a session present, this genuinely exercises the false-grant path, not just "no session halts"
+        ad_set_id: 'adset_1',
+        params: { name: 'New Maintenance Ad', creative_id: 'creative_1', confirm: true }
+      });
+
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(metaService.createAd).not.toHaveBeenCalled();
     });
 
     it('blocks a VALID AD UPDATE without confirm and does not call metaService.updateAd', async () => {
@@ -700,13 +732,18 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(typeof result.confirmationPrompt).toBe('string');
       expect(result.confirmationPrompt).toContain('Maintenance Ad Set');
       expect(result.confirmationPrompt).toContain('Maintenance Campaign');
-      expect(result.confirmationPrompt.toLowerCase()).toContain('confirm');
+      // ENG-1635/1644 gap 5: must ask for approval through a review card, never invite a
+      // typed "confirm"/"yes" reply — that flag is fully inert now (see the sibling
+      // `message` field's own "Do NOT re-call... with params.confirm=true" instruction).
+      expect(result.confirmationPrompt.toLowerCase()).toContain('approval');
+      expect(result.confirmationPrompt.toLowerCase()).not.toContain('reply "yes"');
     });
 
-    it('does NOT set awaitingUserConfirmation when confirm=true (gate bypassed, executes)', async () => {
+    it('does NOT set awaitingUserConfirmation on a GRANTED write (gap 5: confirm=true itself grants nothing — the top-level beforeEach stub does)', async () => {
       (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad_new', name: 'New Maintenance Ad' });
 
       const result = await callApi(service, 'AD', 'CREATE', {
+        sessionId: 'session-1', // gap 5: the grant check only runs at all with a sessionId present
         ad_set_id: 'adset_1',
         params: { name: 'New Maintenance Ad', creative_id: 'creative_1', confirm: true }
       });
@@ -809,7 +846,7 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(out).toContain('AD: pause Prospecting Ad');
       expect(out).toContain('AD_SET: pause Prospecting Ad Set');
       expect(out).toContain('CAMPAIGN: pause Prospecting Campaign');
-      expect(out.match(/Reply "yes" \/ "confirm"/g)?.length).toBe(1);
+      expect(out.match(/This needs your explicit approval through a review card/g)?.length).toBe(1);
     });
 
     it('batches multiple confirmations under ONE intro/footer using confirmationDetail', () => {
@@ -831,7 +868,7 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(out).not.toContain('FULL PROMPT 1');
       expect(out).not.toContain('FULL PROMPT 2');
       // Footer appears exactly once.
-      expect(out.match(/Reply "yes" \/ "confirm"/g)?.length).toBe(1);
+      expect(out.match(/This needs your explicit approval through a review card/g)?.length).toBe(1);
     });
 
     it('ignores requiresConfirmation-only results (delete_leads / work-plan stay un-halted)', () => {

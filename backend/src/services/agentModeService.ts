@@ -27,7 +27,7 @@ import { createHash, createHmac, randomUUID } from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
-import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
+import { chatbotDb, ChatMessage, ChatSession, searchPlatformKnowledgeBase } from './chatbotService';
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
@@ -111,16 +111,35 @@ import { RunEmitter } from './agentMode/streamEvents';
 // the outreach-onboarding prospect preview cannot drift apart.
 import { isAnonymizedSearchLead } from '../utils/anonymizedLinkedInLead';
 import {
-  applyAnswer,
-  buildPendingUserQuestion,
-  checkQuestionGate,
-  findAnsweredObjectiveCandidate,
-  summarizeAnsweredObjectiveQuestions,
-  findQuestionByKind,
-  renderQuestionPrompt,
   verifyExplicitStatement,
   type AskUserQuestionOption,
+  type PendingUserQuestion,
 } from './agentMode/core/askUserQuestion';
+import {
+  createApprovalDeck,
+  appendApprovalDeckItem,
+  finalizeApprovalDeck,
+  findApprovalDeckAnswerForDigest,
+  findAnsweredDeckItemByKind,
+  reconstructApprovalDeckFromHistory,
+  applyDeckAnswers,
+  approvedWriteItems,
+  renderApprovalDeckPrompt,
+  type PendingApprovalDeck,
+  type ApprovalDeckItem,
+  type ApprovalDeckAnsweredBy,
+  type InboundDeckAnswer,
+  type QuestionDeckQuestionInput,
+} from './agentMode/core/approvalDeck';
+import {
+  type WorkflowStepDefinition,
+  type WorkflowStepVerification,
+  type WorkflowRunState,
+  type WorkflowVerificationMismatch,
+  summarizeIndependentStepBatch,
+  StepContendedError,
+} from './agentMode/core/workflow';
+import { startWorkflow, advanceIndependentWorkflow, type AdvanceIndependentOutcome } from './agentMode/workflowRunner';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
 import { settingsService } from './settingsService';
 import {
@@ -521,6 +540,19 @@ type MetaApiResult = {
   error?: string;
   details?: any;
   [key: string]: any;
+};
+
+// ENG-1635/1644: per-item detail behind an approval deck's fully_applied/
+// partially_applied/unapplied result — see summarizeApprovalDeckRun.
+type ApprovalDeckExecutionSummary = {
+  status: 'fully_applied' | 'partially_applied' | 'unapplied';
+  items: Array<{
+    stepId: string;
+    status: 'verified' | 'failed';
+    appliedObjectId?: string;
+    error?: string;
+    mismatches?: Array<{ parameter: string; requested: unknown; applied: unknown }>;
+  }>;
 };
 
 import {
@@ -3356,7 +3388,7 @@ export class AgentModeService {
     // false/undefined otherwise); every other caller of generateMarketingResponse
     // is an attended interactive path and leaves this undefined.
     isUnattendedRun?: boolean,
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition }> {
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition; pendingApprovalDeck?: PendingApprovalDeck }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
@@ -3903,6 +3935,13 @@ export class AgentModeService {
       let responseMessage: any = null;
       let workPlanDispositionRetries = 0;
       let workPlanTurnDisposition: WorkPlanTurnDisposition | undefined;
+      // ENG-1635/1644: mirrors workPlanTurnDisposition's hoist-and-return-at-the-end
+      // pattern above. Without this, the deck built at the loop seam below only ever
+      // reaches the frontend via a full session refetch (a page reload) — the
+      // optimistic assistant bubble this turn's POST /generate response drives has no
+      // way to know a deck exists, so it falls back to the plain-text prompt with no
+      // buttons until the user reloads.
+      let pendingApprovalDeck: PendingApprovalDeck | undefined;
       let skillsUpdated = false;
       let filteredToolsCache: any[] | null = null; // Cache for filtered tools
 
@@ -3915,6 +3954,15 @@ export class AgentModeService {
       const toolSignatureHistory: string[] = [];
       const SIGNATURE_HISTORY_WINDOW = 10;
       const SIGNATURE_REPEAT_THRESHOLD = 3;
+      // ENG-1635/1644 follow-up: cross-TURN retry-backstop TRANSPARENCY for a
+      // Meta write that keeps failing the same way — see the annotation logic
+      // below (and applyMetaWriteRetryBackstop's own header) for why this
+      // never blocks a real attempt, only guarantees the approval card itself
+      // carries the failure history once a target has failed this many times
+      // in a row. 2 = one automatic retry is trusted with no extra noise on the
+      // card (a real chance to self-correct); the card for a 3rd consecutive
+      // attempt at the same target gets the warning annotation.
+      const META_WRITE_RETRY_BACKSTOP_THRESHOLD = 2;
 
       // Track max_tokens continuations to prevent infinite continuation loops
       let maxTokensContinuations = 0;
@@ -4617,7 +4665,21 @@ export class AgentModeService {
           // as a normal answer, so `isUnusableSynthesis` never flags it; this checks
           // the claim's numbers against `toolCalls` instead of the text's shape.
           //
-          // ENG-2076: gated on `assetProducingToolsInPlay` — this guard only
+          // ENG-1635/1644: ALSO skip when this turn resolves an approval-deck
+          // submission. Deck-approved writes dispatch via
+          // buildMetaWriteWorkflowSteps().execute() in the controller, BEFORE this
+          // function (and its `toolCalls` ledger) ever runs — so a turn that
+          // narrates "all 6 creatives created" off the already-verified
+          // `[Approval deck outcome: ...]` note this function was handed has a
+          // correctly non-empty claim against a `toolCalls` ledger that is
+          // legitimately empty, not a hallucination. Found live-driving: this
+          // guard fired a false "0 of 6 were actually produced" correction directly
+          // under a summary table of 6 real, verified creative IDs. The deck
+          // outcome note is itself a server-computed, per-item, already-verified
+          // record — strictly more precise than this heuristic ever is — so
+          // deferring to it here is correct, not just a suppression.
+          //
+          // ENG-2076: ALSO gated on `assetProducingToolsInPlay` — this guard only
           // understands image/video/HTML-template generation tools, so a turn that
           // never called one of them (e.g. a Meta Ads turn built entirely on
           // `call_meta_marketing_api`, or ANY turn that merely RECAPPED an earlier
@@ -4629,7 +4691,13 @@ export class AgentModeService {
           // session-history-scoped — see the function's own doc comment for why a
           // session-wide check reintroduces the same bug for any session that mixes
           // media generation with a later, unrelated recap turn.
-          if (falseClaimGuardEnabled && content && assetProducingToolsInPlay(toolCalls)) {
+          //
+          // Both narrowings are independent false-positive fixes for the SAME
+          // check, found in two separate reviews — combined with AND, not one
+          // replacing the other: either condition alone means this check must
+          // not run.
+          const turnResolvesApprovalDeck = messageContent.includes('[Approval deck outcome:');
+          if (falseClaimGuardEnabled && content && assetProducingToolsInPlay(toolCalls) && !turnResolvesApprovalDeck) {
             const falseClaim = detectFalseCompletionClaim(content, toolCalls);
             if (falseClaim) {
               console.warn(
@@ -4960,15 +5028,141 @@ export class AgentModeService {
         // Human-in-the-loop confirmation gate: if a tool in this iteration requested
         // explicit user confirmation (e.g. a Meta Ads publish/change/delete), STOP the
         // autonomous loop and hand control back to the user. The model CANNOT self-approve
-        // — only a new user message restarts the turn, after which it re-calls the tool
-        // with confirm=true. This is the safety net for the wrong-campaign / wrong-asset
-        // class of mistake: the user sees the resolved target and must approve it.
+        // — a Meta write specifically is only ever executed once the user answers an
+        // approval deck directly in the UI (ENG-1635/1644); the model re-calling the tool
+        // with confirm=true does nothing on its own (see buildMetaWriteApprovalDeck /
+        // callMetaMarketingApi's gate). This is the safety net for the wrong-campaign /
+        // wrong-asset class of mistake: the user sees the resolved target and must
+        // approve it.
         // Post-refactor (core/toolDispatch), this iteration's results live on the
         // toolCalls ledger (each entry carries .result = the minimal result, which
         // preserves awaitingUserConfirmation). Re-shape the new slice for the seam.
         const iterationResults = toolCalls
           .slice(toolCallsLengthBeforeIteration)
           .map((tc: any) => ({ status: tc.error ? 'error' as const : 'success' as const, result: tc.result }));
+        // ENG-1635/1644 gap 5 (Round-3 consequence #1) + Phase 2 v3: when this
+        // iteration halted on ANY Meta write(s) and/or present_question_deck
+        // call(s), wrap them in ONE approval deck instead of the plain text
+        // batch below. Partition first — both deck kinds share the SAME
+        // persist-and-tag seam below (parameterized by which deck got built);
+        // only `otherHalts` (a genuinely unsupported/future halt shape) bails
+        // to the old plain-text path, preserving today's safety net exactly.
+        // Priority within this iteration, deterministic, not a race:
+        //   1. any otherHalts present -> bail entirely (unchanged behavior).
+        //   2. writeHalts present -> build the WRITE deck; writes always win a
+        //      mixed turn (security-critical: a write must never dead-loop
+        //      behind a lower-stakes planning question) — any questionDeckHalts
+        //      in this SAME iteration are dropped from this deck, stashed on
+        //      it as droppedQuestionDeckPayload so the re-ask directive
+        //      reaches Emma once this write-deck is answered or cancelled
+        //      (never through userMessage — same round-6 fix as the outcome
+        //      note).
+        //   3. else questionDeckHalts present -> build the QUESTION deck.
+        const { writeHalts, questionDeckHalts, otherHalts } = this.partitionApprovalHalts(iterationResults);
+
+        // ENG-1635/1644 follow-up: retry-backstop TRANSPARENCY, checked before
+        // building a fresh deck for a write. Found live: a write that fails
+        // Meta-side validation got silently re-proposed identically, turn after
+        // turn, with zero explanation — the model's own in-turn anti-loop
+        // detector (below, in this same function) never caught it because each
+        // retry is only ONE iteration per turn (one halt, one break) — there's
+        // never two identical signatures WITHIN one turn to trip that detector.
+        //
+        // Deliberately NOT a hard block. An earlier version of this fix
+        // intercepted and replaced the turn with a stop message once a target
+        // had failed twice — but that blocks dispatch based on TARGET identity
+        // alone (entity+action+campaign/ad-set), not on whether anything
+        // actually changed. A genuinely corrected 3rd attempt (a real, different,
+        // would-succeed budget) would have been silently blocked too, never even
+        // shown to the user — trading one failure mode (silent identical retry)
+        // for another (silently refusing a good attempt). Caught live re-verifying
+        // this exact fix (Manan: "make sure being overly cautious... does not
+        // impact quality or behavior negatively anywhere").
+        //
+        // Instead: annotate the approval card itself with the failure history —
+        // this is a CODE-level guarantee the user sees the context (never
+        // dependent on Emma choosing to mention it in her own prose), while
+        // NEVER preventing a real attempt from being shown and approved. If the
+        // user approves again knowing this history, that's an informed choice,
+        // not a silent loop — and if it fails again, the next card carries the
+        // same warning, so nothing is ever hidden.
+        if (writeHalts.length > 0 && sessionId) {
+          const sessionForBackstop = await chatbotDb.getChatSession(sessionId);
+          const priorFailure = sessionForBackstop?.lastFailedMetaWrite;
+          if (priorFailure && priorFailure.count >= META_WRITE_RETRY_BACKSTOP_THRESHOLD) {
+            for (const h of writeHalts as any[]) {
+              const dispatch = h?.metaWriteDispatch;
+              if (!dispatch || this.computeMetaWriteTargetSignature(dispatch) !== priorFailure.signature) continue;
+              const warning =
+                `⚠️ This exact target has already failed ${priorFailure.count} time(s) in a row with: ` +
+                `"${priorFailure.error}" — review before approving again.\n\n`;
+              if (typeof h.confirmationDetail === 'string') h.confirmationDetail = warning + h.confirmationDetail;
+              if (typeof h.confirmationPrompt === 'string') h.confirmationPrompt = warning + h.confirmationPrompt;
+              if (typeof h.summary === 'string') h.summary = warning + h.summary;
+            }
+          }
+        }
+
+        const approvalDeck: PendingApprovalDeck | null =
+          sessionId && otherHalts.length === 0
+            ? this.buildApprovalDeckForIteration(writeHalts, questionDeckHalts)
+            : null;
+        if (approvalDeck) {
+          // Found by fresh-mind review: resumeStuckApprovalDeckWorkflowRun's
+          // message-history fallback (see its own header) can only ever find
+          // a reply message for a deck whose run already reached 'completed'
+          // — a run stuck mid-crash never gets one, so that fallback can
+          // never actually fire for the exact case it exists for. THIS is
+          // the real fix: this is the one place a new deck is about to
+          // overwrite session.pendingApprovalDeck — if an older deck is
+          // still sitting there, still fully answered, with its workflow
+          // run stuck 'in_progress' from a prior crash, this is the LAST
+          // moment its items/answers are durably available anywhere. Resume
+          // it here, before the overwrite, not after.
+          const sessionForResume = await chatbotDb.getChatSession(sessionId as string);
+          if (sessionForResume) await this.resumeStuckApprovalDeckWorkflowRun(sessionId as string, sessionForResume);
+
+          const posted = await chatbotDb.updateSessionApprovalDeck(sessionId as string, approvalDeck, {
+            failIfAwaitingExists: true,
+          });
+          if (posted) {
+            pendingApprovalDeck = approvalDeck;
+            const deckPrompt = renderApprovalDeckPrompt(approvalDeck);
+            content = deckPrompt;
+            (messages as any[]).push({
+              role: 'assistant',
+              content: deckPrompt,
+              llm: llmModel,
+              // ENG-1635/1644 Phase B: no tool-call result carries the deck's data (unlike
+              // ask_user_question, this halt is pushed as plain content) — this is the only
+              // correlator the frontend has to know THIS message should render the
+              // interactive ApprovalDeckCard instead of (or over) the plain-text prompt.
+              // Matched against session.pendingApprovalDeck.deckId, same "current slot"
+              // check the ask_user_question card already does for its own questionId.
+              // Applies identically regardless of which deck kind this is (Phase 2) —
+              // the frontend only ever branches on pendingApprovalDeckId matching, never
+              // on deck contents.
+              //
+              // approvalDeckItems: the full structured items array, stamped here so this
+              // message is self-contained for rendering once it's no longer the session's
+              // live slot (a later deck overwrites session.pendingApprovalDeck entirely —
+              // without its own copy, THIS message would have no way to reconstruct its
+              // card and would fall back to plain text forever, even after being answered).
+              // Mirrors ask_user_question's toolCall.result carrying its own question/options.
+              metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true, pendingApprovalDeckId: approvalDeck.deckId, approvalDeckItems: approvalDeck.items }
+            });
+            if (onProgress) {
+              runEmitter.emitLegacy({ iteration, status: 'complete', toolCalls: toolCalls.slice() });
+            }
+            break;
+          }
+          // posted === null: lost the one-live-slot race (something else in this
+          // session claimed the slot between the deck build and this write) — fall
+          // through to the plain per-item prompt below rather than silently dropping
+          // the halt or retrying, exactly like collectConfirmationPrompt already would
+          // have handled these same items.
+        }
+
         const confirmationPrompt = this.collectConfirmationPrompt(iterationResults);
         if (confirmationPrompt) {
           content = confirmationPrompt;
@@ -5387,7 +5581,8 @@ export class AgentModeService {
         // ENG-907: the wall-clock counterpart — the turn delivered a partial answer
         // because it ran out of time, so a scheduled run must continue it.
         ...(truncatedByTimeBudget ? { truncatedByTimeBudget: true } : {}),
-        ...(workPlanTurnDisposition ? { workPlanTurnDisposition } : {})
+        ...(workPlanTurnDisposition ? { workPlanTurnDisposition } : {}),
+        ...(pendingApprovalDeck ? { pendingApprovalDeck } : {})
       };
     } catch (error: any) {
       // Log with full detail so Bedrock validation errors (e.g. "Input is too long") are visible
@@ -6515,6 +6710,14 @@ export class AgentModeService {
     // voluntarily. Restriction to Meta-only is prompt-level (tool description),
     // not code-enforced — see emma/tools.ts for the explicit scope language.
     'ask_user_question',
+    // ENG-1635/1644 Phase 2: registered here for the same reason
+    // ask_user_question is -- without this, subscription/skill filtering
+    // strips a new tool from most real sessions despite it working in every
+    // unit test (this exact class of bug already happened once, ENG-396/400).
+    // MANDATORY, not DEFAULT_FOUNDATION_TOOLS above -- that's a weaker
+    // fallback-only list; this one is force-merged unconditionally, "so no
+    // config can strip them", regardless of any DB override.
+    'present_question_deck',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -7401,10 +7604,53 @@ export class AgentModeService {
           ? { tracking_override_token: result.tracking_override_token } : {}),
         ...(result.conversion_action_removal_token
           ? { conversion_action_removal_token: result.conversion_action_removal_token } : {}),
+        // ENG-1635: same class of bug as the two tokens above (ENG-1526/ENG-1322) — this
+        // minimizer discards anything it doesn't name, and buildMetaWriteManifestQuestion
+        // (the loop seam, right after this) reads metaWriteManifestDigest off the SAME
+        // halted result to decide whether every item in this iteration is a Meta write.
+        // Without this, every batch silently falls back to the old per-item prompt —
+        // found live on env1, not by a handler-level test (same discovery gap the
+        // comment above describes: handler tests call the dispatcher directly and never
+        // reach this function).
+        ...(result.metaWriteManifestDigest
+          ? { metaWriteManifestDigest: result.metaWriteManifestDigest } : {}),
+        // ENG-1635/1644 Round 3: same class of bug as the fields above — this minimizer
+        // discards anything it doesn't name, and buildMetaWriteApprovalDeck (the loop
+        // seam, right after this) needs metaWriteDispatch on the SAME halted result to
+        // later let a workflow step execute the approved write without the model ever
+        // re-calling this tool. Named here explicitly so it doesn't get silently dropped
+        // the same way metaWriteManifestDigest itself was, undetected by 20 passing
+        // tests, until live-driving on env1 caught it.
+        ...(result.metaWriteDispatch
+          ? { metaWriteDispatch: result.metaWriteDispatch } : {}),
       };
-      // ENG-396: also preserve the structured AskUserQuestion payload so the chat
-      // card can render its options and the frontend can post back a structured
-      // selection. Without this the per-tool minimizers drop these unknown fields.
+      // ENG-1635/1644 Phase 2g (extended in the ask_user_question-retirement
+      // migration): same class of bug as metaWriteManifestDigest/
+      // metaWriteDispatch above — this minimizer discards anything it doesn't
+      // name, and the iteration-end seam's partitionApprovalHalts reads
+      // questionDeckPayload off the SAME halted result to classify this as a
+      // question-deck halt at all. Checked by SHAPE (Array.isArray), not by
+      // `result.type` string — partitionApprovalHalts itself classifies this
+      // way (agentModeService.ts's partitionApprovalHalts), and ask_user_question's
+      // migrated execute() + resolveCampaignObjectiveGate's Path 3 BOTH still set
+      // `type: 'ask_user_question'` (unchanged calling-convention tag) while ALSO
+      // carrying questionDeckPayload — checking type first here silently stripped
+      // questionDeckPayload for both of them and fell back to the old plain-text
+      // prompt every time, found live on env1 driving the real objective gate
+      // (not by any handler-level test — same discovery gap the comments above
+      // describe: those tests call the dispatcher directly and never reach this
+      // function). Must be checked BEFORE the true-legacy-shape branch below.
+      if (Array.isArray(result.questionDeckPayload)) {
+        return {
+          ...base,
+          type: result.type,
+          questionDeckPayload: result.questionDeckPayload,
+        };
+      }
+      // ENG-396: true legacy shape (no questionDeckPayload — real options/
+      // questionId directly on the result). No current producer emits this
+      // anymore (both ask_user_question and the objective gate migrated to
+      // questionDeckPayload above); kept only as a defensive fallback.
       if (result.type === 'ask_user_question') {
         return {
           ...base,
@@ -20735,14 +20981,76 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   }
 
   /**
+   * ENG-1635: best-effort extraction of the Meta object id a write's dispatch
+   * result carries, for the manifest outcome record. A CREATE echoes the new
+   * object nested under its entity-shaped key (`campaign.id` / `adSet.id` /
+   * `ad.id` / `creative.id` / `audience.id`); an UPDATE/DELETE typically has no
+   * such nested object at all (just a message) — undefined in that case is
+   * correct, not a bug, since there's nothing new to name.
+   */
+  private static extractDispatchedObjectId(result: any): string | undefined {
+    if (!result || typeof result !== 'object') return undefined;
+    for (const key of ['campaign', 'adSet', 'ad', 'creative', 'audience']) {
+      const id = result[key]?.id;
+      if (typeof id === 'string' && id) return id;
+    }
+    return undefined;
+  }
+
+  /**
+   * ENG-1635: resolve the account id a write will ACTUALLY execute against —
+   * mirroring buildMetaWriteConfirmation's own resolution (see its comment
+   * above `scopeAccountId`) — and compute this call's manifest digest against
+   * THAT id, never the raw `account_id` argument.
+   *
+   * A raw argument can be omitted (the common single-connected-account case;
+   * `POST /emma/meta-ads/marketing-api` validates nothing) or vary
+   * cosmetically call to call while resolving to the same real account. Two
+   * calls that both omit/vary the raw argument but resolve to DIFFERENT real
+   * accounts must never hash the same, and a legitimately-identical write
+   * must not hash differently just because its raw argument differs from an
+   * earlier call's — so every manifest digest, at both producer (preview) and
+   * grant (claim) time, has to go through this same resolution. Both current
+   * callers (claimMetaWriteManifestGrant below, and the manifest producer)
+   * share this rather than each resolving credentials their own way.
+   */
+  private async resolveMetaWriteManifestDigest(
+    userId: string,
+    entity_type: string,
+    action: string,
+    account_id: string,
+    campaign_id: string | undefined,
+    ad_set_id: string | undefined,
+    ad_id: string | undefined,
+    params: any,
+  ): Promise<string> {
+    let scopeAccountId: string = account_id ?? '';
+    try {
+      const creds = await this.getMetaCredentials(userId, account_id);
+      if (creds.accountId) scopeAccountId = creds.accountId;
+    } catch {
+      // Same degrade-not-block behavior as buildMetaWriteConfirmation: a credential
+      // failure surfaces during actual execution, not here — fall back to the raw
+      // argument rather than letting digest computation itself throw.
+    }
+    return computeMetaWriteManifestDigest(getJwtSecret(), {
+      entity_type, action, account_id: scopeAccountId, campaign_id, ad_set_id, ad_id, params,
+    });
+  }
+
+  /**
    * ENG-1642: check whether this exact Meta write is authorized by an
    * answered `meta_write_manifest` question in the session, and if so claim
-   * it (at-most-once). Returns true only when a fresh claim succeeds THIS
-   * call — a digest not in any manifest, an unanswered/non-human-attributed
-   * manifest, or a digest already consumed all return false, which falls
-   * through to the normal confirmation halt.
+   * it (at-most-once). `granted` is true only when a fresh claim succeeds
+   * THIS call — a digest not in any manifest, an unanswered/non-human-
+   * attributed manifest, or a digest already consumed all return false,
+   * which falls through to the normal confirmation halt. `digest` is always
+   * returned (even on a false grant) so a caller that DOES grant can record
+   * this write's execution outcome (ENG-1635) against the exact digest the
+   * user approved, without re-resolving credentials a third time.
    */
   private async claimMetaWriteManifestGrant(
+    userId: string,
     sessionId: string,
     entity_type: string,
     action: string,
@@ -20751,40 +21059,202 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     ad_set_id: string | undefined,
     ad_id: string | undefined,
     params: any,
-  ): Promise<boolean> {
-    const digest = computeMetaWriteManifestDigest(getJwtSecret(), {
-      entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params,
-    });
+    grantSourceDeck?: PendingApprovalDeck,
+  ): Promise<
+    | { granted: true; digest: string }
+    // `reason` distinguishes two genuinely different cases a caller needs to
+    // treat differently (see buildMetaWriteWorkflowSteps's own use of it):
+    // 'not_approved' — this digest was never authorized at all (rejected,
+    // never in any deck, or a genuine client-side forgery attempt) — a real
+    // failure. 'already_consumed' — this digest WAS authorized and has
+    // already been (or is concurrently being) claimed by ANOTHER caller —
+    // not a failure of THIS attempt, just a lost race for an at-most-once
+    // resource; the write may well be succeeding right now via whoever won.
+    | { granted: false; digest: string; reason: 'not_approved' | 'already_consumed' }
+  > {
+    const digest = await this.resolveMetaWriteManifestDigest(
+      userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
+    );
     const session = await chatbotDb.getChatSession(sessionId);
-    // A session can carry MULTIPLE answered `meta_write_manifest` questions
-    // (each roll-off archives the prior one) — a newer manifest must not
-    // hide an EARLIER manifest that still authorizes this call's digest, so
-    // scan every candidate of this kind rather than taking only the single
-    // match `findQuestionByKind` would return.
-    const manifestCandidates: any[] = [];
-    if (session?.pendingUserQuestion?.kind === 'meta_write_manifest') {
-      manifestCandidates.push(session.pendingUserQuestion);
-    }
-    if (session?.answeredQuestions) {
-      for (const q of Object.values(session.answeredQuestions)) {
-        if (q.kind === 'meta_write_manifest') manifestCandidates.push(q);
-      }
-    }
     // Session already recorded this exact digest consumed — a repeat of the
     // same call re-confirms rather than executing again (acceptance
     // criterion 3).
-    if (session?.consumedMetaWriteManifestDigests?.[digest]) return false;
-    for (const manifestQuestion of manifestCandidates) {
-      const gate = checkQuestionGate(manifestQuestion);
-      if (!gate.allowed) continue;
-      // The card's approve-option payload carries the digests it authorizes
-      // (see the `meta_write_manifest` card producer) — the digest for THIS
-      // call must be one of them, not merely "some manifest was answered".
-      const grantedDigests: unknown = (gate.payload as any)?.digests;
-      if (!Array.isArray(grantedDigests) || !grantedDigests.includes(digest)) continue;
-      return chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
+    if (session?.consumedMetaWriteManifestDigests?.[digest]) return { granted: false, digest, reason: 'already_consumed' };
+    // ENG-1635/1644 gap 5 (plan's Migration note): sourced from the answered
+    // approval deck now, not a `meta_write_manifest`-kind AskUserQuestion —
+    // see approvalDeck.ts's findApprovalDeckAnswerForDigest header. This is
+    // the ONLY path a Meta write may be granted through; `params.confirm`
+    // alone is never sufficient (see the gate below, which no longer reads
+    // it at all before calling this).
+    //
+    // `grantSourceDeck` is an explicit override for resumeStuckApprovalDeckWorkflowRun's
+    // benefit ONLY: `session.pendingApprovalDeck` is whatever deck is
+    // CURRENTLY live, which for a step being resumed after a crash may
+    // already have been overwritten by a later, unrelated deck — reading it
+    // here would make every one of the crashed deck's still-approved writes
+    // fail closed as "no longer authorized," permanently losing them instead
+    // of resuming them. The normal (non-resume) call path never passes this,
+    // so its behavior is unchanged: it still reads the live session field,
+    // which IS the deck that was just answered.
+    const outcome = findApprovalDeckAnswerForDigest(grantSourceDeck ?? session?.pendingApprovalDeck, digest);
+    if (!outcome.granted) return { granted: false, digest, reason: 'not_approved' };
+    const granted = await chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
+    return granted ? { granted: true, digest } : { granted: false, digest, reason: 'already_consumed' };
+  }
+
+  /**
+   * ENG-1635: when every `awaitingUserConfirmation` result this iteration is a Meta
+   * write (each carries the `metaWriteManifestDigest` set on the halt above), build ONE
+   * approval deck covering all of them instead of the plain per-call text batching
+   * below — so a single submission grants every listed write via
+   * `claimMetaWriteManifestGrant` (now sourced from this deck, gap 5) rather than
+   * requiring N separate `confirm:true` re-calls, one human reply each. Fixes the
+   * "12 serial prompts" defect (ENG-1635) at its root: `collectConfirmationPrompt`
+   * already batched the DISPLAY of N halts into one message, but never authorized more
+   * than one write per answer — each of the N still needed its own individually-gated
+   * replay.
+   *
+   * Fires on a SINGLE halted write too (deck of size 1) — gap 5's fix (ENG-1635/1644
+   * Round 3) made confirm=true permanently inert as an independent path, so a lone
+   * write has no path forward EXCEPT this one; a separate single-write text path can
+   * no longer coexist with this one without dead-ending every solo write.
+   *
+   * Returns null (falls back to `collectConfirmationPrompt`'s plain prompt, unchanged)
+   * when: the iteration has no halted writes, or ANY halted result in the iteration is
+   * NOT a Meta write (e.g. an image-edit confirmation, which carries no digest and
+   * whose own confirm=true gate is unhardened and out of scope for this ticket — mixing
+   * it into a deck item would either need its own grant mechanism this ticket never
+   * built, or would silently downgrade its protection to "was in an approved deck," a
+   * guarantee this ticket never verified for that tool).
+   */
+  /**
+   * ENG-1635/1644 Phase 2 v3: split one iteration's halts into the three
+   * buckets the generalized seam needs. A halt only ever lands in ONE bucket:
+   * a real Meta-write shape (digest + dispatch) -> writeHalts; a real
+   * present_question_deck shape (questionDeckPayload array) -> questionDeckHalts;
+   * anything else that set awaitingUserConfirmation -> otherHalts (e.g. a
+   * genuinely unsupported/future halt type — the seam bails to the old
+   * plain-text path on any of these, preserving today's safety net exactly).
+   */
+  private partitionApprovalHalts(
+    toolResults: Array<{ status: 'success' | 'error'; result?: any }>
+  ): { writeHalts: any[]; questionDeckHalts: any[]; otherHalts: any[] } {
+    const writeHalts: any[] = [];
+    const questionDeckHalts: any[] = [];
+    const otherHalts: any[] = [];
+    for (const tr of toolResults) {
+      if (tr.status !== 'success') continue;
+      const r: any = tr.result;
+      if (!r || r.awaitingUserConfirmation !== true) continue;
+      if (typeof r.metaWriteManifestDigest === 'string' && r.metaWriteManifestDigest && r.metaWriteDispatch) {
+        writeHalts.push(r);
+      } else if (Array.isArray(r.questionDeckPayload)) {
+        questionDeckHalts.push(r);
+      } else {
+        otherHalts.push(r);
+      }
     }
-    return false;
+    return { writeHalts, questionDeckHalts, otherHalts };
+  }
+
+  /** Build a write-only deck from ALREADY-PARTITIONED write halts (see
+   *  partitionApprovalHalts above — the caller guarantees every entry here
+   *  has a real digest + dispatch, so no mixed-shape bail is needed here). */
+  private buildMetaWriteApprovalDeckFromHalts(writeHalts: any[]): PendingApprovalDeck | null {
+    if (writeHalts.length === 0) return null;
+    try {
+      let deck = createApprovalDeck(uuidv4(), new Date().toISOString());
+      writeHalts.forEach((r, i) => {
+        deck = appendApprovalDeckItem(deck, {
+          itemId: `write-${i + 1}`,
+          kind: 'meta_write',
+          question: r.confirmationDetail || r.confirmationPrompt || r.summary || 'this action',
+          // Haven's CS-64 "REJECT — <correction>" convention (gap 1) applies to
+          // a Meta write item too — the correction is captured as data on the
+          // answer, never auto-applied; a rejected item simply never becomes a
+          // workflow step (see approvedWriteItems), the correction text itself
+          // is for whatever surfaces it back to Emma next turn.
+          allowFreeText: true,
+          metaWriteManifestDigest: r.metaWriteManifestDigest,
+          metaWriteDispatch: r.metaWriteDispatch,
+        });
+      });
+      return finalizeApprovalDeck(deck, new Date().toISOString());
+    } catch (err) {
+      // Should be unreachable (every item built above is well-formed), but a
+      // malformed deck must fall back to the old per-item prompt, never throw and
+      // silently drop the halt.
+      console.error('AgentMode: buildMetaWriteApprovalDeckFromHalts failed, falling back to plain prompt:', err);
+      return null;
+    }
+  }
+
+  /** Build a question-only deck from ALREADY-PARTITIONED question-deck halts.
+   *  Each halt's questionDeckPayload is an array (present_question_deck can
+   *  front-load several questions in one call) — if the model somehow made
+   *  more than one present_question_deck call in the same iteration, every
+   *  question across all of them merges into this one deck, same "merge
+   *  same-iteration halts" behavior the write-deck builder already has. */
+  private buildQuestionApprovalDeckFromHalts(questionHalts: any[]): PendingApprovalDeck | null {
+    const questions: QuestionDeckQuestionInput[] = [];
+    for (const r of questionHalts) {
+      if (Array.isArray(r.questionDeckPayload)) questions.push(...r.questionDeckPayload);
+    }
+    if (questions.length === 0) return null;
+    try {
+      let deck = createApprovalDeck(uuidv4(), new Date().toISOString());
+      questions.forEach((q, i) => {
+        deck = appendApprovalDeckItem(deck, {
+          itemId: `question-${i + 1}`,
+          // ask_user_question's migrated payload carries its own kind/immutable
+          // (e.g. 'meta_objective', immutable:true for the objective gate) —
+          // present_question_deck's questions never set either, so this falls
+          // back to the pre-existing 'plan_choice'/not-immutable default.
+          kind: typeof q.kind === 'string' && q.kind.trim() !== '' ? q.kind : 'plan_choice',
+          question: q.question,
+          options: q.options,
+          allowEmmaDecide: q.allowEmmaDecide === true,
+          ...(q.immutable === true ? { immutable: true } : {}),
+        });
+      });
+      return finalizeApprovalDeck(deck, new Date().toISOString());
+    } catch (err) {
+      // Same fallback contract as the write-deck builder above — a malformed
+      // deck (e.g. a bad recommended-option count) falls back to the old
+      // plain-text prompt rather than throwing and dropping the halt.
+      console.error('AgentMode: buildQuestionApprovalDeckFromHalts failed, falling back to plain prompt:', err);
+      return null;
+    }
+  }
+
+  /**
+   * ENG-1635/1644 Phase 2 v3: the iteration-end priority rule, deterministic
+   * not a race. Callers pass ALREADY-PARTITIONED halts (partitionApprovalHalts
+   * above) with otherHalts already confirmed empty. Writes always win a mixed
+   * turn — security-critical: a write must never dead-loop behind a
+   * lower-stakes planning question — so any questionDeckHalts present
+   * alongside a write are dropped from the deck that gets built and stashed
+   * on it as droppedQuestionDeckPayload instead, so the re-ask directive can
+   * reach Emma once this write-deck is answered or cancelled.
+   */
+  private buildApprovalDeckForIteration(writeHalts: any[], questionDeckHalts: any[]): PendingApprovalDeck | null {
+    if (writeHalts.length > 0) {
+      let deck = this.buildMetaWriteApprovalDeckFromHalts(writeHalts);
+      if (deck && questionDeckHalts.length > 0) {
+        const dropped: QuestionDeckQuestionInput[] = [];
+        for (const r of questionDeckHalts) {
+          if (Array.isArray(r.questionDeckPayload)) dropped.push(...r.questionDeckPayload);
+        }
+        if (dropped.length > 0) {
+          deck = { ...deck, droppedQuestionDeckPayload: dropped };
+        }
+      }
+      return deck;
+    }
+    if (questionDeckHalts.length > 0) {
+      return this.buildQuestionApprovalDeckFromHalts(questionDeckHalts);
+    }
+    return null;
   }
 
   /**
@@ -20816,10 +21286,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     if (items.length === 1) return items[0].prompt;
     // Multiple actions batched in one turn (e.g. "edit these two images"): one intro,
     // each target listed once, one footer — instead of repeating the full wrapper N times.
+    // ENG-1635/1644 gap 5: same fix as the single-item confirmationPrompt above — never
+    // invite a typed "yes"/"confirm" reply, that flag is fully inert now. This whole
+    // function is a fallback-only path (see its own doc comment / the caller's
+    // fall-through contract); the normal path deck-routes every write instead.
     return `Based on your request, here are the ${items.length} changes I'm about to make — ` +
       `please review each target before I proceed:\n\n` +
       items.map((i, n) => `${n + 1}. ${i.detail}`).join('\n\n') +
-      `\n\nReply "yes" / "confirm" to proceed with all of these, or tell me what to change.`;
+      `\n\nThis needs your explicit approval through a review card, not a typed reply — ` +
+      `if no card appears here, refresh the page or ask again and I'll represent it as one.`;
   }
 
   /**
@@ -21094,10 +21569,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * (verified explicit-statement) success durable for the rest of the session,
    * the same way a card answer is — so a target-confirmation retry (or any
    * later CAMPAIGN CREATE in this session) finds it via Path 2 instead of
-   * re-deriving it against a possibly different later message. Synthesizes a
-   * single-option "question" that's already answered — never shown to the
-   * user (no card was needed; the user already stated it themselves), just a
-   * structural record for the gate to find.
+   * re-deriving it against a possibly different later message.
+   *
+   * ENG-1635/1644 PR2: writes to session.objectiveConfirmations (a plain
+   * advisory map field, see its own doc comment on ChatSession) instead of
+   * the old pendingUserQuestion primitive — this record is never shown to
+   * the user as a card (no card was needed; the user already stated it
+   * themselves), and the deck/message-history mechanism that replaced
+   * pendingUserQuestion for real cards has no equivalent "never rendered"
+   * mode, so reusing it here would risk a synthetic bookkeeping message
+   * actually appearing in the user's chat transcript.
    */
   private async persistExplicitObjectiveConfirmation(
     sessionId: string,
@@ -21106,43 +21587,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     objectiveKind: string,
     sourceQuestionId?: string,
   ): Promise<void> {
-    const question = buildPendingUserQuestion({
-      questionId: uuidv4(),
-      question: 'Meta campaign objective (confirmed from the user\'s own explicit statement).',
-      options: [
-        {
-          id: 'confirmed',
-          label: objective,
-          consequence: 'Confirmed by the user\'s own words — not shown as a card.',
-          recommended: true,
-          why: `The user explicitly stated this: "${quote}"`,
-          payload: { objective, ...(sourceQuestionId ? { sourceQuestionId } : {}) },
-        },
-        {
-          // Structural placeholder only — the primitive requires 2–4 options
-          // and exactly one recommended. This one was never actually offered;
-          // it can never be selected since this record is built pre-answered.
-          id: 'not-applicable',
-          label: 'N/A',
-          consequence: 'Not a real choice — this record reflects an explicit user statement, not a live card.',
-          payload: {},
-        },
-      ],
-      immutable: true,
-      allowEmmaDecide: false,
-      kind: objectiveKind,
-      createdAt: new Date().toISOString(),
-    });
-    const answered = applyAnswer(question, {
-      optionId: 'confirmed',
-      delegated: false,
+    await chatbotDb.updateSessionObjectiveConfirmation(sessionId, objectiveKind, {
+      objective,
       answeredBy: 'user',
-      rationale: sourceQuestionId
-        ? `Consumed answered objective card ${sourceQuestionId}`
-        : `Explicitly stated by the user: "${quote}"`,
       at: new Date().toISOString(),
+      quote: sourceQuestionId ? `Consumed answered objective card ${sourceQuestionId}` : quote,
     });
-    await chatbotDb.updateSessionAskUserQuestion(sessionId, answered);
   }
 
   /**
@@ -21156,8 +21606,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    *
    * 1. Explicitly stated by the user THIS turn — verified against the actual
    *    message text (verifyExplicitStatement), never trusted on a model flag.
-   * 2. A prior ask_user_question (kind 'meta_objective') answered by the user
-   *    or delegation — live or archived in this session (checkQuestionGate).
+   * 2. A prior confirmation already settled this session — objectiveConfirmations
+   *    (persistExplicitObjectiveConfirmation), a prior answered deck-of-one item
+   *    (findAnsweredDeckItemByKind), answered by the user or delegation.
    * 3. Neither: this method emits the blocking question itself (grounded,
    *    static per the 80/20 design) and refuses the create.
    */
@@ -21249,43 +21700,39 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // the claim; fall through to the deterministic ask gate below.
     }
 
-    // Path 2: already settled via a prior ask_user_question in this session,
-    // scoped to THIS campaign (see objectiveKind above).
+    // Path 2: already settled — cheapest check first (ENG-1635/1644 PR2:
+    // objectiveConfirmations, no message fetch needed — this is now the
+    // primary sink persistExplicitObjectiveConfirmation writes to), then a
+    // prior deck-of-one item (the current mechanism, post
+    // ask_user_question-retirement), then a prior ask_user_question (legacy
+    // — kept as a fallback for any record settled before that migration,
+    // deleted in PR2 Part B once the 40 pre-migration stale records are
+    // drained), scoped to THIS campaign (see objectiveKind above).
     const session = await chatbotDb.getChatSession(sessionId);
-    const candidate = findQuestionByKind(session?.pendingUserQuestion, session?.answeredQuestions, objectiveKind);
-    const outcome = checkQuestionGate(candidate);
-    if (outcome.allowed) {
-      const objective = (outcome.payload as any)?.objective;
+    const objectiveConfirmation = session?.objectiveConfirmations?.[objectiveKind];
+    if (objectiveConfirmation && AgentModeService.META_OBJECTIVE_VALUES.includes(objectiveConfirmation.objective)) {
+      return { allowed: true, objective: objectiveConfirmation.objective };
+    }
+    // Deck-history has no archive field (approvalDeck.ts file header) —
+    // findAnsweredDeckItemByKind scans message-metadata pairs, the same
+    // self-contained pairing the frontend already reconstructs historical
+    // cards from.
+    const deckHistoryMessages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
+    const deckOutcome = findAnsweredDeckItemByKind(deckHistoryMessages as any, objectiveKind);
+    if (deckOutcome.found) {
+      const pickedOption = deckOutcome.item.options?.find((o) => o.id === deckOutcome.answer.verdict);
+      const objective = (pickedOption?.payload as any)?.objective;
       if (typeof objective === 'string' && AgentModeService.META_OBJECTIVE_VALUES.includes(objective)) {
         return { allowed: true, objective };
       }
     }
-
-    const { consumedQuestionIds, hasAnsweredObjectiveCard } = summarizeAnsweredObjectiveQuestions(
-      session?.pendingUserQuestion,
-      session?.answeredQuestions,
-      AgentModeService.META_OBJECTIVE_VALUES,
-    );
-    const looseCandidate = findAnsweredObjectiveCandidate(
-      session?.pendingUserQuestion,
-      session?.answeredQuestions,
-      {
-        accountId: account_id,
-        validObjectives: AgentModeService.META_OBJECTIVE_VALUES,
-        bindsLabel: (objective, text) => Boolean(AgentModeService.META_OBJECTIVE_KEYWORDS[objective]?.test(text)),
-        consumedQuestionIds,
-      },
-    );
-    if (looseCandidate) {
-      await this.persistExplicitObjectiveConfirmation(
-        sessionId,
-        looseCandidate.objective,
-        `answered objective card ${looseCandidate.question.questionId}`,
-        objectiveKind,
-        looseCandidate.question.questionId,
-      );
-      return { allowed: true, objective: looseCandidate.objective };
-    }
+    // ENG-1635/1644 PR2: the legacy findQuestionByKind/checkQuestionGate and
+    // findAnsweredObjectiveCandidate/summarizeAnsweredObjectiveQuestions
+    // fallbacks (scanned session.pendingUserQuestion/answeredQuestions) are
+    // deleted — nothing writes those fields anymore (persistExplicitObjectiveConfirmation
+    // migrated to objectiveConfirmations, checked above), and the pre-migration
+    // stale records those fallbacks existed to serve have been drained (see
+    // the one-off migration that nulled them, PR2 Part E).
 
     // Path 3: nothing settled — surface the blocking ask ourselves. Never
     // proceed on a guess (this is the load-bearing refusal). Recommendation is
@@ -21324,47 +21771,57 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       },
     ];
 
-    const question = buildPendingUserQuestion({
-      questionId: uuidv4(),
-      question: 'Which Meta campaign objective should this campaign use? It cannot be changed after creation.',
-      intro: hasAnsweredObjectiveCard
-        ? 'You answered an objective question earlier, but it did not match this campaign and account, so I need this one confirmed.'
-        : undefined,
+    // ENG-1635/1644 (ask_user_question retirement): no more buildPendingUserQuestion
+    // + synchronous updateSessionAskUserQuestion write. Return the same bare
+    // halt-marker shape ask_user_question's own execute() now returns (a
+    // 1-entry questionDeckPayload) — gate.response is returned directly as
+    // callMetaMarketingApi's own result (verified: emma/tools.ts's
+    // call_meta_marketing_api execute() returns it unwrapped), so this flows
+    // through the exact same iteration-end seam
+    // (partitionApprovalHalts/buildApprovalDeckForIteration) that already
+    // persists and renders any other halt as a real deck-of-one card — no
+    // gate-specific persistence code needed here anymore. If another
+    // halt/deck is already awaiting in this session, that shared seam's own
+    // failIfAwaitingExists guard falls through to the old plain-text prompt,
+    // the same fallback every other halt type already gets on a lost race,
+    // not a special case for this gate anymore.
+    const questionText = 'Which Meta campaign objective should this campaign use? It cannot be changed after creation.';
+    // The old card's separate `intro` sentence has no equivalent field on the
+    // deck primitive (ApprovalDeckItem/QuestionDeckQuestionInput carry only
+    // `question`) — folded into the question text itself rather than adding a
+    // schema field for a narrow, purely informational retry hint.
+    // ENG-1635/1644 PR2: "answered an objective question earlier, just not
+    // for THIS campaign" now derives from objectiveConfirmations (any entry
+    // at all, regardless of key) rather than the deleted legacy scan — same
+    // near-miss UX hint, sourced from the current sink instead of a decaying
+    // legacy one.
+    const hasAnsweredObjectiveCard = Object.keys(session?.objectiveConfirmations ?? {}).length > 0;
+    const question = hasAnsweredObjectiveCard
+      ? `You answered an objective question earlier, but it did not match this campaign and account, so I need this one confirmed.\n\n${questionText}`
+      : questionText;
+
+    const questionDeckPayload: QuestionDeckQuestionInput[] = [{
+      question,
       options,
-      immutable: true,
       allowEmmaDecide: true,
       kind: objectiveKind,
-      createdAt: new Date().toISOString(),
-    });
-
-    const posted = await chatbotDb.updateSessionAskUserQuestion(sessionId, question, { failIfAwaitingExists: true });
-    if (!posted) {
-      return {
-        allowed: false,
-        response: {
-          success: false,
-          error: 'ASK_USER_QUESTION_ALREADY_PENDING',
-          message:
-            'A question is already waiting for the user to answer. Wait until it is answered before creating this campaign.',
-        } as any,
-      };
-    }
-
-    const prompt = renderQuestionPrompt(question);
+      immutable: true,
+    }];
     return {
       allowed: false,
       response: {
         success: true,
         awaitingUserConfirmation: true,
         type: 'ask_user_question',
+        // sessionId is echoed back because this method can auto-provision one
+        // internally when the caller passed none (see the anomaly branch
+        // above) — without it on the response, a caller that started with no
+        // session has no way to learn which session the halt (and the deck
+        // built from it) actually landed on.
         sessionId,
-        questionId: question.questionId,
-        question: question.question,
-        options: question.options,
-        recommendedOptionId: question.recommendedOptionId,
-        allowEmmaDecide: question.allowEmmaDecide,
-        confirmationPrompt: prompt,
-        summary: prompt,
+        questionDeckPayload,
+        confirmationPrompt: questionText,
+        summary: questionText,
         message:
           'The campaign objective is immutable and has not been confirmed by the user yet. Do NOT retry the create yourself — the run halts here until they pick an option or delegate.',
       } as any,
@@ -21452,11 +21909,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
 
     // Target-confirmation guardrail for mutating actions (publish/change/delete).
-    // The agent must echo the resolved target back to the user and re-call with
-    // confirm=true. This prevents acting on an ambiguous target (e.g. publishing
-    // an ad into the wrong campaign or editing the wrong asset). `confirm` is a
-    // gate-only flag and is stripped before dispatch so it never reaches Meta.
-    const confirmed = params.confirm === true;
+    // ENG-1635/1644 gap 5: `params.confirm` used to be read here into a
+    // `confirmed` boolean that could independently satisfy the halt below —
+    // that was the bypass (see the gate's own comment further down). The flag
+    // is no longer read as a trust signal at all; it is still stripped before
+    // dispatch below (`'confirm' in params`) purely so it never leaks to Meta
+    // as a literal field, not because it still means anything to this gate.
     /*
      * ENG-941, Greptile security P1 ("Confirmed replay can add override"): the preview and
      * the confirmed execution are two separate calls with separately supplied params, so a
@@ -21481,29 +21939,35 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     const overrideApproved =
       overrideClaimed && trackingOverrideTokenMatches((params as any)?.tracking_override_token, overrideDigest);
 
-    // ENG-1642: an approved deployment manifest authorizes its exact writes
-    // without re-confirmation. `confirmed` from the model-controlled `confirm`
-    // flag is never itself trustworthy (that's the whole reason the gate
-    // below exists) — but a call whose canonical digest appears in a
-    // HUMAN-attributed, answered `meta_write_manifest` question, and has not
-    // already been consumed in this session, may execute once without the
-    // halt. Deliberately narrower than the tracking-override mechanism: this
-    // never implies `override_tracking_check` (acceptance criterion 5), so
-    // the tracking pre-flight below is unaffected either way.
+    // ENG-1635/1644 gap 5 (critical, code-verified fix — see the reviewed plan):
+    // an approved deck authorizes its exact writes without re-confirmation, and
+    // this is now the ONLY path a Meta write may proceed through. `confirmed`
+    // (params.confirm, model-controlled) used to be OR'd alongside this grant
+    // check — `!confirmed && !manifestGranted` meant confirmed=true ALONE, with
+    // no grant at all, skipped the halt below. That is the exact failure mode
+    // of the 2026-07-19 RankAI incident (see askUserQuestion.ts's header),
+    // reproduced by this gate itself: a model could call this tool with
+    // confirm:true on a first, never-previewed call and the write would
+    // execute with no human ever asked. The grant check below now runs
+    // unconditionally for every Meta write action (not gated on `!confirmed`),
+    // and `confirmed` no longer appears in the halt condition at all — see
+    // below. `params.confirm` is now fully inert as a trust signal; it is not
+    // read anywhere in this function anymore (only stripped before dispatch,
+    // see above, so it never leaks to Meta as a literal field).
     let manifestGranted = false;
     if (
-      !confirmed &&
       AgentModeService.isMetaWriteAction(entity_type, action) &&
       sessionId
     ) {
-      manifestGranted = await this.claimMetaWriteManifestGrant(
-        sessionId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
+      const grant = await this.claimMetaWriteManifestGrant(
+        userId, sessionId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
+      manifestGranted = grant.granted;
     }
 
     if (
       AgentModeService.isMetaWriteAction(entity_type, action) &&
-      (!confirmed && !manifestGranted || (overrideClaimed && !overrideApproved))
+      (!manifestGranted || (overrideClaimed && !overrideApproved))
     ) {
       /*
        * MERGE NOTE: main's manifest grant decides WHETHER this gate runs; the tenancy fields
@@ -21522,6 +21986,14 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
        * belongs on the write-scoping work rather than being assumed away here.
        */
       const { summary, target, tenancyRefused, tenancyRefusalMessage } = await this.buildMetaWriteConfirmation(
+        userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
+      );
+      // ENG-1635: this call's manifest digest, computed once here (against the SAME
+      // resolved account buildMetaWriteConfirmation just used) so the manifest producer
+      // at the loop seam (collectConfirmationPrompt's caller) can batch every halted
+      // write from this iteration into one approval without re-resolving credentials
+      // or re-deriving the digest a second way.
+      const metaWriteManifestDigest = await this.resolveMetaWriteManifestDigest(
         userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
       /*
@@ -21568,17 +22040,26 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         requiresConfirmation: true,
         awaitingUserConfirmation: true,
         summary,
+        // ENG-1635/1644 gap 5: never invite a typed "yes"/"confirm" reply — that flag is
+        // fully inert now (see the `message` field below and callMetaMarketingApi's gate).
+        // This exact field is only ever surfaced to the user when deck-routing itself
+        // failed (a malformed deck, or a lost one-live-slot race — see
+        // buildApprovalDeckForIteration's fallback contract) — the normal path never
+        // reaches it, this write instead becomes a real approval-deck card.
         confirmationPrompt:
           `Based on your request, here's the exact Meta Ads change I'm about to make — ` +
           `please check it's the right target before I proceed:\n\n${summary}\n\n` +
-          `Reply "yes" / "confirm" if this is correct, or tell me what to change ` +
-          `(for example, a different campaign, ad set, or asset).`,
+          `This needs your explicit approval through a review card, not a typed reply — ` +
+          `if no card appears here, refresh the page or ask again and I'll represent it as one.`,
         // Per-item body (no intro/footer) used when several writes are batched in one turn.
         confirmationDetail: summary,
-        message: `Confirm this Meta Ads ${entity_type} ${action} before it runs: ${summary} ` +
-          `Show the user the exact target above (campaign / ad set / asset) and get explicit approval. ` +
+        message: `This Meta Ads ${entity_type} ${action} needs review before it runs: ${summary} ` +
+          `Show the user the exact target above (campaign / ad set / asset). ` +
           `If more than one campaign or asset could match the request, ask the user to disambiguate first. ` +
-          `Once approved, call call_meta_marketing_api again with the same arguments plus params.confirm=true.` +
+          `Do NOT re-call call_meta_marketing_api with params.confirm=true — that flag no longer grants ` +
+          `anything on its own (ENG-1635/1644). This write is now included in the pending approval review ` +
+          `presented to the user automatically; take no further action that depends on it until they submit ` +
+          `their answer.` +
           (overrideClaimed
             ? ` This call also waives the tracking pre-flight check, so the user must be shown the ` +
               `WARNING above and approve it explicitly; the replay must additionally carry ` +
@@ -21587,14 +22068,80 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         // Only issued when an override was actually described in this preview, so it can only
         // ever approve a waiver the user was shown.
         ...(overrideClaimed ? { tracking_override_token: overrideDigest } : {}),
-        target
+        target,
+        // ENG-1635: internal-only correlator for the manifest producer — never part of the
+        // model-facing `message`, so nothing tells the model this exists or invites it to
+        // forge one. Consumed exclusively by collectConfirmationPrompt's caller in the same
+        // process, never serialized to the client.
+        metaWriteManifestDigest,
+        // ENG-1635/1644 Round 3 consequence #3: the dispatch parameters needed to
+        // execute this exact write LATER, without the model ever re-calling this tool
+        // — a workflow step (built from an approved deck item) reads this to call
+        // dispatchAuthorizedMetaWrite directly. Deliberately the RAW account_id (the
+        // same variable both claimMetaWriteManifestGrant's call above and
+        // metaWriteManifestDigest's own computation used) rather than target.account_id
+        // — resolveMetaWriteManifestDigest resolves credentials internally itself, so
+        // re-deriving the digest from these exact fields at claim time (execute() calls
+        // claimMetaWriteManifestGrant before dispatching) must start from the SAME input
+        // that produced the digest being matched, not a value resolveMetaWriteManifestDigest
+        // was never given and has no proven-idempotent relationship to. Internal-only,
+        // same as the digest above — never part of the model-facing `message`.
+        metaWriteDispatch: { entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params },
       } as any;
     }
-    if ('confirm' in params) {
+    // ENG-1635/1644 Round 3 consequence #3: everything past this point (strip the
+    // gate-only flags, run the ENG-941 tracking pre-flight, dispatch to the
+    // entity-specific write method) is shared with a workflow step's execute()
+    // dispatching an approved deck item directly — see dispatchAuthorizedMetaWrite's
+    // own header for why that reuses this exact method rather than re-deriving it.
+    const dispatchResult: MetaApiResult = await this.dispatchAuthorizedMetaWrite(
+      userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, overrideApproved, sessionId,
+    );
+
+    // ENG-1635/1644 Migration note: the old per-write outcome recording +
+    // reconciliation (recordMetaWriteManifestOutcome / reconcileMetaWriteManifestIfComplete)
+    // that used to run here is RETIRED, not kept running alongside its
+    // replacement — a manifest-granted write dispatched through THIS function
+    // (the model-driven path; the normal path is now submitApprovalDeckAnswers's
+    // step-per-write dispatch, which never re-enters this function at all) has
+    // its outcome recorded as a workflow checkpoint instead, and
+    // summarizeApprovalDeckRun reads run.checkpoints directly rather than a
+    // separate outcome map — one source of truth, not two that could drift.
+    return dispatchResult;
+  }
+
+  /**
+   * Already-authorized Meta write dispatch — everything that happens AFTER a write has
+   * cleared its gate. Strips the gate-only flags (confirm, tracking_override_token,
+   * override_tracking_check — none of these are real Meta fields and none may reach the
+   * Graph API), runs the ENG-941 deterministic tracking pre-flight, then dispatches to
+   * the entity-specific write method. Extracted verbatim (byte-for-byte behavior,
+   * ENG-1635/1644 Round 3 consequence #3) from callMetaMarketingApi's own post-gate body
+   * so a workflow step's execute() for an approved deck item can call this SAME logic
+   * directly instead of re-invoking callMetaMarketingApi itself — re-entering that gate
+   * would need its own fresh manifestGranted, sourced from the same digest gap 4's
+   * per-step digest-match check already claimed/consumed, which fails by construction
+   * (an at-most-once claim cannot be claimed twice). This method performs NO
+   * authorization of its own — every caller MUST have already established it (the
+   * gate above, for a model-driven call; a claimed digest match, for a workflow step).
+   */
+  private async dispatchAuthorizedMetaWrite(
+    userId: string,
+    entity_type: string,
+    action: string,
+    account_id: string,
+    campaign_id: string | undefined,
+    ad_set_id: string | undefined,
+    ad_id: string | undefined,
+    params: any,
+    overrideApproved: boolean,
+    sessionId: string | undefined,
+  ): Promise<MetaApiResult> {
+    if (params && typeof params === 'object' && 'confirm' in params) {
       params = { ...params };
       delete params.confirm;
     }
-    if ('tracking_override_token' in params) {
+    if (params && typeof params === 'object' && 'tracking_override_token' in params) {
       params = { ...params };
       delete (params as any).tracking_override_token;
     }
@@ -21612,13 +22159,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
      * the Graph API. Per ENG-388 (Harsha's decision) the conversational override is the
      * only override path — no portal control — and it is recorded on the run record.
      *
-     * Order matters and is deliberate: this sits AFTER the ENG-400 confirmation gate,
-     * so it only runs on a confirmed call. The two ask different questions — that gate
-     * asks "did a human intend this?", this one asks "can it report a conversion?" —
-     * and doing the network checks on an unconfirmed preview would waste them.
+     * Order matters and is deliberate: this sits AFTER the caller's own confirmation
+     * gate, so it only runs on an authorized call. The two ask different questions —
+     * that gate asks "did a human intend this?", this one asks "can it report a
+     * conversion?" — and doing the network checks on an unconfirmed preview would
+     * waste them.
      */
-    // Reaching here with an override means it survived the binding check above, so it is one
-    // the user was shown and approved — never one the model added to the replay.
+    // Reaching here with an override means it survived the binding check the caller
+    // already did, so it is one the user was shown and approved — never one the model
+    // added to the replay.
     const overrideTrackingCheck = overrideApproved;
     if (params && typeof params === 'object' && 'override_tracking_check' in params) {
       params = { ...params };
@@ -21671,41 +22220,468 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       if (!gate.proceed) return gate.blockResult as MetaApiResult;
     }
 
-    switch (entity_type) {
-      case 'CAMPAIGN':
-        // Map master params to specific params if needed, but schema is unified so passing through is safe
-        return this.manageMetaAdsCampaigns(userId, action as any, account_id, campaign_id, params);
+    // ENG-1635: wrapped in an IIFE (rather than each case returning directly, as
+    // before) purely so an authorized write's outcome can be recorded right after
+    // dispatch resolves, in ONE place, without duplicating the switch or touching
+    // every branch. Every case's behavior is unchanged byte for byte from the
+    // original callMetaMarketingApi body — this only interposes AFTER the result
+    // exists and BEFORE it returns.
+    return (async (): Promise<MetaApiResult> => {
+      switch (entity_type) {
+        case 'CAMPAIGN':
+          // Map master params to specific params if needed, but schema is unified so passing through is safe
+          return this.manageMetaAdsCampaigns(userId, action as any, account_id, campaign_id, params);
 
-      case 'AD_SET':
-        // Validation for Ad Set CREATE handled within manageMetaAdsAdSets -> createMetaAdsAdSet
-        return this.manageMetaAdsAdSets(userId, action as any, account_id, campaign_id, ad_set_id, params);
+        case 'AD_SET':
+          // Validation for Ad Set CREATE handled within manageMetaAdsAdSets -> createMetaAdsAdSet
+          return this.manageMetaAdsAdSets(userId, action as any, account_id, campaign_id, ad_set_id, params);
 
-      case 'AD_CREATIVE':
-        // campaign_id is forwarded so AD_CREATIVE LIST can SAY it cannot honour it, rather than
-        // dropping it silently — the same threading the AD case below does (ENG-1476).
-        return this.manageMetaAdsAdCreatives(userId, action as any, account_id, params, ad_set_id, campaign_id);
+        case 'AD_CREATIVE':
+          // campaign_id is forwarded so AD_CREATIVE LIST can SAY it cannot honour it, rather than
+          // dropping it silently — the same threading the AD case below does (ENG-1476).
+          return this.manageMetaAdsAdCreatives(userId, action as any, account_id, params, ad_set_id, campaign_id);
 
-      case 'AD':
-        // campaign_id is forwarded here (ENG-1476). It was already in scope for the tracking
-        // gate above and was simply never handed to the AD handler, which is why an
-        // AD LIST scoped to a campaign returned the entire account instead.
-        return this.manageMetaAdsAds(userId, action as any, account_id, ad_set_id, ad_id, params, campaign_id);
+        case 'AD':
+          // campaign_id is forwarded here (ENG-1476). It was already in scope for the tracking
+          // gate above and was simply never handed to the AD handler, which is why an
+          // AD LIST scoped to a campaign returned the entire account instead.
+          return this.manageMetaAdsAds(userId, action as any, account_id, ad_set_id, ad_id, params, campaign_id);
 
-      case 'CUSTOM_AUDIENCE':
-        return this.manageMetaCustomAudiences(userId, action as any, account_id, params);
+        case 'CUSTOM_AUDIENCE':
+          return this.manageMetaCustomAudiences(userId, action as any, account_id, params);
 
-      case 'TARGETING':
-        return this.searchAdTargeting(userId, account_id, params.q, params.type, params.location_types);
+        case 'TARGETING':
+          return this.searchAdTargeting(userId, account_id, params.q, params.type, params.location_types);
 
-      case 'PAGE':
-        return this.listMetaPages(userId, account_id);
+        case 'PAGE':
+          return this.listMetaPages(userId, account_id);
 
-      case 'DATASET':
-        return this.manageMetaDatasets(userId, action as any, account_id, params);
+        case 'DATASET':
+          return this.manageMetaDatasets(userId, action as any, account_id, params);
 
-      default:
-        throw new Error(`Invalid entity_type: ${entity_type}`);
+        default:
+          throw new Error(`Invalid entity_type: ${entity_type}`);
+      }
+    })();
+  }
+
+  /**
+   * ENG-1635/1644 Round 3 consequence #3: build ONE WorkflowStepDefinition per
+   * approved deck write item. execute() dispatches directly via
+   * dispatchAuthorizedMetaWrite — it does NOT re-invoke callMetaMarketingApi
+   * (see that method's own header: re-entering its gate would need a fresh
+   * manifestGranted sourced from the same digest this step is about to claim,
+   * and an at-most-once claim cannot be claimed twice). Instead it
+   * independently re-claims the digest via claimMetaWriteManifestGrant right
+   * before dispatching — gap 4's per-step digest re-verification — so a step
+   * can only ever execute the exact write this deck answer approved, and only
+   * once: a step is called at most once (crash-restart skips any step that
+   * already has a checkpoint, per findNextIndependentStep), and even a
+   * hypothetical second attempt would find the digest already consumed and
+   * refuse rather than double-dispatch.
+   *
+   * overrideApproved is always `false` here — Phase A does not carry a
+   * tracking-override waiver through the deck path (no UI/mechanism exists
+   * yet for the user to approve one as part of a deck item); the ENG-941
+   * pre-flight runs for real rather than silently honoring a stale
+   * override_tracking_check flag from the original halted call.
+   */
+  private buildMetaWriteWorkflowSteps(
+    sessionId: string,
+    userId: string,
+    approved: Array<{ item: ApprovalDeckItem }>,
+    // Passed by resumeStuckApprovalDeckWorkflowRun only — see
+    // claimMetaWriteManifestGrant's own header for why a resumed step must
+    // NOT rely on session.pendingApprovalDeck for its grant check.
+    grantSourceDeck?: PendingApprovalDeck,
+  ): WorkflowStepDefinition[] {
+    return approved.map(({ item }) => {
+      const dispatch = item.metaWriteDispatch!;
+      return {
+        id: item.itemId,
+        inputs: [],
+        outputs: [],
+        requiredParameters: [],
+        execute: async (): Promise<Record<string, unknown>> => {
+          const grant = await this.claimMetaWriteManifestGrant(
+            userId, sessionId, dispatch.entity_type, dispatch.action, dispatch.account_id,
+            dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
+            grantSourceDeck,
+          );
+          if (!grant.granted) {
+            if (grant.reason === 'already_consumed') {
+              // Found by review: a concurrent driver of the SAME run (e.g.
+              // two overlapping resumeStuckApprovalDeckWorkflowRun calls)
+              // could already be dispatching, or have already dispatched,
+              // this exact write. This is not a real failure — throwing a
+              // plain Error here would let advanceIndependentWorkflow record
+              // a 'failed' checkpoint that could win the version race over
+              // the OTHER driver's real 'verified' one, permanently
+              // mis-recording a successful write as failed.
+              throw new StepContendedError(
+                'This write is already being handled by a concurrent request.',
+              );
+            }
+            throw new Error(
+              'This write is no longer authorized — its approval was not found or was already consumed.',
+            );
+          }
+          const dispatchResult = await this.dispatchAuthorizedMetaWrite(
+            userId, dispatch.entity_type, dispatch.action, dispatch.account_id,
+            dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
+            false, sessionId,
+          );
+          return { dispatchResult: dispatchResult as unknown as Record<string, unknown> };
+        },
+        verify: async (executeResult): Promise<WorkflowStepVerification> => {
+          const result = executeResult.dispatchResult as MetaApiResult | undefined;
+          if (!result || result.success !== true) {
+            // `message` is the enriched, actionable text (enrichMetaError — e.g. "Your ad
+            // set budget must be more than ₹94.91" with the Meta code/subcode) whenever the
+            // underlying write method built one; `error` is the raw SDK message (e.g. just
+            // "Invalid parameter") and was being checked FIRST, so the `||` chain always
+            // short-circuited on it and silently discarded the enriched text before it ever
+            // reached the deck outcome summary / answerAck. Found live: a repeatedly-failing
+            // ad-set create (real cause: account currency's minimum budget) got silently
+            // re-proposed identically 3 times with no explanation ever surfaced, because
+            // Emma never actually received anything more specific than "Invalid parameter."
+            return { verified: false, error: result?.message || result?.error || 'Meta write failed' };
+          }
+          // Reuses whatever read-back mismatch detection the underlying write
+          // method already performs (Phase 1's existing resolver — today,
+          // AD_SET CREATE's bid_strategy/budget/timing comparison; not yet a
+          // uniform contract across every entity_type/action). A write method
+          // with no built-in read-back has nothing further to check here
+          // beyond its own reported success, which is what the check above
+          // already gates on.
+          if (
+            result.readBackVerified === true &&
+            Array.isArray(result.readBackMismatches) &&
+            result.readBackMismatches.length > 0
+          ) {
+            return {
+              verified: false,
+              mismatches: result.readBackMismatches.map((m: any) => ({
+                parameter: m.parameter, requested: m.requested, applied: m.applied,
+              })),
+            };
+          }
+          return {
+            verified: true,
+            verifiedFields: {
+              appliedObjectId: AgentModeService.extractDispatchedObjectId(result),
+              ...(result.readBackVerified === true ? { readBack: result.readBack } : {}),
+            },
+          };
+        },
+      };
+    });
+  }
+
+  /**
+   * Drives an independent-step workflow run to a terminal state, shared by
+   * both callers of advanceIndependentWorkflow (submitApprovalDeckAnswers'
+   * own drive, and resumeStuckApprovalDeckWorkflowRun below). Treats
+   * 'step_verified'/'step_failed'/'contended' identically as "keep going" —
+   * see AdvanceIndependentOutcome's own header for why 'contended' belongs
+   * in that set: it means a concurrent driver of this SAME run already
+   * claimed the step's real side effect, not that anything actually failed.
+   *
+   * Bounded: a run stuck emitting 'contended' past MAX_CONTENDED_RETRIES
+   * (the other driver never finishing, e.g. it crashed too) stops rather
+   * than spinning forever — the caller treats that exactly like 'conflict'/
+   * 'no_active_run' (give up cleanly; a later call gets another chance).
+   */
+  private async driveIndependentWorkflowToCompletion(
+    sessionId: string,
+    definition: { workflowId: string; steps: WorkflowStepDefinition[] },
+  ): Promise<AdvanceIndependentOutcome> {
+    const MAX_CONTENDED_RETRIES = 20;
+    let contendedStreak = 0;
+    let outcome = await advanceIndependentWorkflow(sessionId, definition);
+    while (outcome.kind === 'step_verified' || outcome.kind === 'step_failed' || outcome.kind === 'contended') {
+      if (outcome.kind === 'contended') {
+        contendedStreak++;
+        if (contendedStreak > MAX_CONTENDED_RETRIES) break;
+      } else {
+        contendedStreak = 0;
+      }
+      outcome = await advanceIndependentWorkflow(sessionId, definition);
     }
+    return outcome;
+  }
+
+  /**
+   * Self-heal for a real gap found by fresh-mind PR review, not the original
+   * plan: advanceIndependentWorkflow (workflowRunner.ts) has no caller
+   * anywhere except submitApprovalDeckAnswers below, and an independent-step
+   * run never reaches 'failed' — only 'completed' (every step attempted) or
+   * stuck 'in_progress' forever if the process dies mid-drain (core/
+   * workflow.ts's own header on findNextIndependentStep explains why). Left
+   * unresumed, that stuck run also permanently blocks startWorkflow's
+   * failIfActiveExists guard for EVERY later deck in this session
+   * (updateSessionWorkflowRun only allows a new run once the prior one is
+   * 'completed'/'failed') — so the next unrelated deck this session ever
+   * answers would silently fail with a misleading 'conflict' outcome and
+   * dispatch nothing, a variant of the exact Vincent Hu incident (stuck
+   * batch, manual rebuild needed) this ticket exists to prevent, just
+   * triggered by infra instead of a Meta API error.
+   *
+   * Called from two places: here (before handling a NEW deck ANSWER), and —
+   * this is the one that actually matters — right before a fresh deck is
+   * about to be PERSISTED and overwrite `session.pendingApprovalDeck` (see
+   * the call site right before `updateSessionApprovalDeck(..., approvalDeck,
+   * ...)` in the main iteration loop). A no-op when nothing is stuck.
+   *
+   * The stuck run's own workflowId encodes its deckId
+   * (`approval-deck-<deckId>`, see submitApprovalDeckAnswers below). If that
+   * deck is still `session.pendingApprovalDeck`, its items are read
+   * directly — this is the ONLY path that can actually succeed, and it's
+   * why the second call site above is load-bearing: it's the last point in
+   * the whole turn where that's still guaranteed true, before a new deck
+   * would silently take the slot. The message-history fallback below is
+   * defensive depth only, not a real second path in practice — a reply
+   * message (`metadata.approvalDeckAnswer`) is only ever persisted AFTER
+   * `submitApprovalDeckAnswers` returns `'submitted'`, which requires the
+   * run to have already reached `'completed'`; a run stuck `'in_progress'`
+   * from a crash therefore can never have one. Found by a second fresh-mind
+   * review: the original design leaned on this fallback as the answer for
+   * "a later deck has already overwritten pendingApprovalDeck," but that's
+   * exactly the state combination that can't occur. Real fix was adding the
+   * earlier call site, not improving this fallback — kept here anyway in
+   * case some future/unanticipated path does leave such a message behind.
+   */
+  private async resumeStuckApprovalDeckWorkflowRun(sessionId: string, session: ChatSession): Promise<void> {
+    const run = session.workflowRun;
+    if (!run || run.status !== 'in_progress') return;
+    const prefix = 'approval-deck-';
+    if (!run.workflowId.startsWith(prefix)) return; // not one of ours — leave it alone
+    const stuckDeckId = run.workflowId.slice(prefix.length);
+
+    let stuckDeck: PendingApprovalDeck | null = null;
+    if (session.pendingApprovalDeck?.deckId === stuckDeckId && session.pendingApprovalDeck.status === 'answered') {
+      stuckDeck = session.pendingApprovalDeck;
+    } else {
+      const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
+      stuckDeck = reconstructApprovalDeckFromHistory(messages as any, stuckDeckId);
+    }
+    if (!stuckDeck) return;
+
+    const approved = approvedWriteItems(stuckDeck);
+    if (approved.length === 0) return;
+    // Explicit grantSourceDeck: this deck may no longer be
+    // session.pendingApprovalDeck (a later deck can have overwritten it) —
+    // claimMetaWriteManifestGrant must check authorization against THIS
+    // deck's own recorded answers, not whatever deck is live now.
+    const steps = this.buildMetaWriteWorkflowSteps(sessionId, session.userId, approved, stuckDeck);
+    const definition = { workflowId: run.workflowId, steps };
+    const stepIdToDispatch = new Map(approved.map(({ item }) => [item.itemId, item.metaWriteDispatch!] as const));
+
+    const outcome = await this.driveIndependentWorkflowToCompletion(sessionId, definition);
+    if (outcome.kind !== 'completed') return; // conflict/no_active_run/contended-exhausted — another request already resolved it (or is still resolving it)
+    const summary = this.summarizeApprovalDeckRun(outcome.run);
+    if (summary) {
+      await this.applyMetaWriteRetryBackstop(sessionId, session, summary, stepIdToDispatch);
+    }
+  }
+
+  /**
+   * ENG-1635/1644: resolve a full submission of deck answers, and — for every
+   * item the user approved — drive it to completion via the independent-step
+   * workflow engine before returning. This is what actually executes a deck's
+   * approved writes; the model never re-calls call_meta_marketing_api for
+   * them (see the halt's rewritten model-facing message, gap 5 Round 3
+   * consequence #2).
+   *
+   * Re-reads the session fresh (never trusts an in-memory snapshot), so a
+   * concurrent submission or a session that has moved on loses cleanly rather
+   * than corrupting either the answer or the run.
+   */
+  async submitApprovalDeckAnswers(
+    sessionId: string,
+    expectedDeckId: string,
+    inboundAnswers: InboundDeckAnswer[],
+    answeredBy: ApprovalDeckAnsweredBy,
+  ): Promise<
+    | { outcome: 'invalid'; reason: string }
+    | { outcome: 'conflict' }
+    | { outcome: 'submitted'; run: WorkflowRunState | null; summary: ApprovalDeckExecutionSummary | null; answeredDeck: PendingApprovalDeck }
+  > {
+    const session = await chatbotDb.getChatSession(sessionId);
+    if (session) await this.resumeStuckApprovalDeckWorkflowRun(sessionId, session);
+    const deck = session?.pendingApprovalDeck;
+    if (!deck) return { outcome: 'invalid', reason: 'No pending approval deck in this session.' };
+    // Stale-card guard, same shape as askUserQuestion.ts's resolveInboundAnswer
+    // check on questionId. itemIds are only deck-scoped by convention
+    // (write-1, write-2, ...) — two different decks with the same item count
+    // collide on itemId, so without this a stale/replayed submission (double-
+    // click before the button disables, browser back+resubmit, a client retry
+    // after the first attempt already succeeded) would silently apply to
+    // whatever deck happens to be pending now instead of the one the user
+    // actually looked at.
+    if (expectedDeckId && expectedDeckId !== deck.deckId) {
+      return {
+        outcome: 'invalid',
+        reason: `Answer deckId (${expectedDeckId}) does not match the currently pending deck (${deck.deckId}).`,
+      };
+    }
+
+    let answered: PendingApprovalDeck;
+    try {
+      answered = applyDeckAnswers(deck, inboundAnswers, answeredBy, new Date().toISOString());
+    } catch (err: any) {
+      return { outcome: 'invalid', reason: err?.message || 'Invalid deck submission.' };
+    }
+
+    const persisted = await chatbotDb.updateSessionApprovalDeck(sessionId, answered, {
+      requireStillAwaiting: deck.deckId,
+    });
+    if (!persisted) return { outcome: 'conflict' };
+
+    const approved = approvedWriteItems(answered);
+    if (approved.length === 0) {
+      // Every item was rejected — nothing to execute, no workflow needed. `summary:
+      // null` here is distinct from an 'unapplied' summary: nothing was ATTEMPTED
+      // at all, versus every item being attempted and every one failing.
+      return { outcome: 'submitted', run: null, summary: null, answeredDeck: answered };
+    }
+
+    const steps = this.buildMetaWriteWorkflowSteps(sessionId, session!.userId, approved);
+    const definition = { workflowId: `approval-deck-${deck.deckId}`, steps };
+    // ENG-1635/1644 follow-up: the retry-backstop needs each step's real target
+    // identity after the run completes, keyed the same way checkpoints are
+    // (stepId === item.itemId — see buildMetaWriteWorkflowSteps).
+    const stepIdToDispatch = new Map(approved.map(({ item }) => [item.itemId, item.metaWriteDispatch!] as const));
+
+    const started = await startWorkflow(sessionId, definition, undefined).catch(() => null);
+    if (!started) return { outcome: 'conflict' };
+
+    // Keep advancing until every step has been attempted — step_verified/
+    // step_failed/contended all mean "keep going" here, UNLIKE the
+    // sequential engine's advanceWorkflow (see advanceIndependentWorkflow's
+    // own header, and driveIndependentWorkflowToCompletion's for 'contended').
+    const outcome = await this.driveIndependentWorkflowToCompletion(sessionId, definition);
+    if (outcome.kind === 'conflict' || outcome.kind === 'no_active_run' || outcome.kind === 'contended') {
+      return { outcome: 'conflict' };
+    }
+    const summary = this.summarizeApprovalDeckRun(outcome.run);
+    if (summary) {
+      await this.applyMetaWriteRetryBackstop(sessionId, session!, summary, stepIdToDispatch);
+    }
+    return { outcome: 'submitted', run: outcome.run, summary, answeredDeck: answered };
+  }
+
+  /**
+   * ENG-1635/1644 follow-up: records a per-target consecutive-failure streak so
+   * the loop-seam annotation logic (agentModeService's main iteration loop, see
+   * its own comment right before this field is read) can guarantee the failure
+   * history is visible on the next approval card for the same target — found
+   * live, a write that failed 3x in a row got silently re-proposed identically
+   * each time, with zero explanation, because nothing surfaced the failure
+   * independent of whether the model chose to mention it in prose (the enriched
+   * error reaching Emma via answerAck, fixed separately, was necessary but not
+   * sufficient — she still didn't reliably act on it every time).
+   *
+   * Deliberately does NOT block or gate dispatch itself — see the annotation
+   * logic's own comment for why an earlier hard-block version of this was
+   * reverted (it could silently refuse a genuinely corrected, would-succeed
+   * attempt, trading one failure mode for a worse one). This is purely
+   * bookkeeping: a success against the streak's target clears it, a failure
+   * increments it, and code elsewhere reads it to decide whether to add a
+   * warning to the next card — never whether to allow the attempt at all.
+   *
+   * Tracks ONE target's streak at a time (the most recently failed one in this
+   * batch) — decks are small in practice and the reproduced bug was always a
+   * single-item repeated retry; a full per-signature map would be real
+   * over-engineering for a batch shape that's never actually occurred.
+   */
+  private async applyMetaWriteRetryBackstop(
+    sessionId: string,
+    session: ChatSession,
+    summary: ApprovalDeckExecutionSummary,
+    stepIdToDispatch: Map<string, NonNullable<ApprovalDeckItem['metaWriteDispatch']>>,
+  ): Promise<void> {
+    const current = session.lastFailedMetaWrite ?? null;
+    let next = current;
+    for (const item of summary.items) {
+      const dispatch = stepIdToDispatch.get(item.stepId);
+      if (!dispatch) continue;
+      const signature = this.computeMetaWriteTargetSignature(dispatch);
+      if (item.status === 'verified') {
+        // A success against the same target the streak was tracking means
+        // whatever was wrong got fixed — the backstop's job here is done.
+        if (current?.signature === signature) next = null;
+        continue;
+      }
+      if (item.status === 'failed') {
+        const sameTargetAsBefore = current?.signature === signature;
+        next = {
+          signature,
+          error: item.error || 'Meta write failed',
+          count: sameTargetAsBefore ? current!.count + 1 : 1,
+          at: new Date().toISOString(),
+        };
+      }
+    }
+    if (next === current) return;
+    try {
+      await chatbotDb.updateSessionLastFailedMetaWrite(sessionId, next);
+    } catch (err) {
+      console.error('AgentMode: failed to update lastFailedMetaWrite retry-backstop counter:', err);
+    }
+  }
+
+  private computeMetaWriteTargetSignature(dispatch: {
+    entity_type: string;
+    action: string;
+    account_id: string;
+    campaign_id?: string;
+    ad_set_id?: string;
+    ad_id?: string;
+  }): string {
+    // Target identity only — deliberately NOT the params/digest. A genuinely
+    // corrected retry (different budget, same ad set) still targets the same
+    // entity, and should still count toward the same streak; the backstop is
+    // about a TARGET repeatedly failing, not about byte-identical arguments.
+    return [
+      dispatch.entity_type,
+      dispatch.action,
+      dispatch.account_id,
+      dispatch.campaign_id ?? '',
+      dispatch.ad_set_id ?? '',
+      dispatch.ad_id ?? '',
+    ].join(':');
+  }
+
+  /**
+   * ENG-1635/1644: turn a completed independent-step run's checkpoints into
+   * one fully_applied/partially_applied/unapplied result with per-item detail
+   * — the checkpoint-scanning replacement for the retired
+   * metaWriteManifestOutcomes map / reconcileMetaWriteManifestIfComplete
+   * (see the Migration note in the reviewed plan: these are REPLACED, not
+   * kept running alongside the new step-based tracking). The three-way
+   * status itself is domain-agnostic (summarizeIndependentStepBatch, pure,
+   * workflow.ts); this layer adds the Meta-specific per-item shape
+   * (appliedObjectId, error/mismatches) that a domain-agnostic engine file
+   * has no business knowing about. Returns null while the run has not
+   * reached 'completed' yet — same as the pure function underneath.
+   */
+  private summarizeApprovalDeckRun(run: WorkflowRunState): ApprovalDeckExecutionSummary | null {
+    const status = summarizeIndependentStepBatch(run);
+    if (!status) return null;
+    const items = run.checkpoints.map((c) => ({
+      stepId: c.stepId,
+      status: c.status,
+      ...(c.status === 'verified'
+        ? { appliedObjectId: (c.verifiedFields as any)?.appliedObjectId as string | undefined }
+        : {}),
+      ...(c.status === 'failed'
+        ? Array.isArray(c.discrepancy)
+          ? { mismatches: c.discrepancy as WorkflowVerificationMismatch[] }
+          : { error: (c.discrepancy as { error: string } | undefined)?.error }
+        : {}),
+    }));
+    return { status, items };
   }
 
   /**

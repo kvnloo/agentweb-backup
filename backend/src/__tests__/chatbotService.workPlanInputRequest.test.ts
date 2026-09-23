@@ -27,12 +27,13 @@ describe('chatbotDb.updateSessionWorkPlanInputRequest', () => {
     expect(params.ExpressionAttributeValues[':pendingWorkPlanInput']).toEqual(request());
   });
 
-  it('atomically refuses a second open input request or an open question', async () => {
+  it('atomically refuses a second open input request or an open deck (PR2: 2-way cross-slot guard)', async () => {
     await chatbotDb.updateSessionWorkPlanInputRequest('s-1', request(), { failIfAwaitingExists: true });
 
     const params = updateSpy.mock.calls[0][0];
     expect(params.ConditionExpression).toContain('attribute_not_exists(pendingWorkPlanInput)');
-    expect(params.ConditionExpression).toContain('attribute_not_exists(pendingUserQuestion)');
+    expect(params.ConditionExpression).toContain('attribute_not_exists(pendingApprovalDeck)');
+    expect(params.ConditionExpression).not.toContain('pendingUserQuestion');
   });
 
   it('removes only the pending work-plan request when the step consumes it', async () => {
