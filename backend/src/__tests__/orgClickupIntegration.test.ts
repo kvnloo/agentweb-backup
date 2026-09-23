@@ -2,9 +2,9 @@
  * Tests for org-wide ClickUp integration.
  *
  * Design:
- *   - Org admins / KB editors connect once (org-level storage).
+ *   - Org admins connect once (org-level storage).
  *   - All org members consume through the shared token via getAccessToken().
- *   - Solo users keep per-user storage and are completely unaffected.
+ *   - Existing per-user tokens remain readable; new connections require org-admin authority.
  */
 import request from "supertest";
 import express from "express";
@@ -104,7 +104,7 @@ jest.mock("../utils/crypto", () => ({
 const MOCK_WORKSPACES = [{ id: "ws-1", name: "Acme Workspace", avatar: null }];
 
 jest.mock("axios", () => ({
-  get: jest.fn().mockResolvedValue({ data: { teams: [{ id: "ws-1", name: "Acme Workspace", avatar: null }] } }),
+  get: jest.fn().mockResolvedValue({ data: { user: { id: 1, email: "integration@example.com" }, teams: [{ id: "ws-1", name: "Acme Workspace", avatar: null }] } }),
   post: jest.fn(),
 }));
 
@@ -195,37 +195,11 @@ describe("ClickUp org-wide integration", () => {
   describe("Solo user (no org)", () => {
     beforeEach(() => { currentUserId = SOLO_USER_ID; });
 
-    it("POST /save-token saves token to user secrets", async () => {
-      const res = await request(app)
-        .post("/api/clickup/save-token")
-        .send({ token: "pk_solo_token" });
-
-      expect(res.status).toBe(200);
-      expect(res.body.success).toBe(true);
-      // Must NOT touch orgDb
+    it.each(['/save-token', '/disconnect'])('rejects mutations without org-admin authority: %s', async (route) => {
+      const res = await request(app).post(`/api/clickup${route}`).send({ token: 'pk_solo_token' });
+      expect(res.status).toBe(403);
       expect(mockSetOrgSecret).not.toHaveBeenCalled();
-      // Must write to userDb
-      expect(mockUpdateUser).toHaveBeenCalledWith(
-        SOLO_USER_ID,
-        expect.objectContaining({
-          secrets: expect.objectContaining({
-            clickup_access_token: `encrypted:pk_solo_token:${SOLO_USER_ID}`,
-          }),
-        })
-      );
-    });
-
-    it("POST /disconnect removes token from user secrets", async () => {
-      // Pre-seed a user secret
-      mockUsers[SOLO_USER_ID].secrets = {
-        clickup_access_token: `encrypted:pk_solo_token:${SOLO_USER_ID}`,
-      };
-
-      const res = await request(app).post("/api/clickup/disconnect").send({});
-      expect(res.status).toBe(200);
-      expect(res.body.success).toBe(true);
-      // Must NOT touch orgDb
-      expect(mockRemoveOrgSecret).not.toHaveBeenCalled();
+      expect(mockUpdateUser).not.toHaveBeenCalled();
     });
 
     it("GET /status returns disconnected when no token", async () => {
@@ -271,26 +245,11 @@ describe("ClickUp org-wide integration", () => {
   describe("Org KB editor", () => {
     beforeEach(() => { currentUserId = EDITOR_USER_ID; });
 
-    it("POST /save-token succeeds for KB editor", async () => {
-      const res = await request(app)
-        .post("/api/clickup/save-token")
-        .send({ token: "pk_editor_token" });
-
-      expect(res.status).toBe(200);
-      expect(res.body.success).toBe(true);
-      expect(mockSetOrgSecret).toHaveBeenCalledWith(
-        ORG_ID,
-        "clickup_access_token",
-        `encrypted:pk_editor_token:${ORG_ID}`
-      );
-    });
-
-    it("POST /disconnect succeeds for KB editor", async () => {
-      mockOrg.secrets = { clickup_access_token: "enc-token" };
-
-      const res = await request(app).post("/api/clickup/disconnect").send({});
-      expect(res.status).toBe(200);
-      expect(mockRemoveOrgSecret).toHaveBeenCalledWith(ORG_ID, "clickup_access_token");
+    it.each(['/save-token', '/disconnect'])('KB editor cannot manage connection: %s', async (route) => {
+      const res = await request(app).post(`/api/clickup${route}`).send({ token: 'pk_editor_token' });
+      expect(res.status).toBe(403);
+      expect(mockSetOrgSecret).not.toHaveBeenCalled();
+      expect(mockRemoveOrgSecret).not.toHaveBeenCalled();
     });
   });
 

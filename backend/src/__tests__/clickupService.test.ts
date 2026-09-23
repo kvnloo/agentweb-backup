@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { getAccessToken, getWorkspaces, listDocs, readDocContent, listTasks, readTaskContent, createDoc, editPage } from '../services/clickupService';
+import { getAccessToken, getWorkspaces, getClickUpIdentity, listDocs, readDocContent, listTasks, readTaskContent, createDoc, editPage } from '../services/clickupService';
 
 jest.mock('axios');
 const mockAxiosGet = axios.get as jest.Mock;
@@ -80,15 +80,14 @@ describe('clickupService', () => {
       ]);
       expect(mockAxiosGet).toHaveBeenCalledWith(
         'https://api.clickup.com/api/v2/team',
-        { headers: { Authorization: 'ck_test_token' } }
+        { headers: { Authorization: 'ck_test_token' }, timeout: 10000 }
       );
     });
 
-    it('should handle null teams array', async () => {
+    it('rejects malformed teams instead of reporting a healthy empty workspace list', async () => {
       mockAxiosGet.mockResolvedValueOnce({ data: { teams: null } });
 
-      const workspaces = await getWorkspaces('ck_test_token');
-      expect(workspaces).toEqual([]);
+      await expect(getWorkspaces('ck_test_token')).rejects.toThrow('Invalid ClickUp workspace response');
     });
   });
 
@@ -643,5 +642,20 @@ describe('clickupService', () => {
       await expect(editPage('ck_token', 'ws-1', 'doc-1', 'page-1', 'content'))
         .rejects.toThrow('Not Found');
     });
+  });
+});
+
+describe('ClickUp identity boundary', () => {
+  it.each([null, {}, { id: {} }, { id: 1, email: [] }, { id: true, username: 'name' }])('rejects malformed user %p', async user => {
+    mockAxiosGet.mockResolvedValueOnce({ data: { user } });
+    await expect(getClickUpIdentity('token')).rejects.toThrow('Invalid ClickUp identity response');
+  });
+  it('normalizes the numeric ClickUp ID and displays the integration email', async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: { user: { id: 42, email: 'agentwebintegration@xcures.ai', username: 'integration' } } });
+    await expect(getClickUpIdentity('token')).resolves.toEqual({ id: '42', email: 'agentwebintegration@xcures.ai', username: 'integration' });
+  });
+  it.each([[null], [{ id: {}, name: 'workspace' }], [{ id: 'ws', name: {} }], { id: 'ws' }])('rejects malformed workspace elements %p', async teams => {
+    mockAxiosGet.mockResolvedValueOnce({ data: { teams } });
+    await expect(getWorkspaces('token')).rejects.toThrow('Invalid ClickUp workspace response');
   });
 });

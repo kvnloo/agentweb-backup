@@ -90,14 +90,38 @@ export async function getAccessToken(userId: string): Promise<string | null> {
  * Fetch workspaces (teams) the token has access to.
  */
 export async function getWorkspaces(accessToken: string): Promise<ClickUpWorkspace[]> {
-  const response = await axios.get<{ teams: any[] }>(`${CLICKUP_API_V2}/team`, {
-    headers: { Authorization: accessToken },
+  const response = await axios.get(`${CLICKUP_API_V2}/team`, {
+    headers: { Authorization: accessToken }, timeout: 10000,
   });
-  return (response.data.teams || []).map((team: any) => ({
+  const teams = response.data?.teams;
+  if (!Array.isArray(teams) || teams.some((team: any) =>
+    !team || typeof team.id !== 'string' || !team.id || typeof team.name !== 'string'
+  )) throw new Error('Invalid ClickUp workspace response');
+  return teams.map((team: any) => ({
     id: team.id,
     name: team.name,
-    avatar: team.avatar || null,
+    avatar: typeof team.avatar === 'string' ? team.avatar : null,
   }));
+}
+
+export interface ClickUpIdentity { id: string; email: string | null; username: string | null; }
+
+/** Identity is read from the existing token, so legacy connections need no migration. */
+export async function getClickUpIdentity(accessToken: string): Promise<ClickUpIdentity> {
+  const response = await axios.get(`${CLICKUP_API_V2}/user`, {
+    headers: { Authorization: accessToken }, timeout: 10000,
+  });
+  const user = response.data?.user;
+  if (!user || !((typeof user.id === 'number' && Number.isFinite(user.id)) ||
+    (typeof user.id === 'string' && user.id.length > 0)) ||
+    !(typeof user.email === 'string' || typeof user.username === 'string')) {
+    throw new Error('Invalid ClickUp identity response');
+  }
+  return {
+    id: String(user.id),
+    email: typeof user.email === 'string' ? user.email : null,
+    username: typeof user.username === 'string' ? user.username : null,
+  };
 }
 
 /**
