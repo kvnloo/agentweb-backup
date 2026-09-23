@@ -15,7 +15,6 @@ import SharedExecution from './pages/SharedExecution';
 import Layout from './components/Layout';
 import OAuthCallback from './pages/OAuthCallback';
 import AdminDashboard from './pages/AdminDashboard';
-import SourceAccessPanel from './components/admin/SourceAccessPanel';
 import GTMPlans from './pages/GTMPlans';
 import PrivateRoute from './components/PrivateRoute';
 import AdminRoute from './components/AdminRoute';
@@ -87,7 +86,6 @@ export default function App() {
                     <Route path="oauth-callback" element={<OAuthCallback />} />
                     <Route path="release" element={<Release />} />
                     <Route path="api" element={<Api />} />
-                    <Route path="source-access" element={<PrivateRoute><SourceAccessPanel /></PrivateRoute>} />
                     <Route path="execution/:executionId/token/:token" element={<SharedExecution />} />
                     <Route
                       path="tasks"
