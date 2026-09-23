@@ -1,4 +1,4 @@
-import React, { Component, useEffect, useState } from "react";
+import React, { Component, useEffect, useState, useCallback } from "react";
 import {
   Box,
   Typography,
@@ -310,9 +310,24 @@ const McpServersTab: React.FC = () => {
     missingRequiredUrl ||
     missingRequiredCommand;
 
+  const loadServers = useCallback(async (silent = false) => {
+    try {
+      if (!silent) setLoading(true);
+      if (!silent) setError("");
+      const response = await axios.get(buildApiUrl("/api/admin/mcp-servers"), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setServers(response.data);
+    } catch (err: any) {
+      if (!silent) setError(err.response?.data?.message || "Failed to load MCP servers");
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, [token]);
+
   useEffect(() => {
     loadServers();
-  }, []);
+  }, [loadServers]);
 
   // Tick every second so OAuth countdowns stay live.
   useEffect(() => {
@@ -326,22 +341,7 @@ const McpServersTab: React.FC = () => {
   useEffect(() => {
     const id = setInterval(() => loadServers(true), SERVER_POLL_MS);
     return () => clearInterval(id);
-  }, [token]);
-
-  const loadServers = async (silent = false) => {
-    try {
-      if (!silent) setLoading(true);
-      if (!silent) setError("");
-      const response = await axios.get(buildApiUrl("/api/admin/mcp-servers"), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      setServers(response.data);
-    } catch (err: any) {
-      if (!silent) setError(err.response?.data?.message || "Failed to load MCP servers");
-    } finally {
-      if (!silent) setLoading(false);
-    }
-  };
+  }, [token, loadServers]);
 
   const handleDiscoverTools = async (serverName: string) => {
     try {
