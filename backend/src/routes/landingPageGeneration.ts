@@ -3204,7 +3204,10 @@ async function syncLeadCaptureForPage(
   const repoMatch = page.githubRepoUrl.match(/github\.com\/([^/]+\/[^/]+?)(?:\.git)?(?:\s|$)/);
   if (!repoMatch) {
     console.error(`[LP GENERATION] ENG-310: unparseable githubRepoUrl on page ${page.id}: ${page.githubRepoUrl}`);
-    return "Lead list saved, but this page's GitHub repo URL is malformed so the live site was not updated.";
+    // Same "saved" wrongness the captureRouteSkipped arm below was fixed for: a detach that
+    // reports "saved" tells the owner the opposite of what they asked for.
+    return `${leadListId === null ? "Lead list removed" : "Lead list saved"}, but this page's ` +
+      `GitHub repo URL is malformed so the live site was not updated.`;
   }
   const repoFullName = repoMatch[1];
 
@@ -3302,7 +3305,8 @@ async function syncLeadCaptureForPage(
   } catch (err: any) {
     // syncLeadCaptureFilesToRepo does not throw, so this is a sibling-fetch failure.
     console.error(`[LP GENERATION] ENG-310: lead-capture sync failed for page ${page.id}:`, err?.message || err);
-    return "Lead list saved, but the live site was not updated. It will be applied on the next deploy or retry.";
+    return `${leadListId === null ? "Lead list removed" : "Lead list saved"}, but the live site ` +
+      `was not updated. It will be applied on the next deploy or retry.`;
   }
 }
 
