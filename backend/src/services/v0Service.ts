@@ -379,16 +379,15 @@ async function waitForCompletedV0Version(
 // by ATTEMPT COUNT, so axios timeouts can stretch it far past its nominal 300s.
 let captureRouteGateMaxMsOverride: number | null = null;
 /**
- * Derived, not frozen. pollVercelDeployment is bounded by ATTEMPT COUNT
- * (vercelPollMaxAttempts x vercelPollIntervalMs) plus an axios round trip per attempt, so a
- * literal equal to the nominal budget is always slightly short — which made the settle on the
- * `timeout` branch unreachable, the cap always winning that race. Adding the settle plus
- * headroom keeps the cap a backstop for the pathological case rather than a truncation, and
- * recomputing it means setVercelPollConfig cannot silently falsify it.
+ * Derived, not frozen. This caps the POLL only — the settle runs after the race, not inside
+ * it, so budgeting for the settle here would buy nothing. pollVercelDeployment is bounded by
+ * ATTEMPT COUNT (vercelPollMaxAttempts x vercelPollIntervalMs) plus an axios round trip per
+ * attempt, so a literal equal to the nominal budget is always slightly short; the headroom
+ * covers those round trips. Recomputing it means setVercelPollConfig cannot silently
+ * falsify it. Worst case for the whole gate is this cap PLUS captureRouteSettleMs.
  */
 export const captureRouteGateMaxMs = (): number =>
-  captureRouteGateMaxMsOverride ??
-  vercelPollMaxAttempts * vercelPollIntervalMs + captureRouteSettleMs + 60_000;
+  captureRouteGateMaxMsOverride ?? vercelPollMaxAttempts * vercelPollIntervalMs + 60_000;
 // And when the poll comes back anything other than READY-for-our-commit, the route is NOT
 // known to be live: Vercel auto-cancels a superseded deployment, and pollVercelDeployment
 // maps CANCELED to `error` and returns on its FIRST tick. Resolving there would reopen the
@@ -4624,17 +4623,29 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
  * caller can fall through. ENG-2079 stopped that from FAILING the page; this stops the
  * pointless wait from happening at all.
  */
+/**
+ * Which generated files the CONTENT greps below may read.
+ *
+ * Excluding by path, not by extension. These checks join every accepted file and regex the
+ * result, so a file that merely MENTIONS a pattern satisfies them — next.config.js with
+ * `fbq('track','Lead')` in a comment made a missing pixel read as present, and a service
+ * worker mentioning "/api/capture" made a form-less page read as having a form. Excluding
+ * `.js` wholesale fixed that but also blinded the checks to `app/page.js`, which
+ * MODULE_EXTENSIONS and detectIncompleteSyntheticPage both treat as a real page shape, and
+ * which survives remapFilesForSubPage. Naming the non-source paths keeps both properties.
+ *
+ * Only the first-page path can see these files at all — remapFilesForSubPage already drops
+ * config and public/ — but the raw v0 zip reaches the validators unfiltered there.
+ */
+const isScannableSource = (path: string): boolean =>
+  /\.(tsx|ts|jsx|js)$/.test(path) &&
+  !/(^|\/)(next|tailwind|postcss|eslint|vite|jest)\.config\./.test(path) &&
+  !/^public\//.test(path);
+
 export function hasLeadCaptureForm(files: Array<{ path: string; content: Buffer }>): boolean {
   const source = files
-    // .jsx included — a page v0 emitted as app/page.jsx was invisible here, silently
-    // disabling the gate and all three corrections on a page that really does capture.
-    //
-    // .js deliberately EXCLUDED. These checks grep joined source, so a `.js` file that
-    // merely MENTIONS the pattern satisfies them: next.config.js with fbq('track','Lead')
-    // in a comment made a missing pixel read as present, and a service worker mentioning
-    // "/api/capture" made a form-less page read as having a form. v0 emits page components
-    // as .tsx/.jsx; .js in a generated zip is configuration, not the form.
-    .filter((f) => /\.(tsx|ts|jsx)$/.test(f.path))
+
+    .filter((f) => isScannableSource(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
   // Any reference to the path in shipped source, not only the prescribed
@@ -4666,10 +4677,7 @@ export function hasLeadCaptureForm(files: Array<{ path: string; content: Buffer 
  */
 export function validateCaptureFormHasContactField(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
   const source = files
-    // .jsx/.js included: MODULE_EXTENSIONS and findUnparseableModule both handle them, and
-    // a page v0 emitted as app/page.jsx was invisible here — silently disabling the gate
-    // (and with it all three corrections) on a page that really does capture.
-    .filter((f) => /\.(tsx|ts|jsx)$/.test(f.path))
+    .filter((f) => isScannableSource(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
 
@@ -4688,11 +4696,10 @@ export function validateCaptureFormHasContactField(files: Array<{ path: string; 
 
 export function validatePixelLeadEvent(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
   const tsxSource = files
-    // Same extension set as hasLeadCaptureForm. Leaving these narrow while the ENG-2080
     // gate reads .jsx/.js is worse than leaving both narrow: the gate opens on a page
     // whose form these validators cannot see, so each fires a BILLED correction asking
     // v0 to add tracking that is already there, and re-fails identically on every retry.
-    .filter((f) => /\.(tsx|ts|jsx)$/.test(f.path))
+    .filter((f) => isScannableSource(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
 
@@ -4737,11 +4744,10 @@ export function validatePixelLeadEvent(files: Array<{ path: string; content: Buf
  */
 export function validateGoogleAdsConversion(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
   const tsxSource = files
-    // Same extension set as hasLeadCaptureForm. Leaving these narrow while the ENG-2080
     // gate reads .jsx/.js is worse than leaving both narrow: the gate opens on a page
     // whose form these validators cannot see, so each fires a BILLED correction asking
     // v0 to add tracking that is already there, and re-fails identically on every retry.
-    .filter((f) => /\.(tsx|ts|jsx)$/.test(f.path))
+    .filter((f) => isScannableSource(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
 
@@ -4780,11 +4786,10 @@ export function validateGoogleAdsConversion(files: Array<{ path: string; content
  */
 export function validateBridgeOutRedirect(files: Array<{ path: string; content: Buffer }>, bridgeOutUrl: string): { ok: boolean; reason?: string } {
   const tsxSource = files
-    // Same extension set as hasLeadCaptureForm. Leaving these narrow while the ENG-2080
     // gate reads .jsx/.js is worse than leaving both narrow: the gate opens on a page
     // whose form these validators cannot see, so each fires a BILLED correction asking
     // v0 to add tracking that is already there, and re-fails identically on every retry.
-    .filter((f) => /\.(tsx|ts|jsx)$/.test(f.path))
+    .filter((f) => isScannableSource(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
 

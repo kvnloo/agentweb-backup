@@ -779,16 +779,22 @@ describe("runGenerationSmokeTest", () => {
       fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
     });
     mockGetLeadsByListId.mockResolvedValue({ items: [] });
-    // Carries the synthetic phone: the point lookup now requires isSmokeTestLead(row), so a
-    // real customer row that somehow landed on this id is never adopted or deleted. It
-    // deliberately does NOT need a fresh createdAt — the adopted-row case (a phone
-    // collision, where webhooks.ts reuses the existing row without rewriting createdAt)
-    // must still be found.
-    mockGetLeadById.mockImplementation(async (_listId: string, leadId: string) => ({
-      leadId,
-      phone: "415-555-0142",
-      createdAt: "2020-01-01T00:00:00.000Z",
-    }));
+    // Stateful, because the id is now looked up twice for different reasons. The first call
+    // is claimSmokeTestPhone proving the id is FREE before the form is submitted; every call
+    // after that is the poll looking for the row the submission created. Returning a row to
+    // the claim would (correctly) make it redraw.
+    //
+    // The row deliberately carries a STALE createdAt: having claimed the id, the poll must
+    // accept it on identity alone, which is the adopted-row case — webhooks.ts reuses an
+    // existing row on a phone collision without rewriting createdAt.
+    let claimChecked = false;
+    mockGetLeadById.mockImplementation(async (_listId: string, leadId: string) => {
+      if (!claimChecked) {
+        claimChecked = true;
+        return null;
+      }
+      return { leadId, phone: "415-555-0142", createdAt: "2020-01-01T00:00:00.000Z" };
+    });
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
@@ -845,20 +851,34 @@ describe("runGenerationSmokeTest", () => {
       ...SINGLE_EMAIL_FIELD,
       fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
     });
-    mockGetLeadsByListId.mockImplementation(async () => {
+    const staleRow = () => {
       const digits = String(
         ((mockPage.fill as jest.Mock).mock.calls.find((c) => c[0] === "#phone") || [])[1] || ""
       ).replace(/\D/g, "");
-      return {
-        items: [{ leadId: "older", phone: digits, createdAt: "2000-01-01T00:00:00.000Z" }],
-        lastEvaluatedKey: null,
-        hasMore: false,
-      };
-    });
+      return { leadId: "older", phone: digits, createdAt: "2000-01-01T00:00:00.000Z" };
+    };
+    mockGetLeadsByListId.mockImplementation(async () => ({
+      items: [staleRow()],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    }));
+    // The row DynamoDB would actually return. A stranded row from a previous run lives at
+    // lead_ph_<sha(phone)> — webhooks.ts keys it there — which is exactly the id the point
+    // lookup queries. Stubbing this to null (the shared beforeEach default) made the test
+    // pass without ever exercising that branch.
+    mockGetLeadById.mockImplementation(async (_listId: string, leadId: string) => ({
+      ...staleRow(),
+      leadId,
+    }));
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
+    // Nothing landed this run, so this must be a FAIL — and the stranded row is the only
+    // evidence the previous run failed, so it must survive. Accepting it would report green
+    // over a broken capture pipeline and then delete the trace.
     expect(mockDeleteLead).not.toHaveBeenCalled();
+    const persisted = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(persisted.ok).toBe(false);
   });
 
   it("DIAGNOSIS: an iframe-embedded form is not reported as 'no lead form'", async () => {

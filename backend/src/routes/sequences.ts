@@ -169,7 +169,15 @@ router.post(
         return res.status(400).json({ error: 'Sequence has no steps' });
       }
 
-      const inputs = leads.map((l: any) => ({
+      // Same guard as the by-list route and crm.ts. An enrollment with no address makes
+      // dripSequenceWorker call sendAsSender({ to: undefined }) and RETHROW, so it retries
+      // forever; and leadEmail is the leadEmail-index partition key, so the row is invisible
+      // to getActiveEnrollment and is re-created on every run. Reported rather than dropped
+      // silently — this route takes an explicit lead array, so the caller chose these rows
+      // and deserves to know some were not enrollable.
+      const enrollable = leads.filter((l: any) => l.leadEmail);
+      const skippedNoEmail = leads.length - enrollable.length;
+      const inputs = enrollable.map((l: any) => ({
         sequenceId: req.params.sequenceId,
         userId: authReq.user!.userId,
         listId: l.listId,
@@ -179,7 +187,7 @@ router.post(
       }));
 
       const result = await dripSequenceDb.bulkEnroll(inputs);
-      res.json(result);
+      res.json(skippedNoEmail > 0 ? { ...result, skippedNoEmail } : result);
     } catch (err: any) {
       if (err instanceof SequenceNotFoundError) return res.status(404).json({ error: err.message });
       if (err instanceof SequenceAuthError) return res.status(403).json({ error: err.message });

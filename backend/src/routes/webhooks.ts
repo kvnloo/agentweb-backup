@@ -737,6 +737,13 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // Merge custom fields
       const existingCustomFields = existingLead.customFields || {};
       const mergedCf = { ...existingCustomFields, ...mergedCustomFields };
+      // `source` is defaulted to 'api' whenever the caller omits it, so a blind spread lets
+      // that synthesized value overwrite a real stored source on every repeat submission —
+      // the same data loss the phone adopt path was fixed for, on the far more common email
+      // path. Restore it unless THIS submission actually named one.
+      if (!callerSuppliedSource && 'source' in existingCustomFields) {
+        mergedCf.source = existingCustomFields.source;
+      }
       if (JSON.stringify(existingCustomFields) !== JSON.stringify(mergedCf)) {
         updates.customFields = mergedCf;
         changed = true;
@@ -907,12 +914,11 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           // customer-visible: forwardedAt is what the owner alert renders as the received
           // time. The email branch avoids this by omitting the key entirely; this branch
           // cannot, so it restores it.
-          // ONLY forwardedAt. `source` is caller-supplied when the lander sends one, so
-          // restoring it would silently revert a real value: a multi-step lander posting
-          // source "hero-form" then "qualify-form" would have step 2's overwritten with
-          // step 1's. The email branch overwrites `source`, and this branch mirrors it.
-          // forwardedAt is different — it is minted by THIS handler on every submission
-          // (existingLead is null here), so the merged copy is never the visitor's data.
+          // forwardedAt unconditionally: it is minted by THIS handler on every submission
+          // (existingLead is null on this branch), so the merged copy is never the
+          // visitor's data and the stored capture time must win. `source` is handled by
+          // provenance just below, exactly as the email branch now does — a caller-supplied
+          // source wins, a defaulted one never overwrites.
           if ('forwardedAt' in adoptedExistingCustom) {
             adoptedMergedCustom.forwardedAt = adoptedExistingCustom.forwardedAt;
           }

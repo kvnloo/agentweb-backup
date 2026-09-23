@@ -5656,12 +5656,14 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       // slightly short of the poll's real wall clock (it does an axios round trip per
       // attempt), which made the settle on the timeout branch unreachable — the cap always
       // won that race. Deriving it also means setVercelPollConfig cannot silently falsify it.
+      // The settle is NOT part of this — it runs after the race, not inside it, so the cap
+      // budgeting for it would just delay the poll's own deadline by 45s for nothing.
       setCaptureRouteGateConfig(null, 1_000);
       setVercelPollConfig(5_000, 60);
-      expect(captureRouteGateMaxMs()).toBe(60 * 5_000 + 1_000 + 60_000);
+      expect(captureRouteGateMaxMs()).toBe(60 * 5_000 + 60_000);
 
       setVercelPollConfig(1_000, 10);
-      expect(captureRouteGateMaxMs()).toBe(10 * 1_000 + 1_000 + 60_000);
+      expect(captureRouteGateMaxMs()).toBe(10 * 1_000 + 60_000);
     });
 
     it("ENG-449: a capture-route sync that never commits does not strand the smoke test", async () => {
@@ -6693,6 +6695,25 @@ describe("the enhancement validators must read the same files the ENG-2080 gate 
 
     const adsConfig = f("tailwind.config.js", "module.exports = { /* gtag('event','conversion') */ };");
     expect(validateGoogleAdsConversion(adsConfig).ok).toBe(false);
+  });
+
+  it("a real .js page source is still read — the exclusion is by path, not extension", () => {
+    // Excluding `.js` wholesale also blinded these to app/page.js, which MODULE_EXTENSIONS
+    // and detectIncompleteSyntheticPage both treat as a real page shape and which survives
+    // remapFilesForSubPage. Naming the non-source paths keeps the config false positives out
+    // without reopening that blind spot.
+    const page = f(
+      "app/page.js",
+      `export default function P(){
+         const submit = async () => {
+           await fetch("/api/capture", { method: "POST" });
+           fbq('track','Lead',{},{eventID:id});
+         };
+         return <form onSubmit={submit}><input type="email" name="email"/></form>; }`
+    );
+    expect(hasLeadCaptureForm(page)).toBe(true);
+    expect(validatePixelLeadEvent(page).ok).toBe(true);
+    expect(validateCaptureFormHasContactField(page).ok).toBe(true);
   });
 
   it("validateBridgeOutRedirect sees a redirect emitted as .jsx", () => {

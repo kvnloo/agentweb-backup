@@ -156,10 +156,51 @@ async function sweepStrandedSmokeLeads(listId: string, beforeIso: string): Promi
   return deleted;
 }
 
+/**
+ * Pick a synthetic phone whose deterministic lead id is FREE in this list, and say whether
+ * we managed to prove it.
+ *
+ * buildSmokeTestPhone draws from 100 values (the NANP reserved fictional block), and
+ * sweepStrandedSmokeLeads deliberately spares rows younger than SWEEP_MIN_AGE_MS — so
+ * roughly 1 run in 100 starts with a stranded row sitting under the exact id it is about to
+ * use. Without this claim the poll cannot distinguish that row from its own: it would report
+ * a PASS over a capture pipeline that filed nothing, and then delete the only evidence the
+ * previous run failed. A false pass is the expensive direction; the whole gate exists to
+ * avoid one.
+ *
+ * `claimed: false` means we could not check (the list was unreadable). The caller then keeps
+ * the stricter freshness rule rather than trusting the id.
+ */
+async function claimSmokeTestPhone(listId: string): Promise<{ phone: string; claimed: boolean }> {
+  let lastCandidate = buildSmokeTestPhone();
+  for (let attempt = 0; attempt < 8; attempt++) {
+    lastCandidate = buildSmokeTestPhone();
+    const id = phoneLeadId(lastCandidate);
+    if (!id) return { phone: lastCandidate, claimed: false };
+    try {
+      const occupied = await crmDb.getLeadById(listId, id, { consistentRead: true });
+      if (!occupied) return { phone: lastCandidate, claimed: true };
+    } catch (err: any) {
+      console.warn(
+        `[smokeTest] could not check whether ${id} is free in list ${listId}: ${err?.message || err}`
+      );
+      return { phone: lastCandidate, claimed: false };
+    }
+  }
+  // Every draw was taken — the list is saturated with stranded rows. Proceed unclaimed so
+  // the poll stays strict, and say so: this is worth seeing in the logs.
+  console.warn(
+    `[smokeTest] every synthetic phone id is already occupied in list ${listId} — the sweep is not keeping up`
+  );
+  return { phone: lastCandidate, claimed: false };
+}
+
 async function pollForLeadByPhone(
   listId: string,
   phone: string,
-  submittedAtIso: string
+  submittedAtIso: string,
+  /** True only when claimSmokeTestPhone proved this id empty before the form was submitted. */
+  idWasClaimed: boolean
 ): Promise<{ leadId: string } | null> {
   // Shared with the suppression sites so an E.164 phone can never match in one place and
   // miss in the other.
@@ -183,7 +224,16 @@ async function pollForLeadByPhone(
           // collision the conditional create loses, webhooks.ts adopts the existing row
           // WITHOUT rewriting createdAt, and the test then reports a false `ok: false` and
           // strands the row — which raises the collision surface for the next run.
-          if (direct && isSmokeTestLead(direct)) {
+          // Two ways to know the row is OURS. If we claimed the id before submitting, the
+          // list had nothing there, so anything under it now arrived from this submission —
+          // including the adopted-row case, where webhooks.ts reuses a row without
+          // rewriting createdAt and a freshness test would reject it forever. If we could
+          // NOT claim it, fall back to freshness: accepting any synthetic row there would
+          // turn a stranded row from a previous run into a false pass.
+          const isOurs = idWasClaimed
+            ? isSmokeTestLead(direct)
+            : isSmokeTestLead(direct) && String((direct as any).createdAt || "") >= submittedAtIso;
+          if (direct && isOurs) {
             return { leadId: deterministicId };
           }
         } catch (err: any) {
@@ -1170,7 +1220,9 @@ async function runGenerationSmokeTestNow(
     // the landers this path was added for), provably unroutable (unlike an arbitrary
     // 555-XXXX line: 555-1212 is live directory assistance), and impossible for a real
     // visitor to hold, which is what makes it safe to key suppression off.
-    const testPhone = buildSmokeTestPhone();
+    // Claimed BEFORE the form is submitted — see claimSmokeTestPhone. The flag is what lets
+    // the poll tell our row from one a previous run stranded under the same id.
+    const { phone: testPhone, claimed: phoneIdClaimed } = await claimSmokeTestPhone(leadListId);
     const email = buildSmokeTestEmail();
     const fillOutcome = await fillAllRequiredFields(browserPage, email, testPhone);
     // ENG-2081: captured HERE, not at the end of the try block. Everything between this
@@ -1365,7 +1417,7 @@ async function runGenerationSmokeTestNow(
     // still found and deleted rather than stranded in the customer's CRM.
     const lead = emailFilled
       ? await pollForLead(leadListId, email)
-      : await pollForLeadByPhone(leadListId, testPhone, submittedAtIso);
+      : await pollForLeadByPhone(leadListId, testPhone, submittedAtIso, phoneIdClaimed);
     if (lead) {
       leadCaptured = true;
       await crmDb.deleteLead(leadListId, lead.leadId);
