@@ -4628,10 +4628,15 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
  */
 export function hasLeadCaptureForm(files: Array<{ path: string; content: Buffer }>): boolean {
   const source = files
-    // .jsx/.js included: MODULE_EXTENSIONS and findUnparseableModule both handle them, and
-    // a page v0 emitted as app/page.jsx was invisible here — silently disabling the gate
-    // (and with it all three corrections) on a page that really does capture.
-    .filter((f) => /\.(tsx|ts|jsx|js)$/.test(f.path))
+    // .jsx included — a page v0 emitted as app/page.jsx was invisible here, silently
+    // disabling the gate and all three corrections on a page that really does capture.
+    //
+    // .js deliberately EXCLUDED. These checks grep joined source, so a `.js` file that
+    // merely MENTIONS the pattern satisfies them: next.config.js with fbq('track','Lead')
+    // in a comment made a missing pixel read as present, and a service worker mentioning
+    // "/api/capture" made a form-less page read as having a form. v0 emits page components
+    // as .tsx/.jsx; .js in a generated zip is configuration, not the form.
+    .filter((f) => /\.(tsx|ts|jsx)$/.test(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
   // Any reference to the path in shipped source, not only the prescribed
@@ -4666,7 +4671,7 @@ export function validateCaptureFormHasContactField(files: Array<{ path: string; 
     // .jsx/.js included: MODULE_EXTENSIONS and findUnparseableModule both handle them, and
     // a page v0 emitted as app/page.jsx was invisible here — silently disabling the gate
     // (and with it all three corrections) on a page that really does capture.
-    .filter((f) => /\.(tsx|ts|jsx|js)$/.test(f.path))
+    .filter((f) => /\.(tsx|ts|jsx)$/.test(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
 
@@ -4689,7 +4694,7 @@ export function validatePixelLeadEvent(files: Array<{ path: string; content: Buf
     // gate reads .jsx/.js is worse than leaving both narrow: the gate opens on a page
     // whose form these validators cannot see, so each fires a BILLED correction asking
     // v0 to add tracking that is already there, and re-fails identically on every retry.
-    .filter((f) => /\.(tsx|ts|jsx|js)$/.test(f.path))
+    .filter((f) => /\.(tsx|ts|jsx)$/.test(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
 
@@ -4738,7 +4743,7 @@ export function validateGoogleAdsConversion(files: Array<{ path: string; content
     // gate reads .jsx/.js is worse than leaving both narrow: the gate opens on a page
     // whose form these validators cannot see, so each fires a BILLED correction asking
     // v0 to add tracking that is already there, and re-fails identically on every retry.
-    .filter((f) => /\.(tsx|ts|jsx|js)$/.test(f.path))
+    .filter((f) => /\.(tsx|ts|jsx)$/.test(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
 
@@ -4781,7 +4786,7 @@ export function validateBridgeOutRedirect(files: Array<{ path: string; content: 
     // gate reads .jsx/.js is worse than leaving both narrow: the gate opens on a page
     // whose form these validators cannot see, so each fires a BILLED correction asking
     // v0 to add tracking that is already there, and re-fails identically on every retry.
-    .filter((f) => /\.(tsx|ts|jsx|js)$/.test(f.path))
+    .filter((f) => /\.(tsx|ts|jsx)$/.test(f.path))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
 

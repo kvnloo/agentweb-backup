@@ -189,6 +189,8 @@ import {
   validateBridgeOutRedirect,
   captureRouteGateMaxMs,
   buildLandingPageMiddleware,
+  hasLeadCaptureForm,
+  validateGoogleAdsConversion,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord, getVercelBuildErrors, isNonErrorBuildLine } from "../services/v0Service";
@@ -6667,6 +6669,26 @@ describe("the enhancement validators must read the same files the ENG-2080 gate 
         f("components/lead-form.jsx", `fbq('track', 'Lead', {}, { eventID: id });`)
       ).ok
     ).toBe(true);
+  });
+
+  it("a .js config file must NOT satisfy any of them", () => {
+    // These checks grep the JOINED source of every file they accept, so including `.js`
+    // meant a file that merely MENTIONS the pattern satisfied them. Both of these were
+    // observed true against the deployed build before `.js` was excluded: a missing pixel
+    // read as present, and a form-less page read as having a capture form — which
+    // re-enables the very correction rounds ENG-2080 removed. v0 emits page components as
+    // .tsx/.jsx; `.js` in a generated zip is configuration, not the form.
+    const nextConfig = f(
+      "next.config.js",
+      "module.exports = { /* fbq('track','Lead') mentioned in a comment */ };"
+    );
+    expect(validatePixelLeadEvent(nextConfig).ok).toBe(false);
+
+    const serviceWorker = f("public/sw.js", `self.addEventListener('fetch', e => { /* "/api/capture" */ });`);
+    expect(hasLeadCaptureForm(serviceWorker)).toBe(false);
+
+    const adsConfig = f("tailwind.config.js", "module.exports = { /* gtag('event','conversion') */ };");
+    expect(validateGoogleAdsConversion(adsConfig).ok).toBe(false);
   });
 
   it("validateBridgeOutRedirect sees a redirect emitted as .jsx", () => {
