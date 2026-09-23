@@ -37,10 +37,10 @@ export function deriveSelfActivity(
 ): SelfActivitySignal {
   const parsed = user.lastActiveAt ? new Date(user.lastActiveAt) : null;
   const valid = parsed !== null && !Number.isNaN(parsed.getTime());
+  const ageMs = valid ? now.getTime() - (parsed as Date).getTime() : -1;
+  // A future timestamp (clock skew / bad write) is not evidence of activity.
   const selfActiveRecently =
-    valid &&
-    now.getTime() - (parsed as Date).getTime() <=
-      SELF_ACTIVITY_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+    valid && ageMs >= 0 && ageMs <= SELF_ACTIVITY_WINDOW_DAYS * 24 * 60 * 60 * 1000;
 
   const usage = user.tokenUsage;
   const hasUsageThisMonth =

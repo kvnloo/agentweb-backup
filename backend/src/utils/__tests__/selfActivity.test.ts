@@ -49,4 +49,13 @@ describe("deriveSelfActivity (ENG-1271)", () => {
     expect(r.lastSelfActiveAt).toBeNull();
     expect(r.staffOperatedSuspect).toBe(true);
   });
+
+  it("does not treat a future lastActiveAt as recent self-activity", () => {
+    const r = deriveSelfActivity(
+      { lastActiveAt: "2026-12-01T00:00:00.000Z", tokenUsage: heavyUsage },
+      now,
+    );
+    expect(r.selfActiveRecently).toBe(false);
+    expect(r.staffOperatedSuspect).toBe(true);
+  });
 });
