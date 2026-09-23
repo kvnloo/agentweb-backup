@@ -99,3 +99,18 @@ describe('openRouterIgnoredProviders', () => {
     expect(openRouterIgnoredProviders('anthropic/claude-opus-5')).toEqual([]);
   });
 });
+
+import { openRouterPreferredProviders } from '../openRouterRequestParams';
+
+describe('openRouterPreferredProviders (cloud-credit routing, 2026-09-22)', () => {
+  it('sends Anthropic to AWS Bedrock', () => {
+    expect(openRouterPreferredProviders('anthropic/claude-opus-5.5')).toEqual(['Amazon Bedrock']);
+  });
+  it('sends OpenAI to Azure', () => {
+    expect(openRouterPreferredProviders('openai/gpt-6-sol')).toEqual(['Azure']);
+  });
+  it('leaves Grok and others on default OpenRouter routing', () => {
+    expect(openRouterPreferredProviders('x-ai/grok-4.7')).toEqual([]);
+    expect(openRouterPreferredProviders('google/gemini-3.8-flash')).toEqual([]);
+  });
+});
