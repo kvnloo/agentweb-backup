@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   Box,
   Button,
@@ -153,12 +153,68 @@ const SubscriptionTypesTab: React.FC = () => {
   const [topUpPackagesInput, setTopUpPackagesInput] = useState('');
   const [expandedSkills, setExpandedSkills] = useState<Set<string>>(new Set());
 
+  const loadSubscriptionTypes = useCallback(async () => {
+    try {
+      setLoading(true);
+      const response = await axios.get(buildApiUrl('/api/admin/subscription-types'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setSubscriptionTypes(response.data);
+      setError('');
+    } catch (err: any) {
+      console.error('Error loading subscription types:', err);
+      setError(err.response?.data?.message || 'Failed to load subscription types');
+    } finally {
+      setLoading(false);
+    }
+  }, [token]);
+
+  const loadAvailableSkills = useCallback(async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/admin/available-skills'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (response.data && Array.isArray(response.data)) {
+        setAvailableSkills(response.data);
+      }
+    } catch (error) {
+      console.error('Error loading available skills:', error);
+    }
+  }, [token]);
+
+  const loadAvailablePages = useCallback(async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/subscription/customer-portal-pages'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (response.data && response.data.pages) {
+        // Pages are already in the correct format (without /marketing prefix)
+        setAvailablePages(response.data.pages);
+      }
+    } catch (error) {
+      console.error('Error loading available pages:', error);
+    }
+  }, [token]);
+
+  const loadAvailableFeatures = useCallback(async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/admin/subscription-features'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (Array.isArray(response.data?.features)) {
+        setAvailableFeatures(response.data.features);
+      }
+    } catch (error) {
+      console.error('Error loading subscription features:', error);
+    }
+  }, [token]);
+
   useEffect(() => {
     loadSubscriptionTypes();
     loadAvailableSkills();
     loadAvailablePages();
     loadAvailableFeatures();
-  }, []);
+  }, [loadSubscriptionTypes, loadAvailableSkills, loadAvailablePages, loadAvailableFeatures]);
 
   // Update formData when availableSkills or availablePages loads (for new types or when editing types with "*")
   useEffect(() => {
@@ -206,62 +262,6 @@ const SubscriptionTypesTab: React.FC = () => {
       }
     }
   }, [availableSkills, availablePages, availableFeatures, editDialogOpen, editingType]);
-
-  const loadSubscriptionTypes = async () => {
-    try {
-      setLoading(true);
-      const response = await axios.get(buildApiUrl('/api/admin/subscription-types'), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      setSubscriptionTypes(response.data);
-      setError('');
-    } catch (err: any) {
-      console.error('Error loading subscription types:', err);
-      setError(err.response?.data?.message || 'Failed to load subscription types');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const loadAvailableSkills = async () => {
-    try {
-      const response = await axios.get(buildApiUrl('/api/admin/available-skills'), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (response.data && Array.isArray(response.data)) {
-        setAvailableSkills(response.data);
-      }
-    } catch (error) {
-      console.error('Error loading available skills:', error);
-    }
-  };
-
-  const loadAvailablePages = async () => {
-    try {
-      const response = await axios.get(buildApiUrl('/api/subscription/customer-portal-pages'), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (response.data && response.data.pages) {
-        // Pages are already in the correct format (without /marketing prefix)
-        setAvailablePages(response.data.pages);
-      }
-    } catch (error) {
-      console.error('Error loading available pages:', error);
-    }
-  };
-
-  const loadAvailableFeatures = async () => {
-    try {
-      const response = await axios.get(buildApiUrl('/api/admin/subscription-features'), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (Array.isArray(response.data?.features)) {
-        setAvailableFeatures(response.data.features);
-      }
-    } catch (error) {
-      console.error('Error loading subscription features:', error);
-    }
-  };
 
   const handleOpenEditDialog = (type?: SubscriptionType) => {
     if (type) {

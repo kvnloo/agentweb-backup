@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Container,
@@ -40,7 +40,7 @@ export default function Tasks() {
   const { token } = useAuth();
   const navigate = useNavigate();
 
-  const fetchTasks = async () => {
+  const fetchTasks = useCallback(async () => {
     try {
       const response = await axios.get(`${API_URL}/api/tasks`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -49,7 +49,7 @@ export default function Tasks() {
     } catch (error: any) {
       console.error('Error fetching tasks:', error);
     }
-  };
+  }, [token]);
 
   useEffect(() => {
     // Initial fetch
@@ -60,7 +60,7 @@ export default function Tasks() {
 
     // Cleanup interval on component unmount
     return () => clearInterval(intervalId);
-  }, [token]);
+  }, [fetchTasks]);
 
   // Filter out archived tasks
   const activeTasks = tasks.filter(task => task.status !== 'archived');

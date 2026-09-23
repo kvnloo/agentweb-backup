@@ -28,8 +28,8 @@ import { workPlanService } from '../services/workPlanService';
 import { projectWorkPlanForCustomer } from '../services/workPlanCustomerProjection';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { resolveInboundAnswer, resolveTypedTextAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
 import { buildWorkPlanInputRequest, resolveWorkPlanInputAnswer, WorkPlanInputRequestError } from '../services/agentMode/core/workPlanInputRequest';
+import { applyDeckAnswers, type PendingApprovalDeck, type InboundDeckAnswer } from '../services/agentMode/core/approvalDeck';
 import type { WorkPlanTurnDisposition } from '../services/agentMode/core/workPlanTurnDisposition';
 import { priorTurnNeedsWorkPlanDispositionRetry } from '../services/agentMode/core/workPlanTurnDisposition';
 import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/agentMode/core/resumePlan';
@@ -3709,15 +3709,19 @@ type RunVerifiedChatResult = {
   }>;
   attempts: number;
   workPlanCompleted: boolean;
-  // ENG-396: set when a headless turn left an unanswered blocking AskUserQuestion.
-  // The run stopped without proceeding on a guess; a human must answer it. The
+  // ENG-396: set when a headless turn left an unanswered blocking question. The
+  // run stopped without proceeding on a guess; a human must answer it. The
   // scheduled caller maps this to a `pending_user_input` outcome and notifies.
   parked?: boolean;
-  pendingUserQuestion?: PendingUserQuestion;
+  // ENG-1635/1644 PR2: the sole park slot now — ask_user_question/the
+  // objective gate always build a deck-of-one, and the legacy
+  // pendingUserQuestion park branch was deleted once its pre-migration stale
+  // records were drained.
+  pendingApprovalDeck?: PendingApprovalDeck;
   // ENG-636: set when a run had to stop on a blocking question but the caller has
   // NO channel to reach a human (headless, fire-and-forget). The run failed
-  // explicitly instead of parking into a void; there is no pendingUserQuestion to
-  // answer. Distinct from `parked` so monitoring/callers can tell the two apart.
+  // explicitly instead of parking into a void. Distinct from `parked` so
+  // monitoring/callers can tell the two apart.
   parkedUnnotifiable?: boolean;
   // ENG-635: the run met its tool/keyword requirements but its final turn still
   // deferred to an absent human (completion gate exhausted while still asking to
@@ -3798,7 +3802,7 @@ async function runVerifiedChatInner(
     // ENG-636: does a PARK on this run actually reach a human? Only true for
     // callers with a notification/answer channel: runScheduledChat (owner email)
     // and the interactive verifiedGenerate endpoint (the live session renders the
-    // pendingUserQuestion card). Default FALSE so any headless, fire-and-forget
+    // deck-of-one card). Default FALSE so any headless, fire-and-forget
     // caller (resultEndpoint, imageReports, slack/humanEval/revision) is fail-safe:
     // an unanswerable park is surfaced as an explicit `parkedUnnotifiable` failure
     // rather than dropped into a void no one will ever action. Fail-safe default
@@ -4145,50 +4149,9 @@ async function runVerifiedChatInner(
     { action: 'autoTake' } | { action: 'park'; result: RunVerifiedChatResult } | null
   > => {
     const postTurnSession = await chatbotDb.getChatSession(sessionId);
-    if (postTurnSession?.pendingUserQuestion?.status !== 'awaiting') return null;
-    const pending = postTurnSession.pendingUserQuestion;
 
-    // Reversible questions auto-proceed in any headless run; immutable ones only
-    // when the schedule explicitly waived the human protection (full autonomy).
-    const canAutoTake = fullAutonomy || pending.immutable !== true;
-    if (canAutoTake && autoTakesUsed < MAX_AUTO_TAKES) {
-      autoTakesUsed++;
-      const answered = resolveInboundAnswer(pending, { delegated: true }, new Date().toISOString());
-      await chatbotDb.updateSessionAskUserQuestion(sessionId, answered, {
-        requireStillAwaiting: pending.questionId,
-      });
-      const chosen = answered.options.find(o => o.id === answered.answer!.optionId);
-      const takeKind = fullAutonomy && pending.immutable === true ? 'full-autonomy' : 'reversible-default';
-      console.log(
-        `AgentMode runVerifiedChat: ${takeKind} auto-take on session ${sessionId} — question ${pending.questionId} → "${chosen?.label}" (delegation); continuing`
-      );
-      // Breadcrumb in history so Emma sees the decision and resumes without
-      // re-asking (best-effort; the persisted answer is the source of truth).
-      // Label the breadcrumb by the actual session, not the trigger: runVerifiedChat
-      // is also invoked from non-scheduled callers (verifiedGenerate, slack revision,
-      // revisionService, humanEvalActionService, imageReports), so hardcoding
-      // '[Scheduled run]' would write a false label into those sessions' history.
-      const breadcrumbPrefix =
-        fullAutonomy && pending.immutable === true
-          ? '[Full autonomy]'
-          : postTurnSession.sessionType === 'scheduled'
-            ? '[Scheduled run]'
-            : '[Auto-proceed]';
-      try {
-        await chatbotDb.addMessageToSession(sessionId, {
-          role: 'user',
-          content: `${breadcrumbPrefix} Proceed with "${chosen?.label}"${answered.answer?.rationale ? ` — ${answered.answer.rationale}` : ''}.`,
-          timestamp: new Date().toISOString(),
-          metadata: { timestamp: new Date().toISOString(), autoDelegatedAnswer: true, questionId: pending.questionId } as any,
-        });
-      } catch (breadcrumbError) {
-        console.error('Failed to persist auto-take breadcrumb:', breadcrumbError);
-      }
-      return { action: 'autoTake' };
-    }
-
-    // Shared failure body for both park variants below.
-    const stopResultBase = {
+    // Shared failure body for both park variants below, either slot.
+    const buildStopResultBase = () => ({
       success: false as const,
       content: allContent,
       toolCalls: allToolCalls,
@@ -4204,39 +4167,86 @@ async function runVerifiedChatInner(
       })),
       attempts: attempt,
       workPlanCompleted: false,
-    };
+    });
 
-    // ENG-636: a PARK only makes sense when a human will actually see and answer
-    // the question. Callers with a notification/answer channel (scheduled →
-    // owner email; interactive verifiedGenerate → live session card) set
-    // parkNotifiable. Headless, fire-and-forget callers do NOT — for them a park
-    // is a dead end: no one is told, no one can answer, and the run silently
-    // delivers nothing. In that case FAIL EXPLICITLY (parkedUnnotifiable) instead
-    // of returning a pendingUserQuestion nobody will ever action. This is the
-    // correct terminal behavior for an IMMUTABLE question too: we must never
-    // auto-decide an irreversible choice, and the write gate still blocks the
-    // action — so an honest, monitorable failure is the safe outcome.
-    if (!parkNotifiable) {
-      console.error(
-        `AgentMode runVerifiedChat: session ${sessionId} hit a blocking user question (${pending.questionId}, immutable=${pending.immutable === true}) after ${autoTakesUsed} auto-take(s), but this run has NO channel to reach a human (parkNotifiable=false). Failing explicitly rather than parking into a void — no deliverable, no one to answer (ENG-636).`
+    // ENG-1635/1644 PR2: the legacy pendingUserQuestion slot branch is
+    // deleted — nothing populates it anymore, and the pre-migration stale
+    // records have been drained (eng1635-null-stale-pending-user-questions.ts).
+    // buildStopResultBase is still used by the deck branch below.
+
+    // New slot: a deck-of-one from the migrated ask_user_question/objective-gate
+    // producers (ENG-1635/1644 retirement). Narrowly scoped — exactly what
+    // those two producers build (a single, non-write item) — a genuine
+    // multi-item present_question_deck or a Meta-write deck was never covered
+    // by headless auto-take/park before this migration either, and stays out
+    // of scope here: those always require a live, interactive human.
+    const deck = postTurnSession?.pendingApprovalDeck;
+    if (deck?.status === 'awaiting' && deck.items.length === 1 && !deck.items[0].metaWriteManifestDigest) {
+      const item = deck.items[0];
+
+      const canAutoTake = fullAutonomy || item.immutable !== true;
+      if (canAutoTake && autoTakesUsed < MAX_AUTO_TAKES) {
+        autoTakesUsed++;
+        // A synthesized delegated:true answer resolves deterministically to
+        // item.recommended via applyDeckAnswers (verified directly against
+        // approvalDeck.ts) — the deck-of-one equivalent of
+        // resolveInboundAnswer's delegated branch above.
+        const inbound: InboundDeckAnswer[] = [{ itemId: item.itemId, verdict: '', delegated: true }];
+        const answeredDeck = applyDeckAnswers(deck, inbound, 'delegation', new Date().toISOString());
+        await chatbotDb.updateSessionApprovalDeck(sessionId, answeredDeck, {
+          requireStillAwaiting: deck.deckId,
+        });
+        const deckAnswer = answeredDeck.answers?.find(a => a.itemId === item.itemId);
+        const chosenOption = item.options?.find(o => o.id === deckAnswer?.verdict);
+        const takeKind = fullAutonomy && item.immutable === true ? 'full-autonomy' : 'reversible-default';
+        console.log(
+          `AgentMode runVerifiedChat: ${takeKind} auto-take on session ${sessionId} — deck ${deck.deckId} item ${item.itemId} → "${chosenOption?.label}" (delegation); continuing`
+        );
+        const breadcrumbPrefix =
+          fullAutonomy && item.immutable === true
+            ? '[Full autonomy]'
+            : postTurnSession?.sessionType === 'scheduled'
+              ? '[Scheduled run]'
+              : '[Auto-proceed]';
+        try {
+          await chatbotDb.addMessageToSession(sessionId, {
+            role: 'user',
+            content: `${breadcrumbPrefix} Proceed with "${chosenOption?.label}".`,
+            timestamp: new Date().toISOString(),
+            metadata: { timestamp: new Date().toISOString(), autoDelegatedAnswer: true, pendingApprovalDeckId: deck.deckId } as any,
+          });
+        } catch (breadcrumbError) {
+          console.error('Failed to persist auto-take breadcrumb:', breadcrumbError);
+        }
+        return { action: 'autoTake' };
+      }
+
+      const stopResultBase = buildStopResultBase();
+
+      if (!parkNotifiable) {
+        console.error(
+          `AgentMode runVerifiedChat: session ${sessionId} hit a blocking deck-of-one question (${deck.deckId}, immutable=${item.immutable === true}) after ${autoTakesUsed} auto-take(s), but this run has NO channel to reach a human (parkNotifiable=false). Failing explicitly rather than parking into a void — no deliverable, no one to answer (ENG-636).`
+        );
+        return {
+          action: 'park',
+          result: { ...stopResultBase, parkedUnnotifiable: true },
+        };
+      }
+
+      console.warn(
+        `AgentMode runVerifiedChat: parking session ${sessionId} — blocking deck-of-one question (${deck.deckId}, immutable=${item.immutable === true}) awaiting a human selection after ${autoTakesUsed} auto-take(s); run will not proceed on a guess. A human will be notified (scheduled owner email / interactive card).`
       );
       return {
         action: 'park',
-        result: { ...stopResultBase, parkedUnnotifiable: true },
+        result: {
+          ...stopResultBase,
+          parked: true,
+          pendingApprovalDeck: deck,
+        },
       };
     }
 
-    console.warn(
-      `AgentMode runVerifiedChat: parking session ${sessionId} — blocking user question (${pending.questionId}, immutable=${pending.immutable === true}) awaiting a human selection after ${autoTakesUsed} auto-take(s); run will not proceed on a guess. A human will be notified (scheduled owner email / interactive card).`
-    );
-    return {
-      action: 'park',
-      result: {
-        ...stopResultBase,
-        parked: true,
-        pendingUserQuestion: postTurnSession.pendingUserQuestion,
-      },
-    };
+    return null;
   };
 
   while (attempt < maxAttempts) {
@@ -4353,6 +4363,7 @@ async function runVerifiedChatInner(
           livePublishAuthorization,
           approvedRevisionImageSources,
           undefined, undefined, undefined, // userMessageKind, requireWorkPlanDisposition, clientId
+          undefined, undefined, // approvalDeckAnswerMeta, approvalDeckCancelledMeta — not a deck reply
           // ENG-2072: propagate this run's unattended status into the continuation
           // turn's tool-dispatch context, same as the main attempt below.
           isUnattendedRun
@@ -4488,6 +4499,7 @@ async function runVerifiedChatInner(
         livePublishAuthorization,
         approvedRevisionImageSources,
         undefined, undefined, undefined, // userMessageKind, requireWorkPlanDisposition, clientId
+        undefined, undefined, // approvalDeckAnswerMeta, approvalDeckCancelledMeta — not a deck reply
         // ENG-2072: true only for runScheduledChat's call (and the "Test run" path
         // that shares it); false for the interactive verifiedGenerate endpoint —
         // see ToolContext.isUnattendedRun.
@@ -5488,8 +5500,8 @@ export async function runScheduledChat(
   attempt: number;
   createdAt: string;
   summary?: string;
-  // Present only on a parked run — links the pending question for the UI.
-  pendingQuestionId?: string;
+  // Present only on a parked run — links the pending deck for the UI.
+  pendingApprovalDeckId?: string;
   // ENG-947: present only when the run stopped early on the publish-press budget
   // with the publish tool still uncalled (content drafted and held, not published).
   publishHeldForApproval?: boolean;
@@ -6621,24 +6633,31 @@ export async function runScheduledChat(
     // early-return BEFORE the oncall/auto-issue path. `sessionId: ''` reuses the
     // established convention (see error/token paths) so the orchestrator/callers
     // skip their normal result email — the paused email below carries the link.
-    if (result.parked && result.pendingUserQuestion) {
+    // ENG-1635/1644 PR2: a parked run now only ever carries pendingApprovalDeck
+    // — ask_user_question/the objective gate no longer populate
+    // pendingUserQuestion at all, and the legacy slot's own resolution branch
+    // in resolveAwaitingUserQuestion was deleted once its stale pre-migration
+    // records were drained.
+    if (result.parked && result.pendingApprovalDeck) {
+      const questionText = result.pendingApprovalDeck?.items?.[0]?.question;
+      const questionLogId = result.pendingApprovalDeck?.deckId;
       const scheduleUser = await userDb.getUserById(userId);
       const notifyEmails = (schedule.emailNotifications && schedule.emailNotifications.length > 0)
         ? schedule.emailNotifications
         : (scheduleUser?.email ? [scheduleUser.email] : []);
-      if (notifyEmails.length > 0) {
+      if (notifyEmails.length > 0 && questionText) {
         await emailService.sendScheduledChatPausedForInputEmail(
           notifyEmails,
           schedule.scheduleName,
           schedule.scheduleId,
-          result.pendingUserQuestion.question,
+          questionText,
           sessionId
         );
       } else {
         // Parked but no recipient (no emailNotifications and no account email) — the
         // owner won't be notified. Surface it loudly rather than parking silently.
         console.warn(
-          `AgentMode runScheduledChat: schedule ${schedule.scheduleId} parked on a user question but has NO notification recipient — owner will not be told. Session ${sessionId}, question ${result.pendingUserQuestion.questionId}`
+          `AgentMode runScheduledChat: schedule ${schedule.scheduleId} parked on a user question but has NO notification recipient — owner will not be told. Session ${sessionId}, question ${questionLogId}`
         );
       }
 
@@ -6658,9 +6677,9 @@ export async function runScheduledChat(
         functionCallDetails: {},
         executionTime: Date.now() - now.getTime(),
         // Empty on purpose — suppresses the callers' result email (the paused
-        // email already notified). The pending question id links back for the UI.
+        // email already notified). The pending question/deck id links back for the UI.
         sessionId: '',
-        pendingQuestionId: result.pendingUserQuestion.questionId,
+        ...(result.pendingApprovalDeck ? { pendingApprovalDeckId: result.pendingApprovalDeck.deckId } : {}),
         attempt: result.attempts,
         createdAt: new Date().toISOString(),
       };
@@ -8128,6 +8147,16 @@ export async function generateSessionResponse(
   // message and echoed back nowhere else needed -- the caller already knows its
   // own clientId, only messageIndex (assigned server-side) needs to come back.
   clientId?: string,
+  // ENG-1635/1644: the structured, server-resolved answer set for this reply's deck
+  // submission, stamped onto the reply's own metadata — mirrors answeredQuestionMeta
+  // above exactly. Without this, a deck's card can only ever reflect the session's
+  // single live pendingApprovalDeck slot; the moment a NEWER deck opens, this one's
+  // card has no way to know it was answered and falls back to plain text forever.
+  approvalDeckAnswerMeta?: { deckId: string; answers: any[] },
+  // ENG-1635/1644: which deck this reply cancelled, if any — same rationale as
+  // approvalDeckAnswerMeta, mirrored for the cancel path so the card can render
+  // a real "Cancelled" state instead of the generic superseded fallback.
+  approvalDeckCancelledMeta?: { deckId: string },
   // ENG-2072: tri-state per-turn "is this an unattended scheduled/test run" signal
   // — see ToolContext.isUnattendedRun in mcp/client/toolRegistry.ts. `true` only
   // from runVerifiedChatInner's calls sourced from runScheduledChat. `false` from
@@ -8168,6 +8197,11 @@ export async function generateSessionResponse(
   // when reusingDanglingDirective skipped the save). Lets the caller echo a stable id
   // for the user's own optimistic bubble without waiting for a session refetch.
   userMessageIndex?: number;
+  // ENG-1635/1644: the deck built THIS turn, when the tool loop halted on one or
+  // more Meta writes — threaded through from the inner generateAgentResponse call
+  // so the controller can lift it onto the live HTTP response (see that field's
+  // own comment there for why this is needed at all).
+  pendingApprovalDeck?: PendingApprovalDeck;
 }> {
   // Clear any stale cancel from a previous request on this session
   clearCancel(sessionId);
@@ -8229,6 +8263,12 @@ export async function generateSessionResponse(
       // ENG-396: structured record of the card selection this reply answered (from a
       // click, not the text). The card reads this to show which option was chosen.
       ...(answeredQuestionMeta ? { askUserQuestionAnswer: answeredQuestionMeta } : {}),
+      // ENG-1635/1644: same rationale, generalized to a whole deck's answer set —
+      // see approvalDeckAnswerMeta's own comment above.
+      ...(approvalDeckAnswerMeta ? { approvalDeckAnswer: approvalDeckAnswerMeta } : {}),
+      // ENG-1635/1644: same rationale, for the cancel path — see
+      // approvalDeckCancelledMeta's own comment above.
+      ...(approvalDeckCancelledMeta ? { approvalDeckCancelled: approvalDeckCancelledMeta } : {}),
       // ENG-1239: marks server-authored turns (e.g. the media auto-continuation
       // directive) so the frontend can hide them instead of rendering them as a
       // customer-typed chat bubble.
@@ -9077,9 +9117,29 @@ export const agentModeController = {
     // `turnStartMs` is block-scoped to the try, so it cannot serve the error path.
     let turnStartMsForDiagnosis: number | null = null;
     let modelPolicyDecision: EffectiveModelPolicyDecision | undefined;
+    // ENG-1635/1644: the deck this turn just answered, if any — surfaced on the
+    // live response alongside any brand-new deck the generate loop below might
+    // build, so the optimistic ApprovalDeckCard flips to its locked/answered
+    // view immediately instead of only after a page reload.
+    let answeredApprovalDeck: PendingApprovalDeck | undefined;
+    // ENG-1635/1644: the server-resolved answer set for this turn's deck submission,
+    // stamped onto the reply message so the deck's own card stays self-contained once
+    // a newer deck rolls session.pendingApprovalDeck past it — see the comment on
+    // generateSessionResponse's approvalDeckAnswerMeta param for the full rationale.
+    let approvalDeckAnswerMeta: { deckId: string; answers: any[] } | undefined;
+    // ENG-1635/1644 Phase 1b: true when this turn cancelled a deck — tells the
+    // frontend to clear its own copy of pendingApprovalDeck (the deck was
+    // cleared to null server-side, not answered, so answeredApprovalDeck's
+    // "flip to locked view" shape doesn't apply here).
+    let deckCancelled = false;
+    // ENG-1635/1644: which deck this turn cancelled, stamped onto the reply
+    // message so the deck's own card can show a real "Cancelled" state — not
+    // just the generic "Superseded — not answered" a deck that was silently
+    // replaced/abandoned some other way would show. Mirrors approvalDeckAnswerMeta.
+    let approvalDeckCancelledMeta: { deckId: string } | undefined;
     try {
       const user = req.user as User;
-      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer, clientId } = req.body;
+      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer, deckAnswer, deckCancel, clientId } = req.body;
       let { userMessage } = req.body;
 
       // If the request contains audio, transcribe it to text first
@@ -9119,95 +9179,18 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
 
-      // ENG-396: structured AskUserQuestion answer channel. When the chat card
-      // posts a selection, resolve it against the session's pending question and
-      // persist the ANSWERED state BEFORE the run starts, so the consumer gate
-      // (checkQuestionGate — e.g. the Meta objective write, ENG-400) reads a
-      // human-attributed answer from the DB rather than parsing it from prose.
-      // Placed before the idempotency/session locks so a bad selection returns
-      // cleanly with no lock to release. answeredBy is derived server-side inside
-      // resolveInboundAnswer — the client cannot forge who answered.
+      // ENG-1635/1644 PR2: the legacy questionAnswer/pendingUserQuestion
+      // handling (structured answer, typed-text abandon/re-ask) is deleted —
+      // nothing ever populates session.pendingUserQuestion anymore (PR1: every
+      // halt builds a deck-of-one instead), the pre-migration stale records
+      // have been drained (one-off migration script,
+      // eng1635-null-stale-pending-user-questions.ts), and the only two
+      // producers of a `questionAnswer` request body (AskUserQuestionCard.tsx,
+      // the emma_answer_question MCP tool) are deleted in this same PR2 pass.
+      // answerAck/answeredQuestionMeta stay declared below — deckAnswer and
+      // deckCancel still populate them.
       let answerAck: string | undefined;
       let answeredQuestionMeta: { questionId: string; optionId: string; delegated: boolean } | undefined;
-      if (questionAnswer) {
-        try {
-          const answered = resolveInboundAnswer(
-            session.pendingUserQuestion,
-            {
-              questionId: questionAnswer.questionId,
-              optionId: questionAnswer.optionId,
-              delegated: questionAnswer.delegated === true,
-            },
-            new Date().toISOString(),
-          );
-          // Optimistic-locked: only persists if the question is STILL exactly
-          // this one and STILL 'awaiting' at write time. Without this, two
-          // concurrent submissions (e.g. a double-click) could both validate
-          // against the same in-memory snapshot and the later write would
-          // silently clobber the earlier answer.
-          const persisted = await chatbotDb.updateSessionAskUserQuestion(sessionId, answered, {
-            requireStillAwaiting: session.pendingUserQuestion!.questionId,
-          });
-          if (!persisted) {
-            // Lost the race to a concurrent submission that already answered
-            // this same question — refresh and re-render rather than silently
-            // overwriting whichever answer actually won.
-            return res.status(409).json({
-              error: 'This question was already answered by a concurrent request.',
-              code: 'ASK_USER_QUESTION_INVALID',
-            });
-          }
-          // ENG-396: make Emma name the chosen option in her reply (esp. for delegation,
-          // where the user's "Let Emma decide" bubble doesn't say which option won).
-          answerAck = buildAnswerAcknowledgement(answered) ?? undefined;
-          // ENG-396: stamp the STRUCTURED selection on this reply so the card reads which
-          // option was chosen from the click record — never inferred from prose. Superseded
-          // cards read this instead of matching chat text.
-          if (answered.answer) {
-            answeredQuestionMeta = {
-              questionId: answered.questionId,
-              optionId: answered.answer.optionId,
-              delegated: answered.answer.delegated === true,
-            };
-          }
-        } catch (err) {
-          if (err instanceof AskUserQuestionError) {
-            // Stale/duplicate/invalid selection (e.g. the card was already
-            // answered, or the questionId no longer matches). 409 so the client
-            // can refresh the session and re-render the current question state.
-            return res.status(409).json({ error: err.message, code: 'ASK_USER_QUESTION_INVALID' });
-          }
-          throw err;
-        }
-      } else if (session.pendingUserQuestion?.status === 'awaiting') {
-        const abandoned = session.pendingUserQuestion;
-        const typedAnswer = resolveTypedTextAnswer(abandoned, userMessage, new Date().toISOString());
-        const nextQuestion = typedAnswer ?? null;
-        // Both typed resolution and clear/re-ask retain the same optimistic lock:
-        // a concurrent card click must never be erased or overwritten.
-        const persisted = await chatbotDb.updateSessionAskUserQuestion(sessionId, nextQuestion, {
-          requireStillAwaiting: abandoned.questionId,
-        });
-        if (persisted) {
-          session.pendingUserQuestion = typedAnswer;
-          if (typedAnswer?.answer) {
-            answerAck = buildAnswerAcknowledgement(typedAnswer) ?? undefined;
-            answeredQuestionMeta = {
-              questionId: typedAnswer.questionId,
-              optionId: typedAnswer.answer.optionId,
-              delegated: false,
-            };
-          } else {
-            answerAck = buildReaskDirective(abandoned);
-          }
-        } else {
-          // Lost the race — a concurrent structured answer already resolved
-          // this question. Re-read the fresh state so the run proceeds against
-          // the REAL answer rather than silently discarding it.
-          const fresh = await chatbotDb.getChatSession(sessionId);
-          session.pendingUserQuestion = fresh?.pendingUserQuestion;
-        }
-      }
 
       // Work-plan details are validated and persisted as structured values before
       // Emma receives the continuation. This keeps chat and MCP answers identical
@@ -9234,6 +9217,129 @@ export const agentModeController = {
           }
           throw err;
         }
+      }
+
+      // ENG-1635/1644: a full approval-deck submission. Unlike questionAnswer/
+      // workPlanInputAnswer, this doesn't just persist an answer for the model to
+      // read later — submitApprovalDeckAnswers actually dispatches every approved
+      // write (step-per-write, independent-step engine) SYNCHRONOUSLY before this
+      // request returns, so by the time Emma sees this turn the writes have
+      // already run. The outcome (and gap 4: any REJECT — <correction> free text,
+      // and any 'comment' free text) is injected via answerAck — the same
+      // LLM-only channel ENG-396 already uses, "never stored on the displayed
+      // user bubble" (see its own doc comment on generateSessionResponse) — NOT
+      // appended to userMessage. userMessage becomes userMessageObj.content
+      // verbatim below and is rendered in the user's own chat history; the
+      // frontend already sends a clean, human-readable label as userMessage
+      // (e.g. "Approved all 3") specifically for that display, so appending raw
+      // JSON onto it was a leak, not an LLM-only channel (round 6 finding).
+      if (deckAnswer) {
+        if (!session.pendingApprovalDeck) {
+          return res.status(409).json({ error: 'This approval deck is no longer awaiting a response.', code: 'APPROVAL_DECK_INVALID' });
+        }
+        const result = await agentModeService.submitApprovalDeckAnswers(sessionId, deckAnswer.deckId, deckAnswer.answers, 'user');
+        if (result.outcome === 'invalid') {
+          return res.status(409).json({ error: result.reason, code: 'APPROVAL_DECK_INVALID' });
+        }
+        if (result.outcome === 'conflict') {
+          return res.status(409).json({ error: 'This approval deck was already answered by a concurrent request.', code: 'APPROVAL_DECK_INVALID' });
+        }
+        answeredApprovalDeck = result.answeredDeck;
+        // ENG-1635/1644: server-resolved answers (delegation already resolved to the
+        // recommended option) — NOT the raw client-submitted deckAnswer.answers — so a
+        // reconstructed historical card shows the true resolved verdict, same guarantee
+        // askUserQuestionAnswer already gives for a single question.
+        if (answeredApprovalDeck?.answers) {
+          approvalDeckAnswerMeta = { deckId: deckAnswer.deckId, answers: answeredApprovalDeck.answers };
+        }
+        const rejections = (deckAnswer.answers || [])
+          .filter((a: any) => a?.verdict === 'reject' && typeof a?.freeText === 'string' && a.freeText.trim())
+          .map((a: any) => ({ itemId: a.itemId, correction: a.freeText.trim() }));
+        const commented = (deckAnswer.answers || [])
+          .filter((a: any) => a?.verdict === 'comment' && typeof a?.freeText === 'string' && a.freeText.trim())
+          .map((a: any) => ({ itemId: a.itemId, comment: a.freeText.trim() }));
+        // Found live on env1 (2026-09-16): a pure question-deck (present_question_deck,
+        // no Meta write items at all) has approvedWriteItems() === [] by construction,
+        // so submitApprovalDeckAnswers ALWAYS returns summary: null for it — not because
+        // nothing was answered, but because "summary" only ever described WRITE
+        // execution outcomes. The old code below rendered that as
+        // status:'nothing_approved', items:[] regardless of what was actually picked,
+        // which read to Emma as "the user answered nothing" — she re-asked the exact
+        // same deck, a real dead loop (confirmed live: 3 identical decks in a row).
+        // Fix: resolve every non-write, non-comment item's actual selection (option
+        // label if resolvable) into its own `selections` array, and don't claim
+        // 'nothing_approved' for a deck that was never about writes at all.
+        const deckItems = answeredApprovalDeck?.items ?? [];
+        const isWriteDeck = deckItems.some((item) => Boolean(item.metaWriteManifestDigest));
+        const selections = deckItems
+          .filter((item) => !item.metaWriteManifestDigest)
+          .map((item) => {
+            const ans = answeredApprovalDeck?.answers?.find((a) => a.itemId === item.itemId);
+            if (!ans || ans.verdict === 'comment') return null;
+            const pickedOption = item.options?.find((o) => o.id === ans.verdict);
+            return { itemId: item.itemId, question: item.question, selected: pickedOption?.label ?? ans.verdict };
+          })
+          .filter((s): s is { itemId: string; question: string; selected: string } => s !== null);
+        const deckOutcomeStatus = isWriteDeck ? (result.summary?.status ?? 'nothing_approved') : 'answered';
+        // Found live: a write that failed Meta-side validation (e.g. a budget under the
+        // account's real minimum) got silently re-proposed identically 3 times in a row —
+        // the per-item `error` was present in this same JSON the whole time, but nothing
+        // told Emma what to DO with a failure, so she just retried instead of explaining it
+        // to the user or adjusting the params herself. A bare JSON dump relies entirely on
+        // the model inferring the right response; make it explicit instead.
+        const failureInstruction = (deckOutcomeStatus === 'partially_applied' || deckOutcomeStatus === 'unapplied')
+          ? ' At least one item above has status "failed" with its own `error` — read it, explain the ' +
+            'actual failure to the user in plain language, and adjust the params yourself if the error ' +
+            'tells you how (e.g. raise a budget that was below the account minimum) before ever retrying ' +
+            'the same write again. Do NOT silently re-propose an identical write that already failed.'
+          : '';
+        const deckOutcomeDirective = `[Approval deck outcome: ${JSON.stringify({
+          status: deckOutcomeStatus,
+          ...(isWriteDeck ? { items: result.summary?.items ?? [] } : {}),
+          ...(selections.length > 0 ? { selections } : {}),
+          ...(rejections.length > 0 ? { rejectedWithCorrections: rejections } : {}),
+          ...(commented.length > 0 ? { commented } : {}),
+        })}]${failureInstruction}`;
+        answerAck = answerAck ? `${answerAck}\n\n${deckOutcomeDirective}` : deckOutcomeDirective;
+      }
+
+      // ENG-1635/1644 Phase 1b: abandon the whole deck without answering any
+      // item. Mirrors AskUserQuestion's real abandon precedent exactly — clear
+      // to null (chatbotDb.updateSessionApprovalDeck(sessionId, null, ...)), no
+      // new status value. Once pendingApprovalDeck is null, the original halt
+      // message's card match (metadata.pendingApprovalDeckId ===
+      // session.pendingApprovalDeck?.deckId) is false for every message, so it
+      // falls back to the plain-text prompt — the same, already-accepted
+      // behavior a superseded deck already has.
+      if (deckCancel) {
+        if (!session.pendingApprovalDeck || session.pendingApprovalDeck.deckId !== deckCancel.deckId) {
+          return res.status(409).json({ error: 'This approval deck is no longer awaiting a response.', code: 'APPROVAL_DECK_INVALID' });
+        }
+        const cleared = await chatbotDb.updateSessionApprovalDeck(sessionId, null, {
+          requireStillAwaiting: deckCancel.deckId,
+        });
+        if (!cleared) {
+          return res.status(409).json({ error: 'This approval deck was already answered or cancelled by a concurrent request.', code: 'APPROVAL_DECK_INVALID' });
+        }
+        deckCancelled = true;
+        approvalDeckCancelledMeta = { deckId: deckCancel.deckId };
+        // ENG-1635/1644 Phase 2b/1b: a write-deck can carry droppedQuestionDeckPayload
+        // (questions dropped because a write halted in the same turn and won
+        // priority — see buildApprovalDeckForIteration). The answer path already
+        // reads this field; the cancel path is a SEPARATE code path and must read
+        // it too, or cancelling a write-deck with a dropped question loses it
+        // permanently — read from the pre-clear snapshot still in `session`, since
+        // the deck itself is about to be nulled.
+        const droppedQuestions = session.pendingApprovalDeck.droppedQuestionDeckPayload;
+        const cancelDirective = droppedQuestions && droppedQuestions.length > 0
+          ? `[Approval deck cancelled by the user — no item in it was approved, rejected, or executed. ` +
+            `Do not treat any pending write as granted. This deck had also dropped ${droppedQuestions.length} ` +
+            `question(s) that were never asked (a write halted in the same turn and took priority): ` +
+            `${JSON.stringify(droppedQuestions.map((q: any) => q.question))}. Re-ask them via present_question_deck, ` +
+            `or ask what they would like to do instead.]`
+          : '[Approval deck cancelled by the user — no item in it was approved, rejected, ' +
+            'or executed. Do not treat any pending write as granted; ask what they would like to do instead.]';
+        answerAck = answerAck ? `${answerAck}\n\n${cancelDirective}` : cancelDirective;
       }
 
       // Cross-restart duplicate-submit lock (ENG-147: one question spawned ~30
@@ -9457,6 +9563,8 @@ export const agentModeController = {
         undefined, // userMessageKind
         Boolean(questionAnswer || workPlanInputAnswer),
         typeof clientId === 'string' ? clientId : undefined, // ENG-1495
+        approvalDeckAnswerMeta, // ENG-1635/1644: structured deck answer stamped on the reply
+        approvalDeckCancelledMeta, // ENG-1635/1644: which deck this reply cancelled, if any
         // ENG-2072: this IS the live /generate route useAgentModeChat.tsx hits —
         // a real person is watching this turn, even if it lands on a session
         // reopened from the "Scheduled" sidebar tab. Never fall back to
@@ -9740,6 +9848,19 @@ export const agentModeController = {
         skills: response.skills,
         ...(invalidations ? { invalidations } : {}),
         ...(response.workPlanTurnDisposition ? { workPlanTurnDisposition: response.workPlanTurnDisposition } : {}),
+        // ENG-1635/1644: without this, the deck built this turn only reaches the
+        // frontend via a full session refetch — the optimistic assistant bubble has
+        // no way to know a deck exists and falls back to plain text with no buttons
+        // until the user reloads the page (found live-driving on env1).
+        ...(response.pendingApprovalDeck ? { pendingApprovalDeck: response.pendingApprovalDeck } : {}),
+        // Deliberately a SEPARATE field from pendingApprovalDeck above, not merged:
+        // this one only syncs currentSession's copy of a deck THIS turn just
+        // answered so its card flips to the locked view without a reload — it must
+        // never tag the new reply message's own metadata.pendingApprovalDeckId (the
+        // frontend only does that off pendingApprovalDeck above), or the same deck
+        // would match two messages at once and render the card twice.
+        ...(answeredApprovalDeck ? { answeredApprovalDeck } : {}),
+        ...(deckCancelled ? { deckCancelled: true } : {}),
         ...(modelPolicyDecision ? {
           requestedModel: modelPolicyDecision.requestedModel,
           effectiveModel: modelPolicyDecision.effectiveModel,
@@ -10465,12 +10586,15 @@ export const agentModeController = {
           supportNote: supportNote,
           skills: sharedSkills,
           slackThread: session.slackThread,
-          // ENG-396: expose the AskUserQuestion state so a shared/read-only card can
+          pendingWorkPlanInput: session.pendingWorkPlanInput,
+          // ENG-1635/1644: expose the live deck slot so a shared/read-only card can
           // reflect the real answered option (highlight + "Answered") instead of a bare
-          // "View only". Everything here is already visible in the transcript's card, so
-          // it leaks nothing new; the share stays read-only via the card's readOnly path.
-          pendingUserQuestion: session.pendingUserQuestion,
-          pendingWorkPlanInput: session.pendingWorkPlanInput
+          // "View only" — used to distinguish "still the current awaiting deck" vs
+          // "superseded". Everything here is already visible in the transcript's
+          // card, so it leaks nothing new; the share stays read-only via the card's
+          // readOnly path. (PR2: the pendingUserQuestion sibling of this field is
+          // gone — ask_user_question/the objective gate always build a deck-of-one now.)
+          pendingApprovalDeck: session.pendingApprovalDeck
         }
       });
 
@@ -10517,8 +10641,16 @@ export const agentModeController = {
     try {
       const { shareId } = req.params;
       const { conversable } = req.query;
-      const { userMessage, llmModel, attachments = [], workPlanInputAnswer, clientId } = req.body;
+      const { userMessage, llmModel, attachments = [], workPlanInputAnswer, deckAnswer, deckCancel, clientId } = req.body;
       let effectiveUserMessage = userMessage;
+      // ENG-1635/1644: same LLM-only-directive / stamped-reply-metadata triple as
+      // the authenticated path's deckAnswer/deckCancel handling below — see
+      // generateResponse for the full rationale on each field.
+      let answerAck: string | undefined;
+      let answeredApprovalDeck: PendingApprovalDeck | undefined;
+      let approvalDeckAnswerMeta: { deckId: string; answers: any[] } | undefined;
+      let deckCancelled = false;
+      let approvalDeckCancelledMeta: { deckId: string } | undefined;
 
       if (!userMessage) {
         return res.status(400).json({ error: 'User message is required' });
@@ -10597,6 +10729,98 @@ export const agentModeController = {
         }
       }
 
+      // ENG-1635/1644: a full approval-deck submission via a shared/ishare link.
+      // Mirrors the authenticated path's deckAnswer handling (see generateResponse)
+      // with one addition: an anonymous shared-link visitor may never approve a
+      // real Meta write or an immutable (e.g. campaign-objective) item — only a
+      // genuine question deck. The deck's own contract is atomic and never mixes
+      // kinds in one deck (partitionApprovalHalts/buildApprovalDeckForIteration:
+      // writes always win a mixed turn), so refusing the WHOLE submission the
+      // instant any item is write- or immutable-shaped is correct and sufficient,
+      // not just cautious. Gated against session.pendingApprovalDeck fetched fresh
+      // above — never the client-claimed item shape.
+      if (deckAnswer) {
+        if (!session.pendingApprovalDeck || session.pendingApprovalDeck.deckId !== deckAnswer.deckId) {
+          return res.status(409).json({ error: 'This approval deck is no longer awaiting a response.', code: 'APPROVAL_DECK_INVALID' });
+        }
+        const hasBlockedItem = (session.pendingApprovalDeck.items || []).some(
+          (item) => Boolean(item.metaWriteManifestDigest) || item.immutable === true,
+        );
+        if (hasBlockedItem) {
+          return res.status(403).json({ error: 'This shared link cannot approve a write or a locked decision — only the account owner can.', code: 'APPROVAL_DECK_FORBIDDEN' });
+        }
+        const result = await agentModeService.submitApprovalDeckAnswers(session.sessionId, deckAnswer.deckId, deckAnswer.answers, 'user');
+        if (result.outcome === 'invalid') {
+          return res.status(409).json({ error: result.reason, code: 'APPROVAL_DECK_INVALID' });
+        }
+        if (result.outcome === 'conflict') {
+          return res.status(409).json({ error: 'This approval deck was already answered by a concurrent request.', code: 'APPROVAL_DECK_INVALID' });
+        }
+        answeredApprovalDeck = result.answeredDeck;
+        if (answeredApprovalDeck?.answers) {
+          approvalDeckAnswerMeta = { deckId: deckAnswer.deckId, answers: answeredApprovalDeck.answers };
+        }
+        const rejections = (deckAnswer.answers || [])
+          .filter((a: any) => a?.verdict === 'reject' && typeof a?.freeText === 'string' && a.freeText.trim())
+          .map((a: any) => ({ itemId: a.itemId, correction: a.freeText.trim() }));
+        const commented = (deckAnswer.answers || [])
+          .filter((a: any) => a?.verdict === 'comment' && typeof a?.freeText === 'string' && a.freeText.trim())
+          .map((a: any) => ({ itemId: a.itemId, comment: a.freeText.trim() }));
+        // Non-write deck (the only kind reachable here — the block above refuses
+        // any write item) — see generateResponse's identical comment for why
+        // 'nothing_approved' is wrong for a pure question deck: submitApprovalDeckAnswers
+        // only ever describes WRITE execution outcomes in `summary`, so a question deck
+        // resolves every non-comment item's actual selection into `selections` instead.
+        const deckItems = answeredApprovalDeck?.items ?? [];
+        const isWriteDeck = deckItems.some((item) => Boolean(item.metaWriteManifestDigest));
+        const selections = deckItems
+          .filter((item) => !item.metaWriteManifestDigest)
+          .map((item) => {
+            const ans = answeredApprovalDeck?.answers?.find((a) => a.itemId === item.itemId);
+            if (!ans || ans.verdict === 'comment') return null;
+            const pickedOption = item.options?.find((o) => o.id === ans.verdict);
+            return { itemId: item.itemId, question: item.question, selected: pickedOption?.label ?? ans.verdict };
+          })
+          .filter((s): s is { itemId: string; question: string; selected: string } => s !== null);
+        const deckOutcomeStatus = isWriteDeck ? (result.summary?.status ?? 'nothing_approved') : 'answered';
+        const deckOutcomeDirective = `[Approval deck outcome: ${JSON.stringify({
+          status: deckOutcomeStatus,
+          ...(isWriteDeck ? { items: result.summary?.items ?? [] } : {}),
+          ...(selections.length > 0 ? { selections } : {}),
+          ...(rejections.length > 0 ? { rejectedWithCorrections: rejections } : {}),
+          ...(commented.length > 0 ? { commented } : {}),
+        })}]`;
+        answerAck = answerAck ? `${answerAck}\n\n${deckOutcomeDirective}` : deckOutcomeDirective;
+      }
+
+      // ENG-1635/1644 Phase 1b: abandon the whole deck without answering any item —
+      // safe to allow unconditionally on a shared link (unlike deckAnswer above),
+      // since cancelling never executes or approves anything; it only clears
+      // session.pendingApprovalDeck to null. Mirrors the authenticated path exactly.
+      if (deckCancel) {
+        if (!session.pendingApprovalDeck || session.pendingApprovalDeck.deckId !== deckCancel.deckId) {
+          return res.status(409).json({ error: 'This approval deck is no longer awaiting a response.', code: 'APPROVAL_DECK_INVALID' });
+        }
+        const cleared = await chatbotDb.updateSessionApprovalDeck(session.sessionId, null, {
+          requireStillAwaiting: deckCancel.deckId,
+        });
+        if (!cleared) {
+          return res.status(409).json({ error: 'This approval deck was already answered or cancelled by a concurrent request.', code: 'APPROVAL_DECK_INVALID' });
+        }
+        deckCancelled = true;
+        approvalDeckCancelledMeta = { deckId: deckCancel.deckId };
+        const droppedQuestions = session.pendingApprovalDeck.droppedQuestionDeckPayload;
+        const cancelDirective = droppedQuestions && droppedQuestions.length > 0
+          ? `[Approval deck cancelled by the user — no item in it was approved, rejected, or executed. ` +
+            `Do not treat any pending write as granted. This deck had also dropped ${droppedQuestions.length} ` +
+            `question(s) that were never asked (a write halted in the same turn and took priority): ` +
+            `${JSON.stringify(droppedQuestions.map((q: any) => q.question))}. Re-ask them via present_question_deck, ` +
+            `or ask what they would like to do instead.]`
+          : '[Approval deck cancelled by the user — no item in it was approved, rejected, ' +
+            'or executed. Do not treat any pending write as granted; ask what they would like to do instead.]';
+        answerAck = answerAck ? `${answerAck}\n\n${cancelDirective}` : cancelDirective;
+      }
+
       // ENG-705: this route is registered before `router.use(authenticateToken)`,
       // so the caller is anonymous — but the spend is not. Gate on the share
       // OWNER's allowance (the account `generateSessionResponse` already bills
@@ -10670,8 +10894,8 @@ export const agentModeController = {
           undefined, // pageContext
           undefined, // isDelegatedAccess
           ishareSenderInfo,
-          undefined, // answerAck
-          undefined, // answeredQuestionMeta
+          answerAck, // ENG-1635/1644: make Emma name the deck outcome/cancel in her reply
+          undefined, // answeredQuestionMeta — ask_user_question's own channel, retired
           // ENG-907: this endpoint enforces the same whole-turn cap as the interactive
           // one (withGenerationTimeout is armed on the next line), so hand the loop the
           // deadline too — otherwise an ishare turn is guillotined with nothing to show
@@ -10682,6 +10906,8 @@ export const agentModeController = {
           undefined, // userMessageKind
           Boolean(workPlanInputAnswer),
           typeof clientId === 'string' ? clientId : undefined, // ENG-1495
+          approvalDeckAnswerMeta, // ENG-1635/1644: structured deck answer stamped on the reply
+          approvalDeckCancelledMeta, // ENG-1635/1644: which deck this reply cancelled, if any
           // ENG-2072: a real person (the share-link viewer) is typing this turn —
           // never fall back to session.sessionType here either.
           false,
@@ -10705,6 +10931,12 @@ export const agentModeController = {
         workPlan: response.workPlan,
         skills: response.skills,
         ...(response.workPlanTurnDisposition ? { workPlanTurnDisposition: response.workPlanTurnDisposition } : {}),
+        // ENG-1635/1644: same immediate-sync fields as the authenticated path (see
+        // generateResponse) — lets the optimistic ApprovalDeckCard on a shared link
+        // flip to its locked/answered/cancelled view without a reload.
+        ...(response.pendingApprovalDeck ? { pendingApprovalDeck: response.pendingApprovalDeck } : {}),
+        ...(answeredApprovalDeck ? { answeredApprovalDeck } : {}),
+        ...(deckCancelled ? { deckCancelled: true } : {}),
       });
       } finally {
         releaseSessionGeneration(session.sessionId);
@@ -14752,7 +14984,7 @@ export const agentModeController = {
         maxAttempts: maxAttemptsParam || 5,
         attachments: attachmentsArray,
         // ENG-636: interactive endpoint — the user's live session renders the
-        // pendingUserQuestion card, so a park reaches a human who can answer.
+        // deck-of-one card, so a park reaches a human who can answer.
         parkNotifiable: true,
         // ENG-2072: a real person is watching this turn — never force hands-off
         // work-plan autocomplete, even if this session happens to be scheduled.

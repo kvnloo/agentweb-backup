@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   Box,
   Typography,
@@ -39,7 +39,7 @@ export default function ScheduleList({ taskId, onScheduleUpdated }: ScheduleList
   const [loading, setLoading] = useState(true);
   const { token } = useAuth();
 
-  const fetchSchedules = async () => {
+  const fetchSchedules = useCallback(async () => {
     try {
       const response = await axios.get(
         `${API_URL}/api/schedules/task/${taskId}`,
@@ -57,11 +57,11 @@ export default function ScheduleList({ taskId, onScheduleUpdated }: ScheduleList
     } finally {
       setLoading(false);
     }
-  };
+  }, [taskId, token]);
 
   useEffect(() => {
     fetchSchedules();
-  }, [taskId, token]);
+  }, [taskId, token, fetchSchedules]);
 
   const handleStatusToggle = async (scheduleId: string, currentStatus: string) => {
     try {

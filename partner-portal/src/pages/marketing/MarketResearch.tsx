@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { 
   Box, 
   Typography, 
@@ -72,14 +72,10 @@ const MarketResearch: React.FC = () => {
     });
   }, [isAuthenticated, token]);
 
-  // Load recent tasks when component mounts and user is authenticated
-  useEffect(() => {
-    if (isAuthenticated() && token) {
-      loadRecentTasks();
-    }
-  }, [isAuthenticated, token]);
-
-  const loadRecentTasks = async () => {
+  // Declared above the effect below (which depends on it): a `const` referenced in a dependency
+  // array before its own declaration line is a temporal-dead-zone error at runtime, not just a
+  // stale-closure lint warning.
+  const loadRecentTasks = useCallback(async () => {
     if (!token) {
       console.error('Cannot load tasks: No authentication token available');
       setError('Authentication token is missing. Please try logging out and logging back in.');
@@ -88,7 +84,7 @@ const MarketResearch: React.FC = () => {
 
     setIsLoading(true);
     setError(null);
-    
+
     try {
       console.log('Loading recent tasks...');
       const tasks = await getAllMarketResearch(token);
@@ -96,9 +92,9 @@ const MarketResearch: React.FC = () => {
       setRecentTasks(tasks || []);
     } catch (error) {
       console.error('Error loading tasks:', error);
-      
+
       let errorMessage = 'Failed to load recent research tasks';
-      
+
       if (error instanceof Error) {
         if (error.message.includes('401') || error.message.includes('auth')) {
           errorMessage = 'Authentication error. Please try logging out and logging back in.';
@@ -108,9 +104,9 @@ const MarketResearch: React.FC = () => {
           errorMessage += `: ${error.message}`;
         }
       }
-      
+
       setError(errorMessage);
-      
+
       setSnackbar({
         open: true,
         message: errorMessage,
@@ -119,7 +115,14 @@ const MarketResearch: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [token]);
+
+  // Load recent tasks when component mounts and user is authenticated
+  useEffect(() => {
+    if (isAuthenticated() && token) {
+      loadRecentTasks();
+    }
+  }, [isAuthenticated, token, loadRecentTasks]);
 
   const handleSubmitResearch = async () => {
     if (!token) {

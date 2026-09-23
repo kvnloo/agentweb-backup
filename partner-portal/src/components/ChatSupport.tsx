@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { useLocation } from 'react-router-dom';
 import axios from 'axios';
@@ -164,7 +164,7 @@ const ChatSupport: React.FC = () => {
         }
       };
     }
-  }, [token, isOpen, session?.sessionId]);
+  }, [token, isOpen, session?.sessionId, apiUrl]);
 
   // Update page info when route changes
   useEffect(() => {
@@ -191,7 +191,10 @@ const ChatSupport: React.FC = () => {
       
       setCurrentPage(currentPageInfo);
     }
-  }, [location.pathname, isOpen]);
+    // currentPage/session are read but not just for re-triggering: the internal
+    // `currentPage !== currentPageInfo` guard above already makes a re-run from a session
+    // update (e.g. a new chat message) a no-op once currentPage catches up.
+  }, [location.pathname, isOpen, currentPage, session]);
 
   // Add page info when chat is first opened
   useEffect(() => {
@@ -215,14 +218,9 @@ const ChatSupport: React.FC = () => {
       setCurrentPage(currentPageInfo);
       setShowPageNotification(true);
     }
-  }, [isOpen, session]);
-
-  // Create or get existing chat session
-  useEffect(() => {
-    if (token && isOpen && !session) {
-      fetchOrCreateSession();
-    }
-  }, [token, isOpen]);
+    // The `!currentPage` guard above makes a re-run inert once currentPage is set, so adding
+    // it and location.pathname cannot re-fire this "first open" branch a second time.
+  }, [isOpen, session, currentPage, location.pathname]);
 
   // Manage page title when chat is opened/closed
   useEffect(() => {
@@ -243,9 +241,11 @@ const ChatSupport: React.FC = () => {
   }, [session?.messages]);
 
   useEffect(() => {
-    // Clean up charts when component unmounts
+    // Clean up charts when component unmounts. Capture the ref's current value now — by the
+    // time this cleanup runs, chartRefs.current may already point somewhere else.
+    const charts = chartRefs.current;
     return () => {
-      Object.values(chartRefs.current).forEach(canvas => {
+      Object.values(charts).forEach(canvas => {
         const chart = Chart.getChart(canvas);
         if (chart) {
           chart.destroy();
@@ -254,14 +254,37 @@ const ChatSupport: React.FC = () => {
     };
   }, []);
 
-  const fetchOrCreateSession = async () => {
+  // Create a new chat session manually. useCallback so fetchOrCreateSession (below) and the
+  // effect that calls it can depend on a stable reference instead of a new function every render.
+  const createNewChatSession = useCallback(async () => {
+    try {
+      setIsLoading(true);
+      const createResponse = await axios.post(
+        `${apiUrl}/api/chatbot/sessions?portal=partner`,
+        {
+          currentUrl: window.location.pathname,
+          pageContext: document.querySelector('main')?.innerHTML || ''
+        },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setSession(createResponse.data);
+      // Clear the message input when starting a new chat
+      setMessage('');
+    } catch (error) {
+      console.error('Error creating new chat session:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [apiUrl, token]);
+
+  const fetchOrCreateSession = useCallback(async () => {
     try {
       setIsLoading(true);
       // First try to get existing sessions
       const sessionsResponse = await axios.get(`${apiUrl}/api/chatbot/sessions`, {
         headers: { Authorization: `Bearer ${token}` }
       });
-      
+
       // If there are existing sessions, use the most recent one
       if (sessionsResponse.data && sessionsResponse.data.length > 0) {
         // Sort by updatedAt in descending order to get most recent
@@ -278,7 +301,16 @@ const ChatSupport: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [apiUrl, token, createNewChatSession]);
+
+  // Create or get existing chat session. Placed after fetchOrCreateSession's own declaration —
+  // referencing it in this effect's dependency array before that `const` is initialized would be
+  // a temporal-dead-zone error, not just a stale closure.
+  useEffect(() => {
+    if (token && isOpen && !session) {
+      fetchOrCreateSession();
+    }
+  }, [token, isOpen, session, fetchOrCreateSession]);
 
   const sendMessage = async () => {
     if (!message.trim() || !session || isLoading) return;
@@ -370,28 +402,6 @@ const ChatSupport: React.FC = () => {
     if (msg.role === 'assistant' && typeof msg.content !== 'string') return false;
     return true;
   }) || [], [session?.messages]);
-
-  // Create a new chat session manually
-  const createNewChatSession = async () => {
-    try {
-      setIsLoading(true);
-      const createResponse = await axios.post(
-        `${apiUrl}/api/chatbot/sessions?portal=partner`,
-        { 
-          currentUrl: window.location.pathname,
-          pageContext: document.querySelector('main')?.innerHTML || ''
-        },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      setSession(createResponse.data);
-      // Clear the message input when starting a new chat
-      setMessage('');
-    } catch (error) {
-      console.error('Error creating new chat session:', error);
-    } finally {
-      setIsLoading(false);
-    }
-  };
 
   const renderChart = (content: string) => {
     // Extract chart data from the content

@@ -285,7 +285,7 @@ export default function WorkflowExecutionDetails() {
         setIsAutoRefreshing(false);
       }
     };
-  }, [execution?.status, execution?.tasks, fetchData]);
+  }, [execution, fetchData]);
 
   const getStatusColor = (status: string) => {
     switch (status.toLowerCase()) {
