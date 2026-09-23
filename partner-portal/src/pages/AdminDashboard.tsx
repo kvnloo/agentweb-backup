@@ -77,7 +77,6 @@ import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
 import OnboardingTab from "../components/admin/OnboardingTab";
 import ConnectedAccountsTab from "../components/admin/ConnectedAccountsTab";
-import SourceAccessPanel from "../components/admin/SourceAccessPanel";
 import ContractorsTab from "../components/admin/ContractorsTab";
 import {
   UserGrowthChart,
@@ -6662,7 +6661,6 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
         </TabPanel>
 
         <TabPanel value={tabValue} index={21}>
-          <SourceAccessPanel embedded />
           <ConnectedAccountsTab />
         </TabPanel>
 
