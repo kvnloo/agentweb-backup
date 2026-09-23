@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   Box,
   Button,
@@ -90,7 +90,7 @@ export default function Config() {
   const [shareSuccess, setShareSuccess] = useState('');
   const [userId, setUserId] = useState<string>('');
 
-  const fetchConfigs = async () => {
+  const fetchConfigs = useCallback(async () => {
     try {
       const [configsResponse, sharedConfigsResponse, userResponse] = await Promise.all([
         axios.get(buildApiUrl('/api/config'), {
@@ -136,11 +136,11 @@ export default function Config() {
       console.error('Error fetching configs:', err);
       setError('Failed to fetch configurations');
     }
-  };
+  }, [token]);
 
   useEffect(() => {
     fetchConfigs();
-  }, [token]);
+  }, [fetchConfigs]);
 
   const handleAddConfig = async () => {
     try {

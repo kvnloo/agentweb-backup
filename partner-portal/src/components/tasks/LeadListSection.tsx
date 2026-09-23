@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { Card, CardContent, CardHeader, Box, IconButton, TextField, Typography, CircularProgress, Alert } from "@mui/material";
 import { useAuth } from "../../contexts/AuthContext";
 import { buildApiUrl } from "../../config";
@@ -29,11 +29,7 @@ export const LeadListSection: React.FC<LeadListSectionProps> = ({
   const [isEditing, setIsEditing] = useState(false);
   const [editedContent, setEditedContent] = useState('');
 
-  useEffect(() => {
-    fetchLeadList();
-  }, [taskId]);
-
-  const fetchLeadList = async () => {
+  const fetchLeadList = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
@@ -52,7 +48,11 @@ export const LeadListSection: React.FC<LeadListSectionProps> = ({
     } finally {
       setLoading(false);
     }
-  };
+  }, [taskId, token]);
+
+  useEffect(() => {
+    fetchLeadList();
+  }, [fetchLeadList]);
 
   const handleEdit = () => {
     setIsEditing(true);

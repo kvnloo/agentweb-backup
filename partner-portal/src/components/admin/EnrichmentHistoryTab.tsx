@@ -387,14 +387,14 @@ export default function EnrichmentHistoryTab() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  const buildParams = (days: number, token?: string) => {
+  const buildParams = useCallback((days: number, token?: string) => {
     const endDate = new Date().toISOString();
     const startDate = new Date(Date.now() - (days === 0 ? 0 : days * 86400000));
     if (days === 0) startDate.setHours(0, 0, 0, 0);
     let p = `startDate=${startDate.toISOString()}&endDate=${endDate}`;
     if (token) p += `&nextToken=${encodeURIComponent(token)}`;
     return p;
-  };
+  }, []);
 
   useEffect(() => {
     if (!token) return;
@@ -405,7 +405,7 @@ export default function EnrichmentHistoryTab() {
     setSelectedList(null);
   }, [selectedUser, token]);
 
-  const buildJobUrl = (days: number, paginationToken?: string, listId?: string, userId?: string) => {
+  const buildJobUrl = useCallback((days: number, paginationToken?: string, listId?: string, userId?: string) => {
     const params = buildParams(days, paginationToken);
     // List view: no date filter — show all runs for the list
     if (listId) {
@@ -414,7 +414,7 @@ export default function EnrichmentHistoryTab() {
     }
     if (userId) return buildApiUrl(`/api/admin/users/${userId}/enrichment-jobs?${params}`);
     return buildApiUrl(`/api/admin/enrichment-jobs?${params}`);
-  };
+  }, [buildParams]);
 
   const fetchSeqRef = useRef(0);
 
@@ -436,7 +436,7 @@ export default function EnrichmentHistoryTab() {
     } finally {
       if (seq === fetchSeqRef.current) setLoading(false);
     }
-  }, [token]);
+  }, [token, buildJobUrl]);
 
   const loadMore = useCallback(async () => {
     if (!nextToken) return;
@@ -451,7 +451,7 @@ export default function EnrichmentHistoryTab() {
     } finally {
       setLoadingMore(false);
     }
-  }, [nextToken, timeframeDays, selectedUser, selectedList, token]);
+  }, [nextToken, timeframeDays, selectedUser, selectedList, token, buildJobUrl]);
 
   const sentinelRef = useRef<HTMLDivElement>(null);
 
