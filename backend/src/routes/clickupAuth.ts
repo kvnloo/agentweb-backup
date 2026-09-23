@@ -9,6 +9,8 @@ import { getAccessToken, getWorkspaces, listDocs, listTasks } from '../services/
 import { getClickUpConfig } from '../config/integrations';
 import { canEditItem } from '../services/orgShareService';
 import { getJwtSecret } from '../config/jwt';
+import { canInOrg } from '../services/orgAuthz';
+import { buildClickUpAccessInventory } from '../services/integrationAccessService';
 
 const router = express.Router();
 
@@ -305,6 +307,30 @@ router.get('/status', authenticateToken, async (req: any, res) => {
     console.warn('[ClickUp Status] Error checking status:', error.message);
     // If the token is invalid, report disconnected
     res.json({ connected: false, workspaces: [] });
+  }
+});
+
+// ============================================
+// GET /access-inventory — ENG-2118: org-admin-only, read-only list of every
+// workspace/space/folder/list/doc NAME the connected token can reach. Live
+// from the provider on every call (the "refresh" is just a re-fetch).
+// ============================================
+router.get('/access-inventory', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  try {
+    const user = await userDb.getUserById(userId);
+    if (!user?.orgId) return res.status(403).json({ error: 'Org admin access required' });
+    const org = await orgDb.getOrgById(user.orgId);
+    if (!canInOrg({ userId, orgId: user.orgId, orgRole: (user as any).orgRole }, org, 'org:accounts:read')) {
+      return res.status(403).json({ error: 'Org admin access required' });
+    }
+    const accessToken = await getAccessToken(userId);
+    const inventory = await buildClickUpAccessInventory(accessToken);
+    res.set('Cache-Control', 'no-store');
+    res.json(inventory);
+  } catch (error: any) {
+    console.error('[ClickUp AccessInventory] Error:', error.message);
+    res.status(502).json({ error: 'Failed to read ClickUp access inventory' });
   }
 });
 
