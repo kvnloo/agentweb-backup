@@ -3,6 +3,7 @@ import { imageService } from "../services/imageGeneration";
 import { getSecret } from '../utils/secretsManager';
 import { agentModeService } from '../services/agentModeService';
 import { CONTENT_RESTYLE_MODEL } from '../config';
+import { currentRunFunding } from '../services/funding/runFunding';
 import axios from "axios";
 import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
@@ -436,12 +437,20 @@ ${researchContext}`;
 CRITICAL REQUIREMENT: The article content must be approximately ${finalTargetWords} words in length. This is a hard requirement. The content field in your JSON response must contain at least ${Math.floor(finalTargetWords * 0.9)} words. Write comprehensive, detailed content with multiple sections, examples, and actionable insights to meet this word count. Do not stop writing until you have reached the target word count.`;
     
     // Generate JSON content using LangChain
+    // ENG-1816 F1: this call previously carried no userId, so its spend booked to
+    // "system" and escaped both billing and the funding policy. Read the run's owner
+    // from the ambient store instead of threading a new parameter through this
+    // function's signature.
     const blogData = await llmService.generateJSONContent<{
       title: string;
       description: string;
       content: string;
       imagePrompt: string;
-    }>(systemPrompt, blogPrompt, 'json', undefined, { feature: 'content_gen' });
+    }>(systemPrompt, blogPrompt, 'json', undefined, {
+      feature: 'content_gen',
+      userId: currentRunFunding()?.ownerUserId,
+      billingUserId: currentRunFunding()?.billingUserId,
+    });
 
     // Validate the response structure
     if (!blogData.title || !blogData.content) {
@@ -580,13 +589,19 @@ OUTPUT FORMAT (STRICT JSON):
 
   try {
     const systemInstruction = "You are an expert content editor. Restyle content while preserving key information. Always respond with valid JSON only, no markdown code blocks.";
+    // ENG-1816 F1: this call previously carried no userId, so its spend booked to
+    // "system" and escaped both billing and the funding policy.
     const response = await agentModeService.callLLM(CONTENT_RESTYLE_MODEL, [
       { role: 'system', content: systemInstruction },
       { role: 'user', content: prompt },
     ], {
       temperature: 0.7,
       response_format: { type: 'json_object' },
-      usageContext: { feature: 'content_gen' },
+      usageContext: {
+        feature: 'content_gen',
+        userId: currentRunFunding()?.ownerUserId,
+        billingUserId: currentRunFunding()?.billingUserId,
+      },
       taskClass: 'content_generation',
     });
 

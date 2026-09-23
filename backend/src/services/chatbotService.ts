@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { getAzureClient } from "../utils/llmClients";
+import { currentRunFunding } from "./funding/runFunding";
 import { v4 as uuidv4 } from "uuid";
 import AWS from "aws-sdk";
 import dotenv from "dotenv";
@@ -62,11 +63,17 @@ export const dynamodb = new AWS.DynamoDB.DocumentClient({
 });
 
 // Metered client for embeddings (knowledge-base semantic search). Uses the
-// separate EMBEDDINGS endpoint/key/api-version the module singleton used. No
-// userId is in scope on this path, so usage is attributed to platform overhead.
+// separate EMBEDDINGS endpoint/key/api-version the module singleton used.
+// ENG-1816 F1: previously carried no userId, so usage was attributed to platform
+// overhead. Read the run's owner from the ambient store instead of threading a new
+// parameter through this function and its two call sites in findRelevantChunks.
 function embeddingsClientFor() {
   return getAzureClient(
-    { feature: "embeddings" },
+    {
+      feature: "embeddings",
+      userId: currentRunFunding()?.ownerUserId,
+      billingUserId: currentRunFunding()?.billingUserId,
+    },
     process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT || "text-embedding-3-large",
     {
       endpoint: process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT,
