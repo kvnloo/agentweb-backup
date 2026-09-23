@@ -464,6 +464,31 @@ describe('executePreparedTools', () => {
     expect(result.pendingCounterUpdates).toEqual({});
   });
 
+  // ENG-2086: a tool can fail by echoing its own (unbounded) result back inside
+  // `error` — call_google_ads_reporting_api's serving_chain mode JSON.stringifies
+  // the full campaign/ad-group/keyword tree into `error` whenever the account
+  // isn't fully READY/DELIVERING. Unlike the success path (which offloads/caps
+  // `toolContent` above), this error branch had NO size guard at all, so a
+  // multi-MB error message went out to the LLM provider unbounded and
+  // OpenRouter/Gemini 400'd on the oversized request (prod session
+  // d02669e9-c3b8-4b65-ab51-a9c045c63b65, surfaced as an opaque "please
+  // rephrase" to the user). This pins that the error branch is capped the same
+  // way the success branch caps `toolContent`.
+  it('caps an oversized error message before it reaches the LLM', async () => {
+    const huge = 'X'.repeat(400_000);
+    const ports = makePorts({
+      executePreparedAgentTool: async () => {
+        throw new Error(huge);
+      },
+    });
+    const input = makeInput([toolCall('a', 'call_google_ads_reporting_api', '{}')], ports);
+    await executePreparedTools(input);
+
+    const stored = input.messages[0].content as string;
+    expect(stored.length).toBeLessThan(400_000);
+    expect(stored).toContain('[Error message truncated for size — original length: 400000 chars]');
+  });
+
   // ENG-1626: a ToolResultPolicyBlockedError is a tool refusing BY DESIGN (e.g.
   // set_work_plan_status's out-of-order/missing-calls gates, which return
   // {success:false, blocked:true, reason:'...'} without throwing). It downgrades
