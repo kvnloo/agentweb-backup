@@ -97,3 +97,72 @@ export async function buildClickUpAccessInventory(
   }
   return { source: 'clickup', connected: true, identity, checkedAt, workspaces: tree, errors };
 }
+
+// ── Google Drive ────────────────────────────────────────────────────────────
+
+export interface DriveAccessInventory {
+  source: 'google_drive';
+  connected: boolean;
+  identity: { email: string | null } | null;
+  checkedAt: string;
+  sharedDrives: AccessNode[];
+  folders: AccessNode[];
+  truncated: boolean;
+  errors: string[];
+}
+
+/** Minimal slice of the googleapis drive_v3 client this inventory uses. */
+export interface DriveListClient {
+  drives: { list(params: any): Promise<{ data: { drives?: any[]; nextPageToken?: string } }> };
+  files: { list(params: any): Promise<{ data: { files?: any[]; nextPageToken?: string } }> };
+}
+
+const DRIVE_FOLDER_CAP = 1000;
+
+/**
+ * Lists shared drives and folders (names/ids only) the connected Drive token
+ * can see. Never lists file contents or non-folder files.
+ */
+export async function buildDriveAccessInventory(
+  drive: DriveListClient | null,
+  email: string | null,
+  now: () => Date = () => new Date(),
+): Promise<DriveAccessInventory> {
+  const checkedAt = now().toISOString();
+  const base = { source: 'google_drive' as const, checkedAt, sharedDrives: [] as AccessNode[], folders: [] as AccessNode[], truncated: false, errors: [] as string[] };
+  if (!drive) return { ...base, connected: false, identity: null };
+  const result: DriveAccessInventory = { ...base, connected: true, identity: { email } };
+  try {
+    let pageToken: string | undefined;
+    do {
+      const { data } = await drive.drives.list({ pageSize: 100, pageToken, fields: 'nextPageToken, drives(id, name)' });
+      result.sharedDrives.push(...(data.drives || []).map((d: any) => ({ id: String(d.id), name: String(d.name), type: 'workspace' as const })));
+      pageToken = data.nextPageToken;
+    } while (pageToken);
+  } catch (e) {
+    result.errors.push(`shared drives: ${describe(e)}`);
+  }
+  try {
+    let pageToken: string | undefined;
+    do {
+      const { data } = await drive.files.list({
+        q: "mimeType='application/vnd.google-apps.folder' and trashed=false",
+        pageSize: 200,
+        pageToken,
+        fields: 'nextPageToken, files(id, name)',
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+      });
+      result.folders.push(...(data.files || []).map((f: any) => ({ id: String(f.id), name: String(f.name), type: 'folder' as const })));
+      pageToken = data.nextPageToken;
+      if (result.folders.length >= DRIVE_FOLDER_CAP) {
+        result.truncated = Boolean(pageToken) || result.folders.length > DRIVE_FOLDER_CAP;
+        result.folders = result.folders.slice(0, DRIVE_FOLDER_CAP);
+        break;
+      }
+    } while (pageToken);
+  } catch (e) {
+    result.errors.push(`folders: ${describe(e)}`);
+  }
+  return result;
+}
