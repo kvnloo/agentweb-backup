@@ -3276,10 +3276,15 @@ async function syncLeadCaptureForPage(
           `KEEP being filed into the list you just removed until the route is repaired.`
         );
       }
+      // Re-submitting the SAME list is not a change at all: the untouched deployed route
+      // already maps this path to exactly the list that was asked for, so there is nothing
+      // to warn about. Reachable from an idempotent PATCH retry or re-picking the current
+      // list. Warning here would claim leads are not being filed while they are.
+      if (page.leadListId === leadListId) return undefined;
       // A SWITCH is not a first attach. The deployed route still carries the old mapping, so
       // submissions keep arriving — into the PREVIOUS list, silently. "Will not be filed"
       // would be wrong in the same direction the detach arm above was wrong.
-      if (page.leadListId && page.leadListId !== leadListId) {
+      if (page.leadListId) {
         return (
           `The lead list was saved, but this site's ${untouched} Submissions from this page ` +
           `will KEEP being filed into the previously attached list until the route is repaired.`

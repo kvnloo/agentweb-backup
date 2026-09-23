@@ -173,10 +173,12 @@ async function sweepStrandedSmokeLeads(listId: string, beforeIso: string): Promi
  * rather than trusting the id.
  */
 async function claimSmokeTestPhone(listId: string): Promise<{ phone: string; claimed: boolean }> {
+  const probed = new Set<string>();
   for (let attempt = 0; attempt < 8; attempt++) {
     const candidate = buildSmokeTestPhone();
     const id = phoneLeadId(candidate);
     if (!id) return { phone: candidate, claimed: false };
+    probed.add(candidate);
     try {
       const occupied = await crmDb.getLeadById(listId, id, { consistentRead: true });
       if (!occupied) return { phone: candidate, claimed: true };
@@ -187,16 +189,25 @@ async function claimSmokeTestPhone(listId: string): Promise<{ phone: string; cla
       return { phone: candidate, claimed: false };
     }
   }
-  // Every draw was taken — the list is saturated with stranded rows. Return a FRESH draw
-  // rather than `lastCandidate`, which we just proved occupied: submitting a known-collided
-  // number guarantees webhooks.ts adopts the existing row without rewriting createdAt, so
-  // the freshness rule below can never match and the run is a certain false FAIL that
-  // strands yet another row. An unproven draw is only ~1% likely to collide. Unclaimed
-  // either way, so the poll stays strict — and say so: this is worth seeing in the logs.
+  // Eight consecutive draws all landed on occupied ids. Return one we have NOT proven
+  // occupied: re-submitting a known-collided number guarantees webhooks.ts adopts the
+  // existing row without rewriting createdAt, so the freshness rule in the poll can never
+  // match and the run is a CERTAIN false FAIL that strands yet another row.
+  //
+  // This improves the odds, it does not fix them, and the arithmetic is worth stating
+  // because the obvious reading is far too optimistic: 8 hits in a row out of a 100-value
+  // block is strong evidence the block is nearly full (uniform prior → Beta(9,1), so ~90%
+  // occupancy), not that we were unlucky. Expect this run to fail too. The actual remedy is
+  // the sweep catching up — which is what the warning below is for, and why it names the
+  // list. Unclaimed either way, so the poll stays strict.
+  let fallback = buildSmokeTestPhone();
+  for (let attempt = 0; attempt < 8 && probed.has(fallback); attempt++) {
+    fallback = buildSmokeTestPhone();
+  }
   console.warn(
     `[smokeTest] every synthetic phone id is already occupied in list ${listId} — the sweep is not keeping up`
   );
-  return { phone: buildSmokeTestPhone(), claimed: false };
+  return { phone: fallback, claimed: false };
 }
 
 async function pollForLeadByPhone(

@@ -41,6 +41,8 @@ function emitResponse({
 }
 
 /** The default single-email-field lander shape returned by the mocked discovery. */
+import { phoneLeadId } from "../utils/smokeTestLead";
+
 const SINGLE_EMAIL_FIELD = {
   scope: 'form[data-agentweb-smoke-form="1"] ',
   fields: [
@@ -879,6 +881,37 @@ describe("runGenerationSmokeTest", () => {
     expect(mockDeleteLead).not.toHaveBeenCalled();
     const persisted = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
     expect(persisted.ok).toBe(false);
+  });
+
+  it("SATURATED LIST: the fallback phone is not one the claim already proved occupied", async () => {
+    // Every id is taken, so the claim exhausts its 8 draws and gives up. It must NOT then
+    // submit the last number it probed: webhooks.ts would adopt that existing row without
+    // rewriting createdAt, the poll's freshness rule could never match, and the run would be
+    // a CERTAIN false FAIL that strands another row — deepening the saturation that caused
+    // it. (An unprobed draw is not likely to be free either — 8 hits out of 100 implies
+    // ~90% occupancy — but it is the only move that can succeed at all.)
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD,
+      fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+    });
+    mockGetLeadById.mockImplementation(async (_listId: string, leadId: string) => ({
+      leadId, phone: "4155550199", createdAt: "2000-01-01T00:00:00.000Z",
+    }));
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    const probedIds = mockGetLeadById.mock.calls.slice(0, 8).map((c: any[]) => c[1]);
+    expect(probedIds).toHaveLength(8);
+    // Genuinely redrawing a new number each attempt, not re-probing one id.
+    expect(new Set(probedIds).size).toBeGreaterThan(1);
+
+    const filled = String(
+      ((mockPage.fill as jest.Mock).mock.calls.find((c) => c[0] === "#phone") || [])[1] || ""
+    );
+    expect(filled).toMatch(/^41555501\d{2}$/);
+    const filledId = phoneLeadId(filled);
+    expect(filledId).toBeTruthy();
+    expect(probedIds).not.toContain(filledId);
   });
 
   it("DIAGNOSIS: an iframe-embedded form is not reported as 'no lead form'", async () => {

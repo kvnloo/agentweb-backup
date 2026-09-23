@@ -4641,11 +4641,11 @@ const isScannableSource = (path: string): boolean =>
   /\.(tsx|ts|jsx|js)$/.test(path) &&
   // Any *.config.*, not a list of the six we happened to have seen: v0 ships sanity,
   // contentlayer and playwright configs too, and a name list silently readmits each new one.
-  !/(^|\/)[^/]+\.config\.[cm]?[jt]sx?$/.test(path) &&
+  !/(^|\/)[^/]+\.config\.[jt]sx?$/.test(path) &&
   // Service workers are not page source wherever they are emitted. `public/` is the
   // conventional home and is never compiled by Next, but the root is just as common.
   !/^public\//.test(path) &&
-  !/(^|\/)(sw|service-worker)\.[cm]?[jt]s$/.test(path);
+  !/(^|\/)(sw|service-worker)\.[jt]sx?$/.test(path);
 
 export function hasLeadCaptureForm(files: Array<{ path: string; content: Buffer }>): boolean {
   const source = files

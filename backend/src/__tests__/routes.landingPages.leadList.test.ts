@@ -249,6 +249,45 @@ describe('PATCH /generated/:id/lead-list — captureRouteSkipped warning (ENG-44
     expect(res.body.captureSyncWarning).not.toMatch(/will not be filed/);
   });
 
+  // Re-picking the list that is already attached. The deployed route is untouched and
+  // already maps this path to that same list, so submissions ARE being filed — the
+  // first-attach wording ("will not be filed") is the one string that is definitely false
+  // here. Reachable from an idempotent PATCH retry.
+  it('SAME LIST re-submitted: no warning at all', async () => {
+    mockGetLandingPageById.mockResolvedValue({ ...deployedPage, leadListId: 'l2' });
+    const res = await request(app)
+      .patch('/api/landing-pages/v0/generated/p1/lead-list')
+      .send({ leadListId: 'l2' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.captureSyncWarning).toBeUndefined();
+  });
+
+  // ENG-449: `2ecef1ff` fixed these two returns and shipped with no gate — the pre-push
+  // hook skipped every suite because this file is a hub file, so a revert would be silent.
+  it('MALFORMED REPO URL: says "removed", not "saved", on a detach', async () => {
+    mockGetLandingPageById.mockResolvedValue({
+      ...deployedPage, leadListId: 'l1', githubRepoUrl: 'not-a-github-url',
+    });
+    const res = await request(app)
+      .patch('/api/landing-pages/v0/generated/p1/lead-list')
+      .send({ leadListId: null });
+
+    expect(res.status).toBe(200);
+    expect(res.body.captureSyncWarning).toMatch(/^Lead list removed, but this page's GitHub repo URL is malformed/);
+  });
+
+  it('SYNC FAILURE: says "removed", not "saved", on a detach', async () => {
+    mockGetLandingPageById.mockResolvedValue({ ...deployedPage, leadListId: 'l1' });
+    mockSyncLeadCapture.mockRejectedValue(new Error('github exploded'));
+    const res = await request(app)
+      .patch('/api/landing-pages/v0/generated/p1/lead-list')
+      .send({ leadListId: null });
+
+    expect(res.status).toBe(200);
+    expect(res.body.captureSyncWarning).toMatch(/^Lead list removed, but the live site was not updated/);
+  });
+
   it('no warning when the capture route was written', async () => {
     mockGetLandingPageById.mockResolvedValue({ ...deployedPage, leadListId: 'l1' });
     mockSyncLeadCapture.mockResolvedValue({ committed: true, pushedCommitSha: 'abc1234' });

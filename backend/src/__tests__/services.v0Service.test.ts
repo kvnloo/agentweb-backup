@@ -6720,7 +6720,10 @@ describe("the enhancement validators must read the same files the ENG-2080 gate 
     // The first version named next/tailwind/postcss/eslint/vite/jest. v0 also emits sanity,
     // contentlayer and playwright configs, and a name list silently readmits each new one —
     // the same false positive, one release later.
-    for (const path of ["sanity.config.js", "contentlayer.config.js", "playwright.config.ts", "next.config.mjs"]) {
+    // next.config.mjs is deliberately NOT in this list: .mjs fails the extension gate before
+    // either config regex is consulted, so it would pass identically under the old six-name
+    // rule — a decoration, not an assertion.
+    for (const path of ["sanity.config.js", "contentlayer.config.js", "playwright.config.ts", "foo/bar.config.jsx"]) {
       expect(hasLeadCaptureForm(f(path, `module.exports = { proxy: "/api/capture" };`))).toBe(false);
     }
     // A file merely NAMED config.js is page source, not configuration.
@@ -6730,7 +6733,7 @@ describe("the enhancement validators must read the same files the ENG-2080 gate 
   it("a service worker is not page source wherever it is emitted", () => {
     // `public/` is the conventional home and is start-anchored, so a worker at the repo root
     // or under a sub-app slipped through the path check.
-    for (const path of ["sw.js", "service-worker.js", "my-app/public/sw.js"]) {
+    for (const path of ["sw.js", "service-worker.js", "my-app/public/sw.js", "sw.jsx", "app/service-worker.tsx"]) {
       expect(hasLeadCaptureForm(f(path, `self.addEventListener('fetch', e => { /* "/api/capture" */ });`))).toBe(false);
     }
   });
