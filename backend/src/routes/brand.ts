@@ -433,6 +433,7 @@ router.post(
         parsedIsGradient = typeof isGradient === 'string' ? isGradient === 'true' : Boolean(isGradient);
       }
 
+      const saveCondition = brandVersionGuard(existingBrandGuidelines, EXPECTED_BRAND_NAMES);
       const brandGuidelinesData = {
         ...existingBrandGuidelines,
         rev: uuidv4(),
@@ -472,10 +473,18 @@ router.post(
         `[BRAND DEBUG] About to update user with email: ${user.email}`
       );
 
-      // If user is in an org, save to org; otherwise save to user. The
+      // Save to the record that supplied the snapshot. The
       // admin-or-listed-editor gate ran above, before the owner-record read.
       if (user.orgId) {
-        await orgDb.updateOrg(user.orgId, { brandGuidelines: brandGuidelinesData });
+        // An inherited brand still lives on the owner record. Save there, as
+        // asset deletion does, so the condition checks the snapshot's source.
+        const options = { condition: saveCondition };
+        if (postOrg && !postOrg.brandGuidelines && existingBrandGuidelines) {
+          await userDb.updateUser(postOrg.ownerUserId || user.userId,
+            { brandGuidelines: brandGuidelinesData }, options);
+        } else {
+          await orgDb.updateOrg(user.orgId, { brandGuidelines: brandGuidelinesData }, options);
+        }
         console.log(`[BRAND DEBUG] Updated org ${user.orgId} brand guidelines`);
         // Onboarding v2 Phase 1: flip brand-build status to ready if we were
         // building. Uses the user record (not the org) because the status
@@ -508,7 +517,9 @@ router.post(
         Key: { email: user.email }, // Use email as primary key
         UpdateExpression:
           "SET brandGuidelines = :brandGuidelines, updatedAt = :updatedAt",
+        ConditionExpression: saveCondition.expression,
         ExpressionAttributeValues: {
+          ...saveCondition.values,
           ":brandGuidelines": brandGuidelinesData,
           ":updatedAt": new Date().toISOString(),
         },
@@ -558,6 +569,11 @@ router.post(
         },
       });
     } catch (error) {
+      if ((error as any)?.code === 'ConditionalCheckFailedException') {
+        return res.status(409).json({
+          error: "Brand guidelines are being updated. Please refresh and try again.",
+        });
+      }
       console.error("[BRAND DEBUG] Error saving brand guidelines:", error);
       res.status(500).json({
         error: "Failed to save brand guidelines",

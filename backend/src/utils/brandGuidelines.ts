@@ -8,7 +8,7 @@ export const CORE_BRAND_FIELDS = [
 export function record(value: unknown): Record<string, any> {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
-const text = (value: unknown): string => typeof value === 'string' ? value.trim() : '';
+const text = (value: unknown): string => typeof value === 'string' ? value.trim().slice(0, 300) : '';
 const first = (...values: unknown[]): string => values.map(text).find(Boolean) || '';
 const strings = (value: unknown): string[] => Array.isArray(value) ? value.map(text).filter(Boolean) : [];
 export const isEmptyBrandField = (value: unknown): boolean =>
@@ -26,18 +26,14 @@ export function fillEmptyBrandGuidelines(existing: unknown, strategy: unknown, o
   const market = record(strategy);
   const source = record(onboarding);
   const overview = record(market.businessOverview);
-  const icps = Array.isArray(market.icp) ? market.icp.map(record) : [];
-  const propositions = icps.map(icp => text(icp.valueProposition)).filter(Boolean);
   const candidates: Record<string, string | string[]> = {
     brandName: first(market.brandName, market.companyName, overview.companyName, source.companyName),
     domain: first(market.domain, overview.domain, source.productDomain, source.companyUrl),
     tagline: first(market.tagline, overview.tagline, source.tagline),
-    valueProposition: first(market.valueProposition, overview.valueProposition, source.valueProposition,
-      propositions.join('\n'), market.businessOverview),
-    targetAudience: first(market.targetAudience, overview.targetAudience, source.targetAudience,
-      icps.map(icp => first(icp.description, icp.title)).filter(Boolean).join('\n')),
+    valueProposition: first(market.valueProposition, overview.valueProposition, source.valueProposition),
+    targetAudience: first(market.targetAudience, overview.targetAudience, source.targetAudience),
     toneOfVoice: first(market.toneOfVoice, overview.toneOfVoice, source.toneOfVoice),
-    keyMessages: [market.keyMessages, overview.keyMessages, source.keyMessages, propositions]
+    keyMessages: [market.keyMessages, overview.keyMessages, source.keyMessages]
       .map(strings).find(values => values.length > 0) || [],
   };
   const patch = Object.fromEntries(Object.entries(candidates)

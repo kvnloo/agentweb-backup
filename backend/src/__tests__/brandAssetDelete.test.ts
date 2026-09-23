@@ -1007,3 +1007,51 @@ describe('POST /api/brand/guidelines — MCP partial update persistence', () => 
     expect(saved.rev).not.toBe(brand.rev);
   });
 });
+
+
+describe('POST guidelines concurrent attachment deletion', () => {
+  it('saves an inherited org brand conditionally on the owner record', async () => {
+    const user = { ...soloUser, orgId: 'org', orgRole: 'owner' };
+    mockDynamoGet.mockResolvedValue({ Item: user });
+    mockGetOrgById.mockResolvedValue({ orgId: 'org', ownerUserId: 'me' });
+    const res = await request(makeApp(user)).post('/api/brand/guidelines').send({ brandName: 'Changed' });
+    expect(res.status).toBe(201);
+    expect(mockUpdateOrg).not.toHaveBeenCalled();
+    expect(mockUpdateUser).toHaveBeenCalledWith('me', expect.objectContaining({
+      brandGuidelines: expect.objectContaining({ attachments: ownBrand.attachments,
+        brandData: expect.objectContaining({ brandName: 'Changed' }) }),
+    }), { condition: { expression: 'attribute_not_exists(brandGuidelines.updatedAt) AND attribute_not_exists(brandGuidelines.rev)', values: {} } });
+  });
+
+  it.each(['solo', 'org', 'owner-fallback'])('rejects a stale revision and preserves the deletion (%s)', async owner => {
+    const inOrg = owner !== 'solo';
+    const before = { ...ownBrand, rev: 'read-rev', updatedAt: '2026-09-22T00:00:00.000Z' };
+    let stored = { ...before, rev: 'deleted-rev', attachments: [ownBrand.attachments[0]] };
+    const user = { ...soloUser, brandGuidelines: before, ...(inOrg ? { orgId: 'org', orgRole: 'owner' } : {}) };
+    mockDynamoGet.mockResolvedValue({ Item: user });
+    mockGetOrgById.mockResolvedValue({ orgId: 'org', ownerUserId: 'me',
+      ...(owner === 'org' ? { brandGuidelines: before } : {}) });
+    const write = (next: any, expression: string, values: any) => {
+      expect(expression).toContain('brandGuidelines.updatedAt = :expectedBrandUpdatedAt');
+      expect(expression).toContain('brandGuidelines.rev = :expectedBrandRev');
+      expect(values[':expectedBrandUpdatedAt']).toBe(before.updatedAt);
+      expect(values[':expectedBrandRev']).toBe(before.rev);
+      if (values[':expectedBrandRev'] !== stored.rev) {
+        throw Object.assign(new Error('conflict'), { code: 'ConditionalCheckFailedException' });
+      }
+      stored = next;
+      return {};
+    };
+    const writeMock = owner === 'solo' ? mockDynamoUpdate : owner === 'org' ? mockUpdateOrg : mockUpdateUser;
+    if (owner === 'solo') {
+      writeMock.mockImplementationOnce(p => write(p.ExpressionAttributeValues[':brandGuidelines'], p.ConditionExpression, p.ExpressionAttributeValues));
+    } else {
+      writeMock.mockImplementationOnce((_id, patch, options) => write(patch.brandGuidelines, options?.condition?.expression, options?.condition?.values));
+    }
+    const res = await request(makeApp(user)).post('/api/brand/guidelines').send({ brandName: 'Changed' });
+    expect(res.status).toBe(409);
+    expect(stored.attachments).toEqual([ownBrand.attachments[0]]);
+    expect(stored.rev).toBe('deleted-rev');
+    expect(writeMock).toHaveBeenCalledTimes(1);
+  });
+});

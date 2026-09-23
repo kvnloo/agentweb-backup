@@ -7,7 +7,7 @@ jest.mock('../services/db', () => ({
 }));
 const users = userDb as jest.Mocked<typeof userDb>;
 const orgs = orgDb as jest.Mocked<typeof orgDb>;
-const strategy = { businessOverview: 'IT management', tagline: 'Easy IT', toneOfVoice: 'Direct',
+const strategy = { valueProposition: 'Manage endpoints easily', targetAudience: 'IT teams at growing companies', keyMessages: ['Manage endpoints easily'], businessOverview: 'IT management', tagline: 'Easy IT', toneOfVoice: 'Direct',
   icp: [{ title: 'IT teams', description: 'IT teams at growing companies', valueProposition: 'Manage endpoints easily' }] };
 const source = { companyName: 'NinjaOne', productDomain: 'ninjaone.com' };
 
@@ -134,4 +134,21 @@ it('creates the canonical brand shape without inventing unavailable copy', () =>
   expect(result.guidelines.brandData).toMatchObject({ brandName: 'NinjaOne', domain: 'ninjaone.com',
     tagline: '', primaryColor: '', fontFamily: '', brandValues: [], founders: [], keyMessages: [] });
   expect(result.guidelines.attachments).toEqual([]);
+});
+
+
+it('never repurposes businessOverview or ICP prose into brand copy', () => {
+  const result = fillEmptyBrandGuidelines({}, { businessOverview: 'Long business history. '.repeat(100),
+    icp: [{ description: 'An ICP description', title: 'An ICP title', valueProposition: 'Segment-specific copy' }] }, source);
+  expect(result.guidelines.brandData.valueProposition).toBe('');
+  expect(result.guidelines.brandData.targetAudience).toBe('');
+  expect(result.guidelines.brandData.keyMessages).toEqual([]);
+});
+
+it('validates explicit source shapes and caps each source string at 300 characters', () => {
+  const result = fillEmptyBrandGuidelines({}, { valueProposition: 'x'.repeat(500), targetAudience: {},
+    keyMessages: [null, 7, 'y'.repeat(500)], domain: ['bad'], brandName: true },
+    { companyName: 'Acme', targetAudience: 'Teams' });
+  expect(result.guidelines.brandData).toMatchObject({ brandName: 'Acme', domain: '',
+    valueProposition: 'x'.repeat(300), targetAudience: 'Teams', keyMessages: ['y'.repeat(300)] });
 });
