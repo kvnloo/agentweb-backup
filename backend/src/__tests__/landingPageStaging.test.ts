@@ -576,7 +576,7 @@ describe("POST /publish", () => {
     // Verify force-patch was called on main with the draft SHA
     expect(mockedAxios.patch).toHaveBeenCalledWith(
       expect.stringContaining("/git/refs/heads/main"),
-      expect.objectContaining({ sha: "draft-tip-sha-abc", force: true }),
+      expect.objectContaining({ sha: "draft-tip-sha-abc", force: false }),
       expect.any(Object)
     );
   });

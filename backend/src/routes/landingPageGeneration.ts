@@ -2012,16 +2012,38 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
     } catch (mergeErr: any) {
       if (mergeErr.response?.status !== 409) throw mergeErr;
 
-      console.warn(`[LP GENERATION] Standard merge returned 409; force-advancing main to draft branch tip`);
+      // Force-advancing main to the draft tip is only safe when the draft already
+      // contains every main commit. If main moved on since the draft was cut, a force
+      // update silently reverts those commits (other pages, manual PRs) in production.
+      try {
+        const cmp = await axios.get<any>(
+          `${repoBase}/compare/${draftSha}...main`,
+          { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+        );
+        if (Number(cmp.data?.ahead_by) > 0) {
+          return res.status(409).json({
+            error: "draft_behind_main",
+            message: `The draft is missing ${cmp.data.ahead_by} commit(s) that are already on main and conflicts with them. Publishing would revert live changes. Re-run the edit so it is rebuilt on current main.`,
+          });
+        }
+      } catch (cmpErr: any) {
+        return res.status(409).json({
+          error: "draft_divergence_unknown",
+          message: "Could not confirm the draft contains main; refusing to force-publish.",
+        });
+      }
+
+      console.warn(`[LP GENERATION] Standard merge returned 409; fast-forwarding main to draft branch tip`);
 
       // The post-Tests ref read above proved that this exact SHA is still the
       // draft tip. Use that immutable SHA here, never a newer untested branch tip.
       if (await refuseIfConsentWithdrawn()) return;
 
-      // Force-update main to the tested draft SHA.
+      // Fast-forward main to the tested draft SHA. force:false makes GitHub reject
+      // the update if main advanced between the compare above and this PATCH.
       await axios.patch<any>(
         `${repoBase}/git/refs/heads/main`,
-        { sha: draftSha, force: true },
+        { sha: draftSha, force: false },
         { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
       );
       mergeCommitSha = draftSha;
