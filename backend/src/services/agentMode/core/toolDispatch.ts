@@ -1493,7 +1493,24 @@ export async function executePreparedTools(
       // classifier the telemetry uses — so a terminal failure (auth, provider
       // rejection, schema reject) carries a hard stop signal instead of inviting
       // a retry spiral.
-      const errMsg = error instanceof Error ? error.message : String(error);
+      //
+      // ENG-2086: unlike the success path above, this branch had no size guard at
+      // all. A tool can fail by echoing its own (unbounded) result back inside
+      // `error` — call_google_ads_reporting_api's serving_chain mode does exactly
+      // this, JSON.stringify-ing the full campaign/ad-group/keyword tree into
+      // `error` whenever the account isn't fully READY/DELIVERING. For a large
+      // account that reached multiple MB, went out to the LLM provider unbounded
+      // (this branch is on the hot path to the next request, not just persistence),
+      // and OpenRouter/Gemini 400'd on the oversized request — surfaced to the user
+      // as an opaque "please rephrase" (prod session d02669e9-c3b8-4b65-ab51-a9c045c63b65,
+      // 2026-09-22). Cap it the same way the success path caps `toolContent`.
+      const rawErrMsg = error instanceof Error ? error.message : String(error);
+      const errMsg = rawErrMsg.length > maxToolContentSize
+        ? sealTruncatedPayloadWithNotice(
+          rawErrMsg.substring(0, maxToolContentSize),
+          `[Error message truncated for size — original length: ${rawErrMsg.length} chars]`,
+        )
+        : rawErrMsg;
       const errorContent = appendRetryabilityGuidance(
         ports.formatToolError(toolCall.function.name, errMsg),
         classifyToolErrorClass(error),
