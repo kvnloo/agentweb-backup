@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
 import { buildApiUrl } from '../config';
 import { useAuth } from '../contexts/AuthContext';
@@ -149,13 +149,7 @@ export default function ClientHealth() {
   const [notes, setNotes] = useState<Record<string, string>>({});
   const [savingNote, setSavingNote] = useState(false);
 
-  useEffect(() => {
-    if (user?.isAdmin) {
-      fetchClients();
-    }
-  }, [token, user?.isAdmin]);
-
-  const fetchClients = async () => {
+  const fetchClients = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
@@ -172,7 +166,13 @@ export default function ClientHealth() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [token]);
+
+  useEffect(() => {
+    if (user?.isAdmin) {
+      fetchClients();
+    }
+  }, [token, user?.isAdmin, fetchClients]);
 
   const fetchClientDetail = async (client: ClientSummary) => {
     setSelectedClient(client);

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import {
   useParams,
   useNavigate,
@@ -477,7 +477,7 @@ export default function TaskDetails() {
   const showActions =
     !isAdminRoute || (task && user && task.userId === user.userId);
 
-  const fetchTask = async () => {
+  const fetchTask = useCallback(async () => {
     if (!taskId) return;
     try {
       const [taskResponse, executionsResponse] = await Promise.all([
@@ -499,7 +499,20 @@ export default function TaskDetails() {
       setError(error.response?.data?.message || "Failed to fetch task details");
       return null;
     }
-  };
+  }, [taskId, token]);
+
+  const getLatestExecution = useCallback(() => {
+    if (executions.length === 0) return null;
+    const nonArchivedExecutions = executions.filter(
+      (execution) => !execution.archived
+    );
+    if (nonArchivedExecutions.length === 0) return null;
+    return nonArchivedExecutions.reduce((latest, current) => {
+      return new Date(current.startTime) > new Date(latest.startTime)
+        ? current
+        : latest;
+    });
+  }, [executions]);
 
   useEffect(() => {
     const fetchTaskAndExecutions = async () => {
@@ -523,7 +536,7 @@ export default function TaskDetails() {
     }, 5000);
 
     return () => clearInterval(intervalId);
-  }, [taskId, token, shouldPoll]);
+  }, [taskId, token, shouldPoll, fetchTask]);
 
   // Control polling interval based on execution status
   useEffect(() => {
@@ -547,7 +560,7 @@ export default function TaskDetails() {
         window.location.reload();
       }, 1000);
     }
-  }, [executions]);
+  }, [executions, getLatestExecution, shouldPoll]);
 
   useEffect(() => {
     const fetchSubscribers = async () => {
@@ -894,19 +907,6 @@ export default function TaskDetails() {
       console.error("Error updating feedback:", error);
       setError(error.response?.data?.message || "Failed to update feedback");
     }
-  };
-
-  const getLatestExecution = () => {
-    if (executions.length === 0) return null;
-    const nonArchivedExecutions = executions.filter(
-      (execution) => !execution.archived
-    );
-    if (nonArchivedExecutions.length === 0) return null;
-    return nonArchivedExecutions.reduce((latest, current) => {
-      return new Date(current.startTime) > new Date(latest.startTime)
-        ? current
-        : latest;
-    });
   };
 
   const getStatusColor = (status: string) => {
@@ -1477,7 +1477,7 @@ export default function TaskDetails() {
       }
     };
     loadData();
-  }, [taskId, token]);
+  }, [taskId, token, fetchTask]);
 
   // Add function to handle knowledge base update
   const handleUpdateKnowledgeBase = async (executionId: string) => {

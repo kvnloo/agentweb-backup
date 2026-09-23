@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Container,
@@ -121,20 +121,7 @@ export default function Templates() {
   const { token, user } = useAuth();
   const navigate = useNavigate();
 
-  // Check if user is admin and redirect if not
-  useEffect(() => {
-    if (user && !user.isAdmin) {
-      navigate("/tasks");
-    }
-  }, [user, navigate]);
-
-  useEffect(() => {
-    if (user?.isAdmin) {
-      fetchTemplates();
-    }
-  }, [token, user]);
-
-  const fetchTemplates = async () => {
+  const fetchTemplates = useCallback(async () => {
     setLoading(true);
     try {
       const response = await axios.get(buildApiUrl("/api/templates"), {
@@ -148,7 +135,20 @@ export default function Templates() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [token]);
+
+  // Check if user is admin and redirect if not
+  useEffect(() => {
+    if (user && !user.isAdmin) {
+      navigate("/tasks");
+    }
+  }, [user, navigate]);
+
+  useEffect(() => {
+    if (user?.isAdmin) {
+      fetchTemplates();
+    }
+  }, [token, user, fetchTemplates]);
 
   const handleOpenDialog = (templateId: string) => {
     setDeleteId(templateId);

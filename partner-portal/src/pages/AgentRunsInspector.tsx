@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import axios from 'axios';
 import { buildApiUrl, CUSTOMER_FRONTEND_URL } from '../config';
@@ -189,13 +189,7 @@ export default function AgentRunsInspector() {
     [runs, selectedRunId]
   );
 
-  useEffect(() => {
-    if (user?.isAdmin) {
-      void fetchRuns();
-    }
-  }, [user?.isAdmin]);
-
-  const fetchRuns = async () => {
+  const fetchRuns = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
@@ -222,7 +216,23 @@ export default function AgentRunsInspector() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [token, filters]);
+
+  // Keep a ref to the latest fetchRuns so the mount effect below can call the
+  // freshest closure (current token/filters) without re-running itself every
+  // time filters change — this effect's job is a single fetch when admin
+  // status resolves, not a live search-as-you-type re-fetch. The Search /
+  // Refresh buttons already call fetchRuns() directly with fresh filters.
+  const fetchRunsRef = useRef(fetchRuns);
+  useEffect(() => {
+    fetchRunsRef.current = fetchRuns;
+  }, [fetchRuns]);
+
+  useEffect(() => {
+    if (user?.isAdmin) {
+      void fetchRunsRef.current();
+    }
+  }, [user?.isAdmin]);
 
   if (!user?.isAdmin) {
     return (
