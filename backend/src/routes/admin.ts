@@ -24,6 +24,7 @@ import { workflowDb } from "../services/workflowDb";
 import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
+import { deriveSelfActivity } from "../utils/selfActivity";
 import { generateSecurePassword, getInitialPasswordExpiry } from "../utils/secureRandom";
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance, resolveBillingUserId } from "../services/tokenUsageService";
 import { grantMonthlyLlmUsageCredit } from "../services/llmUsageCreditService";
@@ -236,6 +237,8 @@ const compactAdminUserForList = (user: any): Record<string, any> => {
     }
   }
   compact.secretNames = user.secrets ? Object.keys(user.secrets) : [];
+  // ENG-1271: per-account customer self-activity vs staff-operated signal.
+  compact.selfActivity = deriveSelfActivity(user);
   return compact;
 };
 
