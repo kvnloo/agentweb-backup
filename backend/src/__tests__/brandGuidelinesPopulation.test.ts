@@ -1,4 +1,4 @@
-import { emptyBrandFields, fillEmptyBrandGuidelines, mapManageBrandUpdate } from '../utils/brandGuidelines';
+import { emptyBrandFields, fillEmptyBrandGuidelines, isEmptyBrandField, mapManageBrandUpdate } from '../utils/brandGuidelines';
 import { planBrandGuidelinesPopulation, applyBrandGuidelinesPopulation } from '../services/brandGuidelinesPopulation';
 import { userDb, orgDb } from '../services/db';
 jest.mock('../services/db', () => ({
@@ -47,10 +47,26 @@ it('ignores malformed external source elements and never invents absent copy', (
   expect(fillEmptyBrandGuidelines({}, { icp: 'bad' }, {}).filledFields).toEqual([]);
 });
 
-it('maps only supplied MCP fields and allowlists visual identity without accepting founders/attachments', () => {
-  expect(mapManageBrandUpdate({ mission: '', key_messages: [], visual_identity: {
-    primaryColor: '#123456', founders: [], attachments: [], brandName: 'Injected',
-  } })).toEqual({ valueProposition: '', keyMessages: [], primaryColor: '#123456' });
+it('treats nulls, blank strings, whitespace, and empty arrays as empty but preserves populated values', () => {
+  for (const value of [undefined, null, '', '   ', []]) expect(isEmptyBrandField(value)).toBe(true);
+  for (const value of ['copy', ['message'], false, 0, {}]) expect(isEmptyBrandField(value)).toBe(false);
+});
+
+it('maps every manage_brand argument to its persisted field and allowlists visual identity', () => {
+  expect(mapManageBrandUpdate({
+    company_name: 'New Corp', mission: 'Make IT easy', tone_of_voice: 'Direct',
+    target_audience: 'IT teams', key_messages: ['Simplify IT'],
+    visual_identity: {
+      primaryColor: '#111111', primaryColorEnd: '#222222', secondaryColor: '#333333',
+      fontFamily: 'Inter', isGradient: true, founders: [], attachments: [], brandName: 'Injected',
+    },
+  })).toEqual({
+    brandName: 'New Corp', valueProposition: 'Make IT easy', toneOfVoice: 'Direct',
+    targetAudience: 'IT teams', keyMessages: ['Simplify IT'], primaryColor: '#111111',
+    primaryColorEnd: '#222222', secondaryColor: '#333333', fontFamily: 'Inter', isGradient: true,
+  });
+  expect(mapManageBrandUpdate({ mission: '', key_messages: [] }))
+    .toEqual({ valueProposition: '', keyMessages: [] });
 });
 
 beforeEach(() => jest.clearAllMocks());
