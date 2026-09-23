@@ -51,6 +51,8 @@ import { userDb } from '../services/db';
 import { enrichWithRCA } from '../loops/instances/ai-eval-funnel/rcaEnricher';
 import { asMutationId } from '../loops/core/types';
 import { cronJobRegistry } from '../utils/cronJobRegistry';
+import { restyleContent } from '../controllers/blog';
+import { withRunFunding, type RunFunding } from '../services/funding/runFunding';
 
 const mockResolveBilling = resolveBillingUserId as jest.MockedFunction<typeof resolveBillingUserId>;
 const mockMeter = meterUserUsage as jest.MockedFunction<typeof meterUserUsage>;
@@ -403,5 +405,61 @@ describe('call sites pass userId / sessionId / feature to callLLM', () => {
     const ctx = usageContextOf(callLLM);
     expect(ctx).toEqual({ feature: 'platform:eval_rca' });
     expect(ctx).not.toHaveProperty('userId');
+  });
+});
+
+// ENG-1816 F1: same class of bug as ENG-1858 above — these three call sites carried
+// no userId, so their spend booked to "system" and escaped the funding policy on top
+// of the billing gap. Fixed by reading the ambient RunFunding store instead of
+// threading a new parameter through each function's signature. See
+// finding-emma-llm-callsite-scope in the ENG-1816 brain for the original inventory.
+describe('ENG-1816 F1: attribution leaks fixed via the ambient RunFunding store', () => {
+  const MEMBER = 'member-eng1816';
+  let callLLM: jest.SpyInstance;
+
+  function funding(): RunFunding {
+    return {
+      route: 'agentweb',
+      fallback: 'agentweb',
+      ownerUserId: MEMBER,
+      billingUserId: ORG_ROOT,
+      resolvedAt: new Date().toISOString(),
+    };
+  }
+
+  beforeEach(() => {
+    callLLM = jest.spyOn(agentModeService, 'callLLM');
+  });
+
+  it('restyleContent (blog.ts) carries the run owner when called inside a RunFunding scope', async () => {
+    callLLM.mockResolvedValue(llmReply(JSON.stringify({
+      title: 'A Title',
+      description: 'A description',
+      content: 'Some content',
+      imagePrompt: 'A prompt',
+    })));
+
+    await withRunFunding(funding(), () => restyleContent('original research', 'a topic'));
+
+    expect(usageContextOf(callLLM)).toEqual({
+      feature: 'content_gen',
+      userId: MEMBER,
+      billingUserId: ORG_ROOT,
+    });
+  });
+
+  it('restyleContent outside any RunFunding scope still books to "system" — the ambient store, not a new required parameter, is what changed', async () => {
+    callLLM.mockResolvedValue(llmReply(JSON.stringify({
+      title: 'A Title',
+      description: 'A description',
+      content: 'Some content',
+      imagePrompt: 'A prompt',
+    })));
+
+    await restyleContent('original research', 'a topic');
+
+    const ctx = usageContextOf(callLLM);
+    expect(ctx.userId).toBeUndefined();
+    expect(ctx.billingUserId).toBeUndefined();
   });
 });
