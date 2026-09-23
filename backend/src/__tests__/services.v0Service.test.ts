@@ -5602,7 +5602,11 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       // that it is DEPLOYED — the sibling's build is typically still running. "up-to-date"
       // matched neither branch of the if/else, so the gate stayed Promise.resolve() and the
       // smoke test fired against a route that did not yet carry this page's path.
-      setCaptureRouteGateConfig(60_000, 5_000);
+      // 20ms, not seconds: the assertion only needs the settle to outlast a microtask, and a
+      // multi-second timer here outlives the test — leaving runGenerationSmokeTest chained
+      // behind it to fire inside whichever test is running when it lands. mockRunGenerationSmokeTest
+      // is module-scoped and clearAllMocks() clears calls, not pending work.
+      setCaptureRouteGateConfig(60_000, 20);
       setupSiteRecordMock();
       await setupV0Mocks();
       setupGitHubMocks();

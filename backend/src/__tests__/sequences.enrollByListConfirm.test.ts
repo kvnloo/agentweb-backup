@@ -132,6 +132,35 @@ describe('POST /:sequenceId/enrollments/by-list — variable-warning gating', ()
     expect(dripSequenceDb.bulkEnroll).toHaveBeenCalled();
   });
 
+  it('the confirm dialog counts only the leads that will actually be enrolled', async () => {
+    // The filter has to run BEFORE the coverage loop. Applied at the mapper instead, the
+    // response described one population and enrolled another: leadCount included leads that
+    // were never candidates, and needsConfirmation could fire over a variable missing only
+    // on those leads — asking the user to confirm a warning about rows nothing would send to.
+    dripSequenceDb.getSequence.mockResolvedValue(seqWith([
+      { stepId: 's1', stepNumber: 1, name: 'Intro', delayDays: 0, channel: 'email',
+        subject: 'Hi {{firstName}}', bodyHtml: 'Hello' },
+    ]));
+    crmDb.getAllLeadsByListId.mockResolvedValue([
+      { leadId: 'l1', email: 'a@example.com', firstName: 'A' },
+      { leadId: 'l2', email: 'b@example.com', firstName: 'B' },
+      // No email AND no firstName — it must not be counted, and must not be the reason
+      // the confirmation gate fires.
+      { leadId: 'l3', phone: '4155550142' },
+    ]);
+
+    const res = await request(app)
+      .post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1' });
+
+    expect(res.status).toBe(200);
+    // Both remaining leads have firstName, so there is nothing to warn about at all.
+    expect(res.body.needsConfirmation).toBeFalsy();
+    expect(dripSequenceDb.bulkEnroll).toHaveBeenCalledTimes(1);
+    const [inputs] = dripSequenceDb.bulkEnroll.mock.calls[0];
+    expect(inputs).toHaveLength(2);
+  });
+
   it('never enrols a lead with no email address', async () => {
     // leadEmail feeds sendAsSender({ to }) in dripSequenceWorker, which RETHROWS on failure,
     // so an undefined address makes the enrollment retry forever. It is also the

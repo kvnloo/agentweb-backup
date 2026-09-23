@@ -2741,24 +2741,7 @@ async function addPageToExistingRepo(
         // the response path) and is the whole fix: submitting the form before this build
         // lands means submitting to a route that does not yet know this page's path.
         const { pushedCommitSha, pushTimestampMs } = syncResult;
-        captureRouteBuild = pollVercelDeployment(existingPage.vercelProjectId!, vercelToken, pushTimestampMs, pushedCommitSha)
-          .then(async (syncDeployResult) => {
-            // Only a READY build for THIS commit proves the route now carries this page's
-            // path. Anything else — ERROR, CANCELED (auto-cancel on supersession, returned
-            // on the first tick), or the attempt budget running out — means we do not know,
-            // and proceeding immediately is how the original race behaved. Wait out a
-            // bounded settle window so a superseding build has a chance to land, then run
-            // the smoke test regardless; a late smoke test is recoverable, a false
-            // `ok: false` on every page is not.
-            // "success" — NOT "ready". pollVercelDeployment returns exactly
-            // success | error | timeout, so comparing against "ready" was always true and
-            // this settle fired on every build, including the ones that proved the route
-            // live. Every other comparison in this file uses "success".
-            if (syncDeployResult.buildStatus !== "success") {
-              await sleepMs(captureRouteSettleMs);
-            }
-            return syncDeployResult;
-          })
+        const syncBuildPoll = pollVercelDeployment(existingPage.vercelProjectId!, vercelToken, pushTimestampMs, pushedCommitSha)
           .then((syncDeployResult) => {
             if (syncDeployResult.buildStatus === "error") {
               console.error(
@@ -2774,19 +2757,34 @@ async function addPageToExistingRepo(
                   `likely just slow, or superseded by a newer concurrent commit; not treated as a failure.`
               );
             }
+            return syncDeployResult.buildStatus;
           })
           .catch((pollErr: any) => {
             console.error(
               `[V0 SERVICE] ENG-483: capture-route sync build poll itself failed for ${repoFullName}:`,
               pollErr?.message || pollErr
             );
+            return undefined;
           });
 
-        // Independent wall-clock cap. pollVercelDeployment is bounded by attempt count, not
-        // time, so without this the detached smoke dispatch can sit far past the gate's
-        // documented cost. Whichever finishes first wins; the smoke test then runs either
-        // way, because a delayed check beats a check that never happens.
-        captureRouteBuild = Promise.race([captureRouteBuild, sleepMs(captureRouteGateMaxMs())]);
+        // The cap bounds the POLL, not the gate as a whole. Racing the whole chain meant the
+        // cap could swallow the settle that follows it: pollVercelDeployment is bounded by
+        // attempt count, and each attempt can burn VERCEL_POLL_TIMEOUT_MS on a hung request,
+        // so a handful of slow polls pushed the chain past the cap and the settle — the
+        // thing the cap was raised to make room for — never ran.
+        //
+        // Only a `success` for THIS commit proves the route carries this page's path.
+        // Anything else — ERROR, CANCELED (auto-cancel on supersession, returned on the
+        // first tick), the attempt budget running out, or the cap expiring with no answer —
+        // means we do not know, and proceeding immediately is how the original race behaved.
+        // So the settle runs on every one of those, and the smoke test runs after it either
+        // way: a late check is recoverable, a false `ok: false` on every page is not.
+        captureRouteBuild = Promise.race([
+          syncBuildPoll,
+          sleepMs(captureRouteGateMaxMs()).then(() => undefined),
+        ]).then((buildStatus) =>
+          buildStatus === "success" ? undefined : sleepMs(captureRouteSettleMs)
+        );
       }
     } catch (syncErr: any) {
       console.error(

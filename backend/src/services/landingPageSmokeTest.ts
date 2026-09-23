@@ -95,6 +95,11 @@ const SWEEP_MAX_DELETES = 20;
 // predates B's start and carries the marker) and delete it out from under A's poll —
 // turning a passing page into a false FAIL. Leave anything recent alone; a genuinely
 // stranded row is minutes old by the next deploy, never seconds.
+/** Pages of 100 the phone fallback walks before giving up for this attempt — the same
+ *  shape sweepStrandedSmokeLeads uses, and bounded for the same reason: this runs on a
+ *  paying customer's list, up to pollMaxAttempts times. */
+const POLL_SCAN_MAX_PAGES = 3;
+
 const SWEEP_MIN_AGE_MS = 2 * 60 * 1000;
 /**
  * Delete synthetic leads that a PREVIOUS run stranded in this list.
@@ -171,28 +176,46 @@ async function pollForLeadByPhone(
       // the row is never found at all.
       if (deterministicId && typeof (crmDb as any).getLeadById === "function") {
         try {
-          const direct = await crmDb.getLeadById(listId, deterministicId);
-          if (direct && String((direct as any).createdAt || "") >= submittedAtIso) {
+          const direct = await crmDb.getLeadById(listId, deterministicId, { consistentRead: true });
+          // No createdAt comparison on this branch, deliberately. The id is a hash of OUR
+          // synthetic number, so a row under it can only be ours. Requiring a fresh
+          // createdAt made the adopted-row case permanently unfindable: on a phone
+          // collision the conditional create loses, webhooks.ts adopts the existing row
+          // WITHOUT rewriting createdAt, and the test then reports a false `ok: false` and
+          // strands the row — which raises the collision surface for the next run.
+          if (direct && isSmokeTestLead(direct)) {
             return { leadId: deterministicId };
           }
-        } catch {
-          // fall through to the scan
+        } catch (err: any) {
+          // Fall through to the scan, but say so: a throttled or timed-out point lookup is
+          // exactly when the scan matters, and swallowing it silently hides the reason a
+          // run went slow. Same treatment the sweep gives the same class of error.
+          console.warn(
+            `[smokeTest] point lookup for ${deterministicId} failed in list ${listId}: ${err?.message || err}`
+          );
         }
       }
 
-      // Fallback, and NOT order-dependent any more. getLeadsByListId sorts on leadId — the
-      // table's RANGE key — so "newest first" only ever held because createLead mints
-      // `lead_<timestamp>_<rand>`. ENG-2082 introduced a second shape, `lead_ph_<sha256>`,
-      // whose 'p' sorts above every digit: on a phone-only lander EVERY row is lead_ph_*,
-      // ordered by random hash, so our row is very often not on page one. Missing it strands
-      // the synthetic row in a customer's CRM — the incident sweepStrandedSmokeLeads exists
-      // for — so scan a real window rather than trusting position.
-      const page = await crmDb.getLeadsByListId(listId, 300);
-      const hit = (page?.items || []).find(
-        (lead: any) =>
-          phoneDigits(lead?.phone) === wanted &&
-          String(lead?.createdAt || "") >= submittedAtIso
-      );
+      // Fallback for rows the point lookup cannot cover — chiefly a lander that invents its
+      // own placeholder email, so webhooks.ts keys it `lead_<timestamp>_<rand>` instead.
+      //
+      // PAGINATED, not one wide Limit. getLeadsByListId is a Query ordered by leadId (the
+      // RANGE key) and DynamoDB caps a page at 1MB regardless of Limit, so asking for 300
+      // widened the window without making it order-independent — and `lead_<timestamp>_*`
+      // sorts BELOW every `lead_ph_*`, exactly the rows a phone-only list is full of. Walk
+      // the cursor the way sweepStrandedSmokeLeads does instead.
+      let lastKey: any = undefined;
+      let hit: any = undefined;
+      for (let page = 0; page < POLL_SCAN_MAX_PAGES && !hit; page++) {
+        const result = await crmDb.getLeadsByListId(listId, 100, lastKey);
+        hit = ((result?.items || []) as any[]).find(
+          (lead: any) =>
+            phoneDigits(lead?.phone) === wanted &&
+            String(lead?.createdAt || "") >= submittedAtIso
+        );
+        lastKey = result?.lastEvaluatedKey;
+        if (!lastKey) break;
+      }
       if (hit?.leadId) return { leadId: hit.leadId as string };
     } catch {
       // list unreadable — nothing to clean up

@@ -376,6 +376,31 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       expect(updates.customFields.qualified).toBe('yes');
     });
 
+    it('ENG-2082: a repeat submission that omits source must not clobber the stored one', async () => {
+      // `source` is never absent from incomingCustomFields — the destructure defaults it to
+      // 'api'. So restoring only forwardedAt means that synthesized default overwrites a
+      // real stored value whenever any OTHER field changes. Step 1 of a multi-step lander
+      // posts source "hero-form"; step 2 posts only the qualification answer; the row ends
+      // up reading "api". Same data loss as before, moved one case over.
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      const race: any = new Error('Lead already exists for this deterministic key');
+      race.leadAlreadyExists = true;
+      (crmDb.createLead as jest.Mock).mockRejectedValueOnce(race);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead_ph_existing', listId: 'list_123', phone: '4155550142', firstName: '',
+        customFields: { forwardedAt: '2020-01-01T00:00:00.000Z', source: 'hero-form' },
+      });
+
+      await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', phone: '4155550142', qualified: 'yes' });
+
+      const [, , updates] = (crmDb.updateLead as jest.Mock).mock.calls[0];
+      expect(updates.customFields.qualified).toBe('yes');
+      expect(updates.customFields.forwardedAt).toBe('2020-01-01T00:00:00.000Z');
+      expect(updates.customFields.source).toBe('hero-form');
+    });
+
     it('ENG-2082: a repeat phone submission merges its new data instead of discarding it', async () => {
       // failIfExists + a deterministic id means every later submission from the same number
       // lands on the adopt path, not just the concurrent race. A multi-step lander posts the

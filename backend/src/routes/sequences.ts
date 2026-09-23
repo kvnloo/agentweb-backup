@@ -223,6 +223,23 @@ router.post(
         leads = await crmDb.getAllLeadsByListId(listId);
       }
 
+      // Filtered HERE, before coverage — not at the mapper. leadEmail feeds
+      // sendAsSender({ to }) in dripSequenceWorker, which RETHROWS on failure, so an
+      // email-less lead does not fail once: the enrollment retries forever. leadEmail is
+      // also the leadEmail-index partition key, so the row is invisible to
+      // getActiveEnrollment and is re-created on every run. crm.ts's identical mapper has
+      // always filtered.
+      //
+      // Filtering up front rather than at the mapper keeps one population throughout:
+      // leadCount, the missing/present warning counts and the confirm gate all describe
+      // exactly the leads that will be enrolled. Filtering later made the dialog report a
+      // different set than the one it enrolled — and could raise needsConfirmation over
+      // variables missing only on leads that were never candidates.
+      //
+      // Email-less leads were already reachable (LinkedIn imports, the invite mirror);
+      // ENG-2082 made a whole new list type produce them.
+      leads = leads.filter((l: any) => l.email);
+
       // Variable coverage across all steps + channels (email subject/body + LinkedIn
       // messageText). Warn — but allow override via `confirm` — when a supported
       // variable is missing for any lead, or an unsupported token is referenced.
@@ -253,17 +270,7 @@ router.post(
         });
       }
 
-      // Mirrors the identical mapper in crm.ts, which has always filtered. Without it an
-      // email-less lead enrols with leadEmail undefined, and dripSequenceWorker then calls
-      // sendAsSender({ to: undefined }) and RETHROWS on failure — so the enrollment retries
-      // forever. leadEmail is also the leadEmail-index partition key, so the row is
-      // invisible to getActiveEnrollment and is re-created on every run.
-      //
-      // Email-less leads are a designed-for state (LinkedIn imports, the invite mirror), so
-      // this was already reachable — but ENG-2082 made a whole new list type produce them,
-      // which is why it is being closed here rather than left for later.
       const inputs = leads
-        .filter((l: any) => l.email)
         .map((l: any) => ({
           sequenceId: req.params.sequenceId,
           userId: authReq.user!.userId,

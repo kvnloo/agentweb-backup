@@ -654,6 +654,13 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       source: source?.trim() || customFields?.source || 'api',
     };
 
+    // ENG-2082: did the CALLER name a source, or did the line above invent one? The adopt
+    // path needs the distinction. `source` is never absent from incomingCustomFields, so
+    // merging it blindly lets the synthesized 'api' overwrite a real stored value whenever
+    // some other field changes — step 1 of a multi-step lander posts "hero-form", step 2
+    // posts only its answers, and the row ends up reading "api".
+    const callerSuppliedSource = !!(source?.trim() || customFields?.source);
+
     // Attribution — accept either the new `attribution` shape or the legacy
     // flat `utm` shape (same normaliser controllers/auth.ts uses for signup).
     // If the client sends nothing, we stamp nothing; the CSV import and other
@@ -908,6 +915,12 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           // (existingLead is null here), so the merged copy is never the visitor's data.
           if ('forwardedAt' in adoptedExistingCustom) {
             adoptedMergedCustom.forwardedAt = adoptedExistingCustom.forwardedAt;
+          }
+          // Restore `source` ONLY when this submission did not name one. A caller-supplied
+          // source is real data and must win (that is the multi-step case); a defaulted one
+          // must never overwrite what is already stored.
+          if (!callerSuppliedSource && 'source' in adoptedExistingCustom) {
+            adoptedMergedCustom.source = adoptedExistingCustom.source;
           }
           adoptedUpdates.customFields = adoptedMergedCustom;
           adoptedChanged = true;

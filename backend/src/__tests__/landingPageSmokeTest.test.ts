@@ -779,16 +779,25 @@ describe("runGenerationSmokeTest", () => {
       fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
     });
     mockGetLeadsByListId.mockResolvedValue({ items: [] });
+    // Carries the synthetic phone: the point lookup now requires isSmokeTestLead(row), so a
+    // real customer row that somehow landed on this id is never adopted or deleted. It
+    // deliberately does NOT need a fresh createdAt — the adopted-row case (a phone
+    // collision, where webhooks.ts reuses the existing row without rewriting createdAt)
+    // must still be found.
     mockGetLeadById.mockImplementation(async (_listId: string, leadId: string) => ({
       leadId,
-      createdAt: new Date(Date.now() + 60_000).toISOString(),
+      phone: "415-555-0142",
+      createdAt: "2020-01-01T00:00:00.000Z",
     }));
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
     expect(mockGetLeadById).toHaveBeenCalledWith(
       BASE_PAGE.leadListId,
-      expect.stringMatching(/^lead_ph_[0-9a-f]{24}$/)
+      expect.stringMatching(/^lead_ph_[0-9a-f]{24}$/),
+      // Consistent: this read chases a key webhooks.ts may have written moments ago, and an
+      // eventually-consistent miss here is indistinguishable from "no such lead".
+      { consistentRead: true }
     );
     // Found means cleaned up — the whole point is not leaving it in the customer's CRM.
     expect(mockDeleteLead).toHaveBeenCalledWith(
