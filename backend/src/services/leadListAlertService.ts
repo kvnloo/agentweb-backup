@@ -1,6 +1,12 @@
 import { crmDb, userDb } from './db';
 import { emailService } from './emailService';
 import { sendLeadNotification } from './slackService';
+import {
+  bootstrapMessagingChannels,
+  getMessagingChannel,
+  resolveDestination,
+} from './messagingChannelService';
+import { TEMPLATES } from './whatsappService';
 
 const normalizeEventType = (eventType: string) => eventType.trim().toLowerCase();
 
@@ -269,12 +275,17 @@ export const leadListAlertService = {
       ccEmails,
     });
 
-    // Send Slack notification if the user has a slackChannel configured
+    const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+    const crmUrl = `${customerFrontendUrl}/crm?listId=${encodeURIComponent(list.listId)}`;
+    const listName = list.name || 'Lead List';
+
+    // Send Slack notification if the user has a slackChannel configured.
+    // Deliberately still reading the deprecated singular `slackChannel` rather than
+    // the shared resolver: switching to it would newly alert every user who has only
+    // `slackChannels` set, which is a delivery change customers did not ask for and
+    // is outside ENG-273's scope. Slack behavior here is byte-identical.
     if (user.slackChannel) {
       try {
-        const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-        const crmUrl = `${customerFrontendUrl}/crm?listId=${encodeURIComponent(list.listId)}`;
-
         await sendLeadNotification(user.slackChannel, {
           firstName: lead.firstName,
           lastName: lead.lastName,
@@ -282,7 +293,7 @@ export const leadListAlertService = {
           company: lead.company,
           phone: lead.phone,
           linkedin: lead.linkedin,
-          listName: list.name || 'Lead List',
+          listName,
           listId: list.listId,
           crmUrl,
           eventType: normalizedEventType,
@@ -292,6 +303,32 @@ export const leadListAlertService = {
         // Log but don't fail — email was already sent successfully
         console.error('Failed to send Slack lead notification:', slackError);
       }
+    }
+
+    // WhatsApp is a peer channel, additive to both the email baseline and Slack.
+    // The Slack version is Block Kit; WhatsApp has no blocks, so it gets a flat
+    // template — name, then what happened plus the CRM link.
+    try {
+      await bootstrapMessagingChannels();
+      const whatsappTo = await resolveDestination(user, 'whatsapp');
+      if (whatsappTo) {
+        const leadName =
+          [lead.firstName, lead.lastName].filter(Boolean).join(' ').trim() ||
+          lead.email ||
+          'A lead';
+        await getMessagingChannel('whatsapp').sendMessage({
+          destination: whatsappTo,
+          text: `${leadName} — ${normalizedEventType} on ${listName}. ${crmUrl}`,
+          template: {
+            name: TEMPLATES.LEAD_ALERT.name,
+            variables: [leadName, `${normalizedEventType} on ${listName}. ${crmUrl}`],
+          },
+        } as any);
+      }
+    } catch (whatsappError) {
+      // Same contract as the Slack path: email already landed, so a channel failure
+      // must never fail the alert.
+      console.error('Failed to send WhatsApp lead notification:', whatsappError);
     }
   },
 
