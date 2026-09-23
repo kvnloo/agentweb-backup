@@ -463,6 +463,7 @@ export interface User {
     brandData: {
       brandName: string;
       tagline: string;
+      valueProposition?: string;
       domain?: string;
       primaryColor: string;
       primaryColorEnd: string;
@@ -490,8 +491,8 @@ export interface User {
     createdAt: string;
     updatedAt: string;
     /**
-     * Opaque identity of the write that produced this value, stamped only by
-     * the asset-delete path's conditional writes. `updatedAt` is millisecond
+     * Opaque identity of the write that produced this value, stamped by
+     * the asset-delete, brand-route and fill-only population writes. `updatedAt` is millisecond
      * granular and every other brand writer mints its own, so two writes can
      * share a stamp; pairing it with a revision lets a conditional write
      * identify the exact value it read. Absent on anything written by another

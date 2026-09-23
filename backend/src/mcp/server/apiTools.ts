@@ -1,3 +1,4 @@
+import { mapManageBrandUpdate } from '../../utils/brandGuidelines';
 import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from '../../services/workPlanSteps';
 /**
  * API Tools — MCP tools that wrap the backend REST API via HTTP self-calls.
@@ -1545,7 +1546,7 @@ mcpToolRegistry.register({
       const data = await mcpFetch({ method: 'GET', path: '/api/brand/guidelines', context: c });
       return jsonResult(data);
     }
-    const { action, ...body } = args;
+    const body = mapManageBrandUpdate(args);
     const data = await mcpFetch({ method: 'POST', path: '/api/brand/guidelines', context: c, body });
     return jsonResult(data);
   }

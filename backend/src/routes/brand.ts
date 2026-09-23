@@ -230,6 +230,7 @@ router.post(
         keyMessages,
         brandName,
         tagline,
+        valueProposition,
         domain,
         brandValues,
         targetAudience,
@@ -433,7 +434,11 @@ router.post(
       }
 
       const brandGuidelinesData = {
+        ...existingBrandGuidelines,
+        rev: uuidv4(),
         brandData: {
+          ...existingBrandGuidelines?.brandData,
+          valueProposition: valueProposition !== undefined ? valueProposition : (existingBrandGuidelines?.brandData?.valueProposition || ""),
           // Only update fields that are provided, preserve existing data for missing fields
           brandName: brandName !== undefined ? brandName : (existingBrandGuidelines?.brandData?.brandName || ""),
           tagline: tagline !== undefined ? tagline : (existingBrandGuidelines?.brandData?.tagline || ""),

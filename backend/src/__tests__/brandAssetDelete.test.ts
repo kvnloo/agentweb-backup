@@ -982,3 +982,28 @@ describe("DELETE /api/brand/guidelines/asset/:key — write identity", () => {
     (console.error as jest.Mock).mockRestore();
   });
 });
+
+describe('POST /api/brand/guidelines — MCP partial update persistence', () => {
+  it.each([false, true])('persists mapped fields and retains founders/assets (org=%s)', async inOrg => {
+    const { mapManageBrandUpdate } = await import('../utils/brandGuidelines');
+    const brand = { ...ownBrand, rev: 'old-revision', custom: 'preserved', brandData: { ...ownBrand.brandData,
+      founders: [{ name: 'Founder' }], logoUrl: 'logo', tagline: 'Keep this' } };
+    const user = { ...soloUser, brandGuidelines: brand, ...(inOrg ? { orgId: 'org', orgRole: 'owner' } : {}) };
+    mockDynamoGet.mockResolvedValue({ Item: user });
+    mockGetOrgById.mockResolvedValue({ orgId: 'org', ownerUserId: 'me', brandGuidelines: brand });
+    const res = await request(makeApp(user)).post('/api/brand/guidelines').send(mapManageBrandUpdate({
+      company_name: 'New Corp', mission: 'Make IT easy', tone_of_voice: 'Direct',
+      target_audience: 'IT teams', key_messages: ['Simplify IT'],
+    }));
+    expect(res.status).toBe(201);
+    const saved = inOrg ? mockUpdateOrg.mock.calls[0][1].brandGuidelines :
+      mockDynamoUpdate.mock.calls[0][0].ExpressionAttributeValues[':brandGuidelines'];
+    expect(saved.brandData).toMatchObject({ brandName: 'New Corp', valueProposition: 'Make IT easy',
+      toneOfVoice: 'Direct', targetAudience: 'IT teams', keyMessages: ['Simplify IT'],
+      founders: brand.brandData.founders, logoUrl: 'logo', tagline: 'Keep this' });
+    expect(saved.attachments).toEqual(brand.attachments);
+    expect(saved.custom).toBe('preserved');
+    expect(saved.rev).toEqual(expect.any(String));
+    expect(saved.rev).not.toBe(brand.rev);
+  });
+});
