@@ -1514,12 +1514,17 @@ export async function executePreparedTools(
         ports.formatToolError(toolCall.function.name, errMsg),
         classifyToolErrorClass(error),
       );
-      const errorContent = formattedError.length > maxToolContentSize
-        ? sealTruncatedPayloadWithNotice(
-          formattedError.substring(0, maxToolContentSize),
-          `[Error message truncated for size — original length: ${formattedError.length} chars]`,
-        )
-        : formattedError;
+      let errorContent = formattedError;
+      if (formattedError.length > maxToolContentSize) {
+        const notice = `[Error message truncated for size — original length: ${formattedError.length} chars]`;
+        // Reserve room for the notice AND the '\n\n' separator sealTruncatedPayload
+        // inserts before it — otherwise appending the notice after slicing to the
+        // full cap pushes the sealed result past maxToolContentSize (CodeRabbit,
+        // PR #3039). Mirrors messageSizeGuard.ts's fitContent, which reserves the
+        // same way for the DynamoDB persistence cap.
+        const sliceBudget = Math.max(0, maxToolContentSize - notice.length - 2);
+        errorContent = sealTruncatedPayloadWithNotice(formattedError.substring(0, sliceBudget), notice);
+      }
       messages.push({
         tool_call_id: toolCall.id,
         role: 'tool',

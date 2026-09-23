@@ -485,10 +485,9 @@ describe('executePreparedTools', () => {
     await executePreparedTools(input);
 
     const stored = input.messages[0].content as string;
-    // The cap slices to maxToolContentSize (300_000) and then appends the
-    // truncation notice on top, same as the success path's identical pattern
-    // above — so a small, bounded overshoot for the notice itself is expected.
-    expect(stored.length).toBeLessThan(300_100);
+    // The cap reserves room for the notice before slicing, so the final sealed
+    // result never exceeds maxToolContentSize (300_000) — not "roughly", exactly.
+    expect(stored.length).toBeLessThanOrEqual(300_000);
     expect(stored).toContain('[Error message truncated for size — original length:');
   });
 
@@ -516,8 +515,8 @@ describe('executePreparedTools', () => {
     // Proves the fix: the raw message (299,995 chars) is UNDER maxToolContentSize
     // on its own, so a raw-message-only cap would have left this untouched. The
     // assembled content (300,000+ once formatted and retryability-guided) must
-    // still come out capped.
-    expect(stored.length).toBeLessThan(300_100);
+    // still come out capped — exactly, notice included.
+    expect(stored.length).toBeLessThanOrEqual(300_000);
     expect(stored).toContain('[Error message truncated for size — original length:');
   });
 
