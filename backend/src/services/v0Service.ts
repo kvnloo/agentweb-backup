@@ -5923,7 +5923,8 @@ export async function getDeploymentStatus(
  */
 export async function getPreviewDeploymentUrl(
   vercelProjectId: string,
-  branch: string
+  branch: string,
+  commitSha?: string
 ): Promise<{ previewUrl?: string; buildStatus: string; buildError?: string; prUrl?: string }> {
   const vercelToken = await getVercelToken();
   const headers = { Authorization: `Bearer ${vercelToken}`, "Content-Type": "application/json" };
@@ -5958,15 +5959,24 @@ export async function getPreviewDeploymentUrl(
     { headers }
   );
 
-  const deployments = deploymentsRes.data?.deployments || [];
+  const deployments = deploymentsRes.data?.deployments;
+  if (!Array.isArray(deployments) || deployments.some((d: any) =>
+    !d || typeof d !== 'object' || typeof (d.readyState || d.state) !== 'string' ||
+    (d.meta != null && (typeof d.meta !== 'object' || Array.isArray(d.meta)))
+  )) throw new Error('Invalid Vercel deployments response');
   console.log(`[V0 SERVICE] Found ${deployments.length} deployments for project ${vercelProjectId}, looking for branch "${branch}". Branches in deployments: [${deployments.map((d: any) => d.meta?.githubCommitRef || 'none').join(', ')}]`);
 
   // Find the most recent deployment for this branch
   const branchDeployment = deployments.find((d: any) =>
-    d.meta?.githubCommitRef === branch
+    d.meta?.githubCommitRef === branch && (!commitSha || deploymentCommitSha(d) === commitSha)
   );
 
   if (!branchDeployment) {
+    // A push may not have appeared in Vercel yet. An older READY/ERROR on this
+    // reusable branch is not evidence for the commit the agent just published.
+    if (commitSha && deployments.some((d: any) => d.meta?.githubCommitRef === branch)) {
+      return { buildStatus: 'building', previewUrl: undefined };
+    }
     // No deployment found — Vercel deploys on PRs, not branch pushes.
     // Create a draft PR to trigger the Vercel preview deployment.
     const repoLink = projRes?.data?.link;

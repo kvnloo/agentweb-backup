@@ -825,7 +825,21 @@ describe("GET /preview-url", () => {
     expect(res.status).toBe(200);
     expect(res.body.previewUrl).toBe("https://test-landing-page-draft-session-12345678.vercel.app");
     expect(res.body.buildStatus).toBe("success");
-    expect(mockGetPreviewDeploymentUrl).toHaveBeenCalledWith("prj_test123", "draft/agentweb-preview");
+    expect(mockGetPreviewDeploymentUrl).toHaveBeenCalledWith("prj_test123", "draft/agentweb-preview", undefined);
+  });
+
+  it('passes a requested commit SHA through to Vercel lookup', async () => {
+    mockGetPreviewDeploymentUrl.mockResolvedValueOnce({ buildStatus: 'building' });
+    const sha = 'a'.repeat(40);
+    const res = await request(app).get(`/api/landing-pages/v0/generated/page-123/preview-url?branch=draft/agentweb-preview&commitSha=${sha}`);
+    expect(res.status).toBe(200);
+    expect(mockGetPreviewDeploymentUrl).toHaveBeenCalledWith('prj_test123', 'draft/agentweb-preview', sha);
+  });
+
+  it('rejects a malformed commit SHA', async () => {
+    const res = await request(app).get('/api/landing-pages/v0/generated/page-123/preview-url?branch=draft/agentweb-preview&commitSha=invalid');
+    expect(res.status).toBe(400);
+    expect(mockGetPreviewDeploymentUrl).not.toHaveBeenCalled();
   });
 
   it("SUCCESS: returns not_found when no deployment exists for the branch", async () => {
