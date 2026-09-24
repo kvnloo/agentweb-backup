@@ -4304,7 +4304,19 @@ export class AgentModeService {
             hardCapMs: turnHardCapMs,
             longestLlmCallMs: Math.max(longestLlmCallMsThisRun, longestToolDispatchMsThisRun),
           });
-          llmCallTimeoutMs = Math.max(MIN_LLM_CALL_TIMEOUT_MS, preCallBudget.remainingMs - preCallBudget.reserveMs);
+          // CodeRabbit (PR #3050): the MIN_LLM_CALL_TIMEOUT_MS floor alone can still hand
+          // out a bound LONGER than the wall-clock actually left before turnHardCapMs —
+          // e.g. remainingMs=5000 would floor to 30000, letting this call run 25s past
+          // the outer hard cap and get killed by that uncontrolled race instead of this
+          // one, recreating the exact failure mode this fix exists to prevent. Clamp to
+          // whichever is smaller. A resulting near-zero value is safe, not a footgun:
+          // the openai client's fetchWithTimeout does `setTimeout(() => abort(), ms)`,
+          // so `ms<=0` aborts on the next tick rather than disabling the timeout — this
+          // still reaches the catch below as a clean, classifiable 'timeout' error.
+          llmCallTimeoutMs = Math.min(
+            preCallBudget.remainingMs,
+            Math.max(MIN_LLM_CALL_TIMEOUT_MS, preCallBudget.remainingMs - preCallBudget.reserveMs),
+          );
         }
         // OTel `chat` span (ENG-141): brackets the primary call AND the backup
         // retry; the `finally` closes it with the FINAL model + usage attrs
