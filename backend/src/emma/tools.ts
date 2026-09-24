@@ -573,6 +573,11 @@ For a customer-facing credential reconnect (e.g. a disconnected ad account or CM
       return {
         success: true,
         decisionId: decision.decisionId,
+        // Review fix: the requested expiresInDays is silently clamped to
+        // [1, 30] above — without surfacing the real expiresAt, Emma has no
+        // runtime signal when her request was reduced and could tell the
+        // user a duration that isn't actually true.
+        expiresAt: decision.expiresAt,
         message: audience === 'team'
           ? `Queued for ${decision.approver}'s review — they'll answer from Slack, this session isn't blocked on it.`
           : `Queued for the customer to answer — this session isn't blocked on it.`,

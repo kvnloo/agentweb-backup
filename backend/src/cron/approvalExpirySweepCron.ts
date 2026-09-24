@@ -16,6 +16,7 @@ import { notifyOriginSessionOfExpiry } from '../services/approvalInboxExecution'
 // approvalInboxExecution.ts (imported above) already transitively pulls in
 // chatbotService.ts, so this adds no new heavy import chain to this file.
 import { upsertApproverQueueMessage, postDecisionExpiredNotice } from '../services/approvalInboxSlack';
+import { notifyCustomerOfExpiredCredentialDecision } from '../services/approvalInboxCustomerNotify';
 
 const TAG = '[approvalExpirySweepCron]';
 
@@ -59,6 +60,15 @@ async function processDueDecision(decision: ApprovalDecision, summary: ApprovalE
         await postDecisionExpiredNotice(result.decision.approver, result.decision);
       } catch (slackErr) {
         console.warn(`${TAG} Failed to post expiry notice for decision ${decision.decisionId}:`, slackErr);
+      }
+    } else if (result.decision.gateType === 'customer_credential') {
+      // Review fix: a customer-audience decision has no approver/Slack
+      // presence at all — without this, expiry was completely silent for
+      // the customer, who only ever got the one creation-time email.
+      try {
+        await notifyCustomerOfExpiredCredentialDecision(result.decision);
+      } catch (notifyErr) {
+        console.warn(`${TAG} Failed to notify customer of expiry for decision ${decision.decisionId}:`, notifyErr);
       }
     }
   } catch (error) {

@@ -59,6 +59,43 @@ export async function notifyCustomerOfPendingCredentialDecision(decision: Approv
 }
 
 /**
+ * Review fix (round 4): notifyCustomerOfPendingCredentialDecision fires once
+ * at creation, but nothing customer-facing ever fired again — a customer who
+ * never reconnected got exactly one email, then silence. The expiry sweep's
+ * own notice (notifyOriginSessionOfExpiry, approvalInboxExecution.ts) only
+ * writes to the internal chat-session history, not something a customer
+ * checking their email would ever see. Without this, the exact "dies
+ * silently" gap this PR's title claims to close was left open for the one
+ * audience most likely to actually be waiting on a real answer.
+ */
+export async function notifyCustomerOfExpiredCredentialDecision(decision: ApprovalDecision): Promise<void> {
+  if (decision.gateType !== 'customer_credential') return;
+  if (!decision.customerId) return;
+
+  const user = await userDb.getUserById(decision.customerId);
+  const customerEmail = decision.customerEmail || (user as any)?.email;
+
+  if (!customerEmail) {
+    await alertNoResolvableCustomer(decision);
+    return;
+  }
+
+  const subject = 'Your AgentWeb reconnect window has closed';
+  const text =
+    `${decision.businessImpact}\n\n` +
+    `The window to take care of this has closed without a response, so it's no longer active. ` +
+    `If this still matters, let us know and we'll raise it again.\n\n` +
+    `If you weren't expecting this, reply to this email and we'll help.`;
+  const html =
+    `<p>${decision.businessImpact}</p>` +
+    `<p>The window to take care of this has closed without a response, so it's no longer active. ` +
+    `If this still matters, let us know and we'll raise it again.</p>` +
+    `<p>If you weren't expecting this, reply to this email and we'll help.</p>`;
+
+  await emailService.sendEmail(customerEmail, subject, text, html);
+}
+
+/**
  * Gap-closing round: called from a real OAuth reconnect callback (Meta,
  * LinkedIn) once a connection is genuinely re-established. Finds the
  * matching pending customer_credential decision (if any) and auto-claims

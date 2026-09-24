@@ -163,6 +163,20 @@ describe('approvalInboxService.createDecision', () => {
       customerActionUrl: 'https://x', credentialPlatform: 'meta', expiresAt: FUTURE,
     } as any)).rejects.toThrow(ApprovalInboxError);
   });
+
+  it('review fix: a credentialPlatform outside meta/instagram/linkedin is rejected — no route could ever auto-resolve it', async () => {
+    await expect(service.createDecision({
+      gateType: 'customer_credential', customerId: 'cust-1', businessImpact: 'x', evidencePacket: {},
+      customerActionUrl: 'https://x', credentialPlatform: 'Facebook Ads', credentialAccountId: 'act_123', expiresAt: FUTURE,
+    } as any)).rejects.toThrow(ApprovalInboxError);
+  });
+
+  it('review fix: a credentialAccountId that normalizes to empty (e.g. literally "act_") is rejected', async () => {
+    await expect(service.createDecision({
+      gateType: 'customer_credential', customerId: 'cust-1', businessImpact: 'x', evidencePacket: {},
+      customerActionUrl: 'https://x', credentialPlatform: 'meta', credentialAccountId: 'act_', expiresAt: FUTURE,
+    } as any)).rejects.toThrow(ApprovalInboxError);
+  });
 });
 
 describe('approvalInboxService.claimDecision', () => {

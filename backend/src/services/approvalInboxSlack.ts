@@ -276,11 +276,19 @@ export async function resolveApprovalDecision(
   }
 
   if (decision.approver) {
+    // Review fix: separate try/catches — a queue-refresh failure (e.g.
+    // getApproverChannel throwing) must not silently skip the resolution
+    // notice too. Same class of bug already fixed for stage_pending_decision
+    // and the expiry sweep; this call site was missed.
     try {
       await upsertApproverQueueMessage(decision.approver);
+    } catch (err: any) {
+      console.warn('[approval-inbox-slack] claim succeeded but queue refresh failed:', err?.message || err);
+    }
+    try {
       await postDecisionResolvedNotice(decision.approver, decision);
     } catch (err: any) {
-      console.warn('[approval-inbox-slack] claim succeeded but Slack refresh failed:', err?.message || err);
+      console.warn('[approval-inbox-slack] claim succeeded but resolution notice failed:', err?.message || err);
     }
   }
   return result;

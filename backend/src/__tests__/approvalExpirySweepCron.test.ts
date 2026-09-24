@@ -15,9 +15,14 @@ jest.mock('../services/approvalInboxSlack', () => ({
   postDecisionExpiredNotice: jest.fn(),
 }));
 
+jest.mock('../services/approvalInboxCustomerNotify', () => ({
+  notifyCustomerOfExpiredCredentialDecision: jest.fn(),
+}));
+
 import { approvalInboxService } from '../services/approvalInboxService';
 import { notifyOriginSessionOfExpiry } from '../services/approvalInboxExecution';
 import { upsertApproverQueueMessage, postDecisionExpiredNotice } from '../services/approvalInboxSlack';
+import { notifyCustomerOfExpiredCredentialDecision } from '../services/approvalInboxCustomerNotify';
 import { runApprovalExpirySweep } from '../cron/approvalExpirySweepCron';
 
 const mockListDuePending = approvalInboxService.listDuePending as jest.Mock;
@@ -25,6 +30,7 @@ const mockExpireDecision = approvalInboxService.expireDecision as jest.Mock;
 const mockNotify = notifyOriginSessionOfExpiry as jest.Mock;
 const mockUpsertQueue = upsertApproverQueueMessage as jest.Mock;
 const mockPostExpiredNotice = postDecisionExpiredNotice as jest.Mock;
+const mockNotifyCustomerExpired = notifyCustomerOfExpiredCredentialDecision as jest.Mock;
 
 describe('runApprovalExpirySweep', () => {
   beforeEach(() => {
@@ -33,6 +39,7 @@ describe('runApprovalExpirySweep', () => {
     mockExpireDecision.mockResolvedValue({ expired: false });
     mockNotify.mockResolvedValue(undefined);
     mockUpsertQueue.mockResolvedValue(undefined);
+    mockNotifyCustomerExpired.mockResolvedValue(undefined);
     mockPostExpiredNotice.mockResolvedValue(undefined);
   });
 
@@ -78,7 +85,7 @@ describe('runApprovalExpirySweep', () => {
   });
 
   it('never touches Slack for a customer-audience decision (no approver) that expires', async () => {
-    const decision = { decisionId: 'd1', originSessionId: 'sess-1' };
+    const decision = { decisionId: 'd1', originSessionId: 'sess-1', gateType: 'customer_credential' };
     mockListDuePending.mockImplementation(async (status: string) =>
       status === 'pending_customer_response' ? [decision] : []);
     mockExpireDecision.mockResolvedValue({ expired: true, decision });
@@ -87,6 +94,41 @@ describe('runApprovalExpirySweep', () => {
 
     expect(mockUpsertQueue).not.toHaveBeenCalled();
     expect(mockPostExpiredNotice).not.toHaveBeenCalled();
+  });
+
+  it('review fix: notifies the customer directly when a customer_credential decision expires — the internal chat-session note alone is not customer-visible', async () => {
+    const decision = { decisionId: 'd1', originSessionId: 'sess-1', gateType: 'customer_credential', customerId: 'cust-1' };
+    mockListDuePending.mockImplementation(async (status: string) =>
+      status === 'pending_customer_response' ? [decision] : []);
+    mockExpireDecision.mockResolvedValue({ expired: true, decision });
+
+    await runApprovalExpirySweep();
+
+    expect(mockNotifyCustomerExpired).toHaveBeenCalledWith(decision);
+  });
+
+  it('never notifies the customer for a non-customer_credential customer-audience decision (none exist today, but the gate must hold)', async () => {
+    const decision = { decisionId: 'd1', originSessionId: 'sess-1', gateType: 'customer_confirmation', customerId: 'cust-1' };
+    mockListDuePending.mockImplementation(async (status: string) =>
+      status === 'pending_customer_response' ? [decision] : []);
+    mockExpireDecision.mockResolvedValue({ expired: true, decision });
+
+    await runApprovalExpirySweep();
+
+    expect(mockNotifyCustomerExpired).not.toHaveBeenCalled();
+  });
+
+  it('a customer-notify failure on expiry is swallowed, not counted as a sweep failure', async () => {
+    const decision = { decisionId: 'd1', originSessionId: 'sess-1', gateType: 'customer_credential', customerId: 'cust-1' };
+    mockListDuePending.mockImplementation(async (status: string) =>
+      status === 'pending_customer_response' ? [decision] : []);
+    mockExpireDecision.mockResolvedValue({ expired: true, decision });
+    mockNotifyCustomerExpired.mockRejectedValue(new Error('email service down'));
+
+    const summary = await runApprovalExpirySweep();
+
+    expect(summary.expired).toBe(1);
+    expect(summary.failed).toBe(0);
   });
 
   it('a Slack queue refresh failure after expiry is swallowed, not counted as a sweep failure', async () => {
@@ -148,28 +190,38 @@ describe('runApprovalExpirySweep', () => {
   });
 
   it('review fix: warns when listDuePending returns a full 100-item page — a possible partial run, not silently treated as complete', async () => {
+    // try/finally (review fix): a failing assertion must not skip the
+    // restore and leave console.warn permanently mocked for every later
+    // test in this Jest worker — same class of leak already fixed for
+    // SLACK_BOT_TOKEN in approvalInboxSlack.test.ts, missed here.
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
-    const hundredDecisions = Array.from({ length: 100 }, (_, i) => ({ decisionId: `d${i}` }));
-    mockListDuePending.mockImplementation(async (status: string) =>
-      status === 'pending_team_review' ? hundredDecisions : []);
-    mockExpireDecision.mockResolvedValue({ expired: false });
+    try {
+      const hundredDecisions = Array.from({ length: 100 }, (_, i) => ({ decisionId: `d${i}` }));
+      mockListDuePending.mockImplementation(async (status: string) =>
+        status === 'pending_team_review' ? hundredDecisions : []);
+      mockExpireDecision.mockResolvedValue({ expired: false });
 
-    await runApprovalExpirySweep();
+      await runApprovalExpirySweep();
 
-    expect(warnSpy.mock.calls.some(call => String(call[0]).includes('100-item cap'))).toBe(true);
-    warnSpy.mockRestore();
+      expect(warnSpy.mock.calls.some(call => String(call[0]).includes('100-item cap'))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it('does not warn when well under the 100-item cap', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
-    mockListDuePending.mockImplementation(async (status: string) =>
-      status === 'pending_team_review' ? [{ decisionId: 'd1' }] : []);
-    mockExpireDecision.mockResolvedValue({ expired: false });
+    try {
+      mockListDuePending.mockImplementation(async (status: string) =>
+        status === 'pending_team_review' ? [{ decisionId: 'd1' }] : []);
+      mockExpireDecision.mockResolvedValue({ expired: false });
 
-    await runApprovalExpirySweep();
+      await runApprovalExpirySweep();
 
-    expect(warnSpy.mock.calls.some(call => String(call[0]).includes('100-item cap'))).toBe(false);
-    warnSpy.mockRestore();
+      expect(warnSpy.mock.calls.some(call => String(call[0]).includes('100-item cap'))).toBe(false);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it('a listDuePending failure for one status does not prevent scanning the other', async () => {

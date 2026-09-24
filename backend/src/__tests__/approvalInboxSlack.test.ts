@@ -188,6 +188,24 @@ describe('approvalInboxSlack', () => {
       expect(result.claimed).toBe(true);
     });
 
+    it('review fix: the resolution notice still posts even when the queue refresh fails — separate try/catches, not one combined', async () => {
+      const decision = { decisionId: 'd1', approver: 'matt', verdict: 'approve', businessImpact: 'x' };
+      mockClaimDecision.mockResolvedValue({ claimed: true, decision });
+      // Fails ONLY the queue refresh (listPendingForApprover, called inside
+      // upsertApproverQueueMessage/renderApproverQueueMessage) — postDecisionResolvedNotice
+      // doesn't depend on this, so it must still be attempted independently.
+      mockListPending.mockRejectedValue(new Error('DynamoDB unavailable'));
+
+      const result = await approvalInboxSlack.resolveApprovalDecision('d1', 'approve', 'matt');
+
+      expect(result.claimed).toBe(true);
+      // The resolution notice is a real chat.postMessage with the verdict
+      // label — proves it ran despite the queue refresh throwing.
+      expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
+        text: expect.stringContaining('Approved'),
+      }));
+    });
+
     it('still reports the claim as successful even when the post-claim Slack refresh throws', async () => {
       const decision = { decisionId: 'd1', approver: 'matt', verdict: 'approve', businessImpact: 'x' };
       mockClaimDecision.mockResolvedValue({ claimed: true, decision });

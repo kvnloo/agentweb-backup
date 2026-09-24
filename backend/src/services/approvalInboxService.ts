@@ -158,11 +158,29 @@ export interface CreateApprovalDecisionRequest {
 const MIN_OPTIONS = 2;
 const MAX_OPTIONS = 4;
 
+// Review fix: emma/tools.ts's JSON schema declares an enum for
+// credentialPlatform, but that's only advisory at the LLM tool-calling
+// layer (validateAndRepairToolArgs only checks `type`, never `enum`) — not
+// a real guarantee. These are the only platforms whose reconnect routes
+// actually call autoResolveCredentialDecisionOnReconnect; any other value
+// can structurally never auto-resolve. Enforced here for real.
+const VALID_CREDENTIAL_PLATFORMS = ['meta', 'instagram', 'linkedin'];
+
 // Worst-case page bound for listPendingForApprover/listPendingForCustomer's
 // pagination (review fix) — keeps an approver/customer with an enormous,
 // mostly-resolved history from turning a routine lookup into an unbounded
 // scan when few or no items are actually pending.
 const MAX_PENDING_LOOKUP_PAGES = 20;
+
+// Shared between validateCreateRequest (reject at creation time) and
+// findPendingCredentialDecision (match at reconnect time) — a single source
+// of truth for what "the same account id" means, so the two can never drift
+// (review fix). Strips a leading "act_" — Meta's own API surfaces account
+// ids both with and without it (established precedent: metaService.ts's own
+// norm() helper, and 3 tool schemas explicitly warning "no act_ prefix").
+function normalizeCredentialAccountId(v: string): string {
+  return v.trim().toLowerCase().replace(/^act_/, '');
+}
 
 // Deliberately duplicated from approvalDeck.ts's own (file-private, not
 // exported) validateItemShape rather than refactoring that live-in-production
@@ -234,8 +252,21 @@ function validateCreateRequest(request: CreateApprovalDecisionRequest): void {
     if (!request.credentialPlatform || request.credentialPlatform.trim() === '') {
       throw new ApprovalInboxError(`gateType 'customer_credential' requires credentialPlatform — lets a real reconnect auto-resolve this decision`);
     }
+    if (!VALID_CREDENTIAL_PLATFORMS.includes(request.credentialPlatform.trim().toLowerCase())) {
+      throw new ApprovalInboxError(
+        `gateType 'customer_credential' requires credentialPlatform to be one of: ${VALID_CREDENTIAL_PLATFORMS.join(', ')} — got "${request.credentialPlatform}", which no reconnect route can ever auto-resolve`,
+      );
+    }
     if (!request.credentialAccountId || request.credentialAccountId.trim() === '') {
       throw new ApprovalInboxError(`gateType 'customer_credential' requires credentialAccountId — lets a real reconnect auto-resolve this decision`);
+    }
+    // Review fix: a raw value like "act_" is non-empty but normalizes to ''
+    // (normalizeCredentialAccountId strips the act_ prefix) — reject it here
+    // rather than letting it silently create a decision that can never
+    // correctly match, and that risks matching a different one of this same
+    // customer's own decisions that also happens to normalize to ''.
+    if (normalizeCredentialAccountId(request.credentialAccountId) === '') {
+      throw new ApprovalInboxError(`gateType 'customer_credential' requires a credentialAccountId with real content after normalization (not just an "act_" prefix)`);
     }
   }
 }
@@ -521,16 +552,17 @@ export class ApprovalInboxService {
     // explicitly warning Emma "no act_ prefix") because Meta's own API
     // surfaces the id both with and without it; a real reconnect always
     // passes the bare form, so a credentialAccountId written WITH the prefix
-    // must still match (review fix).
+    // must still match (review fix). Uses the shared normalizeCredentialAccountId
+    // (module-level) rather than a local copy, so this can never drift from
+    // what validateCreateRequest rejects at creation time (review fix).
     const normPlatform = platform.trim().toLowerCase();
-    const normAccountId = (v: string) => v.trim().toLowerCase().replace(/^act_/, '');
-    const normTargetAccountId = normAccountId(accountId);
+    const normTargetAccountId = normalizeCredentialAccountId(accountId);
     return (
       pending.find(
         (d) =>
           d.gateType === 'customer_credential' &&
           d.credentialPlatform?.trim().toLowerCase() === normPlatform &&
-          (d.credentialAccountId ? normAccountId(d.credentialAccountId) : undefined) === normTargetAccountId,
+          (d.credentialAccountId ? normalizeCredentialAccountId(d.credentialAccountId) : undefined) === normTargetAccountId,
       ) ?? null
     );
   }

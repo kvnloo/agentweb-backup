@@ -792,13 +792,19 @@ createTestAccount().then(async () => {
       // ENG-1644 gap-closing: sweep AW-ApprovalDecisions for decisions past
       // expiresAt that nobody ever answered — flip to 'expired', notify the
       // origin session. Hourly — decisions expire on a 1-7 day horizon.
-      const { runApprovalExpirySweep } = await import('./cron/approvalExpirySweepCron');
-      setInterval(() => {
-        if (!isCronEnabled()) return;
-        cronJobRegistry.track('ApprovalExpirySweep', runApprovalExpirySweep())
-          .catch(e => console.error('[ApprovalExpirySweep] sweep failed:', e));
-      }, 60 * 60 * 1000).unref();
-      console.info('[ApprovalExpirySweep] sweep scheduled hourly');
+      // Own try/catch (review fix) — an import failure here must not abort
+      // registration of every cron block after it in this boot sequence.
+      try {
+        const { runApprovalExpirySweep } = await import('./cron/approvalExpirySweepCron');
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('ApprovalExpirySweep', runApprovalExpirySweep())
+            .catch(e => console.error('[ApprovalExpirySweep] sweep failed:', e));
+        }, 60 * 60 * 1000).unref();
+        console.info('[ApprovalExpirySweep] sweep scheduled hourly');
+      } catch (error) {
+        console.error('[ApprovalExpirySweep] Failed to initialize:', error);
+      }
 
       // ENG-916: Meta Ads Metrics Snapshot — runs daily at 09:00 UTC (after
       // ActivationCron at 08:00), re-pulling the last 30 dates each run so the

@@ -39,6 +39,7 @@ beforeEach(() => {
     audience: 'team',
     approver: 'matt',
     status: 'pending_team_review',
+    expiresAt: '2026-10-01T00:00:00.000Z',
   });
   mockNotifyCustomer.mockResolvedValue(undefined);
   mockUpsertApproverQueueMessage.mockResolvedValue({ posted: false });
@@ -77,6 +78,9 @@ describe('stage_pending_decision', () => {
 
     expect(result.success).toBe(true);
     expect(result.decisionId).toBe('decision-1');
+    // Review fix: the effective (possibly clamped) expiresAt must be
+    // surfaced so Emma never overstates a duration that was silently reduced.
+    expect(result.expiresAt).toBe('2026-10-01T00:00:00.000Z');
     // gap-closing round: every new team-audience decision must both refresh
     // the queue message AND fire a real, always-new notification — the
     // queue-only update alone doesn't reliably notify an approver.

@@ -22,7 +22,7 @@ import { emailService } from '../services/emailService';
 import { userDb } from '../services/db';
 import { approvalInboxService } from '../services/approvalInboxService';
 import { executeResolvedDecision } from '../services/approvalInboxExecution';
-import { notifyCustomerOfPendingCredentialDecision, autoResolveCredentialDecisionOnReconnect } from '../services/approvalInboxCustomerNotify';
+import { notifyCustomerOfPendingCredentialDecision, notifyCustomerOfExpiredCredentialDecision, autoResolveCredentialDecisionOnReconnect } from '../services/approvalInboxCustomerNotify';
 
 const mockSendEmail = emailService.sendEmail as jest.Mock;
 const mockSendOncallAlert = emailService.sendOncallAlert as jest.Mock;
@@ -84,6 +84,47 @@ describe('notifyCustomerOfPendingCredentialDecision', () => {
 
   it('missing customerActionUrl is a no-op (should never happen — createDecision validates this, defense in depth)', async () => {
     await notifyCustomerOfPendingCredentialDecision({ ...baseDecision, customerActionUrl: undefined });
+    expect(mockSendEmail).not.toHaveBeenCalled();
+  });
+});
+
+describe('notifyCustomerOfExpiredCredentialDecision (review fix)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetUserById.mockResolvedValue({ userId: 'cust-1', email: 'customer@example.com' });
+    mockSendEmail.mockResolvedValue(undefined);
+  });
+
+  it('non-customer_credential gate types are a no-op', async () => {
+    await notifyCustomerOfExpiredCredentialDecision({ ...baseDecision, gateType: 'plan_choice' });
+    expect(mockSendEmail).not.toHaveBeenCalled();
+  });
+
+  it('sends a real, distinct email telling the customer the window closed', async () => {
+    await notifyCustomerOfExpiredCredentialDecision(baseDecision);
+
+    expect(mockSendEmail).toHaveBeenCalledTimes(1);
+    const [to, subject, text] = mockSendEmail.mock.calls[0];
+    expect(to).toBe('customer@example.com');
+    expect(subject.toLowerCase()).toContain('closed');
+    expect(text).toContain(baseDecision.businessImpact);
+    expect(text.toLowerCase()).toContain('closed');
+  });
+
+  it('fires an oncall alert and sends no email when no email is resolvable', async () => {
+    mockGetUserById.mockResolvedValue({ userId: 'cust-1' });
+    await notifyCustomerOfExpiredCredentialDecision(baseDecision);
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(mockSendOncallAlert).toHaveBeenCalledWith(
+      expect.stringContaining('cust-1'),
+      expect.stringContaining('d1'),
+      expect.objectContaining({ decisionId: 'd1', customerId: 'cust-1' }),
+    );
+  });
+
+  it('missing customerId is a no-op', async () => {
+    await notifyCustomerOfExpiredCredentialDecision({ ...baseDecision, customerId: undefined });
     expect(mockSendEmail).not.toHaveBeenCalled();
   });
 });
