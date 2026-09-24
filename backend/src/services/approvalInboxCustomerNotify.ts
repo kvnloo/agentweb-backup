@@ -1,6 +1,7 @@
 import { emailService } from './emailService';
 import { userDb } from './db';
-import type { ApprovalDecision } from './approvalInboxService';
+import { approvalInboxService, type ApprovalDecision } from './approvalInboxService';
+import { executeResolvedDecision } from './approvalInboxExecution';
 
 /**
  * ENG-1644 Phase E (narrow scope): customer-facing delivery for
@@ -55,4 +56,39 @@ export async function notifyCustomerOfPendingCredentialDecision(decision: Approv
     `<p>If you weren't expecting this, reply to this email and we'll help.</p>`;
 
   await emailService.sendEmail(customerEmail, subject, text, html);
+}
+
+/**
+ * Gap-closing round: called from a real OAuth reconnect callback (Meta,
+ * LinkedIn) once a connection is genuinely re-established. Finds the
+ * matching pending customer_credential decision (if any) and auto-claims
+ * it — closes the loop that previously left every customer_credential
+ * decision as a one-way notification that could never resolve to "done".
+ * Self-contained (own try/catch, never throws) since this is called from
+ * inside a real reconnect handler — a failure here must never break the
+ * actual reconnect response.
+ */
+export async function autoResolveCredentialDecisionOnReconnect(
+  customerId: string,
+  platform: string,
+  accountId: string,
+): Promise<void> {
+  try {
+    const decision = await approvalInboxService.findPendingCredentialDecision(customerId, platform, accountId);
+    if (!decision) return;
+
+    const result = await approvalInboxService.claimDecision(decision.decisionId, 'approve', 'system:auto-reconnect');
+    if (!result.claimed) {
+      // Lost a race — already resolved some other way, or expired. Nothing
+      // left to do; not an error.
+      return;
+    }
+    await executeResolvedDecision(result.decision);
+  } catch (err: any) {
+    console.warn(
+      '[approval-inbox-customer-notify] failed to auto-resolve credential decision on reconnect:',
+      { customerId, platform, accountId },
+      err?.message || err,
+    );
+  }
 }

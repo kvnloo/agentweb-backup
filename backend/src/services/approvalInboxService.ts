@@ -114,6 +114,13 @@ export interface ApprovalDecision {
    *  caller supplies the exact target rather than this service knowing how
    *  to build one per platform. */
   customerActionUrl?: string;
+  /** Both required iff gateType === 'customer_credential' — the platform
+   *  (e.g. 'meta', 'linkedin') and connected-account id this decision is
+   *  actually about. Lets a real OAuth reconnect auto-resolve the matching
+   *  decision (gap-closing round) without parsing customerActionUrl, which
+   *  is free-text and not a guaranteed-stable contract. */
+  credentialPlatform?: string;
+  credentialAccountId?: string;
   originSessionId?: string;
   originCorrelator?: string;
   createdAt: string;
@@ -139,6 +146,8 @@ export interface CreateApprovalDecisionRequest {
   metaWriteManifestDigest?: string;
   metaWriteDispatch?: ApprovalDecisionMetaWriteDispatch;
   customerActionUrl?: string;
+  credentialPlatform?: string;
+  credentialAccountId?: string;
   originSessionId?: string;
   originCorrelator?: string;
   /** ISO timestamp. Required — every decision must have a real expiry (ticket
@@ -216,6 +225,12 @@ function validateCreateRequest(request: CreateApprovalDecisionRequest): void {
     if (!request.customerActionUrl || request.customerActionUrl.trim() === '') {
       throw new ApprovalInboxError(`gateType 'customer_credential' requires customerActionUrl — the link the customer's notification email points to`);
     }
+    if (!request.credentialPlatform || request.credentialPlatform.trim() === '') {
+      throw new ApprovalInboxError(`gateType 'customer_credential' requires credentialPlatform — lets a real reconnect auto-resolve this decision`);
+    }
+    if (!request.credentialAccountId || request.credentialAccountId.trim() === '') {
+      throw new ApprovalInboxError(`gateType 'customer_credential' requires credentialAccountId — lets a real reconnect auto-resolve this decision`);
+    }
   }
 }
 
@@ -249,6 +264,8 @@ export class ApprovalInboxService {
       metaWriteManifestDigest: request.metaWriteManifestDigest,
       metaWriteDispatch: request.metaWriteDispatch,
       customerActionUrl: request.customerActionUrl,
+      credentialPlatform: request.credentialPlatform,
+      credentialAccountId: request.credentialAccountId,
       originSessionId: request.originSessionId,
       originCorrelator: request.originCorrelator,
       createdAt: now,
@@ -341,6 +358,65 @@ export class ApprovalInboxService {
     }
   }
 
+  /**
+   * Flips a pending decision to 'expired' once its expiresAt has passed with
+   * nobody having answered it — same race-free shape as claimDecision (no
+   * pre-read, single atomic conditional update): only succeeds if the item
+   * is still genuinely pending AND already past expiry, so a real claim that
+   * lands first (or a previous sweep tick that already expired it) always
+   * wins cleanly, never double-processed. Called by approvalExpirySweepCron.
+   */
+  async expireDecision(decisionId: string): Promise<{ expired: true; decision: ApprovalDecision } | { expired: false }> {
+    const now = new Date().toISOString();
+    try {
+      const result = await dynamodb
+        .update({
+          TableName: APPROVAL_DECISIONS_TABLE,
+          Key: { decisionId },
+          UpdateExpression: 'SET #status = :expired, updatedAt = :now',
+          ConditionExpression: '(#status = :pendingTeam OR #status = :pendingCustomer) AND expiresAt <= :now',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: {
+            ':expired': 'expired',
+            ':now': now,
+            ':pendingTeam': 'pending_team_review',
+            ':pendingCustomer': 'pending_customer_response',
+          },
+          ReturnValues: 'ALL_NEW',
+        })
+        .promise();
+      return { expired: true, decision: result.Attributes as ApprovalDecision };
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') {
+        // Already resolved by a real claim, or already expired by a
+        // previous sweep tick — nothing to do, not an error.
+        return { expired: false };
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Due-for-expiry lookup for the sweep cron. StatusExpiryIndex's HASH key is
+   * `status`, so a single query can only cover one pending status at a time —
+   * the cron calls this once per pending status value, not a design flaw
+   * (DynamoDB has no cross-partition-key OR in one query).
+   */
+  async listDuePending(status: 'pending_team_review' | 'pending_customer_response', limit = 100): Promise<ApprovalDecision[]> {
+    const now = new Date().toISOString();
+    const result = await dynamodb
+      .query({
+        TableName: APPROVAL_DECISIONS_TABLE,
+        IndexName: 'StatusExpiryIndex',
+        KeyConditionExpression: '#status = :status AND expiresAt <= :now',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':status': status, ':now': now },
+        Limit: limit,
+      })
+      .promise();
+    return (result.Items as ApprovalDecision[] | undefined) ?? [];
+  }
+
   /** Records the outcome of actually executing an approved decision (Phase D) —
    *  unconditional, since by this point claimDecision has already made this
    *  at-most-once; this just records what happened. */
@@ -394,6 +470,22 @@ export class ApprovalInboxService {
       })
       .promise();
     return (result.Items as ApprovalDecision[] | undefined) ?? [];
+  }
+
+  /**
+   * Finds the pending customer_credential decision (if any) matching a real
+   * OAuth reconnect — gap-closing round. Filters listPendingForCustomer's
+   * small, already-bounded result set in-code rather than a new GSI: a
+   * customer has at most a handful of pending decisions at once, and this
+   * only needs to run once per reconnect, not on a hot path.
+   */
+  async findPendingCredentialDecision(customerId: string, platform: string, accountId: string): Promise<ApprovalDecision | null> {
+    const pending = await this.listPendingForCustomer(customerId);
+    return (
+      pending.find(
+        (d) => d.gateType === 'customer_credential' && d.credentialPlatform === platform && d.credentialAccountId === accountId,
+      ) ?? null
+    );
   }
 }
 

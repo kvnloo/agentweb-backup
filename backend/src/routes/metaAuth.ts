@@ -347,6 +347,15 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
                 }
             });
             connectedAccounts.push(account);
+
+            // ENG-1644 gap-closing: if the customer had a pending reconnect
+            // decision for this exact account, this real reconnect resolves
+            // it. Dynamic import — approvalInboxCustomerNotify.ts transitively
+            // pulls in emailService/chatbotService/agentModeService, too heavy
+            // to load statically into a lightweight OAuth route file.
+            // Self-contained/never-throws — must not affect this response.
+            const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
+            await autoResolveCredentialDecisionOnReconnect(userId, 'meta', adAccount.account_id);
         }
 
         res.json({ success: true, connectedAccounts });

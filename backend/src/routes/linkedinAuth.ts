@@ -368,6 +368,13 @@ router.post('/connect-accounts', authenticateToken, async (req: any, res) => {
 
       const account = await createAccount(userId, 'linkedin', accountInput);
       connectedAccounts.push(account);
+
+      // ENG-1644 gap-closing: resolve any pending reconnect decision for
+      // this exact account. Dynamic import — see metaAuth.ts's identical
+      // comment for why (heavy transitive chain, must stay out of this
+      // file's static load). Self-contained/never-throws.
+      const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
+      await autoResolveCredentialDecisionOnReconnect(userId, 'linkedin', profile.urn);
     }
 
     // Connect selected organizations
@@ -392,6 +399,10 @@ router.post('/connect-accounts', authenticateToken, async (req: any, res) => {
 
         const account = await createAccount(userId, 'linkedin', accountInput);
         connectedAccounts.push(account);
+
+        // ENG-1644 gap-closing: same as the personal-account case above.
+        const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
+        await autoResolveCredentialDecisionOnReconnect(userId, 'linkedin', org.urn);
       }
     }
 

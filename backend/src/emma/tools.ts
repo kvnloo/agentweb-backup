@@ -386,7 +386,7 @@ Do NOT use this for a Meta Ads write approval — those already go through call_
 
 Always include businessImpact (why this matters, one line) and an evidencePacket (links/context the approver needs to decide without re-doing your research) — the whole point is the approver can act on ONE response with everything they need already in front of them, never asking you to re-explain.
 
-For a customer-facing credential reconnect (e.g. a disconnected ad account or CMS login) — set audience to "customer", gateType to "customer_credential", provide customerId instead of approver, and customerActionUrl pointing to where they fix it (e.g. their connected-accounts settings page). This emails the customer directly, never the team Slack queue. Customer-facing plan/confirmation questions (gateType "customer_confirmation") are NOT supported yet — no delivery surface exists for them; do not call this tool for that case, ask the current user directly instead if they're the right person, or use present_question_deck.`,
+For a customer-facing credential reconnect (e.g. a disconnected ad account or CMS login) — set audience to "customer", gateType to "customer_credential", provide customerId instead of approver, customerActionUrl pointing to where they fix it (e.g. their connected-accounts settings page), and credentialPlatform/credentialAccountId identifying exactly which connection this is about — when the customer actually reconnects, that's what lets this decision auto-resolve to "done" instead of sitting open forever. This emails the customer directly, never the team Slack queue. Customer-facing plan/confirmation questions (gateType "customer_confirmation") are NOT supported yet — no delivery surface exists for them; do not call this tool for that case, ask the current user directly instead if they're the right person, or use present_question_deck.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -416,6 +416,14 @@ For a customer-facing credential reconnect (e.g. a disconnected ad account or CM
         customerActionUrl: {
           type: 'string',
           description: 'Required for gateType="customer_credential". The exact URL the customer\'s email links to (e.g. their connected-accounts settings page).',
+        },
+        credentialPlatform: {
+          type: 'string',
+          description: 'Required for gateType="customer_credential". Which platform this reconnect is about, e.g. "meta" or "linkedin" — must match the platform value used elsewhere for this customer\'s connected accounts.',
+        },
+        credentialAccountId: {
+          type: 'string',
+          description: 'Required for gateType="customer_credential". The specific connected account id that needs reconnecting.',
         },
         evidencePacket: {
           type: 'object',
@@ -499,6 +507,8 @@ For a customer-facing credential reconnect (e.g. a disconnected ad account or CM
         },
         options,
         customerActionUrl: audience === 'customer' ? args?.customerActionUrl : undefined,
+        credentialPlatform: audience === 'customer' ? args?.credentialPlatform : undefined,
+        credentialAccountId: audience === 'customer' ? args?.credentialAccountId : undefined,
         originSessionId: sessionId,
         expiresAt,
       });

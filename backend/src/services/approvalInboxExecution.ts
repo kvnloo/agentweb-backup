@@ -49,6 +49,38 @@ async function notifyOriginSession(decision: ApprovalDecision): Promise<void> {
   });
 }
 
+/**
+ * Called by approvalExpirySweepCron once a decision has been atomically
+ * flipped to 'expired' (nobody answered it in time) — tells the origin
+ * session explicitly rather than leaving it silently unresolved forever.
+ * Self-contained (own try/catch, never throws) since the cron calls this
+ * directly, not through executeResolvedDecision's wrapper.
+ */
+export async function notifyOriginSessionOfExpiry(decision: ApprovalDecision): Promise<void> {
+  if (!decision.originSessionId) return;
+
+  const approverLabel = decision.approver || (decision.audience === 'customer' ? 'the customer' : 'the approver');
+  const content = [
+    `[Approval Inbox ${decision.decisionId}] This decision expired with no answer from ${approverLabel}.`,
+    `Decision: ${decision.businessImpact}`,
+    'Do not assume this was approved or rejected — nobody answered it in time. Re-raise it if it still matters, or proceed without it if it no longer does.',
+  ].join('\n');
+
+  try {
+    await chatbotDb.addMessageToSession(decision.originSessionId, {
+      role: 'system',
+      content,
+      metadata: {
+        timestamp: new Date().toISOString(),
+        isContextMessage: true,
+        kind: 'approval-inbox-resolution',
+      },
+    });
+  } catch (err: any) {
+    console.warn('[approval-inbox-execution] failed to notify origin session of expiry for decision', decision.decisionId, err?.message || err);
+  }
+}
+
 export async function executeResolvedDecision(decision: ApprovalDecision): Promise<void> {
   if (decision.gateType === 'meta_write') {
     // No producer exists yet — stage_pending_decision explicitly refuses
