@@ -16,7 +16,6 @@
  * non-agentweb route meaningful. This function is the one place later tickets extend.
  */
 import { AsyncLocalStorage } from "async_hooks";
-import { getFundingFlags } from "./fundingFlags";
 
 export type FundingRoute = "agentweb" | "api_key" | "claude_subscription" | "codex_subscription";
 
@@ -49,6 +48,15 @@ const runFundingStore = new AsyncLocalStorage<RunFunding>();
  * needs the true billing subject.
  */
 export async function resolveRunFunding({ userId }: ResolveRunFundingInput): Promise<RunFunding> {
+  // Lazy require, not a top-level import: `fundingFlags.ts` pulls in `settingsService.ts`,
+  // which constructs a real AWS.DynamoDB.DocumentClient at module-load time. A top-level
+  // import here would make merely importing `currentRunFunding`/`withRunFunding` — used
+  // pervasively across files that have nothing to do with AWS (blog.ts, chatbotService.ts)
+  // — eagerly load the AWS SDK graph. This broke `blog.test.ts`, which specifically avoids
+  // an AWS SDK mock because `generateBlogContent` already lazy-imports settingsService for
+  // exactly this reason. Same idiom as `deferredBillingMetering.ts`'s lazy tokenUsageService
+  // require ("pulls in the db -> aws config graph").
+  const { getFundingFlags } = require("./fundingFlags") as typeof import("./fundingFlags");
   // Read the flags so the fallback path is exercised and covered by tests, even though
   // F1 cannot yet act on a non-agentweb result (no connection kind exists to route to).
   await getFundingFlags();
