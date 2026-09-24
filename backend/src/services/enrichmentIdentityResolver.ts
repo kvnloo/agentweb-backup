@@ -337,7 +337,19 @@ export async function resolveIdentity(
       const copyableFields: Array<keyof SiblingLeadResult & keyof LeadRecord> = [
         'firstName', 'lastName', 'email', 'company', 'website',
       ];
+      // ENG-2082: `email` is only safe to copy when SOME strong anchor matched the sibling.
+      // With no email and no LinkedIn on this lead, the only thing findSiblingLeads could
+      // have matched on is name+company — and findLeadsByNameCompany is a table-wide GSI
+      // query with no listId or userId predicate. Copying an address across that match
+      // takes a STRANGER'S email, writes it into email-index, and makes this lead mailable
+      // at it. The guard below used to make this unreachable for inbound capture, because a
+      // captured lead always had an email; phone-only capture removed that.
+      //
+      // Scoped to `email` deliberately. name/company/website across a name+company match
+      // are the same-shaped risk but far lower stakes — nothing sends to them.
+      const strongAnchor = !!email || !!linkedinUrl;
       for (const field of copyableFields) {
+        if (field === 'email' && !strongAnchor) continue;
         const currentValue = (lead as any)[field];
         if (typeof currentValue === 'string' && currentValue.trim() !== '') continue;
         if (refresh && refresh.has(`${lead.leadId}:${field}`)) continue;
