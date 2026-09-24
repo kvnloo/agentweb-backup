@@ -162,7 +162,7 @@ describe('stage_pending_decision', () => {
     expect(mockCreateDecision).not.toHaveBeenCalled();
   });
 
-  it('customer_credential: passes customerActionUrl through and notifies the customer, not the Slack queue', async () => {
+  it('customer_credential: passes customerActionUrl/credentialPlatform/credentialAccountId through and notifies the customer, not the Slack queue', async () => {
     mockCreateDecision.mockResolvedValue({
       decisionId: 'decision-2',
       audience: 'customer',
@@ -179,6 +179,8 @@ describe('stage_pending_decision', () => {
         businessImpact: 'Your Meta ad account disconnected.',
         evidencePacket: {},
         customerActionUrl: 'https://app.agentweb.pro/settings?tab=connected-accounts&platform=meta',
+        credentialPlatform: 'meta',
+        credentialAccountId: 'act_123',
       },
       { userId: 'user-1', sessionId: 'sess-1' },
     );
@@ -187,6 +189,8 @@ describe('stage_pending_decision', () => {
       gateType: 'customer_credential',
       customerId: 'cust-1',
       customerActionUrl: 'https://app.agentweb.pro/settings?tab=connected-accounts&platform=meta',
+      credentialPlatform: 'meta',
+      credentialAccountId: 'act_123',
     }));
     expect(mockNotifyCustomer).toHaveBeenCalledWith(expect.objectContaining({ decisionId: 'decision-2' }));
     expect(result.success).toBe(true);

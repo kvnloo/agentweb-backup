@@ -133,16 +133,34 @@ describe('approvalInboxService.createDecision', () => {
     mockDynamoDB.put.mockReturnValue(ok());
     const decision = await service.createDecision({
       gateType: 'customer_credential', customerId: 'cust-1', businessImpact: 'Needs a fresh OAuth token.',
-      evidencePacket: {}, customerActionUrl: 'https://app.agentweb.pro/settings?tab=connected-accounts', expiresAt: FUTURE,
+      evidencePacket: {}, customerActionUrl: 'https://app.agentweb.pro/settings?tab=connected-accounts',
+      credentialPlatform: 'meta', credentialAccountId: 'act_123', expiresAt: FUTURE,
     } as any);
     expect(decision.audience).toBe('customer');
     expect(decision.status).toBe('pending_customer_response');
     expect(decision.customerActionUrl).toBe('https://app.agentweb.pro/settings?tab=connected-accounts');
+    expect(decision.credentialPlatform).toBe('meta');
+    expect(decision.credentialAccountId).toBe('act_123');
   });
 
   it('a customer_credential decision without customerActionUrl is rejected', async () => {
     await expect(service.createDecision({
-      gateType: 'customer_credential', customerId: 'cust-1', businessImpact: 'x', evidencePacket: {}, expiresAt: FUTURE,
+      gateType: 'customer_credential', customerId: 'cust-1', businessImpact: 'x', evidencePacket: {},
+      credentialPlatform: 'meta', credentialAccountId: 'act_123', expiresAt: FUTURE,
+    } as any)).rejects.toThrow(ApprovalInboxError);
+  });
+
+  it('a customer_credential decision without credentialPlatform is rejected', async () => {
+    await expect(service.createDecision({
+      gateType: 'customer_credential', customerId: 'cust-1', businessImpact: 'x', evidencePacket: {},
+      customerActionUrl: 'https://x', credentialAccountId: 'act_123', expiresAt: FUTURE,
+    } as any)).rejects.toThrow(ApprovalInboxError);
+  });
+
+  it('a customer_credential decision without credentialAccountId is rejected', async () => {
+    await expect(service.createDecision({
+      gateType: 'customer_credential', customerId: 'cust-1', businessImpact: 'x', evidencePacket: {},
+      customerActionUrl: 'https://x', credentialPlatform: 'meta', expiresAt: FUTURE,
     } as any)).rejects.toThrow(ApprovalInboxError);
   });
 });
@@ -200,5 +218,92 @@ describe('approvalInboxService.claimDecision', () => {
     const params = mockDynamoDB.update.mock.calls[0][0];
     expect(params.ExpressionAttributeValues[':newStatus']).toBe('edited');
     expect(params.ExpressionAttributeValues[':freeText']).toBe('wrong account');
+  });
+});
+
+describe('approvalInboxService.expireDecision', () => {
+  it('atomically flips a genuinely-due pending decision to expired — no pre-read, one conditional update', async () => {
+    mockDynamoDB.update.mockReturnValue(ok({ Attributes: { decisionId: 'd1', status: 'expired' } }));
+
+    const result = await service.expireDecision('d1');
+    expect(result.expired).toBe(true);
+    expect(mockDynamoDB.get).not.toHaveBeenCalled();
+    const params = mockDynamoDB.update.mock.calls[0][0];
+    expect(params.ConditionExpression).toContain('#status = :pendingTeam');
+    expect(params.ConditionExpression).toContain('expiresAt <= :now');
+    expect(params.ExpressionAttributeValues[':expired']).toBe('expired');
+  });
+
+  it('loses cleanly (expired:false, no throw) to a claim that landed first — the real race this exists to handle', async () => {
+    mockDynamoDB.update.mockReturnValue(conditionalFail());
+
+    const result = await service.expireDecision('d1');
+    expect(result.expired).toBe(false);
+    // Unlike claimDecision, there's no follow-up read here — a lost race just
+    // means "nothing to do," no specific reason needs reporting to a caller.
+    expect(mockDynamoDB.get).not.toHaveBeenCalled();
+  });
+
+  it('loses cleanly to a previous sweep tick that already expired the same decision', async () => {
+    mockDynamoDB.update.mockReturnValue(conditionalFail());
+    const result = await service.expireDecision('already-expired-d1');
+    expect(result.expired).toBe(false);
+  });
+});
+
+describe('approvalInboxService.listDuePending', () => {
+  it('queries StatusExpiryIndex for the given status with expiresAt <= now', async () => {
+    mockDynamoDB.query.mockReturnValue(ok({ Items: [{ decisionId: 'd1', status: 'pending_team_review' }] }));
+
+    const result = await service.listDuePending('pending_team_review');
+    expect(result).toHaveLength(1);
+    const params = mockDynamoDB.query.mock.calls[0][0];
+    expect(params.IndexName).toBe('StatusExpiryIndex');
+    expect(params.ExpressionAttributeValues[':status']).toBe('pending_team_review');
+    expect(params.KeyConditionExpression).toContain('expiresAt <= :now');
+  });
+
+  it('returns an empty array when nothing is due, not undefined/throw', async () => {
+    mockDynamoDB.query.mockReturnValue(ok({}));
+    const result = await service.listDuePending('pending_customer_response');
+    expect(result).toEqual([]);
+  });
+});
+
+describe('approvalInboxService.findPendingCredentialDecision', () => {
+  it('finds the matching pending customer_credential decision by platform + accountId', async () => {
+    mockDynamoDB.query.mockReturnValue(ok({
+      Items: [
+        { decisionId: 'd1', gateType: 'customer_credential', credentialPlatform: 'linkedin', credentialAccountId: 'urn:li:person:other' },
+        { decisionId: 'd2', gateType: 'customer_credential', credentialPlatform: 'meta', credentialAccountId: 'act_123' },
+      ],
+    }));
+
+    const result = await service.findPendingCredentialDecision('cust-1', 'meta', 'act_123');
+    expect(result?.decisionId).toBe('d2');
+  });
+
+  it('returns null when no pending decision matches the platform+accountId', async () => {
+    mockDynamoDB.query.mockReturnValue(ok({
+      Items: [{ decisionId: 'd1', gateType: 'customer_credential', credentialPlatform: 'meta', credentialAccountId: 'act_999' }],
+    }));
+
+    const result = await service.findPendingCredentialDecision('cust-1', 'meta', 'act_123');
+    expect(result).toBeNull();
+  });
+
+  it('never matches a non-customer_credential decision even with the same platform/accountId fields', async () => {
+    mockDynamoDB.query.mockReturnValue(ok({
+      Items: [{ decisionId: 'd1', gateType: 'plan_choice', credentialPlatform: 'meta', credentialAccountId: 'act_123' }],
+    }));
+
+    const result = await service.findPendingCredentialDecision('cust-1', 'meta', 'act_123');
+    expect(result).toBeNull();
+  });
+
+  it('returns null when the customer has no pending decisions at all', async () => {
+    mockDynamoDB.query.mockReturnValue(ok({}));
+    const result = await service.findPendingCredentialDecision('cust-1', 'meta', 'act_123');
+    expect(result).toBeNull();
   });
 });

@@ -10,13 +10,26 @@ jest.mock('../services/db', () => ({
   userDb: { getUserById: jest.fn() },
 }));
 
+jest.mock('../services/approvalInboxService', () => ({
+  approvalInboxService: { findPendingCredentialDecision: jest.fn(), claimDecision: jest.fn() },
+}));
+
+jest.mock('../services/approvalInboxExecution', () => ({
+  executeResolvedDecision: jest.fn(),
+}));
+
 import { emailService } from '../services/emailService';
 import { userDb } from '../services/db';
-import { notifyCustomerOfPendingCredentialDecision } from '../services/approvalInboxCustomerNotify';
+import { approvalInboxService } from '../services/approvalInboxService';
+import { executeResolvedDecision } from '../services/approvalInboxExecution';
+import { notifyCustomerOfPendingCredentialDecision, autoResolveCredentialDecisionOnReconnect } from '../services/approvalInboxCustomerNotify';
 
 const mockSendEmail = emailService.sendEmail as jest.Mock;
 const mockSendOncallAlert = emailService.sendOncallAlert as jest.Mock;
 const mockGetUserById = userDb.getUserById as jest.Mock;
+const mockFindPendingCredentialDecision = approvalInboxService.findPendingCredentialDecision as jest.Mock;
+const mockClaimDecision = approvalInboxService.claimDecision as jest.Mock;
+const mockExecuteResolvedDecision = executeResolvedDecision as jest.Mock;
 
 const baseDecision: any = {
   decisionId: 'd1',
@@ -72,5 +85,46 @@ describe('notifyCustomerOfPendingCredentialDecision', () => {
   it('missing customerActionUrl is a no-op (should never happen — createDecision validates this, defense in depth)', async () => {
     await notifyCustomerOfPendingCredentialDecision({ ...baseDecision, customerActionUrl: undefined });
     expect(mockSendEmail).not.toHaveBeenCalled();
+  });
+});
+
+describe('autoResolveCredentialDecisionOnReconnect', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('no match: does nothing, never claims', async () => {
+    mockFindPendingCredentialDecision.mockResolvedValue(null);
+
+    await autoResolveCredentialDecisionOnReconnect('cust-1', 'meta', 'act_123');
+
+    expect(mockClaimDecision).not.toHaveBeenCalled();
+    expect(mockExecuteResolvedDecision).not.toHaveBeenCalled();
+  });
+
+  it('a match: claims as approve (system:auto-reconnect) and executes the resolution', async () => {
+    const decision = { decisionId: 'd1', gateType: 'customer_credential' };
+    mockFindPendingCredentialDecision.mockResolvedValue(decision);
+    const claimedDecision = { ...decision, status: 'approved' };
+    mockClaimDecision.mockResolvedValue({ claimed: true, decision: claimedDecision });
+
+    await autoResolveCredentialDecisionOnReconnect('cust-1', 'meta', 'act_123');
+
+    expect(mockFindPendingCredentialDecision).toHaveBeenCalledWith('cust-1', 'meta', 'act_123');
+    expect(mockClaimDecision).toHaveBeenCalledWith('d1', 'approve', 'system:auto-reconnect');
+    expect(mockExecuteResolvedDecision).toHaveBeenCalledWith(claimedDecision);
+  });
+
+  it('a lost claim race (already resolved some other way) is a clean no-op, not an error', async () => {
+    mockFindPendingCredentialDecision.mockResolvedValue({ decisionId: 'd1' });
+    mockClaimDecision.mockResolvedValue({ claimed: false, reason: 'already_resolved' });
+
+    await expect(autoResolveCredentialDecisionOnReconnect('cust-1', 'meta', 'act_123')).resolves.toBeUndefined();
+    expect(mockExecuteResolvedDecision).not.toHaveBeenCalled();
+  });
+
+  it('never throws — a failure here must not break the real reconnect flow calling it', async () => {
+    mockFindPendingCredentialDecision.mockRejectedValue(new Error('DynamoDB unavailable'));
+    await expect(autoResolveCredentialDecisionOnReconnect('cust-1', 'meta', 'act_123')).resolves.toBeUndefined();
   });
 });

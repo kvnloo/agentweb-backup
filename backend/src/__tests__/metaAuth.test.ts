@@ -3,6 +3,7 @@ import express from 'express';
 import jwt from 'jsonwebtoken';
 import axios from 'axios';
 import { metaService } from '../services/metaService';
+import { autoResolveCredentialDecisionOnReconnect } from '../services/approvalInboxCustomerNotify';
 
 jest.mock('axios');
 import * as connectedAccountsDb from '../services/connectedAccountsDb';
@@ -12,6 +13,13 @@ import metaAuthRouter from '../routes/metaAuth';
 jest.mock('../services/metaService');
 jest.mock('../services/instagramService');
 jest.mock('../services/connectedAccountsDb');
+// ENG-1644 gap-closing: /connect-ad-accounts dynamically imports this to
+// auto-resolve a pending reconnect decision — mocked here (jest.mock
+// intercepts dynamic imports identically to static ones) so tests assert on
+// it directly rather than relying on its own real, silent error-swallowing.
+jest.mock('../services/approvalInboxCustomerNotify', () => ({
+    autoResolveCredentialDecisionOnReconnect: jest.fn().mockResolvedValue(undefined),
+}));
 
 // In-memory mock for oauthSessionDb so tests don't hit DynamoDB
 const mockSessionStore = new Map<string, any>();
@@ -68,6 +76,15 @@ jest.mock('../config/integrations', () => ({
             redirectUri: 'http://localhost/callback',
             marketingScopes: ['ads_management', 'pages_show_list'],
             instagramScopes: ['instagram_business_basic']
+        },
+        // ENG-1644 gap-closing: /connect-ad-accounts now transitively pulls
+        // in linkedInAdsService.ts (via approvalInboxCustomerNotify.ts's
+        // chatbotService/agentModeService chain), which reads this at
+        // module-load time. Real INTEGRATION_CONFIG.linkedinAds.apiVersion
+        // is always populated (config/integrations.ts) — this mock just
+        // needs to match that shape now, not a real LinkedIn Ads test concern.
+        linkedinAds: {
+            apiVersion: '202603',
         }
     }
 }));
@@ -213,6 +230,9 @@ describe('Meta Auth Routes', () => {
                     })
                 })
             );
+            // ENG-1644 gap-closing: a real successful reconnect must try to
+            // auto-resolve any matching pending decision for this exact account.
+            expect(autoResolveCredentialDecisionOnReconnect).toHaveBeenCalledWith('test_user_id', 'meta', 'act_123');
         });
 
         it('should reject request without token session ID', async () => {
