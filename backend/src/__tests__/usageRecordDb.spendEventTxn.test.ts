@@ -64,9 +64,12 @@ describe('incrementUsageWithSpendEvent', () => {
 
     expect(mockDynamoDB.transactWrite).toHaveBeenCalledTimes(1);
     const items = mockDynamoDB.transactWrite.mock.calls[0][0].TransactItems;
-    expect(items).toHaveLength(2);
+    expect(items).toHaveLength(3); // ledger + spend event + F5 projection maintenance
     expect(items[0].Update).toBeDefined();
     expect(items[1].Put.TableName).toBe('AW-SpendEvents');
+    // ENG-1250 F5: the projection update rides in the SAME transaction, appended last.
+    expect(items[2].Update.TableName).toBe('AW-SpendProjection');
+    expect(items[2].Update.UpdateExpression).toBe('SET computedAt = :now ADD settledMicroUsd :m, settledEventCount :c');
   });
 
   it('targets AW-SpendEvents, never the LLM-only charge table', () => {

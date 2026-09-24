@@ -78,12 +78,14 @@ describe('incrementUsageWithChargeEvent with a spend event (ENG-1934)', () => {
 
     expect(mockDynamoDB.transactWrite).toHaveBeenCalledTimes(1);
     const [{ TransactItems }] = mockDynamoDB.transactWrite.mock.calls[0];
-    expect(TransactItems).toHaveLength(3);
+    expect(TransactItems).toHaveLength(4); // ledger + charge + spend event + F5 projection
     expect(TransactItems[2].Put).toEqual({
       TableName: 'AW-SpendEvents',
       Item: spendEvent,
       ConditionExpression: 'attribute_not_exists(billingUserId) AND attribute_not_exists(eventId)',
     });
+    // ENG-1250 F5: projection update atomic with the charge, appended last.
+    expect(TransactItems[3].Update.TableName).toBe('AW-SpendProjection');
   });
 
   it('writes one item per priced portion — engine-priced and book-priced stay separate events', async () => {
@@ -92,17 +94,21 @@ describe('incrementUsageWithChargeEvent with a spend event (ENG-1934)', () => {
     await usageRecordDb.incrementUsageWithChargeEvent(increment, charge, [spendEvent, engineEvent]);
 
     const [{ TransactItems }] = mockDynamoDB.transactWrite.mock.calls[0];
-    expect(TransactItems).toHaveLength(4);
-    expect(TransactItems.slice(2).map((i: any) => i.Put.Item.rateCardVersion)).toEqual([
+    expect(TransactItems).toHaveLength(5); // ledger + charge + 2 spend events + 1 grouped F5 projection
+    expect(TransactItems.slice(2, 4).map((i: any) => i.Put.Item.rateCardVersion)).toEqual([
       'llm-price-book:2026-09-10',
       'caller:agent-engine',
     ]);
+    // ENG-1250 F5: both settled events (same subject+month) fold into ONE
+    // projection Update — a transaction may not touch the same item twice.
+    expect(TransactItems[4].Update.TableName).toBe('AW-SpendProjection');
+    expect(TransactItems[4].Update.ExpressionAttributeValues[':c']).toBe(2);
   });
 
   it('a condition failure on ANY spend-event item alone still throws, never "duplicate"', async () => {
     const engineEvent = { ...spendEvent, eventId: `${spendEvent.eventId}#engine`, rateCardVersion: 'caller:agent-engine' };
     mockDynamoDB.transactWrite.mockReturnValue({
-      promise: jest.fn().mockRejectedValue(cancelled(['None', 'None', 'None', 'ConditionalCheckFailed'])),
+      promise: jest.fn().mockRejectedValue(cancelled(['None', 'None', 'None', 'ConditionalCheckFailed', 'None'])),
     });
 
     await expect(
