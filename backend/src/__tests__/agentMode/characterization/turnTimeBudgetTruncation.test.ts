@@ -672,4 +672,64 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     expect(finalSynthesisPerCall.some(Boolean)).toBe(false);
     expect(result.content).toMatch(/10 best posts/);
   });
+
+  it('grows the synthesis reserve using slow TOOL-dispatch time, not just slow LLM calls (ENG-2121)', async () => {
+    // Prod bug: a Meta ad-creative work-plan step spent its turn on heavy
+    // knowledge-base reads (design tokens / media assets) and was cut off by the
+    // whole-turn hard cap before it ever got to issue a generate_image call — the
+    // user saw the bare "Partial results — I hit the time limit" fallback instead
+    // of a graceful, nudge-driven partial answer. Every individual LLM call in
+    // that turn was fast; it was the TOOL call (a heavy read_knowledge_base_files)
+    // that was slow, and the reserve calc only ever widened for slow LLM calls —
+    // so the budget kept reading as "normal" long after most of the clock was gone,
+    // and a second slow read ran the turn straight past the hard cap.
+    const SLOW_TOOL_MS = 380_000; // ~6.3 min, in line with a heavy multi-file KB read
+    let call = 0;
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const messages = args[1] || [];
+      const isFinalSynthesis = messages.some(
+        (m: any) =>
+          m?.role === 'user' &&
+          typeof m.content === 'string' &&
+          /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
+      );
+      nowMs += 5_000; // every LLM call itself is fast
+      return buildLLMResponse(
+        isFinalSynthesis
+          ? { content: 'Partial results — here is what I gathered before the time limit.' }
+          : {
+              content: `Reading knowledge base batch ${++call}.`,
+              tool_calls: [
+                { id: `c${call}`, name: 'read_knowledge_base_files', arguments: '{"files":["design-tokens.json"]}' },
+              ],
+            },
+      );
+    });
+    jest.spyOn(service as any, 'executeTool').mockImplementation(async (...args: any[]) => {
+      const toolName: string = args[1];
+      if (toolName === 'read_knowledge_base_files') {
+        nowMs += SLOW_TOOL_MS;
+      }
+      return JSON.stringify({ success: true, data: `mock:${toolName}` });
+    });
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    const startedAt = nowMs;
+    const result = (await service.generateMarketingResponse(
+      'Generate the first wave of ad creatives using the brand design tokens.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+      false, undefined, undefined, false, undefined, undefined, undefined, false, false,
+      nowMs,
+    )) as any;
+
+    // The loop's own bookkeeping must never let elapsed time cross the controller's
+    // hard cap — if it does, `withGenerationTimeout`'s real-clock race has already
+    // fired and this graceful partial answer never reaches the user (ENG-2121).
+    expect(nowMs - startedAt).toBeLessThanOrEqual(CAP_MS);
+    expect(result.truncatedByTimeBudget).toBe(true);
+    expect(result.content).toMatch(/Partial results/);
+  });
 });
