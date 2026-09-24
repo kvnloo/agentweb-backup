@@ -237,6 +237,83 @@ describe('ENG-1635/1644 reconciliation — Vincent Hu partial-failure regression
     expect(result.summary!.items.every((i) => i.status === 'verified')).toBe(true);
   });
 
+  describe('ENG-1644 prep: resolvedAccountId freeze — dispatch must use the frozen account, never re-derive from live state', () => {
+    // Deliberately gives the item's raw account_id (used only for the claim's own
+    // digest re-derivation) a DIFFERENT value from resolvedAccountId (used for the
+    // actual dispatch) — a same-session write would never see this in practice
+    // (both are the same real resolution moments apart), but a durable,
+    // days-later cross-session resume (ENG-1644) is exactly the case where they
+    // CAN legitimately diverge if the user's connected accounts changed in
+    // between. Proves the dispatch path prefers resolvedAccountId, not that the
+    // digest/claim logic changed at all.
+    function driftFixtureDeck() {
+      const dispatch = {
+        ...writeDispatchFor('94043'),
+        resolvedAccountId: 'frozen-account-should-win-000',
+      };
+      const at = new Date().toISOString();
+      return {
+        deckId: 'deck-drift-1',
+        status: 'awaiting' as const,
+        createdAt: at,
+        finalizedAt: at,
+        items: [{
+          itemId: 'write-1',
+          kind: 'meta_write',
+          question: 'Create ad set AS_94043?',
+          // digest is computed over the RAW account_id (ACCOUNT) exactly like every
+          // other fixture in this file — resolvedAccountId is additive, it must
+          // never change what the claim matches against.
+          metaWriteManifestDigest: digestFor('94043'),
+          metaWriteDispatch: dispatch,
+        }],
+      };
+    }
+
+    it('dispatches against the frozen resolvedAccountId, not the raw account_id used for the digest claim', async () => {
+      let seenAccountId: unknown;
+      jest.spyOn(service as any, 'manageMetaAdsAdSets').mockImplementation((async (..._args: unknown[]) => {
+        seenAccountId = _args[2];
+        const params: any = _args[5];
+        return { success: true, message: 'created', adSet: { id: `id-${params?.name}` } };
+      }) as any);
+
+      sessionState.pendingApprovalDeck = driftFixtureDeck();
+
+      const result = await service.submitApprovalDeckAnswers(
+        SESSION_ID, 'deck-drift-1', [{ itemId: 'write-1', verdict: 'approve' }], 'user',
+      );
+
+      expect(result.outcome).toBe('submitted');
+      if (result.outcome !== 'submitted') throw new Error('unreachable');
+      expect(result.summary?.status).toBe('fully_applied');
+      // The claim itself must still have succeeded — proves the raw account_id
+      // (unaffected by this change) still matched the digest correctly.
+      expect(seenAccountId).toBe('frozen-account-should-win-000');
+      expect(seenAccountId).not.toBe(ACCOUNT);
+    });
+
+    it('falls back to the raw account_id when resolvedAccountId is absent (pre-migration record)', async () => {
+      let seenAccountId: unknown;
+      jest.spyOn(service as any, 'manageMetaAdsAdSets').mockImplementation((async (..._args: unknown[]) => {
+        seenAccountId = _args[2];
+        const params: any = _args[5];
+        return { success: true, message: 'created', adSet: { id: `id-${params?.name}` } };
+      }) as any);
+
+      // No resolvedAccountId at all — exactly what every deck built before this
+      // field existed looks like.
+      sessionState.pendingApprovalDeck = answeredDeckFixture();
+
+      const result = await service.submitApprovalDeckAnswers(SESSION_ID, 'deck-vincent-1', approveAll(), 'user');
+
+      expect(result.outcome).toBe('submitted');
+      if (result.outcome !== 'submitted') throw new Error('unreachable');
+      expect(result.summary?.status).toBe('fully_applied');
+      expect(seenAccountId).toBe(ACCOUNT);
+    });
+  });
+
   describe('ENG-1635/1644 follow-up: lastFailedMetaWrite retry-backstop counter (found live 2026-09-18)', () => {
     // A fresh single-item deck against the SAME target each time, as if the model
     // re-proposed the write across separate turns — mirrors the real repro (3
