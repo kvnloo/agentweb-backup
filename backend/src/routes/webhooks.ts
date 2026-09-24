@@ -842,13 +842,18 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // page regardless of Limit — eventually push their email leads off page one entirely.
       // Worst for phone-first landers, which are precisely who this path was built for.
       //
-      // Real captures therefore take an ordinary timestamp id and lose the dedupe. That is
-      // not a regression: this endpoint rejected phone-only submissions outright until now,
-      // so there is no dedupe behaviour to lose, and 17.5k phone-only rows already in
-      // production (7.5% of all leads, from imports) have never had one either. Email leads
-      // dedupe through email-index; phone has no equivalent GSI, which is the actual gap.
-      // ENG-2123 adds that index and restores dedupe on top of it. Until then the primary
-      // key stops doubling as an index.
+      // Real captures therefore take an ordinary timestamp id and lose the dedupe. This is a
+      // FIX, not a precaution: 61cc335ea opened this endpoint to phone-only submissions and
+      // is already an ancestor of main and deployed, so the deterministic id is live right
+      // now and the first real phone-only capture writes a row that pins to the top of that
+      // customer's list forever. AW-Leads currently holds zero lead_ph_ rows only because
+      // none has landed yet.
+      //
+      // Losing the dedupe costs nothing measurable: 17.5k phone-only rows are already in
+      // production (7.5% of all leads, 100 lists, created continuously Feb-Sep) and not one
+      // has ever been deduped. Email leads dedupe through email-index; phone has no
+      // equivalent GSI, which is the actual gap — ENG-2123 adds that index and restores
+      // dedupe on top of it. Until then the primary key stops doubling as an index.
       const deterministicLeadId =
         !normalizedEmail && isSmokeTestPhone(normalizedPhone) ? phoneLeadId(normalizedPhone) : '';
       try {
