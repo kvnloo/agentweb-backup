@@ -2290,7 +2290,11 @@ router.get("/generated/:id/preview-url", async (req, res: Response) => {
       return res.status(400).json({ error: "Invalid branch name" });
     }
 
-    const result = await getPreviewDeploymentUrl(vercelProjectId, branch);
+    const commitSha = req.query.commitSha;
+    if (commitSha !== undefined && (typeof commitSha !== 'string' || !/^[a-f0-9]{40}$/i.test(commitSha))) {
+      return res.status(400).json({ error: 'Invalid commit SHA' });
+    }
+    const result = await getPreviewDeploymentUrl(vercelProjectId, branch, commitSha);
     res.json(result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error getting preview URL:", error);

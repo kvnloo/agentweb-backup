@@ -275,6 +275,14 @@ process.on('message', async (message: any) => {
     // durable session record instead of needing logs that expire in 14 days.
     const retryAfterHeaderPresent = (error as any)?.retryAfterHeaderPresent;
     const retryAfterMs = (error as any)?.retryAfterMs;
+    // ENG-2121: same IPC-boundary hazard ENG-1670 already documented above for
+    // status/code — the controller's whole-turn timeout backstop (which salvages
+    // any images/tool work already persisted this turn) only runs when it sees
+    // this flag on the error it awaits. Without forwarding it here, EVERY
+    // generation request (the interactive endpoint always runs through this
+    // worker) would silently lose the tag at this exact hop, regardless of the
+    // wrapping fix in generateMarketingResponse's own catch.
+    const isGenerationTimeout = (error as any)?.isGenerationTimeout;
     process.send!({
       type: 'error',
       requestId,
@@ -287,6 +295,7 @@ process.on('message', async (message: any) => {
       ...(originalMessage ? { originalMessage } : {}),
       ...(partialUsageMessages?.length ? { partialUsageMessages } : {}),
       ...(status !== undefined ? { status } : {}),
+      ...(isGenerationTimeout ? { isGenerationTimeout } : {}),
       ...(code !== undefined ? { code } : {}),
       ...(retryAfterHeaderPresent !== undefined ? { retryAfterHeaderPresent } : {}),
       ...(retryAfterMs !== undefined ? { retryAfterMs } : {})

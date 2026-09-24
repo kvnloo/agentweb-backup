@@ -889,6 +889,81 @@ const createAssetApprovalsTable = async () => {
   }
 };
 
+// ENG-1644: durable, cross-session approval decisions (Matt/Harsha/Fangfang
+// named approvers + customer-audience requests). decisionId is the HASH key —
+// for gateType='meta_write' it IS the metaWriteManifestDigest itself (see
+// metaLaunchGate.ts's own comment: "Child ENG-1644 uses this same digest as
+// its pending-approval store key"), so a changed payload is structurally a
+// new record, never an in-place edit — no separate digest-lookup GSI needed.
+// NOT modeled on AW-AssetApprovals above — that table is keyed on assetUrl
+// with no approver-indexed GSI at all, not a real precedent for this shape.
+const createApprovalDecisionsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-ApprovalDecisions`,
+    AttributeDefinitions: [
+      { AttributeName: 'decisionId', AttributeType: 'S' },
+      { AttributeName: 'approver', AttributeType: 'S' },
+      { AttributeName: 'customerId', AttributeType: 'S' },
+      { AttributeName: 'status', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' },
+      { AttributeName: 'expiresAt', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'decisionId', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        // "give me approver X's pending queue"
+        IndexName: 'ApproverIndex',
+        KeySchema: [
+          { AttributeName: 'approver', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+        ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 },
+      },
+      {
+        // "this customer's outstanding requests" (Phase E)
+        IndexName: 'CustomerIndex',
+        KeySchema: [
+          { AttributeName: 'customerId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+        ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 },
+      },
+      {
+        // Future expiry sweep (UX hygiene only — claimDecision enforces
+        // expiry synchronously on its own, so this GSI isn't load-bearing
+        // for v1 correctness, just cheap to add now vs. a second data-plane
+        // review later).
+        IndexName: 'StatusExpiryIndex',
+        KeySchema: [
+          { AttributeName: 'status', KeyType: 'HASH' },
+          { AttributeName: 'expiresAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+        ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 },
+      },
+    ],
+    ProvisionedThroughput: {
+      ReadCapacityUnits: 5,
+      WriteCapacityUnits: 5,
+    },
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 // Create BatchReviews table
 const createBatchReviewsTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
@@ -2582,6 +2657,7 @@ const main = async () => {
     await createChatMessagesTable();
     await createTaskLeadListTable();
     await createAssetApprovalsTable();
+    await createApprovalDecisionsTable();
     await createBatchReviewsTable();
     await createSettingsTable();
     await createPromptTemplatesTable();

@@ -17,14 +17,20 @@ jest.mock("../services/db", () => ({ userDb: { getUserById: jest.fn() } }));
 jest.mock("../services/subscriptionService", () => ({ getSubscriptionTypeConfig: jest.fn() }));
 jest.mock("../services/llmUsageCreditService", () => ({ getLlmUsageCreditAdjustment: jest.fn() }));
 
-import { persistSubjectProjection } from "../scripts/spendProjectionBackfill";
+import { persistSubjectProjection, allowanceFor } from "../scripts/spendProjectionBackfill";
 import { getProjection, putProjectionIfUnchanged } from "../services/spendProjectionDb";
 import { listSpendEvents, SpendEvent } from "../services/spendEventDb";
 import { AllowanceInputs } from "../services/spendProjection";
+import { userDb } from "../services/db";
+import { getSubscriptionTypeConfig } from "../services/subscriptionService";
+import { getLlmUsageCreditAdjustment } from "../services/llmUsageCreditService";
 
 const getProjectionMock = getProjection as jest.Mock;
 const putMock = putProjectionIfUnchanged as jest.Mock;
 const listMock = listSpendEvents as jest.Mock;
+const getUserMock = userDb.getUserById as jest.Mock;
+const getConfigMock = getSubscriptionTypeConfig as jest.Mock;
+const getCreditMock = getLlmUsageCreditAdjustment as jest.Mock;
 
 const U = "u1";
 const M = "2026-09";
@@ -113,5 +119,50 @@ describe("persistSubjectProjection (F2 optimistic concurrency)", () => {
 
     await expect(persistSubjectProjection(U, M, allowance, [ev(1000)], 3)).rejects.toThrow(/could not converge/);
     expect(putMock).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("allowanceFor — fail loud on unresolvable inputs (the 2026-09-21 near-miss)", () => {
+  beforeEach(() => {
+    getUserMock.mockReset();
+    getConfigMock.mockReset();
+    getCreditMock.mockReset();
+    getCreditMock.mockReturnValue({ purchasedMicroUsd: 0, adminGrantedMicroUsd: 0, migrationOffsetMicroUsd: 0 });
+  });
+
+  it("THROWS when the user cannot be read (does not silently seed 'unlimited')", async () => {
+    getUserMock.mockResolvedValue(null);
+    await expect(allowanceFor(U, M)).rejects.toThrow(/user not found/i);
+    expect(getConfigMock).not.toHaveBeenCalled();
+  });
+
+  it("THROWS when the user has no subscriptionType", async () => {
+    getUserMock.mockResolvedValue({ subscriptionType: undefined });
+    await expect(allowanceFor(U, M)).rejects.toThrow(/no subscriptionType/i);
+  });
+
+  it("THROWS when the subscription config cannot be resolved (config source unreadable)", async () => {
+    getUserMock.mockResolvedValue({ subscriptionType: "Super Premium" });
+    getConfigMock.mockResolvedValue(null);
+    await expect(allowanceFor(U, M)).rejects.toThrow(/no subscription config/i);
+  });
+
+  it("returns unlimited ONLY when the config resolves and the tier genuinely has no policy", async () => {
+    getUserMock.mockResolvedValue({ subscriptionType: "FreeInternal" });
+    getConfigMock.mockResolvedValue({ llmUsagePolicy: null }); // resolved, no cap
+    await expect(allowanceFor(U, M)).resolves.toEqual({ includedAllowanceMicroUsd: 0, unlimited: true });
+  });
+
+  it("returns the real cap for a capped tier, credits folded in", async () => {
+    getUserMock.mockResolvedValue({ subscriptionType: "Super Premium", llmUsageCredits: {} });
+    getConfigMock.mockResolvedValue({ llmUsagePolicy: { hardCostThresholdMicroUsd: 150_000_000 } });
+    getCreditMock.mockReturnValue({ purchasedMicroUsd: 50_000_000, adminGrantedMicroUsd: 0, migrationOffsetMicroUsd: 0 });
+    await expect(allowanceFor(U, M)).resolves.toEqual({
+      includedAllowanceMicroUsd: 150_000_000,
+      purchasedCreditsMicroUsd: 50_000_000,
+      adminAdjustmentMicroUsd: 0,
+      migrationAdjustmentMicroUsd: 0,
+      unlimited: false,
+    });
   });
 });

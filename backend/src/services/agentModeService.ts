@@ -3913,6 +3913,39 @@ export class AgentModeService {
           ? turnStartedAtMs + generationTimeoutMs
           : undefined;
       let longestLlmCallMsThisRun = 0;
+      // ENG-2121: mirrors longestLlmCallMsThisRun, but for the tool-DISPATCH phase of an
+      // iteration (executePreparedTools) rather than the LLM call. A heavy knowledge-base
+      // read (or any other slow non-media tool) can burn several minutes of wall clock —
+      // time the reserve calc below never saw, since it only widened for slow LLM calls.
+      // That would let a turn spend most of its budget on a genuinely slow tool call,
+      // still read as comfortably "normal"/"wrap_up" because no single LLM call looked
+      // slow, and then start another equally slow tool call that ran the turn past the
+      // controller's hard cap before the graceful final-synthesis nudge ever got a
+      // chance to fire. Defensive widening for that general shape of turn — reserved for
+      // production session d874874f's own reported symptom (a Meta ad work-plan step cut
+      // off between finishing its KB reads and issuing generate_image), the actual KB
+      // reads there were fast (~14s, ~8s); see the sibling fix below for what actually
+      // ran long in that session.
+      let longestToolDispatchMsThisRun = 0;
+      // ENG-2121: the reserve above only ever widens BETWEEN iterations — it cannot help
+      // a single LLM call that is itself the runaway, including the turn's very first
+      // call, before any prior-call evidence exists to widen the reserve at all.
+      // Production session d874874f hit this gap twice, two different ways: its first
+      // turn got 2 fast tool calls in (iterations 1-2), then a 3rd-iteration LLM call
+      // alone ran ~578s and blew the 600s cap — survived only because the controller's
+      // OWN opportunistic backstop (outside this loop) found those 2 tool calls' results
+      // to salvage into a "reply continue" message. Its next turn ("Continue building
+      // all the creative") had no such luck: iteration 1's LLM call alone ran the entire
+      // ~601s cap with nothing yet dispatched, so the controller had nothing to salvage
+      // and the user got the much worse generic diagnosis-agent fallback ("please click
+      // retry", falsely claiming completed work it never actually did). Bound EVERY LLM
+      // call, on EVERY iteration including the first, to whatever time remains before
+      // the synthesis reserve so a pathological call fails fast (a catchable timeout)
+      // instead of silently consuming the whole turn — and, per the catch block below,
+      // retry that failure with a forced final synthesis on EVERY iteration too
+      // (including the first), so even a bare iteration-1 hang gets one bounded chance
+      // at an honest answer from the model itself instead of an immediate hard failure.
+      const MIN_LLM_CALL_TIMEOUT_MS = 30_000;
       let timeBudgetWrapUpWarned = false;
       // Sticky: once the loop switches to synthesis it never offers tools again this turn.
       let forceFinalSynthesis = false;
@@ -4037,7 +4070,10 @@ export class AgentModeService {
           const timeBudget = evaluateTurnTimeBudget({
             startedAtMs: turnStartedAtMs,
             hardCapMs: turnHardCapMs,
-            longestLlmCallMs: longestLlmCallMsThisRun,
+            // ENG-2121: size the reserve off whichever phase of an iteration was
+            // slowest — the LLM call or the tool dispatch that followed it — so a
+            // heavy KB read grows the headroom exactly like a slow LLM call would.
+            longestLlmCallMs: Math.max(longestLlmCallMsThisRun, longestToolDispatchMsThisRun),
           });
           if (timeBudget.phase === 'final_synthesis' && iteration > 1) {
             forceFinalSynthesis = true;
@@ -4249,6 +4285,31 @@ export class AgentModeService {
         const chatTaskClass: GatewayTaskClass = isScheduledSession
           ? 'scheduled_background'
           : 'interactive_chat';
+        // ENG-2121: bound THIS call's own wall-clock time to whatever remains before the
+        // synthesis reserve — including on iteration 1, where longestLlmCallMsThisRun/
+        // longestToolDispatchMsThisRun are both still 0. Undeadlined callers (no
+        // turnHardCapMs) pass `undefined` through and keep callLLM's own default.
+        let llmCallTimeoutMs: number | undefined;
+        if (turnHardCapMs !== undefined) {
+          const preCallBudget = evaluateTurnTimeBudget({
+            startedAtMs: turnStartedAtMs,
+            hardCapMs: turnHardCapMs,
+            longestLlmCallMs: Math.max(longestLlmCallMsThisRun, longestToolDispatchMsThisRun),
+          });
+          // CodeRabbit (PR #3050): the MIN_LLM_CALL_TIMEOUT_MS floor alone can still hand
+          // out a bound LONGER than the wall-clock actually left before turnHardCapMs —
+          // e.g. remainingMs=5000 would floor to 30000, letting this call run 25s past
+          // the outer hard cap and get killed by that uncontrolled race instead of this
+          // one, recreating the exact failure mode this fix exists to prevent. Clamp to
+          // whichever is smaller. A resulting near-zero value is safe, not a footgun:
+          // the openai client's fetchWithTimeout does `setTimeout(() => abort(), ms)`,
+          // so `ms<=0` aborts on the next tick rather than disabling the timeout — this
+          // still reaches the catch below as a clean, classifiable 'timeout' error.
+          llmCallTimeoutMs = Math.min(
+            preCallBudget.remainingMs,
+            Math.max(MIN_LLM_CALL_TIMEOUT_MS, preCallBudget.remainingMs - preCallBudget.reserveMs),
+          );
+        }
         // OTel `chat` span (ENG-141): brackets the primary call AND the backup
         // retry; the `finally` closes it with the FINAL model + usage attrs
         // (response undefined there = both attempts threw → status ERROR).
@@ -4285,6 +4346,10 @@ export class AgentModeService {
             // Scheduled and interactive conversations canary independently;
             // OpenRouter owns provider fallback once either class is enabled.
             taskClass: chatTaskClass,
+            // ENG-2121: bound this call to whatever remains before the synthesis
+            // reserve (computed above) instead of letting it run unbounded — see the
+            // catch block below for what happens when this actually fires.
+            timeoutMs: llmCallTimeoutMs,
           });
         } catch (callError) {
           // OpenRouter performs provider/model failover inside the one request. A
@@ -4293,8 +4358,61 @@ export class AgentModeService {
           if (forceFinalSynthesis && turnHardCapMs !== undefined && isTransientLLMError(callError)) {
             recordSpanError(chatSpan, callError);
             synthesisRetryUnaffordable = true;
+          } else if (
+            // ENG-2121: this call ran into the per-call bound set above (or a genuine
+            // upstream timeout). Retry once with forced final synthesis instead of
+            // throwing this straight up to the controller, which would have no
+            // persisted work from THIS call to salvage and would fall straight to the
+            // generic diagnosis-agent fallback.
+            //
+            // Deliberately NOT gated on `iteration > 1` the way the between-iteration
+            // pre-check above is. That gate exists to stop the loop PROACTIVELY forcing
+            // synthesis before iteration 1 has even attempted the user's request —
+            // reasonable, since nothing has failed yet at that point. This branch only
+            // ever runs REACTIVELY, after a call already failed: the reserve time this
+            // retry spends would otherwise just be thrown away when the loop rethrows
+            // below, so retrying costs nothing extra either way, and even on a bare
+            // iteration-1 timeout the model can still honestly tell the user what
+            // happened (a real "Verified: nothing yet, reply continue" answer built by
+            // the model that was actually working on the request) instead of the
+            // generic diagnosis agent guessing from turnStartCalledFunctions alone —
+            // which is what produced production session d874874f's hallucinated
+            // "I have successfully completed..." fallback on its own iteration-1 hang.
+            // `!forceFinalSynthesis` below still caps this at exactly one retry ever,
+            // so there is no risk of looping.
+            !forceFinalSynthesis
+            && turnHardCapMs !== undefined
+            && classifyToolErrorClass(callError) === 'timeout'
+          ) {
+            recordSpanError(chatSpan, callError);
+            forceFinalSynthesis = true;
+            truncatedByTimeBudget = true;
+            console.warn(
+              `AgentMode: LLM call timed out for session ${sessionId} at iteration ${iteration} — ` +
+              'forcing a final synthesis so the work done so far is delivered instead of a hard failure'
+            );
+            (messages as any[]).push({
+              role: 'user',
+              content: buildTurnTimeBudgetNudge(
+                evaluateTurnTimeBudget({
+                  startedAtMs: turnStartedAtMs,
+                  hardCapMs: turnHardCapMs,
+                  longestLlmCallMs: Math.max(longestLlmCallMsThisRun, longestToolDispatchMsThisRun),
+                }),
+                'final_synthesis',
+              ),
+            });
+            continue;
           } else {
             recordSpanError(chatSpan, callError);
+            // ENG-2121: tag a genuine timeout so the controller's own whole-turn
+            // timeout backstop (which salvages any images/tool work already persisted
+            // this turn — see withGenerationTimeout's caller) treats this the same as
+            // its own hard-cap race firing, rather than skipping straight to the
+            // generic diagnosis-agent fallback because the tag is missing.
+            if (turnHardCapMs !== undefined && classifyToolErrorClass(callError) === 'timeout') {
+              (callError as any).isGenerationTimeout = true;
+            }
             throw callError;
           }
         } finally {
@@ -4875,6 +4993,11 @@ export class AgentModeService {
           });
         }
 
+        // ENG-2121: wall-clock time this iteration spends dispatching tools — fed back
+        // into the time-budget check above (as longestToolDispatchMsThisRun) so a slow
+        // non-media tool (e.g. a heavy knowledge-base read) grows the synthesis reserve
+        // the same way a slow LLM call already does.
+        const toolDispatchStart = Date.now();
         // Tool-dispatch boundary (core seam): validate/prepare tool calls,
         // decide parallel-vs-sequential, execute through the gateway, classify
         // tool-result errors, process results (screenshot S3, minimal-result, CRM
@@ -4944,6 +5067,10 @@ export class AgentModeService {
             socketEmit,
           },
         });
+        const toolDispatchDurationMs = Date.now() - toolDispatchStart;
+        if (toolDispatchDurationMs > longestToolDispatchMsThisRun) {
+          longestToolDispatchMsThisRun = toolDispatchDurationMs;
+        }
         const { pendingCounterUpdates, failedCounterUpdates } = dispatchResult;
         if (dispatchResult.skillsUpdated) {
           skillsUpdated = true;
@@ -5591,8 +5718,15 @@ export class AgentModeService {
 
       // Determine user-friendly message based on error type
       let userMessage: string;
+      // ENG-2121: the openai/OpenRouter client's own APIConnectionTimeoutError (what
+      // callLLM's `timeoutMs` bound actually throws) carries name "Error" and no `.code`
+      // — none of the checks below ever matched it, so a genuine LLM-call timeout fell
+      // through to the generic "I encountered an error" message instead of this timeout-
+      // specific one. classifyToolErrorClass also matches on message text (e.g. "Request
+      // timed out.", the exact string that class uses) as a fallback for exactly this case.
       const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError' || error?.name === 'ModelTimeoutException'
-        || (typeof error?.code === 'string' && ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ECONNABORTED'].includes(error.code));
+        || (typeof error?.code === 'string' && ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ECONNABORTED'].includes(error.code))
+        || classifyToolErrorClass(error) === 'timeout';
       // Bedrock errors surface httpStatusCode via $metadata rather than a top-level status field
       const httpStatus = error?.status ?? error?.$metadata?.httpStatusCode;
       // Check for context-limit patterns in the raw error message before falling through to generic 400
@@ -5630,6 +5764,13 @@ export class AgentModeService {
       wrappedError.originalMessage = error?.message || String(error);
       if (error?.status) wrappedError.status = error.status;
       if (error?.code) wrappedError.code = error.code;
+      // ENG-2121: the loop's per-call time-budget bound tags a genuine timeout with
+      // this flag so the controller's whole-turn timeout backstop (which salvages any
+      // images/tool work already persisted this turn) treats it the same as its own
+      // hard-cap race firing. Without forwarding it here, this wrap would silently
+      // drop the tag and every such turn would fall straight to the generic
+      // diagnosis-agent fallback regardless of what was actually salvageable.
+      if (error?.isGenerationTimeout) wrappedError.isGenerationTimeout = true;
       // ENG-1670: whether the provider actually sent a Retry-After header is not
       // guaranteed (OpenRouter's own docs: conditional, not promised even for a
       // single-provider model). Rather than that staying an unanswerable question
@@ -6710,6 +6851,11 @@ export class AgentModeService {
     // fallback-only list; this one is force-merged unconditionally, "so no
     // config can strip them", regardless of any DB override.
     'present_question_deck',
+    // ENG-1644 Phase B: same reason as present_question_deck immediately
+    // above — without MANDATORY registration, subscription/skill filtering
+    // would strip a durable-decision tool from most real sessions despite
+    // every unit test passing.
+    'stage_pending_decision',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -22078,7 +22224,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         // that produced the digest being matched, not a value resolveMetaWriteManifestDigest
         // was never given and has no proven-idempotent relationship to. Internal-only,
         // same as the digest above — never part of the model-facing `message`.
-        metaWriteDispatch: { entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params },
+        //
+        // ENG-1644: `resolvedAccountId` is ADDITIVE, alongside the raw `account_id` above,
+        // never replacing it — `account_id` must stay raw for the digest-matching reason
+        // just explained. `target.account_id` is the account `getMetaCredentials` actually
+        // resolved for THIS preview, frozen here as a plain value. A cross-session resume
+        // (days later, outside this process) must dispatch against this frozen id, not
+        // re-derive one from the user's live connected-accounts state at claim time — that
+        // state can drift between preview and a delayed approval in a way it structurally
+        // cannot within the same request. See ENG-1644 for the durable consumer; same-session
+        // dispatch (buildMetaWriteWorkflowSteps/resumeStuckApprovalDeckWorkflowRun) also
+        // prefers this value when present, closing the same latent gap there too.
+        metaWriteDispatch: { entity_type, action, account_id, resolvedAccountId: target.account_id, campaign_id, ad_set_id, ad_id, params },
       } as any;
     }
     // ENG-1635/1644 Round 3 consequence #3: everything past this point (strip the
@@ -22318,8 +22475,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
               'This write is no longer authorized — its approval was not found or was already consumed.',
             );
           }
+          // ENG-1644: dispatch against the FROZEN resolved account (falling back to
+          // the raw id only for pre-migration records that predate this field) —
+          // never re-derive from live connected-accounts state here. The grant claim
+          // above correctly used the raw id (matching the digest's own input); this
+          // is the one place that must use the resolved one.
           const dispatchResult = await this.dispatchAuthorizedMetaWrite(
-            userId, dispatch.entity_type, dispatch.action, dispatch.account_id,
+            userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId ?? dispatch.account_id,
             dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
             false, sessionId,
           );

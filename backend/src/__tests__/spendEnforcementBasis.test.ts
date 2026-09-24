@@ -184,6 +184,38 @@ describe("spendEnforcementBasis", () => {
     });
   });
 
+  describe("month rollover (Gate 3)", () => {
+    // The projection is keyed by (billingUserId, billingMonth). Enforcement must
+    // read the CURRENT month's row, so last month's over-cap settled can never
+    // carry into a fresh month — it either reads this month's (fresh/low) row or,
+    // before the writer has created it, fails open to legacy (which also resets
+    // monthly). This pins the month-keying that makes rollover correct.
+    it("queries the projection for the exact billingMonth passed", async () => {
+      process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+      getProjectionMock.mockResolvedValue(projection(10_000_000));
+      await resolveEnforcementCostBasisMicroUsd({ billingUserId: ACCT, billingMonth: "2026-10", legacyRawCostUsedMicroUsd: 0 });
+      expect(getProjectionMock).toHaveBeenCalledWith(ACCT, "2026-10");
+    });
+
+    it("does not let last month's over-cap row leak into the new month", async () => {
+      process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+      // A row exists ONLY for 2026-09 (over cap); the new month 2026-10 has none yet.
+      getProjectionMock.mockImplementation(async (_id: string, month: string) =>
+        month === "2026-09" ? projection(500_000_000) : null,
+      );
+
+      const lastMonth = await resolveEnforcementCostBasisMicroUsd({ billingUserId: ACCT, billingMonth: "2026-09", legacyRawCostUsedMicroUsd: 0 });
+      expect(lastMonth.basis).toBe("spend_ledger");
+      expect(lastMonth.rawCostUsedMicroUsd).toBe(500_000_000);
+
+      // New month: no row yet → fails open to legacy (fresh), NOT the $500 over-cap total.
+      const newMonth = await resolveEnforcementCostBasisMicroUsd({ billingUserId: ACCT, billingMonth: "2026-10", legacyRawCostUsedMicroUsd: 0 });
+      expect(newMonth.basis).toBe("legacy");
+      expect(newMonth.projectionMissing).toBe(true);
+      expect(newMonth.rawCostUsedMicroUsd).toBe(0);
+    });
+  });
+
   describe("computedAt staleness guard", () => {
     it("is disabled by default: an ancient snapshot is still used when no threshold is set", async () => {
       process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
