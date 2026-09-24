@@ -592,11 +592,18 @@ router.post(
       const variables = extractVariables(allTemplate);
 
       let leads: any[] = [];
+      let verifyTotalLeads = 0;
       if (listId) {
         const leadsResult = await crmDb.getLeadsByListId(listId);
         leads = Array.isArray(leadsResult)
           ? leadsResult
           : ((leadsResult as any).items ?? (leadsResult as any).leads ?? []);
+        // Same population the enrol routes use. Without this, this screen reported variable
+        // coverage over leads enrol-by-list will never enrol — two screens, same list,
+        // contradictory numbers, and coverage warnings raised over rows that were never
+        // candidates. ENG-2082 made address-less leads common enough to diverge visibly.
+        verifyTotalLeads = leads.length;
+        leads = leads.filter((l: any) => l.email);
       } else if (req.params.sequenceId && req.params.sequenceId !== 'test') {
         // Verify against the sequence's enrolled leads
         const enrollments = await dripSequenceDb.listEnrollmentsForSequence(req.params.sequenceId);
@@ -625,6 +632,9 @@ router.post(
         variables,
         variableCoverage,
         leadCount: leads.length,
+        ...(verifyTotalLeads > leads.length
+          ? { totalLeads: verifyTotalLeads, skippedNoEmail: verifyTotalLeads - leads.length }
+          : {}),
       });
     } catch (error) {
       console.error('[sequences] verify-variables error:', error);

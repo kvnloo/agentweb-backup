@@ -406,6 +406,31 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     expect(res.body).not.toHaveProperty('skippedNoEmail');
   });
 
+  // ENG-2083: verify-variables counted a different population than enroll-by-list, so the
+  // same list produced contradictory numbers on two screens — and coverage warnings could
+  // be raised over leads that were never enrolment candidates.
+  it('verify-variables counts the same population enrol-by-list will actually enrol', async () => {
+    const crmDbMock = require('../services/db').crmDb;
+    crmDbMock.getLeadsByListId = jest.fn().mockResolvedValue({
+      items: [
+        { leadId: 'l1', email: 'a@example.com', firstName: 'Ann' },
+        { leadId: 'l2', firstName: 'Ben' },
+        { leadId: 'l3', email: '', firstName: 'Cal' },
+      ],
+    });
+
+    const res = await request(app)
+      .post('/seq_1/steps/verify-variables')
+      .send({ listId: 'list-1', subject: 'Hi {{firstName}}', htmlContent: '' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.leadCount).toBe(1);
+    expect(res.body.totalLeads).toBe(3);
+    expect(res.body.skippedNoEmail).toBe(2);
+    // and coverage describes only the enrollable lead
+    expect(res.body.variableCoverage.firstName).toEqual({ present: 1, missing: 0 });
+  });
+
   it('does not call updateSequence again if listId is already in autoEnrollListIds', async () => {
     dripSequenceDb.getSequence.mockResolvedValueOnce({
       ...mockSequence,

@@ -146,6 +146,17 @@ async function autoEnrollListIntoSequences(userId: string, listId: string): Prom
 // In-memory cache for CRM data files uploaded to S3
 // Key: `${userId}:${listId}`, Value: { leadsUrl, eventsUrl, expiresAt }
 const crmDataFileCache = new Map<string, { leadsUrl: string; eventsUrl: string; expiresAt: number }>();
+
+/**
+ * Columns the /analyze leads CSV ALWAYS carries, in this order, whether or not any lead in
+ * the list happens to have them. The header used to be a union of the keys present across
+ * the list, so a list where every lead is phone-only (ENG-2082) shipped a CSV with no
+ * `email` column while the prompt promised one — and the generated pandas hit a KeyError.
+ * Shared with the prompt below so the two can never drift again.
+ */
+const CRM_ANALYZE_CORE_LEAD_FIELDS = [
+  'leadId', 'email', 'phone', 'firstName', 'lastName', 'company', 'title', 'status', 'stage',
+];
 const CRM_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 /**
@@ -6790,6 +6801,12 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
 
     // Separate eligible leads from skipped ones (do-not-contact includes unsubscribed + DNC)
     const skippedDoNotContact = leads.filter((l: any) => isDoNotContact(l)).length;
+    // Counted and reported, not silently dropped. The `l.email &&` below has always
+    // excluded address-less leads, but no bucket accounted for them — so total, sent,
+    // failed and the three skipped* counts did not sum to the list size, and the gap was
+    // invisible. The PREVIEW endpoint already reports noEmailCount; this is the send
+    // endpoint catching up. ENG-2082 turns the gap from a rarity into a routine one.
+    const skippedNoEmail = leads.filter((l: any) => !l.email && !isDoNotContact(l)).length;
     let eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
 
     // ENG-1194: malformed addresses and provider-disallowed test domains (e.g.
@@ -6968,6 +6985,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       skippedMissingVars,
       skippedUndeliverable,
       skippedInvalid,
+      skippedNoEmail,
       skippedDueToLimit,
       skippedLeadIds,
       stoppedEarlyReason,
@@ -7334,9 +7352,15 @@ router.post('/lists/:listId/analyze', async (req: Request, res: Response) => {
         }
       }
       // Put core identity fields first for readability, then remaining fields alphabetically
-      const coreFields = ['leadId', 'email', 'firstName', 'lastName', 'company', 'title', 'status', 'stage'];
+      const coreFields = CRM_ANALYZE_CORE_LEAD_FIELDS;
       const remainingFields = [...leadKeySet].filter(k => !coreFields.includes(k)).sort();
-      const leadHeaders = [...coreFields.filter(k => leadKeySet.has(k)), ...remainingFields];
+      // Core columns are emitted unconditionally, not only when some lead happens to have
+      // them. leadKeySet is a union across the list, so a list where EVERY lead is
+      // phone-only (ENG-2082 makes that a normal shape for a phone-first lander) produced a
+      // CSV with no `email` column at all — while the prompt below promises one, so the
+      // generated pandas code does df['email'] and dies with a KeyError. escapeCell already
+      // renders a missing value as an empty cell, so the column costs nothing when unused.
+      const leadHeaders = [...coreFields, ...remainingFields];
 
       const escapeCell = (v: any): string => {
         if (v === undefined || v === null) return '';
@@ -7401,7 +7425,9 @@ router.post('/lists/:listId/analyze', async (req: Request, res: Response) => {
     const { agentModeService } = await import('../services/agentModeService');
     const result = await agentModeService.performDataAnalysis(
       [leadsUrl, eventsUrl],
-      `You are analyzing CRM data for the lead list "${list.name}".\n\nFile 1 (crm_leads_*.csv): leads with fields leadId, email, firstName, lastName, company, title, status, stage, isICP, engagementCount, createdAt.\nFile 2 (crm_email_events_*.csv): email events with fields eventId, leadEmail, eventType (email.sent, email.delivered, email.opened, email.clicked, email.bounced), emailId, createdAt.\n\nUser instruction: ${instruction}`,
+      // Names the columns the CSV is GUARANTEED to carry, from the same constant the
+      // header is built from, rather than a hardcoded list that drifted away from it.
+      `You are analyzing CRM data for the lead list "${list.name}".\n\nFile 1 (crm_leads_*.csv): leads with at least these fields ${CRM_ANALYZE_CORE_LEAD_FIELDS.join(', ')} (further columns may be present; a blank cell means the lead has no value for it — note that a lead may legitimately have a phone and no email).\nFile 2 (crm_email_events_*.csv): email events with fields eventId, leadEmail, eventType (email.sent, email.delivered, email.opened, email.clicked, email.bounced), emailId, createdAt.\n\nUser instruction: ${instruction}`,
       userId
     );
 
