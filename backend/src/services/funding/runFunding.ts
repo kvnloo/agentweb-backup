@@ -93,14 +93,22 @@ const seenUnsetRunFundingSites = new Set<string>();
  * fire-and-forget, never throws — this is a discovery aid for A2+/B4+, not an
  * enforcement mechanism.
  *
- * Logs once per unique `where`, not once per call. `recordLlmUsage`'s only real
- * call site (`agentModeService.callLLM`) passes one fixed `where` string, and
- * `callLLM` itself is reached by ~20+ unrelated files (crons, GrowthGenius, CRM
- * enrichment, etc.) that have nothing to do with agent-mode chat turns and are
- * never wrapped in `withRunFunding` — logging on every one of their calls would
- * spam a warning on a large fraction of the backend's total LLM traffic. Per-site
- * dedup keeps this a discovery aid (does this unwrapped path exist at all) rather
- * than a firehose.
+ * Logs once per unique `where`, not once per call — `callLLM` is reached by
+ * ~20+ unrelated files (crons, CRM enrichment, etc.) with nothing to do with
+ * agent-mode chat turns, and logging on every one of their calls would spam a
+ * warning on a large fraction of the backend's total LLM traffic.
+ *
+ * KNOWN LIMITATION (round-4 PR review): `where` is passed per CALLING FUNCTION
+ * (`recordLlmUsage`, `generateMarketingResponseWorker`), not per ultimate
+ * caller — in production there are exactly 2 distinct `where` values ever
+ * logged, no matter how many different unwrapped features reach them. This
+ * mechanism proved it could NOT be relied on to discover new gaps: it never
+ * flagged GrowthGenius or Live Voice, both real unwrapped entry points found
+ * only by manual review, because whichever surface hits `callLLM` first after
+ * boot consumes the one `'agentModeService.callLLM'` slot forever. Treat this
+ * as "at least one unwrapped path exists somewhere" at best, never as "no log
+ * means no gap" — the entry-point inventory must be maintained by hand (see
+ * the KNOWN GAP comment in `agentModeController.ts`), not discovered here.
  */
 export function noteRunFundingUnset(where: string): void {
   if (seenUnsetRunFundingSites.has(where)) return;

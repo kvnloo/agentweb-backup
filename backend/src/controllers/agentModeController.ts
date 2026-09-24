@@ -8518,6 +8518,14 @@ export async function generateSessionResponse(
   // meterUserUsage call is pre-existing metering this PR never touches. But it must
   // be closed before any non-agentweb route ships, or a Live Voice user's spend can
   // never route to their own connection.
+  //
+  // CLOSED (round 4): growthGeniusController.ts's sendMessage had the identical gap
+  // — a real multi-turn chat product, same shape as the sidebar assistant, whose 3
+  // callLLM sites (title, initial turn, tool-follow-up) never entered a RunFunding
+  // scope. Unlike Live Voice this had no architectural reason to defer, so it was
+  // wrapped immediately rather than added to this list. Found by manual review, not
+  // by noteRunFundingUnset — see that function's own comment for why it can't be
+  // trusted to surface gaps like this one.
   const runFunding = await resolveRunFunding({ userId });
 
   // Generate AI response using worker process to prevent blocking the main event loop
