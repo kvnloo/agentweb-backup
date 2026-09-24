@@ -766,6 +766,46 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     expect(seenTimeoutMs[0]).toBeGreaterThanOrEqual(30_000);
   });
 
+  it('never bounds a call to LONGER than the wall-clock actually left before the hard cap (CodeRabbit, PR #3050)', async () => {
+    // The MIN_LLM_CALL_TIMEOUT_MS floor above exists so a call gets a real chance to
+    // succeed — but applied blindly, it can hand out a bound bigger than the time
+    // actually left (e.g. remainingMs=5000 flooring to 30000), letting this call run
+    // PAST the controller's own hard cap and get killed by that uncontrolled race
+    // instead of this one — recreating the exact failure mode this whole fix exists to
+    // prevent. Model that by stamping the caller's deadline far enough in the past that
+    // under 30s of real budget is left by the time the loop's first call fires.
+    const seenTimeoutMs: any[] = [];
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const options = args[2] || {};
+      seenTimeoutMs.push(options.timeoutMs);
+      return buildLLMResponse({ content: 'Here is the answer.' });
+    });
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    // Mirrors the existing "measures against the CALLER's deadline" test's pattern:
+    // capture the deadline stamp BEFORE the clock advances, then advance `nowMs` (the
+    // mocked Date.now()) to model setup latency the caller already burned before the
+    // loop got control — turnStartMs stays the earlier, real anchor.
+    const callerTurnStartMs = nowMs;
+    const SETUP_LATENCY_MS = CAP_MS - 5_000; // only 5s of real budget left when the loop starts
+    nowMs += SETUP_LATENCY_MS;
+
+    await service.generateMarketingResponse(
+      'Generate the first wave of ad creatives using the brand design tokens.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+      false, undefined, undefined, false, undefined, undefined, undefined, false, false,
+      callerTurnStartMs,
+    );
+
+    expect(seenTimeoutMs).toHaveLength(1);
+    // Capped at (approximately) the ~5s actually left, never floored up to 30s.
+    expect(seenTimeoutMs[0]).toBeLessThanOrEqual(5_000);
+    expect(seenTimeoutMs[0]).toBeGreaterThan(0);
+  });
+
   it('retries with a forced synthesis instead of failing loudly when the VERY FIRST call times out (ENG-2121)', async () => {
     // Prod session d874874f's SECOND turn ("Continue building all the creative"):
     // iteration 1's own LLM call ran the entire ~601s cap with nothing yet dispatched.
