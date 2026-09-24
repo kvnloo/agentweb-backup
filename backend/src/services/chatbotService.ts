@@ -72,7 +72,13 @@ function embeddingsClientFor() {
     {
       feature: "embeddings",
       userId: currentRunFunding()?.ownerUserId,
-      billingUserId: currentRunFunding()?.billingUserId,
+      // billingUserId deliberately omitted: unlike the callLLM-routed sites (blog.ts,
+      // agentModeService.ts step-removal judge), this reaches recordUsage directly
+      // (getAzureClient -> wrapOpenAICompatible -> fireRecord -> recordUsage), which
+      // has no org-root resolution to suppress today — but keeping the field out
+      // here too means a future refactor onto meterUserUsage/meterWithResolvedBilling
+      // can't silently reintroduce the ENG-1217 bug fixed 3 times elsewhere in this
+      // PR (round-5 PR review finding).
     },
     process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT || "text-embedding-3-large",
     {
