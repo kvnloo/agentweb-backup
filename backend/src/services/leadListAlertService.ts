@@ -1,4 +1,4 @@
-import { crmDb, userDb } from './db';
+import { crmDb, userDb, orgDb } from './db';
 import { emailService } from './emailService';
 import { sendLeadNotification } from './slackService';
 import {
@@ -283,10 +283,16 @@ export const leadListAlertService = {
     // Deliberately still reading the deprecated singular `slackChannel` rather than
     // the shared resolver: switching to it would newly alert every user who has only
     // `slackChannels` set, which is a delivery change customers did not ask for and
-    // is outside ENG-273's scope. Slack behavior here is byte-identical.
+    // is outside ENG-273's scope. ENG-2120 transfers org-enabled new-lead
+    // delivery to the CRM insert hook; other legacy events keep this destination.
     if (user.slackChannel) {
       try {
-        await sendLeadNotification(user.slackChannel, {
+        // The org delivery path owns new-lead Slack alerts when enabled. A second
+        // legacy send would bypass its masking/filters and create duplicates.
+        const orgOwnsNewLeadAlert = normalizedEventType === 'api.lead_added' && user.orgId
+          ? (await orgDb.getOrgById(user.orgId))?.leadNotifications?.enabled === true
+          : false;
+        if (!orgOwnsNewLeadAlert) await sendLeadNotification(user.slackChannel, {
           firstName: lead.firstName,
           lastName: lead.lastName,
           email: lead.email,

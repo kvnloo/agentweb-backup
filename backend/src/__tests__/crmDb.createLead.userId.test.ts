@@ -1,3 +1,5 @@
+jest.mock('../services/orgLeadNotificationService', () => ({ dispatchLeadCreated: jest.fn() }));
+import { dispatchLeadCreated } from '../services/orgLeadNotificationService';
 // Tests that crmDb.createLead writes the userId (derived from parent list)
 // and nameCompanyKey attributes used by CRM-history Tier 0 GSIs.
 
@@ -189,5 +191,31 @@ describe('crmDb.createLead — deterministic id + failIfExists', () => {
     await expect(
       crmDb.createLead('list-1', { firstName: 'Jane', leadId: 'lead_li_x', failIfExists: true }),
     ).rejects.toMatchObject({ leadAlreadyExists: true });
+  });
+});
+
+
+describe('lead-created notification write boundary', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    queryPromiseMock.mockResolvedValue({ Items: [] });
+    getPromiseMock.mockResolvedValue({ Item: { listId: 'list-1', userId: 'owner' } });
+    putPromiseMock.mockResolvedValue({});
+  });
+  it('returns the saved lead while Slack work remains pending', async () => {
+    (dispatchLeadCreated as jest.Mock).mockReturnValue(new Promise(() => {}));
+    const lead = await crmDb.createLead('list-1', { firstName: 'Jane', customFields: {} });
+    expect(lead.leadId).toBeDefined();
+    expect(dispatchLeadCreated).toHaveBeenCalledWith('list-1', lead.leadId);
+  });
+  it('contains a rejected notification without failing lead save', async () => {
+    (dispatchLeadCreated as jest.Mock).mockRejectedValue(new Error('Slack down'));
+    await expect(crmDb.createLead('list-1', { customFields: {} })).resolves.toHaveProperty('leadId');
+    await new Promise(resolve => setImmediate(resolve));
+  });
+  it('does not notify when the lead write fails', async () => {
+    putPromiseMock.mockRejectedValueOnce(new Error('write failed'));
+    await expect(crmDb.createLead('list-1', { customFields: {} })).rejects.toThrow('write failed');
+    expect(dispatchLeadCreated).not.toHaveBeenCalled();
   });
 });
