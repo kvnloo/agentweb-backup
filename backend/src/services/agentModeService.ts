@@ -3925,12 +3925,33 @@ export class AgentModeService {
       // iteration (executePreparedTools) rather than the LLM call. A heavy knowledge-base
       // read (or any other slow non-media tool) can burn several minutes of wall clock —
       // time the reserve calc below never saw, since it only widened for slow LLM calls.
-      // That let a turn spend most of its budget on KB reads, still read as comfortably
-      // "normal"/"wrap_up" because no single LLM call looked slow, and then start another
-      // equally slow tool call that ran the turn past the controller's hard cap before the
-      // graceful final-synthesis nudge ever got a chance to fire (production: a Meta ad
-      // work-plan step cut off between finishing its KB reads and issuing generate_image).
+      // That would let a turn spend most of its budget on a genuinely slow tool call,
+      // still read as comfortably "normal"/"wrap_up" because no single LLM call looked
+      // slow, and then start another equally slow tool call that ran the turn past the
+      // controller's hard cap before the graceful final-synthesis nudge ever got a
+      // chance to fire. Defensive widening for that general shape of turn — reserved for
+      // production session d874874f's own reported symptom (a Meta ad work-plan step cut
+      // off between finishing its KB reads and issuing generate_image), the actual KB
+      // reads there were fast (~14s, ~8s); see the sibling fix below for what actually
+      // ran long in that session.
       let longestToolDispatchMsThisRun = 0;
+      // ENG-2121: the reserve above only ever widens BETWEEN iterations — it cannot help
+      // a single LLM call that is itself the runaway, and the loop deliberately never
+      // forces synthesis on iteration 1 (nothing done yet to synthesize — see the
+      // `iteration > 1` gate below). Production session d874874f hit this gap twice, two
+      // different ways: its first turn got 2 fast tool calls in (iterations 1-2), then a
+      // 3rd-iteration LLM call alone ran ~578s and blew the 600s cap — survived only
+      // because the controller's OWN opportunistic backstop (outside this loop) found
+      // those 2 tool calls' results to salvage into a "reply continue" message. Its next
+      // turn ("Continue building all the creative") had no such luck: iteration 1's LLM
+      // call alone ran the entire ~601s cap with nothing yet dispatched, so the
+      // controller had nothing to salvage and the user got the much worse generic
+      // diagnosis-agent fallback ("please click retry", falsely claiming completed work).
+      // Bound EVERY LLM call, on EVERY iteration including the first, to whatever time
+      // remains before the synthesis reserve so a pathological call fails fast (a
+      // catchable timeout) instead of silently consuming the whole turn — see the
+      // callLLM invocation and its catch below for what happens once it does.
+      const MIN_LLM_CALL_TIMEOUT_MS = 30_000;
       let timeBudgetWrapUpWarned = false;
       // Sticky: once the loop switches to synthesis it never offers tools again this turn.
       let forceFinalSynthesis = false;
@@ -4270,6 +4291,19 @@ export class AgentModeService {
         const chatTaskClass: GatewayTaskClass = isScheduledSession
           ? 'scheduled_background'
           : 'interactive_chat';
+        // ENG-2121: bound THIS call's own wall-clock time to whatever remains before the
+        // synthesis reserve — including on iteration 1, where longestLlmCallMsThisRun/
+        // longestToolDispatchMsThisRun are both still 0. Undeadlined callers (no
+        // turnHardCapMs) pass `undefined` through and keep callLLM's own default.
+        let llmCallTimeoutMs: number | undefined;
+        if (turnHardCapMs !== undefined) {
+          const preCallBudget = evaluateTurnTimeBudget({
+            startedAtMs: turnStartedAtMs,
+            hardCapMs: turnHardCapMs,
+            longestLlmCallMs: Math.max(longestLlmCallMsThisRun, longestToolDispatchMsThisRun),
+          });
+          llmCallTimeoutMs = Math.max(MIN_LLM_CALL_TIMEOUT_MS, preCallBudget.remainingMs - preCallBudget.reserveMs);
+        }
         // OTel `chat` span (ENG-141): brackets the primary call AND the backup
         // retry; the `finally` closes it with the FINAL model + usage attrs
         // (response undefined there = both attempts threw → status ERROR).
@@ -4306,6 +4340,10 @@ export class AgentModeService {
             // Scheduled and interactive conversations canary independently;
             // OpenRouter owns provider fallback once either class is enabled.
             taskClass: chatTaskClass,
+            // ENG-2121: bound this call to whatever remains before the synthesis
+            // reserve (computed above) instead of letting it run unbounded — see the
+            // catch block below for what happens when this actually fires.
+            timeoutMs: llmCallTimeoutMs,
           });
         } catch (callError) {
           // OpenRouter performs provider/model failover inside the one request. A
@@ -4314,8 +4352,50 @@ export class AgentModeService {
           if (forceFinalSynthesis && turnHardCapMs !== undefined && isTransientLLMError(callError)) {
             recordSpanError(chatSpan, callError);
             synthesisRetryUnaffordable = true;
+          } else if (
+            // ENG-2121: this call ran into the per-call bound set above (or a genuine
+            // upstream timeout) and prior iterations THIS run already did real work, so
+            // there is something to synthesize. Treat it exactly like the between-
+            // iteration time-budget check earlier in the loop: drop into forced final
+            // synthesis and retry once with tools withheld, instead of throwing this up
+            // to the controller — which has no persisted work from THIS call to salvage
+            // and would fall straight to the generic diagnosis-agent fallback. Iteration
+            // 1 has nothing to synthesize yet, so it still falls through to the throw
+            // below and fails loudly, same as before this fix (ENG-907's original intent).
+            !forceFinalSynthesis
+            && turnHardCapMs !== undefined
+            && iteration > 1
+            && classifyToolErrorClass(callError) === 'timeout'
+          ) {
+            recordSpanError(chatSpan, callError);
+            forceFinalSynthesis = true;
+            truncatedByTimeBudget = true;
+            console.warn(
+              `AgentMode: LLM call timed out for session ${sessionId} at iteration ${iteration} — ` +
+              'forcing a final synthesis so the work done so far is delivered instead of a hard failure'
+            );
+            (messages as any[]).push({
+              role: 'user',
+              content: buildTurnTimeBudgetNudge(
+                evaluateTurnTimeBudget({
+                  startedAtMs: turnStartedAtMs,
+                  hardCapMs: turnHardCapMs,
+                  longestLlmCallMs: Math.max(longestLlmCallMsThisRun, longestToolDispatchMsThisRun),
+                }),
+                'final_synthesis',
+              ),
+            });
+            continue;
           } else {
             recordSpanError(chatSpan, callError);
+            // ENG-2121: tag a genuine timeout so the controller's own whole-turn
+            // timeout backstop (which salvages any images/tool work already persisted
+            // this turn — see withGenerationTimeout's caller) treats this the same as
+            // its own hard-cap race firing, rather than skipping straight to the
+            // generic diagnosis-agent fallback because the tag is missing.
+            if (turnHardCapMs !== undefined && classifyToolErrorClass(callError) === 'timeout') {
+              (callError as any).isGenerationTimeout = true;
+            }
             throw callError;
           }
         } finally {
@@ -5621,8 +5701,15 @@ export class AgentModeService {
 
       // Determine user-friendly message based on error type
       let userMessage: string;
+      // ENG-2121: the openai/OpenRouter client's own APIConnectionTimeoutError (what
+      // callLLM's `timeoutMs` bound actually throws) carries name "Error" and no `.code`
+      // — none of the checks below ever matched it, so a genuine LLM-call timeout fell
+      // through to the generic "I encountered an error" message instead of this timeout-
+      // specific one. classifyToolErrorClass also matches on message text (e.g. "Request
+      // timed out.", the exact string that class uses) as a fallback for exactly this case.
       const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError' || error?.name === 'ModelTimeoutException'
-        || (typeof error?.code === 'string' && ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ECONNABORTED'].includes(error.code));
+        || (typeof error?.code === 'string' && ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ECONNABORTED'].includes(error.code))
+        || classifyToolErrorClass(error) === 'timeout';
       // Bedrock errors surface httpStatusCode via $metadata rather than a top-level status field
       const httpStatus = error?.status ?? error?.$metadata?.httpStatusCode;
       // Check for context-limit patterns in the raw error message before falling through to generic 400
@@ -5660,6 +5747,13 @@ export class AgentModeService {
       wrappedError.originalMessage = error?.message || String(error);
       if (error?.status) wrappedError.status = error.status;
       if (error?.code) wrappedError.code = error.code;
+      // ENG-2121: the loop's per-call time-budget bound tags a genuine timeout with
+      // this flag so the controller's whole-turn timeout backstop (which salvages any
+      // images/tool work already persisted this turn) treats it the same as its own
+      // hard-cap race firing. Without forwarding it here, this wrap would silently
+      // drop the tag and every such turn would fall straight to the generic
+      // diagnosis-agent fallback regardless of what was actually salvageable.
+      if (error?.isGenerationTimeout) wrappedError.isGenerationTimeout = true;
       // ENG-1670: whether the provider actually sent a Retry-After header is not
       // guaranteed (OpenRouter's own docs: conditional, not promised even for a
       // single-provider model). Rather than that staying an unanswerable question
