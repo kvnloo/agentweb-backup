@@ -90,6 +90,8 @@ async function leadContext(routing: RoutingContext, leadId: string) {
   if (!lead || lead.listId !== listId || lead.leadId !== leadId) return;
   if (isSmokeTestLead(lead)) return;
   const customFields = record(lead.customFields) ? lead.customFields : {};
+  // Progressive email capture is a draft; notify only after the form advances.
+  if (customFields.stage === 'email') return;
   const source = string(customFields.source) || 'crm';
   const sources = [list.listId, list.name, source,
     ...Object.entries(customFields).filter(([key]) => SOURCE_KEYS.has(normalizedKey(key))).map(([, value]) => value),

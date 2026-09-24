@@ -431,6 +431,50 @@ it('includes all available detailed attribution and submitted fields', async () 
     'utm_source: google', 'utm_medium: cpc', 'referrer: https://referrer.test', 'answer: Yes']) expect(text).toContain(value);
 });
 
+describe('progressive form notifications', () => {
+  it.each(['create', 'batch', 'recovery'])('keeps email-stage drafts silent on %s', async path => {
+    delete lead.firstName; delete lead.lastName; delete lead.phone;
+    lead.customFields = { stage: 'email', source: 'booking_email_capture' };
+    if (path === 'create') await dispatchLeadCreated('list-a', 'lead-a');
+    else if (path === 'batch') await dispatchLeadsCreated('list-a', ['lead-a']);
+    else await processLeadNotificationJob(job);
+    expect(postMessage).not.toHaveBeenCalled();
+    expect(queue.enqueueJob).not.toHaveBeenCalled();
+    expect(crmDb.claimLeadStepOnce).not.toHaveBeenCalled();
+  });
+
+  it('sends full contacts once on completion and still notifies a distinct later submission', async () => {
+    delete lead.firstName; delete lead.lastName; delete lead.phone;
+    lead.customFields = { stage: 'email', source: 'booking_email_capture' };
+    await dispatchLeadCreated('list-a', 'lead-a');
+
+    Object.assign(lead, { firstName: 'Jane', lastName: 'Doe', phone: '+1 (415) 555-1234' });
+    lead.customFields = { stage: 'questions', source: 'booking_email_capture', goal: 'Review my funnel' };
+    const submission = { submissionId: 'completed-form', submittedAt: '2026-09-24T01:00:00Z' };
+    await dispatchLeadCreated('list-a', 'lead-a', submission);
+    expect(postMessage).toHaveBeenCalledTimes(1);
+    const text = postMessage.mock.calls[0][0].text;
+    for (const contact of ['Name: Jane Doe', 'Phone: +1 (415) 555-1234', 'Email: jane@example.com',
+      'goal: Review my funnel']) expect(text).toContain(contact);
+
+    lead.system = mock(crmDb.setLeadFields).mock.calls[0][2].system;
+    await dispatchLeadCreated('list-a', 'lead-a', submission);
+    await processLeadNotificationJob({ ...job, ...submission });
+    expect(postMessage).toHaveBeenCalledTimes(1);
+    await dispatchLeadCreated('list-a', 'lead-a', { ...submission, submissionId: 'later-form' });
+    expect(postMessage).toHaveBeenCalledTimes(2);
+    expect(postMessage.mock.calls[1][0].client_msg_id).not.toBe(postMessage.mock.calls[0][0].client_msg_id);
+  });
+
+  it.each([undefined, 'questions', 'Email', ' email ', null, {}, ['email']])(
+    'preserves arbitrary LP notifications for stages other than exactly email: %j', async stage => {
+      lead.customFields = { source: 'never-registered-lp', stage };
+      await dispatchLeadCreated('list-a', 'lead-a');
+      expect(postMessage).toHaveBeenCalledTimes(1);
+    },
+  );
+});
+
 it('deduplicates a submission retry while allowing separate submissions of the same lead', async () => {
   const first = { submissionId: 'submission-1', submittedAt: '2026-09-24T01:00:00Z' };
   await dispatchLeadCreated('list-a', 'lead-a', first);
