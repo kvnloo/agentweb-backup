@@ -132,10 +132,18 @@ describe('approvalInboxService.createDecision', () => {
   it('a valid customer_credential decision gets audience=customer and status=pending_customer_response, never the team pending status', async () => {
     mockDynamoDB.put.mockReturnValue(ok());
     const decision = await service.createDecision({
-      gateType: 'customer_credential', customerId: 'cust-1', businessImpact: 'Needs a fresh OAuth token.', evidencePacket: {}, expiresAt: FUTURE,
+      gateType: 'customer_credential', customerId: 'cust-1', businessImpact: 'Needs a fresh OAuth token.',
+      evidencePacket: {}, customerActionUrl: 'https://app.agentweb.pro/settings?tab=connected-accounts', expiresAt: FUTURE,
     } as any);
     expect(decision.audience).toBe('customer');
     expect(decision.status).toBe('pending_customer_response');
+    expect(decision.customerActionUrl).toBe('https://app.agentweb.pro/settings?tab=connected-accounts');
+  });
+
+  it('a customer_credential decision without customerActionUrl is rejected', async () => {
+    await expect(service.createDecision({
+      gateType: 'customer_credential', customerId: 'cust-1', businessImpact: 'x', evidencePacket: {}, expiresAt: FUTURE,
+    } as any)).rejects.toThrow(ApprovalInboxError);
   });
 });
 

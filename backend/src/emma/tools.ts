@@ -386,7 +386,7 @@ Do NOT use this for a Meta Ads write approval — those already go through call_
 
 Always include businessImpact (why this matters, one line) and an evidencePacket (links/context the approver needs to decide without re-doing your research) — the whole point is the approver can act on ONE response with everything they need already in front of them, never asking you to re-explain.
 
-For a customer-facing request (not a team approver) — e.g. asking the customer to reconnect a credential or confirm an action — set audience to "customer" and provide customerId instead of approver. This uses a completely separate, customer-facing delivery path, never the team Slack queue.`,
+For a customer-facing credential reconnect (e.g. a disconnected ad account or CMS login) — set audience to "customer", gateType to "customer_credential", provide customerId instead of approver, and customerActionUrl pointing to where they fix it (e.g. their connected-accounts settings page). This emails the customer directly, never the team Slack queue. Customer-facing plan/confirmation questions (gateType "customer_confirmation") are NOT supported yet — no delivery surface exists for them; do not call this tool for that case, ask the current user directly instead if they're the right person, or use present_question_deck.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -407,11 +407,15 @@ For a customer-facing request (not a team approver) — e.g. asking the customer
         gateType: {
           type: 'string',
           enum: ['plan_choice', 'customer_credential', 'customer_confirmation'],
-          description: '"plan_choice" for a team approver picking between options. "customer_credential"/"customer_confirmation" for a customer-facing ask — never used with audience="team".',
+          description: '"plan_choice" for a team approver picking between options. "customer_credential" for a customer credential-reconnect ask — never used with audience="team". "customer_confirmation" is not supported yet and will be refused.',
         },
         businessImpact: {
           type: 'string',
           description: 'One line: why this decision matters right now.',
+        },
+        customerActionUrl: {
+          type: 'string',
+          description: 'Required for gateType="customer_credential". The exact URL the customer\'s email links to (e.g. their connected-accounts settings page).',
         },
         evidencePacket: {
           type: 'object',
@@ -459,6 +463,16 @@ For a customer-facing request (not a team approver) — e.g. asking the customer
       return { success: false, message: 'stage_pending_decision cannot carry a Meta write — use call_meta_marketing_api directly.' };
     }
 
+    if (gateType === 'customer_confirmation') {
+      // ENG-1644 Phase E: no delivery surface exists for this gate type yet
+      // (no generic customer inbox anywhere in the codebase, confirmed by a
+      // scoping pass) — refused explicitly rather than accepted into a dead
+      // end, same treatment meta_write gets above. customer_credential IS
+      // supported (see below) since it reuses an already-live UI/email
+      // pattern (connected-accounts reconnect).
+      return { success: false, message: 'stage_pending_decision does not support gateType="customer_confirmation" yet — no customer-facing delivery surface exists for it.' };
+    }
+
     const expiresInDays = typeof args?.expiresInDays === 'number' && args.expiresInDays > 0 ? args.expiresInDays : 7;
     const expiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString();
 
@@ -484,11 +498,12 @@ For a customer-facing request (not a team approver) — e.g. asking the customer
           links: Array.isArray(args?.evidencePacket?.links) ? args.evidencePacket.links : undefined,
         },
         options,
+        customerActionUrl: audience === 'customer' ? args?.customerActionUrl : undefined,
         originSessionId: sessionId,
         expiresAt,
       });
 
-      // Best-effort — a Slack posting failure must never fail the tool call
+      // Best-effort — a delivery failure must never fail the tool call
       // itself; the decision is already durably persisted above regardless.
       if (decision.audience === 'team' && decision.approver) {
         try {
@@ -496,6 +511,13 @@ For a customer-facing request (not a team approver) — e.g. asking the customer
           await upsertApproverQueueMessage(decision.approver);
         } catch (err: any) {
           console.warn('[stage_pending_decision] failed to post/update Slack queue message:', err?.message || err);
+        }
+      } else if (decision.gateType === 'customer_credential') {
+        try {
+          const { notifyCustomerOfPendingCredentialDecision } = await import('../services/approvalInboxCustomerNotify');
+          await notifyCustomerOfPendingCredentialDecision(decision);
+        } catch (err: any) {
+          console.warn('[stage_pending_decision] failed to notify customer:', err?.message || err);
         }
       }
 

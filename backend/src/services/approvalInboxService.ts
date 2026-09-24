@@ -107,6 +107,13 @@ export interface ApprovalDecision {
   /** Present iff gateType === 'meta_write'; equal to decisionId. */
   metaWriteManifestDigest?: string;
   metaWriteDispatch?: ApprovalDecisionMetaWriteDispatch;
+  /** ENG-1644 Phase E: required iff gateType === 'customer_credential' — the
+   *  exact URL the customer's notification email links to (e.g. an existing
+   *  `/settings?tab=connected-accounts&platform=...` deep link). Generalizes
+   *  linkedInDisconnectNotifyService.ts's hardcoded-to-LinkedIn URL: the
+   *  caller supplies the exact target rather than this service knowing how
+   *  to build one per platform. */
+  customerActionUrl?: string;
   originSessionId?: string;
   originCorrelator?: string;
   createdAt: string;
@@ -131,6 +138,7 @@ export interface CreateApprovalDecisionRequest {
   options?: AskUserQuestionOption[];
   metaWriteManifestDigest?: string;
   metaWriteDispatch?: ApprovalDecisionMetaWriteDispatch;
+  customerActionUrl?: string;
   originSessionId?: string;
   originCorrelator?: string;
   /** ISO timestamp. Required — every decision must have a real expiry (ticket
@@ -204,6 +212,10 @@ function validateCreateRequest(request: CreateApprovalDecisionRequest): void {
     if (request.metaWriteManifestDigest || request.metaWriteDispatch) {
       throw new ApprovalInboxError(`gateType 'plan_choice' must not carry a metaWriteManifestDigest/metaWriteDispatch`);
     }
+  } else if (request.gateType === 'customer_credential') {
+    if (!request.customerActionUrl || request.customerActionUrl.trim() === '') {
+      throw new ApprovalInboxError(`gateType 'customer_credential' requires customerActionUrl — the link the customer's notification email points to`);
+    }
   }
 }
 
@@ -236,6 +248,7 @@ export class ApprovalInboxService {
       options: request.options,
       metaWriteManifestDigest: request.metaWriteManifestDigest,
       metaWriteDispatch: request.metaWriteDispatch,
+      customerActionUrl: request.customerActionUrl,
       originSessionId: request.originSessionId,
       originCorrelator: request.originCorrelator,
       createdAt: now,

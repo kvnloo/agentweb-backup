@@ -12,11 +12,17 @@ jest.mock('../services/approvalInboxService', () => ({
   approvalInboxService: { createDecision: jest.fn() },
 }));
 
+jest.mock('../services/approvalInboxCustomerNotify', () => ({
+  notifyCustomerOfPendingCredentialDecision: jest.fn(),
+}));
+
 import '../emma/tools';
 import { emmaToolRegistry } from '../emma/registry';
 import { approvalInboxService } from '../services/approvalInboxService';
+import { notifyCustomerOfPendingCredentialDecision } from '../services/approvalInboxCustomerNotify';
 
 const mockCreateDecision = approvalInboxService.createDecision as jest.Mock;
+const mockNotifyCustomer = notifyCustomerOfPendingCredentialDecision as jest.Mock;
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -25,6 +31,7 @@ beforeEach(() => {
     approver: 'matt',
     status: 'pending_team_review',
   });
+  mockNotifyCustomer.mockResolvedValue(undefined);
 });
 
 describe('stage_pending_decision', () => {
@@ -141,5 +148,65 @@ describe('stage_pending_decision', () => {
     );
     expect(result.success).toBe(false);
     expect(result.message).toContain('exactly one recommended');
+  });
+
+  it('rejects gateType=customer_confirmation outright — no delivery surface exists, no createDecision call at all', async () => {
+    const tool = emmaToolRegistry.getTool('stage_pending_decision')!;
+    const result = await tool.execute(
+      { audience: 'customer', customerId: 'cust-1', gateType: 'customer_confirmation', businessImpact: 'x', evidencePacket: {} },
+      { userId: 'user-1', sessionId: 'sess-1' },
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('customer_confirmation');
+    expect(mockCreateDecision).not.toHaveBeenCalled();
+  });
+
+  it('customer_credential: passes customerActionUrl through and notifies the customer, not the Slack queue', async () => {
+    mockCreateDecision.mockResolvedValue({
+      decisionId: 'decision-2',
+      audience: 'customer',
+      gateType: 'customer_credential',
+      customerId: 'cust-1',
+      status: 'pending_customer_response',
+    });
+    const tool = emmaToolRegistry.getTool('stage_pending_decision')!;
+    const result = await tool.execute(
+      {
+        audience: 'customer',
+        customerId: 'cust-1',
+        gateType: 'customer_credential',
+        businessImpact: 'Your Meta ad account disconnected.',
+        evidencePacket: {},
+        customerActionUrl: 'https://app.agentweb.pro/settings?tab=connected-accounts&platform=meta',
+      },
+      { userId: 'user-1', sessionId: 'sess-1' },
+    );
+
+    expect(mockCreateDecision).toHaveBeenCalledWith(expect.objectContaining({
+      gateType: 'customer_credential',
+      customerId: 'cust-1',
+      customerActionUrl: 'https://app.agentweb.pro/settings?tab=connected-accounts&platform=meta',
+    }));
+    expect(mockNotifyCustomer).toHaveBeenCalledWith(expect.objectContaining({ decisionId: 'decision-2' }));
+    expect(result.success).toBe(true);
+  });
+
+  it('a customer-notify failure does not fail the tool call — decision is already persisted', async () => {
+    mockCreateDecision.mockResolvedValue({
+      decisionId: 'decision-3',
+      audience: 'customer',
+      gateType: 'customer_credential',
+      customerId: 'cust-1',
+    });
+    mockNotifyCustomer.mockRejectedValue(new Error('email service down'));
+    const tool = emmaToolRegistry.getTool('stage_pending_decision')!;
+    const result = await tool.execute(
+      { audience: 'customer', customerId: 'cust-1', gateType: 'customer_credential', businessImpact: 'x', evidencePacket: {}, customerActionUrl: 'https://x' },
+      { userId: 'user-1', sessionId: 'sess-1' },
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.decisionId).toBe('decision-3');
   });
 });
