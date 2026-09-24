@@ -264,7 +264,7 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       expect(response.body.message).toBe('Email or phone is required');
     });
 
-    it('ENG-2082: accepts a phone-only lead and keys it deterministically on the number', async () => {
+    it('ENG-2082: a SYNTHETIC phone-only lead is keyed deterministically (the smoke test reads it back)', async () => {
       // A phone-only lander used to be impossible: this route required an email, so every
       // submission was refused before a row was built and the page captured nothing.
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
@@ -287,6 +287,31 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       // `email` is omitted entirely, never written as '': it keys the email-index GSI and
       // DynamoDB rejects an empty string for an index key attribute.
       expect('email' in created).toBe(false);
+    });
+
+    it('ENG-2123: a REAL phone-only lead gets an ordinary timestamp id, not a deterministic one', async () => {
+      // leadId is the RANGE key and getLeadsByListId pages it with ScanIndexForward:false,
+      // so a `lead_ph_…` id ('p' = 0x70, above every digit) sorts ABOVE every
+      // lead_<timestamp>_… row — pinning phone-only leads to the top of the customer's list
+      // in hash order forever, and pushing email leads off page one once the 1MB page cap
+      // is reached. Synthetic numbers keep the deterministic id because the smoke test has
+      // to read its own row back; real captures must not pay for that.
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.createLead as jest.Mock).mockResolvedValue({
+        leadId: 'lead_1790000000000_abc', listId: 'list_123', phone: '2125559876', customFields: {},
+      });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', phone: '+1 (212) 555-9876' });
+
+      expect(response.status).toBe(201);
+      const [, created] = (crmDb.createLead as jest.Mock).mock.calls[0];
+      expect(created.leadId).toBeUndefined();
+      expect(created.failIfExists).toBeUndefined();
+      // still a phone-only row: email omitted, never ''
+      expect('email' in created).toBe(false);
+      expect(created.phone).toBeTruthy();
     });
 
     it('ENG-2082: the same number in a different format collapses onto the same row', async () => {

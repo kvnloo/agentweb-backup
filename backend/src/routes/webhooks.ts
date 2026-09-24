@@ -26,7 +26,7 @@ import { normalizeAttribution, promoteAttributionFromCustomFields } from '../typ
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
-import { isSmokeTestLead, phoneDigits, phoneLeadId } from '../utils/smokeTestLead';
+import { isSmokeTestLead, isSmokeTestPhone, phoneDigits, phoneLeadId } from '../utils/smokeTestLead';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from '../services/asyncJobQueue';
 import { handleHardBounceRecipients } from '../services/emailDeliverabilityService';
 // ENG-926 §C: the per-list budget and the per-account BUC pause used to live here as
@@ -826,14 +826,31 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     } else {
       // Create a new lead.
       // ENG-2082: with no email there is nothing to query on beforehand, so a phone-only
-      // lead keys on its own normalized number and lets the conditional create do the
-      // deduping — the ENG-787 mechanism createLead already exposes for exactly this
-      // ("a caller that keys a lead on a stable identity"). phoneDigits is the shared
-      // normalizer, so +1 (415) 555-0142 and 4155550142 resolve to the same row.
-      // Derived by the shared helper, never inline: the smoke test reads this id back to
-      // find the row it just created, and a drift between the two would make it silently
-      // miss every phone-only capture.
-      const deterministicLeadId = !normalizedEmail ? phoneLeadId(normalizedPhone) : '';
+      // lead can key on its own normalized number and let the conditional create dedupe —
+      // the ENG-787 mechanism createLead exposes for exactly this ("a caller that keys a
+      // lead on a stable identity"). phoneDigits is the shared normalizer, so
+      // +1 (415) 555-0142 and 4155550142 resolve to the same row. Derived by the shared
+      // helper, never inline: the smoke test reads this id back to find the row it just
+      // created, and a drift between the two would make it silently miss every capture.
+      //
+      // SYNTHETIC NUMBERS ONLY, deliberately. leadId is the table's RANGE key and
+      // getLeadsByListId pages it with ScanIndexForward:false — "newest leadId
+      // (timestamp-prefixed) first". `lead_ph_…` breaks that assumption: 'p' (0x70) beats
+      // every digit, so a deterministic id sorts ABOVE every lead_<timestamp>_… row. Giving
+      // real captures one would pin every phone-only lead to the top of the customer's list
+      // forever, ordered by hash rather than recency, and — because the query caps at 1MB a
+      // page regardless of Limit — eventually push their email leads off page one entirely.
+      // Worst for phone-first landers, which are precisely who this path was built for.
+      //
+      // Real captures therefore take an ordinary timestamp id and lose the dedupe. That is
+      // not a regression: this endpoint rejected phone-only submissions outright until now,
+      // so there is no dedupe behaviour to lose, and 17.5k phone-only rows already in
+      // production (7.5% of all leads, from imports) have never had one either. Email leads
+      // dedupe through email-index; phone has no equivalent GSI, which is the actual gap.
+      // ENG-2123 adds that index and restores dedupe on top of it. Until then the primary
+      // key stops doubling as an index.
+      const deterministicLeadId =
+        !normalizedEmail && isSmokeTestPhone(normalizedPhone) ? phoneLeadId(normalizedPhone) : '';
       try {
         lead = await crmDb.createLead(
           leadList.listId,
