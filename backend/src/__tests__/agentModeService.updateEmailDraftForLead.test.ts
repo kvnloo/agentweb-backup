@@ -414,6 +414,27 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
   });
 
   describe('Error cases', () => {
+    // ENG-2082: lead capture now accepts phone-only submissions, and this runs
+    // fire-and-forget from the forward-lead webhook when the list has autoDraftEnabled.
+    // Unguarded it spends two billed LLM calls writing a polished email to someone with no
+    // address — and a LinkedIn note for a lead with no LinkedIn — then persists both and
+    // reports success. send_email_to_lead already refuses on this exact condition.
+    it('refuses to draft for a lead with no email address, before any LLM call', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead1', listId: 'list1', phone: '2125559876', firstName: '', lastName: '',
+      });
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        'list1', 'lead1', 'Create email', 'session1', 'user1'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('No email address');
+      // nothing drafted, nothing billed
+      expect(crmDb.getLeadEngagements).not.toHaveBeenCalled();
+    });
+
     it('should return error if list not found', async () => {
       const listId = 'nonexistent';
       const leadId = 'lead1';

@@ -32,7 +32,10 @@ const formatLeadName = (lead: any) => {
   const firstName = typeof lead.firstName === 'string' ? lead.firstName.trim() : '';
   const lastName = typeof lead.lastName === 'string' ? lead.lastName.trim() : '';
   const fullName = [firstName, lastName].filter(Boolean).join(' ');
-  return fullName || lead.email || lead.leadId || 'Unknown lead';
+  // phone before leadId: a phone-only capture is a contactable human, and falling through
+  // to the leadId puts a database key in front of the owner as the prospect's name.
+  const phone = typeof lead.phone === 'string' ? lead.phone.trim() : '';
+  return fullName || lead.email || phone || lead.leadId || 'Unknown lead';
 };
 
 const buildEventDetails = (eventType: string, eventData: any) => {
@@ -140,10 +143,14 @@ const sendAlertEmail = async ({
   ccEmails?: string[];
 }) => {
   const leadName = formatLeadName(lead);
-  const leadEmail = lead.email || 'Unknown email';
+  // Matches the sibling builder below, which already got this right: an absent address is
+  // not "Unknown email", it is nothing to show. Printing the placeholder also flipped
+  // showLeadEmail TRUE precisely when there was no email, so every phone-only lead was
+  // announced to its owner as `<leadId> (Unknown email)`.
+  const leadEmail = lead.email || '';
   const normalizedLeadName = String(leadName).trim().toLowerCase();
   const normalizedLeadEmail = String(leadEmail).trim().toLowerCase();
-  const showLeadEmail = normalizedLeadName !== normalizedLeadEmail;
+  const showLeadEmail = !!leadEmail && normalizedLeadName !== normalizedLeadEmail;
   const eventTime = createdAt ? new Date(createdAt).toLocaleString() : new Date().toLocaleString();
   const subject = `Lead list alert: ${eventType}`;
   const eventDetails = buildEventDetails(eventType, eventData);

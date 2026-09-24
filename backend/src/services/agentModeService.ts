@@ -15235,6 +15235,22 @@ export class AgentModeService {
         };
       }
 
+      // No address, nothing to draft. ENG-2082 opened lead capture to phone-only
+      // submissions, and this runs fire-and-forget from the forward-lead webhook whenever
+      // the list has autoDraftEnabled — so without this guard every phone-only capture
+      // spends two billed LLM calls writing a polished email to a person who has no
+      // address, plus a LinkedIn invite note for a lead with no LinkedIn, then persists
+      // both and reports "drafts created successfully". The operator opens the CRM to a
+      // ready-to-send draft addressed to nobody. send_email_to_lead already refuses on
+      // exactly this condition; the draft path simply never learned to.
+      if (!lead.email) {
+        return {
+          success: false,
+          message: 'No email address',
+          error: 'This lead does not have an email address — there is nothing to draft.'
+        };
+      }
+
       // Check do-not-contact status
       const { isDoNotContact: isDNC, getDoNotContactReason: getDNCReason } = await import('../utils/leadContactStatus');
       if (isDNC(lead)) {
