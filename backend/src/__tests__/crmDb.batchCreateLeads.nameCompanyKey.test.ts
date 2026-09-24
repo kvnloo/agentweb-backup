@@ -1,5 +1,5 @@
-jest.mock('../services/orgLeadNotificationService', () => ({ dispatchLeadCreated: jest.fn().mockResolvedValue(undefined) }));
-import { dispatchLeadCreated } from '../services/orgLeadNotificationService';
+jest.mock('../services/orgLeadNotificationService', () => ({ dispatchLeadsCreated: jest.fn().mockResolvedValue(undefined) }));
+import { dispatchLeadsCreated } from '../services/orgLeadNotificationService';
 // Tests that batchCreateLeads sets nameCompanyKey on new leads when
 // firstName + lastName + company are all present. This was a bug where the
 // field was never written, breaking Tier 0 sibling matching during enrichment.
@@ -131,6 +131,9 @@ it('notifies only persisted batch rows, leaving DynamoDB unprocessed rows resuma
   expect(result.newCount).toBe(1);
   expect(result.rowOutcomes).toEqual(['created', 'unprocessed']);
   expect(result.created).toHaveLength(1);
-  expect(dispatchLeadCreated).toHaveBeenCalledTimes(1);
-  expect(dispatchLeadCreated).toHaveBeenCalledWith('list-1', result.created[0].leadId);
+  // batchCreateLeads deliberately calls the batch-optimized dispatchLeadsCreated
+  // (one shared routing lookup for the whole import), not the per-lead
+  // dispatchLeadCreated that createLead's single-insert path uses.
+  expect(dispatchLeadsCreated).toHaveBeenCalledTimes(1);
+  expect(dispatchLeadsCreated).toHaveBeenCalledWith('list-1', [result.created[0].leadId]);
 });
