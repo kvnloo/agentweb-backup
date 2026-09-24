@@ -70,7 +70,8 @@ it('posts correct fields and CRM deep link through the org bot', async () => {
   await dispatchLeadCreated('list-a', 'lead-a');
   const message = postMessage.mock.calls[0][0];
   expect(clients).toEqual(['xoxb-org-a']);
-  expect(message).toMatchObject({ channel: 'C123', username: 'Emma', unfurl_links: false });
+  expect(message).toMatchObject({ channel: 'C123', unfurl_links: false, unfurl_media: false, parse: 'none' });
+  expect(message).not.toHaveProperty('username');
   expect(message.text).toContain('Jane Doe');
   expect(message.text).toContain('jane@example.com');
   expect(message.text).toContain('+1 (415) 555-1234');
@@ -255,9 +256,10 @@ describe('AgentWeb uses the same org notification mechanism', () => {
     expect(clients).toEqual(['xoxb-agentweb-fixture']);
     expect(postMessage).toHaveBeenCalledTimes(1);
     expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({
-      channel: 'CAGENTWEBFIXTURE', username: 'Emma',
+      channel: 'CAGENTWEBFIXTURE',
       text: expect.stringContaining(`Lead list: ${entry.name}`),
     }));
+    expect(postMessage.mock.calls[0][0]).not.toHaveProperty('username');
     expect(postMessage.mock.calls[0][0].text).toContain('+1 (415) 555-1234');
     expect(postMessage.mock.calls[0][0].text).toContain(`/crm?listId=${list.listId}&leadId=lead-a`);
     expect(queue.enqueueJob).toHaveBeenCalledWith('org_lead_notification', expect.any(String), {
@@ -389,6 +391,7 @@ it.each([null, [], 'invalid', { utm: { source: {}, campaign: ['invalid'] }, land
 it('uses the exact contact-first layout and omits empty optional fields', async () => {
   lead.customFields = { empty: '', missing: null, whitespace: '   ' };
   await dispatchLeadCreated('list-a', 'lead-a');
+  expect(postMessage.mock.calls[0][0]).not.toHaveProperty('username');
   expect(postMessage.mock.calls[0][0].text).toBe([
     'New lead:', 'Name: Jane Doe', 'Phone: +1 (415) 555-1234', 'Email: jane@example.com', '',
     'Lead list: Inbound', 'Created: 2026-09-23T12:00:00Z',
