@@ -1055,9 +1055,11 @@ router.get('/contacts', async (req: Request, res: Response) => {
     // Merge deduped contacts across users, re-dedup by email
     const contactMap = new Map<string, any>();
     let rawCount = 0;
+    let noEmailCount = 0;
     let listsCount = 0;
     for (const r of perUserResults) {
       rawCount += r.rawCount;
+      noEmailCount += r.noEmailCount ?? 0;
       listsCount += r.listsCount;
       for (const c of r.contacts) {
         // dedupKey, never email: an email-less contact carries `email: ''`, so keying on
@@ -1077,7 +1079,10 @@ router.get('/contacts', async (req: Request, res: Response) => {
     const total = contacts.length;
     if (parsedLimit !== undefined) contacts = contacts.slice(0, parsedLimit);
 
-    const result = { contacts, total, rawCount, listsCount };
+    // noEmailCount travels with the rest. Live-testing the phone-only work showed the
+    // service computing it and this route quietly dropping it, so the UI still had no way
+    // to explain a total that is smaller than rawCount.
+    const result = { contacts, total, rawCount, listsCount, noEmailCount };
     const durationMs = Date.now() - started;
     const primaryResult = perUserResults[0];
 

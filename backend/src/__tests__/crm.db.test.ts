@@ -562,6 +562,50 @@ describe('CRM Database Service', () => {
   });
 
   describe('updateLead', () => {
+    // ENG-2082: setLeadFields derives domain/lifecycle on an email write, but updateLead is
+    // the ORDINARY path — a person editing the lead — and was left out of the first pass.
+    // Caught live: a phone-only lead given an address came back with both still null.
+    it('derives domain and backfills lifecycle when an email is set', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: { leadId: 'lead_123', listId: 'list_123' } }),
+      });
+
+      await crmDb.updateLead('list_123', 'lead_123', { email: 'Ada@Example.com' });
+
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.UpdateExpression).toContain('domain = :derivedDomain');
+      expect(call.ExpressionAttributeValues[':derivedDomain']).toBe('example.com');
+      expect(call.UpdateExpression).toContain('lifecycle = if_not_exists(lifecycle, :derivedLifecycle)');
+      expect(call.ExpressionAttributeValues[':derivedLifecycle']).toBe('inbox');
+    });
+
+    it('does not derive when the email is being cleared', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: { leadId: 'lead_123', listId: 'list_123' } }),
+      });
+
+      await crmDb.updateLead('list_123', 'lead_123', { email: '' });
+
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.UpdateExpression).toContain('REMOVE');
+      expect(call.UpdateExpression).not.toContain('derivedDomain');
+      expect(call.UpdateExpression).not.toContain('derivedLifecycle');
+    });
+
+    it('lets an explicit domain or lifecycle win', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: { leadId: 'lead_123', listId: 'list_123' } }),
+      });
+
+      await crmDb.updateLead('list_123', 'lead_123', {
+        email: 'ada@example.com', domain: 'override.com', lifecycle: 'paying',
+      } as any);
+
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.UpdateExpression).not.toContain('derivedDomain');
+      expect(call.UpdateExpression).not.toContain('derivedLifecycle');
+    });
+
     it('should update lead fields', async () => {
       const listId = 'list_123';
       const leadId = 'lead_123';

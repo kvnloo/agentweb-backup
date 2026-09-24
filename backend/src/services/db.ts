@@ -7510,6 +7510,24 @@ export const crmDb = {
           // Only set email if it's not empty (GSI key cannot be empty string)
           setExpressions.push('email = :email');
           expressionAttributeValues[':email'] = emailValue;
+          // Derived from email, same as createLead does via buildLeadCrmFields and as
+          // setLeadFields now does. This path is the ORDINARY one — a person editing the
+          // lead, or any caller using updateLead — and it was left out of the first pass at
+          // this fix, which only covered the enrichment write. Caught by live-testing: a
+          // phone-only lead given an address came back with domain and lifecycle both null.
+          // Skipped when the caller states either explicitly.
+          if ((updates as any).domain === undefined) {
+            const derivedDomain = extractDomainFromEmail(emailValue);
+            if (derivedDomain) {
+              setExpressions.push('domain = :derivedDomain');
+              expressionAttributeValues[':derivedDomain'] = derivedDomain;
+            }
+          }
+          // Backfill only — never knock a lead already at paying back to inbox.
+          if ((updates as any).lifecycle === undefined) {
+            setExpressions.push('lifecycle = if_not_exists(lifecycle, :derivedLifecycle)');
+            expressionAttributeValues[':derivedLifecycle'] = 'inbox';
+          }
         } else {
           // Remove email attribute if it's being set to empty/null
           removeExpressions.push('email');
