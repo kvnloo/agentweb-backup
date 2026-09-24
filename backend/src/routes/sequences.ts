@@ -244,7 +244,16 @@ router.post(
       if (lifecycle) {
         const r = await crmDb.getLeadsByStatus(listId, lifecycle);
         leads = Array.isArray(r) ? r : ((r as any).items ?? (r as any).leads ?? []);
-        if (leads.length === 0 && LIFECYCLE_STAGES.has(String(lifecycle))) {
+        // Only complain when the value is a lifecycle stage AND NOT a status this list
+        // actually defines. `at_risk` and `churned` are BOTH lifecycle stages and default
+        // lead statuses (db.ts:5364), and a list can define any statusConfig it likes — so
+        // the first version of this guard answered a perfectly valid `status: churned`
+        // filter that happened to match nothing with a 400 telling the caller to "filter by
+        // a lead status instead", which is exactly what they had done.
+        const listStatuses = new Set(
+          ((list as any)?.statusConfig || []).map((s: any) => String(s?.value)),
+        );
+        if (leads.length === 0 && LIFECYCLE_STAGES.has(String(lifecycle)) && !listStatuses.has(String(lifecycle))) {
           console.error(
             `[sequences] ENG-2127: lifecycle filter "${lifecycle}" matched 0 leads in list ` +
             `${listId} because getLeadsByStatus queries the \`status\` attribute, not ` +

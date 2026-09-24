@@ -449,6 +449,30 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     expect(dripSequenceDb.bulkEnroll).not.toHaveBeenCalled();
   });
 
+  // at_risk and churned are BOTH lifecycle stages AND default lead statuses (db.ts:5364),
+  // and a list may define any statusConfig it likes. The first version of this guard
+  // answered a perfectly valid `status: churned` filter that matched nothing with a 400
+  // telling the caller to filter by a status instead — which is what they had done.
+  it('does NOT reject a value the list defines as a real status', async () => {
+    const crmDbMock = require('../services/db').crmDb;
+    crmDbMock.getLeadListById = jest.fn().mockResolvedValue({
+      listId: 'list-1', userId: 'user-123',
+      statusConfig: [
+        { value: 'active', label: 'Active', color: 'green', type: 'active' },
+        { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
+      ],
+    });
+    crmDbMock.canOrgMemberAccessList = jest.fn().mockResolvedValue(true);
+    crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({ items: [] });
+
+    const res = await request(app)
+      .post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1', lifecycle: 'churned' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.error).toBeUndefined();
+  });
+
   it('still enrols normally when a lifecycle filter does return leads', async () => {
     const crmDbMock = require('../services/db').crmDb;
     crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({

@@ -132,6 +132,14 @@ export type LeadRole = (typeof LEAD_ROLES)[number];
  */
 export interface LeadCrmExtensions {
   domain?: string;
+  /**
+   * ENG-2082: a phone-only capture is contactable and inbound. Without it the lifecycle
+   * default below keys on email alone, so every phone-only lead is STORED with no
+   * lifecycle at all — and `lifecycle is_empty` in delete_leads_by_filter then selects
+   * exactly those rows. computeLifecycle already treats phone as contactable; this is the
+   * write path catching up so the stored field agrees with the computed one.
+   */
+  phone?: string;
   accountOwnerUserId?: string;
   /** Additional POC emails (non-org users). Stored as a list on the lead record. */
   pocEmails?: string[];
@@ -297,11 +305,13 @@ export function buildLeadCrmFields(
   if (typeof ext.heatScore === 'number') out.heatScore = ext.heatScore;
   if (typeof ext.healthScore === 'number') out.healthScore = ext.healthScore;
 
-  // Default lifecycle: if caller provided one, use it; otherwise default to 'inbox'
-  // when we have an email (matches migration plan for backfilling 17k leads).
+  // Default lifecycle: if caller provided one, use it; otherwise default to 'inbox' when
+  // the lead is CONTACTABLE — an email or a phone. Same rule computeLifecycle applies
+  // (lifecycleService.ts); the two must agree or the stored field contradicts the computed
+  // one for every phone-only lead.
   if (ext.lifecycle) {
     out.lifecycle = ext.lifecycle;
-  } else if (email && email.trim()) {
+  } else if ((email && email.trim()) || (ext.phone && String(ext.phone).trim())) {
     out.lifecycle = 'inbox';
   }
 

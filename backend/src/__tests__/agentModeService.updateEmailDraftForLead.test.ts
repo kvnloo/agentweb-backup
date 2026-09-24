@@ -419,6 +419,42 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
     // Unguarded it spends two billed LLM calls writing a polished email to someone with no
     // address — and a LinkedIn note for a lead with no LinkedIn — then persists both and
     // reports success. send_email_to_lead already refuses on this exact condition.
+    // This function ALSO writes the LinkedIn connection-request note, and
+    // linkedInInviteCrmMirror creates leads with a linkedin and no email. Gating on email
+    // alone deleted a working feature to fix a new one.
+    it('still drafts for a LinkedIn-only lead (no email)', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead1', listId: 'list1', linkedin: 'https://linkedin.com/in/ada',
+        firstName: 'Ada', lastName: 'Lovelace',
+      });
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        'list1', 'lead1', 'Create email', 'session1', 'user1'
+      );
+
+      expect(result?.message).not.toBe('No email address');
+      expect(crmDb.getLeadEngagements).toHaveBeenCalled();
+    });
+
+    it('marks a lead with no contact channel as SKIPPED, not failed', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead1', listId: 'list1', phone: '2125559876', firstName: '', lastName: '',
+      });
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        'list1', 'lead1', 'Create email', 'session1', 'user1'
+      );
+
+      // `skipped` is what stops webhooks.ts reporting autoDraftStatus='failed' and putting
+      // the reason into the owner alert on every phone-only capture.
+      expect(result.success).toBe(false);
+      expect(result.skipped).toBe(true);
+      expect(result.reason).toBe('no_contact_channel');
+      expect(crmDb.getLeadEngagements).not.toHaveBeenCalled();
+    });
+
     it('refuses to draft for a lead with no email address, before any LLM call', async () => {
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'user1' });
       (crmDb.getLeadById as jest.Mock).mockResolvedValue({

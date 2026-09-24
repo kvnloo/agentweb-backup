@@ -6521,6 +6521,7 @@ export const crmDb = {
       // isPrimary, dealIds[], accountOwnerUserId, expectedClose, closedDate.
       const crmFields = buildLeadCrmFields(emailValue, {
         domain: leadData.domain,
+        phone: leadData.phone,
         accountOwnerUserId: leadData.accountOwnerUserId,
         pocEmails: leadData.pocEmails,
         priority: leadData.priority,
@@ -7543,6 +7544,9 @@ export const crmDb = {
             }
           }
           // Backfill only — never knock a lead already at paying back to inbox.
+          // NOTE: this arm is inside the email branch. A lead that gains only a PHONE is
+          // handled at creation by buildLeadCrmFields; there is no separate phone arm here
+          // because updateLead cannot tell "gained a phone" from "already had one".
           if ((updates as any).lifecycle === undefined) {
             expressionAttributeNames['#derivedLifecycleAttr'] = 'lifecycle';
             setExpressions.push('#derivedLifecycleAttr = if_not_exists(#derivedLifecycleAttr, :derivedLifecycle)');

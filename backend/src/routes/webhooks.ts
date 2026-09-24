@@ -1124,7 +1124,14 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
                 leadList.userId,
                 'text'
               );
-              if (!autoDraftResult?.success) {
+              if (autoDraftResult?.skipped) {
+                // Nothing to draft is not a failure. Without this, a lead with no contact
+                // channel reports autoDraftStatus='failed' and the reason lands in the
+                // owner alert — so every phone-only capture into an autoDraft list would
+                // email its owner a failure notice. Mirrors autoSend's 'skipped_no_email'.
+                console.log(`Auto draft skipped (${autoDraftResult.reason || 'no_contact_channel'}) for lead ${lead.leadId}`);
+                autoDraftStatus = 'skipped_no_email';
+              } else if (!autoDraftResult?.success) {
                 const errMsg = autoDraftResult?.error || autoDraftResult?.message || 'Unknown auto-draft error';
                 console.error('Auto draft creation failed:', errMsg);
                 autoDraftStatus = 'failed';

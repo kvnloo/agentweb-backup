@@ -15249,19 +15249,28 @@ export class AgentModeService {
         };
       }
 
-      // No address, nothing to draft. ENG-2082 opened lead capture to phone-only
-      // submissions, and this runs fire-and-forget from the forward-lead webhook whenever
-      // the list has autoDraftEnabled — so without this guard every phone-only capture
-      // spends two billed LLM calls writing a polished email to a person who has no
-      // address, plus a LinkedIn invite note for a lead with no LinkedIn, then persists
-      // both and reports "drafts created successfully". The operator opens the CRM to a
-      // ready-to-send draft addressed to nobody. send_email_to_lead already refuses on
-      // exactly this condition; the draft path simply never learned to.
-      if (!lead.email) {
+      // No contact channel at all, nothing to draft. ENG-2082 opened lead capture to
+      // phone-only submissions, and this runs fire-and-forget from the forward-lead webhook
+      // whenever the list has autoDraftEnabled — so without a guard every phone-only capture
+      // spends two billed LLM calls writing a polished email to a person who has no address
+      // and a LinkedIn note for a lead with no LinkedIn, then reports success.
+      //
+      // Gated on email AND linkedin, not email alone. This function also produces the
+      // LinkedIn connection-request note below, and linkedInInviteCrmMirror creates leads
+      // that have a linkedin and NO email — refusing those would delete a working feature
+      // to fix a new one.
+      //
+      // `skipped` so the caller can tell "nothing to do" from "this broke": webhooks.ts maps
+      // a plain falsy result to autoDraftStatus='failed' and puts the error in the OWNER
+      // ALERT, which would mean every phone-only capture emails its owner a failure notice.
+      // Its sibling autoSend path already has the right word for this — 'skipped_no_email'.
+      if (!lead.email && !lead.linkedin) {
         return {
           success: false,
+          skipped: true,
+          reason: 'no_contact_channel',
           message: 'No email address',
-          error: 'This lead does not have an email address — there is nothing to draft.'
+          error: 'This lead has neither an email address nor a LinkedIn profile — there is nothing to draft.'
         };
       }
 
