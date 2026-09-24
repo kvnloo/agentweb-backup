@@ -3,7 +3,7 @@ import { imageService } from "../services/imageGeneration";
 import { getSecret } from '../utils/secretsManager';
 import { agentModeService } from '../services/agentModeService';
 import { CONTENT_RESTYLE_MODEL } from '../config';
-import { currentRunFunding } from '../services/funding/runFunding';
+import { currentRunFunding, resolveRunFunding, withRunFunding } from '../services/funding/runFunding';
 import axios from "axios";
 import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
@@ -1336,8 +1336,17 @@ export const generateBlogPost = async (req: AuthRequest, res: Response) => {
       // Create drafts from the topic for generateBlogContent
       const titleDraft = topic;
       const contentDraft = `# ${topic}\n\nThis article will cover ${topic}.`;
-      
-      const blogData = await generateBlogContent(titleDraft, contentDraft, length, researchContext, agentWebRequirements);
+
+      // ENG-1816 F1: this route calls generateBlogContent directly, outside the agent-
+      // mode worker's withRunFunding scope, so currentRunFunding() would otherwise be
+      // undefined here and the leak fix at that call site would be a silent no-op.
+      // resolveRunFunding always resolves 'agentweb' today, so this changes nothing
+      // observable — it only makes the attribution fix at generateBlogContent's call
+      // site actually fire on this entry point too.
+      const runFunding = await resolveRunFunding({ userId });
+      const blogData = await withRunFunding(runFunding, () =>
+        generateBlogContent(titleDraft, contentDraft, length, researchContext, agentWebRequirements),
+      );
 
       console.log("✅ Content generation complete! Processing AI response...");
       console.log("✅ Content validation passed!");
