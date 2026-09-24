@@ -13,6 +13,9 @@
  */
 import { approvalInboxService, type ApprovalDecision } from '../services/approvalInboxService';
 import { notifyOriginSessionOfExpiry } from '../services/approvalInboxExecution';
+// approvalInboxExecution.ts (imported above) already transitively pulls in
+// chatbotService.ts, so this adds no new heavy import chain to this file.
+import { upsertApproverQueueMessage } from '../services/approvalInboxSlack';
 
 const TAG = '[approvalExpirySweepCron]';
 
@@ -36,6 +39,19 @@ async function processDueDecision(decision: ApprovalDecision, summary: ApprovalE
     }
     summary.expired++;
     await notifyOriginSessionOfExpiry(result.decision);
+    // Review fix: every other resolution path (resolveApprovalDecision,
+    // approvalInboxSlack.ts) refreshes the approver's Slack queue message so
+    // a resolved item's buttons disappear immediately — the expiry path was
+    // the one exception, leaving a stale message with live, now-nonfunctional
+    // Approve/Reject/Edit buttons for a decision that's no longer claimable.
+    // Best-effort — a Slack refresh failure must never fail the sweep.
+    if (result.decision.approver) {
+      try {
+        await upsertApproverQueueMessage(result.decision.approver);
+      } catch (slackErr) {
+        console.warn(`${TAG} Failed to refresh Slack queue after expiring decision ${decision.decisionId}:`, slackErr);
+      }
+    }
   } catch (error) {
     summary.failed++;
     console.error(`${TAG} Failed to process decision ${decision.decisionId}:`, error);

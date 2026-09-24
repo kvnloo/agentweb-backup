@@ -158,6 +158,12 @@ export interface CreateApprovalDecisionRequest {
 const MIN_OPTIONS = 2;
 const MAX_OPTIONS = 4;
 
+// Worst-case page bound for listPendingForApprover/listPendingForCustomer's
+// pagination (review fix) — keeps an approver/customer with an enormous,
+// mostly-resolved history from turning a routine lookup into an unbounded
+// scan when few or no items are actually pending.
+const MAX_PENDING_LOOKUP_PAGES = 20;
+
 // Deliberately duplicated from approvalDeck.ts's own (file-private, not
 // exported) validateItemShape rather than refactoring that live-in-production
 // file's exports as a side effect of this new one — same three checks
@@ -441,35 +447,65 @@ export class ApprovalInboxService {
   }
 
   async listPendingForApprover(approver: ApprovalDecisionApprover, limit = 50): Promise<ApprovalDecision[]> {
-    const result = await dynamodb
-      .query({
-        TableName: APPROVAL_DECISIONS_TABLE,
-        IndexName: 'ApproverIndex',
-        KeyConditionExpression: 'approver = :approver',
-        FilterExpression: '#status = :pending',
-        ExpressionAttributeNames: { '#status': 'status' },
-        ExpressionAttributeValues: { ':approver': approver, ':pending': 'pending_team_review' },
-        ScanIndexForward: true,
-        Limit: limit,
-      })
-      .promise();
-    return (result.Items as ApprovalDecision[] | undefined) ?? [];
+    // DynamoDB applies Limit to items READ before FilterExpression is
+    // evaluated, not to items returned after filtering — a plain single
+    // query with Limit would silently stop short of a genuinely pending item
+    // that happens to sort past the first `limit` historical (any-status)
+    // records for this approver. Page through with LastEvaluatedKey,
+    // accumulating only matches, until either the index is exhausted or we
+    // have `limit` real pending matches (review fix). Capped at
+    // MAX_PENDING_LOOKUP_PAGES pages — a worst-case bound against an
+    // approver with an enormous, mostly-resolved history and near-zero
+    // currently pending, so this can never turn into an unbounded scan.
+    const matches: ApprovalDecision[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    let pages = 0;
+    do {
+      const result = await dynamodb
+        .query({
+          TableName: APPROVAL_DECISIONS_TABLE,
+          IndexName: 'ApproverIndex',
+          KeyConditionExpression: 'approver = :approver',
+          FilterExpression: '#status = :pending',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: { ':approver': approver, ':pending': 'pending_team_review' },
+          ScanIndexForward: true,
+          ExclusiveStartKey: lastEvaluatedKey,
+        })
+        .promise();
+      matches.push(...((result.Items as ApprovalDecision[] | undefined) ?? []));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+      pages++;
+    } while (lastEvaluatedKey && matches.length < limit && pages < MAX_PENDING_LOOKUP_PAGES);
+    return matches.slice(0, limit);
   }
 
   async listPendingForCustomer(customerId: string, limit = 50): Promise<ApprovalDecision[]> {
-    const result = await dynamodb
-      .query({
-        TableName: APPROVAL_DECISIONS_TABLE,
-        IndexName: 'CustomerIndex',
-        KeyConditionExpression: 'customerId = :customerId',
-        FilterExpression: '#status = :pending',
-        ExpressionAttributeNames: { '#status': 'status' },
-        ExpressionAttributeValues: { ':customerId': customerId, ':pending': 'pending_customer_response' },
-        ScanIndexForward: true,
-        Limit: limit,
-      })
-      .promise();
-    return (result.Items as ApprovalDecision[] | undefined) ?? [];
+    // Same Limit-before-FilterExpression hazard as listPendingForApprover
+    // above — page through rather than risk missing a real pending decision
+    // behind a customer's older, already-resolved history (review fix).
+    // Same worst-case page cap as listPendingForApprover above.
+    const matches: ApprovalDecision[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    let pages = 0;
+    do {
+      const result = await dynamodb
+        .query({
+          TableName: APPROVAL_DECISIONS_TABLE,
+          IndexName: 'CustomerIndex',
+          KeyConditionExpression: 'customerId = :customerId',
+          FilterExpression: '#status = :pending',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: { ':customerId': customerId, ':pending': 'pending_customer_response' },
+          ScanIndexForward: true,
+          ExclusiveStartKey: lastEvaluatedKey,
+        })
+        .promise();
+      matches.push(...((result.Items as ApprovalDecision[] | undefined) ?? []));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+      pages++;
+    } while (lastEvaluatedKey && matches.length < limit && pages < MAX_PENDING_LOOKUP_PAGES);
+    return matches.slice(0, limit);
   }
 
   /**

@@ -419,7 +419,7 @@ For a customer-facing credential reconnect (e.g. a disconnected ad account or CM
         },
         credentialPlatform: {
           type: 'string',
-          description: 'Required for gateType="customer_credential". Which platform this reconnect is about, e.g. "meta" or "linkedin" — must match the platform value used elsewhere for this customer\'s connected accounts.',
+          description: 'Required for gateType="customer_credential". Which platform this reconnect is about, e.g. "meta", "instagram", or "linkedin" — must match the platform value used elsewhere for this customer\'s connected accounts. Instagram is a distinct platform from Meta ad accounts — use "instagram", never "meta", for an Instagram reconnect.',
         },
         credentialAccountId: {
           type: 'string',
@@ -453,7 +453,7 @@ For a customer-facing credential reconnect (e.g. a disconnected ad account or CM
         },
         expiresInDays: {
           type: 'number',
-          description: 'How many days this decision stays open before expiring. Defaults to 7.',
+          description: 'How many days this decision stays open before expiring. Defaults to 7. Clamped to a maximum of 30 — a larger value is silently reduced to 30, so do not promise the customer/approver a longer window than that.',
         },
       },
       required: ['audience', 'gateType', 'businessImpact', 'evidencePacket'],

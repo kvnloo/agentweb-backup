@@ -372,9 +372,15 @@ router.post('/connect-accounts', authenticateToken, async (req: any, res) => {
       // ENG-1644 gap-closing: resolve any pending reconnect decision for
       // this exact account. Dynamic import — see metaAuth.ts's identical
       // comment for why (heavy transitive chain, must stay out of this
-      // file's static load). Self-contained/never-throws.
-      const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
-      await autoResolveCredentialDecisionOnReconnect(userId, 'linkedin', profile.urn);
+      // file's static load). The function itself never throws, but the
+      // import statement can — own try/catch (review fix) so that can't
+      // abort the response after accounts already connected.
+      try {
+        const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
+        await autoResolveCredentialDecisionOnReconnect(userId, 'linkedin', profile.urn);
+      } catch (autoResolveErr: any) {
+        console.warn('[LinkedIn Connect] auto-resolve credential decision failed:', autoResolveErr?.message || autoResolveErr);
+      }
     }
 
     // Connect selected organizations
@@ -400,9 +406,14 @@ router.post('/connect-accounts', authenticateToken, async (req: any, res) => {
         const account = await createAccount(userId, 'linkedin', accountInput);
         connectedAccounts.push(account);
 
-        // ENG-1644 gap-closing: same as the personal-account case above.
-        const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
-        await autoResolveCredentialDecisionOnReconnect(userId, 'linkedin', org.urn);
+        // ENG-1644 gap-closing: same as the personal-account case above,
+        // including the own try/catch (review fix).
+        try {
+          const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
+          await autoResolveCredentialDecisionOnReconnect(userId, 'linkedin', org.urn);
+        } catch (autoResolveErr: any) {
+          console.warn('[LinkedIn Connect] auto-resolve credential decision failed (org):', autoResolveErr?.message || autoResolveErr);
+        }
       }
     }
 

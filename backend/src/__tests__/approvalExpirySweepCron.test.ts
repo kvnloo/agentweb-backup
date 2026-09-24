@@ -10,13 +10,19 @@ jest.mock('../services/approvalInboxExecution', () => ({
   notifyOriginSessionOfExpiry: jest.fn(),
 }));
 
+jest.mock('../services/approvalInboxSlack', () => ({
+  upsertApproverQueueMessage: jest.fn(),
+}));
+
 import { approvalInboxService } from '../services/approvalInboxService';
 import { notifyOriginSessionOfExpiry } from '../services/approvalInboxExecution';
+import { upsertApproverQueueMessage } from '../services/approvalInboxSlack';
 import { runApprovalExpirySweep } from '../cron/approvalExpirySweepCron';
 
 const mockListDuePending = approvalInboxService.listDuePending as jest.Mock;
 const mockExpireDecision = approvalInboxService.expireDecision as jest.Mock;
 const mockNotify = notifyOriginSessionOfExpiry as jest.Mock;
+const mockUpsertQueue = upsertApproverQueueMessage as jest.Mock;
 
 describe('runApprovalExpirySweep', () => {
   beforeEach(() => {
@@ -24,6 +30,7 @@ describe('runApprovalExpirySweep', () => {
     mockListDuePending.mockResolvedValue([]);
     mockExpireDecision.mockResolvedValue({ expired: false });
     mockNotify.mockResolvedValue(undefined);
+    mockUpsertQueue.mockResolvedValue(undefined);
   });
 
   it('queries both pending statuses, not just one', async () => {
@@ -33,7 +40,7 @@ describe('runApprovalExpirySweep', () => {
   });
 
   it('expires a genuinely-due decision and notifies its origin session', async () => {
-    const decision = { decisionId: 'd1', originSessionId: 'sess-1' };
+    const decision = { decisionId: 'd1', originSessionId: 'sess-1', approver: 'matt' };
     mockListDuePending.mockImplementation(async (status: string) =>
       status === 'pending_team_review' ? [decision] : []);
     mockExpireDecision.mockResolvedValue({ expired: true, decision });
@@ -43,6 +50,41 @@ describe('runApprovalExpirySweep', () => {
     expect(mockExpireDecision).toHaveBeenCalledWith('d1');
     expect(mockNotify).toHaveBeenCalledWith(decision);
     expect(summary).toEqual({ scanned: 1, expired: 1, alreadyResolved: 0, failed: 0 });
+  });
+
+  it('review fix: refreshes the approver\'s Slack queue message after a team-audience decision expires — the buttons must disappear, not stay live on a stale message', async () => {
+    const decision = { decisionId: 'd1', originSessionId: 'sess-1', approver: 'harsha' };
+    mockListDuePending.mockImplementation(async (status: string) =>
+      status === 'pending_team_review' ? [decision] : []);
+    mockExpireDecision.mockResolvedValue({ expired: true, decision });
+
+    await runApprovalExpirySweep();
+
+    expect(mockUpsertQueue).toHaveBeenCalledWith('harsha');
+  });
+
+  it('never touches Slack for a customer-audience decision (no approver) that expires', async () => {
+    const decision = { decisionId: 'd1', originSessionId: 'sess-1' };
+    mockListDuePending.mockImplementation(async (status: string) =>
+      status === 'pending_customer_response' ? [decision] : []);
+    mockExpireDecision.mockResolvedValue({ expired: true, decision });
+
+    await runApprovalExpirySweep();
+
+    expect(mockUpsertQueue).not.toHaveBeenCalled();
+  });
+
+  it('a Slack queue refresh failure after expiry is swallowed, not counted as a sweep failure', async () => {
+    const decision = { decisionId: 'd1', originSessionId: 'sess-1', approver: 'matt' };
+    mockListDuePending.mockImplementation(async (status: string) =>
+      status === 'pending_team_review' ? [decision] : []);
+    mockExpireDecision.mockResolvedValue({ expired: true, decision });
+    mockUpsertQueue.mockRejectedValue(new Error('Slack API down'));
+
+    const summary = await runApprovalExpirySweep();
+
+    expect(summary.expired).toBe(1);
+    expect(summary.failed).toBe(0);
   });
 
   it('a decision that expireDecision reports as already claimed is counted, not notified', async () => {

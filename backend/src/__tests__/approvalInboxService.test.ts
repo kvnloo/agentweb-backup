@@ -270,6 +270,73 @@ describe('approvalInboxService.listDuePending', () => {
   });
 });
 
+describe('approvalInboxService.listPendingForApprover / listPendingForCustomer (review fix: Limit-before-filter pagination)', () => {
+  it('listPendingForApprover finds a real pending match that sorts past the first page of (mostly non-pending) history', async () => {
+    // Page 1: DynamoDB scanned a full page of this approver's history, none
+    // of which matched the status FilterExpression (real DynamoDB applies
+    // FilterExpression server-side — Items here already reflects that, empty
+    // — while Limit only bounded how many were SCANNED, hence LastEvaluatedKey
+    // still pointing past them). Before the fix, a single query with a plain
+    // Limit would have silently returned nothing.
+    mockDynamoDB.query
+      .mockReturnValueOnce(ok({
+        Items: [],
+        LastEvaluatedKey: { decisionId: 'old-2' },
+      }))
+      .mockReturnValueOnce(ok({
+        Items: [{ decisionId: 'new-1', status: 'pending_team_review' }],
+      }));
+
+    const result = await service.listPendingForApprover('matt');
+    expect(result).toHaveLength(1);
+    expect(result[0].decisionId).toBe('new-1');
+    expect(mockDynamoDB.query).toHaveBeenCalledTimes(2);
+    // Second call resumes from the first page's LastEvaluatedKey.
+    expect(mockDynamoDB.query.mock.calls[1][0].ExclusiveStartKey).toEqual({ decisionId: 'old-2' });
+  });
+
+  it('listPendingForCustomer finds a real pending match that sorts past the first page of history', async () => {
+    mockDynamoDB.query
+      .mockReturnValueOnce(ok({
+        Items: [],
+        LastEvaluatedKey: { decisionId: 'old-1' },
+      }))
+      .mockReturnValueOnce(ok({
+        Items: [{ decisionId: 'new-1', status: 'pending_customer_response' }],
+      }));
+
+    const result = await service.listPendingForCustomer('cust-1');
+    expect(result).toHaveLength(1);
+    expect(result[0].decisionId).toBe('new-1');
+  });
+
+  it('stops paging once it has accumulated `limit` real matches, without over-fetching', async () => {
+    mockDynamoDB.query.mockReturnValue(ok({
+      Items: [{ decisionId: 'm1', status: 'pending_team_review' }, { decisionId: 'm2', status: 'pending_team_review' }],
+      LastEvaluatedKey: { decisionId: 'm2' },
+    }));
+
+    const result = await service.listPendingForApprover('matt', 2);
+    expect(result).toHaveLength(2);
+    expect(mockDynamoDB.query).toHaveBeenCalledTimes(1);
+  });
+
+  it('is capped at a bounded number of pages when nothing ever matches, instead of paging forever', async () => {
+    // Every page scans history but the status filter matches nothing —
+    // Items reflects that (empty), LastEvaluatedKey keeps pointing further.
+    mockDynamoDB.query.mockReturnValue(ok({
+      Items: [],
+      LastEvaluatedKey: { decisionId: 'old' },
+    }));
+
+    const result = await service.listPendingForApprover('matt');
+    expect(result).toEqual([]);
+    // Bounded, not unbounded — proves the safety cap actually stops the loop.
+    expect(mockDynamoDB.query.mock.calls.length).toBeLessThan(1000);
+    expect(mockDynamoDB.query.mock.calls.length).toBeGreaterThan(1);
+  });
+});
+
 describe('approvalInboxService.findPendingCredentialDecision', () => {
   it('finds the matching pending customer_credential decision by platform + accountId', async () => {
     mockDynamoDB.query.mockReturnValue(ok({

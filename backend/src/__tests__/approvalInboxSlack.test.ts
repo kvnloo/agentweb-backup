@@ -217,12 +217,18 @@ describe('approvalInboxSlack', () => {
     });
 
     it('never posts when the Slack client is not initialized', async () => {
+      // try/finally (review fix): a failing assertion above must not skip
+      // the restore and leak an unset SLACK_BOT_TOKEN into whatever test
+      // file runs next in this same Jest worker process.
       delete process.env.SLACK_BOT_TOKEN;
-      jest.resetModules();
-      const freshModule = require('../services/approvalInboxSlack');
-      await freshModule.postDecisionAddedNotice('matt', decision);
-      expect(mockPostMessage).not.toHaveBeenCalled();
-      process.env.SLACK_BOT_TOKEN = 'xoxb-test';
+      try {
+        jest.resetModules();
+        const freshModule = require('../services/approvalInboxSlack');
+        await freshModule.postDecisionAddedNotice('matt', decision);
+        expect(mockPostMessage).not.toHaveBeenCalled();
+      } finally {
+        process.env.SLACK_BOT_TOKEN = 'xoxb-test';
+      }
     });
   });
 });

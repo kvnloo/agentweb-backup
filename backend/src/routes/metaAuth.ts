@@ -354,8 +354,16 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
             // pulls in emailService/chatbotService/agentModeService, too heavy
             // to load statically into a lightweight OAuth route file.
             // Self-contained/never-throws — must not affect this response.
-            const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
-            await autoResolveCredentialDecisionOnReconnect(userId, 'meta', adAccount.account_id);
+            // The function itself already never throws, but the import
+            // statement CAN (module-load failure) — wrapped in its own
+            // try/catch (review fix) so that risk can't abort the loop and
+            // lose already-connected accounts' success from this response.
+            try {
+                const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
+                await autoResolveCredentialDecisionOnReconnect(userId, 'meta', adAccount.account_id);
+            } catch (autoResolveErr: any) {
+                console.warn('[Meta Connect Ad Accounts] auto-resolve credential decision failed:', autoResolveErr?.message || autoResolveErr);
+            }
         }
 
         res.json({ success: true, connectedAccounts });
@@ -403,8 +411,13 @@ router.post('/connect-instagram', authenticateToken, async (req: any, res) => {
         // ENG-1644 gap-closing (review fix): missed on the first pass —
         // Instagram is a distinct platform from Meta ad accounts in this
         // reconnect system, same treatment as /connect-ad-accounts above.
-        const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
-        await autoResolveCredentialDecisionOnReconnect(userId, 'instagram', instagramAccount.id);
+        // Own try/catch (review fix) — see that call site's comment for why.
+        try {
+            const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
+            await autoResolveCredentialDecisionOnReconnect(userId, 'instagram', instagramAccount.id);
+        } catch (autoResolveErr: any) {
+            console.warn('[Meta Connect Instagram] auto-resolve credential decision failed:', autoResolveErr?.message || autoResolveErr);
+        }
 
         res.json({ success: true, connectedAccount: account });
 
