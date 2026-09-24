@@ -1,3 +1,4 @@
+import { attributionValues, fieldKey, humanizeField, resolveNotificationNames, slackAttributionUrl, submittedPacific } from './leadNotificationAttribution';
 import { createHash } from 'crypto';
 import { isSmokeTestLead } from '../utils/smokeTestLead';
 import { WebClient, ChatPostMessageArguments } from '@slack/web-api';
@@ -107,7 +108,7 @@ async function context(listId: string, leadId: string, expectedOrgId?: string) {
   return routing && leadContext(routing, leadId);
 }
 
-function message(ctx: NonNullable<Awaited<ReturnType<typeof context>>>, job: LeadNotificationJob) {
+async function message(ctx: NonNullable<Awaited<ReturnType<typeof context>>>, job: LeadNotificationJob) {
   const { config, lead, customFields, hideEmail, list } = ctx;
   const name = [string(lead.firstName), string(lead.lastName)].filter(Boolean).join(' ');
   const phone = string(lead.phone);
@@ -121,8 +122,10 @@ function message(ctx: NonNullable<Awaited<ReturnType<typeof context>>>, job: Lea
     return escapeSlack(text, limit);
   };
   const crmUrl = `${(process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro').replace(/\/$/, '')}/crm?listId=${encodeURIComponent(job.listId)}&leadId=${encodeURIComponent(job.leadId)}`;
+  const footer = `<${crmUrl}|Open in CRM>`;
   const fields: string[] = [];
-  let length = 0;
+  // Keep room for the CRM link even when attribution URLs are unusually long.
+  let length = footer.length + 2;
   const append = (line: string): boolean => {
     const size = line.length + (fields.length ? 1 : 0);
     if (length + size > MAX_MESSAGE_LENGTH) return false;
@@ -135,49 +138,35 @@ function message(ctx: NonNullable<Awaited<ReturnType<typeof context>>>, job: Lea
   if (phone) append(`Phone: ${config.maskPhone ? maskLeadPhone(phone) : escapeSlack(phone, phone.length)}`);
   if (email && !hideEmail) append(`Email: ${escapeSlack(email, email.length)}`);
   append('');
-  if (string(list.name)) append(`Lead list: ${render(list.name)}`);
-  if (string(customFields.source)) append(`Source: ${render(customFields.source)}`);
-  if (string(lead.company)) append(`Company: ${render(lead.company)}`);
   const timestamp = job.submittedAt || string(lead.createdAt);
-  if (timestamp) append(`${job.submittedAt ? 'Submitted' : 'Created'}: ${render(timestamp)}`);
-  append(`<${crmUrl}|Open in CRM>`);
-  const first = record(lead.firstTouch) ? lead.firstTouch : {};
-  const last = record(lead.lastTouch) ? lead.lastTouch : {};
-  const touches = job.submissionId ? [last, first] : [first, last];
-  const touchValue = (key: string) => touches.map(t => string(t[key])).find(Boolean) || '';
-  const touchBag = (key: string): Record<string, string> => Object.fromEntries(
-    [...touches].reverse().flatMap(t => record(t[key])
-      ? Object.entries(t[key]).filter((entry): entry is [string, string] => !!string(entry[1])) : []),
-  );
-  const utm = touchBag('utm');
-  const attributionFields: Record<string, unknown> = {};
-  for (const key of ['source', 'medium', 'campaign', 'term', 'content', 'id']) {
-    const fallback = key === 'source' ? lead.utmSource : key === 'medium' ? lead.utmMedium : undefined;
-    const value = string(utm[key]) || string(fallback);
-    if (value) attributionFields[`utm_${key}`] = value;
+  const values = attributionValues(lead, !!job.submissionId);
+  const value = (...keys: string[]) => keys.map(k => values.get(fieldKey(k)) || '').find(Boolean) || '';
+  const attribution = await resolveNotificationNames(list.userId, values, timestamp, ctx.org.connected_accounts);
+  append('Attribution:');
+  const detail = (label: string, text: string) => {
+    if (text) append(`${label}: ${render(text)}`);
+  };
+  const landing = [render(attribution.landingName), slackAttributionUrl(attribution.landingUrl)].filter(Boolean).join(' — ');
+  if (landing) append(`Landing page: ${landing}`);
+  detail('Lead list', string(list.name));
+  detail('Campaign', attribution.campaign);
+  detail('Ad set', attribution.adSet);
+  detail('Ad', attribution.ad);
+  detail('Source / Medium', [value('utm_source', 'source'), value('utm_medium', 'medium')].filter(Boolean).join(' / '));
+  const referrer = slackAttributionUrl(value('referrer'));
+  if (referrer) append(`Referrer: ${referrer}`);
+  detail('Submitted', submittedPacific(timestamp));
+  const answerFields: Record<string, unknown> = {};
+  for (const key of ['company', 'title', 'notes', 'linkedin']) {
+    if (string(lead[key])) answerFields[key] = lead[key];
   }
-  for (const key of ['landingUrl', 'referrer']) {
-    if (touchValue(key)) attributionFields[key] = touchValue(key);
-  }
-  const clickIds = touchBag('clickIds');
-  const fallbackClicks = record(lead.clickIds) ? lead.clickIds : {};
-  for (const key of ['fbclid', 'gclid']) {
-    const value = string(clickIds[key]) || string(fallbackClicks[key]);
-    if (value) attributionFields[key] = value;
-  }
-  const extras = touchBag('extraParams');
-  for (const [key, value] of Object.entries(extras)) {
-    if (/^(landingpage(name|url|path|id)|campaign(name|id)?|ad(name|id|setname|setid)?|utm(id|campaign|content|term))$/.test(normalizedKey(key)) && string(value)) {
-      attributionFields[key] = value;
-    }
-  }
-  for (const key of ['title', 'notes', 'linkedin']) {
-    if (string(lead[key])) attributionFields[key] = lead[key];
-  }
+  let hasAnswers = false;
   const seen = new Set<string>();
-  for (const [key, value] of [...Object.entries(attributionFields), ...Object.entries(customFields)]) {
+  for (const [key, value] of [...Object.entries(answerFields), ...Object.entries(customFields)]) {
     const normalized = normalizedKey(key);
-    if (!normalized || seen.has(normalized) || OMIT_CUSTOM_KEYS.has(normalized) || /^[_$]/.test(key) ||
+    if (!normalized || seen.has(normalized) || (OMIT_CUSTOM_KEYS.has(normalized) && !(normalized === 'company' && key in answerFields)) ||
+        /^(utm(source|medium|campaign|content|term|id)|landingpage(name|title|url|id|path)|landingurl|campaign(name|id)?|adset(name|id)?)$/.test(normalized) ||
+        ['ad', 'adname', 'adid', 'fbclid', 'gclid', 'referrer', 'medium', 'stage', 'submittedat', 'sourceid', 'lpid'].includes(normalized) || /^[_$]/.test(key) ||
         /^(internal|system|aws|slack)/.test(normalized) ||
         /email|phone|mobile|telephone|token|password|secret|authorization|apikey/.test(normalized)) continue;
     // Never stringify nested objects/arrays: they can contain unvalidated private data.
@@ -186,10 +175,18 @@ function message(ctx: NonNullable<Awaited<ReturnType<typeof context>>>, job: Lea
     if (!scalar.trim()) continue;
     const rendered = render(scalar);
     if (!rendered.trim()) continue;
-    if (append(`${render(key, 60)}: ${rendered}`)) {
+    const line = `${render(humanizeField(key), 60)}: ${rendered}`;
+    if (!hasAnswers) {
+      if (length + line.length + '\n\nForm answers:\n'.length > MAX_MESSAGE_LENGTH) continue;
+      append(''); append('Form answers:'); hasAnswers = true;
+    }
+    if (append(line)) {
       seen.add(normalized);
     }
   }
+  length -= footer.length + 2;
+  append('');
+  append(footer);
   for (const id of config.mentions || []) {
     if (!append(`<@${id}>`)) break;
   }
@@ -213,6 +210,7 @@ async function deliverLeadNotification(job: LeadNotificationJob, ctx: NonNullabl
     const client = new WebClient(ctx.connection.access_token, {
       timeout: 8000, retryConfig: { retries: 0 }, rejectRateLimitedCalls: true,
     });
+    const renderedMessage = await message(ctx, job);
     let authenticated = false;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
@@ -223,7 +221,7 @@ async function deliverLeadNotification(job: LeadNotificationJob, ctx: NonNullabl
         }
         // Use the Emma bot's identity; username overrides require chat:write.customize.
         const payload: ChatPostMessageArguments & { client_msg_id: string } = {
-          channel: ctx.config.slackChannelId, text: message(ctx, job),
+          channel: ctx.config.slackChannelId, text: renderedMessage,
           client_msg_id: messageIdOf(job), unfurl_links: false, unfurl_media: false, parse: 'none',
         };
         const result = await client.chat.postMessage(payload);

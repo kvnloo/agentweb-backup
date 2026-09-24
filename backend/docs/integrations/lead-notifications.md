@@ -35,45 +35,76 @@ Name: Jane Doe
 Phone: +1 (415) 555-1234
 Email: jane@example.com
 
+Attribution:
+Landing page: New LP — https://example.com/path
 Lead list: Inbound
-Source: waterheater-landing
-Created: 2026-09-23T12:00:00Z
+Campaign: Launch
+Ad set: Property managers
+Ad: Demo video
+Source / Medium: google / cpc
+Referrer: https://example.org/
+Submitted: Sep 23, 2026, 5:00 AM PT
+
+Form answers:
+Heater type: tankless
+
 <https://app.agentweb.pro/crm?listId=list-a&leadId=lead-a|Open in CRM>
-landingPageName: New LP
-landingUrl: https://example.com/path
-landingPagePath: /path
-campaignName: Launch
-campaignId: campaign-1
-utm_campaign: launch
-utm_content: ad-name
-utm_term: ad-set
-adId: ad-1
-fbclid: fb-click
-gclid: g-click
-utm_source: google
-utm_medium: cpc
-referrer: https://referrer.test
-heater_type: tankless
 ```
 
-The header is literally `New lead:`. The top block contains name, phone, email in
-that order, with full unmasked contact values. Empty fields, placeholder emails,
-and unavailable attribution are omitted; no `Unknown`, em-dash or empty labels.
-The detail block includes available list name, source, company, timestamp, CRM
-link, LP name/URL/path/ID, campaign name/ID and UTM campaign, ad/ad-set context
-(`utm_content`, `utm_term`, ad IDs/names), click IDs, source/medium, referrer and
-submitted scalar form fields. `firstTouch`/`lastTouch`, their `utm`, `clickIds` and
-allowlisted `extraParams`, top-level click IDs/UTM fallbacks, and `customFields`
-provide attribution. Repeat submissions prefer last touch and use `Submitted:`
-with their server submission timestamp. No missing attribution is guessed.
+The header is literally `New lead:`. Contact order is name, phone, email, with
+full unmasked values by default. Empty fields, placeholder emails, and unavailable
+attribution are omitted. `Form answers:` is omitted when there are no answers.
+Labels humanize camelCase, snake_case and kebab-case, and equivalent keys dedupe.
+Consumed attribution, contact aliases, and internal/system/credential fields never
+repeat as form answers. Nested objects/arrays are not stringified.
 
-Contact aliases and internal/system/credential fields are excluded from custom
-fields. Nested objects/arrays are not stringified. Values are Slack-escaped;
-line/control characters and formatting delimiters are neutralized. Optional
-values are bounded to 300 input characters, labels to 60, and the whole message
-to 12,000 escaped characters. Whole optional lines exceeding the budget are
-omitted; there is no separate field-count cap. Configured Slack user-ID mentions
-alone use active mention syntax. `CUSTOMER_FRONTEND_URL` sets the CRM link origin.
+First-touch attribution wins for new leads; repeat submissions prefer last touch.
+Malformed or empty preferred fields fall back to the other touch, then custom
+fields/top-level legacy attribution. Submitted time uses the accepted submission
+time or the lead creation time, rendered in America/Los_Angeles with a `PT` suffix
+and daylight-saving adjustment. Invalid timestamps are omitted.
+
+Landing and referrer URLs normalize HTTP(S), reject embedded credentials, and
+remove fragments. Query keys containing email, phone, token, code, session, auth,
+password, secret or key (case-insensitive, ignoring separators) have their values
+redacted, including repeated/encoded keys. Safe UTM/click parameters remain. Each
+URL is limited to **2,048 escaped characters**: oversized queries lose whole pairs,
+prioritizing UTM/click attribution, without slicing paths, values or escape entities.
+An origin/path exceeding that budget, or raw input over 64 KiB, is omitted. Normal
+URLs retain their full scheme, host, path and safe query, including those over 300
+characters. This is query-key redaction, not arbitrary PII detection in paths or
+values under unrelated keys.
+
+Names use notification-only, read-only DynamoDB lookups. A supplied page ID uses
+one primary-key get; its ID, persisted owner and non-archived state must match.
+URL-only lookup uses the existing owner `UserIdIndex`, evaluating at most **25**
+records in one request and matching exact origin/path. Incomplete results (a
+`LastEvaluatedKey`), ambiguity or missing records retain supplied names.
+Campaign IDs/UTM campaign names use one owner/date query of existing
+`AW-AdsMetricsSnapshots` over the preceding 30 days, evaluating at most **100**
+records. Incomplete, malformed or ambiguous results retain raw values. Both reads
+use projected fields, no retries and no pagination. The shared **two-second overall
+deadline aborts underlying SDK and provider requests**, rather than merely stopping
+the wait; late completions cannot alter returned attribution or start more requests.
+There is no new table, index, migration, global scan or data mutation.
+
+There is no persisted AW-Ads name directory or click-to-ad index in this repo.
+For numeric `ad_id`, `utm_content`, or `utm_term`, an unambiguous persisted **org**
+Meta ad-account connection permits a read-only Graph lookup (1.5-second timeout per
+candidate, at most three; two seconds overall for enrichment). The result must match both the requested ad ID and the
+connected account ID; explicit campaign IDs must agree too. Its campaign/ad-set/ad
+names can then enrich the message. No connection/token refresh or provider write
+occurs. Missing/ambiguous accounts and lookup failures preserve raw identifiers;
+`fbclid`/`gclid` remain labeled raw click identifiers in the Ad line and are never
+treated as ad IDs. Non-Meta ads retain their submitted names/identifiers.
+
+Values are Slack-escaped; control characters and formatting delimiters in free
+text are neutralized. Optional text is bounded to 300 input characters, labels to
+60, and the whole message to 12,000 escaped characters. URLs preserve punctuation
+within their separate privacy and length limits.
+Whole lines exceeding the budget are omitted; the CRM link has reserved space.
+There is no separate field-count cap. Configured Slack user-ID mentions alone use
+active mention syntax. `CUSTOMER_FRONTEND_URL` sets the CRM link origin.
 
 ## Routing and delivery
 
@@ -146,27 +177,77 @@ Complexity impact: extends one generic formatter and existing queue; adds one
 repeat-submission hook and removes arbitrary email-hiding/field-count behavior.
 No dependency, new table, polling loop, production config or data mutation added.
 
-## Verification for this revision
+## Verification for this follow-up
 
-Focused Jest: **169 passed in 8 suites**. TDD reproduced 36 formatter/default
-failures with 15 passing tests, then 2 repeat-submission failures with 9 passing
-tests before their respective fixes. Final command from `backend/`:
+Privacy regressions first reproduced **3 failures with 117 existing tests passing**.
+Final focused Jest: **195 passed in 5 suites**, covering formatter/privacy,
+attribution, SDK request bounds/cancellation, forwarding and legacy notifications.
+Commands from `backend/`:
 
 ```sh
-node --max-old-space-size=2048 node_modules/.bin/jest --runInBand --runTestsByPath \
+NODE_OPTIONS=--max-old-space-size=1536 ./node_modules/.bin/jest --runInBand --runTestsByPath \
   src/__tests__/orgLeadNotificationService.test.ts \
+  src/__tests__/leadNotificationAttribution.test.ts \
+  src/__tests__/leadNotificationLookup.test.ts \
   src/__tests__/leadListAlertService.orgNotifications.test.ts \
-  src/__tests__/crmDb.createLead.userId.test.ts \
-  src/__tests__/crmDb.batchCreateLeads.nameCompanyKey.test.ts \
-  src/__tests__/leadListAlertService.apiEvents.test.ts \
-  src/__tests__/slackLeadNotification.test.ts \
-  src/__tests__/webhooks.forwardLead.customFields.test.ts \
   src/__tests__/webhooks.leadForwarding.test.ts
+
+node --max-old-space-size=1536 ./node_modules/typescript/bin/tsc --noEmit
 ```
 
-Scoped TypeScript compiler check: **6 changed TypeScript files, 0 diagnostics**.
-Ran serially with `node --max-old-space-size=4096 /tmp/eng2120-scoped-typecheck.cjs`:
-uses repository compiler options, explicit Node/Jest types, those six root files,
-and syntactic/semantic diagnostics scoped to each changed file. The initial
-harness omitted Jest type roots; correcting the harness resolved those diagnostics.
-`git diff --check` passed. No full typecheck, build, live Slack send or deployment.
+The **actual full backend typecheck** was attempted on Atem using the repository's
+`tsconfig.json` and entire `src/**/*` graph. The command above is the full compiler
+command from `npm run typecheck`, with its hardcoded 6144 MB heap replaced by the
+requested 1536 MB cap (setting `NODE_OPTIONS` alone cannot override the script's
+explicit cap). **It failed: exit 134, `Reached heap limit Allocation failed -
+JavaScript heap out of memory`, before TypeScript diagnostics.** The cap was not
+raised. Full backend type safety is therefore unverified; no scratch/scoped harness
+is presented as full evidence. Jest uses the repository's isolated-module transform
+and does not establish full type safety either.
+
+`git diff --check` passed. No full build, live Slack send, commit, push or deployment.
+Complexity impact: replaces unbounded shared-service pagination with one small
+notification-only storage adapter; one sanitizer serves both URL fields. Adds no
+dependency, schema, persistence or configuration change.
+
+## Haven capture diagnosis (2026-09-24)
+
+`https://learn.usehaven.ai/` currently serves Webflow, not the Next.js LP repo.
+Its inline `wf-form-Main-Form` handler POSTs only to
+`https://api.hsforms.com/submissions/v3/integration/submit/45038699/8df411dd-00aa-4051-8cb9-626fb64ff2d3`
+and redirects to `https://calendly.com/havenapp/haven-demo` even on non-2xx or
+network failure. A browser submission with outbound POSTs intercepted confirmed
+this behavior; no actual lead was sent. The live `/api/capture` path returns 404.
+
+The separate `/home/harsha/lp-work/lp-haven` repo already implements a valid capture
+path in `app/haven-automate-tenant-communic/_components/lead-capture-form.tsx` →
+`app/api/capture/route.ts` → AgentWeb `/api/webhooks/forward-lead`. Its configured
+list `list_1785171395180_9k5a5nzny` exists and has `publicAccessEnabled: true`
+(verified with a projected, read-only DynamoDB get). The local `domainMap.ts` is
+empty, and changes to this repo cannot affect the currently served Webflow form.
+
+Necessary LP-side patch if this hostname is intended to serve the generated LP:
+
+```diff
+--- domainMap.ts
++++ domainMap.ts
+@@
+-export const DOMAIN_MAP: Record<string, string> = {};
++export const DOMAIN_MAP: Record<string, string> = {
++  "learn.usehaven.ai": "/haven-automate-tenant-communic",
++};
+```
+
+Then attach the hostname to the LP's Vercel project and switch its domain routing
+from Webflow to that deployment. The existing middleware stamps `aw_page` with the
+mapped path; the existing capture route selects the correct list. No backend code
+change is needed for this flow. This patch and hosting changes were **not applied**.
+
+If retaining Webflow is intended, patch its actual form embed/integration instead:
+add a server-side relay to AgentWeb's existing forward-lead endpoint with the list
+ID above; map `First-Name` → `firstName`, `Last-name` → `lastName`, `mobilephone` →
+`phone`, `email`/`company` unchanged, and the units/message/attribution fields into
+the documented capture payload. Await successful CRM capture before showing success
+or redirecting, and surface/retry failures. A browser-only cross-origin JSON POST
+is insufficient: the AgentWeb preflight from this origin currently returns 403.
+Do not weaken backend CORS to work around the missing server-side integration.
