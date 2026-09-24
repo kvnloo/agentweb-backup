@@ -3986,6 +3986,9 @@ emmaToolRegistry.register({
             leadId: it.leadId,
             listId: it.listId,
             email: it.email || null,
+            // ENG-2082: without this the phone never reaches askCrm, so its projection and
+            // its specific_contact haystack stay blind to phone-only leads.
+            phone: it.phone || null,
             firstName: it.firstName || null,
             lastName: it.lastName || null,
             company: it.company || null,

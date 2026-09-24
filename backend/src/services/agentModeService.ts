@@ -13179,6 +13179,10 @@ export class AgentModeService {
         leads: matchingLeads.map((lead: any) => ({
           leadId: lead.leadId,
           email: lead.email || '',
+          // ENG-2082: a phone-only lead is contactable. Omitting the number here showed the
+          // model a row with NO contact channel at all, which reads as junk — and
+          // `email is_empty` in delete_leads_by_filter matches exactly these rows.
+          phone: lead.phone || '',
           firstName: lead.firstName || '',
           lastName: lead.lastName || '',
           company: lead.company || '',
@@ -13496,6 +13500,8 @@ export class AgentModeService {
             leadId: entry.lead.leadId,
             ...(isMultiList ? { listId: entry.listId, listName: entry.listName } : {}),
             email: entry.lead.email || '',
+            // ENG-2082: see get_leads — a phone-only lead has a contact channel; show it.
+            phone: entry.lead.phone || '',
             firstName: entry.lead.firstName || '',
             lastName: entry.lead.lastName || '',
             company: entry.lead.company || '',
@@ -13848,6 +13854,8 @@ export class AgentModeService {
           matches.push({
             leadId: lead.leadId,
             email: lead.email || '',
+            // ENG-2082: see get_leads — a phone-only lead has a contact channel; show it.
+            phone: lead.phone || '',
             firstName: lead.firstName || '',
             lastName: lead.lastName || '',
             company: lead.company || '',
@@ -14233,7 +14241,13 @@ export class AgentModeService {
               matchCount++;
               if (sampleLeads.length < sampleLimit) {
                 sampleLeads.push({
+                  // ENG-2082: this is the preview for a DESTRUCTIVE op, and `email is_empty`
+                  // matches phone-only leads exactly. Without the number every sample row
+                  // rendered blank, so the operator confirmed a delete against rows that
+                  // looked like empty junk and were in fact contactable leads.
+                  leadId: lead.leadId,
                   email: lead.email || '',
+                  phone: lead.phone || '',
                   firstName: lead.firstName || '',
                   lastName: lead.lastName || '',
                   company: lead.company || ''

@@ -34,6 +34,13 @@ interface SingleInput {
 
 interface ResolvedProfile {
   found: boolean;
+  /**
+   * Why `found` is false, when we can say. Absent means a lookup genuinely ran and came
+   * back empty; `insufficient_input` means no lookup was attempted at all. Emma reported
+   * both as "no email exists for this person", which is a different and much stronger
+   * claim than "I did not have enough to search on".
+   */
+  reason?: 'insufficient_input';
   email?: string;
   firstName?: string;
   lastName?: string;
@@ -107,7 +114,11 @@ async function resolveSingle(input: SingleInput, userId: string): Promise<{ inpu
   const haveName = !!(firstName || lastName);
   const haveOrg = !!(domain || company);
   if (!linkedin && !(haveName && haveOrg)) {
-    return { input, found: false };
+    // No lookup was attempted — say so, rather than letting a bare `found: false` be read
+    // as a finding. ENG-2082 made this common: a phone-only lead often has neither a name
+    // nor an org, so Emma would confidently report that no email exists for someone she
+    // never searched for.
+    return { input, found: false, reason: 'insufficient_input' as const };
   }
   const r = await waterfallFindEmail(
     {
