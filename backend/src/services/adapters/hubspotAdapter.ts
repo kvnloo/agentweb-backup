@@ -308,9 +308,24 @@ export class HubspotAdapter implements CrmAdapter {
                         contactId = updated.contactId;
                         wasNew = false;
                     } catch (err: any) {
+                        // ONLY fall back when the contact is genuinely gone. The fallback
+                        // exists for a contact deleted in HubSpot; catching everything
+                        // turned a 429 or a 5xx into "create a new contact", which is the
+                        // duplicate this whole branch prevents — and hubspotService retries
+                        // 429 exactly once before throwing, so a sustained rate limit would
+                        // reach here and silently fork the record.
+                        const status = err?.response?.status;
+                        if (status !== 404 && status !== 410) {
+                            result.errorCount++;
+                            result.errors.push(
+                                `Lead ${lead.leadId}: updating stored contact ${existingContactId} failed ` +
+                                `(${this.formatError(err)})`,
+                            );
+                            continue;
+                        }
                         console.warn(
                             `[HubspotAdapter] stored contact ${existingContactId} for lead ${lead.leadId} ` +
-                            `did not update (${this.formatError(err)}) — falling back to upsert/create.`,
+                            `no longer exists (${status}) — falling back to upsert/create.`,
                         );
                         const fresh = await upsertOrCreate();
                         contactId = fresh.contactId;
@@ -1049,6 +1064,9 @@ export class HubspotAdapter implements CrmAdapter {
 
         let cursor: string | undefined;
 
+        // Lazy, built at most once per pull — see the email-less branch below.
+        let contactIdIndex: Map<string, any> | null = null;
+
         do {
             const { results, nextCursor } = await svc.listContactsPage(contactProps, cursor);
             const pageLeadData: any[] = [];
@@ -1126,9 +1144,25 @@ export class HubspotAdapter implements CrmAdapter {
                 // to import a contactable person. Resolve them by the contact id we already
                 // store instead, and update in place.
                 if (!leadData.email && !leadData.linkedin) {
-                    const existing = await crmDb
-                        .getLeadByHubSpotContactId(listId, String(contact.id))
-                        .catch(() => null);
+                    // Resolved from ONE pass over the list, built lazily on first need and
+                    // reused for the whole pull. The first version queried per contact, and
+                    // getLeadByHubSpotContactId is a partition Query with a FilterExpression
+                    // — no index — so a pull with 100 email-less contacts meant 100 full
+                    // scans of the list, sequentially, inside the page loop.
+                    if (!contactIdIndex) {
+                        contactIdIndex = new Map<string, any>();
+                        try {
+                            for (const l of await crmDb.getAllLeadsByListId(listId)) {
+                                const cid = (l as any)?.syncMetadata?.hubspot_contact_id;
+                                if (cid && !contactIdIndex.has(String(cid))) contactIdIndex.set(String(cid), l);
+                            }
+                        } catch (err: any) {
+                            // Degrade to "no match" rather than failing the pull: the worst
+                            // case is the pre-existing duplicate behaviour, not a lost sync.
+                            console.warn(`[HubspotAdapter] could not index contact ids for ${listId}: ${this.formatError(err)}`);
+                        }
+                    }
+                    const existing = contactIdIndex.get(String(contact.id)) ?? null;
                     if (existing) {
                         try {
                             await crmDb.updateLead(listId, existing.leadId, leadData);

@@ -561,6 +561,45 @@ describe('CRM Database Service', () => {
     });
   });
 
+  describe('getLeadByHubSpotContactId', () => {
+    // There is no index on syncMetadata.hubspot_contact_id, so this is a partition Query
+    // with a FilterExpression — DynamoDB applies the filter AFTER reading and caps each
+    // page at 1MB. A single-shot query only searches the first page, so on a large list the
+    // match is missed and the reverse-sync callers create the duplicate they exist to avoid.
+    it('keeps paging until it finds the match', async () => {
+      mockDocumentClientMethods.query
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [], LastEvaluatedKey: { listId: 'list_123', leadId: 'p1' } }) })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [], LastEvaluatedKey: { listId: 'list_123', leadId: 'p2' } }) })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [{ leadId: 'found', listId: 'list_123' }] }) });
+
+      const lead = await crmDb.getLeadByHubSpotContactId('list_123', 'c99');
+
+      expect(lead).toEqual({ leadId: 'found', listId: 'list_123' });
+      expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(3);
+      // page 2 and 3 must carry the cursor from the page before
+      expect(mockDocumentClientMethods.query.mock.calls[1][0].ExclusiveStartKey).toEqual({ listId: 'list_123', leadId: 'p1' });
+      expect(mockDocumentClientMethods.query.mock.calls[2][0].ExclusiveStartKey).toEqual({ listId: 'list_123', leadId: 'p2' });
+    });
+
+    it('returns null once the pages run out', async () => {
+      mockDocumentClientMethods.query
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [], LastEvaluatedKey: { leadId: 'p1' } }) })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [] }) });
+
+      expect(await crmDb.getLeadByHubSpotContactId('list_123', 'c99')).toBeNull();
+      expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(2);
+    });
+
+    it('stops on the first page when the match is there', async () => {
+      mockDocumentClientMethods.query.mockReturnValueOnce({
+        promise: jest.fn().mockResolvedValue({ Items: [{ leadId: 'found' }], LastEvaluatedKey: { leadId: 'p1' } }),
+      });
+
+      expect(await crmDb.getLeadByHubSpotContactId('list_123', 'c99')).toEqual({ leadId: 'found' });
+      expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('updateLead', () => {
     // ENG-2082: setLeadFields derives domain/lifecycle on an email write, but updateLead is
     // the ORDINARY path — a person editing the lead — and was left out of the first pass.

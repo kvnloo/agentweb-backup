@@ -7293,17 +7293,30 @@ export const crmDb = {
 
   async getLeadByHubSpotContactId(listId: string, contactId: string) {
     try {
-      const params: any = {
-        TableName: `${TABLE_PREFIX}AW-Leads`,
-        KeyConditionExpression: 'listId = :listId',
-        FilterExpression: 'syncMetadata.hubspot_contact_id = :contactId',
-        ExpressionAttributeValues: {
-          ':listId': listId,
-          ':contactId': contactId,
-        },
-      };
-      const result = await dynamodb.query(params).promise();
-      return result.Items?.[0] ?? null;
+      // PAGINATED, deliberately. There is no index on syncMetadata.hubspot_contact_id, so
+      // this is a partition Query with a FilterExpression — DynamoDB applies the filter
+      // AFTER reading, and caps each page at 1MB regardless. A single query therefore only
+      // searches the first ~1MB of the list: on any list bigger than that the match can sit
+      // on a later page and the caller gets null. For the reverse-sync callers that false
+      // negative is the whole bug they are trying to avoid — they would create a duplicate
+      // lead carrying a hubspot_contact_id that already exists on another row.
+      let lastEvaluatedKey: any = undefined;
+      do {
+        const params: any = {
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          KeyConditionExpression: 'listId = :listId',
+          FilterExpression: 'syncMetadata.hubspot_contact_id = :contactId',
+          ExpressionAttributeValues: {
+            ':listId': listId,
+            ':contactId': contactId,
+          },
+          ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+        };
+        const result = await dynamodb.query(params).promise();
+        if (result.Items?.length) return result.Items[0];
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
+      return null;
     } catch (error) {
       handleDynamoDbError(error, "getLeadByHubSpotContactId");
       throw error;

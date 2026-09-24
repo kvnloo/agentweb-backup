@@ -184,7 +184,7 @@ describe('HubspotAdapter.pushLeads — email validation', () => {
   // Preferring the stored id must not cost us recovery: upsert used to recreate a contact
   // that had been deleted in HubSpot, and it still has to.
   it('falls back to upsert when the stored contact id no longer resolves', async () => {
-    mockUpdateContact.mockRejectedValueOnce(new Error('404 contact not found'));
+    mockUpdateContact.mockRejectedValueOnce(Object.assign(new Error('not found'), { response: { status: 404 } }));
     const leads = [
       {
         leadId: 'l1', listId: 'list_1', firstName: 'Foo', email: 'foo@example.com',
@@ -201,7 +201,7 @@ describe('HubspotAdapter.pushLeads — email validation', () => {
   });
 
   it('falls back to create when the stored id is stale and there is no email', async () => {
-    mockUpdateContact.mockRejectedValueOnce(new Error('404 contact not found'));
+    mockUpdateContact.mockRejectedValueOnce(Object.assign(new Error('gone'), { response: { status: 410 } }));
     const leads = [
       { leadId: 'l1', listId: 'list_1', firstName: 'Foo', syncMetadata: { hubspot_contact_id: 'gone' } },
     ];
@@ -211,6 +211,39 @@ describe('HubspotAdapter.pushLeads — email validation', () => {
     expect(mockCreateContact).toHaveBeenCalledTimes(1);
     expect(mockUpsertContact).not.toHaveBeenCalled();
     expect(result.errorCount).toBe(0);
+  });
+
+  // The fallback is for a contact that is GONE. Treating every failure as gone turns a
+  // rate limit into "create a new contact" — forking the record this branch exists to keep
+  // whole. hubspotService retries a 429 once and then throws, so a sustained limit lands
+  // here.
+  it('does NOT fall back on a 429 — it reports the error instead of forking the contact', async () => {
+    mockUpdateContact.mockRejectedValueOnce(Object.assign(new Error('rate limited'), { response: { status: 429 } }));
+    const leads = [
+      {
+        leadId: 'l1', listId: 'list_1', firstName: 'Foo', email: 'foo@example.com',
+        syncMetadata: { hubspot_contact_id: 'c99' },
+      },
+    ];
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    expect(mockUpsertContact).not.toHaveBeenCalled();
+    expect(mockCreateContact).not.toHaveBeenCalled();
+    expect(result.errorCount).toBe(1);
+    expect(result.newCount).toBe(0);
+  });
+
+  it('does NOT fall back on a 500 either', async () => {
+    mockUpdateContact.mockRejectedValueOnce(Object.assign(new Error('boom'), { response: { status: 500 } }));
+    const leads = [
+      { leadId: 'l1', listId: 'list_1', firstName: 'Foo', syncMetadata: { hubspot_contact_id: 'c99' } },
+    ];
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    expect(mockCreateContact).not.toHaveBeenCalled();
+    expect(result.errorCount).toBe(1);
   });
 
   it('skips an email-less lead that has no mappable properties (nothing to push)', async () => {
