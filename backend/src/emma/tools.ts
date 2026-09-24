@@ -517,8 +517,13 @@ For a customer-facing credential reconnect (e.g. a disconnected ad account or CM
       // itself; the decision is already durably persisted above regardless.
       if (decision.audience === 'team' && decision.approver) {
         try {
-          const { upsertApproverQueueMessage } = await import('../services/approvalInboxSlack');
+          const { upsertApproverQueueMessage, postDecisionAddedNotice } = await import('../services/approvalInboxSlack');
           await upsertApproverQueueMessage(decision.approver);
+          // Gap-closing round: the queue message alone updates in place and
+          // Slack won't reliably notify for that — this is a real, always-new
+          // message so the approver actually gets pinged, not just an
+          // invisibly-edited summary.
+          await postDecisionAddedNotice(decision.approver, decision);
         } catch (err: any) {
           console.warn('[stage_pending_decision] failed to post/update Slack queue message:', err?.message || err);
         }

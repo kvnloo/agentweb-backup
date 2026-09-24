@@ -282,3 +282,29 @@ export async function postDecisionResolvedNotice(approver: ApprovalDecisionAppro
     console.warn('[approval-inbox-slack] failed to post resolution notice:', err?.message || err);
   }
 }
+
+/**
+ * ENG-1644 gap-closing round: real production testing found the queue
+ * message alone doesn't reliably reach an approver — upsertApproverQueueMessage
+ * updates the SAME message in place (chat.update) after the first decision
+ * ever staged to an approver, and Slack does not push-notify or re-surface a
+ * channel as unread for a message edit the way it does for a genuinely new
+ * message. Call this right after upsertApproverQueueMessage on every NEW
+ * decision (never on resolution — postDecisionResolvedNotice already covers
+ * that) so a second/third/etc. pending decision still produces a real,
+ * always-new chat.postMessage — a real notification, not a silent edit.
+ */
+export async function postDecisionAddedNotice(approver: ApprovalDecisionApprover, decision: ApprovalDecision): Promise<void> {
+  if (!slackClient) return;
+  try {
+    const channel = await getApproverChannel(approver);
+    const slackUserId = await getApproverSlackUserId(approver);
+    const mention = slackUserId ? `<@${slackUserId}>` : approver;
+    await slackClient.chat.postMessage({
+      channel,
+      text: `🔔 ${mention} — new decision: ${decision.businessImpact}`,
+    });
+  } catch (err: any) {
+    console.warn('[approval-inbox-slack] failed to post new-decision notice:', err?.message || err);
+  }
+}

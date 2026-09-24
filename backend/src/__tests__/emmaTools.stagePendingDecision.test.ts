@@ -16,22 +16,33 @@ jest.mock('../services/approvalInboxCustomerNotify', () => ({
   notifyCustomerOfPendingCredentialDecision: jest.fn(),
 }));
 
+jest.mock('../services/approvalInboxSlack', () => ({
+  upsertApproverQueueMessage: jest.fn(),
+  postDecisionAddedNotice: jest.fn(),
+}));
+
 import '../emma/tools';
 import { emmaToolRegistry } from '../emma/registry';
 import { approvalInboxService } from '../services/approvalInboxService';
 import { notifyCustomerOfPendingCredentialDecision } from '../services/approvalInboxCustomerNotify';
+import { upsertApproverQueueMessage, postDecisionAddedNotice } from '../services/approvalInboxSlack';
 
 const mockCreateDecision = approvalInboxService.createDecision as jest.Mock;
 const mockNotifyCustomer = notifyCustomerOfPendingCredentialDecision as jest.Mock;
+const mockUpsertApproverQueueMessage = upsertApproverQueueMessage as jest.Mock;
+const mockPostDecisionAddedNotice = postDecisionAddedNotice as jest.Mock;
 
 beforeEach(() => {
   jest.clearAllMocks();
   mockCreateDecision.mockResolvedValue({
     decisionId: 'decision-1',
+    audience: 'team',
     approver: 'matt',
     status: 'pending_team_review',
   });
   mockNotifyCustomer.mockResolvedValue(undefined);
+  mockUpsertApproverQueueMessage.mockResolvedValue(undefined);
+  mockPostDecisionAddedNotice.mockResolvedValue(undefined);
 });
 
 describe('stage_pending_decision', () => {
@@ -66,6 +77,11 @@ describe('stage_pending_decision', () => {
 
     expect(result.success).toBe(true);
     expect(result.decisionId).toBe('decision-1');
+    // gap-closing round: every new team-audience decision must both refresh
+    // the queue message AND fire a real, always-new notification — the
+    // queue-only update alone doesn't reliably notify an approver.
+    expect(mockUpsertApproverQueueMessage).toHaveBeenCalledWith('matt');
+    expect(mockPostDecisionAddedNotice).toHaveBeenCalledWith('matt', expect.objectContaining({ decisionId: 'decision-1' }));
     // No awaitingUserConfirmation anywhere in the result — this tool never
     // halts the turn, unlike present_question_deck/call_meta_marketing_api.
     expect(result.awaitingUserConfirmation).toBeUndefined();

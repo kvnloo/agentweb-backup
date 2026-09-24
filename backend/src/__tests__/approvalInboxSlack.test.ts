@@ -181,4 +181,43 @@ describe('approvalInboxSlack', () => {
       if (result.claimed) expect(result.decision.decisionId).toBe('d1');
     });
   });
+
+  describe('postDecisionAddedNotice', () => {
+    const decision: any = { decisionId: 'd1', approver: 'matt', businessImpact: 'Needs a fresh subject line.' };
+
+    it('always posts a real, new chat.postMessage — never chat.update', async () => {
+      await approvalInboxSlack.postDecisionAddedNotice('matt', decision);
+
+      expect(mockPostMessage).toHaveBeenCalledTimes(1);
+      expect(mockUpdate).not.toHaveBeenCalled();
+      const call = mockPostMessage.mock.calls[0][0];
+      expect(call.channel).toBe('C-MATT');
+      expect(call.text).toContain('Needs a fresh subject line.');
+    });
+
+    it('mentions the approver by real Slack ID when resolvable', async () => {
+      await approvalInboxSlack.postDecisionAddedNotice('matt', decision);
+      expect(mockPostMessage.mock.calls[0][0].text).toContain('<@U-MATT>');
+    });
+
+    it('falls back to the plain approver name when no Slack ID is resolvable', async () => {
+      mockGetApproverSlackUserId.mockResolvedValue(undefined);
+      await approvalInboxSlack.postDecisionAddedNotice('matt', decision);
+      expect(mockPostMessage.mock.calls[0][0].text).toContain('matt');
+    });
+
+    it('a post failure is swallowed — never throws', async () => {
+      mockPostMessage.mockRejectedValue(new Error('Slack API down'));
+      await expect(approvalInboxSlack.postDecisionAddedNotice('matt', decision)).resolves.toBeUndefined();
+    });
+
+    it('never posts when the Slack client is not initialized', async () => {
+      delete process.env.SLACK_BOT_TOKEN;
+      jest.resetModules();
+      const freshModule = require('../services/approvalInboxSlack');
+      await freshModule.postDecisionAddedNotice('matt', decision);
+      expect(mockPostMessage).not.toHaveBeenCalled();
+      process.env.SLACK_BOT_TOKEN = 'xoxb-test';
+    });
+  });
 });
