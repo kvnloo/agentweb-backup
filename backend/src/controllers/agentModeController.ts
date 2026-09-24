@@ -8496,18 +8496,28 @@ export async function generateSessionResponse(
   // MCP) converges on before crossing the worker fork, so none of those call sites
   // need their own resolveRunFunding call. NOT the only entry into the worker:
   // controllers/benchmark.ts calls generateMarketingResponseWorkerService.runInWorker
-  // directly for benchmark runs, bypassing this. Harmless today only because the
-  // worker's own fallback (generateMarketingResponseWorker.ts) reconstructs
-  // RunFunding from the always-present userId when none was sent — but that
-  // fallback must not be relied on once a real non-agentweb route exists; benchmark
-  // runs will need their own resolveRunFunding call before that lands. Also not the
-  // choke point for Emma's *other* turn loop — the sidebar assistant
-  // (chatbotService.generateChatResponse) is resolved separately, at its own 3
-  // call sites (chatSocketHandler.ts, controllers/chatbot.ts) — and for internal
-  // MCP tool calls, which resolve lazily inside mcp/server/registry.ts's execute()
-  // only when no ambient RunFunding is already active. F1 always resolves
+  // directly for benchmark runs, bypassing this — safe because the worker's own
+  // fallback (generateMarketingResponseWorker.ts) calls resolveRunFunding itself
+  // when none was sent, the same resolution this call site uses, not a hand-built
+  // stand-in for it. Also not the choke point for Emma's *other* turn loop — the
+  // sidebar assistant (chatbotService.generateChatResponse) is resolved separately,
+  // at its own 3 call sites (chatSocketHandler.ts, controllers/chatbot.ts) — and for
+  // internal MCP tool calls, which resolve lazily inside mcp/server/registry.ts's
+  // execute() only when no ambient RunFunding is already active. F1 always resolves
   // 'agentweb' everywhere; A1+/B1+ make the result meaningful once a real
   // connection exists to route to.
+  //
+  // KNOWN GAP, not yet closed: liveVoiceService.ts (the Gemini Live voice feature)
+  // calls agentModeService.callLLM/executeTool and its own meterUserUsage directly,
+  // with no RunFunding entry point anywhere in that file — found by a round-3 PR
+  // review, deliberately left unwrapped rather than rushed here, since it's a
+  // long-lived streaming session with a materially different lifecycle from the
+  // request/response and socket-turn paths above, not a same-shape fix. Not a
+  // behavior change today either way: its callLLM path falls back the same as any
+  // other unwrapped path (noteRunFundingUnset + today's billing), and its direct
+  // meterUserUsage call is pre-existing metering this PR never touches. But it must
+  // be closed before any non-agentweb route ships, or a Live Voice user's spend can
+  // never route to their own connection.
   const runFunding = await resolveRunFunding({ userId });
 
   // Generate AI response using worker process to prevent blocking the main event loop

@@ -7,7 +7,7 @@ import { agentModeService } from '../services/agentModeService';
 import { installWorkerShutdownGuards } from './workerShutdownGuards';
 import { installSandboxMetaInterceptorAtBoot } from '../services/sandbox/bootstrap';
 import { shouldBootstrapBackgroundJobs } from '../utils/instanceState';
-import { withRunFunding, noteRunFundingUnset, type RunFunding } from '../services/funding/runFunding';
+import { withRunFunding, noteRunFundingUnset, resolveRunFunding, type RunFunding } from '../services/funding/runFunding';
 
 // Survive the OS process-group/cgroup SIGTERM on deploy so an in-flight scheduled run
 // isn't aborted before the parent's drain can let it finish (ENG-201). The parent is the
@@ -165,19 +165,16 @@ process.on('message', async (message: any) => {
       // ENG-1816 F1: enter the ambient store BEFORE calling into agentModeService, so
       // every nested callLLM call in this turn (including tool-internal ones) reads
       // the same funding without any of those ~50 call sites being edited. A caller
-      // that hasn't been updated to send `runFunding` falls back to today's behavior
-      // (agentweb) rather than failing closed, but is counted so unwrapped paths are
-      // discoverable before a customer route depends on them.
+      // that hasn't been updated to send `runFunding` (e.g. controllers/benchmark.ts)
+      // falls back to resolving it fresh here rather than failing closed, but is
+      // counted so unwrapped callers are discoverable before a customer route
+      // depends on them. Resolving via resolveRunFunding — not a hand-built
+      // 'agentweb' literal — so this fallback stays correct as resolution logic
+      // evolves instead of silently drifting from it.
       let effectiveRunFunding: RunFunding = runFunding;
       if (!effectiveRunFunding) {
         noteRunFundingUnset('generateMarketingResponseWorker');
-        effectiveRunFunding = {
-          route: 'agentweb',
-          fallback: 'agentweb',
-          ownerUserId: userId,
-          billingUserId: userId,
-          resolvedAt: new Date().toISOString(),
-        };
+        effectiveRunFunding = await resolveRunFunding({ userId });
       }
 
       // Progress callback to forward progress updates to parent process
