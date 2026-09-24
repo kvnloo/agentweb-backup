@@ -236,10 +236,19 @@ export async function resolveApprovalDecision(
   const result = await approvalInboxService.claimDecision(decisionId, verdict, answeredBy, freeText);
   if (!result.claimed) return result;
 
+  // The claim itself is already durably committed above — a failure to
+  // refresh Slack must never surface as a failed claim (same non-fatal
+  // principle as stage_pending_decision's own post-create refresh). Without
+  // this, a missing channel/Slack config would make a SUCCESSFUL approve
+  // bubble up as a 500 to the caller, even though the DB already reflects it.
   const { decision } = result;
   if (decision.approver) {
-    await upsertApproverQueueMessage(decision.approver);
-    await postDecisionResolvedNotice(decision.approver, decision);
+    try {
+      await upsertApproverQueueMessage(decision.approver);
+      await postDecisionResolvedNotice(decision.approver, decision);
+    } catch (err: any) {
+      console.warn('[approval-inbox-slack] claim succeeded but Slack refresh failed:', err?.message || err);
+    }
   }
   return result;
 }

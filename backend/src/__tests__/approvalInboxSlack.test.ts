@@ -150,5 +150,16 @@ describe('approvalInboxSlack', () => {
       expect(mockPostMessage).not.toHaveBeenCalled();
       expect(mockUpdate).not.toHaveBeenCalled();
     });
+
+    it('still reports the claim as successful even when the post-claim Slack refresh throws', async () => {
+      const decision = { decisionId: 'd1', approver: 'matt', verdict: 'approve', businessImpact: 'x' };
+      mockClaimDecision.mockResolvedValue({ claimed: true, decision });
+      mockGetApproverChannel.mockRejectedValue(new Error('No Slack channel configured for approver matt'));
+
+      const result = await approvalInboxSlack.resolveApprovalDecision('d1', 'approve', 'matt');
+
+      expect(result.claimed).toBe(true);
+      if (result.claimed) expect(result.decision.decisionId).toBe('d1');
+    });
   });
 });
