@@ -119,6 +119,7 @@ describe('getAllAvailableConnectedAccounts', () => {
       'attio',
       'google_ads',
       'google_drive',
+      'linkedin_ads',
     ];
     for (const platform of expectedPlatforms) {
       expect(result).toContain(platform);

@@ -94,6 +94,7 @@ const AVAILABLE_CONNECTED_ACCOUNTS = [
   { id: 'linkedin', label: 'LinkedIn' },
   { id: 'unipile', label: 'LinkedIn Outreach' },
   { id: 'meta', label: 'Meta Marketing' },
+  { id: 'linkedin_ads', label: 'LinkedIn Ads' },
   { id: 'instagram', label: 'Instagram Business' },
   { id: 'twitter', label: 'Twitter/X' },
   { id: 'gmail', label: 'Gmail' },

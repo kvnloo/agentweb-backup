@@ -20,13 +20,13 @@ jest.mock('../utils/agentModeAlerts', () => ({
 }));
 
 // Unrestricted-plan platform list mirrors subscriptionService's real
-// getAllAvailableConnectedAccounts() — deliberately does NOT include
-// 'linkedin_ads' (that gap is a pre-existing, out-of-scope subscriptionService
-// quirk), but does include 'meta' and 'google_ads' so an unrestricted plan is
-// still correctly treated as ad-entitled.
+// getAllAvailableConnectedAccounts() (ENG: linkedin_ads entitlement-gap fix —
+// linkedin_ads is now included, alongside 'meta' and 'google_ads', so an
+// unrestricted plan is correctly treated as ad-entitled for all three).
 const UNRESTRICTED_CONNECTED_ACCOUNTS = [
   'linkedin', 'unipile', 'meta', 'gmail', 'outlook', 'calendly', 'youtube',
   'fathom', 'instagram', 'twitter', 'hubspot', 'attio', 'google_ads', 'google_drive',
+  'linkedin_ads',
 ];
 
 const mockGetAllowedConnectedAccounts = jest.fn().mockResolvedValue(UNRESTRICTED_CONNECTED_ACCOUNTS);
