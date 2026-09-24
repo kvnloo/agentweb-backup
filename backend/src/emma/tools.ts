@@ -19,6 +19,7 @@ import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalServ
 import { enqueueAutoHumanEval, claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
 import { type AskUserQuestionOption } from '../services/agentMode/core/askUserQuestion';
 import type { QuestionDeckQuestionInput } from '../services/agentMode/core/approvalDeck';
+import { approvalInboxService, type ApprovalDecisionApprover, type ApprovalDecisionGateType } from '../services/approvalInboxService';
 import { CLIENT_ID_SCHEMA_PROPERTY } from '../mcp/server/toolHelpers';
 
 // Register browser cookie persistence tools
@@ -352,6 +353,154 @@ ask_user_question remains available, unchanged, as a narrow escape hatch for a g
       confirmationPrompt: summary,
       summary,
     };
+  },
+});
+
+// ENG-1644 Phase B: durable, cross-session decisions for a NAMED approver
+// (Matt/Harsha/Fangfang) or the customer themselves — answerable from Slack
+// days later, outside this session, unlike present_question_deck's/
+// call_meta_marketing_api's session-scoped halt.
+//
+// Deliberately does NOT accept a Meta-write payload as model input, even
+// though the ticket's own seed cases include write-shaped approvals (e.g.
+// Haven Lease). ENG-1635's write-manifest digest/dispatch are explicitly
+// internal-only, same-process data — buildMetaWriteConfirmation's own
+// comment states they are "never part of the model-facing message... never
+// serialized to the client," specifically so a model can never see, forge,
+// or replay one. Accepting a model-supplied metaWriteDispatch here would
+// reopen exactly the self-approval-bypass class of gap ENG-1635/1644's
+// gap 5 fix closed — the model itself would become the source of the
+// account/entity/params a "write" claims to represent. Routing a real Meta
+// write's halt into the durable store instead of the session-scoped deck
+// needs its OWN backend-only mechanism (reading the halt's already-computed,
+// already-verified digest/dispatch directly, the same way the session deck
+// does today) — not a tool argument. That's real, separate work, tracked
+// as an open gap, not silently dropped.
+emmaToolRegistry.register({
+  name: 'stage_pending_decision',
+  definition: {
+    name: 'stage_pending_decision',
+    description: `Raise a durable, named-approver decision that survives outside this session — the approver (Matt, Harsha, or Fangfang) answers it from Slack, potentially days later, not in this chat. Use this instead of ask_user_question/present_question_deck when the answer genuinely belongs to someone OTHER than the person you're talking to right now (a named team approver's call, not the current user's), or when you need to hand off a durable decision that shouldn't block this session.
+
+Do NOT use this for a Meta Ads write approval — those already go through call_meta_marketing_api's own confirmation gate; this tool cannot carry write parameters at all.
+
+Always include businessImpact (why this matters, one line) and an evidencePacket (links/context the approver needs to decide without re-doing your research) — the whole point is the approver can act on ONE response with everything they need already in front of them, never asking you to re-explain.
+
+For a customer-facing request (not a team approver) — e.g. asking the customer to reconnect a credential or confirm an action — set audience to "customer" and provide customerId instead of approver. This uses a completely separate, customer-facing delivery path, never the team Slack queue.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        audience: {
+          type: 'string',
+          enum: ['team', 'customer'],
+          description: '"team" routes to a named approver\'s Slack queue. "customer" routes to the customer directly, never a team queue.',
+        },
+        approver: {
+          type: 'string',
+          enum: ['matt', 'harsha', 'fangfang'],
+          description: 'Required when audience="team". The named approver who must answer this.',
+        },
+        customerId: {
+          type: 'string',
+          description: 'Required when audience="customer". The customer this decision is for.',
+        },
+        gateType: {
+          type: 'string',
+          enum: ['plan_choice', 'customer_credential', 'customer_confirmation'],
+          description: '"plan_choice" for a team approver picking between options. "customer_credential"/"customer_confirmation" for a customer-facing ask — never used with audience="team".',
+        },
+        businessImpact: {
+          type: 'string',
+          description: 'One line: why this decision matters right now.',
+        },
+        evidencePacket: {
+          type: 'object',
+          description: 'Everything the approver needs to decide without asking you to re-explain.',
+          properties: {
+            chatUrl: { type: 'string' },
+            researchSummary: { type: 'string' },
+            links: { type: 'array', items: { type: 'string' } },
+          },
+        },
+        options: {
+          type: 'array',
+          minItems: 2,
+          maxItems: 4,
+          description: 'Required for gateType="plan_choice". 2-4 options; exactly one with recommended:true and a one-line why.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string' },
+              label: { type: 'string' },
+              consequence: { type: 'string' },
+              recommended: { type: 'boolean' },
+              why: { type: 'string' },
+            },
+            required: ['label', 'consequence'],
+          },
+        },
+        expiresInDays: {
+          type: 'number',
+          description: 'How many days this decision stays open before expiring. Defaults to 7.',
+        },
+      },
+      required: ['audience', 'gateType', 'businessImpact', 'evidencePacket'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const sessionId = context?.sessionId;
+    const audience = args?.audience;
+    const gateType = args?.gateType as ApprovalDecisionGateType;
+
+    if (gateType === 'meta_write' as any) {
+      // Structurally unreachable via the input schema's enum (no 'meta_write'
+      // option), but guarded explicitly in code too — see the file comment
+      // above for why this can never be accepted as model input.
+      return { success: false, message: 'stage_pending_decision cannot carry a Meta write — use call_meta_marketing_api directly.' };
+    }
+
+    const expiresInDays = typeof args?.expiresInDays === 'number' && args.expiresInDays > 0 ? args.expiresInDays : 7;
+    const expiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString();
+
+    const options = Array.isArray(args?.options)
+      ? args.options.map((o: any, i: number) => ({
+          id: typeof o?.id === 'string' && o.id.trim() !== '' ? o.id : `option-${i + 1}`,
+          label: o?.label,
+          consequence: o?.consequence,
+          recommended: o?.recommended === true,
+          why: o?.why,
+        }))
+      : undefined;
+
+    try {
+      const decision = await approvalInboxService.createDecision({
+        gateType,
+        approver: audience === 'team' ? (args?.approver as ApprovalDecisionApprover) : undefined,
+        customerId: audience === 'customer' ? args?.customerId : undefined,
+        businessImpact: args?.businessImpact,
+        evidencePacket: {
+          chatUrl: args?.evidencePacket?.chatUrl,
+          researchSummary: args?.evidencePacket?.researchSummary,
+          links: Array.isArray(args?.evidencePacket?.links) ? args.evidencePacket.links : undefined,
+        },
+        options,
+        originSessionId: sessionId,
+        expiresAt,
+      });
+
+      // Deliberately does NOT halt the turn (no awaitingUserConfirmation) —
+      // unlike present_question_deck/call_meta_marketing_api, this decision
+      // lives outside this session entirely; Emma's turn completes normally.
+      return {
+        success: true,
+        decisionId: decision.decisionId,
+        message: audience === 'team'
+          ? `Queued for ${decision.approver}'s review — they'll answer from Slack, this session isn't blocked on it.`
+          : `Queued for the customer to answer — this session isn't blocked on it.`,
+      };
+    } catch (error: any) {
+      return { success: false, message: error?.message || 'Failed to stage the decision.' };
+    }
   },
 });
 

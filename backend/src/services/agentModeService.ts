@@ -6718,6 +6718,11 @@ export class AgentModeService {
     // fallback-only list; this one is force-merged unconditionally, "so no
     // config can strip them", regardless of any DB override.
     'present_question_deck',
+    // ENG-1644 Phase B: same reason as present_question_deck immediately
+    // above — without MANDATORY registration, subscription/skill filtering
+    // would strip a durable-decision tool from most real sessions despite
+    // every unit test passing.
+    'stage_pending_decision',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
