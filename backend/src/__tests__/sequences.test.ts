@@ -431,6 +431,52 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     expect(res.body.variableCoverage.firstName).toEqual({ present: 1, missing: 0 });
   });
 
+  // ENG-2127: the lifecycle filter is handed to getLeadsByStatus, which queries the
+  // `status` attribute and never reads `lifecycle`. The vocabularies are disjoint, so it
+  // matches nothing — and an empty array is a legitimate result, so the caller used to
+  // report "0 enrolled" with no indication that the filter itself is broken.
+  it('refuses a lifecycle filter instead of silently enrolling nobody', async () => {
+    const crmDbMock = require('../services/db').crmDb;
+    crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({ items: [] });
+
+    const res = await request(app)
+      .post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1', lifecycle: 'inbox' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('lifecycle_filter_unsupported');
+    expect(res.body.message).toMatch(/matches nothing/);
+    expect(dripSequenceDb.bulkEnroll).not.toHaveBeenCalled();
+  });
+
+  it('still enrols normally when a lifecycle filter does return leads', async () => {
+    const crmDbMock = require('../services/db').crmDb;
+    crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({
+      items: [{ leadId: 'l1', email: 'a@example.com' }],
+    });
+
+    const res = await request(app)
+      .post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1', lifecycle: 'inbox' });
+
+    expect(res.status).toBe(200);
+    expect(dripSequenceDb.bulkEnroll).toHaveBeenCalled();
+  });
+
+  // A real lead STATUS is a legitimate filter and must keep working, including when the
+  // list genuinely has none of them.
+  it('leaves a real status filter alone, even when it matches nothing', async () => {
+    const crmDbMock = require('../services/db').crmDb;
+    crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({ items: [] });
+
+    const res = await request(app)
+      .post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1', lifecycle: 'qualified' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.error).toBeUndefined();
+  });
+
   it('does not call updateSequence again if listId is already in autoEnrollListIds', async () => {
     dripSequenceDb.getSequence.mockResolvedValueOnce({
       ...mockSequence,
