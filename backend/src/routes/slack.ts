@@ -22,6 +22,13 @@ import {
   resolveSlackFileUrl,
   postSlackMessage
 } from "../services/slackService";
+import {
+  APPROVAL_DECISION_ACTION_IDS,
+  isAuthorizedApprover,
+  openDecisionVerdictModal,
+  resolveApprovalDecision,
+} from "../services/approvalInboxSlack";
+import { approvalInboxService } from "../services/approvalInboxService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
 import { taskDb, subscriberDb } from "../services/db";
 import { emailService } from "../services/emailService";
@@ -1182,6 +1189,47 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
         channel: channel.id
       });
 
+      // ENG-1644 Phase C: approval-inbox decisions carry a { decisionId }
+      // value, not the asset-approval { assetUrl, filename, executionId }
+      // shape everything below this handles — intercepted first, own
+      // self-contained branch, never falls through to the asset-approval
+      // logic.
+      if (APPROVAL_DECISION_ACTION_IDS.includes(action.action_id as any)) {
+        let decisionData: any;
+        try {
+          decisionData = JSON.parse(action.value);
+        } catch (error) {
+          console.error("❌ Error parsing approval-decision action value:", error);
+          return res.status(200).json({ text: "Invalid action data" });
+        }
+        const { decisionId } = decisionData;
+        const decision = await approvalInboxService.getDecision(decisionId);
+        if (!decision) {
+          return res.status(200).json({ response_type: "ephemeral", text: "This decision no longer exists." });
+        }
+        const authorized = await isAuthorizedApprover(decision, user.id);
+        if (!authorized) {
+          return res.status(200).json({
+            response_type: "ephemeral",
+            text: `Only ${decision.approver} (or a configured fallback approver) can act on this decision.`,
+          });
+        }
+
+        if (action.action_id === 'approve_decision') {
+          const result = await resolveApprovalDecision(decisionId, 'approve', user.username || user.id);
+          if (!result.claimed) {
+            return res.status(200).json({ response_type: "ephemeral", text: `Could not approve — ${result.reason}.` });
+          }
+          return res.status(200).json({ response_type: "ephemeral", text: `✅ Approved by @${user.username}.` });
+        } else if (action.action_id === 'reject_decision') {
+          await openDecisionVerdictModal(payload.trigger_id, decisionId, 'reject');
+          return res.status(200).json({});
+        } else if (action.action_id === 'edit_decision') {
+          await openDecisionVerdictModal(payload.trigger_id, decisionId, 'edit');
+          return res.status(200).json({});
+        }
+      }
+
       // Parse the action data
       let assetData;
       try {
@@ -1351,7 +1399,33 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
     else if (payload.type === 'view_submission') {
       const user = payload.user;
       const view = payload.view;
-      
+
+      if (view.callback_id === 'approval_decision_verdict_modal') {
+        const metadata = JSON.parse(view.private_metadata);
+        const { decisionId, verdict } = metadata as { decisionId: string; verdict: 'reject' | 'edit' };
+        const freeText: string | undefined =
+          view.state.values.decision_free_text_input?.decision_free_text?.value || undefined;
+
+        if (verdict === 'edit' && !freeText?.trim()) {
+          return res.status(200).json({
+            response_action: 'errors',
+            errors: { decision_free_text_input: 'A correction is required.' },
+          });
+        }
+
+        const decision = await approvalInboxService.getDecision(decisionId);
+        if (!decision) {
+          return res.status(200).json({ response_action: 'clear' });
+        }
+        const authorized = await isAuthorizedApprover(decision, user.id);
+        if (!authorized) {
+          return res.status(200).json({ response_action: 'clear' });
+        }
+
+        await resolveApprovalDecision(decisionId, verdict, user.username || user.id, freeText);
+        return res.status(200).json({ response_action: 'clear' });
+      }
+
       if (view.callback_id === 'feedback_modal') {
         const metadata = JSON.parse(view.private_metadata);
         const { assetUrl, filename, executionId, assetType } = metadata;

@@ -6859,6 +6859,11 @@ export class AgentModeService {
     // fallback-only list; this one is force-merged unconditionally, "so no
     // config can strip them", regardless of any DB override.
     'present_question_deck',
+    // ENG-1644 Phase B: same reason as present_question_deck immediately
+    // above — without MANDATORY registration, subscription/skill filtering
+    // would strip a durable-decision tool from most real sessions despite
+    // every unit test passing.
+    'stage_pending_decision',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -22227,7 +22232,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         // that produced the digest being matched, not a value resolveMetaWriteManifestDigest
         // was never given and has no proven-idempotent relationship to. Internal-only,
         // same as the digest above — never part of the model-facing `message`.
-        metaWriteDispatch: { entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params },
+        //
+        // ENG-1644: `resolvedAccountId` is ADDITIVE, alongside the raw `account_id` above,
+        // never replacing it — `account_id` must stay raw for the digest-matching reason
+        // just explained. `target.account_id` is the account `getMetaCredentials` actually
+        // resolved for THIS preview, frozen here as a plain value. A cross-session resume
+        // (days later, outside this process) must dispatch against this frozen id, not
+        // re-derive one from the user's live connected-accounts state at claim time — that
+        // state can drift between preview and a delayed approval in a way it structurally
+        // cannot within the same request. See ENG-1644 for the durable consumer; same-session
+        // dispatch (buildMetaWriteWorkflowSteps/resumeStuckApprovalDeckWorkflowRun) also
+        // prefers this value when present, closing the same latent gap there too.
+        metaWriteDispatch: { entity_type, action, account_id, resolvedAccountId: target.account_id, campaign_id, ad_set_id, ad_id, params },
       } as any;
     }
     // ENG-1635/1644 Round 3 consequence #3: everything past this point (strip the
@@ -22467,8 +22483,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
               'This write is no longer authorized — its approval was not found or was already consumed.',
             );
           }
+          // ENG-1644: dispatch against the FROZEN resolved account (falling back to
+          // the raw id only for pre-migration records that predate this field) —
+          // never re-derive from live connected-accounts state here. The grant claim
+          // above correctly used the raw id (matching the digest's own input); this
+          // is the one place that must use the resolved one.
           const dispatchResult = await this.dispatchAuthorizedMetaWrite(
-            userId, dispatch.entity_type, dispatch.action, dispatch.account_id,
+            userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId ?? dispatch.account_id,
             dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
             false, sessionId,
           );
