@@ -573,9 +573,16 @@ describe('CRM Database Service', () => {
       await crmDb.updateLead('list_123', 'lead_123', { email: 'Ada@Example.com' });
 
       const call = mockDocumentClientMethods.update.mock.calls[0][0];
-      expect(call.UpdateExpression).toContain('domain = :derivedDomain');
+      // Asserted through the NAME PLACEHOLDER, not the bare attribute: `domain` is a
+      // DynamoDB reserved keyword, and a bare `domain = :x` throws ValidationException
+      // against a real table. These tests mock dynamodb.update and cannot see that, so the
+      // placeholder mapping is the thing worth pinning.
+      expect(call.ExpressionAttributeNames['#derivedDomainAttr']).toBe('domain');
+      expect(call.UpdateExpression).toContain('#derivedDomainAttr = :derivedDomain');
+      expect(call.UpdateExpression).not.toMatch(/(^|[^#\w])domain = /);
       expect(call.ExpressionAttributeValues[':derivedDomain']).toBe('example.com');
-      expect(call.UpdateExpression).toContain('lifecycle = if_not_exists(lifecycle, :derivedLifecycle)');
+      expect(call.ExpressionAttributeNames['#derivedLifecycleAttr']).toBe('lifecycle');
+      expect(call.UpdateExpression).toContain('#derivedLifecycleAttr = if_not_exists(#derivedLifecycleAttr, :derivedLifecycle)');
       expect(call.ExpressionAttributeValues[':derivedLifecycle']).toBe('inbox');
     });
 
@@ -919,10 +926,13 @@ describe('CRM Database Service', () => {
       await crmDb.setLeadFields('list_123', 'lead_123', { topLevel: { email: 'ada@Example.com' } });
 
       const call = mockDocumentClientMethods.update.mock.calls[0][0];
-      expect(call.UpdateExpression).toContain('domain = :derivedDomain');
+      // Through the name placeholder — `domain` is a DynamoDB reserved keyword.
+      expect(call.ExpressionAttributeNames['#derivedDomainAttr']).toBe('domain');
+      expect(call.UpdateExpression).toContain('#derivedDomainAttr = :derivedDomain');
+      expect(call.UpdateExpression).not.toMatch(/(^|[^#\w])domain = /);
       expect(call.ExpressionAttributeValues[':derivedDomain']).toBe('example.com');
       // lifecycle is BACKFILLED only — a lead already at paying must not drop to inbox.
-      expect(call.UpdateExpression).toContain('lifecycle = if_not_exists(lifecycle, :derivedLifecycle)');
+      expect(call.UpdateExpression).toContain('#derivedLifecycleAttr = if_not_exists(#derivedLifecycleAttr, :derivedLifecycle)');
       expect(call.ExpressionAttributeValues[':derivedLifecycle']).toBe('inbox');
       mergeSpy.mockRestore();
     });

@@ -7516,16 +7516,23 @@ export const crmDb = {
           // this fix, which only covered the enrichment write. Caught by live-testing: a
           // phone-only lead given an address came back with domain and lifecycle both null.
           // Skipped when the caller states either explicitly.
+          // `domain` is a DynamoDB RESERVED KEYWORD and must go through a name
+          // placeholder. Unit tests cannot catch this — they mock dynamodb.update and never
+          // validate expression syntax — so the first version of this threw
+          // ValidationException against a real table and 500'd every lead update that
+          // carried an email. Same trap the `system` attribute is commented about above.
           if ((updates as any).domain === undefined) {
             const derivedDomain = extractDomainFromEmail(emailValue);
             if (derivedDomain) {
-              setExpressions.push('domain = :derivedDomain');
+              expressionAttributeNames['#derivedDomainAttr'] = 'domain';
+              setExpressions.push('#derivedDomainAttr = :derivedDomain');
               expressionAttributeValues[':derivedDomain'] = derivedDomain;
             }
           }
           // Backfill only — never knock a lead already at paying back to inbox.
           if ((updates as any).lifecycle === undefined) {
-            setExpressions.push('lifecycle = if_not_exists(lifecycle, :derivedLifecycle)');
+            expressionAttributeNames['#derivedLifecycleAttr'] = 'lifecycle';
+            setExpressions.push('#derivedLifecycleAttr = if_not_exists(#derivedLifecycleAttr, :derivedLifecycle)');
             expressionAttributeValues[':derivedLifecycle'] = 'inbox';
           }
         } else {
@@ -9858,15 +9865,22 @@ export const crmDb = {
       if (!('domain' in options.topLevel)) {
         const derivedDomain = extractDomainFromEmail(String(options.topLevel.email));
         if (derivedDomain) {
+          // Name placeholder: `domain` is a DynamoDB reserved keyword. See updateLead.
+          attrNames['#derivedDomainAttr'] = 'domain';
           attrValues[':derivedDomain'] = derivedDomain;
-          setClauses.push(ine ? 'domain = if_not_exists(domain, :derivedDomain)' : 'domain = :derivedDomain');
+          setClauses.push(
+            ine
+              ? '#derivedDomainAttr = if_not_exists(#derivedDomainAttr, :derivedDomain)'
+              : '#derivedDomainAttr = :derivedDomain',
+          );
         }
       }
       // lifecycle is only ever BACKFILLED here, never rewritten: a lead already at paying
       // or in_deal must not be knocked back to inbox just because its address changed.
       if (!('lifecycle' in options.topLevel)) {
+        attrNames['#derivedLifecycleAttr'] = 'lifecycle';
         attrValues[':derivedLifecycle'] = 'inbox';
-        setClauses.push('lifecycle = if_not_exists(lifecycle, :derivedLifecycle)');
+        setClauses.push('#derivedLifecycleAttr = if_not_exists(#derivedLifecycleAttr, :derivedLifecycle)');
       }
     }
 

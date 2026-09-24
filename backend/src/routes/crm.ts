@@ -1090,6 +1090,10 @@ router.get('/contacts', async (req: Request, res: Response) => {
       contacts: result.contacts,
       total: result.total,
       rawCount: result.rawCount,
+      // How many of rawCount have no email. They are INCLUDED in contacts (ENG-2082), so
+      // without this the caller sees total < rawCount and cannot explain the difference.
+      // Adding it to `result` alone was not enough — this response enumerates its fields.
+      noEmailCount: result.noEmailCount,
       listsCount: result.listsCount,
       durationMs,
       ...(primaryResult?.nextCursor !== undefined && { nextCursor: primaryResult.nextCursor }),
