@@ -3936,21 +3936,23 @@ export class AgentModeService {
       // ran long in that session.
       let longestToolDispatchMsThisRun = 0;
       // ENG-2121: the reserve above only ever widens BETWEEN iterations — it cannot help
-      // a single LLM call that is itself the runaway, and the loop deliberately never
-      // forces synthesis on iteration 1 (nothing done yet to synthesize — see the
-      // `iteration > 1` gate below). Production session d874874f hit this gap twice, two
-      // different ways: its first turn got 2 fast tool calls in (iterations 1-2), then a
-      // 3rd-iteration LLM call alone ran ~578s and blew the 600s cap — survived only
-      // because the controller's OWN opportunistic backstop (outside this loop) found
-      // those 2 tool calls' results to salvage into a "reply continue" message. Its next
-      // turn ("Continue building all the creative") had no such luck: iteration 1's LLM
-      // call alone ran the entire ~601s cap with nothing yet dispatched, so the
-      // controller had nothing to salvage and the user got the much worse generic
-      // diagnosis-agent fallback ("please click retry", falsely claiming completed work).
-      // Bound EVERY LLM call, on EVERY iteration including the first, to whatever time
-      // remains before the synthesis reserve so a pathological call fails fast (a
-      // catchable timeout) instead of silently consuming the whole turn — see the
-      // callLLM invocation and its catch below for what happens once it does.
+      // a single LLM call that is itself the runaway, including the turn's very first
+      // call, before any prior-call evidence exists to widen the reserve at all.
+      // Production session d874874f hit this gap twice, two different ways: its first
+      // turn got 2 fast tool calls in (iterations 1-2), then a 3rd-iteration LLM call
+      // alone ran ~578s and blew the 600s cap — survived only because the controller's
+      // OWN opportunistic backstop (outside this loop) found those 2 tool calls' results
+      // to salvage into a "reply continue" message. Its next turn ("Continue building
+      // all the creative") had no such luck: iteration 1's LLM call alone ran the entire
+      // ~601s cap with nothing yet dispatched, so the controller had nothing to salvage
+      // and the user got the much worse generic diagnosis-agent fallback ("please click
+      // retry", falsely claiming completed work it never actually did). Bound EVERY LLM
+      // call, on EVERY iteration including the first, to whatever time remains before
+      // the synthesis reserve so a pathological call fails fast (a catchable timeout)
+      // instead of silently consuming the whole turn — and, per the catch block below,
+      // retry that failure with a forced final synthesis on EVERY iteration too
+      // (including the first), so even a bare iteration-1 hang gets one bounded chance
+      // at an honest answer from the model itself instead of an immediate hard failure.
       const MIN_LLM_CALL_TIMEOUT_MS = 30_000;
       let timeBudgetWrapUpWarned = false;
       // Sticky: once the loop switches to synthesis it never offers tools again this turn.
@@ -4354,17 +4356,28 @@ export class AgentModeService {
             synthesisRetryUnaffordable = true;
           } else if (
             // ENG-2121: this call ran into the per-call bound set above (or a genuine
-            // upstream timeout) and prior iterations THIS run already did real work, so
-            // there is something to synthesize. Treat it exactly like the between-
-            // iteration time-budget check earlier in the loop: drop into forced final
-            // synthesis and retry once with tools withheld, instead of throwing this up
-            // to the controller — which has no persisted work from THIS call to salvage
-            // and would fall straight to the generic diagnosis-agent fallback. Iteration
-            // 1 has nothing to synthesize yet, so it still falls through to the throw
-            // below and fails loudly, same as before this fix (ENG-907's original intent).
+            // upstream timeout). Retry once with forced final synthesis instead of
+            // throwing this straight up to the controller, which would have no
+            // persisted work from THIS call to salvage and would fall straight to the
+            // generic diagnosis-agent fallback.
+            //
+            // Deliberately NOT gated on `iteration > 1` the way the between-iteration
+            // pre-check above is. That gate exists to stop the loop PROACTIVELY forcing
+            // synthesis before iteration 1 has even attempted the user's request —
+            // reasonable, since nothing has failed yet at that point. This branch only
+            // ever runs REACTIVELY, after a call already failed: the reserve time this
+            // retry spends would otherwise just be thrown away when the loop rethrows
+            // below, so retrying costs nothing extra either way, and even on a bare
+            // iteration-1 timeout the model can still honestly tell the user what
+            // happened (a real "Verified: nothing yet, reply continue" answer built by
+            // the model that was actually working on the request) instead of the
+            // generic diagnosis agent guessing from turnStartCalledFunctions alone —
+            // which is what produced production session d874874f's hallucinated
+            // "I have successfully completed..." fallback on its own iteration-1 hang.
+            // `!forceFinalSynthesis` below still caps this at exactly one retry ever,
+            // so there is no risk of looping.
             !forceFinalSynthesis
             && turnHardCapMs !== undefined
-            && iteration > 1
             && classifyToolErrorClass(callError) === 'timeout'
           ) {
             recordSpanError(chatSpan, callError);
