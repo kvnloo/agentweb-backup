@@ -19,7 +19,12 @@ async function notifyOriginSession(decision: ApprovalDecision): Promise<void> {
 
   const verdictLabel =
     decision.verdict === 'approve' ? 'approved' : decision.verdict === 'reject' ? 'rejected' : 'sent back with a correction';
-  const approverLabel = decision.answeredBy || decision.approver || 'the approver';
+  // A 'system:<reason>' answeredBy (e.g. the customer_credential auto-resolve
+  // path's 'system:auto-reconnect') is an internal attribution tag, not
+  // something a human should read verbatim — humanize it (review fix).
+  const approverLabel = decision.answeredBy?.startsWith('system:')
+    ? `the system automatically (${decision.answeredBy.slice('system:'.length).replace(/-/g, ' ')})`
+    : decision.answeredBy || decision.approver || 'the approver';
 
   const content = [
     `[Approval Inbox ${decision.decisionId}] ${approverLabel} ${verdictLabel} this decision.`,

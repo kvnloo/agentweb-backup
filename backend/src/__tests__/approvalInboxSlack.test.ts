@@ -95,7 +95,7 @@ describe('approvalInboxSlack', () => {
         { decisionId: 'd1', businessImpact: 'x', evidencePacket: {}, options: [] },
       ]);
 
-      await approvalInboxSlack.upsertApproverQueueMessage('matt');
+      const result = await approvalInboxSlack.upsertApproverQueueMessage('matt');
 
       expect(mockPostMessage).toHaveBeenCalledTimes(1);
       expect(mockUpdate).not.toHaveBeenCalled();
@@ -105,6 +105,9 @@ describe('approvalInboxSlack', () => {
         expect.any(String),
         'approval-inbox',
       );
+      // A fresh post is itself a real notification — callers rely on this to
+      // avoid double-notifying (see postDecisionAddedNotice's caller).
+      expect(result).toEqual({ posted: true });
     });
 
     it('updates an existing tracked message in place, no new post', async () => {
@@ -115,10 +118,11 @@ describe('approvalInboxSlack', () => {
       );
       mockListPending.mockResolvedValue([]);
 
-      await approvalInboxSlack.upsertApproverQueueMessage('matt');
+      const result = await approvalInboxSlack.upsertApproverQueueMessage('matt');
 
       expect(mockUpdate).toHaveBeenCalledWith(expect.objectContaining({ channel: 'C-MATT', ts: '999.1' }));
       expect(mockPostMessage).not.toHaveBeenCalled();
+      expect(result).toEqual({ posted: false });
     });
 
     it('falls back to posting fresh if the tracked update fails', async () => {
@@ -129,9 +133,10 @@ describe('approvalInboxSlack', () => {
       );
       mockUpdate.mockResolvedValue({ ok: false, error: 'message_not_found' });
 
-      await approvalInboxSlack.upsertApproverQueueMessage('matt');
+      const result = await approvalInboxSlack.upsertApproverQueueMessage('matt');
 
       expect(mockPostMessage).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({ posted: true });
     });
   });
 

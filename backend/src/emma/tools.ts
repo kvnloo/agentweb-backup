@@ -481,7 +481,16 @@ For a customer-facing credential reconnect (e.g. a disconnected ad account or CM
       return { success: false, message: 'stage_pending_decision does not support gateType="customer_confirmation" yet — no customer-facing delivery surface exists for it.' };
     }
 
-    const expiresInDays = typeof args?.expiresInDays === 'number' && args.expiresInDays > 0 ? args.expiresInDays : 7;
+    // Clamped to a sane [1, 30]-day window — an unbounded/non-finite value
+    // here (e.g. Infinity, or a model typo like 700) would either produce an
+    // invalid Date (toISOString() throws) or a decision that outlives any
+    // realistic review cadence (review fix).
+    const MAX_EXPIRES_IN_DAYS = 30;
+    const rawExpiresInDays = args?.expiresInDays;
+    const expiresInDays =
+      typeof rawExpiresInDays === 'number' && Number.isFinite(rawExpiresInDays) && rawExpiresInDays > 0
+        ? Math.min(rawExpiresInDays, MAX_EXPIRES_IN_DAYS)
+        : 7;
     const expiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString();
 
     const options = Array.isArray(args?.options)
@@ -515,17 +524,30 @@ For a customer-facing credential reconnect (e.g. a disconnected ad account or CM
 
       // Best-effort — a delivery failure must never fail the tool call
       // itself; the decision is already durably persisted above regardless.
+      // Queue-refresh and added-notice are independent Slack calls in
+      // separate try/catches (review fix) — one failing must never skip the
+      // other. postDecisionAddedNotice is skipped only when the queue
+      // refresh itself already did a real, fresh chat.postMessage (the
+      // approver's very first-ever pending decision) — that post IS the
+      // notification; posting a second message would double-notify (review
+      // fix). Any other outcome (update-in-place, or the refresh failing
+      // outright) still gets its own attempt at a real notification below.
       if (decision.audience === 'team' && decision.approver) {
+        let freshlyPosted = false;
         try {
-          const { upsertApproverQueueMessage, postDecisionAddedNotice } = await import('../services/approvalInboxSlack');
-          await upsertApproverQueueMessage(decision.approver);
-          // Gap-closing round: the queue message alone updates in place and
-          // Slack won't reliably notify for that — this is a real, always-new
-          // message so the approver actually gets pinged, not just an
-          // invisibly-edited summary.
-          await postDecisionAddedNotice(decision.approver, decision);
+          const { upsertApproverQueueMessage } = await import('../services/approvalInboxSlack');
+          const result = await upsertApproverQueueMessage(decision.approver);
+          freshlyPosted = result.posted;
         } catch (err: any) {
-          console.warn('[stage_pending_decision] failed to post/update Slack queue message:', err?.message || err);
+          console.warn('[stage_pending_decision] failed to refresh Slack queue message:', err?.message || err);
+        }
+        if (!freshlyPosted) {
+          try {
+            const { postDecisionAddedNotice } = await import('../services/approvalInboxSlack');
+            await postDecisionAddedNotice(decision.approver, decision);
+          } catch (err: any) {
+            console.warn('[stage_pending_decision] failed to post new-decision notice:', err?.message || err);
+          }
         }
       } else if (decision.gateType === 'customer_credential') {
         try {

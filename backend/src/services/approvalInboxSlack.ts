@@ -134,11 +134,19 @@ async function renderApproverQueueMessage(approver: ApprovalDecisionApprover): P
 /**
  * Re-render and upsert an approver's queue message. Call this after ANY
  * create or resolve event affecting that approver's queue.
+ *
+ * Returns `{ posted: true }` when this call did a real, fresh chat.postMessage
+ * (no tracked message yet, or the tracked update failed and it fell back to
+ * posting) — a fresh post is itself a real notification. Returns
+ * `{ posted: false }` when it updated the existing tracked message in place
+ * (chat.update — no new-message notification). Callers that separately want
+ * to guarantee a real notification (e.g. postDecisionAddedNotice) should skip
+ * that when `posted` is already true, to avoid double-notifying.
  */
-export async function upsertApproverQueueMessage(approver: ApprovalDecisionApprover): Promise<void> {
+export async function upsertApproverQueueMessage(approver: ApprovalDecisionApprover): Promise<{ posted: boolean }> {
   if (!slackClient) {
     console.warn('[approval-inbox-slack] Slack client not initialized (SLACK_BOT_TOKEN unset) — skipping post');
-    return;
+    return { posted: false };
   }
 
   const { text, blocks } = await renderApproverQueueMessage(approver);
@@ -147,7 +155,7 @@ export async function upsertApproverQueueMessage(approver: ApprovalDecisionAppro
   if (existingRef) {
     try {
       const result = await slackClient.chat.update({ channel: existingRef.channel, ts: existingRef.messageTs, text, blocks });
-      if (result.ok) return;
+      if (result.ok) return { posted: false };
       console.warn('[approval-inbox-slack] chat.update failed, will post a fresh message:', result.error);
     } catch (err: any) {
       console.warn('[approval-inbox-slack] chat.update threw, will post a fresh message:', err?.message || err);
@@ -160,6 +168,7 @@ export async function upsertApproverQueueMessage(approver: ApprovalDecisionAppro
     throw new Error(`Failed to post approval-inbox message for ${approver}: ${result.error}`);
   }
   await setMessageRef(approver, { channel, messageTs: result.ts });
+  return { posted: true };
 }
 
 export const APPROVAL_DECISION_ACTION_IDS = ['approve_decision', 'reject_decision', 'edit_decision'] as const;

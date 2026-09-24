@@ -481,9 +481,18 @@ export class ApprovalInboxService {
    */
   async findPendingCredentialDecision(customerId: string, platform: string, accountId: string): Promise<ApprovalDecision | null> {
     const pending = await this.listPendingForCustomer(customerId);
+    // Normalize both sides before comparing — credentialPlatform is
+    // free-text Emma writes at stage time (e.g. "Meta" vs "meta"), and stray
+    // whitespace on either side would otherwise silently miss a real match
+    // (review fix).
+    const normPlatform = platform.trim().toLowerCase();
+    const normAccountId = accountId.trim().toLowerCase();
     return (
       pending.find(
-        (d) => d.gateType === 'customer_credential' && d.credentialPlatform === platform && d.credentialAccountId === accountId,
+        (d) =>
+          d.gateType === 'customer_credential' &&
+          d.credentialPlatform?.trim().toLowerCase() === normPlatform &&
+          d.credentialAccountId?.trim().toLowerCase() === normAccountId,
       ) ?? null
     );
   }

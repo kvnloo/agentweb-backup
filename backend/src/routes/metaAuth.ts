@@ -400,6 +400,12 @@ router.post('/connect-instagram', authenticateToken, async (req: any, res) => {
             }
         });
 
+        // ENG-1644 gap-closing (review fix): missed on the first pass —
+        // Instagram is a distinct platform from Meta ad accounts in this
+        // reconnect system, same treatment as /connect-ad-accounts above.
+        const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
+        await autoResolveCredentialDecisionOnReconnect(userId, 'instagram', instagramAccount.id);
+
         res.json({ success: true, connectedAccount: account });
 
     } catch (error: any) {

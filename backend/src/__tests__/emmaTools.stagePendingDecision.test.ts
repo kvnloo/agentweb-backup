@@ -41,7 +41,7 @@ beforeEach(() => {
     status: 'pending_team_review',
   });
   mockNotifyCustomer.mockResolvedValue(undefined);
-  mockUpsertApproverQueueMessage.mockResolvedValue(undefined);
+  mockUpsertApproverQueueMessage.mockResolvedValue({ posted: false });
   mockPostDecisionAddedNotice.mockResolvedValue(undefined);
 });
 
@@ -85,6 +85,36 @@ describe('stage_pending_decision', () => {
     // No awaitingUserConfirmation anywhere in the result — this tool never
     // halts the turn, unlike present_question_deck/call_meta_marketing_api.
     expect(result.awaitingUserConfirmation).toBeUndefined();
+  });
+
+  it('skips postDecisionAddedNotice when the queue refresh itself freshly posted — first-ever decision for an approver — to avoid double-notifying', async () => {
+    mockUpsertApproverQueueMessage.mockResolvedValue({ posted: true });
+    const tool = emmaToolRegistry.getTool('stage_pending_decision')!;
+    await tool.execute(
+      { audience: 'team', approver: 'matt', gateType: 'plan_choice', businessImpact: 'x', evidencePacket: {}, options: [
+        { label: 'A', consequence: 'x', recommended: true },
+        { label: 'B', consequence: 'x' },
+      ] },
+      { userId: 'user-1', sessionId: 'sess-1' },
+    );
+
+    expect(mockUpsertApproverQueueMessage).toHaveBeenCalledWith('matt');
+    expect(mockPostDecisionAddedNotice).not.toHaveBeenCalled();
+  });
+
+  it('still attempts postDecisionAddedNotice in its own try/catch when the queue refresh itself throws', async () => {
+    mockUpsertApproverQueueMessage.mockRejectedValue(new Error('Slack API down'));
+    const tool = emmaToolRegistry.getTool('stage_pending_decision')!;
+    const result = await tool.execute(
+      { audience: 'team', approver: 'matt', gateType: 'plan_choice', businessImpact: 'x', evidencePacket: {}, options: [
+        { label: 'A', consequence: 'x', recommended: true },
+        { label: 'B', consequence: 'x' },
+      ] },
+      { userId: 'user-1', sessionId: 'sess-1' },
+    );
+
+    expect(mockPostDecisionAddedNotice).toHaveBeenCalledWith('matt', expect.objectContaining({ decisionId: 'decision-1' }));
+    expect(result.success).toBe(true);
   });
 
   it('maps a customer-audience call to customerId, never an approver', async () => {
@@ -150,6 +180,25 @@ describe('stage_pending_decision', () => {
     );
     const explicitExpiry = new Date(mockCreateDecision.mock.calls[0][0].expiresAt).getTime();
     expect(explicitExpiry).toBeLessThan(before + 2 * 24 * 60 * 60 * 1000);
+  });
+
+  it('clamps an absurd expiresInDays to 30 days instead of producing an unbounded or invalid date (review fix)', async () => {
+    const tool = emmaToolRegistry.getTool('stage_pending_decision')!;
+    const before = Date.now();
+
+    for (const wild of [700, Infinity, NaN]) {
+      mockCreateDecision.mockClear();
+      await tool.execute(
+        { audience: 'team', approver: 'harsha', gateType: 'plan_choice', businessImpact: 'x', evidencePacket: {}, expiresInDays: wild, options: [
+          { label: 'A', consequence: 'x', recommended: true },
+          { label: 'B', consequence: 'x' },
+        ] },
+        { userId: 'user-1', sessionId: 'sess-1' },
+      );
+      const expiry = new Date(mockCreateDecision.mock.calls[0][0].expiresAt).getTime();
+      expect(Number.isFinite(expiry)).toBe(true);
+      expect(expiry).toBeLessThanOrEqual(before + 31 * 24 * 60 * 60 * 1000);
+    }
   });
 
   it('propagates a createDecision validation error as a failed tool result, not a throw', async () => {

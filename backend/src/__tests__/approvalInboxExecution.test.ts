@@ -56,6 +56,14 @@ describe('executeResolvedDecision', () => {
     expect(mockRecordExecutionResult).toHaveBeenCalledWith('d1', 'executed', expect.objectContaining({ success: true }));
   });
 
+  it('humanizes a system:<reason> answeredBy instead of echoing the raw internal tag (review fix)', async () => {
+    await executeResolvedDecision({ ...baseDecision, answeredBy: 'system:auto-reconnect', gateType: 'customer_credential', audience: 'customer', approver: undefined });
+
+    const call = mockAddMessage.mock.calls[0][1];
+    expect(call.content).toContain('the system automatically (auto reconnect) approved this decision');
+    expect(call.content).not.toContain('system:auto-reconnect');
+  });
+
   it('reject verdict still notifies the origin session (not just approve)', async () => {
     await executeResolvedDecision({ ...baseDecision, verdict: 'reject' });
 

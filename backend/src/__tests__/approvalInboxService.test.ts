@@ -306,4 +306,13 @@ describe('approvalInboxService.findPendingCredentialDecision', () => {
     const result = await service.findPendingCredentialDecision('cust-1', 'meta', 'act_123');
     expect(result).toBeNull();
   });
+
+  it('matches case-insensitively and ignores stray whitespace on both sides (review fix)', async () => {
+    mockDynamoDB.query.mockReturnValue(ok({
+      Items: [{ decisionId: 'd1', gateType: 'customer_credential', credentialPlatform: 'Meta', credentialAccountId: ' act_123 ' }],
+    }));
+
+    const result = await service.findPendingCredentialDecision('cust-1', ' meta ', 'ACT_123');
+    expect(result?.decisionId).toBe('d1');
+  });
 });
