@@ -33,6 +33,22 @@ const VALID_PERSON_LINKEDIN_RE = /^\/in\//i;
 const PERSON_LINKEDIN_FIELDS = new Set(['linkedin', 'linkedinurl']);
 const COMPANY_LINKEDIN_FIELDS = new Set(['companylinkedin', 'companylinkedinurl']);
 
+// `email` is shape-validated for a reason the linkedin fields do not share: it is the
+// PARTITION KEY of the email-index GSI. A malformed value is not just a bad cell, it is a
+// bad index entry on a row that other code then looks up by address.
+//
+// This became reachable with ENG-2082. A phone-only lead has no email, so
+// leadValueIsEmpty(lead,'email') is true and bucketByOverwritePolicy no longer blocks a
+// fill — which means a Tier-4 web-LLM guess can now land here. Previously the lead's own
+// address always won and the LLM value was discarded before it reached the write.
+//
+// Deliberately a SHAPE check, not deliverability: that is enrich.so's job downstream and
+// costs a network call. This only rejects values that are not addresses at all — the
+// "Not found", "N/A", "john at acme dot com" and "email: x@y.com" shapes an LLM emits when
+// it has nothing.
+const EMAIL_FIELDS = new Set(['email', 'emailaddress', 'workemail']);
+const VALID_EMAIL_RE = /^[^\s@,;<>()[\]\\]+@[^\s@,;<>()[\]\\]+\.[A-Za-z]{2,}$/;
+
 function normalizeFieldName(field: string): string {
   return field.toLowerCase().replace(/_/g, '');
 }
@@ -54,6 +70,14 @@ export function isValidFieldValue(field: string, value: string): boolean {
   const key = normalizeFieldName(field);
   const isCompanyLinkedin = COMPANY_LINKEDIN_FIELDS.has(key);
   const isPersonLinkedin = PERSON_LINKEDIN_FIELDS.has(key);
+
+  if (EMAIL_FIELDS.has(key)) {
+    if (typeof value !== 'string') return false;
+    const trimmed = value.trim();
+    // One address only. A provider returning "a@x.com, b@y.com" is not giving us a value
+    // this row can be keyed on.
+    return trimmed.length > 0 && trimmed.length <= 254 && VALID_EMAIL_RE.test(trimmed);
+  }
 
   // Non-linkedin fields are never inspected — return early so nothing else can
   // ever gate them. Only the two linkedin URL fields below get any validation.

@@ -22,8 +22,7 @@ import {
 import { apolloEmailStatusToConfidence, type MappedPerson, type MappedMatch } from './apolloFieldMapper';
 import { getEnrichSoService, type ReverseResult, type EnrichSoConfidence } from './enrichSoService';
 import { findEmailViaPatterns } from './emailPatternFinder';
-import { apolloAsyncRequestCacheKey, APOLLO_SCHEMA_VERSION } from './apolloCacheKeys';
-import { normalizeLinkedInUrl } from './enrichmentGroups';
+import { apolloAsyncRequestCacheKey, buildMatchCanonicalKey, APOLLO_SCHEMA_VERSION } from './apolloCacheKeys';
 import { crmDb } from './db';
 import { getFieldConfidence } from './fieldConfidenceRegistry';
 
@@ -114,14 +113,24 @@ export function __resetWaterfallDedupForTesting(): void {
 }
 
 function apolloDedupToken(lead: any): string | null {
-  // S1: reuse the canonical LinkedIn URL normalizer so /in/x and /in/x/?utm_*
-  // dedup to the same token (same as apolloCacheKeys' canonical form).
-  if (lead.linkedin) {
-    const norm = normalizeLinkedInUrl(lead.linkedin);
-    if (norm) return `li:${norm}`;
-  }
-  if (lead.email) return `em:${String(lead.email).trim().toLowerCase()}`;
-  return null;
+  // Built from the SAME canonical key the cache layer uses, so the two cannot disagree
+  // about what is identifiable. They did: this returned null for a lead with only a name
+  // and an org, and getApolloMatchForLead bails on a null token — so Apollo never ran at
+  // all for that shape, silently, even though buildMatchCanonicalKey produces a perfectly
+  // good `apollo:name:…` key for it and matchPerson below is passed firstName/lastName/
+  // organizationName precisely to support it. 22 fields came back unfilled with no
+  // diagnostic. ENG-2082 made the shape common: a phone-only capture that collected a name
+  // and a company has no email and no LinkedIn.
+  return buildMatchCanonicalKey({
+    linkedinUrl: lead.linkedin || undefined,
+    email: lead.email || undefined,
+    firstName: lead.firstName || undefined,
+    lastName: lead.lastName || undefined,
+    organizationName: lead.company || undefined,
+    domain: lead.website
+      ? String(lead.website).replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0]
+      : undefined,
+  });
 }
 
 async function getApolloMatchForLead(lead: any, ctx: WaterfallContext): Promise<ApolloMatchResult | null> {

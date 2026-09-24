@@ -7,7 +7,7 @@ import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
 import { parsePendingKinds } from '../utils/metaConversionPending';
-import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, LeadImportRowOutcome } from "../utils/leadSchema";
+import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, extractDomainFromEmail, LeadImportRowOutcome } from "../utils/leadSchema";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
@@ -9820,6 +9820,29 @@ export const crmDb = {
     for (const [k, v] of Object.entries(options.topLevel ?? {})) {
       attrValues[`:tl_${k}`] = v;
       setClauses.push(ine ? `${k} = if_not_exists(${k}, :tl_${k})` : `${k} = :tl_${k}`);
+    }
+
+    // Same treatment as nameCompanyKey below: `domain` and `lifecycle` are DERIVED from
+    // email, and creation derives them via buildLeadCrmFields — which is called from
+    // exactly one place (createLead). Every later write of an email therefore left the row
+    // half-built: in email-index but with no domain and, worse, no lifecycle, so it was
+    // permanently invisible to getLeadsByStatus(listId, lifecycle) and to every inbox view
+    // built on it. ENG-2082 made this routine, because a phone-only lead starts with no
+    // email and enrichment is exactly what fills one in later.
+    if (options.topLevel && 'email' in options.topLevel && String(options.topLevel.email ?? '').trim()) {
+      if (!('domain' in options.topLevel)) {
+        const derivedDomain = extractDomainFromEmail(String(options.topLevel.email));
+        if (derivedDomain) {
+          attrValues[':derivedDomain'] = derivedDomain;
+          setClauses.push(ine ? 'domain = if_not_exists(domain, :derivedDomain)' : 'domain = :derivedDomain');
+        }
+      }
+      // lifecycle is only ever BACKFILLED here, never rewritten: a lead already at paying
+      // or in_deal must not be knocked back to inbox just because its address changed.
+      if (!('lifecycle' in options.topLevel)) {
+        attrValues[':derivedLifecycle'] = 'inbox';
+        setClauses.push('lifecycle = if_not_exists(lifecycle, :derivedLifecycle)');
+      }
     }
 
     // Recompute nameCompanyKey when firstName/lastName/company is in topLevel.

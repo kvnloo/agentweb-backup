@@ -567,12 +567,22 @@ export async function resolveIdentity(
       if (apolloResult) {
         let emailTrusted = false;
         if (apolloResult.email && !email && !resolved.email) {
+          const emailConfidence = apolloEmailStatusToConfidence(apolloResult.emailStatus ?? '');
           email = apolloResult.email;
           resolved.email = apolloResult.email;
           meta.email = {
             ...makeApiMeta('apollo', 'email', apolloResult.fromCache),
-            confidence: apolloEmailStatusToConfidence(apolloResult.emailStatus ?? ''),
+            confidence: emailConfidence,
           };
+          // NOT gated on emailConfidence, deliberately — see ENG-2125. A guessed address is
+          // weak evidence of a person match (it is a pattern Apollo synthesised from the
+          // domain, and maps to 'low' three lines up), and accepting it here is what makes
+          // matchConfident true on a weak name+company match, unlocking company/title/
+          // linkedin/website fills. The comment on the broker chain below asserts that
+          // "the unified Apollo Tier 3" applies an emailStatus gate; this one does not, so
+          // one of the two is wrong. The test at enrichmentIdentityResolver.test.ts:1754
+          // pins the current behaviour on purpose, so this is a product decision about
+          // match confidence rather than an oversight — left alone pending that decision.
           emailTrusted = true;
         }
 

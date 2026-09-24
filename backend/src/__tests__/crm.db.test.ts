@@ -862,6 +862,55 @@ describe('CRM Database Service', () => {
       mergeSpy.mockRestore();
     });
 
+    // ENG-2082: `domain` and `lifecycle` are derived from email, and creation is the only
+    // place that derived them (buildLeadCrmFields, called solely from createLead). Every
+    // LATER write of an email left the row in email-index with no domain and no lifecycle —
+    // permanently invisible to getLeadsByStatus and every inbox view built on it. A
+    // phone-only lead starts with no email, so enrichment filling one in is exactly the
+    // common case now.
+    it('derives domain and backfills lifecycle when an email is written', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+      const mergeSpy = jest.spyOn(crmDb, 'mergeFieldNames').mockResolvedValue();
+
+      await crmDb.setLeadFields('list_123', 'lead_123', { topLevel: { email: 'ada@Example.com' } });
+
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.UpdateExpression).toContain('domain = :derivedDomain');
+      expect(call.ExpressionAttributeValues[':derivedDomain']).toBe('example.com');
+      // lifecycle is BACKFILLED only — a lead already at paying must not drop to inbox.
+      expect(call.UpdateExpression).toContain('lifecycle = if_not_exists(lifecycle, :derivedLifecycle)');
+      expect(call.ExpressionAttributeValues[':derivedLifecycle']).toBe('inbox');
+      mergeSpy.mockRestore();
+    });
+
+    it('does not touch domain or lifecycle when no email is written', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+      const mergeSpy = jest.spyOn(crmDb, 'mergeFieldNames').mockResolvedValue();
+
+      await crmDb.setLeadFields('list_123', 'lead_123', { topLevel: { title: 'CTO' } });
+
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.UpdateExpression).not.toContain('derivedDomain');
+      expect(call.UpdateExpression).not.toContain('derivedLifecycle');
+      mergeSpy.mockRestore();
+    });
+
+    it('lets an explicit domain or lifecycle win over the derived one', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+      const mergeSpy = jest.spyOn(crmDb, 'mergeFieldNames').mockResolvedValue();
+
+      await crmDb.setLeadFields('list_123', 'lead_123', {
+        topLevel: { email: 'ada@example.com', domain: 'override.com', lifecycle: 'paying' },
+      });
+
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.UpdateExpression).not.toContain('derivedDomain');
+      expect(call.UpdateExpression).not.toContain('derivedLifecycle');
+      expect(call.ExpressionAttributeValues[':tl_domain']).toBe('override.com');
+      expect(call.ExpressionAttributeValues[':tl_lifecycle']).toBe('paying');
+      mergeSpy.mockRestore();
+    });
+
     // Greptile P1 on #2291: internal per-booking idempotency markers (e.g. Calendly
     // webhook completion flags) must never show up in CSV exports or the Configure
     // Display Fields UI the way customFields does — `system` is the existing sidecar
