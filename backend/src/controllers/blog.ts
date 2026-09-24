@@ -448,8 +448,14 @@ CRITICAL REQUIREMENT: The article content must be approximately ${finalTargetWor
       imagePrompt: string;
     }>(systemPrompt, blogPrompt, 'json', undefined, {
       feature: 'content_gen',
+      // billingUserId deliberately omitted: this reaches meterWithResolvedBilling
+      // via llmService's gateway path (generateJSONContent -> invoke -> invokeGateway
+      // -> agentModeService.callLLM), which only resolves the org-root billing
+      // subject when billingUserId is absent (ENG-1858). A third instance of the
+      // same bug as restyleContent/wasStepRemovalUserAuthorized below, found by a
+      // round-4 PR review — missed here because llmService.ts's compatibility
+      // wrapper makes the gateway routing non-obvious from this call site alone.
       userId: currentRunFunding()?.ownerUserId,
-      billingUserId: currentRunFunding()?.billingUserId,
     });
 
     // Validate the response structure

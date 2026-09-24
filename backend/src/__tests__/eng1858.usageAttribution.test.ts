@@ -51,7 +51,7 @@ import { userDb } from '../services/db';
 import { enrichWithRCA } from '../loops/instances/ai-eval-funnel/rcaEnricher';
 import { asMutationId } from '../loops/core/types';
 import { cronJobRegistry } from '../utils/cronJobRegistry';
-import { restyleContent } from '../controllers/blog';
+import { restyleContent, generateBlogContent } from '../controllers/blog';
 import { withRunFunding, type RunFunding } from '../services/funding/runFunding';
 
 const mockResolveBilling = resolveBillingUserId as jest.MockedFunction<typeof resolveBillingUserId>;
@@ -447,6 +447,32 @@ describe('ENG-1816 F1: attribution leaks fixed via the ambient RunFunding store'
     // absent. Forwarding RunFunding's billingUserId here would re-suppress that
     // resolution for org members — the exact ENG-1217 bug — for a value nothing
     // else reads yet (round-3 PR review finding).
+    expect(usageContextOf(callLLM)).toEqual({
+      feature: 'content_gen',
+      userId: MEMBER,
+    });
+  });
+
+  it('generateBlogContent (blog.ts) carries the run owner when called inside a RunFunding scope, and never forwards billingUserId', async () => {
+    // Reaches meterWithResolvedBilling via a non-obvious path: generateJSONContent
+    // -> invoke -> invokeGateway -> agentModeService.callLLM. A round-3 review
+    // manually traced this and concluded (incorrectly) that this call site was
+    // exempt from the ENG-1217 billingUserId-forwarding bug because it looked like
+    // a direct meterUserUsage call; round-4 traced the gateway path fully and found
+    // it reaches the exact same sink as restyleContent. This test pins the fix so
+    // that mistake can't silently regress.
+    callLLM.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({
+        title: 'A Title',
+        description: 'A description',
+        content: 'Some content',
+        imagePrompt: 'A prompt',
+      }) } }],
+      usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+    });
+
+    await withRunFunding(funding(), () => generateBlogContent('title draft', 'content draft'));
+
     expect(usageContextOf(callLLM)).toEqual({
       feature: 'content_gen',
       userId: MEMBER,
