@@ -289,7 +289,8 @@ export const leadListAlertService = {
       try {
         // The org delivery path owns new-lead Slack alerts when enabled. A second
         // legacy send would bypass its masking/filters and create duplicates.
-        const orgOwnsNewLeadAlert = normalizedEventType === 'api.lead_added' && user.orgId
+        const orgOwnsNewLeadAlert = (normalizedEventType === 'api.lead_added' ||
+          (normalizedEventType === 'api.lead_updated' && eventData.orgLeadSubmission === true)) && user.orgId
           ? (await orgDb.getOrgById(user.orgId))?.leadNotifications?.enabled === true
           : false;
         if (!orgOwnsNewLeadAlert) await sendLeadNotification(user.slackChannel, {

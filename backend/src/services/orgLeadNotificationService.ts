@@ -8,13 +8,13 @@ export interface LeadNotificationsConfig {
   slackChannelId: string;
   /** Case-insensitive persisted list IDs/names or LP/source identifiers; absent means all. */
   sources?: string[];
-  maskPhone: boolean;
+  maskPhone?: boolean;
   /** Slack user IDs, not arbitrary mrkdwn. */
   mentions?: string[];
-  /** Case-insensitive whole-email globs; only * is special. Matching emails are hidden; leads still notify. */
+  /** Deprecated; only noemail+*@waterheater.app placeholders are hidden. */
   excludeEmailPatterns?: string[];
 }
-interface LeadNotificationJob { orgId: string; listId: string; leadId: string }
+interface LeadNotificationJob { orgId: string; listId: string; leadId: string; submissionId?: string; submittedAt?: string }
 const SOURCE = 'org_lead_notification';
 const string = (v: unknown): string => typeof v === 'string' ? v.trim() : '';
 const record = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -36,8 +36,7 @@ const OMIT_CUSTOM_KEYS = new Set([
   'heatscore', 'healthscore', 'namecompanykey', 'ttl', 'pk', 'sk', 'tel',
 ]);
 const MAX_MESSAGE_LENGTH = 12000;
-const MAX_CUSTOM_FIELDS = 20;
-const keyOf = (job: LeadNotificationJob): string => createHash('sha256').update(JSON.stringify([job.orgId, job.listId, job.leadId])).digest('hex');
+const keyOf = (job: LeadNotificationJob): string => createHash('sha256').update(JSON.stringify([job.orgId, job.listId, job.leadId, ...(job.submissionId ? [job.submissionId] : [])])).digest('hex');
 // Slack accepts a caller-generated message UUID; keep it identical across retries/recovery.
 const messageIdOf = (job: LeadNotificationJob): string => {
   const hex = keyOf(job);
@@ -50,7 +49,7 @@ export function maskLeadPhone(phone: string): string {
   return digits.length > 4 ? `***-***-${digits.slice(-4)}` : '***';
 }
 function configOf(value: unknown): LeadNotificationsConfig | undefined {
-  if (!record(value) || value.enabled !== true || typeof value.maskPhone !== 'boolean' ||
+  if (!record(value) || value.enabled !== true || (value.maskPhone !== undefined && typeof value.maskPhone !== 'boolean') ||
       typeof value.slackChannelId !== 'string' || !/^[CG][A-Z0-9]+$/.test(value.slackChannelId)) return;
   for (const field of ['sources', 'mentions', 'excludeEmailPatterns']) {
     if (value[field] !== undefined && (!strings(value[field]) || value[field].length > 50 || value[field].some((entry: string) => entry.length > 254))) return;
@@ -79,10 +78,7 @@ async function context(listId: string, leadId: string, expectedOrgId?: string) {
   ].map(value => string(value).toLowerCase()).filter(Boolean);
   if (config.sources && !config.sources.some(s => sources.includes(s.trim().toLowerCase()))) return;
   const email = string(lead.email);
-  const hideEmail = config.excludeEmailPatterns?.some(pattern => {
-    const regex = pattern.trim().replace(/\*+/g, '*').split('*').map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*');
-    return new RegExp(`^${regex}$`, 'i').test(email);
-  }) ?? false;
+  const hideEmail = /^noemail\+[^@]*@waterheater\.app$/i.test(email);
   // Only org-owned connections. No personal-account lookup, global bot, or cross-org fallback.
   const accounts: unknown[] = Array.isArray(org.connected_accounts) ? org.connected_accounts : [];
   const slack = accounts.filter(a => record(a) && a.platform === 'slack');
@@ -92,19 +88,19 @@ async function context(listId: string, leadId: string, expectedOrgId?: string) {
   const connection = account.config;
   if (connection.account_type !== 'bot' || !/^xoxb-/.test(string(connection.access_token)) ||
       !/^T[A-Z0-9]+$/.test(string(connection.team_id)) || account.account_id !== connection.team_id) return;
-  return { org, config, lead, source, connection, customFields, hideEmail };
+  return { org, config, lead, source, connection, customFields, hideEmail, list };
 }
 
 function message(ctx: NonNullable<Awaited<ReturnType<typeof context>>>, job: LeadNotificationJob) {
-  const { config, lead, source, customFields, hideEmail } = ctx;
-  const name = [string(lead.firstName), string(lead.lastName)].filter(Boolean).join(' ') || 'Unknown';
+  const { config, lead, customFields, hideEmail, list } = ctx;
+  const name = [string(lead.firstName), string(lead.lastName)].filter(Boolean).join(' ');
   const phone = string(lead.phone);
   const email = string(lead.email);
   // Custom fields can repeat contact data under a free-text field. Apply the same
   // policy there, before escaping; contact-key aliases are excluded below as well.
   const render = (value: unknown, limit = 300): string => {
     let text = string(value);
-    if (hideEmail && email) text = text.split(new RegExp(email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi')).join('—');
+    text = text.replace(/(?<![\w.+-])noemail\+[^\s@]*@waterheater\.app(?![\w.-])/gi, '');
     if (config.maskPhone && phone) text = text.split(phone).join(maskLeadPhone(phone));
     return escapeSlack(text, limit);
   };
@@ -118,22 +114,50 @@ function message(ctx: NonNullable<Awaited<ReturnType<typeof context>>>, job: Lea
     length += size;
     return true;
   };
-  [
-    '*New lead*', `Name: ${render(name)}`, `Email: ${hideEmail ? '—' : escapeSlack(email) || '—'}`,
-    `Phone: ${phone ? (config.maskPhone ? maskLeadPhone(phone) : escapeSlack(phone)) : '—'}`,
-    `Company: ${render(lead.company) || '—'}`, `Source: ${render(source)}`,
-    `Created: ${render(lead.createdAt)}`, `<${crmUrl}|Open in CRM>`,
-  ].forEach(append);
-  const touch = record(lead.firstTouch) ? lead.firstTouch : {};
-  const utm = record(touch.utm) ? touch.utm : {};
+  append('New lead:');
+  if (name) append(`Name: ${render(name, name.length)}`);
+  if (phone) append(`Phone: ${config.maskPhone ? maskLeadPhone(phone) : escapeSlack(phone, phone.length)}`);
+  if (email && !hideEmail) append(`Email: ${escapeSlack(email, email.length)}`);
+  append('');
+  if (string(list.name)) append(`Lead list: ${render(list.name)}`);
+  if (string(customFields.source)) append(`Source: ${render(customFields.source)}`);
+  if (string(lead.company)) append(`Company: ${render(lead.company)}`);
+  const timestamp = job.submittedAt || string(lead.createdAt);
+  if (timestamp) append(`${job.submittedAt ? 'Submitted' : 'Created'}: ${render(timestamp)}`);
+  append(`<${crmUrl}|Open in CRM>`);
+  const first = record(lead.firstTouch) ? lead.firstTouch : {};
+  const last = record(lead.lastTouch) ? lead.lastTouch : {};
+  const touches = job.submissionId ? [last, first] : [first, last];
+  const touchValue = (key: string) => touches.map(t => string(t[key])).find(Boolean) || '';
+  const touchBag = (key: string): Record<string, string> => Object.fromEntries(
+    [...touches].reverse().flatMap(t => record(t[key])
+      ? Object.entries(t[key]).filter((entry): entry is [string, string] => !!string(entry[1])) : []),
+  );
+  const utm = touchBag('utm');
   const attributionFields: Record<string, unknown> = {};
   for (const key of ['source', 'medium', 'campaign', 'term', 'content', 'id']) {
     const fallback = key === 'source' ? lead.utmSource : key === 'medium' ? lead.utmMedium : undefined;
     const value = string(utm[key]) || string(fallback);
     if (value) attributionFields[`utm_${key}`] = value;
   }
-  if (string(touch.landingUrl)) attributionFields.landingUrl = touch.landingUrl;
-  let count = 0;
+  for (const key of ['landingUrl', 'referrer']) {
+    if (touchValue(key)) attributionFields[key] = touchValue(key);
+  }
+  const clickIds = touchBag('clickIds');
+  const fallbackClicks = record(lead.clickIds) ? lead.clickIds : {};
+  for (const key of ['fbclid', 'gclid']) {
+    const value = string(clickIds[key]) || string(fallbackClicks[key]);
+    if (value) attributionFields[key] = value;
+  }
+  const extras = touchBag('extraParams');
+  for (const [key, value] of Object.entries(extras)) {
+    if (/^(landingpage(name|url|path|id)|campaign(name|id)?|ad(name|id|setname|setid)?|utm(id|campaign|content|term))$/.test(normalizedKey(key)) && string(value)) {
+      attributionFields[key] = value;
+    }
+  }
+  for (const key of ['title', 'notes', 'linkedin']) {
+    if (string(lead[key])) attributionFields[key] = lead[key];
+  }
   const seen = new Set<string>();
   for (const [key, value] of [...Object.entries(attributionFields), ...Object.entries(customFields)]) {
     const normalized = normalizedKey(key);
@@ -144,10 +168,10 @@ function message(ctx: NonNullable<Awaited<ReturnType<typeof context>>>, job: Lea
     const scalar = typeof value === 'string' ? value :
       typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value)) ? String(value) : '';
     if (!scalar.trim()) continue;
-    if (count >= MAX_CUSTOM_FIELDS) break;
-    if (append(`${render(key, 60)}: ${render(scalar)}`)) {
+    const rendered = render(scalar);
+    if (!rendered.trim()) continue;
+    if (append(`${render(key, 60)}: ${rendered}`)) {
       seen.add(normalized);
-      count++;
     }
   }
   for (const id of config.mentions || []) {
@@ -215,11 +239,11 @@ export async function processLeadNotificationJob(job: LeadNotificationJob): Prom
 }
 
 /** Never rejects to a lead saver. Call fire-and-forget immediately after a successful write. */
-export async function dispatchLeadCreated(listId: string, leadId: string): Promise<void> {
+export async function dispatchLeadCreated(listId: string, leadId: string, submission?: { submissionId: string; submittedAt: string }): Promise<void> {
   try {
     const ctx = await context(listId, leadId);
     if (!ctx) return;
-    const job = { orgId: ctx.org.orgId, listId, leadId };
+    const job = { orgId: ctx.org.orgId, listId, leadId, ...submission };
     const key = keyOf(job);
     const queued = await enqueueJob(SOURCE, key, job, { claimImmediately: true });
     if (queued === 'duplicate') return;
