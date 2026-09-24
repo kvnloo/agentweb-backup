@@ -1,4 +1,4 @@
-import { attributionValues, fieldKey, humanizeField, resolveNotificationNames, submittedPacific } from './leadNotificationAttribution';
+import { attributionValues, fieldKey, humanizeField, resolveNotificationNames, slackAttributionUrl, submittedPacific } from './leadNotificationAttribution';
 import { createHash } from 'crypto';
 import { isSmokeTestLead } from '../utils/smokeTestLead';
 import { WebClient, ChatPostMessageArguments } from '@slack/web-api';
@@ -143,17 +143,18 @@ async function message(ctx: NonNullable<Awaited<ReturnType<typeof context>>>, jo
   const value = (...keys: string[]) => keys.map(k => values.get(fieldKey(k)) || '').find(Boolean) || '';
   const attribution = await resolveNotificationNames(list.userId, values, timestamp, ctx.org.connected_accounts);
   append('Attribution:');
-  const detail = (label: string, text: string, full = false) => {
-    if (text) append(`${label}: ${render(text, full ? text.length : 300)}`);
+  const detail = (label: string, text: string) => {
+    if (text) append(`${label}: ${render(text)}`);
   };
-  const landing = [render(attribution.landingName), attribution.landingUrl.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')].filter(Boolean).join(' — ');
+  const landing = [render(attribution.landingName), slackAttributionUrl(attribution.landingUrl)].filter(Boolean).join(' — ');
   if (landing) append(`Landing page: ${landing}`);
   detail('Lead list', string(list.name));
   detail('Campaign', attribution.campaign);
   detail('Ad set', attribution.adSet);
   detail('Ad', attribution.ad);
   detail('Source / Medium', [value('utm_source', 'source'), value('utm_medium', 'medium')].filter(Boolean).join(' / '));
-  detail('Referrer', value('referrer'), true);
+  const referrer = slackAttributionUrl(value('referrer'));
+  if (referrer) append(`Referrer: ${referrer}`);
   detail('Submitted', submittedPacific(timestamp));
   const answerFields: Record<string, unknown> = {};
   for (const key of ['company', 'title', 'notes', 'linkedin']) {

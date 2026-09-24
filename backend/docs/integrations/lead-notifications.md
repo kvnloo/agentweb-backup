@@ -64,13 +64,29 @@ fields/top-level legacy attribution. Submitted time uses the accepted submission
 time or the lead creation time, rendered in America/Los_Angeles with a `PT` suffix
 and daylight-saving adjustment. Invalid timestamps are omitted.
 
-Landing URLs use URL normalization, retain query strings, and are not shortened to
-300 characters. Names resolve through owner-scoped `getLandingPagesByOwner` by
-page ID or exact origin/path; missing or ambiguous records retain supplied names.
-Campaign IDs/UTM campaign names resolve from the owner's existing
-`AW-AdsMetricsSnapshots` over the preceding 30 days. Truncated results, ambiguous
-account matches, and unavailable storage retain raw values. There is no new table,
-index, migration, or global scan.
+Landing and referrer URLs normalize HTTP(S), reject embedded credentials, and
+remove fragments. Query keys containing email, phone, token, code, session, auth,
+password, secret or key (case-insensitive, ignoring separators) have their values
+redacted, including repeated/encoded keys. Safe UTM/click parameters remain. Each
+URL is limited to **2,048 escaped characters**: oversized queries lose whole pairs,
+prioritizing UTM/click attribution, without slicing paths, values or escape entities.
+An origin/path exceeding that budget, or raw input over 64 KiB, is omitted. Normal
+URLs retain their full scheme, host, path and safe query, including those over 300
+characters. This is query-key redaction, not arbitrary PII detection in paths or
+values under unrelated keys.
+
+Names use notification-only, read-only DynamoDB lookups. A supplied page ID uses
+one primary-key get; its ID, persisted owner and non-archived state must match.
+URL-only lookup uses the existing owner `UserIdIndex`, evaluating at most **25**
+records in one request and matching exact origin/path. Incomplete results (a
+`LastEvaluatedKey`), ambiguity or missing records retain supplied names.
+Campaign IDs/UTM campaign names use one owner/date query of existing
+`AW-AdsMetricsSnapshots` over the preceding 30 days, evaluating at most **100**
+records. Incomplete, malformed or ambiguous results retain raw values. Both reads
+use projected fields, no retries and no pagination. The shared **two-second overall
+deadline aborts underlying SDK and provider requests**, rather than merely stopping
+the wait; late completions cannot alter returned attribution or start more requests.
+There is no new table, index, migration, global scan or data mutation.
 
 There is no persisted AW-Ads name directory or click-to-ad index in this repo.
 For numeric `ad_id`, `utm_content`, or `utm_term`, an unambiguous persisted **org**
@@ -84,7 +100,8 @@ treated as ad IDs. Non-Meta ads retain their submitted names/identifiers.
 
 Values are Slack-escaped; control characters and formatting delimiters in free
 text are neutralized. Optional text is bounded to 300 input characters, labels to
-60, and the whole message to 12,000 escaped characters. URLs preserve punctuation.
+60, and the whole message to 12,000 escaped characters. URLs preserve punctuation
+within their separate privacy and length limits.
 Whole lines exceeding the budget are omitted; the CRM link has reserved space.
 There is no separate field-count cap. Configured Slack user-ID mentions alone use
 active mention syntax. `CUSTOMER_FRONTEND_URL` sets the CRM link origin.
@@ -162,35 +179,36 @@ No dependency, new table, polling loop, production config or data mutation added
 
 ## Verification for this follow-up
 
-Focused Jest: **117 passed in 2 suites**, plus **53 passed in 2 integration suites**.
-The initial exact-layout TDD run had **3 failing regressions and 1 passing contact
-test** before implementation. Additional red/green checks covered numeric ad
-resolution, URL punctuation/message budgeting, and conflicting campaign IDs.
+Privacy regressions first reproduced **3 failures with 117 existing tests passing**.
+Final focused Jest: **195 passed in 5 suites**, covering formatter/privacy,
+attribution, SDK request bounds/cancellation, forwarding and legacy notifications.
 Commands from `backend/`:
 
 ```sh
 NODE_OPTIONS=--max-old-space-size=1536 ./node_modules/.bin/jest --runInBand --runTestsByPath \
   src/__tests__/orgLeadNotificationService.test.ts \
-  src/__tests__/leadNotificationAttribution.test.ts
-
-NODE_OPTIONS=--max-old-space-size=1536 ./node_modules/.bin/jest --runInBand --runTestsByPath \
+  src/__tests__/leadNotificationAttribution.test.ts \
+  src/__tests__/leadNotificationLookup.test.ts \
   src/__tests__/leadListAlertService.orgNotifications.test.ts \
   src/__tests__/webhooks.leadForwarding.test.ts
 
-NODE_OPTIONS=--max-old-space-size=1536 node /tmp/eng2120-scoped-typecheck.cjs
+node --max-old-space-size=1536 ./node_modules/typescript/bin/tsc --noEmit
 ```
 
-Scoped TypeScript compiler check: **4 changed source/test files, 21 dependency
-declarations, 0 diagnostics**. The scratch harness checks changed source bodies
-against isolated declarations for dependencies; it supplies the three unannotated
-DynamoDB read methods' AttributeMap return contracts explicitly. This is not a full
-repository typecheck. An initial two-file `tsc --noEmit` attempt still pulled the
-transitive implementation graph and exhausted the 1536 MB cap; the cap was not
-raised. `git diff --check` passed. No full build, live Slack send, commit or deployment.
+The **actual full backend typecheck** was attempted on Atem using the repository's
+`tsconfig.json` and entire `src/**/*` graph. The command above is the full compiler
+command from `npm run typecheck`, with its hardcoded 6144 MB heap replaced by the
+requested 1536 MB cap (setting `NODE_OPTIONS` alone cannot override the script's
+explicit cap). **It failed: exit 134, `Reached heap limit Allocation failed -
+JavaScript heap out of memory`, before TypeScript diagnostics.** The cap was not
+raised. Full backend type safety is therefore unverified; no scratch/scoped harness
+is presented as full evidence. Jest uses the repository's isolated-module transform
+and does not establish full type safety either.
 
-The local CodeRabbit review identified an unbounded enrichment wait; the formatter
-now has a two-second overall deadline with a stalled-storage regression. Enrichment
-adds read-only lookups and one helper, without schema changes or new dependencies.
+`git diff --check` passed. No full build, live Slack send, commit, push or deployment.
+Complexity impact: replaces unbounded shared-service pagination with one small
+notification-only storage adapter; one sanitizer serves both URL fields. Adds no
+dependency, schema, persistence or configuration change.
 
 ## Haven capture diagnosis (2026-09-24)
 

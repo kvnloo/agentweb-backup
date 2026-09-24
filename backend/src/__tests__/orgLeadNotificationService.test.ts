@@ -1,7 +1,5 @@
-jest.mock('../services/adsMetricsDb', () => ({ adsMetricsDb: { getSnapshotsByUserDateRange: jest.fn() } }));
-jest.mock('../services/v0Service', () => ({ getLandingPagesByOwner: jest.fn() }));
-import { adsMetricsDb } from '../services/adsMetricsDb';
-import { getLandingPagesByOwner } from '../services/v0Service';
+jest.mock('../services/leadNotificationLookup', () => ({ notificationLookup: { pages: jest.fn(), campaigns: jest.fn() } }));
+import { notificationLookup } from '../services/leadNotificationLookup';
 const postMessage = jest.fn();
 const authTest = jest.fn();
 const clients: string[] = [];
@@ -40,8 +38,8 @@ let lead: any;
 
 beforeEach(() => {
   jest.resetAllMocks();
-  mock(adsMetricsDb.getSnapshotsByUserDateRange).mockResolvedValue({ rows: [], truncated: false });
-  mock(getLandingPagesByOwner).mockResolvedValue([]);
+  mock(notificationLookup.campaigns).mockResolvedValue({ rows: [], truncated: false });
+  mock(notificationLookup.pages).mockResolvedValue([]);
   mock(WebClient).mockImplementation((token: string) => {
     clients.push(token);
     return { auth: { test: authTest }, chat: { postMessage } };
@@ -627,8 +625,8 @@ describe('reserved smoke lead suppression', () => {
 
 describe('ENG-2120 exact readable layout', () => {
   it('orders resolved attribution before humanized deduplicated form answers', async () => {
-    mock(getLandingPagesByOwner).mockResolvedValue([{ userId: 'owner-a', name: 'Haven demo', deployedUrl: 'https://learn.usehaven.ai/', leadListId: 'list-a' }]);
-    mock(adsMetricsDb.getSnapshotsByUserDateRange).mockResolvedValue({ truncated: false, rows: [
+    mock(notificationLookup.pages).mockResolvedValue([{ userId: 'owner-a', name: 'Haven demo', deployedUrl: 'https://learn.usehaven.ai/', leadListId: 'list-a' }]);
+    mock(notificationLookup.campaigns).mockResolvedValue({ truncated: false, rows: [
       { userId: 'owner-a', rowType: 'campaign', campaignId: 'campaign-1', campaignName: 'Tenant launch', entityKey: 'meta#account#campaign-1', date: '2026-09-23' },
     ] });
     lead.firstTouch = { landingUrl: 'https://LEARN.usehaven.ai:443?utm_campaign=campaign-1',
@@ -663,8 +661,8 @@ describe('ENG-2120 exact readable layout', () => {
 
   it('retains a full long normalized URL and raw click identifiers on lookup failure', async () => {
     const url = 'https://example.com/path?q=' + 'x'.repeat(400);
-    mock(getLandingPagesByOwner).mockRejectedValue(new Error('offline'));
-    mock(adsMetricsDb.getSnapshotsByUserDateRange).mockRejectedValue(new Error('offline'));
+    mock(notificationLookup.pages).mockRejectedValue(new Error('offline'));
+    mock(notificationLookup.campaigns).mockRejectedValue(new Error('offline'));
     lead.firstTouch = { landingUrl: url, utm: { campaign: 'raw' }, clickIds: { fbclid: 'fb-click', gclid: 'g-click' } };
     await dispatchLeadCreated('list-a', 'lead-a');
     expect(postMessage.mock.calls[0][0].text).toBe([
@@ -724,3 +722,19 @@ it('renders resolved Meta campaign, ad set and ad names in the exact layout', as
     expect(request.mock.calls[0][1]?.headers).toEqual({ Authorization: 'Bearer meta-test' });
   } finally { request.mockRestore(); }
 });
+
+ it.each(['landingUrl', 'referrer'])('redacts private query values and fragments in %s', async key => {
+   lead.firstTouch = { [key]: 'https://example.com/path?EMAIL=private%40example.com&phone=123&access_token=private-token&code=private-code&sessionId=private-session&auth=private-auth&password=private-password&secret=private-secret&api_key=private-key&utm_source=google&gclid=click#private-fragment' };
+   await dispatchLeadCreated('list-a', 'lead-a');
+   const text = postMessage.mock.calls[0][0].text;
+   expect(text).not.toContain('private');
+   expect(text).not.toContain('phone=123');
+   expect(text).toContain('utm_source=google&amp;gclid=click');
+ });
+ it('bounds each escaped URL while retaining path and safe attribution', async () => {
+   lead.firstTouch = { landingUrl: 'https://example.com/path?utm_source=google&gclid=click&huge=' + '&x='.repeat(1000) };
+   await dispatchLeadCreated('list-a', 'lead-a');
+   const line = postMessage.mock.calls[0][0].text.split('\n').find((line: string) => line.startsWith('Landing page:'));
+   expect(line).toContain('https://example.com/path?utm_source=google&amp;gclid=click');
+   expect(line.length).toBeLessThanOrEqual(2048 + 'Landing page: '.length);
+ });
