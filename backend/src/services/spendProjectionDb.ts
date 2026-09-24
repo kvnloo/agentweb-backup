@@ -189,86 +189,57 @@ export function isProjectionWriterEnabled(): boolean {
 }
 
 /**
- * Fold a batch of just-committed spend events into the persisted projection.
+ * Build the projection-maintenance items to fold a batch of settled spend events
+ * into `AW-SpendProjection`, as `transactWrite` items to be appended to the SAME
+ * transaction that writes the ledger + spend events (ENG-1250 F5, durable
+ * delivery). Returning items rather than issuing the write is what makes it
+ * durable: the projection update commits atomically with the spend event, so a
+ * crash can never leave the ledger ahead of the projection, and a duplicate
+ * replay (whose transaction is canceled) can never double-add.
  *
- * Never throws: this is observe-only maintenance invoked from the charging
- * transaction's success path, and a projection write failing must never break
- * the metering it mirrors (identical stance to `spendLedgerDualWrite`).
- *
- * Only `settled` events move `settledMicroUsd`; reserved/voided are ignored here
+ * Only `settled` events move `settledMicroUsd`; reserved/voided are ignored
  * (reservations are §4's, voided cost nothing). Events are grouped by subject +
- * month so one batch that spans a midnight boundary still lands in the right
- * months.
- */
-/**
- * One subject+month's settled delta, applied with a monotonic computedAt (F4).
+ * month — one Update per group — both so a batch spanning midnight lands in the
+ * right months AND because a DynamoDB transaction may not touch the same item
+ * (billingUserId+billingMonth) twice.
  *
- * Concurrent writers each carry their own `now`; out-of-order completion could
- * SET an older computedAt over a newer one, which would make the staleness guard
- * misjudge freshness. So the combined SET+ADD is guarded to only move computedAt
- * FORWARD (`attribute_not_exists(computedAt) OR computedAt <= :now`). If a newer
- * timestamp is already present the condition fails — and we then retry the SAME
- * delta as an ADD-only update with no computedAt SET, so the settled spend and
- * count are NEVER dropped, only the backwards timestamp write is.
+ * The Update is UNCONDITIONAL: a failing condition would abort the whole
+ * charging transaction, and here it must not. The monotonic-`computedAt` guard
+ * the standalone writer used is unnecessary now — in the transactional path the
+ * projection is written in lockstep with the ledger, so it can never lag it; an
+ * out-of-order `computedAt` between two near-simultaneous charges is cosmetic and
+ * only touches the default-off staleness guard. The ADD creates the row on first
+ * touch and never writes reserved/available/allowance siblings (§4's fields).
+ *
+ * Returns `[]` when the kill switch is off, leaving the transaction exactly the
+ * items it would otherwise be — the reversible off-switch, now at the point the
+ * items are assembled.
  */
-async function applyGroup(
-  g: { billingUserId: string; billingMonth: string; micro: number; count: number },
-  now: string,
-): Promise<void> {
-  const Key = { billingUserId: g.billingUserId, billingMonth: g.billingMonth };
-  try {
-    await db()
-      .update({
-        TableName: SPEND_PROJECTION_TABLE,
-        Key,
-        // SET stamps freshness (only forward); ADD both creates the row on first
-        // touch and never overwrites reserved/available/allowance siblings.
-        UpdateExpression: "SET computedAt = :now ADD settledMicroUsd :m, settledEventCount :c",
-        ConditionExpression: "attribute_not_exists(computedAt) OR computedAt <= :now",
-        ExpressionAttributeValues: { ":now": now, ":m": g.micro, ":c": g.count },
-      })
-      .promise();
-  } catch (error: any) {
-    if (error?.code !== "ConditionalCheckFailedException") throw error;
-    // A newer computedAt already exists: keep it, but the settled spend still
-    // has to land. ADD-only, no computedAt SET.
-    await db()
-      .update({
-        TableName: SPEND_PROJECTION_TABLE,
-        Key,
-        UpdateExpression: "ADD settledMicroUsd :m, settledEventCount :c",
-        ExpressionAttributeValues: { ":m": g.micro, ":c": g.count },
-      })
-      .promise();
-  }
-}
-
-export async function applySettledSpendEvents(
+export function settledProjectionUpdateItems(
   events: readonly SpendEvent[],
   now: string = new Date().toISOString(),
-): Promise<void> {
-  try {
-    if (!isProjectionWriterEnabled()) return;
+): AWS.DynamoDB.DocumentClient.TransactWriteItem[] {
+  if (!isProjectionWriterEnabled()) return [];
 
-    const groups = new Map<string, { billingUserId: string; billingMonth: string; micro: number; count: number }>();
-    for (const e of events) {
-      if (e.lifecycle !== "settled") continue;
-      if (!e.billingUserId || !MONTH.test(e.billingMonth)) continue;
-      const key = `${e.billingUserId}\u0000${e.billingMonth}`;
-      const g = groups.get(key) ?? { billingUserId: e.billingUserId, billingMonth: e.billingMonth, micro: 0, count: 0 };
-      g.micro += e.costMicroUsd;
-      g.count += 1;
-      groups.set(key, g);
-    }
-    if (groups.size === 0) return;
-
-    await Promise.all([...groups.values()].map((g) => applyGroup(g, now)));
-  } catch (err) {
-    console.error(
-      "[spendProjectionWriter] settled-spend projection maintenance failed (observe-only, swallowed):",
-      err,
-    );
+  const groups = new Map<string, { billingUserId: string; billingMonth: string; micro: number; count: number }>();
+  for (const e of events) {
+    if (e.lifecycle !== "settled") continue;
+    if (!e.billingUserId || !MONTH.test(e.billingMonth)) continue;
+    const key = `${e.billingUserId}\u0000${e.billingMonth}`;
+    const g = groups.get(key) ?? { billingUserId: e.billingUserId, billingMonth: e.billingMonth, micro: 0, count: 0 };
+    g.micro += e.costMicroUsd;
+    g.count += 1;
+    groups.set(key, g);
   }
+
+  return [...groups.values()].map((g) => ({
+    Update: {
+      TableName: SPEND_PROJECTION_TABLE,
+      Key: { billingUserId: g.billingUserId, billingMonth: g.billingMonth },
+      UpdateExpression: "SET computedAt = :now ADD settledMicroUsd :m, settledEventCount :c",
+      ExpressionAttributeValues: { ":now": now, ":m": g.micro, ":c": g.count },
+    },
+  }));
 }
 
 export interface PersistedProjectionReconciliation {
