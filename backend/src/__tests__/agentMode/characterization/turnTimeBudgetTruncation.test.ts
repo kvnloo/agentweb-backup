@@ -766,13 +766,67 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     expect(seenTimeoutMs[0]).toBeGreaterThanOrEqual(30_000);
   });
 
-  it('still fails loudly when iteration 1 itself times out with nothing yet to synthesize (no false partial)', async () => {
-    // ENG-907's original, deliberate design: the first iteration is exempt from forced
-    // synthesis because there is nothing done yet to synthesize — a run should fail
-    // loudly rather than emit an empty "partial" apology. Confirms the per-call bound
-    // above doesn't change that: a timeout on the very first call must still propagate,
-    // tagged isGenerationTimeout so the controller's own salvage backstops (which check
-    // for images/tool work persisted so far) get a fair chance instead of being skipped.
+  it('retries with a forced synthesis instead of failing loudly when the VERY FIRST call times out (ENG-2121)', async () => {
+    // Prod session d874874f's SECOND turn ("Continue building all the creative"):
+    // iteration 1's own LLM call ran the entire ~601s cap with nothing yet dispatched.
+    // ENG-907's original design exempted iteration 1 from forced synthesis because
+    // nothing had failed yet at that point — a reasonable reason to not PROACTIVELY
+    // give up before trying. But this catch runs REACTIVELY, after the call already
+    // failed, so that rationale does not apply: retrying costs nothing beyond the
+    // reserve that would otherwise be thrown away, and even with zero tool work done,
+    // the model itself can give the user an honest answer built from the REAL request
+    // context — a materially better outcome than the generic diagnosis agent's guess,
+    // which is what produced this exact session's hallucinated "I have successfully
+    // completed the brand intelligence, market research..." fallback.
+    let call = 0;
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const messages = args[1] || [];
+      const isFinalSynthesis = messages.some(
+        (m: any) =>
+          m?.role === 'user' &&
+          typeof m.content === 'string' &&
+          /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
+      );
+      call++;
+      if (isFinalSynthesis) {
+        nowMs += 5_000;
+        return buildLLMResponse({
+          content: 'Partial results — I ran into a delay before I could start; nothing verified yet. Reply "continue" and I\'ll pick this up.',
+        });
+      }
+      nowMs += 570_000;
+      const err: any = new Error('Request timed out.');
+      throw err;
+    });
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    const startedAt = nowMs;
+    const result = (await service.generateMarketingResponse(
+      'Generate the first wave of ad creatives using the brand design tokens.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+      false, undefined, undefined, false, undefined, undefined, undefined, false, false,
+      nowMs,
+    )) as any;
+
+    // Resolved gracefully — never thrown up to the controller.
+    expect(nowMs - startedAt).toBeLessThanOrEqual(CAP_MS);
+    expect(result.truncatedByTimeBudget).toBe(true);
+    expect(result.content).toMatch(/Partial results/);
+    // Exactly one retry after the timed-out first call.
+    expect(call).toBe(2);
+  });
+
+  it('still fails loudly, tagged, when iteration 1\'s OWN retry also times out (no infinite loop, no false partial)', async () => {
+    // The regression guard for the fix above: retrying is a bounded, one-shot
+    // affordance, not a way to paper over a request that genuinely cannot complete in
+    // time (e.g. the context itself is too large to process within the reserve). When
+    // even the retry times out, this must still fail loudly and tagged — never loop
+    // again, never fabricate a partial from nothing — so the controller's own salvage
+    // backstop (which checks for images/tool work actually persisted so far) gets a
+    // fair, honest chance instead of this loop looping forever or lying.
     jest.spyOn(service as any, 'callLLM').mockImplementation(async () => {
       nowMs += 570_000;
       const err: any = new Error('Request timed out.');
