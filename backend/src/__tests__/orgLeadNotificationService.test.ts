@@ -1,3 +1,7 @@
+jest.mock('../services/adsMetricsDb', () => ({ adsMetricsDb: { getSnapshotsByUserDateRange: jest.fn() } }));
+jest.mock('../services/v0Service', () => ({ getLandingPagesByOwner: jest.fn() }));
+import { adsMetricsDb } from '../services/adsMetricsDb';
+import { getLandingPagesByOwner } from '../services/v0Service';
 const postMessage = jest.fn();
 const authTest = jest.fn();
 const clients: string[] = [];
@@ -36,6 +40,8 @@ let lead: any;
 
 beforeEach(() => {
   jest.resetAllMocks();
+  mock(adsMetricsDb.getSnapshotsByUserDateRange).mockResolvedValue({ rows: [], truncated: false });
+  mock(getLandingPagesByOwner).mockResolvedValue([]);
   mock(WebClient).mockImplementation((token: string) => {
     clients.push(token);
     return { auth: { test: authTest }, chat: { postMessage } };
@@ -77,7 +83,7 @@ it('posts correct fields and CRM deep link through the org bot', async () => {
   expect(message.text).toContain('+1 (415) 555-1234');
   expect(message.text).toContain('waterheater-landing');
   expect(message.text).toContain('/crm?listId=list-a&leadId=lead-a');
-  expect(message.text).toContain('2026-09-23T12:00:00Z');
+  expect(message.text).toContain('Sep 23, 2026, 5:00 AM PT');
 });
 it('hides matching placeholder emails without dropping the lead notification', async () => {
   org.leadNotifications.excludeEmailPatterns = ['noemail+*@waterheater.app'];
@@ -326,10 +332,9 @@ it('renders LP, campaign, UTM and submitted form fields with bounded escaped val
     details: 'x'.repeat(1000) };
   await dispatchLeadCreated('list-a', 'lead-a');
   const text = postMessage.mock.calls[0][0].text;
-  for (const field of ['landingPageId: lp-123', 'campaign: fall', 'utm_source: google',
-    'utm_medium: cpc', 'utm_campaign: water-heaters', 'heater_type: tankless',
-    'household_size: 4', 'needs_installation: false']) expect(text).toContain(field);
-  expect(text).toContain('note&lt;!channel&gt;: &lt;@U999&gt; &amp; &lt;https://evil.test|click&gt;');
+  for (const field of ['Campaign: water-heaters', 'Source / Medium: google / cpc', 'Heater type: tankless',
+    'Household size: 4', 'Needs installation: false']) expect(text).toContain(field);
+  expect(text).toContain('Note&lt;!channel&gt;: &lt;@U999&gt; &amp; &lt;https://evil.test|click&gt;');
   expect(text).not.toMatch(/<@U999>|<!channel>|\*bold\*|`code`/);
   expect(text).not.toContain('x'.repeat(301));
 });
@@ -349,7 +354,7 @@ it('does not expose duplicate contact, internal, system or nested custom fields'
   for (const value of [lead.email, lead.phone, 'duplicate-name', 'duplicate-company', 'secret-owner',
     'secret-tenant', 'secret-list', 'nested-secret', 'private-note', 'debug-secret', 'internal-time',
     'token-secret', 'password-secret', 'array-secret', 'sync-secret', 'ip-secret', 'owner-secret']) expect(text).not.toContain(value);
-  expect(text.match(/Source:/g)).toHaveLength(1);
+  expect(text.match(/Source \/ Medium:/g)).toHaveLength(1);
 });
 it('bounds total message size after escaping', async () => {
   lead.customFields = Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`field${i}`, '&'.repeat(1000)]));
@@ -363,7 +368,7 @@ it('bounds total message size after escaping', async () => {
 it('includes every submitted scalar field when the message budget allows', async () => {
   lead.customFields = Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`field${i}`, 'value']));
   await dispatchLeadCreated('list-a', 'lead-a');
-  expect(postMessage.mock.calls[0][0].text.match(/field\d+:/g)).toHaveLength(100);
+  expect(postMessage.mock.calls[0][0].text.match(/Field\d+:/g)).toHaveLength(100);
 });
 
 it('renders structured first-touch UTM and LP attribution without duplicate custom values', async () => {
@@ -371,10 +376,10 @@ it('renders structured first-touch UTM and LP attribution without duplicate cust
   lead.customFields = { UTM_SOURCE: 'duplicate-source', utm_campaign: 'duplicate-campaign', question: 'Replacement' };
   await dispatchLeadCreated('list-a', 'lead-a');
   const text = postMessage.mock.calls[0][0].text;
-  expect(text).toContain('utm_source: google');
-  expect(text).toContain('utm_campaign: launch');
-  expect(text).toContain('landingUrl: https://example.com/lp');
-  expect(text).toContain('question: Replacement');
+  expect(text).toContain('Source / Medium: google');
+  expect(text).toContain('Campaign: launch');
+  expect(text).toContain('Landing page: https://example.com/lp');
+  expect(text).toContain('Question: Replacement');
   expect(text).not.toContain('duplicate-');
 });
 it.each([null, [], 'invalid', { utm: { source: {}, campaign: ['invalid'] }, landingUrl: {} }])('ignores malformed persisted attribution %j', async firstTouch => {
@@ -383,7 +388,7 @@ it.each([null, [], 'invalid', { utm: { source: {}, campaign: ['invalid'] }, land
   lead.utmSource = 'fallback-source';
   await dispatchLeadCreated('list-a', 'lead-a');
   expect(postMessage).toHaveBeenCalledTimes(1);
-  expect(postMessage.mock.calls[0][0].text).toContain('utm_source: fallback-source');
+  expect(postMessage.mock.calls[0][0].text).toContain('Source / Medium: fallback-source');
   expect(postMessage.mock.calls[0][0].text).not.toContain('[object Object]');
 });
 
@@ -394,7 +399,7 @@ it('uses the exact contact-first layout and omits empty optional fields', async 
   expect(postMessage.mock.calls[0][0]).not.toHaveProperty('username');
   expect(postMessage.mock.calls[0][0].text).toBe([
     'New lead:', 'Name: Jane Doe', 'Phone: +1 (415) 555-1234', 'Email: jane@example.com', '',
-    'Lead list: Inbound', 'Created: 2026-09-23T12:00:00Z',
+    'Attribution:', 'Lead list: Inbound', 'Submitted: Sep 23, 2026, 5:00 AM PT', '',
     '<https://app.agentweb.pro/crm?listId=list-a&leadId=lead-a|Open in CRM>',
   ].join('\n'));
 });
@@ -416,7 +421,7 @@ it.each(['Haven', 'SWH', 'AgentWeb', 'Unknown org'])('notifies arbitrary unknown
   await dispatchLeadCreated('list-a', 'lead-a');
   expect(postMessage).toHaveBeenCalledTimes(1);
   expect(postMessage.mock.calls[0][0].text).toContain('Phone: +1 (415) 555-1234');
-  expect(postMessage.mock.calls[0][0].text).toContain('landingPageName: Future page');
+  expect(postMessage.mock.calls[0][0].text).toContain('Landing page: Future page');
 });
 it('includes all available detailed attribution and submitted fields', async () => {
   lead.firstTouch = { utm: { source: 'google', medium: 'cpc', campaign: 'utm-launch', content: 'ad-name', term: 'ad-set' },
@@ -425,10 +430,9 @@ it('includes all available detailed attribution and submitted fields', async () 
   lead.customFields = { landingPageName: 'New LP', landingPagePath: '/path', answer: 'Yes' };
   await dispatchLeadCreated('list-a', 'lead-a');
   const text = postMessage.mock.calls[0][0].text;
-  for (const value of ['landingPageName: New LP', 'landingPagePath: /path', 'landingUrl: https://lp.test/path',
-    'campaignName: Launch', 'campaignId: campaign-1', 'utm_campaign: utm-launch', 'utm_content: ad-name',
-    'utm_term: ad-set', 'adId: ad-1', 'fbclid: fb-click', 'gclid: g-click', 'Lead list: Inbound',
-    'utm_source: google', 'utm_medium: cpc', 'referrer: https://referrer.test', 'answer: Yes']) expect(text).toContain(value);
+  for (const value of ['Landing page: New LP — https://lp.test/path', 'Campaign: Launch', 'Ad set: ad-set',
+    'Ad: ad-1; fbclid=fb-click; gclid=g-click', 'Lead list: Inbound',
+    'Source / Medium: google / cpc', 'Referrer: https://referrer.test', 'Answer: Yes']) expect(text).toContain(value);
 });
 
 describe('progressive form notifications', () => {
@@ -455,7 +459,7 @@ describe('progressive form notifications', () => {
     expect(postMessage).toHaveBeenCalledTimes(1);
     const text = postMessage.mock.calls[0][0].text;
     for (const contact of ['Name: Jane Doe', 'Phone: +1 (415) 555-1234', 'Email: jane@example.com',
-      'goal: Review my funnel']) expect(text).toContain(contact);
+      'Goal: Review my funnel']) expect(text).toContain(contact);
 
     lead.system = mock(crmDb.setLeadFields).mock.calls[0][2].system;
     await dispatchLeadCreated('list-a', 'lead-a', submission);
@@ -484,7 +488,7 @@ it('deduplicates a submission retry while allowing separate submissions of the s
   await dispatchLeadCreated('list-a', 'lead-a', { ...first, submissionId: 'submission-2' });
   expect(postMessage).toHaveBeenCalledTimes(2);
   expect(postMessage.mock.calls[0][0].client_msg_id).not.toBe(postMessage.mock.calls[1][0].client_msg_id);
-  expect(postMessage.mock.calls[0][0].text).toContain('Submitted: 2026-09-24T01:00:00Z');
+  expect(postMessage.mock.calls[0][0].text).toContain('Submitted: Sep 23, 2026, 6:00 PM PT');
 });
 
 it.each([null, [], 'wrong-type', { fbclid: {}, gclid: ['bad'] }])('ignores malformed click-id and extra-param boundaries %j', async value => {
@@ -500,7 +504,7 @@ it('retains available secondary-touch details when the preferred touch has missi
   lead.lastTouch = { utm: { content: 'last-ad' }, clickIds: { fbclid: 'last-click' }, referrer: 'https://referrer.test' };
   await dispatchLeadCreated('list-a', 'lead-a');
   const text = postMessage.mock.calls[0][0].text;
-  for (const value of ['utm_campaign: first-campaign', 'utm_content: last-ad', 'fbclid: last-click', 'referrer: https://referrer.test']) expect(text).toContain(value);
+  for (const value of ['Campaign: first-campaign', 'Ad: last-ad; fbclid=last-click', 'Referrer: https://referrer.test']) expect(text).toContain(value);
 });
 it('keeps full contact values and only strips exact placeholder addresses from form text', async () => {
   lead.firstName = 'N'.repeat(310);
@@ -508,7 +512,7 @@ it('keeps full contact values and only strips exact placeholder addresses from f
   await dispatchLeadCreated('list-a', 'lead-a');
   const text = postMessage.mock.calls[0][0].text;
   expect(text).toContain(`Name: ${lead.firstName} Doe`);
-  expect(text).toContain('note: realnoemail+x@waterheater.app noemail+x@waterheater.app.evil');
+  expect(text).toContain('Note: realnoemail+x@waterheater.app noemail+x@waterheater.app.evil');
   expect(text).not.toContain('placeholder:');
 });
 
@@ -618,4 +622,105 @@ describe('reserved smoke lead suppression', () => {
     await dispatchLeadCreated('list-a', 'lead-a');
     expect(postMessage).toHaveBeenCalledTimes(1);
   });
+});
+
+
+describe('ENG-2120 exact readable layout', () => {
+  it('orders resolved attribution before humanized deduplicated form answers', async () => {
+    mock(getLandingPagesByOwner).mockResolvedValue([{ userId: 'owner-a', name: 'Haven demo', deployedUrl: 'https://learn.usehaven.ai/', leadListId: 'list-a' }]);
+    mock(adsMetricsDb.getSnapshotsByUserDateRange).mockResolvedValue({ truncated: false, rows: [
+      { userId: 'owner-a', rowType: 'campaign', campaignId: 'campaign-1', campaignName: 'Tenant launch', entityKey: 'meta#account#campaign-1', date: '2026-09-23' },
+    ] });
+    lead.firstTouch = { landingUrl: 'https://LEARN.usehaven.ai:443?utm_campaign=campaign-1',
+      utm: { campaign: 'campaign-1', content: 'Video A', term: 'Property managers', source: 'facebook', medium: 'paid_social' },
+      referrer: 'https://facebook.com/' };
+    lead.customFields = { utm_campaign: 'duplicate', number_of_units: 1000, wantsDemo: false, empty: '', stage: 'questions' };
+    await dispatchLeadCreated('list-a', 'lead-a');
+    expect(postMessage.mock.calls[0][0].text).toBe([
+      'New lead:', 'Name: Jane Doe', 'Phone: +1 (415) 555-1234', 'Email: jane@example.com', '',
+      'Attribution:', 'Landing page: Haven demo — https://learn.usehaven.ai/?utm_campaign=campaign-1',
+      'Lead list: Inbound', 'Campaign: Tenant launch', 'Ad set: Property managers', 'Ad: Video A',
+      'Source / Medium: facebook / paid_social', 'Referrer: https://facebook.com/',
+      'Submitted: Sep 23, 2026, 5:00 AM PT', '', 'Form answers:', 'Number of units: 1000', 'Wants demo: false', '',
+      '<https://app.agentweb.pro/crm?listId=list-a&leadId=lead-a|Open in CRM>',
+    ].join('\n'));
+  });
+
+  it('renders unknown-page custom-only attribution and winter PT exactly', async () => {
+    lead.createdAt = '2026-01-02T02:05:00Z';
+    lead.customFields = { landing_page_name: 'Any new page', landing_page_url: 'https://EXAMPLE.com:443/demo?q=one&x=two',
+      campaign_id: 'unknown-campaign', ad_set_id: 'unknown-set', ad_id: 'unknown-ad', utm_source: 'google', utm_medium: 'cpc',
+      referrer: 'https://example.org/', preferred_time: 'Morning' };
+    await dispatchLeadCreated('list-a', 'lead-a');
+    expect(postMessage.mock.calls[0][0].text).toBe([
+      'New lead:', 'Name: Jane Doe', 'Phone: +1 (415) 555-1234', 'Email: jane@example.com', '',
+      'Attribution:', 'Landing page: Any new page — https://example.com/demo?q=one&amp;x=two',
+      'Lead list: Inbound', 'Campaign: unknown-campaign', 'Ad set: unknown-set', 'Ad: unknown-ad',
+      'Source / Medium: google / cpc', 'Referrer: https://example.org/', 'Submitted: Jan 1, 2026, 6:05 PM PT', '',
+      'Form answers:', 'Preferred time: Morning', '', '<https://app.agentweb.pro/crm?listId=list-a&leadId=lead-a|Open in CRM>',
+    ].join('\n'));
+  });
+
+  it('retains a full long normalized URL and raw click identifiers on lookup failure', async () => {
+    const url = 'https://example.com/path?q=' + 'x'.repeat(400);
+    mock(getLandingPagesByOwner).mockRejectedValue(new Error('offline'));
+    mock(adsMetricsDb.getSnapshotsByUserDateRange).mockRejectedValue(new Error('offline'));
+    lead.firstTouch = { landingUrl: url, utm: { campaign: 'raw' }, clickIds: { fbclid: 'fb-click', gclid: 'g-click' } };
+    await dispatchLeadCreated('list-a', 'lead-a');
+    expect(postMessage.mock.calls[0][0].text).toBe([
+      'New lead:', 'Name: Jane Doe', 'Phone: +1 (415) 555-1234', 'Email: jane@example.com', '',
+      'Attribution:', 'Landing page: ' + url, 'Lead list: Inbound', 'Campaign: raw',
+      'Ad: fbclid=fb-click; gclid=g-click', 'Source / Medium: waterheater-landing', 'Submitted: Sep 23, 2026, 5:00 AM PT', '',
+      '<https://app.agentweb.pro/crm?listId=list-a&leadId=lead-a|Open in CRM>',
+    ].join('\n'));
+  });
+});
+
+it('preserves form questions with attribution-like prefixes and exact URL punctuation', async () => {
+  lead.firstTouch = { landingUrl: 'https://example.com/_offer?q=*special*&other=one_two' };
+  lead.customFields = { campaignGoal: 'More demos', adsetPreference: 'Owners', landingPageFeedback: 'Helpful' };
+  await dispatchLeadCreated('list-a', 'lead-a');
+  const text = postMessage.mock.calls[0][0].text;
+  expect(text).toContain('Landing page: https://example.com/_offer?q=*special*&amp;other=one_two');
+  expect(text).toContain('Campaign goal: More demos');
+  expect(text).toContain('Adset preference: Owners');
+  expect(text).toContain('Landing page feedback: Helpful');
+});
+it('reserves the CRM link even when attribution alone consumes the message budget', async () => {
+  lead.firstTouch = { landingUrl: 'https://example.com/?q=' + 'x'.repeat(11800) };
+  await dispatchLeadCreated('list-a', 'lead-a');
+  const text = postMessage.mock.calls[0][0].text;
+  expect(text.length).toBeLessThanOrEqual(12000);
+  expect(text).toContain('Open in CRM');
+  expect(text).not.toContain('Form answers:');
+});
+it('uses repeat-submission attribution and humanizes duplicate answer labels once', async () => {
+  lead.firstTouch = { utm: { campaign: 'old' }, landingUrl: 'https://example.com/old' };
+  lead.lastTouch = { utm: { campaign: 'new' }, landingUrl: 'https://example.com/new' };
+  lead.customFields = { preferredTime: 'Morning', preferred_time: 'Duplicate' };
+  await dispatchLeadCreated('list-a', 'lead-a', { submissionId: 'repeat', submittedAt: '2026-09-24T01:00:00Z' });
+  const text = postMessage.mock.calls[0][0].text;
+  expect(text).toContain('Campaign: new');
+  expect(text).toContain('Landing page: https://example.com/new');
+  expect(text).toContain('Submitted: Sep 23, 2026, 6:00 PM PT');
+  expect(text).toContain('Preferred time: Morning');
+  expect(text).not.toContain('Duplicate');
+});
+
+it('renders resolved Meta campaign, ad set and ad names in the exact layout', async () => {
+  org.connected_accounts.push({ platform: 'meta', account_id: 'act_123', config: { account_type: 'ad_account', access_token: 'meta-test' } });
+  lead.firstTouch = { utm: { campaign: '789', content: '456', source: 'facebook', medium: 'cpc' } };
+  lead.customFields = { portfolioSize: 100 };
+  const request = jest.spyOn(global, 'fetch').mockResolvedValue({ ok: true, json: async () => ({ id: '456', account_id: '123', name: 'Demo video',
+    campaign: { id: '789', name: 'Tenant launch' }, adset: { id: '234', name: 'Property managers' } }) } as Response);
+  try {
+    await dispatchLeadCreated('list-a', 'lead-a');
+    expect(postMessage.mock.calls[0][0].text).toBe([
+      'New lead:', 'Name: Jane Doe', 'Phone: +1 (415) 555-1234', 'Email: jane@example.com', '',
+      'Attribution:', 'Lead list: Inbound', 'Campaign: Tenant launch', 'Ad set: Property managers', 'Ad: Demo video',
+      'Source / Medium: facebook / cpc', 'Submitted: Sep 23, 2026, 5:00 AM PT', '',
+      'Form answers:', 'Portfolio size: 100', '', '<https://app.agentweb.pro/crm?listId=list-a&leadId=lead-a|Open in CRM>',
+    ].join('\n'));
+    expect(request.mock.calls[0][1]?.headers).toEqual({ Authorization: 'Bearer meta-test' });
+  } finally { request.mockRestore(); }
 });
