@@ -43,6 +43,13 @@ export interface EnrichSoReverseResult {
  */
 export interface SiblingLeadResult {
   leadId: string;
+  /**
+   * Which index found this sibling. `nameCompany` is a GUESS at identity — the query is
+   * table-wide with no tenant predicate — so it is not allowed to donate an email.
+   * Absent when a dep implementation does not report it; callers fall back to the coarser
+   * whole-lead anchor check.
+   */
+  matchedBy?: 'email' | 'linkedin' | 'nameCompany';
   listId?: string;
   userId?: string;
   updatedAt?: string;
@@ -349,11 +356,19 @@ export async function resolveIdentity(
       // are the same-shaped risk but far lower stakes — nothing sends to them.
       const strongAnchor = !!email || !!linkedinUrl;
       for (const field of copyableFields) {
-        if (field === 'email' && !strongAnchor) continue;
         const currentValue = (lead as any)[field];
         if (typeof currentValue === 'string' && currentValue.trim() !== '') continue;
         if (refresh && refresh.has(`${lead.leadId}:${field}`)) continue;
         for (const sib of siblings) {
+          // Per-sibling, not per-lead. findSiblingLeads merges three index queries, so a
+          // lead that HAS a linkedin still pulls in name+company matches — and the coarse
+          // "do we have a strong anchor" test would wave those through. What matters is how
+          // THIS sibling was found. Falls back to the coarse test when a dep does not
+          // report matchedBy.
+          if (field === 'email') {
+            const weakMatch = sib.matchedBy ? sib.matchedBy === 'nameCompany' : !strongAnchor;
+            if (weakMatch) continue;
+          }
           const v = sib[field];
           if (typeof v !== 'string' || v.trim() === '') continue;
           (resolved as any)[field] = v;
