@@ -9826,9 +9826,16 @@ export const crmDb = {
     // email, and creation derives them via buildLeadCrmFields — which is called from
     // exactly one place (createLead). Every later write of an email therefore left the row
     // half-built: in email-index but with no domain and, worse, no lifecycle, so it was
-    // permanently invisible to getLeadsByStatus(listId, lifecycle) and to every inbox view
-    // built on it. ENG-2082 made this routine, because a phone-only lead starts with no
-    // email and enrichment is exactly what fills one in later.
+    // with neither, so nothing downstream that reads them can see it. ENG-2082 made this
+    // routine, because a phone-only lead starts with no email and enrichment is exactly
+    // what fills one in later.
+    //
+    // NB: an earlier version of this comment claimed the row becomes "invisible to
+    // getLeadsByStatus(listId, lifecycle)". That is wrong and worth not repeating —
+    // getLeadsByStatus queries the `status` attribute on listId-status-index and never
+    // reads `lifecycle` at all. sequences.ts:228 does pass a lifecycle value into it, but
+    // that is a separate defect (the two vocabularies are disjoint: status is
+    // contacted/new/qualified/…, lifecycle is inbox/signed_up), filed on its own.
     if (options.topLevel && 'email' in options.topLevel && String(options.topLevel.email ?? '').trim()) {
       if (!('domain' in options.topLevel)) {
         const derivedDomain = extractDomainFromEmail(String(options.topLevel.email));
