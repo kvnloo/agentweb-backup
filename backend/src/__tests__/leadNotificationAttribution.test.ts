@@ -92,6 +92,12 @@ it.each([
   expect(result.landingName).toBe('');
   expect(notificationLookup.pages).toHaveBeenCalledWith('owner', 'page', expect.any(AbortSignal));
 });
+it('accepts the landingPage and pageUrl aliases as full landing URLs', async () => {
+  for (const key of ['landingpage', 'pageurl']) {
+    expect(await resolveNotificationNames('owner', new Map([[key, 'https://example.com/path?utm_source=qa']]), date))
+      .toMatchObject({ landingUrl: 'https://example.com/path?utm_source=qa' });
+  }
+});
 it('resolves a direct page and normalizes its stored URL', async () => {
   mock(notificationLookup.pages).mockResolvedValue([{ id: 'page', userId: 'owner', name: 'Demo', deployedUrl: 'https://EXAMPLE.com/demo' }]);
   expect(await resolveNotificationNames('owner', new Map([['landingpageid', 'page']]), date))

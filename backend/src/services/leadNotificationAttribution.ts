@@ -76,7 +76,7 @@ export function attributionValues(lead: Record<string, any>, repeat: boolean): M
 export async function resolveNotificationNames(userId: string, values: Map<string, string>, submittedAt: string, accounts?: unknown) {
   const get = (...keys: string[]) => keys.map(k => values.get(fieldKey(k)) || '').find(Boolean) || '';
   const result = { landingName: get('landingPageName', 'landingPageTitle'),
-    landingUrl: normalizeLandingUrl(get('landingUrl', 'landingPageUrl')),
+    landingUrl: normalizeLandingUrl(get('landingUrl', 'landingPageUrl', 'pageUrl', 'landingPage')),
     campaign: get('campaignName', 'utm_campaign', 'campaignId', 'campaign', 'utm_id'),
     adSet: get('adSetName', 'adSetId', 'utm_term'),
     ad: get('adName', 'adId', 'utm_content') };
