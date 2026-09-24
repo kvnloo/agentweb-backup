@@ -479,6 +479,25 @@ describe('ENG-1816 F1: attribution leaks fixed via the ambient RunFunding store'
     });
   });
 
+  it('wasStepRemovalUserAuthorized (agentModeService.ts) carries the run owner and never forwards billingUserId', async () => {
+    jest.spyOn(chatbotDb, 'getMostRecentRealUserMessage').mockResolvedValue({
+      content: 'skip that step',
+    } as any);
+    callLLM.mockResolvedValue(llmReply('yes'));
+
+    const authorized = await withRunFunding(funding(), () =>
+      (agentModeService as any).wasStepRemovalUserAuthorized(SESSION, [
+        { fn: 'publish_post', stepTitle: 'Publish' },
+      ]),
+    );
+
+    expect(authorized).toBe(true);
+    expect(usageContextOf(callLLM)).toEqual({
+      feature: 'step_removal_authorization_judge',
+      userId: MEMBER,
+    });
+  });
+
   it('restyleContent outside any RunFunding scope still books to "system" — the ambient store, not a new required parameter, is what changed', async () => {
     callLLM.mockResolvedValue(llmReply(JSON.stringify({
       title: 'A Title',
