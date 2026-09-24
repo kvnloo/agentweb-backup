@@ -8491,11 +8491,23 @@ export async function generateSessionResponse(
     if (result) screenshotUrl = result.url;
   }
 
-  // ENG-1816 F1: resolved once here — this is the single choke point every entry
+  // ENG-1816 F1: resolved once here — this is the choke point every AGENT-MODE entry
   // path (interactive, scheduled via runVerifiedChat, work-plan continuation, API/
-  // MCP) already converges on before crossing the worker fork, so no other call site
-  // needs its own resolveRunFunding call. F1 always resolves 'agentweb'; A1+/B1+ make
-  // the result meaningful once a real connection exists to route to.
+  // MCP) converges on before crossing the worker fork, so none of those call sites
+  // need their own resolveRunFunding call. NOT the only entry into the worker:
+  // controllers/benchmark.ts calls generateMarketingResponseWorkerService.runInWorker
+  // directly for benchmark runs, bypassing this. Harmless today only because the
+  // worker's own fallback (generateMarketingResponseWorker.ts) reconstructs
+  // RunFunding from the always-present userId when none was sent — but that
+  // fallback must not be relied on once a real non-agentweb route exists; benchmark
+  // runs will need their own resolveRunFunding call before that lands. Also not the
+  // choke point for Emma's *other* turn loop — the sidebar assistant
+  // (chatbotService.generateChatResponse) is resolved separately, at its own 3
+  // call sites (chatSocketHandler.ts, controllers/chatbot.ts) — and for internal
+  // MCP tool calls, which resolve lazily inside mcp/server/registry.ts's execute()
+  // only when no ambient RunFunding is already active. F1 always resolves
+  // 'agentweb' everywhere; A1+/B1+ make the result meaningful once a real
+  // connection exists to route to.
   const runFunding = await resolveRunFunding({ userId });
 
   // Generate AI response using worker process to prevent blocking the main event loop
