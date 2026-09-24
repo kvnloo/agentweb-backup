@@ -446,17 +446,31 @@ export class ApprovalInboxService {
     return (result.Item as ApprovalDecision | undefined) ?? null;
   }
 
-  async listPendingForApprover(approver: ApprovalDecisionApprover, limit = 50): Promise<ApprovalDecision[]> {
-    // DynamoDB applies Limit to items READ before FilterExpression is
-    // evaluated, not to items returned after filtering — a plain single
-    // query with Limit would silently stop short of a genuinely pending item
-    // that happens to sort past the first `limit` historical (any-status)
-    // records for this approver. Page through with LastEvaluatedKey,
-    // accumulating only matches, until either the index is exhausted or we
-    // have `limit` real pending matches (review fix). Capped at
-    // MAX_PENDING_LOOKUP_PAGES pages — a worst-case bound against an
-    // approver with an enormous, mostly-resolved history and near-zero
-    // currently pending, so this can never turn into an unbounded scan.
+  /**
+   * Shared by listPendingForApprover/listPendingForCustomer — both are a
+   * "query one GSI's partition, filter to one pending status" lookup that
+   * differ only in index/key. DynamoDB applies Limit to items READ before
+   * FilterExpression is evaluated, not to items returned after filtering —
+   * a single page could scan straight past a genuinely pending item sorted
+   * behind older, already-resolved history for the same partition key
+   * (review fix). Pages with a real per-page Limit (so each round trip
+   * stays bounded, unlike a plain unbounded query) via ExclusiveStartKey,
+   * accumulating only real matches, until either the index is exhausted,
+   * `limit` matches are found, or MAX_PENDING_LOOKUP_PAGES round trips are
+   * spent — a worst-case bound against an enormous, mostly-resolved history
+   * with near-zero currently pending, so this can never turn into an
+   * unbounded scan (review fix — the codebase's existing generic
+   * paginatedQuery helper, utils/dynamoPagination.ts, doesn't support this
+   * bounded early-exit shape, so this stays a dedicated helper here rather
+   * than misusing that one).
+   */
+  private async listPendingByIndex(
+    indexName: string,
+    keyName: string,
+    keyValue: string,
+    pendingStatus: ApprovalDecisionStatus,
+    limit: number,
+  ): Promise<ApprovalDecision[]> {
     const matches: ApprovalDecision[] = [];
     let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
     let pages = 0;
@@ -464,12 +478,13 @@ export class ApprovalInboxService {
       const result = await dynamodb
         .query({
           TableName: APPROVAL_DECISIONS_TABLE,
-          IndexName: 'ApproverIndex',
-          KeyConditionExpression: 'approver = :approver',
+          IndexName: indexName,
+          KeyConditionExpression: `${keyName} = :keyValue`,
           FilterExpression: '#status = :pending',
           ExpressionAttributeNames: { '#status': 'status' },
-          ExpressionAttributeValues: { ':approver': approver, ':pending': 'pending_team_review' },
+          ExpressionAttributeValues: { ':keyValue': keyValue, ':pending': pendingStatus },
           ScanIndexForward: true,
+          Limit: limit,
           ExclusiveStartKey: lastEvaluatedKey,
         })
         .promise();
@@ -480,32 +495,12 @@ export class ApprovalInboxService {
     return matches.slice(0, limit);
   }
 
+  async listPendingForApprover(approver: ApprovalDecisionApprover, limit = 50): Promise<ApprovalDecision[]> {
+    return this.listPendingByIndex('ApproverIndex', 'approver', approver, 'pending_team_review', limit);
+  }
+
   async listPendingForCustomer(customerId: string, limit = 50): Promise<ApprovalDecision[]> {
-    // Same Limit-before-FilterExpression hazard as listPendingForApprover
-    // above — page through rather than risk missing a real pending decision
-    // behind a customer's older, already-resolved history (review fix).
-    // Same worst-case page cap as listPendingForApprover above.
-    const matches: ApprovalDecision[] = [];
-    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
-    let pages = 0;
-    do {
-      const result = await dynamodb
-        .query({
-          TableName: APPROVAL_DECISIONS_TABLE,
-          IndexName: 'CustomerIndex',
-          KeyConditionExpression: 'customerId = :customerId',
-          FilterExpression: '#status = :pending',
-          ExpressionAttributeNames: { '#status': 'status' },
-          ExpressionAttributeValues: { ':customerId': customerId, ':pending': 'pending_customer_response' },
-          ScanIndexForward: true,
-          ExclusiveStartKey: lastEvaluatedKey,
-        })
-        .promise();
-      matches.push(...((result.Items as ApprovalDecision[] | undefined) ?? []));
-      lastEvaluatedKey = result.LastEvaluatedKey;
-      pages++;
-    } while (lastEvaluatedKey && matches.length < limit && pages < MAX_PENDING_LOOKUP_PAGES);
-    return matches.slice(0, limit);
+    return this.listPendingByIndex('CustomerIndex', 'customerId', customerId, 'pending_customer_response', limit);
   }
 
   /**
@@ -520,15 +515,22 @@ export class ApprovalInboxService {
     // Normalize both sides before comparing — credentialPlatform is
     // free-text Emma writes at stage time (e.g. "Meta" vs "meta"), and stray
     // whitespace on either side would otherwise silently miss a real match
-    // (review fix).
+    // (review fix). Also strip a leading "act_" from the account id — this
+    // exact ambiguity already has a real, established precedent in this
+    // codebase (metaService.ts's own norm() helper, and 3 other tool schemas
+    // explicitly warning Emma "no act_ prefix") because Meta's own API
+    // surfaces the id both with and without it; a real reconnect always
+    // passes the bare form, so a credentialAccountId written WITH the prefix
+    // must still match (review fix).
     const normPlatform = platform.trim().toLowerCase();
-    const normAccountId = accountId.trim().toLowerCase();
+    const normAccountId = (v: string) => v.trim().toLowerCase().replace(/^act_/, '');
+    const normTargetAccountId = normAccountId(accountId);
     return (
       pending.find(
         (d) =>
           d.gateType === 'customer_credential' &&
           d.credentialPlatform?.trim().toLowerCase() === normPlatform &&
-          d.credentialAccountId?.trim().toLowerCase() === normAccountId,
+          (d.credentialAccountId ? normAccountId(d.credentialAccountId) : undefined) === normTargetAccountId,
       ) ?? null
     );
   }

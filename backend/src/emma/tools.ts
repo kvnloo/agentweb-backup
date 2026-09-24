@@ -419,7 +419,12 @@ For a customer-facing credential reconnect (e.g. a disconnected ad account or CM
         },
         credentialPlatform: {
           type: 'string',
-          description: 'Required for gateType="customer_credential". Which platform this reconnect is about, e.g. "meta", "instagram", or "linkedin" — must match the platform value used elsewhere for this customer\'s connected accounts. Instagram is a distinct platform from Meta ad accounts — use "instagram", never "meta", for an Instagram reconnect.',
+          // Constrained to exactly the platforms whose reconnect routes call
+          // autoResolveCredentialDecisionOnReconnect — a free-text value
+          // Emma might otherwise write (e.g. "Facebook Ads") would silently
+          // never match at reconnect time (review fix).
+          enum: ['meta', 'instagram', 'linkedin'],
+          description: 'Required for gateType="customer_credential". Which platform this reconnect is about — must match the platform value used elsewhere for this customer\'s connected accounts. Instagram is a distinct platform from Meta ad accounts — use "instagram", never "meta", for an Instagram reconnect.',
         },
         credentialAccountId: {
           type: 'string',
@@ -484,12 +489,16 @@ For a customer-facing credential reconnect (e.g. a disconnected ad account or CM
     // Clamped to a sane [1, 30]-day window — an unbounded/non-finite value
     // here (e.g. Infinity, or a model typo like 700) would either produce an
     // invalid Date (toISOString() throws) or a decision that outlives any
-    // realistic review cadence (review fix).
+    // realistic review cadence (review fix). The lower bound matters too —
+    // `> 0` alone let a tiny value like 0.0005 through, producing a decision
+    // that's already past its own expiresAt within milliseconds of creation
+    // (review fix).
+    const MIN_EXPIRES_IN_DAYS = 1;
     const MAX_EXPIRES_IN_DAYS = 30;
     const rawExpiresInDays = args?.expiresInDays;
     const expiresInDays =
       typeof rawExpiresInDays === 'number' && Number.isFinite(rawExpiresInDays) && rawExpiresInDays > 0
-        ? Math.min(rawExpiresInDays, MAX_EXPIRES_IN_DAYS)
+        ? Math.min(Math.max(rawExpiresInDays, MIN_EXPIRES_IN_DAYS), MAX_EXPIRES_IN_DAYS)
         : 7;
     const expiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString();
 

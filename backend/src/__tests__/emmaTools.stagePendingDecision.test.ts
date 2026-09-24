@@ -201,6 +201,22 @@ describe('stage_pending_decision', () => {
     }
   });
 
+  it('clamps a tiny positive expiresInDays up to 1 day instead of creating an already-expired decision (review fix)', async () => {
+    const tool = emmaToolRegistry.getTool('stage_pending_decision')!;
+    const before = Date.now();
+
+    await tool.execute(
+      { audience: 'team', approver: 'harsha', gateType: 'plan_choice', businessImpact: 'x', evidencePacket: {}, expiresInDays: 0.0005, options: [
+        { label: 'A', consequence: 'x', recommended: true },
+        { label: 'B', consequence: 'x' },
+      ] },
+      { userId: 'user-1', sessionId: 'sess-1' },
+    );
+    const expiry = new Date(mockCreateDecision.mock.calls[0][0].expiresAt).getTime();
+    // Clamped up to the 1-day floor, not left at ~43ms in the future.
+    expect(expiry).toBeGreaterThanOrEqual(before + 23 * 60 * 60 * 1000);
+  });
+
   it('propagates a createDecision validation error as a failed tool result, not a throw', async () => {
     mockCreateDecision.mockRejectedValue(new Error('options must have exactly one recommended:true entry'));
     const tool = emmaToolRegistry.getTool('stage_pending_decision')!;

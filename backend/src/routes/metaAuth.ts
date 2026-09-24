@@ -61,6 +61,27 @@ async function retrieveTokenSession(sessionId: string, userId: string) {
     return session;
 }
 
+/**
+ * ENG-1644 gap-closing: if the customer had a pending reconnect decision for
+ * this exact account, this real reconnect resolves it. Dynamic import —
+ * approvalInboxCustomerNotify.ts transitively pulls in
+ * emailService/chatbotService/agentModeService, too heavy to load statically
+ * into this lightweight OAuth route file. The function itself never throws,
+ * but the import statement can — own try/catch (review fix) so that can't
+ * abort a response after earlier accounts in the same loop already
+ * connected. Shared by both call sites in this file (review fix — the
+ * inline block was flagged as duplicated 4x across this file and
+ * linkedinAuth.ts by 3 independent review passes).
+ */
+async function safeAutoResolveCredentialDecision(label: string, userId: string, platform: string, accountId: string): Promise<void> {
+    try {
+        const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
+        await autoResolveCredentialDecisionOnReconnect(userId, platform, accountId);
+    } catch (err: any) {
+        console.warn(`[${label}] auto-resolve credential decision failed:`, err?.message || err);
+    }
+}
+
 // ============================================
 // Routes
 // ============================================
@@ -348,22 +369,7 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
             });
             connectedAccounts.push(account);
 
-            // ENG-1644 gap-closing: if the customer had a pending reconnect
-            // decision for this exact account, this real reconnect resolves
-            // it. Dynamic import — approvalInboxCustomerNotify.ts transitively
-            // pulls in emailService/chatbotService/agentModeService, too heavy
-            // to load statically into a lightweight OAuth route file.
-            // Self-contained/never-throws — must not affect this response.
-            // The function itself already never throws, but the import
-            // statement CAN (module-load failure) — wrapped in its own
-            // try/catch (review fix) so that risk can't abort the loop and
-            // lose already-connected accounts' success from this response.
-            try {
-                const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
-                await autoResolveCredentialDecisionOnReconnect(userId, 'meta', adAccount.account_id);
-            } catch (autoResolveErr: any) {
-                console.warn('[Meta Connect Ad Accounts] auto-resolve credential decision failed:', autoResolveErr?.message || autoResolveErr);
-            }
+            await safeAutoResolveCredentialDecision('Meta Connect Ad Accounts', userId, 'meta', adAccount.account_id);
         }
 
         res.json({ success: true, connectedAccounts });
@@ -411,13 +417,7 @@ router.post('/connect-instagram', authenticateToken, async (req: any, res) => {
         // ENG-1644 gap-closing (review fix): missed on the first pass —
         // Instagram is a distinct platform from Meta ad accounts in this
         // reconnect system, same treatment as /connect-ad-accounts above.
-        // Own try/catch (review fix) — see that call site's comment for why.
-        try {
-            const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
-            await autoResolveCredentialDecisionOnReconnect(userId, 'instagram', instagramAccount.id);
-        } catch (autoResolveErr: any) {
-            console.warn('[Meta Connect Instagram] auto-resolve credential decision failed:', autoResolveErr?.message || autoResolveErr);
-        }
+        await safeAutoResolveCredentialDecision('Meta Connect Instagram', userId, 'instagram', instagramAccount.id);
 
         res.json({ success: true, connectedAccount: account });
 

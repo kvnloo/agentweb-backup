@@ -25,6 +25,24 @@ const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
+/**
+ * ENG-1644 gap-closing: resolve any pending reconnect decision for this
+ * exact account. Dynamic import — see metaAuth.ts's identical comment for
+ * why (heavy transitive chain, must stay out of this file's static load).
+ * The function itself never throws, but the import statement can — own
+ * try/catch (review fix) so that can't abort the response. Shared by both
+ * call sites in this file (review fix — flagged as duplicated 4x across
+ * this file and metaAuth.ts by 3 independent review passes).
+ */
+async function safeAutoResolveCredentialDecision(label: string, userId: string, platform: string, accountId: string): Promise<void> {
+  try {
+    const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
+    await autoResolveCredentialDecisionOnReconnect(userId, platform, accountId);
+  } catch (err: any) {
+    console.warn(`[${label}] auto-resolve credential decision failed:`, err?.message || err);
+  }
+}
+
 interface StatePayload {
   userId: string;
   nonce: string;
@@ -369,18 +387,7 @@ router.post('/connect-accounts', authenticateToken, async (req: any, res) => {
       const account = await createAccount(userId, 'linkedin', accountInput);
       connectedAccounts.push(account);
 
-      // ENG-1644 gap-closing: resolve any pending reconnect decision for
-      // this exact account. Dynamic import — see metaAuth.ts's identical
-      // comment for why (heavy transitive chain, must stay out of this
-      // file's static load). The function itself never throws, but the
-      // import statement can — own try/catch (review fix) so that can't
-      // abort the response after accounts already connected.
-      try {
-        const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
-        await autoResolveCredentialDecisionOnReconnect(userId, 'linkedin', profile.urn);
-      } catch (autoResolveErr: any) {
-        console.warn('[LinkedIn Connect] auto-resolve credential decision failed:', autoResolveErr?.message || autoResolveErr);
-      }
+      await safeAutoResolveCredentialDecision('LinkedIn Connect', userId, 'linkedin', profile.urn);
     }
 
     // Connect selected organizations
@@ -406,14 +413,8 @@ router.post('/connect-accounts', authenticateToken, async (req: any, res) => {
         const account = await createAccount(userId, 'linkedin', accountInput);
         connectedAccounts.push(account);
 
-        // ENG-1644 gap-closing: same as the personal-account case above,
-        // including the own try/catch (review fix).
-        try {
-          const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
-          await autoResolveCredentialDecisionOnReconnect(userId, 'linkedin', org.urn);
-        } catch (autoResolveErr: any) {
-          console.warn('[LinkedIn Connect] auto-resolve credential decision failed (org):', autoResolveErr?.message || autoResolveErr);
-        }
+        // ENG-1644 gap-closing: same as the personal-account case above.
+        await safeAutoResolveCredentialDecision('LinkedIn Connect (org)', userId, 'linkedin', org.urn);
       }
     }
 

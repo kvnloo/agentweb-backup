@@ -335,6 +335,15 @@ describe('approvalInboxService.listPendingForApprover / listPendingForCustomer (
     expect(mockDynamoDB.query.mock.calls.length).toBeLessThan(1000);
     expect(mockDynamoDB.query.mock.calls.length).toBeGreaterThan(1);
   });
+
+  it('review fix: each page still carries a real Limit — pagination fixed the correctness bug without leaving every round trip unbounded', async () => {
+    mockDynamoDB.query.mockReturnValue(ok({ Items: [{ decisionId: 'm1', status: 'pending_team_review' }] }));
+
+    await service.listPendingForApprover('matt', 25);
+
+    const params = mockDynamoDB.query.mock.calls[0][0];
+    expect(params.Limit).toBe(25);
+  });
 });
 
 describe('approvalInboxService.findPendingCredentialDecision', () => {
@@ -348,6 +357,16 @@ describe('approvalInboxService.findPendingCredentialDecision', () => {
 
     const result = await service.findPendingCredentialDecision('cust-1', 'meta', 'act_123');
     expect(result?.decisionId).toBe('d2');
+  });
+
+  it('matches regardless of a leading "act_" prefix on either side (review fix — Meta surfaces the id both ways)', async () => {
+    mockDynamoDB.query.mockReturnValue(ok({
+      Items: [{ decisionId: 'd1', gateType: 'customer_credential', credentialPlatform: 'meta', credentialAccountId: 'act_555' }],
+    }));
+
+    // Decision was stored WITH the prefix; a real reconnect passes the bare id.
+    const result = await service.findPendingCredentialDecision('cust-1', 'meta', '555');
+    expect(result?.decisionId).toBe('d1');
   });
 
   it('returns null when no pending decision matches the platform+accountId', async () => {

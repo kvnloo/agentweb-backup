@@ -167,7 +167,18 @@ export async function upsertApproverQueueMessage(approver: ApprovalDecisionAppro
   if (!result.ok || !result.ts) {
     throw new Error(`Failed to post approval-inbox message for ${approver}: ${result.error}`);
   }
-  await setMessageRef(approver, { channel, messageTs: result.ts });
+  // Review fix: chat.postMessage has ALREADY genuinely succeeded at this
+  // point — a failure in this bookkeeping write must not make the caller
+  // think nothing was posted (it was), which would otherwise cause a
+  // duplicate postDecisionAddedNotice on top of a post that already
+  // happened. Ref-tracking failing just means the NEXT upsert won't find it
+  // and posts fresh again — a real but much smaller cost than a guaranteed
+  // double-notify.
+  try {
+    await setMessageRef(approver, { channel, messageTs: result.ts });
+  } catch (err: any) {
+    console.warn('[approval-inbox-slack] posted fresh message but failed to save its ref:', err?.message || err);
+  }
   return { posted: true };
 }
 
@@ -275,21 +286,38 @@ export async function resolveApprovalDecision(
   return result;
 }
 
+/**
+ * Shared scaffold for every one-off, always-fresh notice this file posts
+ * (resolved / added / expired) — same slackClient guard, channel lookup,
+ * postMessage call, and swallow-and-warn failure handling; only the message
+ * text differs per caller (review fix — 3rd near-identical copy was the
+ * signal this needed factoring, not 2). Takes a text BUILDER, not a plain
+ * string, so any async work needed to build the text (e.g. postDecisionAddedNotice's
+ * mention lookup) still runs inside both the slackClient guard (no wasted
+ * work when Slack is disabled) and the try/catch (still failure-isolated) —
+ * a plain-string signature would silently move that work outside both.
+ */
+async function postApproverNotice(
+  approver: ApprovalDecisionApprover,
+  buildText: () => Promise<string> | string,
+  failureLabel: string,
+): Promise<void> {
+  if (!slackClient) return;
+  try {
+    const text = await buildText();
+    const channel = await getApproverChannel(approver);
+    await slackClient.chat.postMessage({ channel, text });
+  } catch (err: any) {
+    console.warn(`[approval-inbox-slack] failed to post ${failureLabel}:`, err?.message || err);
+  }
+}
+
 export async function postDecisionResolvedNotice(approver: ApprovalDecisionApprover, decision: ApprovalDecision): Promise<void> {
   // The re-rendered queue message already reflects the resolution (the item
   // simply disappears from the pending list) — this is an additional,
   // explicit confirmation in-channel so the resolution isn't silent.
-  if (!slackClient) return;
-  try {
-    const channel = await getApproverChannel(approver);
-    const verdictLabel = decision.verdict === 'approve' ? '✅ Approved' : decision.verdict === 'reject' ? '❌ Rejected' : '💬 Edited';
-    await slackClient.chat.postMessage({
-      channel,
-      text: `${verdictLabel}: ${decision.businessImpact}`,
-    });
-  } catch (err: any) {
-    console.warn('[approval-inbox-slack] failed to post resolution notice:', err?.message || err);
-  }
+  const verdictLabel = decision.verdict === 'approve' ? '✅ Approved' : decision.verdict === 'reject' ? '❌ Rejected' : '💬 Edited';
+  await postApproverNotice(approver, () => `${verdictLabel}: ${decision.businessImpact}`, 'resolution notice');
 }
 
 /**
@@ -304,16 +332,25 @@ export async function postDecisionResolvedNotice(approver: ApprovalDecisionAppro
  * always-new chat.postMessage — a real notification, not a silent edit.
  */
 export async function postDecisionAddedNotice(approver: ApprovalDecisionApprover, decision: ApprovalDecision): Promise<void> {
-  if (!slackClient) return;
-  try {
-    const channel = await getApproverChannel(approver);
-    const slackUserId = await getApproverSlackUserId(approver);
-    const mention = slackUserId ? `<@${slackUserId}>` : approver;
-    await slackClient.chat.postMessage({
-      channel,
-      text: `🔔 ${mention} — new decision: ${decision.businessImpact}`,
-    });
-  } catch (err: any) {
-    console.warn('[approval-inbox-slack] failed to post new-decision notice:', err?.message || err);
-  }
+  await postApproverNotice(
+    approver,
+    async () => {
+      const slackUserId = await getApproverSlackUserId(approver);
+      const mention = slackUserId ? `<@${slackUserId}>` : approver;
+      return `🔔 ${mention} — new decision: ${decision.businessImpact}`;
+    },
+    'new-decision notice',
+  );
+}
+
+/**
+ * Review fix: the expiry sweep was only re-rendering the queue message
+ * (chat.update) when a decision expired — the exact "an edit alone doesn't
+ * notify" gap postDecisionAddedNotice exists to close, left open for
+ * expiry. Without this, an approver has no way to tell "this expired" apart
+ * from "someone else already claimed it" or a rendering glitch — the item
+ * just silently vanishes from the queue.
+ */
+export async function postDecisionExpiredNotice(approver: ApprovalDecisionApprover, decision: ApprovalDecision): Promise<void> {
+  await postApproverNotice(approver, () => `⏳ Expired with no answer: ${decision.businessImpact}`, 'expiry notice');
 }

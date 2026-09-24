@@ -15,7 +15,7 @@ import { approvalInboxService, type ApprovalDecision } from '../services/approva
 import { notifyOriginSessionOfExpiry } from '../services/approvalInboxExecution';
 // approvalInboxExecution.ts (imported above) already transitively pulls in
 // chatbotService.ts, so this adds no new heavy import chain to this file.
-import { upsertApproverQueueMessage } from '../services/approvalInboxSlack';
+import { upsertApproverQueueMessage, postDecisionExpiredNotice } from '../services/approvalInboxSlack';
 
 const TAG = '[approvalExpirySweepCron]';
 
@@ -51,6 +51,15 @@ async function processDueDecision(decision: ApprovalDecision, summary: ApprovalE
       } catch (slackErr) {
         console.warn(`${TAG} Failed to refresh Slack queue after expiring decision ${decision.decisionId}:`, slackErr);
       }
+      // Review fix: the queue refresh above is a silent edit (chat.update)
+      // — an approver can't tell "this expired" apart from "someone else
+      // claimed it" from that alone. A real, always-new message, same
+      // reasoning as postDecisionAddedNotice.
+      try {
+        await postDecisionExpiredNotice(result.decision.approver, result.decision);
+      } catch (slackErr) {
+        console.warn(`${TAG} Failed to post expiry notice for decision ${decision.decisionId}:`, slackErr);
+      }
     }
   } catch (error) {
     summary.failed++;
@@ -73,6 +82,13 @@ export async function runApprovalExpirySweep(): Promise<ApprovalExpirySweepSumma
     } catch (error) {
       console.error(`${TAG} Failed to query due decisions for status ${status}:`, error);
       continue;
+    }
+    // listDuePending caps at Limit:100 with no pagination — self-healing
+    // (the next hourly tick picks up whatever's left), but a silent partial
+    // run reads identically to a complete one in the summary log unless
+    // flagged (review fix).
+    if (dueDecisions.length >= 100) {
+      console.warn(`${TAG} Hit the 100-item cap for status ${status} — backlog likely exceeds this tick, remainder deferred to next run.`);
     }
     summary.scanned += dueDecisions.length;
     for (const decision of dueDecisions) {

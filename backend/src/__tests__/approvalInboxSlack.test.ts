@@ -138,6 +138,19 @@ describe('approvalInboxSlack', () => {
       expect(mockPostMessage).toHaveBeenCalledTimes(1);
       expect(result).toEqual({ posted: true });
     });
+
+    it('still reports posted:true when the real post succeeded but saving its ref afterward throws (review fix)', async () => {
+      mockListPending.mockResolvedValue([{ decisionId: 'd1', businessImpact: 'x', evidencePacket: {}, options: [] }]);
+      mockSetSetting.mockRejectedValue(new Error('settings write failed'));
+
+      const result = await approvalInboxSlack.upsertApproverQueueMessage('matt');
+
+      // chat.postMessage genuinely succeeded — the caller (stage_pending_decision)
+      // relies on posted:true here to avoid a real double-notify on top of a
+      // post that already went out.
+      expect(mockPostMessage).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({ posted: true });
+    });
   });
 
   describe('resolveApprovalDecision', () => {
@@ -229,6 +242,27 @@ describe('approvalInboxSlack', () => {
       } finally {
         process.env.SLACK_BOT_TOKEN = 'xoxb-test';
       }
+    });
+  });
+
+  describe('postDecisionExpiredNotice (review fix)', () => {
+    const decision: any = { decisionId: 'd1', approver: 'harsha', businessImpact: 'A CTA image needs sign-off.' };
+
+    it('posts a real, new chat.postMessage distinct from the queue-refresh edit', async () => {
+      mockGetApproverChannel.mockResolvedValue('C-HARSHA');
+      await approvalInboxSlack.postDecisionExpiredNotice('harsha', decision);
+
+      expect(mockPostMessage).toHaveBeenCalledTimes(1);
+      expect(mockUpdate).not.toHaveBeenCalled();
+      const call = mockPostMessage.mock.calls[0][0];
+      expect(call.channel).toBe('C-HARSHA');
+      expect(call.text).toContain('Expired');
+      expect(call.text).toContain('A CTA image needs sign-off.');
+    });
+
+    it('a post failure is swallowed — never throws', async () => {
+      mockPostMessage.mockRejectedValue(new Error('Slack API down'));
+      await expect(approvalInboxSlack.postDecisionExpiredNotice('harsha', decision)).resolves.toBeUndefined();
     });
   });
 });
