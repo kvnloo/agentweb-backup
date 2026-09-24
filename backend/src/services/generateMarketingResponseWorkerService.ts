@@ -245,6 +245,14 @@ export class GenerateMarketingResponseWorkerService {
         if (message.retryAfterMs !== undefined) {
           error.retryAfterMs = message.retryAfterMs;
         }
+        // ENG-2121: restore the whole-turn-timeout tag so the controller's own
+        // backstop (withGenerationTimeout's caller — salvages any images/tool work
+        // already persisted this turn) treats a bounded per-call LLM timeout the
+        // same as its own hard-cap race firing, instead of silently losing the
+        // signal at this same IPC boundary ENG-1670 already had to patch once.
+        if (message.isGenerationTimeout) {
+          error.isGenerationTimeout = message.isGenerationTimeout;
+        }
         pending.reject(error);
       }
     });
