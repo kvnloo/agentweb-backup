@@ -1,0 +1,262 @@
+import { WebClient } from '@slack/web-api';
+import { resolveSlackApiUrl } from './slackService';
+import { settingsService } from './settingsService';
+import { getApproverChannel, getApproverSlackUserId, getFallbackApproverSlackUserIds } from './approverDirectory';
+import {
+  approvalInboxService,
+  type ApprovalDecision,
+  type ApprovalDecisionApprover,
+  type ApprovalDecisionVerdict,
+} from './approvalInboxService';
+
+/**
+ * ENG-1644 Phase C: ONE live, upsertable Slack message per approver,
+ * re-rendered whole on every create/resolve event for that approver's
+ * queue — deliberately NOT one message per decision, which would reproduce
+ * the exact serial-prompt problem this ticket exists to kill.
+ *
+ * Rebuilds the message's blocks from the CURRENT DB state on every call
+ * (via listPendingForApprover) rather than incrementally patching blocks
+ * the way updateApprovalMessage (slackService.ts, one-asset case) does —
+ * simpler and can't drift from what's actually still pending.
+ */
+
+let slackClient: WebClient | null = null;
+if (process.env.SLACK_BOT_TOKEN) {
+  const slackApiUrl = resolveSlackApiUrl();
+  slackClient = slackApiUrl
+    ? new WebClient(process.env.SLACK_BOT_TOKEN, { slackApiUrl })
+    : new WebClient(process.env.SLACK_BOT_TOKEN);
+}
+
+function messageRefSettingName(approver: ApprovalDecisionApprover): string {
+  return `approval_inbox_message_ref_${approver}`;
+}
+
+interface MessageRef {
+  channel: string;
+  messageTs: string;
+}
+
+async function getMessageRef(approver: ApprovalDecisionApprover): Promise<MessageRef | null> {
+  const setting = await settingsService.getSetting(messageRefSettingName(approver));
+  if (!setting?.settingValue) return null;
+  try {
+    const parsed = JSON.parse(setting.settingValue);
+    return parsed?.channel && parsed?.messageTs ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function setMessageRef(approver: ApprovalDecisionApprover, ref: MessageRef): Promise<void> {
+  await settingsService.setSetting(
+    messageRefSettingName(approver),
+    JSON.stringify(ref),
+    `Live approval-inbox queue message for ${approver}`,
+    'approval-inbox',
+  );
+}
+
+function decisionItemBlocks(decision: ApprovalDecision): any[] {
+  const links = decision.evidencePacket?.links?.filter(Boolean) || [];
+  if (decision.evidencePacket?.chatUrl) links.unshift(decision.evidencePacket.chatUrl);
+
+  const summaryLines = [
+    `*${decision.businessImpact}*`,
+    decision.evidencePacket?.researchSummary,
+    links.length > 0 ? links.map((l) => `<${l}|link>`).join(' · ') : undefined,
+  ].filter(Boolean);
+
+  const optionLines = (decision.options || [])
+    .map((o) => `${o.recommended ? '⭐ ' : ''}*${o.label}* — ${o.consequence}${o.recommended && o.why ? ` _(${o.why})_` : ''}`)
+    .join('\n');
+
+  return [
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: summaryLines.join('\n') + (optionLines ? `\n${optionLines}` : '') },
+    },
+    {
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: '✅ Approve', emoji: true },
+          style: 'primary',
+          action_id: 'approve_decision',
+          value: JSON.stringify({ decisionId: decision.decisionId }),
+        },
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: '💬 Edit', emoji: true },
+          action_id: 'edit_decision',
+          value: JSON.stringify({ decisionId: decision.decisionId }),
+        },
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: '❌ Reject', emoji: true },
+          style: 'danger',
+          action_id: 'reject_decision',
+          value: JSON.stringify({ decisionId: decision.decisionId }),
+        },
+      ],
+    },
+    { type: 'divider' },
+  ];
+}
+
+async function renderApproverQueueMessage(approver: ApprovalDecisionApprover): Promise<{ text: string; blocks: any[] }> {
+  const decisions = await approvalInboxService.listPendingForApprover(approver);
+  const slackUserId = await getApproverSlackUserId(approver);
+  const mention = slackUserId ? `<@${slackUserId}>` : approver;
+
+  if (decisions.length === 0) {
+    return {
+      text: `${approver}'s approval queue is empty.`,
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `${mention} — no pending decisions right now.` } }],
+    };
+  }
+
+  const blocks: any[] = [
+    { type: 'section', text: { type: 'mrkdwn', text: `${mention} — *${decisions.length} pending decision${decisions.length === 1 ? '' : 's'}*` } },
+    { type: 'divider' },
+  ];
+  for (const decision of decisions) blocks.push(...decisionItemBlocks(decision));
+
+  return {
+    text: `${approver} has ${decisions.length} pending decision${decisions.length === 1 ? '' : 's'}`,
+    blocks,
+  };
+}
+
+/**
+ * Re-render and upsert an approver's queue message. Call this after ANY
+ * create or resolve event affecting that approver's queue.
+ */
+export async function upsertApproverQueueMessage(approver: ApprovalDecisionApprover): Promise<void> {
+  if (!slackClient) {
+    console.warn('[approval-inbox-slack] Slack client not initialized (SLACK_BOT_TOKEN unset) — skipping post');
+    return;
+  }
+
+  const { text, blocks } = await renderApproverQueueMessage(approver);
+  const existingRef = await getMessageRef(approver);
+
+  if (existingRef) {
+    try {
+      const result = await slackClient.chat.update({ channel: existingRef.channel, ts: existingRef.messageTs, text, blocks });
+      if (result.ok) return;
+      console.warn('[approval-inbox-slack] chat.update failed, will post a fresh message:', result.error);
+    } catch (err: any) {
+      console.warn('[approval-inbox-slack] chat.update threw, will post a fresh message:', err?.message || err);
+    }
+  }
+
+  const channel = await getApproverChannel(approver);
+  const result = await slackClient.chat.postMessage({ channel, text, blocks });
+  if (!result.ok || !result.ts) {
+    throw new Error(`Failed to post approval-inbox message for ${approver}: ${result.error}`);
+  }
+  await setMessageRef(approver, { channel, messageTs: result.ts });
+}
+
+export const APPROVAL_DECISION_ACTION_IDS = ['approve_decision', 'reject_decision', 'edit_decision'] as const;
+export type ApprovalDecisionActionId = typeof APPROVAL_DECISION_ACTION_IDS[number];
+
+/**
+ * The real, currently-absent gap the plan called out: approve_asset's own
+ * handler has zero identity check today (only Slack's own token/team-id are
+ * verified). Refuses any clicking Slack user who isn't the decision's named
+ * approver AND isn't on the configured fallback allowlist.
+ */
+export async function isAuthorizedApprover(decision: ApprovalDecision, clickingSlackUserId: string): Promise<boolean> {
+  if (!decision.approver) return false;
+  const approverSlackId = await getApproverSlackUserId(decision.approver);
+  if (approverSlackId && approverSlackId === clickingSlackUserId) return true;
+  const fallbackIds = await getFallbackApproverSlackUserIds();
+  return fallbackIds.includes(clickingSlackUserId);
+}
+
+/**
+ * Reject/Edit both need free text (reject's is optional context, edit's is
+ * the mandatory correction) — same modal shape as slackService.ts's own
+ * openRejectModal, generalized to carry a decisionId instead of an assetUrl.
+ */
+export async function openDecisionVerdictModal(
+  triggerId: string,
+  decisionId: string,
+  verdict: 'reject' | 'edit',
+): Promise<void> {
+  if (!slackClient) throw new Error('Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.');
+
+  const isEdit = verdict === 'edit';
+  await slackClient.views.open({
+    trigger_id: triggerId,
+    view: {
+      type: 'modal',
+      callback_id: 'approval_decision_verdict_modal',
+      title: { type: 'plain_text', text: isEdit ? 'Chat about this' : 'Reject' },
+      submit: { type: 'plain_text', text: isEdit ? 'Send' : 'Reject' },
+      close: { type: 'plain_text', text: 'Cancel' },
+      private_metadata: JSON.stringify({ decisionId, verdict }),
+      blocks: [
+        {
+          type: 'input',
+          block_id: 'decision_free_text_input',
+          optional: !isEdit,
+          element: {
+            type: 'plain_text_input',
+            action_id: 'decision_free_text',
+            multiline: true,
+            placeholder: {
+              type: 'plain_text',
+              text: isEdit ? "What should change before this is re-approved?" : 'Optional — why is this rejected?',
+            },
+          },
+          label: { type: 'plain_text', text: isEdit ? 'Correction' : 'Reason' },
+        },
+      ],
+    },
+  });
+}
+
+/**
+ * Shared claim path for both the direct Approve button and the two
+ * modal-driven verdicts. Never executes anything itself (Phase D's job) —
+ * this only resolves the durable record and refreshes the approver's
+ * Slack surfaces so the resolution is visible immediately.
+ */
+export async function resolveApprovalDecision(
+  decisionId: string,
+  verdict: ApprovalDecisionVerdict,
+  answeredBy: string,
+  freeText?: string,
+): Promise<{ claimed: true; decision: ApprovalDecision } | { claimed: false; reason: string }> {
+  const result = await approvalInboxService.claimDecision(decisionId, verdict, answeredBy, freeText);
+  if (!result.claimed) return result;
+
+  const { decision } = result;
+  if (decision.approver) {
+    await upsertApproverQueueMessage(decision.approver);
+    await postDecisionResolvedNotice(decision.approver, decision);
+  }
+  return result;
+}
+
+export async function postDecisionResolvedNotice(approver: ApprovalDecisionApprover, decision: ApprovalDecision): Promise<void> {
+  // The re-rendered queue message already reflects the resolution (the item
+  // simply disappears from the pending list) — this is an additional,
+  // explicit confirmation in-channel so the resolution isn't silent.
+  if (!slackClient) return;
+  try {
+    const channel = await getApproverChannel(approver);
+    const verdictLabel = decision.verdict === 'approve' ? '✅ Approved' : decision.verdict === 'reject' ? '❌ Rejected' : '💬 Edited';
+    await slackClient.chat.postMessage({
+      channel,
+      text: `${verdictLabel}: ${decision.businessImpact}`,
+    });
+  } catch (err: any) {
+    console.warn('[approval-inbox-slack] failed to post resolution notice:', err?.message || err);
+  }
+}

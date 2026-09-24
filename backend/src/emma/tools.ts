@@ -488,6 +488,17 @@ For a customer-facing request (not a team approver) — e.g. asking the customer
         expiresAt,
       });
 
+      // Best-effort — a Slack posting failure must never fail the tool call
+      // itself; the decision is already durably persisted above regardless.
+      if (decision.audience === 'team' && decision.approver) {
+        try {
+          const { upsertApproverQueueMessage } = await import('../services/approvalInboxSlack');
+          await upsertApproverQueueMessage(decision.approver);
+        } catch (err: any) {
+          console.warn('[stage_pending_decision] failed to post/update Slack queue message:', err?.message || err);
+        }
+      }
+
       // Deliberately does NOT halt the turn (no awaitingUserConfirmation) —
       // unlike present_question_deck/call_meta_marketing_api, this decision
       // lives outside this session entirely; Emma's turn completes normally.
