@@ -647,7 +647,7 @@ describe('ENG-2120 exact readable layout', () => {
   it('renders unknown-page custom-only attribution and winter PT exactly', async () => {
     lead.createdAt = '2026-01-02T02:05:00Z';
     lead.customFields = { landing_page_name: 'Any new page', landing_page_url: 'https://EXAMPLE.com:443/demo?q=one&x=two',
-      campaign_id: 'unknown-campaign', ad_set_id: 'unknown-set', ad_id: 'unknown-ad', utm_source: 'google', utm_medium: 'cpc',
+      landing_page: '/', campaign_id: 'unknown-campaign', ad_set_id: 'unknown-set', ad_id: 'unknown-ad', utm_source: 'google', utm_medium: 'cpc',
       referrer: 'https://example.org/', preferred_time: 'Morning' };
     await dispatchLeadCreated('list-a', 'lead-a');
     expect(postMessage.mock.calls[0][0].text).toBe([

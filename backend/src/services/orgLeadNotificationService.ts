@@ -165,7 +165,7 @@ async function message(ctx: NonNullable<Awaited<ReturnType<typeof context>>>, jo
   for (const [key, value] of [...Object.entries(answerFields), ...Object.entries(customFields)]) {
     const normalized = normalizedKey(key);
     if (!normalized || seen.has(normalized) || (OMIT_CUSTOM_KEYS.has(normalized) && !(normalized === 'company' && key in answerFields)) ||
-        /^(utm(source|medium|campaign|content|term|id)|landingpage(name|title|url|id|path)|landingurl|campaign(name|id)?|adset(name|id)?)$/.test(normalized) ||
+        /^(utm(source|medium|campaign|content|term|id)|landingpage(name|title|url|id|path)?|landingurl|campaign(name|id)?|adset(name|id)?)$/.test(normalized) ||
         ['ad', 'adname', 'adid', 'fbclid', 'gclid', 'referrer', 'medium', 'stage', 'submittedat', 'sourceid', 'lpid'].includes(normalized) || /^[_$]/.test(key) ||
         /^(internal|system|aws|slack)/.test(normalized) ||
         /email|phone|mobile|telephone|token|password|secret|authorization|apikey/.test(normalized)) continue;
