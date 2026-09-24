@@ -3921,6 +3921,16 @@ export class AgentModeService {
           ? turnStartedAtMs + generationTimeoutMs
           : undefined;
       let longestLlmCallMsThisRun = 0;
+      // ENG-2121: mirrors longestLlmCallMsThisRun, but for the tool-DISPATCH phase of an
+      // iteration (executePreparedTools) rather than the LLM call. A heavy knowledge-base
+      // read (or any other slow non-media tool) can burn several minutes of wall clock —
+      // time the reserve calc below never saw, since it only widened for slow LLM calls.
+      // That let a turn spend most of its budget on KB reads, still read as comfortably
+      // "normal"/"wrap_up" because no single LLM call looked slow, and then start another
+      // equally slow tool call that ran the turn past the controller's hard cap before the
+      // graceful final-synthesis nudge ever got a chance to fire (production: a Meta ad
+      // work-plan step cut off between finishing its KB reads and issuing generate_image).
+      let longestToolDispatchMsThisRun = 0;
       let timeBudgetWrapUpWarned = false;
       // Sticky: once the loop switches to synthesis it never offers tools again this turn.
       let forceFinalSynthesis = false;
@@ -4045,7 +4055,10 @@ export class AgentModeService {
           const timeBudget = evaluateTurnTimeBudget({
             startedAtMs: turnStartedAtMs,
             hardCapMs: turnHardCapMs,
-            longestLlmCallMs: longestLlmCallMsThisRun,
+            // ENG-2121: size the reserve off whichever phase of an iteration was
+            // slowest — the LLM call or the tool dispatch that followed it — so a
+            // heavy KB read grows the headroom exactly like a slow LLM call would.
+            longestLlmCallMs: Math.max(longestLlmCallMsThisRun, longestToolDispatchMsThisRun),
           });
           if (timeBudget.phase === 'final_synthesis' && iteration > 1) {
             forceFinalSynthesis = true;
@@ -4883,6 +4896,11 @@ export class AgentModeService {
           });
         }
 
+        // ENG-2121: wall-clock time this iteration spends dispatching tools — fed back
+        // into the time-budget check above (as longestToolDispatchMsThisRun) so a slow
+        // non-media tool (e.g. a heavy knowledge-base read) grows the synthesis reserve
+        // the same way a slow LLM call already does.
+        const toolDispatchStart = Date.now();
         // Tool-dispatch boundary (core seam): validate/prepare tool calls,
         // decide parallel-vs-sequential, execute through the gateway, classify
         // tool-result errors, process results (screenshot S3, minimal-result, CRM
@@ -4952,6 +4970,10 @@ export class AgentModeService {
             socketEmit,
           },
         });
+        const toolDispatchDurationMs = Date.now() - toolDispatchStart;
+        if (toolDispatchDurationMs > longestToolDispatchMsThisRun) {
+          longestToolDispatchMsThisRun = toolDispatchDurationMs;
+        }
         const { pendingCounterUpdates, failedCounterUpdates } = dispatchResult;
         if (dispatchResult.skillsUpdated) {
           skillsUpdated = true;
