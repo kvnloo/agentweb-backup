@@ -1,11 +1,12 @@
-jest.mock('../services/orgLeadNotificationService', () => ({ dispatchLeadCreated: jest.fn() }));
-import { dispatchLeadCreated } from '../services/orgLeadNotificationService';
+jest.mock('../services/orgLeadNotificationService', () => ({ dispatchLeadCreated: jest.fn(), dispatchLeadsCreated: jest.fn() }));
+import { dispatchLeadCreated, dispatchLeadsCreated } from '../services/orgLeadNotificationService';
 // Tests that crmDb.createLead writes the userId (derived from parent list)
 // and nameCompanyKey attributes used by CRM-history Tier 0 GSIs.
 
 const queryPromiseMock = jest.fn();
 const getPromiseMock = jest.fn();
 const putPromiseMock = jest.fn();
+const batchWriteMock = jest.fn();
 const putSpy: jest.Mock = jest.fn(() => ({ promise: putPromiseMock }));
 
 jest.mock('aws-sdk', () => ({
@@ -19,7 +20,7 @@ jest.mock('aws-sdk', () => ({
       delete: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
       scan: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({ Items: [] }) })),
       batchGet: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
-      batchWrite: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
+      batchWrite: jest.fn((params: unknown) => ({ promise: () => batchWriteMock(params) })),
     })),
   },
   S3: jest.fn(() => ({
@@ -218,4 +219,42 @@ describe('lead-created notification write boundary', () => {
     await expect(crmDb.createLead('list-1', { customFields: {} })).rejects.toThrow('write failed');
     expect(dispatchLeadCreated).not.toHaveBeenCalled();
   });
+});
+
+
+describe('batch notification write boundary', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    queryPromiseMock.mockResolvedValue({ Items: [] });
+    getPromiseMock.mockResolvedValue({ Item: { listId: 'list-1', userId: 'owner' } });
+    batchWriteMock.mockReset().mockResolvedValue({});
+    (dispatchLeadsCreated as jest.Mock).mockReset().mockResolvedValue(undefined);
+  });
+  it.each(['pending', 'rejected'])('returns all saved rows with a %s batch notification', async state => {
+    (dispatchLeadsCreated as jest.Mock).mockImplementation(() => state === 'pending'
+      ? new Promise(() => {}) : Promise.reject(new Error('Slack down')));
+    const rows = Array.from({ length: 51 }, (_, i) => ({ email: `person${i}@example.com` }));
+    const result = await crmDb.batchCreateLeads('list-1', rows);
+    await new Promise(resolve => setImmediate(resolve));
+    expect(result.successCount).toBe(51);
+    expect(dispatchLeadsCreated).toHaveBeenCalledTimes(1);
+    expect(dispatchLeadsCreated).toHaveBeenCalledWith('list-1', result.created.map(row => row.leadId));
+    expect(dispatchLeadCreated).not.toHaveBeenCalled();
+  });
+
+  it('notifies only persisted rows across failed and partially unprocessed chunks', async () => {
+    batchWriteMock.mockReset().mockRejectedValueOnce(new Error('chunk failed'))
+      .mockImplementationOnce(async ({ RequestItems }) => {
+        const table = Object.keys(RequestItems)[0];
+        return { UnprocessedItems: { [table]: [RequestItems[table][0]] } };
+      }).mockResolvedValue({});
+    const result = await crmDb.batchCreateLeads('list-1',
+      Array.from({ length: 51 }, (_, i) => ({ email: `partial${i}@example.com` })));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(result.created).toHaveLength(25);
+    expect(dispatchLeadsCreated).toHaveBeenCalledTimes(1);
+    expect(dispatchLeadsCreated).toHaveBeenCalledWith('list-1', result.created.map(row => row.leadId));
+    expect(dispatchLeadCreated).not.toHaveBeenCalled();
+  });
+
 });

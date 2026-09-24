@@ -8425,11 +8425,6 @@ export const crmDb = {
           const saved = batchCreated.filter(row => !unprocessed.has(row.leadId));
           results.successCount += saved.length;
           results.newCount += saved.length;
-          for (const { leadId } of saved) {
-            void import('./orgLeadNotificationService')
-              .then(({ dispatchLeadCreated }) => dispatchLeadCreated(listId, leadId))
-              .catch(() => console.warn('[leadNotifications] hook failed', { listId, leadId }));
-          }
           // Promote batch IDs into the global created list only after the write
           // succeeds — keeps results.created in sync with what's actually persisted.
           results.created.push(...saved);
@@ -8447,6 +8442,14 @@ export const crmDb = {
             results.rowOutcomes[sourceIndex] = 'failed';
           });
         }
+      }
+
+      // One detached dispatcher for all successful writes, not one per 25-row chunk.
+      // Notification delivery must never delay or fail the import save.
+      if (results.created.length) {
+        void import('./orgLeadNotificationService')
+          .then(({ dispatchLeadsCreated }) => dispatchLeadsCreated(listId, results.created.map(row => row.leadId)))
+          .catch(() => console.warn('[leadNotifications] batch hook failed', { listId }));
       }
 
       // Extract all field names from imported leads (both new and updated)

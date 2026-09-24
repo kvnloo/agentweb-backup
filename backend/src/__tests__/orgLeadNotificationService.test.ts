@@ -24,7 +24,7 @@ jest.mock('../services/whatsappService', () => ({ TEMPLATES: {} }));
 import { WebClient } from '@slack/web-api';
 import { crmDb, userDb, orgDb } from '../services/db';
 import * as queue from '../services/asyncJobQueue';
-import { dispatchLeadCreated, processLeadNotificationJob, maskLeadPhone } from '../services/orgLeadNotificationService';
+import { dispatchLeadsCreated, dispatchLeadCreated, processLeadNotificationJob, maskLeadPhone } from '../services/orgLeadNotificationService';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { sendLeadNotification } from '../services/slackService';
 import { emailService } from '../services/emailService';
@@ -463,4 +463,112 @@ it('keeps full contact values and only strips exact placeholder addresses from f
   expect(text).toContain(`Name: ${lead.firstName} Doe`);
   expect(text).toContain('note: realnoemail+x@waterheater.app noemail+x@waterheater.app.evil');
   expect(text).not.toContain('placeholder:');
+});
+
+
+describe('bounded import notifications', () => {
+  const ids = Array.from({ length: 13 }, (_, i) => `lead-${i}`);
+  beforeEach(() => {
+    mock(crmDb.getLeadById).mockImplementation(async (_listId, leadId) => ({ ...lead, leadId }));
+  });
+
+  it('resolves routing once and stops disabled imports before reading any leads', async () => {
+    org.leadNotifications.enabled = false;
+    await dispatchLeadsCreated('list-a', ids);
+    expect(crmDb.getLeadListById).toHaveBeenCalledTimes(1);
+    expect(userDb.getUserById).toHaveBeenCalledTimes(1);
+    expect(orgDb.getOrgById).toHaveBeenCalledTimes(1);
+    expect(crmDb.getLeadById).not.toHaveBeenCalled();
+    expect(queue.enqueueJob).not.toHaveBeenCalled();
+    expect(postMessage).not.toHaveBeenCalled();
+  });
+
+  it('keeps at most five pipelines active across the whole import', async () => {
+    let active = 0;
+    let peak = 0;
+    const releases: Array<() => void> = [];
+    postMessage.mockImplementation(() => {
+      active++;
+      peak = Math.max(peak, active);
+      return new Promise(resolve => releases.push(() => {
+        active--;
+        resolve({ ok: true, ts: '123' });
+      }));
+    });
+    const work = dispatchLeadsCreated('list-a', ids);
+    await new Promise(resolve => setImmediate(resolve));
+    expect(postMessage).toHaveBeenCalledTimes(5);
+    expect(queue.enqueueJob).toHaveBeenCalledTimes(5);
+    while (releases.length) {
+      releases.shift()!();
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    await work;
+    expect(peak).toBe(5);
+    expect(postMessage).toHaveBeenCalledTimes(ids.length);
+    expect(crmDb.getLeadListById).toHaveBeenCalledTimes(1);
+    expect(userDb.getUserById).toHaveBeenCalledTimes(1);
+    expect(orgDb.getOrgById).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains per-lead dedupe keys, retries and durable recovery after a failed delivery', async () => {
+    jest.useFakeTimers();
+    postMessage.mockRejectedValue(new Error('offline'));
+    const work = dispatchLeadsCreated('list-a', ['lead-a']);
+    await jest.runAllTimersAsync();
+    await work;
+    expect(postMessage).toHaveBeenCalledTimes(3);
+    expect(queue.markJobFailed).toHaveBeenCalledTimes(1);
+    const [source, key, queuedJob] = mock(queue.enqueueJob).mock.calls[0];
+    const messageId = postMessage.mock.calls[0][0].client_msg_id;
+    expect(new Set(postMessage.mock.calls.map(([p]) => p.client_msg_id)).size).toBe(1);
+    postMessage.mockResolvedValue({ ok: true, ts: 'recovered' });
+    await processLeadNotificationJob(queuedJob);
+    expect(postMessage.mock.calls[3][0].client_msg_id).toBe(messageId);
+    org.leadNotifications.enabled = false;
+    await processLeadNotificationJob(queuedJob);
+    expect(postMessage).toHaveBeenCalledTimes(4);
+    org.leadNotifications.enabled = true;
+    mock(queue.enqueueJob).mockResolvedValue('duplicate');
+    await dispatchLeadCreated('list-a', 'lead-a');
+    expect(queue.enqueueJob).toHaveBeenLastCalledWith(source, key, queuedJob, { claimImmediately: true });
+    expect(postMessage).toHaveBeenCalledTimes(4);
+  });
+
+  it('contains routing and individual lead failures without abandoning other leads', async () => {
+    mock(crmDb.getLeadById).mockRejectedValueOnce(new Error('read failed'));
+    await expect(dispatchLeadsCreated('list-a', ids)).resolves.toBeUndefined();
+    expect(postMessage).toHaveBeenCalledTimes(ids.length - 1);
+    mock(orgDb.getOrgById).mockRejectedValueOnce(new Error('offline'));
+    await expect(dispatchLeadsCreated('list-a', ids)).resolves.toBeUndefined();
+  });
+});
+
+describe('reserved smoke lead suppression', () => {
+  it.each([
+    { email: 'smoke-test+1720000000000@agentweb.pro' },
+    { email: ' SMOKE-TEST+123@AGENTWEB.PRO ' },
+    { email: 'noemail+123@waterheater.app', phone: '4155550100' },
+    { phone: '+1 (415) 555-0199' },
+  ])('skips create, repeat, batch and recovered jobs for %j', async marker => {
+    Object.assign(lead, marker);
+    await dispatchLeadCreated('list-a', 'lead-a');
+    await dispatchLeadCreated('list-a', 'lead-a', { submissionId: 'repeat', submittedAt: 'now' });
+    await dispatchLeadsCreated('list-a', ['lead-a']);
+    await processLeadNotificationJob(job);
+    await processLeadNotificationJob({ ...job, submissionId: 'repeat', submittedAt: 'now' });
+    expect(queue.enqueueJob).not.toHaveBeenCalled();
+    expect(crmDb.claimLeadStepOnce).not.toHaveBeenCalled();
+    expect(postMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { email: 'smoke-test+abc@agentweb.pro', phone: '4155550200' },
+    { email: 'smoke-test+123@example.com', phone: '4155550099' },
+    { email: 'noemail+123@waterheater.app', phone: '+14155551234' },
+  ])('keeps nonreserved leads eligible: %j', async contact => {
+    Object.assign(lead, contact);
+    await dispatchLeadCreated('list-a', 'lead-a');
+    expect(postMessage).toHaveBeenCalledTimes(1);
+  });
 });

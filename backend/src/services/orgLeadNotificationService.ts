@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { isSmokeTestLead } from '../utils/smokeTestLead';
 import { WebClient, ChatPostMessageArguments } from '@slack/web-api';
 import { crmDb, orgDb, userDb } from './db';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from './asyncJobQueue';
@@ -59,7 +60,7 @@ function configOf(value: unknown): LeadNotificationsConfig | undefined {
 }
 
 /** All routing comes from persisted list ownership, never lead.userId/tenantId or form input. */
-async function context(listId: string, leadId: string, expectedOrgId?: string) {
+async function routingContext(listId: string, expectedOrgId?: string) {
   const list = await crmDb.getLeadListById(listId);
   if (!list || list.listId !== listId || !string(list.userId)) return;
   const owner = await userDb.getUserById(list.userId);
@@ -69,16 +70,6 @@ async function context(listId: string, leadId: string, expectedOrgId?: string) {
   if (!org || org.orgId !== owner.orgId) return;
   const config = configOf(org.leadNotifications);
   if (!config) return;
-  const lead = await crmDb.getLeadById(listId, leadId, { consistentRead: true });
-  if (!lead || lead.listId !== listId || lead.leadId !== leadId) return;
-  const customFields = record(lead.customFields) ? lead.customFields : {};
-  const source = string(customFields.source) || 'crm';
-  const sources = [list.listId, list.name, source,
-    ...Object.entries(customFields).filter(([key]) => SOURCE_KEYS.has(normalizedKey(key))).map(([, value]) => value),
-  ].map(value => string(value).toLowerCase()).filter(Boolean);
-  if (config.sources && !config.sources.some(s => sources.includes(s.trim().toLowerCase()))) return;
-  const email = string(lead.email);
-  const hideEmail = /^noemail\+[^@]*@waterheater\.app$/i.test(email);
   // Only org-owned connections. No personal-account lookup, global bot, or cross-org fallback.
   const accounts: unknown[] = Array.isArray(org.connected_accounts) ? org.connected_accounts : [];
   const slack = accounts.filter(a => record(a) && a.platform === 'slack');
@@ -88,7 +79,30 @@ async function context(listId: string, leadId: string, expectedOrgId?: string) {
   const connection = account.config;
   if (connection.account_type !== 'bot' || !/^xoxb-/.test(string(connection.access_token)) ||
       !/^T[A-Z0-9]+$/.test(string(connection.team_id)) || account.account_id !== connection.team_id) return;
-  return { org, config, lead, source, connection, customFields, hideEmail, list };
+  return { org, config, connection, list };
+}
+
+type RoutingContext = NonNullable<Awaited<ReturnType<typeof routingContext>>>;
+async function leadContext(routing: RoutingContext, leadId: string) {
+  const { list, config } = routing;
+  const listId = list.listId;
+  const lead = await crmDb.getLeadById(listId, leadId, { consistentRead: true });
+  if (!lead || lead.listId !== listId || lead.leadId !== leadId) return;
+  if (isSmokeTestLead(lead)) return;
+  const customFields = record(lead.customFields) ? lead.customFields : {};
+  const source = string(customFields.source) || 'crm';
+  const sources = [list.listId, list.name, source,
+    ...Object.entries(customFields).filter(([key]) => SOURCE_KEYS.has(normalizedKey(key))).map(([, value]) => value),
+  ].map(value => string(value).toLowerCase()).filter(Boolean);
+  if (config.sources && !config.sources.some(s => sources.includes(s.trim().toLowerCase()))) return;
+  const email = string(lead.email);
+  const hideEmail = /^noemail\+[^@]*@waterheater\.app$/i.test(email);
+  return { ...routing, lead, source, customFields, hideEmail };
+}
+
+async function context(listId: string, leadId: string, expectedOrgId?: string) {
+  const routing = await routingContext(listId, expectedOrgId);
+  return routing && leadContext(routing, leadId);
 }
 
 function message(ctx: NonNullable<Awaited<ReturnType<typeof context>>>, job: LeadNotificationJob) {
@@ -185,6 +199,10 @@ export async function processLeadNotificationJob(job: LeadNotificationJob): Prom
   if (!record(job) || !string(job.orgId) || !string(job.listId) || !string(job.leadId)) throw new Error('Invalid lead notification job');
   const ctx = await context(job.listId, job.leadId, job.orgId);
   if (!ctx) return;
+  await deliverLeadNotification(job, ctx);
+}
+
+async function deliverLeadNotification(job: LeadNotificationJob, ctx: NonNullable<Awaited<ReturnType<typeof context>>>) {
   const step = stepOf(job);
   if (ctx.lead.system?.[step] === 'sent') return;
   if (!await crmDb.claimLeadStepOnce(job.listId, job.leadId, step)) throw new Error('Lead notification claimed');
@@ -240,8 +258,34 @@ export async function processLeadNotificationJob(job: LeadNotificationJob): Prom
 
 /** Never rejects to a lead saver. Call fire-and-forget immediately after a successful write. */
 export async function dispatchLeadCreated(listId: string, leadId: string, submission?: { submissionId: string; submittedAt: string }): Promise<void> {
+  await dispatchLead(listId, leadId, submission);
+}
+
+/** One routing lookup and at most five active pipelines for an entire import. */
+export async function dispatchLeadsCreated(listId: string, leadIds: string[]): Promise<void> {
+  if (!leadIds.length) return;
   try {
-    const ctx = await context(listId, leadId);
+    const routing = await routingContext(listId);
+    if (!routing) return;
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(5, leadIds.length) }, async () => {
+      while (next < leadIds.length) {
+        const leadId = leadIds[next++];
+        await dispatchLead(listId, leadId, undefined, routing);
+      }
+    }));
+  } catch {
+    console.warn('[leadNotifications] batch dispatch failed', { listId });
+  }
+}
+
+async function dispatchLead(
+  listId: string, leadId: string,
+  submission?: { submissionId: string; submittedAt: string },
+  routing?: RoutingContext,
+): Promise<void> {
+  try {
+    const ctx = routing ? await leadContext(routing, leadId) : await context(listId, leadId);
     if (!ctx) return;
     const job = { orgId: ctx.org.orgId, listId, leadId, ...submission };
     const key = keyOf(job);
@@ -250,7 +294,9 @@ export async function dispatchLeadCreated(listId: string, leadId: string, submis
     if (queued !== 'enqueued') throw new Error('Lead notification queue unavailable');
     const stop = startHeartbeat(SOURCE, key);
     try {
-      await processLeadNotificationJob(job);
+      // Batch delivery reuses its validated routing; recovered jobs always reload it.
+      if (routing) await deliverLeadNotification(job, ctx);
+      else await processLeadNotificationJob(job);
       await markJobComplete(SOURCE, key);
     } catch {
       // Never put contact details, bot tokens, or raw Slack errors into queue logs.
