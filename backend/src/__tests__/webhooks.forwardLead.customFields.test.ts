@@ -22,6 +22,8 @@ import request from 'supertest';
 import express from 'express';
 import webhookRouter from '../routes/webhooks';
 import { crmDb, userDb } from '../services/db';
+import { dispatchLeadCreated } from '../services/orgLeadNotificationService';
+jest.mock('../services/orgLeadNotificationService', () => ({ dispatchLeadCreated: jest.fn().mockResolvedValue(undefined) }));
 
 jest.mock('../services/db', () => ({
   crmDb: {
@@ -81,6 +83,34 @@ describe('forward-lead — unknown top-level fields reach customFields', () => {
     (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
     (crmDb.createLead as jest.Mock).mockResolvedValue({ leadId: 'lead_1', listId: 'list_123', email: 'test@example.com' });
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user_123', connected_accounts: [] });
+  });
+
+  it.each(['email', 'phone'])('notifies every unknown-LP repeat submission matched by %s', async identity => {
+    const existing = { leadId: 'lead_repeat', listId: 'list_123', email: identity === 'email' ? 'repeat@example.com' : '', phone: '+14155551234', customFields: {} };
+    if (identity === 'email') (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(existing);
+    else {
+      (crmDb.createLead as jest.Mock).mockRejectedValue({ leadAlreadyExists: true });
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(existing);
+    }
+    for (let i = 0; i < 2; i++) {
+      const response = await request(app).post('/api/webhooks/forward-lead').send({
+        listId: 'list_123', email: existing.email, phone: existing.phone,
+        source: 'unknown-future-lander', landingPagePath: '/never-registered',
+      });
+      expect(response.status).toBe(200);
+      await flush();
+    }
+    expect(dispatchLeadCreated).toHaveBeenCalledTimes(2);
+    const calls = (dispatchLeadCreated as jest.Mock).mock.calls;
+    expect(calls[0]).toEqual(['list_123', 'lead_repeat', { submissionId: expect.any(String), submittedAt: expect.any(String) }]);
+    expect(calls[0][2].submissionId).not.toBe(calls[1][2].submissionId);
+  });
+
+  it('leaves new unknown-LP submissions to the single CRM insert hook', async () => {
+    await request(app).post('/api/webhooks/forward-lead').send({ listId: 'list_123', email: 'new@example.com', source: 'unknown-future-lander' });
+    await flush();
+    expect(crmDb.createLead).toHaveBeenCalledTimes(1);
+    expect(dispatchLeadCreated).not.toHaveBeenCalled();
   });
 
   it('stores a landing-page qualification payload sent as top-level keys', async () => {

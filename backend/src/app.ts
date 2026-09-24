@@ -1,3 +1,4 @@
+import { registerLeadNotificationProcessor } from './services/orgLeadNotificationService';
 import { evaluationAdminRoutes } from './routes/evaluation';
 import { evaluationHttpBoundary } from './middleware/evaluation';
 import express from "express";
@@ -396,6 +397,7 @@ app.use("/api/messaging-channels", messagingChannelsRoutes);
 app.use("/api/webhooks/calendly", calendlyWebhookRoutes);
 app.use("/api/webhooks/unipile", unipileWebhookRoutes);
 registerConversionRelayProcessor();
+registerLeadNotificationProcessor();
 app.use("/api/benchmark", benchmarkRoutes);
 app.use("/api/seo", seoRoutes);
 app.use("/api/funnels", funnelRoutes);
