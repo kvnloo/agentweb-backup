@@ -86,24 +86,34 @@ export function currentRunFunding(): RunFunding | undefined {
   return runFundingStore.getStore();
 }
 
-let unsetRunFundingCount = 0;
+const seenUnsetRunFundingSites = new Set<string>();
 
 /**
  * Greppable marker for call sites outside any `withRunFunding` scope. Log-only,
  * fire-and-forget, never throws — this is a discovery aid for A2+/B4+, not an
  * enforcement mechanism.
+ *
+ * Logs once per unique `where`, not once per call. `recordLlmUsage`'s only real
+ * call site (`agentModeService.callLLM`) passes one fixed `where` string, and
+ * `callLLM` itself is reached by ~20+ unrelated files (crons, GrowthGenius, CRM
+ * enrichment, etc.) that have nothing to do with agent-mode chat turns and are
+ * never wrapped in `withRunFunding` — logging on every one of their calls would
+ * spam a warning on a large fraction of the backend's total LLM traffic. Per-site
+ * dedup keeps this a discovery aid (does this unwrapped path exist at all) rather
+ * than a firehose.
  */
 export function noteRunFundingUnset(where: string): void {
-  unsetRunFundingCount += 1;
-  console.warn(`[RunFunding] UNSET at ${where} (count=${unsetRunFundingCount}) — treated as agentweb`);
+  if (seenUnsetRunFundingSites.has(where)) return;
+  seenUnsetRunFundingSites.add(where);
+  console.warn(`[RunFunding] UNSET at ${where} — treated as agentweb (logged once per call site)`);
 }
 
-/** Test hook: reset the unset-call-site counter between test cases. */
+/** Test hook: reset the unset-call-site set between test cases. */
 export function __resetRunFundingUnsetCountForTests(): void {
-  unsetRunFundingCount = 0;
+  seenUnsetRunFundingSites.clear();
 }
 
-/** Test hook: read the unset-call-site counter. */
+/** Test hook: read how many distinct unwrapped call sites have fired. */
 export function __getRunFundingUnsetCountForTests(): number {
-  return unsetRunFundingCount;
+  return seenUnsetRunFundingSites.size;
 }
