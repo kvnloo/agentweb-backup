@@ -35198,11 +35198,13 @@ Reply with ONLY one word: yes or no.`;
           // ENG-1816 F1: this judge previously carried no userId, so its spend booked
           // to "system" and escaped both billing and the funding policy. Read the
           // run's owner from the ambient store instead of threading a new parameter
-          // through this method's signature.
+          // through this method's signature. billingUserId deliberately omitted: this
+          // reaches meterWithResolvedBilling, which only resolves the org-root billing
+          // subject when billingUserId is absent (ENG-1858) — passing ownerUserId here
+          // would re-suppress that resolution for org members, the exact ENG-1217 bug.
           usageContext: {
             feature: 'step_removal_authorization_judge',
             userId: currentRunFunding()?.ownerUserId,
-            billingUserId: currentRunFunding()?.billingUserId,
           },
         },
       );

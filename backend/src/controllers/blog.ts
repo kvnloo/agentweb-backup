@@ -599,8 +599,12 @@ OUTPUT FORMAT (STRICT JSON):
       response_format: { type: 'json_object' },
       usageContext: {
         feature: 'content_gen',
+        // billingUserId deliberately omitted: this reaches meterWithResolvedBilling,
+        // which only resolves the org-root billing subject when billingUserId is
+        // absent (ENG-1858). Passing ownerUserId here would re-suppress that
+        // resolution for org members — the exact ENG-1217 bug — for zero benefit,
+        // since nothing reads RunFunding's billingUserId today.
         userId: currentRunFunding()?.ownerUserId,
-        billingUserId: currentRunFunding()?.billingUserId,
       },
       taskClass: 'content_generation',
     });

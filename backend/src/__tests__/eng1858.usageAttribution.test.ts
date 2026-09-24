@@ -441,10 +441,15 @@ describe('ENG-1816 F1: attribution leaks fixed via the ambient RunFunding store'
 
     await withRunFunding(funding(), () => restyleContent('original research', 'a topic'));
 
+    // billingUserId is deliberately NOT forwarded from RunFunding, even though
+    // funding() sets one: this ctx reaches meterWithResolvedBilling, which only
+    // resolves the org-root billing subject (ENG-1858) when billingUserId is
+    // absent. Forwarding RunFunding's billingUserId here would re-suppress that
+    // resolution for org members — the exact ENG-1217 bug — for a value nothing
+    // else reads yet (round-3 PR review finding).
     expect(usageContextOf(callLLM)).toEqual({
       feature: 'content_gen',
       userId: MEMBER,
-      billingUserId: ORG_ROOT,
     });
   });
 
