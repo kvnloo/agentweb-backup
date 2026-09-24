@@ -11,7 +11,7 @@
 import { meterWithResolvedBilling } from "../agentMode/deferredBillingMetering";
 import type { RecordUsageContext } from "../usageRecorderService";
 import { getAttemptUsageJournal, type AttemptUsage } from "./attemptUsageJournal";
-import { currentRunFunding, noteRunFundingUnset, type RunFunding } from "./runFunding";
+import { noteRunFundingUnset, type RunFunding } from "./runFunding";
 
 export type RecordLlmUsageInput = RecordUsageContext;
 
@@ -73,9 +73,4 @@ async function recordToJournal(runFunding: RunFunding, ctx: RecordLlmUsageInput)
     settlementState: "settled",
   };
   await getAttemptUsageJournal().record(attempt);
-}
-
-/** Convenience wrapper reading funding from the ambient store. */
-export function recordLlmUsageForCurrentRun(ctx: RecordLlmUsageInput, where?: string): void {
-  recordLlmUsage(currentRunFunding(), ctx, where);
 }
