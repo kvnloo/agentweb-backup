@@ -1,3 +1,5 @@
+jest.mock('../services/orgLeadNotificationService', () => ({ dispatchLeadCreated: jest.fn().mockResolvedValue(undefined) }));
+import { dispatchLeadCreated } from '../services/orgLeadNotificationService';
 // Tests that batchCreateLeads sets nameCompanyKey on new leads when
 // firstName + lastName + company are all present. This was a bug where the
 // field was never written, breaking Tier 0 sibling matching during enrichment.
@@ -110,4 +112,25 @@ describe('crmDb.batchCreateLeads — nameCompanyKey (new-lead path)', () => {
     expect(alice?.nameCompanyKey).toBe('alice|smith|corp');
     expect(bob?.nameCompanyKey).toBeUndefined();
   });
+});
+
+
+it('notifies only persisted batch rows, leaving DynamoDB unprocessed rows resumable', async () => {
+  jest.clearAllMocks();
+  queryPromiseMock.mockResolvedValue({ Items: [] });
+  getPromiseMock.mockResolvedValue({ Item: { listId: 'list-1', userId: 'user-1' } });
+  batchWritePromiseMock.mockImplementationOnce(async () => {
+    const request = batchWriteSpy.mock.calls[0][0];
+    const table = Object.keys(request.RequestItems)[0];
+    return { UnprocessedItems: { [table]: [request.RequestItems[table][1]] } };
+  });
+  const result = await crmDb.batchCreateLeads('list-1', [
+    { email: 'saved@example.com', customFields: {} },
+    { email: 'pending@example.com', customFields: {} },
+  ]);
+  expect(result.newCount).toBe(1);
+  expect(result.rowOutcomes).toEqual(['created', 'unprocessed']);
+  expect(result.created).toHaveLength(1);
+  expect(dispatchLeadCreated).toHaveBeenCalledTimes(1);
+  expect(dispatchLeadCreated).toHaveBeenCalledWith('list-1', result.created[0].leadId);
 });

@@ -174,4 +174,43 @@ describe("ENG-1250 §9.6 enforcement cutover — admission chain", () => {
     expect(res.mode.usageMode).toBe("full_choice");
     expect(res.model.effectiveModel).toBe(PREMIUM);
   });
+
+  // ── Gate 3: lifecycle behaviours on the new rail (Harsha's 09-15 gate) ──
+
+  it("BOUNDARY (ledger basis): settled exactly at the cap pauses; one micro-USD under admits", async () => {
+    process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+    // No credits, so the effective cap is the raw $150 hard threshold.
+    getProjectionMock.mockResolvedValueOnce(projection(150 * USD));
+    const at = await admit({ legacyRawMicroUsd: 0, ledgerSettledMicroUsd: 150 * USD });
+    expect(at.mode.usageMode).toBe("paused");
+
+    getProjectionMock.mockResolvedValueOnce(projection(150 * USD - 1));
+    const under = await admit({ legacyRawMicroUsd: 0, ledgerSettledMicroUsd: 150 * USD - 1 });
+    expect(under.mode.usageMode).toBe("full_choice");
+  });
+
+  it("CREDIT REVERSAL (ledger basis): a purchase resumes an over-cap account, and reversing it re-pauses", async () => {
+    process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+    // Ledger settled $218.24 over a $150 cap → paused without credit.
+    const credited = {
+      month: MONTH,
+      totalPurchasedMicroUsd: 100 * USD, // cap becomes $250
+      totalPurchasedReversedMicroUsd: 0,
+      totalAdminGrantedMicroUsd: 0,
+      totalMigrationOffsetMicroUsd: 0,
+    };
+    getProjectionMock.mockResolvedValueOnce(projection(LLM_PLUS_VENDOR));
+    const resumed = await admit({ legacyRawMicroUsd: LLM_ONLY, ledgerSettledMicroUsd: LLM_PLUS_VENDOR, credits: credited });
+    expect(resumed.basis).toBe("spend_ledger");
+    expect(resumed.mode.usageMode).toBe("full_choice");
+    expect(resumed.model.effectiveModel).toBe(PREMIUM); // same model, never a downgrade
+
+    // Same purchase reversed (e.g. chargeback) → cap back to $150 → re-paused, blocked.
+    const reversed = { ...credited, totalPurchasedReversedMicroUsd: 100 * USD };
+    getProjectionMock.mockResolvedValueOnce(projection(LLM_PLUS_VENDOR));
+    const repaused = await admit({ legacyRawMicroUsd: LLM_ONLY, ledgerSettledMicroUsd: LLM_PLUS_VENDOR, credits: reversed });
+    expect(repaused.mode.usageMode).toBe("paused");
+    expect(repaused.model.effectiveModel).toBeNull();
+    expect(repaused.model.modelSelection).toBe("blocked");
+  });
 });
