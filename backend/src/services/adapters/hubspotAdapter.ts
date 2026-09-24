@@ -280,25 +280,46 @@ export class HubspotAdapter implements CrmAdapter {
 
                 let contactId: string;
                 let wasNew: boolean;
-                if (email) {
-                    // Email present — find-or-create by email (dedup).
-                    const upserted = await svc.upsertContact(contactData);
-                    contactId = upserted.contactId;
-                    wasNew = upserted.isNew;
-                } else {
-                    // No email to dedup on. If we synced this lead before, update the
-                    // known contact by id; otherwise create a fresh email-less contact.
-                    const existingContactId: string | undefined =
-                        lead.syncMetadata?.hubspot_contact_id || lead.customFields?.hubspot_contact_id;
-                    if (existingContactId) {
+                // A contact id we stored ourselves is a stronger identity than the email,
+                // and it is checked FIRST regardless of whether an email is present now.
+                // Previously the branch was chosen by email alone, so a lead first synced
+                // without one (ENG-2082) got contact A by id — and then, the moment it
+                // gained an address, upsertContact matched on email instead, created
+                // contact B, and overwrote our stored id. Contact A was orphaned in the
+                // customer's HubSpot: a real person, now a duplicate nobody updates again.
+                const existingContactId: string | undefined =
+                    lead.syncMetadata?.hubspot_contact_id || lead.customFields?.hubspot_contact_id;
+                const upsertOrCreate = async () => {
+                    if (email) {
+                        const upserted = await svc.upsertContact(contactData);
+                        return { contactId: upserted.contactId, wasNew: upserted.isNew };
+                    }
+                    const created = await svc.createContact(contactData);
+                    return { contactId: created.contactId, wasNew: true };
+                };
+
+                if (existingContactId) {
+                    // Update the contact we know we created, and fall back to the
+                    // email/create path if that id no longer resolves — a contact deleted
+                    // in HubSpot must still be recoverable, which is what upsert gave us
+                    // for free before.
+                    try {
                         const updated = await svc.updateContact(existingContactId, contactData);
                         contactId = updated.contactId;
                         wasNew = false;
-                    } else {
-                        const created = await svc.createContact(contactData);
-                        contactId = created.contactId;
-                        wasNew = true;
+                    } catch (err: any) {
+                        console.warn(
+                            `[HubspotAdapter] stored contact ${existingContactId} for lead ${lead.leadId} ` +
+                            `did not update (${this.formatError(err)}) — falling back to upsert/create.`,
+                        );
+                        const fresh = await upsertOrCreate();
+                        contactId = fresh.contactId;
+                        wasNew = fresh.wasNew;
                     }
+                } else {
+                    const fresh = await upsertOrCreate();
+                    contactId = fresh.contactId;
+                    wasNew = fresh.wasNew;
                 }
                 if (wasNew) result.newCount++; else result.updatedCount++;
 
@@ -1096,6 +1117,31 @@ export class HubspotAdapter implements CrmAdapter {
 
                 leadData.customFields = customFields;
                 if (Object.keys(syncMetadata).length > 0) leadData.syncMetadata = syncMetadata;
+
+                // batchCreateLeads dedupes on email, then LinkedIn URL. A contact with
+                // NEITHER matches nothing, so it was created fresh on EVERY pull —
+                // accumulating a duplicate per run. Attio's pull sidesteps this by skipping
+                // email-less people outright (attioAdapter.ts:578), but that is the wrong
+                // trade now that phone-only leads are first-class: it would silently refuse
+                // to import a contactable person. Resolve them by the contact id we already
+                // store instead, and update in place.
+                if (!leadData.email && !leadData.linkedin) {
+                    const existing = await crmDb
+                        .getLeadByHubSpotContactId(listId, String(contact.id))
+                        .catch(() => null);
+                    if (existing) {
+                        try {
+                            await crmDb.updateLead(listId, existing.leadId, leadData);
+                            result.successCount++;
+                            result.updatedCount++;
+                        } catch (err: any) {
+                            result.errorCount++;
+                            result.errors.push(`Contact ${contact.id} update: ${this.formatError(err)}`);
+                        }
+                        continue;
+                    }
+                }
+
                 pageLeadData.push(leadData);
             }
 

@@ -180,7 +180,15 @@ async function handleHubSpotEvent(
     }
     leadFields.syncMetadata = { hubspot_contact_id: objectId };
 
-    const lead = await crmDb.getLeadByEmail(listId, email.toLowerCase());
+    // Email first, then the contact id we stored when WE pushed this lead. Email alone is
+    // not an identity for a lead that has none — an ENG-2082 lead syncs to HubSpot with a
+    // hubspot_contact_id and no address, so once HubSpot returns one this missed and
+    // created a SECOND row carrying the same hubspot_contact_id. Worse here than in
+    // webhooks.ts: that path at least gates creation on data.isCreation, this one does not,
+    // so a bare property change was enough to duplicate the lead.
+    const lead =
+      (await crmDb.getLeadByEmail(listId, email.toLowerCase())) ||
+      (await crmDb.getLeadByHubSpotContactId(listId, String(objectId)).catch(() => null));
 
     if (!lead) {
       // New contact in HubSpot — create it in our list

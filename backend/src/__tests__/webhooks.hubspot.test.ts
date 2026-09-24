@@ -44,12 +44,14 @@ jest.mock('../utils/leadContactStatus', () => ({ isDoNotContact: jest.fn().mockR
 
 const mockGetLeadListsByUserId = jest.fn();
 const mockGetLeadByEmail = jest.fn();
+const mockGetLeadByHubSpotContactId = jest.fn();
 const mockUpdateLead = jest.fn();
 const mockCreateLead = jest.fn();
 jest.mock('../services/db', () => ({
   crmDb: {
     getLeadListsByUserId: (...a: any[]) => mockGetLeadListsByUserId(...a),
     getLeadByEmail: (...a: any[]) => mockGetLeadByEmail(...a),
+    getLeadByHubSpotContactId: (...a: any[]) => mockGetLeadByHubSpotContactId(...a),
     updateLead: (...a: any[]) => mockUpdateLead(...a),
     createLead: (...a: any[]) => mockCreateLead(...a),
     getLeadListById: jest.fn(),
@@ -155,6 +157,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
     mockGetUserIdByHubSpotPortalId.mockResolvedValue(USER_ID);
     mockGetLeadListsByUserId.mockResolvedValue([mockList]);
     mockGetLeadByEmail.mockResolvedValue(mockLead);
+    mockGetLeadByHubSpotContactId.mockResolvedValue(null);
     mockUpdateLead.mockResolvedValue(undefined);
     mockCreateLead.mockResolvedValue(undefined);
     mockGetContactById.mockResolvedValue({});
@@ -241,6 +244,30 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
     await flushPromises();
     expect(mockGetContactEmailById).toHaveBeenCalledTimes(2);
     expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
+  // ENG-2082: a phone-only lead syncs to HubSpot with a hubspot_contact_id and NO email.
+  // The moment HubSpot returns an address for it, an email-only lookup misses — dropping
+  // the edit, and on a creation event minting a SECOND row carrying the same
+  // hubspot_contact_id as the first.
+  it('resolves by hubspot_contact_id when the lead has no email yet, instead of duplicating it', async () => {
+    mockGetLeadByEmail.mockResolvedValue(null); // our row has no address, so email misses
+    mockGetLeadByHubSpotContactId.mockResolvedValue({
+      leadId: 'lead-phone-only',
+      listId: LIST_ID,
+      phone: '2125559876',
+      syncMetadata: { hubspot_contact_id: '777' },
+    });
+    mockGetContactById.mockResolvedValue({ email: 'new@example.com', firstname: 'New', lastname: 'Person' });
+
+    const body = [{ subscriptionType: 'contact.creation', portalId: PORTAL_ID, objectId: '777' }];
+    await request(app).post('/api/webhooks/hubspot').send(body);
+    await flushPromises();
+    await flushPromises();
+
+    expect(mockCreateLead).not.toHaveBeenCalled();
+    expect(mockUpdateLead).toHaveBeenCalled();
+    expect(mockUpdateLead.mock.calls[0][1]).toBe('lead-phone-only');
   });
 
   it('creates a lead on contact.creation when the contact is not yet in the list', async () => {

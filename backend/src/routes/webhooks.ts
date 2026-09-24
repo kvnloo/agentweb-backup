@@ -1677,7 +1677,15 @@ export async function processHubspotWebhookJob(payload: HubspotJobPayload): Prom
             continue;
           }
 
-          const lead = await crmDb.getLeadByEmail(list.listId, email.toLowerCase());
+          // Email first, then the contact id we already stored when WE pushed this lead.
+          // Email alone is not an identity for a lead that has none: ENG-2082 leads sync to
+          // HubSpot with a hubspot_contact_id and no address, so the moment HubSpot returns
+          // one this lookup missed, the edit was dropped and — on a creation event — a
+          // SECOND row was created carrying the same hubspot_contact_id as the first. The
+          // Attio path and crmWebhook.ts:136 already resolve by id; this one did not.
+          const lead =
+            (await crmDb.getLeadByEmail(list.listId, email.toLowerCase())) ||
+            (await crmDb.getLeadByHubSpotContactId(list.listId, String(objectId)).catch(() => null));
 
           // Deletion: flag an existing lead as CRM-removed (nothing to do if absent).
           if (data.isDeleted) {
