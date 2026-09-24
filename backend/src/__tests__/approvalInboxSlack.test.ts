@@ -26,9 +26,14 @@ jest.mock('../services/approvalInboxService', () => ({
   approvalInboxService: { listPendingForApprover: jest.fn(), claimDecision: jest.fn() },
 }));
 
+jest.mock('../services/approvalInboxExecution', () => ({
+  executeResolvedDecision: jest.fn(),
+}));
+
 import { settingsService } from '../services/settingsService';
 import { getApproverChannel, getApproverSlackUserId, getFallbackApproverSlackUserIds } from '../services/approverDirectory';
 import { approvalInboxService } from '../services/approvalInboxService';
+import { executeResolvedDecision } from '../services/approvalInboxExecution';
 
 // approvalInboxSlack.ts reads SLACK_BOT_TOKEN at module-load time to decide
 // whether to construct a real slackClient — must be set before this import,
@@ -43,6 +48,7 @@ const mockGetApproverSlackUserId = getApproverSlackUserId as jest.Mock;
 const mockGetFallback = getFallbackApproverSlackUserIds as jest.Mock;
 const mockListPending = approvalInboxService.listPendingForApprover as jest.Mock;
 const mockClaimDecision = approvalInboxService.claimDecision as jest.Mock;
+const mockExecuteResolvedDecision = executeResolvedDecision as jest.Mock;
 
 describe('approvalInboxSlack', () => {
   beforeEach(() => {
@@ -55,6 +61,7 @@ describe('approvalInboxSlack', () => {
     mockListPending.mockResolvedValue([]);
     mockPostMessage.mockResolvedValue({ ok: true, ts: '1111.2222' });
     mockUpdate.mockResolvedValue({ ok: true });
+    mockExecuteResolvedDecision.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -139,9 +146,10 @@ describe('approvalInboxSlack', () => {
       expect(mockClaimDecision).toHaveBeenCalledWith('d1', 'approve', 'matt', undefined);
       // Refresh (queue message) + resolution notice both post/update via Slack.
       expect(mockPostMessage.mock.calls.length + mockUpdate.mock.calls.length).toBeGreaterThan(0);
+      expect(mockExecuteResolvedDecision).toHaveBeenCalledWith(decision);
     });
 
-    it('never touches Slack when the claim itself fails', async () => {
+    it('never touches Slack or execution when the claim itself fails', async () => {
       mockClaimDecision.mockResolvedValue({ claimed: false, reason: 'already_resolved' });
 
       const result = await approvalInboxSlack.resolveApprovalDecision('d1', 'approve', 'matt');
@@ -149,6 +157,17 @@ describe('approvalInboxSlack', () => {
       expect(result.claimed).toBe(false);
       expect(mockPostMessage).not.toHaveBeenCalled();
       expect(mockUpdate).not.toHaveBeenCalled();
+      expect(mockExecuteResolvedDecision).not.toHaveBeenCalled();
+    });
+
+    it('still reports the claim as successful even when execution throws unexpectedly', async () => {
+      const decision = { decisionId: 'd1', approver: 'matt', verdict: 'approve', businessImpact: 'x' };
+      mockClaimDecision.mockResolvedValue({ claimed: true, decision });
+      mockExecuteResolvedDecision.mockRejectedValue(new Error('unexpected execution failure'));
+
+      const result = await approvalInboxSlack.resolveApprovalDecision('d1', 'approve', 'matt');
+
+      expect(result.claimed).toBe(true);
     });
 
     it('still reports the claim as successful even when the post-claim Slack refresh throws', async () => {

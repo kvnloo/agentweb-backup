@@ -8,6 +8,7 @@ import {
   type ApprovalDecisionApprover,
   type ApprovalDecisionVerdict,
 } from './approvalInboxService';
+import { executeResolvedDecision } from './approvalInboxExecution';
 
 /**
  * ENG-1644 Phase C: ONE live, upsertable Slack message per approver,
@@ -223,9 +224,10 @@ export async function openDecisionVerdictModal(
 
 /**
  * Shared claim path for both the direct Approve button and the two
- * modal-driven verdicts. Never executes anything itself (Phase D's job) —
- * this only resolves the durable record and refreshes the approver's
- * Slack surfaces so the resolution is visible immediately.
+ * modal-driven verdicts. Resolves the durable record, executes it (Phase D —
+ * plan_choice/customer_* notify the origin session; meta_write is a no-op
+ * pending a real producer, see approvalInboxExecution.ts), then refreshes
+ * the approver's Slack surfaces so the resolution is visible immediately.
  */
 export async function resolveApprovalDecision(
   decisionId: string,
@@ -236,12 +238,23 @@ export async function resolveApprovalDecision(
   const result = await approvalInboxService.claimDecision(decisionId, verdict, answeredBy, freeText);
   if (!result.claimed) return result;
 
-  // The claim itself is already durably committed above — a failure to
-  // refresh Slack must never surface as a failed claim (same non-fatal
-  // principle as stage_pending_decision's own post-create refresh). Without
-  // this, a missing channel/Slack config would make a SUCCESSFUL approve
-  // bubble up as a 500 to the caller, even though the DB already reflects it.
+  // The claim itself is already durably committed above — a failure in
+  // execution or in the Slack refresh must never surface as a failed claim
+  // (same non-fatal principle as stage_pending_decision's own post-create
+  // refresh). Without this, a missing channel/Slack config — or a failed
+  // origin-session notify — would make a SUCCESSFUL approve bubble up as a
+  // 500 to the caller, even though the DB already reflects it.
   const { decision } = result;
+  try {
+    // executeResolvedDecision already catches everything internally and is
+    // not expected to throw — wrapped here too anyway, defense-in-depth
+    // against the exact bug class just found and fixed for the Slack
+    // refresh below: nothing downstream of a committed claim may mask it.
+    await executeResolvedDecision(decision);
+  } catch (err: any) {
+    console.warn('[approval-inbox-slack] claim succeeded but execution failed:', err?.message || err);
+  }
+
   if (decision.approver) {
     try {
       await upsertApproverQueueMessage(decision.approver);
