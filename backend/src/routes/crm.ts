@@ -1049,7 +1049,9 @@ router.get('/contacts', async (req: Request, res: Response) => {
       rawCount += r.rawCount;
       listsCount += r.listsCount;
       for (const c of r.contacts) {
-        const key = c.email?.toLowerCase() ?? '';
+        // dedupKey, never email: an email-less contact carries `email: ''`, so keying on
+        // the address here would merge every phone-only contact across every user into one.
+        const key = c.dedupKey || c.email?.toLowerCase() || '';
         if (!contactMap.has(key)) contactMap.set(key, c);
       }
     }

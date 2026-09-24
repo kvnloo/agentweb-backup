@@ -31,8 +31,11 @@ function baseConfig(overrides: Partial<EnrichmentConfig> = {}): EnrichmentConfig
   } as EnrichmentConfig;
 }
 
+// A default email, because the cron now agrees with the engine's precondition: a lead with
+// no email, no LinkedIn and no full name can never be enriched, so it is not selected.
+// Pass `{ email: undefined }` to build the identity-less shape deliberately.
 function lead(leadId: string, overrides: Record<string, any> = {}) {
-  return { leadId, listId: 'list-1', ...overrides };
+  return { leadId, listId: 'list-1', email: `${leadId}@example.com`, ...overrides };
 }
 
 function makeDeps(overrides: Partial<CrmAutoEnrichmentCronDeps> = {}): CrmAutoEnrichmentCronDeps {
@@ -225,6 +228,54 @@ describe('runCrmAutoEnrichmentCron', () => {
 
     const [runInput] = (deps.runEnrichment as jest.Mock).mock.calls[0];
     expect(runInput.leadIds.length).toBeLessThanOrEqual(50);
+  });
+
+  // ENG-2082: resolveLeadIdentity rejects a lead with no email, no LinkedIn and no full
+  // name as 'no_identity_signal', and the engine `continue`s on that category BEFORE
+  // stamping enrichmentMetadata. Selecting such a lead therefore reselects it forever.
+  it('never selects a lead that the engine can only reject for lack of identity', async () => {
+    const deps = makeDeps({
+      getAutoEnrichEnabledLists: jest.fn().mockResolvedValue([{ listId: 'list-1', userId: 'u1' }]),
+      getAllLeadsByListId: jest.fn().mockResolvedValue([
+        lead('phone-only', { email: undefined, phone: '2125559876' }),
+        lead('bare', { email: undefined }),
+      ]),
+    });
+
+    await runCrmAutoEnrichmentCron(deps);
+
+    expect(deps.runEnrichment).not.toHaveBeenCalled();
+  });
+
+  it('still selects an identity-less-email lead that has a LinkedIn or a full name', async () => {
+    const deps = makeDeps({
+      getAutoEnrichEnabledLists: jest.fn().mockResolvedValue([{ listId: 'list-1', userId: 'u1' }]),
+      getAllLeadsByListId: jest.fn().mockResolvedValue([
+        lead('has-li', { email: undefined, linkedin: 'https://linkedin.com/in/ada' }),
+        lead('has-name', { email: undefined, firstName: 'Ada', lastName: 'Lovelace' }),
+        lead('neither', { email: undefined, firstName: 'Ada' }),
+      ]),
+    });
+
+    await runCrmAutoEnrichmentCron(deps);
+
+    const [runInput] = (deps.runEnrichment as jest.Mock).mock.calls[0];
+    expect(runInput.leadIds.sort()).toEqual(['has-li', 'has-name']);
+  });
+
+  // The starvation this prevents: 50 unenrichable rows fill the per-run budget and the
+  // enrichable lead behind them is never reached on any tick.
+  it('does not let unenrichable leads consume the per-list budget', async () => {
+    const dead = Array.from({ length: 60 }, (_, i) => lead(`dead-${i}`, { email: undefined }));
+    const deps = makeDeps({
+      getAutoEnrichEnabledLists: jest.fn().mockResolvedValue([{ listId: 'list-1', userId: 'u1' }]),
+      getAllLeadsByListId: jest.fn().mockResolvedValue([...dead, lead('real')]),
+    });
+
+    await runCrmAutoEnrichmentCron(deps);
+
+    const [runInput] = (deps.runEnrichment as jest.Mock).mock.calls[0];
+    expect(runInput.leadIds).toEqual(['real']);
   });
 
   it('surfaces a failed enrichment run via the oncall alert — not silently swallowed', async () => {

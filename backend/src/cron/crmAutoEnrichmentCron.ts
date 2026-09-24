@@ -92,9 +92,32 @@ export interface CrmAutoEnrichmentCronDeps {
  * it up. (CodeRabbit, PR #2583.)
  */
 function isUnenriched(
-  lead: { enrichmentMetadata?: Record<string, unknown> },
+  lead: {
+    enrichmentMetadata?: Record<string, unknown>;
+    email?: string | null;
+    linkedin?: string | null;
+    firstName?: string | null;
+    lastName?: string | null;
+  },
   config: EnrichmentConfig,
 ): boolean {
+  // Agree with the engine's own precondition, or this cron reselects the same rows forever.
+  // resolveLeadIdentity (enrichmentIdentityResolver.ts:293) rejects a lead with no email,
+  // no LinkedIn and no full name as 'no_identity_signal', and crmEnrichmentServiceV3.ts
+  // `continue`s on that category BEFORE pendingWrites — so no enrichmentMetadata is ever
+  // stamped and the selector below picks the identical lead up on the next tick.
+  //
+  // ENG-2082 made this reachable in volume: a phone-only capture with no name has exactly
+  // that shape. At MAX_LEADS_PER_LIST_PER_RUN = 50, fifty such rows permanently consume a
+  // list's per-run budget and NO other lead on that list is ever enriched again. Silent,
+  // because they count as `skipped` rather than `failed`, so no alert fires.
+  const hasEmail = typeof lead.email === 'string' && lead.email.trim() !== '';
+  const hasLinkedin = typeof lead.linkedin === 'string' && lead.linkedin.trim() !== '';
+  const hasFullName =
+    typeof lead.firstName === 'string' && lead.firstName.trim() !== '' &&
+    typeof lead.lastName === 'string' && lead.lastName.trim() !== '';
+  if (!hasEmail && !hasLinkedin && !hasFullName) return false;
+
   // Card-revenue fields are never filled by the cron (it doesn't use Enigma,
   // ENG-1388); counting them would reselect the same leads on every tick.
   const enabledFieldNames = config.fields
