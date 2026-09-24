@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { growthGeniusService } from '../services/growthGeniusService';
 import { UserPayload } from '../middleware/auth';
 import { chatbotDb } from '../services/chatbotService';
+import { resolveRunFunding, withRunFunding } from '../services/funding/runFunding';
 
 export const growthGeniusController = {
   // Create a new chat session
@@ -273,11 +274,18 @@ export const growthGeniusController = {
       const userMessages = session.messages?.filter(msg => msg.role === 'user') || [];
       const isFirstMessage = userMessages.length === 0;
 
+      // ENG-1816 F1: GrowthGenius is a real multi-turn chat product — the same
+      // shape as the Emma sidebar's generateChatResponse — but its 3 callLLM call
+      // sites (title, initial turn, tool-follow-up turn) never entered any
+      // RunFunding scope, found by a round-4 PR review. Resolved once per message,
+      // same as the sidebar's fix, so both calls below share one funding decision.
+      const runFunding = await resolveRunFunding({ userId: user.userId });
+
       // If this is the first message, generate a session title
       if (isFirstMessage) {
         try {
           console.log('GrowthGenius: First message detected, generating session title');
-          const title = await growthGeniusService.generateSessionTitle(content, user.userId);
+          const title = await withRunFunding(runFunding, () => growthGeniusService.generateSessionTitle(content, user.userId));
           await chatbotDb.updateSessionTitle(sessionId, title);
           console.log('GrowthGenius: Session title updated to:', title);
         } catch (error) {
@@ -287,7 +295,7 @@ export const growthGeniusController = {
       }
 
       // Generate AI response using the service
-      const aiResponse = await growthGeniusService.generateResponse(
+      const aiResponse = await withRunFunding(runFunding, () => growthGeniusService.generateResponse(
         content,
         session.messages
           ?.filter(msg => msg.role !== 'system') // Filter out system messages
@@ -299,7 +307,7 @@ export const growthGeniusController = {
           })) || [], // Convert ChatMessage to GrowthGeniusMessage format
         user.userId,
         session.selectedStartupId // Pass startup context
-      );
+      ));
 
       // Create assistant message object
       const assistantMessage = {
