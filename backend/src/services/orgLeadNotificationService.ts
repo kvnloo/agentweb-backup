@@ -219,8 +219,9 @@ async function deliverLeadNotification(job: LeadNotificationJob, ctx: NonNullabl
           if (!auth.ok || !auth.bot_id || auth.team_id !== ctx.connection.team_id) throw new Error('Slack workspace mismatch');
           authenticated = true;
         }
+        // Use the Emma bot's identity; username overrides require chat:write.customize.
         const payload: ChatPostMessageArguments & { client_msg_id: string } = {
-          channel: ctx.config.slackChannelId, text: message(ctx, job), username: 'Emma',
+          channel: ctx.config.slackChannelId, text: message(ctx, job),
           client_msg_id: messageIdOf(job), unfurl_links: false, unfurl_media: false, parse: 'none',
         };
         const result = await client.chat.postMessage(payload);
