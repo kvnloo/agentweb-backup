@@ -18,6 +18,12 @@ describe('deriveQuickStatus (ENG-2133)', () => {
     expect(deriveQuickStatus({ ...base, ad_connection: 'connected', has_crm: false })).toBe('mediocre');
   });
 
+  it('treats ads on Google/LinkedIn as activated, split on lander and CRM like connected', () => {
+    expect(deriveQuickStatus({ ...base, has_ads: false, ad_connection: 'other_platform' })).toBe('healthy');
+    expect(deriveQuickStatus({ ...base, has_ads: false, ad_connection: 'other_platform', has_crm: false })).toBe('mediocre');
+    expect(quickSummary({ ...base, has_ads: false, ad_connection: 'other_platform' })).toBe('Ads on Google/LinkedIn');
+  });
+
   it('falls back to has_ads when an older backend omits ad_connection', () => {
     expect(deriveQuickStatus({ ...base, has_ads: false })).toBe('onboarding');
     expect(deriveQuickStatus(base)).toBe('healthy');

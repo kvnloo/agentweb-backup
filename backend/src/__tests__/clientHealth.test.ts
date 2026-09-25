@@ -150,6 +150,22 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.health.status_reasons.join(' ')).toContain('2026-09-15T20:52:34.993Z');
   });
 
+  it('does not call a Google/LinkedIn Ads client onboarding or blocked when Meta is absent', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({ userId: 'client-user', email: 'client@example.com', adAccount: '' });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      { platform: 'google_ads', config: { account_type: 'google_ads', refresh_token: 'r', token_expires_at: 1 } },
+      { platform: 'linkedin_ads', config: { account_type: 'ad_account', refresh_token: 'r', token_expires_at: 1 } },
+    ]);
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.health.ads_layer.connection).toBe('other_platform');
+    expect(['onboarding', 'blocked', 'at-risk']).not.toContain(result.health.status);
+    expect(result.health.status_reasons.join(' ')).not.toMatch(/activation|ad account/i);
+    expect(mockedMetaFetch).not.toHaveBeenCalled();
+  });
+
   it('reads campaigns through the first usable Meta account, not a stale first record (#3070 review)', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
     (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({ userId: 'client-user', email: 'client@example.com', adAccount: '' });
@@ -1535,6 +1551,14 @@ describe('Client Health - classifyMetaAdConnection', () => {
       .toBe('connected');
   });
 
+  it('is other_platform when ads run on Google Ads or LinkedIn Ads without Meta (ThinkingAI shape)', () => {
+    expect(classifyMetaAdConnection([{ platform: 'google_ads', config: { account_type: 'google_ads' } }], '', now).connection)
+      .toBe('other_platform');
+    expect(classifyMetaAdConnection([{ platform: 'linkedin_ads', config: { account_type: 'ad_account' } }], '', now).connection)
+      .toBe('other_platform');
+    expect(classifyMetaAdConnection([{ platform: 'gmail', config: {} }], '', now).connection).toBe('never_connected');
+  });
+
   it('ignores non-ad Meta accounts (e.g. pages)', () => {
     const page = { platform: 'meta', config: { account_type: 'page', token_expires_at: now + 1 } };
     expect(classifyMetaAdConnection([page], '', now).connection).toBe('never_connected');
@@ -1548,11 +1572,14 @@ describe('Client Health - listAllClients ad_connection', () => {
       { userId: 'u-never', email: 'never@example.com' },
       { userId: 'u-expired', email: 'expired@example.com' },
       { userId: 'u-legacy', email: 'legacy@example.com', adAccount: 'act_legacy' },
+      { userId: 'u-google', email: 'google@example.com' },
     ]);
     (getAccountsByUserId as jest.Mock).mockImplementation(async (userId: string) =>
       userId === 'u-expired'
         ? [{ platform: 'meta', config: { account_type: 'ad_account', token_expires_at: expired } }]
-        : []);
+        : userId === 'u-google'
+          ? [{ platform: 'google_ads', config: { account_type: 'google_ads' } }]
+          : []);
 
     const result = await listAllClients('admin-user', true);
 
@@ -1561,6 +1588,7 @@ describe('Client Health - listAllClients ad_connection', () => {
     expect(byId['u-never'].ad_connection).toBe('never_connected');
     expect(byId['u-expired'].ad_connection).toBe('expired');
     expect(byId['u-legacy'].ad_connection).toBe('connected');
+    expect(byId['u-google'].ad_connection).toBe('other_platform');
     // has_ads keeps its historical meaning (an ad account is on record) for existing consumers.
     expect(byId['u-expired'].has_ads).toBe(true);
     (getAccountsByUserId as jest.Mock).mockReset();
