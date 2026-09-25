@@ -70,6 +70,63 @@ describe('buildCutoffPopulation', () => {
     expect(result.cases).toHaveLength(1);
   });
 
+  it('does not count a failed checkout before the cutoff as paying when the first subscription starts after it', () => {
+    const result = buildCutoffPopulation(
+      data({
+        users: [{ userId: 'late', createdAt: at(-90), subscription_status: 'active' }],
+        payments: [
+          { userId: 'late', timestamp: at(-2), eventType: 'payment_failed' },
+          { userId: 'late', timestamp: at(4), eventType: 'subscription_created' },
+        ],
+      }),
+      C,
+      30 * DAY_MS,
+    );
+    expect(result).toMatchObject({ excludedNotYetPaying: 1, cases: [] });
+  });
+
+  it('counts ad spend over the 30 complete days before the cutoff, not the cutoff day itself', () => {
+    const spendOn = (date: string) => ({ userId: 'u', date, spend: 10 });
+    const expired = { platform: 'meta', created_at: at(-60), config: { account_type: 'ad_account', token_expires_at: C - DAY_MS } };
+    const population = (date: string) =>
+      buildCutoffPopulation(
+        data({
+          users: [{ userId: 'u', createdAt: at(-90), subscription_status: 'active', connected_accounts: [expired] }],
+          // An early row so the snapshot history covers the whole window.
+          spend: [spendOn('2026-03-01'), spendOn(date)],
+        }),
+        C,
+        30 * DAY_MS,
+      ).cases[0].state;
+    // Spend inside the window makes the requirement current, so the expired connection is at risk.
+    expect(population('2026-05-02')).toBe('at_risk');
+    expect(population('2026-05-31')).toBe('at_risk');
+    // The cutoff day has not happened yet at C; the day before the window is out of it.
+    expect(population('2026-06-01')).toBe('insufficient_evidence');
+    expect(population('2026-05-01')).toBe('insufficient_evidence');
+  });
+
+  it('excludes an account whose ad connection has no created_at, since it may postdate the cutoff', () => {
+    const result = buildCutoffPopulation(
+      data({
+        users: [
+          {
+            userId: 'undated',
+            createdAt: at(-90),
+            subscription_status: 'active',
+            connected_accounts: [{ platform: 'meta', config: { account_type: 'ad_account', token_expires_at: C + 90 * DAY_MS } }],
+          },
+          // A non-ad connection without a date does not matter to the classifier.
+          { userId: 'social', createdAt: at(-90), subscription_status: 'active', connected_accounts: [{ platform: 'linkedin', config: {} }] },
+        ],
+      }),
+      C,
+      30 * DAY_MS,
+    );
+    expect(result.excludedUndatedConnection).toBe(1);
+    expect(result.cases).toHaveLength(1);
+  });
+
   it('judges ad tokens and connections as of the cutoff', () => {
     const meta = (tokenExpiresAt: number, createdAt: string) => ({
       platform: 'meta',

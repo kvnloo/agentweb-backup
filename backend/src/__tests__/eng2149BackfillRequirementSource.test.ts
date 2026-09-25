@@ -4,6 +4,7 @@
  */
 import {
   planRequirementBackfill,
+  planRequirementRollback,
   assertApplyAllowed,
   APPLY_ENV_VAR,
   BACKFILL_SET_BY,
@@ -51,5 +52,18 @@ describe('planRequirementBackfill', () => {
       NOW,
     );
     expect(plan).toEqual({ writes: [], alreadySet: 0, unknownContracted: ['x'] });
+  });
+});
+
+describe('planRequirementRollback', () => {
+  it('selects exactly the rows written with the given --set-by value', () => {
+    const rows: ScannedCapabilityRow[] = [
+      { userId: 'a', capability: 'ad_platform_integration', requirementSource: 'onboarding_intent', requirementSetBy: BACKFILL_SET_BY },
+      { userId: 'b', capability: 'ad_platform_integration', requirementSource: 'contracted', requirementSetBy: 'ops@example.com' },
+      { userId: 'c', capability: 'ad_platform_integration', requirementSource: 'contracted', requirementSetBy: 'someone-else@example.com' },
+      { userId: 'd', capability: 'account_health_signal', requirementSetBy: 'ops@example.com' },
+    ];
+    expect(planRequirementRollback(rows, 'ops@example.com').map((r) => r.userId)).toEqual(['b']);
+    expect(planRequirementRollback(rows, BACKFILL_SET_BY).map((r) => r.userId)).toEqual(['a']);
   });
 });

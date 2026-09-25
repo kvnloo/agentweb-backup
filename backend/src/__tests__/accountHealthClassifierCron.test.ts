@@ -15,6 +15,8 @@ jest.mock('../services/accountCapabilityRequirementsDb', () => ({
   putAccountHealthSignalState: jest.fn(),
   isSuppressed: jest.fn(),
 }));
+jest.mock('../loops/eval/evalRegistry', () => ({ mayGate: jest.fn() }));
+jest.mock('../utils/instanceState', () => ({ isCronEnabled: jest.fn() }));
 
 import { userDb } from '../services/db';
 import { paymentHistoryDb, type PaymentHistoryRecord } from '../services/paymentHistoryDb';
@@ -30,6 +32,8 @@ import {
 } from '../services/accountCapabilityRequirementsDb';
 import { decideAccountHealthSignal, runAccountHealthClassifier, type AccountHealthUser } from '../cron/accountHealthClassifierCron';
 import { classifyAccountHealth, type AccountHealthSignals } from '../services/accountHealthClassifier';
+import { mayGate } from '../loops/eval/evalRegistry';
+import { isCronEnabled } from '../utils/instanceState';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const NOW = Date.parse('2026-09-25T12:00:00.000Z');
@@ -57,7 +61,7 @@ function classify(overrides: Partial<AccountHealthSignals> = {}, nowMs: number =
 function replay(results: Array<{ at: number; overrides?: Partial<AccountHealthSignals> }>) {
   let state: AccountHealthSignalState | null = null;
   return results.map(({ at, overrides }) => {
-    const decision = decideAccountHealthSignal(state, classify(overrides, at), iso(at));
+    const decision = decideAccountHealthSignal(state, classify(overrides, at), iso(at), { oncallAllowed: true });
     if (decision.next) state = decision.next;
     return decision;
   });
@@ -133,11 +137,21 @@ describe('decideAccountHealthSignal', () => {
     expect(decision).toMatchObject({ channel: 'needs_review', emit: true });
   });
 
+  it('AC4: when a correction lapses mid-episode the same risk escalates to oncall once', () => {
+    const result = classify();
+    const first = decideAccountHealthSignal(null, result, iso(NOW), { correctionActive: true, oncallAllowed: true });
+    expect(first).toMatchObject({ channel: 'needs_review', emit: true });
+    const lapsed = decideAccountHealthSignal(first.next, classify({}, NOW + DAY_MS), iso(NOW + DAY_MS), { oncallAllowed: true });
+    expect(lapsed).toMatchObject({ channel: 'oncall', emit: true, reason: 'escalated' });
+    const repeat = decideAccountHealthSignal(lapsed.next, classify({}, NOW + 2 * DAY_MS), iso(NOW + 2 * DAY_MS), { oncallAllowed: true });
+    expect(repeat).toMatchObject({ channel: 'oncall', emit: false, reason: 'unchanged' });
+  });
+
   it('AC4: an active correction downgrades a connection-only risk, but not a payment risk', () => {
     const expired = classify();
-    expect(decideAccountHealthSignal(null, expired, iso(NOW), { correctionActive: true }).channel).toBe('needs_review');
+    expect(decideAccountHealthSignal(null, expired, iso(NOW), { correctionActive: true, oncallAllowed: true }).channel).toBe('needs_review');
     const paymentAndExpired = classify({ payments: [{ eventType: 'payment_failed', timestamp: iso(NOW - DAY_MS) }] });
-    expect(decideAccountHealthSignal(null, paymentAndExpired, iso(NOW), { correctionActive: true }).channel).toBe('oncall');
+    expect(decideAccountHealthSignal(null, paymentAndExpired, iso(NOW), { correctionActive: true, oncallAllowed: true }).channel).toBe('oncall');
   });
 });
 
@@ -177,6 +191,8 @@ describe('runAccountHealthClassifier', () => {
       return true;
     });
     jest.mocked(sendAgentModeOncallAlert).mockResolvedValue(true);
+    jest.mocked(mayGate).mockReturnValue(true);
+    jest.mocked(isCronEnabled).mockReturnValue(true);
   });
 
   afterAll(() => {
@@ -188,6 +204,16 @@ describe('runAccountHealthClassifier', () => {
   it('is inert with the flag unset: no scan, no write, no alert', async () => {
     delete process.env.ACCOUNT_HEALTH_ALERTS_ENABLED;
     users.push({ userId: 'u1', connected_accounts: [expiredMeta], subscription_status: 'active' });
+    const summary = await runAccountHealthClassifier({ now: NOW });
+    expect(summary.scanned).toBe(0);
+    expect(userDb.scanWithFilter).not.toHaveBeenCalled();
+    expect(putAccountHealthSignalState).not.toHaveBeenCalled();
+    expect(sendAgentModeOncallAlert).not.toHaveBeenCalled();
+  });
+
+  it('does nothing on a draining instance (graceful shutdown disabled cron), including the first run', async () => {
+    users.push({ userId: 'u1', connected_accounts: [expiredMeta], subscription_status: 'active' });
+    jest.mocked(isCronEnabled).mockReturnValue(false);
     const summary = await runAccountHealthClassifier({ now: NOW });
     expect(summary.scanned).toBe(0);
     expect(userDb.scanWithFilter).not.toHaveBeenCalled();
@@ -220,6 +246,20 @@ describe('runAccountHealthClassifier', () => {
     });
     expect(alert.message).toContain('Current ads requirement: required');
     expect(alert.message).toContain('Next actor: Customer: reconnect');
+  });
+
+  it('ENG-2128 principle 2: an unvalidated classifier never pages oncall; at_risk escalates once validated', async () => {
+    users.push({ userId: 'u1', connected_accounts: [expiredMeta], subscription_status: 'active' });
+    jest.mocked(mayGate).mockReturnValue(false);
+    const gated = await runAccountHealthClassifier({ now: NOW });
+    expect(mayGate).toHaveBeenCalledWith('account-health-classifier');
+    expect(gated).toMatchObject({ oncall: 0, needsReview: 1 });
+    expect(sendAgentModeOncallAlert).not.toHaveBeenCalled();
+    expect(store.get('u1')?.lastSignalChannel).toBe('needs_review');
+
+    jest.mocked(mayGate).mockReturnValue(true);
+    expect(await runAccountHealthClassifier({ now: NOW + DAY_MS })).toMatchObject({ oncall: 1 });
+    expect(jest.mocked(sendAgentModeOncallAlert).mock.calls[0][0].context).toMatchObject({ reason: 'escalated' });
   });
 
   it('never pages oncall for a never-connected account: CS nudge log line only', async () => {
