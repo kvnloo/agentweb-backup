@@ -273,7 +273,7 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
     source: 'services/accountHealthClassifier.ts via cron/accountHealthClassifierCron.ts; backtest scripts/eng2143-account-health-backtest.ts',
     model: 'none',
     modelFamily: 'none',
-    consumers: ['oncall alert (at_risk) and CS nudge log (activation_incomplete), only when ACCOUNT_HEALTH_ALERTS_ENABLED=true'],
+    consumers: ['needs-review log (at_risk; oncall alert only once mayGate is true) and CS nudge log (activation_incomplete), only when ACCOUNT_HEALTH_ALERTS_ENABLED=true'],
     knownIssues: ['ENG-2016', 'ENG-1342', 'ENG-1913', 'ENG-2149'],
     notes: 'Replaces renewal-integration-health. Not validated: the 2026-09-25 backtest has single-digit churn positives, so its precision CI is too wide to gate. Current-requirement fields arrive with OPS-4 (ENG-2149); no live campaign-delivery source yet, so zero delivery is not evaluated live.',
   },

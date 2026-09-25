@@ -5,7 +5,8 @@
  *  - the ENG-1342 account-health block in `metaTrackingMonitorCron`: `console.warn` only.
  *
  * Every paying account is classified by `accountHealthClassifier`; the result is routed by state:
- *  - `at_risk` → the oncall alert path, at most once per account + billing cycle + episode, again
+ *  - `at_risk` → the oncall alert path once the classifier has a qualifying validation in the
+ *    eval registry (`mayGate`); until then a needs-review log line. At most once per account + billing cycle + episode, again
  *    only when new risk evidence appears (ENG-2016 AC3). A human correction on the account's
  *    capability row still suppresses a connection/delivery-only alert (ENG-2016 AC4).
  *  - `activation_incomplete` → a CS nudge log line. Never oncall, never churn (decision D6).
@@ -40,6 +41,7 @@ import {
   type EvidenceCode,
 } from '../services/accountHealthClassifier';
 import type { AdConnectionAccount } from '../services/clientHealthService';
+import { mayGate } from '../loops/eval/evalRegistry';
 
 const TAG = '[accountHealthClassifierCron]';
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -78,11 +80,15 @@ export interface AccountHealthSignalDecision {
 /** Only connection/delivery risks are about the ad capability a human correction covers. */
 const CORRECTABLE_RISKS: ReadonlySet<EvidenceCode> = new Set(['ads_connection_expired', 'zero_delivery']);
 
-function channelFor(result: AccountHealthClassification, correctionActive: boolean): AccountHealthChannel {
+/** The registry id whose validation decides whether at-risk may page oncall (ENG-2128 principle 2). */
+export const ACCOUNT_HEALTH_GRADER_ID = 'account-health-classifier';
+
+function channelFor(result: AccountHealthClassification, correctionActive: boolean, oncallAllowed: boolean): AccountHealthChannel {
   switch (result.state) {
     case 'at_risk': {
       const risks = result.evidence.filter((e) => e.kind === 'risk').map((e) => e.code);
-      return correctionActive && risks.every((c) => CORRECTABLE_RISKS.has(c)) ? 'needs_review' : 'oncall';
+      if (correctionActive && risks.every((c) => CORRECTABLE_RISKS.has(c))) return 'needs_review';
+      return oncallAllowed ? 'oncall' : 'needs_review';
     }
     case 'activation_incomplete':
       return 'cs_nudge';
@@ -102,9 +108,9 @@ export function decideAccountHealthSignal(
   prev: AccountHealthSignalState | null,
   result: AccountHealthClassification,
   nowIso: string,
-  opts: { correctionActive?: boolean } = {},
+  opts: { correctionActive?: boolean; oncallAllowed?: boolean } = {},
 ): AccountHealthSignalDecision {
-  const channel = channelFor(result, opts.correctionActive ?? false);
+  const channel = channelFor(result, opts.correctionActive ?? false, opts.oncallAllowed ?? false);
   const codes = result.evidence
     .filter((e) => e.kind === 'risk' || e.kind === 'activation' || e.kind === 'gap')
     .map((e) => e.code)
@@ -288,6 +294,10 @@ export async function runAccountHealthClassifier(
   if (dryRun) summary.captured = [];
   const nowMs = opts.now ?? Date.now();
   const nowIso = new Date(nowMs).toISOString();
+  // Unvalidated graders cannot alert: until a qualifying validation is recorded in the eval
+  // registry, at_risk is a needs-review log line. Once it is, the stored needs_review signal
+  // escalates to oncall on the next run.
+  const oncallAllowed = mayGate(ACCOUNT_HEALTH_GRADER_ID);
 
   let users: AccountHealthUser[];
   try {
@@ -311,6 +321,7 @@ export async function runAccountHealthClassifier(
       const prev = await getAccountHealthSignalState(user.userId);
       const decision = decideAccountHealthSignal(prev, result, nowIso, {
         correctionActive: isSuppressed(capabilityRow, nowMs),
+        oncallAllowed,
       });
       if (!decision.emit) summary.silent++;
       if (dryRun) {
