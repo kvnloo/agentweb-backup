@@ -82,10 +82,18 @@ function decisionItemBlocks(decision: ApprovalDecision): any[] {
   if (decision.evidencePacket?.chatUrl) links.unshift(decision.evidencePacket.chatUrl);
 
   const summaryLines = [
-    // ENG-2159: rendered as its own distinct, always-present line — a real
-    // account got mistakenly rejected because the account it concerned was
-    // buried in businessImpact prose (or absent) rather than shown plainly.
-    `:office: *${decision.subjectLabel}*`,
+    // ENG-2159: rendered as its own distinct, always-present line for any
+    // decision created after this shipped — a real account got mistakenly
+    // rejected because the account it concerned was buried in businessImpact
+    // prose (or absent) rather than shown plainly.
+    //
+    // Still guarded (not unconditional): subjectLabel is required at CREATE
+    // time (validateCreateRequest), but pre-existing records created before
+    // this field existed have no value for it — an unconditional render
+    // produced a literal "undefined" line in a real, live prod card (found
+    // live-testing this exact fix, not assumed). Legacy records simply omit
+    // the line, same fallback shape as the optional subjectContactEmail line.
+    decision.subjectLabel ? `:office: *${decision.subjectLabel}*` : undefined,
     decision.subjectContactEmail ? formatContactLine(decision.subjectContactEmail) : undefined,
     `*${decision.businessImpact}*`,
     decision.evidencePacket?.researchSummary,

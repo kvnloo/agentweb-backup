@@ -125,6 +125,19 @@ describe('approvalInboxSlack', () => {
       expect(rendered).toContain('Needs sign-off on the campaign build.');
     });
 
+    it('omits the subject-label line entirely for a legacy record with no subjectLabel, never renders the literal string "undefined" (found live in prod)', async () => {
+      mockListPending.mockResolvedValue([
+        { decisionId: 'd1', businessImpact: 'A pre-ENG-2159 decision with no subjectLabel field at all.', evidencePacket: {}, options: [] },
+      ]);
+
+      await approvalInboxSlack.upsertApproverQueueMessage('matt');
+
+      const rendered = JSON.stringify(mockPostMessage.mock.calls[0][0].blocks);
+      expect(rendered).not.toContain('undefined');
+      expect(rendered).not.toContain(':office:');
+      expect(rendered).toContain('A pre-ENG-2159 decision with no subjectLabel field at all.');
+    });
+
     it('renders subjectContactEmail with the domain repeated and bolded, never bold markers inside the auto-linked address (ENG-2159 follow-up)', async () => {
       mockListPending.mockResolvedValue([
         { decisionId: 'd1', subjectLabel: 'x', subjectContactEmail: 'vincent@thinkingai.com', businessImpact: 'x', evidencePacket: {}, options: [] },
