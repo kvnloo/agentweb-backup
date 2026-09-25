@@ -19,6 +19,9 @@ harness (ENG-2136) produces those runs; record the result on the entry, with evi
 | session-judge-matt | agent | LLM judge | gemini-3.5-flash (Gemini) | no |
 | finalize-guard | agent | LLM judge | gemini-3.1-flash-lite (Gemini), off in prod | no |
 | agent-run-verdict | agent | code | — | no |
+| agent-task-success | agent | code, offline | — | no |
+| agent-tool-correctness | agent | code, offline | — | no |
+| agent-groundedness-offline | agent | code, offline (finalize-guard lexicon) | — | no |
 | okareo-no-hallucinated-capabilities-v2 | agent | LLM judge (Okareo) | unknown | calibration set only |
 | enrichment-golden-set | agent | code | — | golden set, CRM enrichment only |
 | human-eval-queue | creative | human (free text) | — | no |
@@ -61,6 +64,16 @@ Sources, consumers and known issues for each entry are in `evalRegistry.ts`.
    ad images and ad copy) on fixture pairs.
 10. **Account health mislabelled activation as risk** — a never-connected ad account read as
     blocked / At Risk. Fixed by ENG-2133.
+
+## Agent graders (ENG-2137)
+
+`loops/eval/agentGraders.ts` grades a session without an LLM: task success from the work plan
+(ENG-1710 relaxed rule, with tool evidence for completed steps), tool-call correctness (loop-event
+failure classes, plus ad-platform writes never read back — the grader side of ENG-592), groundedness
+(finalize-guard lexicon vs successful tool calls) and cost / turns / tokens / tool latency per
+successful task. `scripts/evalAgentGraders.ts` runs them read-only over a date range and prints
+results per model × task type with n and a Wilson CI. None is validated; pass^k needs the sandbox
+(ENG-1906).
 
 ## Known false-positive catalogue (session judges)
 
