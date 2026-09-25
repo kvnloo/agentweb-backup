@@ -132,6 +132,15 @@ export async function notifyCustomerOfExpiredCredentialDecision(decision: Approv
  * expiresAt and the next sweep tick lost the claim silently, and the sweep
  * later emailed the customer a false "your window closed" despite them
  * having already fixed it.
+ *
+ * Review fix: each decision's claim+execute now runs via Promise.allSettled
+ * instead of a sequential for-loop — the same "attempt every item
+ * independently, one failure doesn't stop the rest" idiom already used by
+ * admin.ts's chat-session scoring endpoint. This runs inline in a real OAuth
+ * reconnect HTTP callback, so its latency scaled linearly with the number of
+ * duplicate decisions under the old sequential-await loop; resolving them
+ * concurrently keeps the reconnect response fast regardless of how many
+ * duplicates a customer has.
  */
 export async function autoResolveCredentialDecisionOnReconnect(
   customerId: string,
@@ -141,25 +150,27 @@ export async function autoResolveCredentialDecisionOnReconnect(
   try {
     const decisions = await approvalInboxService.findPendingCredentialDecisions(customerId, platform, accountId);
 
-    for (const decision of decisions) {
-      try {
-        const result = await approvalInboxService.claimDecision(decision.decisionId, 'approve', 'system:auto-reconnect', undefined, { skipExpiryCheck: true });
-        if (!result.claimed) {
-          // Lost a race on THIS decision — already resolved some other way,
-          // or the sweep beat this reconnect to expiring it outright (a
-          // real, if now much narrower, remaining race). Not an error;
-          // still attempt the rest of the matches.
-          continue;
+    await Promise.allSettled(
+      decisions.map(async (decision) => {
+        try {
+          const result = await approvalInboxService.claimDecision(decision.decisionId, 'approve', 'system:auto-reconnect', undefined, { skipExpiryCheck: true });
+          if (!result.claimed) {
+            // Lost a race on THIS decision — already resolved some other way,
+            // or the sweep beat this reconnect to expiring it outright (a
+            // real, if now much narrower, remaining race). Not an error;
+            // the other matches are attempted independently regardless.
+            return;
+          }
+          await executeResolvedDecision(result.decision);
+        } catch (err: any) {
+          console.warn(
+            '[approval-inbox-customer-notify] failed to auto-resolve one credential decision on reconnect:',
+            { customerId, platform, accountId, decisionId: decision.decisionId },
+            err?.message || err,
+          );
         }
-        await executeResolvedDecision(result.decision);
-      } catch (err: any) {
-        console.warn(
-          '[approval-inbox-customer-notify] failed to auto-resolve one credential decision on reconnect:',
-          { customerId, platform, accountId, decisionId: decision.decisionId },
-          err?.message || err,
-        );
-      }
-    }
+      }),
+    );
   } catch (err: any) {
     console.warn(
       '[approval-inbox-customer-notify] failed to auto-resolve credential decisions on reconnect:',
