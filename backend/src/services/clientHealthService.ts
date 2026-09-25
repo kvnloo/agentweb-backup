@@ -356,11 +356,18 @@ export async function assessClientHealth(
     // queried against an account id it may not be granted access to, returning zero campaigns
     // with no error. Only falls back to the legacy id + shared token TOGETHER, and only when the
     // connected account has no usable (non-empty) access_token of its own.
-    // Prefer the first account classifyMetaAdConnection would count as usable, so a stale first
-    // record cannot shadow a working later one (the health status and the fetch agree).
+    // Prefer the first account the campaign fetch can actually use (unexpired AND carrying an
+    // account id and token), then any unexpired record, then the first. A stale or incomplete first
+    // record must not shadow a working later one (the health status and the fetch agree).
     const nowMs = Date.now();
+    const hasFetchCredentials = (acc: AdConnectionAccount): boolean => {
+      const config = acc.config as { ad_account_id?: string; access_token?: string } | undefined;
+      return !!config?.ad_account_id && !!config?.access_token;
+    };
     const connectedMetaAccount =
-      metaAdAccounts.find((acc) => isUsableMetaAdAccount(acc, nowMs)) ?? metaAdAccounts[0];
+      metaAdAccounts.find((acc) => isUsableMetaAdAccount(acc, nowMs) && hasFetchCredentials(acc)) ??
+      metaAdAccounts.find((acc) => isUsableMetaAdAccount(acc, nowMs)) ??
+      metaAdAccounts[0];
     const connectedAdAccountId = (connectedMetaAccount?.config as any)?.ad_account_id;
     const connectedAccessToken = connectedMetaAccount?.config?.access_token;
     // An expired connected account never wins over a legacy adAccount: the classifier counts the
