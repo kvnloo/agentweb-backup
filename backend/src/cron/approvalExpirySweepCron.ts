@@ -8,7 +8,7 @@
  * StatusExpiryIndex (status HASH, expiresAt RANGE) was provisioned in
  * create-tables.ts specifically for this and had zero consumers until now.
  *
- * Registered in server.ts to run hourly — decisions expire on a 1-7 day
+ * Registered in server.ts to run hourly — decisions expire on a 1-30 day
  * horizon, hourly is far more granular than needed.
  */
 import { approvalInboxService, type ApprovalDecision } from '../services/approvalInboxService';

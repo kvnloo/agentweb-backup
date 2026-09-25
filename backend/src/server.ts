@@ -791,7 +791,9 @@ createTestAccount().then(async () => {
 
       // ENG-1644 gap-closing: sweep AW-ApprovalDecisions for decisions past
       // expiresAt that nobody ever answered — flip to 'expired', notify the
-      // origin session. Hourly — decisions expire on a 1-7 day horizon.
+      // origin session. Hourly — decisions expire on a 1-30 day horizon
+      // (review fix: was "1-7 day", stale relative to emma/tools.ts's own
+      // MAX_EXPIRES_IN_DAYS=30 clamp added earlier in this same PR).
       // Own try/catch (review fix) — an import failure here must not abort
       // registration of every cron block after it in this boot sequence.
       try {

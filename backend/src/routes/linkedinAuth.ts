@@ -29,17 +29,19 @@ const IS_PRODUCTION = process.env.NODE_ENV === 'production';
  * ENG-1644 gap-closing: resolve any pending reconnect decision for this
  * exact account. Dynamic import — see metaAuth.ts's identical comment for
  * why (heavy transitive chain, must stay out of this file's static load).
- * The function itself never throws, but the import statement can — own
- * try/catch (review fix) so that can't abort the response. Shared by both
- * call sites in this file (review fix — flagged as duplicated 4x across
- * this file and metaAuth.ts by 3 independent review passes).
+ * safeAutoResolveCredentialDecision itself never throws, but the import
+ * statement can — own try/catch (review fix) so that can't abort the
+ * response. The wrapper's own logic lives once in
+ * approvalInboxCustomerNotify.ts, not duplicated per file (review fix — this
+ * local copy was flagged as duplicated 3x across this file, metaAuth.ts, and
+ * linkedInAdsAuth.ts by 4 independent review passes).
  */
-async function safeAutoResolveCredentialDecision(label: string, userId: string, platform: string, accountId: string): Promise<void> {
+async function safeAutoResolve(label: string, userId: string, platform: string, accountId: string): Promise<void> {
   try {
-    const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
-    await autoResolveCredentialDecisionOnReconnect(userId, platform, accountId);
+    const { safeAutoResolveCredentialDecision } = await import('../services/approvalInboxCustomerNotify');
+    await safeAutoResolveCredentialDecision(label, userId, platform, accountId);
   } catch (err: any) {
-    console.warn(`[${label}] auto-resolve credential decision failed:`, err?.message || err);
+    console.warn(`[${label}] auto-resolve module failed to load:`, err?.message || err);
   }
 }
 
@@ -387,7 +389,7 @@ router.post('/connect-accounts', authenticateToken, async (req: any, res) => {
       const account = await createAccount(userId, 'linkedin', accountInput);
       connectedAccounts.push(account);
 
-      await safeAutoResolveCredentialDecision('LinkedIn Connect', userId, 'linkedin', profile.urn);
+      await safeAutoResolve('LinkedIn Connect', userId, 'linkedin', profile.urn);
     }
 
     // Connect selected organizations
@@ -414,7 +416,7 @@ router.post('/connect-accounts', authenticateToken, async (req: any, res) => {
         connectedAccounts.push(account);
 
         // ENG-1644 gap-closing: same as the personal-account case above.
-        await safeAutoResolveCredentialDecision('LinkedIn Connect (org)', userId, 'linkedin', org.urn);
+        await safeAutoResolve('LinkedIn Connect (org)', userId, 'linkedin', org.urn);
       }
     }
 

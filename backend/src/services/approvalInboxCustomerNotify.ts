@@ -129,3 +129,27 @@ export async function autoResolveCredentialDecisionOnReconnect(
     );
   }
 }
+
+/**
+ * Review fix: this exact try/catch-and-log wrapper around
+ * autoResolveCredentialDecisionOnReconnect was independently duplicated in
+ * metaAuth.ts, linkedinAuth.ts, and linkedInAdsAuth.ts (3 near-identical
+ * copies, flagged by 4 separate review passes across this PR) — any future
+ * fix to the wrapping/logging behavior had to be applied in three places by
+ * hand. autoResolveCredentialDecisionOnReconnect itself already never
+ * throws; this wrapper exists only so a caller can label its own failures
+ * distinctly (e.g. "[Meta Connect Ad Accounts]" vs "[LinkedIn Ads Connect]")
+ * without re-implementing the try/catch shape at every call site. Callers
+ * still reach this via a dynamic `await import(...)` (see any call site's
+ * own comment for why — this module's own transitive chain is too heavy for
+ * a route file's static load) and still wrap THAT import in their own
+ * try/catch, since a module-load failure happens before this function is
+ * ever reachable.
+ */
+export async function safeAutoResolveCredentialDecision(label: string, userId: string, platform: string, accountId: string): Promise<void> {
+  try {
+    await autoResolveCredentialDecisionOnReconnect(userId, platform, accountId);
+  } catch (err: any) {
+    console.warn(`[${label}] auto-resolve credential decision failed:`, err?.message || err);
+  }
+}

@@ -19,16 +19,20 @@ const IS_PRODUCTION = process.env.NODE_ENV === 'production';
  * ENG-1644 gap-closing: linkedin_ads was a live platform with zero
  * auto-resolve wiring — a customer_credential decision for a LinkedIn Ads
  * reconnect could never resolve on its own, no matter what the customer
- * did. Same pattern as metaAuth.ts/linkedinAuth.ts's identical helper: the
- * function itself never throws, but the import statement can — own
- * try/catch so that can't abort this response.
+ * did. Same pattern as metaAuth.ts/linkedinAuth.ts's identical helper:
+ * safeAutoResolveCredentialDecision itself never throws, but the import
+ * statement can — own try/catch so that can't abort this response. The
+ * wrapper's own logic lives once in approvalInboxCustomerNotify.ts, not
+ * duplicated per file (review fix — this local copy was flagged as
+ * duplicated 3x across this file, metaAuth.ts, and linkedinAuth.ts by 4
+ * independent review passes).
  */
-async function safeAutoResolveCredentialDecision(label: string, userId: string, platform: string, accountId: string): Promise<void> {
+async function safeAutoResolve(label: string, userId: string, platform: string, accountId: string): Promise<void> {
   try {
-    const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
-    await autoResolveCredentialDecisionOnReconnect(userId, platform, accountId);
+    const { safeAutoResolveCredentialDecision } = await import('../services/approvalInboxCustomerNotify');
+    await safeAutoResolveCredentialDecision(label, userId, platform, accountId);
   } catch (err: any) {
-    console.warn(`[${label}] auto-resolve credential decision failed:`, err?.message || err);
+    console.warn(`[${label}] auto-resolve module failed to load:`, err?.message || err);
   }
 }
 
@@ -268,7 +272,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
       },
     });
 
-    await safeAutoResolveCredentialDecision('LinkedIn Ads Connect', userId, 'linkedin_ads', adAccountId);
+    await safeAutoResolve('LinkedIn Ads Connect', userId, 'linkedin_ads', adAccountId);
 
     res.json({ success: true, account });
   } catch (error: any) {

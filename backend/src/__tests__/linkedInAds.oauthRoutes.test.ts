@@ -51,9 +51,12 @@ jest.mock('../middleware/auth', () => ({
 // ENG-1644 gap-closing (review fix): approvalInboxCustomerNotify.ts
 // transitively pulls in emailService/chatbotService/agentModeService — too
 // heavy to load for real in a unit test, same reasoning as metaAuth.test.ts
-// and linkedinAuth.test.ts's identical mock.
+// and linkedinAuth.test.ts's identical mock. Mocks the shared
+// safeAutoResolveCredentialDecision wrapper (review fix — routes now call
+// this, not the raw autoResolveCredentialDecisionOnReconnect directly,
+// consolidated out of 3 near-identical per-file copies).
 jest.mock('../services/approvalInboxCustomerNotify', () => ({
-  autoResolveCredentialDecisionOnReconnect: jest.fn(),
+  safeAutoResolveCredentialDecision: jest.fn(),
 }));
 
 import request from 'supertest';
@@ -61,7 +64,7 @@ import express from 'express';
 import router from '../routes/linkedInAdsAuth';
 import * as linkedInAdsService from '../services/linkedInAdsService';
 import { createAccount } from '../services/connectedAccountsDb';
-import { autoResolveCredentialDecisionOnReconnect } from '../services/approvalInboxCustomerNotify';
+import { safeAutoResolveCredentialDecision } from '../services/approvalInboxCustomerNotify';
 import jwt from 'jsonwebtoken';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'test-jwt-secret';
@@ -293,11 +296,11 @@ describe('POST /connect', () => {
       adAccountId: 'urn:li:sponsoredAccount:111',
       adAccountName: 'Test Ad Account',
     });
-    expect(autoResolveCredentialDecisionOnReconnect).toHaveBeenCalledWith('user-123', 'linkedin_ads', 'urn:li:sponsoredAccount:111');
+    expect(safeAutoResolveCredentialDecision).toHaveBeenCalledWith('LinkedIn Ads Connect', 'user-123', 'linkedin_ads', 'urn:li:sponsoredAccount:111');
   });
 
   it('a failure in the auto-resolve call never breaks the real connect response', async () => {
-    (autoResolveCredentialDecisionOnReconnect as jest.Mock).mockRejectedValue(new Error('DynamoDB unavailable'));
+    (safeAutoResolveCredentialDecision as jest.Mock).mockRejectedValue(new Error('DynamoDB unavailable'));
     const tokenSessionId = await getValidSessionId();
     const res = await request(app).post('/connect').send({
       tokenSessionId,

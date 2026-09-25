@@ -1,6 +1,7 @@
 import AWS from 'aws-sdk';
 import { randomUUID } from 'crypto';
 import type { AskUserQuestionOption } from './agentMode/core/askUserQuestion';
+import type { PlatformType } from './connectedAccountsDb';
 
 // Same per-file DynamoDB client convention as approvalDb.ts/chatbotService.ts —
 // each service owns its own DocumentClient instance rather than sharing one.
@@ -164,7 +165,11 @@ const MAX_OPTIONS = 4;
 // a real guarantee. These are the only platforms whose reconnect routes
 // actually call autoResolveCredentialDecisionOnReconnect; any other value
 // can structurally never auto-resolve. Enforced here for real.
-const VALID_CREDENTIAL_PLATFORMS = ['meta', 'instagram', 'linkedin', 'linkedin_ads'];
+// Typed against PlatformType (review fix) — a typo or a future rename of one
+// of these platform values in connectedAccountsDb.ts now fails tsc instead
+// of silently drifting, only ever surfacing at runtime for whatever exact
+// value happened to be exercised.
+const VALID_CREDENTIAL_PLATFORMS: PlatformType[] = ['meta', 'instagram', 'linkedin', 'linkedin_ads'];
 
 // Worst-case page bound for listPendingForApprover/listPendingForCustomer's
 // pagination (review fix) — keeps an approver/customer with an enormous,
@@ -252,7 +257,7 @@ function validateCreateRequest(request: CreateApprovalDecisionRequest): void {
     if (!request.credentialPlatform || request.credentialPlatform.trim() === '') {
       throw new ApprovalInboxError(`gateType 'customer_credential' requires credentialPlatform — lets a real reconnect auto-resolve this decision`);
     }
-    if (!VALID_CREDENTIAL_PLATFORMS.includes(request.credentialPlatform.trim().toLowerCase())) {
+    if (!(VALID_CREDENTIAL_PLATFORMS as string[]).includes(request.credentialPlatform.trim().toLowerCase())) {
       throw new ApprovalInboxError(
         `gateType 'customer_credential' requires credentialPlatform to be one of: ${VALID_CREDENTIAL_PLATFORMS.join(', ')} — got "${request.credentialPlatform}", which no reconnect route can ever auto-resolve`,
       );
@@ -523,6 +528,14 @@ export class ApprovalInboxService {
       lastEvaluatedKey = result.LastEvaluatedKey;
       pages++;
     } while (lastEvaluatedKey && matches.length < limit && pages < MAX_PENDING_LOOKUP_PAGES);
+    // Review fix: listDuePending already warns on its own truncation cap —
+    // this sibling cap was silent. A real (if rare) cause of "a genuinely
+    // pending item was invisible" deserves the same visibility.
+    if (lastEvaluatedKey && pages >= MAX_PENDING_LOOKUP_PAGES) {
+      console.warn(
+        `[approval-inbox-service] listPendingByIndex hit the ${MAX_PENDING_LOOKUP_PAGES}-page cap for ${indexName}=${keyValue} with more history unscanned — result may be missing a genuinely pending item.`,
+      );
+    }
     return matches.slice(0, limit);
   }
 
