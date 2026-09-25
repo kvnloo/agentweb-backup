@@ -91,8 +91,8 @@ export interface LLMModelConfig extends GatewayReasoningConfig {
    * Opus and Claude Sonnet, or Gemini Pro and Gemini Flash, are different
    * product tiers serving different jobs, not generations of the same
    * model, so they must never share a family or a stronger sibling tier
-   * would wrongly hide a still-useful different-tier model. Omitted
-   * (no family) means this model is never auto-dominated.
+   * would wrongly hide a still-useful different-tier model. Omitted families
+   * are inferred conservatively from the model product line.
    */
   family?: string;
   /**
@@ -290,8 +290,8 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   'openrouter/openai/gpt-6-luna': { supportedReasoningEfforts: ['max', 'xhigh', 'high', 'medium', 'low', 'none'], name: 'GPT-6 Luna', provider: 'openai', tier: 'ultra_cheap', description: 'Fast and very inexpensive GPT-6 reasoning', client: null, supportsTemperature: false, supportsVision: true, qualityScore: 37, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, GPT-6 Luna, max' },
   // Grok 4.7: served only by xAI on OpenRouter (no Bedrock/Azure endpoint), so
   // it runs on OpenRouter credits until an xAI BYOK key is attached.
-  'openrouter/x-ai/grok-4.7': { supportedReasoningEfforts: ['xhigh', 'high', 'medium', 'low'], name: 'Grok 4.7', provider: 'xai', tier: 'pro', description: 'SpaceXAI\'s latest, strong at agentic coding', client: null, supportsTemperature: true, supportsVision: true, qualityScore: 46, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Grok 4.7, xhigh' },
-  'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 44, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Grok 4.6, high' },
+  'openrouter/x-ai/grok-4.7': { supportedReasoningEfforts: ['xhigh', 'high', 'medium', 'low'], name: 'Grok 4.7', family: 'grok', provider: 'xai', tier: 'pro', description: 'SpaceXAI\'s latest, strong at agentic coding', client: null, supportsTemperature: true, supportsVision: true, qualityScore: 46, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Grok 4.7, xhigh' },
+  'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', family: 'grok', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 44, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Grok 4.6, high' },
   'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, qualityScore: 36, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, DeepSeek V4 Pro 0813, Reasoning, Max Effort' },
   // ENG-1786 research uses AA's canonical DeepSeek V4 Flash 0731,
   // Reasoning, Max Effort variant. The prior 2026-08-19 source used 0423;
