@@ -500,6 +500,13 @@ describe('scheduledRunSignalsConditionalSkip', () => {
   //     so explicitly). Calling one is not evidence the other's requirement
   //     was also satisfied. Not aliased; logged here so it isn't silently
   //     missed.
+  //   - stage_pending_decision -> ask_user_question / present_question_deck:
+  //     its own description says to use it INSTEAD of those two when the
+  //     answer belongs to a named team approver (Slack, potentially days
+  //     later), not the current user — the opposite direction from a same-
+  //     requirement substitute. It doesn't even block this session the way
+  //     the other two do. Not aliased; logged here so it isn't silently
+  //     missed.
   it('redirect audit: pins every "use/prefer tool X instead" cross-reference between two registered tools (ENG-1276 follow-up #3)', () => {
     const allTools = emmaToolRegistry.getAllTools();
     const allNames = allTools.map((t) => t.name);
@@ -551,6 +558,8 @@ describe('scheduledRunSignalsConditionalSkip', () => {
         'remove_image_background -> update_html_file',
         'search_leads -> ask_crm',
         'send_email_from_sender -> email',
+        'stage_pending_decision -> ask_user_question',
+        'stage_pending_decision -> present_question_deck',
         'twitter_manage_post -> post_on_connected_account',
         'update_book_content -> generate_book_content',
       ].sort()
