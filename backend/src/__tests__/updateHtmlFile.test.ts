@@ -270,10 +270,16 @@ describe('updateHtmlFile', () => {
     });
 
     it('should fail when expected_count does not match actual count for part replacement', async () => {
-      jest.spyOn(agentModeService as any, 'performDirectReplacement').mockReturnValue({
-        content: '<html><h1>New Title</h1></html>',
-        changeCount: 2 // Different from expected_count: 1
-      });
+      // ENG-2103 F2: performContentReplacements/performDirectReplacement now live in
+      // emma/impl/shared/contentReplacements.ts as plain functions calling each other
+      // directly (not via `this`), so jest.spyOn(agentModeService, 'performDirectReplacement')
+      // no longer intercepts this internal call. Exercise the real mismatch instead of
+      // mocking the collaborator: content with two real occurrences of old_content
+      // against expected_count: 1 hits the exact same "changeCount !== expected_count"
+      // branch performDirectReplacement's own regex-count logic produces.
+      jest.spyOn(agentModeService as any, 'fetchFileContent').mockResolvedValue(
+        '<html><h1>Old Title</h1><h1>Old Title</h1></html>'
+      );
 
       const result = await (agentModeService as any).updateHtmlFile(
         'https://s3.amazonaws.com/bucket/file.html',
