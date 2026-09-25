@@ -308,9 +308,9 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
 });
 
 describe('getModelOptions — authoritative model discovery', () => {
-  it('keeps every entitled model selectable past the former optimization threshold (ENG-1211)', async () => {
+  it('keeps entitled models selectable and replaces superseded backup recommendations', async () => {
     mockAgentModeService.getSupportedModels.mockResolvedValue([
-      'anthropic.claude-opus-5', 'gpt-5-chat-2',
+      'anthropic.claude-opus-5', 'openrouter/x-ai/grok-4.6', 'openrouter/x-ai/grok-4.7',
     ] as any);
     mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
       billingUserId: 'test-user-123',
@@ -318,8 +318,8 @@ describe('getModelOptions — authoritative model discovery', () => {
         version: 'pro-v1', enforcementState: 'enforce',
         optimizationCostThresholdMicroUsd: 80_000_000,
         hardCostThresholdMicroUsd: 150_000_000,
-        optimizedModelIds: ['gpt-5-chat-2'],
-        optimizedDefaultModel: 'gpt-5-chat-2',
+        optimizedModelIds: ['openrouter/x-ai/grok-4.6'],
+        optimizedDefaultModel: 'openrouter/x-ai/grok-4.6',
       },
       costUsedMicroUsd: 80_000_000,
       tokenUsed: 1,
@@ -336,14 +336,13 @@ describe('getModelOptions — authoritative model discovery', () => {
 
     // ENG-1211 AC1: nothing below the hard cap hides a model, so the picker
     // offers the full entitled set even on a legacy `optimized` usage state.
-    // scheduleBackupModels still exposes the cheap catalog for the legacy backup
-    // field and the ENG-1213 recommendation surface.
+    // Backup recommendations advance to Grok 4.7; stored choices remain selectable.
     expect(json).toHaveBeenCalledWith(expect.objectContaining({
       usageMode: 'optimized',
       canGenerate: true,
-      selectableModels: ['anthropic.claude-opus-5', 'gpt-5-chat-2'],
-      allModels: ['anthropic.claude-opus-5', 'gpt-5-chat-2'],
-      scheduleBackupModels: ['gpt-5-chat-2'],
+      selectableModels: ['anthropic.claude-opus-5', 'openrouter/x-ai/grok-4.6', 'openrouter/x-ai/grok-4.7'],
+      allModels: ['anthropic.claude-opus-5', 'openrouter/x-ai/grok-4.6', 'openrouter/x-ai/grok-4.7'],
+      scheduleBackupModels: ['openrouter/x-ai/grok-4.7'],
     }));
   });
 });

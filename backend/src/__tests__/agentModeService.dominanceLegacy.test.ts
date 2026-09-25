@@ -1,14 +1,14 @@
-import { deriveDominanceLegacyIds, type DominanceCandidate } from '../services/agentModeService';
+import { deriveDominanceLegacyIds, type DominanceCandidate } from '../services/agentMode/modelSupersession';
 
 // Pure-function unit tests for deriveDominanceLegacyIds — the real-registry
 // integration behavior (GPT-5.4 Nano vs GPT-5.6 Luna, and the Sonnet/Opus
 // false-positive guard) is covered in agentModeService.sonnet45.test.ts.
 describe('deriveDominanceLegacyIds', () => {
   function candidate(overrides: Partial<DominanceCandidate> & Pick<DominanceCandidate, 'id'>): DominanceCandidate {
-    return { tier: 'medium', legacy: false, ...overrides };
+    return { cost: 2, legacy: false, ...overrides };
   }
 
-  it('flags a model dominated by a same-family sibling: same tier, strictly higher quality', () => {
+  it('flags a model dominated by a same-family sibling: same price, strictly higher quality', () => {
     const result = deriveDominanceLegacyIds([
       candidate({ id: 'weak', family: 'x', tier: 'ultra_cheap', qualityScore: 40 }),
       candidate({ id: 'strong', family: 'x', tier: 'ultra_cheap', qualityScore: 52 }),
@@ -17,10 +17,10 @@ describe('deriveDominanceLegacyIds', () => {
     expect(result.has('strong')).toBe(false);
   });
 
-  it('flags a model dominated by a cheaper same-family sibling: same quality, strictly cheaper tier', () => {
+  it('flags a model dominated by a cheaper same-family sibling: same quality, strictly cheaper price', () => {
     const result = deriveDominanceLegacyIds([
-      candidate({ id: 'expensive', family: 'x', tier: 'pro', qualityScore: 60 }),
-      candidate({ id: 'cheaper', family: 'x', tier: 'medium', qualityScore: 60 }),
+      candidate({ id: 'expensive', family: 'x', cost: 4, qualityScore: 60 }),
+      candidate({ id: 'cheaper', family: 'x', cost: 2, qualityScore: 60 }),
     ]);
     expect(result.has('expensive')).toBe(true);
   });
@@ -35,8 +35,8 @@ describe('deriveDominanceLegacyIds', () => {
 
   it('does NOT flag a model that is cheaper but also worse — that is a real tradeoff, not dominance', () => {
     const result = deriveDominanceLegacyIds([
-      candidate({ id: 'cheap-and-weak', family: 'x', tier: 'ultra_cheap', qualityScore: 20 }),
-      candidate({ id: 'expensive-and-strong', family: 'x', tier: 'ultra_premium', qualityScore: 90 }),
+      candidate({ id: 'cheap-and-weak', family: 'x', cost: 1, qualityScore: 20 }),
+      candidate({ id: 'expensive-and-strong', family: 'x', cost: 10, qualityScore: 90 }),
     ]);
     expect(result.size).toBe(0);
   });
@@ -57,7 +57,7 @@ describe('deriveDominanceLegacyIds', () => {
     expect(result.size).toBe(0);
   });
 
-  it('ignores a model with no `family` tag entirely — never auto-dominated or used as a dominator', () => {
+  it('does not compare unrelated inferred product lines', () => {
     const result = deriveDominanceLegacyIds([
       candidate({ id: 'no-family-weak', tier: 'ultra_cheap', qualityScore: 10 }),
       candidate({ id: 'no-family-strong', tier: 'ultra_cheap', qualityScore: 99 }),

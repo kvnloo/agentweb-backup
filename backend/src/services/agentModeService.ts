@@ -1,3 +1,4 @@
+import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
@@ -1087,53 +1088,8 @@ export function tierFromQualityScore(qualityScore: number): ModelTier {
   return band?.tier ?? 'ultra_cheap';
 }
 
-/** Cheapest-to-most-expensive numeric rank of each tier, for dominance comparison. */
-const TIER_RANK: Record<ModelTier, number> = {
-  ultra_cheap: 0,
-  cheap: 1,
-  medium: 2,
-  pro: 3,
-  ultra_premium: 4,
-};
-
-export interface DominanceCandidate {
-  id: string;
-  /** LLMModelConfig.family — omitted candidates are never auto-dominated. */
-  family?: string;
-  tier: ModelTier;
-  qualityScore?: number;
-  /** The model's OWN static legacy flag (not the final computed one) — only
-   *  a candidate that was not already legacy can dominate another. */
-  legacy: boolean;
-}
-
-/**
- * Ids that should be treated as legacy because a same-`family`, originally
- * non-legacy sibling is at least as cheap (same-or-lower cost tier band) AND
- * at least as good (same-or-higher quality score), strictly so in at least
- * one dimension — e.g. GPT-5.6 Luna (ultra_cheap, quality 43) strictly beats
- * GPT-5.4 Nano (ultra_cheap, quality 31): same band, higher quality, so Nano
- * is dominated. Comparison is scoped to `family`, never "same provider" —
- * Claude Opus and Claude Sonnet are different product tiers, not
- * generations of one model, so a stronger Opus must never hide Sonnet.
- */
-export function deriveDominanceLegacyIds(candidates: DominanceCandidate[]): Set<string> {
-  const dominated = new Set<string>();
-  for (const a of candidates) {
-    if (!a.family || typeof a.qualityScore !== 'number') continue;
-    const beatenBySibling = candidates.some((b) => {
-      if (b.id === a.id || b.family !== a.family || b.legacy || typeof b.qualityScore !== 'number') {
-        return false;
-      }
-      const cheaperOrEqual = TIER_RANK[b.tier] <= TIER_RANK[a.tier];
-      const betterOrEqualQuality = b.qualityScore >= a.qualityScore!;
-      const strictlyBetter = TIER_RANK[b.tier] < TIER_RANK[a.tier] || b.qualityScore > a.qualityScore!;
-      return cheaperOrEqual && betterOrEqualQuality && strictlyBetter;
-    });
-    if (beatenBySibling) dominated.add(a.id);
-  }
-  return dominated;
-}
+export { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
+export type { DominanceCandidate } from './agentMode/modelSupersession';
 
 /** Metadata for a model as returned to the frontend picker. */
 export interface SupportedModelInfo {
