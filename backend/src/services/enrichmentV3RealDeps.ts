@@ -129,11 +129,21 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
       // when an email is unusually shared across many tenants.
       const seen = new Set<string>();
       const merged: any[] = [];
-      for (const set of [byEmail, byLinkedin, byNameCompany]) {
+      // Tagged with HOW each sibling matched. The resolver needs this to decide whether a
+      // sibling is trustworthy enough to donate an email: name+company is a guess, and
+      // findLeadsByNameCompany is table-wide with no tenant predicate. Iterated strongest
+      // first and deduped on first occurrence, so a sibling that matches on both email and
+      // name+company is tagged `email` — the strongest anchor that found it.
+      for (const [set, matchedBy] of [
+        [byEmail, 'email'],
+        [byLinkedin, 'linkedin'],
+        [byNameCompany, 'nameCompany'],
+      ] as Array<[any[], 'email' | 'linkedin' | 'nameCompany']>) {
         for (const item of (set || [])) {
           if (!item || !item.leadId || item.leadId === excludeLeadId) continue;
           if (seen.has(item.leadId)) continue;
           seen.add(item.leadId);
+          item.matchedBy = matchedBy;
           // Raw lead rows already carry enrichmentMetadata (no projection is
           // applied to these GSI queries), so Tier 0b can read each copied
           // field's provenance and re-verify web-sourced copies via the critic.

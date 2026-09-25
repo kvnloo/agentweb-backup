@@ -165,13 +165,46 @@ describe('buildPersonCanonicalKey', () => {
 
   it('falls back to domain + name when free email + company', () => {
     // 'Corp' is a legal suffix so normalizeCompanyName('Acme Corp') → 'acme'
-    const lead: LeadInfo = { email: 'john@gmail.com', company: 'Acme Corp', firstName: 'John', lastName: 'Doe' };
-    expect(buildPersonCanonicalKey(lead)).toBe('person:acme:john-doe');
+    const lead: LeadInfo = { userId: 'u1', email: 'john@gmail.com', company: 'Acme Corp', firstName: 'John', lastName: 'Doe' };
+    // Tenant-scoped: this key is a GUESS at identity, and AW-EnrichmentRawCache has no
+    // tenant dimension, so an unscoped key served one customer's cached profile to
+    // another's unrelated lead for 90 days.
+    expect(buildPersonCanonicalKey(lead)).toBe('person:u:u1:acme:john-doe');
+  });
+
+  it('two tenants with the same person do NOT share a weak key', () => {
+    const base = { company: 'Acme Corp', firstName: 'John', lastName: 'Doe' };
+    const a = buildPersonCanonicalKey({ ...base, userId: 'tenant-a' } as LeadInfo);
+    const b = buildPersonCanonicalKey({ ...base, userId: 'tenant-b' } as LeadInfo);
+    expect(a).not.toBe(b);
+    expect(a).toBeTruthy();
+  });
+
+  it('falls back to listId when the row has no userId (11.9% of production rows)', () => {
+    const k = buildPersonCanonicalKey({ listId: 'list_9', company: 'Acme Corp', firstName: 'John', lastName: 'Doe' } as LeadInfo);
+    expect(k).toBe('person:u:list_9:acme:john-doe');
+  });
+
+  it('two lists do not share a weak key either', () => {
+    const base = { company: 'Acme Corp', firstName: 'John', lastName: 'Doe' };
+    expect(buildPersonCanonicalKey({ ...base, listId: 'list_a' } as LeadInfo))
+      .not.toBe(buildPersonCanonicalKey({ ...base, listId: 'list_b' } as LeadInfo));
+  });
+
+  it('refuses to build a weak key with no scope at all, rather than sharing one globally', () => {
+    expect(buildPersonCanonicalKey({ company: 'Acme Corp', firstName: 'John', lastName: 'Doe' } as LeadInfo)).toBeNull();
+  });
+
+  it('the STRONG email key stays global — same address is the same person', () => {
+    const a = buildPersonCanonicalKey({ userId: 'tenant-a', email: 'john@acme.com' } as LeadInfo);
+    const b = buildPersonCanonicalKey({ userId: 'tenant-b', email: 'john@acme.com' } as LeadInfo);
+    expect(a).toBe('person:john@acme.com');
+    expect(a).toBe(b);
   });
 
   it('falls back to website domain + name when no work email', () => {
-    const lead: LeadInfo = { website: 'https://acme.com', firstName: 'Jane', lastName: 'Smith' };
-    expect(buildPersonCanonicalKey(lead)).toBe('person:acme.com:jane-smith');
+    const lead: LeadInfo = { userId: 'u1', website: 'https://acme.com', firstName: 'Jane', lastName: 'Smith' };
+    expect(buildPersonCanonicalKey(lead)).toBe('person:u:u1:acme.com:jane-smith');
   });
 });
 

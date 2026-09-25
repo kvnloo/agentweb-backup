@@ -41,6 +41,8 @@ function emitResponse({
 }
 
 /** The default single-email-field lander shape returned by the mocked discovery. */
+import { phoneLeadId } from "../utils/smokeTestLead";
+
 const SINGLE_EMAIL_FIELD = {
   scope: 'form[data-agentweb-smoke-form="1"] ',
   fields: [
@@ -101,9 +103,11 @@ jest.mock("../utils/browserUtils", () => ({
 const mockGetLeadByEmail = jest.fn();
 const mockDeleteLead = jest.fn();
 const mockGetLeadsByListId = jest.fn();
+const mockGetLeadById = jest.fn();
 jest.mock("../services/db", () => ({
   crmDb: {
     getLeadByEmail: (...args: any[]) => mockGetLeadByEmail(...args),
+    getLeadById: (...args: any[]) => mockGetLeadById(...args),
     deleteLead: (...args: any[]) => mockDeleteLead(...args),
     getLeadsByListId: (...args: any[]) => mockGetLeadsByListId(...args),
   },
@@ -144,6 +148,10 @@ describe("runGenerationSmokeTest", () => {
     jest.clearAllMocks();
     mockGetLeadByEmail.mockReset();
     mockGetLeadByEmail.mockResolvedValue(null);
+    // Persistent implementations survive jest.clearAllMocks(), which clears calls only —
+    // the leak this file has been bitten by more than once. Reset it with the others.
+    mockGetLeadById.mockReset();
+    mockGetLeadById.mockResolvedValue(null);
     mockGetLeadsByListId.mockReset();
     mockGetLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false });
     (mockPage.evaluate as jest.Mock).mockResolvedValue(SINGLE_EMAIL_FIELD);
@@ -761,6 +769,51 @@ describe("runGenerationSmokeTest", () => {
     expect(mockUpdateLandingPageSmokeTestResult.mock.calls[0][1].ok).toBe(true);
   });
 
+  it("finds the phone-only lead by its deterministic id, not by hoping it is on page one", async () => {
+    // getLeadsByListId sorts on leadId, the table's RANGE key, so "newest first" only ever
+    // held because createLead mints `lead_<timestamp>_<rand>`. ENG-2082 added a second shape,
+    // `lead_ph_<sha256>`, whose 'p' sorts above every digit — so on a phone-only lander EVERY
+    // row is lead_ph_*, ordered by random hash, and ours is frequently not on page one.
+    // Missing it reports a false ok:false AND strands the synthetic row in a real CRM.
+    // Here the page deliberately does NOT contain our row; only the point lookup finds it.
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD,
+      fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+    });
+    mockGetLeadsByListId.mockResolvedValue({ items: [] });
+    // Stateful, because the id is now looked up twice for different reasons. The first call
+    // is claimSmokeTestPhone proving the id is FREE before the form is submitted; every call
+    // after that is the poll looking for the row the submission created. Returning a row to
+    // the claim would (correctly) make it redraw.
+    //
+    // The row deliberately carries a STALE createdAt: having claimed the id, the poll must
+    // accept it on identity alone, which is the adopted-row case — webhooks.ts reuses an
+    // existing row on a phone collision without rewriting createdAt.
+    let claimChecked = false;
+    mockGetLeadById.mockImplementation(async (_listId: string, leadId: string) => {
+      if (!claimChecked) {
+        claimChecked = true;
+        return null;
+      }
+      return { leadId, phone: "415-555-0142", createdAt: "2020-01-01T00:00:00.000Z" };
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockGetLeadById).toHaveBeenCalledWith(
+      BASE_PAGE.leadListId,
+      expect.stringMatching(/^lead_ph_[0-9a-f]{24}$/),
+      // Consistent: this read chases a key webhooks.ts may have written moments ago, and an
+      // eventually-consistent miss here is indistinguishable from "no such lead".
+      { consistentRead: true }
+    );
+    // Found means cleaned up — the whole point is not leaving it in the customer's CRM.
+    expect(mockDeleteLead).toHaveBeenCalledWith(
+      BASE_PAGE.leadListId,
+      expect.stringMatching(/^lead_ph_[0-9a-f]{24}$/)
+    );
+  });
+
   it("CLEANUP: a lander with no email field still gets its synthetic lead deleted, by phone", async () => {
     // The lander invents its own placeholder address (observed live:
     // noemail+<ts>@waterheater.app), so isSmokeTestEmail never matches and pollForLead
@@ -800,20 +853,65 @@ describe("runGenerationSmokeTest", () => {
       ...SINGLE_EMAIL_FIELD,
       fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
     });
-    mockGetLeadsByListId.mockImplementation(async () => {
+    const staleRow = () => {
       const digits = String(
         ((mockPage.fill as jest.Mock).mock.calls.find((c) => c[0] === "#phone") || [])[1] || ""
       ).replace(/\D/g, "");
-      return {
-        items: [{ leadId: "older", phone: digits, createdAt: "2000-01-01T00:00:00.000Z" }],
-        lastEvaluatedKey: null,
-        hasMore: false,
-      };
-    });
+      return { leadId: "older", phone: digits, createdAt: "2000-01-01T00:00:00.000Z" };
+    };
+    mockGetLeadsByListId.mockImplementation(async () => ({
+      items: [staleRow()],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    }));
+    // The row DynamoDB would actually return. A stranded row from a previous run lives at
+    // lead_ph_<sha(phone)> — webhooks.ts keys it there — which is exactly the id the point
+    // lookup queries. Stubbing this to null (the shared beforeEach default) made the test
+    // pass without ever exercising that branch.
+    mockGetLeadById.mockImplementation(async (_listId: string, leadId: string) => ({
+      ...staleRow(),
+      leadId,
+    }));
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
+    // Nothing landed this run, so this must be a FAIL — and the stranded row is the only
+    // evidence the previous run failed, so it must survive. Accepting it would report green
+    // over a broken capture pipeline and then delete the trace.
     expect(mockDeleteLead).not.toHaveBeenCalled();
+    const persisted = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(persisted.ok).toBe(false);
+  });
+
+  it("SATURATED LIST: the fallback phone is not one the claim already proved occupied", async () => {
+    // Every id is taken, so the claim exhausts its 8 draws and gives up. It must NOT then
+    // submit the last number it probed: webhooks.ts would adopt that existing row without
+    // rewriting createdAt, the poll's freshness rule could never match, and the run would be
+    // a CERTAIN false FAIL that strands another row — deepening the saturation that caused
+    // it. (An unprobed draw is not likely to be free either — 8 hits out of 100 implies
+    // ~90% occupancy — but it is the only move that can succeed at all.)
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD,
+      fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+    });
+    mockGetLeadById.mockImplementation(async (_listId: string, leadId: string) => ({
+      leadId, phone: "4155550199", createdAt: "2000-01-01T00:00:00.000Z",
+    }));
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    const probedIds = mockGetLeadById.mock.calls.slice(0, 8).map((c: any[]) => c[1]);
+    expect(probedIds).toHaveLength(8);
+    // Genuinely redrawing a new number each attempt, not re-probing one id.
+    expect(new Set(probedIds).size).toBeGreaterThan(1);
+
+    const filled = String(
+      ((mockPage.fill as jest.Mock).mock.calls.find((c) => c[0] === "#phone") || [])[1] || ""
+    );
+    expect(filled).toMatch(/^41555501\d{2}$/);
+    const filledId = phoneLeadId(filled);
+    expect(filledId).toBeTruthy();
+    expect(probedIds).not.toContain(filledId);
   });
 
   it("DIAGNOSIS: an iframe-embedded form is not reported as 'no lead form'", async () => {
@@ -1115,6 +1213,26 @@ describe("runGenerationSmokeTest", () => {
     // on a page that never had a form to submit.
     const persisted = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
     expect(persisted.noFormOnPage).toBe(true);
+  });
+
+  it("ENG-2081: the classification survives a throw AFTER the fill", async () => {
+    // The three fields used to be copied out at the END of the try block — after submit, the
+    // URL wait, the lead poll and the delete. pollForLead does not catch DynamoDB errors, so
+    // a throttle there sent execution to the outer catch with the fields still at their
+    // defaults: the record then read `ok:false, leadCaptured:false` with no classification,
+    // which is a CRM fault to whoever reads it. They are captured right after the fill now.
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD,
+      iframeCount: 2,
+    });
+    mockGetLeadByEmail.mockRejectedValue(new Error("ProvisionedThroughputExceeded"));
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    const persisted = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(persisted.ok).toBe(false);
+    // The evidence that explains the failure must outlive the failure itself.
+    expect(persisted.iframeCount).toBe(2);
   });
 
   it("DIAGNOSIS: an auth-only page says so, instead of blaming the CRM", async () => {

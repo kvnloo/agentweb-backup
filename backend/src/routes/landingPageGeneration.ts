@@ -3230,7 +3230,10 @@ async function syncLeadCaptureForPage(
   const repoMatch = page.githubRepoUrl.match(/github\.com\/([^/]+\/[^/]+?)(?:\.git)?(?:\s|$)/);
   if (!repoMatch) {
     console.error(`[LP GENERATION] ENG-310: unparseable githubRepoUrl on page ${page.id}: ${page.githubRepoUrl}`);
-    return "Lead list saved, but this page's GitHub repo URL is malformed so the live site was not updated.";
+    // Same "saved" wrongness the captureRouteSkipped arm below was fixed for: a detach that
+    // reports "saved" tells the owner the opposite of what they asked for.
+    return `${leadListId === null ? "Lead list removed" : "Lead list saved"}, but this page's ` +
+      `GitHub repo URL is malformed so the live site was not updated.`;
   }
   const repoFullName = repoMatch[1];
 
@@ -3279,6 +3282,45 @@ async function syncLeadCaptureForPage(
       rootRecord?.metaPixelId,
       rootRecord?.metaAdAccountId,
     );
+    // captureRouteSkipped first: its contract states that NEITHER `committed` nor
+    // `up-to-date` implies the route carries this page's path — when the deployed
+    // LIST_BY_PATH could not be parsed, route.ts is left out of the commit entirely.
+    // Returning "saved" over that reports success for a list attachment whose leads will
+    // still 422, which is the one outcome the flag exists to prevent.
+    if (result.captureRouteSkipped) {
+      // Attaching and DETACHING both come through here, and the consequence is opposite for
+      // each. captureRouteSkipped means route.ts was left EXACTLY as deployed, so it still
+      // carries the old mapping: an attach's leads are not filed yet, while a detach's leads
+      // keep being filed into the list the user just removed. Saying "will not be filed" on
+      // a detach tells the user the opposite of what happens.
+      const untouched =
+        `capture route could not be updated — its deployed route file could not be parsed, ` +
+        `so it was left untouched.`;
+      if (leadListId === null) {
+        return (
+          `Lead list removed, but this site's ${untouched} Submissions from this page will ` +
+          `KEEP being filed into the list you just removed until the route is repaired.`
+        );
+      }
+      // Re-submitting the SAME list is not a change at all: the untouched deployed route
+      // already maps this path to exactly the list that was asked for, so there is nothing
+      // to warn about. Reachable from an idempotent PATCH retry or re-picking the current
+      // list. Warning here would claim leads are not being filed while they are.
+      if (page.leadListId === leadListId) return undefined;
+      // A SWITCH is not a first attach. The deployed route still carries the old mapping, so
+      // submissions keep arriving — into the PREVIOUS list, silently. "Will not be filed"
+      // would be wrong in the same direction the detach arm above was wrong.
+      if (page.leadListId) {
+        return (
+          `The lead list was saved, but this site's ${untouched} Submissions from this page ` +
+          `will KEEP being filed into the previously attached list until the route is repaired.`
+        );
+      }
+      return (
+        `The lead list was saved, but this site's ${untouched} Submissions from this page ` +
+        `will not be filed until the route is repaired.`
+      );
+    }
     if (result.committed || result.reason === "up-to-date") return undefined;
     // Attaching and DETACHING both come through here; "saved" is wrong for a removal.
     const lead = leadListId === null ? "Lead list removed" : "Lead list saved";
@@ -3294,7 +3336,8 @@ async function syncLeadCaptureForPage(
   } catch (err: any) {
     // syncLeadCaptureFilesToRepo does not throw, so this is a sibling-fetch failure.
     console.error(`[LP GENERATION] ENG-310: lead-capture sync failed for page ${page.id}:`, err?.message || err);
-    return "Lead list saved, but the live site was not updated. It will be applied on the next deploy or retry.";
+    return `${leadListId === null ? "Lead list removed" : "Lead list saved"}, but the live site ` +
+      `was not updated. It will be applied on the next deploy or retry.`;
   }
 }
 
