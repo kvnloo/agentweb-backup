@@ -32,6 +32,8 @@ import * as googleDriveImpl from './impl/googleDrive';
 import * as googleDocsSheetsImpl from './impl/googleDocsSheets';
 // ENG-2103 (F2): HTML/landing-page misc tool cluster, same treatment as booksImpl above.
 import * as htmlToolsImpl from './impl/htmlTools';
+// ENG-2103 (F2): leads/CRM tool cluster, same treatment as booksImpl above.
+import * as leadsImpl from './impl/leads';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -3898,7 +3900,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getLeadLists(context?.userId);
+    return await leadsImpl.getLeadLists(context?.userId);
   }
 });
 
@@ -3928,7 +3930,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createLeadList(args.name, args.description || '', context?.userId, args.list_type);
+    return await leadsImpl.createLeadList(args.name, args.description || '', context?.userId, args.list_type);
   }
 });
 
@@ -3964,7 +3966,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.addLeadsToList(args.list_id, args.leads || [], context?.userId, {
+    return await leadsImpl.addLeadsToList(args.list_id, args.leads || [], context?.userId, {
       // The turn's real cap, not `runBudgetDeadlineMs` — that one carries the media-gen
       // soft deadline, which is neither a bound on the turn nor still meaningful once it
       // has passed (ENG-1133).
@@ -4055,7 +4057,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getLeads(args.list_id, context?.userId, {
+    return await leadsImpl.getLeads(args.list_id, context?.userId, {
       search: args.search,
       status: args.status,
       icpOnly: args.icp_only,
@@ -4122,7 +4124,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.searchLeads(args.list_id, args.filters, context?.userId, args.limit, {
+    return await leadsImpl.searchLeads(args.list_id, args.filters, context?.userId, args.limit, {
       search: args.search,
       cursor: args.cursor,
       listIds: args.list_ids,
@@ -4234,7 +4236,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getLeadDetails(args.list_id, args.lead_id, context?.userId);
+    return await leadsImpl.getLeadDetails(args.list_id, args.lead_id, context?.userId);
   }
 });
 
@@ -4263,7 +4265,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getLeadsNeedingFollowup(args.list_id, context?.userId, {
+    return await leadsImpl.getLeadsNeedingFollowup(args.list_id, context?.userId, {
       limit: args.limit,
       scanLimit: args.scan_limit,
     });
@@ -4296,7 +4298,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.updateLead(args.list_id, args.lead_id, args.updates, context?.userId);
+    return await leadsImpl.updateLead(args.list_id, args.lead_id, args.updates, context?.userId);
   }
 });
 
@@ -4336,7 +4338,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.setLeadContactStatus(
+    return await leadsImpl.setLeadContactStatus(
       args.list_id,
       args.lead_ids,
       args.contact_status,
@@ -4369,7 +4371,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.deleteLeads(args.list_id, args.lead_ids, context?.userId);
+    return await leadsImpl.deleteLeads(args.list_id, args.lead_ids, context?.userId);
   }
 });
 
@@ -4416,7 +4418,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.deleteLeadsByFilter(args.list_id, args.filters, context?.userId, args.confirm);
+    return await leadsImpl.deleteLeadsByFilter(args.list_id, args.filters, context?.userId, args.confirm);
   }
 });
 
@@ -4480,7 +4482,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.updateLeadList(args.list_id, {
+    return await leadsImpl.updateLeadList(args.list_id, {
       name: args.name,
       description: args.description,
       icpsOnly: args.icps_only,
@@ -4510,7 +4512,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.deleteLeadList(args.list_id, context?.userId);
+    return await leadsImpl.deleteLeadList(args.list_id, context?.userId);
   }
 });
 
@@ -4551,7 +4553,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.updateLeadStatus(
+    return await leadsImpl.updateLeadStatus(
       args.list_id, args.lead_id, args.status, context?.userId,
       args.deal_value, args.deal_currency, args.notes
     );
@@ -4575,7 +4577,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getLeadListStatuses(args.list_id, context?.userId);
+    return await leadsImpl.getLeadListStatuses(args.list_id, context?.userId);
   }
 });
 
@@ -4610,7 +4612,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.configureLeadStatuses(args.list_id, args.statuses, context?.userId);
+    return await leadsImpl.configureLeadStatuses(args.list_id, args.statuses, context?.userId);
   }
 });
 
@@ -4639,7 +4641,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getLeadEngagements(args.list_id, args.lead_id, context?.userId, args.limit);
+    return await leadsImpl.getLeadEngagements(args.list_id, args.lead_id, context?.userId, args.limit);
   }
 });
 
@@ -4677,7 +4679,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.addLeadEngagement(
+    return await leadsImpl.addLeadEngagement(
       args.list_id, args.lead_id, args.event_type,
       context?.userId, args.event_data, args.event_date
     );
@@ -4705,7 +4707,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.sendEmailToLead(args.list_id, args.lead_id, context?.userId);
+    return await leadsImpl.sendEmailToLead(args.list_id, args.lead_id, context?.userId);
   }
 });
 
