@@ -90,6 +90,40 @@ describe("EvalLabelling (ENG-2135)", () => {
     expect(screen.getByText("1/4")).toBeInTheDocument();
   });
 
+  it("drops the saved confirmation as soon as a label or the note changes (#3079 review)", async () => {
+    routeGets(true);
+    mockedAxios.put.mockResolvedValue({ data: { case: { ...CASE, labels: { task_success: "pass" }, version: 4 } } });
+    renderPage();
+    await screen.findByText("Synthetic session");
+    fireEvent.click(screen.getByRole("button", { name: "task_success pass" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save labels" }));
+    expect(await screen.findByText("Labels saved.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "task_success fail" }));
+    expect(screen.queryByText("Labels saved.")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Save labels" }));
+    expect(await screen.findByText("Labels saved.")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Note"), { target: { value: "edited" } });
+    expect(screen.queryByText("Labels saved.")).not.toBeInTheDocument();
+  });
+
+  it("locks the labels and note while a save is in flight (#3079 review)", async () => {
+    routeGets(true);
+    let resolvePut: (value: unknown) => void = () => undefined;
+    mockedAxios.put.mockReturnValue(new Promise((resolve) => { resolvePut = resolve; }));
+    renderPage();
+    await screen.findByText("Synthetic session");
+    fireEvent.click(screen.getByRole("button", { name: "Save labels" }));
+
+    expect(screen.getByRole("button", { name: "task_success pass" })).toBeDisabled();
+    expect(screen.getByLabelText("Note")).toBeDisabled();
+
+    resolvePut({ data: { case: { ...CASE, version: 4 } } });
+    expect(await screen.findByText("Labels saved.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "task_success pass" })).not.toBeDisabled();
+  });
+
   it("explains a version conflict instead of overwriting another labeller", async () => {
     routeGets(true);
     mockedAxios.put.mockRejectedValue(Object.assign(new Error("conflict"), { isAxiosError: true, response: { status: 409, data: { error: "version_conflict" } } }));
