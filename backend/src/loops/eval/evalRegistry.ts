@@ -230,6 +230,18 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
     notes: 'Advisory (ENG-2139): never blocks generation. No OCR text-ratio/spelling check yet. Not run when the provider returns a remote URL instead of bytes (Runway).',
   },
   {
+    id: 'creative-rubric-judge',
+    surface: 'creative',
+    graderType: 'llm_judge',
+    measures: 'ENG-421 launch-ready floor as 7 binary checks with rationale (hook clarity, offer specificity, proof integrity, brand fidelity, format readiness, policy/compliance risk, media-buyer usefulness); pairwise preference vs a prior creative for the same account and placement',
+    source: 'services/creativeRubricJudge.ts; prompts services/creativeRubricJudgePrompt.ts; runtime hook services/creativeRubricJudgeRuntime.ts; offline scripts/scoreCreativeRubric.ts',
+    model: 'anthropic.claude-sonnet-5 (CREATIVE_RUBRIC_JUDGE_MODEL; Google/OpenAI models refused)',
+    modelFamily: 'claude',
+    consumers: ['AW-HumanEvalQueue.creativeRubric (agent-mode generate_image ads, sampled)', 'scripts/scoreCreativeRubric.ts (offline, read-only)'],
+    knownIssues: ['ENG-421'],
+    notes: 'Advisory (ENG-2140): never blocks generation. Off unless CREATIVE_RUBRIC_JUDGE_ENABLED=true with CREATIVE_RUBRIC_JUDGE_SAMPLE_RATE > 0 (unset in prod). Runs only after the deterministic gates pass. Not yet validated against human labels (ENG-2136 harness, per-criterion kappa).',
+  },
+  {
     id: 'client-health-assessment',
     surface: 'account_health',
     graderType: 'code',
