@@ -40,6 +40,7 @@ import { getEnrichmentConfig as svcGetEnrichmentConfig } from '../services/enric
 import { buildConfigServiceDeps } from '../services/enrichmentConfigDeps';
 import { crmDb } from '../services/db';
 import { isCardRevenueField } from '../services/enrichmentGroups';
+import { CrmEnrichmentService } from '../services/crmEnrichmentService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 
 const TAG = '[crmAutoEnrichmentCron]';
@@ -111,7 +112,18 @@ function isUnenriched(
   // that shape. At MAX_LEADS_PER_LIST_PER_RUN = 50, fifty such rows permanently consume a
   // list's per-run budget and NO other lead on that list is ever enriched again. Silent,
   // because they count as `skipped` rather than `failed`, so no alert fires.
-  const hasEmail = typeof lead.email === 'string' && lead.email.trim() !== '';
+  // A PLACEHOLDER-domain address is not an identity signal, because resolveIdentity
+  // zeroes it (`email = ''`) before its own no_identity_signal check. A bare non-empty
+  // test therefore disagrees with the resolver: a lead whose only signal is
+  // `queue-verify@example.com`, with no name and no linkedin, counts as having identity
+  // here, is selected, is rejected there, gets no enrichmentMetadata stamp, and is
+  // reselected on the very next tick — the exact infinite loop this guard was added to
+  // close, just narrower than the phone-only shape it was written for. Same predicate as
+  // the resolver so the two cannot drift.
+  const rawEmail = typeof lead.email === 'string' ? lead.email.trim() : '';
+  const emailIsPlaceholder =
+    !!rawEmail && CrmEnrichmentService.isPlaceholderDomain(rawEmail.split('@')[1] || '');
+  const hasEmail = rawEmail !== '' && !emailIsPlaceholder;
   const hasLinkedin = typeof lead.linkedin === 'string' && lead.linkedin.trim() !== '';
   const hasFullName =
     typeof lead.firstName === 'string' && lead.firstName.trim() !== '' &&

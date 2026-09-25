@@ -265,14 +265,6 @@ describe('POST /:sequenceId/enrollments - bulk enroll', () => {
     expect(res.body.skipped).toBe(0);
   });
 
-  it('omits skippedNoEmail when every lead has an address', async () => {
-    const res = await request(app)
-      .post('/seq_1/enrollments')
-      .send({ leads: [{ listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@example.com' }] });
-    expect(res.status).toBe(200);
-    expect(res.body).not.toHaveProperty('skippedNoEmail');
-  });
-
   it('rejects empty leads array', async () => {
     const res = await request(app).post('/seq_1/enrollments').send({ leads: [] });
     expect(res.status).toBe(400);

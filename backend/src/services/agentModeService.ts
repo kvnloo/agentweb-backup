@@ -15367,7 +15367,10 @@ export class AgentModeService {
       // a plain falsy result to autoDraftStatus='failed' and puts the error in the OWNER
       // ALERT, which would mean every phone-only capture emails its owner a failure notice.
       // Its sibling autoSend path already has the right word for this — 'skipped_no_email'.
-      if (!lead.email && !lead.linkedin) {
+      // Trimmed on both sides. The note gate below trims and this did not, so
+      // `linkedin: '   '` passed here, closed there, and fell through to the
+      // nothing-generated arm.
+      if (!String(lead.email ?? '').trim() && !String(lead.linkedin ?? '').trim()) {
         return {
           success: false,
           skipped: true,
@@ -15749,6 +15752,12 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
 
       return {
         success: true,
+        // `skipped` when NEITHER draft was produced. webhooks.ts maps `success && !skipped`
+        // to autoDraftStatus='created', so without this the owner alert said "Auto Draft:
+        // Created" over nothing at all — reachable when the note LLM returns parseable but
+        // contentless JSON, or when `linkedin` is whitespace (the entry guard uses raw
+        // truthiness, the note gate trims, so the two disagree on that value).
+        ...(!emailData && !messageDraft ? { skipped: true, reason: 'nothing_generated' } : {}),
         // Say what actually happened. Each draft is now gated on its own channel, so all
         // four combinations are reachable and the old two-way message described one.
         message: emailData && messageDraft
