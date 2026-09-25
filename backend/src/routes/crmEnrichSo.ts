@@ -458,11 +458,31 @@ router.get('/lists/:listId/leads/enrichment-counts', async (req: Request, res: R
     // For lookup: "already done" = had email but isn't missing any standard field.
     const lookupAlreadyDone = withEmail - lookupPending;
 
+    // Every bucket set partitions `total`. It did not before: a lead that is neither
+    // applicable nor already done — a phone-only capture with no name or company is the
+    // common shape since ENG-2082 — fell out of both, so the confirm dialog's numbers
+    // silently failed to add up to the list it was describing. Derived rather than
+    // re-filtered so it cannot drift from the two counts above it.
+    const notApplicable = (pending: number, alreadyDone: number) =>
+      Math.max(0, total - pending - alreadyDone);
+
     return res.json({
       total,
-      validate: { pending: validatePending, alreadyDone: validateAlreadyDone },
-      find:     { pending: findPending,     alreadyDone: findAlreadyDone },
-      lookup:   { pending: lookupPending,   alreadyDone: lookupAlreadyDone },
+      validate: {
+        pending: validatePending,
+        alreadyDone: validateAlreadyDone,
+        notApplicable: notApplicable(validatePending, validateAlreadyDone),
+      },
+      find: {
+        pending: findPending,
+        alreadyDone: findAlreadyDone,
+        notApplicable: notApplicable(findPending, findAlreadyDone),
+      },
+      lookup: {
+        pending: lookupPending,
+        alreadyDone: lookupAlreadyDone,
+        notApplicable: notApplicable(lookupPending, lookupAlreadyDone),
+      },
     });
   } catch (error: any) {
     console.error('[CRM enrich.so] enrichment-counts error:', error);

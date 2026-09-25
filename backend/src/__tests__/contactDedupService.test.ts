@@ -97,10 +97,16 @@ describe('contactDedupService', () => {
       });
 
       const result = await dedupContactsForUser({ userId: 'u1' });
-      // Foo dedupes across L1+L2, Bar only in L1. No-email rows dropped.
-      expect(result.total).toBe(2);
+      // Foo dedupes across L1+L2, Bar only in L1. ENG-2082: the two address-less rows are
+      // INCLUDED now rather than counted and dropped — they are real, contactable leads,
+      // and dropping them is why a customer could watch a capture land and not find it in
+      // the Contacts tab. They cannot collapse together: neither has a phone, so each
+      // falls back to its own lead key.
+      expect(result.total).toBe(4);
       expect(result.rawCount).toBe(5);
+      expect(result.noEmailCount).toBe(2);
       expect(result.listsCount).toBe(2);
+      expect(new Set(result.contacts.map((c) => c.dedupKey)).size).toBe(4);
 
       const foo = result.contacts.find((c) => c.email === 'foo@example.com');
       expect(foo).toBeDefined();
@@ -111,6 +117,84 @@ describe('contactDedupService', () => {
 
       const bar = result.contacts.find((c) => c.email === 'bar@example.com');
       expect(bar!.lists).toHaveLength(1);
+    });
+
+
+    it('ENG-2082: phone-only leads are contacts, and two of them never collapse into one', async () => {
+      asMock(crmDb.getLeadListsByUserId).mockResolvedValue([{ listId: 'L1', name: 'Inbound', listType: 'sales' }]);
+      asMock(crmDb.getLeadsByListId).mockResolvedValue({
+        items: [
+          { leadId: 'p1', phone: '2125559876', firstName: 'Cal' },
+          { leadId: 'p2', phone: '2125550001', firstName: 'Dee' },
+          // same human, same number in a different format -> ONE contact
+          { leadId: 'p3', phone: '+1 (212) 555-9876', firstName: 'Cal' },
+          { leadId: 'n1' },
+        ],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+
+      const result = await dedupContactsForUser({ userId: 'u1' });
+
+      expect(result.rawCount).toBe(4);
+      expect(result.noEmailCount).toBe(4);
+      // Cal's two rows merge on the normalized number; Dee and the bare row stay separate.
+      expect(result.total).toBe(3);
+      const keys = result.contacts.map((c) => c.dedupKey).sort();
+      expect(keys).toEqual(['lead:L1/n1', 'phone:2125550001', 'phone:2125559876']);
+      // and they are not all sharing one empty-email identity
+      expect(result.contacts.every((c) => c.email === '')).toBe(true);
+    });
+
+    // The mirror of the portal's floor. `+1` and `1` both reduce to `1`, so without it every
+    // lead across the account carrying only a country code collapsed into ONE contact — the
+    // rest disappear and their list memberships are grafted onto the survivor. A merge is
+    // destructive in a way a split is not.
+    it('does NOT collapse two people whose phones are only a country code', async () => {
+      asMock(crmDb.getLeadListsByUserId).mockResolvedValue([{ listId: 'L1', name: 'Inbound', listType: 'sales' }]);
+      asMock(crmDb.getLeadsByListId).mockResolvedValue({
+        items: [
+          { leadId: 'a', phone: '+1', firstName: 'Ann', lastName: 'Alpha' },
+          { leadId: 'b', phone: '1', firstName: 'Ben', lastName: 'Beta' },
+        ],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+
+      const result = await dedupContactsForUser({ userId: 'u1' });
+
+      expect(result.total).toBe(2);
+      const keys = result.contacts.map((c) => c.dedupKey).sort();
+      expect(keys).toEqual(['lead:L1/a', 'lead:L1/b']);
+      expect(keys).not.toContain('phone:1');
+    });
+
+    it('still merges two rows that share a REAL number', async () => {
+      asMock(crmDb.getLeadListsByUserId).mockResolvedValue([{ listId: 'L1', name: 'Inbound', listType: 'sales' }]);
+      asMock(crmDb.getLeadsByListId).mockResolvedValue({
+        items: [
+          { leadId: 'a', phone: '(212) 555-0147' },
+          { leadId: 'b', phone: '+1 212 555 0147' },
+        ],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+
+      const result = await dedupContactsForUser({ userId: 'u1' });
+      expect(result.total).toBe(1);
+      expect(result.contacts[0].dedupKey).toBe('phone:2125550147');
+    });
+
+    it('ENG-2082: a phone-only contact is named by its number, not left blank', async () => {
+      asMock(crmDb.getLeadListsByUserId).mockResolvedValue([{ listId: 'L1', name: 'Inbound', listType: 'sales' }]);
+      asMock(crmDb.getLeadsByListId).mockResolvedValue({
+        items: [{ leadId: 'p1', phone: '2125559876' }],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+
+      const result = await dedupContactsForUser({ userId: 'u1' });
+      expect(result.contacts[0].name).toBe('2125559876');
     });
 
     it('sorts by heat score (desc) by default', async () => {

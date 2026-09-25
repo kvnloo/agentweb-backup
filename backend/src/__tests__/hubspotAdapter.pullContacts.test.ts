@@ -7,6 +7,8 @@
 jest.mock('../services/db', () => ({
   crmDb: {
     batchCreateLeads: jest.fn(),
+    getAllLeadsByListId: jest.fn(),
+    updateLead: jest.fn(),
   },
 }));
 
@@ -59,6 +61,8 @@ describe('HubspotAdapter.pullContacts — customFields always set', () => {
       errors: [],
     });
     mockGetContactDealAssociations.mockResolvedValue([]);
+    (crmDb.getAllLeadsByListId as jest.Mock).mockResolvedValue([]);
+    (crmDb.updateLead as jest.Mock).mockResolvedValue(undefined);
   });
 
   it('sets customFields to {} when no custom mappings configured (no undefined)', async () => {
@@ -116,3 +120,73 @@ describe('HubspotAdapter.pullContacts — customFields always set', () => {
     }
   });
 });
+
+/**
+ * The email-less pull branch. batchCreateLeads dedupes on email then LinkedIn, so a contact
+ * with neither matched nothing and was recreated on every pull. Resolving it by the stored
+ * hubspot_contact_id fixes that — but crmDb.updateLead does `SET customFields = :customFields`
+ * and `SET syncMetadata = :syncMetadata`, i.e. WHOLESALE MAP REPLACEMENT, where the
+ * batchCreateLeads path it bypasses merges both on purpose.
+ */
+describe('HubspotAdapter.pullContacts — email-less contacts resolved by stored contact id', () => {
+  const existingLead = {
+    leadId: 'lead-existing',
+    listId: 'list-1',
+    phone: '2125559876',
+    firstName: 'Cal',
+    customFields: { lead_score: '90', internal_note: 'VIP — do not lose me' },
+    syncMetadata: { hubspot_contact_id: 'hs-9', attio_record_id: 'attio-abc', syncStatus: 'synced' },
+  };
+
+  beforeEach(() => {
+    (crmDb.getAllLeadsByListId as jest.Mock).mockResolvedValue([existingLead]);
+    mockListContactsPage.mockResolvedValueOnce({
+      results: [{ id: 'hs-9', properties: { firstname: 'Calvin' } }],
+      nextCursor: undefined,
+    });
+  });
+
+  it('updates the existing lead instead of creating a duplicate', async () => {
+    const adapter = new HubspotAdapter();
+    await adapter.pullContacts(auth, 'list-1', makeConfig());
+
+    const created = (crmDb.batchCreateLeads as jest.Mock).mock.calls[0]?.[1] ?? [];
+    expect(created).toHaveLength(0);
+    expect(crmDb.updateLead).toHaveBeenCalledWith('list-1', 'lead-existing', expect.anything());
+  });
+
+  it('MERGES customFields rather than replacing them', async () => {
+    const adapter = new HubspotAdapter();
+    await adapter.pullContacts(auth, 'list-1', makeConfig());
+
+    const [, , updates] = (crmDb.updateLead as jest.Mock).mock.calls[0];
+    // The customer's own fields must survive a pull. Replacing the map deletes them all.
+    expect(updates.customFields).toMatchObject({
+      lead_score: '90',
+      internal_note: 'VIP — do not lose me',
+    });
+  });
+
+  it("MERGES syncMetadata, so another provider's record id is not destroyed", async () => {
+    const adapter = new HubspotAdapter();
+    await adapter.pullContacts(auth, 'list-1', makeConfig());
+
+    const [, , updates] = (crmDb.updateLead as jest.Mock).mock.calls[0];
+    expect(updates.syncMetadata.attio_record_id).toBe('attio-abc');
+    expect(updates.syncMetadata.hubspot_contact_id).toBe('hs-9');
+  });
+
+  it('does not write at all when nothing changed', async () => {
+    mockListContactsPage.mockReset();
+    mockListContactsPage.mockResolvedValueOnce({
+      results: [{ id: 'hs-9', properties: { firstname: 'Cal' } }],
+      nextCursor: undefined,
+    });
+
+    const adapter = new HubspotAdapter();
+    await adapter.pullContacts(auth, 'list-1', makeConfig());
+
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
+  });
+});
+
