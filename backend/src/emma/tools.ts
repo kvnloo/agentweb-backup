@@ -26,6 +26,8 @@ import { CLIENT_ID_SCHEMA_PROPERTY } from '../mcp/server/toolHelpers';
 import * as booksImpl from './impl/books';
 // ENG-2103 (F2): GTM plans tool cluster, same treatment as booksImpl above.
 import * as gtmPlansImpl from './impl/gtmPlans';
+// ENG-2103 (F2): Google Drive tool cluster, same treatment as booksImpl above.
+import * as googleDriveImpl from './impl/googleDrive';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -9958,7 +9960,7 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
     const fileId = (args.url_or_id as string).match(/\/d\/([a-zA-Z0-9_-]+)/)?.[1] ?? args.url_or_id.trim();
-    return agentModeService.readGoogleFileById(fileId, context.userId);
+    return googleDriveImpl.readGoogleFileById(fileId, context.userId);
   },
 });
 
@@ -10007,15 +10009,15 @@ emmaToolRegistry.register({
     if (!context?.userId) return { success: false, message: 'Authentication required' };
     if (args.action === 'search') {
       if (!args.query) return { success: false, message: 'query is required for action=search' };
-      return agentModeService.searchGoogleDrive(args.query, context.userId, args.type);
+      return googleDriveImpl.searchGoogleDrive(args.query, context.userId, args.type);
     }
     if (args.action === 'list') {
       if (!args.folder_url_or_id) return { success: false, message: 'folder_url_or_id is required for action=list' };
-      return agentModeService.listGoogleDriveFolder(args.folder_url_or_id, context.userId);
+      return googleDriveImpl.listGoogleDriveFolder(args.folder_url_or_id, context.userId);
     }
     if (args.action === 'create_folder') {
       if (!args.name) return { success: false, message: 'name is required for action=create_folder' };
-      return agentModeService.createGoogleDriveFolder(args.name, context.userId, args.parent_folder_id);
+      return googleDriveImpl.createGoogleDriveFolder(args.name, context.userId, args.parent_folder_id);
     }
     return { success: false, message: `Unknown action: ${args.action}` };
   },

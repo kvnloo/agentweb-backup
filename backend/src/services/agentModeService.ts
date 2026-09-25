@@ -195,6 +195,23 @@ import { mergeCustomFields } from '../utils/customFieldsGuard';
 import * as booksImpl from '../emma/impl/books';
 // ENG-2103 (F2): GTM plans tool cluster, same treatment as booksImpl above.
 import * as gtmPlansImpl from '../emma/impl/gtmPlans';
+// ENG-2103 (F2): Google Drive tool cluster, same treatment as booksImpl/gtmPlansImpl.
+import * as googleDriveImpl from '../emma/impl/googleDrive';
+import {
+  getGoogleDriveOAuthClient as sharedGetGoogleDriveOAuthClient,
+  getGoogleDriveClient as sharedGetGoogleDriveClient,
+  getGoogleDriveServiceAccountEmail as sharedGetGoogleDriveServiceAccountEmail,
+  readGoogleDriveFileContent as sharedReadGoogleDriveFileContent,
+  fetchDriveFileComments as sharedFetchDriveFileComments,
+} from '../emma/impl/shared/googleDriveAccess';
+import {
+  escapeDriveQueryValue,
+  driveErrorReasons as sharedDriveErrorReasons,
+  isDriveThrottle as sharedIsDriveThrottle,
+  driveErrorCode as sharedDriveErrorCode,
+  driveThrottleRefusal as sharedDriveThrottleRefusal,
+} from '../emma/impl/shared/googleDriveErrors';
+import { pdfPageRender } from '../emma/impl/shared/pdfTextRender';
 import {
   performContentReplacements as sharedPerformContentReplacements,
   performDirectReplacement as sharedPerformDirectReplacement,
@@ -992,53 +1009,9 @@ interface PDFData {
   version: string;
 }
 
-/**
- * Custom pdf-parse pagerender function that preserves table structure.
- *
- * The default pdf-parse renderer concatenates items sharing the same exact Y
- * coordinate without adding spaces, and doesn't sort items by X position.
- * This causes numbers in tabular PDFs to run together or appear out of order.
- *
- * This renderer:
- * 1. Sorts all text items by Y (descending = top-to-bottom) then X (ascending = left-to-right)
- * 2. Groups items into rows using a Y-tolerance to handle slight vertical misalignments
- * 3. Separates items on the same row with a space so numbers don't concatenate
- */
-function pdfPageRender(pageData: any): Promise<string> {
-  return pageData.getTextContent({ normalizeWhitespace: false, disableCombineTextItems: false })
-    .then((textContent: any) => {
-      const Y_TOLERANCE = 3; // points — items within this vertical distance are on the same row
-
-      // Sort: top-to-bottom (higher Y first in PDF coords), left-to-right
-      const items: Array<{ str: string; x: number; y: number }> = textContent.items
-        .filter((item: any) => item.str && item.str.trim() !== '')
-        .map((item: any) => ({ str: item.str, x: item.transform[4], y: item.transform[5] }))
-        .sort((a: any, b: any) => {
-          if (Math.abs(a.y - b.y) > Y_TOLERANCE) return b.y - a.y; // top first
-          return a.x - b.x; // left first within same row
-        });
-
-      if (items.length === 0) return '';
-
-      // Group items into rows
-      const rows: string[][] = [];
-      let currentRow: string[] = [];
-      let rowY = items[0].y;
-
-      for (const item of items) {
-        if (Math.abs(item.y - rowY) <= Y_TOLERANCE) {
-          currentRow.push(item.str);
-        } else {
-          rows.push(currentRow);
-          currentRow = [item.str];
-          rowY = item.y;
-        }
-      }
-      if (currentRow.length > 0) rows.push(currentRow);
-
-      return rows.map(row => row.join(' ')).join('\n');
-    });
-}
+// ENG-2103 (F2): pdfPageRender moved to emma/impl/shared/pdfTextRender.ts
+// (imported above) — shared with readGoogleDriveFileContent, which now lives
+// in emma/impl/shared/googleDriveAccess.ts.
 
 export type { ModelTier, ModelProvider } from './agentMode/llmModelRegistry';
 
@@ -1361,28 +1334,10 @@ function linkedInPublicIdFromUrl(url: string | undefined | null): string | null 
 /** Narrow local shape of a stored google_ads config (ENG-1362). */
 type GoogleAdsConfigShape = { customer_id: string; currency?: string; test_account?: boolean };
 
-/**
- * Escape a value for interpolation into a Google Drive `q` string literal.
- *
- * Drive's query grammar requires BOTH `\` and `'` to be escaped inside a string. The call
- * sites here escaped only the quote, so a backslash in a value survived verbatim: a file
- * literally named `report\` produced `name = 'report\'`, whose trailing `\'` reads as an
- * escaped quote, leaving the string unterminated — an opaque Drive 400 rather than a match.
- * The same gap is what lets a crafted value manipulate quote parity and reach past the
- * parent-folder clause the query is scoped by, so this is a correctness AND a scoping fix.
- *
- * Backslash MUST be replaced first: doing the quote first would then double-escape the
- * backslashes it just introduced.
- */
-function escapeDriveQueryValue(value: string): string {
-  // A non-string reaching here used to throw on `.replace`; `String(...)` would instead embed the
-  // literal `undefined` and run a confidently wrong query. Refuse loudly rather than search for a
-  // file named "undefined" and report it missing.
-  if (typeof value !== 'string') {
-    throw new Error(`Drive query value must be a string, received ${value === null ? 'null' : typeof value}`);
-  }
-  return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-}
+// ENG-2103 (F2): escapeDriveQueryValue moved to
+// emma/impl/shared/googleDriveErrors.ts (imported above) — shared with
+// searchGoogleDrive (now in emma/impl/googleDrive.ts) and the knowledge-base
+// cluster's Drive query building, which still lives on this class.
 
 /**
  * Validate a model-supplied Drive date filter, returning the `YYYY-MM-DD` day it names.
@@ -1515,11 +1470,10 @@ export class AgentModeService {
   // save-as-you-go around browser automation tools, so an intermittent login
   // success is captured without depending on the model calling the cookie tools).
   private browserCookieAutoState = createAutoPersistState();
-  // ENG-1624: cached so a sub-folder-access error can name the service account
-  // to share with, without re-fetching the secret on every failure. Only the
-  // email is kept — the private key must never outlive the local
-  // getGoogleDriveClient() call that parses the secret.
-  private driveServiceAccountEmail: string | null = null;
+  // ENG-2103 (F2): driveServiceAccountEmail moved to a module-level singleton
+  // in emma/impl/shared/googleDriveAccess.ts (the same "pure cache" treatment
+  // as F1's runFundingStore) — getGoogleDriveClient/getGoogleDriveServiceAccountEmail
+  // below now delegate there.
   private toolRegistry: ToolRegistry;
   private mcpClientService: McpClientService;
   private static toolsRegistered: boolean = false;
@@ -23963,26 +23917,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
   // Knowledge base search functionality
   // Helper: get an authenticated Google Drive client using the service account
+  // ENG-2103 (F2): delegates to emma/impl/shared/googleDriveAccess.ts, shared
+  // between emma/impl/googleDrive.ts (readGoogleFileById's fallback) and this
+  // class's own knowledge-base methods (searchKnowledgeBase,
+  // listKnowledgeBaseFiles, readKnowledgeBaseFiles, materializeKnowledgeBaseAsset).
   private async getGoogleDriveClient() {
-    // ENG-1277: lazy load. `googleapis` pulls in ~990 transitive modules that
-    // every jest worker paid on `require()` of this file (1,023 of 1,388 test
-    // files statically import agentModeService.ts) even when a test never
-    // touches Drive/Sheets.
-    const { google } = await import('googleapis');
-    const { getSecret } = await import('../utils/secretsManager');
-    const environment = process.env.NODE_ENV || 'development';
-    const secretName = environment === 'production' ? 'prod/AgentWeb/Google/Share' : 'dev/AgentWeb/Google/Share';
-    const credentials = JSON.parse(await getSecret(secretName));
-    this.driveServiceAccountEmail = credentials.client_email || null;
-    const auth = new google.auth.GoogleAuth({
-      credentials,
-      scopes: ['https://www.googleapis.com/auth/drive.readonly'],
-    });
-    return google.drive({ version: 'v3', auth });
+    return sharedGetGoogleDriveClient();
   }
 
   private getGoogleDriveServiceAccountEmail(): string {
-    return this.driveServiceAccountEmail || 'the AgentWeb Google Drive service account';
+    return sharedGetGoogleDriveServiceAccountEmail();
   }
 
   /**
@@ -24036,51 +23980,28 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return String(text ?? '').replace(/\d{8,}/g, '[id]');
   }
 
+  // ENG-2103 (F2): these four delegate to emma/impl/shared/googleDriveErrors.ts,
+  // shared between emma/impl/googleDrive.ts (this extraction), this class's
+  // own classifyDriveError (knowledge-base cluster), and
+  // createGoogleDoc/updateGoogleDoc/createGoogleSheet/updateGoogleSheet
+  // (Google Docs/Sheets cluster) — all of which reference these by the class
+  // name (`AgentModeService.driveErrorCode(...)`), so they are kept as static
+  // delegating methods rather than touched-and-rewritten at each call site.
   private static driveErrorReasons(err: any): string[] {
-    const raw = [
-      ...(Array.isArray(err?.errors) ? err.errors : []),
-      ...(Array.isArray(err?.response?.data?.error?.errors) ? err.response.data.error.errors : []),
-    ];
-    return raw.map((e: any) => String(e?.reason ?? '')).filter(Boolean);
+    return sharedDriveErrorReasons(err);
   }
 
   /** True when a 401/403 is really a quota/throttle answer, not an access decision. */
   private static isDriveThrottle(err: any): boolean {
-    return AgentModeService.driveErrorReasons(err).some(r => /ratelimitexceeded|dailylimitexceeded/i.test(r));
+    return sharedIsDriveThrottle(err);
   }
 
-  /**
-   * The HTTP status of a Drive error, as a NUMBER.
-   *
-   * gaxios surfaces `code` as a string in some shapes (notably when the response body carries no
-   * `error.code`), and every `code === 403` comparison in this file is strict — so a string
-   * `'403'` silently matched nothing and fell through to the generic "temporary Drive error"
-   * branch. Coercing once, in one place, is what stops each new handler from inheriting that.
-   */
   private static driveErrorCode(err: any): number | undefined {
-    const raw = err?.code ?? err?.status;
-    const n = typeof raw === 'number' ? raw : Number(raw);
-    return Number.isFinite(n) ? n : undefined;
+    return sharedDriveErrorCode(err);
   }
 
-  /**
-   * The refusal a THROTTLED Drive call should return, or null when it is not a throttle.
-   *
-   * Drive answers 403 for quota exhaustion as well as for permission denial, and every handler
-   * in this file read the status alone — so a rate-limited user was told their connection had
-   * expired, or that Emma lacks access to a folder she can see, or that a Sheet "was not created
-   * by Emma". All false, and all pointing at a fix that cannot work. One sentence, one place, so
-   * the next handler cannot reintroduce it.
-   */
   private static driveThrottleRefusal(err: any): { success: false; message: string } | null {
-    const code = AgentModeService.driveErrorCode(err);
-    if ((code !== 403 && code !== 401) || !AgentModeService.isDriveThrottle(err)) return null;
-    return {
-      success: false,
-      message:
-        'Google Drive is rate-limiting this account right now — this is a temporary quota answer, '
-        + 'NOT a permissions problem, so nothing needs to be shared or reconnected. Wait a minute and retry.',
-    };
+    return sharedDriveThrottleRefusal(err);
   }
 
   private classifyDriveError(err: any): string {
@@ -24535,31 +24456,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return match ? match[1] : urlOrId.trim();
   }
 
+  // ENG-2103 (F2): delegates to emma/impl/shared/googleDriveAccess.ts.
   private async fetchDriveFileComments(drive: any, fileId: string): Promise<string> {
-    try {
-      const resp = await drive.comments.list({
-        fileId,
-        fields: 'comments(content,quotedFileContent,author,replies,resolved,createdTime)',
-        includeDeleted: false,
-        pageSize: 100,
-      });
-      const comments: any[] = resp.data.comments || [];
-      if (comments.length === 0) return '';
-      const lines: string[] = ['\n\n--- COMMENTS & FEEDBACK ---'];
-      for (const c of comments) {
-        const author = c.author?.displayName || 'Unknown';
-        const quote = c.quotedFileContent?.value ? ` [on: "${c.quotedFileContent.value}"]` : '';
-        const resolved = c.resolved ? ' [resolved]' : '';
-        lines.push(`\n[${author}]${quote}${resolved}: ${c.content}`);
-        for (const reply of (c.replies || [])) {
-          const rAuthor = reply.author?.displayName || 'Unknown';
-          lines.push(`  ↳ [${rAuthor}]: ${reply.content}`);
-        }
-      }
-      return lines.join('\n');
-    } catch {
-      return '';
-    }
+    return sharedFetchDriveFileComments(drive, fileId);
   }
 
   // Helper: get Google Drive shared folders for a caller.
@@ -25743,61 +25642,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   }
 
   // Helper: read a Google Drive file's content as text
+  // ENG-2103 (F2): delegates to emma/impl/shared/googleDriveAccess.ts. Kept as
+  // a class method (not deleted) because
+  // __tests__/agentModeService.googleDrive.test.ts spies on it directly via
+  // `jest.spyOn(service as any, 'readGoogleDriveFileContent')`.
   private async readGoogleDriveFileContent(drive: any, fileId: string, fileName: string, mimeType: string): Promise<string> {
-    let content: Buffer;
-
-    // Google Workspace files need to be exported
-    if (mimeType === 'application/vnd.google-apps.document') {
-      const res = await drive.files.export({ fileId, mimeType: 'text/plain' }, { responseType: 'arraybuffer' });
-      content = Buffer.from(res.data);
-    } else if (mimeType === 'application/vnd.google-apps.spreadsheet') {
-      const res = await drive.files.export({ fileId, mimeType: 'text/csv' }, { responseType: 'arraybuffer' });
-      content = Buffer.from(res.data);
-    } else if (mimeType === 'application/vnd.google-apps.presentation') {
-      const res = await drive.files.export({ fileId, mimeType: 'text/plain' }, { responseType: 'arraybuffer' });
-      content = Buffer.from(res.data);
-    } else {
-      // Binary files — download directly
-      const res = await drive.files.get({ fileId, alt: 'media', supportsAllDrives: true }, { responseType: 'arraybuffer' });
-      content = Buffer.from(res.data);
-    }
-
-    const extension = (fileName.split('.').pop() || '').toLowerCase();
-
-    if (extension === 'pdf' || mimeType === 'application/pdf') {
-      const pdfParse = require('pdf-parse');
-      const pdfData = await pdfParse(content, { pagerender: pdfPageRender });
-      return pdfData.text || '';
-    } else if (['xlsx', 'xls', 'xlsm', 'xlsb'].includes(extension) ||
-      mimeType.includes('spreadsheetml') || mimeType.includes('ms-excel')) {
-      const XLSX = require('xlsx');
-      const workbook = XLSX.read(content, { type: 'buffer' });
-      const lines: string[] = [];
-      for (const sheetName of workbook.SheetNames) {
-        const sheet = workbook.Sheets[sheetName];
-        const csv = XLSX.utils.sheet_to_csv(sheet, { blankrows: false });
-        if (csv.trim()) {
-          lines.push(`Sheet: ${sheetName}`);
-          lines.push(csv);
-        }
-      }
-      return lines.join('\n\n');
-    } else if (['docx', 'doc'].includes(extension) ||
-      mimeType.includes('wordprocessingml') || mimeType.includes('msword')) {
-      try {
-        const mammoth = require('mammoth');
-        const result = await mammoth.extractRawText({ buffer: content });
-        return result.value || '';
-      } catch {
-        return content.toString('utf-8');
-      }
-    } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) ||
-      mimeType.startsWith('text/') ||
-      mimeType.startsWith('application/vnd.google-apps.')) {
-      return content.toString('utf-8');
-    } else {
-      return content.toString('base64');
-    }
+    return sharedReadGoogleDriveFileContent(drive, fileId, fileName, mimeType);
   }
 
   // Helper: read a single knowledge base file
@@ -26605,304 +26455,33 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
   // Read a Google Doc or Sheet directly by file ID.
   // Tries user OAuth first (works for internal Workspace files); falls back to service account.
+  // ENG-2103 (F2): Google Drive tool cluster. Bodies moved verbatim to
+  // emma/impl/googleDrive.ts; these delegate rather than duplicate because
+  // __tests__/agentModeService.googleDrive.test.ts calls these class methods
+  // directly on a real instance (a real second caller beyond emma/tools.ts,
+  // confirmed by grep) — deleting them would break that suite.
   public async readGoogleFileById(fileId: string, userId: string): Promise<any> {
-    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
-    const { google } = await import('googleapis');
-    let drive: any;
-    let usingOAuth = false;
-    try {
-      const oauthClient = await this.getGoogleDriveOAuthClient(userId);
-      drive = google.drive({ version: 'v3', auth: oauthClient });
-      usingOAuth = true;
-    } catch (e) {
-      console.error('[AgentMode] getGoogleDriveOAuthClient failed, falling back to SA:', e);
-      drive = await this.getGoogleDriveClient();
-    }
-
-    const readWithDrive = async (driveClient: any) => {
-      const meta = await driveClient.files.get({ fileId, fields: 'id,name,mimeType,modifiedTime', supportsAllDrives: true });
-      const { name, mimeType, modifiedTime } = meta.data;
-      const isGoogleNative =
-        mimeType === 'application/vnd.google-apps.document' ||
-        mimeType === 'application/vnd.google-apps.spreadsheet';
-      const [contentStr, commentsStr] = await Promise.all([
-        this.readGoogleDriveFileContent(driveClient, fileId, name || fileId, mimeType || ''),
-        isGoogleNative ? this.fetchDriveFileComments(driveClient, fileId) : Promise.resolve(''),
-      ]);
-      const combined = contentStr + commentsStr;
-      const maxLen = 1_000_000;
-      return {
-        success: true,
-        message: `Successfully read Google file "${name}"`,
-        file_id: fileId,
-        file_name: name,
-        content: combined.length > maxLen ? combined.substring(0, maxLen) + '\n\n[Content truncated]' : combined,
-        size: contentStr.length,
-        type: mimeType,
-        modifiedTime,
-      };
-    };
-
-    try {
-      return await readWithDrive(drive);
-    } catch (oauthErr: any) {
-      // OAuth drive.file scope can't access files it didn't create — retry with SA
-      if (usingOAuth && (oauthErr?.code === 403 || oauthErr?.status === 403 || oauthErr?.code === 401 || oauthErr?.status === 401)) {
-        try {
-          const saDrive = await this.getGoogleDriveClient();
-          return await readWithDrive(saDrive);
-        } catch (saErr: any) {
-          // ENG-1300: carry the real numeric HTTP status through so a clean
-          // 401/403/404 classifies as auth/not_found instead of the generic
-          // Error/bug fallback once toolResultError rebuilds an Error from the
-          // message alone.
-          const code = saErr?.code || saErr?.status;
-          const is404 = code === 404;
-          const msg = is404
-            ? `File not found or not accessible. Share the file with the service account, or connect Google Drive in Settings for files you own.`
-            : `Failed to read file: ${saErr instanceof Error ? saErr.message : 'Unknown error'}`;
-          return { success: false, message: msg, code };
-        }
-      }
-      const code = oauthErr?.code || oauthErr?.status;
-      const is404 = code === 404;
-      const msg = is404
-        ? `File not found or you don't have access (fileId: ${fileId}).`
-        : `Failed to read file: ${oauthErr instanceof Error ? oauthErr.message : 'Unknown error'}`;
-      return { success: false, message: msg, code };
-    }
-  }
-
-  // ── Google Drive OAuth helpers (user-authenticated, write-capable) ──────────
-
-  private async getGoogleDriveOAuthClient(userId: string) {
-    const { getAccountByPlatform } = await import('../services/connectedAccountsDb');
-    const account = await getAccountByPlatform(userId, 'google_drive');
-    if (!account) {
-      throw new Error('Google Drive not connected. Connect Google Drive in Settings → Connected Accounts.');
-    }
-    const cfg = account.config as any;
-    const { getGoogleDriveConfig } = await import('../config/integrations');
-    const driveConfig = await getGoogleDriveConfig();
-    const { OAuth2Client } = await import('google-auth-library');
-    const client = new OAuth2Client(driveConfig.clientId, driveConfig.clientSecret);
-    client.setCredentials({
-      access_token: cfg.access_token,
-      refresh_token: cfg.refresh_token,
-      expiry_date: cfg.token_expires_at,
-    });
-    // Persist refreshed tokens back to DB — use updateAccountTokens to preserve all other account fields
-    client.on('tokens', async (tokens) => {
-      try {
-        const { updateAccountTokens } = await import('../services/connectedAccountsDb');
-        await updateAccountTokens(userId, 'google_drive', {
-          access_token: tokens.access_token ?? cfg.access_token,
-          refresh_token: tokens.refresh_token ?? cfg.refresh_token,
-          token_expires_at: tokens.expiry_date ?? cfg.token_expires_at,
-        }, cfg.email);
-      } catch { /* best effort */ }
-    });
-    return client;
+    return googleDriveImpl.readGoogleFileById(fileId, userId);
   }
 
   public async listGoogleDriveFolder(folderIdOrUrl: string, userId: string): Promise<any> {
-    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
-    const { google } = await import('googleapis');
-    try {
-      const auth = await this.getGoogleDriveOAuthClient(userId);
-      const drive = google.drive({ version: 'v3', auth });
-
-      const folderIdFromUrl = folderIdOrUrl.match(/\/folders\/([a-zA-Z0-9_-]+)/)?.[1];
-      const rawId = folderIdOrUrl.trim();
-      const folderId = folderIdFromUrl ?? (/^[a-zA-Z0-9_-]+$/.test(rawId) ? rawId : null);
-      if (!folderId) {
-        return { success: false, message: 'Invalid folder ID or URL. Please provide a valid Google Drive folder URL or folder ID.' };
-      }
-
-      const resp = await drive.files.list({
-        q: `'${folderId}' in parents and trashed = false`,
-        fields: 'files(id,name,mimeType,modifiedTime,webViewLink),nextPageToken',
-        orderBy: 'name',
-        pageSize: 100,
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-      });
-
-      const files = resp.data.files || [];
-      const hasMore = !!resp.data.nextPageToken;
-
-      if (files.length === 0) {
-        return { success: true, message: 'Folder is empty.', files: [] };
-      }
-
-      const formatted = files.map(f => ({
-        id: f.id,
-        name: f.name,
-        type: f.mimeType,
-        url: f.webViewLink,
-        modified: f.modifiedTime,
-      }));
-
-      return {
-        success: true,
-        message: `Found ${files.length} item(s) in folder.${hasMore ? ' (Showing first 100 — folder has more items.)' : ''}`,
-        folder_id: folderId,
-        files: formatted,
-      };
-    } catch (err: any) {
-      /*
-       * ENG-1300 (from main) wanted `code` carried onto the result so a clean 401/403/404
-       * classifies as auth/not_found rather than the generic fallback — the `, code }`
-       * returns below are its half of that change and are kept.
-       *
-       * `driveErrorCode` rather than `err?.code || err?.status`: gaxios can surface the
-       * status as a STRING, and every comparison below is strict, so '403' matched no
-       * branch and fell through to the generic message — losing the very classification
-       * ENG-1300 was adding. Same binding, normalised once.
-       */
-      const code = AgentModeService.driveErrorCode(err);
-      const throttled = AgentModeService.driveThrottleRefusal(err);
-      if (throttled) return throttled;
-      if (code === 403 || code === 401) {
-        return { success: false, message: 'Google Drive access denied. Your Google Drive connection may have expired — reconnect in Settings → Connected Accounts.', code };
-      }
-      if (code === 404) {
-        return { success: false, message: 'Folder not found. Check the URL or ID and try again.', code };
-      }
-      return { success: false, message: err?.message || 'Failed to list folder contents', code };
-    }
+    return googleDriveImpl.listGoogleDriveFolder(folderIdOrUrl, userId);
   }
 
   public async createGoogleDriveFolder(name: string, userId: string, parentFolderId?: string): Promise<any> {
-    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
-    const { google } = await import('googleapis');
-    try {
-      const auth = await this.getGoogleDriveOAuthClient(userId);
-      const drive = google.drive({ version: 'v3', auth });
-
-      const requestBody: any = { name, mimeType: 'application/vnd.google-apps.folder' };
-      if (parentFolderId) requestBody.parents = [parentFolderId];
-
-      const resp = await drive.files.create({ requestBody, fields: 'id,name,webViewLink' });
-      const folderId = resp.data.id!;
-      const folderUrl = resp.data.webViewLink || `https://drive.google.com/drive/folders/${folderId}`;
-
-      return { success: true, folder_id: folderId, folder_url: folderUrl, name: resp.data.name };
-    } catch (err: any) {
-      /*
-       * ENG-1300 (from main) wanted `code` carried onto the result so a clean 401/403/404
-       * classifies as auth/not_found rather than the generic fallback — the `, code }`
-       * returns below are its half of that change and are kept.
-       *
-       * `driveErrorCode` rather than `err?.code || err?.status`: gaxios can surface the
-       * status as a STRING, and every comparison below is strict, so '403' matched no
-       * branch and fell through to the generic message — losing the very classification
-       * ENG-1300 was adding. Same binding, normalised once.
-       */
-      const code = AgentModeService.driveErrorCode(err);
-      const throttled = AgentModeService.driveThrottleRefusal(err);
-      if (throttled) return throttled;
-      if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot create folder in that location — Emma does not have access to the specified parent folder.', code };
-      }
-      if (code === 404) {
-        return { success: false, message: 'Parent folder not found. Check the folder ID and try again.', code };
-      }
-      return { success: false, message: err?.message || 'Failed to create Google Drive folder', code };
-    }
+    return googleDriveImpl.createGoogleDriveFolder(name, userId, parentFolderId);
   }
 
   public async searchGoogleDrive(query: string, userId: string, type?: string): Promise<any> {
-    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
-    const { google } = await import('googleapis');
-    try {
-      const auth = await this.getGoogleDriveOAuthClient(userId);
-      const drive = google.drive({ version: 'v3', auth });
+    return googleDriveImpl.searchGoogleDrive(query, userId, type);
+  }
 
-      const namePart = `name contains '${escapeDriveQueryValue(query)}'`;
-      const typePart = type === 'folder'
-        ? ` and mimeType = 'application/vnd.google-apps.folder'`
-        : type === 'file'
-        ? ` and mimeType != 'application/vnd.google-apps.folder'`
-        : '';
-      const q = `${namePart}${typePart} and trashed = false`;
-
-      const resp = await drive.files.list({
-        q,
-        // `nextPageToken` is requested so this read can tell a complete result from a capped
-        // one. Without it the 20-row cap below was invisible and unknowable.
-        fields: 'nextPageToken, files(id,name,mimeType,webViewLink,parents)',
-        orderBy: 'modifiedTime desc',
-        pageSize: 20,
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-      });
-
-      const files = resp.data.files || [];
-      /*
-       * ENG-1584, same sentence, different edge.
-       *
-       * `Found ${n} item(s) matching "x"` off a hard `pageSize: 20` with no `nextPageToken`
-       * requested reads as "these are all the matches" and means "these are the first 20". A
-       * model that searches for a file, sees it missing, and reports it absent is the exact
-       * failure that told a customer a protected ad did not exist. The sibling
-       * `listGoogleDriveFolder` already reports `hasMore`; this read did not.
-       *
-       * Deliberately NOT drained into full pagination: a name-substring search is an
-       * interactive lookup, not an inventory, and 20 newest-first matches is the right size.
-       * The bound is fine — going UNANNOUNCED was the defect.
-       */
-      const hasMore = !!resp.data.nextPageToken;
-      if (files.length === 0) {
-        return {
-          success: true,
-          complete: !hasMore,
-          message: hasMore
-            ? `No items found in the first page of matches for "${query}", but MORE PAGES EXIST — this is not evidence that nothing matches. Narrow the query and search again.`
-            : `No items found matching "${query}" (complete search).`,
-          results: [],
-        };
-      }
-
-      const results = files.map(f => ({
-        id: f.id,
-        name: f.name,
-        type: f.mimeType === 'application/vnd.google-apps.folder' ? 'folder' : f.mimeType,
-        url: f.webViewLink,
-        parent_folder_ids: f.parents,
-      }));
-
-      // Completeness ahead of the payload — anything after `results` can fall outside the
-      // sealed prefix the model reads once this result is offloaded.
-      return {
-        success: true,
-        complete: !hasMore,
-        ...(hasMore && { hasMore: true }),
-        totalCount: results.length,
-        message: hasMore
-          ? `Found ${results.length} item(s) matching "${query}", but THIS LIST IS INCOMPLETE — Drive had more matches and the search stopped at its 20-item bound. Do NOT conclude a file is absent from Drive because it is not here. Narrow the query and search again.`
-          : `Found ${results.length} item(s) matching "${query}" (complete list).`,
-        results,
-      };
-    } catch (err: any) {
-      /*
-       * ENG-1300 (from main) wanted `code` carried onto the result so a clean 401/403/404
-       * classifies as auth/not_found rather than the generic fallback — the `, code }`
-       * returns below are its half of that change and are kept.
-       *
-       * `driveErrorCode` rather than `err?.code || err?.status`: gaxios can surface the
-       * status as a STRING, and every comparison below is strict, so '403' matched no
-       * branch and fell through to the generic message — losing the very classification
-       * ENG-1300 was adding. Same binding, normalised once.
-       */
-      const code = AgentModeService.driveErrorCode(err);
-      const throttled = AgentModeService.driveThrottleRefusal(err);
-      if (throttled) return throttled;
-      if (code === 403 || code === 401) {
-        return { success: false, message: 'Google Drive access denied. Ensure Drive is connected in Settings → Connected Accounts.', code };
-      }
-      return { success: false, message: err?.message || 'Failed to search Google Drive', code };
-    }
+  // ENG-2103 (F2): delegates to emma/impl/shared/googleDriveAccess.ts, shared
+  // between emma/impl/googleDrive.ts (this extraction) and this class's own
+  // createGoogleDoc/updateGoogleDoc/createGoogleSheet/updateGoogleSheet (a
+  // separate, not-yet-extracted "Google Docs/Sheets" cluster).
+  private async getGoogleDriveOAuthClient(userId: string) {
+    return sharedGetGoogleDriveOAuthClient(userId);
   }
 
   // ── Markdown → HTML (for Google Drive HTML import) ───────────────────────
