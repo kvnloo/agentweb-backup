@@ -2723,6 +2723,7 @@ const main = async () => {
     await createPromptSignalsTable();
     await createEvaluationsTable();
     await createAccountCapabilityRequirementsTable();
+    await createEvalGoldenCasesTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -3692,6 +3693,45 @@ const createEvaluationsTable = async () => {
     console.log(`Created ${params.TableName} table:`, result);
   } catch (error: any) {
     if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-2135 (ENG-2128 D2) — golden-set case ids + binary labels (loops/eval/goldenSetStore.ts).
+// The app reads the table name from EVAL_GOLDEN_CASES_TABLE, not from this prefix, so the store
+// stays inert until OPS-2 (ENG-2147) creates the table and sets the variable. SurfaceIndex lists
+// one surface's cases (labelling UI, validation runner) without a scan.
+const createEvalGoldenCasesTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-EvalGoldenCases`,
+    AttributeDefinitions: [
+      { AttributeName: 'caseId', AttributeType: 'S' },
+      { AttributeName: 'surface', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'caseId', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'SurfaceIndex',
+        KeySchema: [
+          { AttributeName: 'surface', KeyType: 'HASH' },
+          { AttributeName: 'caseId', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error) {
+    if ((error as AWS.AWSError).code === 'ResourceInUseException') {
       console.log(`${params.TableName} table already exists`);
     } else {
       throw error;
