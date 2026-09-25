@@ -3155,7 +3155,8 @@ mcpToolRegistry.register({
 Returns for each client:
 - userId: internal account id — use this to map a userId (e.g. from get_chat_history) back to a human-readable email/displayName
 - displayName, email, roles
-- has_ads: whether they have a Meta ad account connected
+- has_ads: whether a Meta ad account is on record (it may have expired — see ad_connection)
+- ad_connection: never_connected (no ad account anywhere: activation, not churn) / connected / expired (Meta connection broke) / other_platform (ads on Google Ads or LinkedIn Ads, no Meta)
 - has_lander: whether they have landing pages (productDomain or seoDomains)
 - has_crm: whether they have CRM integrations (email domain, LinkedIn)
 - last_activity: last login timestamp
@@ -3194,7 +3195,10 @@ Returns a structured health assessment with:
 - **Lander layer**: Landing page / website presence (productDomain, seoDomains)
 - **Lead quality layer**: CRM / lead capture integrations (email domain, LinkedIn)
 - **Creative variety**: Distinct creatives, cannibalization warnings, fatigue indicators
-- **Overall status**: healthy / mediocre / at-risk / blocked with reasons
+- **Overall status**: healthy / mediocre / at-risk / blocked / onboarding with reasons
+  - onboarding = activation incomplete (no ad account ever connected). This is NOT churn or at-risk — treat it as an activation nudge.
+  - ads_layer.connection other_platform = ads run on Google Ads or LinkedIn Ads; the Meta layer is not assessed and this is not a problem.
+  - at-risk from the ads layer means a connection that broke (token expired; ads_layer.token_expired_at).
 
 Use this to quickly diagnose a client's marketing funnel completeness.`,
     inputSchema: {
