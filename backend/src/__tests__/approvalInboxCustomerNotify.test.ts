@@ -36,6 +36,8 @@ const baseDecision: any = {
   gateType: 'customer_credential',
   audience: 'customer',
   customerId: 'cust-1',
+  subjectLabel: 'Meta Ad Account act_123',
+  subjectContactEmail: 'owner@thinkingai.com',
   businessImpact: 'Your ad account needs to be reconnected.',
   customerActionUrl: 'https://app.agentweb.pro/settings?tab=connected-accounts&platform=meta',
 };
@@ -63,6 +65,19 @@ describe('notifyCustomerOfPendingCredentialDecision', () => {
     expect(text).toContain('Your ad account needs to be reconnected.');
     expect(text).toContain(baseDecision.customerActionUrl);
     expect(html).toContain(baseDecision.customerActionUrl);
+    // ENG-2159: subjectLabel present alongside businessImpact, not instead of it.
+    expect(text).toContain('Meta Ad Account act_123');
+    expect(html).toContain('Meta Ad Account act_123');
+    // ENG-2159 follow-up: subjectContactEmail parity with the Slack card.
+    expect(text).toContain('owner@thinkingai.com');
+    expect(html).toContain('owner@thinkingai.com');
+  });
+
+  it('omits the contact-email parenthetical when subjectContactEmail is absent (optional field)', async () => {
+    await notifyCustomerOfPendingCredentialDecision({ ...baseDecision, subjectContactEmail: undefined });
+    const [, , text, html] = mockSendEmail.mock.calls[0];
+    expect(text).not.toContain('(');
+    expect(html).not.toContain('owner@thinkingai.com');
   });
 
   it('prefers decision.customerEmail over a DB lookup when both are present', async () => {
@@ -109,6 +124,8 @@ describe('notifyCustomerOfExpiredCredentialDecision (review fix)', () => {
     expect(subject.toLowerCase()).toContain('closed');
     expect(text).toContain(baseDecision.businessImpact);
     expect(text.toLowerCase()).toContain('closed');
+    expect(text).toContain('Meta Ad Account act_123');
+    expect(text).toContain('owner@thinkingai.com');
   });
 
   it('fires an oncall alert and sends no email when no email is resolvable', async () => {
