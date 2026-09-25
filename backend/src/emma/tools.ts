@@ -38,6 +38,8 @@ import * as leadsImpl from './impl/leads';
 import * as brandMarketStrategyImpl from './impl/brandMarketStrategy';
 // ENG-2103 (F2): video-generation / media-post-processing tool cluster, same treatment as booksImpl above.
 import * as mediaVideoImpl from './impl/mediaVideo';
+// ENG-2103 (F2): createHtmlFile/createHtmlTemplate tool cluster, same treatment as booksImpl above.
+import * as htmlCreationImpl from './impl/htmlCreation';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -6500,7 +6502,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     const documentType = args.document_type === 'email' ? 'email' : 'document';
-    return await agentModeService.createHtmlFile(args.title, args.content_draft, args.format_requirements || '', context?.userId, context?.sessionId, documentType);
+    return await htmlCreationImpl.createHtmlFile(args.title, args.content_draft, args.format_requirements || '', context?.userId, context?.sessionId, documentType);
   }
 });
 
@@ -6542,7 +6544,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createHtmlTemplate(
+    return await htmlCreationImpl.createHtmlTemplate(
       args.html_source,
       args.template_id,
       args.template_name,
