@@ -589,6 +589,26 @@ export class HumanEvalService {
     return matches;
   }
 
+  /**
+   * Every candidate of one review type, all accounts, across all scan pages (ENG-2142: the weekly
+   * calibration sampler's pool). No result cap, like `listCandidatesForUser`. Offline/cron use only: it scans.
+   */
+  async listCandidatesByReviewType(reviewType: HumanEvalReviewType): Promise<HumanEvalCandidate[]> {
+    const matches: HumanEvalCandidate[] = [];
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await this.db.scan({
+        TableName: HUMAN_EVAL_QUEUE_TABLE,
+        FilterExpression: 'reviewType = :reviewType',
+        ExpressionAttributeValues: { ':reviewType': reviewType },
+        ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+      }).promise();
+      matches.push(...((result.Items || []) as HumanEvalCandidate[]));
+      lastKey = result.LastEvaluatedKey;
+    } while (lastKey);
+    return matches;
+  }
+
   private async appendFeedback(candidate: HumanEvalCandidate, feedback: HumanEvalFeedback): Promise<void> {
     await this.db.update({
       TableName: HUMAN_EVAL_QUEUE_TABLE,

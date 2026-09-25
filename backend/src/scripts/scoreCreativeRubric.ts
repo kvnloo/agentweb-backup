@@ -76,8 +76,8 @@ export async function priorBestFor(
   return selectPriorBest(candidate, await service.listCandidatesForUser(candidate.userId, 'creative_image'));
 }
 
-/** OpenRouter without the usage ledger: this script must write nothing. */
-const unmeteredOpenRouterLlm: RubricJudgeLlm = {
+/** OpenRouter without the usage ledger: this script (and creativeCalibrationReport.ts) must write nothing. */
+export const unmeteredOpenRouterLlm: RubricJudgeLlm = {
   async complete(request) {
     const { agentModeService } = await import('../services/agentModeService');
     const { resolveOpenRouterUpstreamModelId } = await import('../utils/openRouterGatewayContract');
@@ -97,7 +97,8 @@ const unmeteredOpenRouterLlm: RubricJudgeLlm = {
   },
 };
 
-async function briefFor(candidate: HumanEvalCandidate): Promise<CreativeBrief> {
+/** The judge brief for a stored candidate: generation request, placement and brand profile. */
+export async function briefFor(candidate: HumanEvalCandidate): Promise<CreativeBrief> {
   const { resolveBrandGuidelinesForUser } = await import('../services/agentMode/brandLogo');
   const brandData = candidate.userId ? (await resolveBrandGuidelinesForUser(candidate.userId))?.brandData : undefined;
   const brand = brandProfileFromBrandData(brandData);
