@@ -524,6 +524,82 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     expect(customers.body.error).toBeUndefined();
   });
 
+  // My own regression, found by Manan questioning the "sequences are email-only" claim.
+  // SequenceChannel is 'email' | 'linkedin', and dripSequenceWorker's sendLinkedInStep
+  // loads the lead by leadId and reaches it through lead.linkedin — it never touches the
+  // address. So a LinkedIn-only lead in a LinkedIn sequence WAS being messaged, and an
+  // `l.email` enrollability test silently removed that capability.
+  describe('channel-aware enrollability', () => {
+    const linkedInSequence = {
+      ...mockSequence,
+      steps: [{ stepId: 's1', stepNumber: 1, name: 'invite', delayDays: 0,
+                channel: 'linkedin', messageText: 'hi {{firstName}}' }],
+    };
+
+    it('enrols a LinkedIn-only lead into a LinkedIn sequence', async () => {
+      dripSequenceDb.getSequence.mockResolvedValue(linkedInSequence);
+      const crmDbMock = require('../services/db').crmDb;
+      crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+        { leadId: 'l1', listId: 'list-1', linkedin: 'https://linkedin.com/in/ada', firstName: 'Ada' },
+      ]);
+
+      const res = await request(app)
+        .post('/seq_1/enrollments/by-list')
+        .send({ listId: 'list-1' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.enrollableLeads).toBe(1);
+      expect(dripSequenceDb.bulkEnroll).toHaveBeenCalled();
+      // The dedup key must be populated or getExistingEnrollment cannot see the row and
+      // it is re-created — and the lead re-messaged — on every run.
+      const input = dripSequenceDb.bulkEnroll.mock.calls[0][0][0];
+      expect(input.leadEmail).toBe('https://linkedin.com/in/ada');
+    });
+
+    it('still refuses an address-less lead for an EMAIL sequence', async () => {
+      dripSequenceDb.getSequence.mockResolvedValue(mockSequence);
+      const crmDbMock = require('../services/db').crmDb;
+      crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+        { leadId: 'l1', listId: 'list-1', linkedin: 'https://linkedin.com/in/ada' },
+      ]);
+
+      const res = await request(app)
+        .post('/seq_1/enrollments/by-list')
+        .send({ listId: 'list-1' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.enrollableLeads).toBe(0);
+      expect(res.body.skippedNoEmail).toBe(1);
+    });
+
+    it('a MIXED sequence needs both channels — one is not enough', async () => {
+      dripSequenceDb.getSequence.mockResolvedValue({
+        ...mockSequence,
+        steps: [
+          { stepId: 's1', stepNumber: 1, name: 'mail', delayDays: 0, subject: 'x', bodyHtml: 'y' },
+          { stepId: 's2', stepNumber: 2, name: 'invite', delayDays: 1, channel: 'linkedin', messageText: 'z' },
+        ],
+      });
+      const crmDbMock = require('../services/db').crmDb;
+      crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+        { leadId: 'both', listId: 'list-1', email: 'a@x.com', linkedin: 'https://linkedin.com/in/a' },
+        { leadId: 'mail-only', listId: 'list-1', email: 'b@x.com' },
+        { leadId: 'li-only', listId: 'list-1', linkedin: 'https://linkedin.com/in/c' },
+      ]);
+
+      const res = await request(app)
+        .post('/seq_1/enrollments/by-list')
+        .send({ listId: 'list-1' });
+
+      expect(res.status).toBe(200);
+      // Only the lead reachable on EVERY channel — a step the lead cannot receive throws
+      // in the worker and retries forever, which is what this guard exists to prevent.
+      expect(res.body.enrollableLeads).toBe(1);
+      const ids = dripSequenceDb.bulkEnroll.mock.calls[0][0].map((i: any) => i.leadId);
+      expect(ids).toEqual(['both']);
+    });
+  });
+
   it('still enrols normally when a lifecycle filter does return leads', async () => {
     const crmDbMock = require('../services/db').crmDb;
     crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({

@@ -76,6 +76,15 @@ const threeLeads = [
   { leadId: 'l3', email: 'c@example.com', firstName: 'C' },
 ];
 
+// The same three leads, reachable on LinkedIn. Enrollability is derived from the
+// sequence's own channels now, so a LinkedIn-step sequence cannot reach a lead that has
+// only an address — the worker's sendLinkedInStep needs `lead.linkedin` and throws
+// without it. The original fixture gave these leads emails only and was written when
+// enrollability was email-only regardless of channel.
+const threeLeadsOnLinkedIn = threeLeads.map((l) => ({
+  ...l, linkedin: `https://linkedin.com/in/${l.leadId}`,
+}));
+
 beforeEach(() => {
   jest.clearAllMocks();
   crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-123' });
@@ -106,7 +115,7 @@ describe('POST /:sequenceId/enrollments/by-list — variable-warning gating', ()
       { stepId: 's1', stepNumber: 1, name: 'LI', delayDays: 0, channel: 'linkedin',
         messageText: 'Hey {{customFields.region}}' },
     ]));
-    crmDb.getAllLeadsByListId.mockResolvedValue(threeLeads);
+    crmDb.getAllLeadsByListId.mockResolvedValue(threeLeadsOnLinkedIn);
 
     const res = await request(app).post('/seq_1/enrollments/by-list').send({ listId: 'list-1' });
 
