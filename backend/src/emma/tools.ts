@@ -36,6 +36,8 @@ import * as htmlToolsImpl from './impl/htmlTools';
 import * as leadsImpl from './impl/leads';
 // ENG-2103 (F2): brand guidelines / market strategy tool cluster, same treatment as booksImpl above.
 import * as brandMarketStrategyImpl from './impl/brandMarketStrategy';
+// ENG-2103 (F2): video-generation / media-post-processing tool cluster, same treatment as booksImpl above.
+import * as mediaVideoImpl from './impl/mediaVideo';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -5305,7 +5307,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.removeC2PAFromImage(args.image_url, args.filename, context?.userId);
+    return await mediaVideoImpl.removeC2PAFromImage(args.image_url, args.filename, context?.userId);
   }
 });
 
@@ -5346,7 +5348,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.removeImageBackground(args.image_url, args.filename, context?.userId, {
+    return await mediaVideoImpl.removeImageBackground(args.image_url, args.filename, context?.userId, {
       tolerance: args.tolerance,
       surfaceColor: args.surface_color
     });
@@ -5542,7 +5544,7 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     // If the LLM didn't specify a model, fall back to the admin-configured video API default
     const videoModel = args.videoModel || await agentModeService.getVideoApiDefaultModel();
-    return await agentModeService.generateVideo(
+    return await mediaVideoImpl.generateVideo(
       args.prompt,
       args.filename,
       context?.userId,
@@ -5631,7 +5633,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.composeVideo(
+    return await mediaVideoImpl.composeVideo(
       args.clip_urls,
       args.filename,
       context?.userId,
@@ -5682,7 +5684,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.muxVideoWithAudio(
+    return await mediaVideoImpl.muxVideoWithAudio(
       args.video_url,
       args.audio_url,
       args.filename,
@@ -5726,7 +5728,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.generateVoiceover(
+    return await mediaVideoImpl.generateVoiceover(
       args.script,
       args.filename,
       context?.userId,
@@ -5751,7 +5753,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (_args: any, context?: any) => {
-    return await agentModeService.listVideoCharacters(context?.userId);
+    return await mediaVideoImpl.listVideoCharacters(context?.userId);
   }
 });
 
@@ -5772,7 +5774,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, _context?: any) => {
-    return await agentModeService.getVideoCharacter(args.character_id);
+    return await mediaVideoImpl.getVideoCharacter(args.character_id);
   }
 });
 
@@ -5805,7 +5807,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createVideoCharacter(context?.userId, {
+    return await mediaVideoImpl.createVideoCharacter(context?.userId, {
       name: args.name,
       description: args.description,
       referenceImageUrl: args.reference_image_url,
@@ -5832,7 +5834,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.deleteVideoCharacter(context?.userId, args.character_id);
+    return await mediaVideoImpl.deleteVideoCharacter(context?.userId, args.character_id);
   }
 });
 
