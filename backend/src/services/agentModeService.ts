@@ -15635,7 +15635,18 @@ ${emailDraftFormat === 'text'
       const leadTitle = (lead as any).title || '';
       const leadCompany = (lead as any).company || '';
       const leadDesc = [leadName || null, leadTitle, leadCompany ? `at ${leadCompany}` : null].filter(Boolean).join(', ');
-      const emailSummary = (emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent || '').slice(0, 300);
+      // `emailData` is null for a LinkedIn-only lead — that is the entire point of
+      // gating the email draft. The line below dereferenced it unconditionally, one line
+      // ABOVE the ternary that correctly handles null, so the LinkedIn-only lead this
+      // block exists to serve threw `Cannot read properties of null (reading
+      // 'textContent')` and produced no note at all. Found on env2, not by the unit
+      // test: that test asserts no email-strategist prompt was sent, which stays true
+      // when the function throws before reaching any prompt.
+      // The `|| ''` also bound to the false branch only, so a text draft with an empty
+      // textContent threw here too.
+      const emailSummary = emailData
+        ? String((emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent) || '').slice(0, 300)
+        : '';
       const messagePrompt = `You are writing a LinkedIn connection request note. The goal is to get the recipient to accept.
 
 Recipient: ${leadDesc}

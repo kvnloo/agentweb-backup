@@ -462,6 +462,44 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       expect(crmDb.getLeadEngagements).toHaveBeenCalled();
     });
 
+    // Found on env2, NOT here. The two assertions above both pass while the function
+    // throws: one measures a prompt that was never sent, the other a call made before the
+    // throw. The gating change set `emailData` to null for a LinkedIn-only lead, and the
+    // note builder dereferenced `emailData.textContent` one line ABOVE the ternary that
+    // handles null — so the lead this whole branch exists to serve got a TypeError and no
+    // note at all. Assert the outcome, not the absence of a side effect.
+    it('a LinkedIn-only lead REACHES the note builder without throwing on the null email draft', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead1', listId: 'list1', linkedin: 'https://linkedin.com/in/ada',
+        firstName: 'Ada', lastName: 'Lovelace', title: 'CTO', company: 'Analytical Engines',
+      });
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        'list1', 'lead1', 'Create email', 'session1', 'user1'
+      );
+
+      // The TypeError surfaced as a failure result with that exact text.
+      expect(String(result?.error ?? '')).not.toMatch(/Cannot read properties of null/);
+      expect(String(result?.error ?? '')).not.toMatch(/textContent/);
+
+      // And the note prompt must actually have been built and sent — the note is the only
+      // thing a LinkedIn-only lead can get, so "no email prompt" alone is not success.
+      const systemPrompts = (agentModeService.callLLM as jest.Mock).mock.calls
+        .flatMap((c: any[]) => (c[1] ?? []))
+        .map((m: any) => String(m?.content ?? ''));
+      const userPrompts = (agentModeService.callLLM as jest.Mock).mock.calls
+        .flatMap((c: any[]) => (c[1] ?? []))
+        .filter((m: any) => m?.role === 'user')
+        .map((m: any) => String(m.content));
+      const all = [...systemPrompts, ...userPrompts].join('\n');
+      expect(all).toMatch(/LinkedIn connection request note/i);
+      // With no draft to quote it must fall back to the profile-only wording, not to
+      // "Subject: undefined".
+      expect(all).toMatch(/no address on file/i);
+      expect(all).not.toMatch(/Subject: undefined/);
+    });
+
     it('marks a lead with no contact channel as SKIPPED, not failed', async () => {
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'user1' });
       (crmDb.getLeadById as jest.Mock).mockResolvedValue({
