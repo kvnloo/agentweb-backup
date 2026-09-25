@@ -30734,6 +30734,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
             `Image generated: ${result.filename || filename}. ` +
             `Model: ${imageModelUsed}. Size: ${size || 'default'}. Quality: ${quality || 'default'}.`,
           sourceKey: `image:${sessionId}:${result.filename || filename}:${result.imageUrl}`,
+          creativeGates: result.gates,
           action: {
             type: 'agent_mode_image_revision',
             sessionId,

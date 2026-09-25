@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import { humanEvalService, type HumanEvalAction, type HumanEvalCandidate, type HumanEvalReviewType } from './humanEvalService';
 import { settingsService } from './settingsService';
+import type { CreativeGateResult } from './creativeGates';
 
 export interface AutoHumanEvalInput {
   reviewType: HumanEvalReviewType;
@@ -19,6 +20,8 @@ export interface AutoHumanEvalInput {
    * stored fail-open as 'uncategorized'.
    */
   category?: string;
+  /** Advisory creative gate result from generation (ENG-2139); stored on the candidate. */
+  creativeGates?: CreativeGateResult;
 }
 
 function dedupeSettingKey(sourceKey: string): string {
@@ -115,6 +118,7 @@ export async function enqueueAutoHumanEval(
       originalRequest: input.originalRequest,
       action: input.action,
       category: input.category,
+      creativeGates: input.creativeGates,
     });
 
     // Round-4 review finding: this sourceKey-marker write is housekeeping, not the actual

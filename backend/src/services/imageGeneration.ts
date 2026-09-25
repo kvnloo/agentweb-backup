@@ -4,12 +4,19 @@ import { uploadFileToS3 } from "../utils/s3Utils";
 import { getOpenAIClient, getGeminiClient } from "../utils/llmClients";
 import { recordUsage, meterUserUsage } from "./usageRecorderService";
 import { imageGenerationCostUsd, LLM_PRICE_BOOK_PROVENANCE } from "../utils/llmPricing";
+import { runCreativeGates, type CreativeGateResult } from "./creativeGates";
+import { resolveGeminiAspectRatio } from "./creativePlacementSpecs";
 
 interface ImageGenerationResult {
   success: boolean;
   imageUrl?: string;
   filename?: string;
   error?: string;
+  /**
+   * Advisory deterministic checks on the rendered image (ENG-2139). Absent when the provider
+   * returned a remote URL instead of image bytes (Runway) or the gates could not run.
+   */
+  gates?: CreativeGateResult;
 }
 
 // Supported image generation models
@@ -603,6 +610,8 @@ export class ImageService {
             imageBuffer = await this.removeC2PAMetadata(imageBuffer);
           }
           
+          const gates = await this.runAdvisoryGates(imageBuffer, params.size, modelToUse);
+
           // Upload to S3
           const uploadResult = await uploadFileToS3(
             imageBuffer,
@@ -617,9 +626,11 @@ export class ImageService {
               success: true,
               imageUrl: uploadResult.url,
               filename: result.filename || params.filename,
+              ...(gates ? { gates } : {}),
             };
           } else {
-            // If S3 upload fails, return the original result
+            // If S3 upload fails, return the original result. Its bytes can differ from the
+            // measured buffer (C2PA removal), so the gate result would describe another artifact.
             console.warn('Failed to upload image to S3, returning original result:', uploadResult.error);
             return result;
           }
@@ -1142,65 +1153,46 @@ export class ImageService {
   }
 
   /**
+   * ENG-2139: advisory creative gates on the final bytes. Only Gemini 3 maps `size` to an
+   * aspect ratio itself, so only there can a substituted ratio be detected up front; the
+   * output aspect check covers every provider. Never throws and never fails the generation.
+   */
+  private async runAdvisoryGates(
+    imageBuffer: Buffer,
+    size: string | undefined,
+    model: string
+  ): Promise<CreativeGateResult | undefined> {
+    try {
+      const mapsSizeToAspect = model === "gemini-3-pro-image-preview" || model === "gemini-3.1-flash-image";
+      const gates = await runCreativeGates(imageBuffer, {
+        requestedSize: size,
+        ...(mapsSizeToAspect ? { aspectResolution: resolveGeminiAspectRatio(size) } : {}),
+      });
+      if (!gates.passed) {
+        const failed = gates.checks.filter((c) => c.status === "fail").map((c) => `${c.id}: ${c.reason}`);
+        console.warn(`[creative-gates] advisory failures (${model}, size ${size || "default"}):`, failed.join("; "));
+      }
+      return gates;
+    } catch (err) {
+      console.warn("[creative-gates] evaluation failed (ignored):", err instanceof Error ? err.message : err);
+      return undefined;
+    }
+  }
+
+  /**
    * Convert size parameter to aspect ratio for Gemini 3 Pro
    * Supports: 1:1, 9:16, 16:9, 3:4, 4:3, 3:2, 2:3, 5:4, 4:5, 21:9
+   * The mapping lives in `resolveGeminiAspectRatio`, which also reports when the requested
+   * shape was substituted so the creative gates can flag it (ENG-2139).
    */
   private convertSizeToAspectRatio(size?: string): string {
-    if (!size || size === 'auto') {
-      return '1:1'; // Default aspect ratio
-    }
-
-    // If already in aspect ratio format (e.g., "16:9"), validate and return
-    if (size.includes(':')) {
-      const validRatios = ['1:1', '9:16', '16:9', '3:4', '4:3', '3:2', '2:3', '5:4', '4:5', '21:9'];
-      if (validRatios.includes(size)) {
-        return size;
-      }
-      // If it's a ratio format but not in the valid list, default to 1:1
+    const resolved = resolveGeminiAspectRatio(size);
+    if (resolved.fallback === 'unsupported_ratio') {
       console.warn(`⚠️ Aspect ratio ${size} not supported, defaulting to 1:1`);
-      return '1:1';
+    } else if (resolved.fallback === 'unparseable_size') {
+      console.warn(`⚠️ Could not parse size ${size}, defaulting to 1:1`);
     }
-
-    // Convert common size formats to aspect ratios
-    // Format: "WIDTHxHEIGHT" (e.g., "1024x1024", "1536x1024")
-    if (size.includes('x')) {
-      const [width, height] = size.split('x').map(Number);
-      if (!isNaN(width) && !isNaN(height) && width > 0 && height > 0) {
-        // Calculate the ratio
-        const ratio = width / height;
-        
-        // Map to closest supported aspect ratio
-        const ratioMap: { [key: number]: string } = {
-          1.0: '1:1',        // 1024x1024, 512x512, etc.
-          0.5625: '9:16',    // 576x1024, 1080x1920, etc.
-          1.7778: '16:9',    // 1920x1080, 1024x576, etc.
-          0.75: '3:4',       // 768x1024, etc.
-          1.3333: '4:3',     // 1024x768, etc.
-          1.5: '3:2',        // 1536x1024, etc.
-          0.6667: '2:3',     // 1024x1536, etc.
-          1.25: '5:4',       // 1280x1024, etc.
-          0.8: '4:5',        // 1024x1280, etc.
-          2.3333: '21:9'     // 2560x1080, etc.
-        };
-
-        // Find closest ratio
-        let closestRatio = '1:1';
-        let minDiff = Infinity;
-        for (const [targetRatio, aspectRatio] of Object.entries(ratioMap)) {
-          const diff = Math.abs(ratio - parseFloat(targetRatio));
-          if (diff < minDiff) {
-            minDiff = diff;
-            closestRatio = aspectRatio;
-          }
-        }
-
-        return closestRatio;
-      }
-    }
-
-    // Default to 1:1 if we can't parse the size
-    console.warn(`⚠️ Could not parse size ${size}, defaulting to 1:1`);
-    return '1:1';
+    return resolved.aspectRatio;
   }
 
   /**
