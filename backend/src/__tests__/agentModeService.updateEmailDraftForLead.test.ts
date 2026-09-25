@@ -445,6 +445,11 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
         .filter((m: any) => m?.role === 'system')
         .map((m: any) => String(m.content));
       expect(systemPrompts.some((p) => p.includes('email marketing strategist'))).toBe(false);
+
+      // The name says "and no email is written to the lead" — assert it, rather than
+      // leaving half the name unverified.
+      const written = (crmDb.updateLead as jest.Mock).mock.calls.map((c: any[]) => c[2] ?? {});
+      expect(written.some((w: any) => 'emailDraft' in w || 'emailDraftFormat' in w)).toBe(false);
     });
 
     it('still drafts for a LinkedIn-only lead (no email)', async () => {
@@ -469,6 +474,10 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
     // handles null — so the lead this whole branch exists to serve got a TypeError and no
     // note at all. Assert the outcome, not the absence of a side effect.
     it('a LinkedIn-only lead REACHES the note builder without throwing on the null email draft', async () => {
+      // Mocked HERE, not inherited. jest.config sets clearMocks, which clears calls but not
+      // implementations, so this test previously survived on a mockResolvedValue leaked
+      // from a test ~100 lines above and threw when run with -t in isolation.
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue([]);
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'user1' });
       (crmDb.getLeadById as jest.Mock).mockResolvedValue({
         leadId: 'lead1', listId: 'list1', linkedin: 'https://linkedin.com/in/ada',
@@ -498,6 +507,53 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       // "Subject: undefined".
       expect(all).toMatch(/no address on file/i);
       expect(all).not.toMatch(/Subject: undefined/);
+    });
+
+    // The other half of "the two drafts are independent". A commit claimed the note was
+    // gated on lead.linkedin; only the email gate existed, so every ordinary email-only
+    // lead paid a second billed LLM call to write a LinkedIn note for a lead with no
+    // LinkedIn URL — the mirror image of the harm the guard was added to stop.
+    it('an EMAIL-ONLY lead does not pay for a LinkedIn note it can never send', async () => {
+      // A real email draft, so the run reaches persistence and `success` means something.
+      (agentModeService.callLLM as jest.Mock).mockResolvedValue({
+        choices: [{ message: { content: JSON.stringify({
+          subject: 'Hello Ada', textContent: 'Hi Ada, quick note.',
+        }) } }],
+      });
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue([]);
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead1', listId: 'list1', email: 'ada@example.com',
+        firstName: 'Ada', lastName: 'Lovelace',
+      });
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        'list1', 'lead1', 'Create email', 'session1', 'user1'
+      );
+
+      // FIRST: the run has to have SUCCEEDED. Without this the test cannot tell "the note
+      // was gated off" from "the note path threw before building its prompt" — the
+      // absence-only version passed under a mutation that forced the gate open, because
+      // resolving the LinkedIn account then failed and the prompt was never reached.
+      expect(result?.success).toBe(true);
+      const written = (crmDb.updateLead as jest.Mock).mock.calls.map((c: any[]) => c[2] ?? {});
+      expect(written.some((w: any) => 'emailDraft' in w)).toBe(true);
+
+      const prompts = (agentModeService.callLLM as jest.Mock).mock.calls
+        .flatMap((c: any[]) => (c[1] ?? []))
+        .map((m: any) => String(m?.content ?? ''));
+      const all = prompts.join('\n');
+      // The email draft is the whole job for this lead...
+      expect(all).toMatch(/email marketing strategist/i);
+      // ...and the note prompt must never be built.
+      expect(all).not.toMatch(/LinkedIn connection request note/i);
+      // Measure the billed calls directly, not just the prompt text.
+      const features = (agentModeService.callLLM as jest.Mock).mock.calls
+        .map((c: any[]) => c[2]?.usageContext?.feature).filter(Boolean);
+      expect(features).not.toContain('invite_message');
+      // And nothing is persisted as a message draft for a lead with no LinkedIn.
+      expect(written.some((w: any) => 'messageDraft' in w)).toBe(false);
+      expect(result?.data?.message ?? null).toBeNull();
     });
 
     it('marks a lead with no contact channel as SKIPPED, not failed', async () => {
@@ -1167,6 +1223,11 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       lastName: 'Smith',
       company: 'Tech Corp',
       title: 'CTO',
+      // Required now that the note is gated on it. These three tests are ABOUT the
+      // LinkedIn connection-request note, and a note for a lead with no profile URL
+      // cannot be sent — sendInvitation needs one — so the fixture was describing a
+      // lead the feature does not apply to.
+      linkedin: 'https://linkedin.com/in/jane-smith',
     };
     const mockList = { listId, userId, name: 'Test List' };
     const mockBrandGuidelines = { exists: false };

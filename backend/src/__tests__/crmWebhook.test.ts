@@ -26,6 +26,7 @@ jest.mock('../services/db', () => ({
     getLeadByHubSpotContactId: jest.fn().mockResolvedValue(null),
     createLead: jest.fn().mockResolvedValue({ leadId: 'new-lead' }),
     updateLead: jest.fn(),
+    deleteLead: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -241,22 +242,72 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     );
   });
 
+  // This test was vacuous as first written: it sent a `firstname` change, so no email
+  // could be resolved and the handler `continue`d before reaching the adoption branch at
+  // all. updateLead was never called and the assertion reduced to
+  // `({}).email === undefined` — it passed with the guard deleted. The event has to carry
+  // an address, and the lead has to be found with one already, or nothing is under test.
   it('does not overwrite an address the lead already has', async () => {
-    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockResolvedValue({
       leadId: 'lead-1', listId: VALID_LIST_ID, email: 'john@acme.com',
+      syncMetadata: { hubspot_contact_id: '12345' },
     });
 
     await request(app)
       .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
       .set('x-webhook-secret', VALID_SECRET)
-      .send([{
-        subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '12345',
-        propertyName: 'firstname', propertyValue: 'Johnny',
-      }]);
+      // Two properties for the same contact, so there is still something to write once
+      // the address is dropped — with email alone the update is empty and correctly never
+      // issued, which would make the assertion below vacuous again for a new reason.
+      .send([
+        { subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '12345',
+          propertyName: 'firstname', propertyValue: 'Johnny' },
+        { subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '12345',
+          propertyName: 'email', propertyValue: 'different@acme.com' },
+      ]);
 
     await new Promise(r => setTimeout(r, 50));
-    const updates = (crmDb.updateLead as jest.Mock).mock.calls[0]?.[2] ?? {};
+    // The branch must actually have been reached — without this the rest is vacuous.
+    expect(crmDb.updateLead).toHaveBeenCalled();
+    const updates = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
+    expect(updates.firstName).toBe('Johnny');
     expect(updates.email).toBeUndefined();
+  });
+
+  // A throw out of the deletion lookup does not just skip that contact: it escapes
+  // handleHubSpotEvent into the fire-and-forget wrapper and abandons every remaining
+  // objectId in the batch. HubSpot already has its 200, so nothing retries.
+  it('an exhausted DELETION lookup does not abandon the rest of the batch', async () => {
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue({
+      ...mockConfig('hubspot'), deleteOnPull: true,
+    });
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockImplementation(async (_l: string, id: string) => {
+      if (String(id) === '111') {
+        throw Object.assign(new Error('exhausted 20 pages'), { lookupExhausted: true });
+      }
+      return { leadId: 'lead-222', listId: VALID_LIST_ID, phone: '2125550000',
+               syncMetadata: { hubspot_contact_id: '222' } };
+    });
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+
+    await request(app)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send([
+        { subscriptionType: 'contact.deletion', portalId: 99999, objectId: '111' },
+        { subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '222',
+          propertyName: 'email', propertyValue: 'survivor@acme.com' },
+      ]);
+
+    await new Promise(r => setTimeout(r, 80));
+    // The lead we could not identify must NOT be deleted...
+    expect(crmDb.deleteLead).not.toHaveBeenCalled();
+    // ...and the event behind it must still have been processed.
+    expect(crmDb.updateLead).toHaveBeenCalledWith(
+      VALID_LIST_ID, 'lead-222',
+      expect.objectContaining({ email: 'survivor@acme.com' }),
+    );
   });
 
   it('refuses to create when the contact-id lookup was exhausted', async () => {

@@ -133,7 +133,22 @@ async function handleHubSpotEvent(
     // can't resolve its email. Find the lead by stored hubspot_contact_id instead.
     if (data.isDeleted) {
       if (config.deleteOnPull) {
-        const lead = await crmDb.getLeadByHubSpotContactId(listId, objectId);
+        // THIRD call site. The other two catch `lookupExhausted`; this one did not, and an
+        // uncaught throw here does not just skip this contact — it escapes
+        // handleHubSpotEvent into the fire-and-forget wrapper, abandoning every remaining
+        // objectId in the same batch. HubSpot already has its 200, so nothing retries and
+        // those events are gone. Before the cap started throwing this returned null and the
+        // loop simply moved on, which is the behaviour restored here.
+        let lead: any = null;
+        try {
+          lead = await crmDb.getLeadByHubSpotContactId(listId, objectId);
+        } catch (lookupErr: any) {
+          if (lookupErr?.lookupExhausted) {
+            console.warn(`[CrmWebhook/HubSpot] ${lookupErr.message} — cannot confirm which lead objectId=${objectId} refers to; not deleting.`);
+            continue;
+          }
+          throw lookupErr;
+        }
         console.log(`[CrmWebhook/HubSpot] deletion lookup for objectId=${objectId}: lead=${lead?.leadId ?? 'not found'}`);
         if (lead) {
           await crmDb.deleteLead(listId, lead.leadId);

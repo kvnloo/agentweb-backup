@@ -8506,6 +8506,14 @@ export const crmDb = {
           // single-lead path, left wide open on the path that creates most leads. The two
           // creation paths now agree; the predicates below mirror buildLeadCrmFields
           // exactly (leadSchema.ts) rather than re-deciding the rule here.
+          // DERIVED ONLY — a caller-supplied `domain`/`lifecycle` is ignored here, which
+          // is a deliberate divergence from createLead (it honours both via
+          // buildLeadCrmFields). Neither is in this function's input type, but
+          // crm.ts's bulk-import spreads `...rest` from the request body, so both can
+          // arrive at runtime. `lifecycle` is a one-way door — askCrmService reads
+          // `lead.lifecycle ?? computeLifecycle(...)`, so a stored value outranks the
+          // computation for the life of the lead — and accepting an unvalidated one from
+          // a bulk import is not a door worth opening. Pinned by test.
           const derivedDomain = emailValue ? extractDomainFromEmail(emailValue) : null;
           if (derivedDomain) {
             item.domain = derivedDomain;

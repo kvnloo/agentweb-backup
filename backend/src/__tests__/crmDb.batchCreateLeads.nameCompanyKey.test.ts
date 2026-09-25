@@ -174,9 +174,12 @@ describe('crmDb.batchCreateLeads — derived domain and lifecycle', () => {
     expect(byId((i) => i.firstName === 'Neither')?.lifecycle).toBeUndefined();
   });
 
-  // The stored value must agree with what computeLifecycle would say, or the two
-  // contradict each other for every row this path writes.
-  it('agrees with buildLeadCrmFields, which is what the single-create path uses', async () => {
+  // Agreement holds for the inputs this path DERIVES from — an email and a phone. It is
+  // not a general equivalence: createLead also honours a caller-supplied `domain` and
+  // `lifecycle`, and this path deliberately does not (see the test below). An earlier
+  // version of this comment claimed the two "cannot drift again", which overstated what
+  // is actually pinned here.
+  it('agrees with buildLeadCrmFields on the derived inputs (email, phone)', async () => {
     const { buildLeadCrmFields } = require('../utils/leadSchema');
     for (const lead of [
       { email: 'x@y.com' },
@@ -196,6 +199,29 @@ describe('crmDb.batchCreateLeads — derived domain and lifecycle', () => {
       expect(bulk.lifecycle).toBe(single.lifecycle);
       expect(bulk.domain).toBe(single.domain);
     }
+  });
+
+  // crm.ts's bulk-import spreads `...rest` straight from the request body, so these keys
+  // reach batchCreateLeads at runtime even though its input type has neither. The derived
+  // values must win: `lifecycle` short-circuits askCrmService's computation permanently,
+  // and nothing validates a value arriving this way.
+  it('ignores a caller-supplied domain and lifecycle, deriving both instead', async () => {
+    await crmDb.batchCreateLeads('list-1', [
+      { email: 'ada@real-domain.com', domain: 'attacker-supplied.com', lifecycle: 'paying' } as any,
+    ]);
+
+    const items = batchedItems();
+    expect(items[0].domain).toBe('real-domain.com');
+    expect(items[0].lifecycle).toBe('inbox');
+  });
+
+  it('refuses to store a junk lifecycle smuggled through the bulk path', async () => {
+    await crmDb.batchCreateLeads('list-1', [
+      { email: 'grace@example.com', lifecycle: 'super_duper_customer' } as any,
+    ]);
+
+    const items = batchedItems();
+    expect(items[0].lifecycle).toBe('inbox');
   });
 });
 

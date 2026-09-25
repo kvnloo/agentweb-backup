@@ -15625,9 +15625,20 @@ ${emailDraftFormat === 'text'
       // Create message draft optimised for LinkedIn connection invites. The char limit
       // depends on the sending account tier: 300 for Premium, 200 for free. Resolve the
       // account the same way the send-invite route does (list-assigned → user's own).
+      // The email draft was gated on lead.email; this is the other half, and it was
+      // missing. A commit claimed "the two drafts are independent now — email gated on
+      // lead.email, note on lead.linkedin" and only shipped the first clause, so every
+      // ordinary email-only lead captured into an autoDraft list paid a second billed LLM
+      // call plus two LinkedIn API round trips to write a connection note for a lead with
+      // no LinkedIn URL — and stored it as messageDraft. Exactly the mirror of the harm
+      // the guard was added to stop; the env2 check only exercised the LinkedIn-only
+      // direction, so nothing caught it.
+      const wantsLinkedInNote = !!String((lead as any).linkedin ?? '').trim();
       const { linkedInOutreachService, LinkedInOutreachService } = await import('./linkedInOutreachService');
-      const inviteAccountId = (list as any)?.linkedInAccountId
-        || await linkedInOutreachService.resolveUserOwnedAccountId(userId);
+      const inviteAccountId = wantsLinkedInNote
+        ? ((list as any)?.linkedInAccountId
+          || await linkedInOutreachService.resolveUserOwnedAccountId(userId))
+        : null;
       const inviteCharLimit = inviteAccountId
         ? await linkedInOutreachService.getInviteCharLimitForAccount(userId, inviteAccountId)
         : 200;
@@ -15669,23 +15680,26 @@ Good: "Sarah, Island's browser-isolation is one of the smarter takes on shadow I
 
 Reply with ONLY valid JSON: {"content": "the note text"}`;
 
-      const messageCompletion = await this.callLLM('gemini-3.5-flash', [
-        { role: 'user', content: messagePrompt },
-      ], {
-        temperature: 0.8,
-        max_completion_tokens: 2048,
-        usageContext: { userId, sessionId, feature: 'invite_message' },
-        taskClass: 'content_generation',
-      });
+      const messageCompletion = wantsLinkedInNote
+        ? await this.callLLM('gemini-3.5-flash', [
+          { role: 'user', content: messagePrompt },
+        ], {
+          temperature: 0.8,
+          max_completion_tokens: 2048,
+          usageContext: { userId, sessionId, feature: 'invite_message' },
+          taskClass: 'content_generation',
+        })
+        : null;
 
-      const messageResponseContent = messageCompletion.choices[0].message.content;
-      if (!messageResponseContent) {
+      const messageResponseContent = messageCompletion?.choices?.[0]?.message?.content ?? null;
+      // Only a lead we actually asked for a note about can be missing one.
+      if (wantsLinkedInNote && !messageResponseContent) {
         throw new Error('No message content generated from LLM');
       }
 
       // Parse the JSON response — Gemini may wrap it in markdown or prose
-      let messageData;
-      try {
+      let messageData: any = null;
+      if (messageResponseContent) try {
         const cleanedMsg = messageResponseContent.replace(/```json\s*/g, '').replace(/\s*```/g, '').trim();
         const bs = cleanedMsg.indexOf('{');
         const be = cleanedMsg.lastIndexOf('}');
@@ -15722,19 +15736,30 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         };
       }
 
-      // Update lead with both email draft and message draft
-      await crmDb.updateLead(listId, leadId, {
+      // Update lead with whichever drafts were actually produced. With both gated off
+      // there is nothing to write, and an empty update is not free: it costs a read plus
+      // an UpdateItem that only bumps updatedAt and re-projects the GSIs.
+      const draftUpdates = {
         ...(emailDraft && { emailDraft, emailDraftFormat }),
         ...(messageDraft && { messageDraft: messageDraft })
-      });
+      };
+      if (Object.keys(draftUpdates).length > 0) {
+        await crmDb.updateLead(listId, leadId, draftUpdates);
+      }
 
       return {
         success: true,
-        message: emailData
+        // Say what actually happened. Each draft is now gated on its own channel, so all
+        // four combinations are reachable and the old two-way message described one.
+        message: emailData && messageDraft
           ? (existingDraft
             ? 'Email and message drafts updated successfully'
             : 'Email and message drafts created successfully')
-          : 'LinkedIn message draft created — no email draft, this lead has no address',
+          : emailData
+            ? (existingDraft ? 'Email draft updated successfully' : 'Email draft created successfully')
+            : messageDraft
+              ? 'LinkedIn message draft created — no email draft, this lead has no address'
+              : 'No draft created — nothing usable was generated for this lead',
         data: {
           // null, not a fabricated shape: webhooks.ts reads data.email to decide whether to
           // auto-send, and an object with undefined fields would read as a real draft.

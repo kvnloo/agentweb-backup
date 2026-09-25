@@ -99,10 +99,23 @@ jest.mock("axios", () => ({
   patch: (...args: any[]) => mockAxiosPatch(...args),
 }));
 
-// Mock uuid
+// Mock uuid.
+//
+// This used to return one constant for every call, which quietly defeated the id-scoped
+// smoke-test assertions further down: filtering the mock calls by `result.id` excluded
+// nothing when every page in the file carried the same id, so those assertions were
+// exactly as load-sensitive as the bare toHaveBeenCalledTimes(1) they replaced.
+//
+// First call still returns the historical constant, so the four tests that assert
+// `result.id === "test-uuid-1234"` keep working; every later call is unique, which is
+// what makes the scoping real.
+let uuidCounter = 0;
 jest.mock("uuid", () => ({
-  v4: () => "test-uuid-1234",
+  v4: () => `test-uuid-${++uuidCounter}`,
 }));
+
+/** A freshly minted id, as opposed to one recycled from an existing record. */
+const MINTED_ID = /^test-uuid-\d+$/;
 
 // Mock settingsService
 const mockGetSetting = jest.fn().mockResolvedValue(null);
@@ -804,7 +817,7 @@ describe("v0Service - generateLandingPage", () => {
       expect.objectContaining({ responseMode: "async" })
     );
     expect(result.userId).toBe("user-1");
-    expect(result.id).toBe("test-uuid-1234");
+    expect(result.id).toMatch(MINTED_ID);
   });
 
   it("SUCCESS: no brand → still generates", async () => {
@@ -818,7 +831,7 @@ describe("v0Service - generateLandingPage", () => {
     );
 
     expect(mockChatsCreate).toHaveBeenCalledTimes(1);
-    expect(result.id).toBe("test-uuid-1234");
+    expect(result.id).toMatch(MINTED_ID);
   });
 
   describe("ENG-1141: metaPixelOverride at chat-creation time", () => {
@@ -926,7 +939,7 @@ describe("v0Service - generateLandingPage", () => {
 
       const result = await generateLandingPage("user-1", "Create page", "Resolver threw", {});
 
-      expect(result.id).toBe("test-uuid-1234");
+      expect(result.id).toMatch(MINTED_ID);
       expect(result.metaPixelId).toBeUndefined();
       resolveSpy.mockRestore();
     });
@@ -996,7 +1009,7 @@ describe("v0Service - generateLandingPage", () => {
     const result = await generateLandingPage("user-1", "Retry page", "Retry", {});
 
     // New uuid is minted — the chat-bearing failed record is left alone.
-    expect(result.id).toBe("test-uuid-1234");
+    expect(result.id).toMatch(MINTED_ID);
   });
 
   it("SUCCESS: recycles the newest orphan AND archives the older orphan backlog", async () => {

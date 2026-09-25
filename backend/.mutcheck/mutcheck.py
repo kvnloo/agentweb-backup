@@ -73,9 +73,22 @@ def main():
             print('  verdict: INVALID — the mutation broke the build, which proves nothing '
                   'about the test. Use a semantically valid replacement.')
             return 3
-        verdict = 'BINDS' if after_failed else '*** VACUOUS — the suite passes without the code ***'
-        print(f'  verdict: {verdict}')
-        return 0 if after_failed else 2
+        if after_failed:
+            # A single run is not evidence on a suite that flakes. A review of this repo
+            # caught mutcheck reporting BINDS for a semantically IDENTICAL mutation — the
+            # failure was a ~10% flake in the suite, not the mutation. Confirm by running
+            # the mutated tree again: a real binding fails every time.
+            confirm_failed, confirm_line, confirm_broke = run_suite(pattern)
+            print(f'  confirm: {confirm_line}')
+            if confirm_broke or not confirm_failed:
+                print('  verdict: *** FLAKY — the mutated suite failed once and passed once. '
+                      'This proves nothing; stabilise the suite before trusting any verdict '
+                      'from it. ***')
+                return 4
+            print('  verdict: BINDS')
+            return 0
+        print('  verdict: *** VACUOUS — the suite passes without the code ***')
+        return 2
     finally:
         shutil.copy2(backup, p)
         backup.unlink()

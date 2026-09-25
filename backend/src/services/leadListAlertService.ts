@@ -64,7 +64,10 @@ const buildEventDetails = (eventType: string, eventData: any) => {
       const draftLabel = eventData.autoDraftStatus === 'created'
         ? 'Created'
         : eventData.autoDraftStatus === 'skipped_no_email'
-          ? 'Skipped — lead has no email address'
+          // The upstream reason is 'no_contact_channel' — neither an email NOR a LinkedIn
+          // profile. The internal message was corrected to match; this owner-facing label
+          // was not, so it named one of the two missing channels.
+          ? 'Skipped — lead has no email address or LinkedIn profile to draft for'
           : 'Failed';
       details.push({ label: 'Auto Draft', value: draftLabel });
 
