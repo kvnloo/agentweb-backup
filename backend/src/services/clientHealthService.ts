@@ -20,7 +20,11 @@ import { isEvaluationUser } from './evaluationPolicy';
 // churn/at-risk signal, so it never shares a status with a connection that broke.
 type HealthStatus = 'healthy' | 'mediocre' | 'at-risk' | 'blocked' | 'onboarding';
 
-export type AdConnectionState = 'never_connected' | 'connected' | 'expired';
+export type AdConnectionState = 'never_connected' | 'connected' | 'expired' | 'other_platform';
+
+/** Non-Meta ad platforms. This service only reads Meta campaigns, but a client advertising here
+ * has activated ads and must not read as onboarding. */
+const OTHER_AD_PLATFORMS = new Set(['google_ads', 'linkedin_ads']);
 
 /** The fields the connection classifier reads; ConnectedAccount records satisfy it. */
 export interface AdConnectionAccount {
@@ -45,7 +49,9 @@ function isUsableMetaAdAccount(acc: AdConnectionAccount, nowMs: number): boolean
  *   expiry), or a Meta ad account whose token is unexpired, carries no expiry, or can refresh.
  * - `expired`: Meta ad accounts are on record but every token has expired with no refresh token
  *   — a connection that broke (at-risk), reported with the latest expiry.
- * - `never_connected`: nothing on record — an activation state, never a risk state.
+ * - `other_platform`: no Meta ad account, but a Google Ads or LinkedIn Ads account is on record —
+ *   ads are activated elsewhere, so the Meta layer is not assessed (expiry there is ENG-2143's).
+ * - `never_connected`: no ad account on any platform — an activation state, never a risk state.
  *
  * Same timestamp rule as connectedAccountsDb.isTokenNotExpired, inlined so it stays a pure
  * function of its inputs.
@@ -57,7 +63,10 @@ export function classifyMetaAdConnection(
 ): { connection: AdConnectionState; expiredAt?: string } {
   if (typeof legacyAdAccount === 'string' && legacyAdAccount.trim() !== '') return { connection: 'connected' };
   const metaAdAccounts = (connectedAccounts ?? []).filter(isMetaAdAccount);
-  if (metaAdAccounts.length === 0) return { connection: 'never_connected' };
+  if (metaAdAccounts.length === 0) {
+    const otherAds = (connectedAccounts ?? []).some((acc) => !!acc?.platform && OTHER_AD_PLATFORMS.has(acc.platform));
+    return { connection: otherAds ? 'other_platform' : 'never_connected' };
+  }
   if (metaAdAccounts.some((acc) => isUsableMetaAdAccount(acc, nowMs))) return { connection: 'connected' };
   // Every account failed isUsableMetaAdAccount, so each carries a numeric token_expires_at.
   const latestExpiry = Math.max(...metaAdAccounts.map((acc) => acc.config?.token_expires_at ?? 0));
@@ -248,7 +257,7 @@ function determineStatus(
   const reasons: string[] = [];
 
   if (adsLayer.connection === 'never_connected') {
-    reasons.push('Activation incomplete: no Meta ad account connected yet');
+    reasons.push('Activation incomplete: no ad account connected yet');
   } else if (adsLayer.connection === 'expired') {
     reasons.push(`Meta ad account connection expired ${adsLayer.token_expired_at} — reconnect needed`);
   }
@@ -277,7 +286,8 @@ function determineStatus(
     status = 'onboarding';
   } else if (adsLayer.connection === 'expired') {
     status = 'at-risk';
-  } else if (!campaignsUnread && adsLayer.active_campaigns === 0 && !landerLayer.has_lander) {
+  } else if (adsLayer.connection === 'connected' && !campaignsUnread &&
+             adsLayer.active_campaigns === 0 && !landerLayer.has_lander) {
     status = 'blocked';
   } else if (reasons.length === 0) {
     status = 'healthy';
