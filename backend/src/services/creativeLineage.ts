@@ -31,6 +31,9 @@
  * Prompt text is never stored: only its sha256.
  *
  * Every entry point is fire-and-forget safe: it never throws and never delays generation or publish.
+ * One user's writes run one at a time in the order they started (see `serialized`), and a publish
+ * lookup that finds nothing yet is re-tried (see LOOKUP_RETRY_DELAYS_MS), so overlapping tool calls
+ * and index lag do not drop a link.
  */
 
 import AWS from 'aws-sdk';
@@ -162,13 +165,78 @@ export interface CreativeLineageDeps {
   env?: Env;
   db?: CreativeLineageDb;
   now?: () => Date;
+  /** Waits before re-trying a user-index lookup that found nothing (default LOOKUP_RETRY_DELAYS_MS). */
+  lookupRetryDelaysMs?: readonly number[];
+  sleep?: (ms: number) => Promise<void>;
 }
 
-function resolveDeps(deps: CreativeLineageDeps): { table: string; db: CreativeLineageDb; now: () => Date } | null {
+/**
+ * The user index (userId-createdAt-index) is eventually consistent, and the agent can dispatch a
+ * publish step while the previous step's stamp is still being written, so a lookup that finds
+ * nothing is re-tried after these delays. Stamps are fire-and-forget: the wait delays nothing.
+ */
+export const LOOKUP_RETRY_DELAYS_MS: readonly number[] = [2000, 5000];
+
+interface Ctx {
+  table: string;
+  db: CreativeLineageDb;
+  now: () => Date;
+  retryDelaysMs: readonly number[];
+  sleep: (ms: number) => Promise<void>;
+}
+
+function resolveDeps(deps: CreativeLineageDeps): Ctx | null {
   const { tableName } = readCreativeLineageConfig(deps.env);
   if (!tableName) return null;
-  return { table: tableName, db: deps.db ?? documentClientDb(), now: deps.now ?? (() => new Date()) };
+  return {
+    table: tableName,
+    db: deps.db ?? documentClientDb(),
+    now: deps.now ?? (() => new Date()),
+    retryDelaysMs: deps.lookupRetryDelaysMs ?? LOOKUP_RETRY_DELAYS_MS,
+    sleep: deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
+  };
 }
+
+const userQueues = new Map<string, Promise<void>>();
+
+/**
+ * Runs one user's lineage writes one at a time, in the order they were started. Each entry point
+ * calls this before its first await, so a generate → upload → creative → ad sequence is written in
+ * that order even when the calls overlap (the agent dispatches same-iteration tools concurrently).
+ * Per process: one session's tool calls run in one process.
+ */
+function serialized<T>(userId: string, task: () => Promise<T>): Promise<T> {
+  const previous = userQueues.get(userId) ?? Promise.resolve();
+  const run = previous.then(task);
+  const tail = run.then(() => undefined, () => undefined);
+  userQueues.set(userId, tail);
+  void tail.then(() => {
+    if (userQueues.get(userId) === tail) userQueues.delete(userId);
+  });
+  return run;
+}
+
+/**
+ * Runs `attempt` serialized for the user; while it reports `retry` (a lookup found nothing yet),
+ * waits OUTSIDE the queue and tries again, so the write it is waiting for can run meanwhile.
+ */
+async function withLookupRetry<T>(
+  ctx: Ctx,
+  userId: string,
+  attempt: (n: number) => Promise<{ result: T; retry: boolean }>,
+  combine: (acc: T | undefined, next: T) => T,
+): Promise<T> {
+  let acc: T | undefined;
+  for (let n = 0; ; n++) {
+    const { result, retry } = await serialized(userId, () => attempt(n));
+    acc = combine(acc, result);
+    const delay = ctx.retryDelaysMs[n];
+    if (!retry || delay === undefined) return acc;
+    await ctx.sleep(delay);
+  }
+}
+
+const concatIds = (acc: string[] | undefined, next: string[]): string[] => [...(acc ?? []), ...next];
 
 function decodeKey(key: string): string {
   try {
@@ -265,22 +333,26 @@ export async function recordGeneratedCreative(
       createdAt: now,
       updatedAt: now,
     };
-    try {
-      await ctx.db.put({ TableName: ctx.table, Item: record, ConditionExpression: 'attribute_not_exists(creativeId)' });
-    } catch (err) {
-      // Same S3 key twice means the same image: keep the first record and its links.
-      if (!isConditionFailure(err)) throw err;
-    }
+    // Queued before any await, so a publish step started after generation finds the record.
+    await serialized(input.userId, async () => {
+      try {
+        await ctx.db.put({ TableName: ctx.table, Item: record, ConditionExpression: 'attribute_not_exists(creativeId)' });
+      } catch (err) {
+        // Same S3 key twice means the same image: keep the first record and its links.
+        if (!isConditionFailure(err)) throw err;
+      }
+    });
 
+    // Awaited outside the queue: the enqueue (Slack, S3 copy) must not hold up publish stamps.
     const candidate = humanEvalCandidate ? await humanEvalCandidate.catch(() => null) : null;
     if (candidate?.candidateId) {
-      await ctx.db.update({
+      await serialized(input.userId, () => ctx.db.update({
         TableName: ctx.table,
         Key: { creativeId },
         UpdateExpression: 'SET humanEvalCandidateId = :candidateId, updatedAt = :now',
         ConditionExpression: 'attribute_exists(creativeId)',
         ExpressionAttributeValues: { ':candidateId': candidate.candidateId, ':now': ctx.now().toISOString() },
-      });
+      }));
     }
     return creativeId;
   } catch (err) {
@@ -306,7 +378,7 @@ export async function stampMetaImageUpload(
   const creativeId = creativeIdForUrl(input.imageUrl);
   if (!creativeId || !input.imageHash || !input.userId) return null;
   try {
-    await ctx.db.update({
+    await serialized(input.userId, () => ctx.db.update({
       TableName: ctx.table,
       Key: { creativeId },
       UpdateExpression: 'ADD metaImageHashes :hash SET updatedAt = :now',
@@ -316,7 +388,7 @@ export async function stampMetaImageUpload(
         ':now': ctx.now().toISOString(),
         ':userId': input.userId,
       },
-    });
+    }));
     return creativeId;
   } catch (err) {
     // Condition failure = an image we have no record for (generated before lineage was on, or
@@ -355,7 +427,7 @@ type LookupAttribute = 'metaImageHashes' | 'metaCreativeIds' | 'metaAdIds';
 
 /** This user's creative records (within the lookup window) whose string set holds `value`. */
 async function findUserCreativesContaining(
-  ctx: { table: string; db: CreativeLineageDb; now: () => Date },
+  ctx: Ctx,
   userId: string,
   attribute: LookupAttribute,
   value: string,
@@ -388,19 +460,20 @@ interface ResolvedCreative {
 }
 
 async function stampCreative(
-  ctx: { table: string; db: CreativeLineageDb; now: () => Date },
-  input: { userId: string; accountId: string; metaCreativeId: string; params: MetaCreativeMediaParams; via: MetaPublishVia },
-): Promise<ResolvedCreative[]> {
-  const { imageUrls, imageHashes } = collectCreativeMedia(input.params);
+  ctx: Ctx,
+  input: { userId: string; accountId: string; metaCreativeId: string; via: MetaPublishVia },
+  media: { imageUrls: string[]; imageHashes: string[] },
+): Promise<{ stamped: ResolvedCreative[]; unresolvedHashes: string[] }> {
   const resolved = new Map<string, ResolvedCreative>();
-  for (const url of imageUrls) {
+  for (const url of media.imageUrls) {
     const creativeId = creativeIdForUrl(url);
     if (creativeId && !resolved.has(creativeId)) resolved.set(creativeId, { creativeId });
   }
-  for (const imageHash of imageHashes) {
-    for (const record of await findUserCreativesContaining(ctx, input.userId, 'metaImageHashes', imageHash)) {
-      resolved.set(record.creativeId, { creativeId: record.creativeId, imageHash });
-    }
+  const unresolvedHashes: string[] = [];
+  for (const imageHash of media.imageHashes) {
+    const records = await findUserCreativesContaining(ctx, input.userId, 'metaImageHashes', imageHash);
+    if (records.length === 0) unresolvedHashes.push(imageHash);
+    for (const record of records) resolved.set(record.creativeId, { creativeId: record.creativeId, imageHash });
   }
 
   const stamped: ResolvedCreative[] = [];
@@ -434,7 +507,36 @@ async function stampCreative(
       if (!isConditionFailure(err)) warn(`creative stamp for ${target.creativeId} failed (non-fatal)`, err);
     }
   }
-  return stamped;
+  return { stamped, unresolvedHashes };
+}
+
+/**
+ * Stamps the Meta creative on the generated images it uses and, when `adId` is given, the ad on
+ * those same creatives (read back consistently). An image hash that resolves to nothing yet is
+ * re-tried (an image hash of an asset we did not generate simply never resolves).
+ */
+function stampCreativeAndAd(
+  ctx: Ctx,
+  input: { userId: string; accountId: string; metaCreativeId: string; params: MetaCreativeMediaParams; via: MetaPublishVia; adId?: string },
+  beforeFirstAttempt?: () => Promise<unknown>,
+): Promise<string[]> {
+  const media = collectCreativeMedia(input.params);
+  let pending = media;
+  return withLookupRetry(ctx, input.userId, async (n) => {
+    if (n === 0 && beforeFirstAttempt) await beforeFirstAttempt();
+    const { stamped, unresolvedHashes } = await stampCreative(ctx, input, pending);
+    pending = { imageUrls: [], imageHashes: unresolvedHashes };
+    let ids = stamped.map((s) => s.creativeId);
+    if (input.adId) {
+      const records: CreativeLineageRecord[] = [];
+      for (const creativeId of ids) {
+        const res = await ctx.db.get({ TableName: ctx.table, Key: { creativeId }, ConsistentRead: true });
+        if (res.Item) records.push(res.Item as CreativeLineageRecord);
+      }
+      ids = await stampAd(ctx, { ...input, adId: input.adId }, records);
+    }
+    return { result: ids, retry: unresolvedHashes.length > 0 };
+  }, concatIds);
 }
 
 /** True when the ad's latest link on this record is to `metaCreativeId` and has not ended since. */
@@ -450,7 +552,7 @@ function hasOpenAdLink(record: CreativeLineageRecord, accountId: string, adId: s
  * the report stops crediting it from this moment, whether or not the new creative is ours.
  */
 async function closeAdLinks(
-  ctx: { table: string; db: CreativeLineageDb; now: () => Date },
+  ctx: Ctx,
   input: { userId: string; accountId: string; adId: string },
 ): Promise<string[]> {
   const closed: string[] = [];
@@ -474,7 +576,7 @@ async function closeAdLinks(
 }
 
 async function stampAd(
-  ctx: { table: string; db: CreativeLineageDb; now: () => Date },
+  ctx: Ctx,
   input: { userId: string; accountId: string; metaCreativeId: string; adId: string; via: MetaPublishVia },
   targets: CreativeLineageRecord[],
 ): Promise<string[]> {
@@ -528,8 +630,7 @@ export async function stampMetaCreativeCreated(
   const ctx = resolveDeps(deps);
   if (!ctx || !input.userId || !input.metaCreativeId) return [];
   try {
-    const stamped = await stampCreative(ctx, { ...input, via: input.via ?? 'create_creative' });
-    return stamped.map((s) => s.creativeId);
+    return await stampCreativeAndAd(ctx, { ...input, via: input.via ?? 'create_creative' });
   } catch (err) {
     warn(`creative stamp failed (non-fatal)`, err);
     return [];
@@ -547,8 +648,10 @@ export async function stampMetaAdCreated(
   const ctx = resolveDeps(deps);
   if (!ctx || !input.userId || !input.metaCreativeId || !input.adId) return [];
   try {
-    const targets = await findUserCreativesContaining(ctx, input.userId, 'metaCreativeIds', input.metaCreativeId);
-    return await stampAd(ctx, { ...input, via: input.via ?? 'create_ad' }, targets);
+    return await withLookupRetry(ctx, input.userId, async () => {
+      const targets = await findUserCreativesContaining(ctx, input.userId, 'metaCreativeIds', input.metaCreativeId);
+      return { result: await stampAd(ctx, { ...input, via: input.via ?? 'create_ad' }, targets), retry: targets.length === 0 };
+    }, concatIds);
   } catch (err) {
     warn(`ad stamp failed (non-fatal)`, err);
     return [];
@@ -575,14 +678,7 @@ export async function stampMetaPublish(
   if (!ctx || !input.userId || !input.metaCreativeId || !input.adId) return [];
   try {
     // A swap replaces what the ad carried before; end those links first so they stop here.
-    if (input.via === 'swap_creative') await closeAdLinks(ctx, input);
-    const stamped = await stampCreative(ctx, input);
-    const records: CreativeLineageRecord[] = [];
-    for (const { creativeId } of stamped) {
-      const res = await ctx.db.get({ TableName: ctx.table, Key: { creativeId }, ConsistentRead: true });
-      if (res.Item) records.push(res.Item as CreativeLineageRecord);
-    }
-    return await stampAd(ctx, input, records);
+    return await stampCreativeAndAd(ctx, input, input.via === 'swap_creative' ? () => closeAdLinks(ctx, input) : undefined);
   } catch (err) {
     warn(`publish stamp failed (non-fatal)`, err);
     return [];
@@ -601,9 +697,11 @@ export async function stampMetaAdCreativeChanged(
   const ctx = resolveDeps(deps);
   if (!ctx || !input.userId || !input.metaCreativeId || !input.adId) return [];
   try {
-    await closeAdLinks(ctx, input);
-    const targets = await findUserCreativesContaining(ctx, input.userId, 'metaCreativeIds', input.metaCreativeId);
-    return await stampAd(ctx, { ...input, via: 'swap_creative' }, targets);
+    return await withLookupRetry(ctx, input.userId, async (n) => {
+      if (n === 0) await closeAdLinks(ctx, input);
+      const targets = await findUserCreativesContaining(ctx, input.userId, 'metaCreativeIds', input.metaCreativeId);
+      return { result: await stampAd(ctx, { ...input, via: 'swap_creative' }, targets), retry: targets.length === 0 };
+    }, concatIds);
   } catch (err) {
     warn(`ad creative change stamp failed (non-fatal)`, err);
     return [];
