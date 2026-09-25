@@ -1,0 +1,48 @@
+/**
+ * Validate one eval-registry grader against the golden set's test split (ENG-2135).
+ *
+ * Usage:
+ *   npx ts-node --transpile-only src/scripts/runGraderValidation.ts <graderId> [--evidence <url>] [--split dev|test]
+ *
+ * Needs EVAL_GOLDEN_CASES_TABLE (OPS-2 / ENG-2147). Read-only: prints the per-criterion
+ * agreement report and the `validation` record as JSON. It never edits evalRegistry.ts; to let
+ * a grader gate, record the printed validation there in a reviewed PR with --evidence set to
+ * the published run.
+ */
+
+import { goldenSetStoreFromEnv, GOLDEN_CASES_TABLE_ENV } from '../loops/eval/goldenSetStore';
+import { defaultGoldenCaseGraders, runValidation } from '../loops/eval/runValidation';
+import { isQualifyingValidation } from '../loops/eval/evalRegistry';
+import type { GoldenSplit } from '../loops/eval/goldenSet';
+
+async function main(): Promise<void> {
+  const [graderId, ...rest] = process.argv.slice(2);
+  if (!graderId) throw new Error('usage: runGraderValidation.ts <graderId> [--evidence <url>] [--split dev|test]');
+  let evidence: string | undefined;
+  let split: GoldenSplit = 'test';
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] === '--evidence') evidence = rest[++i];
+    else if (rest[i] === '--split' && (rest[i + 1] === 'dev' || rest[i + 1] === 'test')) split = rest[++i] as GoldenSplit;
+    else throw new Error(`unknown argument ${rest[i]}`);
+  }
+
+  const store = goldenSetStoreFromEnv();
+  if (!store.isProvisioned()) {
+    console.error(`Golden-set store not provisioned: set ${GOLDEN_CASES_TABLE_ENV} (OPS-2 / ENG-2147).`);
+    process.exit(1);
+  }
+  const run = await runValidation({ graderId, store, graders: defaultGoldenCaseGraders(), evidence, split });
+  console.log(JSON.stringify(run, null, 2));
+  console.log(
+    run.validation && isQualifyingValidation(run.validation)
+      ? `${graderId}: meets the registry bar on ${run.primaryCriterion} — record it in evalRegistry.ts via a reviewed PR.`
+      : `${graderId}: does not meet the registry bar (or has no evidence link) — mayGate stays false.`,
+  );
+}
+
+if (require.main === module) {
+  main().catch((error: unknown) => {
+    console.error('runGraderValidation failed:', error instanceof Error ? error.message : error);
+    process.exit(1);
+  });
+}
