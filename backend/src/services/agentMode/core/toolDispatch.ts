@@ -30,6 +30,7 @@ import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
 import { ToolResultPolicyBlockedError } from '../../../utils/toolResultError';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
+import { LLM_MODEL_REGISTRY } from '../llmModelRegistry';
 import { sealTruncatedPayload, sealTruncatedPayloadWithNotice } from './truncatedPayload';
 import { parseToolCallArguments, TruncatedToolCallArgumentsError } from './repairToolCallArguments';
 import {
@@ -1332,15 +1333,28 @@ export async function executePreparedTools(
         }
       }
 
-      // For playwright screenshots, pass the image back to the LLM as a vision input.
+      // For playwright screenshots, pass the image back to the LLM as a vision input —
+      // but only to a model that can actually take one.
+      //
+      // ENG-2132: this used to gate on `!isGeminiModel` alone, added in a0e5523ce for a
+      // DIFFERENT, Gemini-specific reason (its OpenAI-compat endpoint 400s on `image_url`
+      // inside a tool-role message regardless of vision capability). That condition
+      // silently assumed every OTHER model accepts an inline image, which is false for a
+      // model with no verified vision support at all — openrouter/deepseek/deepseek-v4-flash
+      // has no `supportsVision` entry in LLM_MODEL_REGISTRY, so OpenRouter has no endpoint
+      // for it that accepts image input, and the next LLM call 404s with "No endpoints
+      // found that support image input" (prod session ffe0e1ad-16f4-4ca6-ada2-3bc87c3d3761,
+      // 2026-09-23). Use the SAME registry flag getVisionModelOptions already trusts for
+      // this, rather than inferring capability from "isn't Gemini".
       let toolContent: any;
       const isGeminiModel = llmModel.startsWith('gemini-');
-      if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).dataUrl && !isGeminiModel) {
+      const modelSupportsInlineScreenshot = !isGeminiModel && LLM_MODEL_REGISTRY[llmModel]?.supportsVision === true;
+      if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).dataUrl && modelSupportsInlineScreenshot) {
         toolContent = [
           { type: 'text', text: 'Screenshot captured. Analyze the image below to verify the result visually. Do not include the raw image URL or data URI in your response to the user.' },
           { type: 'image_url', image_url: { url: (processedResult as any).dataUrl, detail: 'high' } },
         ];
-      } else if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).screenshotUrl && isGeminiModel) {
+      } else if (toolCall.function.name === 'playwright_browser_take_screenshot' && (processedResult as any).screenshotUrl) {
         toolContent = `Screenshot captured. URL: ${(processedResult as any).screenshotUrl}\n\n${ports.extractToolContent(result)}`;
       } else {
         toolContent = ports.extractToolContent(result);
