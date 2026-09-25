@@ -10,7 +10,6 @@ jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     readFileContent: jest.fn(),
     createHtmlFromTemplate: jest.fn(),
-    updateHtmlFile: jest.fn(),
   },
 }));
 
@@ -21,9 +20,16 @@ jest.mock('../emma/impl/htmlCreation', () => ({
   createHtmlTemplate: jest.fn(),
 }));
 
+// ENG-2103 (F2): update_html_file's execute() calls emma/impl/htmlUpdate.ts
+// directly (not agentModeService) — mock it separately.
+jest.mock('../emma/impl/htmlUpdate', () => ({
+  updateHtmlFile: jest.fn(),
+}));
+
 import { emmaToolRegistry } from '../emma/registry';
 import { agentModeService } from '../services/agentModeService';
 import * as htmlCreationImpl from '../emma/impl/htmlCreation';
+import * as htmlUpdateImpl from '../emma/impl/htmlUpdate';
 
 // Import tools.ts to ensure tools are registered.
 import '../emma/tools';
@@ -150,7 +156,7 @@ describe('HTML Emma tools contract cleanup', () => {
     const tool = emmaToolRegistry.getTool('update_html_file');
     if (!tool) throw new Error('Tool update_html_file not found');
 
-    (agentModeService.updateHtmlFile as jest.Mock).mockResolvedValue({ success: true, s3_url: 'https://example.com/updated.html' });
+    (htmlUpdateImpl.updateHtmlFile as jest.Mock).mockResolvedValue({ success: true, s3_url: 'https://example.com/updated.html' });
 
     const operations = [{ action: 'replaceInner', selector: 'h1', html: 'New title' }];
     const result = await tool.execute(
@@ -162,7 +168,7 @@ describe('HTML Emma tools contract cleanup', () => {
       { userId: 'user-123', sessionId: 'sess-1' }
     );
 
-    expect(agentModeService.updateHtmlFile).toHaveBeenCalledWith(
+    expect(htmlUpdateImpl.updateHtmlFile).toHaveBeenCalledWith(
       'https://example.com/source.html',
       'css',
       operations,

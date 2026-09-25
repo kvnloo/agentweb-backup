@@ -1,5 +1,10 @@
 import { AgentModeService } from '../services/agentModeService';
 import { DynamoDB } from 'aws-sdk';
+// ENG-2103 (F2): updateHtmlFile's body now lives in emma/impl/htmlUpdate.ts
+// and calls fetchFileContent/uploadUpdatedFile there directly (not
+// `this.<method>`), so the spies below target that module instead of the
+// class singleton.
+import * as htmlUpdateImpl from '../emma/impl/htmlUpdate';
 
 // Mock AWS SDK
 jest.mock('aws-sdk', () => ({
@@ -88,7 +93,7 @@ describe('updateHtmlFile', () => {
 
     it('should accept valid update_type "part"', async () => {
       // Mock fetchFileContent
-      jest.spyOn(agentModeService as any, 'fetchFileContent').mockResolvedValue('<html><h1>Old</h1></html>');
+      jest.spyOn(htmlUpdateImpl, 'fetchFileContent').mockResolvedValue('<html><h1>Old</h1></html>');
       // Mock performDirectReplacement
       jest.spyOn(agentModeService as any, 'performDirectReplacement').mockReturnValue({
         content: '<html><h1>New</h1></html>',
@@ -108,7 +113,7 @@ describe('updateHtmlFile', () => {
 
     it('should accept valid update_type "full"', async () => {
       // Mock fetchFileContent
-      jest.spyOn(agentModeService as any, 'fetchFileContent').mockResolvedValue('<html>Old</html>');
+      jest.spyOn(htmlUpdateImpl, 'fetchFileContent').mockResolvedValue('<html>Old</html>');
 
       const result = await (agentModeService as any).updateHtmlFile(
         'https://s3.amazonaws.com/bucket/file.html',
@@ -125,7 +130,7 @@ describe('updateHtmlFile', () => {
   describe('full replacement (update_type="full")', () => {
     beforeEach(() => {
       // Mock fetchFileContent to return test content
-      jest.spyOn(agentModeService as any, 'fetchFileContent').mockResolvedValue('<html>Test content</html>');
+      jest.spyOn(htmlUpdateImpl, 'fetchFileContent').mockResolvedValue('<html>Test content</html>');
       
       // Mock createHash to return consistent hash
       const mockHash = jest.fn(() => ({
@@ -205,7 +210,7 @@ describe('updateHtmlFile', () => {
   describe('part replacement (update_type="part")', () => {
     beforeEach(() => {
       // Mock fetchFileContent to return test content
-      jest.spyOn(agentModeService as any, 'fetchFileContent').mockResolvedValue('<html><h1>Old Title</h1></html>');
+      jest.spyOn(htmlUpdateImpl, 'fetchFileContent').mockResolvedValue('<html><h1>Old Title</h1></html>');
       
       // Mock performDirectReplacement
       jest.spyOn(agentModeService as any, 'performDirectReplacement').mockReturnValue({
@@ -277,7 +282,7 @@ describe('updateHtmlFile', () => {
       // mocking the collaborator: content with two real occurrences of old_content
       // against expected_count: 1 hits the exact same "changeCount !== expected_count"
       // branch performDirectReplacement's own regex-count logic produces.
-      jest.spyOn(agentModeService as any, 'fetchFileContent').mockResolvedValue(
+      jest.spyOn(htmlUpdateImpl, 'fetchFileContent').mockResolvedValue(
         '<html><h1>Old Title</h1><h1>Old Title</h1></html>'
       );
 
@@ -411,7 +416,7 @@ describe('updateHtmlFile', () => {
 
   describe('error handling', () => {
     it('should handle fetchFileContent errors', async () => {
-      jest.spyOn(agentModeService as any, 'fetchFileContent').mockRejectedValue(new Error('Network error'));
+      jest.spyOn(htmlUpdateImpl, 'fetchFileContent').mockRejectedValue(new Error('Network error'));
 
       const result = await (agentModeService as any).updateHtmlFile(
         'https://s3.amazonaws.com/bucket/file.html',
@@ -432,7 +437,7 @@ describe('updateHtmlFile', () => {
         error: 'Upload failed'
       });
 
-      jest.spyOn(agentModeService as any, 'fetchFileContent').mockResolvedValue('<html>Test</html>');
+      jest.spyOn(htmlUpdateImpl, 'fetchFileContent').mockResolvedValue('<html>Test</html>');
       jest.spyOn(agentModeService as any, 'performDirectReplacement').mockReturnValue({
         content: '<html>Updated</html>',
         changeCount: 1
@@ -453,12 +458,12 @@ describe('updateHtmlFile', () => {
 
   describe('integration scenarios', () => {
     it('should handle mixed replacement types in single call', async () => {
-      jest.spyOn(agentModeService as any, 'fetchFileContent').mockResolvedValue('<html>Test content</html>');
+      jest.spyOn(htmlUpdateImpl, 'fetchFileContent').mockResolvedValue('<html>Test content</html>');
       jest.spyOn(agentModeService as any, 'performDirectReplacement').mockReturnValue({
         content: '<html>Updated content</html>',
         changeCount: 1
       });
-      jest.spyOn(agentModeService as any, 'uploadUpdatedFile').mockResolvedValue({
+      jest.spyOn(htmlUpdateImpl, 'uploadUpdatedFile').mockResolvedValue({
         url: 'https://s3.amazonaws.com/bucket/new-file.html'
       });
 
