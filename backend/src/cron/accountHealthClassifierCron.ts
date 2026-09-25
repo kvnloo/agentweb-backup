@@ -42,6 +42,7 @@ import {
 } from '../services/accountHealthClassifier';
 import type { AdConnectionAccount } from '../services/clientHealthService';
 import { mayGate } from '../loops/eval/evalRegistry';
+import { isCronEnabled } from '../utils/instanceState';
 
 const TAG = '[accountHealthClassifierCron]';
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -289,6 +290,12 @@ export async function runAccountHealthClassifier(
   const dryRun = opts.dryRun ?? false;
   if (!dryRun && !isAccountHealthAlertsEnabled()) {
     console.log(`${TAG} ACCOUNT_HEALTH_ALERTS_ENABLED is not 'true'; refusing a live run`);
+    return summary;
+  }
+  // Checked here rather than only in server.ts's interval callback, so the immediate first run
+  // cannot write state or page oncall from an instance that graceful shutdown is draining.
+  if (!dryRun && !isCronEnabled()) {
+    console.log(`${TAG} cron disabled on this instance (draining); skipping`);
     return summary;
   }
   if (dryRun) summary.captured = [];
