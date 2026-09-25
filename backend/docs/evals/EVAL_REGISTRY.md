@@ -32,6 +32,7 @@ harness (ENG-2136) produces those runs; record the result on the entry, with evi
 | client-health-assessment | account health | code | — | no |
 | renewal-integration-health | account health | code, off in prod | — | no |
 | account-health-evaluators | account health | code, log-only | — | no |
+| account-health-classifier | account health | code, off until `ACCOUNT_HEALTH_ALERTS_ENABLED` (ENG-2143) | — | no (backtest n too small) |
 | crm-contact-lifecycle | account health (CRM contacts) | code | — | no |
 
 Sources, consumers and known issues for each entry are in `evalRegistry.ts`.
