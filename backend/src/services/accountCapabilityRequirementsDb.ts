@@ -243,6 +243,9 @@ export interface AccountHealthSignalState {
   /** Evidence codes already reported in that episode. */
   lastSignalCodes?: string[];
   lastSignalAt?: string;
+  /** Channel of the last emitted signal, so a later needs_review → oncall escalation is not
+   * mistaken for an unchanged repeat. */
+  lastSignalChannel?: string;
   /** Optimistic-concurrency counter: every instance runs the cron, and only one may emit. */
   version: number;
 }
@@ -252,8 +255,8 @@ export async function getAccountHealthSignalState(userId: string): Promise<Accou
     .get({ TableName: TABLE_NAME, Key: { userId, capability: ACCOUNT_HEALTH_SIGNAL_CAPABILITY } })
     .promise();
   if (!result.Item) return null;
-  const { state, stateSince, lastEpisodeKey, lastSignalCodes, lastSignalAt, version } = result.Item;
-  return { state, stateSince, lastEpisodeKey, lastSignalCodes, lastSignalAt, version };
+  const { state, stateSince, lastEpisodeKey, lastSignalCodes, lastSignalAt, lastSignalChannel, version } = result.Item;
+  return { state, stateSince, lastEpisodeKey, lastSignalCodes, lastSignalAt, lastSignalChannel, version };
 }
 
 /**

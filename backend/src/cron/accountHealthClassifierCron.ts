@@ -52,8 +52,18 @@ export function isAccountHealthAlertsEnabled(): boolean {
 }
 
 export type AccountHealthChannel = 'oncall' | 'cs_nudge' | 'needs_review' | 'none';
-/** `retry`: same episode, but its signal was never delivered (the last send failed). */
-export type AccountHealthSignalReason = 'new_episode' | 'new_billing_cycle' | 'new_evidence' | 'retry' | 'unchanged';
+/**
+ * `retry`: same episode, but its signal was never delivered (the last send failed).
+ * `escalated`: same episode and evidence, but it was last signalled below oncall (a correction
+ * that has since lapsed) and now routes to oncall.
+ */
+export type AccountHealthSignalReason =
+  | 'new_episode'
+  | 'new_billing_cycle'
+  | 'new_evidence'
+  | 'escalated'
+  | 'retry'
+  | 'unchanged';
 
 export interface AccountHealthSignalDecision {
   channel: AccountHealthChannel;
@@ -114,6 +124,7 @@ export function decideAccountHealthSignal(
   else if (!prev?.lastEpisodeKey) reason = 'retry';
   else if (prev.lastEpisodeKey !== episodeKey) reason = 'new_billing_cycle';
   else if (codes.some((c) => !priorCodes.includes(c))) reason = 'new_evidence';
+  else if (channel === 'oncall' && prev.lastSignalChannel !== 'oncall') reason = 'escalated';
   else reason = 'unchanged';
 
   const emit = channel !== 'none' && reason !== 'unchanged';
@@ -126,6 +137,7 @@ export function decideAccountHealthSignal(
         lastEpisodeKey: episodeKey,
         lastSignalCodes: [...new Set([...priorCodes, ...codes])].sort(),
         lastSignalAt: nowIso,
+        lastSignalChannel: channel,
         version,
       }
     : { state: result.state, stateSince, version };
@@ -331,7 +343,14 @@ export async function runAccountHealthClassifier(
           // Release the claim so the next run retries instead of treating the alert as delivered.
           await putAccountHealthSignalState(
             user.userId,
-            { ...claimed, lastEpisodeKey: prev?.lastEpisodeKey, lastSignalCodes: prev?.lastSignalCodes, lastSignalAt: prev?.lastSignalAt, version: claimed.version + 1 },
+            {
+              ...claimed,
+              lastEpisodeKey: prev?.lastEpisodeKey,
+              lastSignalCodes: prev?.lastSignalCodes,
+              lastSignalAt: prev?.lastSignalAt,
+              lastSignalChannel: prev?.lastSignalChannel,
+              version: claimed.version + 1,
+            },
             claimed.version,
           ).catch((releaseError: unknown) => console.error(`${TAG} claim release failed for user ${user.userId}:`, releaseError));
         }
