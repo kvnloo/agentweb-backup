@@ -30,6 +30,8 @@ import * as gtmPlansImpl from './impl/gtmPlans';
 import * as googleDriveImpl from './impl/googleDrive';
 // ENG-2103 (F2): Google Docs/Sheets tool cluster, same treatment as booksImpl above.
 import * as googleDocsSheetsImpl from './impl/googleDocsSheets';
+// ENG-2103 (F2): HTML/landing-page misc tool cluster, same treatment as booksImpl above.
+import * as htmlToolsImpl from './impl/htmlTools';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -3205,7 +3207,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listHtmlTemplates(context?.userId, args.type);
+    return await htmlToolsImpl.listHtmlTemplates(context?.userId, args.type);
   }
 });
 
@@ -6367,7 +6369,7 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     // If extractDesignTokens is true, use CSS extraction
     if (args.extractDesignTokens) {
-      return await agentModeService.extractCSSFromURL(args, context?.userId);
+      return await htmlToolsImpl.extractCSSFromURL(args, context?.userId);
     }
 
     // Default: read raw HTML
@@ -6617,7 +6619,7 @@ emmaToolRegistry.register({
     },
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.convertToPdf(args.source_url, args.output_filename, context?.userId, {
+    return await htmlToolsImpl.convertToPdf(args.source_url, args.output_filename, context?.userId, {
       orientation: args.orientation,
       format: args.format,
     });

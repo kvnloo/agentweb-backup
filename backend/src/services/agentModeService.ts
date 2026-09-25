@@ -199,6 +199,10 @@ import * as gtmPlansImpl from '../emma/impl/gtmPlans';
 import * as googleDriveImpl from '../emma/impl/googleDrive';
 // ENG-2103 (F2): Google Docs/Sheets tool cluster, same treatment as googleDriveImpl.
 import * as googleDocsSheetsImpl from '../emma/impl/googleDocsSheets';
+// ENG-2103 (F2): HTML/landing-page misc tool cluster (convertToPdf,
+// extractCSSFromURL, listHtmlTemplates), same treatment as googleDriveImpl.
+import * as htmlToolsImpl from '../emma/impl/htmlTools';
+import { getTemplatesForUser as sharedGetTemplatesForUser } from '../emma/impl/shared/htmlTemplates';
 import { markdownToDocsRequests as sharedMarkdownToDocsRequests } from '../emma/impl/googleDocsSheets';
 import {
   escapeHtml as sharedEscapeHtml,
@@ -15185,209 +15189,18 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
     }
   }
 
-  /**
-   * Extract CSS design tokens from a URL
-   * Used by read_page_source tool (extractDesignTokens=true)
-   */
+  // ENG-2103 (F2): delegates to emma/impl/htmlTools.ts. Kept as a class method
+  // (not deleted) because routes/emmaApi.ts calls it directly on the class
+  // singleton, and agentModeService.extractCSSFromURL.logo.test.ts calls it
+  // directly on a real instance.
   public async extractCSSFromURL(args: any, userId: string): Promise<any> {
-    try {
-      const { url, options } = args;
-
-      if (!url) {
-        return {
-          success: false,
-          error: 'URL is required'
-        };
-      }
-
-      // Import the CSS extractor service
-      const { extractCSSFromURL, analyzeDesignTokens, inferBrandTokens } = require('./cssExtractor');
-
-      // Extract CSS from URL
-      console.log(`Extracting CSS from ${url}...`);
-      const extractedCSS = await extractCSSFromURL(url, options);
-
-      // Analyze design tokens
-      console.log('Analyzing design tokens...');
-      const detailedTokens = await analyzeDesignTokens(extractedCSS);
-
-      // Log extraction details for debugging
-      console.log(`CSS extraction details: ${extractedCSS.stylesheets.length} stylesheets, ` +
-        `source=${extractedCSS.stylesheets[0]?.source || 'none'}, ` +
-        `computedElements=${extractedCSS.computedElements ? Object.keys(extractedCSS.computedElements).join(',') : 'none'}`);
-      console.log(`Design tokens: ${detailedTokens.colors.all.length} colors, ` +
-        `${detailedTokens.typography.fontFamilies.length} fonts, ` +
-        `top colors: ${detailedTokens.colors.all.slice(0, 5).map((c: any) => `${c.value}(${c.count})`).join(', ')}`);
-
-      // Infer brand tokens
-      console.log('Inferring brand tokens...');
-      const suggestedBrandTokens = inferBrandTokens(detailedTokens);
-
-      // Process brand identity: download logo and upload to S3. Extracted to
-      // services/agentMode/brandLogo.ts (ENG-326); behavior pinned by
-      // agentModeService.extractCSSFromURL.logo.test.ts.
-      const brandIdentity = extractedCSS.brandIdentity || { logoUrl: null, brandName: null, tagline: null, favicon: null };
-      const logoDownload = brandIdentity.logoUrl
-        ? await downloadBrandLogoToS3(brandIdentity.logoUrl, userId)
-        : null;
-      // Non-uploaded outcomes fall back to surfacing the raw discovered URL
-      // below (`s3LogoUrl || brandIdentity.logoUrl`) — unchanged extraction
-      // behavior; only the deterministic PERSIST path treats them differently.
-      const s3LogoUrl: string | null =
-        logoDownload?.status === 'uploaded' ? logoDownload.url : null;
-
-      // Format detailed tokens as JSON string for Emma to save to KB if needed
-      const detailedTokensJSON = JSON.stringify({
-        version: '1.0',
-        source: url,
-        extractedAt: extractedCSS.extractedAt,
-        tokens: detailedTokens,
-        metadata: {
-          extractionMethod: 'puppeteer-wallace',
-          savedBy: 'emma',
-          userId
-        }
-      }, null, 2);
-
-      // A site may render a completely different design under a dark color-scheme
-      // preference (ENG-285: rankai.ai is matte black with a purple accent under
-      // dark, near-white under light). The tokens above describe the site's
-      // DEFAULT render; when a distinct dark render exists, analyze it too and
-      // surface both so the caller can pick the intended brand theme.
-      let darkThemeTokens: any = null;
-      if (extractedCSS.themes?.hasDarkVariant && extractedCSS.themes.dark) {
-        try {
-          // Analyse the dark render with ITS OWN computed styles AND stylesheets —
-          // reusing the light render's stylesheets would blend light colours into
-          // the reported dark palette (ENG-285).
-          const darkCSS = {
-            ...extractedCSS,
-            computedElements: extractedCSS.themes.dark.computedElements,
-            stylesheets: extractedCSS.themes.dark.stylesheets,
-          };
-          const darkDetailed = await analyzeDesignTokens(darkCSS);
-          darkThemeTokens = {
-            ...inferBrandTokens(darkDetailed),
-            backgrounds: darkDetailed.colors.backgrounds.slice(0, 3),
-            text: darkDetailed.colors.text.slice(0, 3),
-          };
-          console.log(`Dark color-scheme variant detected for ${url}; extracted its palette too.`);
-        } catch (err) {
-          console.warn('Dark-variant token analysis failed; reporting default render only:', err);
-        }
-      }
-
-      // Format summary for LLM
-      const formattedSummary = this.formatCSSExtractionResult({
-        url,
-        suggestedBrandTokens,
-        detailedTokens,
-        darkThemeTokens,
-        brandIdentity: {
-          logoUrl: s3LogoUrl || brandIdentity.logoUrl || null,
-          brandName: brandIdentity.brandName || null,
-          tagline: brandIdentity.tagline || null,
-        },
-      });
-
-      // Merge brand identity into suggestedBrandTokens so Emma naturally displays it
-      const enrichedBrandTokens = {
-        ...suggestedBrandTokens,
-        brandName: brandIdentity.brandName || null,
-        logoUrl: s3LogoUrl || brandIdentity.logoUrl || null,
-        tagline: brandIdentity.tagline || null,
-      };
-
-      return {
-        success: true,
-        url,
-        extractedAt: extractedCSS.extractedAt,
-        suggestedBrandTokens: enrichedBrandTokens,
-        detailedTokens,
-        detailedTokensJSON, // Emma can save this to KB using update_knowledge_base_file tool
-        hasDarkVariant: !!darkThemeTokens,
-        darkThemeTokens, // null unless the site renders a distinct dark theme
-        formattedContent: formattedSummary
-      };
-    } catch (error: any) {
-      console.error('AgentMode: Error extracting CSS:', error);
-      return {
-        success: false,
-        error: error.message || 'Failed to extract CSS from URL',
-        details: error.stack
-      };
-    }
+    return htmlToolsImpl.extractCSSFromURL(args, userId);
   }
 
-  /**
-   * Format CSS extraction result for LLM consumption
-   */
-  private formatCSSExtractionResult(data: any): string {
-    const { url, suggestedBrandTokens, detailedTokens, brandIdentity, darkThemeTokens } = data;
+  // ENG-2103 (F2): formatCSSExtractionResult moved to emma/impl/htmlTools.ts
+  // and deleted here — its only caller (extractCSSFromURL) moved with it, and
+  // it had zero test references.
 
-    let formatted = `# CSS Extraction Results\n\n`;
-    formatted += `**Source:** ${url}\n\n`;
-
-    // Brand identity section
-    if (brandIdentity) {
-      formatted += `## Brand Identity\n\n`;
-      formatted += `- **Brand Name:** ${brandIdentity.brandName || 'Not detected'}\n`;
-      formatted += `- **Logo:** ${brandIdentity.logoUrl || 'Not detected'}\n`;
-      formatted += `- **Tagline:** ${brandIdentity.tagline || 'Not detected'}\n\n`;
-    }
-
-    // Suggested brand tokens (what should go in brand guidelines)
-    formatted += `## Suggested Brand Tokens\n\n`;
-    formatted += `These are the recommended tokens to add to your brand guidelines:\n\n`;
-
-    formatted += `### Colors\n`;
-    formatted += `- **Primary:** ${suggestedBrandTokens.colors.primary}\n`;
-    formatted += `- **Secondary:** ${suggestedBrandTokens.colors.secondary}\n`;
-    formatted += `- **Palette:** ${suggestedBrandTokens.colors.palette.join(', ')}\n\n`;
-
-    formatted += `### Typography\n`;
-    formatted += `- **Heading Font:** ${suggestedBrandTokens.typography.headingFont}\n`;
-    formatted += `- **Body Font:** ${suggestedBrandTokens.typography.bodyFont}\n`;
-    formatted += `- **Font Weights:**\n`;
-    formatted += `  - Regular: ${suggestedBrandTokens.typography.fontWeights.regular}\n`;
-    formatted += `  - Semibold: ${suggestedBrandTokens.typography.fontWeights.semibold}\n`;
-    formatted += `  - Bold: ${suggestedBrandTokens.typography.fontWeights.bold}\n\n`;
-
-    formatted += `### Visual Effects\n`;
-    formatted += `- **Primary Shadow:** ${suggestedBrandTokens.visualEffects.primaryShadow}\n`;
-    formatted += `- **Border Radius:** ${suggestedBrandTokens.visualEffects.borderRadius}\n\n`;
-
-    // Dark color-scheme variant, when the site has one. The tokens above describe
-    // what the site serves a no-preference visitor; this is what a dark-mode
-    // visitor sees. Which one is "the brand" is a judgement call, so present both
-    // rather than silently choosing (ENG-285).
-    if (darkThemeTokens) {
-      formatted += `## Dark Theme Variant Detected\n\n`;
-      formatted += `This site renders a **distinct dark theme** under \`prefers-color-scheme: dark\`. `;
-      formatted += `The tokens above are its DEFAULT (light) render; the dark render is:\n\n`;
-      formatted += `- **Primary:** ${darkThemeTokens.colors.primary}\n`;
-      formatted += `- **Secondary:** ${darkThemeTokens.colors.secondary}\n`;
-      formatted += `- **Backgrounds:** ${(darkThemeTokens.backgrounds || []).join(', ') || 'Not detected'}\n`;
-      formatted += `- **Text:** ${(darkThemeTokens.text || []).join(', ') || 'Not detected'}\n`;
-      formatted += `- **Palette:** ${darkThemeTokens.colors.palette.join(', ')}\n\n`;
-      formatted += `⚠️ Confirm with the user which theme represents their brand before applying tokens — `;
-      formatted += `a site whose design is dark still serves the light render to visitors whose OS is set to light.\n\n`;
-    }
-
-    // Summary of detailed tokens
-    formatted += `## Detailed Analysis\n\n`;
-    formatted += `- **Total Colors Found:** ${detailedTokens.colors.all.length}\n`;
-    formatted += `- **Font Families:** ${detailedTokens.typography.fontFamilies.length}\n`;
-    formatted += `- **Font Sizes:** ${detailedTokens.typography.fontSizes.length}\n`;
-    formatted += `- **Box Shadows:** ${detailedTokens.visualEffects.boxShadows.length}\n`;
-    formatted += `- **Border Radius Values:** ${detailedTokens.visualEffects.borderRadius.length}\n\n`;
-
-    formatted += `### Next Steps\n\n`;
-    formatted += `1. **Apply to Brand Guidelines:** Use \`update_brand_guidelines\` with the suggested values above\n`;
-    formatted += `2. **Save Detailed Data:** Use \`update_knowledge_base_file\` to save the detailed CSS analysis (detailedTokensJSON) for future reference\n`;
-
-    return formatted;
-  }
 
   /**
    * Create a new knowledge base (task) with initial content
@@ -27824,69 +27637,17 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
   }
 
+  // ENG-2103 (F2): delegates to emma/impl/htmlTools.ts. Kept as a class method
+  // (not deleted) because agentModeService.convertToPdfSsrf.test.ts and
+  // agentModeService.convertToPdfFoundation.test.ts call it directly on a
+  // real instance.
   public async convertToPdf(
     sourceUrl: string,
     outputFilename: string,
     userId: string,
     options?: { orientation?: 'portrait' | 'landscape' | 'auto'; format?: string }
   ): Promise<any> {
-    try {
-      console.log('AgentMode: Converting to PDF:', sourceUrl, 'for user:', userId);
-
-      if (!sourceUrl || typeof sourceUrl !== 'string') {
-        throw new Error('source_url is required and must be a string');
-      }
-      if (!sourceUrl.startsWith('http://') && !sourceUrl.startsWith('https://')) {
-        throw new Error('source_url must be an HTTP or HTTPS URL');
-      }
-
-      // SSRF guard: convert_to_pdf is a foundation tool reachable by every
-      // session by default, and renderHtmlToPdf navigates a real browser to
-      // sourceUrl server-side. Without this, a user could point it at an
-      // internal address (e.g. the cloud metadata endpoint) and get the
-      // response rendered back to them as a downloadable PDF. renderHtmlToPdf
-      // also re-validates on every navigation request (including redirect
-      // hops), so this call fails fast for the common case without spinning
-      // up a browser first.
-      await assertPublicHostname(sourceUrl);
-
-      // Shared render path: orientation is auto-detected (16:9 decks print
-      // landscape) unless the caller forces it, and wide content is scaled to
-      // fit so the right side is never clipped.
-      const { buffer, orientation, scale } = await renderHtmlToPdf({
-        url: sourceUrl,
-        orientation: options?.orientation ?? 'auto',
-        format: options?.format,
-      });
-      console.log(
-        `AgentMode: PDF rendered (orientation=${orientation}, scale=${scale.toFixed(2)})`
-      );
-
-      const pdfFilename = (outputFilename || 'export')
-        .replace(/\.html?$/i, '')
-        .replace(/[^a-zA-Z0-9_\-]/g, '_') + '.pdf';
-
-      const uploadResult = await uploadFileToS3(buffer, pdfFilename, userId, 'application/pdf');
-
-      if (!uploadResult.success || !uploadResult.url) {
-        throw new Error(uploadResult.error || 'Failed to upload PDF to S3');
-      }
-
-      return {
-        success: true,
-        pdf_url: uploadResult.url,
-        filename: pdfFilename,
-        orientation,
-        message: `PDF created and saved. Download: ${uploadResult.url}`,
-      };
-    } catch (error) {
-      console.error('AgentMode: Error converting to PDF:', error);
-      return {
-        success: false,
-        message: 'Failed to convert to PDF.',
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
-    }
+    return htmlToolsImpl.convertToPdf(sourceUrl, outputFilename, userId, options);
   }
 
   // Read file content from URL with support for various file types
@@ -30492,21 +30253,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   }
 
   // Fetch templates from new keys only
+  // ENG-2103 (F2): delegates to emma/impl/shared/htmlTemplates.ts, shared
+  // between emma/impl/htmlTools.ts's listHtmlTemplates (this extraction) and
+  // this class's own findTemplateById (used by the deferred
+  // createHtmlFromTemplate cluster).
   private async getTemplatesForUser(userId: string): Promise<{ userTemplates: any[], publicTemplates: any[] }> {
-    const [newUserSetting, newPublicSetting] = await Promise.all([
-      settingsService.getSetting(`templates_${userId}`),
-      settingsService.getSetting('templates_public'),
-    ]);
-
-    const parse = (s: any): any[] => {
-      if (!s?.settingValue) return [];
-      try { return JSON.parse(s.settingValue); } catch { return []; }
-    };
-
-    const userTemplates = parse(newUserSetting);
-    const publicTemplates = parse(newPublicSetting);
-
-    return { userTemplates, publicTemplates };
+    return sharedGetTemplatesForUser(userId);
   }
 
   // Find a template by id, searching user templates first then public
@@ -30526,44 +30278,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return { template: null, isPublic: false };
   }
 
-  // List all HTML templates for the user (merged from new keys)
+  // ENG-2103 (F2): delegates to emma/impl/htmlTools.ts. Kept as a class method
+  // (not deleted) because routes/emmaApi.ts calls it directly on the class
+  // singleton, and publicHtmlTemplates.test.ts calls it directly on a real
+  // instance.
   public async listHtmlTemplates(userId: string, type?: string): Promise<any> {
-    try {
-      const { userTemplates, publicTemplates } = await this.getTemplatesForUser(userId);
-
-      const mapTemplate = (template: any, isPublic: boolean) => ({
-        template_id: template.template_id,
-        template_name: template.template_name,
-        type: template.type || ['email'],
-        subject: template.subject,
-        variables: template.variables || [],
-        arrayVariables: template.arrayVariables || [],
-        created_at: template.created_at,
-        updated_at: template.updated_at,
-        ...(isPublic ? { isPublic: true } : {})
-      });
-
-      let merged = [
-        ...userTemplates.map((t: any) => mapTemplate(t, false)),
-        ...publicTemplates.map((t: any) => mapTemplate(t, true))
-      ];
-
-      if (type) {
-        merged = merged.filter((t: any) => Array.isArray(t.type) && t.type.includes(type));
-      }
-
-      return {
-        success: true,
-        email_templates: merged
-      };
-    } catch (error) {
-      console.error('Error listing email templates:', error);
-      return {
-        success: false,
-        message: 'Failed to list email templates',
-        error: error instanceof Error ? error.message : 'Unknown error'
-      };
-    }
+    return htmlToolsImpl.listHtmlTemplates(userId, type);
   }
 
   // Update HTML file with direct content replacement
