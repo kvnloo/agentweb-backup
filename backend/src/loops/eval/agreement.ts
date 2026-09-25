@@ -144,9 +144,9 @@ export function perClassMetrics<L extends string | number>(
     }
     const precision = tp + fp === 0 ? null : tp / (tp + fp);
     const recall = tp + fn === 0 ? null : tp / (tp + fn);
-    const f1 = precision === null || recall === null || precision + recall === 0
-      ? null
-      : (2 * precision * recall) / (precision + recall);
+    // Count form: defined whenever the class occurs at all, so a class the grader always gets
+    // wrong scores 0 rather than looking like "no data".
+    const f1 = 2 * tp + fp + fn === 0 ? null : (2 * tp) / (2 * tp + fp + fn);
     out[String(c)] = { precision, recall, f1, support: tp + fn };
   }
   return out;
@@ -173,6 +173,10 @@ export function bootstrapCI<L extends string | number>(
   assertPairs(pairs);
   const iterations = opts.iterations ?? 2000;
   const level = opts.level ?? 0.95;
+  if (!Number.isInteger(iterations) || iterations <= 0) {
+    throw new Error('bootstrapCI: iterations must be a positive integer');
+  }
+  if (!(level > 0 && level < 1)) throw new Error('bootstrapCI: level must be strictly between 0 and 1');
   const rand = mulberry32(opts.seed ?? 2128);
   const stats: number[] = [];
   for (let it = 0; it < iterations; it++) {
