@@ -3,7 +3,7 @@ import { getSecret } from './secretsManager';
 
 // Keep the model and output size fixed across all embedding callers.
 const EMBEDDING_MODEL = 'openai/text-embedding-3-large';
-const EMBEDDING_DIMENSIONS = 3072;
+const EMBEDDING_DIMENSIONS = 1536; // must match stored vectors (previous Azure deployment requested 1536)
 
 /**
  * Embed arbitrary text. Returns null on empty input or any failure, so callers can degrade

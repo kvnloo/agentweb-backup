@@ -32,7 +32,7 @@ import { getSecret } from '../utils/secretsManager';
 import { getModelPrice } from '../utils/llmPricing';
 import { embedText } from '../utils/embeddings';
 import { meterUsageFromResponse } from '../utils/llmClients';
-const vector = Array(3072).fill(0.1);
+const vector = Array(1536).fill(0.1);
 const mockMeter = meterUsageFromResponse as jest.Mock;
 
 describe('embedText', () => {
@@ -86,12 +86,12 @@ describe('embedText', () => {
     expect(await embedText('hello')).toBeNull();
   });
 
-  it('keeps the required model and 3072-dimensional vector contract', async () => {
+  it('keeps the required model and 1536-dimensional vector contract', async () => {
     mockCreate.mockResolvedValue({ data: [{ embedding: vector }] });
     await embedText('hello');
     expect(getModelPrice('openai/text-embedding-3-large')).toEqual(getModelPrice('text-embedding-3-large'));
     expect(mockCreate).toHaveBeenCalledWith({
-      model: 'openai/text-embedding-3-large', input: 'hello', dimensions: 3072,
+      model: 'openai/text-embedding-3-large', input: 'hello', dimensions: 1536,
     });
     expect(mockMeter).toHaveBeenCalledWith(
       expect.objectContaining({ provider: 'openrouter', model: 'openai/text-embedding-3-large' }),
