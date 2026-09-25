@@ -70,6 +70,14 @@ describe('perClassMetrics', () => {
     expect(m['2'].support).toBe(3);
   });
 
+  it('scores F1 as 0, not null, for a class the grader always gets wrong', () => {
+    const m = perClassMetrics(pairs(['a', 'b', 'a'], ['b', 'a', 'a']));
+    // class b: tp 0, fp 1, fn 1 -> precision 0, recall 0, F1 0
+    expect(m.b).toEqual({ precision: 0, recall: 0, f1: 0, support: 1 });
+    // class a: tp 1, fp 1, fn 1 -> F1 = 2/4
+    expect(m.a.f1).toBeCloseTo(0.5, 10);
+  });
+
   it('returns null instead of dividing by zero', () => {
     const m = perClassMetrics(pairs(['fail', 'fail'], ['pass', 'pass']));
     expect(m.fail.precision).toBeNull();
@@ -96,6 +104,16 @@ describe('wilsonInterval', () => {
 });
 
 describe('bootstrapCI and agreementReport', () => {
+  it('rejects iteration counts and levels that cannot give an interval', () => {
+    const data = textbookTable();
+    for (const iterations of [0, -5, 1.5, Number.NaN]) {
+      expect(() => bootstrapCI(data, cohensKappa, { iterations })).toThrow(/iterations/);
+    }
+    for (const level of [0, 1, 1.2, Number.NaN]) {
+      expect(() => bootstrapCI(data, cohensKappa, { level })).toThrow(/level/);
+    }
+  });
+
   it('is reproducible for a fixed seed and brackets the point estimate', () => {
     const data = textbookTable();
     const a = bootstrapCI(data, cohensKappa, { seed: 7, iterations: 500 });
