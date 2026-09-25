@@ -6,6 +6,15 @@
  *    never see the cross-tenant origin tag.
  *  - Removes `siblingLeadId`, `siblingListId`, `siblingUserId` from any field
  *    meta (those exist only for server-side debugging / data-lineage work).
+ *  - ENG-1388/ENG-1930: strips Enigma card-revenue fields from a lead when the
+ *    VIEWER (not the list owner) isn't on the Enigma allowlist. The allowlist
+ *    (ENIGMA_ENRICHMENT_USER_ALLOWLIST) only ever gated who could TRIGGER a
+ *    paid lookup — canAccessCrmList's normal org-sharing path lets any
+ *    same-org member read a lead once it exists, with no allowlist check at
+ *    all (found live, CodeRabbit on agentweb#3061: an org member who was
+ *    never allowlisted could already read card revenue on a co-worker's
+ *    list). Enigma's licence is internal-use-only, not "internal to whichever
+ *    org happens to share this list" — this is the actual display boundary.
  *
  * Internal-only endpoints that legitimately need the full audit shape (admin
  * delegation, debug routes) should NOT call this — they should serialize the
@@ -13,6 +22,8 @@
  */
 
 import type { EnrichedFieldMeta } from './enrichedFieldValue';
+import { isCardRevenueField } from '../services/enrichmentGroups';
+import { isEnigmaEnrichmentEnabledForUser } from '../services/enigmaCardRevenueEnrichment';
 
 type AnyMeta = Partial<EnrichedFieldMeta> & Record<string, any>;
 
@@ -38,13 +49,39 @@ export function sanitizeEnrichmentMetadataForResponse(
   return out;
 }
 
+/** Drops any card-revenue key from a plain field-keyed map (customFields or enrichmentMetadata). */
+function stripCardRevenueKeys<V>(map: Record<string, V> | undefined | null): Record<string, V> | undefined {
+  if (!map || typeof map !== 'object') return map as undefined;
+  const out: Record<string, V> = {};
+  for (const [field, value] of Object.entries(map)) {
+    if (!isCardRevenueField(field)) out[field] = value;
+  }
+  return out;
+}
+
 /**
- * Convenience wrapper: shallow-clones the lead and replaces its
- * `enrichmentMetadata` with the sanitized version. Returns a new object so
- * the caller's reference to the raw row is untouched.
+ * Convenience wrapper: shallow-clones the lead, replaces its
+ * `enrichmentMetadata` with the sanitized version, and — when `viewerUserId`
+ * is given and NOT Enigma-allowlisted — strips card-revenue fields from both
+ * `customFields` and `enrichmentMetadata` regardless of list ownership. Pass
+ * `viewerUserId` at every customer-facing read; omitting it preserves the old
+ * behaviour (no card-revenue filtering) for callers that already restrict
+ * this some other way (there are none today — every caller should pass it).
+ * Returns a new object so the caller's reference to the raw row is untouched.
  */
-export function sanitizeLeadForResponse<T extends { enrichmentMetadata?: any }>(lead: T | null | undefined): T | null | undefined {
+export function sanitizeLeadForResponse<T extends { enrichmentMetadata?: any; customFields?: Record<string, any> }>(
+  lead: T | null | undefined,
+  viewerUserId?: string,
+): T | null | undefined {
   if (!lead) return lead;
-  if (!lead.enrichmentMetadata) return lead;
-  return { ...lead, enrichmentMetadata: sanitizeEnrichmentMetadataForResponse(lead.enrichmentMetadata) };
+  const hideCardRevenue = !!viewerUserId && !isEnigmaEnrichmentEnabledForUser(viewerUserId);
+  if (!lead.enrichmentMetadata && !hideCardRevenue) return lead;
+  return {
+    ...lead,
+    ...(lead.enrichmentMetadata ? { enrichmentMetadata: sanitizeEnrichmentMetadataForResponse(lead.enrichmentMetadata) } : {}),
+    ...(hideCardRevenue ? {
+      customFields: stripCardRevenueKeys(lead.customFields) ?? lead.customFields,
+      ...(lead.enrichmentMetadata ? { enrichmentMetadata: stripCardRevenueKeys(sanitizeEnrichmentMetadataForResponse(lead.enrichmentMetadata)) } : {}),
+    } : {}),
+  };
 }

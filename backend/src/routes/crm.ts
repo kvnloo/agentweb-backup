@@ -1976,7 +1976,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
             engagementCount: engagementCounts.total,
             engagementCountLast7Days: engagementCounts.last7Days,
             totalAllMessages: engagementCounts.totalAllMessages,
-          }),
+          }, userId),
           syncStatus: resolveSyncStatus(lead, crmConn.connected),
         };
       })
@@ -2565,7 +2565,7 @@ router.get('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
       return res.status(404).json({ message: 'Lead not found' });
     }
 
-    res.json(sanitizeLeadForResponse(lead));
+    res.json(sanitizeLeadForResponse(lead, userId));
   } catch (error: any) {
     console.error('Error fetching lead:', error);
     res.status(500).json({ message: error.message || 'Failed to fetch lead' });
@@ -2790,7 +2790,7 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
       void validateLeadEmailInBackground(listId, leadId, updates.email, userId);
     }
 
-    res.json(sanitizeLeadForResponse(updatedLead));
+    res.json(sanitizeLeadForResponse(updatedLead, userId));
   } catch (error: any) {
     console.error('Error updating lead:', error);
     res.status(500).json({ message: error.message || 'Failed to update lead' });
@@ -5304,7 +5304,7 @@ router.post('/lists/:listId/leads/:leadId/engagements', async (req: Request, res
     } catch (alertError) {
       console.error('Failed to send lead list alert email:', alertError);
     }
-    res.json({ success: true, lead: sanitizeLeadForResponse(updatedLead) });
+    res.json({ success: true, lead: sanitizeLeadForResponse(updatedLead, userId) });
   } catch (error: any) {
     console.error('Error adding lead engagement:', error);
     res.status(500).json({ message: error.message || 'Failed to add lead engagement' });
@@ -5353,7 +5353,7 @@ router.put('/lists/:listId/leads/:leadId/engagements/:eventId', async (req: Requ
     };
 
     const updatedLead = await crmDb.updateLeadEngagement(listId, leadId, eventId, engagement);
-    res.json({ success: true, lead: sanitizeLeadForResponse(updatedLead) });
+    res.json({ success: true, lead: sanitizeLeadForResponse(updatedLead, userId) });
   } catch (error: any) {
     console.error('Error updating lead engagement:', error);
     res.status(500).json({ message: error.message || 'Failed to update lead engagement' });
@@ -5386,7 +5386,7 @@ router.delete('/lists/:listId/leads/:leadId/engagements/:eventId', async (req: R
     }
 
     const updatedLead = await crmDb.deleteLeadEngagement(listId, leadId, eventId);
-    res.json({ success: true, lead: sanitizeLeadForResponse(updatedLead) });
+    res.json({ success: true, lead: sanitizeLeadForResponse(updatedLead, userId) });
   } catch (error: any) {
     console.error('Error deleting lead engagement:', error);
     res.status(500).json({ message: error.message || 'Failed to delete lead engagement' });
