@@ -3155,7 +3155,7 @@ mcpToolRegistry.register({
 Returns for each client:
 - userId: internal account id — use this to map a userId (e.g. from get_chat_history) back to a human-readable email/displayName
 - displayName, email, roles
-- has_ads: whether they have a Meta ad account connected
+- has_ads: whether a Meta ad account is on record (it may have expired — see ad_connection)
 - ad_connection: never_connected (activation, not churn) / connected / expired (a connection that broke)
 - has_lander: whether they have landing pages (productDomain or seoDomains)
 - has_crm: whether they have CRM integrations (email domain, LinkedIn)

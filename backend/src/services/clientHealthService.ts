@@ -22,6 +22,22 @@ type HealthStatus = 'healthy' | 'mediocre' | 'at-risk' | 'blocked' | 'onboarding
 
 export type AdConnectionState = 'never_connected' | 'connected' | 'expired';
 
+/** The fields the connection classifier reads; ConnectedAccount records satisfy it. */
+export interface AdConnectionAccount {
+  platform?: string;
+  config?: { account_type?: string; token_expires_at?: number; refresh_token?: string };
+}
+
+function isMetaAdAccount(acc: AdConnectionAccount | null | undefined): acc is AdConnectionAccount {
+  return acc?.platform === 'meta' && acc.config?.account_type === 'ad_account';
+}
+
+/** A Meta ad account whose token is unexpired, carries no expiry, or can refresh. */
+function isUsableMetaAdAccount(acc: AdConnectionAccount, nowMs: number): boolean {
+  const expiresAt = acc.config?.token_expires_at;
+  return typeof expiresAt !== 'number' || expiresAt > nowMs || !!acc.config?.refresh_token;
+}
+
 /**
  * Classify the client's Meta ad connection without any live API call.
  *
@@ -34,24 +50,17 @@ export type AdConnectionState = 'never_connected' | 'connected' | 'expired';
  * Same timestamp rule as connectedAccountsDb.isTokenNotExpired, inlined so it stays a pure
  * function of its inputs.
  */
-/** A Meta ad account whose token is unexpired, carries no expiry, or can refresh. */
-function isUsableMetaAdAccount(acc: any, nowMs: number): boolean {
-  const expiresAt = acc?.config?.token_expires_at;
-  return typeof expiresAt !== 'number' || expiresAt > nowMs || !!acc?.config?.refresh_token;
-}
-
 export function classifyMetaAdConnection(
-  connectedAccounts: any[],
+  connectedAccounts: ReadonlyArray<AdConnectionAccount | null | undefined> | null | undefined,
   legacyAdAccount: string | undefined,
   nowMs: number = Date.now(),
 ): { connection: AdConnectionState; expiredAt?: string } {
   if (typeof legacyAdAccount === 'string' && legacyAdAccount.trim() !== '') return { connection: 'connected' };
-  const metaAdAccounts = (connectedAccounts || []).filter(
-    (acc: any) => acc?.platform === 'meta' && acc.config?.account_type === 'ad_account'
-  );
+  const metaAdAccounts = (connectedAccounts ?? []).filter(isMetaAdAccount);
   if (metaAdAccounts.length === 0) return { connection: 'never_connected' };
-  if (metaAdAccounts.some((acc: any) => isUsableMetaAdAccount(acc, nowMs))) return { connection: 'connected' };
-  const latestExpiry = Math.max(...metaAdAccounts.map((acc: any) => acc.config.token_expires_at as number));
+  if (metaAdAccounts.some((acc) => isUsableMetaAdAccount(acc, nowMs))) return { connection: 'connected' };
+  // Every account failed isUsableMetaAdAccount, so each carries a numeric token_expires_at.
+  const latestExpiry = Math.max(...metaAdAccounts.map((acc) => acc.config?.token_expires_at ?? 0));
   return { connection: 'expired', expiredAt: new Date(latestExpiry).toISOString() };
 }
 
@@ -351,10 +360,15 @@ export async function assessClientHealth(
     // record cannot shadow a working later one (the health status and the fetch agree).
     const nowMs = Date.now();
     const connectedMetaAccount =
-      metaAdAccounts.find((acc: any) => isUsableMetaAdAccount(acc, nowMs)) ?? metaAdAccounts[0];
+      metaAdAccounts.find((acc) => isUsableMetaAdAccount(acc, nowMs)) ?? metaAdAccounts[0];
     const connectedAdAccountId = (connectedMetaAccount?.config as any)?.ad_account_id;
     const connectedAccessToken = connectedMetaAccount?.config?.access_token;
-    const useConnectedAccount = !!connectedAdAccountId && !!connectedAccessToken;
+    // An expired connected account never wins over a legacy adAccount: the classifier counts the
+    // legacy account as the live connection, so the fetch must read through it too.
+    const connectedIsUsable = !!connectedMetaAccount && isUsableMetaAdAccount(connectedMetaAccount, nowMs);
+    const legacyAvailable = typeof client.adAccount === 'string' && client.adAccount.trim() !== '';
+    const useConnectedAccount =
+      !!connectedAdAccountId && !!connectedAccessToken && (connectedIsUsable || !legacyAvailable);
 
     // Reused below for the campaigns/insights fetches, the reported ad_account_id, and the
     // thresholds lookup, replacing three independent re-derivations that previously disagreed on
