@@ -12,6 +12,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import axios from 'axios';
+import { Link as RouterLink } from 'react-router-dom';
 import {
   Alert,
   Box,
@@ -54,6 +55,16 @@ export interface GoldenCaseView {
   labelledAt?: string;
   split: 'dev' | 'test';
   version: number;
+  /** Pairwise calibration cases only (ENG-2142); labelled on the calibration page, not here. */
+  pair?: {
+    candidateIdB: string;
+    batch: string;
+    position: number;
+    batchSize: number;
+    category: string;
+    placement: string;
+    signal: string;
+  };
 }
 
 const SURFACES: ReadonlyArray<{ value: Surface; label: string }> = [
@@ -369,7 +380,8 @@ export default function EvalLabelling() {
       if (!status.data.provisioned) return;
       const res = await axios.get<{ cases: GoldenCaseView[] }>(buildApiUrl(`/api/admin/eval/golden-cases?surface=${which}`), { headers });
       if (!isCurrent()) return;
-      const next = [...res.data.cases].sort(byLeastLabelled);
+      // Pairwise calibration cases take an A/B/tie choice on their own page, not binary criteria.
+      const next = res.data.cases.filter((c) => c.pair === undefined).sort(byLeastLabelled);
       setCases(next);
       setSelectedId((current) => (current && next.some((c) => c.caseId === current) ? current : next[0]?.caseId ?? null));
     } catch (err) {
@@ -405,6 +417,7 @@ export default function EvalLabelling() {
       </Stack>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
         Binary human labels for the golden sets that validate AgentWeb&apos;s graders. Case content is loaded from its source when opened and is never copied into the golden set.
+        {' '}Pairwise creative comparisons are on the <Link component={RouterLink} to="/eval-labelling/calibration">weekly creative calibration</Link> page.
       </Typography>
 
       {provisioned === false && (
