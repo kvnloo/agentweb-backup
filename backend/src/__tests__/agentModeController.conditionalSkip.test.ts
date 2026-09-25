@@ -501,12 +501,15 @@ describe('scheduledRunSignalsConditionalSkip', () => {
   //     was also satisfied. Not aliased; logged here so it isn't silently
   //     missed.
   //   - stage_pending_decision -> ask_user_question / present_question_deck:
-  //     its own description says to use it INSTEAD of those two when the
-  //     answer belongs to a named team approver (Slack, potentially days
-  //     later), not the current user — the opposite direction from a same-
-  //     requirement substitute. It doesn't even block this session the way
-  //     the other two do. Not aliased; logged here so it isn't silently
-  //     missed.
+  //     stage_pending_decision's own description says to use it "instead of
+  //     ask_user_question/present_question_deck when the answer genuinely
+  //     belongs to someone OTHER than the person you're talking to right
+  //     now" — a durable, named-approver decision routed to Slack (or a
+  //     customer email), answered possibly days later, not a blocking
+  //     in-session halt. Different AUDIENCE and different timing, not the
+  //     same requirement — calling one is not evidence the other's
+  //     requirement was also satisfied. Not aliased; logged here so it
+  //     isn't silently missed.
   it('redirect audit: pins every "use/prefer tool X instead" cross-reference between two registered tools (ENG-1276 follow-up #3)', () => {
     const allTools = emmaToolRegistry.getAllTools();
     const allNames = allTools.map((t) => t.name);

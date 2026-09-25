@@ -51,6 +51,8 @@ import { userDb } from '../services/db';
 import { enrichWithRCA } from '../loops/instances/ai-eval-funnel/rcaEnricher';
 import { asMutationId } from '../loops/core/types';
 import { cronJobRegistry } from '../utils/cronJobRegistry';
+import { restyleContent, generateBlogContent } from '../controllers/blog';
+import { withRunFunding, type RunFunding } from '../services/funding/runFunding';
 
 const mockResolveBilling = resolveBillingUserId as jest.MockedFunction<typeof resolveBillingUserId>;
 const mockMeter = meterUserUsage as jest.MockedFunction<typeof meterUserUsage>;
@@ -403,5 +405,111 @@ describe('call sites pass userId / sessionId / feature to callLLM', () => {
     const ctx = usageContextOf(callLLM);
     expect(ctx).toEqual({ feature: 'platform:eval_rca' });
     expect(ctx).not.toHaveProperty('userId');
+  });
+});
+
+// ENG-1816 F1: same class of bug as ENG-1858 above — these three call sites carried
+// no userId, so their spend booked to "system" and escaped the funding policy on top
+// of the billing gap. Fixed by reading the ambient RunFunding store instead of
+// threading a new parameter through each function's signature. See
+// finding-emma-llm-callsite-scope in the ENG-1816 brain for the original inventory.
+describe('ENG-1816 F1: attribution leaks fixed via the ambient RunFunding store', () => {
+  const MEMBER = 'member-eng1816';
+  let callLLM: jest.SpyInstance;
+
+  function funding(): RunFunding {
+    return {
+      route: 'agentweb',
+      fallback: 'agentweb',
+      ownerUserId: MEMBER,
+      billingUserId: ORG_ROOT,
+      resolvedAt: new Date().toISOString(),
+    };
+  }
+
+  beforeEach(() => {
+    callLLM = jest.spyOn(agentModeService, 'callLLM');
+  });
+
+  it('restyleContent (blog.ts) carries the run owner when called inside a RunFunding scope', async () => {
+    callLLM.mockResolvedValue(llmReply(JSON.stringify({
+      title: 'A Title',
+      description: 'A description',
+      content: 'Some content',
+      imagePrompt: 'A prompt',
+    })));
+
+    await withRunFunding(funding(), () => restyleContent('original research', 'a topic'));
+
+    // billingUserId is deliberately NOT forwarded from RunFunding, even though
+    // funding() sets one: this ctx reaches meterWithResolvedBilling, which only
+    // resolves the org-root billing subject (ENG-1858) when billingUserId is
+    // absent. Forwarding RunFunding's billingUserId here would re-suppress that
+    // resolution for org members — the exact ENG-1217 bug — for a value nothing
+    // else reads yet (round-3 PR review finding).
+    expect(usageContextOf(callLLM)).toEqual({
+      feature: 'content_gen',
+      userId: MEMBER,
+    });
+  });
+
+  it('generateBlogContent (blog.ts) carries the run owner when called inside a RunFunding scope, and never forwards billingUserId', async () => {
+    // Reaches meterWithResolvedBilling via a non-obvious path: generateJSONContent
+    // -> invoke -> invokeGateway -> agentModeService.callLLM. A round-3 review
+    // manually traced this and concluded (incorrectly) that this call site was
+    // exempt from the ENG-1217 billingUserId-forwarding bug because it looked like
+    // a direct meterUserUsage call; round-4 traced the gateway path fully and found
+    // it reaches the exact same sink as restyleContent. This test pins the fix so
+    // that mistake can't silently regress.
+    callLLM.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({
+        title: 'A Title',
+        description: 'A description',
+        content: 'Some content',
+        imagePrompt: 'A prompt',
+      }) } }],
+      usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+    });
+
+    await withRunFunding(funding(), () => generateBlogContent('title draft', 'content draft'));
+
+    expect(usageContextOf(callLLM)).toEqual({
+      feature: 'content_gen',
+      userId: MEMBER,
+    });
+  });
+
+  it('wasStepRemovalUserAuthorized (agentModeService.ts) carries the run owner and never forwards billingUserId', async () => {
+    jest.spyOn(chatbotDb, 'getMostRecentRealUserMessage').mockResolvedValue({
+      content: 'skip that step',
+    } as any);
+    callLLM.mockResolvedValue(llmReply('yes'));
+
+    const authorized = await withRunFunding(funding(), () =>
+      (agentModeService as any).wasStepRemovalUserAuthorized(SESSION, [
+        { fn: 'publish_post', stepTitle: 'Publish' },
+      ]),
+    );
+
+    expect(authorized).toBe(true);
+    expect(usageContextOf(callLLM)).toEqual({
+      feature: 'step_removal_authorization_judge',
+      userId: MEMBER,
+    });
+  });
+
+  it('restyleContent outside any RunFunding scope still books to "system" — the ambient store, not a new required parameter, is what changed', async () => {
+    callLLM.mockResolvedValue(llmReply(JSON.stringify({
+      title: 'A Title',
+      description: 'A description',
+      content: 'Some content',
+      imagePrompt: 'A prompt',
+    })));
+
+    await restyleContent('original research', 'a topic');
+
+    const ctx = usageContextOf(callLLM);
+    expect(ctx.userId).toBeUndefined();
+    expect(ctx.billingUserId).toBeUndefined();
   });
 });
