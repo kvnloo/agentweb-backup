@@ -39,6 +39,9 @@ jest.mock('../services/metaTokenRefresh', () => ({
 }));
 
 import { assessClientHealth, listAllClients, classifyMetaAdConnection } from '../services/clientHealthService';
+import { fetchWithRetryAndPaging as metaFetch } from '../utils/metaApiFetch';
+
+const mockedMetaFetch = jest.mocked(metaFetch);
 
 const { userDb } = require('../services/db');
 const { getAccountsByUserId } = require('../services/connectedAccountsDb');
@@ -154,15 +157,29 @@ describe('Client Health - assessClientHealth', () => {
       { platform: 'meta', config: { account_type: 'ad_account', ad_account_id: '111111', access_token: 'stale', token_expires_at: 1 } },
       { platform: 'meta', config: { account_type: 'ad_account', ad_account_id: '222222', access_token: 'fresh', token_expires_at: Date.now() + 86_400_000 } },
     ]);
-    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
-    (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({ data: [] });
+    mockedMetaFetch.mockResolvedValueOnce({ data: [] });
 
     const result = await assessClientHealth('admin-user', 'client@example.com');
 
     expect(result.health.ads_layer.connection).toBe('connected');
-    expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(expect.stringContaining('act_222222/campaigns'));
-    expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(expect.stringContaining('access_token=fresh'));
+    expect(mockedMetaFetch).toHaveBeenCalledWith(expect.stringContaining('act_222222/campaigns'));
+    expect(mockedMetaFetch).toHaveBeenCalledWith(expect.stringContaining('access_token=fresh'));
     expect(result.health.ads_layer.ad_account_id).toBe('222222');
+  });
+
+  it('reads through the legacy adAccount when the only connected account has expired', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({ userId: 'client-user', email: 'client@example.com', adAccount: '555555' });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      { platform: 'meta', config: { account_type: 'ad_account', ad_account_id: '111111', access_token: 'stale', token_expires_at: 1 } },
+    ]);
+    mockedMetaFetch.mockResolvedValueOnce({ data: [] });
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.health.ads_layer.connection).toBe('connected');
+    expect(mockedMetaFetch).toHaveBeenCalledWith(expect.stringContaining('act_555555/campaigns'));
+    expect(mockedMetaFetch).not.toHaveBeenCalledWith(expect.stringContaining('access_token=stale'));
   });
 
   it('does not report a confirmed zero-campaign status when the campaign read failed (#3070 review)', async () => {
@@ -171,8 +188,7 @@ describe('Client Health - assessClientHealth', () => {
     (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
       { platform: 'meta', config: { account_type: 'ad_account', ad_account_id: '333333', access_token: 'tok' } },
     ]);
-    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
-    (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({ error: { message: 'permission denied' } });
+    mockedMetaFetch.mockResolvedValueOnce({ error: { message: 'permission denied' } });
 
     const result = await assessClientHealth('admin-user', 'client@example.com');
 
@@ -1472,7 +1488,8 @@ describe('Client Health - listAllClients', () => {
 
 describe('Client Health - classifyMetaAdConnection', () => {
   const now = Date.parse('2026-09-25T00:00:00Z');
-  const meta = (config: any) => ({ platform: 'meta', config: { account_type: 'ad_account', ...config } });
+  const meta = (config: { token_expires_at?: number; refresh_token?: string }) =>
+    ({ platform: 'meta', config: { account_type: 'ad_account', ...config } });
 
   it('is never_connected with no Meta ad account and no legacy adAccount', () => {
     expect(classifyMetaAdConnection([], '', now).connection).toBe('never_connected');
@@ -1523,7 +1540,8 @@ describe('Client Health - listAllClients ad_connection', () => {
 
     const result = await listAllClients('admin-user', true);
 
-    const byId = Object.fromEntries(result.clients.map((c: any) => [c.userId, c]));
+    const byId = Object.fromEntries(
+      result.clients.map((c: { userId: string; ad_connection: string; has_ads: boolean }) => [c.userId, c]));
     expect(byId['u-never'].ad_connection).toBe('never_connected');
     expect(byId['u-expired'].ad_connection).toBe('expired');
     expect(byId['u-legacy'].ad_connection).toBe('connected');
