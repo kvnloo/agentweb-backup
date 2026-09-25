@@ -238,6 +238,72 @@ describe('Meta Auth Routes', () => {
             expect(safeAutoResolveCredentialDecision).toHaveBeenCalledWith('Meta Connect Ad Accounts', 'test_user_id', 'meta', 'act_123');
         });
 
+        it('fix: a partial createAccount failure still connects the accounts that succeeded, does not lose them to a blanket 500', async () => {
+            jest.spyOn(jwt, 'verify').mockReturnValue({ userId: 'test_user_id' } as any);
+            (axios.get as jest.Mock).mockResolvedValue({ data: { access_token: 'valid_access_token', expires_in: 3600 } });
+            (metaService.getAdAccounts as jest.Mock).mockResolvedValue([]);
+            (metaService.getPages as jest.Mock).mockResolvedValue([]);
+
+            const finalizeRes = await request(app)
+                .post('/auth/meta/finalize')
+                .send({ code: 'valid_code', state: 'valid_state' });
+            const tokenSessionId = finalizeRes.body.tokenSessionId;
+
+            // First account succeeds, second throws — a real, isolated,
+            // per-item failure, not a global mock failure.
+            (connectedAccountsDb.createAccount as jest.Mock)
+                .mockResolvedValueOnce({ platform: 'meta', account_id: 'act_111' })
+                .mockRejectedValueOnce(new Error('DynamoDB unavailable'));
+
+            const response = await request(app)
+                .post('/auth/meta/connect-ad-accounts')
+                .send({
+                    tokenSessionId,
+                    adAccounts: [
+                        { account_id: 'act_111', name: 'Account One', currency: 'USD', account_status: 1 },
+                        { account_id: 'act_222', name: 'Account Two', currency: 'USD', account_status: 1 },
+                    ],
+                });
+
+            // 200, not 500 — account one's real success must not be hidden
+            // behind account two's failure.
+            expect(response.status).toBe(200);
+            expect(response.body.success).toBe(true);
+            expect(response.body.connectedAccounts).toHaveLength(1);
+            expect(response.body.connectedAccounts[0].account_id).toBe('act_111');
+            expect(response.body.partialFailure).toBe(true);
+            expect(response.body.failed).toEqual([{ account_id: 'act_222', error: 'DynamoDB unavailable' }]);
+            // The succeeding account's auto-resolve attempt must still fire —
+            // it isn't skipped just because a later item in the batch failed.
+            expect(safeAutoResolveCredentialDecision).toHaveBeenCalledWith('Meta Connect Ad Accounts', 'test_user_id', 'meta', 'act_111');
+            expect(safeAutoResolveCredentialDecision).not.toHaveBeenCalledWith('Meta Connect Ad Accounts', 'test_user_id', 'meta', 'act_222');
+        });
+
+        it('fix: when every item fails, the response is the same 500 shape as before this fix (fully backward compatible)', async () => {
+            jest.spyOn(jwt, 'verify').mockReturnValue({ userId: 'test_user_id' } as any);
+            (axios.get as jest.Mock).mockResolvedValue({ data: { access_token: 'valid_access_token', expires_in: 3600 } });
+            (metaService.getAdAccounts as jest.Mock).mockResolvedValue([]);
+            (metaService.getPages as jest.Mock).mockResolvedValue([]);
+
+            const finalizeRes = await request(app)
+                .post('/auth/meta/finalize')
+                .send({ code: 'valid_code', state: 'valid_state' });
+            const tokenSessionId = finalizeRes.body.tokenSessionId;
+
+            (connectedAccountsDb.createAccount as jest.Mock).mockRejectedValue(new Error('DynamoDB unavailable'));
+
+            const response = await request(app)
+                .post('/auth/meta/connect-ad-accounts')
+                .send({
+                    tokenSessionId,
+                    adAccounts: [{ account_id: 'act_111', name: 'Account One', currency: 'USD', account_status: 1 }],
+                });
+
+            expect(response.status).toBe(500);
+            expect(response.body.error).toBe('Failed to connect Meta ad accounts');
+            expect(response.body.success).toBeUndefined();
+        });
+
         it('should reject request without token session ID', async () => {
             const response = await request(app)
                 .post('/auth/meta/connect-ad-accounts')

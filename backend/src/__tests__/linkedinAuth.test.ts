@@ -32,7 +32,7 @@ jest.mock('../config/integrations', () => ({
   // ENG-1644 gap-closing: /connect-accounts now dynamically imports
   // approvalInboxCustomerNotify.ts, whose transitive chain includes
   // linkedInAdsService.ts, which reads this at module-load time. Without
-  // it, autoResolveCredentialDecisionOnReconnect fails silently every call
+  // it, safeAutoResolveCredentialDecision fails silently every call
   // (caught by its own try/catch) — real coverage requires this to resolve.
   INTEGRATION_CONFIG: {
     linkedinAds: {
@@ -41,10 +41,13 @@ jest.mock('../config/integrations', () => ({
   },
 }));
 
-// ENG-1644 gap-closing: mocked so tests assert on it directly rather than
-// relying on its own real, silent error-swallowing.
+// ENG-1644 gap-closing (review fix): mocks the shared
+// safeAutoResolveCredentialDecision wrapper — the route now calls this, not
+// the raw autoResolveCredentialDecisionOnReconnect directly (consolidated
+// out of 3 near-identical per-file copies). Mocked so tests assert on it
+// directly rather than relying on its own real, silent error-swallowing.
 jest.mock('../services/approvalInboxCustomerNotify', () => ({
-  autoResolveCredentialDecisionOnReconnect: jest.fn().mockResolvedValue(undefined),
+  safeAutoResolveCredentialDecision: jest.fn().mockResolvedValue(undefined),
 }));
 
 // Mock axios
