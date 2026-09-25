@@ -500,6 +500,16 @@ describe('scheduledRunSignalsConditionalSkip', () => {
   //     so explicitly). Calling one is not evidence the other's requirement
   //     was also satisfied. Not aliased; logged here so it isn't silently
   //     missed.
+  //   - stage_pending_decision -> ask_user_question / present_question_deck:
+  //     stage_pending_decision's own description says to use it "instead of
+  //     ask_user_question/present_question_deck when the answer genuinely
+  //     belongs to someone OTHER than the person you're talking to right
+  //     now" — a durable, named-approver decision routed to Slack (or a
+  //     customer email), answered possibly days later, not a blocking
+  //     in-session halt. Different AUDIENCE and different timing, not the
+  //     same requirement — calling one is not evidence the other's
+  //     requirement was also satisfied. Not aliased; logged here so it
+  //     isn't silently missed.
   it('redirect audit: pins every "use/prefer tool X instead" cross-reference between two registered tools (ENG-1276 follow-up #3)', () => {
     const allTools = emmaToolRegistry.getAllTools();
     const allNames = allTools.map((t) => t.name);
@@ -551,6 +561,8 @@ describe('scheduledRunSignalsConditionalSkip', () => {
         'remove_image_background -> update_html_file',
         'search_leads -> ask_crm',
         'send_email_from_sender -> email',
+        'stage_pending_decision -> ask_user_question',
+        'stage_pending_decision -> present_question_deck',
         'twitter_manage_post -> post_on_connected_account',
         'update_book_content -> generate_book_content',
       ].sort()
