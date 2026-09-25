@@ -4,7 +4,8 @@ import express from 'express';
 jest.mock('../middleware/auth', () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
     req.user = {
-      userId: 'user-1',
+      // x-no-user-id simulates a token without a userId (e.g. a service token).
+      userId: req.headers['x-no-user-id'] === '1' ? undefined : 'user-1',
       email: 'test@example.com',
       isAdmin: req.headers['x-admin'] === '1',
     };
@@ -273,6 +274,12 @@ describe('GET /api/human-eval/candidates/:candidateId (ENG-2154)', () => {
     mockGetCandidate.mockResolvedValue({ candidateId: 'candidate-9' });
     expect((await request(app).get('/api/human-eval/candidates/candidate-9')).status).toBe(404);
     expect((await request(app).get('/api/human-eval/candidates/candidate-9').set('x-admin', '1')).status).toBe(200);
+  });
+
+  it('does not treat a missing caller id and a missing owner as a match (#3080 review)', async () => {
+    mockGetCandidate.mockResolvedValue({ candidateId: 'candidate-9' });
+    const res = await request(app).get('/api/human-eval/candidates/candidate-9').set('x-no-user-id', '1');
+    expect(res.status).toBe(404);
   });
 
   it('answers 404 for an unknown id', async () => {
