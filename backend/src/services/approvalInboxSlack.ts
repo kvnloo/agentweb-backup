@@ -64,6 +64,10 @@ function decisionItemBlocks(decision: ApprovalDecision): any[] {
   if (decision.evidencePacket?.chatUrl) links.unshift(decision.evidencePacket.chatUrl);
 
   const summaryLines = [
+    // ENG-2159: rendered as its own distinct, always-present line — a real
+    // account got mistakenly rejected because the account it concerned was
+    // buried in businessImpact prose (or absent) rather than shown plainly.
+    `:office: *${decision.subjectLabel}*`,
     `*${decision.businessImpact}*`,
     decision.evidencePacket?.researchSummary,
     links.length > 0 ? links.map((l) => `<${l}|link>`).join(' · ') : undefined,
