@@ -1,12 +1,17 @@
 import { REPLAY_FIXTURES, checkAllReplayFixtures } from '../loops/eval/agentModeReplayFixtures';
-import { extractReplayTurns, loadReplayFixtures, type ReplayMessage } from '../loops/eval/agentModeReplayFixtureSource';
+import type AWS from 'aws-sdk';
+import { chatMessagesFetcher, extractReplayTurns, loadReplayFixtures, type ReplayMessage } from '../loops/eval/agentModeReplayFixtureSource';
 import { newGoldenCase } from '../loops/eval/goldenSet';
 import { createGoldenSetStore, type GoldenSetStore } from '../loops/eval/goldenSetStore';
 
 const NOW = new Date('2026-09-25T00:00:00.000Z');
 
 function storeWith(links: Record<string, { sessionId: string; messageIndex: number }>): GoldenSetStore {
-  const cases = Object.entries(links).map(([fixtureId, l]) =>
+  return storeWithLinks(Object.entries(links));
+}
+
+function storeWithLinks(links: Array<[string, { sessionId: string; messageIndex: number }]>): GoldenSetStore {
+  const cases = links.map(([fixtureId, l]) =>
     newGoldenCase({ surface: 'agent', taskType: 'replay_fixture', sourceId: l.sessionId, seedSource: `replay_fixture:${fixtureId}`, now: NOW, replay: { fixtureId, messageIndex: l.messageIndex } }),
   );
   return {
@@ -81,5 +86,56 @@ describe('replay fixture content source (ENG-2135)', () => {
         expect.stringMatching(/length-limit-ignored-1: no golden case links this fixture/),
       ]),
     );
+  });
+
+  it('keeps the placeholder when two cases link the same fixture instead of silently picking one', async () => {
+    const fetchMessages = jest.fn(async () => MESSAGES);
+    const out = await loadReplayFixtures({
+      store: storeWithLinks([
+        ['yesno-terse-1', { sessionId: 's1', messageIndex: 15 }],
+        ['yesno-terse-1', { sessionId: 's2', messageIndex: 15 }],
+      ]),
+      fetchMessages,
+    });
+    expect(out.fixtures).toEqual(REPLAY_FIXTURES);
+    expect(out.notes).toEqual(expect.arrayContaining([expect.stringMatching(/yesno-terse-1: linked by 2 golden cases/)]));
+    expect(fetchMessages).not.toHaveBeenCalled();
+  });
+
+  it('reads text parts of structured content and rejects a turn whose content has no text', () => {
+    const structured: ReplayMessage[] = [
+      { messageIndex: 1, role: 'user', content: [{ type: 'text', text: 'Is it ' }, { type: 'image_url', image_url: {} }, { type: 'text', text: 'on?' }] },
+      { messageIndex: 2, role: 'assistant', content: [{ type: 'text', text: 'Yes.' }] },
+    ];
+    expect(extractReplayTurns(structured, 1)).toEqual([
+      { role: 'user', content: 'Is it on?' },
+      { role: 'assistant', content: 'Yes.' },
+    ]);
+    const imageOnlyPrompt: ReplayMessage[] = [
+      { messageIndex: 1, role: 'user', content: [{ type: 'image_url', image_url: {} }] },
+      { messageIndex: 2, role: 'assistant', content: 'Yes.' },
+    ];
+    expect(extractReplayTurns(imageOnlyPrompt, 1)).toBeNull();
+    const unreadableReply: ReplayMessage[] = [
+      { messageIndex: 1, role: 'user', content: 'Is it on?' },
+      { messageIndex: 2, role: 'assistant', content: { unexpected: true } },
+      { messageIndex: 3, role: 'assistant', content: 'Yes.' },
+    ];
+    expect(extractReplayTurns(unreadableReply, 1)).toBeNull();
+  });
+
+  it('passes structured content from AW-ChatMessages through to extraction instead of blanking it', async () => {
+    const query = jest.fn(() => ({
+      promise: async () => ({
+        Items: [
+          { messageIndex: 1, message: { role: 'user', content: [{ type: 'text', text: 'q' }] } },
+          { messageIndex: 2, message: { role: 'assistant', content: 'a' } },
+        ],
+      }),
+    }));
+    const fetch = chatMessagesFetcher({ query } as unknown as AWS.DynamoDB.DocumentClient);
+    const messages = await fetch('s1', 1);
+    expect(messages[0].content).toEqual([{ type: 'text', text: 'q' }]);
+    expect(extractReplayTurns(messages, 1)).toEqual([{ role: 'user', content: 'q' }, { role: 'assistant', content: 'a' }]);
   });
 });
