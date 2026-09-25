@@ -99,6 +99,24 @@ describe('AgentModeService - generate_image function', () => {
       expect(enqueueAutoHumanEvalSpy).toHaveBeenCalledWith(expect.objectContaining({ creativeGates: gates }));
     });
 
+    it('gives the rubric judge the generation request as the creative brief (ENG-2140)', async () => {
+      mockImageService.generateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/demo-ad.png',
+        filename: 'demo-ad.png',
+      });
+      const service = agentModeService as unknown as {
+        generateImage(...args: unknown[]): Promise<{ success: boolean }>;
+      };
+
+      await service.generateImage('Demo ad for Acme, CTA Book a demo', 'demo-ad.png', '1080x1350', 'medium', [], 'user123', 'session123', 'gemini-3-pro-image-preview', undefined, undefined, 'ad');
+
+      expect(enqueueAutoHumanEvalSpy).toHaveBeenCalledWith(expect.objectContaining({
+        category: 'ad',
+        creativeBrief: { generationRequest: 'Demo ad for Acme, CTA Book a demo' },
+      }));
+    });
+
     it('should pass size parameter as-is without modification', async () => {
       mockImageService.generateImage.mockResolvedValue({
         success: true,
