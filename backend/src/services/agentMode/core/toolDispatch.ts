@@ -530,6 +530,20 @@ function getInputImages(toolCallArgs: any): string[] {
  * ENG-936: ensure a revision-style image edit binds to an explicitly approved
  * source URL before execution. A false pass here means `confirm=true` was issued
  * for the wrong source and must be stopped before gateway execution.
+ *
+ * ENG-2166 fix: this gate exists to validate an EDIT's source, not to gate
+ * `generate_image` in general. `approvedRevisionImageSources` is fixed for an
+ * entire run (e.g. revisionService.ts's Slack-driven "revise this asset" flow
+ * sets it once for the whole bounded runVerifiedChat call). Previously, once
+ * that list was non-empty, EVERY generate_image call for the rest of the run
+ * was forced through this check — including plain text-to-image calls that
+ * never set inputImages at all and were never attempting an edit. A real
+ * customer session hit this: Emma made one approved, confirmed edit, then
+ * every subsequent unrelated text-to-image call in the same run failed with
+ * "Expected one of: [the one approved URL]. Received none." — permanently
+ * blocking all new generations for the rest of the session. A call with no
+ * inputImages isn't a revision at all, so this gate must not apply to it
+ * regardless of whether an approved-sources list happens to be active.
  */
 function isApprovedImageSourceForRevision(
   args: any,
@@ -541,12 +555,8 @@ function isApprovedImageSourceForRevision(
 
   const inputImages = getInputImages(args);
   if (!Array.isArray(inputImages) || inputImages.length === 0) {
-    return {
-      approved: false,
-      errorMessage:
-        `generate_image confirmation requires explicit approved source inputImages. ` +
-        `Expected one of: ${approvedSources.join(', ')}. Received none.`,
-    };
+    // Not an edit — a plain generation never needs an approved source.
+    return { approved: true };
   }
 
   const mismatch = inputImages.find((url) => !approvedSources.includes(url));
