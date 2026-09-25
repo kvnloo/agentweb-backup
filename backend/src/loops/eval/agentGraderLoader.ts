@@ -308,25 +308,52 @@ export interface LoadOptions {
 
 const MAX_EVENT_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
 
+/** AW-ChatSessions attributes the graders and the online sampler read (no message text). */
+export const SESSION_PROJECTION = 'sessionId, userId, createdAt, updatedAt, workPlan, portalType, sessionType';
+
 /**
- * Load every session updated in [from, to] with its messages, loop events and spend. Loop events
- * are read from the earliest loaded session's createdAt (at most 14 days before `from`) so a
- * session that started before the window keeps its early runs.
+ * Every session whose `updatedAt` is in [from, to], via the time-ordered AdminUpdatedAtIndex
+ * (a query, never a scan). Items carry SESSION_PROJECTION only.
  */
-export async function loadSessionsForGrading(
+export async function listSessionsUpdatedBetween(
   reader: ReadOnlyDocReader,
-  tables: GraderTables,
-  options: LoadOptions,
-): Promise<LoadedSession[]> {
-  let sessionItems = await readAll(reader, 'query', {
-    TableName: tables.sessions,
+  sessionsTable: string,
+  window: { from: string; to: string },
+): Promise<DocItem[]> {
+  return readAll(reader, 'query', {
+    TableName: sessionsTable,
     IndexName: 'AdminUpdatedAtIndex',
     KeyConditionExpression: 'adminListPartition = :p AND updatedAt BETWEEN :from AND :to',
-    ProjectionExpression: 'sessionId, createdAt, updatedAt, workPlan',
-    ExpressionAttributeValues: { ':p': 'all', ':from': options.from, ':to': options.to },
+    ProjectionExpression: SESSION_PROJECTION,
+    ExpressionAttributeValues: { ':p': 'all', ':from': window.from, ':to': window.to },
   });
-  sessionItems.sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')));
-  if (options.limit != null) sessionItems = sessionItems.slice(0, options.limit);
+}
+
+export interface LoadItemsOptions {
+  /** ISO lower bound of the window the sessions were picked from. */
+  from: string;
+  /** ISO upper bound of that window. */
+  to: string;
+  /** Parallel AW-ChatMessages queries. */
+  concurrency?: number;
+  /**
+   * Read AW-SpendEvents for cost per success. That table has no session index, so this is a
+   * scan; the online sampler leaves it off.
+   */
+  includeSpend: boolean;
+}
+
+/**
+ * Load the given AW-ChatSessions items with their messages, loop events and (optionally) spend.
+ * Loop events are read from the earliest session's createdAt (at most 14 days before `from`) so
+ * a session that started before the window keeps its early runs.
+ */
+export async function loadSessionItems(
+  reader: ReadOnlyDocReader,
+  tables: GraderTables,
+  sessionItems: readonly DocItem[],
+  options: LoadItemsOptions,
+): Promise<LoadedSession[]> {
   if (sessionItems.length === 0) return [];
 
   const floor = new Date(Date.parse(options.from) - MAX_EVENT_LOOKBACK_MS).toISOString();
@@ -341,13 +368,15 @@ export async function loadSessionsForGrading(
       KeyConditionExpression: 'loopId = :l AND tsSession BETWEEN :from AND :to',
       ExpressionAttributeValues: { ':l': 'agent-mode', ':from': eventsFrom, ':to': `${options.to}￿` },
     }),
-    readAll(reader, 'scan', {
-      TableName: tables.spendEvents,
-      FilterExpression: 'occurredAt BETWEEN :from AND :to AND attribute_exists(#refs.sessionId)',
-      ProjectionExpression: '#refs, costMicroUsd, quantity, #unit, operation, lifecycle',
-      ExpressionAttributeNames: { '#refs': 'references', '#unit': 'unit' },
-      ExpressionAttributeValues: { ':from': eventsFrom, ':to': `${options.to}￿` },
-    }),
+    options.includeSpend
+      ? readAll(reader, 'scan', {
+        TableName: tables.spendEvents,
+        FilterExpression: 'occurredAt BETWEEN :from AND :to AND attribute_exists(#refs.sessionId)',
+        ProjectionExpression: '#refs, costMicroUsd, quantity, #unit, operation, lifecycle',
+        ExpressionAttributeNames: { '#refs': 'references', '#unit': 'unit' },
+        ExpressionAttributeValues: { ':from': eventsFrom, ':to': `${options.to}￿` },
+      })
+      : Promise.resolve([]),
   ]);
   const events = groupEventsBySession(eventRows);
   const spend = spendBySession(spendRows);
@@ -360,5 +389,33 @@ export async function loadSessionsForGrading(
       ExpressionAttributeValues: { ':s': sessionId },
     });
     return buildLoadedSession(item, messageRows, events.get(sessionId) ?? [], spend.get(sessionId));
+  });
+}
+
+export interface LoadOptions {
+  /** ISO lower bound on the session's updatedAt. */
+  from: string;
+  /** ISO upper bound on the session's updatedAt. */
+  to: string;
+  /** Grade at most this many sessions (most recently updated first). */
+  limit?: number;
+  /** Parallel AW-ChatMessages queries. */
+  concurrency?: number;
+}
+
+/** Load every session updated in [from, to] with its messages, loop events and spend. */
+export async function loadSessionsForGrading(
+  reader: ReadOnlyDocReader,
+  tables: GraderTables,
+  options: LoadOptions,
+): Promise<LoadedSession[]> {
+  let sessionItems = await listSessionsUpdatedBetween(reader, tables.sessions, options);
+  sessionItems.sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')));
+  if (options.limit != null) sessionItems = sessionItems.slice(0, options.limit);
+  return loadSessionItems(reader, tables, sessionItems, {
+    from: options.from,
+    to: options.to,
+    concurrency: options.concurrency,
+    includeSpend: true,
   });
 }
