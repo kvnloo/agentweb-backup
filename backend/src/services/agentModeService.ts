@@ -533,7 +533,7 @@ import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import type { LeadImportRowOutcome } from '../utils/leadSchema';
-import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution } from '../utils/leadSchema';
+import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor } from '../utils/leadSchema';
 
 type MetaApiResult = {
   success: boolean;
@@ -14561,20 +14561,12 @@ export class AgentModeService {
         return { success: false, message: 'Access denied', error: 'You do not have permission to view this list' };
       }
 
-      const defaultStatuses = [
-        { value: 'new', label: 'New', color: 'gray', type: 'active' },
-        { value: 'contacted', label: 'Contacted', color: 'blue', type: 'active' },
-        { value: 'qualified', label: 'Qualified', color: 'indigo', type: 'active' },
-        { value: 'proposal_sent', label: 'Proposal Sent', color: 'purple', type: 'active' },
-        { value: 'negotiating', label: 'Negotiating', color: 'yellow', type: 'active' },
-        { value: 'won', label: 'Won', color: 'green', type: 'won' },
-        { value: 'lost', label: 'Lost', color: 'red', type: 'lost' },
-        { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
-      ];
-
       return {
         success: true,
-        statuses: list.statusConfig || defaultStatuses,
+        // Was a second copy of createLeadList's literal. Shared now, so a list created
+        // before statusConfig was persisted reads back the same vocabulary a list created
+        // today stores — and it honours listType, which the local copy did not.
+        statuses: list.statusConfig || defaultStatusConfigFor((list as any)?.listType),
         listName: list.name,
       };
     } catch (error) {
@@ -15371,7 +15363,9 @@ export class AgentModeService {
           success: false,
           skipped: true,
           reason: 'no_contact_channel',
-          message: 'No email address',
+          // The guard widened to email-or-linkedin; the message did not follow it, so a
+          // LinkedIn-less, email-less lead reported a problem it only half had.
+          message: 'No contact channel',
           error: 'This lead has neither an email address nor a LinkedIn profile — there is nothing to draft.'
         };
       }

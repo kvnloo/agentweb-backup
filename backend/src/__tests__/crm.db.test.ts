@@ -52,6 +52,7 @@ jest.mock('../services/contactEventsDb', () => ({
 
 import { crmDb, userDb } from '../services/db';
 import AWS from 'aws-sdk';
+import { LEAD_LIFECYCLES } from '../utils/leadSchema';
 
 describe('CRM Database Service', () => {
   beforeEach(() => {
@@ -1014,16 +1015,102 @@ describe('CRM Database Service', () => {
       const call = mockDocumentClientMethods.update.mock.calls[0][0];
       expect(call.UpdateExpression).not.toContain('derivedDomain');
       expect(call.UpdateExpression).not.toContain('derivedLifecycle');
-      expect(call.ExpressionAttributeValues[':tl_domain']).toBe('override.com');
-      expect(call.ExpressionAttributeValues[':tl_lifecycle']).toBe('paying');
-      // And the caller-supplied key must be ESCAPED too. The previous version of this test
+      // And the caller-supplied key must be ESCAPED on BOTH halves. An earlier version
       // asserted only the value, which certified a bare `domain = :tl_domain` — a
       // ValidationException against a real table — as the desired behaviour.
       const domainRef = Object.entries(call.ExpressionAttributeNames as Record<string, string>)
         .find(([, v]) => v === 'domain')?.[0];
       expect(domainRef).toBeDefined();
-      expect(call.UpdateExpression).toContain(`${domainRef} = :tl_domain`);
+      const domainValueRef = String(call.UpdateExpression).match(
+        new RegExp(`${domainRef} = (:\\w+)`),
+      )?.[1];
+      expect(domainValueRef).toBeDefined();
+      expect(call.ExpressionAttributeValues[domainValueRef!]).toBe('override.com');
       expect(call.UpdateExpression).not.toMatch(/(^|[^#\w])domain = /);
+
+      const lifecycleRef = Object.entries(call.ExpressionAttributeNames as Record<string, string>)
+        .find(([, v]) => v === 'lifecycle')?.[0];
+      const lifecycleValueRef = String(call.UpdateExpression).match(
+        new RegExp(`${lifecycleRef} = (:\\w+)`),
+      )?.[1];
+      expect(call.ExpressionAttributeValues[lifecycleValueRef!]).toBe('paying');
+      mergeSpy.mockRestore();
+    });
+
+    // `lifecycle` was unwritable through updateLead until an explicit handler was added
+    // for it, so nothing on this path had to validate it. It outranks the live
+    // computation in askCrmService permanently (`lead.lifecycle ?? computeLifecycle(...)`),
+    // which makes an unvalidated write a one-way door.
+    it('refuses an unknown lifecycle rather than storing it permanently', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+      });
+
+      await expect(
+        crmDb.updateLead('list_123', 'lead_123', { lifecycle: 'super_duper_customer' } as any),
+      ).rejects.toThrow(/Invalid lead lifecycle/);
+      expect(mockDocumentClientMethods.update).not.toHaveBeenCalled();
+    });
+
+    it('accepts every value the lead vocabulary actually defines', async () => {
+      for (const stage of LEAD_LIFECYCLES) {
+        mockDocumentClientMethods.update.mockReset();
+        mockDocumentClientMethods.update.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+        });
+        await crmDb.updateLead('list_123', 'lead_123', { lifecycle: stage } as any);
+        const call = mockDocumentClientMethods.update.mock.calls[0][0];
+        expect(call.ExpressionAttributeValues[':lifecycleAttr']).toBe(stage);
+        expect(call.ExpressionAttributeNames['#lifecycleAttr']).toBe('lifecycle');
+      }
+    });
+
+    // Symmetry with `domain`, which REMOVEs on empty. Clearing is the only route back to
+    // the computed value; the first version of the handler hit no branch at all for an
+    // empty string — neither written nor cleared, and silent about it.
+    it('CLEARS lifecycle on an empty value instead of silently ignoring it', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+      });
+
+      await crmDb.updateLead('list_123', 'lead_123', { lifecycle: '' } as any);
+
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.ExpressionAttributeNames['#lifecycleAttr']).toBe('lifecycle');
+      expect(call.UpdateExpression).toMatch(/REMOVE[\s\S]*#lifecycleAttr/);
+      expect(call.ExpressionAttributeValues[':lifecycleAttr']).toBeUndefined();
+    });
+
+    // The name placeholder was indexed before the value one was. A key with a character
+    // DynamoDB disallows in a placeholder (`-`, `.`, space) therefore still produced a
+    // syntax ValidationException from the value half — invisible here until asserted,
+    // because the mocked client never parses the expression. Both halves are generated
+    // now, so no key can reach the wire verbatim.
+    it('generates BOTH placeholders for a topLevel key DynamoDB would reject verbatim', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+      const mergeSpy = jest.spyOn(crmDb, 'mergeFieldNames').mockResolvedValue();
+
+      await crmDb.setLeadFields('list_123', 'lead_123', {
+        topLevel: { 'lead-source.v2 tag': 'webinar' },
+      });
+
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      // Neither the raw key nor a `:tl_<key>` derived from it may appear anywhere.
+      expect(call.UpdateExpression).not.toContain('lead-source.v2 tag');
+      expect(Object.keys(call.ExpressionAttributeValues)).not.toContain(':tl_lead-source.v2 tag');
+      // Every placeholder DynamoDB sees must match its own grammar.
+      for (const ref of Object.keys(call.ExpressionAttributeValues)) {
+        expect(ref).toMatch(/^:[A-Za-z0-9_]+$/);
+      }
+      for (const ref of Object.keys(call.ExpressionAttributeNames ?? {})) {
+        expect(ref).toMatch(/^#[A-Za-z0-9_]+$/);
+      }
+      // And the value still lands, routed through the generated pair.
+      const nameRef = Object.entries(call.ExpressionAttributeNames as Record<string, string>)
+        .find(([, v]) => v === 'lead-source.v2 tag')?.[0];
+      expect(nameRef).toBeDefined();
+      const valueRef = String(call.UpdateExpression).match(new RegExp(`${nameRef} = (:\\w+)`))?.[1];
+      expect(call.ExpressionAttributeValues[valueRef!]).toBe('webinar');
       mergeSpy.mockRestore();
     });
 
@@ -1094,7 +1181,8 @@ describe('CRM Database Service', () => {
       // because DynamoDB has ~570 reserved words and a bare one throws only against a
       // real table.
       expect(second.ExpressionAttributeNames['#tl0']).toBe('email');
-      expect(second.UpdateExpression).toContain('#tl0 = if_not_exists(#tl0, :tl_email)');
+      expect(second.UpdateExpression).toContain('#tl0 = if_not_exists(#tl0, :tl0)');
+      expect(second.ExpressionAttributeValues[':tl0']).toBe('a@b.com');
       expect(second.UpdateExpression).toContain(
         'enrichmentMetadata.#em0 = if_not_exists(enrichmentMetadata.#em0, :em0)',
       );

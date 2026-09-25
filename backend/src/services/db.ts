@@ -8,7 +8,7 @@ import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
 import { parsePendingKinds } from '../utils/metaConversionPending';
-import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, extractDomainFromEmail, LeadImportRowOutcome } from "../utils/leadSchema";
+import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, extractDomainFromEmail, defaultStatusConfigFor, isValidLeadLifecycle, LeadImportRowOutcome } from "../utils/leadSchema";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
@@ -5364,21 +5364,7 @@ export const crmDb = {
           autoDraftInstruction: typeof autoDraftInstruction === 'string' ? autoDraftInstruction.trim() : '',
           autoSendEnabled: autoSendEnabled === true, // Default: auto send disabled
           engagedOnly: false,
-          statusConfig: statusConfig || (listType === 'customers' ? [
-            { value: 'onboarding', label: 'Onboarding', color: 'blue', type: 'active' },
-            { value: 'active', label: 'Active', color: 'green', type: 'active' },
-            { value: 'at_risk', label: 'At Risk', color: 'yellow', type: 'active' },
-            { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
-          ] : [
-            { value: 'new', label: 'New', color: 'gray', type: 'active' },
-            { value: 'contacted', label: 'Contacted', color: 'blue', type: 'active' },
-            { value: 'qualified', label: 'Qualified', color: 'indigo', type: 'active' },
-            { value: 'proposal_sent', label: 'Proposal Sent', color: 'purple', type: 'active' },
-            { value: 'negotiating', label: 'Negotiating', color: 'yellow', type: 'active' },
-            { value: 'won', label: 'Won', color: 'green', type: 'won' },
-            { value: 'lost', label: 'Lost', color: 'red', type: 'lost' },
-            { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
-          ]),
+          statusConfig: statusConfig || defaultStatusConfigFor(listType),
           ...(listType ? { listType } : {}),
           ...(isSystemManaged ? { isSystemManaged: true } : {}),
         },
@@ -7610,9 +7596,24 @@ export const crmDb = {
       if ((updates as any).lifecycle !== undefined) {
         const lifecycleValue = String((updates as any).lifecycle ?? '').trim();
         if (lifecycleValue) {
+          // Membership is checked HERE, not only at the route. createLead validates via
+          // buildLeadCrmFields and throws; before this handler existed a `lifecycle` key
+          // on an update was silently dropped, so nothing had to validate it. Now that it
+          // is written, an arbitrary string would become permanent for the lead —
+          // askCrmService reads `lead.lifecycle ?? computeLifecycle(...)`, so a stored
+          // junk value outranks the live computation forever.
+          if (!isValidLeadLifecycle(lifecycleValue)) {
+            throw new Error(`Invalid lead lifecycle: ${lifecycleValue}`);
+          }
           expressionAttributeNames['#lifecycleAttr'] = 'lifecycle';
           setExpressions.push('#lifecycleAttr = :lifecycleAttr');
           expressionAttributeValues[':lifecycleAttr'] = lifecycleValue;
+        } else {
+          // Symmetry with `domain` directly above, which REMOVEs on empty. Clearing the
+          // attribute is the only way back to the computed value, and the previous
+          // version hit no branch at all: neither written nor cleared, silently.
+          expressionAttributeNames['#lifecycleAttr'] = 'lifecycle';
+          removeExpressions.push('#lifecycleAttr');
         }
       }
 
@@ -9934,13 +9935,20 @@ export const crmDb = {
     // and never validate expression syntax. That already shipped once from this file. An
     // allowlist of "the reserved ones we remembered" is the same bug waiting; escaping
     // unconditionally is the only version that cannot rot as callers add fields.
+    // The VALUE placeholder is generated too, not just the name. DynamoDB restricts a
+    // placeholder to [A-Za-z0-9_] after the colon, so the previous `:tl_${k}` produced a
+    // syntax ValidationException for any key carrying a `-`, `.` or space — the same class
+    // of failure, out of the same loop, that escaping the name was added to stop. No
+    // current caller passes such a key; indexing both halves means none ever can.
     let tlIdx = 0;
     for (const [k, v] of Object.entries(options.topLevel ?? {})) {
-      const nameRef = `#tl${tlIdx++}`;
+      const i = tlIdx++;
+      const nameRef = `#tl${i}`;
+      const valueRef = `:tl${i}`;
       attrNames[nameRef] = k;
-      attrValues[`:tl_${k}`] = v;
+      attrValues[valueRef] = v;
       setClauses.push(
-        ine ? `${nameRef} = if_not_exists(${nameRef}, :tl_${k})` : `${nameRef} = :tl_${k}`,
+        ine ? `${nameRef} = if_not_exists(${nameRef}, ${valueRef})` : `${nameRef} = ${valueRef}`,
       );
     }
 

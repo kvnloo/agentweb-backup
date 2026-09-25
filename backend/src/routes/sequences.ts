@@ -20,6 +20,7 @@ import { sendAsSender } from '../services/sendAsSender';
 import axios from 'axios';
 import { extractVariables, leadHasVariable, isSupportedVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
+import { LEAD_LIFECYCLES, defaultStatusConfigFor } from '../utils/leadSchema';
 
 /**
  * ENG-2127: the by-list enrol accepts a `lifecycle` filter and hands it to
@@ -34,9 +35,7 @@ import { LLMService } from '../utils/llmService';
  * or dropping the control) and is tracked on ENG-2127. Until then this at least refuses to
  * fail silently.
  */
-const LIFECYCLE_STAGES = new Set([
-  'unknown', 'inbox', 'signed_up', 'in_deal', 'trialing', 'paying', 'at_risk', 'churned',
-]);
+const LIFECYCLE_STAGES: ReadonlySet<string> = new Set<string>(LEAD_LIFECYCLES);
 
 const router = express.Router();
 
@@ -250,8 +249,16 @@ router.post(
         // the first version of this guard answered a perfectly valid `status: churned`
         // filter that happened to match nothing with a 400 telling the caller to "filter by
         // a lead status instead", which is exactly what they had done.
+        // A list with no stored statusConfig does not have NO statuses — it falls back to
+        // the default set, which contains `churned` (and `at_risk` for a customers list).
+        // Reading absent as empty put the original 400 straight back for every list
+        // created before createLeadList started persisting a default.
+        const storedStatusConfig = (list as any)?.statusConfig;
+        const effectiveStatusConfig = Array.isArray(storedStatusConfig) && storedStatusConfig.length > 0
+          ? storedStatusConfig
+          : defaultStatusConfigFor((list as any)?.listType);
         const listStatuses = new Set(
-          ((list as any)?.statusConfig || []).map((s: any) => String(s?.value)),
+          effectiveStatusConfig.map((s: any) => String(s?.value)),
         );
         if (leads.length === 0 && LIFECYCLE_STAGES.has(String(lifecycle)) && !listStatuses.has(String(lifecycle))) {
           console.error(

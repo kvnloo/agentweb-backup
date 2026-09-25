@@ -116,6 +116,55 @@ export const LEAD_LIFECYCLES = [
 ] as const;
 export type LeadLifecycle = (typeof LEAD_LIFECYCLES)[number];
 
+/**
+ * The default `statusConfig` a lead list falls back to when it has none stored.
+ *
+ * This literal previously existed twice — `createLeadList` (which persists it) and
+ * `getLeadListStatuses` (which substitutes it on read). A third consumer appeared in
+ * sequences.ts, where treating "no statusConfig" as "no statuses" made a filter on the
+ * perfectly real status `churned` answer 400. Three copies of a vocabulary is how the
+ * copies drift, so it lives here with the rest of the lead vocabulary instead.
+ *
+ * `at_risk` and `churned` are deliberately BOTH lead statuses and lifecycle stages; any
+ * code deciding "is this value a lifecycle stage?" has to check the list's statuses too.
+ */
+export interface LeadStatusConfigEntry {
+  value: string;
+  label: string;
+  color: string;
+  type: string;
+}
+
+const DEFAULT_PROSPECT_STATUS_CONFIG: readonly LeadStatusConfigEntry[] = [
+  { value: 'new', label: 'New', color: 'gray', type: 'active' },
+  { value: 'contacted', label: 'Contacted', color: 'blue', type: 'active' },
+  { value: 'qualified', label: 'Qualified', color: 'indigo', type: 'active' },
+  { value: 'proposal_sent', label: 'Proposal Sent', color: 'purple', type: 'active' },
+  { value: 'negotiating', label: 'Negotiating', color: 'yellow', type: 'active' },
+  { value: 'won', label: 'Won', color: 'green', type: 'won' },
+  { value: 'lost', label: 'Lost', color: 'red', type: 'lost' },
+  { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
+];
+
+const DEFAULT_CUSTOMER_STATUS_CONFIG: readonly LeadStatusConfigEntry[] = [
+  { value: 'onboarding', label: 'Onboarding', color: 'blue', type: 'active' },
+  { value: 'active', label: 'Active', color: 'green', type: 'active' },
+  { value: 'at_risk', label: 'At Risk', color: 'yellow', type: 'active' },
+  { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
+];
+
+/**
+ * A FRESH array of fresh objects every call — one of the two consumers writes the result
+ * straight into DynamoDB and the other hands it to a caller, so a shared reference here
+ * would be a mutation waiting to happen.
+ */
+export function defaultStatusConfigFor(listType?: string | null): LeadStatusConfigEntry[] {
+  const source = listType === 'customers'
+    ? DEFAULT_CUSTOMER_STATUS_CONFIG
+    : DEFAULT_PROSPECT_STATUS_CONFIG;
+  return source.map((s) => ({ ...s }));
+}
+
 export const LEAD_ROLES = [
   'KDM',
   'Champion',
@@ -163,6 +212,15 @@ export interface LeadCrmExtensions {
 
 const VALID_PRIORITIES: ReadonlySet<string> = new Set<LeadPriority>(['Low', 'Medium', 'High']);
 const VALID_LIFECYCLES: ReadonlySet<string> = new Set(LEAD_LIFECYCLES);
+
+/**
+ * `lifecycle` short-circuits the live computation in askCrmService (`lead.lifecycle ??
+ * computeLifecycle(...)`), so a stored value is permanent for that lead. Anything that
+ * can write the attribute has to check membership first, not just this file.
+ */
+export function isValidLeadLifecycle(value: unknown): boolean {
+  return typeof value === 'string' && VALID_LIFECYCLES.has(value);
+}
 const VALID_ROLES: ReadonlySet<string> = new Set(LEAD_ROLES);
 
 /**
@@ -283,7 +341,8 @@ export function validateLeadCrmExtensions(ext: LeadCrmExtensions): void {
  * - Validates enums
  * - Derives `domain` from `email` when not explicitly provided
  * - Omits empty-string / undefined values (DynamoDB GSI keys hate empty strings)
- * - Defaults `lifecycle` to 'inbox' when an email exists but no lifecycle is supplied
+ * - Defaults `lifecycle` to 'inbox' when the lead is CONTACTABLE (an email or a phone)
+ *   and no lifecycle is supplied — phone was added in ENG-2082
  */
 export function buildLeadCrmFields(
   email: string | null | undefined,

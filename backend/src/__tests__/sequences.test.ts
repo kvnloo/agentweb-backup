@@ -473,6 +473,57 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     expect(res.body.error).toBeUndefined();
   });
 
+  // Same defect, one step further out: a list with NO stored statusConfig does not have
+  // no statuses — it falls back to the default set, which contains `churned`. Reading
+  // absent as empty reinstated the bogus 400 for every list created before
+  // createLeadList began persisting a default.
+  it('does NOT reject a default status on a list with no stored statusConfig', async () => {
+    const crmDbMock = require('../services/db').crmDb;
+    crmDbMock.getLeadListById = jest.fn().mockResolvedValue({
+      listId: 'list-1', userId: 'user-123',
+      // no statusConfig key at all — the pre-default row shape
+    });
+    crmDbMock.canOrgMemberAccessList = jest.fn().mockResolvedValue(true);
+    crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({ items: [] });
+
+    const res = await request(app)
+      .post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1', lifecycle: 'churned' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.error).toBeUndefined();
+  });
+
+  // ...and the fallback is listType-aware: `at_risk` is a default status only for a
+  // customers list. On a prospect list it is a lifecycle stage and nothing else, so the
+  // guard must still fire — otherwise the widening has simply disabled it.
+  it('still rejects a lifecycle-only value on a list with no stored statusConfig', async () => {
+    const crmDbMock = require('../services/db').crmDb;
+    crmDbMock.getLeadListById = jest.fn().mockResolvedValue({
+      listId: 'list-1', userId: 'user-123',
+    });
+    crmDbMock.canOrgMemberAccessList = jest.fn().mockResolvedValue(true);
+    crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({ items: [] });
+
+    const res = await request(app)
+      .post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1', lifecycle: 'at_risk' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('lifecycle_filter_unsupported');
+
+    // but on a customers list the same value IS a default status
+    crmDbMock.getLeadListById = jest.fn().mockResolvedValue({
+      listId: 'list-1', userId: 'user-123', listType: 'customers',
+    });
+    const customers = await request(app)
+      .post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1', lifecycle: 'at_risk' });
+
+    expect(customers.status).toBe(200);
+    expect(customers.body.error).toBeUndefined();
+  });
+
   it('still enrols normally when a lifecycle filter does return leads', async () => {
     const crmDbMock = require('../services/db').crmDb;
     crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({

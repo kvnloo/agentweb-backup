@@ -5556,7 +5556,11 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       });
       await new Promise((r) => setImmediate(r));
 
-      expect(mockRunGenerationSmokeTest).toHaveBeenCalledTimes(1);
+      // Scoped to THIS page — see the note on the sibling assertion below: the mock is
+      // module-scoped and a deferred dispatch from another test can otherwise inflate it.
+      const callsForThisPage = (mockRunGenerationSmokeTest as jest.Mock).mock.calls
+        .filter((c: any[]) => c[0]?.id === result.id);
+      expect(callsForThisPage).toHaveLength(1);
     });
 
     it("a SUCCESSFUL sync build releases the gate immediately, with no settle wait", async () => {
@@ -5596,7 +5600,11 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
 
       expect(result.status).toBe("deployed");
       await new Promise((r) => setImmediate(r));
-      expect(mockRunGenerationSmokeTest).toHaveBeenCalledTimes(1);
+      // Scoped to THIS page — see the note on the sibling assertion below: the mock is
+      // module-scoped and a deferred dispatch from another test can otherwise inflate it.
+      const callsForThisPage = (mockRunGenerationSmokeTest as jest.Mock).mock.calls
+        .filter((c: any[]) => c[0]?.id === result.id);
+      expect(callsForThisPage).toHaveLength(1);
     });
 
     it("an 'up-to-date' sync does NOT prove the route is deployed, so the gate still settles", async () => {
@@ -5653,6 +5661,17 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       // Nothing was committed, so there is no build to poll — but the settle must still run.
       await new Promise((r) => setImmediate(r));
       expect(mockRunGenerationSmokeTest).not.toHaveBeenCalled();
+
+      // Then WAIT IT OUT. The 20ms settle above is the whole point of the test, but leaving
+      // it in flight made this test the polluter its own comment describes: the dispatch
+      // landed inside whichever test was running 20ms later, and clearAllMocks() clears
+      // recorded calls, not pending timers. Draining here both removes the leak and turns
+      // the settle from an unobserved side effect into the assertion it should always have
+      // been — the gate must resolve, not hang.
+      await new Promise((r) => setTimeout(r, 80));
+      expect(mockRunGenerationSmokeTest).toHaveBeenCalledWith(
+        expect.objectContaining({ id: result.id, status: "deployed" }),
+      );
     });
 
     it("the gate cap is derived from the poll's real budget, not a frozen literal", () => {
@@ -5694,7 +5713,13 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
 
       expect(result.status).toBe("deployed");
       await new Promise((r) => setImmediate(r));
-      expect(mockRunGenerationSmokeTest).toHaveBeenCalledTimes(1);
+      // Counted for THIS page, not globally. A bare toHaveBeenCalledTimes(1) made the test
+      // load-sensitive: mockRunGenerationSmokeTest is module-scoped and a sibling test's
+      // deferred dispatch could land inside this one, so it passed alone and failed at
+      // --maxWorkers=4. Scoping by id also asserts the dispatch was for the right page.
+      const callsForThisPage = (mockRunGenerationSmokeTest as jest.Mock).mock.calls
+        .filter((c: any[]) => c[0]?.id === result.id);
+      expect(callsForThisPage).toHaveLength(1);
     });
 
     it("SUCCESS: new sub-page has no leadListId → sync still commits siblings, new page's own path stays absent", async () => {

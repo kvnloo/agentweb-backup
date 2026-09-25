@@ -491,7 +491,7 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.message).toBe('No email address');
+      expect(result.message).toBe('No contact channel');
       // nothing drafted, nothing billed
       expect(crmDb.getLeadEngagements).not.toHaveBeenCalled();
     });

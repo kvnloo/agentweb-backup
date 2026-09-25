@@ -23,6 +23,7 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { isValidLeadLifecycle, LEAD_LIFECYCLES } from '../utils/leadSchema';
 import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValidation';
 import { syncContact, SyncInput } from '../services/contactSyncService';
 import { isCardRevenueField } from '../services/enrichmentGroups';
@@ -2753,6 +2754,22 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
 
     if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
+    }
+
+    // `lifecycle` became a writable attribute on this route when updateLead grew an
+    // explicit handler for it; before that the key was silently dropped. It outranks the
+    // live computation in askCrmService permanently, so it is validated at the edge as a
+    // 400 rather than reaching updateLead's throw and surfacing as a 500.
+    if (updates?.lifecycle !== undefined && updates.lifecycle !== null) {
+      // Trimmed for the check because updateLead trims before storing — validating the
+      // raw value would 400 on "  paying  " while the layer below would have accepted it.
+      // An empty value is the explicit CLEAR, not an invalid stage.
+      const proposedLifecycle = String(updates.lifecycle).trim();
+      if (proposedLifecycle && !isValidLeadLifecycle(proposedLifecycle)) {
+        return res.status(400).json({
+          message: `Invalid lifecycle "${String(updates.lifecycle)}". Expected one of: ${LEAD_LIFECYCLES.join(', ')}.`,
+        });
+      }
     }
 
     if (updates?.selectedSenderId !== undefined) {
