@@ -10,7 +10,7 @@
  * are the ground truth those graders are validated against.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import axios from 'axios';
 import {
   Alert,
@@ -332,26 +332,33 @@ export default function EvalLabelling() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Each load gets a sequence number; a load that is no longer the latest (the admin switched
+  // surface meanwhile) must not overwrite the current surface's cases.
+  const loadSeq = useRef(0);
+
   const fetchCases = useCallback(async (which: Surface) => {
+    const seq = ++loadSeq.current;
+    const isCurrent = () => seq === loadSeq.current;
     setLoading(true);
     setError(null);
+    setCases([]);
     try {
       const headers = { Authorization: `Bearer ${token}` };
       const status = await axios.get<{ provisioned: boolean }>(buildApiUrl('/api/admin/eval/golden-cases/status'), { headers });
+      if (!isCurrent()) return;
       setProvisioned(status.data.provisioned);
-      if (!status.data.provisioned) {
-        setCases([]);
-        return;
-      }
+      if (!status.data.provisioned) return;
       const res = await axios.get<{ cases: GoldenCaseView[] }>(buildApiUrl(`/api/admin/eval/golden-cases?surface=${which}`), { headers });
+      if (!isCurrent()) return;
       const next = [...res.data.cases].sort((a, b) => labelledCount(a) - labelledCount(b) || a.caseId.localeCompare(b.caseId));
       setCases(next);
       setSelectedId((current) => (current && next.some((c) => c.caseId === current) ? current : next[0]?.caseId ?? null));
     } catch (err) {
+      if (!isCurrent()) return;
       if (isNotProvisioned(err)) setProvisioned(false);
       else setError(apiMessage(err, 'Failed to load golden cases.'));
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }, [token]);
 
