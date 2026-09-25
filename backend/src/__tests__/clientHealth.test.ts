@@ -38,7 +38,10 @@ jest.mock('../services/metaTokenRefresh', () => ({
   ensureFreshMetaAdAccountToken: jest.fn().mockResolvedValue({ attempted: false, refreshed: false }),
 }));
 
-import { assessClientHealth, listAllClients } from '../services/clientHealthService';
+import { assessClientHealth, listAllClients, classifyMetaAdConnection } from '../services/clientHealthService';
+import { fetchWithRetryAndPaging as metaFetch } from '../utils/metaApiFetch';
+
+const mockedMetaFetch = jest.mocked(metaFetch);
 
 const { userDb } = require('../services/db');
 const { getAccountsByUserId } = require('../services/connectedAccountsDb');
@@ -94,8 +97,9 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.error).toMatch(/not found/i);
   });
 
-  // FAIL test 3: Client has no ad account configured
-  it('should report blocked status when client has no ad account', async () => {
+  // ENG-2133 (ENG-2128 T1): never connecting an ad account is an activation state,
+  // not a blocked/at-risk (churn) state. This test previously asserted /blocked|at-risk/.
+  it('reports onboarding (activation), not blocked/at-risk, when the client never connected an ad account', async () => {
     const adminUserId = 'admin-user';
     const clientUserId = 'client-user';
 
@@ -117,8 +121,115 @@ describe('Client Health - assessClientHealth', () => {
 
     expect(result.success).toBe(true);
     expect(result.health.ads_layer.connected).toBe(false);
-    expect(result.health.status).toMatch(/blocked|at-risk/i);
+    expect(result.health.ads_layer.connection).toBe('never_connected');
+    expect(result.health.status).toBe('onboarding');
+    expect(result.health.status_reasons.join(' ')).toMatch(/activation/i);
   });
+
+  it('reports at-risk with the expiry date when the only Meta ad account token has expired', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user',
+      email: 'client@example.com',
+      displayName: 'Client User',
+      adAccount: '',
+    });
+    const expiredAt = Date.parse('2026-09-15T20:52:34.993Z');
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      {
+        platform: 'meta',
+        config: { account_type: 'ad_account', ad_account_id: 'act_1', access_token: 'tok', token_expires_at: expiredAt },
+      },
+    ]);
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.health.ads_layer.connection).toBe('expired');
+    expect(result.health.status).toBe('at-risk');
+    expect(result.health.status_reasons.join(' ')).toContain('2026-09-15T20:52:34.993Z');
+  });
+
+  it('does not call a Google/LinkedIn Ads client onboarding or blocked when Meta is absent', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({ userId: 'client-user', email: 'client@example.com', adAccount: '' });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      { platform: 'google_ads', config: { account_type: 'google_ads', refresh_token: 'r', token_expires_at: 1 } },
+      { platform: 'linkedin_ads', config: { account_type: 'ad_account', refresh_token: 'r', token_expires_at: 1 } },
+    ]);
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.health.ads_layer.connection).toBe('other_platform');
+    expect(['onboarding', 'blocked', 'at-risk']).not.toContain(result.health.status);
+    expect(result.health.status_reasons.join(' ')).not.toMatch(/activation|ad account/i);
+    expect(mockedMetaFetch).not.toHaveBeenCalled();
+  });
+
+  it('reads campaigns through the first usable Meta account, not a stale first record (#3070 review)', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({ userId: 'client-user', email: 'client@example.com', adAccount: '' });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      { platform: 'meta', config: { account_type: 'ad_account', ad_account_id: '111111', access_token: 'stale', token_expires_at: 1 } },
+      { platform: 'meta', config: { account_type: 'ad_account', ad_account_id: '222222', access_token: 'fresh', token_expires_at: Date.now() + 86_400_000 } },
+    ]);
+    mockedMetaFetch.mockResolvedValueOnce({ data: [] });
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.health.ads_layer.connection).toBe('connected');
+    expect(mockedMetaFetch).toHaveBeenCalledWith(expect.stringContaining('act_222222/campaigns'));
+    expect(mockedMetaFetch).toHaveBeenCalledWith(expect.stringContaining('access_token=fresh'));
+    expect(result.health.ads_layer.ad_account_id).toBe('222222');
+  });
+
+  it('skips an unexpired record that lacks fetch credentials for a later complete one (#3070 review)', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({ userId: 'client-user', email: 'client@example.com', adAccount: '' });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      { platform: 'meta', config: { account_type: 'ad_account', ad_account_id: '444444' } },
+      { platform: 'meta', config: { account_type: 'ad_account', ad_account_id: '666666', access_token: 'complete' } },
+    ]);
+    mockedMetaFetch.mockResolvedValueOnce({ data: [] });
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(mockedMetaFetch).toHaveBeenCalledWith(expect.stringContaining('act_666666/campaigns'));
+    expect(mockedMetaFetch).toHaveBeenCalledWith(expect.stringContaining('access_token=complete'));
+    expect(result.health.ads_layer.ad_account_id).toBe('666666');
+  });
+
+  it('reads through the legacy adAccount when the only connected account has expired', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({ userId: 'client-user', email: 'client@example.com', adAccount: '555555' });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      { platform: 'meta', config: { account_type: 'ad_account', ad_account_id: '111111', access_token: 'stale', token_expires_at: 1 } },
+    ]);
+    mockedMetaFetch.mockResolvedValueOnce({ data: [] });
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.health.ads_layer.connection).toBe('connected');
+    expect(mockedMetaFetch).toHaveBeenCalledWith(expect.stringContaining('act_555555/campaigns'));
+    expect(mockedMetaFetch).not.toHaveBeenCalledWith(expect.stringContaining('access_token=stale'));
+  });
+
+  it('does not report a confirmed zero-campaign status when the campaign read failed (#3070 review)', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({ userId: 'client-user', email: 'client@example.com', adAccount: '' });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      { platform: 'meta', config: { account_type: 'ad_account', ad_account_id: '333333', access_token: 'tok' } },
+    ]);
+    mockedMetaFetch.mockResolvedValueOnce({ error: { message: 'permission denied' } });
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.health.ads_layer.campaigns_complete).toBe(false);
+    expect(result.health.status).not.toBe('blocked');
+    expect(result.health.status_reasons.join(' ')).toMatch(/could not be read/i);
+    expect(result.health.status_reasons).not.toContain('No active ad campaigns');
+  });
+
 
   // SUCCESS test: Full health assessment for a client with connected accounts
   it('should return full health assessment for a connected client', async () => {
@@ -1404,5 +1515,82 @@ describe('Client Health - listAllClients', () => {
     expect(result.clients).toHaveLength(1);
     expect(result.clients[0].has_lander).toBe(true);
     expect(result.clients[0].has_crm).toBe(true);
+  });
+});
+
+describe('Client Health - classifyMetaAdConnection', () => {
+  const now = Date.parse('2026-09-25T00:00:00Z');
+  const meta = (config: { token_expires_at?: number; refresh_token?: string }) =>
+    ({ platform: 'meta', config: { account_type: 'ad_account', ...config } });
+
+  it('is never_connected with no Meta ad account and no legacy adAccount', () => {
+    expect(classifyMetaAdConnection([], '', now).connection).toBe('never_connected');
+    expect(classifyMetaAdConnection([], undefined, now).connection).toBe('never_connected');
+  });
+
+  it('is connected with a legacy adAccount (shared token has no per-client expiry)', () => {
+    expect(classifyMetaAdConnection([], 'act_legacy', now).connection).toBe('connected');
+  });
+
+  it('is connected when any Meta ad account token is unexpired or carries no expiry', () => {
+    expect(classifyMetaAdConnection([meta({ token_expires_at: now + 1 })], '', now).connection).toBe('connected');
+    expect(classifyMetaAdConnection([meta({})], '', now).connection).toBe('connected');
+    expect(classifyMetaAdConnection([meta({ token_expires_at: now - 1 }), meta({ token_expires_at: now + 1 })], '', now).connection)
+      .toBe('connected');
+  });
+
+  it('is expired, reporting the latest expiry, when every Meta ad account token has expired', () => {
+    const result = classifyMetaAdConnection(
+      [meta({ token_expires_at: now - 10_000 }), meta({ token_expires_at: now - 5_000 })], '', now);
+    expect(result.connection).toBe('expired');
+    expect(result.expiredAt).toBe(new Date(now - 5_000).toISOString());
+  });
+
+  it('treats an expired token with a refresh_token as connected (it can renew)', () => {
+    expect(classifyMetaAdConnection([meta({ token_expires_at: now - 1, refresh_token: 'r' })], '', now).connection)
+      .toBe('connected');
+  });
+
+  it('is other_platform when ads run on Google Ads or LinkedIn Ads without Meta (ThinkingAI shape)', () => {
+    expect(classifyMetaAdConnection([{ platform: 'google_ads', config: { account_type: 'google_ads' } }], '', now).connection)
+      .toBe('other_platform');
+    expect(classifyMetaAdConnection([{ platform: 'linkedin_ads', config: { account_type: 'ad_account' } }], '', now).connection)
+      .toBe('other_platform');
+    expect(classifyMetaAdConnection([{ platform: 'gmail', config: {} }], '', now).connection).toBe('never_connected');
+  });
+
+  it('ignores non-ad Meta accounts (e.g. pages)', () => {
+    const page = { platform: 'meta', config: { account_type: 'page', token_expires_at: now + 1 } };
+    expect(classifyMetaAdConnection([page], '', now).connection).toBe('never_connected');
+  });
+});
+
+describe('Client Health - listAllClients ad_connection', () => {
+  it('reports never_connected / expired / connected per client', async () => {
+    const expired = Date.parse('2020-01-01T00:00:00Z');
+    (userDb.getAllUsers as jest.Mock).mockResolvedValueOnce([
+      { userId: 'u-never', email: 'never@example.com' },
+      { userId: 'u-expired', email: 'expired@example.com' },
+      { userId: 'u-legacy', email: 'legacy@example.com', adAccount: 'act_legacy' },
+      { userId: 'u-google', email: 'google@example.com' },
+    ]);
+    (getAccountsByUserId as jest.Mock).mockImplementation(async (userId: string) =>
+      userId === 'u-expired'
+        ? [{ platform: 'meta', config: { account_type: 'ad_account', token_expires_at: expired } }]
+        : userId === 'u-google'
+          ? [{ platform: 'google_ads', config: { account_type: 'google_ads' } }]
+          : []);
+
+    const result = await listAllClients('admin-user', true);
+
+    const byId = Object.fromEntries(
+      result.clients.map((c: { userId: string; ad_connection: string; has_ads: boolean }) => [c.userId, c]));
+    expect(byId['u-never'].ad_connection).toBe('never_connected');
+    expect(byId['u-expired'].ad_connection).toBe('expired');
+    expect(byId['u-legacy'].ad_connection).toBe('connected');
+    expect(byId['u-google'].ad_connection).toBe('other_platform');
+    // has_ads keeps its historical meaning (an ad account is on record) for existing consumers.
+    expect(byId['u-expired'].has_ads).toBe(true);
+    (getAccountsByUserId as jest.Mock).mockReset();
   });
 });
