@@ -15,7 +15,8 @@
  * the classifier says `at_risk`.
  *
  * Signals are rebuilt as of C: payment events and ad spend up to C, ad accounts connected by C
- * with token expiry judged at C, activity only when last seen before C. Current subscription
+ * with token expiry judged at C (an ad connection with no created_at excludes the pair), activity
+ * only when last seen before C. Current subscription
  * status is NOT used (it would leak the outcome). Known approximations: refresh tokens and the
  * legacy `adAccount` field are current values; no campaign-level delivery exists, so zero
  * delivery is never evaluated; requirement fields do not exist before OPS-4.
@@ -23,6 +24,7 @@
 import AWS from "aws-sdk";
 import { classifyAccountHealth, type AccountHealthState } from "../services/accountHealthClassifier";
 import type { AdConnectionAccount } from "../services/clientHealthService";
+import { AD_HEALTH_PLATFORMS } from "../services/accountHealthService";
 import type { RequirementFields } from "../services/accountHealthClassifier";
 import { perClassMetrics, wilsonInterval, type Interval, type LabelPair } from "../loops/eval/agreement";
 
@@ -70,6 +72,8 @@ export interface CutoffPopulation {
   excludedUndatedCancel: number;
   excludedAlreadyChurned: number;
   excludedNotYetPaying: number;
+  /** An ad connection with no created_at may postdate the cutoff, so the pair is not scored. */
+  excludedUndatedConnection: number;
 }
 
 const byUser = <T extends { userId: string }>(rows: readonly T[]): Map<string, T[]> => {
@@ -84,7 +88,7 @@ export function buildCutoffPopulation(data: BacktestData, cutoffMs: number, hori
   const spend = byUser(data.spend);
   const firstSpendDate = data.spend.reduce<string | null>((min, r) => (min === null || r.date < min ? r.date : min), null);
   const cutoffIso = new Date(cutoffMs).toISOString();
-  const out: CutoffPopulation = { cases: [], excludedUndatedCancel: 0, excludedAlreadyChurned: 0, excludedNotYetPaying: 0 };
+  const out: CutoffPopulation = { cases: [], excludedUndatedCancel: 0, excludedAlreadyChurned: 0, excludedNotYetPaying: 0, excludedUndatedConnection: 0 };
 
   for (const user of data.users) {
     if (!user.subscription_status || user.userId.startsWith("eval_")) continue;
@@ -113,6 +117,11 @@ export function buildCutoffPopulation(data: BacktestData, cutoffMs: number, hori
       out.excludedNotYetPaying++;
       continue;
     }
+    const adConnections = (user.connected_accounts ?? []).filter((acc) => AD_HEALTH_PLATFORMS.has(acc.platform ?? ""));
+    if (adConnections.some((acc) => !Number.isFinite(acc.created_at ? Date.parse(acc.created_at) : NaN))) {
+      out.excludedUndatedConnection++;
+      continue;
+    }
     const truth: Outcome = cancels.some((t) => t > cutoffMs && t <= cutoffMs + horizonMs) ? "churned" : "retained";
 
     const windowStart = new Date(cutoffMs - 30 * DAY_MS).toISOString().slice(0, 10);
@@ -130,7 +139,7 @@ export function buildCutoffPopulation(data: BacktestData, cutoffMs: number, hori
     const result = classifyAccountHealth({
       nowMs: cutoffMs,
       connectedAccounts: (user.connected_accounts ?? []).filter(
-        (acc) => !acc.created_at || Date.parse(acc.created_at) <= cutoffMs,
+        (acc) => !!acc.created_at && Date.parse(acc.created_at) <= cutoffMs,
       ),
       legacyAdAccount: user.adAccount,
       requirement: requirement && verifiedMs <= cutoffMs ? requirement : null,
@@ -271,7 +280,7 @@ async function main(): Promise<void> {
     report(`cutoff ${new Date(cutoff).toISOString().slice(0, 10)}`, scoreBacktest(population.cases));
     console.log(
       `  excluded: undated_cancel=${population.excludedUndatedCancel} already_churned=${population.excludedAlreadyChurned} ` +
-        `not_yet_paying=${population.excludedNotYetPaying}`,
+        `not_yet_paying=${population.excludedNotYetPaying} undated_connection=${population.excludedUndatedConnection}`,
     );
   }
   report(`pooled over ${cutoffs.length} cutoff(s) (pairs, not independent accounts)`, scoreBacktest(all));
