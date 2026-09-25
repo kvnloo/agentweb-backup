@@ -240,6 +240,16 @@ const DEFAULT_AESTHETIC: Aesthetic = "minimal-typographic";
  * "Your checkout is leaking revenue right now — every declined card,
  * every abandoned cart, every manual payout..." rendered onto the image.
  */
+/**
+ * The 4:5 layout block is stored under the historical key `storyLayout` (seeded into
+ * AW-PromptTemplates, so the key stays) and older rows label it "Story 4:5:". 1080x1350 is Meta's
+ * 4:5 feed portrait, not a Story (9:16), so relabel the block before it reaches the model
+ * (ENG-2139). Covers stored rows without a template edit.
+ */
+export function portraitFeedLayout(layout: string): string {
+  return layout.replace(/^Story 4:5:/gm, "Feed portrait 4:5:");
+}
+
 export function buildSixLayerPromptForVariant(
   inputs: SixLayerPromptInputs,
   /**
@@ -289,7 +299,7 @@ export function buildSixLayerPromptForVariant(
   const personaPain = persona?.pain || "";
 
   const isFeed = format === "1080x1080";
-  const layoutBlock = isFeed ? archetype.feedLayout : archetype.storyLayout;
+  const layoutBlock = isFeed ? archetype.feedLayout : portraitFeedLayout(archetype.storyLayout);
 
   const lines: string[] = [];
 
