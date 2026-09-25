@@ -28,6 +28,8 @@ import * as booksImpl from './impl/books';
 import * as gtmPlansImpl from './impl/gtmPlans';
 // ENG-2103 (F2): Google Drive tool cluster, same treatment as booksImpl above.
 import * as googleDriveImpl from './impl/googleDrive';
+// ENG-2103 (F2): Google Docs/Sheets tool cluster, same treatment as booksImpl above.
+import * as googleDocsSheetsImpl from './impl/googleDocsSheets';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -10087,7 +10089,7 @@ emmaToolRegistry.register({
     const style = args.plain === true ? 'plain' : 'styled';
     const so = args.style_options;
     const styleOptions = so ? { primaryColor: so.primary_color, fontFamily: so.font_family, fontSize: so.font_size, lineHeight: so.line_height, compact: so.compact } : undefined;
-    return agentModeService.createGoogleDoc(args.title, args.content, context.userId, args.folder_id, args.share_with_emails, style, styleOptions);
+    return googleDocsSheetsImpl.createGoogleDoc(args.title, args.content, context.userId, args.folder_id, args.share_with_emails, style, styleOptions);
   },
 });
 
@@ -10133,7 +10135,7 @@ emmaToolRegistry.register({
     const style = args.plain === true ? 'plain' : (args.plain === false || args.style_options) ? 'styled' : 'plain';
     const so = args.style_options;
     const styleOptions = so ? { primaryColor: so.primary_color, fontFamily: so.font_family, fontSize: so.font_size, lineHeight: so.line_height, compact: so.compact } : undefined;
-    return agentModeService.updateGoogleDoc(args.url_or_id, args.content, context.userId, style, styleOptions);
+    return googleDocsSheetsImpl.updateGoogleDoc(args.url_or_id, args.content, context.userId, style, styleOptions);
   },
 });
 
@@ -10169,7 +10171,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
-    return agentModeService.createGoogleSheet(args.title, args.data, context.userId, args.folder_id, args.share_with_emails);
+    return googleDocsSheetsImpl.createGoogleSheet(args.title, args.data, context.userId, args.folder_id, args.share_with_emails);
   },
 });
 
@@ -10200,7 +10202,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
-    return agentModeService.updateGoogleSheet(args.url_or_id, args.range, args.data, context.userId);
+    return googleDocsSheetsImpl.updateGoogleSheet(args.url_or_id, args.range, args.data, context.userId);
   },
 });
 
