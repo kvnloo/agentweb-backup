@@ -103,6 +103,11 @@ function labelledCount(c: GoldenCaseView): number {
   return c.criteria.filter((criterion) => c.labels[criterion] !== undefined).length;
 }
 
+/** Least-labelled first, so the next case to label is at the top. */
+function byLeastLabelled(a: GoldenCaseView, b: GoldenCaseView): number {
+  return labelledCount(a) - labelledCount(b) || a.caseId.localeCompare(b.caseId);
+}
+
 interface ChatMessageView {
   role: string;
   content?: unknown;
@@ -350,7 +355,7 @@ export default function EvalLabelling() {
       if (!status.data.provisioned) return;
       const res = await axios.get<{ cases: GoldenCaseView[] }>(buildApiUrl(`/api/admin/eval/golden-cases?surface=${which}`), { headers });
       if (!isCurrent()) return;
-      const next = [...res.data.cases].sort((a, b) => labelledCount(a) - labelledCount(b) || a.caseId.localeCompare(b.caseId));
+      const next = [...res.data.cases].sort(byLeastLabelled);
       setCases(next);
       setSelectedId((current) => (current && next.some((c) => c.caseId === current) ? current : next[0]?.caseId ?? null));
     } catch (err) {
@@ -457,7 +462,7 @@ export default function EvalLabelling() {
                       key={selected.caseId}
                       goldenCase={selected}
                       token={token}
-                      onSaved={(saved) => setCases((prev) => prev.map((c) => (c.caseId === saved.caseId ? saved : c)))}
+                      onSaved={(saved) => setCases((prev) => prev.map((c) => (c.caseId === saved.caseId ? saved : c)).sort(byLeastLabelled))}
                     />
                   </CardContent>
                 </Card>
