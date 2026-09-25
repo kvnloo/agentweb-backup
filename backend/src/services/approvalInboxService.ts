@@ -100,6 +100,26 @@ export interface ApprovalDecision {
   customerEmail?: string;
   customerName?: string;
   status: ApprovalDecisionStatus;
+  /** ENG-2159: required, regardless of audience. A short human label naming
+   *  the account/customer this decision is actually about (e.g. "TriCityAI ·
+   *  Meta Ad Account 2041725529929988") — deliberately separate from
+   *  customerId/customerName above, which stay customer-audience-only by
+   *  design (ticket point 6). Without this, a team-audience decision has no
+   *  structured way to say what it's about at all; whatever account info
+   *  showed up before was purely incidental to how the model phrased
+   *  businessImpact. Rendered as its own prominent line, never folded into
+   *  free text a reviewer might not read closely. */
+  subjectLabel: string;
+  /** ENG-2159 follow-up: optional, purely informational — the account
+   *  owner's email, if known, shown alongside subjectLabel. Deliberately a
+   *  DIFFERENT field from customerEmail above: customerEmail is tied to
+   *  customerId (routing — who this decision is FOR, customer-audience
+   *  only), this is display-only context about whose account a TEAM
+   *  decision concerns. Carries no routing/execution semantics, so it's
+   *  allowed on any audience, unlike customerId (ticket point 6's hard
+   *  invariant stays about customerId specifically, not about showing
+   *  contact info). */
+  subjectContactEmail?: string;
   businessImpact: string;
   evidencePacket: ApprovalDecisionEvidencePacket;
   /** Present for plan_choice items — the fixed decision-deck option shape,
@@ -141,6 +161,8 @@ export interface CreateApprovalDecisionRequest {
   customerId?: string;
   customerEmail?: string;
   customerName?: string;
+  subjectLabel: string;
+  subjectContactEmail?: string;
   businessImpact: string;
   evidencePacket: ApprovalDecisionEvidencePacket;
   options?: AskUserQuestionOption[];
@@ -210,6 +232,9 @@ function validateOptions(options: AskUserQuestionOption[] | undefined): void {
 }
 
 function validateCreateRequest(request: CreateApprovalDecisionRequest): void {
+  if (typeof request.subjectLabel !== 'string' || request.subjectLabel.trim() === '') {
+    throw new ApprovalInboxError('subjectLabel must be a non-empty string naming the account/customer this decision is about');
+  }
   if (typeof request.businessImpact !== 'string' || request.businessImpact.trim() === '') {
     throw new ApprovalInboxError('businessImpact must be a non-empty string');
   }
@@ -300,6 +325,8 @@ export class ApprovalInboxService {
       customerEmail: request.customerEmail,
       customerName: request.customerName,
       status: isCustomer ? 'pending_customer_response' : 'pending_team_review',
+      subjectLabel: request.subjectLabel,
+      subjectContactEmail: request.subjectContactEmail,
       businessImpact: request.businessImpact,
       evidencePacket: request.evidencePacket,
       options: request.options,
