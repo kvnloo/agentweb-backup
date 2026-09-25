@@ -789,6 +789,25 @@ createTestAccount().then(async () => {
       }, 15 * 60 * 1000).unref();
       console.info('[AdsLearning] evaluation scheduled every 15 minutes');
 
+      // ENG-1644 gap-closing: sweep AW-ApprovalDecisions for decisions past
+      // expiresAt that nobody ever answered — flip to 'expired', notify the
+      // origin session. Hourly — decisions expire on a 1-30 day horizon
+      // (review fix: was "1-7 day", stale relative to emma/tools.ts's own
+      // MAX_EXPIRES_IN_DAYS=30 clamp added earlier in this same PR).
+      // Own try/catch (review fix) — an import failure here must not abort
+      // registration of every cron block after it in this boot sequence.
+      try {
+        const { runApprovalExpirySweep } = await import('./cron/approvalExpirySweepCron');
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('ApprovalExpirySweep', runApprovalExpirySweep())
+            .catch(e => console.error('[ApprovalExpirySweep] sweep failed:', e));
+        }, 60 * 60 * 1000).unref();
+        console.info('[ApprovalExpirySweep] sweep scheduled hourly');
+      } catch (error) {
+        console.error('[ApprovalExpirySweep] Failed to initialize:', error);
+      }
+
       // ENG-916: Meta Ads Metrics Snapshot — runs daily at 09:00 UTC (after
       // ActivationCron at 08:00), re-pulling the last 30 dates each run so the
       // final refresh occurs after reporting-day end plus 28 elapsed days.
@@ -1006,6 +1025,24 @@ createTestAccount().then(async () => {
         console.log('[renewalIntegrationHealthCron] Initialized — running daily');
       } catch (error) {
         console.error('[renewalIntegrationHealthCron] Failed to initialize:', error);
+      }
+
+      // Account-health classifier sweep (ENG-2143), the replacement for the renewal cron above:
+      // at-risk → deduped oncall, activation incomplete → CS nudge log. Off unless
+      // ACCOUNT_HEALTH_ALERTS_ENABLED=true (enabling it in prod is an OPS step).
+      if (process.env.ACCOUNT_HEALTH_ALERTS_ENABLED === 'true') try {
+        const { runAccountHealthClassifier } = await import('./cron/accountHealthClassifierCron');
+        const ACCOUNT_HEALTH_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        cronJobRegistry.track('accountHealthClassifierCron', runAccountHealthClassifier())
+          .catch(e => console.error('[accountHealthClassifierCron] Error on first run:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('accountHealthClassifierCron', runAccountHealthClassifier())
+            .catch(e => console.error('[accountHealthClassifierCron] Error:', e));
+        }, ACCOUNT_HEALTH_INTERVAL_MS);
+        console.log('[accountHealthClassifierCron] Initialized — running daily');
+      } catch (error) {
+        console.error('[accountHealthClassifierCron] Failed to initialize:', error);
       }
 
       // CRM Auto-Enrichment (ENG-88) — runs every 15 minutes.

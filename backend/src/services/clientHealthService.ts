@@ -36,8 +36,9 @@ function isMetaAdAccount(acc: AdConnectionAccount | null | undefined): acc is Ad
   return acc?.platform === 'meta' && acc.config?.account_type === 'ad_account';
 }
 
-/** A Meta ad account whose token is unexpired, carries no expiry, or can refresh. */
-function isUsableMetaAdAccount(acc: AdConnectionAccount, nowMs: number): boolean {
+/** An ad account whose token is unexpired, carries no expiry, or can refresh. The rule is not
+ * Meta-specific: accountHealthClassifier applies it to Google Ads and LinkedIn Ads too (ENG-2143). */
+export function hasUsableAdToken(acc: AdConnectionAccount, nowMs: number): boolean {
   const expiresAt = acc.config?.token_expires_at;
   return typeof expiresAt !== 'number' || expiresAt > nowMs || !!acc.config?.refresh_token;
 }
@@ -67,8 +68,8 @@ export function classifyMetaAdConnection(
     const otherAds = (connectedAccounts ?? []).some((acc) => !!acc?.platform && OTHER_AD_PLATFORMS.has(acc.platform));
     return { connection: otherAds ? 'other_platform' : 'never_connected' };
   }
-  if (metaAdAccounts.some((acc) => isUsableMetaAdAccount(acc, nowMs))) return { connection: 'connected' };
-  // Every account failed isUsableMetaAdAccount, so each carries a numeric token_expires_at.
+  if (metaAdAccounts.some((acc) => hasUsableAdToken(acc, nowMs))) return { connection: 'connected' };
+  // Every account failed hasUsableAdToken, so each carries a numeric token_expires_at.
   const latestExpiry = Math.max(...metaAdAccounts.map((acc) => acc.config?.token_expires_at ?? 0));
   return { connection: 'expired', expiredAt: new Date(latestExpiry).toISOString() };
 }
@@ -375,14 +376,14 @@ export async function assessClientHealth(
       return !!config?.ad_account_id && !!config?.access_token;
     };
     const connectedMetaAccount =
-      metaAdAccounts.find((acc) => isUsableMetaAdAccount(acc, nowMs) && hasFetchCredentials(acc)) ??
-      metaAdAccounts.find((acc) => isUsableMetaAdAccount(acc, nowMs)) ??
+      metaAdAccounts.find((acc) => hasUsableAdToken(acc, nowMs) && hasFetchCredentials(acc)) ??
+      metaAdAccounts.find((acc) => hasUsableAdToken(acc, nowMs)) ??
       metaAdAccounts[0];
     const connectedAdAccountId = (connectedMetaAccount?.config as any)?.ad_account_id;
     const connectedAccessToken = connectedMetaAccount?.config?.access_token;
     // An expired connected account never wins over a legacy adAccount: the classifier counts the
     // legacy account as the live connection, so the fetch must read through it too.
-    const connectedIsUsable = !!connectedMetaAccount && isUsableMetaAdAccount(connectedMetaAccount, nowMs);
+    const connectedIsUsable = !!connectedMetaAccount && hasUsableAdToken(connectedMetaAccount, nowMs);
     const legacyAvailable = typeof client.adAccount === 'string' && client.adAccount.trim() !== '';
     const useConnectedAccount =
       !!connectedAdAccountId && !!connectedAccessToken && (connectedIsUsable || !legacyAvailable);
