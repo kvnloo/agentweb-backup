@@ -1422,7 +1422,18 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
           return res.status(200).json({ response_action: 'clear' });
         }
 
-        await resolveApprovalDecision(decisionId, verdict, user.username || user.id, freeText);
+        // Review fix: the sibling approve_decision button path already
+        // checks result.claimed and surfaces a real error — this modal
+        // path was discarding the result and always clearing, silently
+        // closing as if it succeeded even when the claim genuinely failed
+        // (already resolved, expired, etc).
+        const result = await resolveApprovalDecision(decisionId, verdict, user.username || user.id, freeText);
+        if (!result.claimed) {
+          return res.status(200).json({
+            response_action: 'errors',
+            errors: { decision_free_text_input: `Could not submit — ${result.reason}.` },
+          });
+        }
         return res.status(200).json({ response_action: 'clear' });
       }
 
