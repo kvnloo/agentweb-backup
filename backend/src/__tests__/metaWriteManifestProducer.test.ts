@@ -200,6 +200,16 @@ describe('ENG-1635/1644 approval deck producer — Phoenix 12-prompt regression'
     expect(minimized.awaitingUserConfirmation).toBe(true);
   });
 
+  it('ENG-1644 prep: metaWriteDispatch.resolvedAccountId is populated at preview time and matches the resolved account, alongside the unchanged raw account_id', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: SESSION_ID });
+    const preview = await previewAd('ad-0');
+    expect(preview.metaWriteDispatch.account_id).toBe(ACCOUNT);
+    expect(preview.metaWriteDispatch.resolvedAccountId).toBe(ACCOUNT);
+    // Digest-unaffected is proven separately (same fixture, unchanged value)
+    // in metaWriteManifestReconciliation.test.ts's resolvedAccountId-freeze
+    // suite — not duplicated here.
+  });
+
   it('falls back to null when nothing halted this iteration', () => {
     const result = buildWriteDeckFromIterationResults([
       { status: 'success', result: { success: true, message: 'read-only, nothing to confirm' } },

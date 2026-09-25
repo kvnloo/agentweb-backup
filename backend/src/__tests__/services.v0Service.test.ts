@@ -167,6 +167,7 @@ import {
   buildPageSlug,
   autoFixV0Files,
   getDeploymentStatus,
+  getPreviewDeploymentUrl,
   isOrphanedFailedPage,
   cleanupOrphanedFailedPages,
   commitFilesToRepoMain,
@@ -1142,9 +1143,12 @@ describe("v0Service - commitFilesToRepoMain (retry + rebase)", () => {
     mockAxiosPost.mockResolvedValue(post);
     mockAxiosPatch.mockResolvedValue({ data: {} });
 
-    const res = await commitFilesToRepoMain("o/r", {}, files, "msg");
+    const res = await commitFilesToRepoMain("o/r", {}, [...files, { path: 'app/globals.css', content: Buffer.from('body {}') }], "msg");
     expect(res.pushedCommitSha).toBe("new-sha");
     expect(mockAxiosGet).toHaveBeenCalledTimes(1); // no rebase needed
+    expect(mockAxiosPost.mock.calls.filter(([url]) => url.endsWith('/git/trees'))).toHaveLength(1);
+    expect(mockAxiosPost.mock.calls.filter(([url]) => url.endsWith('/git/commits'))).toHaveLength(1);
+    expect(mockAxiosPatch).toHaveBeenCalledTimes(1);
   });
 
   it("ENG-497: commits to a non-default branch when one is passed, never touching heads/main", async () => {
@@ -6745,5 +6749,44 @@ describe("the enhancement validators must read the same files the ENG-2080 gate 
         "https://x.test/book"
       ).ok
     ).toBe(true);
+  });
+});
+
+describe('getPreviewDeploymentUrl commit matching', () => {
+  beforeEach(() => { mockAxiosGet.mockReset(); mockAxiosPatch.mockReset(); mockAxiosPost.mockReset(); });
+  const deployment = (sha: string, state = 'READY') => ({
+    meta: { githubCommitRef: 'draft/agentweb-preview', githubCommitSha: sha },
+    readyState: state, uid: 'deploy', url: `${sha}.vercel.app`,
+  });
+  const setup = (deployments: unknown) => {
+    mockAxiosGet.mockResolvedValueOnce({ data: {} }).mockResolvedValueOnce({ data: { deployments } });
+    mockAxiosPatch.mockResolvedValue({ status: 200 });
+  };
+  it.each(['READY', 'ERROR'])('ignores an older %s build until the new commit appears', async state => {
+    setup([deployment('old', state)]);
+    await expect(getPreviewDeploymentUrl('project', 'draft/agentweb-preview', 'new')).resolves.toEqual({ buildStatus: 'building' });
+  });
+  it('accepts the alternate Git commit metadata key', async () => {
+    setup([{ ...deployment('new'), meta: { githubCommitRef: 'draft/agentweb-preview', gitCommitSha: 'new' } }]);
+    await expect(getPreviewDeploymentUrl('project', 'draft/agentweb-preview', 'new')).resolves.toMatchObject({ buildStatus: 'success' });
+  });
+  it.each([{ deployments: [] }, { deployments: [deployment('old')] }])('ensures an open draft PR while waiting for a commit (%j)', async ({ deployments }) => {
+    mockAxiosGet.mockResolvedValueOnce({ data: { link: { type: 'github', org: 'o', repo: 'r' } } })
+      .mockResolvedValueOnce({ data: { deployments } }).mockResolvedValueOnce({ data: [] });
+    mockAxiosPatch.mockResolvedValue({ status: 200 });
+    mockAxiosPost.mockResolvedValueOnce({ data: { number: 1, html_url: 'https://github.com/o/r/pull/1' } });
+    await expect(getPreviewDeploymentUrl('project', 'draft/agentweb-preview', 'new')).resolves.toMatchObject({ buildStatus: 'building', prUrl: 'https://github.com/o/r/pull/1' });
+  });
+  it('returns the matching commit even when a newer branch deployment exists', async () => {
+    setup([deployment('other'), deployment('new')]);
+    await expect(getPreviewDeploymentUrl('project', 'draft/agentweb-preview', 'new')).resolves.toEqual({ buildStatus: 'success', previewUrl: 'https://new.vercel.app' });
+  });
+  it('preserves latest-branch lookup for existing callers', async () => {
+    setup([deployment('latest')]);
+    await expect(getPreviewDeploymentUrl('project', 'draft/agentweb-preview')).resolves.toEqual({ buildStatus: 'success', previewUrl: 'https://latest.vercel.app' });
+  });
+  it.each([{}, [null], [{ readyState: {} }]])('rejects malformed Vercel data %j', async data => {
+    setup(data);
+    await expect(getPreviewDeploymentUrl('project', 'draft/agentweb-preview', 'new')).rejects.toThrow('Invalid Vercel deployments response');
   });
 });

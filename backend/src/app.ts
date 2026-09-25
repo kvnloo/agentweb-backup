@@ -1,3 +1,4 @@
+import { registerLeadNotificationProcessor } from './services/orgLeadNotificationService';
 import { evaluationAdminRoutes } from './routes/evaluation';
 import { evaluationHttpBoundary } from './middleware/evaluation';
 import express from "express";
@@ -130,6 +131,7 @@ import charactersRoutes from "./routes/characters";
 import contractorRoutes from "./routes/contractor";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
+import { authenticateAgentRunsSecretOrAdmin } from "./middleware/agentRunsAuth";
 
 
 import { setupMcpServer } from "./mcp/server/mcpServer";
@@ -361,6 +363,17 @@ app.use("/api/users", usersRoutes);
 app.use("/api/tasks", taskRoutes);
 app.use("/api/waitlist", waitlistRoutes);
 app.use("/api/schedules", scheduleRoutes);
+// D78: mounted AHEAD of the catch-all `/api/admin` router below (which applies a blanket
+// authenticateToken/isAdmin via router.use with no path filter, matching this path too) —
+// registration order matters in Express, so a later, more specific mount here would never
+// be reached; a request without a valid admin session would 401 out of the catch-all before
+// this gate's own secret-header check ever ran. Mounting first means this route's own gate
+// decides: a correct AW_AGENT_RUNS_SECRET header authenticates directly (narrowed to one
+// sessionId, limit<=3, never falling through to the catch-all below); no header falls
+// through to this gate's own authenticateToken/isAdmin call, identical to the old behavior,
+// and never reaches the catch-all a second time since this mount already terminates the
+// response either way. See middleware/agentRunsAuth.ts.
+app.use("/api/admin/agent-runs", authenticateAgentRunsSecretOrAdmin(agentRunsRoutes));
 app.use("/api/admin", adminRoutes);
 app.use("/api/admin", adminUsageRoutes);
 app.use("/api/admin", mcpUsageAdminRoutes);
@@ -396,6 +409,7 @@ app.use("/api/messaging-channels", messagingChannelsRoutes);
 app.use("/api/webhooks/calendly", calendlyWebhookRoutes);
 app.use("/api/webhooks/unipile", unipileWebhookRoutes);
 registerConversionRelayProcessor();
+registerLeadNotificationProcessor();
 app.use("/api/benchmark", benchmarkRoutes);
 app.use("/api/seo", seoRoutes);
 app.use("/api/funnels", funnelRoutes);
@@ -446,7 +460,6 @@ app.use("/api/admin/lead-magnets", authenticateToken, isAdmin, leadMagnetAdminRo
 app.use("/api/admin/fathom-onboarding", authenticateToken, isAdmin, fathomOnboardingAdminRoutes);
 app.use("/api/admin/onboarding-loop", authenticateToken, isAdmin, onboardingLoopAdminRoutes);
 app.use("/api/admin/loops", authenticateToken, isAdmin, loopHealthRoutes);
-app.use("/api/admin/agent-runs", authenticateToken, isAdmin, agentRunsRoutes);
 app.use("/api/client-health", authenticateToken, isAdmin, clientHealthRoutes);
 // ENG-1551 — lead volume drought monitor. Same double-gate as client-health: middleware +
 // service-layer admin check.

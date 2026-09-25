@@ -61,13 +61,39 @@ async function eventsBySubject(month: string): Promise<Map<string, SpendEvent[]>
   return bySubject;
 }
 
-/** Resolve a subject's allowance the same way the impact/snapshot scripts do. */
-async function allowanceFor(billingUserId: string, month: string): Promise<AllowanceInputs> {
+/**
+ * Resolve a subject's allowance the same way the impact/snapshot scripts do.
+ *
+ * FAIL LOUD on unresolvable inputs. The 2026-09-21 near-miss: a perms-starved run
+ * couldn't read AW-Users / the subscription config, so getUserById and
+ * getSubscriptionTypeConfig returned null and this silently seeded EVERY subject
+ * as `unlimited` (usable=0), persisting wrong allowance to prod. A genuinely
+ * uncapped tier and an unreadable one must not look the same: a null user, a
+ * missing subscriptionType, or a null config is a RESOLUTION FAILURE and throws;
+ * only a config that resolves and simply has no `llmUsagePolicy` is a real
+ * uncapped tier.
+ */
+export async function allowanceFor(billingUserId: string, month: string): Promise<AllowanceInputs> {
   const user = await userDb.getUserById(billingUserId);
-  const policy = (await getSubscriptionTypeConfig(user?.subscriptionType || "Unknown"))?.llmUsagePolicy ?? null;
-  const adj = getLlmUsageCreditAdjustment(user?.llmUsageCredits, month);
+  if (!user) {
+    throw new Error(
+      `allowance resolution failed for ${billingUserId}: user not found — refusing to seed 'unlimited' on an unresolved subject`,
+    );
+  }
+  const tier = user.subscriptionType;
+  if (!tier) {
+    throw new Error(`allowance resolution failed for ${billingUserId}: no subscriptionType on the user record`);
+  }
+  const config = await getSubscriptionTypeConfig(tier);
+  if (config == null) {
+    throw new Error(
+      `allowance resolution failed for ${billingUserId}: no subscription config for tier '${tier}' (config source unreadable?)`,
+    );
+  }
+  const adj = getLlmUsageCreditAdjustment(user.llmUsageCredits, month);
+  const policy = config.llmUsagePolicy ?? null;
   if (policy == null) {
-    // No configured cap → uncapped; allowance figures are not meaningful.
+    // Config resolved and this tier genuinely has no cost cap → truly uncapped.
     return { includedAllowanceMicroUsd: 0, unlimited: true };
   }
   return {
@@ -146,9 +172,21 @@ async function main(): Promise<void> {
   let written = 0;
   let worstDriftMicroUsd = 0;
   const drifters: string[] = [];
+  const unresolved: string[] = [];
 
   for (const [billingUserId, events] of bySubject) {
-    const allowance = await allowanceFor(billingUserId, month);
+    // Fail loud but robust: a subject whose allowance can't be resolved is
+    // SKIPPED (never written with a guessed 'unlimited'), recorded, and the run
+    // exits non-zero at the end — one unresolved subject must not abort the rest,
+    // and must not silently persist wrong allowance.
+    let allowance: AllowanceInputs;
+    try {
+      allowance = await allowanceFor(billingUserId, month);
+    } catch (e) {
+      unresolved.push(`${billingUserId} (${e instanceof Error ? e.message : String(e)})`);
+      console.error(`  SKIP ${billingUserId}: ${e instanceof Error ? e.message : String(e)}`);
+      continue;
+    }
     const projection = projectMonth(billingUserId, month, events, allowance);
 
     // Self-consistency: projectMonth's settled figure must equal the event sum.
@@ -181,8 +219,16 @@ async function main(): Promise<void> {
 
   console.log(`\n${write ? `wrote ${written} projection row(s)` : "dry-run complete, nothing written"}.`);
   console.log(`worst reconciliation drift: ${worstDriftMicroUsd}µ (tolerance ${PERSISTED_PROJECTION_TOLERANCE_MICRO_USD}µ)`);
+  if (unresolved.length) {
+    console.error(
+      `ALLOWANCE UNRESOLVED for ${unresolved.length} subject(s) — skipped, NOT written ` +
+        `(fix the read access / config and re-run):\n  ${unresolved.join("\n  ")}`,
+    );
+  }
   if (drifters.length) {
     console.error(`DRIFT beyond tolerance for ${drifters.length} subject(s):\n  ${drifters.join("\n  ")}`);
+  }
+  if (unresolved.length || drifters.length) {
     process.exit(2);
   }
   console.log("all subjects reconcile within tolerance.\n");

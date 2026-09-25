@@ -170,4 +170,55 @@ describe('ENG-1670 — the worker forwards status/code on a generateMarketingRes
     expect(errorCall![0]).toMatchObject({ retryAfterHeaderPresent: false });
     expect(errorCall![0]).not.toHaveProperty('retryAfterMs');
   });
+
+  // ENG-2121: same IPC-boundary hazard as the status/code case above, for the
+  // whole-turn-timeout tag the loop's per-call bound now sets. Live-verified in
+  // preview (2026-09-24) that without this the controller's timeout-salvage
+  // backstop never saw the flag at all — prod would have silently regressed to
+  // the generic diagnosis-agent fallback for every such failure.
+  it('forwards isGenerationTimeout when the wrapped error carries it', async () => {
+    const timeoutError: any = new Error('Your request took longer than expected. Please try again.');
+    timeoutError.isGenerationTimeout = true;
+    generateMarketingResponse.mockRejectedValue(timeoutError);
+
+    await handleMessage({
+      type: 'generateMarketingResponse',
+      requestId: 'req-5',
+      params: {
+        messageContent: 'go',
+        sessionHistory: [],
+        userId: 'user-1',
+        llmModel: 'gemini-3.7-flash',
+        sessionId: 'sess-5',
+      },
+    });
+
+    const errorCall = (process.send as jest.Mock).mock.calls.find(
+      (call) => call[0]?.type === 'error'
+    );
+    expect(errorCall).toBeDefined();
+    expect(errorCall![0]).toMatchObject({ isGenerationTimeout: true });
+  });
+
+  it('omits isGenerationTimeout when the error carries none', async () => {
+    generateMarketingResponse.mockRejectedValue(new Error('Generic failure'));
+
+    await handleMessage({
+      type: 'generateMarketingResponse',
+      requestId: 'req-6',
+      params: {
+        messageContent: 'go',
+        sessionHistory: [],
+        userId: 'user-1',
+        llmModel: 'gemini-3.7-flash',
+        sessionId: 'sess-6',
+      },
+    });
+
+    const errorCall = (process.send as jest.Mock).mock.calls.find(
+      (call) => call[0]?.type === 'error'
+    );
+    expect(errorCall).toBeDefined();
+    expect(errorCall![0]).not.toHaveProperty('isGenerationTimeout');
+  });
 });

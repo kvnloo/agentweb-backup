@@ -72,6 +72,14 @@ export interface ApprovalDeckItem {
     entity_type: string;
     action: string;
     account_id: string;
+    /** ENG-1644: the account getMetaCredentials actually resolved for this
+     *  preview, frozen as a plain value — additive alongside the raw
+     *  account_id above (which must stay raw for digest-matching). A durable,
+     *  cross-session resume must dispatch against this frozen id rather than
+     *  re-deriving one from live connected-accounts state, which can drift
+     *  between preview and a delayed approval. Absent on any record created
+     *  before this field existed. */
+    resolvedAccountId?: string;
     campaign_id?: string;
     ad_set_id?: string;
     ad_id?: string;

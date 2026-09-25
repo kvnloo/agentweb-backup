@@ -963,6 +963,16 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       }
     }
 
+    // Inserts already notify at the CRM write boundary. Every accepted repeat form
+    // submission also notifies, even when it merges into an unchanged existing row.
+    // A server-generated event ID keeps distinct submissions separate on recovery.
+    if (!isNew) {
+      const submission = { submissionId: crypto.randomUUID(), submittedAt: new Date().toISOString() };
+      void import('../services/orgLeadNotificationService')
+        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, submission))
+        .catch(() => console.warn('[leadNotifications] submission hook failed', { listId: leadList.listId, leadId: lead.leadId }));
+    }
+
     // Send API response immediately so caller is not blocked
     if (isNew) {
       res.status(201).json({
@@ -1233,6 +1243,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
             lead,
             alertEventType,
             {
+              orgLeadSubmission: true,
               source: mergedCustomFields.source,
               forwardedAt: mergedCustomFields.forwardedAt,
               company: leadData.company,

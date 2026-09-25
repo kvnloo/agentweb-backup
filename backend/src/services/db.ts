@@ -1,3 +1,4 @@
+import type { LeadNotificationsConfig } from './orgLeadNotificationService';
 import { writeWithEvaluationGuard } from './evaluationPersistence';
 import AWS from "aws-sdk";
 import { assertMemoryContentWithinLimit } from '../utils/memoryContentLimit';
@@ -668,11 +669,12 @@ export interface User {
   stripeConnectMode?: 'live' | 'test'; // Which Stripe mode the connection was made in
   connected_accounts?: Array<{
     platform: 'linkedin' | 'facebook'
-    | 'meta' | 'twitter' | 'instagram' | 'hubspot' | 'attio' | 'fathom' | 'gmail' | 'outlook' | 'youtube' | 'clickup';
+    | 'meta' | 'twitter' | 'instagram' | 'hubspot' | 'attio' | 'fathom' | 'gmail' | 'outlook' | 'youtube' | 'clickup' | 'slack';
     account_id: string;
     account_name: string;
     config: {
-      account_type: 'personal' | 'company_page';
+      account_type: 'personal' | 'company_page' | 'bot';
+      team_id?: string;
       profile_id?: string;
       page_id?: string;
       organization_id?: string;
@@ -818,6 +820,7 @@ export interface User {
 }
 
 export interface Organization {
+  leadNotifications?: LeadNotificationsConfig;
   /**
    * Optimistic-concurrency counter for owner-losing operations. Absent until
    * the first one; see orgDb.claimOwnerChange.
@@ -6565,6 +6568,10 @@ export const crmDb = {
       }
 
       await dynamodb.put(params).promise();
+      // Covers landing-page form capture and every single CRM insert. Never await Slack.
+      void import('./orgLeadNotificationService')
+        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(listId, leadId))
+        .catch(() => console.warn('[leadNotifications] hook failed', { listId, leadId }));
 
       // Extract field names from lead data
       const fieldNames: string[] = [];
@@ -8499,13 +8506,16 @@ export const crmDb = {
             },
           };
 
-          await dynamodb.batchWrite(params).promise();
-          results.successCount += batch.length;
-          results.newCount += batch.length;
+          const written = await dynamodb.batchWrite(params).promise();
+          const unprocessed = new Set((written.UnprocessedItems?.[`${TABLE_PREFIX}AW-Leads`] || [])
+            .map(request => request.PutRequest?.Item?.leadId));
+          const saved = batchCreated.filter(row => !unprocessed.has(row.leadId));
+          results.successCount += saved.length;
+          results.newCount += saved.length;
           // Promote batch IDs into the global created list only after the write
           // succeeds — keeps results.created in sync with what's actually persisted.
-          results.created.push(...batchCreated);
-          batchCreated.forEach(({ sourceIndex }) => {
+          results.created.push(...saved);
+          saved.forEach(({ sourceIndex }) => {
             results.rowOutcomes[sourceIndex] = 'created';
           });
         } catch (batchError: any) {
@@ -8519,6 +8529,14 @@ export const crmDb = {
             results.rowOutcomes[sourceIndex] = 'failed';
           });
         }
+      }
+
+      // One detached dispatcher for all successful writes, not one per 25-row chunk.
+      // Notification delivery must never delay or fail the import save.
+      if (results.created.length) {
+        void import('./orgLeadNotificationService')
+          .then(({ dispatchLeadsCreated }) => dispatchLeadsCreated(listId, results.created.map(row => row.leadId)))
+          .catch(() => console.warn('[leadNotifications] batch hook failed', { listId }));
       }
 
       // Extract all field names from imported leads (both new and updated)
