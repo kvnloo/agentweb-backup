@@ -143,11 +143,16 @@ async function handleHubSpotEvent(
         try {
           lead = await crmDb.getLeadByHubSpotContactId(listId, objectId);
         } catch (lookupErr: any) {
-          if (lookupErr?.lookupExhausted) {
-            console.warn(`[CrmWebhook/HubSpot] ${lookupErr.message} — cannot confirm which lead objectId=${objectId} refers to; not deleting.`);
-            continue;
-          }
-          throw lookupErr;
+          // Same reasoning as the property-change branch, and the same blast radius as
+          // before: a throw here escapes handleHubSpotEvent into the fire-and-forget
+          // wrapper and abandons every remaining objectId in this delivery — HubSpot
+          // already has its 200, so nothing retries. The previous version only caught the
+          // page-cap case, so a throttle still took the whole batch down.
+          const why = lookupErr?.lookupExhausted
+            ? lookupErr.message
+            : `contact-id lookup failed (${lookupErr?.message || lookupErr})`;
+          console.warn(`[CrmWebhook/HubSpot] ${why} — cannot confirm which lead objectId=${objectId} refers to; not deleting.`);
+          continue;
         }
         console.log(`[CrmWebhook/HubSpot] deletion lookup for objectId=${objectId}: lead=${lead?.leadId ?? 'not found'}`);
         if (lead) {
@@ -206,13 +211,21 @@ async function handleHubSpotEvent(
       try {
         lead = await crmDb.getLeadByHubSpotContactId(listId, String(objectId));
       } catch (lookupErr: any) {
-        if (lookupErr?.lookupExhausted) {
-          // Cannot prove absence, and this path has no isCreation gate — so falling through
-          // would create a duplicate on a bare property change. Skip instead.
-          console.warn(`[CrmWebhook/HubSpot] ${lookupErr.message} — skipping objectId=${objectId}`);
-          continue;
-        }
-        lead = null;
+        // ANY failure here means we could not prove the lead is absent, and this path has
+        // no isCreation gate — falling through to `if (!lead) createLead` mints a second
+        // row carrying an already-used hubspot_contact_id, which is the exact duplicate
+        // this lookup exists to prevent.
+        //
+        // `lookupExhausted` is only the page-cap case. A throttle, a timeout or anything
+        // handleDynamoDbError rethrows used to land on `lead = null` and create — under
+        // precisely the load the cap was designed for, since a bulk import into the
+        // customer's HubSpot fires thousands of these, each missing on email and walking
+        // the partition. Skipping loses an edit; creating corrupts the list.
+        const why = lookupErr?.lookupExhausted
+          ? lookupErr.message
+          : `contact-id lookup failed (${lookupErr?.message || lookupErr})`;
+        console.warn(`[CrmWebhook/HubSpot] ${why} — skipping objectId=${objectId}`);
+        continue;
       }
     }
 

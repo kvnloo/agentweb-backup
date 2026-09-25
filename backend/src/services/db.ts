@@ -8518,11 +8518,24 @@ export const crmDb = {
           if (derivedDomain) {
             item.domain = derivedDomain;
           }
-          // Contactable = an email OR a phone. Same rule computeLifecycle applies, so the
-          // stored value cannot contradict the computed one for a phone-only lead.
-          if (emailValue || String(lead.phone ?? '').trim()) {
-            item.lifecycle = 'inbox';
-          }
+          // NO lifecycle stamp — the same reasoning as updateLead and setLeadFields above,
+          // which this originally contradicted. An earlier version of this block wrote
+          // `lifecycle = 'inbox'` for any contactable lead, and that is worse here than
+          // anywhere else: this is the path the HubSpot pull, the Attio pull and CSV import
+          // use, so it creates most leads. askCrmService reads
+          // `lead.lifecycle ?? computeLifecycle(...)`, nothing in production advances a
+          // stored value (lifecycleService.applyAndUpdate has no production callers), and
+          // backfill-crm-scores.ts only writes `if (lead.lifecycle == null)` — so every
+          // bulk-imported lead would have answered "inbox" for the rest of its life, no
+          // matter what it became. Before this PR those rows stored nothing and were
+          // computed correctly; stamping them would have been a regression.
+          //
+          // `domain` above is different and is kept: it is derived once from the email and
+          // nothing recomputes it, so storing it cannot disagree with anything.
+          //
+          // The `lifecycle is_empty` delete-filter footgun that motivated stamping is real
+          // but is not solved by freezing the value — it needs the filter to evaluate the
+          // computed lifecycle. Tracked on ENG-2155.
 
           return {
             PutRequest: {

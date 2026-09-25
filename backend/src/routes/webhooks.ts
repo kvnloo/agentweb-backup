@@ -1714,13 +1714,16 @@ export async function processHubspotWebhookJob(payload: HubspotJobPayload): Prom
             try {
               lead = await crmDb.getLeadByHubSpotContactId(list.listId, String(objectId));
             } catch (lookupErr: any) {
-              if (lookupErr?.lookupExhausted) {
-                // We cannot prove the lead is absent, and the creation branch below would
-                // mint a duplicate on that assumption. Skip this list instead.
-                console.warn(`[HubSpot Webhook] ${lookupErr.message} — skipping list ${list.listId}`);
-                continue;
-              }
-              lead = null;
+              // ANY failure means we cannot prove the lead is absent, and the branches
+              // below act on that assumption. `lookupExhausted` is only the page-cap case;
+              // a throttle or timeout used to fall through as `lead = null`. Less severe
+              // here than in crmWebhook — creation is gated on data.isCreation — but the
+              // edit is still applied to the wrong row or dropped, so skip either way.
+              const why = lookupErr?.lookupExhausted
+                ? lookupErr.message
+                : `contact-id lookup failed (${lookupErr?.message || lookupErr})`;
+              console.warn(`[HubSpot Webhook] ${why} — skipping list ${list.listId}`);
+              continue;
             }
           }
 
