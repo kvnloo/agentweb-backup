@@ -66,6 +66,7 @@ import CostDashboardTab from "../components/admin/CostDashboardTab";
 import ResultEndpointsTab from "../components/admin/ResultEndpointsTab";
 import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
 import EvalV2Tab from "../components/admin/EvalV2Tab";
+import { SatisfactionBadges, SatisfactionColumnHeader } from "../components/admin/SatisfactionBadges";
 import CrmTab from "../components/admin/CrmTab";
 import V0CreditsCard from "../components/admin/V0CreditsCard";
 import CostBreakdownBody, { OrgUsageRollup } from "../components/admin/CostBreakdownBody";
@@ -6087,8 +6088,10 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                   <TableCell>Longest Wait</TableCell>
                   <TableCell>Max Heap</TableCell>
                   <TableCell>Feedback</TableCell>
-                  <TableCell>Satisfaction</TableCell>
                   <TableCell>Actions</TableCell>
+                  <TableCell>
+                    <SatisfactionColumnHeader />
+                  </TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
@@ -6309,6 +6312,50 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                           })()}
                         </TableCell>
                         <TableCell>
+                          <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+                            <Button
+                              variant="outlined"
+                              size="small"
+                              component={RouterLink}
+                              to={buildAgentRunInspectorUrl({ sessionId: session.sessionId })}
+                            >
+                              Debug Chat
+                            </Button>
+                            {session.shareMetadata?.isShared && !(session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token) && (
+                              <Button
+                                variant="outlined"
+                                size="small"
+                                color="error"
+                                component="a"
+                                href={`${CUSTOMER_FRONTEND_URL}/share/${session.sessionId}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                sx={{ textAlign: 'center' }}
+                              >
+                                Shared Chat
+                              </Button>
+                            )}
+                            {session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token && (
+                              <Button
+                                variant="outlined"
+                                size="small"
+                                color="error"
+                                component="a"
+                                href={
+                                  session.sessionType === "predefined-work-plan" && session.workPlan?.title
+                                    ? `${CUSTOMER_FRONTEND_URL}/plan/${encodeURIComponent(session.workPlan.title)}/${session.sessionId}?conversable=${session.interactiveShareMetadata.token}`
+                                    : `${CUSTOMER_FRONTEND_URL}/ishare/${session.sessionId}?conversable=${session.interactiveShareMetadata.token}`
+                                }
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                sx={{ textAlign: 'center' }}
+                              >
+                                Shared Chat
+                              </Button>
+                            )}
+                          </Box>
+                        </TableCell>
+                        <TableCell>
                           {(() => {
                             const sat = session.satisfactionScore;
                             if (scoringSessionIds.has(session.sessionId) && !sat) {
@@ -6364,108 +6411,19 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                             if (!sat && (!session.judgeScores || Object.keys(session.judgeScores).length === 0)) {
                               return <span style={{ color: '#999' }}>-</span>;
                             }
-                            const chips: React.ReactNode[] = [];
-                            if (sat) {
-                              const color = sat.score <= 2 ? 'error' : sat.score === 3 ? 'warning' : 'success';
-                              const dimSummary = sat.dimensions
-                                ? ` | Goal:${sat.dimensions.goalCompletion} Accuracy:${sat.dimensions.dataAccuracy} Quality:${sat.dimensions.outputQuality}`
-                                : '';
-                              chips.push(
-                                <Tooltip key="default" title={`Default: ${sat.reason}${dimSummary}${sat.adminOverride ? ' (admin override)' : ''}`}>
-                                  <Chip
-                                    label={`Default: ${sat.score}`}
-                                    size="small"
-                                    color={color}
-                                    variant={sat.adminOverride ? 'filled' : 'outlined'}
-                                    icon={sat.adminOverride ? <EditIcon sx={{ fontSize: '0.8rem' }} /> : undefined}
-                                    onClick={(e) => {
-                                      setScoreOverrideAnchor(e.currentTarget);
-                                      setScoreOverrideSession(session);
-                                      setScoreOverrideValue(sat.score);
-                                      setScoreOverrideReason(sat.reason);
-                                    }}
-                                    sx={{ cursor: 'pointer' }}
-                                  />
-                                </Tooltip>
-                              );
-                              if (sat.dimensions) {
-                                const { goalCompletion, dataAccuracy, outputQuality } = sat.dimensions;
-                                const dimColor = (v: number) => v <= 2 ? 'error' : v === 3 ? 'warning' : 'success';
-                                chips.push(
-                                  <Tooltip key="dim-goal" title="Goal completion"><Chip label={`G:${goalCompletion}`} size="small" color={dimColor(goalCompletion) as any} variant="outlined" sx={{ fontSize: '0.65rem', height: 18 }} /></Tooltip>,
-                                  <Tooltip key="dim-acc" title="Data accuracy"><Chip label={`A:${dataAccuracy}`} size="small" color={dimColor(dataAccuracy) as any} variant="outlined" sx={{ fontSize: '0.65rem', height: 18 }} /></Tooltip>,
-                                  <Tooltip key="dim-qual" title="Output quality"><Chip label={`Q:${outputQuality}`} size="small" color={dimColor(outputQuality) as any} variant="outlined" sx={{ fontSize: '0.65rem', height: 18 }} /></Tooltip>,
-                                );
-                              }
-                            }
-                            if (session.judgeScores) {
-                              Object.entries(session.judgeScores).forEach(([jId, jScore]) => {
-                                const jColor = jScore.score <= 2 ? 'error' : jScore.score === 3 ? 'warning' : 'success';
-                                const jDimSummary = jScore.dimensions
-                                  ? ` | Goal:${jScore.dimensions.goalCompletion} Accuracy:${jScore.dimensions.dataAccuracy} Quality:${jScore.dimensions.outputQuality}`
-                                  : '';
-                                chips.push(
-                                  <Tooltip key={jId} title={`${jScore.judgeName}: ${jScore.reason}${jDimSummary}`}>
-                                    <Chip
-                                      label={`${jScore.judgeName}: ${jScore.score}`}
-                                      size="small"
-                                      color={jColor as any}
-                                      variant="outlined"
-                                    />
-                                  </Tooltip>
-                                );
-                              });
-                            }
                             return (
-                              <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
-                                {chips}
-                              </Box>
+                              <SatisfactionBadges
+                                score={sat}
+                                judgeScores={session.judgeScores}
+                                onOverride={(anchor, score) => {
+                                  setScoreOverrideAnchor(anchor);
+                                  setScoreOverrideSession(session);
+                                  setScoreOverrideValue(score.score);
+                                  setScoreOverrideReason(score.reason);
+                                }}
+                              />
                             );
                           })()}
-                        </TableCell>
-                        <TableCell>
-                          <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
-                            <Button
-                              variant="outlined"
-                              size="small"
-                              component={RouterLink}
-                              to={buildAgentRunInspectorUrl({ sessionId: session.sessionId })}
-                            >
-                              Debug Chat
-                            </Button>
-                            {session.shareMetadata?.isShared && !(session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token) && (
-                              <Button
-                                variant="outlined"
-                                size="small"
-                                color="error"
-                                component="a"
-                                href={`${CUSTOMER_FRONTEND_URL}/share/${session.sessionId}`}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                sx={{ textAlign: 'center' }}
-                              >
-                                Shared Chat
-                              </Button>
-                            )}
-                            {session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token && (
-                              <Button
-                                variant="outlined"
-                                size="small"
-                                color="error"
-                                component="a"
-                                href={
-                                  session.sessionType === "predefined-work-plan" && session.workPlan?.title
-                                    ? `${CUSTOMER_FRONTEND_URL}/plan/${encodeURIComponent(session.workPlan.title)}/${session.sessionId}?conversable=${session.interactiveShareMetadata.token}`
-                                    : `${CUSTOMER_FRONTEND_URL}/ishare/${session.sessionId}?conversable=${session.interactiveShareMetadata.token}`
-                                }
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                sx={{ textAlign: 'center' }}
-                              >
-                                Shared Chat
-                              </Button>
-                            )}
-                          </Box>
                         </TableCell>
                       </TableRow>
                     ))}
