@@ -1,5 +1,10 @@
 import { sanitizeGeneratedHtml } from '../utils/htmlSanitizer';
 import { AgentModeService, agentModeService as singletonAgentService } from '../services/agentModeService';
+// ENG-2103 (F2): createHtmlFile's body now lives in emma/impl/htmlCreation.ts
+// and emma/tools.ts's execute() calls that module directly (not
+// agentModeService), so the "function call handler" describe block below
+// spies on it there instead of on the class singleton.
+import * as htmlCreationImpl from '../emma/impl/htmlCreation';
 
 // Mock AWS SDK
 jest.mock('aws-sdk', () => ({
@@ -868,9 +873,11 @@ describe('AgentModeService - createHtmlFile', () => {
 
   describe('create_html_file function call handler', () => {
     beforeEach(() => {
-      // The execute handler in emma/tools.ts calls agentModeService.createHtmlFile on the
-      // module-level singleton. Spy on the singleton so assertions can verify it was called.
-      jest.spyOn(singletonAgentService as any, 'createHtmlFile').mockImplementation(async (title, content_draft, format_requirements, userId, sessionId) => {
+      // ENG-2103 (F2): the execute handler in emma/tools.ts calls
+      // emma/impl/htmlCreation.ts's createHtmlFile directly (not
+      // agentModeService). Spy on that module so assertions can verify it
+      // was called.
+      jest.spyOn(htmlCreationImpl, 'createHtmlFile').mockImplementation(async (title, content_draft, format_requirements, userId, sessionId) => {
         if (!title) return { success: false, message: 'title is required' };
         if (!content_draft) return { success: false, message: 'content_draft is required' };
         return {
@@ -898,7 +905,7 @@ describe('AgentModeService - createHtmlFile', () => {
       );
 
       expect(result.success).toBe(true);
-      expect((singletonAgentService as any).createHtmlFile).toHaveBeenCalledWith(
+      expect((htmlCreationImpl as any).createHtmlFile).toHaveBeenCalledWith(
         'Test Title',
         'Test content',
         'Use modern design',
@@ -923,7 +930,7 @@ describe('AgentModeService - createHtmlFile', () => {
       );
 
       expect(result.success).toBe(true);
-      expect((singletonAgentService as any).createHtmlFile).toHaveBeenCalledWith(
+      expect((htmlCreationImpl as any).createHtmlFile).toHaveBeenCalledWith(
         'Aquila May 2026 Newsletter',
         'Newsletter content',
         '',
@@ -946,7 +953,7 @@ describe('AgentModeService - createHtmlFile', () => {
         false
       );
 
-      expect((singletonAgentService as any).createHtmlFile).toHaveBeenCalledWith(
+      expect((htmlCreationImpl as any).createHtmlFile).toHaveBeenCalledWith(
         'Test Title',
         'Test content',
         '',
@@ -970,7 +977,7 @@ describe('AgentModeService - createHtmlFile', () => {
       );
 
       expect(result.success).toBe(true);
-      expect((singletonAgentService as any).createHtmlFile).toHaveBeenCalledWith(
+      expect((htmlCreationImpl as any).createHtmlFile).toHaveBeenCalledWith(
         'Test Title',
         'Test content',
         '',
@@ -996,7 +1003,7 @@ describe('AgentModeService - createHtmlFile', () => {
         success: false,
         error: expect.stringContaining('Missing required argument "title"')
       });
-      expect((singletonAgentService as any).createHtmlFile).not.toHaveBeenCalled();
+      expect((htmlCreationImpl as any).createHtmlFile).not.toHaveBeenCalled();
     });
 
     it('should return error when content_draft is missing', async () => {
@@ -1015,7 +1022,7 @@ describe('AgentModeService - createHtmlFile', () => {
         success: false,
         error: expect.stringContaining('Missing required argument "content_draft"')
       });
-      expect((singletonAgentService as any).createHtmlFile).not.toHaveBeenCalled();
+      expect((htmlCreationImpl as any).createHtmlFile).not.toHaveBeenCalled();
     });
 
     it('should handle mock mode for create_html_file', async () => {
@@ -1036,7 +1043,7 @@ describe('AgentModeService - createHtmlFile', () => {
       expect(result.s3_url).toContain('mock-s3-bucket');
       expect(result.title).toBe('Test Title');
       expect(result.message).toContain('Mock HTML file created successfully');
-      expect((singletonAgentService as any).createHtmlFile).not.toHaveBeenCalled();
+      expect((htmlCreationImpl as any).createHtmlFile).not.toHaveBeenCalled();
     });
 
     it('should validate title in mock mode', async () => {

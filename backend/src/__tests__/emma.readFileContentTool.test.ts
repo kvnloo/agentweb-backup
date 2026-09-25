@@ -9,14 +9,21 @@
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     readFileContent: jest.fn(),
-    createHtmlFile: jest.fn(),
     createHtmlFromTemplate: jest.fn(),
     updateHtmlFile: jest.fn(),
   },
 }));
 
+// ENG-2103 (F2): create_html_file's execute() calls emma/impl/htmlCreation.ts
+// directly (not agentModeService) — mock it separately.
+jest.mock('../emma/impl/htmlCreation', () => ({
+  createHtmlFile: jest.fn(),
+  createHtmlTemplate: jest.fn(),
+}));
+
 import { emmaToolRegistry } from '../emma/registry';
 import { agentModeService } from '../services/agentModeService';
+import * as htmlCreationImpl from '../emma/impl/htmlCreation';
 
 // Import tools.ts to ensure tools are registered.
 import '../emma/tools';
@@ -116,7 +123,7 @@ describe('HTML Emma tools contract cleanup', () => {
     const tool = emmaToolRegistry.getTool('create_html_file');
     if (!tool) throw new Error('Tool create_html_file not found');
 
-    (agentModeService.createHtmlFile as jest.Mock).mockResolvedValue({ success: true, s3_url: 'https://example.com/doc.html' });
+    (htmlCreationImpl.createHtmlFile as jest.Mock).mockResolvedValue({ success: true, s3_url: 'https://example.com/doc.html' });
 
     const result = await tool.execute(
       {
@@ -128,7 +135,7 @@ describe('HTML Emma tools contract cleanup', () => {
       { userId: 'user-123', sessionId: 'sess-1' }
     );
 
-    expect(agentModeService.createHtmlFile).toHaveBeenCalledWith(
+    expect(htmlCreationImpl.createHtmlFile).toHaveBeenCalledWith(
       'Weekly Report',
       'Full report body',
       'Use brand colors',
