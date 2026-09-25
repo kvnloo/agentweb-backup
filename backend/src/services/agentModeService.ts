@@ -239,7 +239,7 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -17560,6 +17560,8 @@ TRUTHFULNESS RULES (these override tone):
 - An error, timeout, or interruption ENDS the run; it does not undo, roll back, or discard work that already succeeded. Never say or imply that completed work was lost, was not saved, or must be redone.
 - Only tell the user to retry the parts that did NOT succeed. If a publish, deploy, or send succeeded, explicitly tell the user NOT to re-run it.
 - Do not attribute a failure to an operation that appears in the succeeded list.
+- If the succeeded list is absent or says NONE, then NOTHING completed in this run. Do not describe any step — loading, connecting, signing in, navigating, fetching, reading, analyzing — as having happened. Report only that the run failed before any operation completed, plus what the user can do next. Never infer the steps from the user's request: the request describes what was ASKED FOR, never what occurred.
+- A tool on the succeeded list RAN; that is NOT the same as its goal being achieved or the task being done. This message exists BECAUSE the run failed — report it as a failure with what (if anything) completed, never as a success. You are never shown tool RESULTS, so never claim what any tool FOUND, RETURNED, ANALYZED, matched, or PRODUCED (e.g. do not say "I analyzed the guest data" because a search tool ran — you cannot see whether it found anything). And never tell the user to run or retry an internal step; the only action you may suggest is that they resend their request.
 - The numbers beside each operation are HOW MANY TIMES IT RAN — never how many leads, rows, emails, posts, files, or records it handled. You are not shown those quantities. Never restate a run count as a quantity of things: "add_leads_to_list: 3" means that tool ran 3 times, NOT that 3 leads were added. If you do not know how many items an operation processed, say what ran without inventing a number.`;
 
       const parts: string[] = [
@@ -17574,6 +17576,18 @@ TRUTHFULNESS RULES (these override tone):
       }
       if (context.succeededFunctions && Object.keys(context.succeededFunctions).length > 0) {
         parts.push(`Succeeded operations, as {operation: number of times it RAN} — NOT a count of records handled (these COMPLETED — do not report them as lost): ${JSON.stringify(context.succeededFunctions)}`);
+      } else {
+        // An empty ledger used to be expressed by OMITTING this line entirely, which left
+        // the model with only the error and the user's request — and it filled the gap by
+        // narrating the request back as if it had happened. Observed in prod on 2026-09-25
+        // (session 7adc834c-3afc-4120-abbb-77caf573b80a): zero tools dispatched, yet the
+        // user was told "I have successfully loaded your browser cookies and navigated to
+        // the event management page." The existing output guards cannot catch this —
+        // stripUnfoundedEntityCounts only removes unproven QUANTITIES, and the
+        // reconcileFalse* passes only correct false NEGATIVES (work landed, reported as
+        // lost). Nothing corrected a false POSITIVE, so state the absence explicitly
+        // rather than leaving it to be inferred from silence.
+        parts.push('Succeeded operations: NONE. No operation completed in this run — it failed before anything ran. Do not describe any step as completed.');
       }
       if (context.failedFunctions && Object.keys(context.failedFunctions).length > 0) {
         parts.push(`Failed operations, as {operation: number of times it FAILED} — NOT a count of records handled: ${JSON.stringify(context.failedFunctions)}`);

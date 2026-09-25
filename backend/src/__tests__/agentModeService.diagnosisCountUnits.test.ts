@@ -121,10 +121,14 @@ describe('generateDiagnosticMessage — run counts are labelled, not entity coun
     expect(system).toMatch(/succeeded/i);
   });
 
-  it('omits the success section (and its unit note) when nothing succeeded', async () => {
+  it('states NONE without a unit note when nothing succeeded', async () => {
     const { user } = await promptFor({ ...PROD_CONTEXT, succeededFunctions: {} });
 
-    expect(user).not.toMatch(/Succeeded operations/i);
+    // REVERSED 2026-09-25: the section is now stated rather than omitted, because silence
+    // let the diagnosis agent invent completed steps (see
+    // agentModeService.diagnosisEmptyLedger.test.ts). ENG-1133's actual requirement is
+    // preserved and asserted below — with no counts present, no unit note may appear.
+    expect(user).toMatch(/Succeeded operations: NONE/);
     expect(user).not.toMatch(/number of times it RAN/i);
   });
 });

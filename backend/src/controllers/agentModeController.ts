@@ -2,7 +2,8 @@ import { scheduleBackupModels } from '../services/agentMode/modelSupersession';
 import { isEvaluationUser, EvaluationDenied } from '../services/evaluationPolicy';
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken, isRealAdmin } from '../middleware/auth';
-import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch } from '../services/agentModeService';
+import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch, ADMIN_SKILL_TOOL_NAMES } from '../services/agentModeService';
+import { filterMessagesForClient as filterMessagesForClientPure } from '../utils/adminOnlyMessageFilter';
 import { ABOUT_AGENTWEB_TEAM, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
 import { computeSessionModelAttribution } from '../utils/sessionModelAttribution';
@@ -2003,7 +2004,30 @@ async function loadConfirmedArtifactUrls(
   return [];
 }
 
-async function getDiagnosticErrorMessage(
+/**
+ * ENG-2160 (deterministic close): when the run failed before ANY tool completed, there is
+ * literally nothing to diagnose — and handing the LLM only the error + the user's request is
+ * exactly what let it narrate the request back as if it had happened ("I have successfully loaded
+ * your browser cookies..."). On an empty ledger we skip the LLM entirely and emit a fixed,
+ * honest, error-type-aware message. This makes empty-ledger fabrication STRUCTURALLY impossible,
+ * not merely discouraged by a prompt rule (that rule stays as defense-in-depth for other paths).
+ */
+export function deterministicEmptyLedgerMessage(error: unknown): string {
+  switch (classifyErrorType(error)) {
+    case 'rate_limit':
+      return "I hit a temporary capacity limit before I could start on your request, so nothing was done yet. Please try again in a moment.";
+    case 'context_limit':
+      return "This conversation got too long for me to process, so I couldn't start on your request. Try starting a new chat or shortening the request.";
+    case 'content_filter':
+      return "I wasn't able to start on this request. Please try rephrasing it.";
+    case 'transient':
+      return "I ran into a temporary error before I could start on your request, so nothing was done yet. Please try again.";
+    default:
+      return "I ran into an error before I could start on your request, so nothing was done yet. Please try again.";
+  }
+}
+
+export async function getDiagnosticErrorMessage(
   error: unknown,
   sessionId: string,
   userMessage: string,
@@ -2031,6 +2055,20 @@ async function getDiagnosticErrorMessage(
     const artifactUrls = typeof turnStartMs === 'number'
       ? collectConfirmedArtifactUrls(session?.messages as any, turnStartMs)
       : [];
+    // ENG-2160 known residual (reviewed 2026-09-26): the succeeded-diff comes from calledFunctions,
+    // whose per-iteration increment is best-effort (failures are swallowed so an iteration never
+    // aborts). If a side-effecting tool (send_email / DM / meta-ads) succeeded but its counter
+    // write was lost, the diff reads empty here and the user is told "nothing was done yet — try
+    // again", which could induce a duplicate action. Narrow (requires a DB write failure) and
+    // roughly pre-existing; the high-stakes writes (publish / lead-import / artifact) are covered
+    // by the independent ledgers checked below. Not worth gating the fix on.
+    // ENG-2160 deterministic close: nothing completed this turn AND nothing measurable to report →
+    // do not call the LLM at all; return a fixed honest message. Fabrication becomes impossible
+    // because the model never sees this case.
+    const nothingSucceeded = !succeededFunctions || Object.keys(succeededFunctions).length === 0;
+    if (nothingSucceeded && publishLedger.length === 0 && !importTotals?.known && artifactUrls.length === 0) {
+      return { message: deterministicEmptyLedgerMessage(error), publishLedger: [], artifactUrls: [] };
+    }
     const context: DiagnosisContext = {
       errorType: classifyErrorType(error),
       errorMessage: error instanceof Error ? error.message : String(error),
@@ -2422,22 +2460,11 @@ function evaluateScheduleResponse(
 }
 
 // Common function to filter messages for client display
-const filterMessagesForClient = (messages: any[]) => {
-  return messages.filter(message => {
-    // Remove tool messages
-    if (message.role === 'tool') {
-      return false;
-    }
-
-    // Remove assistant messages that have tool_calls (intermediate messages during tool execution)
-    // BUT keep assistant messages that have metadata.toolCalls (final messages with tool execution results)
-    if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0 && !message.metadata?.toolCalls) {
-      return false;
-    }
-
-    return true;
-  });
-};
+// ENG-2163: thin wrapper over the pure, unit-tested util (src/utils/adminOnlyMessageFilter).
+// The util takes the admin-tool name set as a param so it stays dependency-free; the controller
+// supplies the real ADMIN_SKILL_TOOL_NAMES here. Default viewerIsAdmin=false fails CLOSED.
+const filterMessagesForClient = (messages: any[], opts: { viewerIsAdmin?: boolean } = {}) =>
+  filterMessagesForClientPure(messages, { viewerIsAdmin: opts.viewerIsAdmin, adminToolNames: ADMIN_SKILL_TOOL_NAMES });
 
 // Helper function to check if this is the last run of the day for an hourly schedule
 function isLastRunOfDayForHourlySchedule(currentTime: Date, nextRunTime: Date): boolean {
@@ -9091,9 +9118,12 @@ export const agentModeController = {
       // not expose it at all, so reading a session's own detail page — the natural place
       // to investigate one incident — silently trusted the misleading field.
       const modelAttribution = computeSessionModelAttribution(session.messages, session.llmModel || null);
+      // ENG-2163: a real admin OR an admin viewing via delegation may see admin-tainted turns;
+      // the account owner (customer) viewing their own session may not.
+      const viewerIsAdmin = !!(user?.isAdmin || (req as any).delegateInfo?.isDelegated);
       const filteredSession = {
         ...session,
-        messages: filterMessagesForClient(session.messages),
+        messages: filterMessagesForClient(session.messages, { viewerIsAdmin }),
         hasActiveProgress: progressActive,
         skills,
         ...modelAttribution,
