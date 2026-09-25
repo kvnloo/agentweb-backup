@@ -47,6 +47,19 @@ export type AccountCapabilityStatus = "unhealthy" | "healthy" | "not_entitled" |
  *  `renewalIntegrationHealthCron.ts`'s own `paidAdsIntentReason` already uses. */
 export type AccountCapabilitySourceDetail = "goal" | "emma_help_interests" | "onboarding_event";
 
+/**
+ * ENG-2143 / OPS-4 (ENG-2149): what establishes that the capability is required NOW. `source`
+ * above only records why the row was first created (historical onboarding intent), which ENG-2016
+ * showed cannot distinguish a stale intent from a current requirement.
+ *  - `contracted`: explicitly required by the customer's agreement, set by a human. Does not age.
+ *  - `recent_ads_action`: a verified ads action or work plan; current only while
+ *    `requirementVerifiedAt` is within the last 30 days.
+ *  - `onboarding_intent`: only the historical onboarding signal is known. Never current on its own.
+ * An absent field means unknown. No code path writes these fields yet: OPS-4 backfills them with
+ * `scripts/eng2149-backfill-requirement-source.ts`.
+ */
+export type AccountCapabilityRequirementSource = "contracted" | "recent_ads_action" | "onboarding_intent";
+
 export interface AccountCapabilityRequirement {
   userId: string;
   capability: AccountCapability;
@@ -60,6 +73,11 @@ export interface AccountCapabilityRequirement {
   correctedBy?: string;
   correctionNote?: string;
   correctionExpiresAt?: string;
+  requirementSource?: AccountCapabilityRequirementSource;
+  /** ISO time the requirement source was last confirmed. */
+  requirementVerifiedAt?: string;
+  /** Who set the requirement source (admin email or the backfill id), for audit. */
+  requirementSetBy?: string;
 }
 
 export async function getAccountCapabilityRequirement(
@@ -206,4 +224,63 @@ export async function setAccountCapabilityCorrection(
       ExpressionAttributeValues: values,
     })
     .promise();
+}
+
+/**
+ * ENG-2143: dedupe state for account-health signals. One row per account under its own range key,
+ * so it never touches (or creates) a paid-ads `ad_platform_integration` row. Written only by
+ * `accountHealthClassifierCron`, which runs only when ACCOUNT_HEALTH_ALERTS_ENABLED=true.
+ */
+export const ACCOUNT_HEALTH_SIGNAL_CAPABILITY = "account_health_signal";
+
+export interface AccountHealthSignalState {
+  /** The classifier state last recorded for this account. */
+  state: string;
+  /** When the account entered `state`. A new value starts a new episode, which may alert again. */
+  stateSince: string;
+  /** `state|billingCycle|stateSince` of the last emitted signal. */
+  lastEpisodeKey?: string;
+  /** Evidence codes already reported in that episode. */
+  lastSignalCodes?: string[];
+  lastSignalAt?: string;
+  /** Optimistic-concurrency counter: every instance runs the cron, and only one may emit. */
+  version: number;
+}
+
+export async function getAccountHealthSignalState(userId: string): Promise<AccountHealthSignalState | null> {
+  const result = await dynamodb
+    .get({ TableName: TABLE_NAME, Key: { userId, capability: ACCOUNT_HEALTH_SIGNAL_CAPABILITY } })
+    .promise();
+  if (!result.Item) return null;
+  const { state, stateSince, lastEpisodeKey, lastSignalCodes, lastSignalAt, version } = result.Item;
+  return { state, stateSince, lastEpisodeKey, lastSignalCodes, lastSignalAt, version };
+}
+
+/**
+ * Writes `next` only if the row is still at `expectedVersion` (null = no row yet). Returns false
+ * when another writer got there first, in which case the caller must not emit: that writer did.
+ */
+export async function putAccountHealthSignalState(
+  userId: string,
+  next: AccountHealthSignalState,
+  expectedVersion: number | null
+): Promise<boolean> {
+  try {
+    await dynamodb
+      .put({
+        TableName: TABLE_NAME,
+        Item: { userId, capability: ACCOUNT_HEALTH_SIGNAL_CAPABILITY, ...next },
+        ...(expectedVersion === null
+          ? { ConditionExpression: "attribute_not_exists(userId)" }
+          : {
+              ConditionExpression: "version = :expected",
+              ExpressionAttributeValues: { ":expected": expectedVersion },
+            }),
+      })
+      .promise();
+    return true;
+  } catch (error) {
+    if ((error as { code?: string } | null)?.code === "ConditionalCheckFailedException") return false;
+    throw error;
+  }
 }
