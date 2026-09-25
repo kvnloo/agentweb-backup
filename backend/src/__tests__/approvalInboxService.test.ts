@@ -164,11 +164,20 @@ describe('approvalInboxService.createDecision', () => {
     } as any)).rejects.toThrow(ApprovalInboxError);
   });
 
-  it('review fix: a credentialPlatform outside meta/instagram/linkedin is rejected — no route could ever auto-resolve it', async () => {
+  it('review fix: a credentialPlatform outside meta/instagram/linkedin/linkedin_ads is rejected — no route could ever auto-resolve it', async () => {
     await expect(service.createDecision({
       gateType: 'customer_credential', customerId: 'cust-1', businessImpact: 'x', evidencePacket: {},
       customerActionUrl: 'https://x', credentialPlatform: 'Facebook Ads', credentialAccountId: 'act_123', expiresAt: FUTURE,
     } as any)).rejects.toThrow(ApprovalInboxError);
+  });
+
+  it('review fix: linkedin_ads is accepted — a distinct platform from linkedin, now wired to its own reconnect route', async () => {
+    mockDynamoDB.put.mockReturnValue(ok());
+    const decision = await service.createDecision({
+      gateType: 'customer_credential', customerId: 'cust-1', businessImpact: 'x', evidencePacket: {},
+      customerActionUrl: 'https://x', credentialPlatform: 'linkedin_ads', credentialAccountId: 'urn:li:sponsoredAccount:111', expiresAt: FUTURE,
+    } as any);
+    expect(decision.credentialPlatform).toBe('linkedin_ads');
   });
 
   it('review fix: a credentialAccountId that normalizes to empty (e.g. literally "act_") is rejected', async () => {

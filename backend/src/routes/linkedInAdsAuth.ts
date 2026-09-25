@@ -15,6 +15,23 @@ const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
+/**
+ * ENG-1644 gap-closing: linkedin_ads was a live platform with zero
+ * auto-resolve wiring — a customer_credential decision for a LinkedIn Ads
+ * reconnect could never resolve on its own, no matter what the customer
+ * did. Same pattern as metaAuth.ts/linkedinAuth.ts's identical helper: the
+ * function itself never throws, but the import statement can — own
+ * try/catch so that can't abort this response.
+ */
+async function safeAutoResolveCredentialDecision(label: string, userId: string, platform: string, accountId: string): Promise<void> {
+  try {
+    const { autoResolveCredentialDecisionOnReconnect } = await import('../services/approvalInboxCustomerNotify');
+    await autoResolveCredentialDecisionOnReconnect(userId, platform, accountId);
+  } catch (err: any) {
+    console.warn(`[${label}] auto-resolve credential decision failed:`, err?.message || err);
+  }
+}
+
 interface StatePayload {
   userId: string;
   nonce: string;
@@ -250,6 +267,8 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
         ...(tokens.personUrn && { person_urn: tokens.personUrn }),
       },
     });
+
+    await safeAutoResolveCredentialDecision('LinkedIn Ads Connect', userId, 'linkedin_ads', adAccountId);
 
     res.json({ success: true, account });
   } catch (error: any) {

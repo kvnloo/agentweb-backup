@@ -48,11 +48,20 @@ jest.mock('../middleware/auth', () => ({
   },
 }));
 
+// ENG-1644 gap-closing (review fix): approvalInboxCustomerNotify.ts
+// transitively pulls in emailService/chatbotService/agentModeService — too
+// heavy to load for real in a unit test, same reasoning as metaAuth.test.ts
+// and linkedinAuth.test.ts's identical mock.
+jest.mock('../services/approvalInboxCustomerNotify', () => ({
+  autoResolveCredentialDecisionOnReconnect: jest.fn(),
+}));
+
 import request from 'supertest';
 import express from 'express';
 import router from '../routes/linkedInAdsAuth';
 import * as linkedInAdsService from '../services/linkedInAdsService';
 import { createAccount } from '../services/connectedAccountsDb';
+import { autoResolveCredentialDecisionOnReconnect } from '../services/approvalInboxCustomerNotify';
 import jwt from 'jsonwebtoken';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'test-jwt-secret';
@@ -275,5 +284,26 @@ describe('POST /connect', () => {
     await request(app).post('/connect').send({ tokenSessionId, adAccountId: 'urn:li:sponsoredAccount:111' });
     const secondRes = await request(app).post('/connect').send({ tokenSessionId, adAccountId: 'urn:li:sponsoredAccount:111' });
     expect(secondRes.status).toBe(401);
+  });
+
+  it('review fix: resolves any pending customer_credential decision for this exact linkedin_ads account on a real reconnect', async () => {
+    const tokenSessionId = await getValidSessionId();
+    await request(app).post('/connect').send({
+      tokenSessionId,
+      adAccountId: 'urn:li:sponsoredAccount:111',
+      adAccountName: 'Test Ad Account',
+    });
+    expect(autoResolveCredentialDecisionOnReconnect).toHaveBeenCalledWith('user-123', 'linkedin_ads', 'urn:li:sponsoredAccount:111');
+  });
+
+  it('a failure in the auto-resolve call never breaks the real connect response', async () => {
+    (autoResolveCredentialDecisionOnReconnect as jest.Mock).mockRejectedValue(new Error('DynamoDB unavailable'));
+    const tokenSessionId = await getValidSessionId();
+    const res = await request(app).post('/connect').send({
+      tokenSessionId,
+      adAccountId: 'urn:li:sponsoredAccount:111',
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
   });
 });

@@ -164,7 +164,7 @@ const MAX_OPTIONS = 4;
 // a real guarantee. These are the only platforms whose reconnect routes
 // actually call autoResolveCredentialDecisionOnReconnect; any other value
 // can structurally never auto-resolve. Enforced here for real.
-const VALID_CREDENTIAL_PLATFORMS = ['meta', 'instagram', 'linkedin'];
+const VALID_CREDENTIAL_PLATFORMS = ['meta', 'instagram', 'linkedin', 'linkedin_ads'];
 
 // Worst-case page bound for listPendingForApprover/listPendingForCustomer's
 // pagination (review fix) — keeps an approver/customer with an enormous,

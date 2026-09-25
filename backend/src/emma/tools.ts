@@ -423,8 +423,8 @@ For a customer-facing credential reconnect (e.g. a disconnected ad account or CM
           // autoResolveCredentialDecisionOnReconnect — a free-text value
           // Emma might otherwise write (e.g. "Facebook Ads") would silently
           // never match at reconnect time (review fix).
-          enum: ['meta', 'instagram', 'linkedin'],
-          description: 'Required for gateType="customer_credential". Which platform this reconnect is about — must match the platform value used elsewhere for this customer\'s connected accounts. Instagram is a distinct platform from Meta ad accounts — use "instagram", never "meta", for an Instagram reconnect.',
+          enum: ['meta', 'instagram', 'linkedin', 'linkedin_ads'],
+          description: 'Required for gateType="customer_credential". Which platform this reconnect is about — must match the platform value used elsewhere for this customer\'s connected accounts. Instagram is a distinct platform from Meta ad accounts — use "instagram", never "meta", for an Instagram reconnect. LinkedIn Ads is a distinct platform from a personal/company LinkedIn connection — use "linkedin_ads", never "linkedin", for a LinkedIn Ads account reconnect.',
         },
         credentialAccountId: {
           type: 'string',
