@@ -14,6 +14,7 @@ import {
 } from './slackService';
 import { settingsService } from './settingsService';
 import type { CreativeGateResult } from './creativeGates';
+import type { CreativeRubricResult } from './creativeRubricJudge';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 export const HUMAN_EVAL_QUEUE_TABLE = `${TABLE_PREFIX}AW-HumanEvalQueue`;
@@ -117,6 +118,9 @@ export interface HumanEvalCandidate {
   /** Advisory deterministic image checks from generation time (ENG-2139). Additive: absent on
    *  older records, on non-image candidates, and when the gates could not run. */
   creativeGates?: CreativeGateResult;
+  /** Advisory rubric-judge result (ENG-2140), written after creation when the judge is enabled and
+   *  this creative was sampled. Additive: absent otherwise. */
+  creativeRubric?: CreativeRubricResult;
   /** Absent when Slack posting was disabled or failed for this candidate (ENG-1854) — the
    *  candidate still persists and is reviewable via the queue API either way. */
   slackChannel?: string;
@@ -501,6 +505,17 @@ export class HumanEvalService {
       console.warn('[human-eval] failed to run feedback action:', err?.message || err);
     });
     return true;
+  }
+
+  /** Stores the rubric-judge result on an existing candidate (ENG-2140). Never creates an item. */
+  async setCreativeRubric(candidateId: string, result: CreativeRubricResult): Promise<void> {
+    await this.db.update({
+      TableName: HUMAN_EVAL_QUEUE_TABLE,
+      Key: { candidateId },
+      UpdateExpression: 'SET creativeRubric = :rubric',
+      ConditionExpression: 'attribute_exists(candidateId)',
+      ExpressionAttributeValues: { ':rubric': result },
+    }).promise();
   }
 
   async getCandidate(candidateId: string): Promise<HumanEvalCandidate | null> {
