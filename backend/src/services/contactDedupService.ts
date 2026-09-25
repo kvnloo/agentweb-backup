@@ -15,7 +15,7 @@
  */
 
 import { crmDb } from './db';
-import { phoneDigits } from '../utils/smokeTestLead';
+import { phoneDigits, isDedupablePhone } from '../utils/smokeTestLead';
 
 export interface DedupedContact {
   /**
@@ -195,8 +195,14 @@ export async function dedupContactsForUser(query: DedupQuery): Promise<DedupResu
       // watched a submission land and could not find it. Dedup on the strongest identity
       // the row actually has. Phone is a real one — two rows sharing a number are one
       // person — and the per-lead fallback can never collapse two distinct people.
+      // isDedupablePhone, not just "has digits". `+1` and `1` both reduce to `1`, so every
+      // lead across the account carrying only a country code collapsed into ONE row — the
+      // others vanish from the Inbox and their list memberships are grafted onto the
+      // survivor. A merge is destructive in a way a split is not, so the bar is "could this
+      // be one person's number".
       const phone = phoneDigits(String(lead?.phone ?? ''));
-      const dedupKey = email || (phone ? `phone:${phone}` : `lead:${list.listId}/${lead?.leadId}`);
+      const dedupKey = email
+        || (isDedupablePhone(lead?.phone) ? `phone:${phone}` : `lead:${list.listId}/${lead?.leadId}`);
       if (!email) noEmailCount += 1;
 
       const membership = {

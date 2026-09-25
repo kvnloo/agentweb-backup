@@ -966,7 +966,16 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // Inserts already notify at the CRM write boundary. Every accepted repeat form
     // submission also notifies, even when it merges into an unchanged existing row.
     // A server-generated event ID keeps distinct submissions separate on recovery.
-    if (!isNew) {
+    //
+    // Gated on the synthetic check for the same reason as the cascade far below: this is a
+    // real org lead notification (Slack/email) and the smoke test must not send one. It
+    // sits ABOVE that gate, so it was firing — and `!isNew` is now EXCLUSIVELY the
+    // smoke-test adopt path for a phone-only capture, since deterministicLeadId was
+    // narrowed to synthetic numbers. buildSmokeTestPhone picks one of only 100 reserved
+    // numbers at random, so collisions are routine by construction and every colliding
+    // resubmission notified a real human about a fake lead. The gate's own comment claims
+    // it skips "the whole cascade"; this is the part that escaped it.
+    if (!isNew && !isSmokeTestLead(lead) && !isSmokeTestLead(leadData)) {
       const submission = { submissionId: crypto.randomUUID(), submittedAt: new Date().toISOString() };
       void import('../services/orgLeadNotificationService')
         .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, submission))
