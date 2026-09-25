@@ -19,7 +19,12 @@ async function notifyOriginSession(decision: ApprovalDecision): Promise<void> {
 
   const verdictLabel =
     decision.verdict === 'approve' ? 'approved' : decision.verdict === 'reject' ? 'rejected' : 'sent back with a correction';
-  const approverLabel = decision.answeredBy || decision.approver || 'the approver';
+  // A 'system:<reason>' answeredBy (e.g. the customer_credential auto-resolve
+  // path's 'system:auto-reconnect') is an internal attribution tag, not
+  // something a human should read verbatim — humanize it (review fix).
+  const approverLabel = decision.answeredBy?.startsWith('system:')
+    ? `the system automatically (${decision.answeredBy.slice('system:'.length).replace(/-/g, ' ')})`
+    : decision.answeredBy || decision.approver || 'the approver';
 
   const content = [
     `[Approval Inbox ${decision.decisionId}] ${approverLabel} ${verdictLabel} this decision.`,
@@ -47,6 +52,38 @@ async function notifyOriginSession(decision: ApprovalDecision): Promise<void> {
       kind: 'approval-inbox-resolution',
     },
   });
+}
+
+/**
+ * Called by approvalExpirySweepCron once a decision has been atomically
+ * flipped to 'expired' (nobody answered it in time) — tells the origin
+ * session explicitly rather than leaving it silently unresolved forever.
+ * Self-contained (own try/catch, never throws) since the cron calls this
+ * directly, not through executeResolvedDecision's wrapper.
+ */
+export async function notifyOriginSessionOfExpiry(decision: ApprovalDecision): Promise<void> {
+  if (!decision.originSessionId) return;
+
+  const approverLabel = decision.approver || (decision.audience === 'customer' ? 'the customer' : 'the approver');
+  const content = [
+    `[Approval Inbox ${decision.decisionId}] This decision expired with no answer from ${approverLabel}.`,
+    `Decision: ${decision.businessImpact}`,
+    'Do not assume this was approved or rejected — nobody answered it in time. Re-raise it if it still matters, or proceed without it if it no longer does.',
+  ].join('\n');
+
+  try {
+    await chatbotDb.addMessageToSession(decision.originSessionId, {
+      role: 'system',
+      content,
+      metadata: {
+        timestamp: new Date().toISOString(),
+        isContextMessage: true,
+        kind: 'approval-inbox-resolution',
+      },
+    });
+  } catch (err: any) {
+    console.warn('[approval-inbox-execution] failed to notify origin session of expiry for decision', decision.decisionId, err?.message || err);
+  }
 }
 
 export async function executeResolvedDecision(decision: ApprovalDecision): Promise<void> {
