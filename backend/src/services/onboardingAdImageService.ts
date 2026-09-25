@@ -111,7 +111,9 @@ export interface AdImageBrandContext extends IcpBrandContext {
  *   aws dynamodb get-item --table-name AW-WorkPlans --region us-west-2 \
  *     --key '{"planId":{"S":"plan_1768351741814_jgc2wwlxa"}}'
  *
- * The descriptive content is unchanged. We treat this as the SYSTEM PROMPT
+ * The descriptive content is unchanged except one label: the plan called
+ * 1080x1350 "Story/Reel", but that is Meta's 4:5 feed portrait — Story/Reel
+ * is 9:16 1080x1920 (ENG-421 audit, fixed in ENG-2139). We treat this as the SYSTEM PROMPT
  * for prompt-construction guidance — every per-variant user prompt that we
  * pass to Gemini is built to match this 6-layer schema.
  */
@@ -134,7 +136,7 @@ export const AD_IMAGE_SYSTEM_PROMPT = [
   "  Common formats:",
   "  Only consider formats in these the two porportions with the following frequency 60%/40%:",
   "  - 1080x1080px (Meta Feed — square)",
-  "  - 1080 x 1350px (Story/Reel — vertical)",
+  "  - 1080 x 1350px (Meta Feed — portrait 4:5)",
   "LAYER 2: BACKGROUND / SETTING",
   '  "SETTING: [Ultra-specific scene description]"',
   "  Include:",
@@ -302,7 +304,7 @@ export function buildSixLayerPromptForVariant(
   lines.push(
     isFeed
       ? `Create a photorealistic square Meta Feed ad — 1080x1080px. Aspect ratio 1:1.`
-      : `Create a photorealistic portrait Story/Reel Meta ad — 1080x1350px. Aspect ratio 4:5.`,
+      : `Create a photorealistic portrait Meta Feed ad — 1080x1350px. Aspect ratio 4:5.`,
   );
   lines.push(``);
 
