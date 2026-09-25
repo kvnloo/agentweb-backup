@@ -29,24 +29,38 @@ interface CliOptions {
   json: boolean;
 }
 
-function parseArgs(argv: readonly string[]): CliOptions {
-  const value = (flag: string) => {
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * `--from`/`--to` accept an ISO timestamp or a date. A date-only `--to` covers that whole day
+ * (inclusive), matching how the documented usage reads. A flag given without an operand is an
+ * error, not a silent default.
+ */
+export function parseArgs(argv: readonly string[], now: Date = new Date()): CliOptions {
+  const value = (flag: string): string | undefined => {
     const i = argv.indexOf(flag);
-    return i > -1 ? argv[i + 1] : undefined;
+    if (i === -1) return undefined;
+    const operand = argv[i + 1];
+    if (operand === undefined || operand.startsWith('--')) throw new Error(`${flag} needs a value`);
+    return operand;
   };
-  const toIso = (flag: string, fallback: Date) => {
+  const toDate = (flag: string, fallback: Date, endOfDay: boolean): Date => {
     const raw = value(flag);
-    const d = raw ? new Date(raw) : fallback;
+    if (raw === undefined) return fallback;
+    const d = new Date(raw);
     if (Number.isNaN(d.getTime())) throw new Error(`${flag} must be a date, got "${raw}"`);
-    return d.toISOString();
+    if (endOfDay && DATE_ONLY.test(raw)) d.setUTCHours(23, 59, 59, 999);
+    return d;
   };
-  const now = new Date();
   const limitRaw = value('--limit');
-  const limit = limitRaw ? Number(limitRaw) : undefined;
+  const limit = limitRaw !== undefined ? Number(limitRaw) : undefined;
   if (limit !== undefined && !(Number.isInteger(limit) && limit > 0)) throw new Error('--limit must be a positive integer');
+  const from = toDate('--from', new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000), false);
+  const to = toDate('--to', now, true);
+  if (from.getTime() > to.getTime()) throw new Error('--from must not be after --to');
   return {
-    from: toIso('--from', new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)),
-    to: toIso('--to', now),
+    from: from.toISOString(),
+    to: to.toISOString(),
     limit,
     perSession: argv.includes('--per-session'),
     json: argv.includes('--json'),
@@ -154,7 +168,9 @@ async function main(): Promise<void> {
   printSummary(graded, groups, opts);
 }
 
-main().catch((err: unknown) => {
-  console.error(err instanceof Error ? err.message : err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err: unknown) => {
+    console.error(err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
+}
