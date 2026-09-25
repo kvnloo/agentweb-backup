@@ -639,7 +639,10 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     it('the EXPLICIT enroll route resolves the lead from the CRM, not the request body', async () => {
       dripSequenceDb.getSequence.mockResolvedValue(linkedInSequence);
       const crmDbMock = require('../services/db').crmDb;
-      crmDbMock.getLeadById = jest.fn().mockResolvedValue({
+      // mockResolvedValueOnce on the SHARED mock rather than replacing it: a bare
+      // reassignment persists for every later test in the file, because clearMocks does
+      // not restore implementations.
+      (crmDbMock.getLeadById as jest.Mock).mockResolvedValueOnce({
         leadId: 'lead-1', linkedin: 'https://linkedin.com/in/ada',
       });
 
@@ -658,7 +661,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     it('the explicit route still enrols when the CRM lookup fails, using the payload', async () => {
       dripSequenceDb.getSequence.mockResolvedValue(mockSequence);
       const crmDbMock = require('../services/db').crmDb;
-      crmDbMock.getLeadById = jest.fn().mockRejectedValue(new Error('DynamoDB unavailable'));
+      (crmDbMock.getLeadById as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB unavailable'));
 
       const res = await request(app)
         .post('/seq_1/enrollments')

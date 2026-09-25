@@ -21,6 +21,7 @@ import axios from 'axios';
 import { extractVariables, leadHasVariable, isSupportedVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
 import { LEAD_LIFECYCLES, defaultStatusConfigFor } from '../utils/leadSchema';
+import { isReachableEmail, isReachableLinkedIn } from '../utils/leadReachability';
 
 /**
  * ENG-2127: the by-list enrol accepts a `lifecycle` filter and hands it to
@@ -75,8 +76,11 @@ function requiredChannels(sequence: any): Set<string> {
  * skips every step and completes having sent nothing.
  */
 function leadIsReachable(lead: any, channels: Set<string>): boolean {
-  if (channels.has('email') && String(lead?.email ?? '').trim()) return true;
-  if (channels.has('linkedin') && String(lead?.linkedin ?? '').trim()) return true;
+  // Same predicates the WORKER uses. These used to be "non-empty string" here and
+  // stricter there, so a lead with free text in `linkedin` enrolled and then skipped
+  // every step — contradicting the promise two lines above.
+  if (channels.has('email') && isReachableEmail(lead?.email)) return true;
+  if (channels.has('linkedin') && isReachableLinkedIn(lead?.linkedin)) return true;
   return false;
 }
 
@@ -254,23 +258,62 @@ router.post(
       // route escaped it only because it reads real rows. The lead is loaded once per
       // entry and reused for the identity below.
       const channels = requiredChannels(sequence);
-      const resolved = await Promise.all(leads.map(async (l: any) => {
-        // Promise.resolve().then(...) so a SYNCHRONOUS throw is caught too — a bare
-        // `.catch()` only handles a rejection, and a lookup that is simply unavailable
-        // must degrade to the payload, never 500 the whole enrol.
-        const row = await Promise.resolve()
-          .then(() => crmDb.getLeadById(l.listId, l.leadId))
-          .catch(() => null);
-        // Fall back to the payload when the row is gone, so a caller that supplied an
-        // address still enrols rather than being dropped by a failed read.
-        return {
-          input: l,
-          lead: {
-            email: (row as any)?.email ?? l.leadEmail ?? l.email,
-            linkedin: (row as any)?.linkedin ?? l.linkedin,
-          },
-        };
-      }));
+
+      // AUTHORIZE EVERY LIST BEFORE READING ANY LEAD.
+      //
+      // `listId` and `leadId` come straight out of the request body, and `getLeadById` is
+      // a bare GetItem with no ownership filter. Authorizing only the SEQUENCE — which is
+      // all this route did — let a caller read any lead row in the table through their own
+      // sequence: the skipped-count became a per-lead "does this lead have an email"
+      // oracle, and the victim's address was written into the caller's enrollment and
+      // handed back by GET /:sequenceId/enrollments. Before this commit the route touched
+      // no CRM data at all, so adding the read added the hole. The sibling by-list route
+      // has always done exactly this check.
+      //
+      // Deduped: one authorization per distinct listId, not per lead.
+      const listIds = Array.from(new Set(leads.map((l: any) => String(l.listId ?? ''))));
+      const listAuth = new Map<string, boolean>();
+      for (const lid of listIds) {
+        if (!lid) { listAuth.set(lid, false); continue; }
+        const list = await crmDb.getLeadListById(lid).catch(() => null);
+        listAuth.set(lid, !!list && await crmDb.canOrgMemberAccessList(authReq.user!.userId, list));
+      }
+      const unauthorized = listIds.filter((lid) => !listAuth.get(lid));
+      if (unauthorized.length > 0) {
+        // Refuse the whole call rather than silently enrolling the authorized subset —
+        // a partial success here is indistinguishable from "that lead was unreachable",
+        // which is the oracle this guard exists to close.
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+
+      // BatchGetItem-style chunking rather than one promise per lead: `leads` is
+      // caller-supplied and capped only by the 50mb body limit, so an unbounded
+      // Promise.all over it is a self-inflicted load problem — and a throttled read
+      // degrades to the payload, which for a LinkedIn sequence means reporting the
+      // caller's own leads as unreachable.
+      const CHUNK = 25;
+      const resolved: Array<{ input: any; lead: any; readFailed: boolean }> = [];
+      for (let i = 0; i < leads.length; i += CHUNK) {
+        const batch = await Promise.all(leads.slice(i, i + CHUNK).map(async (l: any) => {
+          // Promise.resolve().then(...) so a SYNCHRONOUS throw is caught too — a bare
+          // `.catch()` only handles a rejection.
+          const row = await Promise.resolve()
+            .then(() => crmDb.getLeadById(l.listId, l.leadId))
+            .catch(() => null);
+          // `||` not `??`: a row that exists with `email: ''` must not block an address
+          // the caller supplied. `??` only falls through on null/undefined, so an empty
+          // string on the row dropped a lead the caller could legitimately enrol.
+          return {
+            input: l,
+            lead: {
+              email: (row as any)?.email || l.leadEmail || l.email || '',
+              linkedin: (row as any)?.linkedin || l.linkedin || '',
+            },
+            readFailed: row === null,
+          };
+        }));
+        resolved.push(...batch);
+      }
       const enrollable = resolved.filter((r) => leadIsReachable(r.lead, channels));
       const skippedUnreachable = resolved.length - enrollable.length;
       const inputs = enrollable.map((r) => ({

@@ -629,7 +629,11 @@ async function exitEnrollment(
   exitReason: ExitReason,
 ): Promise<void> {
   const finalStatus: EnrollmentStatus = exitReason === 'unsubscribed' ? 'unsubscribed' : 'exited';
-  await completeEnrollment(enrollmentId, exitReason, finalStatus);
+  // delivered=false. An exit sends NOTHING — unsubscribe, conversion, engagement exit,
+  // archived sequence, condition-not-met — so stamping a sent-timestamp records a message
+  // that never existed. This is the highest-volume caller of completeEnrollment and the
+  // `delivered` flag was added without reaching it.
+  await completeEnrollment(enrollmentId, exitReason, finalStatus, 'email', false);
 }
 
 async function getEnrollmentStats(sequenceId: string): Promise<{

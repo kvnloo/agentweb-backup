@@ -12,6 +12,7 @@
  */
 
 import { dripSequenceDb, DripSequence, SequenceEnrollment, StepCondition, SequenceChannel } from './dripSequenceDb';
+import { isReachableEmail, isReachableLinkedIn } from '../utils/leadReachability';
 import { sendAsSender, SenderDailyLimitExceededError } from './sendAsSender';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { crmDb, userDb } from './db';
@@ -120,13 +121,19 @@ async function processEnrollment(
 
   const step = sequence.steps[enrollment.currentStep];
   if (!step) {
-    // No more steps — sequence complete
-    await dripSequenceDb.completeEnrollment(enrollment.enrollmentId, 'completed');
+    // No more steps — sequence complete. delivered=false: this branch sends nothing, it
+    // just notices there is nothing left to send.
+    await dripSequenceDb.completeEnrollment(enrollment.enrollmentId, 'completed', 'completed', 'email', false);
     stats.exited++;
     return;
   }
 
-  const channel: SequenceChannel = step.channel ?? 'email';
+  // Normalised the same way requiredChannels does in the route. Lower-casing only there
+  // turned a dead misconfiguration into a live one: a step authored as 'LinkedIn' passed
+  // the route's reachability test, then failed `channel === 'linkedin'` here and was sent
+  // down the EMAIL branch — a blank email, counted as sent, stamped into lastEmailSentAt.
+  const channel: SequenceChannel =
+    (String(step.channel ?? 'email').trim().toLowerCase() as SequenceChannel);
 
   // Build variable context for substitution (shared by both channels)
   const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
@@ -199,10 +206,10 @@ async function sendEmailStep(
   //
   // And the check is a SHAPE, not `includes('@')`: db.ts stores `lead.linkedin`
   // verbatim for anything that is not a personal /in/ profile, so a handle like
-  // `@ada-lovelace` passed the old test and reached the mail provider.
-  const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  // `@ada-lovelace` passed the old test and reached the mail provider. Shared with the
+  // enrol routes so the two cannot disagree about who is reachable.
   const recipient = String(lead?.email ?? enrollment.leadEmail ?? '').trim();
-  if (!EMAIL_SHAPE.test(recipient)) {
+  if (!isReachableEmail(recipient)) {
     console.log(`[dripWorker] Email step ${step.stepNumber} skipped for enrollment ${enrollment.enrollmentId}: lead has no email address`);
     return false;
   }
@@ -218,7 +225,12 @@ async function sendEmailStep(
   bodyHtml = normalizeYoutubeUrls(bodyHtml);
 
   const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
-  const unsubscribeUrl = `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe?listId=${encodeURIComponent(enrollment.listId)}&leadId=${encodeURIComponent(enrollment.leadId)}&email=${encodeURIComponent(enrollment.leadEmail)}`;
+  // `recipient`, NOT enrollment.leadEmail. The identity is the LinkedIn URL for a lead
+  // that had no address at enrolment, and crmPublic's unsubscribe handler compares the
+  // `email` param against lead.email — so the link in a cold email 403'd and the
+  // recipient could not unsubscribe. This became reachable the moment the email step
+  // started sending to the live address instead of skipping.
+  const unsubscribeUrl = `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe?listId=${encodeURIComponent(enrollment.listId)}&leadId=${encodeURIComponent(enrollment.leadId)}&email=${encodeURIComponent(recipient)}`;
   bodyHtml = injectUnsubscribeUrl(bodyHtml, unsubscribeUrl);
 
   const selectedSender = senderConfig.senders.find(
@@ -239,11 +251,11 @@ async function sendEmailStep(
       html: bodyHtml,
     });
   } catch (error) {
-    console.error(`[dripWorker] Send failed for step ${step.stepNumber} to ${enrollment.leadEmail}:`, error);
+    console.error(`[dripWorker] Send failed for step ${step.stepNumber} to ${recipient}:`, error);
     throw error;
   }
 
-  console.log(`[dripWorker] Sent email step ${step.stepNumber} to ${enrollment.leadEmail} via ${sendResult.provider} (id: ${sendResult.messageId})`);
+  console.log(`[dripWorker] Sent email step ${step.stepNumber} to ${recipient} via ${sendResult.provider} (id: ${sendResult.messageId})`);
   return true;
 }
 
@@ -259,7 +271,10 @@ async function sendLinkedInStep(
   // sendMessage throws on those. That throw is not a lead-data skip, so it retried
   // forever: the exact failure this whole change set out to kill, surviving in the one
   // case the emptiness check does not catch.
-  const isPersonalProfile = !!linkedInUrl && /\/in\//i.test(linkedInUrl);
+  // Shared predicate: it mirrors linkedInOutreachService's own `split('/in/')` parse, so
+  // a value this accepts is one the service can resolve. A case-insensitive test accepted
+  // `/IN/`, which the service then threw on — and a throw here is retried forever.
+  const isPersonalProfile = isReachableLinkedIn(linkedInUrl);
   if (!isPersonalProfile) {
     // A LEAD-DATA gap, not a failure. Throwing here rethrew out of processEnrollment, so the
     // enrollment retried this step forever and never reached the steps it COULD receive.
@@ -302,9 +317,17 @@ async function checkExitConditions(
 ): Promise<'converted' | 'engagement' | 'unsubscribed' | null> {
   const { exitConditions } = sequence;
 
-  // Fetch lead once — needed for lifecycle and unsubscribe checks
+  // Fetch lead once — needed for lifecycle, unsubscribe AND the engagement key.
+  // onEmailEngagement was NOT in this condition, so for a sequence configured with only
+  // that exit the lead was null and the engagement lookup fell back to the enrollment
+  // identity — which for an address-less lead is its LinkedIn URL, and matches no Resend
+  // event. The exit could never fire.
   let lead: any = null;
-  if (exitConditions.onLifecycleChange?.length || exitConditions.onUnsubscribe) {
+  if (
+    exitConditions.onLifecycleChange?.length
+    || exitConditions.onUnsubscribe
+    || exitConditions.onEmailEngagement?.length
+  ) {
     lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
   }
 
@@ -340,8 +363,13 @@ async function checkExitConditions(
         `user ${enrollment.userId} has no emailDomain, so no email events exist`,
       );
     } else {
+      // Keyed on the address Resend actually saw, not on the enrollment identity. For a
+      // lead enrolled without an address the identity is its LinkedIn URL, so this query
+      // matched nothing and a sequence set to stop on 'replied' kept sending to someone
+      // who had already replied. `lead` is loaded above for the unsubscribe check.
+      const engagementKey = String((lead as any)?.email ?? '').trim() || enrollment.leadEmail;
       const events = await emailEventsDb
-        .getEventsByEmailDomainAndLeadEmail(emailDomain, enrollment.leadEmail)
+        .getEventsByEmailDomainAndLeadEmail(emailDomain, engagementKey)
         .catch(() => []);
 
       // Scope to engagement that happened AFTER this enrollment started.

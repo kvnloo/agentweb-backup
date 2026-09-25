@@ -218,9 +218,14 @@ describe('dripSequenceWorker — a step the lead cannot receive is skipped, not 
   it('a {{email}} token in a LinkedIn DM never renders the profile URL', async () => {
     // The suite-wide mock is identity; render for real here so the assertion is about
     // the message a human would receive, not about the template.
-    (require('../utils/emailVariables').substituteVariables as jest.Mock)
-      .mockImplementation((tpl: string, vars: Record<string, any>) =>
-        String(tpl).replace(/\{\{(\w+)\}\}/g, (_m, k) => String(vars?.[k] ?? '')));
+    //
+    // mockImplementationOnce, not mockImplementation: `clearMocks` resets calls but NOT
+    // implementations, so a plain mockImplementation here leaked the real renderer into
+    // every test declared after this one and silently changed what they exercise.
+    const vars = require('../utils/emailVariables').substituteVariables as jest.Mock;
+    const render = (tpl: string, v: Record<string, any>) =>
+      String(tpl).replace(/\{\{(\w+)\}\}/g, (_m: string, k: string) => String(v?.[k] ?? ''));
+    vars.mockImplementationOnce(render).mockImplementationOnce(render).mockImplementationOnce(render);
     mockDb.getSequence.mockResolvedValue({
       ...mixedSequence,
       steps: [{ stepId: 's2', stepNumber: 1, name: 'DM', channel: 'linkedin', delayDays: 0,
