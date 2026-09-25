@@ -216,3 +216,14 @@ describe('evaluateCreativeGates', () => {
     expect(status(result, 'aspect_fallback')).toBe('pass');
   });
 });
+
+describe('evaluateCreativeGates blank_render skip reasons', () => {
+  it('distinguishes an unmeasured luminance from a failed decode', () => {
+    const unmeasured = evaluateCreativeGates({ bytes: 1000, decoded: true, width: 1080, height: 1080 });
+    expect(unmeasured.checks.find((c) => c.id === 'blank_render'))
+      .toEqual({ id: 'blank_render', status: 'skipped', reason: 'luminance could not be measured' });
+    const undecoded = evaluateCreativeGates({ bytes: 1000, decoded: false });
+    expect(undecoded.checks.find((c) => c.id === 'blank_render'))
+      .toEqual({ id: 'blank_render', status: 'skipped', reason: 'image did not decode' });
+  });
+});
