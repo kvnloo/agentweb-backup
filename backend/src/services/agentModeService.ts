@@ -15534,66 +15534,75 @@ ${emailDraftFormat === 'text'
   "htmlContent": "Complete HTML email body (well-formatted, professional, email-friendly HTML)"
 }`}`;
 
-      const reportGenerationModel = await this.getReportGenerationDefaultModel();
-      const completion = await this.callLLM(
-        reportGenerationModel,
-        [
+      // The EMAIL draft runs only when there is an address to send to. This function also
+      // produces the LinkedIn connection-request note below, and linkedInInviteCrmMirror
+      // creates leads that have a linkedin and no email — so the guard at the top of this
+      // function cannot refuse them outright. But widening that guard on its own left this
+      // path still running for them: two billed LLM calls producing a polished draft
+      // addressed to nobody, which is the exact harm the guard was added to prevent.
+      let emailDraft: any = null;
+      let emailData: any = null;
+      if (lead.email) {
+        const reportGenerationModel = await this.getReportGenerationDefaultModel();
+        const completion = await this.callLLM(
+          reportGenerationModel,
+          [
+            {
+              role: "system",
+              content: emailDraftFormat === 'text'
+                ? "You are an expert email marketing strategist. Create personalized, professional plain text emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and textContent fields. Use plain text only - no HTML tags or formatting markup."
+                : "You are an expert email marketing strategist. Create personalized, professional emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and htmlContent fields.",
+            },
+            { role: "user", content: emailPrompt },
+          ],
           {
-            role: "system",
-            content: emailDraftFormat === 'text'
-              ? "You are an expert email marketing strategist. Create personalized, professional plain text emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and textContent fields. Use plain text only - no HTML tags or formatting markup."
-              : "You are an expert email marketing strategist. Create personalized, professional emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and htmlContent fields.",
+          temperature: 0.8,
+            max_completion_tokens: 3000,
+            response_format: { type: 'json_object' },
+            usageContext: { userId, sessionId, feature: 'email_draft' },
+            taskClass: 'content_generation',
           },
-          { role: "user", content: emailPrompt },
-        ],
-        {
-        temperature: 0.8,
-          max_completion_tokens: 3000,
-          response_format: { type: 'json_object' },
-          usageContext: { userId, sessionId, feature: 'email_draft' },
-          taskClass: 'content_generation',
-        },
-      );
+        );
 
-      const responseContent = completion.choices[0].message.content;
-      if (!responseContent) {
-        throw new Error('No content generated from LLM');
-      }
-
-      // Parse the JSON response
-      let emailData;
-      try {
-        const cleanedContent = responseContent.replace(/```json\s*|\s*```/g, '').trim();
-        emailData = JSON.parse(cleanedContent);
-      } catch (parseError) {
-        console.error('AgentMode: Error parsing email draft JSON:', parseError);
-        throw new Error('Failed to parse email draft response');
-      }
-
-      // Validate required fields based on format
-      if (emailDraftFormat === 'text') {
-        if (!emailData.subject || !emailData.textContent) {
-          throw new Error('LLM response missing required fields (subject, textContent)');
+        const responseContent = completion.choices[0].message.content;
+        if (!responseContent) {
+          throw new Error('No content generated from LLM');
         }
-      } else {
-        if (!emailData.subject || !emailData.htmlContent) {
-          throw new Error('LLM response missing required fields (subject, htmlContent)');
+
+        // Parse the JSON response
+        try {
+          const cleanedContent = responseContent.replace(/```json\s*|\s*```/g, '').trim();
+          emailData = JSON.parse(cleanedContent);
+        } catch (parseError) {
+          console.error('AgentMode: Error parsing email draft JSON:', parseError);
+          throw new Error('Failed to parse email draft response');
         }
-      }
 
-      // Save draft to lead record with sessionId
-      const now = new Date().toISOString();
-      const emailDraft: any = {
-        subject: emailData.subject,
-        createdAt: existingDraft?.createdAt || now,
-        updatedAt: now,
-        sessionId: sessionId
-      };
+        // Validate required fields based on format
+        if (emailDraftFormat === 'text') {
+          if (!emailData.subject || !emailData.textContent) {
+            throw new Error('LLM response missing required fields (subject, textContent)');
+          }
+        } else {
+          if (!emailData.subject || !emailData.htmlContent) {
+            throw new Error('LLM response missing required fields (subject, htmlContent)');
+          }
+        }
 
-      if (emailDraftFormat === 'text') {
-        emailDraft.textContent = emailData.textContent;
-      } else {
-        emailDraft.htmlContent = emailData.htmlContent;
+        // Save draft to lead record with sessionId
+        const now = new Date().toISOString();
+        emailDraft = {
+          subject: emailData.subject,
+          createdAt: existingDraft?.createdAt || now,
+          updatedAt: now,
+          sessionId: sessionId
+        };
+
+        if (emailDraftFormat === 'text') {
+          emailDraft.textContent = emailData.textContent;
+        } else {
+          emailDraft.htmlContent = emailData.htmlContent;
+        }
       }
 
       // Build activity history section for message prompt (reuse already-fetched engagements)
@@ -15627,7 +15636,7 @@ ${emailDraftFormat === 'text'
       const messagePrompt = `You are writing a LinkedIn connection request note. The goal is to get the recipient to accept.
 
 Recipient: ${leadDesc}
-Context from their email (use to understand the outreach angle): Subject: ${emailData.subject} — ${emailSummary}
+${emailData ? `Context from their email (use to understand the outreach angle): Subject: ${emailData.subject} — ${emailSummary}` : 'No email draft for this lead (no address on file) — write the note from their profile alone.'}
 ${messageActivityContext}
 
 Write a note that:
@@ -15701,26 +15710,31 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
 
       // Update lead with both email draft and message draft
       await crmDb.updateLead(listId, leadId, {
-        emailDraft: emailDraft,
-        emailDraftFormat: emailDraftFormat,
+        ...(emailDraft && { emailDraft, emailDraftFormat }),
         ...(messageDraft && { messageDraft: messageDraft })
       });
 
       return {
         success: true,
-        message: existingDraft
-          ? 'Email and message drafts updated successfully'
-          : 'Email and message drafts created successfully',
+        message: emailData
+          ? (existingDraft
+            ? 'Email and message drafts updated successfully'
+            : 'Email and message drafts created successfully')
+          : 'LinkedIn message draft created — no email draft, this lead has no address',
         data: {
-          email: emailDraftFormat === 'text'
-            ? {
-              subject: emailData.subject,
-              textContent: emailData.textContent
-            }
-            : {
-              subject: emailData.subject,
-              htmlContent: emailData.htmlContent
-            },
+          // null, not a fabricated shape: webhooks.ts reads data.email to decide whether to
+          // auto-send, and an object with undefined fields would read as a real draft.
+          email: !emailData
+            ? null
+            : emailDraftFormat === 'text'
+              ? {
+                subject: emailData.subject,
+                textContent: emailData.textContent
+              }
+              : {
+                subject: emailData.subject,
+                htmlContent: emailData.htmlContent
+              },
           message: messageDraft ? { content: messageDraft.content } : null
         }
       };

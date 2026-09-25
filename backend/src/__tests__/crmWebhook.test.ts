@@ -23,6 +23,8 @@ jest.mock('../services/db', () => ({
     getLeadListById: jest.fn(),
     getLeadByEmail: jest.fn(),
     getLeadByAttioRecordId: jest.fn().mockResolvedValue(null),
+    getLeadByHubSpotContactId: jest.fn().mockResolvedValue(null),
+    createLead: jest.fn().mockResolvedValue({ leadId: 'new-lead' }),
     updateLead: jest.fn(),
   },
 }));
@@ -207,6 +209,72 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
         customFields: expect.objectContaining({ my_custom_crm_field: 'custom_value' }),
       })
     );
+  });
+
+  // ENG-2082: a lead we pushed to HubSpot carries a hubspot_contact_id and, for a
+  // phone-only capture, no address. This whole branch shipped with no coverage — reverting
+  // the fix left the suite fully green, which is how the "both adopt it now" claim went
+  // unchecked.
+  it('resolves by hubspot_contact_id when the email lookup misses, and ADOPTS the address', async () => {
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockResolvedValue({
+      leadId: 'lead-phone-only',
+      listId: VALID_LIST_ID,
+      phone: '2125559876',
+      syncMetadata: { hubspot_contact_id: '12345' },
+    });
+
+    const res = await request(app)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send([{
+        subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '12345',
+        propertyName: 'email', propertyValue: 'late@acme.com',
+      }]);
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 50));
+    expect(crmDb.createLead).not.toHaveBeenCalled();
+    expect(crmDb.updateLead).toHaveBeenCalledWith(
+      VALID_LIST_ID, 'lead-phone-only',
+      expect.objectContaining({ email: 'late@acme.com' }),
+    );
+  });
+
+  it('does not overwrite an address the lead already has', async () => {
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+      leadId: 'lead-1', listId: VALID_LIST_ID, email: 'john@acme.com',
+    });
+
+    await request(app)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send([{
+        subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '12345',
+        propertyName: 'firstname', propertyValue: 'Johnny',
+      }]);
+
+    await new Promise(r => setTimeout(r, 50));
+    const updates = (crmDb.updateLead as jest.Mock).mock.calls[0]?.[2] ?? {};
+    expect(updates.email).toBeUndefined();
+  });
+
+  it('refuses to create when the contact-id lookup was exhausted', async () => {
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockRejectedValue(
+      Object.assign(new Error('exhausted 20 pages'), { lookupExhausted: true }),
+    );
+
+    await request(app)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send([{
+        subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '12345',
+        propertyName: 'email', propertyValue: 'someone@acme.com',
+      }]);
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(crmDb.createLead).not.toHaveBeenCalled();
   });
 
   // ─── Happy paths ──────────────────────────────────────────────────────────────

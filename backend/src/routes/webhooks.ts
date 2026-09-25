@@ -1701,18 +1701,28 @@ export async function processHubspotWebhookJob(payload: HubspotJobPayload): Prom
           // one this lookup missed, the edit was dropped and — on a creation event — a
           // SECOND row was created carrying the same hubspot_contact_id as the first. The
           // Attio path and crmWebhook.ts:136 already resolve by id; this one did not.
-          // Email first. The contact-id fallback is a partition Query with a
-          // FilterExpression and no index, so a MISS walks up to 20 pages of the list — and
-          // it runs once per linked list. Only pay it when the event could actually result
-          // in a write: a property-change for a contact we have never seen is discarded a
-          // few lines below anyway (`if (!data.isCreation) continue`), so walking the list
-          // for it is pure cost on every unrelated webhook the portal sends.
+          // Email first, then the contact id — UNCONDITIONALLY. An earlier version gated the
+          // fallback on `isCreation || isDeleted` to save the partition walk, which quietly
+          // disabled the whole feature: a HubSpot creation event for a lead we pushed
+          // without an address carries no email, so the handler `continue`s at `if (!email)`
+          // above before any lookup happens. The address therefore only ever arrives as a
+          // contact.propertyChange — precisely the case that gate excluded. The walk is
+          // bounded by MAX_PAGES inside the lookup; correctness is not negotiable for it.
           const leadByEmail = await crmDb.getLeadByEmail(list.listId, email.toLowerCase());
-          const lead =
-            leadByEmail ||
-            (data.isCreation || data.isDeleted
-              ? await crmDb.getLeadByHubSpotContactId(list.listId, String(objectId)).catch(() => null)
-              : null);
+          let lead = leadByEmail;
+          if (!lead) {
+            try {
+              lead = await crmDb.getLeadByHubSpotContactId(list.listId, String(objectId));
+            } catch (lookupErr: any) {
+              if (lookupErr?.lookupExhausted) {
+                // We cannot prove the lead is absent, and the creation branch below would
+                // mint a duplicate on that assumption. Skip this list instead.
+                console.warn(`[HubSpot Webhook] ${lookupErr.message} — skipping list ${list.listId}`);
+                continue;
+              }
+              lead = null;
+            }
+          }
 
           // Deletion: flag an existing lead as CRM-removed (nothing to do if absent).
           if (data.isDeleted) {

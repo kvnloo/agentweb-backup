@@ -274,6 +274,50 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
     expect(mockUpdateLead.mock.calls[0][2]).toMatchObject({ email: 'new@example.com' });
   });
 
+  // The address for an AgentWeb-pushed phone-only lead NEVER arrives on contact.creation —
+  // that event carries no email, so the handler `continue`s before any lookup. It arrives as
+  // a propertyChange. An earlier version gated the contact-id fallback on
+  // `isCreation || isDeleted` to save the partition walk, which silently disabled the whole
+  // feature on the only event that reaches it.
+  it('resolves by contact id on a propertyChange, not just on creation', async () => {
+    mockGetLeadByEmail.mockResolvedValue(null);
+    mockGetLeadByHubSpotContactId.mockResolvedValue({
+      leadId: 'lead-phone-only', listId: LIST_ID, phone: '2125559876',
+      syncMetadata: { hubspot_contact_id: '779' },
+    });
+    mockGetContactById.mockResolvedValue({ email: 'late@example.com', firstname: 'Late' });
+
+    await request(app).post('/api/webhooks/hubspot').send([{
+      subscriptionType: 'contact.propertyChange', portalId: PORTAL_ID, objectId: '779',
+      propertyName: 'email', propertyValue: 'late@example.com',
+    }]);
+    await flushPromises();
+    await flushPromises();
+
+    expect(mockGetLeadByHubSpotContactId).toHaveBeenCalled();
+    expect(mockCreateLead).not.toHaveBeenCalled();
+    expect(mockUpdateLead).toHaveBeenCalled();
+    expect(mockUpdateLead.mock.calls[0][1]).toBe('lead-phone-only');
+  });
+
+  // A lookup that gave up after MAX_PAGES cannot prove absence. Creating on that basis
+  // mints the duplicate the lookup exists to prevent.
+  it('does not create a lead when the contact-id lookup was exhausted', async () => {
+    mockGetLeadByEmail.mockResolvedValue(null);
+    mockGetLeadByHubSpotContactId.mockRejectedValue(
+      Object.assign(new Error('exhausted 20 pages'), { lookupExhausted: true }),
+    );
+    mockGetContactById.mockResolvedValue({ email: 'new@example.com', firstname: 'New' });
+
+    await request(app).post('/api/webhooks/hubspot')
+      .send([{ subscriptionType: 'contact.creation', portalId: PORTAL_ID, objectId: '780' }]);
+    await flushPromises();
+    await flushPromises();
+
+    expect(mockCreateLead).not.toHaveBeenCalled();
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
   it('does not clobber an address we already hold with a DIFFERENT one', async () => {
     // The incoming address must differ from the stored one, or this asserts nothing:
     // writing the same value back is indistinguishable from not writing it.

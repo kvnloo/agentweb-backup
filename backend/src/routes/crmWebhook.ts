@@ -186,9 +186,20 @@ async function handleHubSpotEvent(
     // created a SECOND row carrying the same hubspot_contact_id. Worse here than in
     // webhooks.ts: that path at least gates creation on data.isCreation, this one does not,
     // so a bare property change was enough to duplicate the lead.
-    const lead =
-      (await crmDb.getLeadByEmail(listId, email.toLowerCase())) ||
-      (await crmDb.getLeadByHubSpotContactId(listId, String(objectId)).catch(() => null));
+    let lead = await crmDb.getLeadByEmail(listId, email.toLowerCase());
+    if (!lead) {
+      try {
+        lead = await crmDb.getLeadByHubSpotContactId(listId, String(objectId));
+      } catch (lookupErr: any) {
+        if (lookupErr?.lookupExhausted) {
+          // Cannot prove absence, and this path has no isCreation gate — so falling through
+          // would create a duplicate on a bare property change. Skip instead.
+          console.warn(`[CrmWebhook/HubSpot] ${lookupErr.message} — skipping objectId=${objectId}`);
+          continue;
+        }
+        lead = null;
+      }
+    }
 
     if (!lead) {
       // New contact in HubSpot — create it in our list

@@ -422,6 +422,31 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
     // This function ALSO writes the LinkedIn connection-request note, and
     // linkedInInviteCrmMirror creates leads with a linkedin and no email. Gating on email
     // alone deleted a working feature to fix a new one.
+    // Widening the guard to `!email && !linkedin` let the LinkedIn note through — but left
+    // the EMAIL path running for those leads too: two billed LLM calls producing a polished
+    // draft addressed to nobody, the exact harm the guard was added to prevent.
+    it('a LinkedIn-only lead gets NO email draft, and no email is written to the lead', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead1', listId: 'list1', linkedin: 'https://linkedin.com/in/ada',
+        firstName: 'Ada', lastName: 'Lovelace',
+      });
+
+      await (agentModeService as any).updateEmailDraftForLead(
+        'list1', 'lead1', 'Create email', 'session1', 'user1'
+      );
+
+      // Assert on the LLM CALLS, not on the result. Both the gated and ungated versions
+      // return a similar-looking object once the mocked LLM yields nothing usable, so a
+      // result-shaped assertion cannot tell them apart — it passes either way. The billed
+      // call is the harm, so that is what to measure.
+      const systemPrompts = (agentModeService.callLLM as jest.Mock).mock.calls
+        .flatMap((c: any[]) => (c[1] ?? []))
+        .filter((m: any) => m?.role === 'system')
+        .map((m: any) => String(m.content));
+      expect(systemPrompts.some((p) => p.includes('email marketing strategist'))).toBe(false);
+    });
+
     it('still drafts for a LinkedIn-only lead (no email)', async () => {
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'user1' });
       (crmDb.getLeadById as jest.Mock).mockResolvedValue({

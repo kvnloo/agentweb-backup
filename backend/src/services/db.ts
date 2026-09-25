@@ -7332,12 +7332,18 @@ export const crmDb = {
         pages++;
       } while (lastEvaluatedKey && pages < MAX_PAGES);
       if (lastEvaluatedKey) {
-        // Say so rather than reporting a clean absence: the caller treats null as "no such
-        // lead" and may create one, which is the duplicate this lookup exists to prevent.
-        console.warn(
-          `[crmDb] getLeadByHubSpotContactId gave up after ${MAX_PAGES} pages in list ${listId} ` +
-          `looking for contact ${contactId} — reporting not-found, which may duplicate the row.`,
+        // THROW, do not return null. A caller cannot tell "no such lead" from "I stopped
+        // looking" if both are null — and it acts on null by CREATING the lead, which mints
+        // the duplicate carrying an already-used hubspot_contact_id that this lookup exists
+        // to prevent. On a list big enough to need >20 filtered pages that is the likely
+        // outcome, not the unlikely one.
+        const err: any = new Error(
+          `getLeadByHubSpotContactId exhausted ${MAX_PAGES} pages in list ${listId} looking for ` +
+          `contact ${contactId} — cannot prove the lead is absent.`,
         );
+        err.lookupExhausted = true;
+        console.warn(`[crmDb] ${err.message}`);
+        throw err;
       }
       return null;
     } catch (error) {

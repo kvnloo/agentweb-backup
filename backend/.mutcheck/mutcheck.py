@@ -17,7 +17,7 @@ The file is always restored, including on exception.
   ...text to put in its place...
   SPEC
 """
-import subprocess, sys, shutil, pathlib
+import subprocess, sys, shutil, pathlib, re
 
 def run_suite(pattern):
     r = subprocess.run(
@@ -26,9 +26,15 @@ def run_suite(pattern):
         env={**__import__('os').environ, 'NODE_OPTIONS': '--max-old-space-size=6144'},
     )
     out = r.stdout + r.stderr
-    failed = 'failed' in out and 'Tests:' in out
     line = next((l.strip() for l in out.splitlines() if l.strip().startswith('Tests:')), '(no summary)')
-    return failed, line
+    # A mutation that breaks COMPILATION is not evidence that the test binds — it proves
+    # only that the file stopped building. Jest still prints a `Tests:` line in that case,
+    # so a naive `'failed' in out` reports BINDS for a broken edit.
+    broke_build = 'Test suite failed to run' in out
+    # Count real assertion failures, not the word "failed" anywhere in the output.
+    m = re.search(r'Tests:.*?(\d+) failed', line)
+    failed = bool(m) and int(m.group(1)) > 0
+    return failed, line, broke_build
 
 def main():
     path, pattern = sys.argv[1], sys.argv[2]
@@ -47,7 +53,9 @@ def main():
     if anchor == repl:
         sys.exit('REFUSING: replacement is identical to the anchor.')
 
-    before_failed, before_line = run_suite(pattern)
+    before_failed, before_line, before_broke = run_suite(pattern)
+    if before_broke:
+        sys.exit('REFUSING: suite does not build before the mutation.')
     if before_failed:
         sys.exit(f'REFUSING: suite is already failing before the mutation — {before_line}')
 
@@ -58,10 +66,14 @@ def main():
         if mutated == src:
             sys.exit('REFUSING: file unchanged after replace.')
         p.write_text(mutated)
-        after_failed, after_line = run_suite(pattern)
-        verdict = 'BINDS' if after_failed else '*** VACUOUS — the suite passes without the code ***'
+        after_failed, after_line, after_broke = run_suite(pattern)
         print(f'  before : {before_line}')
         print(f'  after  : {after_line}')
+        if after_broke:
+            print('  verdict: INVALID — the mutation broke the build, which proves nothing '
+                  'about the test. Use a semantically valid replacement.')
+            return 3
+        verdict = 'BINDS' if after_failed else '*** VACUOUS — the suite passes without the code ***'
         print(f'  verdict: {verdict}')
         return 0 if after_failed else 2
     finally:

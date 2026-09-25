@@ -57,9 +57,15 @@ const buildEventDetails = (eventType: string, eventData: any) => {
     if (eventData.company) details.push({ label: 'Company', value: String(eventData.company) });
     if (eventData.phone) details.push({ label: 'Phone', value: String(eventData.phone) });
     if (eventData.autoDraftStatus) {
+      // Anything that is not 'created' used to render "Failed", so changing the status
+      // value to 'skipped_no_email' upstream changed nothing the owner sees — a phone-only
+      // capture still mailed them a failure notice. "Nothing to draft" is not a failure;
+      // the autoSendStatus block below has had the right shape for this all along.
       const draftLabel = eventData.autoDraftStatus === 'created'
         ? 'Created'
-        : 'Failed';
+        : eventData.autoDraftStatus === 'skipped_no_email'
+          ? 'Skipped — lead has no email address'
+          : 'Failed';
       details.push({ label: 'Auto Draft', value: draftLabel });
 
       if (eventData.autoSendStatus === 'sent') {
