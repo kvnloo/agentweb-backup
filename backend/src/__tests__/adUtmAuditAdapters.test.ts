@@ -340,9 +340,19 @@ describe('Google — listAdsForUtmAudit and final_url_suffix inheritance', () =>
   const mockGaql = (opts: { campaigns?: any[]; adRows?: any[]; assetGroupRows?: any[] }) => {
     mockAxiosPost.mockImplementation(async (_url: string, body: any) => {
       const q = String(body?.query ?? '');
-      if (q.includes('FROM ad_group_ad')) return { data: { results: opts.adRows ?? [] } };
-      if (q.includes('FROM asset_group')) return { data: { results: opts.assetGroupRows ?? [] } };
-      return { data: { results: opts.campaigns ?? [] } };
+      // search() requires totalResultsCount whenever the caller asked for completeness
+      // tracking (searchSettings.returnTotalResultsCount) — every port call does. A
+      // single-page mock with no more rows than it returns reports its own row count.
+      if (q.includes('FROM ad_group_ad')) {
+        const adRows = opts.adRows ?? [];
+        return { data: { results: adRows, totalResultsCount: adRows.length } };
+      }
+      if (q.includes('FROM asset_group')) {
+        const assetGroupRows = opts.assetGroupRows ?? [];
+        return { data: { results: assetGroupRows, totalResultsCount: assetGroupRows.length } };
+      }
+      const campaigns = opts.campaigns ?? [];
+      return { data: { results: campaigns, totalResultsCount: campaigns.length } };
     });
   };
 
@@ -395,12 +405,15 @@ describe('Google — listAdsForUtmAudit and final_url_suffix inheritance', () =>
                 adGroupAd: { ad: { id: '5001', finalUrls: ['https://example.com/lp'], finalUrlSuffix: GOOGLE_SUFFIX } },
               },
             ],
+            // Google reports the same total on every page of a walk; consistently below what
+            // MAX_PAGES will ever collect, since the point of this fixture is that the cap bites.
+            totalResultsCount: 999,
             nextPageToken: 'more',
           },
         };
       }
       if (q.includes('FROM asset_group')) return { data: { results: [], nextPageToken: 'more' } };
-      return { data: { results: [campaignRow('111', 'Capped')], nextPageToken: 'more' } };
+      return { data: { results: [campaignRow('111', 'Capped')], totalResultsCount: 999, nextPageToken: 'more' } };
     });
 
     const campaignsResult: any = await googleAdReadPort.listCampaigns(USER, CUSTOMER);
@@ -559,9 +572,19 @@ describe('Google — PMax asset groups are audited, never vacuously passed', () 
   const mockGaql = (opts: { campaigns?: any[]; adRows?: any[]; assetGroupRows?: any[] }) => {
     mockAxiosPost.mockImplementation(async (_url: string, body: any) => {
       const q = String(body?.query ?? '');
-      if (q.includes('FROM ad_group_ad')) return { data: { results: opts.adRows ?? [] } };
-      if (q.includes('FROM asset_group')) return { data: { results: opts.assetGroupRows ?? [] } };
-      return { data: { results: opts.campaigns ?? [] } };
+      // search() requires totalResultsCount whenever the caller asked for completeness
+      // tracking (searchSettings.returnTotalResultsCount) — every port call does. A
+      // single-page mock with no more rows than it returns reports its own row count.
+      if (q.includes('FROM ad_group_ad')) {
+        const adRows = opts.adRows ?? [];
+        return { data: { results: adRows, totalResultsCount: adRows.length } };
+      }
+      if (q.includes('FROM asset_group')) {
+        const assetGroupRows = opts.assetGroupRows ?? [];
+        return { data: { results: assetGroupRows, totalResultsCount: assetGroupRows.length } };
+      }
+      const campaigns = opts.campaigns ?? [];
+      return { data: { results: campaigns, totalResultsCount: campaigns.length } };
     });
   };
 

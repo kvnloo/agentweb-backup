@@ -489,13 +489,11 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         ['claude-opus', ['anthropic.claude-opus-5']],
         ['claude-sonnet', []],
         ['claude-fable', []],
-        // GPT-5.6 Sol has no explicit `family` (deliberately — see its
-        // registry comment), so it falls into the `undefined` bucket here.
-        // ENG-1644-unrelated fix: openrouter/openai/gpt-6-sol was added to
-        // the registry with the same inferred "sol" product line, quality
-        // 48 vs Sol's 47, at half Sol's price (per gpt-6-sol's own
-        // description) — a real, correct dominance, not a family-inference
-        // false positive. This was stale from before gpt-6-sol existed.
+        // GPT-6 Sol ("Strong reasoning at half the price of GPT-5.6 Sol") was added
+        // alongside modelSupersession.ts's name-inferred product-line dominance —
+        // neither Sol variant carries an explicit `family`, but both infer to the
+        // same "sol" line, and GPT-6 Sol genuinely dominates (cheaper, equal-or-
+        // better quality). No longer an empty family-less bucket.
         [undefined, ['openrouter/openai/gpt-5.6-sol']],
       ])('ENG-1786: %s keeps its baseline dominance-only legacy rows', async (family, expected) => {
         // Baseline includes ENG-1784 bands and ENG-1781 Luna pricing.

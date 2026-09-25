@@ -16,6 +16,7 @@ jest.mock('../services/settingsService', () => ({
 import { enqueueAutoHumanEval, claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
 import { humanEvalService } from '../services/humanEvalService';
 import { settingsService } from '../services/settingsService';
+import { evaluateCreativeGates } from '../services/creativeGates';
 
 const mockCreateCandidate = humanEvalService.createCandidate as jest.Mock;
 const mockGetSetting = settingsService.getSetting as jest.Mock;
@@ -103,6 +104,22 @@ describe('enqueueAutoHumanEval', () => {
       reviewType: 'creative_image',
       category: 'ad',
     }));
+  });
+
+  it('passes the generation-time creative gate result through to createCandidate (ENG-2139)', async () => {
+    const creativeGates = evaluateCreativeGates(
+      { bytes: 2048, decoded: true, width: 1080, height: 1350, format: 'png', luminanceStdDev: 30 },
+      { requestedSize: '1080x1350' },
+    );
+
+    await enqueueAutoHumanEval({
+      reviewType: 'creative_image',
+      outputSummary: 'Ad image generated.',
+      sourceKey: 'image:session-3:ad.png',
+      creativeGates,
+    });
+
+    expect(mockCreateCandidate).toHaveBeenCalledWith(expect.objectContaining({ creativeGates }));
   });
 
   it('omits category when the enqueueing flow is ambiguous', async () => {
