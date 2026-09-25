@@ -167,6 +167,22 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.health.ads_layer.ad_account_id).toBe('222222');
   });
 
+  it('skips an unexpired record that lacks fetch credentials for a later complete one (#3070 review)', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({ userId: 'client-user', email: 'client@example.com', adAccount: '' });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      { platform: 'meta', config: { account_type: 'ad_account', ad_account_id: '444444' } },
+      { platform: 'meta', config: { account_type: 'ad_account', ad_account_id: '666666', access_token: 'complete' } },
+    ]);
+    mockedMetaFetch.mockResolvedValueOnce({ data: [] });
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(mockedMetaFetch).toHaveBeenCalledWith(expect.stringContaining('act_666666/campaigns'));
+    expect(mockedMetaFetch).toHaveBeenCalledWith(expect.stringContaining('access_token=complete'));
+    expect(result.health.ads_layer.ad_account_id).toBe('666666');
+  });
+
   it('reads through the legacy adAccount when the only connected account has expired', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
     (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({ userId: 'client-user', email: 'client@example.com', adAccount: '555555' });
