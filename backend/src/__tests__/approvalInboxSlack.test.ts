@@ -110,6 +110,51 @@ describe('approvalInboxSlack', () => {
       expect(result).toEqual({ posted: true });
     });
 
+    it('renders subjectLabel as its own distinct line, not folded into businessImpact (ENG-2159)', async () => {
+      mockListPending.mockResolvedValue([
+        { decisionId: 'd1', subjectLabel: 'Vincent Hu · TriCityAI 2041725529929988', businessImpact: 'Needs sign-off on the campaign build.', evidencePacket: {}, options: [] },
+      ]);
+
+      await approvalInboxSlack.upsertApproverQueueMessage('matt');
+
+      const call = mockPostMessage.mock.calls[0][0];
+      const rendered = JSON.stringify(call.blocks);
+      expect(rendered).toContain('Vincent Hu · TriCityAI 2041725529929988');
+      // Both lines present and distinct — the fix isn't complete if
+      // subjectLabel silently replaced businessImpact instead of joining it.
+      expect(rendered).toContain('Needs sign-off on the campaign build.');
+    });
+
+    it('renders subjectContactEmail with the domain repeated and bolded, never bold markers inside the auto-linked address (ENG-2159 follow-up)', async () => {
+      mockListPending.mockResolvedValue([
+        { decisionId: 'd1', subjectLabel: 'x', subjectContactEmail: 'vincent@thinkingai.com', businessImpact: 'x', evidencePacket: {}, options: [] },
+      ]);
+
+      await approvalInboxSlack.upsertApproverQueueMessage('matt');
+
+      const rendered = JSON.stringify(mockPostMessage.mock.calls[0][0].blocks);
+      // The full address must appear intact and un-mangled so Slack's own
+      // auto-linkifier can still recognize it as a real email/mailto link —
+      // splitting it (e.g. bolding mid-address) previously left a stray
+      // literal asterisk in the real rendered message (found live-previewing
+      // this exact string in Block Kit Builder).
+      expect(rendered).toContain('vincent@thinkingai.com');
+      expect(rendered).not.toMatch(/vincent@\*/);
+      // Domain repeated afterward, bolded, fully outside the email span.
+      expect(rendered).toContain('*thinkingai.com*');
+    });
+
+    it('omits the contact-email line entirely when subjectContactEmail is absent', async () => {
+      mockListPending.mockResolvedValue([
+        { decisionId: 'd1', subjectLabel: 'x', businessImpact: 'x', evidencePacket: {}, options: [] },
+      ]);
+
+      await approvalInboxSlack.upsertApproverQueueMessage('matt');
+
+      const rendered = JSON.stringify(mockPostMessage.mock.calls[0][0].blocks);
+      expect(rendered).not.toContain(':email:');
+    });
+
     it('updates an existing tracked message in place, no new post', async () => {
       mockGetSetting.mockImplementation(async (name: string) =>
         name === 'approval_inbox_message_ref_matt'
