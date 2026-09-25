@@ -218,6 +218,18 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
     knownIssues: [],
   },
   {
+    id: 'creative-deterministic-gates',
+    surface: 'creative',
+    graderType: 'code',
+    measures: 'Per generated image: decodes, not a blank/near-uniform render, aspect and minimum size vs the requested placement, file size vs platform limit, silent size-to-aspect substitution',
+    source: 'services/creativeGates.ts; placement table services/creativePlacementSpecs.ts',
+    model: 'none',
+    modelFamily: 'none',
+    consumers: ['imageGeneration result .gates', 'AW-HumanEvalQueue.creativeGates (agent-mode generate_image)', 'onboarding adImageResult variant .gates', 'console.warn on failure'],
+    knownIssues: ['ENG-421'],
+    notes: 'Advisory (ENG-2139): never blocks generation. No OCR text-ratio/spelling check yet. Not run when the provider returns a remote URL instead of bytes (Runway).',
+  },
+  {
     id: 'client-health-assessment',
     surface: 'account_health',
     graderType: 'code',

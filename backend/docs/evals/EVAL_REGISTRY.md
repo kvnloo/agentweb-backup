@@ -28,6 +28,7 @@ harness (ENG-2136) produces those runs; record the result on the entry, with evi
 | onboarding-quality-pairwise | creative | LLM judge, offline pairwise (customer portal) | claude-sonnet-4-6 (Claude) | no |
 | image-prompt-like-rate | creative | human (likes) | — | no |
 | landing-page-smoke-test | creative | code | — | deterministic |
+| creative-deterministic-gates | creative | code, advisory | — | no |
 | client-health-assessment | account health | code | — | no |
 | renewal-integration-health | account health | code, off in prod | — | no |
 | account-health-evaluators | account health | code, log-only | — | no |

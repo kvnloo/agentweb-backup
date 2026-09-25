@@ -37,6 +37,7 @@ import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/age
 import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/finalAnswer';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
+import { resolveRunFunding } from '../services/funding/runFunding';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
@@ -8491,6 +8492,43 @@ export async function generateSessionResponse(
     if (result) screenshotUrl = result.url;
   }
 
+  // ENG-1816 F1: resolved once here — this is the choke point every AGENT-MODE entry
+  // path (interactive, scheduled via runVerifiedChat, work-plan continuation, API/
+  // MCP) converges on before crossing the worker fork, so none of those call sites
+  // need their own resolveRunFunding call. NOT the only entry into the worker:
+  // controllers/benchmark.ts calls generateMarketingResponseWorkerService.runInWorker
+  // directly for benchmark runs, bypassing this — safe because the worker's own
+  // fallback (generateMarketingResponseWorker.ts) calls resolveRunFunding itself
+  // when none was sent, the same resolution this call site uses, not a hand-built
+  // stand-in for it. Also not the choke point for Emma's *other* turn loop — the
+  // sidebar assistant (chatbotService.generateChatResponse) is resolved separately,
+  // at its own 3 call sites (chatSocketHandler.ts, controllers/chatbot.ts) — and for
+  // internal MCP tool calls, which resolve lazily inside mcp/server/registry.ts's
+  // execute() only when no ambient RunFunding is already active. F1 always resolves
+  // 'agentweb' everywhere; A1+/B1+ make the result meaningful once a real
+  // connection exists to route to.
+  //
+  // KNOWN GAP, not yet closed: liveVoiceService.ts (the Gemini Live voice feature)
+  // calls agentModeService.callLLM/executeTool and its own meterUserUsage directly,
+  // with no RunFunding entry point anywhere in that file — found by a round-3 PR
+  // review, deliberately left unwrapped rather than rushed here, since it's a
+  // long-lived streaming session with a materially different lifecycle from the
+  // request/response and socket-turn paths above, not a same-shape fix. Not a
+  // behavior change today either way: its callLLM path falls back the same as any
+  // other unwrapped path (noteRunFundingUnset + today's billing), and its direct
+  // meterUserUsage call is pre-existing metering this PR never touches. But it must
+  // be closed before any non-agentweb route ships, or a Live Voice user's spend can
+  // never route to their own connection.
+  //
+  // CLOSED (round 4): growthGeniusController.ts's sendMessage had the identical gap
+  // — a real multi-turn chat product, same shape as the sidebar assistant, whose 3
+  // callLLM sites (title, initial turn, tool-follow-up) never entered a RunFunding
+  // scope. Unlike Live Voice this had no architectural reason to defer, so it was
+  // wrapped immediately rather than added to this list. Found by manual review, not
+  // by noteRunFundingUnset — see that function's own comment for why it can't be
+  // trusted to surface gaps like this one.
+  const runFunding = await resolveRunFunding({ userId });
+
   // Generate AI response using worker process to prevent blocking the main event loop
   // This allows health checks to continue working during long-running operations
   const response = await generateMarketingResponseWorkerService.runInWorker(
@@ -8519,6 +8557,9 @@ export async function generateSessionResponse(
       approvedRevisionImageSources,
       requireWorkPlanDisposition: enforceWorkPlanDisposition,
       isUnattendedRun,
+      // ENG-1816 F1: plain data across the fork boundary, same shape as
+      // publishAuthorizationOverride above — never a positional argument.
+      runFunding,
     },
     (progress) => {
       // Emit progress updates via SSE
