@@ -4,14 +4,18 @@
  */
 import {
   agreementReport,
+  averageRanks,
   bootstrapCI,
   cohensKappa,
   pairwiseWinRate,
   perClassMetrics,
+  spearmanReport,
+  spearmanRho,
   toGraderValidation,
   weightedKappa,
   wilsonInterval,
   type LabelPair,
+  type XYPair,
 } from '../loops/eval/agreement';
 
 const pairs = <L extends string | number>(truth: L[], predicted: L[]): LabelPair<L>[] =>
@@ -147,5 +151,62 @@ describe('pairwiseWinRate', () => {
     expect(r.ties).toBe(1);
     expect(r.decisiveCI).toEqual(wilsonInterval(2, 3));
     expect(pairwiseWinRate(['tie']).decisiveCI).toBeNull();
+  });
+});
+
+describe('Spearman rank correlation (ENG-2141)', () => {
+  const xy = (xs: number[], ys: number[]): XYPair[] => xs.map((x, i) => ({ x, y: ys[i] }));
+
+  it('gives tied values the mean of their positions', () => {
+    expect(averageRanks([10, 20, 20, 30])).toEqual([1, 2.5, 2.5, 4]);
+    expect(averageRanks([3, 1, 3, 3])).toEqual([3, 1, 3, 3]);
+  });
+
+  it('matches the textbook IQ vs hours-of-TV example: rho = -29/165 (no ties; = 1 - 6*194/990)', () => {
+    const iq = [106, 100, 86, 101, 99, 103, 97, 113, 112, 110];
+    const tv = [7, 27, 2, 50, 28, 29, 20, 12, 6, 17];
+    expect(spearmanRho(xy(iq, tv))).toBeCloseTo(-29 / 165, 12);
+  });
+
+  it('is +1 / -1 for any strictly monotone relation, not only a linear one', () => {
+    const x = [1, 2, 3, 4, 5, 6];
+    expect(spearmanRho(xy(x, x.map((v) => Math.exp(v))))).toBeCloseTo(1, 12);
+    expect(spearmanRho(xy(x, x.map((v) => -(v ** 3))))).toBeCloseTo(-1, 12);
+  });
+
+  it('uses the tie-correct form: y ranks [1,2,3.5,5,3.5] give 8/sqrt(95), not the no-ties shortcut', () => {
+    // dx = [-2,-1,0,1,2], dy = [-2,-1,0.5,2,0.5]: sum dxdy = 8, sum dx^2 = 10, sum dy^2 = 9.5.
+    const rho = spearmanRho(xy([1, 2, 3, 4, 5], [5, 6, 7, 8, 7]));
+    expect(rho).toBeCloseTo(8 / Math.sqrt(95), 12);
+    // The shortcut 1 - 6*sum(d^2)/(n(n^2-1)) with d = [0,0,0.5,1,-1.5] would give 0.825.
+    expect(rho).not.toBeCloseTo(0.825, 3);
+  });
+
+  it('is undefined (NaN) when a variable is constant, and refuses bad input', () => {
+    expect(spearmanRho(xy([1, 2, 3], [4, 4, 4]))).toBeNaN();
+    expect(() => spearmanRho(xy([1], [2]))).toThrow(/at least two/);
+    expect(() => spearmanRho(xy([1, NaN], [2, 3]))).toThrow(/non-finite/);
+  });
+
+  it('reports n, rho and a reproducible bootstrap CI bracketing rho', () => {
+    const data = xy([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], [2, 1, 4, 3, 6, 5, 8, 7, 10, 9]);
+    const a = spearmanReport(data, { iterations: 500, seed: 7 });
+    const b = spearmanReport(data, { iterations: 500, seed: 7 });
+    expect(a).toEqual(b);
+    expect(a.n).toBe(10);
+    expect(a.rho).toBeCloseTo(1 - (6 * 10) / 990, 12);
+    expect(a.ci!.low).toBeLessThanOrEqual(a.rho!);
+    expect(a.ci!.high).toBeGreaterThanOrEqual(a.rho!);
+    expect(a.ci!.high).toBeLessThanOrEqual(1);
+  });
+
+  it('drops and counts resamples on which rho is undefined instead of sorting NaN into the CI', () => {
+    const r = spearmanReport(xy([1, 2, 3], [1, 2, 3]), { iterations: 400, seed: 1 });
+    expect(r.rho).toBeCloseTo(1, 12);
+    // With n = 3, a resample often draws one point three times (constant x): undefined there.
+    expect(r.undefinedResamples).toBeGreaterThan(0);
+    expect(Number.isFinite(r.ci!.low) && Number.isFinite(r.ci!.high)).toBe(true);
+    expect(spearmanReport(xy([1, 1], [2, 3])).rho).toBeNull();
+    expect(spearmanReport(xy([1, 1], [2, 3])).ci).toBeNull();
   });
 });
