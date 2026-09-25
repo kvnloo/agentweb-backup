@@ -1,10 +1,12 @@
 /**
- * TDD tests for /health endpoint version disclosure fix.
+ * Tests for the /health endpoint.
  *
- * Security finding: /health was returning { status: "healthy", version: "28.3.0" }
- * which leaks the application version to unauthenticated clients.
- *
- * Expected: /health returns only { status: "healthy" } with no version field.
+ * `version` was removed here for a time over disclosure concerns, then
+ * deliberately reintroduced by buildInfo.ts as a dated build-label (never the
+ * commit sha) so an incident responder can tell whether a deploy actually
+ * landed on this instance — see buildInfo.ts's own docstring for the
+ * disclosure-vs-operability tradeoff. `/` (the root endpoint, tested below)
+ * was never given this field and still returns bare { status: "healthy" }.
  */
 
 // Mock heavy dependencies before any imports
@@ -55,14 +57,17 @@ describe('/health endpoint', () => {
     expect(res.body.status).toBe('healthy');
   });
 
-  it('should NOT include version in the response', async () => {
+  it('includes a version field (null when no build-info.json is present, e.g. in tests)', async () => {
     const res = await request(app).get('/health');
-    expect(res.body).not.toHaveProperty('version');
+    expect(res.body).toHaveProperty('version');
+    // No dist/build-info.json exists in a test run, so buildInfo.ts's read() falls
+    // back to null rather than a real version label.
+    expect(res.body.version).toBeNull();
   });
 
-  it('should return exactly { status: "healthy" } with no extra fields', async () => {
+  it('returns exactly { status, version } with no other fields', async () => {
     const res = await request(app).get('/health');
-    expect(Object.keys(res.body)).toEqual(['status']);
+    expect(Object.keys(res.body).sort()).toEqual(['status', 'version']);
   });
 });
 
