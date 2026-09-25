@@ -20,7 +20,7 @@ import { sendAsSender } from '../services/sendAsSender';
 import axios from 'axios';
 import { extractVariables, leadHasVariable, isSupportedVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
-import { LEAD_LIFECYCLES, defaultStatusConfigFor } from '../utils/leadSchema';
+import { defaultStatusConfigFor } from '../utils/leadSchema';
 
 /**
  * ENG-2127: the by-list enrol accepts a `lifecycle` filter and hands it to
@@ -35,70 +35,11 @@ import { LEAD_LIFECYCLES, defaultStatusConfigFor } from '../utils/leadSchema';
  * or dropping the control) and is tracked on ENG-2127. Until then this at least refuses to
  * fail silently.
  */
-const LIFECYCLE_STAGES: ReadonlySet<string> = new Set<string>(LEAD_LIFECYCLES);
+const LIFECYCLE_STAGES = new Set([
+  'unknown', 'inbox', 'signed_up', 'in_deal', 'trialing', 'paying', 'at_risk', 'churned',
+]);
 
 const router = express.Router();
-
-/**
- * Which channels a sequence will actually try to use. A step with no `channel` is email
- * (backwards compatibility — see SequenceStep).
- */
-function requiredChannels(sequence: any): Set<string> {
-  const steps = sequence?.steps ?? [];
-  // No sequence in hand (the listId-only verify call) means no channel evidence. Default
-  // to email rather than to the empty set, which would mean "reachable on no channels" —
-  // i.e. filter nothing — and silently widen the population this screen reports on.
-  if (steps.length === 0) return new Set<string>(['email']);
-  // Lower-cased: nothing validates `step.channel` on create/update, so a mis-cased
-  // 'Email' used to match no branch. Under the old every-channel rule that failed OPEN
-  // (everyone enrolled, and the worker's `channel === 'linkedin' ? … : email` delivered
-  // them as email anyway); under at-least-one it fails CLOSED and enrols nobody.
-  return new Set<string>(steps.map((st: any) => String(st?.channel ?? 'email').trim().toLowerCase()));
-}
-
-/**
- * Can this sequence reach this lead on AT LEAST ONE of the channels it uses?
- *
- * The first version of this guard tested `lead.email` only, which was wrong: sequences are
- * not email-only. `SequenceChannel = 'email' | 'linkedin'`, and dripSequenceWorker's
- * sendLinkedInStep reaches the lead through `lead.linkedin` after loading it by leadId —
- * it never touches the address. So a LinkedIn-only lead in a LinkedIn sequence WAS being
- * messaged, and an email-only test excluded it from enrolment entirely.
- *
- * AT LEAST ONE channel, not every one. Requiring every channel was my first answer and it
- * cost a real send: an email-only lead in a mixed email+LinkedIn sequence stopped being
- * enrolled at all, where before it received the email. The worker now SKIPS a step the
- * lead cannot receive instead of throwing (dripSequenceWorker.processEnrollment), so enrolling
- * such a lead no longer jams it — it gets the steps it can receive and completes.
- *
- * A lead that can receive NO step is still refused: enrolling it would create a row that
- * skips every step and completes having sent nothing.
- */
-function leadIsReachable(lead: any, channels: Set<string>): boolean {
-  if (channels.has('email') && String(lead?.email ?? '').trim()) return true;
-  if (channels.has('linkedin') && String(lead?.linkedin ?? '').trim()) return true;
-  return false;
-}
-
-/**
- * `skippedNoEmail` is the field existing callers know, and it is the right word only when
- * the sequence is email-only. A LinkedIn step makes "no email" a lie — a live run on env2
- * reported `skippedNoEmail: 1` for a lead skipped because it had no LinkedIn PROFILE.
- */
-function skipKeyForChannels(channels: Set<string>): string {
-  return channels.has('linkedin') ? 'skippedUnreachable' : 'skippedNoEmail';
-}
-
-/**
- * The enrollment's dedup identity. `leadEmail` is the partition key of
- * `leadEmail-index`, which getExistingEnrollment queries — an empty one makes the row
- * invisible to the dedup check, so it is re-created on every run and the lead is
- * messaged again each time. For a lead with no address the LinkedIn URL is the stable
- * identity; dripSequenceWorker already treats the field that way at its reply-exit check.
- */
-function enrollmentIdentity(lead: any): string {
-  return String(lead?.email ?? '').trim() || String(lead?.linkedin ?? '').trim();
-}
 
 // ─── Sequences CRUD ───────────────────────────────────────────────────────────
 
@@ -246,45 +187,17 @@ router.post(
         return res.status(400).json({ error: 'Sequence has no steps' });
       }
 
-      // Reachability is decided from the CRM ROW, not the request body. This route's
-      // payload is `{ listId, leadId, leadEmail }` — `linkedin` was never part of its
-      // contract, so reading `l.linkedin` here meant every lead looked unreachable to a
-      // LinkedIn sequence and the route enrolled NOBODY. That is the identical regression
-      // this guard was introduced to fix, reintroduced on the sibling route; the by-list
-      // route escaped it only because it reads real rows. The lead is loaded once per
-      // entry and reused for the identity below.
-      const channels = requiredChannels(sequence);
-      const resolved = await Promise.all(leads.map(async (l: any) => {
-        // Promise.resolve().then(...) so a SYNCHRONOUS throw is caught too — a bare
-        // `.catch()` only handles a rejection, and a lookup that is simply unavailable
-        // must degrade to the payload, never 500 the whole enrol.
-        const row = await Promise.resolve()
-          .then(() => crmDb.getLeadById(l.listId, l.leadId))
-          .catch(() => null);
-        // Fall back to the payload when the row is gone, so a caller that supplied an
-        // address still enrols rather than being dropped by a failed read.
-        return {
-          input: l,
-          lead: {
-            email: (row as any)?.email ?? l.leadEmail ?? l.email,
-            linkedin: (row as any)?.linkedin ?? l.linkedin,
-          },
-        };
-      }));
-      const enrollable = resolved.filter((r) => leadIsReachable(r.lead, channels));
-      const skippedUnreachable = resolved.length - enrollable.length;
-      const inputs = enrollable.map((r) => ({
+      const inputs = leads.map((l: any) => ({
         sequenceId: req.params.sequenceId,
         userId: authReq.user!.userId,
-        listId: r.input.listId,
-        leadId: r.input.leadId,
-        leadEmail: enrollmentIdentity(r.lead),
+        listId: l.listId,
+        leadId: l.leadId,
+        leadEmail: l.leadEmail,
         startAt: startAt ?? undefined,
       }));
 
       const result = await dripSequenceDb.bulkEnroll(inputs);
-      const skipKey = skipKeyForChannels(channels);
-      res.json(skippedUnreachable > 0 ? { ...result, [skipKey]: skippedUnreachable } : result);
+      res.json(result);
     } catch (err: any) {
       if (err instanceof SequenceNotFoundError) return res.status(404).json({ error: err.message });
       if (err instanceof SequenceAuthError) return res.status(403).json({ error: err.message });
@@ -324,22 +237,18 @@ router.post(
       if (lifecycle) {
         const r = await crmDb.getLeadsByStatus(listId, lifecycle);
         leads = Array.isArray(r) ? r : ((r as any).items ?? (r as any).leads ?? []);
-        // Only complain when the value is a lifecycle stage AND NOT a status this list
-        // actually defines. `at_risk` and `churned` are BOTH lifecycle stages and default
-        // lead statuses (db.ts:5364), and a list can define any statusConfig it likes — so
-        // the first version of this guard answered a perfectly valid `status: churned`
-        // filter that happened to match nothing with a 400 telling the caller to "filter by
-        // a lead status instead", which is exactly what they had done.
-        // A list with no stored statusConfig does not have NO statuses — it falls back to
-        // the default set, which contains `churned` (and `at_risk` for a customers list).
-        // Reading absent as empty put the original 400 straight back for every list
-        // created before createLeadList started persisting a default.
+        // `at_risk` and `churned` are BOTH lifecycle stages and default lead statuses, and
+        // a list can define any statusConfig it likes — so the first version of this guard
+        // answered a perfectly valid `status: churned` filter that happened to match
+        // nothing with a 400 telling the caller to filter by a status instead, which is
+        // what they had done. A list with NO stored statusConfig does not have no
+        // statuses: it falls back to the default set, which contains `churned`.
         const storedStatusConfig = (list as any)?.statusConfig;
         const effectiveStatusConfig = Array.isArray(storedStatusConfig) && storedStatusConfig.length > 0
           ? storedStatusConfig
           : defaultStatusConfigFor((list as any)?.listType);
         const listStatuses = new Set(
-          effectiveStatusConfig.map((s: any) => String(s?.value)),
+          effectiveStatusConfig.map((sc: any) => String(sc?.value)),
         );
         if (leads.length === 0 && LIFECYCLE_STAGES.has(String(lifecycle)) && !listStatuses.has(String(lifecycle))) {
           console.error(
@@ -360,35 +269,6 @@ router.post(
       } else {
         leads = await crmDb.getAllLeadsByListId(listId);
       }
-
-      // Filtered HERE, before coverage — not at the mapper. A lead the sequence can reach
-      // on no channel would enrol into a row that skips every step and completes having
-      // sent nothing; and an empty identity is the leadEmail-index partition key, so the
-      // row is invisible to getExistingEnrollment and is re-created on every run.
-      //
-      // (The older rationale — that the worker RETHROWS and the enrollment retries
-      // forever — described behaviour that has since been fixed: undeliverable steps are
-      // skipped now. Left corrected rather than deleted because that change is precisely
-      // why this test is at-least-one rather than every-channel.)
-      //
-      // Filtering up front rather than at the mapper keeps one population throughout:
-      // leadCount, the missing/present warning counts and the confirm gate all describe
-      // exactly the leads that will be enrolled. Filtering later made the dialog report a
-      // different set than the one it enrolled — and could raise needsConfirmation over
-      // variables missing only on leads that were never candidates.
-      //
-      // Email-less leads were already reachable (LinkedIn imports, the invite mirror);
-      // ENG-2082 made a whole new list type produce them.
-      // Both counts, deliberately. Filtering silently would shrink leadCount from 100 to 20
-      // with nothing on screen to explain where 80 went — the dialog would look like leads
-      // had vanished. Reporting the population AND the enrollable subset lets the caller say
-      // "20 of 100 leads can be emailed", which is the true statement.
-      const totalLeads = leads.length;
-      // Channel-aware: the first version tested `l.email` only, which excluded a
-      // LinkedIn-only lead from a LinkedIn sequence the worker could actually deliver.
-      const channels = requiredChannels(sequence);
-      leads = leads.filter((l: any) => leadIsReachable(l, channels));
-      const enrollableLeads = leads.length;
 
       // Variable coverage across all steps + channels (email subject/body + LinkedIn
       // messageText). Warn — but allow override via `confirm` — when a supported
@@ -416,29 +296,20 @@ router.post(
           enrolled: false,
           needsConfirmation: true,
           leadCount: leads.length,
-          totalLeads,
-          enrollableLeads,
-          ...(totalLeads > enrollableLeads ? { [skipKeyForChannels(channels)]: totalLeads - enrollableLeads } : {}),
           warnings: { unsupported, missing },
         });
       }
 
-      const inputs = leads
-        .map((l: any) => ({
-          sequenceId: req.params.sequenceId,
-          userId: authReq.user!.userId,
-          listId,
-          leadId: l.leadId,
-          leadEmail: enrollmentIdentity(l),
-          startAt: startAt ?? undefined,
-        }));
+      const inputs = leads.map((l: any) => ({
+        sequenceId: req.params.sequenceId,
+        userId: authReq.user!.userId,
+        listId,
+        leadId: l.leadId,
+        leadEmail: l.email,
+        startAt: startAt ?? undefined,
+      }));
 
       const result = await dripSequenceDb.bulkEnroll(inputs);
-      const counts = {
-        totalLeads,
-        enrollableLeads,
-        ...(totalLeads > enrollableLeads ? { [skipKeyForChannels(channels)]: totalLeads - enrollableLeads } : {}),
-      };
 
       // Auto-enroll is on by default: add listId to sequence's autoEnrollListIds
       // unless it's already there. This means new leads added to this list later
@@ -450,7 +321,7 @@ router.post(
         }).catch((e) => console.error('[sequences] autoEnrollListIds update error:', e));
       }
 
-      res.json({ ...result, ...counts });
+      res.json(result);
     } catch (err: any) {
       if (err instanceof SequenceNotFoundError) return res.status(404).json({ error: err.message });
       if (err instanceof SequenceAuthError) return res.status(403).json({ error: err.message });
@@ -728,28 +599,11 @@ router.post(
       const variables = extractVariables(allTemplate);
 
       let leads: any[] = [];
-      let verifyTotalLeads = 0;
-      // Declared out here so the response below can name the skip reason after the
-      // channel that was actually missing, the same way the two enrol routes do.
-      let verifyChannels = new Set<string>(['email']);
       if (listId) {
         const leadsResult = await crmDb.getLeadsByListId(listId);
         leads = Array.isArray(leadsResult)
           ? leadsResult
           : ((leadsResult as any).items ?? (leadsResult as any).leads ?? []);
-        // Same population the enrol routes use. Without this, this screen reported variable
-        // coverage over leads enrol-by-list will never enrol — two screens, same list,
-        // contradictory numbers, and coverage warnings raised over rows that were never
-        // candidates. ENG-2082 made address-less leads common enough to diverge visibly.
-        verifyTotalLeads = leads.length;
-        // Mirrors the enrol routes exactly — including their channel awareness, or this
-        // screen reports coverage over a different population again.
-        verifyChannels = requiredChannels(
-          req.params.sequenceId && req.params.sequenceId !== 'test'
-            ? await dripSequenceDb.getSequence(req.params.sequenceId).catch(() => null)
-            : null,
-        );
-        leads = leads.filter((l: any) => leadIsReachable(l, verifyChannels));
       } else if (req.params.sequenceId && req.params.sequenceId !== 'test') {
         // Verify against the sequence's enrolled leads
         const enrollments = await dripSequenceDb.listEnrollmentsForSequence(req.params.sequenceId);
@@ -778,9 +632,6 @@ router.post(
         variables,
         variableCoverage,
         leadCount: leads.length,
-        ...(verifyTotalLeads > leads.length
-          ? { totalLeads: verifyTotalLeads, [skipKeyForChannels(verifyChannels)]: verifyTotalLeads - leads.length }
-          : {}),
       });
     } catch (error) {
       console.error('[sequences] verify-variables error:', error);

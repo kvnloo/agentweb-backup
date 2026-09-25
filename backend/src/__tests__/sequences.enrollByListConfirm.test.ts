@@ -76,14 +76,6 @@ const threeLeads = [
   { leadId: 'l3', email: 'c@example.com', firstName: 'C' },
 ];
 
-// The same three leads, reachable on LinkedIn. Enrollability is derived from the
-// sequence's own channels now, so a LinkedIn-step sequence cannot reach a lead that has
-// only an address — the worker's sendLinkedInStep needs `lead.linkedin` and throws
-// without it. The original fixture gave these leads emails only and was written when
-// enrollability was email-only regardless of channel.
-const threeLeadsOnLinkedIn = threeLeads.map((l) => ({
-  ...l, linkedin: `https://linkedin.com/in/${l.leadId}`,
-}));
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -115,7 +107,7 @@ describe('POST /:sequenceId/enrollments/by-list — variable-warning gating', ()
       { stepId: 's1', stepNumber: 1, name: 'LI', delayDays: 0, channel: 'linkedin',
         messageText: 'Hey {{customFields.region}}' },
     ]));
-    crmDb.getAllLeadsByListId.mockResolvedValue(threeLeadsOnLinkedIn);
+    crmDb.getAllLeadsByListId.mockResolvedValue(threeLeads);
 
     const res = await request(app).post('/seq_1/enrollments/by-list').send({ listId: 'list-1' });
 
@@ -139,63 +131,6 @@ describe('POST /:sequenceId/enrollments/by-list — variable-warning gating', ()
     // firstName present on all leads, sender vars excluded → clean → enrolls immediately
     expect(res.body.needsConfirmation).toBeFalsy();
     expect(dripSequenceDb.bulkEnroll).toHaveBeenCalled();
-  });
-
-  it('the confirm dialog counts only the leads that will actually be enrolled', async () => {
-    // The filter has to run BEFORE the coverage loop. Applied at the mapper instead, the
-    // response described one population and enrolled another: leadCount included leads that
-    // were never candidates, and needsConfirmation could fire over a variable missing only
-    // on those leads — asking the user to confirm a warning about rows nothing would send to.
-    dripSequenceDb.getSequence.mockResolvedValue(seqWith([
-      { stepId: 's1', stepNumber: 1, name: 'Intro', delayDays: 0, channel: 'email',
-        subject: 'Hi {{firstName}}', bodyHtml: 'Hello' },
-    ]));
-    crmDb.getAllLeadsByListId.mockResolvedValue([
-      { leadId: 'l1', email: 'a@example.com', firstName: 'A' },
-      { leadId: 'l2', email: 'b@example.com', firstName: 'B' },
-      // No email AND no firstName — it must not be counted, and must not be the reason
-      // the confirmation gate fires.
-      { leadId: 'l3', phone: '4155550142' },
-    ]);
-
-    const res = await request(app)
-      .post('/seq_1/enrollments/by-list')
-      .send({ listId: 'list-1' });
-
-    expect(res.status).toBe(200);
-    // Both remaining leads have firstName, so there is nothing to warn about at all.
-    expect(res.body.needsConfirmation).toBeFalsy();
-    expect(dripSequenceDb.bulkEnroll).toHaveBeenCalledTimes(1);
-    const [inputs] = dripSequenceDb.bulkEnroll.mock.calls[0];
-    expect(inputs).toHaveLength(2);
-  });
-
-  it('never enrols a lead with no email address', async () => {
-    // leadEmail feeds sendAsSender({ to }) in dripSequenceWorker, which RETHROWS on failure,
-    // so an undefined address makes the enrollment retry forever. It is also the
-    // leadEmail-index partition key, so the row is invisible to getActiveEnrollment and is
-    // re-created on every run. Email-less leads were already reachable (LinkedIn imports,
-    // the invite mirror); ENG-2082 made a whole list type produce them. crm.ts's identical
-    // mapper has always filtered — this one did not.
-    dripSequenceDb.getSequence.mockResolvedValue(seqWith([
-      { stepId: 's1', stepNumber: 1, name: 'Intro', delayDays: 0, channel: 'email',
-        subject: 'Hi', bodyHtml: 'Hello' },
-    ]));
-    crmDb.getAllLeadsByListId.mockResolvedValue([
-      { leadId: 'l1', email: 'a@example.com', firstName: 'A' },
-      { leadId: 'l2', phone: '4155550142', firstName: 'PhoneOnly' },
-      { leadId: 'l3', email: '', firstName: 'Empty' },
-    ]);
-
-    const res = await request(app)
-      .post('/seq_1/enrollments/by-list')
-      .send({ listId: 'list-1', confirm: true });
-
-    expect(res.status).toBe(200);
-    const [inputs] = dripSequenceDb.bulkEnroll.mock.calls[0];
-    expect(inputs).toHaveLength(1);
-    expect(inputs[0].leadId).toBe('l1');
-    expect(inputs.every((i: any) => !!i.leadEmail)).toBe(true);
   });
 
   it('with confirm:true and gaps: enrolls and returns the bulkEnroll result', async () => {
