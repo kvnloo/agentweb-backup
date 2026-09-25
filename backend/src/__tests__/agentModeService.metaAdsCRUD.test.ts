@@ -1094,6 +1094,7 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
           expect(sentCreative().image_url).toBe('https://cdn/new.jpg');
           expect(result.success).toBe(true);
           expect(result.verified).toBe(true);
+          expect(result.image_verified).toBe(true);
         });
 
         it('drops the old thumbnail hash when only a new image_url is given (video)', async () => {
@@ -1144,6 +1145,28 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
           expect(result.live_image_hash).toBe('old_hash');
           expect(result.new_creative_id).toBe('new_creative_456');
           expect(attachCalls()).toHaveLength(0);
+        });
+
+        it('fails with SWAP_NOT_REFLECTED when a hash-less read-back still shows the old picture URL', async () => {
+          mockSwap(OLD_LINK_SPEC, { page_id: 'page_123', link_data: { picture: 'https://cdn/old.jpg' } });
+
+          const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', { image_url: 'https://cdn/new.jpg' });
+
+          expect(result.success).toBe(false);
+          expect(result.error).toBe('SWAP_NOT_REFLECTED');
+          expect(result.live_image_url).toBe('https://cdn/old.jpg');
+          expect(attachCalls()).toHaveLength(0);
+        });
+
+        it('attaches but reports image_verified:false when the read-back identifies no image', async () => {
+          mockSwap(OLD_LINK_SPEC, { page_id: 'page_123', link_data: { link: 'https://old.com' } });
+
+          const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', { image_url: 'https://cdn/new.jpg' });
+
+          expect(result.success).toBe(true);
+          expect(result.image_verified).toBe(false);
+          expect(result.message).toContain('image could not be confirmed');
+          expect(attachCalls()).toHaveLength(1);
         });
 
         it('fails with SWAP_NOT_REFLECTED when the new creative does not carry the requested image_hash', async () => {
