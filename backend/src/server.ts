@@ -1008,6 +1008,24 @@ createTestAccount().then(async () => {
         console.error('[renewalIntegrationHealthCron] Failed to initialize:', error);
       }
 
+      // Account-health classifier sweep (ENG-2143), the replacement for the renewal cron above:
+      // at-risk → deduped oncall, activation incomplete → CS nudge log. Off unless
+      // ACCOUNT_HEALTH_ALERTS_ENABLED=true (enabling it in prod is an OPS step).
+      if (process.env.ACCOUNT_HEALTH_ALERTS_ENABLED === 'true') try {
+        const { runAccountHealthClassifier } = await import('./cron/accountHealthClassifierCron');
+        const ACCOUNT_HEALTH_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        cronJobRegistry.track('accountHealthClassifierCron', runAccountHealthClassifier())
+          .catch(e => console.error('[accountHealthClassifierCron] Error on first run:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('accountHealthClassifierCron', runAccountHealthClassifier())
+            .catch(e => console.error('[accountHealthClassifierCron] Error:', e));
+        }, ACCOUNT_HEALTH_INTERVAL_MS);
+        console.log('[accountHealthClassifierCron] Initialized — running daily');
+      } catch (error) {
+        console.error('[accountHealthClassifierCron] Failed to initialize:', error);
+      }
+
       // CRM Auto-Enrichment (ENG-88) — runs every 15 minutes.
       // Ray's manual campaign-monitoring routine included clicking "renew"
       // (the enrich-v3 engine) on managed-campaign lead lists by hand a
