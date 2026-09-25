@@ -1059,6 +1059,67 @@ describe('executePreparedTools', () => {
     });
   });
 
+  // ENG-2132: openrouter/deepseek/deepseek-v4-flash has no verified vision support
+  // (no `supportsVision` entry in LLM_MODEL_REGISTRY). The prior gate only checked
+  // "isn't Gemini" and assumed every other model could take an inline image — for
+  // this model OpenRouter has no endpoint that accepts image input at all, so the
+  // next LLM call 404'd with "No endpoints found that support image input" (prod
+  // session ffe0e1ad-16f4-4ca6-ada2-3bc87c3d3761). Pins that the inline-image
+  // branch requires a verified `supportsVision: true`, not just "not Gemini".
+  describe('screenshot inline-image gating by model vision support (ENG-2132)', () => {
+    function screenshotWithImagePorts() {
+      return makePorts({
+        executePreparedAgentTool: async () => ({
+          raw: { content: [{ type: 'image', data: 'ZmFrZQ==', mimeType: 'image/png' }] },
+        }),
+        uploadScreenshotToS3: async () => ({ url: 'https://s3/shot.png' }),
+      });
+    }
+
+    it('does NOT embed the image for a model with no verified vision support', async () => {
+      const ports = screenshotWithImagePorts();
+      const input = makeInput(
+        [toolCall('a', 'playwright_browser_take_screenshot', '{}')],
+        ports,
+        { llmModel: 'openrouter/deepseek/deepseek-v4-flash' },
+      );
+      await executePreparedTools(input);
+
+      const content = input.messages[0].content;
+      expect(typeof content).toBe('string');
+      expect(content).toContain('https://s3/shot.png');
+      expect(JSON.stringify(content)).not.toContain('image_url');
+    });
+
+    it('still embeds the image for a non-Gemini model with verified vision support', async () => {
+      const ports = screenshotWithImagePorts();
+      const input = makeInput(
+        [toolCall('a', 'playwright_browser_take_screenshot', '{}')],
+        ports,
+        { llmModel: 'gpt-5.4' },
+      );
+      await executePreparedTools(input);
+
+      const content = input.messages[0].content as Array<{ type: string }>;
+      expect(Array.isArray(content)).toBe(true);
+      expect(content.some((part) => part.type === 'image_url')).toBe(true);
+    });
+
+    it('still uses the text+URL fallback for Gemini (unrelated, pre-existing reason)', async () => {
+      const ports = screenshotWithImagePorts();
+      const input = makeInput(
+        [toolCall('a', 'playwright_browser_take_screenshot', '{}')],
+        ports,
+        { llmModel: 'gemini-3.8-flash' },
+      );
+      await executePreparedTools(input);
+
+      const content = input.messages[0].content;
+      expect(typeof content).toBe('string');
+      expect(content).toContain('https://s3/shot.png');
+    });
+  });
+
   describe('adaptive hard-cap deferral (ENG-510)', () => {
     // Gateway fake whose media-gen calls report a configurable wall-clock duration,
     // so we can prove the deferral reserves enough time for one more call below the
