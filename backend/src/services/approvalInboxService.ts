@@ -351,16 +351,33 @@ export class ApprovalInboxService {
    * than just trusting the atomic condition. On failure, a cheap follow-up
    * read exists only to produce a more specific error reason, never to gate
    * the write itself.
+   *
+   * skipExpiryCheck (review fix): a real, observed system event — a
+   * customer's OAuth reconnect genuinely just succeeded, called from
+   * autoResolveCredentialDecisionOnReconnect — is not a "stale UI click"
+   * the expiry guard exists to reject; it's unambiguous ground truth that
+   * arrived a little late. Without this, a reconnect landing in the ~1hr
+   * window between expiresAt and the next sweep tick silently lost the
+   * claim, and the sweep later sent the customer a false "your window
+   * closed" email despite them having already fixed it. Scoped narrowly:
+   * only the auto-reconnect path sets this; the Slack human-click path
+   * (resolveApprovalDecision) never does, since a stale button really
+   * should be rejected there. Still atomic, still requires a real pending
+   * status — only the expiresAt clause is dropped, shrinking the race to a
+   * genuine millisecond-scale DynamoDB race against the sweep's own
+   * expireDecision call, not an hour-wide window.
    */
   async claimDecision(
     decisionId: string,
     verdict: ApprovalDecisionVerdict,
     answeredBy: string,
     freeText?: string,
+    options?: { skipExpiryCheck?: boolean },
   ): Promise<{ claimed: true; decision: ApprovalDecision } | { claimed: false; reason: 'not_found' | 'already_resolved' | 'expired' }> {
     const now = new Date().toISOString();
     const newStatus: ApprovalDecisionStatus =
       verdict === 'approve' ? 'approved' : verdict === 'reject' ? 'rejected' : 'edited';
+    const skipExpiryCheck = options?.skipExpiryCheck === true;
 
     try {
       const result = await dynamodb
@@ -371,7 +388,9 @@ export class ApprovalInboxService {
             'SET #status = :newStatus, answeredAt = :now, answeredBy = :answeredBy, verdict = :verdict, updatedAt = :now' +
             (freeText !== undefined ? ', freeText = :freeText' : ''),
           ConditionExpression:
-            '(#status = :pendingTeam OR #status = :pendingCustomer) AND expiresAt > :now',
+            skipExpiryCheck
+              ? '(#status = :pendingTeam OR #status = :pendingCustomer)'
+              : '(#status = :pendingTeam OR #status = :pendingCustomer) AND expiresAt > :now',
           ExpressionAttributeNames: { '#status': 'status' },
           ExpressionAttributeValues: {
             ':newStatus': newStatus,
@@ -393,7 +412,7 @@ export class ApprovalInboxService {
         // raced against a second write.
         const existing = await this.getDecision(decisionId);
         if (!existing) return { claimed: false, reason: 'not_found' };
-        if (existing.expiresAt <= now) return { claimed: false, reason: 'expired' };
+        if (!skipExpiryCheck && existing.expiresAt <= now) return { claimed: false, reason: 'expired' };
         return { claimed: false, reason: 'already_resolved' };
       }
       throw error;

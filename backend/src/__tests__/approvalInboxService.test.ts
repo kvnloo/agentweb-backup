@@ -242,6 +242,43 @@ describe('approvalInboxService.claimDecision', () => {
     expect(params.ExpressionAttributeValues[':newStatus']).toBe('edited');
     expect(params.ExpressionAttributeValues[':freeText']).toBe('wrong account');
   });
+
+  describe('skipExpiryCheck (review fix — real reconnects are ground truth, not a stale UI click)', () => {
+    it('claims successfully even past expiresAt when skipExpiryCheck is set, and drops the expiresAt clause from the condition', async () => {
+      mockDynamoDB.update.mockReturnValue(ok({ Attributes: { decisionId: 'd1', status: 'approved' } }));
+
+      const result = await service.claimDecision('d1', 'approve', 'system:auto-reconnect', undefined, { skipExpiryCheck: true });
+
+      expect(result.claimed).toBe(true);
+      const params = mockDynamoDB.update.mock.calls[0][0];
+      expect(params.ConditionExpression).toContain('#status = :pendingTeam');
+      expect(params.ConditionExpression).not.toContain('expiresAt');
+    });
+
+    it('still refuses an already-resolved decision even with skipExpiryCheck — status is still checked', async () => {
+      mockDynamoDB.update.mockReturnValue(conditionalFail());
+      mockDynamoDB.get.mockReturnValue(ok({ Item: { decisionId: 'd1', status: 'approved', expiresAt: PAST } }));
+
+      const result = await service.claimDecision('d1', 'approve', 'system:auto-reconnect', undefined, { skipExpiryCheck: true });
+
+      expect(result.claimed).toBe(false);
+      if (result.claimed) throw new Error('unreachable');
+      // Never 'expired' when skipExpiryCheck is set — expiry is not what
+      // failed this claim, the status condition is.
+      expect(result.reason).toBe('already_resolved');
+    });
+
+    it('without skipExpiryCheck, the default (Slack human-click) path is completely unchanged — still rejects a real expiry', async () => {
+      mockDynamoDB.update.mockReturnValue(conditionalFail());
+      mockDynamoDB.get.mockReturnValue(ok({ Item: { decisionId: 'd1', status: 'pending_team_review', expiresAt: PAST } }));
+
+      const result = await service.claimDecision('d1', 'approve', 'slack:U123');
+
+      expect(result.claimed).toBe(false);
+      if (result.claimed) throw new Error('unreachable');
+      expect(result.reason).toBe('expired');
+    });
+  });
 });
 
 describe('approvalInboxService.expireDecision', () => {

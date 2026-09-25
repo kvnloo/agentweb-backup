@@ -152,7 +152,12 @@ describe('autoResolveCredentialDecisionOnReconnect', () => {
     await autoResolveCredentialDecisionOnReconnect('cust-1', 'meta', 'act_123');
 
     expect(mockFindPendingCredentialDecision).toHaveBeenCalledWith('cust-1', 'meta', 'act_123');
-    expect(mockClaimDecision).toHaveBeenCalledWith('d1', 'approve', 'system:auto-reconnect');
+    // Review fix: skipExpiryCheck:true — a real reconnect is ground truth,
+    // not a stale UI click the expiry guard should reject. Without this, a
+    // reconnect landing in the window between expiresAt and the next sweep
+    // tick silently lost the claim and the customer got a false "expired"
+    // email later.
+    expect(mockClaimDecision).toHaveBeenCalledWith('d1', 'approve', 'system:auto-reconnect', undefined, { skipExpiryCheck: true });
     expect(mockExecuteResolvedDecision).toHaveBeenCalledWith(claimedDecision);
   });
 

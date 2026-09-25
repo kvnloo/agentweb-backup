@@ -104,6 +104,14 @@ export async function notifyCustomerOfExpiredCredentialDecision(decision: Approv
  * Self-contained (own try/catch, never throws) since this is called from
  * inside a real reconnect handler — a failure here must never break the
  * actual reconnect response.
+ *
+ * skipExpiryCheck:true (review fix) — this function only ever runs after a
+ * REAL, just-succeeded reconnect; the expiry guard exists to reject stale
+ * human UI clicks, not to invalidate ground truth that arrived a little
+ * late. Without this, a reconnect landing in the ~1hr window between
+ * expiresAt and the next sweep tick lost the claim silently, and the sweep
+ * later emailed the customer a false "your window closed" despite them
+ * having already fixed it.
  */
 export async function autoResolveCredentialDecisionOnReconnect(
   customerId: string,
@@ -114,10 +122,11 @@ export async function autoResolveCredentialDecisionOnReconnect(
     const decision = await approvalInboxService.findPendingCredentialDecision(customerId, platform, accountId);
     if (!decision) return;
 
-    const result = await approvalInboxService.claimDecision(decision.decisionId, 'approve', 'system:auto-reconnect');
+    const result = await approvalInboxService.claimDecision(decision.decisionId, 'approve', 'system:auto-reconnect', undefined, { skipExpiryCheck: true });
     if (!result.claimed) {
-      // Lost a race — already resolved some other way, or expired. Nothing
-      // left to do; not an error.
+      // Lost a race — already resolved some other way, or the sweep beat
+      // this reconnect to expiring it outright (a real, if now much
+      // narrower, remaining race). Nothing left to do; not an error.
       return;
     }
     await executeResolvedDecision(result.decision);
