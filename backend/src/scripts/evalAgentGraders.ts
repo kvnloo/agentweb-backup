@@ -48,7 +48,9 @@ export function parseArgs(argv: readonly string[], now: Date = new Date()): CliO
     const raw = value(flag);
     if (raw === undefined) return fallback;
     const d = new Date(raw);
-    if (Number.isNaN(d.getTime())) throw new Error(`${flag} must be a date, got "${raw}"`);
+    // Date-only input must round-trip: new Date('2026-02-30') silently becomes March 2.
+    const invalid = Number.isNaN(d.getTime()) || (DATE_ONLY.test(raw) && d.toISOString().slice(0, 10) !== raw);
+    if (invalid) throw new Error(`${flag} must be a date, got "${raw}"`);
     if (endOfDay && DATE_ONLY.test(raw)) d.setUTCHours(23, 59, 59, 999);
     return d;
   };
