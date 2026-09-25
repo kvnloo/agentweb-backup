@@ -7,7 +7,7 @@
  *
  * ENG-2128 principle 2: "Unvalidated judges cannot gate or alert." A grader may gate only once a
  * validation run (ENG-2136 agreement harness) records Cohen's kappa >= MIN_KAPPA on at least
- * MIN_VALIDATION_N labelled cases. As of 2026-09-25 no grader meets that bar, so `mayGate` is
+ * MIN_VALIDATION_N labelled cases, with an http(s) link to the run as evidence. As of 2026-09-25 no grader meets that bar, so `mayGate` is
  * false for all of them. Record a validation here (with its evidence link) to change that.
  *
  * Human-readable audit, including evidence for every entry: backend/docs/evals/EVAL_REGISTRY.md.
@@ -145,7 +145,19 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
     modelFamily: 'none',
     consumers: ['session learning notes', 'auto-actions (image revision, LP iteration, enrichment rerun)'],
     knownIssues: ['ENG-90', 'ENG-343', 'ENG-1687', 'ENG-1853', 'ENG-1854'],
-    notes: 'Single hardcoded reviewer per type; no scale or pairwise choice. No automated creative scoring exists.',
+    notes: 'Single hardcoded reviewer per type; no scale or pairwise choice. No grader scores each generated creative; the only automated creative comparison is the offline onboarding-quality-pairwise judge below.',
+  },
+  {
+    id: 'onboarding-quality-pairwise',
+    surface: 'creative',
+    graderType: 'llm_judge',
+    measures: 'Pairwise better/equal/worse per onboarding layer (brand DNA, ICPs, competitor, creative direction, ad images, ad copy) between two pipeline versions',
+    source: 'agentweb-customer-portal: scripts/eval-onboarding-quality.ts + scripts/evalOnboardingQualityPrompt.ts',
+    model: 'claude-sonnet-4-6',
+    modelFamily: 'claude',
+    consumers: ['manual offline runs (Eager DAG KPI 2)'],
+    knownIssues: [],
+    notes: 'Offline, run by hand on fixture pairs to compare pipeline versions; it does not score individual generated creatives in production.',
   },
   {
     id: 'image-prompt-like-rate',
@@ -228,6 +240,19 @@ export function getGrader(id: string): GraderEntry | undefined {
  * blocks a change or raises an alert from a grader's output must check this first.
  */
 export function mayGate(id: string): boolean {
-  const v = getGrader(id)?.validation;
-  return !!v && v.kappa >= MIN_KAPPA && v.n >= MIN_VALIDATION_N;
+  return isQualifyingValidation(getGrader(id)?.validation);
+}
+
+/** kappa >= MIN_KAPPA on n >= MIN_VALIDATION_N cases, with an http(s) link to the run. */
+export function isQualifyingValidation(v: GraderValidation | undefined): boolean {
+  return !!v && v.kappa >= MIN_KAPPA && v.n >= MIN_VALIDATION_N && hasEvidenceLink(v.evidence);
+}
+
+function hasEvidenceLink(evidence: string): boolean {
+  try {
+    const url = new URL(evidence);
+    return url.protocol === 'https:' || url.protocol === 'http:';
+  } catch {
+    return false;
+  }
 }
