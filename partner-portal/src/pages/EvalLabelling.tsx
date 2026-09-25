@@ -294,7 +294,10 @@ function LabelForm({ goldenCase, token, onSaved }: { goldenCase: GoldenCaseView;
               size="small"
               exclusive
               value={labels[criterion] ?? null}
+              disabled={saving}
               onChange={(_e, value: LabelValue | null) => {
+                // Any edit makes the last "saved" confirmation stale.
+                setSaved(false);
                 setLabels((prev) => {
                   const next = { ...prev };
                   if (value) next[criterion] = value;
@@ -311,7 +314,18 @@ function LabelForm({ goldenCase, token, onSaved }: { goldenCase: GoldenCaseView;
           </Stack>
         </Box>
       ))}
-      <TextField label="Note" multiline minRows={2} value={notes} onChange={(e) => setNotes(e.target.value)} inputProps={{ maxLength: 2000 }} />
+      <TextField
+        label="Note"
+        multiline
+        minRows={2}
+        value={notes}
+        disabled={saving}
+        onChange={(e) => {
+          setSaved(false);
+          setNotes(e.target.value);
+        }}
+        inputProps={{ maxLength: 2000 }}
+      />
       {error && <Alert severity="error">{error}</Alert>}
       {saved && <Alert severity="success">Labels saved.</Alert>}
       <Box>
