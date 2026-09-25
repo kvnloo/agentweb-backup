@@ -15,9 +15,17 @@
  */
 
 import { crmDb } from './db';
+import { phoneDigits, isDedupablePhone } from '../utils/smokeTestLead';
 
 export interface DedupedContact {
-  /** Canonical email (lowercased, trimmed) — the dedup key. */
+  /**
+   * What this contact is deduped ON. Email when there is one, else the phone, else the
+   * lead itself. Callers that re-dedup across users MUST key on this and not on `email`:
+   * every email-less contact has `email: ''`, so keying on the address collapses all of
+   * them into a single row.
+   */
+  dedupKey: string;
+  /** Canonical email (lowercased, trimmed). Empty for a phone-only contact. */
   email: string;
   /** Display name, or email fallback. */
   name: string;
@@ -63,6 +71,8 @@ export interface DedupResult {
   total: number;
   /** Total raw lead rows processed (for observability). */
   rawCount: number;
+  /** How many of those rows have no email address. They are included, not dropped. */
+  noEmailCount: number;
   /** Lists consulted. */
   listsCount: number;
   /** Opaque cursor for fetching the next page (if pagination is active). */
@@ -174,24 +184,42 @@ export async function dedupContactsForUser(query: DedupQuery): Promise<DedupResu
   // Group by lowercased email.
   const map = new Map<string, DedupedContact>();
   let rawCount = 0;
+  let noEmailCount = 0;
 
   for (const { list, leads } of perListResults) {
     for (const lead of leads) {
       rawCount += 1;
       const email = String(lead?.email ?? '').trim().toLowerCase();
-      if (!email) continue;
+      // ENG-2082: a phone-only capture used to be counted in rawCount and then dropped, so
+      // the Contacts/Inbox tab answered `{ total: 99, rawCount: 100 }` and the customer
+      // watched a submission land and could not find it. Dedup on the strongest identity
+      // the row actually has. Phone is a real one — two rows sharing a number are one
+      // person — and the per-lead fallback can never collapse two distinct people.
+      // isDedupablePhone, not just "has digits". `+1` and `1` both reduce to `1`, so every
+      // lead across the account carrying only a country code collapsed into ONE row — the
+      // others vanish from the Inbox and their list memberships are grafted onto the
+      // survivor. A merge is destructive in a way a split is not, so the bar is "could this
+      // be one person's number".
+      const phone = phoneDigits(String(lead?.phone ?? ''));
+      const dedupKey = email
+        || (isDedupablePhone(lead?.phone) ? `phone:${phone}` : `lead:${list.listId}/${lead?.leadId}`);
+      if (!email) noEmailCount += 1;
 
       const membership = {
         listId: list.listId,
         name: list.name ?? 'Unnamed list',
       };
       const displayName =
-        [lead.firstName, lead.lastName].filter(Boolean).join(' ').trim() || email;
+        [lead.firstName, lead.lastName].filter(Boolean).join(' ').trim() ||
+        email ||
+        String(lead?.phone ?? '').trim() ||
+        'Unknown contact';
 
       const lastContact = pickLastContact(lead);
-      const existing = map.get(email);
+      const existing = map.get(dedupKey);
       if (!existing) {
-        map.set(email, {
+        map.set(dedupKey, {
+          dedupKey,
           email,
           name: displayName,
           company: lead.company ?? '',
@@ -246,6 +274,7 @@ export async function dedupContactsForUser(query: DedupQuery): Promise<DedupResu
     contacts: limited,
     total,
     rawCount,
+    noEmailCount,
     listsCount: filteredLists.length,
   };
 }

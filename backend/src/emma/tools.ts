@@ -409,6 +409,14 @@ For a customer-facing credential reconnect (a disconnected Meta ad account, Inst
           enum: ['plan_choice', 'customer_credential', 'customer_confirmation'],
           description: '"plan_choice" for a team approver picking between options. "customer_credential" for a customer credential-reconnect ask — never used with audience="team". "customer_confirmation" is not supported yet and will be refused.',
         },
+        subjectLabel: {
+          type: 'string',
+          description: 'Required, always. A short label naming exactly which account/customer this decision is about (e.g. "TriCityAI · Meta Ad Account 2041725529929988", "JustFitKitchen · Meta retargeting campaign"). Rendered as its own prominent line so the approver never has to infer the account from prose — never omit this, even when businessImpact already mentions it.',
+        },
+        subjectContactEmail: {
+          type: 'string',
+          description: 'Optional but include it whenever you know it: the email of the person/account this decision concerns (e.g. the ad account owner). Rendered alongside subjectLabel with the domain highlighted, so the approver can recognize the company at a glance, not just the account id.',
+        },
         businessImpact: {
           type: 'string',
           description: 'One line: why this decision matters right now.',
@@ -461,7 +469,7 @@ For a customer-facing credential reconnect (a disconnected Meta ad account, Inst
           description: 'How many days this decision stays open before expiring. Defaults to 7. Clamped to a maximum of 30 — a larger value is silently reduced to 30, so do not promise the customer/approver a longer window than that.',
         },
       },
-      required: ['audience', 'gateType', 'businessImpact', 'evidencePacket'],
+      required: ['audience', 'gateType', 'subjectLabel', 'businessImpact', 'evidencePacket'],
     },
   },
   execute: async (args: any, context: any) => {
@@ -517,6 +525,8 @@ For a customer-facing credential reconnect (a disconnected Meta ad account, Inst
         gateType,
         approver: audience === 'team' ? (args?.approver as ApprovalDecisionApprover) : undefined,
         customerId: audience === 'customer' ? args?.customerId : undefined,
+        subjectLabel: args?.subjectLabel,
+        subjectContactEmail: args?.subjectContactEmail,
         businessImpact: args?.businessImpact,
         evidencePacket: {
           chatUrl: args?.evidencePacket?.chatUrl,
@@ -4219,6 +4229,9 @@ emmaToolRegistry.register({
             leadId: it.leadId,
             listId: it.listId,
             email: it.email || null,
+            // ENG-2082: without this the phone never reaches askCrm, so its projection and
+            // its specific_contact haystack stay blind to phone-only leads.
+            phone: it.phone || null,
             firstName: it.firstName || null,
             lastName: it.lastName || null,
             company: it.company || null,

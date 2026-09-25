@@ -66,6 +66,83 @@ beforeEach(() => {
   whatsapp.sendMessage.mockResolvedValue({ messageId: 'wamid.1' });
 });
 
+// ENG-2082: lead capture accepts phone-only submissions, so the owner alert is now the
+// most-seen artifact of a lead with no address — one email per captured lead.
+describe('owner alert for a lead with no email address', () => {
+  const { emailService } = require('../services/emailService');
+  const phoneOnly = { leadId: 'lead_ph_4d4be7fa83dae4aa5996c2a3', firstName: '', lastName: '', phone: '2125559876' };
+
+  // sendEmail is positional: (to, subject, text, html). Assert on BOTH bodies, and prove
+  // the body is non-empty first — reading the wrong arg makes every `not.toContain` pass
+  // against an empty string, which is how a vacuous test gets written.
+  const bodies = () => {
+    const call = emailService.sendEmail.mock.calls[0];
+    expect(call).toBeDefined();
+    const [, , text, html] = call;
+    expect(String(text).length).toBeGreaterThan(50);
+    expect(String(html).length).toBeGreaterThan(50);
+    return `${text}\n${html}`;
+  };
+
+  it('never announces the lead as "(Unknown email)"', async () => {
+    await notify({ userId: 'u1', email: 'u@e.com' }, phoneOnly);
+    expect(bodies()).not.toContain('Unknown email');
+  });
+
+  it('identifies the lead by phone, not by its database key', async () => {
+    await notify({ userId: 'u1', email: 'u@e.com' }, phoneOnly);
+    const [, , text] = emailService.sendEmail.mock.calls[0];
+    // Only the NAME line matters. The leadId legitimately appears further down in the
+    // engagement deep-link, so asserting against the whole body would be wrong.
+    const leadLine = String(text).split('\n').find((l: string) => l.startsWith('Lead:'));
+    expect(leadLine).toBe('Lead: 2125559876');
+  });
+
+  it('still shows the address when there is one', async () => {
+    await notify({ userId: 'u1', email: 'u@e.com' }, lead);
+    expect(bodies()).toContain('ada@example.com');
+  });
+});
+
+// ENG-2082: "nothing to draft" is not a failure. The renderer mapped every non-'created'
+// status to "Failed", so changing the status upstream to 'skipped_no_email' changed nothing
+// the owner actually reads — a phone-only capture still mailed them a failure notice.
+describe('owner alert — auto-draft status wording', () => {
+  const { emailService } = require('../services/emailService');
+  const bodies = () => {
+    const call = emailService.sendEmail.mock.calls[0];
+    expect(call).toBeDefined();
+    const [, , text, html] = call;
+    expect(String(text).length).toBeGreaterThan(50);
+    return `${text}\n${html}`;
+  };
+  const notifyWith = (eventData: any) => {
+    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@e.com' });
+    // autoDraftStatus is rendered only under the api.lead_* branch of buildEventDetails.
+    return leadListAlertService.notifyLeadListOwnerIfConfigured(
+      { ...list, alertEvents: ['api.lead_added'] }, lead, 'api.lead_added', eventData,
+      '2026-08-04T00:00:00.000Z',
+    );
+  };
+
+  it('a skipped draft does not read as a failure', async () => {
+    await notifyWith({ source: 'api', autoDraftStatus: 'skipped_no_email' });
+    const body = bodies();
+    expect(body).not.toContain('Auto Draft: Failed');
+    expect(body).toContain('Skipped');
+  });
+
+  it('a real failure still reads as one', async () => {
+    await notifyWith({ source: 'api', autoDraftStatus: 'failed' });
+    expect(bodies()).toContain('Failed');
+  });
+
+  it('a created draft still reads as created', async () => {
+    await notifyWith({ source: 'api', autoDraftStatus: 'created' });
+    expect(bodies()).toContain('Created');
+  });
+});
+
 describe('WhatsApp lead alerts', () => {
   it('sends to WhatsApp when the user has it configured', async () => {
     await notify({ userId: 'u1', email: 'u@e.com', messagingChannels: [WA] });

@@ -43,6 +43,13 @@ export interface EnrichSoReverseResult {
  */
 export interface SiblingLeadResult {
   leadId: string;
+  /**
+   * Which index found this sibling. `nameCompany` is a GUESS at identity — the query is
+   * table-wide with no tenant predicate — so it is not allowed to donate an email.
+   * Absent when a dep implementation does not report it; callers fall back to the coarser
+   * whole-lead anchor check.
+   */
+  matchedBy?: 'email' | 'linkedin' | 'nameCompany';
   listId?: string;
   userId?: string;
   updatedAt?: string;
@@ -337,11 +344,31 @@ export async function resolveIdentity(
       const copyableFields: Array<keyof SiblingLeadResult & keyof LeadRecord> = [
         'firstName', 'lastName', 'email', 'company', 'website',
       ];
+      // ENG-2082: `email` is only safe to copy when SOME strong anchor matched the sibling.
+      // With no email and no LinkedIn on this lead, the only thing findSiblingLeads could
+      // have matched on is name+company — and findLeadsByNameCompany is a table-wide GSI
+      // query with no listId or userId predicate. Copying an address across that match
+      // takes a STRANGER'S email, writes it into email-index, and makes this lead mailable
+      // at it. The guard below used to make this unreachable for inbound capture, because a
+      // captured lead always had an email; phone-only capture removed that.
+      //
+      // Scoped to `email` deliberately. name/company/website across a name+company match
+      // are the same-shaped risk but far lower stakes — nothing sends to them.
+      const strongAnchor = !!email || !!linkedinUrl;
       for (const field of copyableFields) {
         const currentValue = (lead as any)[field];
         if (typeof currentValue === 'string' && currentValue.trim() !== '') continue;
         if (refresh && refresh.has(`${lead.leadId}:${field}`)) continue;
         for (const sib of siblings) {
+          // Per-sibling, not per-lead. findSiblingLeads merges three index queries, so a
+          // lead that HAS a linkedin still pulls in name+company matches — and the coarse
+          // "do we have a strong anchor" test would wave those through. What matters is how
+          // THIS sibling was found. Falls back to the coarse test when a dep does not
+          // report matchedBy.
+          if (field === 'email') {
+            const weakMatch = sib.matchedBy ? sib.matchedBy === 'nameCompany' : !strongAnchor;
+            if (weakMatch) continue;
+          }
           const v = sib[field];
           if (typeof v !== 'string' || v.trim() === '') continue;
           (resolved as any)[field] = v;
@@ -555,12 +582,22 @@ export async function resolveIdentity(
       if (apolloResult) {
         let emailTrusted = false;
         if (apolloResult.email && !email && !resolved.email) {
+          const emailConfidence = apolloEmailStatusToConfidence(apolloResult.emailStatus ?? '');
           email = apolloResult.email;
           resolved.email = apolloResult.email;
           meta.email = {
             ...makeApiMeta('apollo', 'email', apolloResult.fromCache),
-            confidence: apolloEmailStatusToConfidence(apolloResult.emailStatus ?? ''),
+            confidence: emailConfidence,
           };
+          // NOT gated on emailConfidence, deliberately — see ENG-2125. A guessed address is
+          // weak evidence of a person match (it is a pattern Apollo synthesised from the
+          // domain, and maps to 'low' three lines up), and accepting it here is what makes
+          // matchConfident true on a weak name+company match, unlocking company/title/
+          // linkedin/website fills. The comment on the broker chain below asserts that
+          // "the unified Apollo Tier 3" applies an emailStatus gate; this one does not, so
+          // one of the two is wrong. The test at enrichmentIdentityResolver.test.ts:1754
+          // pins the current behaviour on purpose, so this is a product decision about
+          // match confidence rather than an oversight — left alone pending that decision.
           emailTrusted = true;
         }
 

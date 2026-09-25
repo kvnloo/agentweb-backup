@@ -1382,6 +1382,40 @@ createTestAccount().then(async () => {
         console.log('[AgentReliabilitySnapshot] Disabled (AGENT_RELIABILITY_SNAPSHOT_ENABLED=false)');
       }
 
+      // Online eval sampler (ENG-2144) — daily at 17:15 UTC: a seeded uniform random sample of the
+      // previous day's completed sessions, graded by the deterministic ENG-2137 graders into
+      // Dev-AW-LoopEvents (loopId eval-v2), plus the eval-v2-daily snapshots. Off unless
+      // EVAL_V2_SAMPLER_ENABLED=true (enabling it in prod is OPS-7, ENG-2152); the run itself
+      // refuses to write without the flag. No grader is validated, so it raises no alert.
+      if (process.env.EVAL_V2_SAMPLER_ENABLED === 'true') {
+        try {
+          const EVAL_V2_INTERVAL_MS = 24 * 60 * 60 * 1000;
+          const { runEvalV2SamplerCron } = await import('./cron/evalV2SamplerCron');
+          const nowForEvalV2 = new Date();
+          const nextEvalV2Run = new Date(nowForEvalV2);
+          nextEvalV2Run.setUTCHours(17, 15, 0, 0);
+          if (nextEvalV2Run <= nowForEvalV2) {
+            nextEvalV2Run.setUTCDate(nextEvalV2Run.getUTCDate() + 1);
+          }
+          const msUntilEvalV2 = nextEvalV2Run.getTime() - nowForEvalV2.getTime();
+          console.log(
+            `[EvalV2Sampler] Initialized — first run at 17:15 UTC (in ${Math.round(msUntilEvalV2 / 60000)} min)`,
+          );
+          setTimeout(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('EvalV2Sampler', runEvalV2SamplerCron())
+              .catch(e => console.error('[EvalV2Sampler] Error:', e));
+            setInterval(() => {
+              if (!isCronEnabled()) return;
+              cronJobRegistry.track('EvalV2Sampler', runEvalV2SamplerCron())
+                .catch(e => console.error('[EvalV2Sampler] Error:', e));
+            }, EVAL_V2_INTERVAL_MS);
+          }, msUntilEvalV2);
+        } catch (error) {
+          console.error('[EvalV2Sampler] Failed to initialize:', error);
+        }
+      }
+
       // Weekly Engineering Scoreboard — read-only backend replacement for the
       // laptop launchd job. Runs Mondays at 09:00 UTC, gated by
       // ENGINEERING_SCOREBOARD_LOOP_ENABLED=true. It reads Linear + Weave,

@@ -13,16 +13,22 @@ jest.mock('../services/settingsService', () => ({
   },
 }));
 
+jest.mock('../services/creativeRubricJudgeRuntime', () => ({
+  judgeHumanEvalCandidate: jest.fn(),
+}));
+
 import { enqueueAutoHumanEval, claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
 import { humanEvalService } from '../services/humanEvalService';
 import { settingsService } from '../services/settingsService';
 import { evaluateCreativeGates } from '../services/creativeGates';
+import { judgeHumanEvalCandidate } from '../services/creativeRubricJudgeRuntime';
 
 const mockCreateCandidate = humanEvalService.createCandidate as jest.Mock;
 const mockGetSetting = settingsService.getSetting as jest.Mock;
 const mockSetSetting = settingsService.setSetting as jest.Mock;
 const mockClaimSetMember = settingsService.claimSetMember as jest.Mock;
 const mockReleaseSetMember = settingsService.releaseSetMember as jest.Mock;
+const mockJudgeCandidate = jest.mocked(judgeHumanEvalCandidate);
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -35,6 +41,7 @@ beforeEach(() => {
   mockSetSetting.mockResolvedValue(undefined);
   mockClaimSetMember.mockResolvedValue(true);
   mockReleaseSetMember.mockResolvedValue(undefined);
+  mockJudgeCandidate.mockResolvedValue(null);
 });
 
 describe('enqueueAutoHumanEval', () => {
@@ -208,6 +215,56 @@ describe('enqueueAutoHumanEval', () => {
 
     expect(result?.candidateId).toBe('candidate-1');
     expect(mockReleaseSetMember).not.toHaveBeenCalled();
+  });
+
+  describe('creative rubric judge hook (ENG-2140)', () => {
+    const creativeGates = evaluateCreativeGates(
+      { bytes: 2048, decoded: true, width: 1080, height: 1350, format: 'png', luminanceStdDev: 30 },
+      { requestedSize: '1080x1350' },
+    );
+    const imageInput = {
+      reviewType: 'creative_image' as const,
+      userId: 'user-1',
+      category: 'ad',
+      artifactUrl: 'https://example.com/ad.png',
+      outputSummary: 'Ad image generated.',
+      sourceKey: 'image:session-4:ad.png',
+      creativeGates,
+      creativeBrief: { generationRequest: 'A 4:5 demo ad' },
+    };
+
+    it('hands a stored image candidate, its gates and brief to the judge hook', async () => {
+      await enqueueAutoHumanEval(imageInput);
+
+      expect(mockJudgeCandidate).toHaveBeenCalledWith({
+        candidateId: 'candidate-1',
+        userId: 'user-1',
+        category: 'ad',
+        artifactUrl: 'https://example.com/ad.png',
+        creativeGates,
+        brief: { generationRequest: 'A 4:5 demo ad' },
+      });
+    });
+
+    it('does not call the hook for other review types or when no candidate was created', async () => {
+      await enqueueAutoHumanEval({ reviewType: 'landing_page', outputSummary: 'LP generated', sourceKey: 'landing-page:p1' });
+      mockCreateCandidate.mockRejectedValueOnce(new Error('dynamo down'));
+      await enqueueAutoHumanEval({ ...imageInput, sourceKey: 'image:session-4:other.png' });
+
+      expect(mockJudgeCandidate).not.toHaveBeenCalled();
+    });
+
+    it('neither waits on nor fails because of the judge', async () => {
+      mockJudgeCandidate.mockReturnValueOnce(new Promise(() => undefined));
+      await expect(enqueueAutoHumanEval(imageInput)).resolves.toMatchObject({ candidateId: 'candidate-1' });
+
+      mockJudgeCandidate.mockRejectedValueOnce(new Error('judge exploded'));
+      const result = await enqueueAutoHumanEval({ ...imageInput, sourceKey: 'image:session-4:second.png' });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(result?.candidateId).toBe('candidate-1');
+      expect(mockReleaseSetMember).not.toHaveBeenCalled();
+    });
   });
 });
 

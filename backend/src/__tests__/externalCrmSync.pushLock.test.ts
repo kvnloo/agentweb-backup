@@ -115,7 +115,11 @@ afterAll(() => { delete process.env.HUBSPOT_BATCH_PUSH_ENABLED; });
 
 describe('ExternalCrmSyncService per-list push serialization lock', () => {
   let service: ExternalCrmSyncService;
-  const lead = { leadId: 'lead1', email: 'a@b.com' };
+  // Built FRESH per test. The push path writes syncMetadata (including
+  // hubspot_contact_id) onto the object it is handed, so a shared const leaked a
+  // contact id from one test into the next and the third test silently exercised a
+  // different code path than it claimed to.
+  const makeLead = () => ({ leadId: 'lead1', email: 'a@b.com' });
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -130,7 +134,7 @@ describe('ExternalCrmSyncService per-list push serialization lock', () => {
       active--;
       return { contactId: 'c1', isNew: false };
     });
-    mockCrmDb.getLeadById.mockResolvedValue(lead as any);
+    mockCrmDb.getLeadById.mockImplementation(async () => makeLead() as any);
     mockCrmDb.updateLead.mockResolvedValue(undefined as any);
     mockCrmDb.setLeadListCrmSyncConfig.mockResolvedValue(undefined as any);
     service = new ExternalCrmSyncService();
@@ -140,8 +144,8 @@ describe('ExternalCrmSyncService per-list push serialization lock', () => {
     mockListsWithConfigs(['listA']);
 
     await Promise.all([
-      service.autoSyncLead('user1', 'listA', lead, 'hubspot', 'updated'),
-      service.autoSyncLead('user1', 'listA', lead, 'hubspot', 'updated'),
+      service.autoSyncLead('user1', 'listA', makeLead(), 'hubspot', 'updated'),
+      service.autoSyncLead('user1', 'listA', makeLead(), 'hubspot', 'updated'),
     ]);
 
     // With the lock, only one push touches HubSpot at a time → peak concurrency 1.
@@ -164,7 +168,7 @@ describe('ExternalCrmSyncService per-list push serialization lock', () => {
   it('re-reads the lead inside the lock before pushing (sees a just-written deal id)', async () => {
     mockListsWithConfigs(['listA']);
 
-    await service.autoSyncLead('user1', 'listA', lead, 'hubspot', 'updated');
+    await service.autoSyncLead('user1', 'listA', makeLead(), 'hubspot', 'updated');
 
     expect(mockCrmDb.getLeadById).toHaveBeenCalledWith('listA', 'lead1');
   });

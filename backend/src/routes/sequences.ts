@@ -20,6 +20,24 @@ import { sendAsSender } from '../services/sendAsSender';
 import axios from 'axios';
 import { extractVariables, leadHasVariable, isSupportedVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
+import { defaultStatusConfigFor } from '../utils/leadSchema';
+
+/**
+ * ENG-2127: the by-list enrol accepts a `lifecycle` filter and hands it to
+ * crmDb.getLeadsByStatus, which queries the `status` attribute on listId-status-index and
+ * never reads `lifecycle` at all. The two vocabularies are disjoint — measured against
+ * production, `status` holds contacted/new/qualified/open/lost/closed/won/… while
+ * `lifecycle` holds inbox/signed_up — so a lifecycle-filtered enrol can never match
+ * anything. It returns an empty array, which is a legitimate result, so the caller reports
+ * "0 leads enrolled" and nothing anywhere says why.
+ *
+ * Fixing it properly means deciding what the filter should mean (a listId-lifecycle-index,
+ * or dropping the control) and is tracked on ENG-2127. Until then this at least refuses to
+ * fail silently.
+ */
+const LIFECYCLE_STAGES = new Set([
+  'unknown', 'inbox', 'signed_up', 'in_deal', 'trialing', 'paying', 'at_risk', 'churned',
+]);
 
 const router = express.Router();
 
@@ -219,6 +237,35 @@ router.post(
       if (lifecycle) {
         const r = await crmDb.getLeadsByStatus(listId, lifecycle);
         leads = Array.isArray(r) ? r : ((r as any).items ?? (r as any).leads ?? []);
+        // `at_risk` and `churned` are BOTH lifecycle stages and default lead statuses, and
+        // a list can define any statusConfig it likes — so the first version of this guard
+        // answered a perfectly valid `status: churned` filter that happened to match
+        // nothing with a 400 telling the caller to filter by a status instead, which is
+        // what they had done. A list with NO stored statusConfig does not have no
+        // statuses: it falls back to the default set, which contains `churned`.
+        const storedStatusConfig = (list as any)?.statusConfig;
+        const effectiveStatusConfig = Array.isArray(storedStatusConfig) && storedStatusConfig.length > 0
+          ? storedStatusConfig
+          : defaultStatusConfigFor((list as any)?.listType);
+        const listStatuses = new Set(
+          effectiveStatusConfig.map((sc: any) => String(sc?.value)),
+        );
+        if (leads.length === 0 && LIFECYCLE_STAGES.has(String(lifecycle)) && !listStatuses.has(String(lifecycle))) {
+          console.error(
+            `[sequences] ENG-2127: lifecycle filter "${lifecycle}" matched 0 leads in list ` +
+            `${listId} because getLeadsByStatus queries the \`status\` attribute, not ` +
+            `\`lifecycle\`. This filter cannot match; enrolling nothing.`,
+          );
+          return res.status(400).json({
+            error: 'lifecycle_filter_unsupported',
+            message:
+              `Filtering by lifecycle stage "${lifecycle}" is not supported yet — leads are ` +
+              `indexed by status, not lifecycle, so this filter matches nothing. Enrol the ` +
+              `whole list, or filter by a lead status instead.`,
+            lifecycle,
+            enrolled: false,
+          });
+        }
       } else {
         leads = await crmDb.getAllLeadsByListId(listId);
       }

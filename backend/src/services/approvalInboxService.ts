@@ -100,6 +100,26 @@ export interface ApprovalDecision {
   customerEmail?: string;
   customerName?: string;
   status: ApprovalDecisionStatus;
+  /** ENG-2159: required, regardless of audience. A short human label naming
+   *  the account/customer this decision is actually about (e.g. "TriCityAI ·
+   *  Meta Ad Account 2041725529929988") — deliberately separate from
+   *  customerId/customerName above, which stay customer-audience-only by
+   *  design (ticket point 6). Without this, a team-audience decision has no
+   *  structured way to say what it's about at all; whatever account info
+   *  showed up before was purely incidental to how the model phrased
+   *  businessImpact. Rendered as its own prominent line, never folded into
+   *  free text a reviewer might not read closely. */
+  subjectLabel: string;
+  /** ENG-2159 follow-up: optional, purely informational — the account
+   *  owner's email, if known, shown alongside subjectLabel. Deliberately a
+   *  DIFFERENT field from customerEmail above: customerEmail is tied to
+   *  customerId (routing — who this decision is FOR, customer-audience
+   *  only), this is display-only context about whose account a TEAM
+   *  decision concerns. Carries no routing/execution semantics, so it's
+   *  allowed on any audience, unlike customerId (ticket point 6's hard
+   *  invariant stays about customerId specifically, not about showing
+   *  contact info). */
+  subjectContactEmail?: string;
   businessImpact: string;
   evidencePacket: ApprovalDecisionEvidencePacket;
   /** Present for plan_choice items — the fixed decision-deck option shape,
@@ -141,6 +161,8 @@ export interface CreateApprovalDecisionRequest {
   customerId?: string;
   customerEmail?: string;
   customerName?: string;
+  subjectLabel: string;
+  subjectContactEmail?: string;
   businessImpact: string;
   evidencePacket: ApprovalDecisionEvidencePacket;
   options?: AskUserQuestionOption[];
@@ -178,7 +200,7 @@ const VALID_CREDENTIAL_PLATFORMS: PlatformType[] = ['meta', 'instagram', 'linked
 const MAX_PENDING_LOOKUP_PAGES = 20;
 
 // Shared between validateCreateRequest (reject at creation time) and
-// findPendingCredentialDecision (match at reconnect time) — a single source
+// findPendingCredentialDecisions (match at reconnect time) — a single source
 // of truth for what "the same account id" means, so the two can never drift
 // (review fix). Strips a leading "act_" — Meta's own API surfaces account
 // ids both with and without it (established precedent: metaService.ts's own
@@ -210,6 +232,9 @@ function validateOptions(options: AskUserQuestionOption[] | undefined): void {
 }
 
 function validateCreateRequest(request: CreateApprovalDecisionRequest): void {
+  if (typeof request.subjectLabel !== 'string' || request.subjectLabel.trim() === '') {
+    throw new ApprovalInboxError('subjectLabel must be a non-empty string naming the account/customer this decision is about');
+  }
   if (typeof request.businessImpact !== 'string' || request.businessImpact.trim() === '') {
     throw new ApprovalInboxError('businessImpact must be a non-empty string');
   }
@@ -300,6 +325,8 @@ export class ApprovalInboxService {
       customerEmail: request.customerEmail,
       customerName: request.customerName,
       status: isCustomer ? 'pending_customer_response' : 'pending_team_review',
+      subjectLabel: request.subjectLabel,
+      subjectContactEmail: request.subjectContactEmail,
       businessImpact: request.businessImpact,
       evidencePacket: request.evidencePacket,
       options: request.options,
@@ -567,13 +594,21 @@ export class ApprovalInboxService {
   }
 
   /**
-   * Finds the pending customer_credential decision (if any) matching a real
-   * OAuth reconnect — gap-closing round. Filters listPendingForCustomer's
-   * small, already-bounded result set in-code rather than a new GSI: a
-   * customer has at most a handful of pending decisions at once, and this
-   * only needs to run once per reconnect, not on a hot path.
+   * Finds every pending customer_credential decision matching a real OAuth
+   * reconnect — gap-closing round. Filters listPendingForCustomer's small,
+   * already-bounded result set in-code rather than a new GSI: a customer has
+   * at most a handful of pending decisions at once, and this only needs to
+   * run once per reconnect, not on a hot path.
+   *
+   * Plural on purpose (was findPendingCredentialDecision, singular via
+   * .find()) — found live on prod: a customer can end up with more than one
+   * pending decision for the same platform+account (e.g. a duplicate staged
+   * before the first was answered). A reconnect genuinely resolves ALL of
+   * them at once, not just the oldest — a real customer reconnecting once
+   * shouldn't leave a second, newer decision stuck until it silently expires
+   * and the sweep emails a false "your window closed" notice.
    */
-  async findPendingCredentialDecision(customerId: string, platform: string, accountId: string): Promise<ApprovalDecision | null> {
+  async findPendingCredentialDecisions(customerId: string, platform: string, accountId: string): Promise<ApprovalDecision[]> {
     const pending = await this.listPendingForCustomer(customerId);
     // Normalize both sides before comparing — credentialPlatform is
     // free-text Emma writes at stage time (e.g. "Meta" vs "meta"), and stray
@@ -589,13 +624,11 @@ export class ApprovalInboxService {
     // what validateCreateRequest rejects at creation time (review fix).
     const normPlatform = platform.trim().toLowerCase();
     const normTargetAccountId = normalizeCredentialAccountId(accountId);
-    return (
-      pending.find(
-        (d) =>
-          d.gateType === 'customer_credential' &&
-          d.credentialPlatform?.trim().toLowerCase() === normPlatform &&
-          (d.credentialAccountId ? normalizeCredentialAccountId(d.credentialAccountId) : undefined) === normTargetAccountId,
-      ) ?? null
+    return pending.filter(
+      (d) =>
+        d.gateType === 'customer_credential' &&
+        d.credentialPlatform?.trim().toLowerCase() === normPlatform &&
+        (d.credentialAccountId ? normalizeCredentialAccountId(d.credentialAccountId) : undefined) === normTargetAccountId,
     );
   }
 }

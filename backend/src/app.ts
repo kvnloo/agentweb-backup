@@ -86,6 +86,7 @@ import adminTrackingMonitorRoutes from "./routes/adminTrackingMonitor";
 import adminRenewalIntegrationHealthRoutes from "./routes/adminRenewalIntegrationHealth";
 import adminPromptTemplatesRoutes from "./routes/adminPromptTemplates";
 import adminScheduleTemplateRoutes from "./routes/adminScheduleTemplateRoutes";
+import adminGoldenSetRoutes from "./routes/adminGoldenSet";
 import supportRoutes from "./routes/support";
 import integrationsRoutes from "./routes/integrations";
 import featurebaseRoutes from "./routes/featurebase";
@@ -475,6 +476,8 @@ app.use("/api/admin/tracking-monitor", authenticateToken, isAdmin, adminTracking
 app.use("/api/admin/renewal-integration-health", authenticateToken, isAdmin, adminRenewalIntegrationHealthRoutes);
 app.use("/api/admin/prompt-templates", authenticateToken, isAdmin, adminPromptTemplatesRoutes);
 app.use("/api/admin/schedule-templates", authenticateToken, isAdmin, adminScheduleTemplateRoutes);
+// ENG-2135: golden-set labelling (inert until EVAL_GOLDEN_CASES_TABLE is set by OPS-2).
+app.use("/api/admin/eval/golden-cases", authenticateToken, isAdmin, adminGoldenSetRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/integrations", integrationsRoutes);
 app.use("/api/featurebase", featurebaseRoutes);

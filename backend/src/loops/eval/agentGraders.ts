@@ -22,6 +22,19 @@ import { mediaGenProducedAsset } from '../../services/agentMode/core/toolDispatc
 import { toolResultError } from '../../utils/toolResultError';
 import { wilsonInterval, type Interval } from './agreement';
 
+/**
+ * Eval-registry id → version of each session grader below. Stored with every online score
+ * (evalV2Sampler.ts) so a trend never silently mixes verdicts from different logic: bump a
+ * grader's version in the same change that alters what it returns.
+ */
+export const AGENT_GRADER_VERSIONS = {
+  'agent-task-success': 1,
+  'agent-tool-correctness': 1,
+  'agent-groundedness-offline': 1,
+} as const;
+
+export type AgentGraderId = keyof typeof AGENT_GRADER_VERSIONS;
+
 // ---------------------------------------------------------------------------
 // Inputs
 // ---------------------------------------------------------------------------
