@@ -16,6 +16,7 @@
  */
 
 import { randomUUID } from "crypto";
+import type { CreativeGateResult } from "./creativeGates";
 
 export type AdImageStatus = "idle" | "running" | "ready" | "failed";
 
@@ -47,6 +48,12 @@ export interface AdImageVariant {
    * handle. Optional for backward compatibility.
    */
   concept?: string;
+  /**
+   * Advisory deterministic checks on the rendered image (ENG-2139): decode,
+   * blank render, aspect/size vs the requested placement, file size. Absent
+   * on placeholders and on rows generated before the gates shipped.
+   */
+  gates?: CreativeGateResult;
 }
 
 export interface AdImageResult {
