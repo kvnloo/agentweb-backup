@@ -363,6 +363,17 @@ app.use("/api/users", usersRoutes);
 app.use("/api/tasks", taskRoutes);
 app.use("/api/waitlist", waitlistRoutes);
 app.use("/api/schedules", scheduleRoutes);
+// D78: mounted AHEAD of the catch-all `/api/admin` router below (which applies a blanket
+// authenticateToken/isAdmin via router.use with no path filter, matching this path too) —
+// registration order matters in Express, so a later, more specific mount here would never
+// be reached; a request without a valid admin session would 401 out of the catch-all before
+// this gate's own secret-header check ever ran. Mounting first means this route's own gate
+// decides: a correct AW_AGENT_RUNS_SECRET header authenticates directly (narrowed to one
+// sessionId, limit<=3, never falling through to the catch-all below); no header falls
+// through to this gate's own authenticateToken/isAdmin call, identical to the old behavior,
+// and never reaches the catch-all a second time since this mount already terminates the
+// response either way. See middleware/agentRunsAuth.ts.
+app.use("/api/admin/agent-runs", authenticateAgentRunsSecretOrAdmin(agentRunsRoutes));
 app.use("/api/admin", adminRoutes);
 app.use("/api/admin", adminUsageRoutes);
 app.use("/api/admin", mcpUsageAdminRoutes);
@@ -449,11 +460,6 @@ app.use("/api/admin/lead-magnets", authenticateToken, isAdmin, leadMagnetAdminRo
 app.use("/api/admin/fathom-onboarding", authenticateToken, isAdmin, fathomOnboardingAdminRoutes);
 app.use("/api/admin/onboarding-loop", authenticateToken, isAdmin, onboardingLoopAdminRoutes);
 app.use("/api/admin/loops", authenticateToken, isAdmin, loopHealthRoutes);
-// D78: a dedicated header-secret credential (AW_AGENT_RUNS_SECRET) authenticates
-// .aw-agent's one narrow call here (a single sessionId, limit<=3) without the full admin
-// JWT; the admin UI's own browsing of this route still goes through authenticateToken,
-// isAdmin exactly as before when no secret header is sent. See middleware/agentRunsAuth.ts.
-app.use("/api/admin/agent-runs", authenticateAgentRunsSecretOrAdmin(agentRunsRoutes));
 app.use("/api/client-health", authenticateToken, isAdmin, clientHealthRoutes);
 // ENG-1551 — lead volume drought monitor. Same double-gate as client-health: middleware +
 // service-layer admin check.
