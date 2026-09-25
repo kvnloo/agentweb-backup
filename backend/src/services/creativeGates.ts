@@ -135,8 +135,11 @@ export function evaluateCreativeGates(
       : { id: 'decode', status: 'fail', reason: m.decodeError || 'image has no readable dimensions' },
   );
 
-  if (!hasSize || m.luminanceStdDev === undefined) {
-    checks.push({ id: 'blank_render', status: 'skipped', reason: 'image did not decode' });  } else if (m.luminanceStdDev < BLANK_RENDER_MAX_STDDEV) {
+  if (!hasSize) {
+    checks.push({ id: 'blank_render', status: 'skipped', reason: 'image did not decode' });
+  } else if (m.luminanceStdDev === undefined) {
+    checks.push({ id: 'blank_render', status: 'skipped', reason: 'luminance could not be measured' });
+  } else if (m.luminanceStdDev < BLANK_RENDER_MAX_STDDEV) {
     checks.push({
       id: 'blank_render',
       status: 'fail',
