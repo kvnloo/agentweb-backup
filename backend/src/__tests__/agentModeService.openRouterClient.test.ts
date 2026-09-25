@@ -1,3 +1,4 @@
+import { OPENROUTER_PROVIDER_PREFERENCES } from '../services/agentMode/openRouterRequestParams';
 jest.mock('../services/db', () => ({
   getSession: jest.fn(),
   saveMessage: jest.fn(),
@@ -276,7 +277,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect((service as any).llmModels['gpt-5.4'].supportsTemperature).toBe(false);
     expect(request).toEqual(expect.objectContaining({
       model: 'openai/gpt-5.4',
-      provider: { allow_fallbacks: true, require_parameters: true, order: ['Azure'] },
+      provider: { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true },
       usage: { include: true },
     }));
     expect(request).not.toHaveProperty('temperature');
@@ -423,7 +424,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
       model: 'openai/gpt-5.5',
       tools: [{ type: 'openrouter:web_search' }],
-      provider: { allow_fallbacks: true, require_parameters: true, order: ['Azure'] },
+      provider: { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true },
     }));
     expect(create.mock.calls[0][0]).not.toHaveProperty('tool_choice');
     expect(create).toHaveBeenCalledTimes(1);
@@ -535,7 +536,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
       model: 'perplexity/sonar-deep-research',
       models: ['perplexity/sonar-pro-search'],
-      provider: { allow_fallbacks: true, require_parameters: true },
+      provider: { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true },
       usage: { include: true },
     }));
     expect(create).toHaveBeenCalledTimes(1);
@@ -651,7 +652,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
 
     const request = create.mock.calls[0][0];
     expect(request.provider).toEqual({
-      allow_fallbacks: true,
+      ...OPENROUTER_PROVIDER_PREFERENCES,
       require_parameters: true,
       ignore: ['Google'],
     });
@@ -1171,7 +1172,7 @@ describe('ENG-1788: opt-in reasoning effort', () => {
   it('characterizes the unset request byte-for-byte and preserves the response', async () => {
     const result = await service.callLLM(model, messages);
     expect(JSON.stringify(create.mock.calls[0][0])).toBe(
-      '{"model":"openai/gpt-6-astra","messages":[{"role":"user","content":"Hello"}],"provider":{"allow_fallbacks":true,"require_parameters":true,"order":["Azure"]},"usage":{"include":true},"plugins":[{"id":"context-compression"}]}',
+      '{"model":"openai/gpt-6-astra","messages":[{"role":"user","content":"Hello"}],"provider":{"order":["amazon-bedrock","azure","google-vertex","anthropic","openai"],"allow_fallbacks":true,"require_parameters":true},"usage":{"include":true},"plugins":[{"id":"context-compression"}]}',
     );
     expect(result).toEqual({
       id: 'completion-effort', model: 'openai/gpt-6-astra',
