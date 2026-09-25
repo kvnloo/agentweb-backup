@@ -518,12 +518,31 @@ export interface ExecutePreparedToolsResult {
 
 /**
  * ENG-936: normalize image input fields into a single string array for source checks.
+ *
+ * Review fix: `logo_image` is folded in alongside `inputImages`/`input_images`.
+ * `imageGeneration.ts`'s `generateImage()` appends `params.logoImage` onto
+ * `params.inputImages` before generating (and `agentModeService.ts`'s own
+ * `editsExistingImage` check already treats `inputImages.length > 0 || !!logoImage`
+ * as equivalent), so a `logo_image` is a real edit source at execution time — this
+ * gate must see it too, or a call with `confirm:true`, no `inputImages`, and an
+ * unapproved `logo_image` sails through as "not an edit" and bypasses source
+ * validation entirely.
  */
 function getInputImages(toolCallArgs: any): string[] {
   const rawInputImages = toolCallArgs?.inputImages ?? toolCallArgs?.input_images;
-  if (typeof rawInputImages === 'string') return [rawInputImages];
-  if (!Array.isArray(rawInputImages)) return [];
-  return rawInputImages.filter((item): item is string => typeof item === 'string');
+  const images: string[] = [];
+  if (typeof rawInputImages === 'string') {
+    images.push(rawInputImages);
+  } else if (Array.isArray(rawInputImages)) {
+    images.push(...rawInputImages.filter((item): item is string => typeof item === 'string'));
+  }
+
+  const logoImage = toolCallArgs?.logo_image ?? toolCallArgs?.logoImage;
+  if (typeof logoImage === 'string' && logoImage.length > 0) {
+    images.push(logoImage);
+  }
+
+  return images;
 }
 
 /**

@@ -1568,6 +1568,72 @@ describe('executePreparedTools', () => {
       expect(result.pendingCounterUpdates).toEqual({ generate_image: 1 });
     });
 
+    // Review fix: `logo_image` is a real edit source at execution time —
+    // imageGeneration.ts's generateImage() appends it onto inputImages before
+    // generating — but the gate previously only inspected inputImages/input_images.
+    // A call with confirm:true, no inputImages, and an unapproved logo_image sailed
+    // through as "not an edit" (getInputImages returned []) and bypassed source
+    // validation entirely. Must be rejected the same way a mismatched inputImages
+    // call is.
+    it('rejects a logo_image that is not one of the approved sources, even with no inputImages set', async () => {
+      const execOrder: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          execOrder.push(i.toolName);
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+      });
+
+      const input = makeInput(
+        [toolCall('a', 'generate_image', JSON.stringify({
+          prompt: 'add our logo', confirm: true, logo_image: 'https://assets.example.com/unapproved-logo.png',
+        }))],
+        ports,
+        {
+          approvedRevisionImageSources: ['https://assets.example.com/approved.png'],
+        },
+      );
+
+      const result = await executePreparedTools(input);
+
+      expect(execOrder).toEqual([]);
+      expect(result.failedCounterUpdates).toEqual({ generate_image: 1 });
+      expect(result.pendingCounterUpdates).toEqual({});
+      expect(input.toolCallsLedger[0]).toMatchObject({
+        name: 'generate_image',
+        error: expect.stringContaining('source mismatch'),
+      });
+    });
+
+    it('allows a logo_image that matches exactly the approved source', async () => {
+      const execOrder: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          execOrder.push(i.toolName);
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async () => ({ success: true, imageUrl: 'https://s3/branded.png', filename: 'branded.png' }),
+      });
+
+      const input = makeInput(
+        [toolCall('a', 'generate_image', JSON.stringify({
+          prompt: 'add our logo', confirm: true, logo_image: 'https://assets.example.com/approved.png',
+        }))],
+        ports,
+        {
+          approvedRevisionImageSources: ['https://assets.example.com/approved.png'],
+        },
+      );
+
+      const result = await executePreparedTools(input);
+
+      expect(execOrder).toEqual(['generate_image']);
+      expect(result.failedCounterUpdates).toEqual({});
+      expect(result.pendingCounterUpdates).toEqual({ generate_image: 1 });
+    });
+
     // ENG-2166: a real customer (Vincent Hu) hit this. An approved-source list is
     // fixed for the WHOLE run (e.g. revisionService.ts's Slack-driven "revise this
     // asset" flow sets one approved URL for the whole bounded runVerifiedChat call).
