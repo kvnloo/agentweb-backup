@@ -41,6 +41,15 @@ jest.mock('../services/db', () => ({
       { leadId: 'lead-2', email: 'b@example.com' },
     ]),
     getLead: jest.fn().mockResolvedValue({ leadId: 'lead-1', email: 'a@example.com', lifecycle: 'inbox' }),
+    // The explicit enroll route decides reachability from the CRM ROW, not the request
+    // body — its payload has no `linkedin` field, so reading the body made it enrol
+    // nobody for a LinkedIn sequence. Resolve per leadId, because "this lead has no
+    // address" is now a fact about the CRM, not about the payload.
+    getLeadById: jest.fn().mockImplementation(async (_listId: string, leadId: string) => (
+      leadId === 'lead-1'
+        ? { leadId: 'lead-1', email: 'a@example.com' }
+        : { leadId, email: '' }
+    )),
     getLeadsByListId: jest.fn().mockResolvedValue([
       { leadId: 'lead-1', email: 'a@example.com' },
       { leadId: 'lead-2', email: 'b@example.com' },
@@ -260,6 +269,8 @@ describe('POST /:sequenceId/enrollments - bulk enroll', () => {
   // sendAsSender. An address-less enrollment therefore retries forever and stays invisible
   // to getActiveEnrollment. This route takes an explicit array, so the rows are dropped from
   // the enrol call and the count is REPORTED rather than silently swallowed.
+  // The address-less rows are lead-2 and lead-3 in the CRM fixture above; the route reads
+  // the row, not the payload, so that is where the fact now lives.
   it('drops address-less leads from the enrol call and reports the count', async () => {
     const res = await request(app)
       .post('/seq_1/enrollments')
@@ -619,6 +630,87 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
       expect(res.body.enrollableLeads).toBe(3);
       const ids = dripSequenceDb.bulkEnroll.mock.calls[0][0].map((i: any) => i.leadId);
       expect(ids.sort()).toEqual(['both', 'li-only', 'mail-only']);
+    });
+
+    // B1: this route's payload is { listId, leadId, leadEmail } — `linkedin` was never
+    // part of its contract. Reading it from the body made every lead look unreachable to
+    // a LinkedIn sequence, so the route enrolled NOBODY: the same regression the
+    // channel-aware guard was written to fix, on the sibling route.
+    it('the EXPLICIT enroll route resolves the lead from the CRM, not the request body', async () => {
+      dripSequenceDb.getSequence.mockResolvedValue(linkedInSequence);
+      const crmDbMock = require('../services/db').crmDb;
+      crmDbMock.getLeadById = jest.fn().mockResolvedValue({
+        leadId: 'lead-1', linkedin: 'https://linkedin.com/in/ada',
+      });
+
+      const res = await request(app)
+        .post('/seq_1/enrollments')
+        // exactly the payload the route's own contract defines — no `linkedin`
+        .send({ leads: [{ listId: 'list-1', leadId: 'lead-1', leadEmail: '' }] });
+
+      expect(res.status).toBe(200);
+      expect(dripSequenceDb.bulkEnroll).toHaveBeenCalled();
+      const input = dripSequenceDb.bulkEnroll.mock.calls[0][0][0];
+      expect(input.leadEmail).toBe('https://linkedin.com/in/ada');
+      expect(res.body.skippedUnreachable).toBeUndefined();
+    });
+
+    it('the explicit route still enrols when the CRM lookup fails, using the payload', async () => {
+      dripSequenceDb.getSequence.mockResolvedValue(mockSequence);
+      const crmDbMock = require('../services/db').crmDb;
+      crmDbMock.getLeadById = jest.fn().mockRejectedValue(new Error('DynamoDB unavailable'));
+
+      const res = await request(app)
+        .post('/seq_1/enrollments')
+        .send({ leads: [{ listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@example.com' }] });
+
+      expect(res.status).toBe(200);
+      expect(dripSequenceDb.bulkEnroll).toHaveBeenCalled();
+      expect(dripSequenceDb.bulkEnroll.mock.calls[0][0][0].leadEmail).toBe('a@example.com');
+    });
+
+    // Review 5, finding 9. Nothing validates `step.channel` on create/update, so a
+    // mis-cased value is storable. Under the old every-channel rule it failed OPEN
+    // (matched no branch, everyone enrolled, the worker delivered them as email);
+    // at-least-one inverted that to failing CLOSED — nobody enrolled, while the worker
+    // would have sent fine.
+    // Review 5, finding 6. f9ed770cc fixed three of FOUR emitting sites; verify-variables
+    // still hardcoded the key, so it reported `skippedNoEmail` about a lead that HAS one.
+    it('verify-variables names the skip reason after the channel too', async () => {
+      dripSequenceDb.getSequence.mockResolvedValue(linkedInSequence);
+      const crmDbMock = require('../services/db').crmDb;
+      crmDbMock.getLeadsByListId = jest.fn().mockResolvedValue([
+        { leadId: 'l1', listId: 'list-1', email: 'a@x.com' },
+        { leadId: 'l2', listId: 'list-1', linkedin: 'https://linkedin.com/in/b' },
+      ]);
+
+      const res = await request(app)
+        .post('/seq_1/steps/verify-variables')
+        .send({ listId: 'list-1', subject: 'Hi {{firstName}}', htmlContent: '' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.skippedUnreachable).toBe(1);
+      expect(res.body.skippedNoEmail).toBeUndefined();
+    });
+
+    it('a mis-cased channel does not silently empty the enrolment', async () => {
+      dripSequenceDb.getSequence.mockResolvedValue({
+        ...mockSequence,
+        steps: [{ stepId: 's1', stepNumber: 1, name: 'Mail', delayDays: 0,
+                  channel: 'Email', subject: 'x', bodyHtml: 'y' }],
+      });
+      const crmDbMock = require('../services/db').crmDb;
+      crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+        { leadId: 'l1', listId: 'list-1', email: 'a@x.com' },
+        { leadId: 'l2', listId: 'list-1', email: 'b@x.com' },
+      ]);
+
+      const res = await request(app)
+        .post('/seq_1/enrollments/by-list')
+        .send({ listId: 'list-1' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.enrollableLeads).toBe(2);
     });
 
     it('still refuses a lead reachable on NO channel of the sequence', async () => {

@@ -106,9 +106,10 @@ jest.mock("axios", () => ({
 // nothing when every page in the file carried the same id, so those assertions were
 // exactly as load-sensitive as the bare toHaveBeenCalledTimes(1) they replaced.
 //
-// First call still returns the historical constant, so the four tests that assert
-// `result.id === "test-uuid-1234"` keep working; every later call is unique, which is
-// what makes the scoping real.
+// Every call is unique. The four tests that used to assert the literal
+// `"test-uuid-1234"` now assert MINTED_ID instead — what they were really checking is
+// that a FRESH id was minted rather than an existing record's id being recycled, and the
+// regex says that without pinning a particular value.
 let uuidCounter = 0;
 jest.mock("uuid", () => ({
   v4: () => `test-uuid-${++uuidCounter}`,

@@ -532,16 +532,24 @@ async function advanceEnrollment(
   nextStep: number,
   nextSendAt: string,
   channel: SequenceChannel = 'email',
+  /**
+   * False when the step was SKIPPED because the lead could not receive it. Stamping a
+   * sent-timestamp for a message that was never sent is a false record — the worker
+   * advances past undeliverable steps now, so this is reachable.
+   */
+  delivered: boolean = true,
 ): Promise<void> {
   const sentField = channel === 'linkedin' ? 'lastLinkedInSentAt' : 'lastEmailSentAt';
   await dynamodb.update({
     TableName: ENROLLMENTS_TABLE,
     Key: { enrollmentId },
-    UpdateExpression: `SET currentStep = :step, nextSendAt = :next, ${sentField} = :sent REMOVE claimedAt`,
+    UpdateExpression: delivered
+      ? `SET currentStep = :step, nextSendAt = :next, ${sentField} = :sent REMOVE claimedAt`
+      : 'SET currentStep = :step, nextSendAt = :next REMOVE claimedAt',
     ExpressionAttributeValues: {
       ':step': nextStep,
       ':next': nextSendAt,
-      ':sent': now(),
+      ...(delivered ? { ':sent': now() } : {}),
     },
   }).promise();
 }
@@ -551,18 +559,22 @@ async function completeEnrollment(
   exitReason: ExitReason,
   finalStatus: EnrollmentStatus = 'completed',
   channel: SequenceChannel = 'email',
+  /** See advanceEnrollment: false when the final step was skipped, not sent. */
+  delivered: boolean = true,
 ): Promise<void> {
   const sentField = channel === 'linkedin' ? 'lastLinkedInSentAt' : 'lastEmailSentAt';
   await dynamodb.update({
     TableName: ENROLLMENTS_TABLE,
     Key: { enrollmentId },
-    UpdateExpression: `SET #s = :status, exitReason = :reason, completedAt = :ts, ${sentField} = :sent REMOVE claimedAt`,
+    UpdateExpression: delivered
+      ? `SET #s = :status, exitReason = :reason, completedAt = :ts, ${sentField} = :sent REMOVE claimedAt`
+      : 'SET #s = :status, exitReason = :reason, completedAt = :ts REMOVE claimedAt',
     ExpressionAttributeNames: { '#s': 'status' },
     ExpressionAttributeValues: {
       ':status': finalStatus,
       ':reason': exitReason,
       ':ts': now(),
-      ':sent': now(),
+      ...(delivered ? { ':sent': now() } : {}),
     },
   }).promise();
 }

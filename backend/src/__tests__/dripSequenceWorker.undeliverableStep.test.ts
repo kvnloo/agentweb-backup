@@ -1,7 +1,7 @@
 /**
  * A step the LEAD cannot receive is skipped, not failed.
  *
- * It used to throw, and the throw propagated out of executeStep, so the enrollment
+ * It used to throw, and the throw propagated out of processEnrollment, so the enrollment
  * retried the same undeliverable step forever and never reached the steps it COULD
  * receive — an email-only lead in a mixed email+LinkedIn sequence got its email and then
  * jammed. Enrollability was then narrowed to "every channel the sequence uses", which
@@ -147,6 +147,128 @@ describe('dripSequenceWorker — a step the lead cannot receive is skipped, not 
 
     expect(mockSendAsSender).toHaveBeenCalledTimes(1);
     expect(mockSendAsSender.mock.calls[0][2].to).toBe('mail@x.com');
+    expect(stats.sent).toBe(1);
+    expect(stats.skipped).toBe(0);
+  });
+
+  // Review 5, finding 13. db.ts keeps company/school URLs and free text verbatim in
+  // `lead.linkedin`; sendMessage throws on those, and that throw is NOT a lead-data skip,
+  // so it retried forever — the failure this whole change set out to kill, surviving in
+  // the one case an emptiness check cannot catch.
+  it.each([
+    ['a company page', 'https://linkedin.com/company/acme'],
+    ['a school page', 'https://linkedin.com/school/mit'],
+    ['a bare handle', '@ada-lovelace'],
+  ])('skips a LinkedIn step for %s instead of retrying forever', async (_label, value) => {
+    mockDb.getAllDueEnrollments.mockResolvedValue([enrollmentAt(1, 'mail@x.com') as any]);
+    mockCrmDb.getLeadById.mockResolvedValue({
+      leadId: 'lead-1', email: 'mail@x.com', linkedin: value,
+    } as any);
+
+    const stats = await processDueEnrollments();
+
+    expect(mockLinkedIn.sendMessage).not.toHaveBeenCalled();
+    expect(stats.errors).toBe(0);
+    expect(stats.skipped).toBe(1);
+    expect(mockDb.completeEnrollment).toHaveBeenCalledTimes(1);
+  });
+
+  it('still sends to a real personal profile', async () => {
+    mockDb.getAllDueEnrollments.mockResolvedValue([enrollmentAt(1, 'mail@x.com') as any]);
+    mockCrmDb.getLeadById.mockResolvedValue({
+      leadId: 'lead-1', email: 'mail@x.com', linkedin: 'https://www.linkedin.com/in/ada/',
+    } as any);
+
+    const stats = await processDueEnrollments();
+
+    expect(mockLinkedIn.sendMessage).toHaveBeenCalledTimes(1);
+    expect(stats.sent).toBe(1);
+  });
+
+  // Review 5, finding 10. advanceEnrollment/completeEnrollment stamp lastEmailSentAt /
+  // lastLinkedInSentAt unconditionally, so a SKIPPED step recorded a send that never
+  // happened. The `channel` argument was also completely untested in either direction.
+  it('a skipped step does not record a send, and names the right channel', async () => {
+    mockDb.getAllDueEnrollments.mockResolvedValue([enrollmentAt(1, 'mail@x.com') as any]);
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'lead-1', email: 'mail@x.com' } as any);
+
+    await processDueEnrollments();
+
+    expect(mockDb.completeEnrollment).toHaveBeenCalledTimes(1);
+    const [, , , channel, delivered] = mockDb.completeEnrollment.mock.calls[0] as any[];
+    expect(channel).toBe('linkedin');
+    expect(delivered).toBe(false);
+  });
+
+  it('a delivered step DOES record a send', async () => {
+    mockDb.getAllDueEnrollments.mockResolvedValue([enrollmentAt(0, 'mail@x.com') as any]);
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'lead-1', email: 'mail@x.com' } as any);
+
+    await processDueEnrollments();
+
+    expect(mockDb.advanceEnrollment).toHaveBeenCalledTimes(1);
+    const [, , , channel, delivered] = mockDb.advanceEnrollment.mock.calls[0] as any[];
+    expect(channel).toBe('email');
+    expect(delivered).toBe(true);
+  });
+
+  // Review 5, finding 3. msgVars is shared by both channels and `email` was wired to
+  // `enrollment.leadEmail` — which for an address-less lead IS the profile URL. A
+  // {{email}} token in a DM rendered the recipient their own LinkedIn link.
+  it('a {{email}} token in a LinkedIn DM never renders the profile URL', async () => {
+    // The suite-wide mock is identity; render for real here so the assertion is about
+    // the message a human would receive, not about the template.
+    (require('../utils/emailVariables').substituteVariables as jest.Mock)
+      .mockImplementation((tpl: string, vars: Record<string, any>) =>
+        String(tpl).replace(/\{\{(\w+)\}\}/g, (_m, k) => String(vars?.[k] ?? '')));
+    mockDb.getSequence.mockResolvedValue({
+      ...mixedSequence,
+      steps: [{ stepId: 's2', stepNumber: 1, name: 'DM', channel: 'linkedin', delayDays: 0,
+                messageText: 'Hi {{firstName}}, can I reach you at {{email}}?' }],
+    } as any);
+    mockDb.getAllDueEnrollments.mockResolvedValue([
+      enrollmentAt(0, 'https://linkedin.com/in/li-only') as any,
+    ]);
+    mockCrmDb.getLeadById.mockResolvedValue({
+      leadId: 'lead-1', firstName: 'Ada', linkedin: 'https://linkedin.com/in/li-only',
+    } as any);
+
+    await processDueEnrollments();
+
+    expect(mockLinkedIn.sendMessage).toHaveBeenCalledTimes(1);
+    const body = String(mockLinkedIn.sendMessage.mock.calls[0][3]);
+    expect(body).not.toContain('linkedin.com/in/li-only');
+    expect(body).toContain('Ada');
+  });
+
+  // Review 5, finding 4. db.ts stores `lead.linkedin` VERBATIM for anything that is not a
+  // personal /in/ profile, so free text lands there — and `includes('@')` let a handle
+  // through to the mail provider.
+  it('a LinkedIn handle in the identity is not treated as an email address', async () => {
+    mockDb.getAllDueEnrollments.mockResolvedValue([enrollmentAt(0, '@ada-lovelace') as any]);
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'lead-1', linkedin: '@ada-lovelace' } as any);
+
+    const stats = await processDueEnrollments();
+
+    expect(mockSendAsSender).not.toHaveBeenCalled();
+    expect(stats.skipped).toBe(1);
+    expect(stats.sent).toBe(0);
+  });
+
+  // Review 5, finding 5. The identity is frozen at enrolment; the lead is not. A lead that
+  // has GAINED an address must not have its email step skipped and consumed.
+  it('uses the LIVE address when a lead gained one after enrolment', async () => {
+    mockDb.getAllDueEnrollments.mockResolvedValue([
+      enrollmentAt(0, 'https://linkedin.com/in/li-only') as any,
+    ]);
+    mockCrmDb.getLeadById.mockResolvedValue({
+      leadId: 'lead-1', email: 'ada@x.com', linkedin: 'https://linkedin.com/in/li-only',
+    } as any);
+
+    const stats = await processDueEnrollments();
+
+    expect(mockSendAsSender).toHaveBeenCalledTimes(1);
+    expect(mockSendAsSender.mock.calls[0][2].to).toBe('ada@x.com');
     expect(stats.sent).toBe(1);
     expect(stats.skipped).toBe(0);
   });

@@ -49,11 +49,15 @@ function requiredChannels(sequence: any): Set<string> {
   // to email rather than to the empty set, which would mean "reachable on no channels" —
   // i.e. filter nothing — and silently widen the population this screen reports on.
   if (steps.length === 0) return new Set<string>(['email']);
-  return new Set<string>(steps.map((st: any) => String(st?.channel ?? 'email')));
+  // Lower-cased: nothing validates `step.channel` on create/update, so a mis-cased
+  // 'Email' used to match no branch. Under the old every-channel rule that failed OPEN
+  // (everyone enrolled, and the worker's `channel === 'linkedin' ? … : email` delivered
+  // them as email anyway); under at-least-one it fails CLOSED and enrols nobody.
+  return new Set<string>(steps.map((st: any) => String(st?.channel ?? 'email').trim().toLowerCase()));
 }
 
 /**
- * Can this sequence reach this lead on EVERY channel it uses?
+ * Can this sequence reach this lead on AT LEAST ONE of the channels it uses?
  *
  * The first version of this guard tested `lead.email` only, which was wrong: sequences are
  * not email-only. `SequenceChannel = 'email' | 'linkedin'`, and dripSequenceWorker's
@@ -64,7 +68,7 @@ function requiredChannels(sequence: any): Set<string> {
  * AT LEAST ONE channel, not every one. Requiring every channel was my first answer and it
  * cost a real send: an email-only lead in a mixed email+LinkedIn sequence stopped being
  * enrolled at all, where before it received the email. The worker now SKIPS a step the
- * lead cannot receive instead of throwing (dripSequenceWorker.executeStep), so enrolling
+ * lead cannot receive instead of throwing (dripSequenceWorker.processEnrollment), so enrolling
  * such a lead no longer jams it — it gets the steps it can receive and completes.
  *
  * A lead that can receive NO step is still refused: enrolling it would create a row that
@@ -77,13 +81,6 @@ function leadIsReachable(lead: any, channels: Set<string>): boolean {
 }
 
 /**
- * The enrollment's dedup identity. `leadEmail` is the partition key of
- * `leadEmail-index`, which getExistingEnrollment queries — an empty one makes the row
- * invisible to the dedup check, so it is re-created on every run and the lead is
- * messaged again each time. For a lead with no address the LinkedIn URL is the stable
- * identity; dripSequenceWorker already treats the field that way at its reply-exit check.
- */
-/**
  * `skippedNoEmail` is the field existing callers know, and it is the right word only when
  * the sequence is email-only. A LinkedIn step makes "no email" a lie — a live run on env2
  * reported `skippedNoEmail: 1` for a lead skipped because it had no LinkedIn PROFILE.
@@ -92,6 +89,13 @@ function skipKeyForChannels(channels: Set<string>): string {
   return channels.has('linkedin') ? 'skippedUnreachable' : 'skippedNoEmail';
 }
 
+/**
+ * The enrollment's dedup identity. `leadEmail` is the partition key of
+ * `leadEmail-index`, which getExistingEnrollment queries — an empty one makes the row
+ * invisible to the dedup check, so it is re-created on every run and the lead is
+ * messaged again each time. For a lead with no address the LinkedIn URL is the stable
+ * identity; dripSequenceWorker already treats the field that way at its reply-exit check.
+ */
 function enrollmentIdentity(lead: any): string {
   return String(lead?.email ?? '').trim() || String(lead?.linkedin ?? '').trim();
 }
@@ -242,21 +246,39 @@ router.post(
         return res.status(400).json({ error: 'Sequence has no steps' });
       }
 
-      // An enrollment the sequence cannot deliver makes dripSequenceWorker throw and
-      // RETHROW, so it retries forever; and an empty leadEmail is invisible to
-      // getExistingEnrollment, so the row is re-created on every run. Reported rather than
-      // dropped silently — this route takes an explicit lead array, so the caller chose
-      // these rows and deserves to know some were not enrollable.
+      // Reachability is decided from the CRM ROW, not the request body. This route's
+      // payload is `{ listId, leadId, leadEmail }` — `linkedin` was never part of its
+      // contract, so reading `l.linkedin` here meant every lead looked unreachable to a
+      // LinkedIn sequence and the route enrolled NOBODY. That is the identical regression
+      // this guard was introduced to fix, reintroduced on the sibling route; the by-list
+      // route escaped it only because it reads real rows. The lead is loaded once per
+      // entry and reused for the identity below.
       const channels = requiredChannels(sequence);
-      const enrollable = leads.filter((l: any) =>
-        leadIsReachable({ email: l.leadEmail ?? l.email, linkedin: l.linkedin }, channels));
-      const skippedUnreachable = leads.length - enrollable.length;
-      const inputs = enrollable.map((l: any) => ({
+      const resolved = await Promise.all(leads.map(async (l: any) => {
+        // Promise.resolve().then(...) so a SYNCHRONOUS throw is caught too — a bare
+        // `.catch()` only handles a rejection, and a lookup that is simply unavailable
+        // must degrade to the payload, never 500 the whole enrol.
+        const row = await Promise.resolve()
+          .then(() => crmDb.getLeadById(l.listId, l.leadId))
+          .catch(() => null);
+        // Fall back to the payload when the row is gone, so a caller that supplied an
+        // address still enrols rather than being dropped by a failed read.
+        return {
+          input: l,
+          lead: {
+            email: (row as any)?.email ?? l.leadEmail ?? l.email,
+            linkedin: (row as any)?.linkedin ?? l.linkedin,
+          },
+        };
+      }));
+      const enrollable = resolved.filter((r) => leadIsReachable(r.lead, channels));
+      const skippedUnreachable = resolved.length - enrollable.length;
+      const inputs = enrollable.map((r) => ({
         sequenceId: req.params.sequenceId,
         userId: authReq.user!.userId,
-        listId: l.listId,
-        leadId: l.leadId,
-        leadEmail: enrollmentIdentity({ email: l.leadEmail ?? l.email, linkedin: l.linkedin }),
+        listId: r.input.listId,
+        leadId: r.input.leadId,
+        leadEmail: enrollmentIdentity(r.lead),
         startAt: startAt ?? undefined,
       }));
 
@@ -339,12 +361,15 @@ router.post(
         leads = await crmDb.getAllLeadsByListId(listId);
       }
 
-      // Filtered HERE, before coverage — not at the mapper. leadEmail feeds
-      // sendAsSender({ to }) in dripSequenceWorker, which RETHROWS on failure, so an
-      // email-less lead does not fail once: the enrollment retries forever. leadEmail is
-      // also the leadEmail-index partition key, so the row is invisible to
-      // getActiveEnrollment and is re-created on every run. crm.ts's identical mapper has
-      // always filtered.
+      // Filtered HERE, before coverage — not at the mapper. A lead the sequence can reach
+      // on no channel would enrol into a row that skips every step and completes having
+      // sent nothing; and an empty identity is the leadEmail-index partition key, so the
+      // row is invisible to getExistingEnrollment and is re-created on every run.
+      //
+      // (The older rationale — that the worker RETHROWS and the enrollment retries
+      // forever — described behaviour that has since been fixed: undeliverable steps are
+      // skipped now. Left corrected rather than deleted because that change is precisely
+      // why this test is at-least-one rather than every-channel.)
       //
       // Filtering up front rather than at the mapper keeps one population throughout:
       // leadCount, the missing/present warning counts and the confirm gate all describe
@@ -704,6 +729,9 @@ router.post(
 
       let leads: any[] = [];
       let verifyTotalLeads = 0;
+      // Declared out here so the response below can name the skip reason after the
+      // channel that was actually missing, the same way the two enrol routes do.
+      let verifyChannels = new Set<string>(['email']);
       if (listId) {
         const leadsResult = await crmDb.getLeadsByListId(listId);
         leads = Array.isArray(leadsResult)
@@ -716,7 +744,7 @@ router.post(
         verifyTotalLeads = leads.length;
         // Mirrors the enrol routes exactly — including their channel awareness, or this
         // screen reports coverage over a different population again.
-        const verifyChannels = requiredChannels(
+        verifyChannels = requiredChannels(
           req.params.sequenceId && req.params.sequenceId !== 'test'
             ? await dripSequenceDb.getSequence(req.params.sequenceId).catch(() => null)
             : null,
@@ -751,7 +779,7 @@ router.post(
         variableCoverage,
         leadCount: leads.length,
         ...(verifyTotalLeads > leads.length
-          ? { totalLeads: verifyTotalLeads, skippedNoEmail: verifyTotalLeads - leads.length }
+          ? { totalLeads: verifyTotalLeads, [skipKeyForChannels(verifyChannels)]: verifyTotalLeads - leads.length }
           : {}),
       });
     } catch (error) {
