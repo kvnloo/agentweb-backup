@@ -24,6 +24,8 @@ import { CLIENT_ID_SCHEMA_PROPERTY } from '../mcp/server/toolHelpers';
 // ENG-2103 (F2 pilot): books/whitepapers tool bodies live in a standalone module
 // that does not require constructing AgentModeService — see emma/impl/books.ts.
 import * as booksImpl from './impl/books';
+// ENG-2103 (F2): GTM plans tool cluster, same treatment as booksImpl above.
+import * as gtmPlansImpl from './impl/gtmPlans';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -3333,7 +3335,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listGTMPlans(context?.userId);
+    return await gtmPlansImpl.listGTMPlans(context?.userId);
   }
 });
 
@@ -3354,7 +3356,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.readGTMPlan(args.plan_id, context?.userId);
+    return await gtmPlansImpl.readGTMPlan(args.plan_id, context?.userId);
   }
 });
 
@@ -3435,7 +3437,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createGTMPlan(
+    return await gtmPlansImpl.createGTMPlan(
       args.title, args.description || '', args.dri || undefined, args.phases || [], context?.userId, context?.sessionId
     );
   }
@@ -3474,7 +3476,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.updateGTMPlan(args.plan_id, {
+    return await gtmPlansImpl.updateGTMPlan(args.plan_id, {
       title: args.title,
       description: args.description,
       dri: args.dri,
@@ -3542,7 +3544,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.addGTMPhase(args.plan_id, {
+    return await gtmPlansImpl.addGTMPhase(args.plan_id, {
       title: args.title,
       description: args.description,
       dri: args.dri,
@@ -3599,7 +3601,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.addGTMWorkItems(args.plan_id, args.phase_id, args.work_items, context?.userId);
+    return await gtmPlansImpl.addGTMWorkItems(args.plan_id, args.phase_id, args.work_items, context?.userId);
   }
 });
 
@@ -3672,7 +3674,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.updateGTMWorkItem(args.plan_id, args.phase_id, args.work_item_id, {
+    return await gtmPlansImpl.updateGTMWorkItem(args.plan_id, args.phase_id, args.work_item_id, {
       status: args.status,
       notes: args.notes,
       dri: args.dri,
@@ -3726,7 +3728,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.updateGTMPhase(args.plan_id, args.phase_id, {
+    return await gtmPlansImpl.updateGTMPhase(args.plan_id, args.phase_id, {
       title: args.title,
       description: args.description,
       dri: args.dri,
@@ -3760,7 +3762,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.deleteGTMItems(args.plan_id, args.phase_id, args.work_item_id, context?.userId);
+    return await gtmPlansImpl.deleteGTMItems(args.plan_id, args.phase_id, args.work_item_id, context?.userId);
   }
 });
 
@@ -3776,7 +3778,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getGTMCommonItems();
+    return await gtmPlansImpl.getGTMCommonItems();
   }
 });
 
@@ -3823,7 +3825,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.addGTMCommonItems(args.plan_id, args.items, args.target_phase_id, args.new_phase_name, context?.userId);
+    return await gtmPlansImpl.addGTMCommonItems(args.plan_id, args.items, args.target_phase_id, args.new_phase_name, context?.userId);
   }
 });
 
@@ -3868,7 +3870,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.sendGTMStatusReport(args.plan_id, args.phase_id, {
+    return await gtmPlansImpl.sendGTMStatusReport(args.plan_id, args.phase_id, {
       notifyUser: args.notify_user,
       notifyPlanPoc: args.notify_plan_poc,
       notifyPhasePoc: args.notify_phase_poc,
