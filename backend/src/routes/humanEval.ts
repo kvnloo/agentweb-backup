@@ -131,8 +131,14 @@ router.get('/candidates', async (req: Request, res: Response): Promise<void> => 
 
 router.get('/candidates/:candidateId', async (req: Request, res: Response) => {
   try {
+    const authReq = req as AuthenticatedRequest;
     const candidate = await humanEvalService.getCandidate(req.params.candidateId);
-    if (!candidate) return res.status(404).json({ error: 'Candidate not found' });
+    // ENG-2154: admins read any candidate, other users only their own. Anything else is a 404,
+    // not a 403, so a guessed id does not confirm that a candidate exists.
+    const callerId = authReq.user?.userId;
+    const isOwner = !!callerId && !!candidate?.userId && candidate.userId === callerId;
+    const canRead = !!candidate && (authReq.user?.isAdmin === true || isOwner);
+    if (!canRead) return res.status(404).json({ error: 'Candidate not found' });
     res.json({ success: true, candidate });
   } catch (error: any) {
     res.status(500).json({ error: error?.message || 'Failed to load human eval candidate' });
