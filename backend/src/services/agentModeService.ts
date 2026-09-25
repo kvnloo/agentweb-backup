@@ -72,7 +72,6 @@ import {
   type ModelTier,
 } from './agentMode/llmModelRegistry';
 import {
-  assertOpenRouterResponseHasChoices,
   isMalformedOpenRouterResponseError,
 } from './agentMode/openRouterResponseValidation';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice, buildAcceptanceFailureNotice, assetProducingToolsInPlay } from './agentMode/core/synthesisResidue';
@@ -165,8 +164,10 @@ import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { meterUserUsage } from './usageRecorderService';
-import { meterWithResolvedBilling } from './agentMode/deferredBillingMetering';
 import { meterUsageFromResponse } from '../utils/llmClients';
+import { pickTransport } from './funding/transport';
+import { currentRunFunding } from './funding/runFunding';
+import { recordLlmUsage } from './funding/recordLlmUsage';
 import {
   getModelPrice,
   costScoreFromPrice,
@@ -3035,92 +3036,83 @@ export class AgentModeService {
     // win rather than a regression.
     const isScheduledLlmCall = taskClass === 'scheduled_background';
     const maxAttempts = isScheduledLlmCall ? 3 : 2;
-    let lastError: unknown;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        const res = await client.chat.completions.create(
-          params,
-          { timeout: timeoutMs ?? 5 * 60 * 1000, maxRetries: 0 },
-        );
-        // ENG-1681: see openRouterResponseValidation.ts — converts a response
-        // with no `choices` array into an explicit, retryable error before it
-        // ever reaches the unguarded `response.choices[0].message` downstream.
-        assertOpenRouterResponseHasChoices(res, model);
-        // ENG-1712: resolved provider slot + BYOK flag, log-only (no routing
-        // impact) -- lets a production incident/verification tie a specific
-        // call to the provider it actually landed on without reading
-        // credential material out-of-band.
-        const resolvedMetadata = normalizeOpenRouterResponseMetadata(res);
-        console.log(`AgentMode: OpenRouter call succeeded for model "${model}"`, {
-          provider: resolvedMetadata.provider,
-          is_byok: resolvedMetadata.is_byok,
-          ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
-        });
-        // Fire-and-forget usage metering; it must never break an LLM call.
-        try {
-          const usage: any = (res as any)?.usage;
-          if (usage) {
-            const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
-            meterWithResolvedBilling({
-              userId: usageContext?.userId,
-              billingUserId: usageContext?.billingUserId,
-              sessionId: usageContext?.sessionId,
-              model,
-              provider: providerLabel,
-              feature: usageContext?.feature || 'agent_task',
-              eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
-              inputTokens: normalizedUsage.inputTokens,
-              outputTokens: normalizedUsage.outputTokens,
-              cacheReadTokens: normalizedUsage.cacheReadTokens,
-              cacheWriteTokens: normalizedUsage.cacheWriteTokens,
-              cacheWriteByTtl: usage.cache_creation_by_ttl,
-              costUsdOverride:
-                usage.is_byok === true
-                  ? typeof usage.cost_details?.upstream_inference_cost === 'number' &&
-                    Number.isFinite(usage.cost_details.upstream_inference_cost) &&
-                    usage.cost_details.upstream_inference_cost > 0
-                    ? usage.cost_details.upstream_inference_cost
-                    : undefined
-                  : typeof usage.cost === 'number'
-                    ? usage.cost
-                    : undefined,
-            });
-          }
-        } catch {
-          // Metering must never break an LLM call.
-        }
-        // Keep default responses untouched; annotate only the effort actually sent.
-        return reasoningEffort !== undefined && res.usage
-          ? { ...res, usage: { ...res.usage, reasoning_effort: reasoningEffort } }
-          : res;
-      } catch (error) {
-        lastError = error;
-        if (attempt < maxAttempts && isRetryableLlmCallError(error)) {
-          // Retry-After is only honored for scheduled calls (see maxAttempts
-          // comment above) — an interactive/other caller keeps the original
-          // fixed, short backoff so a live turn still fails fast rather than
-          // trusting a provider-reported wait that could be tens of seconds.
-          const retryAfterMs = isScheduledLlmCall ? getRetryAfterMs(error) : undefined;
-          const backoffMs = retryAfterMs ?? 1500 * Math.pow(2, attempt - 1);
-          console.warn(`AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying (attempt ${attempt + 1}/${maxAttempts}) after ${backoffMs}ms${retryAfterMs !== undefined ? ' (honoring Retry-After)' : ''}`, {
-            error: error instanceof Error ? error.message : String(error),
-            // ENG-1712: OpenRouter surfaces the attempted provider/BYOK slot on
-            // some error shapes too (varies by failure type); include when present.
-            ...normalizeOpenRouterErrorMetadata(error),
-          });
-          await this.sleep(backoffMs);
-          continue;
-        }
-        break;
-      }
-    }
-    console.error(`AgentMode: OpenRouter call failed for model "${model}":`, {
-      error: lastError instanceof Error ? lastError.message : String(lastError),
-      stack: lastError instanceof Error ? lastError.stack : undefined,
-      // ENG-1712: same optional provider/BYOK metadata as the retry-warn path.
-      ...normalizeOpenRouterErrorMetadata(lastError),
+
+    // ENG-1816 F1: send/validate/retry mechanics live in OpenRouterPlatformTransport
+    // now (relocated unchanged, not rewritten — see transport/openRouterPlatformTransport.ts).
+    // pickTransport always resolves this same transport today; A2 adds ApiKeyTransport.
+    const res = await pickTransport(currentRunFunding(), model).send(client, model, params, {
+      timeoutMs: timeoutMs ?? 5 * 60 * 1000,
+      maxAttempts,
+      isRetryableError: isRetryableLlmCallError,
+      // Bound to the instance method, not a transport-local timer: this is the seam
+      // agentModeService.openRouterClient.test.ts spies on to assert exact backoff
+      // values without actually waiting.
+      sleep: (ms) => this.sleep(ms),
+      computeBackoff: (error, attempt) => {
+        // Retry-After is only honored for scheduled calls (see maxAttempts comment
+        // above) — an interactive/other caller keeps the original fixed, short
+        // backoff so a live turn still fails fast rather than trusting a
+        // provider-reported wait that could be tens of seconds.
+        const retryAfterMs = isScheduledLlmCall ? getRetryAfterMs(error) : undefined;
+        return {
+          ms: retryAfterMs ?? 1500 * Math.pow(2, attempt - 1),
+          honoredRetryAfter: retryAfterMs !== undefined,
+        };
+      },
     });
-    throw lastError;
+
+    // ENG-1712: resolved provider slot + BYOK flag, log-only (no routing
+    // impact) -- lets a production incident/verification tie a specific
+    // call to the provider it actually landed on without reading
+    // credential material out-of-band.
+    const resolvedMetadata = normalizeOpenRouterResponseMetadata(res);
+    console.log(`AgentMode: OpenRouter call succeeded for model "${model}"`, {
+      provider: resolvedMetadata.provider,
+      is_byok: resolvedMetadata.is_byok,
+      ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+    });
+    // Fire-and-forget usage metering; it must never break an LLM call.
+    // ENG-1816 F1: routed through recordLlmUsage, which decides funding ABOVE this
+    // fire-and-forget funnel — see funding/recordLlmUsage.ts for why. Branch on
+    // RunFunding.route, never on usage.is_byok below: that flag also fires for
+    // AgentWeb's own OpenRouter BYOK credential (the Google slot, ENG-1702/753),
+    // indistinguishable on the wire from a customer's BYOK key.
+    try {
+      const usage: any = (res as any)?.usage;
+      if (usage) {
+        const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
+        recordLlmUsage(currentRunFunding(), {
+          userId: usageContext?.userId,
+          billingUserId: usageContext?.billingUserId,
+          sessionId: usageContext?.sessionId,
+          model,
+          provider: providerLabel,
+          feature: usageContext?.feature || 'agent_task',
+          eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
+          inputTokens: normalizedUsage.inputTokens,
+          outputTokens: normalizedUsage.outputTokens,
+          cacheReadTokens: normalizedUsage.cacheReadTokens,
+          cacheWriteTokens: normalizedUsage.cacheWriteTokens,
+          cacheWriteByTtl: usage.cache_creation_by_ttl,
+          costUsdOverride:
+            usage.is_byok === true
+              ? typeof usage.cost_details?.upstream_inference_cost === 'number' &&
+                Number.isFinite(usage.cost_details.upstream_inference_cost) &&
+                usage.cost_details.upstream_inference_cost > 0
+                ? usage.cost_details.upstream_inference_cost
+                : undefined
+              : typeof usage.cost === 'number'
+                ? usage.cost
+                : undefined,
+        }, 'agentModeService.callLLM');
+      }
+    } catch {
+      // Metering must never break an LLM call.
+    }
+    // Keep default responses untouched; annotate only the effort actually sent.
+    return reasoningEffort !== undefined && res.usage
+      ? { ...res, usage: { ...res.usage, reasoning_effort: reasoningEffort } }
+      : res;
   }
 
   /**
@@ -35338,7 +35330,17 @@ Reply with ONLY one word: yes or no.`;
           temperature: 0,
           max_completion_tokens: 500,
           taskClass: 'scheduled_background',
-          usageContext: { feature: 'step_removal_authorization_judge' },
+          // ENG-1816 F1: this judge previously carried no userId, so its spend booked
+          // to "system" and escaped both billing and the funding policy. Read the
+          // run's owner from the ambient store instead of threading a new parameter
+          // through this method's signature. billingUserId deliberately omitted: this
+          // reaches meterWithResolvedBilling, which only resolves the org-root billing
+          // subject when billingUserId is absent (ENG-1858) — passing ownerUserId here
+          // would re-suppress that resolution for org members, the exact ENG-1217 bug.
+          usageContext: {
+            feature: 'step_removal_authorization_judge',
+            userId: currentRunFunding()?.ownerUserId,
+          },
         },
       );
       const timeoutPromise = new Promise<never>((_, reject) =>

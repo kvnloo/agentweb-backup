@@ -208,7 +208,7 @@ Remember: You're here to help startups and businesses grow through smart marketi
             { role: 'system', content: this.getSystemPrompt() },
             { role: 'user', content: finalContext },
             responseMessage, // Include the assistant's response with tool calls
-            ...responseMessage.tool_calls?.map(toolCall => ({
+            ...responseMessage.tool_calls?.map((toolCall: any) => ({
               tool_call_id: toolCall.id,
               role: 'tool' as const,
               name: toolCall.function.name,

@@ -1,4 +1,5 @@
 import { enforceEvaluationTool } from '../../services/evaluationPolicy';
+import { currentRunFunding, resolveRunFunding, withRunFunding } from '../../services/funding/runFunding';
 import { isAnonymousUserId, buildAnonymousToolRefusal } from '../anonymousToolAccess';
 import { refuseUnauthorizedScheduledPublish, attachPublishRevalidation } from '../../utils/scheduledPublishConsentGuard';
 
@@ -153,7 +154,30 @@ export class McpToolRegistry {
     // A publishing handler may do minutes of work (media download, video upload)
     // between being admitted here and actually committing the post, so admission
     // alone is not enough — hand it a re-validation to run at its last moment.
-    return await handler.execute(args, attachPublishRevalidation(name, context, args));
+    const publishContext = attachPublishRevalidation(name, context, args);
+
+    // ENG-1816 F1: resolve funding ONLY when no ambient RunFunding is already active.
+    // This method is the single dispatch point for BOTH Emma's own in-process tool
+    // calls (agentModeService.ts, already inside the worker's withRunFunding scope)
+    // AND genuinely external entry points that never go through the worker at all —
+    // e.g. an internal MCP_ACCESS_TOKEN caller hitting POST /mcp directly, which
+    // reaches create_blog_article -> agentModeService.createBlogArticle ->
+    // generateBlogContent/restyleContent with no scope ever entered, so their
+    // currentRunFunding()-based attribution fix silently read undefined. Found by
+    // an independent review of this same PR's earlier leak fixes.
+    //
+    // Checking currentRunFunding() first, and only resolving when it's absent, is
+    // load-bearing, not a micro-optimization: a run's funding must be resolved ONCE,
+    // at that run's true entry point. Unconditionally re-resolving here would
+    // overwrite an outer, already-correct funding decision for the duration of every
+    // nested tool call inside an agent-mode turn — harmless today (F1 always
+    // resolves 'agentweb'), but wrong the moment a real customer route exists,
+    // since a fresh resolve could return something different mid-run.
+    if (currentRunFunding() || !context?.userId) {
+      return await handler.execute(args, publishContext);
+    }
+    const runFunding = await resolveRunFunding({ userId: context.userId });
+    return await withRunFunding(runFunding, () => handler.execute(args, publishContext));
   }
 }
 
