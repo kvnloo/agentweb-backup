@@ -1,6 +1,6 @@
 export type HealthStatus = 'healthy' | 'mediocre' | 'at-risk' | 'blocked' | 'onboarding';
 
-export type AdConnectionState = 'never_connected' | 'connected' | 'expired';
+export type AdConnectionState = 'never_connected' | 'connected' | 'expired' | 'other_platform';
 
 export interface ClientHealthFlags {
   has_ads: boolean;
@@ -22,7 +22,8 @@ export function adsLayerConnection(adsLayer: { connected: boolean; connection?: 
 /**
  * Roster status for one client. ENG-2133 (ENG-2128 T1): never connecting an ad account is
  * activation (`onboarding`), not churn — it used to render as a red "At Risk". Only a
- * connection that broke (expired token) is at-risk.
+ * connection that broke (expired token) is at-risk. Ads on Google/LinkedIn (`other_platform`)
+ * count as activated.
  */
 export function deriveQuickStatus(client: ClientHealthFlags): HealthStatus {
   const connection = adConnectionOf(client);
@@ -40,6 +41,7 @@ export function quickSummary(client: ClientHealthFlags): string {
   if (connection === 'expired') parts.push('Ad connection expired');
   if (!client.has_lander) parts.push('No lander');
   if (!client.has_crm) parts.push('No CRM');
+  if (connection === 'other_platform') parts.push('Ads on Google/LinkedIn');
   if (parts.length === 0) return 'All layers connected';
   return parts.join(' · ');
 }

@@ -111,18 +111,21 @@ const ADS_INDICATOR: Record<AdConnectionState, { title: string; color: string }>
   connected: { title: 'Ads connected', color: 'success.main' },
   never_connected: { title: 'Ads not connected yet (activation)', color: 'text.disabled' },
   expired: { title: 'Ad connection expired', color: 'error.light' },
+  other_platform: { title: 'Ads on Google/LinkedIn (no Meta account)', color: 'info.main' },
 };
 
 const ADS_PANEL: Record<AdConnectionState, { border: string; bg: string }> = {
   connected: { border: 'success.light', bg: 'success.50' },
   never_connected: { border: 'grey.300', bg: 'grey.50' },
   expired: { border: 'error.light', bg: 'error.50' },
+  other_platform: { border: 'info.light', bg: 'info.50' },
 };
 
 const ADS_ACCOUNT_LABEL: Record<AdConnectionState, string> = {
   connected: 'Connected',
   never_connected: 'Not connected yet',
   expired: 'Expired — reconnect needed',
+  other_platform: 'Not on Meta (ads on Google/LinkedIn)',
 };
 
 function formatRelativeTime(dateStr: string | null): string {
