@@ -65,6 +65,7 @@ import UsageCostByUserTab from "../components/admin/UsageCostByUserTab";
 import CostDashboardTab from "../components/admin/CostDashboardTab";
 import ResultEndpointsTab from "../components/admin/ResultEndpointsTab";
 import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
+import EvalV2Tab from "../components/admin/EvalV2Tab";
 import CrmTab from "../components/admin/CrmTab";
 import V0CreditsCard from "../components/admin/V0CreditsCard";
 import CostBreakdownBody, { OrgUsageRollup } from "../components/admin/CostBreakdownBody";
@@ -6775,6 +6776,10 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
 
         <TabPanel value={tabValue} index={25}>
           <UsageCostByUserTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={26}>
+          <EvalV2Tab />
         </TabPanel>
         </Box>
       </Box>
