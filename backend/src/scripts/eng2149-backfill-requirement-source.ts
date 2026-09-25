@@ -16,6 +16,7 @@
  *     npx ts-node src/scripts/eng2149-backfill-requirement-source.ts --apply [--contracted=...]
  *   ENG2149_BACKFILL_APPLY=AW-AccountCapabilityRequirements \
  *     npx ts-node src/scripts/eng2149-backfill-requirement-source.ts --rollback --apply     # remove what this script wrote
+ *   (rollback matches requirementSetBy exactly: pass the same --set-by the apply run used)
  *
  * `--apply` refuses to run unless ENG2149_BACKFILL_APPLY equals the exact target table name, so a
  * wrong NODE_ENV cannot write to the other environment's table. Output is counts only.
@@ -79,6 +80,11 @@ export function planRequirementBackfill(
   return plan;
 }
 
+/** Rows whose requirement fields were written by a run with this `setBy` (exact match). */
+export function planRequirementRollback(rows: ReadonlyArray<ScannedCapabilityRow>, setBy: string): ScannedCapabilityRow[] {
+  return rows.filter((row) => row.capability === "ad_platform_integration" && row.requirementSetBy === setBy);
+}
+
 /** Throws unless the operator named the exact table in the apply env var. */
 export function assertApplyAllowed(env: NodeJS.ProcessEnv, tableName: string): void {
   if (env[APPLY_ENV_VAR] !== tableName) {
@@ -123,8 +129,8 @@ async function main(): Promise<void> {
   console.log(`[eng2149] requirementSource today: ${JSON.stringify(countBy(rows, (r) => r.requirementSource ?? "(absent)"))}`);
 
   if (rollback) {
-    const mine = rows.filter((r) => r.capability === "ad_platform_integration" && r.requirementSetBy?.startsWith(BACKFILL_SET_BY));
-    console.log(`[eng2149] rollback: ${mine.length} row(s) carry fields written by ${BACKFILL_SET_BY} (apply=${apply})`);
+    const mine = planRequirementRollback(rows, setBy);
+    console.log(`[eng2149] rollback: ${mine.length} row(s) carry fields written by --set-by=${setBy} (apply=${apply})`);
     if (!apply) return;
     for (const row of mine) {
       await dynamodb
