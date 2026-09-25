@@ -32,7 +32,7 @@ import {
 } from '../services/creativeRubricJudge';
 import { RUBRIC_SYSTEM_PROMPT } from '../services/creativeRubricJudgePrompt';
 import { placementFromGates, selectPriorBest } from '../services/creativeRubricJudgeRuntime';
-import type { HumanEvalCandidate } from '../services/humanEvalService';
+import type { HumanEvalCandidate, HumanEvalService } from '../services/humanEvalService';
 import { getModelPrice } from '../utils/llmPricing';
 
 export interface Args {
@@ -65,6 +65,15 @@ export function parseArgs(raw: readonly string[]): Args {
   }
   if (args.ids.length === 0) throw new Error(`--ids is required. ${USAGE}`);
   return args;
+}
+
+/** The prior best creative for `candidate`'s account and placement, from all of that account's creatives. */
+export async function priorBestFor(
+  candidate: HumanEvalCandidate,
+  service: Pick<HumanEvalService, 'listCandidatesForUser'>,
+): Promise<HumanEvalCandidate | null> {
+  if (!candidate.userId) return null;
+  return selectPriorBest(candidate, await service.listCandidatesForUser(candidate.userId, 'creative_image'));
 }
 
 /** OpenRouter without the usage ledger: this script must write nothing. */
@@ -126,7 +135,6 @@ async function main(): Promise<void> {
   const perCriterion = Object.fromEntries(RUBRIC_CRITERIA.map((id) => [id, { pass: 0, fail: 0 }]));
   const statusCounts: Record<string, number> = {};
   const pairwiseChoices: PairwiseChoice[] = [];
-  let pool: HumanEvalCandidate[] | null = null;
   let tokensIn = 0;
   let tokensOut = 0;
 
@@ -169,8 +177,7 @@ async function main(): Promise<void> {
     }
 
     if (args.pairwise) {
-      pool ??= await humanEvalService.listCandidates({ reviewType: 'creative_image', limit: 200 });
-      const prior = selectPriorBest(candidate, pool);
+      const prior = await priorBestFor(candidate, humanEvalService);
       if (!prior?.artifactUrl) {
         console.log(`${label}: no prior creative for this account and placement`);
         continue;

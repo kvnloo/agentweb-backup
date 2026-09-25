@@ -568,6 +568,27 @@ export class HumanEvalService {
     return matches.slice(0, limit);
   }
 
+  /**
+   * Every candidate of one review type for one user, across all scan pages (ENG-2140: the prior
+   * creative for pairwise judging). Unlike `listCandidates` there is no result cap, so an older
+   * match is never cut off by newer candidates of other accounts. Offline use only: it scans.
+   */
+  async listCandidatesForUser(userId: string, reviewType: HumanEvalReviewType): Promise<HumanEvalCandidate[]> {
+    const matches: HumanEvalCandidate[] = [];
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await this.db.scan({
+        TableName: HUMAN_EVAL_QUEUE_TABLE,
+        FilterExpression: 'userId = :userId AND reviewType = :reviewType',
+        ExpressionAttributeValues: { ':userId': userId, ':reviewType': reviewType },
+        ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+      }).promise();
+      matches.push(...((result.Items || []) as HumanEvalCandidate[]));
+      lastKey = result.LastEvaluatedKey;
+    } while (lastKey);
+    return matches;
+  }
+
   private async appendFeedback(candidate: HumanEvalCandidate, feedback: HumanEvalFeedback): Promise<void> {
     await this.db.update({
       TableName: HUMAN_EVAL_QUEUE_TABLE,
