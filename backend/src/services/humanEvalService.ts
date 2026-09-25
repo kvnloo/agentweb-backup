@@ -13,6 +13,7 @@ import {
   resolveSlackMentionsInText,
 } from './slackService';
 import { settingsService } from './settingsService';
+import type { CreativeGateResult } from './creativeGates';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 export const HUMAN_EVAL_QUEUE_TABLE = `${TABLE_PREFIX}AW-HumanEvalQueue`;
@@ -113,6 +114,9 @@ export interface HumanEvalCandidate {
   outputSummary: string;
   originalRequest?: string;
   action?: HumanEvalAction;
+  /** Advisory deterministic image checks from generation time (ENG-2139). Additive: absent on
+   *  older records, on non-image candidates, and when the gates could not run. */
+  creativeGates?: CreativeGateResult;
   /** Absent when Slack posting was disabled or failed for this candidate (ENG-1854) — the
    *  candidate still persists and is reviewable via the queue API either way. */
   slackChannel?: string;
@@ -143,6 +147,8 @@ export interface CreateHumanEvalCandidateInput {
   action?: HumanEvalAction;
   /** Optional Ad/Organic Post use-case tag; normalized fail-open (unknown → 'uncategorized'). */
   category?: string;
+  /** Advisory creative gate result to store with the candidate (ENG-2139). */
+  creativeGates?: CreativeGateResult;
 }
 
 interface DynamoLike {
@@ -371,6 +377,7 @@ export class HumanEvalService {
       outputSummary: preparedInput.outputSummary.trim(),
       originalRequest: preparedInput.originalRequest?.trim() || undefined,
       action: preparedInput.action,
+      ...(input.creativeGates ? { creativeGates: input.creativeGates } : {}),
       feedback: [],
       createdAt: now,
       updatedAt: now,

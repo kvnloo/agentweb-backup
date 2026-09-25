@@ -62,6 +62,7 @@ import {
 import type { BrandLogoProbeDeps } from "./agentMode/brandLogo";
 import type { ICPPersona } from "./icpStatusService";
 import type { CreativeDirResult } from "./creativeDirStatusService";
+import type { CreativeGateResult } from "./creativeGates";
 import {
   ARCHETYPES,
   AESTHETIC_RULES,
@@ -467,6 +468,7 @@ export interface AdImageGeneratorDep {
     imageUrl?: string;
     filename?: string;
     error?: string;
+    gates?: CreativeGateResult;
   }>;
 }
 
@@ -483,7 +485,7 @@ async function generateWithTimeout(
   format: AdImageFormat,
   timeoutMs: number,
   logoUrl?: string
-): Promise<{ success: boolean; imageUrl?: string; error?: string }> {
+): Promise<{ success: boolean; imageUrl?: string; error?: string; gates?: CreativeGateResult }> {
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
@@ -684,6 +686,7 @@ export async function generateAdImagesForUser(
         promptVersion: `${PROMPT_BUILDER_VERSION}/${t.promptVersion}`,
         archetype: t.archetype,
         concept: t.concept,
+        ...(r.success && r.gates ? { gates: r.gates } : {}),
       };
       if (!r.success) {
         // eslint-disable-next-line no-console
