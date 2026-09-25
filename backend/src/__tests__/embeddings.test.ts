@@ -1,3 +1,4 @@
+jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn().mockResolvedValue({ orgId: 'embed-org' }) }, orgDb: { getOrgById: jest.fn().mockResolvedValue({ modelRoles: {} }) } }));
 /**
  * Tests for the embeddings util used by relevance-based memory retrieval.
  */
@@ -142,4 +143,14 @@ describe('embedText', () => {
     mockCreate.mockResolvedValue(response);
     expect(await embedText('hello')).toBeNull();
   });
+});
+
+it.each([[], [0.1], Array(1536).fill('bad'), null])('rejects malformed or wrong-dimensional embedding %j', async vector => {
+  mockCreate.mockResolvedValue({ data: [{ embedding: vector }] });
+  expect(await embedText('hello')).toBeNull();
+});
+
+it('rejects a wrong-type outer embedding response', async () => {
+  mockCreate.mockResolvedValue({ data: { 0: { embedding: Array(1536).fill(0.1) } } });
+  expect(await embedText('hello')).toBeNull();
 });

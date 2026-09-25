@@ -1,90 +1,126 @@
 # Per-workload model roles inventory
 
-Status: **STOPPED at persistence schema approval**, before runtime implementation.
-Snapshot: `origin/main` / `06914e6ace65415b52ea348d7300e82a38017ac5`, 2026-09-24.
-Branch: `harsha/model-roles`. Author: `deploy <deploy@agentweb.pro>`. No push.
+Status: **Implemented locally on `harsha/model-roles`; no push.**
+Persistence approval: Harsha, 2026-09-24 Slack DM, as supplied in the task:
+optional `modelRoles` map on existing AW-Organizations records; no new table/index.
+Author: `deploy <deploy@agentweb.pro>`.
 
-## Persistence blocker and concrete proposal
+## Implemented contract
 
-`backend/src/services/db.ts:822` defines `Organization`. There is no general JSON
-settings field. `shareSettings` at line 879 is specifically `OrgShareSettings`
-(line 891): sharing/access-control settings with explicit feature keys and
-`editors` arrays. It is replaced as a whole by `routes/orgShareSettings.ts` and
-rebuilt during member cleanup in `orgDb`; putting model preferences there would
-couple unrelated settings and risk losing them.
+Eight roles live in `backend/src/services/modelRoles.ts`. The resolver uses the
+organization override when it is selectable, otherwise the validated default.
+Options come from the text and extracted image registries, excluding restricted,
+static-legacy and dominance-derived legacy models. Text roles exclude Live models;
+chat/research require tools; voice requires the existing Live transport capability.
+The image preview alias is excluded from new selections.
 
-Proposed approval scope: add optional `modelRoles?: Partial<Record<ModelRole,
-string>>` to the existing organization record, stored as a DynamoDB map.
-No new table, index, key, backfill or SQL migration is needed, but this **is a
-new persisted attribute/persistence-model change**. Existing records would use
-defaults. Removing the attribute restores defaults. This proposal is not implemented.
+| Role | Default source, then validated fallback |
+| --- | --- |
+| chat | `agent_mode_default_model`, then `gemini-3.8-flash` |
+| enrichment | `gemini-3.1-flash-lite` |
+| image | `agent_mode_image_api_default_model`, then older `default_image_model` when absent, then `gemini-3-pro-image-preview` |
+| embedding | `openai/text-embedding-3-large` via the shared OpenRouter embeddings helper; 1536 output dimensions |
+| scoring_judge | `default-scoring-model`, then `gemini-3.1-flash-lite` |
+| content_generation | `agent_mode_content_model`, then `gemini-3.8-flash` |
+| research | `gemini-3.8-flash` (tool-capable text; specialized Sonar adapter remains separate) |
+| voice | `gemini-3.1-flash-live-preview` |
 
-`services/settingsService.ts:31` provides a global `AW-Settings` string-value
-store, not an existing org JSON settings field. Inventing org-prefixed global
-keys would introduce a new tenant-persistence convention rather than reuse the
-org settings requested here. No production settings were read or mutated.
+Embedding options deliberately contain only the existing OpenRouter model. Two models
+with 1536 output dimensions can still have incompatible vector spaces; adding a
+second model needs a separately approved reindex/migration. The shared helper
+requests 1536 dimensions and rejects malformed/non-finite/wrong-size vectors.
 
-Linear tracking was attempted but the connector returned `UNAUTHORIZED` / requires
-reauthentication; no issue was created. The explicit user request is the acceptance
-contract. Resume implementation only after approval of the persistence attribute.
+`harsha/model-supersession` is not an ancestor of this branch and its module is
+absent. Invalid and legacy overrides therefore use the default, as requested;
+after that branch merges, successor resolution is a follow-up and must still
+pass the role capability filter.
 
-## Proposed role contract after approval
+Organization overrides and user-to-org membership have bounded 15-second caches
+(maximum 1000 entries each). Membership caching is only for model preferences,
+never authorization. A successful PUT invalidates the local org cache; other
+processes converge after TTL. Runtime storage-read failures use validated defaults
+and are not cached; API persistence failures return errors.
 
-| Role | Default source / candidate | Capability requirement | Follow-up |
-| --- | --- | --- | --- |
-| chat | Existing effective `agent_mode_default_model`; validate before use | text; tools when the caller uses tools | Preserve explicit session/user model choices ahead of role defaults |
-| enrichment | `gemini-3.1-flash-lite` candidate | text | Replace extract/mapping hardcodes only with verified tenant context and compatible gateway calls |
-| image | Existing effective `default_image_model`; validate against image registry | image-out | Preserve explicit request choice; route through image adapter, not text callLLM |
-| embedding | Existing configured embedding deployment | embedding | Dimension/index compatibility must be enforced before allowing a change; existing vectors cannot silently mix models |
-| scoring_judge | `gemini-3.1-flash-lite` | text | Preserve explicit benchmark/judge configurations and model attribution |
-| content_generation | Existing effective text default | text | Blog/report/workflow/LinkedIn generation; preserve explicit task model |
-| research | Existing research configuration / Sonar adapter | text; search-capable adapter | Tool-less Sonar models cannot replace callers that require tool calls |
-| voice | `gemini-3.1-flash-live-preview` candidate | live audio | A text or vision flag alone is insufficient; preserve Live transport |
+## API
 
-These are proposals grounded in this branch, not verified live availability or new
-product defaults. Registry membership alone does not prove provider availability.
-The text registry (`services/agentMode/llmModelRegistry.ts`) exposes vision, live,
-legacy, admin-only and internal-only metadata, but does not yet define image-out
-or embedding capabilities. Image models have a separate registry in
-`services/imageGeneration.ts:16`; embedding calls use deployment configuration.
-Unify capability metadata without advertising image/embedding models to text calls.
-Exclude legacy/unavailable and unauthorized admin/internal models from pickers.
+Authenticated org owners/admins only, for both methods:
+`GET/PUT /api/orgs/me/model-roles`. Org identity and role are loaded from the
+authenticated user; a supplied org ID has no authority.
 
-There is **no `modelSupersession` module on this branch**. Existing alias logic is
-in `services/agentModeService.ts:1291` and `services/imageGeneration.ts:35`.
-Per the requested contract, without modelSupersession invalid/legacy selections
-fall back to the role default; any later successor must pass the same capability
-and availability checks. Validate defaults too and fail explicitly if none is
-usable. Treat malformed persisted overrides as untrusted input (including arrays,
-objects, wrong-type truthy values and unknown role keys); never cross tenants or
-silently convert a storage outage into a successful settings save.
+GET returns `{ modelRoles, revision, roles }`; each role includes `defaultModel`,
+`effectiveModel`, and `allowedModels`. PUT takes `{ modelRoles, revision }` and
+replaces the map. Omitted roles reset to defaults; `{}` resets all. Use the GET
+revision (string or null). Unknown roles, non-string values, wrong capabilities,
+restricted and legacy models are rejected. Missing revision: 428; stale revision:
+409; storage failure: 500. The atomic DynamoDB update touches only `modelRoles`
+and `updatedAt`, requires the org to still exist, and advances the revision even
+when the clock has not advanced.
 
-API proposal: authenticated `GET/PUT /api/orgs/me/model-roles`, deriving org from
-the authenticated user's membership, allowing writes only through the existing
-`org:configure` authorization. GET returns overrides, effective/default models
-and role-filtered options. PUT validates every key/value, rejects wrong capability,
-and uses a revision/conditional write to prevent stale replacement. Explicit
-reset removes the override. Never accept a caller-supplied org ID as authority.
+The org-settings frontend lives in **agentweb-customer-portal**, not this repo.
+The in-repo partner portal has platform-admin settings, not org settings. Add the
+Models section with eight pickers in the customer-portal follow-up, using this API.
 
-`partner-portal` is in this repository, but has no org-settings page; its settings
-components are platform-admin settings. The standalone customer portal owns org
-settings. Do not add org controls to platform-admin Emma settings by accident.
+## Migrated runtime sites
 
-Complexity: inventory only, zero runtime behavior change. Planned implementation
-adds one role policy/resolver and one org map/API, replacing scattered defaults;
-provider adapters, explicit user selections and historical model attribution stay
-intact. No runtime sites have been migrated because persistence is blocked.
+- Enrichment V3: non-web extraction, identity candidate disambiguation, LinkedIn
+  candidate selection and smart-field evaluation. Smart-field attribution records
+  the resolved model. Specialized web-search/critic models remain explicit.
+- Image: both agent-mode's upstream default and the shared image generator.
+  Explicit request models and existing retry/fallback semantics are preserved.
+- Embedding: shared `embedText` (memory/relevance and its callers), via user tenant.
+- Judges: default session scoring and custom judges with no explicit model.
+  Explicit custom-judge/benchmark models retain their existing validation path.
+- Content: blog generation, blog restyling (tenant propagated from agent mode and
+  the HTTP controller), report revision and social engagement memory generation.
 
-## Migration triage
+## Remaining follow-ups
 
-All runtime rows below are **follow-ups**, not completed replacements. Prioritize
-org-aware text callers already using callLLM; resolve once per workload rather than
-on every loop iteration. Require tenant propagation first for system cron jobs,
-benchmarks, provider-specific SDK calls and scripts. Embeddings require data/index
-compatibility work; image and voice require their own transport capabilities.
-Registry IDs, prices, provider translation keys, aliases and historical telemetry
-must remain literal; replacing those with a role resolver would break routing or
-misreport historical usage.
+- Customer-portal Models UI (separate repository).
+- Chat/session/scheduled-chat defaults, with explicit session/user choices first.
+- Specialized research/Sonar, live voice transport and voice artifact extraction.
+- Enrichment web-search/critic adapters and other older extraction/mapping paths.
+- Knowledge-base embeddings inside `chatbotService.findRelevantChunks` (currently
+  no tenant context), plus other direct SDK/vector ingestion paths. Propagate
+  tenant/index identity before migration; no alternate embedding space enabled.
+- Remaining report/workflow/content callers, classification/summary helpers,
+  confirmation/stop/step-removal judges, system cron jobs, scripts and benchmarks.
+- Successor integration after model-supersession merges.
+
+The lexical inventory below is a historical snapshot, not a count of runtime
+migrations or traffic measurements. Literal registry/pricing/provider translation
+IDs and historical telemetry are not replacement targets.
+
+## Validation, rollout and complexity
+
+**153 tests passed across 9 focused Jest suites.** Coverage includes
+override/default/legacy/capability behavior, tenant isolation,
+TTL, admin authorization, malformed inputs, stale-write rejection, deleted-org
+protection, reset, storage failures, embedding shape, judge precedence and image
+routing. Existing focused embedding, scoring, org-write and image suites are run.
+Jest reported open handles: a focused `--detectOpenHandles` run traced these to
+the existing image `withTimeout` implementation, which leaves timeout timers
+alive after a successful race. This is a separate cleanup follow-up; assertions
+pass, but the worker requires forced shutdown.
+
+A bounded 1 GB `tsc --noEmit` checks the new resolver/API/registry/classification
+modules and source-extracted org read/write methods against narrow source-derived
+contracts. Changed integration files receive syntax/transpile checks. This is
+**not** a full backend build: checking their full transitive graph exhausted 1.5 GB
+and 3 GB heaps. Full production build and before/after provider/Okareo parity are
+still required before any later shipping step; no push/deploy is part of this task.
+
+Local CodeRabbit completed its initial review with three overlapping findings
+about repeated membership reads and settings/org/user read outages; all were
+addressed. This is not a latest-diff clean verdict; the final fixes were checked
+with the scoped tests and bounded TypeScript check. No production settings/data were read or mutated.
+Linear search was retried but the connector requires reauthentication, so no issue
+could be created/claimed. The user's explicit task is the acceptance contract.
+
+Complexity: one role resolver, one org map/API, shared image IDs and extracted
+existing model-classification helpers; no new provider adapter, dependency, table
+or index. Replaces scattered defaults. The original classification exports remain
+available from agentModeService for compatibility. Rollback: revert code; the
+optional map is ignored by old code. Reset through PUT restores role defaults.
 
 ## Exhaustive lexical evidence
 

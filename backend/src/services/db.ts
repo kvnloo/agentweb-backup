@@ -820,6 +820,7 @@ export interface User {
 }
 
 export interface Organization {
+  modelRoles?: import('./modelRoles').ModelRoles;
   leadNotifications?: LeadNotificationsConfig;
   /**
    * Optimistic-concurrency counter for owner-losing operations. Absent until
@@ -11492,6 +11493,37 @@ export const orgDb = {
   // that has no updatedAt yet). An overlapping writer then surfaces as a
   // ConditionalCheckFailedException instead of a silent last-writer-wins
   // that erases the other writer's grants.
+  async updateModelRoles(
+    orgId: string,
+    settings: import('./modelRoles').ModelRoles,
+    expectedUpdatedAt: string | undefined,
+  ): Promise<string> {
+    const nowMs = Date.now();
+    const expectedMs = expectedUpdatedAt === undefined ? Number.NaN : Date.parse(expectedUpdatedAt);
+    // `updatedAt` is the compare-and-swap revision for this whole-document
+    // write. It must advance even when two writes land in the same millisecond
+    // (or this process's clock trails the stored revision), otherwise the next
+    // stale writer can match the old token and silently overwrite this write.
+    const nextUpdatedAt = new Date(
+      Number.isFinite(expectedMs) && expectedMs >= nowMs ? expectedMs + 1 : nowMs,
+    ).toISOString();
+    await dynamodb.update({
+      TableName: ORGS_TABLE,
+      Key: { orgId },
+      UpdateExpression: "SET modelRoles = :s, updatedAt = :u",
+      ConditionExpression:
+        expectedUpdatedAt !== undefined
+          ? "attribute_exists(orgId) AND updatedAt = :expected"
+          : "attribute_exists(orgId) AND attribute_not_exists(updatedAt)",
+      ExpressionAttributeValues: {
+        ":s": settings,
+        ":u": nextUpdatedAt,
+        ...(expectedUpdatedAt !== undefined ? { ":expected": expectedUpdatedAt } : {}),
+      },
+    }).promise();
+    return nextUpdatedAt;
+  },
+
   async updateShareSettings(
     orgId: string,
     settings: OrgShareSettings,
