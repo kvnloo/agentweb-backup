@@ -8,7 +8,7 @@
  * threshold, `pending` flag and checker are untouched, so the harness semantics do not change.
  *
  * Falls back to the synthetic fixture (with a note saying why) when the store is not
- * provisioned, no case links the fixture, or the turn cannot be read. Real content lives only in
+ * provisioned, no case or more than one case links the fixture, or the turn cannot be read. Real content lives only in
  * memory for the run; nothing is written anywhere.
  */
 
@@ -55,20 +55,29 @@ export async function loadReplayFixtures(deps: {
     return { fixtures: [...base], notes: ['golden-set store not provisioned: every fixture uses its synthetic placeholder'] };
   }
   const fetchMessages = deps.fetchMessages ?? chatMessagesFetcher();
-  const links = new Map<string, { sessionId: string; messageIndex: number }>();
+  const links = new Map<string, Array<{ sessionId: string; messageIndex: number }>>();
   for (const c of await deps.store.listCases('agent')) {
-    if (c.replay) links.set(c.replay.fixtureId, { sessionId: c.sourceRef.id, messageIndex: c.replay.messageIndex });
+    if (!c.replay) continue;
+    const list = links.get(c.replay.fixtureId) ?? [];
+    list.push({ sessionId: c.sourceRef.id, messageIndex: c.replay.messageIndex });
+    links.set(c.replay.fixtureId, list);
   }
 
   const notes: string[] = [];
   const fixtures: JudgeReplayFixture[] = [];
   for (const fixture of base) {
-    const link = links.get(fixture.id);
-    if (!link) {
-      notes.push(`${fixture.id}: no golden case links this fixture, placeholder kept`);
+    const candidates = links.get(fixture.id) ?? [];
+    if (candidates.length !== 1) {
+      // Two links would make the checked session depend on store order; fix the store instead.
+      notes.push(
+        candidates.length === 0
+          ? `${fixture.id}: no golden case links this fixture, placeholder kept`
+          : `${fixture.id}: linked by ${candidates.length} golden cases, expected one; placeholder kept`,
+      );
       fixtures.push(fixture);
       continue;
     }
+    const link = candidates[0];
     try {
       const turns = extractReplayTurns(await fetchMessages(link.sessionId, link.messageIndex), link.messageIndex);
       if (!turns) {
