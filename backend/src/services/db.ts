@@ -7562,15 +7562,19 @@ export const crmDb = {
               expressionAttributeValues[':derivedDomain'] = derivedDomain;
             }
           }
-          // Backfill only — never knock a lead already at paying back to inbox.
-          // NOTE: this arm is inside the email branch. A lead that gains only a PHONE is
-          // handled at creation by buildLeadCrmFields; there is no separate phone arm here
-          // because updateLead cannot tell "gained a phone" from "already had one".
-          if ((updates as any).lifecycle === undefined) {
-            expressionAttributeNames['#derivedLifecycleAttr'] = 'lifecycle';
-            setExpressions.push('#derivedLifecycleAttr = if_not_exists(#derivedLifecycleAttr, :derivedLifecycle)');
-            expressionAttributeValues[':derivedLifecycle'] = 'inbox';
-          }
+          // NO lifecycle stamp here, deliberately. An earlier version wrote
+          // `lifecycle = if_not_exists(lifecycle, 'inbox')` alongside the domain
+          // derivation. That looked harmless and was not: askCrmService reads
+          // `lead.lifecycle ?? computeLifecycle(...)`, so a STORED value short-circuits the
+          // live computation — and nothing in production advances the stored one
+          // (lifecycleService.applyAndUpdate has no production callers). A lead with an
+          // open deal, once enriched with an email, would answer "inbox" where it had
+          // answered "in_deal".
+          //
+          // The justification for stamping it here was that a missing lifecycle made the
+          // row invisible to getLeadsByStatus — which is false; that function reads
+          // `status`. Creation still derives lifecycle (buildLeadCrmFields), which is
+          // pre-existing behaviour and has no prior value to freeze.
         } else {
           // Remove email attribute if it's being set to empty/null
           removeExpressions.push('email');
@@ -9946,11 +9950,8 @@ export const crmDb = {
       }
       // lifecycle is only ever BACKFILLED here, never rewritten: a lead already at paying
       // or in_deal must not be knocked back to inbox just because its address changed.
-      if (!('lifecycle' in options.topLevel)) {
-        attrNames['#derivedLifecycleAttr'] = 'lifecycle';
-        attrValues[':derivedLifecycle'] = 'inbox';
-        setClauses.push('#derivedLifecycleAttr = if_not_exists(#derivedLifecycleAttr, :derivedLifecycle)');
-      }
+      // No lifecycle stamp — see the matching note in updateLead. A stored value
+      // short-circuits askCrmService's live computation and nothing advances it.
     }
 
     // Recompute nameCompanyKey when firstName/lastName/company is in topLevel.

@@ -604,7 +604,7 @@ describe('CRM Database Service', () => {
     // ENG-2082: setLeadFields derives domain/lifecycle on an email write, but updateLead is
     // the ORDINARY path — a person editing the lead — and was left out of the first pass.
     // Caught live: a phone-only lead given an address came back with both still null.
-    it('derives domain and backfills lifecycle when an email is set', async () => {
+    it('derives domain when an email is set, and does NOT stamp lifecycle', async () => {
       mockDocumentClientMethods.update.mockReturnValue({
         promise: jest.fn().mockResolvedValue({ Attributes: { leadId: 'lead_123', listId: 'list_123' } }),
       });
@@ -620,9 +620,15 @@ describe('CRM Database Service', () => {
       expect(call.UpdateExpression).toContain('#derivedDomainAttr = :derivedDomain');
       expect(call.UpdateExpression).not.toMatch(/(^|[^#\w])domain = /);
       expect(call.ExpressionAttributeValues[':derivedDomain']).toBe('example.com');
-      expect(call.ExpressionAttributeNames['#derivedLifecycleAttr']).toBe('lifecycle');
-      expect(call.UpdateExpression).toContain('#derivedLifecycleAttr = if_not_exists(#derivedLifecycleAttr, :derivedLifecycle)');
-      expect(call.ExpressionAttributeValues[':derivedLifecycle']).toBe('inbox');
+      // Lifecycle is deliberately NOT stamped here. askCrmService reads
+      // `lead.lifecycle ?? computeLifecycle(...)`, so a stored value freezes the live
+      // computation — and nothing in production advances it. A lead with an open deal
+      // would start answering "inbox" instead of "in_deal".
+      // Asserted through ExpressionAttributeNames: the expression only ever contains the
+      // PLACEHOLDER (#derivedLifecycleAttr), so grepping it for the word "lifecycle" would
+      // pass even with the stamp reinstated.
+      expect(Object.values(call.ExpressionAttributeNames ?? {})).not.toContain('lifecycle');
+      expect(call.ExpressionAttributeValues[':derivedLifecycle']).toBeUndefined();
     });
 
     it('does not derive when the email is being cleared', async () => {
@@ -967,7 +973,7 @@ describe('CRM Database Service', () => {
     // permanently invisible to getLeadsByStatus and every inbox view built on it. A
     // phone-only lead starts with no email, so enrichment filling one in is exactly the
     // common case now.
-    it('derives domain and backfills lifecycle when an email is written', async () => {
+    it('derives domain when an email is written, and does NOT stamp lifecycle', async () => {
       mockDocumentClientMethods.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
       const mergeSpy = jest.spyOn(crmDb, 'mergeFieldNames').mockResolvedValue();
 
@@ -979,9 +985,9 @@ describe('CRM Database Service', () => {
       expect(call.UpdateExpression).toContain('#derivedDomainAttr = :derivedDomain');
       expect(call.UpdateExpression).not.toMatch(/(^|[^#\w])domain = /);
       expect(call.ExpressionAttributeValues[':derivedDomain']).toBe('example.com');
-      // lifecycle is BACKFILLED only — a lead already at paying must not drop to inbox.
-      expect(call.UpdateExpression).toContain('#derivedLifecycleAttr = if_not_exists(#derivedLifecycleAttr, :derivedLifecycle)');
-      expect(call.ExpressionAttributeValues[':derivedLifecycle']).toBe('inbox');
+      // Same reasoning as updateLead: no lifecycle stamp on the update path.
+      expect(Object.values(call.ExpressionAttributeNames ?? {})).not.toContain('lifecycle');
+      expect(call.ExpressionAttributeValues[':derivedLifecycle']).toBeUndefined();
       mergeSpy.mockRestore();
     });
 
