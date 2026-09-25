@@ -47,8 +47,8 @@ Sources, consumers and known issues for each entry are in `evalRegistry.ts`.
 3. **The general judge cannot rank sessions.** ENG-1710/1714: AUC 0.67 against relaxed task
    completion, 83.6% of scores are 5, frustrated vs calm sessions 4.63 vs 4.69.
 4. **Scores are a biased sample.** 8,462 of 19,293 sessions (44%) carry a score, written lazily
-   when an admin opens the dashboard or `get_chat_history sync=true` backfills. There is no
-   random sampler (ENG-2144).
+   when an admin opens the dashboard or `get_chat_history sync=true` backfills. ENG-2144 adds
+   a random sampler (below), off until OPS-7 (ENG-2152).
 5. **Almost no human labels exist.** 10 sessions carry `satisfactionScore.adminOverride`. No
    κ/agreement code exists anywhere. The Fangfang/Matt judges were never compared with
    Fangfang's or Matt's own judgments.
@@ -75,6 +75,29 @@ failure classes, plus ad-platform writes never read back — the grader side of 
 successful task. `scripts/evalAgentGraders.ts` runs them read-only over a date range and prints
 results per model × task type with n and a Wilson CI. None is validated; pass^k needs the sandbox
 (ENG-1906).
+
+## Online sampler (ENG-2144)
+
+`cron/evalV2SamplerCron.ts` runs daily at 17:15 UTC when `EVAL_V2_SAMPLER_ENABLED=true`. It takes a
+seeded uniform random sample of `EVAL_V2_SAMPLE_SIZE` (default 50) of the sessions whose last
+activity fell on the previous UTC day (AdminUpdatedAtIndex query), grades them with the three
+deterministic agent graders above, and writes to `Dev-AW-LoopEvents`:
+
+| loopId | Sort key | Row |
+| --- | --- | --- |
+| `eval-v2` | `eval_v2_sample_run#<day>` | the day's frame size, seed and sampled session ids |
+| `eval-v2` | `eval_v2_scored#<day>#<sessionId>` | one per sampled session: verdicts, reasons, counts, `graders` (`id@version`) |
+| `eval-v2-daily` | `<day>#1d`, `<day>#7d` | aggregate per surface × task type × model: n, rate, 95% Wilson CI, `mayGate` per grader |
+
+Scores are conditional puts on a deterministic key, so each (day, session) is written once; a
+finished day is skipped. A live run refuses without the flag; `scripts/evalV2Sample.ts` dry-runs
+any day read-only. `GET /api/admin/loops/eval-v2-trend` serves the snapshots to the partner-portal
+**Eval v2** tab, which labels every grader "unvalidated" while `mayGate` is false. No alert reads
+these rates: none of the graders is validated.
+
+The satisfaction score is no longer a headline: the chat-history badges moved to the last column,
+labelled unvalidated, with neutral colours. The judges and their stored scores are unchanged, and
+the Daily Satisfaction Score Report schedule stays paused.
 
 ## Known false-positive catalogue (session judges)
 
