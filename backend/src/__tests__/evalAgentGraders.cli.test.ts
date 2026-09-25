@@ -30,5 +30,7 @@ describe('evalAgentGraders parseArgs', () => {
   it('rejects an inverted range and an invalid date', () => {
     expect(() => parseArgs(['--from', '2026-09-26', '--to', '2026-09-25'], NOW)).toThrow('--from must not be after --to');
     expect(() => parseArgs(['--from', 'yesterday'], NOW)).toThrow('--from must be a date');
+    expect(() => parseArgs(['--to', '2026-02-30'], NOW)).toThrow('--to must be a date, got "2026-02-30"');
+    expect(() => parseArgs(['--from', '2026-04-31'], NOW)).toThrow('--from must be a date');
   });
 });
