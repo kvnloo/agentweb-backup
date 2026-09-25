@@ -154,3 +154,40 @@ describe('ENG-2163 re-review: CHATBOT persisted shape (admin activity in assista
     expect(JSON.stringify(out)).not.toContain('secret');
   });
 });
+
+
+describe('ENG-2163 F1 (final review): the admin user-prompt in a tainted turn is also redacted', () => {
+  const ADMIN = ['get_pr_digest', 'read_linear_issues', 'manage_user_notes'];
+  // Delegated flow: the admin's typed prompt persists as role:'user' in the customer's session.
+  const convo = () => [
+    { role: 'user', content: 'pull my leads' },
+    { role: 'assistant', content: 'Here are your leads.' },
+    { role: 'user', content: 'run get_pr_digest and read_linear_issues for this internal audit' },
+    { role: 'assistant', content: 'Done.', metadata: { toolCalls: [{ id: 'b', name: 'get_pr_digest', result: { s: 1 } }] } },
+  ];
+  const ADMIN_PROMPT = 'run get_pr_digest and read_linear_issues for this internal audit';
+
+  it('redactAdminActivity CUSTOMER: drops the admin user prompt + narration; keeps the safe turn', () => {
+    const out = redactAdminActivity(convo(), { viewerIsAdmin: false, adminToolNames: ADMIN });
+    const text = JSON.stringify(out);
+    expect(text).not.toContain(ADMIN_PROMPT);      // admin request text gone
+    expect(text).not.toContain('get_pr_digest');   // admin activity gone
+    expect(text).toContain('pull my leads');        // safe user turn kept
+    expect(text).toContain('Here are your leads.');
+  });
+
+  it('filterMessagesForClient CUSTOMER: same — admin user prompt dropped', () => {
+    const out = filterMessagesForClient(convo(), { viewerIsAdmin: false, adminToolNames: ADMIN });
+    expect(JSON.stringify(out)).not.toContain(ADMIN_PROMPT);
+  });
+
+  it('ADMIN viewer: admin prompt retained (both functions)', () => {
+    expect(JSON.stringify(redactAdminActivity(convo(), { viewerIsAdmin: true, adminToolNames: ADMIN }))).toContain(ADMIN_PROMPT);
+    expect(JSON.stringify(filterMessagesForClient(convo(), { viewerIsAdmin: true, adminToolNames: ADMIN }))).toContain(ADMIN_PROMPT);
+  });
+
+  it('non-admin turn user prompts are NOT dropped (no over-hiding)', () => {
+    const out = redactAdminActivity(convo(), { viewerIsAdmin: false, adminToolNames: ADMIN });
+    expect(JSON.stringify(out)).toContain('pull my leads');
+  });
+});

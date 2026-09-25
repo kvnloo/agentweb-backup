@@ -100,8 +100,12 @@ export function filterMessagesForClient(messages: any[], opts: AdminRedactionOpt
       return false;
     }
 
-    // ENG-2163: for a non-admin viewer, also drop assistant messages in an admin-tainted turn.
-    if (!viewerIsAdmin && adminTainted[i] && message.role === 'assistant') {
+    // ENG-2163: for a non-admin viewer, drop the human-readable messages of an admin-tainted
+    // turn — the assistant narration AND the user prompt that triggered the admin tool (in a
+    // delegated flow that prompt is the admin's typed request, e.g. "run get_pr_digest for this
+    // org", persisted as role:'user'; leaving it reveals the admin activity's subject). Tool
+    // messages in the turn are already dropped by the base strip above.
+    if (!viewerIsAdmin && adminTainted[i] && (message.role === 'assistant' || message.role === 'user')) {
       return false;
     }
 
@@ -133,8 +137,11 @@ export function redactAdminActivity(messages: any[], opts: AdminRedactionOptions
     if (message && message.role === 'tool' && typeof message.name === 'string' && adminToolNameSet.has(message.name)) {
       return false;
     }
-    // Drop assistant narration inside an admin-tainted turn.
-    if (adminTainted[i] && message && message.role === 'assistant') {
+    // Drop the human-readable messages of an admin-tainted turn — assistant narration AND the
+    // user prompt that triggered the admin tool (ENG-2163 F1: in a delegated flow the prompt is
+    // the admin's request and reveals the activity's subject). Non-admin tool results elsewhere
+    // in the turn are left intact — only admin-tool results (handled above) are removed.
+    if (adminTainted[i] && message && (message.role === 'assistant' || message.role === 'user')) {
       return false;
     }
     return true;
