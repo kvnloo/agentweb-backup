@@ -131,6 +131,7 @@ import charactersRoutes from "./routes/characters";
 import contractorRoutes from "./routes/contractor";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
+import { authenticateAgentRunsSecretOrAdmin } from "./middleware/agentRunsAuth";
 
 
 import { setupMcpServer } from "./mcp/server/mcpServer";
@@ -448,7 +449,11 @@ app.use("/api/admin/lead-magnets", authenticateToken, isAdmin, leadMagnetAdminRo
 app.use("/api/admin/fathom-onboarding", authenticateToken, isAdmin, fathomOnboardingAdminRoutes);
 app.use("/api/admin/onboarding-loop", authenticateToken, isAdmin, onboardingLoopAdminRoutes);
 app.use("/api/admin/loops", authenticateToken, isAdmin, loopHealthRoutes);
-app.use("/api/admin/agent-runs", authenticateToken, isAdmin, agentRunsRoutes);
+// D78: a dedicated header-secret credential (AW_AGENT_RUNS_SECRET) authenticates
+// .aw-agent's one narrow call here (a single sessionId, limit<=3) without the full admin
+// JWT; the admin UI's own browsing of this route still goes through authenticateToken,
+// isAdmin exactly as before when no secret header is sent. See middleware/agentRunsAuth.ts.
+app.use("/api/admin/agent-runs", authenticateAgentRunsSecretOrAdmin(agentRunsRoutes));
 app.use("/api/client-health", authenticateToken, isAdmin, clientHealthRoutes);
 // ENG-1551 — lead volume drought monitor. Same double-gate as client-health: middleware +
 // service-layer admin check.
