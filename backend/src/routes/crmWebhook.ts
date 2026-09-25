@@ -205,7 +205,12 @@ async function handleHubSpotEvent(
         : undefined;
 
       const updates: Record<string, any> = { ...leadFields };
-      delete updates.email;
+      // Keep the address ONLY when the lead does not already have one — i.e. when it was
+      // resolved by hubspot_contact_id, which is exactly the case this delete was written
+      // before. Dropping it unconditionally assumed "we found it BY email, so email already
+      // matches"; the contact-id fallback broke that assumption and left the row
+      // permanently address-less.
+      if (lead?.email) delete updates.email;
       delete updates.syncMetadata;
       delete updates.customFields;
       if (mergedCustomFields) updates.customFields = mergedCustomFields;

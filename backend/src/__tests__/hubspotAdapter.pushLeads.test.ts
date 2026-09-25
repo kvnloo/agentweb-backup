@@ -234,6 +234,23 @@ describe('HubspotAdapter.pushLeads — email validation', () => {
     expect(result.newCount).toBe(0);
   });
 
+  it('stamps sync_failed when the stored-contact update fails for a non-404 reason', async () => {
+    mockUpdateContact.mockRejectedValueOnce(Object.assign(new Error('rate limited'), { response: { status: 429 } }));
+    const leads = [
+      { leadId: 'l1', listId: 'list_1', firstName: 'Foo', email: 'foo@example.com',
+        syncMetadata: { hubspot_contact_id: 'c99' } },
+    ];
+
+    await adapter.pushLeads(auth, leads, makeConfig());
+
+    // Without this the lead keeps reading `synced` in the CRM after a sustained 429 and
+    // never shows under the sync-failed filter — a silent sync outage.
+    const stamped = (crmDb.updateLead as jest.Mock).mock.calls
+      .map((c: any[]) => c[2])
+      .find((u: any) => u?.syncMetadata?.syncStatus === 'sync_failed');
+    expect(stamped).toBeDefined();
+  });
+
   it('does NOT fall back on a 500 either', async () => {
     mockUpdateContact.mockRejectedValueOnce(Object.assign(new Error('boom'), { response: { status: 500 } }));
     const leads = [

@@ -1690,9 +1690,18 @@ export async function processHubspotWebhookJob(payload: HubspotJobPayload): Prom
           // one this lookup missed, the edit was dropped and — on a creation event — a
           // SECOND row was created carrying the same hubspot_contact_id as the first. The
           // Attio path and crmWebhook.ts:136 already resolve by id; this one did not.
+          // Email first. The contact-id fallback is a partition Query with a
+          // FilterExpression and no index, so a MISS walks up to 20 pages of the list — and
+          // it runs once per linked list. Only pay it when the event could actually result
+          // in a write: a property-change for a contact we have never seen is discarded a
+          // few lines below anyway (`if (!data.isCreation) continue`), so walking the list
+          // for it is pure cost on every unrelated webhook the portal sends.
+          const leadByEmail = await crmDb.getLeadByEmail(list.listId, email.toLowerCase());
           const lead =
-            (await crmDb.getLeadByEmail(list.listId, email.toLowerCase())) ||
-            (await crmDb.getLeadByHubSpotContactId(list.listId, String(objectId)).catch(() => null));
+            leadByEmail ||
+            (data.isCreation || data.isDeleted
+              ? await crmDb.getLeadByHubSpotContactId(list.listId, String(objectId)).catch(() => null)
+              : null);
 
           // Deletion: flag an existing lead as CRM-removed (nothing to do if absent).
           if (data.isDeleted) {
@@ -1712,6 +1721,13 @@ export async function processHubspotWebhookJob(payload: HubspotJobPayload): Prom
           if (data.properties.jobtitle        !== undefined) fields.title     = data.properties.jobtitle;
           if (data.properties.company         !== undefined) fields.company   = data.properties.company;
           if (data.properties.hs_linkedin_url !== undefined) fields.linkedin  = data.properties.hs_linkedin_url;
+          // Adopt the address when we resolved this lead by CONTACT ID rather than by email.
+          // The whole point of that fallback is the lead had no email and HubSpot now has
+          // one — writing every other property but not that one leaves the row address-less,
+          // so getLeadByEmail misses again on the next webhook and the fallback (a full
+          // partition walk) runs forever. Only when it is genuinely new: never clobber a
+          // different address we already hold.
+          if (email && !lead?.email) fields.email = email.toLowerCase();
 
           const standardHubspotProps = ['email', 'firstname', 'lastname', 'phone', 'jobtitle', 'company', 'hs_linkedin_url'];
           const customFieldUpdates: any = {};

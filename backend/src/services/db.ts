@@ -7301,7 +7301,13 @@ export const crmDb = {
       // on a later page and the caller gets null. For the reverse-sync callers that false
       // negative is the whole bug they are trying to avoid — they would create a duplicate
       // lead carrying a hubspot_contact_id that already exists on another row.
+      // BOUNDED, mirroring getLeadByAttioRecordId below. Unbounded, a MISS walks the whole
+      // list — and this now sits on the `||` fallback of every HubSpot webhook whose email
+      // lookup missed, which is the common case, once per linked list. A bulk import into a
+      // customer's HubSpot fires thousands of those.
+      const MAX_PAGES = 20;
       let lastEvaluatedKey: any = undefined;
+      let pages = 0;
       do {
         const params: any = {
           TableName: `${TABLE_PREFIX}AW-Leads`,
@@ -7316,7 +7322,16 @@ export const crmDb = {
         const result = await dynamodb.query(params).promise();
         if (result.Items?.length) return result.Items[0];
         lastEvaluatedKey = result.LastEvaluatedKey;
-      } while (lastEvaluatedKey);
+        pages++;
+      } while (lastEvaluatedKey && pages < MAX_PAGES);
+      if (lastEvaluatedKey) {
+        // Say so rather than reporting a clean absence: the caller treats null as "no such
+        // lead" and may create one, which is the duplicate this lookup exists to prevent.
+        console.warn(
+          `[crmDb] getLeadByHubSpotContactId gave up after ${MAX_PAGES} pages in list ${listId} ` +
+          `looking for contact ${contactId} — reporting not-found, which may duplicate the row.`,
+        );
+      }
       return null;
     } catch (error) {
       handleDynamoDbError(error, "getLeadByHubSpotContactId");
@@ -7535,6 +7550,10 @@ export const crmDb = {
           // validate expression syntax — so the first version of this threw
           // ValidationException against a real table and 500'd every lead update that
           // carried an email. Same trap the `system` attribute is commented about above.
+          //
+          // The explicit-value arms below exist because these guards used to reference
+          // fields updateLead had no handler for: passing `domain` suppressed the
+          // derivation AND was silently dropped, so the caller got neither.
           if ((updates as any).domain === undefined) {
             const derivedDomain = extractDomainFromEmail(emailValue);
             if (derivedDomain) {
@@ -7555,6 +7574,28 @@ export const crmDb = {
         } else {
           // Remove email attribute if it's being set to empty/null
           removeExpressions.push('email');
+        }
+      }
+
+      // Explicit domain / lifecycle. Without these, the guards in the email block above
+      // suppressed the derived value for a field that was then never written at all.
+      if ((updates as any).domain !== undefined) {
+        const domainValue = String((updates as any).domain ?? '').trim().toLowerCase();
+        if (domainValue) {
+          expressionAttributeNames['#domainAttr'] = 'domain';
+          setExpressions.push('#domainAttr = :domainAttr');
+          expressionAttributeValues[':domainAttr'] = domainValue;
+        } else {
+          expressionAttributeNames['#domainAttr'] = 'domain';
+          removeExpressions.push('#domainAttr');
+        }
+      }
+      if ((updates as any).lifecycle !== undefined) {
+        const lifecycleValue = String((updates as any).lifecycle ?? '').trim();
+        if (lifecycleValue) {
+          expressionAttributeNames['#lifecycleAttr'] = 'lifecycle';
+          setExpressions.push('#lifecycleAttr = :lifecycleAttr');
+          expressionAttributeValues[':lifecycleAttr'] = lifecycleValue;
         }
       }
 
@@ -9859,9 +9900,20 @@ export const crmDb = {
         'lastName' in options.topLevel ||
         'company' in options.topLevel
       );
+    // EVERY key goes through a generated name placeholder. DynamoDB has ~570 reserved
+    // words and `domain` is one of them — a bare `SET domain = :x` throws
+    // ValidationException, which unit tests cannot see because they mock dynamodb.update
+    // and never validate expression syntax. That already shipped once from this file. An
+    // allowlist of "the reserved ones we remembered" is the same bug waiting; escaping
+    // unconditionally is the only version that cannot rot as callers add fields.
+    let tlIdx = 0;
     for (const [k, v] of Object.entries(options.topLevel ?? {})) {
+      const nameRef = `#tl${tlIdx++}`;
+      attrNames[nameRef] = k;
       attrValues[`:tl_${k}`] = v;
-      setClauses.push(ine ? `${k} = if_not_exists(${k}, :tl_${k})` : `${k} = :tl_${k}`);
+      setClauses.push(
+        ine ? `${nameRef} = if_not_exists(${nameRef}, :tl_${k})` : `${nameRef} = :tl_${k}`,
+      );
     }
 
     // Same treatment as nameCompanyKey below: `domain` and `lifecycle` are DERIVED from

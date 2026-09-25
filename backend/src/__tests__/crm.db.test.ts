@@ -648,8 +648,17 @@ describe('CRM Database Service', () => {
       } as any);
 
       const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      // Not derived...
       expect(call.UpdateExpression).not.toContain('derivedDomain');
       expect(call.UpdateExpression).not.toContain('derivedLifecycle');
+      // ...and the explicit values are actually WRITTEN. The earlier version of this test
+      // asserted only the two `not`s, which passed because updateLead had no handler for
+      // either field and silently dropped both — the test name said the opposite of what
+      // the code did, and it passed with the whole derivation reverted.
+      expect(call.ExpressionAttributeNames['#domainAttr']).toBe('domain');
+      expect(call.ExpressionAttributeValues[':domainAttr']).toBe('override.com');
+      expect(call.ExpressionAttributeNames['#lifecycleAttr']).toBe('lifecycle');
+      expect(call.ExpressionAttributeValues[':lifecycleAttr']).toBe('paying');
     });
 
     it('should update lead fields', async () => {
@@ -1001,6 +1010,14 @@ describe('CRM Database Service', () => {
       expect(call.UpdateExpression).not.toContain('derivedLifecycle');
       expect(call.ExpressionAttributeValues[':tl_domain']).toBe('override.com');
       expect(call.ExpressionAttributeValues[':tl_lifecycle']).toBe('paying');
+      // And the caller-supplied key must be ESCAPED too. The previous version of this test
+      // asserted only the value, which certified a bare `domain = :tl_domain` — a
+      // ValidationException against a real table — as the desired behaviour.
+      const domainRef = Object.entries(call.ExpressionAttributeNames as Record<string, string>)
+        .find(([, v]) => v === 'domain')?.[0];
+      expect(domainRef).toBeDefined();
+      expect(call.UpdateExpression).toContain(`${domainRef} = :tl_domain`);
+      expect(call.UpdateExpression).not.toMatch(/(^|[^#\w])domain = /);
       mergeSpy.mockRestore();
     });
 
@@ -1067,7 +1084,11 @@ describe('CRM Database Service', () => {
 
       expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
       const second = mockDocumentClientMethods.update.mock.calls[1][0];
-      expect(second.UpdateExpression).toContain('email = if_not_exists(email, :tl_email)');
+      // Through the generated name placeholder: every topLevel key is escaped now,
+      // because DynamoDB has ~570 reserved words and a bare one throws only against a
+      // real table.
+      expect(second.ExpressionAttributeNames['#tl0']).toBe('email');
+      expect(second.UpdateExpression).toContain('#tl0 = if_not_exists(#tl0, :tl_email)');
       expect(second.UpdateExpression).toContain(
         'enrichmentMetadata.#em0 = if_not_exists(enrichmentMetadata.#em0, :em0)',
       );

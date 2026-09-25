@@ -112,6 +112,17 @@ export function __resetWaterfallDedupForTesting(): void {
   enrichSoInflight.clear();
 }
 
+/**
+ * Exported ONLY as a test seam, matching __resetWaterfallDedupForTesting above. This
+ * function doubles as Apollo's eligibility gate — getApolloMatchForLead bails on a null
+ * token — so a test that does not call it cannot tell whether Apollo runs for a given lead
+ * shape. The previous suite for this change asserted buildMatchCanonicalKey directly, which
+ * is unchanged code, and so passed with the change fully reverted.
+ */
+export function __apolloDedupTokenForTesting(lead: any): string | null {
+  return apolloDedupToken(lead);
+}
+
 function apolloDedupToken(lead: any): string | null {
   // Built from the SAME canonical key the cache layer uses, so the two cannot disagree
   // about what is identifiable. They did: this returned null for a lead with only a name

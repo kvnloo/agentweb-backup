@@ -1,4 +1,5 @@
 import { CrmAdapter, CrmAuth, PushContext } from './crmAdapterTypes';
+import { mergeCustomFields } from '../../utils/customFieldsGuard';
 import { ExternalCrmSyncConfig, FieldMapping, SyncResult } from '../externalCrmSyncService';
 import { HubSpotService } from '../hubspotService';
 import { crmDb } from '../db';
@@ -316,11 +317,22 @@ export class HubspotAdapter implements CrmAdapter {
                         // reach here and silently fork the record.
                         const status = err?.response?.status;
                         if (status !== 404 && status !== 410) {
+                            const msg = this.formatError(err);
                             result.errorCount++;
                             result.errors.push(
-                                `Lead ${lead.leadId}: updating stored contact ${existingContactId} failed ` +
-                                `(${this.formatError(err)})`,
+                                `Lead ${lead.leadId}: updating stored contact ${existingContactId} failed (${msg})`,
                             );
+                            // Stamp the failure, exactly as the per-lead catch below and
+                            // every sibling error branch in this file do. `continue` skips
+                            // that catch, so without this the lead keeps reading `synced`
+                            // in the customer's CRM and never appears under the sync-failed
+                            // filter (routes/crm.ts:1938) — a silent sync outage after a
+                            // sustained 429.
+                            await this.persistSyncMetadata(
+                                lead,
+                                config.listId,
+                                buildFailedMetadata(lead.syncMetadata, msg),
+                            ).catch(() => {});
                             continue;
                         }
                         console.warn(
@@ -1165,7 +1177,39 @@ export class HubspotAdapter implements CrmAdapter {
                     const existing = contactIdIndex.get(String(contact.id)) ?? null;
                     if (existing) {
                         try {
-                            await crmDb.updateLead(listId, existing.leadId, leadData);
+                            // MERGE, never replace. crmDb.updateLead does
+                            // `SET customFields = :customFields` and `SET syncMetadata = …`
+                            // — wholesale map replacement. batchCreateLeads, the path this
+                            // branch bypasses, merges both on purpose ("Merging syncMetadata
+                            // to avoid overwriting existing provider IDs"). Writing the
+                            // mapped properties straight through would delete every custom
+                            // field the customer has on that lead AND their attio_record_id,
+                            // on every pull, silently.
+                            const mergedCustomFields = mergeCustomFields(
+                                existing.customFields,
+                                customFields,
+                                { source: 'hubspotAdapter.pull', listId, leadId: existing.leadId },
+                            );
+                            const mergedSyncMetadata = {
+                                ...(existing.syncMetadata || {}),
+                                ...syncMetadata,
+                            };
+                            const merged: Record<string, any> = {
+                                ...leadData,
+                                customFields: mergedCustomFields,
+                                syncMetadata: mergedSyncMetadata,
+                            };
+                            // Nothing new? Don't write. An unconditional update re-bumps
+                            // updatedAt, re-projects three GSIs and re-runs the CAPI relay
+                            // hook on every pull. batchCreateLeads writes only `if (changed)`.
+                            const unchanged = Object.keys(merged).every((k) => {
+                                const a = (existing as any)[k];
+                                const b = (merged as any)[k];
+                                return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+                            });
+                            if (unchanged) { result.successCount++; continue; }
+
+                            await crmDb.updateLead(listId, existing.leadId, merged);
                             result.successCount++;
                             result.updatedCount++;
                         } catch (err: any) {

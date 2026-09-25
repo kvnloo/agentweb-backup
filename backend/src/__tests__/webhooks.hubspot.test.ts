@@ -268,6 +268,27 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
     expect(mockCreateLead).not.toHaveBeenCalled();
     expect(mockUpdateLead).toHaveBeenCalled();
     expect(mockUpdateLead.mock.calls[0][1]).toBe('lead-phone-only');
+    // And it must ADOPT the address. Asserting only "no duplicate" passed while the email
+    // was silently discarded — which left the row address-less, so getLeadByEmail missed on
+    // every later webhook and the expensive contact-id fallback ran forever.
+    expect(mockUpdateLead.mock.calls[0][2]).toMatchObject({ email: 'new@example.com' });
+  });
+
+  it('does not clobber an address we already hold with a DIFFERENT one', async () => {
+    // The incoming address must differ from the stored one, or this asserts nothing:
+    // writing the same value back is indistinguishable from not writing it.
+    mockGetLeadByEmail.mockResolvedValue({
+      leadId: 'lead-with-email', listId: LIST_ID, email: 'existing@example.com',
+    });
+    mockGetContactById.mockResolvedValue({ email: 'someone-else@example.com', firstname: 'New' });
+
+    await request(app).post('/api/webhooks/hubspot')
+      .send([{ subscriptionType: 'contact.creation', portalId: PORTAL_ID, objectId: '778' }]);
+    await flushPromises();
+    await flushPromises();
+
+    const updates = mockUpdateLead.mock.calls[0]?.[2] ?? {};
+    expect(updates.email).toBeUndefined();
   });
 
   it('creates a lead on contact.creation when the contact is not yet in the list', async () => {
