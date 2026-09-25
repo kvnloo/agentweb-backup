@@ -118,3 +118,39 @@ describe('redactAdminActivity — ENG-2163 scoped redaction for raw serve paths 
     expect(redactAdminActivity(input, { viewerIsAdmin: false, adminToolNames: [] })).toBe(input);
   });
 });
+
+
+describe('ENG-2163 re-review: CHATBOT persisted shape (admin activity in assistant.metadata.toolCalls, NO tool-role message)', () => {
+  // The Emma chatbot persists ONLY the final assistant message; admin tool name+result live in
+  // metadata.toolCalls, and there is NO role:'tool' message. The first fix keyed only off
+  // tool-role messages, so it was a no-op here (the real leak). These fixtures use that shape.
+  const ADMIN = ['get_pr_digest', 'read_linear_issues', 'manage_user_notes'];
+  const chatbotConvo = () => [
+    { role: 'user', content: 'pull my leads' },
+    { role: 'assistant', content: 'Here are your leads.', metadata: { toolCalls: [{ id: 'a', name: 'search_leads', result: { ok: true } }] } },
+    { role: 'user', content: 'check infra' },
+    { role: 'assistant', content: 'I reviewed 203 internal PRs; roadmap...', metadata: { toolCalls: [{ id: 'b', name: 'get_pr_digest', result: { totalPRs: 203, internal: 'secret' } }] } },
+  ];
+
+  it('redactAdminActivity CUSTOMER: drops the assistant carrying admin metadata.toolCalls + its narration', () => {
+    const out = redactAdminActivity(chatbotConvo(), { viewerIsAdmin: false, adminToolNames: ADMIN });
+    const assistantContents = out.filter((m: any) => m.role === 'assistant').map((m: any) => m.content);
+    expect(assistantContents).toContain('Here are your leads.');                       // safe turn kept
+    expect(assistantContents).not.toContain('I reviewed 203 internal PRs; roadmap...'); // admin narration gone
+    // and the raw admin result is not present anywhere in the output
+    expect(JSON.stringify(out)).not.toContain('secret');
+    expect(JSON.stringify(out)).not.toContain('get_pr_digest');
+  });
+
+  it('redactAdminActivity ADMIN: keeps it', () => {
+    const out = redactAdminActivity(chatbotConvo(), { viewerIsAdmin: true, adminToolNames: ADMIN });
+    expect(JSON.stringify(out)).toContain('get_pr_digest');
+  });
+
+  it('filterMessagesForClient CUSTOMER (agent-mode filter also honors the metadata.toolCalls taint)', () => {
+    const out = filterMessagesForClient(chatbotConvo(), { viewerIsAdmin: false, adminToolNames: ADMIN });
+    const assistantContents = out.filter((m: any) => m.role === 'assistant').map((m: any) => m.content);
+    expect(assistantContents).not.toContain('I reviewed 203 internal PRs; roadmap...');
+    expect(JSON.stringify(out)).not.toContain('secret');
+  });
+});

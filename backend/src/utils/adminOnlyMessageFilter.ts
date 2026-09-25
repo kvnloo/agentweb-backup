@@ -56,8 +56,18 @@ function computeAdminTaintedTurns(messages: any[], viewerIsAdmin: boolean, admin
       turnStart = i;
       turnHasAdminTool = false;
     }
+    // Agent-mode persists a role:'tool' result message per admin tool.
     if (m && m.role === 'tool' && typeof m.name === 'string' && adminToolNameSet.has(m.name)) {
       turnHasAdminTool = true;
+    }
+    // The Emma chatbot does NOT persist tool-role messages — it persists ONLY the final
+    // assistant message, carrying each tool's name+result inside metadata.toolCalls. Detect
+    // admin activity there too, or chatbot-originated admin turns are never tainted (ENG-2163
+    // re-review finding: the tool-role-only check was a no-op on the chatbot persisted shape).
+    if (m && m.role === 'assistant' && Array.isArray(m.metadata?.toolCalls)) {
+      for (const tc of m.metadata.toolCalls) {
+        if (tc && typeof tc.name === 'string' && adminToolNameSet.has(tc.name)) { turnHasAdminTool = true; break; }
+      }
     }
   }
   markTurn(turnStart, messages.length); // final turn

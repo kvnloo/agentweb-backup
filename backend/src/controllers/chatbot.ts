@@ -75,12 +75,14 @@ export const listUserSessions = async (req: AuthenticatedRequest, res: Response)
     const limitParam = req.query.limit ? parseInt(req.query.limit as string, 10) : undefined;
     const result = await chatbotDb.getUserSessions(userId, undefined, limitParam);
     
-    // Remove page content from response to reduce payload size
+    // Remove page content from response to reduce payload size.
+    // ENG-2163: getUserSessions fully HYDRATES messages, so this list is a transcript dump —
+    // redact delegated-admin activity per session for a non-admin viewer.
     const sanitizedSessions = result.sessions.map(session => {
       const { pageContent, contextChunks, ...rest } = session;
-      return rest;
+      return redactSessionForViewer(rest, req);
     });
-    
+
     res.status(200).json(sanitizedSessions);
   } catch (error) {
     console.error('Error listing chat sessions:', error);
