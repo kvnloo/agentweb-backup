@@ -235,8 +235,9 @@ export function claimBackedByLedger(
 
 /** Is a claim class loosely (keyword-only) matched by a SUCCESSFUL ledger
  * entry? Used only to downgrade a strict-matcher miss to "ambiguous" instead
- * of "confidently unbacked" — see CLAIM_TOOL_LOOSE_MATCHERS. */
-function claimLooselyMatchedByLedger(
+ * of "confidently unbacked" — see CLAIM_TOOL_LOOSE_MATCHERS. Exported for the
+ * offline groundedness grader (loops/eval/agentGraders.ts, ENG-2137). */
+export function claimLooselyMatchedByLedger(
   claimClass: ClaimClass,
   ledger: FinalizeLedgerEntry[],
   ports: Pick<FinalizeGuardPorts, 'toolResultError'>,
