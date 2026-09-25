@@ -2004,7 +2004,30 @@ async function loadConfirmedArtifactUrls(
   return [];
 }
 
-async function getDiagnosticErrorMessage(
+/**
+ * ENG-2160 (deterministic close): when the run failed before ANY tool completed, there is
+ * literally nothing to diagnose — and handing the LLM only the error + the user's request is
+ * exactly what let it narrate the request back as if it had happened ("I have successfully loaded
+ * your browser cookies..."). On an empty ledger we skip the LLM entirely and emit a fixed,
+ * honest, error-type-aware message. This makes empty-ledger fabrication STRUCTURALLY impossible,
+ * not merely discouraged by a prompt rule (that rule stays as defense-in-depth for other paths).
+ */
+export function deterministicEmptyLedgerMessage(error: unknown): string {
+  switch (classifyErrorType(error)) {
+    case 'rate_limit':
+      return "I hit a temporary capacity limit before I could start on your request, so nothing was done yet. Please try again in a moment.";
+    case 'context_limit':
+      return "This conversation got too long for me to process, so I couldn't start on your request. Try starting a new chat or shortening the request.";
+    case 'content_filter':
+      return "I wasn't able to start on this request. Please try rephrasing it.";
+    case 'transient':
+      return "I ran into a temporary error before I could start on your request, so nothing was done yet. Please try again.";
+    default:
+      return "I ran into an error before I could start on your request, so nothing was done yet. Please try again.";
+  }
+}
+
+export async function getDiagnosticErrorMessage(
   error: unknown,
   sessionId: string,
   userMessage: string,
@@ -2032,6 +2055,13 @@ async function getDiagnosticErrorMessage(
     const artifactUrls = typeof turnStartMs === 'number'
       ? collectConfirmedArtifactUrls(session?.messages as any, turnStartMs)
       : [];
+    // ENG-2160 deterministic close: nothing completed this turn AND nothing measurable to report →
+    // do not call the LLM at all; return a fixed honest message. Fabrication becomes impossible
+    // because the model never sees this case.
+    const nothingSucceeded = !succeededFunctions || Object.keys(succeededFunctions).length === 0;
+    if (nothingSucceeded && publishLedger.length === 0 && !importTotals?.known && artifactUrls.length === 0) {
+      return { message: deterministicEmptyLedgerMessage(error), publishLedger: [], artifactUrls: [] };
+    }
     const context: DiagnosisContext = {
       errorType: classifyErrorType(error),
       errorMessage: error instanceof Error ? error.message : String(error),
