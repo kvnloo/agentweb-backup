@@ -556,6 +556,26 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
       expect(input.leadEmail).toBe('https://linkedin.com/in/ada');
     });
 
+    // A live run reported `skippedNoEmail: 1` for a lead skipped because it had no
+    // LinkedIn profile. The count was right and the word was a lie.
+    it('names the skip reason after the channel that was actually missing', async () => {
+      dripSequenceDb.getSequence.mockResolvedValue(linkedInSequence);
+      const crmDbMock = require('../services/db').crmDb;
+      crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+        { leadId: 'l1', listId: 'list-1', email: 'a@x.com' },
+        { leadId: 'l2', listId: 'list-1', linkedin: 'https://linkedin.com/in/b' },
+      ]);
+
+      const res = await request(app)
+        .post('/seq_1/enrollments/by-list')
+        .send({ listId: 'list-1' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.enrollableLeads).toBe(1);
+      expect(res.body.skippedUnreachable).toBe(1);
+      expect(res.body.skippedNoEmail).toBeUndefined();
+    });
+
     it('still refuses an address-less lead for an EMAIL sequence', async () => {
       dripSequenceDb.getSequence.mockResolvedValue(mockSequence);
       const crmDbMock = require('../services/db').crmDb;

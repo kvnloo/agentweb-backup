@@ -77,6 +77,15 @@ function leadIsReachable(lead: any, channels: Set<string>): boolean {
  * messaged again each time. For a lead with no address the LinkedIn URL is the stable
  * identity; dripSequenceWorker already treats the field that way at its reply-exit check.
  */
+/**
+ * `skippedNoEmail` is the field existing callers know, and it is the right word only when
+ * the sequence is email-only. A LinkedIn step makes "no email" a lie — a live run on env2
+ * reported `skippedNoEmail: 1` for a lead skipped because it had no LinkedIn PROFILE.
+ */
+function skipKeyForChannels(channels: Set<string>): string {
+  return channels.has('linkedin') ? 'skippedUnreachable' : 'skippedNoEmail';
+}
+
 function enrollmentIdentity(lead: any): string {
   return String(lead?.email ?? '').trim() || String(lead?.linkedin ?? '').trim();
 }
@@ -246,9 +255,7 @@ router.post(
       }));
 
       const result = await dripSequenceDb.bulkEnroll(inputs);
-      // `skippedNoEmail` kept for an email-only sequence so existing callers still read the
-      // field they know; a LinkedIn step makes "no email" the wrong word for it.
-      const skipKey = channels.has('linkedin') ? 'skippedUnreachable' : 'skippedNoEmail';
+      const skipKey = skipKeyForChannels(channels);
       res.json(skippedUnreachable > 0 ? { ...result, [skipKey]: skippedUnreachable } : result);
     } catch (err: any) {
       if (err instanceof SequenceNotFoundError) return res.status(404).json({ error: err.message });
@@ -380,7 +387,7 @@ router.post(
           leadCount: leads.length,
           totalLeads,
           enrollableLeads,
-          ...(totalLeads > enrollableLeads ? { skippedNoEmail: totalLeads - enrollableLeads } : {}),
+          ...(totalLeads > enrollableLeads ? { [skipKeyForChannels(channels)]: totalLeads - enrollableLeads } : {}),
           warnings: { unsupported, missing },
         });
       }
@@ -399,7 +406,7 @@ router.post(
       const counts = {
         totalLeads,
         enrollableLeads,
-        ...(totalLeads > enrollableLeads ? { skippedNoEmail: totalLeads - enrollableLeads } : {}),
+        ...(totalLeads > enrollableLeads ? { [skipKeyForChannels(channels)]: totalLeads - enrollableLeads } : {}),
       };
 
       // Auto-enroll is on by default: add listId to sequence's autoEnrollListIds
