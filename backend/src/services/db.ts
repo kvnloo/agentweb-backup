@@ -8499,6 +8499,23 @@ export const crmDb = {
             item.nameCompanyKey = nameCompanyKey;
           }
 
+          // ENG-2082 / ENG-2155: this path never derived either field. It never calls
+          // buildLeadCrmFields, so every lead created by the HubSpot pull, the Attio pull
+          // or a CSV import landed with no `domain` and no `lifecycle` — which is the
+          // `lifecycle is_empty` delete-filter footgun that justified deriving them on the
+          // single-lead path, left wide open on the path that creates most leads. The two
+          // creation paths now agree; the predicates below mirror buildLeadCrmFields
+          // exactly (leadSchema.ts) rather than re-deciding the rule here.
+          const derivedDomain = emailValue ? extractDomainFromEmail(emailValue) : null;
+          if (derivedDomain) {
+            item.domain = derivedDomain;
+          }
+          // Contactable = an email OR a phone. Same rule computeLifecycle applies, so the
+          // stored value cannot contradict the computed one for a phone-only lead.
+          if (emailValue || String(lead.phone ?? '').trim()) {
+            item.lifecycle = 'inbox';
+          }
+
           return {
             PutRequest: {
               Item: item,

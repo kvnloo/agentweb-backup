@@ -114,6 +114,91 @@ describe('crmDb.batchCreateLeads — nameCompanyKey (new-lead path)', () => {
   });
 });
 
+// ENG-2082 / ENG-2155: the bulk path never called buildLeadCrmFields and derived neither
+// field, so the HubSpot pull, the Attio pull and CSV import — the paths that create most
+// leads — all produced rows with no `domain` and no `lifecycle`. The missing lifecycle is
+// the `lifecycle is_empty` delete-filter footgun that justified deriving it on the
+// single-lead path in the first place.
+describe('crmDb.batchCreateLeads — derived domain and lifecycle', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    queryPromiseMock.mockResolvedValue({ Items: [] });
+    getPromiseMock.mockResolvedValue({ Item: { listId: 'list-1', userId: 'user-1' } });
+    batchWritePromiseMock.mockResolvedValue({});
+  });
+
+  it('derives domain from the email, and stamps lifecycle inbox', async () => {
+    await crmDb.batchCreateLeads('list-1', [
+      { email: 'Ada@Example.COM', firstName: 'Ada' },
+    ]);
+
+    const items = batchedItems();
+    expect(items[0].domain).toBe('example.com');
+    expect(items[0].lifecycle).toBe('inbox');
+  });
+
+  // The whole point of ENG-2082: a phone-only capture is contactable and inbound.
+  it('stamps lifecycle for a PHONE-ONLY lead, which has no email to derive a domain from', async () => {
+    await crmDb.batchCreateLeads('list-1', [
+      { phone: '2125559876', firstName: 'Grace' },
+    ]);
+
+    const items = batchedItems();
+    expect(items[0].lifecycle).toBe('inbox');
+    expect(items[0].domain).toBeUndefined();
+  });
+
+  it('leaves both off a lead with neither an email nor a phone', async () => {
+    await crmDb.batchCreateLeads('list-1', [
+      { firstName: 'Nobody', company: 'Ghost Ltd', linkedin: 'https://linkedin.com/in/nobody' },
+    ]);
+
+    const items = batchedItems();
+    expect(items[0].lifecycle).toBeUndefined();
+    expect(items[0].domain).toBeUndefined();
+  });
+
+  it('decides per lead across a batch, not once for the batch', async () => {
+    await crmDb.batchCreateLeads('list-1', [
+      { email: 'a@alpha.io' },
+      { phone: '5551234567' },
+      { firstName: 'Neither' },
+    ]);
+
+    const items = batchedItems();
+    const byId = (pred: (i: any) => boolean) => items.find(pred);
+    expect(byId((i) => i.email === 'a@alpha.io')?.domain).toBe('alpha.io');
+    expect(byId((i) => i.email === 'a@alpha.io')?.lifecycle).toBe('inbox');
+    expect(byId((i) => i.phone === '5551234567')?.domain).toBeUndefined();
+    expect(byId((i) => i.phone === '5551234567')?.lifecycle).toBe('inbox');
+    expect(byId((i) => i.firstName === 'Neither')?.lifecycle).toBeUndefined();
+  });
+
+  // The stored value must agree with what computeLifecycle would say, or the two
+  // contradict each other for every row this path writes.
+  it('agrees with buildLeadCrmFields, which is what the single-create path uses', async () => {
+    const { buildLeadCrmFields } = require('../utils/leadSchema');
+    for (const lead of [
+      { email: 'x@y.com' },
+      { phone: '2125550000' },
+      { firstName: 'None' },
+    ]) {
+      jest.clearAllMocks();
+      queryPromiseMock.mockResolvedValue({ Items: [] });
+      getPromiseMock.mockResolvedValue({ Item: { listId: 'list-1', userId: 'user-1' } });
+      batchWritePromiseMock.mockResolvedValue({});
+
+      await crmDb.batchCreateLeads('list-1', [lead]);
+      const bulk = batchedItems()[0];
+      // buildLeadCrmFields takes (email, extensions) — the same two inputs the bulk path
+      // now reads, so a disagreement here means the two creation paths have drifted.
+      const single = buildLeadCrmFields((lead as any).email, { phone: (lead as any).phone });
+      expect(bulk.lifecycle).toBe(single.lifecycle);
+      expect(bulk.domain).toBe(single.domain);
+    }
+  });
+});
+
 
 it('notifies only persisted batch rows, leaving DynamoDB unprocessed rows resumable', async () => {
   jest.clearAllMocks();
