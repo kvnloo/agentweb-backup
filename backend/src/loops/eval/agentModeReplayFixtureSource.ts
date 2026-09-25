@@ -19,7 +19,22 @@ import type { GoldenSetStore } from './goldenSetStore';
 export interface ReplayMessage {
   messageIndex: number;
   role: string;
-  content: string;
+  /** As stored: a string, or structured parts (`[{ type: 'text', text }, ...]`). */
+  content: unknown;
+}
+
+/** The text of a message's content: the string itself, or its text parts joined. null when the
+ * content has no text (e.g. image-only) or an unknown shape, so the turn is never replayed with
+ * a silently blanked prompt or a dropped reply. */
+export function replayContentText(content: unknown): string | null {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return null;
+  const texts = content.flatMap((part) =>
+    typeof part === 'object' && part !== null && (part as { type?: unknown }).type === 'text' && typeof (part as { text?: unknown }).text === 'string'
+      ? [(part as { text: string }).text]
+      : [],
+  );
+  return texts.length > 0 ? texts.join('') : null;
 }
 
 /** Messages of a session from `fromIndex` on, in index order. May stop early once it has read
@@ -37,10 +52,17 @@ export function extractReplayTurns(messages: readonly ReplayMessage[], messageIn
   const ordered = [...messages].sort((a, b) => a.messageIndex - b.messageIndex);
   const start = ordered.findIndex((m) => m.messageIndex === messageIndex);
   if (start < 0 || ordered[start].role !== 'user') return null;
-  const turns: JudgeReplayFixture['turns'] = [{ role: 'user', content: ordered[start].content }];
+  const prompt = replayContentText(ordered[start].content);
+  if (!prompt) return null;
+  const turns: JudgeReplayFixture['turns'] = [{ role: 'user', content: prompt }];
   for (const m of ordered.slice(start + 1)) {
     if (m.role === 'user') break;
-    if (m.role === 'assistant' && m.content) turns.push({ role: 'assistant', content: m.content });
+    if (m.role !== 'assistant') continue;
+    // An empty string is a tool-call-only turn; anything unreadable voids the fixture.
+    if (m.content === '' || m.content === undefined || m.content === null) continue;
+    const text = replayContentText(m.content);
+    if (text === null) return null;
+    if (text) turns.push({ role: 'assistant', content: text });
   }
   return turns.length > 1 ? turns : null;
 }
@@ -81,7 +103,7 @@ export async function loadReplayFixtures(deps: {
     try {
       const turns = extractReplayTurns(await fetchMessages(link.sessionId, link.messageIndex), link.messageIndex);
       if (!turns) {
-        notes.push(`${fixture.id}: linked message is not a user turn with an assistant reply, placeholder kept`);
+        notes.push(`${fixture.id}: linked message is not a user turn with readable text and an assistant reply, placeholder kept`);
         fixtures.push(fixture);
       } else {
         fixtures.push({ ...fixture, turns, isPlaceholder: false });
@@ -117,8 +139,7 @@ export function chatMessagesFetcher(client: AWS.DynamoDB.DocumentClient = new AW
         })
         .promise();
       for (const item of (page.Items ?? []) as ChatMessageItem[]) {
-        const content = item.message?.content;
-        out.push({ messageIndex: item.messageIndex, role: item.message?.role ?? '', content: typeof content === 'string' ? content : '' });
+        out.push({ messageIndex: item.messageIndex, role: item.message?.role ?? '', content: item.message?.content });
       }
       startKey = page.LastEvaluatedKey;
       // Enough once a later user turn closes the reply.
