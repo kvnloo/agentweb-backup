@@ -35,21 +35,35 @@ import { placementFromGates, selectPriorBest } from '../services/creativeRubricJ
 import type { HumanEvalCandidate } from '../services/humanEvalService';
 import { getModelPrice } from '../utils/llmPricing';
 
-interface Args {
+export interface Args {
   ids: string[];
   pairwise: boolean;
   dryRun: boolean;
   model: string;
 }
 
-function parseArgs(raw: readonly string[]): Args {
+const USAGE = 'Usage: scoreCreativeRubric.ts --ids <candidateId,...> [--pairwise] [--model <id>] [--dry-run]';
+
+/**
+ * Strict: an unknown flag (e.g. `--dryrun`), a missing or flag-shaped operand, or no ids is an
+ * error, so a typo can never turn a dry run into live judge calls.
+ */
+export function parseArgs(raw: readonly string[]): Args {
   const args: Args = { ids: [], pairwise: false, dryRun: false, model: DEFAULT_RUBRIC_JUDGE_MODEL };
+  const operand = (i: number, flag: string): string => {
+    const value = raw[i];
+    if (value === undefined || value.startsWith('--') || !value.trim()) throw new Error(`${flag} needs a value. ${USAGE}`);
+    return value.trim();
+  };
   for (let i = 0; i < raw.length; i++) {
-    if (raw[i] === '--ids') args.ids = (raw[++i] ?? '').split(',').map((s) => s.trim()).filter(Boolean);
-    else if (raw[i] === '--model') args.model = raw[++i] ?? args.model;
-    else if (raw[i] === '--pairwise') args.pairwise = true;
-    else if (raw[i] === '--dry-run') args.dryRun = true;
+    const flag = raw[i];
+    if (flag === '--ids') args.ids = operand(++i, flag).split(',').map((s) => s.trim()).filter(Boolean);
+    else if (flag === '--model') args.model = operand(++i, flag);
+    else if (flag === '--pairwise') args.pairwise = true;
+    else if (flag === '--dry-run') args.dryRun = true;
+    else throw new Error(`unknown argument "${flag}". ${USAGE}`);
   }
+  if (args.ids.length === 0) throw new Error(`--ids is required. ${USAGE}`);
   return args;
 }
 
@@ -107,10 +121,6 @@ function estimateCostUsd(model: string, candidate: HumanEvalCandidate, brief: Cr
 
 async function main(): Promise<void> {
   const args = parseArgs(argv.slice(2));
-  if (args.ids.length === 0) {
-    console.error('Usage: scoreCreativeRubric.ts --ids <candidateId,...> [--pairwise] [--model <id>] [--dry-run]');
-    exit(1);
-  }
   const { humanEvalService } = await import('../services/humanEvalService');
 
   const perCriterion = Object.fromEntries(RUBRIC_CRITERIA.map((id) => [id, { pass: 0, fail: 0 }]));
@@ -191,9 +201,11 @@ async function main(): Promise<void> {
   if (pairwiseChoices.length > 0) console.log('Pairwise (A = newer creative):', pairwiseWinRate(pairwiseChoices));
 }
 
-main()
-  .then(() => exit(0))
-  .catch((err) => {
-    console.error(err instanceof Error ? err.message : err);
-    exit(1);
-  });
+if (require.main === module) {
+  main()
+    .then(() => exit(0))
+    .catch((err: unknown) => {
+      console.error(err instanceof Error ? err.message : err);
+      exit(1);
+    });
+}
