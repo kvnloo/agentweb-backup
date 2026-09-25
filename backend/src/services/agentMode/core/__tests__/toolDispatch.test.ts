@@ -1508,7 +1508,7 @@ describe('executePreparedTools', () => {
       expect(result.mediaAssetsProduced).toBe(1);
     });
 
-    it('requires revision source inputImages when approved sources are provided', async () => {
+    it('requires an edit call (inputImages set) to use one of the approved sources', async () => {
       const execOrder: string[] = [];
       const ports = makePorts({
         executeAgentToolThroughGateway: async (i) => {
@@ -1516,6 +1516,171 @@ describe('executePreparedTools', () => {
           const result = await i.execute();
           return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
         },
+      });
+
+      const input = makeInput(
+        [toolCall('a', 'generate_image', JSON.stringify({
+          prompt: 'edit', confirm: true, inputImages: ['https://assets.example.com/unapproved.png'],
+        }))],
+        ports,
+        {
+          approvedRevisionImageSources: ['https://assets.example.com/approved.png'],
+        },
+      );
+
+      const result = await executePreparedTools(input);
+
+      expect(execOrder).toEqual([]);
+      expect(result.failedCounterUpdates).toEqual({ generate_image: 1 });
+      expect(result.pendingCounterUpdates).toEqual({});
+      expect(input.toolCallsLedger[0]).toMatchObject({
+        name: 'generate_image',
+        error: expect.stringContaining('source mismatch'),
+      });
+      expect(input.messages[0].content).toContain('source mismatch');
+    });
+
+    it('allows an edit call that uses exactly the approved source', async () => {
+      const execOrder: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          execOrder.push(i.toolName);
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async () => ({ success: true, imageUrl: 'https://s3/edited.png', filename: 'edited.png' }),
+      });
+
+      const input = makeInput(
+        [toolCall('a', 'generate_image', JSON.stringify({
+          prompt: 'edit', confirm: true, inputImages: ['https://assets.example.com/approved.png'],
+        }))],
+        ports,
+        {
+          approvedRevisionImageSources: ['https://assets.example.com/approved.png'],
+        },
+      );
+
+      const result = await executePreparedTools(input);
+
+      expect(execOrder).toEqual(['generate_image']);
+      expect(result.failedCounterUpdates).toEqual({});
+      expect(result.pendingCounterUpdates).toEqual({ generate_image: 1 });
+    });
+
+    // Review fix: `logo_image` is a real edit source at execution time —
+    // imageGeneration.ts's generateImage() appends it onto inputImages before
+    // generating — but the gate previously only inspected inputImages/input_images.
+    // A call with confirm:true, no inputImages, and an unapproved logo_image sailed
+    // through as "not an edit" (getInputImages returned []) and bypassed source
+    // validation entirely. Must be rejected the same way a mismatched inputImages
+    // call is.
+    it('rejects a logo_image that is not one of the approved sources, even with no inputImages set', async () => {
+      const execOrder: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          execOrder.push(i.toolName);
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+      });
+
+      const input = makeInput(
+        [toolCall('a', 'generate_image', JSON.stringify({
+          prompt: 'add our logo', confirm: true, logo_image: 'https://assets.example.com/unapproved-logo.png',
+        }))],
+        ports,
+        {
+          approvedRevisionImageSources: ['https://assets.example.com/approved.png'],
+        },
+      );
+
+      const result = await executePreparedTools(input);
+
+      expect(execOrder).toEqual([]);
+      expect(result.failedCounterUpdates).toEqual({ generate_image: 1 });
+      expect(result.pendingCounterUpdates).toEqual({});
+      expect(input.toolCallsLedger[0]).toMatchObject({
+        name: 'generate_image',
+        error: expect.stringContaining('source mismatch'),
+      });
+    });
+
+    it('allows a logo_image that matches exactly the approved source', async () => {
+      const execOrder: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          execOrder.push(i.toolName);
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async () => ({ success: true, imageUrl: 'https://s3/branded.png', filename: 'branded.png' }),
+      });
+
+      const input = makeInput(
+        [toolCall('a', 'generate_image', JSON.stringify({
+          prompt: 'add our logo', confirm: true, logo_image: 'https://assets.example.com/approved.png',
+        }))],
+        ports,
+        {
+          approvedRevisionImageSources: ['https://assets.example.com/approved.png'],
+        },
+      );
+
+      const result = await executePreparedTools(input);
+
+      expect(execOrder).toEqual(['generate_image']);
+      expect(result.failedCounterUpdates).toEqual({});
+      expect(result.pendingCounterUpdates).toEqual({ generate_image: 1 });
+    });
+
+    // ENG-2166: a real customer (Vincent Hu) hit this. An approved-source list is
+    // fixed for the WHOLE run (e.g. revisionService.ts's Slack-driven "revise this
+    // asset" flow sets one approved URL for the whole bounded runVerifiedChat call).
+    // Once one confirmed edit against that URL succeeded, every LATER, UNRELATED
+    // generate_image call in the same run — plain text-to-image, no inputImages at
+    // all — started failing with "Expected one of: [the one approved URL]. Received
+    // none.", permanently blocking all new generations for the rest of the session.
+    // A call with no inputImages isn't an edit/revision at all, so the approved-
+    // source gate must never apply to it, regardless of whether an approved-sources
+    // list happens to be active for the run.
+    it('never blocks a plain text-to-image call (no inputImages) even when an approved-sources list is active (ENG-2166)', async () => {
+      const execOrder: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          execOrder.push(i.toolName);
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async () => ({ success: true, imageUrl: 'https://s3/fresh.png', filename: 'fresh.png' }),
+      });
+
+      const input = makeInput(
+        [toolCall('a', 'generate_image', JSON.stringify({ prompt: 'a brand new unrelated image' }))],
+        ports,
+        {
+          approvedRevisionImageSources: ['https://assets.example.com/approved.png'],
+        },
+      );
+
+      const result = await executePreparedTools(input);
+
+      expect(execOrder).toEqual(['generate_image']);
+      expect(result.failedCounterUpdates).toEqual({});
+      expect(result.pendingCounterUpdates).toEqual({ generate_image: 1 });
+    });
+
+    // Same case with confirm:true set but still no inputImages — confirm is only
+    // meaningful for an edit; a plain generation must not be gated on it either.
+    it('never blocks a plain text-to-image call with confirm=true but no inputImages (ENG-2166)', async () => {
+      const execOrder: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          execOrder.push(i.toolName);
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async () => ({ success: true, imageUrl: 'https://s3/fresh2.png', filename: 'fresh2.png' }),
       });
 
       const input = makeInput(
@@ -1528,44 +1693,9 @@ describe('executePreparedTools', () => {
 
       const result = await executePreparedTools(input);
 
-      expect(execOrder).toEqual([]);
-      expect(result.failedCounterUpdates).toEqual({ generate_image: 1 });
-      expect(result.pendingCounterUpdates).toEqual({});
-      expect(input.toolCallsLedger[0]).toMatchObject({
-        name: 'generate_image',
-        error: expect.stringContaining('explicit approved source inputImages'),
-      });
-      expect(input.messages[0].content).toContain('explicit approved source inputImages');
-    });
-
-    it('requires revision source inputImages even without explicit confirm=true', async () => {
-      const execOrder: string[] = [];
-      const ports = makePorts({
-        executeAgentToolThroughGateway: async (i) => {
-          execOrder.push(i.toolName);
-          const result = await i.execute();
-          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
-        },
-      });
-
-      const input = makeInput(
-        [toolCall('a', 'generate_image', JSON.stringify({ prompt: 'edit' }))],
-        ports,
-        {
-          approvedRevisionImageSources: ['https://assets.example.com/approved.png'],
-        },
-      );
-
-      const result = await executePreparedTools(input);
-
-      expect(execOrder).toEqual([]);
-      expect(result.failedCounterUpdates).toEqual({ generate_image: 1 });
-      expect(result.pendingCounterUpdates).toEqual({});
-      expect(input.toolCallsLedger[0]).toMatchObject({
-        name: 'generate_image',
-        error: expect.stringContaining('explicit approved source inputImages'),
-      });
-      expect(input.messages[0].content).toContain('explicit approved source inputImages');
+      expect(execOrder).toEqual(['generate_image']);
+      expect(result.failedCounterUpdates).toEqual({});
+      expect(result.pendingCounterUpdates).toEqual({ generate_image: 1 });
     });
   });
 
