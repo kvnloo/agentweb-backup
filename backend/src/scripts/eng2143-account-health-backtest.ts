@@ -120,7 +120,8 @@ export function buildCutoffPopulation(data: BacktestData, cutoffMs: number, hori
     const recentAdSpend =
       firstSpendDate !== null && firstSpendDate <= windowStart
         ? (spend.get(user.userId) ?? [])
-            .filter((r) => r.date > windowStart && r.date <= cutoffDate)
+            // The 30 complete date labels before the cutoff day.
+            .filter((r) => r.date >= windowStart && r.date < cutoffDate)
             .reduce((sum, r) => sum + r.spend, 0)
         : null;
     const requirement = data.requirements.get(user.userId) ?? null;
