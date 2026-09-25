@@ -16,22 +16,34 @@ jest.mock('../services/approvalInboxCustomerNotify', () => ({
   notifyCustomerOfPendingCredentialDecision: jest.fn(),
 }));
 
+jest.mock('../services/approvalInboxSlack', () => ({
+  upsertApproverQueueMessage: jest.fn(),
+  postDecisionAddedNotice: jest.fn(),
+}));
+
 import '../emma/tools';
 import { emmaToolRegistry } from '../emma/registry';
 import { approvalInboxService } from '../services/approvalInboxService';
 import { notifyCustomerOfPendingCredentialDecision } from '../services/approvalInboxCustomerNotify';
+import { upsertApproverQueueMessage, postDecisionAddedNotice } from '../services/approvalInboxSlack';
 
 const mockCreateDecision = approvalInboxService.createDecision as jest.Mock;
 const mockNotifyCustomer = notifyCustomerOfPendingCredentialDecision as jest.Mock;
+const mockUpsertApproverQueueMessage = upsertApproverQueueMessage as jest.Mock;
+const mockPostDecisionAddedNotice = postDecisionAddedNotice as jest.Mock;
 
 beforeEach(() => {
   jest.clearAllMocks();
   mockCreateDecision.mockResolvedValue({
     decisionId: 'decision-1',
+    audience: 'team',
     approver: 'matt',
     status: 'pending_team_review',
+    expiresAt: '2026-10-01T00:00:00.000Z',
   });
   mockNotifyCustomer.mockResolvedValue(undefined);
+  mockUpsertApproverQueueMessage.mockResolvedValue({ posted: false });
+  mockPostDecisionAddedNotice.mockResolvedValue(undefined);
 });
 
 describe('stage_pending_decision', () => {
@@ -66,9 +78,47 @@ describe('stage_pending_decision', () => {
 
     expect(result.success).toBe(true);
     expect(result.decisionId).toBe('decision-1');
+    // Review fix: the effective (possibly clamped) expiresAt must be
+    // surfaced so Emma never overstates a duration that was silently reduced.
+    expect(result.expiresAt).toBe('2026-10-01T00:00:00.000Z');
+    // gap-closing round: every new team-audience decision must both refresh
+    // the queue message AND fire a real, always-new notification — the
+    // queue-only update alone doesn't reliably notify an approver.
+    expect(mockUpsertApproverQueueMessage).toHaveBeenCalledWith('matt');
+    expect(mockPostDecisionAddedNotice).toHaveBeenCalledWith('matt', expect.objectContaining({ decisionId: 'decision-1' }));
     // No awaitingUserConfirmation anywhere in the result — this tool never
     // halts the turn, unlike present_question_deck/call_meta_marketing_api.
     expect(result.awaitingUserConfirmation).toBeUndefined();
+  });
+
+  it('skips postDecisionAddedNotice when the queue refresh itself freshly posted — first-ever decision for an approver — to avoid double-notifying', async () => {
+    mockUpsertApproverQueueMessage.mockResolvedValue({ posted: true });
+    const tool = emmaToolRegistry.getTool('stage_pending_decision')!;
+    await tool.execute(
+      { audience: 'team', approver: 'matt', gateType: 'plan_choice', businessImpact: 'x', evidencePacket: {}, options: [
+        { label: 'A', consequence: 'x', recommended: true },
+        { label: 'B', consequence: 'x' },
+      ] },
+      { userId: 'user-1', sessionId: 'sess-1' },
+    );
+
+    expect(mockUpsertApproverQueueMessage).toHaveBeenCalledWith('matt');
+    expect(mockPostDecisionAddedNotice).not.toHaveBeenCalled();
+  });
+
+  it('still attempts postDecisionAddedNotice in its own try/catch when the queue refresh itself throws', async () => {
+    mockUpsertApproverQueueMessage.mockRejectedValue(new Error('Slack API down'));
+    const tool = emmaToolRegistry.getTool('stage_pending_decision')!;
+    const result = await tool.execute(
+      { audience: 'team', approver: 'matt', gateType: 'plan_choice', businessImpact: 'x', evidencePacket: {}, options: [
+        { label: 'A', consequence: 'x', recommended: true },
+        { label: 'B', consequence: 'x' },
+      ] },
+      { userId: 'user-1', sessionId: 'sess-1' },
+    );
+
+    expect(mockPostDecisionAddedNotice).toHaveBeenCalledWith('matt', expect.objectContaining({ decisionId: 'decision-1' }));
+    expect(result.success).toBe(true);
   });
 
   it('maps a customer-audience call to customerId, never an approver', async () => {
@@ -136,6 +186,41 @@ describe('stage_pending_decision', () => {
     expect(explicitExpiry).toBeLessThan(before + 2 * 24 * 60 * 60 * 1000);
   });
 
+  it('clamps an absurd expiresInDays to 30 days instead of producing an unbounded or invalid date (review fix)', async () => {
+    const tool = emmaToolRegistry.getTool('stage_pending_decision')!;
+    const before = Date.now();
+
+    for (const wild of [700, Infinity, NaN]) {
+      mockCreateDecision.mockClear();
+      await tool.execute(
+        { audience: 'team', approver: 'harsha', gateType: 'plan_choice', businessImpact: 'x', evidencePacket: {}, expiresInDays: wild, options: [
+          { label: 'A', consequence: 'x', recommended: true },
+          { label: 'B', consequence: 'x' },
+        ] },
+        { userId: 'user-1', sessionId: 'sess-1' },
+      );
+      const expiry = new Date(mockCreateDecision.mock.calls[0][0].expiresAt).getTime();
+      expect(Number.isFinite(expiry)).toBe(true);
+      expect(expiry).toBeLessThanOrEqual(before + 31 * 24 * 60 * 60 * 1000);
+    }
+  });
+
+  it('clamps a tiny positive expiresInDays up to 1 day instead of creating an already-expired decision (review fix)', async () => {
+    const tool = emmaToolRegistry.getTool('stage_pending_decision')!;
+    const before = Date.now();
+
+    await tool.execute(
+      { audience: 'team', approver: 'harsha', gateType: 'plan_choice', businessImpact: 'x', evidencePacket: {}, expiresInDays: 0.0005, options: [
+        { label: 'A', consequence: 'x', recommended: true },
+        { label: 'B', consequence: 'x' },
+      ] },
+      { userId: 'user-1', sessionId: 'sess-1' },
+    );
+    const expiry = new Date(mockCreateDecision.mock.calls[0][0].expiresAt).getTime();
+    // Clamped up to the 1-day floor, not left at ~43ms in the future.
+    expect(expiry).toBeGreaterThanOrEqual(before + 23 * 60 * 60 * 1000);
+  });
+
   it('propagates a createDecision validation error as a failed tool result, not a throw', async () => {
     mockCreateDecision.mockRejectedValue(new Error('options must have exactly one recommended:true entry'));
     const tool = emmaToolRegistry.getTool('stage_pending_decision')!;
@@ -162,7 +247,7 @@ describe('stage_pending_decision', () => {
     expect(mockCreateDecision).not.toHaveBeenCalled();
   });
 
-  it('customer_credential: passes customerActionUrl through and notifies the customer, not the Slack queue', async () => {
+  it('customer_credential: passes customerActionUrl/credentialPlatform/credentialAccountId through and notifies the customer, not the Slack queue', async () => {
     mockCreateDecision.mockResolvedValue({
       decisionId: 'decision-2',
       audience: 'customer',
@@ -179,6 +264,8 @@ describe('stage_pending_decision', () => {
         businessImpact: 'Your Meta ad account disconnected.',
         evidencePacket: {},
         customerActionUrl: 'https://app.agentweb.pro/settings?tab=connected-accounts&platform=meta',
+        credentialPlatform: 'meta',
+        credentialAccountId: 'act_123',
       },
       { userId: 'user-1', sessionId: 'sess-1' },
     );
@@ -187,6 +274,8 @@ describe('stage_pending_decision', () => {
       gateType: 'customer_credential',
       customerId: 'cust-1',
       customerActionUrl: 'https://app.agentweb.pro/settings?tab=connected-accounts&platform=meta',
+      credentialPlatform: 'meta',
+      credentialAccountId: 'act_123',
     }));
     expect(mockNotifyCustomer).toHaveBeenCalledWith(expect.objectContaining({ decisionId: 'decision-2' }));
     expect(result.success).toBe(true);
