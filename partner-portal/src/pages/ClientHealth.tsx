@@ -29,12 +29,18 @@ import PaletteIcon from '@mui/icons-material/Palette';
 import TrendingUpIcon from '@mui/icons-material/TrendingUp';
 import AccessTimeIcon from '@mui/icons-material/AccessTime';
 import ShieldIcon from '@mui/icons-material/Shield';
+import {
+  adConnectionOf,
+  deriveQuickStatus,
+  quickSummary,
+  type AdConnectionState,
+  type HealthStatus,
+} from '../utils/clientHealthStatus';
 
 // ------------------------------------------------------------------
 // Types
 // ------------------------------------------------------------------
 
-type HealthStatus = 'healthy' | 'mediocre' | 'at-risk' | 'blocked' | 'onboarding';
 
 interface ClientSummary {
   userId: string;
@@ -42,6 +48,7 @@ interface ClientSummary {
   displayName: string;
   roles: string[];
   has_ads: boolean;
+  ad_connection?: AdConnectionState;
   has_lander: boolean;
   has_crm: boolean;
   last_activity: string | null;
@@ -49,6 +56,8 @@ interface ClientSummary {
 
 interface AdsLayerHealth {
   connected: boolean;
+  connection?: AdConnectionState;
+  token_expired_at?: string;
   ad_account_id?: string;
   active_campaigns: number;
   campaigns?: Array<{ id: string; name: string; status: string; objective: string }>;
@@ -96,13 +105,12 @@ const STATUS_CONFIG: Record<
   onboarding: { label: 'Onboarding', color: 'info' },
 };
 
-function deriveQuickStatus(client: ClientSummary): HealthStatus {
-  if (!client.has_ads && !client.has_lander && !client.has_crm) return 'blocked';
-  if (!client.has_ads) return 'at-risk';
-  const issues = [!client.has_lander, !client.has_crm].filter(Boolean).length;
-  if (issues === 0) return 'healthy';
-  return 'mediocre';
-}
+// ENG-2133: a never-connected ad account is activation (neutral), not a red failure.
+const ADS_INDICATOR: Record<AdConnectionState, { title: string; color: string }> = {
+  connected: { title: 'Ads connected', color: 'success.main' },
+  never_connected: { title: 'Ads not connected yet (activation)', color: 'text.disabled' },
+  expired: { title: 'Ad connection expired', color: 'error.light' },
+};
 
 function formatRelativeTime(dateStr: string | null): string {
   if (!dateStr) return 'Never';
@@ -111,15 +119,6 @@ function formatRelativeTime(dateStr: string | null): string {
   if (days === 0) return 'Today';
   if (days === 1) return 'Yesterday';
   return `${days}d ago`;
-}
-
-function quickSummary(client: ClientSummary): string {
-  const parts: string[] = [];
-  if (!client.has_ads) parts.push('No ads');
-  if (!client.has_lander) parts.push('No lander');
-  if (!client.has_crm) parts.push('No CRM');
-  if (parts.length === 0) return 'All layers connected';
-  return parts.join(' \u00B7 ');
 }
 
 function StatusIcon({ ok }: { ok: boolean }) {
@@ -646,7 +645,7 @@ export default function ClientHealth() {
       {!loading && !error && clients.length > 0 && (
         <>
           {/* Summary cards */}
-          <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 2, mb: 3 }}>
+          <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 2, mb: 3 }}>
             <Card>
               <CardContent sx={{ textAlign: 'center', py: 2, '&:last-child': { pb: 2 } }}>
                 <Typography variant="h4" fontWeight={700}>{clients.length}</Typography>
@@ -667,6 +666,14 @@ export default function ClientHealth() {
                   {clients.filter((c) => deriveQuickStatus(c) === 'mediocre').length}
                 </Typography>
                 <Typography variant="caption" color="text.secondary">Mediocre</Typography>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent sx={{ textAlign: 'center', py: 2, '&:last-child': { pb: 2 } }}>
+                <Typography variant="h4" fontWeight={700} color="info.main">
+                  {clients.filter((c) => deriveQuickStatus(c) === 'onboarding').length}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">Onboarding</Typography>
               </CardContent>
             </Card>
             <Card>
@@ -710,10 +717,10 @@ export default function ClientHealth() {
 
                       {/* Quick indicators */}
                       <Box sx={{ display: { xs: 'none', sm: 'flex' }, gap: 1.5, alignItems: 'center' }}>
-                        <Tooltip title={client.has_ads ? 'Ads connected' : 'No ad account'}>
+                        <Tooltip title={ADS_INDICATOR[adConnectionOf(client)].title}>
                           <CampaignIcon
                             fontSize="small"
-                            sx={{ color: client.has_ads ? 'success.main' : 'error.light' }}
+                            sx={{ color: ADS_INDICATOR[adConnectionOf(client)].color }}
                           />
                         </Tooltip>
                         <Tooltip title={client.has_lander ? 'Lander detected' : 'No lander'}>
