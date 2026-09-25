@@ -47,12 +47,15 @@ export async function notifyCustomerOfPendingCredentialDecision(decision: Approv
 
   const subject = 'Action needed on your AgentWeb account';
   const text =
-    `${decision.subjectLabel}\n\n` +
-    `${decision.businessImpact}\n\n` +
+    `${decision.subjectLabel}\n` +
+    (decision.subjectContactEmail ? `(${decision.subjectContactEmail})\n` : '') +
+    `\n${decision.businessImpact}\n\n` +
     `Please take care of this here: ${decision.customerActionUrl}\n\n` +
     `If you weren't expecting this, reply to this email and we'll help.`;
   const html =
-    `<p><strong>${decision.subjectLabel}</strong></p>` +
+    `<p><strong>${decision.subjectLabel}</strong>` +
+    (decision.subjectContactEmail ? ` (${decision.subjectContactEmail})` : '') +
+    `</p>` +
     `<p>${decision.businessImpact}</p>` +
     `<p><a href="${decision.customerActionUrl}">Take care of this now</a></p>` +
     `<p>If you weren't expecting this, reply to this email and we'll help.</p>`;
@@ -84,13 +87,16 @@ export async function notifyCustomerOfExpiredCredentialDecision(decision: Approv
 
   const subject = 'Your AgentWeb reconnect window has closed';
   const text =
-    `${decision.subjectLabel}\n\n` +
-    `${decision.businessImpact}\n\n` +
+    `${decision.subjectLabel}\n` +
+    (decision.subjectContactEmail ? `(${decision.subjectContactEmail})\n` : '') +
+    `\n${decision.businessImpact}\n\n` +
     `The window to take care of this has closed without a response, so it's no longer active. ` +
     `If this still matters, let us know and we'll raise it again.\n\n` +
     `If you weren't expecting this, reply to this email and we'll help.`;
   const html =
-    `<p><strong>${decision.subjectLabel}</strong></p>` +
+    `<p><strong>${decision.subjectLabel}</strong>` +
+    (decision.subjectContactEmail ? ` (${decision.subjectContactEmail})` : '') +
+    `</p>` +
     `<p>${decision.businessImpact}</p>` +
     `<p>The window to take care of this has closed without a response, so it's no longer active. ` +
     `If this still matters, let us know and we'll raise it again.</p>` +
