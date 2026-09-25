@@ -6,8 +6,8 @@
  * CTR, and between the score and CPA. The loader is scripts/creativePerformanceCorrelation.ts.
  *
  * Only SETTLED rows count (isMetaRowSettled: Meta revises insights for 28 days, ENG-1550), and only
- * rows from the day the ad started carrying the creative. Everything excluded is counted, never
- * silently dropped.
+ * rows from the day the ad started carrying the creative until the day its creative next changed.
+ * Everything excluded is counted, never silently dropped.
  *
  * Reading the sign: a useful judge correlates POSITIVELY with CTR and NEGATIVELY with CPA.
  */
@@ -32,6 +32,11 @@ export interface LinkedAdMetrics {
   via: MetaPublishVia;
   /** ISO timestamp the ad started carrying this creative. */
   linkedAt: string;
+  /**
+   * Exclusive YYYY-MM-DD: the day the ad's creative changed next (another link or a recorded end),
+   * shared with whatever it changed to, so left out here. Absent while the ad still carries it.
+   */
+  until?: string;
   rows: AdDayMetrics[];
 }
 
@@ -116,7 +121,7 @@ export function aggregateCreative(obs: CreativeObservation): CreativeAggregate {
   for (const ad of obs.ads) {
     const from = firstOwnDate(ad);
     for (const row of ad.rows) {
-      if (row.date < from) continue;
+      if (row.date < from || (ad.until !== undefined && row.date >= ad.until)) continue;
       if (!isMetaRowSettled(row)) {
         agg.unsettledRows++;
         continue;

@@ -189,7 +189,7 @@ import {
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { publishWithResolvedBlogPublisher } from './blogPublishers';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
-import { recordGeneratedCreative, stampMetaAdCreated, stampMetaCreativeCreated, stampMetaImageUpload, stampMetaPublish } from './creativeLineage';
+import { recordGeneratedCreative, stampMetaAdCreated, stampMetaAdCreativeChanged, stampMetaCreativeCreated, stampMetaImageUpload, stampMetaPublish } from './creativeLineage';
 import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
@@ -20139,6 +20139,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         }
 
         await recordCreativeLearningReceipt(userId, accountId, adId, newCreativeId, verification.verified);
+        // ENG-2141: the ad's previous creative links end here; link it to the new one if generated.
+        void stampMetaAdCreativeChanged({ userId, accountId, metaCreativeId: String(newCreativeId), adId });
         return {
           success: true,
           message: `Ad updated successfully. Swapped in creative ${newCreativeId}.`,

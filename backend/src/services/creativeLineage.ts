@@ -94,6 +94,17 @@ export interface MetaAdLink {
   linkedAt: string;
 }
 
+/**
+ * The ad stopped carrying this creative: its creative was changed to another one (which may not be
+ * a generated image at all, so it may have no record of its own to link). Performance from this
+ * date on is not this creative's.
+ */
+export interface MetaAdLinkEnd {
+  accountId: string;
+  adId: string;
+  endedAt: string;
+}
+
 export interface CreativeLineageRecord {
   creativeId: string;
   userId: string;
@@ -113,6 +124,9 @@ export interface CreativeLineageRecord {
   metaCreativeIds?: AWS.DynamoDB.DocumentClient.DynamoDbSet;
   metaCreativeLinks?: MetaCreativeLink[];
   metaAdLinks?: MetaAdLink[];
+  /** Ad ids in metaAdLinks (string set), so a later creative change on the ad can find this record. */
+  metaAdIds?: AWS.DynamoDB.DocumentClient.DynamoDbSet;
+  metaAdLinkEnds?: MetaAdLinkEnd[];
   schemaVersion: number;
   createdAt: string;
   updatedAt: string;
@@ -337,7 +351,7 @@ export function collectCreativeMedia(params: MetaCreativeMediaParams): { imageUr
   return { imageUrls: [...imageUrls], imageHashes: [...imageHashes] };
 }
 
-type LookupAttribute = 'metaImageHashes' | 'metaCreativeIds';
+type LookupAttribute = 'metaImageHashes' | 'metaCreativeIds' | 'metaAdIds';
 
 /** This user's creative records (within the lookup window) whose string set holds `value`. */
 async function findUserCreativesContaining(
@@ -423,6 +437,42 @@ async function stampCreative(
   return stamped;
 }
 
+/** True when the ad's latest link on this record is to `metaCreativeId` and has not ended since. */
+function hasOpenAdLink(record: CreativeLineageRecord, accountId: string, adId: string, metaCreativeId: string): boolean {
+  const links = (record.metaAdLinks ?? []).filter((l) => l.accountId === accountId && l.adId === adId);
+  const latest = links.reduce<MetaAdLink | undefined>((a, l) => (!a || l.linkedAt > a.linkedAt ? l : a), undefined);
+  if (!latest || latest.metaCreativeId !== metaCreativeId) return false;
+  return !(record.metaAdLinkEnds ?? []).some((e) => e.accountId === accountId && e.adId === adId && e.endedAt >= latest.linkedAt);
+}
+
+/**
+ * The ad's creative changed: every creative of this user linked to the ad gets an end marker, so
+ * the report stops crediting it from this moment, whether or not the new creative is ours.
+ */
+async function closeAdLinks(
+  ctx: { table: string; db: CreativeLineageDb; now: () => Date },
+  input: { userId: string; accountId: string; adId: string },
+): Promise<string[]> {
+  const closed: string[] = [];
+  const endedAt = ctx.now().toISOString();
+  const end: MetaAdLinkEnd = { accountId: input.accountId, adId: input.adId, endedAt };
+  for (const record of await findUserCreativesContaining(ctx, input.userId, 'metaAdIds', input.adId)) {
+    try {
+      await ctx.db.update({
+        TableName: ctx.table,
+        Key: { creativeId: record.creativeId },
+        UpdateExpression: 'SET metaAdLinkEnds = list_append(if_not_exists(metaAdLinkEnds, :empty), :end), updatedAt = :now',
+        ConditionExpression: 'attribute_exists(creativeId) AND userId = :userId',
+        ExpressionAttributeValues: { ':empty': [], ':end': [end], ':now': endedAt, ':userId': input.userId },
+      });
+      closed.push(record.creativeId);
+    } catch (err) {
+      if (!isConditionFailure(err)) warn(`ad link end for ${record.creativeId} failed (non-fatal)`, err);
+    }
+  }
+  return closed;
+}
+
 async function stampAd(
   ctx: { table: string; db: CreativeLineageDb; now: () => Date },
   input: { userId: string; accountId: string; metaCreativeId: string; adId: string; via: MetaPublishVia },
@@ -430,7 +480,7 @@ async function stampAd(
 ): Promise<string[]> {
   const stamped: string[] = [];
   for (const record of targets) {
-    if (record.metaAdLinks?.some((l) => l.adId === input.adId && l.metaCreativeId === input.metaCreativeId)) {
+    if (hasOpenAdLink(record, input.accountId, input.adId, input.metaCreativeId)) {
       stamped.push(record.creativeId);
       continue;
     }
@@ -448,9 +498,16 @@ async function stampAd(
       await ctx.db.update({
         TableName: ctx.table,
         Key: { creativeId: record.creativeId },
-        UpdateExpression: 'SET metaAdLinks = list_append(if_not_exists(metaAdLinks, :empty), :link), updatedAt = :now',
+        UpdateExpression:
+          'ADD metaAdIds :adIdSet SET metaAdLinks = list_append(if_not_exists(metaAdLinks, :empty), :link), updatedAt = :now',
         ConditionExpression: 'attribute_exists(creativeId) AND userId = :userId',
-        ExpressionAttributeValues: { ':empty': [], ':link': [link], ':now': linkedAt, ':userId': input.userId },
+        ExpressionAttributeValues: {
+          ':adIdSet': ctx.db.stringSet([input.adId]),
+          ':empty': [],
+          ':link': [link],
+          ':now': linkedAt,
+          ':userId': input.userId,
+        },
       });
       stamped.push(record.creativeId);
     } catch (err) {
@@ -517,6 +574,8 @@ export async function stampMetaPublish(
   const ctx = resolveDeps(deps);
   if (!ctx || !input.userId || !input.metaCreativeId || !input.adId) return [];
   try {
+    // A swap replaces what the ad carried before; end those links first so they stop here.
+    if (input.via === 'swap_creative') await closeAdLinks(ctx, input);
     const stamped = await stampCreative(ctx, input);
     const records: CreativeLineageRecord[] = [];
     for (const { creativeId } of stamped) {
@@ -526,6 +585,27 @@ export async function stampMetaPublish(
     return await stampAd(ctx, input, records);
   } catch (err) {
     warn(`publish stamp failed (non-fatal)`, err);
+    return [];
+  }
+}
+
+/**
+ * An existing ad was pointed at an already-built Meta creative (AD UPDATE with creative_id). Ends
+ * the ad's previous links, then links the ad to the generated creatives that Meta creative uses,
+ * if any. Returns the creativeIds newly linked. Never throws.
+ */
+export async function stampMetaAdCreativeChanged(
+  input: { userId: string; accountId: string; metaCreativeId: string; adId: string },
+  deps: CreativeLineageDeps = {},
+): Promise<string[]> {
+  const ctx = resolveDeps(deps);
+  if (!ctx || !input.userId || !input.metaCreativeId || !input.adId) return [];
+  try {
+    await closeAdLinks(ctx, input);
+    const targets = await findUserCreativesContaining(ctx, input.userId, 'metaCreativeIds', input.metaCreativeId);
+    return await stampAd(ctx, { ...input, via: 'swap_creative' }, targets);
+  } catch (err) {
+    warn(`ad creative change stamp failed (non-fatal)`, err);
     return [];
   }
 }

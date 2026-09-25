@@ -17,7 +17,7 @@
 
 import AWS from 'aws-sdk';
 import { ADS_METRICS_TABLE, buildAdEntityKey, type AdsMetricsAdRow } from '../services/adsMetricsDb';
-import { CREATIVE_LINEAGE_TABLE_ENV, type MetaAdLink } from '../services/creativeLineage';
+import { CREATIVE_LINEAGE_TABLE_ENV, type MetaAdLink, type MetaAdLinkEnd } from '../services/creativeLineage';
 import {
   creativePerformanceReport,
   readRubricScore,
@@ -74,13 +74,53 @@ async function readAll(
   return { items, truncated: Boolean(start) };
 }
 
+const adKey = (accountId: string, adId: string): string => `${accountId}#${adId}`;
+
+function linksOf(creative: DocItem): MetaAdLink[] {
+  return Array.isArray(creative.metaAdLinks) ? (creative.metaAdLinks as MetaAdLink[]) : [];
+}
+
+/**
+ * Every moment each ad's creative changed, across ALL scanned creatives: each link start and each
+ * recorded end. One ad can carry several creatives over its life (swaps), so a link's window must
+ * stop at the next change or the later creative's days are credited to the earlier one too.
+ */
+export function adChangeTimes(creatives: ReadonlyArray<DocItem>): Map<string, string[]> {
+  const times = new Map<string, string[]>();
+  const add = (key: string, at: string) => {
+    const list = times.get(key) ?? [];
+    list.push(at);
+    times.set(key, list);
+  };
+  for (const creative of creatives) {
+    for (const link of linksOf(creative)) add(adKey(link.accountId, link.adId), link.linkedAt);
+    const ends = Array.isArray(creative.metaAdLinkEnds) ? (creative.metaAdLinkEnds as MetaAdLinkEnd[]) : [];
+    for (const end of ends) add(adKey(end.accountId, end.adId), end.endedAt);
+  }
+  for (const list of times.values()) list.sort();
+  return times;
+}
+
+/** Exclusive end date for a link: the date of the ad's first change after it, or undefined. */
+export function linkUntil(link: MetaAdLink, changes: Map<string, string[]>): string | undefined {
+  const next = changes.get(adKey(link.accountId, link.adId))?.find((at) => at > link.linkedAt);
+  return next ? next.slice(0, 10) : undefined;
+}
+
+function previousDate(date: string): string {
+  const d = new Date(`${date}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() - 1);
+  return d.toISOString().slice(0, 10);
+}
+
 export async function loadCreativeObservations(reader: ReadOnlyReader, tables: CorrelationTables): Promise<LoadResult> {
   const { items: creatives } = await readAll((start) => reader.scan({
     TableName: tables.lineage,
     FilterExpression: 'attribute_exists(metaAdLinks)',
-    ProjectionExpression: 'creativeId, humanEvalCandidateId, metaAdLinks',
+    ProjectionExpression: 'creativeId, humanEvalCandidateId, metaAdLinks, metaAdLinkEnds',
     ...(start ? { ExclusiveStartKey: start } : {}),
   }));
+  const changes = adChangeTimes(creatives);
 
   const observations: CreativeObservation[] = [];
   let truncatedAds = 0;
@@ -95,20 +135,27 @@ export async function loadCreativeObservations(reader: ReadOnlyReader, tables: C
       rubricScore = readRubricScore(Item?.creativeRubric);
     }
 
-    const links = Array.isArray(creative.metaAdLinks) ? (creative.metaAdLinks as MetaAdLink[]) : [];
     const ads: CreativeObservation['ads'] = [];
     let truncated = false;
-    for (const link of links) {
+    for (const link of linksOf(creative)) {
       const since = String(link.linkedAt ?? '').slice(0, 10);
+      const until = linkUntil(link, changes);
+      const last = until ? previousDate(until) : undefined;
+      const window = { adId: link.adId, via: link.via, linkedAt: link.linkedAt, ...(until ? { until } : {}) };
+      if (last !== undefined && last < since) {
+        ads.push({ ...window, rows: [] });
+        continue;
+      }
+      const entityKey = buildAdEntityKey('meta', link.accountId, link.adId);
       const { items, truncated: cut } = await readAll((start) => reader.query({
         TableName: tables.adsMetrics,
-        KeyConditionExpression: 'entityKey = :entityKey AND #date >= :since',
+        KeyConditionExpression: last ? 'entityKey = :entityKey AND #date BETWEEN :since AND :last' : 'entityKey = :entityKey AND #date >= :since',
         ExpressionAttributeNames: { '#date': 'date' },
-        ExpressionAttributeValues: { ':entityKey': buildAdEntityKey('meta', link.accountId, link.adId), ':since': since },
+        ExpressionAttributeValues: { ':entityKey': entityKey, ':since': since, ...(last ? { ':last': last } : {}) },
         ...(start ? { ExclusiveStartKey: start } : {}),
       }), MAX_AD_PAGES);
       if (cut) truncated = true;
-      ads.push({ adId: link.adId, via: link.via, linkedAt: link.linkedAt, rows: items as unknown as AdsMetricsAdRow[] });
+      ads.push({ ...window, rows: items as unknown as AdsMetricsAdRow[] });
     }
     if (truncated) {
       truncatedAds++;
