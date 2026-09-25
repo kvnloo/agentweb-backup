@@ -110,6 +110,21 @@ describe('approvalInboxSlack', () => {
       expect(result).toEqual({ posted: true });
     });
 
+    it('renders subjectLabel as its own distinct line, not folded into businessImpact (ENG-2159)', async () => {
+      mockListPending.mockResolvedValue([
+        { decisionId: 'd1', subjectLabel: 'Vincent Hu · TriCityAI 2041725529929988', businessImpact: 'Needs sign-off on the campaign build.', evidencePacket: {}, options: [] },
+      ]);
+
+      await approvalInboxSlack.upsertApproverQueueMessage('matt');
+
+      const call = mockPostMessage.mock.calls[0][0];
+      const rendered = JSON.stringify(call.blocks);
+      expect(rendered).toContain('Vincent Hu · TriCityAI 2041725529929988');
+      // Both lines present and distinct — the fix isn't complete if
+      // subjectLabel silently replaced businessImpact instead of joining it.
+      expect(rendered).toContain('Needs sign-off on the campaign build.');
+    });
+
     it('updates an existing tracked message in place, no new post', async () => {
       mockGetSetting.mockImplementation(async (name: string) =>
         name === 'approval_inbox_message_ref_matt'

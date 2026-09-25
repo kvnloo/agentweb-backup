@@ -36,6 +36,7 @@ const baseDecision: any = {
   gateType: 'customer_credential',
   audience: 'customer',
   customerId: 'cust-1',
+  subjectLabel: 'Meta Ad Account act_123',
   businessImpact: 'Your ad account needs to be reconnected.',
   customerActionUrl: 'https://app.agentweb.pro/settings?tab=connected-accounts&platform=meta',
 };
@@ -63,6 +64,9 @@ describe('notifyCustomerOfPendingCredentialDecision', () => {
     expect(text).toContain('Your ad account needs to be reconnected.');
     expect(text).toContain(baseDecision.customerActionUrl);
     expect(html).toContain(baseDecision.customerActionUrl);
+    // ENG-2159: subjectLabel present alongside businessImpact, not instead of it.
+    expect(text).toContain('Meta Ad Account act_123');
+    expect(html).toContain('Meta Ad Account act_123');
   });
 
   it('prefers decision.customerEmail over a DB lookup when both are present', async () => {
@@ -109,6 +113,7 @@ describe('notifyCustomerOfExpiredCredentialDecision (review fix)', () => {
     expect(subject.toLowerCase()).toContain('closed');
     expect(text).toContain(baseDecision.businessImpact);
     expect(text.toLowerCase()).toContain('closed');
+    expect(text).toContain('Meta Ad Account act_123');
   });
 
   it('fires an oncall alert and sends no email when no email is resolvable', async () => {

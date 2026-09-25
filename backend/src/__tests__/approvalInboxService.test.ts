@@ -46,6 +46,7 @@ const PAST = '2000-01-01T00:00:00.000Z';
 const metaWriteRequest = (overrides: Partial<any> = {}) => ({
   gateType: 'meta_write' as const,
   approver: 'matt' as const,
+  subjectLabel: 'Test Account · Meta Ad Set acc-1',
   businessImpact: 'Pauses an underperforming ad set.',
   evidencePacket: { chatUrl: 'https://example.com/chat/1' },
   metaWriteManifestDigest: 'digest-abc-123',
@@ -77,8 +78,25 @@ describe('approvalInboxService.createDecision', () => {
     expect(mockDynamoDB.get).toHaveBeenCalled();
   });
 
+  it('rejects a decision with no subjectLabel — regardless of audience or gateType (ENG-2159)', async () => {
+    const missing = { gateType: 'plan_choice' as const, approver: 'fangfang' as const, businessImpact: 'x', evidencePacket: {}, options: [
+      { id: 'a', label: 'A', consequence: 'x', recommended: true },
+      { id: 'b', label: 'B', consequence: 'x' },
+    ], expiresAt: FUTURE };
+    await expect(service.createDecision(missing as any)).rejects.toThrow(/subjectLabel/);
+
+    const blank = { ...missing, subjectLabel: '   ' };
+    await expect(service.createDecision(blank as any)).rejects.toThrow(/subjectLabel/);
+  });
+
+  it('persists subjectLabel onto the created record', async () => {
+    mockDynamoDB.put.mockReturnValue(ok());
+    const decision = await service.createDecision(metaWriteRequest({ subjectLabel: 'Vincent Hu · TriCityAI 2041725529929988' }));
+    expect(decision.subjectLabel).toBe('Vincent Hu · TriCityAI 2041725529929988');
+  });
+
   it('rejects a plan_choice decision with fewer than 2 or more than 4 options', async () => {
-    const tooFew = { gateType: 'plan_choice' as const, approver: 'fangfang' as const, businessImpact: 'x', evidencePacket: {}, options: [{ id: 'a', label: 'A', consequence: 'x', recommended: true }], expiresAt: FUTURE };
+    const tooFew = { gateType: 'plan_choice' as const, approver: 'fangfang' as const, subjectLabel: 'Test Account', businessImpact: 'x', evidencePacket: {}, options: [{ id: 'a', label: 'A', consequence: 'x', recommended: true }], expiresAt: FUTURE };
     await expect(service.createDecision(tooFew as any)).rejects.toThrow(ApprovalInboxError);
   });
 
@@ -132,7 +150,7 @@ describe('approvalInboxService.createDecision', () => {
   it('a valid customer_credential decision gets audience=customer and status=pending_customer_response, never the team pending status', async () => {
     mockDynamoDB.put.mockReturnValue(ok());
     const decision = await service.createDecision({
-      gateType: 'customer_credential', customerId: 'cust-1', businessImpact: 'Needs a fresh OAuth token.',
+      gateType: 'customer_credential', customerId: 'cust-1', subjectLabel: 'Test Customer · Meta Ad Account act_123', businessImpact: 'Needs a fresh OAuth token.',
       evidencePacket: {}, customerActionUrl: 'https://app.agentweb.pro/settings?tab=connected-accounts',
       credentialPlatform: 'meta', credentialAccountId: 'act_123', expiresAt: FUTURE,
     } as any);
@@ -174,7 +192,7 @@ describe('approvalInboxService.createDecision', () => {
   it('review fix: linkedin_ads is accepted — a distinct platform from linkedin, now wired to its own reconnect route', async () => {
     mockDynamoDB.put.mockReturnValue(ok());
     const decision = await service.createDecision({
-      gateType: 'customer_credential', customerId: 'cust-1', businessImpact: 'x', evidencePacket: {},
+      gateType: 'customer_credential', customerId: 'cust-1', subjectLabel: 'Test Customer · LinkedIn Ads urn:li:sponsoredAccount:111', businessImpact: 'x', evidencePacket: {},
       customerActionUrl: 'https://x', credentialPlatform: 'linkedin_ads', credentialAccountId: 'urn:li:sponsoredAccount:111', expiresAt: FUTURE,
     } as any);
     expect(decision.credentialPlatform).toBe('linkedin_ads');
