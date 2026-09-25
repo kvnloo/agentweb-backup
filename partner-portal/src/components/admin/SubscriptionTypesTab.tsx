@@ -100,6 +100,7 @@ const AVAILABLE_CONNECTED_ACCOUNTS = [
   { id: 'attio', label: 'Attio' },
   { id: 'google_ads', label: 'Google Ads' },
   { id: 'google_drive', label: 'Google Drive' },
+  { id: 'linkedin_ads', label: 'LinkedIn Ads' },
 ];
 
 interface AvailableSkill {
