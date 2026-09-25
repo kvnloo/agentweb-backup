@@ -10094,6 +10094,23 @@ export class AgentModeService {
       // Create messages for vision API
       const messages = [
         {
+          role: 'system' as const,
+          // Describe only what is visibly on screen. A vision model has no way to
+          // confirm from a single image whether a depicted product, version number,
+          // or model name currently exists — its training data has a cutoff, and
+          // the subject may simply postdate it (this exact prompt has previously
+          // caused a real AgentWeb screenshot of AgentWeb's own model picker to be
+          // called a "fictional mockup" of models that "don't exist"). Authenticity/
+          // existence verdicts are a caller decision (verified via search or other
+          // tools), never this tool's to assert.
+          content:
+            'You describe images factually. Report only what is visibly present: text, layout, colors, objects, ' +
+            'and composition. Never assert or speculate about whether depicted content — a product, brand, ' +
+            'version number, model name, or claim — is real, fake, fictional, outdated, or currently exists. ' +
+            'You cannot verify that from an image alone, and confident guesses here are frequently wrong. If ' +
+            'something looks unfamiliar, describe it neutrally exactly as shown, without a verdict on its legitimacy.'
+        },
+        {
           role: 'user' as const,
           content: [
             {
