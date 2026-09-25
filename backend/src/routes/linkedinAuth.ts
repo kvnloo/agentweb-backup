@@ -368,43 +368,29 @@ router.post('/connect-accounts', authenticateToken, async (req: any, res) => {
 
   try {
     const config = await getLinkedInConfig();
-    const connectedAccounts = [];
+    // Fix: a per-item createAccount failure used to abort the whole
+    // personal+organizations sequence via the outer catch below, returning
+    // one blanket 500 — but an earlier item (personal, or an earlier org in
+    // the loop) may have already durably connected and, if a matching
+    // pending customer_credential decision existed for it, already been
+    // auto-resolved (claimed + executed + origin session notified). That
+    // can't be undone by a retry, yet the client had no way to know the
+    // earlier item actually succeeded. Now each item's createAccount is
+    // isolated so one failure doesn't lose the others' real progress or
+    // misreport it as total failure.
+    const connectedAccounts: any[] = [];
+    const failedAccounts: { account_id: string; error: string }[] = [];
 
     // Connect personal account if selected
     if (personal && profile) {
-      const accountInput = {
-        account_id: profile.urn,
-        account_name: profile.name,
-        config: {
-          account_type: 'personal' as const,
-          profile_id: profile.urn,
-          profile_image_url: profile.picture,
-          access_token: tokens.access_token,
-          refresh_token: tokens.refresh_token,
-          token_expires_at: Date.now() + (tokens.expires_in * 1000),
-          scopes: config.scopes
-        }
-      };
-
-      const account = await createAccount(userId, 'linkedin', accountInput);
-      connectedAccounts.push(account);
-
-      await safeAutoResolve('LinkedIn Connect', userId, 'linkedin', profile.urn);
-    }
-
-    // Connect selected organizations
-    if (organizations && Array.isArray(organizations)) {
-      for (const org of organizations) {
+      try {
         const accountInput = {
-          account_id: org.urn,
-          account_name: org.name,
+          account_id: profile.urn,
+          account_name: profile.name,
           config: {
-            account_type: 'company_page' as const,
-            page_id: org.id,
-            organization_id: org.urn,
-            profile_image_url: org.logoUrl,
-            follower_count: org.followerCount,
-            account_handle: org.vanityName,
+            account_type: 'personal' as const,
+            profile_id: profile.urn,
+            profile_image_url: profile.picture,
             access_token: tokens.access_token,
             refresh_token: tokens.refresh_token,
             token_expires_at: Date.now() + (tokens.expires_in * 1000),
@@ -415,12 +401,62 @@ router.post('/connect-accounts', authenticateToken, async (req: any, res) => {
         const account = await createAccount(userId, 'linkedin', accountInput);
         connectedAccounts.push(account);
 
-        // ENG-1644 gap-closing: same as the personal-account case above.
-        await safeAutoResolve('LinkedIn Connect (org)', userId, 'linkedin', org.urn);
+        await safeAutoResolve('LinkedIn Connect', userId, 'linkedin', profile.urn);
+      } catch (itemError: any) {
+        console.error('[LinkedIn Connect Accounts] Failed to connect personal account:', itemError);
+        failedAccounts.push({ account_id: profile.urn, error: itemError?.message || 'Unknown error' });
       }
     }
 
-    res.json({ success: true, accounts: connectedAccounts });
+    // Connect selected organizations
+    if (organizations && Array.isArray(organizations)) {
+      for (const org of organizations) {
+        try {
+          const accountInput = {
+            account_id: org.urn,
+            account_name: org.name,
+            config: {
+              account_type: 'company_page' as const,
+              page_id: org.id,
+              organization_id: org.urn,
+              profile_image_url: org.logoUrl,
+              follower_count: org.followerCount,
+              account_handle: org.vanityName,
+              access_token: tokens.access_token,
+              refresh_token: tokens.refresh_token,
+              token_expires_at: Date.now() + (tokens.expires_in * 1000),
+              scopes: config.scopes
+            }
+          };
+
+          const account = await createAccount(userId, 'linkedin', accountInput);
+          connectedAccounts.push(account);
+
+          // ENG-1644 gap-closing: same as the personal-account case above.
+          await safeAutoResolve('LinkedIn Connect (org)', userId, 'linkedin', org.urn);
+        } catch (itemError: any) {
+          console.error(`[LinkedIn Connect Accounts] Failed to connect organization ${org.urn}:`, itemError);
+          failedAccounts.push({ account_id: org.urn, error: itemError?.message || 'Unknown error' });
+        }
+      }
+    }
+
+    // Nothing succeeded at all — same response shape as before this fix, so
+    // an all-fail request behaves exactly as it always has.
+    if (connectedAccounts.length === 0) {
+      const details = IS_PRODUCTION ? undefined : failedAccounts.map(f => f.error).join('; ');
+      return res.status(500).json({ error: 'Failed to connect accounts', ...(details && { details }), failed: failedAccounts });
+    }
+
+    // At least one real success — 200 either way (existing frontend reads
+    // `success`/`accounts.length` and keeps working unchanged;
+    // `partialFailure`/`failed` are new, additive fields a client can use
+    // later, ignored harmlessly today).
+    res.json({
+      success: true,
+      accounts: connectedAccounts,
+      ...(failedAccounts.length > 0 ? { partialFailure: true, failed: failedAccounts } : {}),
+    });
 
   } catch (error: any) {
     console.error('[LinkedIn Connect Accounts] Error:', error);

@@ -349,31 +349,60 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
             return res.status(400).json({ error: 'Invalid or expired token session' });
         }
 
-        const connectedAccounts = [];
+        // Fix: a per-item createAccount failure used to abort the whole loop
+        // via the outer catch below, returning one blanket 500 — but an
+        // earlier item in the SAME loop may have already durably connected
+        // and, if a matching pending customer_credential decision existed
+        // for it, already been auto-resolved (claimed + executed + origin
+        // session notified). That can't be undone by a retry, yet the
+        // client had no way to know the earlier item actually succeeded.
+        // Now each item's createAccount is isolated so one failure doesn't
+        // lose the others' real progress or misreport it as total failure.
+        const connectedAccounts: any[] = [];
+        const failedAccounts: { account_id: string; error: string }[] = [];
         for (const adAccount of adAccounts) {
-            const account = await createAccount(userId, 'meta', {
-                account_id: adAccount.account_id,
-                account_name: adAccount.name,
-                config: {
-                    account_type: 'ad_account',
-                    ad_account_id: adAccount.account_id,
-                    currency: adAccount.currency,
-                    account_status: adAccount.account_status,
-                    access_token: session.access_token,
-                    token_expires_at: session.expires_in ? Date.now() + (session.expires_in * 1000) : Date.now() + (60 * 24 * 60 * 60 * 1000),
-                    scopes: session.scopes,
-                    // Authoritative capability signal, read back by getMetaAdsScopeState.
-                    // Omitted (not []) when undetermined, so "we could not ask" never
-                    // masquerades as "nothing was granted" (ENG-629).
-                    ...(session.granted_scopes ? { granted_scopes: session.granted_scopes } : {}),
-                }
-            });
-            connectedAccounts.push(account);
+            try {
+                const account = await createAccount(userId, 'meta', {
+                    account_id: adAccount.account_id,
+                    account_name: adAccount.name,
+                    config: {
+                        account_type: 'ad_account',
+                        ad_account_id: adAccount.account_id,
+                        currency: adAccount.currency,
+                        account_status: adAccount.account_status,
+                        access_token: session.access_token,
+                        token_expires_at: session.expires_in ? Date.now() + (session.expires_in * 1000) : Date.now() + (60 * 24 * 60 * 60 * 1000),
+                        scopes: session.scopes,
+                        // Authoritative capability signal, read back by getMetaAdsScopeState.
+                        // Omitted (not []) when undetermined, so "we could not ask" never
+                        // masquerades as "nothing was granted" (ENG-629).
+                        ...(session.granted_scopes ? { granted_scopes: session.granted_scopes } : {}),
+                    }
+                });
+                connectedAccounts.push(account);
 
-            await safeAutoResolve('Meta Connect Ad Accounts', userId, 'meta', adAccount.account_id);
+                await safeAutoResolve('Meta Connect Ad Accounts', userId, 'meta', adAccount.account_id);
+            } catch (itemError: any) {
+                console.error(`[Meta Connect Ad Accounts] Failed to connect account ${adAccount.account_id}:`, itemError);
+                failedAccounts.push({ account_id: adAccount.account_id, error: itemError?.message || 'Unknown error' });
+            }
         }
 
-        res.json({ success: true, connectedAccounts });
+        // Nothing succeeded at all — same response shape as before this fix,
+        // so an all-fail request behaves exactly as it always has.
+        if (connectedAccounts.length === 0) {
+            return res.status(500).json({ error: 'Failed to connect Meta ad accounts', failed: failedAccounts });
+        }
+
+        // At least one real success — 200 either way (existing frontend
+        // reads `success`/`connectedAccounts.length` and keeps working
+        // unchanged; `partialFailure`/`failed` are new, additive fields a
+        // client can use later, ignored harmlessly today).
+        res.json({
+            success: true,
+            connectedAccounts,
+            ...(failedAccounts.length > 0 ? { partialFailure: true, failed: failedAccounts } : {}),
+        });
 
     } catch (error: any) {
         console.error('[Meta Connect Ad Accounts] Error:', error);
