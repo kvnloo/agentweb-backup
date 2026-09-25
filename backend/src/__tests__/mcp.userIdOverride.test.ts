@@ -39,9 +39,25 @@ jest.mock('@modelcontextprotocol/sdk/types.js', () => ({
 const mockExecute = jest.fn().mockResolvedValue({ success: true });
 jest.mock('../mcp/server/registry', () => ({
   mcpToolRegistry: {
+    register: jest.fn(),
     getToolDefinitions: jest.fn().mockReturnValue([]),
+    getTool: jest.fn().mockReturnValue(undefined),
     execute: (...args: any[]) => mockExecute(...args),
-  }
+  },
+  // evaluationTools.ts (pulled in transitively via mcpServerCore's import chain, same
+  // reason apiTools/workflowTools are stubbed below) does `new McpToolRegistry()` via
+  // emma/registry.ts and then `emmaToolRegistry.register(mcpToolRegistry.getTool(...))`.
+  // This suite exercises the IDOR dispatch, not tool registration, so a no-op class
+  // stub is enough to satisfy that side-effecting import without doing real work.
+  McpToolRegistry: jest.fn().mockImplementation(() => ({
+    register: jest.fn(),
+    getToolDefinitions: jest.fn().mockReturnValue([]),
+    getAllToolDefinitions: jest.fn().mockReturnValue([]),
+    getToolNames: jest.fn().mockReturnValue([]),
+    getTool: jest.fn().mockReturnValue(undefined),
+    getAllTools: jest.fn().mockReturnValue([]),
+    execute: jest.fn(),
+  })),
 }));
 
 jest.mock('../mcp/server/apiTools', () => ({}));

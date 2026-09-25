@@ -489,7 +489,12 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         ['claude-opus', ['anthropic.claude-opus-5']],
         ['claude-sonnet', []],
         ['claude-fable', []],
-        [undefined, []],
+        // GPT-6 Sol ("Strong reasoning at half the price of GPT-5.6 Sol") was added
+        // alongside modelSupersession.ts's name-inferred product-line dominance —
+        // neither Sol variant carries an explicit `family`, but both infer to the
+        // same "sol" line, and GPT-6 Sol genuinely dominates (cheaper, equal-or-
+        // better quality). No longer an empty family-less bucket.
+        [undefined, ['openrouter/openai/gpt-5.6-sol']],
       ])('ENG-1786: %s keeps its baseline dominance-only legacy rows', async (family, expected) => {
         // Baseline includes ENG-1784 bands and ENG-1781 Luna pricing.
         // Static legacy rows remain covered by the existing legacy tests.

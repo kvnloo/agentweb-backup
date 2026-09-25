@@ -4,6 +4,7 @@ import { chatbotDb, generateChatResponse } from '../services/chatbotService';
 import { checkTokenUsage, toCustomerTokenUsage } from '../services/tokenUsageService';
 import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
 import { userDb } from '../services/db';
+import { resolveRunFunding, withRunFunding } from '../services/funding/runFunding';
 
 // Create a new chat session
 export const createChatSession = async (req: AuthenticatedRequest, res: Response) => {
@@ -174,7 +175,15 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
       const isDelegatedAdmin = delegateInfo?.isDelegated === true;
       const adminEmail = isDelegatedAdmin ? delegateInfo.adminEmail : undefined;
       const orgRole = userId ? (await userDb.getUserById(userId))?.orgRole : undefined;
-      const response = await generateChatResponse(sessionId, message, { currentUrl, pageContent: pageContext, portalType, userId, structuredContext, screenshot, model, isDelegatedAdmin: isDelegatedAdmin || undefined, adminEmail, orgRole });
+      // ENG-1816 F1: without this, chatbotService's embeddings-attribution fix is a
+      // silent no-op on this entry point — currentRunFunding() would read undefined.
+      // Guarded on userId: anonymous chat has no owner to attribute to, unchanged from
+      // today. resolveRunFunding always resolves 'agentweb', so nothing observable changes.
+      const response = userId
+        ? await withRunFunding(await resolveRunFunding({ userId }), () =>
+            generateChatResponse(sessionId, message, { currentUrl, pageContent: pageContext, portalType, userId, structuredContext, screenshot, model, isDelegatedAdmin: isDelegatedAdmin || undefined, adminEmail, orgRole }),
+          )
+        : await generateChatResponse(sessionId, message, { currentUrl, pageContent: pageContext, portalType, userId, structuredContext, screenshot, model, isDelegatedAdmin: isDelegatedAdmin || undefined, adminEmail, orgRole });
       
       // Get updated session with the new messages
       const updatedSession = await chatbotDb.getChatSession(sessionId);
@@ -280,7 +289,11 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
     const isDelegatedAdmin = delegateInfo?.isDelegated === true;
     const adminEmail = isDelegatedAdmin ? delegateInfo.adminEmail : undefined;
     const orgRole = (await userDb.getUserById(userId))?.orgRole;
-    const response = await generateChatResponse(
+    // ENG-1816 F1: without this, chatbotService's embeddings-attribution fix is a
+    // silent no-op on this entry point — currentRunFunding() would read undefined.
+    // Session ownership is already verified above, so userId is always present here.
+    const runFunding = await resolveRunFunding({ userId });
+    const response = await withRunFunding(runFunding, () => generateChatResponse(
       sessionId, message,
       {
         currentUrl, pageContent: pageContext, portalType, userId,
@@ -288,7 +301,7 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
         isDelegatedAdmin: isDelegatedAdmin || undefined, adminEmail, orgRole,
         onToolStart: (toolName: string) => sendEvent({ type: 'tool_start', name: toolName })
       }
-    );
+    ));
 
     const updatedSession = await chatbotDb.getChatSession(sessionId);
     const formattedResponse = typeof response === 'string' ? { content: response } : response;
