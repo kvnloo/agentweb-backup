@@ -1,4 +1,4 @@
-import { adsLayerConnection, deriveQuickStatus, quickSummary } from '../clientHealthStatus';
+import { adsLayerConnection, campaignCountLabel, deriveQuickStatus, quickSummary } from '../clientHealthStatus';
 
 const base = { has_ads: true, has_lander: true, has_crm: true };
 
@@ -44,5 +44,14 @@ describe('adsLayerConnection (ENG-2133, #3070 review)', () => {
     expect(adsLayerConnection({ connected: false, connection: 'never_connected' })).toBe('never_connected');
     expect(adsLayerConnection({ connected: true })).toBe('connected');
     expect(adsLayerConnection({ connected: false })).toBe('never_connected');
+  });
+});
+
+describe('campaignCountLabel (ENG-2133, #3070 review)', () => {
+  it('never presents an incomplete read as a confirmed count', () => {
+    expect(campaignCountLabel({ active_campaigns: 3, campaigns_complete: true })).toBe('3');
+    expect(campaignCountLabel({ active_campaigns: 3 })).toBe('3');
+    expect(campaignCountLabel({ active_campaigns: 2, campaigns_complete: false })).toBe('2+ (read incomplete)');
+    expect(campaignCountLabel({ active_campaigns: 0, campaigns_complete: false })).toBe('Unconfirmed (read incomplete)');
   });
 });
