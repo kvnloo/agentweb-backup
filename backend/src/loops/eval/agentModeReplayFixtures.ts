@@ -40,6 +40,12 @@
  * `thresholdSource`'s ENG-1309/1310/1311 criterion reference plus the
  * private Linear issue text, not via anything committed here.
  *
+ * ENG-2135 resolved ENG-1314 (decision D2, option 3 generalised): the real
+ * turns are fetched at run time from production by
+ * agentModeReplayFixtureSource.ts, for every fixture a golden-set case links
+ * to; this file keeps the synthetic placeholders as the fallback when the
+ * store is not provisioned or holds no link.
+ *
  * Only 3 of the 5 sessions have an explicit NUMERIC threshold in the
  * human-written text (ENG-1309's own acceptance criteria — see
  * thresholdSource on each). The other two are judge-dimension assertions
@@ -61,7 +67,8 @@ export interface JudgeReplayFixture {
   label: string;
   /** Where the numeric threshold came from, or why there isn't one yet. */
   thresholdSource: string;
-  /** Always true until ENG-1314 resolves and real content replaces `turns`. */
+  /** True for the synthetic `turns` below; false once agentModeReplayFixtureSource.ts
+   * has swapped in the real turn from the golden-set store. */
   isPlaceholder: boolean;
   /** True when no numeric char/word threshold exists in the human-written
    * text yet — registered for CI-coverage visibility, never gates a build. */
