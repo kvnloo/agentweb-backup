@@ -1,26 +1,9 @@
 import { getOpenAIClient, meterUsageFromResponse } from './llmClients';
+import { getSecret } from './secretsManager';
 
-/**
- * Lightweight embeddings helper, intentionally free of AWS / secrets-manager side effects
- * so it can be imported from routes and services without dragging in heavy module graphs.
- *
- * Uses the same Azure OpenAI embeddings deployment (text-embedding-3-large, 1536 dims) the
- * in-app chatbot already relies on, so relevance-based memory reuses capacity we already pay
- * for — no new vector database or API key.
- */
-const embeddingsClientOptions = {
-  apiKey: process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY,
-  baseURL: `${
-    process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT
-  }/openai/deployments/${
-    process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT || 'text-embedding-3-large'
-  }`,
-  defaultQuery: {
-    'api-version':
-      process.env.AZURE_OPENAI_EMBEDDINGS_API_VERSION || '2024-08-01-preview',
-  },
-  defaultHeaders: { 'api-key': process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY },
-};
+// Keep the model and output size fixed across all embedding callers.
+const EMBEDDING_MODEL = 'openai/text-embedding-3-large';
+const EMBEDDING_DIMENSIONS = 3072;
 
 /**
  * Embed arbitrary text. Returns null on empty input or any failure, so callers can degrade
@@ -36,24 +19,32 @@ export async function embedText(
 ): Promise<number[] | null> {
   try {
     if (!text || !text.trim()) return null;
-    const model = process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT || 'text-embedding-3-large';
+    const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+    const apiKey = (process.env.OPENROUTER_API_KEY ||
+      await getSecret(`${environment}/AgentWeb/OpenRouter`)).trim();
+    if (!apiKey) throw new Error('OpenRouter API key is empty');
     // Un-metered client + explicit meter below so the spend is CHARGED (not just
     // recorded) when a userId is present. metered:false avoids double-recording.
     const embeddingsClient = getOpenAIClient(
       { userId: meterCtx?.userId, feature: meterCtx?.feature || 'embeddings' },
-      embeddingsClientOptions,
+      { apiKey, baseURL: 'https://openrouter.ai/api/v1' },
       { metered: false },
     );
     const response = await embeddingsClient.embeddings.create({
-      model,
+      model: EMBEDDING_MODEL,
       input: text,
-      dimensions: 1536,
+      dimensions: EMBEDDING_DIMENSIONS,
     });
     meterUsageFromResponse(
-      { userId: meterCtx?.userId, model, provider: 'azure-openai', feature: meterCtx?.feature || 'embeddings' },
+      { userId: meterCtx?.userId, model: EMBEDDING_MODEL, provider: 'openrouter', feature: meterCtx?.feature || 'embeddings' },
       response,
     );
-    return response.data[0].embedding;
+    const embedding = Array.isArray(response?.data) ? response.data[0]?.embedding : undefined;
+    if (!Array.isArray(embedding) || embedding.length !== EMBEDDING_DIMENSIONS ||
+        !embedding.every(value => typeof value === 'number' && Number.isFinite(value))) {
+      throw new Error('Invalid embedding vector');
+    }
+    return embedding;
   } catch (error) {
     console.error('[embedText] Failed to embed text:', error);
     return null;

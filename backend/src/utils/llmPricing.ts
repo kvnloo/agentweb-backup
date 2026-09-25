@@ -320,6 +320,7 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'openrouter/perplexity/sonar-pro-search': withDerivedCache(3, 15),
 
   // ── Embeddings (output side is always 0 — embeddings have no completion) ────
+  'openai/text-embedding-3-large': { inPerM: 0.13, outPerM: 0 },
   'text-embedding-3-large': { inPerM: 0.13, outPerM: 0 },
   'text-embedding-3-small': { inPerM: 0.02, outPerM: 0 },
   'text-embedding-ada-002': { inPerM: 0.1, outPerM: 0 },

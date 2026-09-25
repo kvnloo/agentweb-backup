@@ -1,6 +1,6 @@
 import OpenAI from "openai";
-import { getAzureClient } from "../utils/llmClients";
 import { currentRunFunding } from "./funding/runFunding";
+import { embedText } from "../utils/embeddings";
 import { v4 as uuidv4 } from "uuid";
 import AWS from "aws-sdk";
 import dotenv from "dotenv";
@@ -61,34 +61,6 @@ export const dynamodb = new AWS.DynamoDB.DocumentClient({
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
   },
 });
-
-// Metered client for embeddings (knowledge-base semantic search). Uses the
-// separate EMBEDDINGS endpoint/key/api-version the module singleton used.
-// ENG-1816 F1: previously carried no userId, so usage was attributed to platform
-// overhead. Read the run's owner from the ambient store instead of threading a new
-// parameter through this function and its two call sites in findRelevantChunks.
-function embeddingsClientFor() {
-  return getAzureClient(
-    {
-      feature: "embeddings",
-      userId: currentRunFunding()?.ownerUserId,
-      // billingUserId deliberately omitted: unlike the callLLM-routed sites (blog.ts,
-      // agentModeService.ts step-removal judge), this reaches recordUsage directly
-      // (getAzureClient -> wrapOpenAICompatible -> fireRecord -> recordUsage), which
-      // has no org-root resolution to suppress today — but keeping the field out
-      // here too means a future refactor onto meterUserUsage/meterWithResolvedBilling
-      // can't silently reintroduce the ENG-1217 bug fixed 3 times elsewhere in this
-      // PR (round-5 PR review finding).
-    },
-    process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT || "text-embedding-3-large",
-    {
-      endpoint: process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT,
-      apiKey: process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY,
-      apiVersion:
-        process.env.AZURE_OPENAI_EMBEDDINGS_API_VERSION || "2024-08-01-preview",
-    }
-  );
-}
 
 // Interface for message feedback
 export interface MessageFeedback {
@@ -608,27 +580,15 @@ async function findRelevantChunks(
   if (chunks.length === 0) return [];
 
   try {
-    // For simple semantic search, we'll use OpenAI embeddings
-    const queryEmbeddingResponse = await embeddingsClientFor().embeddings.create({
-      model: `${process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT}`,
-      input: query,
-      dimensions: 1536,
-    });
+    const meterCtx = { userId: currentRunFunding()?.ownerUserId, feature: 'embeddings' };
+    const queryEmbedding = await embedText(query, meterCtx);
+    if (!queryEmbedding) return keywordBasedChunkRetrieval(query, chunks, maxChunks);
 
-    const queryEmbedding = queryEmbeddingResponse.data[0].embedding;
-
-    // Get embeddings for all chunks (in a real system, you'd cache these)
     const chunkEmbeddings = await Promise.all(
       chunks.map(async (chunk) => {
-        const response = await embeddingsClientFor().embeddings.create({
-          model: `${process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT}`,
-          input: chunk.content,
-          dimensions: 1536,
-        });
-        return {
-          chunk,
-          embedding: response.data[0].embedding,
-        };
+        const embedding = await embedText(chunk.content, meterCtx);
+        if (!embedding) throw new Error('Chunk embedding unavailable');
+        return { chunk, embedding };
       })
     );
 
