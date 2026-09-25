@@ -107,8 +107,9 @@ export function buildCutoffPopulation(data: BacktestData, cutoffMs: number, hori
       out.excludedAlreadyChurned++;
       continue;
     }
-    // An account whose first subscription starts after C was not paying yet.
-    if (creates.length > 0 && Math.min(...creates) > cutoffMs && !events.some((e) => e.at <= cutoffMs)) {
+    // An account whose first subscription starts after C was not paying yet. Only subscription
+    // evidence counts: a failed checkout before C does not make the account a paying one.
+    if (creates.length > 0 && Math.min(...creates) > cutoffMs && !reactivations.some((t) => t <= cutoffMs)) {
       out.excludedNotYetPaying++;
       continue;
     }
