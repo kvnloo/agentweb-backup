@@ -334,7 +334,14 @@ describe("brandGuidelines write — Scenario 6: org admin can POST /guidelines",
       .field("brandName", "Acme Corp");
 
     expect(res.status).toBe(201);
-    expect(mockUpdateOrg).toHaveBeenCalledWith(ORG_ID, expect.objectContaining({ brandGuidelines: expect.any(Object) }));
+    // brand.ts's org-level write path passes a CAS `condition` as a third arg
+    // (guards against clobbering a concurrent editor's save) — assert on that
+    // shape too rather than only the first two args.
+    expect(mockUpdateOrg).toHaveBeenCalledWith(
+      ORG_ID,
+      expect.objectContaining({ brandGuidelines: expect.any(Object) }),
+      expect.objectContaining({ condition: expect.any(Object) })
+    );
   });
 });
 

@@ -3,6 +3,7 @@
 import { AgentModeService } from '../services/agentModeService';
 import * as autoHumanEvalService from '../services/autoHumanEvalService';
 import * as imageGeneration from '../services/imageGeneration';
+import { evaluateCreativeGates } from '../services/creativeGates';
 
 // Mock dependencies
 jest.mock('../services/imageGeneration');
@@ -75,6 +76,27 @@ describe('AgentModeService - generate_image function', () => {
           artifactUrl: 'https://example.com/image.png',
         }),
       }));
+    });
+
+    it('stores the generation-time creative gate result on the human-eval candidate (ENG-2139)', async () => {
+      const gates = evaluateCreativeGates(
+        { bytes: 2048, decoded: true, width: 1024, height: 1024, format: 'png', luminanceStdDev: 30 },
+        { requestedSize: '9:16' },
+      );
+      mockImageService.generateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/story.png',
+        filename: 'story.png',
+        gates,
+      });
+      const service = agentModeService as unknown as {
+        generateImage(...args: unknown[]): Promise<{ success: boolean }>;
+      };
+
+      const result = await service.generateImage('Story ad', 'story.png', '9:16', 'medium', [], 'user123', 'session123', 'gemini-3-pro-image-preview', undefined, undefined, 'ad');
+
+      expect(result).toMatchObject({ success: true });
+      expect(enqueueAutoHumanEvalSpy).toHaveBeenCalledWith(expect.objectContaining({ creativeGates: gates }));
     });
 
     it('should pass size parameter as-is without modification', async () => {

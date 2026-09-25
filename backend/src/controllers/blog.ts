@@ -3,6 +3,7 @@ import { imageService } from "../services/imageGeneration";
 import { getSecret } from '../utils/secretsManager';
 import { agentModeService } from '../services/agentModeService';
 import { CONTENT_RESTYLE_MODEL } from '../config';
+import { currentRunFunding, resolveRunFunding, withRunFunding } from '../services/funding/runFunding';
 import axios from "axios";
 import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
@@ -436,12 +437,26 @@ ${researchContext}`;
 CRITICAL REQUIREMENT: The article content must be approximately ${finalTargetWords} words in length. This is a hard requirement. The content field in your JSON response must contain at least ${Math.floor(finalTargetWords * 0.9)} words. Write comprehensive, detailed content with multiple sections, examples, and actionable insights to meet this word count. Do not stop writing until you have reached the target word count.`;
     
     // Generate JSON content using LangChain
+    // ENG-1816 F1: this call previously carried no userId, so its spend booked to
+    // "system" and escaped both billing and the funding policy. Read the run's owner
+    // from the ambient store instead of threading a new parameter through this
+    // function's signature.
     const blogData = await llmService.generateJSONContent<{
       title: string;
       description: string;
       content: string;
       imagePrompt: string;
-    }>(systemPrompt, blogPrompt, 'json', undefined, { feature: 'content_gen' });
+    }>(systemPrompt, blogPrompt, 'json', undefined, {
+      feature: 'content_gen',
+      // billingUserId deliberately omitted: this reaches meterWithResolvedBilling
+      // via llmService's gateway path (generateJSONContent -> invoke -> invokeGateway
+      // -> agentModeService.callLLM), which only resolves the org-root billing
+      // subject when billingUserId is absent (ENG-1858). A third instance of the
+      // same bug as restyleContent/wasStepRemovalUserAuthorized below, found by a
+      // round-4 PR review — missed here because llmService.ts's compatibility
+      // wrapper makes the gateway routing non-obvious from this call site alone.
+      userId: currentRunFunding()?.ownerUserId,
+    });
 
     // Validate the response structure
     if (!blogData.title || !blogData.content) {
@@ -580,13 +595,23 @@ OUTPUT FORMAT (STRICT JSON):
 
   try {
     const systemInstruction = "You are an expert content editor. Restyle content while preserving key information. Always respond with valid JSON only, no markdown code blocks.";
+    // ENG-1816 F1: this call previously carried no userId, so its spend booked to
+    // "system" and escaped both billing and the funding policy.
     const response = await agentModeService.callLLM(CONTENT_RESTYLE_MODEL, [
       { role: 'system', content: systemInstruction },
       { role: 'user', content: prompt },
     ], {
       temperature: 0.7,
       response_format: { type: 'json_object' },
-      usageContext: { feature: 'content_gen' },
+      usageContext: {
+        feature: 'content_gen',
+        // billingUserId deliberately omitted: this reaches meterWithResolvedBilling,
+        // which only resolves the org-root billing subject when billingUserId is
+        // absent (ENG-1858). Passing ownerUserId here would re-suppress that
+        // resolution for org members — the exact ENG-1217 bug — for zero benefit,
+        // since nothing reads RunFunding's billingUserId today.
+        userId: currentRunFunding()?.ownerUserId,
+      },
       taskClass: 'content_generation',
     });
 
@@ -1321,8 +1346,17 @@ export const generateBlogPost = async (req: AuthRequest, res: Response) => {
       // Create drafts from the topic for generateBlogContent
       const titleDraft = topic;
       const contentDraft = `# ${topic}\n\nThis article will cover ${topic}.`;
-      
-      const blogData = await generateBlogContent(titleDraft, contentDraft, length, researchContext, agentWebRequirements);
+
+      // ENG-1816 F1: this route calls generateBlogContent directly, outside the agent-
+      // mode worker's withRunFunding scope, so currentRunFunding() would otherwise be
+      // undefined here and the leak fix at that call site would be a silent no-op.
+      // resolveRunFunding always resolves 'agentweb' today, so this changes nothing
+      // observable — it only makes the attribution fix at generateBlogContent's call
+      // site actually fire on this entry point too.
+      const runFunding = await resolveRunFunding({ userId });
+      const blogData = await withRunFunding(runFunding, () =>
+        generateBlogContent(titleDraft, contentDraft, length, researchContext, agentWebRequirements),
+      );
 
       console.log("✅ Content generation complete! Processing AI response...");
       console.log("✅ Content validation passed!");

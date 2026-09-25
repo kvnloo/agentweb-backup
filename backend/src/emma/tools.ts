@@ -386,7 +386,7 @@ Do NOT use this for a Meta Ads write approval — those already go through call_
 
 Always include businessImpact (why this matters, one line) and an evidencePacket (links/context the approver needs to decide without re-doing your research) — the whole point is the approver can act on ONE response with everything they need already in front of them, never asking you to re-explain.
 
-For a customer-facing credential reconnect (e.g. a disconnected ad account or CMS login) — set audience to "customer", gateType to "customer_credential", provide customerId instead of approver, and customerActionUrl pointing to where they fix it (e.g. their connected-accounts settings page). This emails the customer directly, never the team Slack queue. Customer-facing plan/confirmation questions (gateType "customer_confirmation") are NOT supported yet — no delivery surface exists for them; do not call this tool for that case, ask the current user directly instead if they're the right person, or use present_question_deck.`,
+For a customer-facing credential reconnect (a disconnected Meta ad account, Instagram, LinkedIn, or LinkedIn Ads connection — see credentialPlatform's enum for the exact supported list) — set audience to "customer", gateType to "customer_credential", provide customerId instead of approver, customerActionUrl pointing to where they fix it (e.g. their connected-accounts settings page), and credentialPlatform/credentialAccountId identifying exactly which connection this is about — when the customer actually reconnects, that's what lets this decision auto-resolve to "done" instead of sitting open forever. This emails the customer directly, never the team Slack queue. Other platforms (e.g. a CMS login) are NOT supported yet — no reconnect route exists that can auto-resolve them; do not call this tool for that case. Customer-facing plan/confirmation questions (gateType "customer_confirmation") are also NOT supported yet — no delivery surface exists for them; do not call this tool for that case, ask the current user directly instead if they're the right person, or use present_question_deck.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -417,6 +417,19 @@ For a customer-facing credential reconnect (e.g. a disconnected ad account or CM
           type: 'string',
           description: 'Required for gateType="customer_credential". The exact URL the customer\'s email links to (e.g. their connected-accounts settings page).',
         },
+        credentialPlatform: {
+          type: 'string',
+          // Constrained to exactly the platforms whose reconnect routes call
+          // autoResolveCredentialDecisionOnReconnect — a free-text value
+          // Emma might otherwise write (e.g. "Facebook Ads") would silently
+          // never match at reconnect time (review fix).
+          enum: ['meta', 'instagram', 'linkedin', 'linkedin_ads'],
+          description: 'Required for gateType="customer_credential". Which platform this reconnect is about — must match the platform value used elsewhere for this customer\'s connected accounts. Instagram is a distinct platform from Meta ad accounts — use "instagram", never "meta", for an Instagram reconnect. LinkedIn Ads is a distinct platform from a personal/company LinkedIn connection — use "linkedin_ads", never "linkedin", for a LinkedIn Ads account reconnect.',
+        },
+        credentialAccountId: {
+          type: 'string',
+          description: 'Required for gateType="customer_credential". The specific connected account id that needs reconnecting.',
+        },
         evidencePacket: {
           type: 'object',
           description: 'Everything the approver needs to decide without asking you to re-explain.',
@@ -445,7 +458,7 @@ For a customer-facing credential reconnect (e.g. a disconnected ad account or CM
         },
         expiresInDays: {
           type: 'number',
-          description: 'How many days this decision stays open before expiring. Defaults to 7.',
+          description: 'How many days this decision stays open before expiring. Defaults to 7. Clamped to a maximum of 30 — a larger value is silently reduced to 30, so do not promise the customer/approver a longer window than that.',
         },
       },
       required: ['audience', 'gateType', 'businessImpact', 'evidencePacket'],
@@ -473,7 +486,20 @@ For a customer-facing credential reconnect (e.g. a disconnected ad account or CM
       return { success: false, message: 'stage_pending_decision does not support gateType="customer_confirmation" yet — no customer-facing delivery surface exists for it.' };
     }
 
-    const expiresInDays = typeof args?.expiresInDays === 'number' && args.expiresInDays > 0 ? args.expiresInDays : 7;
+    // Clamped to a sane [1, 30]-day window — an unbounded/non-finite value
+    // here (e.g. Infinity, or a model typo like 700) would either produce an
+    // invalid Date (toISOString() throws) or a decision that outlives any
+    // realistic review cadence (review fix). The lower bound matters too —
+    // `> 0` alone let a tiny value like 0.0005 through, producing a decision
+    // that's already past its own expiresAt within milliseconds of creation
+    // (review fix).
+    const MIN_EXPIRES_IN_DAYS = 1;
+    const MAX_EXPIRES_IN_DAYS = 30;
+    const rawExpiresInDays = args?.expiresInDays;
+    const expiresInDays =
+      typeof rawExpiresInDays === 'number' && Number.isFinite(rawExpiresInDays) && rawExpiresInDays > 0
+        ? Math.min(Math.max(rawExpiresInDays, MIN_EXPIRES_IN_DAYS), MAX_EXPIRES_IN_DAYS)
+        : 7;
     const expiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString();
 
     const options = Array.isArray(args?.options)
@@ -499,18 +525,38 @@ For a customer-facing credential reconnect (e.g. a disconnected ad account or CM
         },
         options,
         customerActionUrl: audience === 'customer' ? args?.customerActionUrl : undefined,
+        credentialPlatform: audience === 'customer' ? args?.credentialPlatform : undefined,
+        credentialAccountId: audience === 'customer' ? args?.credentialAccountId : undefined,
         originSessionId: sessionId,
         expiresAt,
       });
 
       // Best-effort — a delivery failure must never fail the tool call
       // itself; the decision is already durably persisted above regardless.
+      // Queue-refresh and added-notice are independent Slack calls in
+      // separate try/catches (review fix) — one failing must never skip the
+      // other. postDecisionAddedNotice is skipped only when the queue
+      // refresh itself already did a real, fresh chat.postMessage (the
+      // approver's very first-ever pending decision) — that post IS the
+      // notification; posting a second message would double-notify (review
+      // fix). Any other outcome (update-in-place, or the refresh failing
+      // outright) still gets its own attempt at a real notification below.
       if (decision.audience === 'team' && decision.approver) {
+        let freshlyPosted = false;
         try {
           const { upsertApproverQueueMessage } = await import('../services/approvalInboxSlack');
-          await upsertApproverQueueMessage(decision.approver);
+          const result = await upsertApproverQueueMessage(decision.approver);
+          freshlyPosted = result.posted;
         } catch (err: any) {
-          console.warn('[stage_pending_decision] failed to post/update Slack queue message:', err?.message || err);
+          console.warn('[stage_pending_decision] failed to refresh Slack queue message:', err?.message || err);
+        }
+        if (!freshlyPosted) {
+          try {
+            const { postDecisionAddedNotice } = await import('../services/approvalInboxSlack');
+            await postDecisionAddedNotice(decision.approver, decision);
+          } catch (err: any) {
+            console.warn('[stage_pending_decision] failed to post new-decision notice:', err?.message || err);
+          }
         }
       } else if (decision.gateType === 'customer_credential') {
         try {
@@ -527,6 +573,11 @@ For a customer-facing credential reconnect (e.g. a disconnected ad account or CM
       return {
         success: true,
         decisionId: decision.decisionId,
+        // Review fix: the requested expiresInDays is silently clamped to
+        // [1, 30] above — without surfacing the real expiresAt, Emma has no
+        // runtime signal when her request was reduced and could tell the
+        // user a duration that isn't actually true.
+        expiresAt: decision.expiresAt,
         message: audience === 'team'
           ? `Queued for ${decision.approver}'s review — they'll answer from Slack, this session isn't blocked on it.`
           : `Queued for the customer to answer — this session isn't blocked on it.`,

@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { getAzureClient } from "../utils/llmClients";
+import { currentRunFunding } from "./funding/runFunding";
 import { v4 as uuidv4 } from "uuid";
 import AWS from "aws-sdk";
 import dotenv from "dotenv";
@@ -62,11 +63,23 @@ export const dynamodb = new AWS.DynamoDB.DocumentClient({
 });
 
 // Metered client for embeddings (knowledge-base semantic search). Uses the
-// separate EMBEDDINGS endpoint/key/api-version the module singleton used. No
-// userId is in scope on this path, so usage is attributed to platform overhead.
+// separate EMBEDDINGS endpoint/key/api-version the module singleton used.
+// ENG-1816 F1: previously carried no userId, so usage was attributed to platform
+// overhead. Read the run's owner from the ambient store instead of threading a new
+// parameter through this function and its two call sites in findRelevantChunks.
 function embeddingsClientFor() {
   return getAzureClient(
-    { feature: "embeddings" },
+    {
+      feature: "embeddings",
+      userId: currentRunFunding()?.ownerUserId,
+      // billingUserId deliberately omitted: unlike the callLLM-routed sites (blog.ts,
+      // agentModeService.ts step-removal judge), this reaches recordUsage directly
+      // (getAzureClient -> wrapOpenAICompatible -> fireRecord -> recordUsage), which
+      // has no org-root resolution to suppress today — but keeping the field out
+      // here too means a future refactor onto meterUserUsage/meterWithResolvedBilling
+      // can't silently reintroduce the ENG-1217 bug fixed 3 times elsewhere in this
+      // PR (round-5 PR review finding).
+    },
     process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT || "text-embedding-3-large",
     {
       endpoint: process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT,
@@ -3790,6 +3803,15 @@ export class ChatbotDB {
     llmModel: string,
     policyDecision?: NonNullable<ChatSession['llmUsagePolicyDecision']>,
   ): Promise<ChatSession> {
+    // A stored llmUsagePolicyDecision describes the specific model it was recorded
+    // for. Changing llmModel without a fresh decision to match (task-type model
+    // overrides, admin/plan model swaps, the picker PATCH endpoint) would otherwise
+    // leave the OLD decision in place, now silently mismatched — e.g. llmModel
+    // reporting "gemini-3.8-flash" while llmUsagePolicyDecision still claims
+    // "openrouter/deepseek/deepseek-v4-flash" was "honored", even though every
+    // actual turn ran on the latter. REMOVE it here so a session record can never
+    // pair a decision with a model it doesn't describe; the next real turn through
+    // resolveEffectiveModelForUser re-stamps a correct, matching pair anyway.
     const params = {
       TableName: this.tableName,
       Key: {
@@ -3797,7 +3819,7 @@ export class ChatbotDB {
       },
       UpdateExpression: policyDecision
         ? "SET llmModel = :llmModel, llmUsagePolicyDecision = :policyDecision, adminListPartition = :adminListPartition"
-        : "SET llmModel = :llmModel, adminListPartition = :adminListPartition",
+        : "SET llmModel = :llmModel, adminListPartition = :adminListPartition REMOVE llmUsagePolicyDecision",
       ExpressionAttributeValues: {
         ":llmModel": llmModel,
         ...(policyDecision ? { ":policyDecision": policyDecision } : {}),

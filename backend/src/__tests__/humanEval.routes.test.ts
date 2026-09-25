@@ -4,7 +4,8 @@ import express from 'express';
 jest.mock('../middleware/auth', () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
     req.user = {
-      userId: 'user-1',
+      // x-no-user-id simulates a token without a userId (e.g. a service token).
+      userId: req.headers['x-no-user-id'] === '1' ? undefined : 'user-1',
       email: 'test@example.com',
       isAdmin: req.headers['x-admin'] === '1',
     };
@@ -36,6 +37,7 @@ import { claimArtifactForHumanEval, releaseArtifactClaim } from '../services/aut
 
 const mockCreateCandidate = humanEvalService.createCandidate as jest.Mock;
 const mockListCandidates = humanEvalService.listCandidates as jest.Mock;
+const mockGetCandidate = humanEvalService.getCandidate as jest.Mock;
 const mockClaimArtifact = claimArtifactForHumanEval as jest.Mock;
 const mockReleaseArtifact = releaseArtifactClaim as jest.Mock;
 
@@ -242,5 +244,46 @@ describe('GET /api/human-eval/candidates', () => {
 
     expect(res.status).toBe(500);
     expect(res.body.error).toContain('scan failed');
+  });
+});
+
+describe('GET /api/human-eval/candidates/:candidateId (ENG-2154)', () => {
+  const candidate = { candidateId: 'candidate-9', userId: 'owner-1', userEmail: 'owner@example.com' };
+
+  it('returns any candidate to an admin', async () => {
+    mockGetCandidate.mockResolvedValue(candidate);
+    const res = await request(app).get('/api/human-eval/candidates/candidate-9').set('x-admin', '1');
+    expect(res.status).toBe(200);
+    expect(res.body.candidate).toEqual(candidate);
+  });
+
+  it("returns the candidate to its owner", async () => {
+    mockGetCandidate.mockResolvedValue({ ...candidate, userId: 'user-1' });
+    const res = await request(app).get('/api/human-eval/candidates/candidate-9');
+    expect(res.status).toBe(200);
+  });
+
+  it("answers 404, not 403, for another user's candidate so its existence does not leak", async () => {
+    mockGetCandidate.mockResolvedValue(candidate);
+    const res = await request(app).get('/api/human-eval/candidates/candidate-9');
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: 'Candidate not found' });
+  });
+
+  it('answers 404 for a candidate without an owner unless the caller is an admin', async () => {
+    mockGetCandidate.mockResolvedValue({ candidateId: 'candidate-9' });
+    expect((await request(app).get('/api/human-eval/candidates/candidate-9')).status).toBe(404);
+    expect((await request(app).get('/api/human-eval/candidates/candidate-9').set('x-admin', '1')).status).toBe(200);
+  });
+
+  it('does not treat a missing caller id and a missing owner as a match (#3080 review)', async () => {
+    mockGetCandidate.mockResolvedValue({ candidateId: 'candidate-9' });
+    const res = await request(app).get('/api/human-eval/candidates/candidate-9').set('x-no-user-id', '1');
+    expect(res.status).toBe(404);
+  });
+
+  it('answers 404 for an unknown id', async () => {
+    mockGetCandidate.mockResolvedValue(null);
+    expect((await request(app).get('/api/human-eval/candidates/nope').set('x-admin', '1')).status).toBe(404);
   });
 });

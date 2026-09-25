@@ -9,8 +9,9 @@ import { clearTerminalProgress } from '../utils/sseProgress';
 import { DRAIN_CEILING_MS, DRAIN_POLL_INTERVAL_MS } from '../utils/shutdownConstants';
 import type { WorkPlanTurnDisposition } from './agentMode/core/workPlanTurnDisposition';
 import type { PendingApprovalDeck } from './agentMode/core/approvalDeck';
+import type { RunFunding } from './funding/runFunding';
 
-interface GenerateMarketingResponseParams {
+export interface GenerateMarketingResponseParams {
   messageContent: string;
   sessionHistory: any[];
   userId: string;
@@ -24,6 +25,15 @@ interface GenerateMarketingResponseParams {
   // ENG-473: when set, the worker persists each settled turn to the session as it
   // completes so a hard process kill leaves a visible partial transcript.
   persistIncrementally?: boolean;
+  // ENG-1816 F1: the run's funding decision, resolved once by the caller and carried
+  // across the fork IPC boundary exactly like publishAuthorizationOverride below —
+  // plain serializable data, never a positional argument (this interface already has
+  // ~15 fields; generateMarketingResponse's own signature has ~19 positional params).
+  // The worker enters an AsyncLocalStorage scope with this value before calling into
+  // agentModeService, so every nested callLLM call sees it without being edited.
+  // Optional only for callers not yet updated; absent is treated as 'agentweb' (F1
+  // never assigns any other route, so this is not yet a real branch in practice).
+  runFunding?: RunFunding;
   // ENG-827 (Greptile): the publish authorization the CALLER already resolved, carried
   // across the worker boundary so the system prompt is built from the same value the
   // required-function checker uses. Two independent reads can land either side of a
@@ -45,7 +55,7 @@ interface GenerateMarketingResponseParams {
   isUnattendedRun?: boolean;
 }
 
-interface GenerateMarketingResponseResult {
+export interface GenerateMarketingResponseResult {
   content: string;
   toolCalls: any[];
   knowledgeBaseQueries: string[];
