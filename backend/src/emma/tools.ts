@@ -21,6 +21,9 @@ import { type AskUserQuestionOption } from '../services/agentMode/core/askUserQu
 import type { QuestionDeckQuestionInput } from '../services/agentMode/core/approvalDeck';
 import { approvalInboxService, type ApprovalDecisionApprover, type ApprovalDecisionGateType } from '../services/approvalInboxService';
 import { CLIENT_ID_SCHEMA_PROPERTY } from '../mcp/server/toolHelpers';
+// ENG-2103 (F2 pilot): books/whitepapers tool bodies live in a standalone module
+// that does not require constructing AgentModeService — see emma/impl/books.ts.
+import * as booksImpl from './impl/books';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -2658,7 +2661,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listBooks(context?.userId, args.type, args.status);
+    return await booksImpl.listBooks(context?.userId, args.type, args.status);
   }
 });
 
@@ -2679,7 +2682,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getBookDetails(args.book_id, context?.userId);
+    return await booksImpl.getBookDetails(args.book_id, context?.userId);
   }
 });
 
@@ -2708,7 +2711,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    const result = await agentModeService.getBookContent(args.book_id, args.section_id, args.chapter_id, context?.userId);
+    const result = await booksImpl.getBookContent(args.book_id, args.section_id, args.chapter_id, context?.userId);
     if (result.success === false) {
       return {
         content: [
@@ -2773,7 +2776,7 @@ emmaToolRegistry.register({
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
-    return await agentModeService.updateBookContent(
+    return await booksImpl.updateBookContent(
       args.book_id,
       args.section_id,
       args.chapter_id,
@@ -2827,7 +2830,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.generateBookContent(
+    return await booksImpl.generateBookContent(
       args.book_id,
       args.section_id,
       args.chapter_id,
@@ -2886,7 +2889,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createBook(args.title, args.description, args.type, args.author, args.language, args.genre, args.tags || [], context?.userId);
+    return await booksImpl.createBook(args.title, args.description, args.type, args.author, args.language, args.genre, args.tags || [], context?.userId);
   }
 });
 
@@ -2911,7 +2914,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createBookOutline(args.book_id, args.outline_json, context?.userId);
+    return await booksImpl.createBookOutline(args.book_id, args.outline_json, context?.userId);
   }
 });
 
@@ -2936,7 +2939,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.addCharacters(args.book_id, args.characters_json, context?.userId);
+    return await booksImpl.addCharacters(args.book_id, args.characters_json, context?.userId);
   }
 });
 
