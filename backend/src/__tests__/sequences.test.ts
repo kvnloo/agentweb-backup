@@ -592,7 +592,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
       expect(res.body.skippedNoEmail).toBe(1);
     });
 
-    it('a MIXED sequence needs both channels — one is not enough', async () => {
+    it('a MIXED sequence enrols anyone reachable on at least one of its channels', async () => {
       dripSequenceDb.getSequence.mockResolvedValue({
         ...mockSequence,
         steps: [
@@ -612,11 +612,31 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
         .send({ listId: 'list-1' });
 
       expect(res.status).toBe(200);
-      // Only the lead reachable on EVERY channel — a step the lead cannot receive throws
-      // in the worker and retries forever, which is what this guard exists to prevent.
-      expect(res.body.enrollableLeads).toBe(1);
+      // All three. Requiring EVERY channel was the first answer and it cost a real send:
+      // the email-only lead stopped being enrolled at all, where before it received the
+      // email. The worker skips a step the lead cannot receive now, so each of these gets
+      // the steps it can and completes.
+      expect(res.body.enrollableLeads).toBe(3);
       const ids = dripSequenceDb.bulkEnroll.mock.calls[0][0].map((i: any) => i.leadId);
-      expect(ids).toEqual(['both']);
+      expect(ids.sort()).toEqual(['both', 'li-only', 'mail-only']);
+    });
+
+    it('still refuses a lead reachable on NO channel of the sequence', async () => {
+      dripSequenceDb.getSequence.mockResolvedValue(linkedInSequence);
+      const crmDbMock = require('../services/db').crmDb;
+      crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+        { leadId: 'phone-only', listId: 'list-1', phone: '2125550000' },
+      ]);
+
+      const res = await request(app)
+        .post('/seq_1/enrollments/by-list')
+        .send({ listId: 'list-1' });
+
+      expect(res.status).toBe(200);
+      // Enrolling it would create a row that skips every step and completes having sent
+      // nothing at all.
+      expect(res.body.enrollableLeads).toBe(0);
+      expect(res.body.skippedUnreachable).toBe(1);
     });
   });
 

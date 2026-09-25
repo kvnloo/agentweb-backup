@@ -61,13 +61,19 @@ function requiredChannels(sequence: any): Set<string> {
  * it never touches the address. So a LinkedIn-only lead in a LinkedIn sequence WAS being
  * messaged, and an email-only test excluded it from enrolment entirely.
  *
- * Every channel, not any: a step whose channel the lead cannot receive throws in the
- * worker and is retried forever, which is the failure this guard exists to prevent.
+ * AT LEAST ONE channel, not every one. Requiring every channel was my first answer and it
+ * cost a real send: an email-only lead in a mixed email+LinkedIn sequence stopped being
+ * enrolled at all, where before it received the email. The worker now SKIPS a step the
+ * lead cannot receive instead of throwing (dripSequenceWorker.executeStep), so enrolling
+ * such a lead no longer jams it — it gets the steps it can receive and completes.
+ *
+ * A lead that can receive NO step is still refused: enrolling it would create a row that
+ * skips every step and completes having sent nothing.
  */
 function leadIsReachable(lead: any, channels: Set<string>): boolean {
-  if (channels.has('email') && !String(lead?.email ?? '').trim()) return false;
-  if (channels.has('linkedin') && !String(lead?.linkedin ?? '').trim()) return false;
-  return true;
+  if (channels.has('email') && String(lead?.email ?? '').trim()) return true;
+  if (channels.has('linkedin') && String(lead?.linkedin ?? '').trim()) return true;
+  return false;
 }
 
 /**
