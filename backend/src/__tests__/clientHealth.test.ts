@@ -147,6 +147,41 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.health.status_reasons.join(' ')).toContain('2026-09-15T20:52:34.993Z');
   });
 
+  it('reads campaigns through the first usable Meta account, not a stale first record (#3070 review)', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({ userId: 'client-user', email: 'client@example.com', adAccount: '' });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      { platform: 'meta', config: { account_type: 'ad_account', ad_account_id: '111111', access_token: 'stale', token_expires_at: 1 } },
+      { platform: 'meta', config: { account_type: 'ad_account', ad_account_id: '222222', access_token: 'fresh', token_expires_at: Date.now() + 86_400_000 } },
+    ]);
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({ data: [] });
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.health.ads_layer.connection).toBe('connected');
+    expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(expect.stringContaining('act_222222/campaigns'));
+    expect(fetchWithRetryAndPaging).toHaveBeenCalledWith(expect.stringContaining('access_token=fresh'));
+    expect(result.health.ads_layer.ad_account_id).toBe('222222');
+  });
+
+  it('does not report a confirmed zero-campaign status when the campaign read failed (#3070 review)', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({ userId: 'client-user', email: 'client@example.com', adAccount: '' });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      { platform: 'meta', config: { account_type: 'ad_account', ad_account_id: '333333', access_token: 'tok' } },
+    ]);
+    const { fetchWithRetryAndPaging } = require('../utils/metaApiFetch');
+    (fetchWithRetryAndPaging as jest.Mock).mockResolvedValueOnce({ error: { message: 'permission denied' } });
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.health.ads_layer.campaigns_complete).toBe(false);
+    expect(result.health.status).not.toBe('blocked');
+    expect(result.health.status_reasons.join(' ')).toMatch(/could not be read/i);
+    expect(result.health.status_reasons).not.toContain('No active ad campaigns');
+  });
+
 
   // SUCCESS test: Full health assessment for a client with connected accounts
   it('should return full health assessment for a connected client', async () => {
