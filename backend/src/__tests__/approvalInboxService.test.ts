@@ -433,7 +433,7 @@ describe('approvalInboxService.listPendingForApprover / listPendingForCustomer (
   });
 });
 
-describe('approvalInboxService.findPendingCredentialDecision', () => {
+describe('approvalInboxService.findPendingCredentialDecisions', () => {
   it('finds the matching pending customer_credential decision by platform + accountId', async () => {
     mockDynamoDB.query.mockReturnValue(ok({
       Items: [
@@ -442,8 +442,25 @@ describe('approvalInboxService.findPendingCredentialDecision', () => {
       ],
     }));
 
-    const result = await service.findPendingCredentialDecision('cust-1', 'meta', 'act_123');
-    expect(result?.decisionId).toBe('d2');
+    const result = await service.findPendingCredentialDecisions('cust-1', 'meta', 'act_123');
+    expect(result).toHaveLength(1);
+    expect(result[0].decisionId).toBe('d2');
+  });
+
+  // ENG-1644 follow-up: real bug found live on prod — .find() only ever
+  // returned the oldest match, so a reconnect left every OTHER pending
+  // duplicate stuck until it silently expired.
+  it('returns EVERY matching pending decision, not just the first, when duplicates exist for the same account (real bug found live on prod)', async () => {
+    mockDynamoDB.query.mockReturnValue(ok({
+      Items: [
+        { decisionId: 'older', gateType: 'customer_credential', credentialPlatform: 'meta', credentialAccountId: 'act_123', createdAt: '2026-09-25T13:29:00.000Z' },
+        { decisionId: 'newer', gateType: 'customer_credential', credentialPlatform: 'meta', credentialAccountId: 'act_123', createdAt: '2026-09-25T17:55:00.000Z' },
+        { decisionId: 'unrelated', gateType: 'customer_credential', credentialPlatform: 'meta', credentialAccountId: 'act_999' },
+      ],
+    }));
+
+    const result = await service.findPendingCredentialDecisions('cust-1', 'meta', 'act_123');
+    expect(result.map((d) => d.decisionId).sort()).toEqual(['newer', 'older']);
   });
 
   it('matches regardless of a leading "act_" prefix on either side (review fix — Meta surfaces the id both ways)', async () => {
@@ -452,17 +469,18 @@ describe('approvalInboxService.findPendingCredentialDecision', () => {
     }));
 
     // Decision was stored WITH the prefix; a real reconnect passes the bare id.
-    const result = await service.findPendingCredentialDecision('cust-1', 'meta', '555');
-    expect(result?.decisionId).toBe('d1');
+    const result = await service.findPendingCredentialDecisions('cust-1', 'meta', '555');
+    expect(result).toHaveLength(1);
+    expect(result[0].decisionId).toBe('d1');
   });
 
-  it('returns null when no pending decision matches the platform+accountId', async () => {
+  it('returns an empty array when no pending decision matches the platform+accountId', async () => {
     mockDynamoDB.query.mockReturnValue(ok({
       Items: [{ decisionId: 'd1', gateType: 'customer_credential', credentialPlatform: 'meta', credentialAccountId: 'act_999' }],
     }));
 
-    const result = await service.findPendingCredentialDecision('cust-1', 'meta', 'act_123');
-    expect(result).toBeNull();
+    const result = await service.findPendingCredentialDecisions('cust-1', 'meta', 'act_123');
+    expect(result).toEqual([]);
   });
 
   it('never matches a non-customer_credential decision even with the same platform/accountId fields', async () => {
@@ -470,14 +488,14 @@ describe('approvalInboxService.findPendingCredentialDecision', () => {
       Items: [{ decisionId: 'd1', gateType: 'plan_choice', credentialPlatform: 'meta', credentialAccountId: 'act_123' }],
     }));
 
-    const result = await service.findPendingCredentialDecision('cust-1', 'meta', 'act_123');
-    expect(result).toBeNull();
+    const result = await service.findPendingCredentialDecisions('cust-1', 'meta', 'act_123');
+    expect(result).toEqual([]);
   });
 
-  it('returns null when the customer has no pending decisions at all', async () => {
+  it('returns an empty array when the customer has no pending decisions at all', async () => {
     mockDynamoDB.query.mockReturnValue(ok({}));
-    const result = await service.findPendingCredentialDecision('cust-1', 'meta', 'act_123');
-    expect(result).toBeNull();
+    const result = await service.findPendingCredentialDecisions('cust-1', 'meta', 'act_123');
+    expect(result).toEqual([]);
   });
 
   it('matches case-insensitively and ignores stray whitespace on both sides (review fix)', async () => {
@@ -485,7 +503,8 @@ describe('approvalInboxService.findPendingCredentialDecision', () => {
       Items: [{ decisionId: 'd1', gateType: 'customer_credential', credentialPlatform: 'Meta', credentialAccountId: ' act_123 ' }],
     }));
 
-    const result = await service.findPendingCredentialDecision('cust-1', ' meta ', 'ACT_123');
-    expect(result?.decisionId).toBe('d1');
+    const result = await service.findPendingCredentialDecisions('cust-1', ' meta ', 'ACT_123');
+    expect(result).toHaveLength(1);
+    expect(result[0].decisionId).toBe('d1');
   });
 });

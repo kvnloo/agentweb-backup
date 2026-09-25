@@ -518,18 +518,51 @@ export interface ExecutePreparedToolsResult {
 
 /**
  * ENG-936: normalize image input fields into a single string array for source checks.
+ *
+ * Review fix: `logo_image` is folded in alongside `inputImages`/`input_images`.
+ * `imageGeneration.ts`'s `generateImage()` appends `params.logoImage` onto
+ * `params.inputImages` before generating (and `agentModeService.ts`'s own
+ * `editsExistingImage` check already treats `inputImages.length > 0 || !!logoImage`
+ * as equivalent), so a `logo_image` is a real edit source at execution time — this
+ * gate must see it too, or a call with `confirm:true`, no `inputImages`, and an
+ * unapproved `logo_image` sails through as "not an edit" and bypasses source
+ * validation entirely.
  */
 function getInputImages(toolCallArgs: any): string[] {
   const rawInputImages = toolCallArgs?.inputImages ?? toolCallArgs?.input_images;
-  if (typeof rawInputImages === 'string') return [rawInputImages];
-  if (!Array.isArray(rawInputImages)) return [];
-  return rawInputImages.filter((item): item is string => typeof item === 'string');
+  const images: string[] = [];
+  if (typeof rawInputImages === 'string') {
+    images.push(rawInputImages);
+  } else if (Array.isArray(rawInputImages)) {
+    images.push(...rawInputImages.filter((item): item is string => typeof item === 'string'));
+  }
+
+  const logoImage = toolCallArgs?.logo_image ?? toolCallArgs?.logoImage;
+  if (typeof logoImage === 'string' && logoImage.length > 0) {
+    images.push(logoImage);
+  }
+
+  return images;
 }
 
 /**
  * ENG-936: ensure a revision-style image edit binds to an explicitly approved
  * source URL before execution. A false pass here means `confirm=true` was issued
  * for the wrong source and must be stopped before gateway execution.
+ *
+ * ENG-2166 fix: this gate exists to validate an EDIT's source, not to gate
+ * `generate_image` in general. `approvedRevisionImageSources` is fixed for an
+ * entire run (e.g. revisionService.ts's Slack-driven "revise this asset" flow
+ * sets it once for the whole bounded runVerifiedChat call). Previously, once
+ * that list was non-empty, EVERY generate_image call for the rest of the run
+ * was forced through this check — including plain text-to-image calls that
+ * never set inputImages at all and were never attempting an edit. A real
+ * customer session hit this: Emma made one approved, confirmed edit, then
+ * every subsequent unrelated text-to-image call in the same run failed with
+ * "Expected one of: [the one approved URL]. Received none." — permanently
+ * blocking all new generations for the rest of the session. A call with no
+ * inputImages isn't a revision at all, so this gate must not apply to it
+ * regardless of whether an approved-sources list happens to be active.
  */
 function isApprovedImageSourceForRevision(
   args: any,
@@ -541,12 +574,8 @@ function isApprovedImageSourceForRevision(
 
   const inputImages = getInputImages(args);
   if (!Array.isArray(inputImages) || inputImages.length === 0) {
-    return {
-      approved: false,
-      errorMessage:
-        `generate_image confirmation requires explicit approved source inputImages. ` +
-        `Expected one of: ${approvedSources.join(', ')}. Received none.`,
-    };
+    // Not an edit — a plain generation never needs an approved source.
+    return { approved: true };
   }
 
   const mismatch = inputImages.find((url) => !approvedSources.includes(url));

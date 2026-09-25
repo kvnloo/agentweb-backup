@@ -918,8 +918,19 @@ describe('getAllAvailableConnectedAccounts', () => {
     for (const platform of [
       'linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom',
       'instagram', 'twitter', 'hubspot', 'attio', 'google_ads', 'google_drive',
+      'linkedin_ads',
     ]) {
       expect(accounts).toContain(platform);
     }
+  });
+
+  // Regression: linkedin_ads has a full platform integration (catalog entry,
+  // OAuth routes, its own account-selection modal, reconnect auto-resolve
+  // wiring) but was missing from this master list — found live in prod, a
+  // real customer connected linkedin_ads once via onboarding (a separate,
+  // ungated flow) then had no way back to reconnect it through the regular
+  // Settings page, since this list is what gates that page's card.
+  it('includes linkedin_ads, which was missing despite having a full platform integration', () => {
+    expect(getAllAvailableConnectedAccounts()).toContain('linkedin_ads');
   });
 });
