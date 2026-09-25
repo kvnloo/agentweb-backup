@@ -42,6 +42,10 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
+import {
+  buildImageSwapNotReflected, judgeImageSwap, readCreativeImage,
+  type CreativeImageReadback, type ImageSwapExpectation,
+} from './agentMode/metaImageSwapCheck';
 import { publishWithdrawnMidFlight, readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { isPublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
@@ -20218,7 +20222,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     let newCreativeParams: any;
     // Set when the caller asked for a new single image / video thumbnail, so the created creative
     // can be read back before it is attached (ENG-2169).
-    let imageSwap: { oldHash?: string; requestedHash?: string } | undefined;
+    let imageSwap: ImageSwapExpectation | undefined;
 
     if (params.placement_assets) {
       // Placement-customized image creative (asset_feed_spec): map different images to different
@@ -20254,7 +20258,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         url_tags: carriedUrlTags,
       };
       if (params.image_hash || params.image_url) {
-        imageSwap = { oldHash: vd.image_hash, requestedHash: params.image_hash };
+        imageSwap = { oldHash: vd.image_hash, oldUrl: vd.image_url, requestedHash: params.image_hash, requestedUrl: params.image_url };
       }
     } else if (existingSpec.link_data?.child_attachments) {
       // Carousel creative – update the main link and optionally per-card links
@@ -20293,7 +20297,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         url_tags: carriedUrlTags,
       };
       if (params.image_hash || params.image_url) {
-        imageSwap = { oldHash: ld.image_hash, requestedHash: params.image_hash };
+        imageSwap = {
+          oldHash: ld.image_hash, oldUrl: ld.picture || ld.image_url,
+          requestedHash: params.image_hash, requestedUrl: params.image_url,
+        };
       }
     } else {
       return {
@@ -20325,34 +20332,17 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // image (or not the requested hash), attaching it would "succeed" while the ad keeps serving
     // the image it was meant to replace — fail loudly instead and leave the ad untouched.
     if (imageSwap) {
-      let liveImageHash: string | undefined;
+      let liveImage: CreativeImageReadback | undefined;
       try {
         const created = await metaService.getAdCreative(accessToken, newCreativeId);
-        const spec = created?.object_story_spec;
-        liveImageHash = spec?.link_data?.image_hash ?? spec?.video_data?.image_hash;
+        liveImage = readCreativeImage(created?.object_story_spec);
       } catch (err: unknown) {
         // Best-effort, like verifyCreativeSwap: an unreadable creative is not proof of a stale image.
         console.warn(`AgentMode: image read-back failed for new creative ${newCreativeId}:`,
           err instanceof Error ? err.message : err);
       }
-      const stale = liveImageHash !== undefined && (imageSwap.requestedHash
-        ? liveImageHash !== imageSwap.requestedHash
-        : liveImageHash === imageSwap.oldHash);
-      if (stale) {
-        return {
-          success: false,
-          message: `The new creative (${newCreativeId}) was built with image hash ${liveImageHash}, not the `
-            + `requested image${imageSwap.requestedHash ? ` (${imageSwap.requestedHash})` : ''}, so it was NOT `
-            + `attached — ad ${adId} still serves its previous creative (${oldCreativeId}). Do not tell the user `
-            + `the image changed. Upload the new image with AD_CREATIVE UPLOAD_IMAGE and retry this UPDATE `
-            + `with the returned image_hash (if it is byte-identical to the current image, there is nothing to swap).`,
-          error: 'SWAP_NOT_REFLECTED',
-          old_creative_id: oldCreativeId,
-          new_creative_id: newCreativeId,
-          requested_image_hash: imageSwap.requestedHash,
-          requested_image_url: params.image_url,
-          live_image_hash: liveImageHash,
-        };
+      if (liveImage && judgeImageSwap(imageSwap, liveImage) === 'stale') {
+        return buildImageSwapNotReflected({ adId, oldCreativeId, newCreativeId, expected: imageSwap, live: liveImage });
       }
     }
 
