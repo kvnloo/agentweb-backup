@@ -3790,6 +3790,15 @@ export class ChatbotDB {
     llmModel: string,
     policyDecision?: NonNullable<ChatSession['llmUsagePolicyDecision']>,
   ): Promise<ChatSession> {
+    // A stored llmUsagePolicyDecision describes the specific model it was recorded
+    // for. Changing llmModel without a fresh decision to match (task-type model
+    // overrides, admin/plan model swaps, the picker PATCH endpoint) would otherwise
+    // leave the OLD decision in place, now silently mismatched — e.g. llmModel
+    // reporting "gemini-3.8-flash" while llmUsagePolicyDecision still claims
+    // "openrouter/deepseek/deepseek-v4-flash" was "honored", even though every
+    // actual turn ran on the latter. REMOVE it here so a session record can never
+    // pair a decision with a model it doesn't describe; the next real turn through
+    // resolveEffectiveModelForUser re-stamps a correct, matching pair anyway.
     const params = {
       TableName: this.tableName,
       Key: {
@@ -3797,7 +3806,7 @@ export class ChatbotDB {
       },
       UpdateExpression: policyDecision
         ? "SET llmModel = :llmModel, llmUsagePolicyDecision = :policyDecision, adminListPartition = :adminListPartition"
-        : "SET llmModel = :llmModel, adminListPartition = :adminListPartition",
+        : "SET llmModel = :llmModel, adminListPartition = :adminListPartition REMOVE llmUsagePolicyDecision",
       ExpressionAttributeValues: {
         ":llmModel": llmModel,
         ...(policyDecision ? { ":policyDecision": policyDecision } : {}),
