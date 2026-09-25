@@ -418,7 +418,21 @@ export default function EvalLabelling() {
                   </TableHead>
                   <TableBody>
                     {cases.map((c) => (
-                      <TableRow key={c.caseId} hover selected={c.caseId === selectedId} onClick={() => setSelectedId(c.caseId)} sx={{ cursor: 'pointer' }}>
+                      <TableRow
+                        key={c.caseId}
+                        hover
+                        selected={c.caseId === selectedId}
+                        aria-selected={c.caseId === selectedId}
+                        tabIndex={0}
+                        onClick={() => setSelectedId(c.caseId)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            setSelectedId(c.caseId);
+                          }
+                        }}
+                        sx={{ cursor: 'pointer' }}
+                      >
                         <TableCell>
                           <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>{c.sourceRef.id.slice(0, 12)}</Typography>
                           <Typography variant="caption" color="text.secondary">{c.taskType}</Typography>
