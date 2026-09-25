@@ -2,7 +2,8 @@ import { scheduleBackupModels } from '../services/agentMode/modelSupersession';
 import { isEvaluationUser, EvaluationDenied } from '../services/evaluationPolicy';
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken, isRealAdmin } from '../middleware/auth';
-import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch } from '../services/agentModeService';
+import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch, ADMIN_SKILL_TOOL_NAMES } from '../services/agentModeService';
+import { filterMessagesForClient as filterMessagesForClientPure } from '../utils/adminOnlyMessageFilter';
 import { ABOUT_AGENTWEB_TEAM, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
 import { computeSessionModelAttribution } from '../utils/sessionModelAttribution';
@@ -2422,22 +2423,11 @@ function evaluateScheduleResponse(
 }
 
 // Common function to filter messages for client display
-const filterMessagesForClient = (messages: any[]) => {
-  return messages.filter(message => {
-    // Remove tool messages
-    if (message.role === 'tool') {
-      return false;
-    }
-
-    // Remove assistant messages that have tool_calls (intermediate messages during tool execution)
-    // BUT keep assistant messages that have metadata.toolCalls (final messages with tool execution results)
-    if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0 && !message.metadata?.toolCalls) {
-      return false;
-    }
-
-    return true;
-  });
-};
+// ENG-2163: thin wrapper over the pure, unit-tested util (src/utils/adminOnlyMessageFilter).
+// The util takes the admin-tool name set as a param so it stays dependency-free; the controller
+// supplies the real ADMIN_SKILL_TOOL_NAMES here. Default viewerIsAdmin=false fails CLOSED.
+const filterMessagesForClient = (messages: any[], opts: { viewerIsAdmin?: boolean } = {}) =>
+  filterMessagesForClientPure(messages, { viewerIsAdmin: opts.viewerIsAdmin, adminToolNames: ADMIN_SKILL_TOOL_NAMES });
 
 // Helper function to check if this is the last run of the day for an hourly schedule
 function isLastRunOfDayForHourlySchedule(currentTime: Date, nextRunTime: Date): boolean {
@@ -9091,9 +9081,12 @@ export const agentModeController = {
       // not expose it at all, so reading a session's own detail page — the natural place
       // to investigate one incident — silently trusted the misleading field.
       const modelAttribution = computeSessionModelAttribution(session.messages, session.llmModel || null);
+      // ENG-2163: a real admin OR an admin viewing via delegation may see admin-tainted turns;
+      // the account owner (customer) viewing their own session may not.
+      const viewerIsAdmin = !!(user?.isAdmin || (req as any).delegateInfo?.isDelegated);
       const filteredSession = {
         ...session,
-        messages: filterMessagesForClient(session.messages),
+        messages: filterMessagesForClient(session.messages, { viewerIsAdmin }),
         hasActiveProgress: progressActive,
         skills,
         ...modelAttribution,
