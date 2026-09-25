@@ -2055,6 +2055,13 @@ export async function getDiagnosticErrorMessage(
     const artifactUrls = typeof turnStartMs === 'number'
       ? collectConfirmedArtifactUrls(session?.messages as any, turnStartMs)
       : [];
+    // ENG-2160 known residual (reviewed 2026-09-26): the succeeded-diff comes from calledFunctions,
+    // whose per-iteration increment is best-effort (failures are swallowed so an iteration never
+    // aborts). If a side-effecting tool (send_email / DM / meta-ads) succeeded but its counter
+    // write was lost, the diff reads empty here and the user is told "nothing was done yet — try
+    // again", which could induce a duplicate action. Narrow (requires a DB write failure) and
+    // roughly pre-existing; the high-stakes writes (publish / lead-import / artifact) are covered
+    // by the independent ledgers checked below. Not worth gating the fix on.
     // ENG-2160 deterministic close: nothing completed this turn AND nothing measurable to report →
     // do not call the LLM at all; return a fixed honest message. Fabrication becomes impossible
     // because the model never sees this case.

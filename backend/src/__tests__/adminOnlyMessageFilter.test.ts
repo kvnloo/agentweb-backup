@@ -1,4 +1,4 @@
-import { filterMessagesForClient } from '../utils/adminOnlyMessageFilter';
+import { filterMessagesForClient, redactAdminActivity } from '../utils/adminOnlyMessageFilter';
 
 /**
  * ENG-2163. Admin/support tools run in a session delegated into a customer's account leak
@@ -69,5 +69,52 @@ describe('filterMessagesForClient — ENG-2163 admin-tainted turn redaction', ()
     const out = filterMessagesForClient(CONVO(), { viewerIsAdmin: false, adminToolNames: [] });
     const texts = out.filter(m => m.role === 'assistant').map(m => m.content);
     expect(texts).toContain('I reviewed 203 internal PRs; here is the internal roadmap summary…');
+  });
+});
+
+
+describe('redactAdminActivity — ENG-2163 scoped redaction for raw serve paths (chatbot / summary)', () => {
+  // Unlike filterMessagesForClient, this must NOT strip normal tool/assistant messages — only
+  // admin content — so it can be applied to endpoints that historically return raw messages.
+  const ADMIN = ['get_pr_digest', 'read_linear_issues', 'manage_user_notes'];
+  const convo = () => [
+    { role: 'user', content: 'pull my leads' },
+    { role: 'tool', name: 'search_leads', content: '{normal tool result}' },
+    { role: 'assistant', content: 'Here are your leads.' },
+    { role: 'user', content: 'check infra' },
+    { role: 'tool', name: 'get_pr_digest', content: '{internal 203 PRs}' },
+    { role: 'assistant', content: 'I reviewed 203 internal PRs; roadmap...' },
+  ];
+
+  it('CUSTOMER: drops the admin tool RESULT and the admin narration, keeps normal tool + assistant', () => {
+    const out = redactAdminActivity(convo(), { viewerIsAdmin: false, adminToolNames: ADMIN });
+    const kinds = out.map((m: any) => m.role + ':' + (m.name || m.content?.slice(0, 12)));
+    expect(out.some((m: any) => m.role === 'tool' && m.name === 'get_pr_digest')).toBe(false); // admin tool result gone
+    expect(out.some((m: any) => m.role === 'tool' && m.name === 'search_leads')).toBe(true);     // normal tool result KEPT (no base strip)
+    expect(out.some((m: any) => m.content === 'I reviewed 203 internal PRs; roadmap...')).toBe(false); // narration gone
+    expect(out.some((m: any) => m.content === 'Here are your leads.')).toBe(true);               // safe assistant kept
+  });
+
+  it('ADMIN: no-op, returns input unchanged', () => {
+    const input = convo();
+    const out = redactAdminActivity(input, { viewerIsAdmin: true, adminToolNames: ADMIN });
+    expect(out).toBe(input);
+  });
+
+  it('no admin tools present: returns input unchanged (no accidental stripping)', () => {
+    const input = [
+      { role: 'user', content: 'hi' },
+      { role: 'tool', name: 'search_leads', content: '{}' },
+      { role: 'assistant', content: 'hello' },
+    ];
+    const out = redactAdminActivity(input, { viewerIsAdmin: false, adminToolNames: ADMIN });
+    // Contents unchanged (a filtered copy is fine here; reference identity is only guaranteed
+    // for the admin-viewer and empty-tool-set early returns, covered by the other cases).
+    expect(out).toEqual(input);
+  });
+
+  it('empty admin-tool set (mocked module): no redaction', () => {
+    const input = convo();
+    expect(redactAdminActivity(input, { viewerIsAdmin: false, adminToolNames: [] })).toBe(input);
   });
 });
