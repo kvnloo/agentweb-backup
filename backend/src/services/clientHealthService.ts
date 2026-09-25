@@ -16,7 +16,42 @@ import { resolveThresholds } from './adsThresholds';
 import { captureFatigueRecommendations } from './adsRecommendationCapture';
 import { isEvaluationUser } from './evaluationPolicy';
 
-type HealthStatus = 'healthy' | 'mediocre' | 'at-risk' | 'blocked';
+// 'onboarding' = activation incomplete (no ad account ever connected). ENG-2133: that is not a
+// churn/at-risk signal, so it never shares a status with a connection that broke.
+type HealthStatus = 'healthy' | 'mediocre' | 'at-risk' | 'blocked' | 'onboarding';
+
+export type AdConnectionState = 'never_connected' | 'connected' | 'expired';
+
+/**
+ * Classify the client's Meta ad connection without any live API call.
+ *
+ * - `connected`: a legacy `adAccount` (read with the shared token, which has no per-client
+ *   expiry), or a Meta ad account whose token is unexpired, carries no expiry, or can refresh.
+ * - `expired`: Meta ad accounts are on record but every token has expired with no refresh token
+ *   — a connection that broke (at-risk), reported with the latest expiry.
+ * - `never_connected`: nothing on record — an activation state, never a risk state.
+ *
+ * Same timestamp rule as connectedAccountsDb.isTokenNotExpired, inlined so it stays a pure
+ * function of its inputs.
+ */
+export function classifyMetaAdConnection(
+  connectedAccounts: any[],
+  legacyAdAccount: string | undefined,
+  nowMs: number = Date.now(),
+): { connection: AdConnectionState; expiredAt?: string } {
+  if (typeof legacyAdAccount === 'string' && legacyAdAccount.trim() !== '') return { connection: 'connected' };
+  const metaAdAccounts = (connectedAccounts || []).filter(
+    (acc: any) => acc?.platform === 'meta' && acc.config?.account_type === 'ad_account'
+  );
+  if (metaAdAccounts.length === 0) return { connection: 'never_connected' };
+  const usable = metaAdAccounts.some((acc: any) => {
+    const expiresAt = acc.config?.token_expires_at;
+    return typeof expiresAt !== 'number' || expiresAt > nowMs || !!acc.config?.refresh_token;
+  });
+  if (usable) return { connection: 'connected' };
+  const latestExpiry = Math.max(...metaAdAccounts.map((acc: any) => acc.config.token_expires_at as number));
+  return { connection: 'expired', expiredAt: new Date(latestExpiry).toISOString() };
+}
 
 /** Both Meta reads share this boundary. A malformed element makes the read incomplete,
  * rather than letting a partial array manufacture a fatigue recommendation. */
@@ -51,6 +86,8 @@ function healthRows(result: any): any[] {
 
 interface AdsLayerHealth {
   connected: boolean;
+  connection: AdConnectionState;
+  token_expired_at?: string;
   ad_account_id?: string;
   active_campaigns: number;
   campaigns?: Array<{ id: string; name: string; status: string; objective: string }>;
@@ -112,6 +149,7 @@ interface ClientSummary {
   displayName: string;
   roles: string[];
   has_ads: boolean;
+  ad_connection: AdConnectionState;
   has_lander: boolean;
   has_crm: boolean;
   last_activity: string | null;
@@ -198,8 +236,10 @@ function determineStatus(
 ): { status: HealthStatus; reasons: string[] } {
   const reasons: string[] = [];
 
-  if (!adsLayer.connected) {
-    reasons.push('No Meta ad account connected');
+  if (adsLayer.connection === 'never_connected') {
+    reasons.push('Activation incomplete: no Meta ad account connected yet');
+  } else if (adsLayer.connection === 'expired') {
+    reasons.push(`Meta ad account connection expired ${adsLayer.token_expired_at} — reconnect needed`);
   }
   if (adsLayer.connected && adsLayer.active_campaigns === 0) {
     reasons.push('No active ad campaigns');
@@ -219,8 +259,10 @@ function determineStatus(
 
   // Determine status
   let status: HealthStatus;
-  if (!adsLayer.connected) {
-    status = 'blocked';
+  if (adsLayer.connection === 'never_connected') {
+    status = 'onboarding';
+  } else if (adsLayer.connection === 'expired') {
+    status = 'at-risk';
   } else if (adsLayer.active_campaigns === 0 && !landerLayer.has_lander) {
     status = 'blocked';
   } else if (reasons.length === 0) {
@@ -476,8 +518,11 @@ export async function assessClientHealth(
       }
     }
 
+    const adConnection = classifyMetaAdConnection(connectedAccounts, client.adAccount);
     const adsLayer: AdsLayerHealth = {
       connected: !!hasAds,
+      connection: adConnection.connection,
+      ...(adConnection.expiredAt ? { token_expired_at: adConnection.expiredAt } : {}),
       ad_account_id: resolvedAdAccountId,
       active_campaigns: activeCampaigns.length,
       campaigns: activeCampaigns.map((c: any) => ({
@@ -742,6 +787,7 @@ export async function listAllClients(callerUserId: string, callerIsAdmin?: boole
           displayName: user.displayName || user.email,
           roles: user.roles || [],
           has_ads: hasAds,
+          ad_connection: classifyMetaAdConnection(accounts, user.adAccount).connection,
           has_lander: hasLander,
           has_crm: hasCrm,
           last_activity: user.lastLoginTime || null,
