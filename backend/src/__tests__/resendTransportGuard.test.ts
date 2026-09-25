@@ -108,9 +108,12 @@ describe('ENG-1112: the Resend transport is unreachable from tests', () => {
   });
 
   it('keeps emailService.sendEmail best-effort — swallowed, but still no Resend traffic', async () => {
-    // `emailService.sendEmail` deliberately swallows send failures (ENG-164), which is
-    // exactly why a live-send regression here is invisible from the caller's side. The
-    // guarantee that matters is therefore about the wire, not the return value.
+    // `emailService.sendEmail` deliberately swallows send failures (ENG-164) rather than
+    // throwing, which is exactly why a live-send regression here is invisible from the
+    // caller's side. Since ENG-1552 it resolves to an outcome ('sent'|'suppressed'|'failed')
+    // rather than void, precisely so a caller can tell a real send from a swallowed one —
+    // the guard's rejection is exactly the swallowed-failure case, so 'failed' is expected.
+    // The guarantee this test is actually for is the wire, not this specific outcome value.
     const { emailService } = await import('../services/emailService');
 
     await expect(
@@ -120,7 +123,7 @@ describe('ENG-1112: the Resend transport is unreachable from tests', () => {
         'should never leave the box',
         '<p>should never leave the box</p>'
       )
-    ).resolves.toBeUndefined();
+    ).resolves.toBe('failed');
 
     // Scoped to Resend on purpose. Importing emailService transitively loads
     // `services/docsKnowledgeSource.ts`, which prefetches
