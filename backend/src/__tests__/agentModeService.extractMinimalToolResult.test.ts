@@ -662,4 +662,34 @@ describe('AgentModeService - extractMinimalToolResult', () => {
     });
   });
 
+  // ENG-1644: stage_pending_decision had no entry in the minimizer at all — a
+  // genuinely successful call (decisionId written, Slack posted) fell into the
+  // default {} and lost its result. Found live-driving prod, never by a unit
+  // test that calls stage_pending_decision's own execute() directly.
+  describe('stage_pending_decision result extraction (ENG-1644)', () => {
+    it('preserves decisionId, success, message, and expiresAt', () => {
+      const result = {
+        success: true,
+        decisionId: 'a1b2c3d4e5f6',
+        message: 'Decision staged for harsha.',
+        expiresAt: '2026-10-02T12:00:00.000Z',
+      };
+      const minimal = (agentModeService as any).extractMinimalToolResult(result, 'stage_pending_decision');
+      expect(minimal).toEqual({
+        success: true,
+        decisionId: 'a1b2c3d4e5f6',
+        expiresAt: '2026-10-02T12:00:00.000Z',
+        message: 'Decision staged for harsha.',
+      });
+    });
+
+    it('omits fields that are absent rather than emitting undefined keys', () => {
+      const result = { success: false, message: 'No approver configured.' };
+      const minimal = (agentModeService as any).extractMinimalToolResult(result, 'stage_pending_decision');
+      expect(minimal).toEqual({ success: false, message: 'No approver configured.' });
+      expect('decisionId' in minimal).toBe(false);
+      expect('expiresAt' in minimal).toBe(false);
+    });
+  });
+
 });

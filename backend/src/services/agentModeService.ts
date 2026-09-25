@@ -8358,6 +8358,27 @@ export class AgentModeService {
       };
     }
 
+    // ENG-1644: same class of bug as metaWriteManifestDigest/metaWriteDispatch/
+    // questionDeckPayload above — this minimizer discards anything it doesn't
+    // name, and stage_pending_decision (never a halting tool — it doesn't set
+    // awaitingUserConfirmation, so the block at the top of this function never
+    // applies to it) had no entry here at all, falling straight to the
+    // default {}. The real, successful result (decisionId, success, message,
+    // expiresAt) was silently discarded on every call. Never caught by unit
+    // tests (they call stage_pending_decision's own execute() directly,
+    // never routing through this function) or by env1/prod DB-level
+    // verification (same reason) — only surfaced live-driving a real Emma
+    // turn through the full production stack, the first time this tool had
+    // ever been exercised that way.
+    if (toolName === 'stage_pending_decision' && result && typeof result === 'object') {
+      return {
+        ...(result.success !== undefined ? { success: result.success } : {}),
+        ...(result.decisionId !== undefined ? { decisionId: result.decisionId } : {}),
+        ...(result.expiresAt !== undefined ? { expiresAt: result.expiresAt } : {}),
+        ...(result.message !== undefined ? { message: result.message } : {}),
+      };
+    }
+
     // ENG-1207: pagination markers survive minimization, for EVERY tool.
     //
     // The default branch returned {}, which is right for storage and wrong for the
