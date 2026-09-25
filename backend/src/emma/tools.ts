@@ -34,6 +34,8 @@ import * as googleDocsSheetsImpl from './impl/googleDocsSheets';
 import * as htmlToolsImpl from './impl/htmlTools';
 // ENG-2103 (F2): leads/CRM tool cluster, same treatment as booksImpl above.
 import * as leadsImpl from './impl/leads';
+// ENG-2103 (F2): brand guidelines / market strategy tool cluster, same treatment as booksImpl above.
+import * as brandMarketStrategyImpl from './impl/brandMarketStrategy';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -2384,7 +2386,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.readBrandGuidelines(context?.userId);
+    return await brandMarketStrategyImpl.readBrandGuidelines(context?.userId);
   }
 });
 
@@ -2463,7 +2465,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.updateBrandGuidelines(args, context?.userId);
+    return await brandMarketStrategyImpl.updateBrandGuidelines(args, context?.userId);
   }
 });
 
@@ -2491,7 +2493,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.readMarketStrategy(context?.userId, {
+    return await brandMarketStrategyImpl.readMarketStrategy(context?.userId, {
       competitorOffset: args?.competitorOffset,
       competitorNames: args?.competitorNames,
     });
@@ -2543,7 +2545,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.updateMarketStrategy(args, context?.userId);
+    return await brandMarketStrategyImpl.updateMarketStrategy(args, context?.userId);
   }
 });
 
@@ -2562,7 +2564,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.regenerateMarketStrategy(context?.userId);
+    return await brandMarketStrategyImpl.regenerateMarketStrategy(context?.userId);
   }
 });
 
