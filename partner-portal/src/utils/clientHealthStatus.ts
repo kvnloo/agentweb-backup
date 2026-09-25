@@ -14,6 +14,11 @@ export function adConnectionOf(client: ClientHealthFlags): AdConnectionState {
   return client.ad_connection ?? (client.has_ads ? 'connected' : 'never_connected');
 }
 
+/** Connection state for the detail view's ads layer; older backends only send `connected`. */
+export function adsLayerConnection(adsLayer: { connected: boolean; connection?: AdConnectionState }): AdConnectionState {
+  return adsLayer.connection ?? (adsLayer.connected ? 'connected' : 'never_connected');
+}
+
 /**
  * Roster status for one client. ENG-2133 (ENG-2128 T1): never connecting an ad account is
  * activation (`onboarding`), not churn — it used to render as a red "At Risk". Only a

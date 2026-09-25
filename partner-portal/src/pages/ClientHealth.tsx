@@ -31,6 +31,7 @@ import AccessTimeIcon from '@mui/icons-material/AccessTime';
 import ShieldIcon from '@mui/icons-material/Shield';
 import {
   adConnectionOf,
+  adsLayerConnection,
   deriveQuickStatus,
   quickSummary,
   type AdConnectionState,
@@ -110,6 +111,18 @@ const ADS_INDICATOR: Record<AdConnectionState, { title: string; color: string }>
   connected: { title: 'Ads connected', color: 'success.main' },
   never_connected: { title: 'Ads not connected yet (activation)', color: 'text.disabled' },
   expired: { title: 'Ad connection expired', color: 'error.light' },
+};
+
+const ADS_PANEL: Record<AdConnectionState, { border: string; bg: string }> = {
+  connected: { border: 'success.light', bg: 'success.50' },
+  never_connected: { border: 'grey.300', bg: 'grey.50' },
+  expired: { border: 'error.light', bg: 'error.50' },
+};
+
+const ADS_ACCOUNT_LABEL: Record<AdConnectionState, string> = {
+  connected: 'Connected',
+  never_connected: 'Not connected yet',
+  expired: 'Expired — reconnect needed',
 };
 
 function formatRelativeTime(dateStr: string | null): string {
@@ -310,16 +323,16 @@ export default function ClientHealth() {
                       p: 2,
                       borderRadius: 2,
                       border: 2,
-                      borderColor: detail.ads_layer.connected ? 'success.light' : 'error.light',
-                      bgcolor: detail.ads_layer.connected ? 'success.50' : 'error.50',
+                      borderColor: ADS_PANEL[adsLayerConnection(detail.ads_layer)].border,
+                      bgcolor: ADS_PANEL[adsLayerConnection(detail.ads_layer)].bg,
                     }}
                   >
                     <CampaignIcon sx={{ mb: 0.5 }} />
                     <Typography variant="subtitle2">Meta Ads</Typography>
                     <Typography variant="caption" color="text.secondary">
-                      {detail.ads_layer.connected
+                      {adsLayerConnection(detail.ads_layer) === 'connected'
                         ? `${detail.ads_layer.active_campaigns} active`
-                        : 'Not connected'}
+                        : ADS_INDICATOR[adsLayerConnection(detail.ads_layer)].title}
                     </Typography>
                   </Box>
                   <ChevronRightIcon color="disabled" />
@@ -380,9 +393,9 @@ export default function ClientHealth() {
                   <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 1 }}>
                     <Typography variant="body2" color="text.secondary">Ad Account</Typography>
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                      <StatusIcon ok={detail.ads_layer.connected} />
+                      <StatusIcon ok={adsLayerConnection(detail.ads_layer) === 'connected'} />
                       <Typography variant="body2">
-                        {detail.ads_layer.connected ? 'Connected' : 'Disconnected'}
+                        {ADS_ACCOUNT_LABEL[adsLayerConnection(detail.ads_layer)]}
                       </Typography>
                     </Box>
                   </Box>
