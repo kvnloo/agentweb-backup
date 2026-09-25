@@ -629,9 +629,10 @@ export class ImageService {
               ...(gates ? { gates } : {}),
             };
           } else {
-            // If S3 upload fails, return the original result
+            // If S3 upload fails, return the original result. Its bytes can differ from the
+            // measured buffer (C2PA removal), so the gate result would describe another artifact.
             console.warn('Failed to upload image to S3, returning original result:', uploadResult.error);
-            return gates ? { ...result, gates } : result;
+            return result;
           }
         }
         
