@@ -40,6 +40,8 @@ import * as brandMarketStrategyImpl from './impl/brandMarketStrategy';
 import * as mediaVideoImpl from './impl/mediaVideo';
 // ENG-2103 (F2): createHtmlFile/createHtmlTemplate tool cluster, same treatment as booksImpl above.
 import * as htmlCreationImpl from './impl/htmlCreation';
+// ENG-2103 (F2): updateHtmlFile tool cluster, same treatment as booksImpl above.
+import * as htmlUpdateImpl from './impl/htmlUpdate';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -3331,7 +3333,7 @@ emmaToolRegistry.register({
       };
     }
 
-    return await agentModeService.updateHtmlFile(args.file_url, args.update_type, operations, context?.userId, context?.sessionId);
+    return await htmlUpdateImpl.updateHtmlFile(args.file_url, args.update_type, operations, context?.userId, context?.sessionId);
   }
 });
 

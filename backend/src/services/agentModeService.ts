@@ -220,7 +220,6 @@ import {
 } from '../emma/impl/shared/googleDriveErrors';
 import { pdfPageRender } from '../emma/impl/shared/pdfTextRender';
 import {
-  performContentReplacements as sharedPerformContentReplacements,
   performDirectReplacement as sharedPerformDirectReplacement,
 } from '../emma/impl/shared/contentReplacements';
 import {
@@ -239,6 +238,8 @@ import * as mediaVideoImpl from '../emma/impl/mediaVideo';
 // ENG-2103 (F2): createHtmlFile/createHtmlTemplate tool cluster, same
 // treatment as leadsImpl above.
 import * as htmlCreationImpl from '../emma/impl/htmlCreation';
+// ENG-2103 (F2): updateHtmlFile tool cluster, same treatment as leadsImpl above.
+import * as htmlUpdateImpl from '../emma/impl/htmlUpdate';
 import { publishWithResolvedBlogPublisher } from './blogPublishers';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
 import { inferSearchFreshness } from '../search/searchFreshness';
@@ -26351,7 +26352,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return htmlToolsImpl.listHtmlTemplates(userId, type);
   }
 
-  // Update HTML file with direct content replacement
+  // ENG-2103 (F2): delegates to emma/impl/htmlUpdate.ts. Kept as a class
+  // method (not deleted) because updateHtmlFile.test.ts and
+  // updateHtmlFile.cssSelector.test.ts call this method directly on a real
+  // instance.
   public async updateHtmlFile(
     fileUrl: string,
     updateType: string,
@@ -26359,109 +26363,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     userId: string,
     sessionId: string
   ): Promise<any> {
-    try {
-      // Handle CSS-selector-based operations
-      if (updateType === 'css') {
-        return await this.updateHtmlFileCss(fileUrl, replacementInstructions, userId, sessionId);
-      }
-
-      // Validate update_type first (before fetching file)
-      if (!updateType || !['part', 'full'].includes(updateType)) {
-        return {
-          success: false,
-          message: 'update_type must be either "part" or "full"'
-        };
-      }
-
-      // Validate replacement instructions (before fetching file)
-      // This is a quick validation to catch errors early
-      if (!Array.isArray(replacementInstructions)) {
-        return {
-          success: false,
-          message: 'replacement_json must be an array of replacement instructions'
-        };
-      }
-
-      if (replacementInstructions.length === 0) {
-        return {
-          success: false,
-          message: 'At least one replacement instruction is required'
-        };
-      }
-
-      // Fetch current file content
-      const currentContent = await this.fetchFileContent(fileUrl);
-      console.log(`AgentMode: Fetched file content, length: ${currentContent.length} characters`);
-
-      // Compute hash of current content for verification
-      const currentContentHash = createHash('sha256').update(currentContent).digest('hex');
-      console.log(`AgentMode: Computed current content hash: ${currentContentHash}`);
-
-      // Use common replacement function (ENG-2103 F2 pilot: promoted to
-      // emma/impl/shared/contentReplacements.ts, shared with update_book_content).
-      const replacementResult = sharedPerformContentReplacements(
-        currentContent,
-        currentContentHash,
-        updateType,
-        replacementInstructions
-      );
-
-      if (!replacementResult.success) {
-        // Map error messages to match expected format for HTML files
-        let errorMessage = replacementResult.error?.message || 'Failed to perform replacements';
-
-        // Replace generic messages with HTML-specific ones for backward compatibility
-        if (replacementResult.error?.isHashMismatch || errorMessage.includes('Content hash mismatch')) {
-          errorMessage = errorMessage.replace('Content hash mismatch', 'File hash mismatch');
-        }
-
-        return {
-          success: false,
-          message: errorMessage,
-          suggestion: replacementResult.error?.suggestion
-        };
-      }
-
-      // Create versioned filename and upload the updated content
-      const versionedFilename = this.createVersionedFilename(fileUrl);
-      console.log(`AgentMode: Original file URL: ${fileUrl}`);
-      console.log(`AgentMode: Generated versioned filename: ${versionedFilename}`);
-      const originalPath = this.extractPathFromS3Url(fileUrl);
-      console.log(`AgentMode: Original path: ${originalPath}`);
-      const uploadResult = await this.uploadUpdatedFile(replacementResult.updatedContent!, versionedFilename, originalPath);
-
-      return {
-        success: true,
-        s3_url: uploadResult.url,
-        message: `File updated successfully with ${replacementResult.replacementResults!.length} replacements`,
-        method: 'mixed_replacement',
-        replacements: replacementResult.replacementResults,
-        versioned_filename: versionedFilename
-      };
-
-    } catch (error) {
-      console.error('Error updating HTML file:', error);
-      return {
-        success: false,
-        message: 'Failed to update HTML file',
-        error: error instanceof Error ? error.message : 'Unknown error',
-        suggestion: 'For entire file replacement, use old_content_hash from read_file_content. For partial replacement, use old_content with the exact text to replace'
-      };
-    }
+    return htmlUpdateImpl.updateHtmlFile(fileUrl, updateType, replacementInstructions, userId, sessionId);
   }
 
-  // Fetch file content from URL
+  // ENG-2103 (F2): delegates to emma/impl/htmlUpdate.ts. Kept as a class
+  // method (not deleted) because updateHtmlFile.test.ts and
+  // updateHtmlFile.cssSelector.test.ts spy on/call
+  // `(agentModeService as any).fetchFileContent` directly.
   public async fetchFileContent(fileUrl: string): Promise<string> {
-    try {
-      const response = await fetch(fileUrl);
-      if (!response.ok) {
-        throw new Error(`Failed to fetch file: ${response.status} ${response.statusText}`);
-      }
-      return await response.text();
-    } catch (error) {
-      console.error('Error fetching file content:', error);
-      throw new Error(`Failed to fetch file content: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
+    return htmlUpdateImpl.fetchFileContent(fileUrl);
   }
 
   // ENG-2103 (F2 pilot): performContentReplacements had exactly two callers
@@ -26482,244 +26392,38 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return sharedPerformDirectReplacement(content, oldContent, newContent, exactMatch);
   }
 
-  // Extract path from S3 URL
-  private extractPathFromS3Url(s3Url: string): string {
-    try {
-      // Parse the S3 URL to extract the key
-      const url = new URL(s3Url);
-      const key = url.pathname.substring(1); // Remove leading slash
-
-      // Extract path by removing the filename
-      const lastSlashIndex = key.lastIndexOf('/');
-      if (lastSlashIndex === -1) {
-        return ''; // No path, just filename
-      }
-
-      return key.substring(0, lastSlashIndex);
-    } catch (error) {
-      console.error('Error extracting path from S3 URL:', error);
-      return '';
-    }
-  }
-
-  // Create versioned filename
-  private createVersionedFilename(originalUrl: string): string {
-    try {
-      // Extract filename from original URL
-      const urlParts = originalUrl.split('/');
-      const filename = urlParts[urlParts.length - 1];
-      console.log(`AgentMode: Extracted filename: ${filename}`);
-
-      // Split filename into name and extension
-      const lastDotIndex = filename.lastIndexOf('.');
-      if (lastDotIndex === -1) {
-        // No extension, just add version
-        console.log(`AgentMode: No extension found, adding _v2`);
-        return `${filename}_v2`;
-      }
-
-      const nameWithoutExt = filename.substring(0, lastDotIndex);
-      const extension = filename.substring(lastDotIndex);
-      console.log(`AgentMode: Name without ext: ${nameWithoutExt}, extension: ${extension}`);
-
-      // Check if filename already has a version pattern (_v followed by digits)
-      const versionMatch = nameWithoutExt.match(/^(.+)_v(\d+)$/);
-      console.log(`AgentMode: Version match result:`, versionMatch);
-
-      if (versionMatch) {
-        // Extract base name and current version number
-        const baseName = versionMatch[1];
-        const currentVersion = parseInt(versionMatch[2], 10);
-        const newVersion = currentVersion + 1;
-        console.log(`AgentMode: Found existing version ${currentVersion}, incrementing to ${newVersion}`);
-        return `${baseName}_v${newVersion}${extension}`;
-      } else {
-        // No existing version, add _v2
-        console.log(`AgentMode: No existing version found, adding _v2`);
-        return `${nameWithoutExt}_v2${extension}`;
-      }
-    } catch (error) {
-      console.error('Error creating versioned filename:', error);
-      // Fallback: add timestamp to avoid conflicts
-      const timestamp = Date.now();
-      const urlParts = originalUrl.split('/');
-      const filename = urlParts[urlParts.length - 1];
-      const lastDotIndex = filename.lastIndexOf('.');
-
-      if (lastDotIndex === -1) {
-        return `${filename}_v2_${timestamp}`;
-      } else {
-        const nameWithoutExt = filename.substring(0, lastDotIndex);
-        const extension = filename.substring(lastDotIndex);
-        return `${nameWithoutExt}_v2_${timestamp}${extension}`;
-      }
-    }
-  }
-
-  // Upload updated file content
+  // ENG-2103 (F2): delegates to emma/impl/htmlUpdate.ts. Kept as a class
+  // method (not deleted) because updateHtmlFile.test.ts and
+  // updateHtmlFile.cssSelector.test.ts spy on/call
+  // `(agentModeService as any).uploadUpdatedFile` directly, and
+  // agentModeService.uploadUpdatedFile.test.ts calls it directly on a real
+  // instance.
   public async uploadUpdatedFile(
     content: string,
     filename: string,
     path: string
   ): Promise<{ url: string }> {
-    try {
-      // Upload to S3 with the same path as the original file
-      const { uploadFileToS3WithPath } = await import('../utils/s3Utils');
-      const { sanitizeGeneratedHtml } = await import('../utils/htmlSanitizer');
-      // ENG-1997 — this is the shared upload sink for BOTH updateHtmlFile's
-      // part/full replacements and updateHtmlFileCss's selector-based edits.
-      // The latter's `setAttribute` operation lets the model set an arbitrary
-      // attribute name/value pair directly (e.g. onerror/onclick), and its
-      // replace/append/etc. actions splice raw HTML with no escaping — same
-      // "LLM-authored HTML reaches a public S3 file unsanitized" trust gap
-      // createHtmlFile had, one step more direct since there's no need to even
-      // reproduce untrusted quoted text, the tool call arguments ARE the payload.
-      const sanitizedContent = sanitizeGeneratedHtml(content);
-      const uploadResult = await uploadFileToS3WithPath(sanitizedContent, filename, 'text/html', path);
-
-      if (!uploadResult.success || !uploadResult.url) {
-        throw new Error(uploadResult.error || 'Failed to upload updated file');
-      }
-
-      return { url: uploadResult.url };
-    } catch (error) {
-      console.error('Error uploading updated file:', error);
-      throw new Error(`Failed to upload updated file: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
+    return htmlUpdateImpl.uploadUpdatedFile(content, filename, path);
   }
 
-  // CSS-selector-based HTML file editing
-  private async updateHtmlFileCss(
-    fileUrl: string,
-    operations: any[],
-    userId: string,
-    sessionId: string
-  ): Promise<any> {
-    try {
-      // Validate operations
-      if (!Array.isArray(operations) || operations.length === 0) {
-        return { success: false, message: 'At least one operation is required' };
-      }
+  // ENG-2103 (F2): delegates to emma/impl/htmlUpdate.ts. Kept as a class
+  // method (not deleted) because updateHtmlFile.test.ts's own
+  // `describe('extractPathFromS3Url', ...)` block calls
+  // `(agentModeService as any).extractPathFromS3Url` directly (no spy — a
+  // direct unit-test call on the real instance) to exercise its pure logic
+  // in isolation.
+  private extractPathFromS3Url(s3Url: string): string {
+    return htmlUpdateImpl.extractPathFromS3Url(s3Url);
+  }
 
-      const validActions = ['remove', 'replace', 'replaceInner', 'append', 'prepend', 'insertBefore', 'insertAfter', 'setAttribute', 'removeAttribute'];
-      const actionsNeedingHtml = ['replace', 'replaceInner', 'append', 'prepend', 'insertBefore', 'insertAfter'];
-
-      for (let i = 0; i < operations.length; i++) {
-        const op = operations[i];
-        if (!op.action || !validActions.includes(op.action)) {
-          return { success: false, message: `Operation ${i + 1}: Invalid action "${op.action}". Valid actions: ${validActions.join(', ')}` };
-        }
-        if (!op.selector) {
-          return { success: false, message: `Operation ${i + 1}: selector is required` };
-        }
-        if (actionsNeedingHtml.includes(op.action) && (op.html === undefined || op.html === null)) {
-          return { success: false, message: `Operation ${i + 1}: html is required for action "${op.action}"` };
-        }
-        if (op.action === 'setAttribute' && (!op.attribute || op.value === undefined)) {
-          return { success: false, message: `Operation ${i + 1}: attribute and value are required for setAttribute` };
-        }
-        if (op.action === 'removeAttribute' && !op.attribute) {
-          return { success: false, message: `Operation ${i + 1}: attribute is required for removeAttribute` };
-        }
-      }
-
-      // Fetch current file content
-      const currentContent = await this.fetchFileContent(fileUrl);
-      console.log(`AgentMode: CSS edit - fetched file, length: ${currentContent.length}`);
-
-      // Load into cheerio
-      const cheerio = await import('cheerio');
-      const $ = cheerio.load(currentContent, { xml: false } as any);
-
-      // Apply operations sequentially, collecting results for each
-      let operationsApplied = 0;
-      const operationResults: { index: number; action: string; selector: string; success: boolean; error?: string }[] = [];
-      for (let i = 0; i < operations.length; i++) {
-        const op = operations[i];
-        const matched = $(op.selector);
-
-        if (matched.length === 0) {
-          console.warn(`AgentMode: CSS edit op ${i + 1}: no match for "${op.selector}"`);
-          operationResults.push({ index: i + 1, action: op.action, selector: op.selector, success: false, error: `No elements matched selector "${op.selector}"` });
-          continue;
-        }
-
-        console.log(`AgentMode: CSS edit op ${i + 1}: ${op.action} on "${op.selector}" (${matched.length} matches)`);
-
-        switch (op.action) {
-          case 'remove':
-            matched.remove();
-            break;
-          case 'replace':
-            matched.replaceWith(op.html);
-            break;
-          case 'replaceInner':
-            matched.html(op.html);
-            break;
-          case 'append':
-            matched.append(op.html);
-            break;
-          case 'prepend':
-            matched.prepend(op.html);
-            break;
-          case 'insertBefore':
-            matched.before(op.html);
-            break;
-          case 'insertAfter':
-            matched.after(op.html);
-            break;
-          case 'setAttribute':
-            matched.attr(op.attribute, op.value);
-            break;
-          case 'removeAttribute':
-            matched.removeAttr(op.attribute);
-            break;
-        }
-        operationsApplied++;
-        operationResults.push({ index: i + 1, action: op.action, selector: op.selector, success: true });
-      }
-
-      // If nothing was applied, return failure
-      if (operationsApplied === 0) {
-        return {
-          success: false,
-          message: `All ${operations.length} operations failed: no selectors matched`,
-          operations: operationResults,
-          suggestion: 'Use read_file_content to inspect the current HTML structure. Use :eq(n) (0-indexed) to select by position within matched set, e.g. ".step-block:eq(1)" for the 2nd .step-block.'
-        };
-      }
-
-      // Serialize back to HTML
-      const updatedContent = $.html();
-      const failedOps = operationResults.filter(r => !r.success);
-      console.log(`AgentMode: CSS edit complete, ${operationsApplied}/${operations.length} operations applied, new length: ${updatedContent.length}`);
-
-      // Upload
-      const versionedFilename = this.createVersionedFilename(fileUrl);
-      const originalPath = this.extractPathFromS3Url(fileUrl);
-      const uploadResult = await this.uploadUpdatedFile(updatedContent, versionedFilename, originalPath);
-
-      return {
-        success: true,
-        s3_url: uploadResult.url,
-        message: failedOps.length > 0
-          ? `File updated with ${operationsApplied}/${operations.length} operations (${failedOps.length} failed: ${failedOps.map(f => `op ${f.index} selector "${f.selector}"`).join(', ')})`
-          : `File updated successfully with ${operationsApplied} CSS-selector operations`,
-        method: 'css_selector',
-        operations_applied: operationsApplied,
-        operations: operationResults,
-        updatedContent,
-        versioned_filename: versionedFilename
-      };
-    } catch (error) {
-      console.error('Error in CSS-selector HTML update:', error);
-      return {
-        success: false,
-        message: 'Failed to update HTML file',
-        error: error instanceof Error ? error.message : 'Unknown error',
-        suggestion: 'Check your CSS selectors and HTML content. Use read_file_content to inspect the current file structure.'
-      };
-    }
+  // ENG-2103 (F2): delegates to emma/impl/htmlUpdate.ts. Kept as a class
+  // method (not deleted) because updateHtmlFile.test.ts's own
+  // `describe('createVersionedFilename', ...)` block calls
+  // `(agentModeService as any).createVersionedFilename` directly (no spy —
+  // a direct unit-test call on the real instance) to exercise its pure
+  // logic in isolation.
+  private createVersionedFilename(originalUrl: string): string {
+    return htmlUpdateImpl.createVersionedFilename(originalUrl);
   }
 
   // Create HTML from template with variable substitution
