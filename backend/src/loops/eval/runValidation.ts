@@ -10,6 +10,10 @@
  * Pairs use binary labels only: a case is left out of a criterion when the human label is `na`
  * or missing (counted as `humanNa` / `unlabelled`), or when the grader gives no pass/fail for it
  * (`graderAbstained`), so abstentions never count as agreement.
+ *
+ * Adapters on this branch: the session judges' stored verdicts (general, Fangfang, Matt) and the
+ * ENG-2137 agent graders run live on the case's session. Account-health and creative graders
+ * register theirs as they land (ENG-2143, ENG-2138). All adapters read only.
  */
 
 import AWS from 'aws-sdk';
@@ -17,6 +21,9 @@ import { agreementReport, toGraderValidation, type AgreementReport, type LabelPa
 import { getGrader, type EvalSurface } from './evalRegistry';
 import type { GoldenCase, GoldenCriterion, GoldenSplit, LabelValue } from './goldenSet';
 import type { GoldenSetStore } from './goldenSetStore';
+import { gradeGroundedness, gradeTaskSuccess, gradeToolCorrectness, type SessionForGrading } from './agentGraders';
+import { buildLoadedSession, groupEventsBySession, type DocItem, type ReadOnlyDocReader, type ReadRequest } from './agentGraderLoader';
+import { LOOP_EVENTS_TABLE } from '../core/sensors/eventTableEventSource';
 
 export type GraderPrediction = Partial<Record<GoldenCriterion, LabelValue>>;
 
@@ -203,4 +210,101 @@ export function storedSessionJudgeGraders(client: AWS.DynamoDB.DocumentClient = 
       sessionJudgeGrader(graderId, async (id) => (await readScores(id))?.judgeScores?.[judgeId]?.dimensions),
     ),
   ];
+}
+
+// Agent graders (ENG-2137), run live on the case's session ------------------------------------
+
+/** Loop events older than this before the session's last update are not read (as agentGraderLoader). */
+const MAX_EVENT_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
+
+async function readAll(reader: ReadOnlyDocReader, request: ReadRequest): Promise<DocItem[]> {
+  const items: DocItem[] = [];
+  let start: DocItem | undefined;
+  do {
+    const page = await reader.query({ ...request, ...(start ? { ExclusiveStartKey: start } : {}) });
+    items.push(...(page.Items ?? []));
+    start = page.LastEvaluatedKey;
+  } while (start);
+  return items;
+}
+
+export interface AgentGraderTables {
+  sessions: string;
+  messages: string;
+  loopEvents: string;
+}
+
+/** Read-only: one session's work plan, messages and agent-mode loop events, as the agent graders take them. */
+export async function loadSessionForGrading(reader: ReadOnlyDocReader, tables: AgentGraderTables, sessionId: string): Promise<SessionForGrading | undefined> {
+  const [item] = await readAll(reader, {
+    TableName: tables.sessions,
+    KeyConditionExpression: 'sessionId = :s',
+    ProjectionExpression: 'sessionId, createdAt, updatedAt, workPlan',
+    ExpressionAttributeValues: { ':s': sessionId },
+  });
+  if (!item) return undefined;
+  const messageRows = await readAll(reader, {
+    TableName: tables.messages,
+    KeyConditionExpression: 'sessionId = :s',
+    ExpressionAttributeValues: { ':s': sessionId },
+  });
+  const updatedAt = typeof item.updatedAt === 'string' ? item.updatedAt : new Date().toISOString();
+  const floor = new Date(Date.parse(updatedAt) - MAX_EVENT_LOOKBACK_MS).toISOString();
+  const createdAt = typeof item.createdAt === 'string' ? item.createdAt : floor;
+  const eventRows = await readAll(reader, {
+    TableName: tables.loopEvents,
+    KeyConditionExpression: 'loopId = :l AND tsSession BETWEEN :from AND :to',
+    // tsSession is the sort key and cannot be filtered on; the session id is also a dimension.
+    FilterExpression: '#dims.sessionId = :s',
+    ExpressionAttributeNames: { '#dims': 'dimensions' },
+    ExpressionAttributeValues: { ':l': 'agent-mode', ':from': createdAt < floor ? floor : createdAt, ':to': `${updatedAt}\uffff`, ':s': sessionId },
+  });
+  return buildLoadedSession(item, messageRows, groupEventsBySession(eventRows).get(sessionId) ?? [], undefined).session;
+}
+
+/** Maps each agent grader's verdict onto its criterion; `excluded` / `no_claims` abstain. */
+export function agentGraderPrediction(graderId: string, session: SessionForGrading | undefined): GraderPrediction {
+  if (!session) return {};
+  switch (graderId) {
+    case 'agent-task-success': {
+      const { verdict } = gradeTaskSuccess(session);
+      return { task_success: verdict === 'success' ? 'pass' : verdict === 'failure' ? 'fail' : 'na' };
+    }
+    case 'agent-tool-correctness':
+      return { tool_correctness: gradeToolCorrectness(session).verdict };
+    case 'agent-groundedness-offline': {
+      const { verdict } = gradeGroundedness(session.finalReply, session.ledger);
+      return { groundedness: verdict === 'grounded' ? 'pass' : verdict === 'ungrounded' ? 'fail' : 'na' };
+    }
+    default:
+      throw new Error(`not an agent grader: ${graderId}`);
+  }
+}
+
+const AGENT_GRADER_CRITERIA: Record<string, GoldenCriterion> = {
+  'agent-task-success': 'task_success',
+  'agent-tool-correctness': 'tool_correctness',
+  'agent-groundedness-offline': 'groundedness',
+};
+
+export function liveAgentGraders(load: (sessionId: string) => Promise<SessionForGrading | undefined>): GoldenCaseGrader[] {
+  return Object.entries(AGENT_GRADER_CRITERIA).map(([graderId, criterion]) => ({
+    graderId,
+    surface: 'agent' as const,
+    criteria: [criterion],
+    primaryCriterion: criterion,
+    grade: async (c: GoldenCase) => agentGraderPrediction(graderId, await load(c.sourceRef.id)),
+  }));
+}
+
+/** Every golden-case adapter available on this branch, reading production (or `Dev-`) tables read-only. */
+export function defaultGoldenCaseGraders(): GoldenCaseGrader[] {
+  const doc = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || 'us-west-2' });
+  const prefix = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+  const reader: ReadOnlyDocReader = {
+    query: (request) => doc.query(request as AWS.DynamoDB.DocumentClient.QueryInput).promise(),
+    scan: (request) => doc.scan(request as AWS.DynamoDB.DocumentClient.ScanInput).promise(),
+  };
+  const tables: AgentGraderTables = { sessions: `${prefix}AW-ChatSessions`, messages: `${prefix}AW-ChatMessages`, loopEvents: LOOP_EVENTS_TABLE };
+  return [...storedSessionJudgeGraders(doc), ...liveAgentGraders((sessionId) => loadSessionForGrading(reader, tables, sessionId))];
 }

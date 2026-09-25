@@ -11,7 +11,7 @@
  */
 
 import { goldenSetStoreFromEnv, GOLDEN_CASES_TABLE_ENV } from '../loops/eval/goldenSetStore';
-import { runValidation, storedSessionJudgeGraders } from '../loops/eval/runValidation';
+import { defaultGoldenCaseGraders, runValidation } from '../loops/eval/runValidation';
 import { isQualifyingValidation } from '../loops/eval/evalRegistry';
 import type { GoldenSplit } from '../loops/eval/goldenSet';
 
@@ -31,7 +31,7 @@ async function main(): Promise<void> {
     console.error(`Golden-set store not provisioned: set ${GOLDEN_CASES_TABLE_ENV} (OPS-2 / ENG-2147).`);
     process.exit(1);
   }
-  const run = await runValidation({ graderId, store, graders: storedSessionJudgeGraders(), evidence, split });
+  const run = await runValidation({ graderId, store, graders: defaultGoldenCaseGraders(), evidence, split });
   console.log(JSON.stringify(run, null, 2));
   console.log(
     run.validation && isQualifyingValidation(run.validation)
