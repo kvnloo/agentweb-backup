@@ -88,9 +88,9 @@ describe('getAllAvailableConnectedAccounts', () => {
     }
   });
 
-  it('returns exactly 14 items', () => {
+  it('returns exactly 15 items', () => {
     const result = getAllAvailableConnectedAccounts();
-    expect(result).toHaveLength(14);
+    expect(result).toHaveLength(15);
   });
 
   it('does not include unexpected platforms', () => {
@@ -110,6 +110,7 @@ describe('getAllAvailableConnectedAccounts', () => {
       'attio',
       'google_ads',
       'google_drive',
+      'linkedin_ads',
     ]);
     for (const platform of result) {
       expect(knownPlatforms.has(platform)).toBe(true);
