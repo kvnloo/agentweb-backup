@@ -7,7 +7,7 @@ Part of ENG-2128 (Eval System v2), slice 1. The machine-readable registry is
 ## Rule: unvalidated graders cannot gate or alert
 
 `mayGate(id)` is true only when the entry carries a `validation` with Cohen's κ ≥ 0.6 on at
-least 30 labelled cases and a link to the run. **No grader qualifies today.** The agreement
+least 30 labelled cases and an http(s) link to the run. **No grader qualifies today.** The agreement
 harness (ENG-2136) produces those runs; record the result on the entry, with evidence.
 
 ## Inventory
@@ -22,6 +22,7 @@ harness (ENG-2136) produces those runs; record the result on the entry, with evi
 | okareo-no-hallucinated-capabilities-v2 | agent | LLM judge (Okareo) | unknown | calibration set only |
 | enrichment-golden-set | agent | code | — | golden set, CRM enrichment only |
 | human-eval-queue | creative | human (free text) | — | no |
+| onboarding-quality-pairwise | creative | LLM judge, offline pairwise (customer portal) | claude-sonnet-4-6 (Claude) | no |
 | image-prompt-like-rate | creative | human (likes) | — | no |
 | landing-page-smoke-test | creative | code | — | deterministic |
 | client-health-assessment | account health | code | — | no |
@@ -52,8 +53,11 @@ Sources, consumers and known issues for each entry are in `evalRegistry.ts`.
    groundedness (shadow evidence: ENG-2150).
 8. **Okareo checks live only in Okareo.** No check is defined in the repo or wired to CI; the
    v2 hallucination check's 11/11 is a calibration result, not human agreement.
-9. **No automated creative grader exists.** Creative quality is free-text Slack feedback from a
-   single reviewer.
+9. **Nothing scores each generated creative.** In production, creative quality is free-text
+   Slack feedback from a single reviewer. The only automated creative comparison is the
+   customer portal's offline `scripts/eval-onboarding-quality.ts`: a Claude Sonnet pairwise judge
+   that compares two onboarding pipeline versions layer by layer (including creative direction,
+   ad images and ad copy) on fixture pairs.
 10. **Account health mislabelled activation as risk** — a never-connected ad account read as
     blocked / At Risk. Fixed by ENG-2133.
 
