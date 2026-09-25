@@ -10,7 +10,7 @@ import {
   type AdDayMetrics,
   type CreativeObservation,
 } from '../loops/eval/creativePerformance';
-import { formatReport, loadCreativeObservations, parseArgs, type ReadOnlyReader } from '../scripts/creativePerformanceCorrelation';
+import { adChangeTimes, formatReport, linkUntil, loadCreativeObservations, parseArgs, type ReadOnlyReader } from '../scripts/creativePerformanceCorrelation';
 
 /** Settled: captured 40 days after the reporting date. */
 function settledRow(date: string, over: Partial<AdDayMetrics> = {}): AdDayMetrics {
@@ -173,5 +173,49 @@ describe('creativePerformanceCorrelation loader (read-only)', () => {
       creative('c', 3, [settledRow('2026-07-01', { clicks: 3 })]),
     ], { iterations: 50 }), 0, opts);
     expect(lines.find((l) => l.startsWith('Rubric score vs CTR'))).toMatch(/rho=1\.000 {2}n=3 {2}95% CI \[/);
+  });
+});
+
+describe('ad link windows stop at the next creative change (CodeRabbit)', () => {
+  const tables = { lineage: 'L', humanEval: 'H', adsMetrics: 'M' };
+  const link = (adId: string, linkedAt: string, via = 'create_ad') => ({ accountId: '1000', adId, metaCreativeId: `mc-${linkedAt}`, via, linkedAt });
+  // ad-1 carries creative A from 07-01, is swapped to creative B on 07-10; ad-2 carries A until it
+  // is swapped to an existing (non-generated) asset on 07-20, which only leaves an end marker.
+  const creatives = [
+    { creativeId: 'A', metaAdLinks: [link('ad-1', '2026-07-01T10:00:00.000Z'), link('ad-2', '2026-07-05T10:00:00.000Z')],
+      metaAdLinkEnds: [{ accountId: '1000', adId: 'ad-1', endedAt: '2026-07-10T09:00:00.000Z' }, { accountId: '1000', adId: 'ad-2', endedAt: '2026-07-20T09:00:00.000Z' }] },
+    { creativeId: 'B', metaAdLinks: [link('ad-1', '2026-07-10T09:00:01.000Z', 'swap_creative')] },
+  ];
+
+  it('bounds each link by the ad\'s next change across all creatives', () => {
+    const changes = adChangeTimes(creatives);
+    expect(linkUntil(creatives[0].metaAdLinks[0] as never, changes)).toBe('2026-07-10');
+    expect(linkUntil(creatives[0].metaAdLinks[1] as never, changes)).toBe('2026-07-20');
+    expect(linkUntil(creatives[1].metaAdLinks[0] as never, changes)).toBeUndefined();
+  });
+
+  it('queries each link only up to the day before the change, and leaves the open link unbounded', async () => {
+    const reader: jest.Mocked<ReadOnlyReader> = {
+      scan: jest.fn().mockResolvedValue({ Items: creatives }),
+      query: jest.fn().mockResolvedValue({ Items: [] }),
+      get: jest.fn().mockResolvedValue({}),
+    };
+    await loadCreativeObservations(reader, tables);
+    expect(reader.scan).toHaveBeenCalledWith(expect.objectContaining({ ProjectionExpression: 'creativeId, humanEvalCandidateId, metaAdLinks, metaAdLinkEnds' }));
+    const queries = reader.query.mock.calls.map(([q]) => [q.KeyConditionExpression, q.ExpressionAttributeValues]);
+    expect(queries).toEqual([
+      ['entityKey = :entityKey AND #date BETWEEN :since AND :last', { ':entityKey': 'meta#1000#ad#ad-1', ':since': '2026-07-01', ':last': '2026-07-09' }],
+      ['entityKey = :entityKey AND #date BETWEEN :since AND :last', { ':entityKey': 'meta#1000#ad#ad-2', ':since': '2026-07-05', ':last': '2026-07-19' }],
+      ['entityKey = :entityKey AND #date >= :since', { ':entityKey': 'meta#1000#ad#ad-1', ':since': '2026-07-10' }],
+    ]);
+  });
+
+  it('never credits one ad-day to two creatives', () => {
+    // Same ad-1 rows for 07-01..07-12, as the store would return them to either link.
+    const rows = Array.from({ length: 12 }, (_, i) => settledRow(`2026-07-${String(i + 1).padStart(2, '0')}`));
+    const a = aggregateCreative({ creativeId: 'A', rubricScore: 3, ads: [{ adId: 'ad-1', via: 'create_ad', linkedAt: '2026-07-01T10:00:00.000Z', until: '2026-07-10', rows }] });
+    const b = aggregateCreative({ creativeId: 'B', rubricScore: 6, ads: [{ adId: 'ad-1', via: 'swap_creative', linkedAt: '2026-07-10T09:00:01.000Z', rows }] });
+    // A: 07-01..07-09 (9 days). B: 07-11..07-12 (the shared swap day 07-10 belongs to neither).
+    expect([a.settledRows, b.settledRows]).toEqual([9, 2]);
   });
 });

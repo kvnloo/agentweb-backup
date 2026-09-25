@@ -73,6 +73,7 @@ describe('agent mode → creative lineage (ENG-2141)', () => {
   let stampCreative: jest.SpyInstance;
   let stampAd: jest.SpyInstance;
   let stampPublish: jest.SpyInstance;
+  let stampChanged: jest.SpyInstance;
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -83,6 +84,7 @@ describe('agent mode → creative lineage (ENG-2141)', () => {
     stampCreative = jest.spyOn(creativeLineage, 'stampMetaCreativeCreated').mockResolvedValue([]);
     stampAd = jest.spyOn(creativeLineage, 'stampMetaAdCreated').mockResolvedValue([]);
     stampPublish = jest.spyOn(creativeLineage, 'stampMetaPublish').mockResolvedValue([]);
+    stampChanged = jest.spyOn(creativeLineage, 'stampMetaAdCreativeChanged').mockResolvedValue([]);
   });
 
   afterEach(() => jest.restoreAllMocks());
@@ -182,5 +184,21 @@ describe('agent mode → creative lineage (ENG-2141)', () => {
       userId: 'user123', accountId: '123456789', metaCreativeId: 'copy_creative', adId: 'copy_ad',
       params: expect.objectContaining({ image_hash: 'hash-1' }), via: 'copy_ad',
     });
+  });
+
+  it('an AD UPDATE with creative_id ends the ad\'s old links and links the new creative, once attached', async () => {
+    jest.mocked(metaService.updateAd).mockResolvedValue({ success: true });
+    jest.mocked(metaService.getAd).mockResolvedValue({ id: 'ad_123', creative: { creative_id: 'mc-7' } });
+
+    const result = await service.updateMetaAdsAd('user123', 'ad_123', { creative_id: 'mc-7' });
+
+    expect(result.success).toBe(true);
+    expect(stampChanged).toHaveBeenCalledWith({ userId: 'user123', accountId: '123456789', metaCreativeId: 'mc-7', adId: 'ad_123' });
+
+    stampChanged.mockClear();
+    jest.mocked(metaService.getAd).mockResolvedValue({ id: 'ad_123', creative: { creative_id: 'old' } });
+    const notAttached = await service.updateMetaAdsAd('user123', 'ad_123', { creative_id: 'mc-7' });
+    expect(notAttached.success).toBe(false);
+    expect(stampChanged).not.toHaveBeenCalled();
   });
 });

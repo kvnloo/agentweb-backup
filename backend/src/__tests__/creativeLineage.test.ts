@@ -10,6 +10,7 @@ import {
   readCreativeLineageConfig,
   recordGeneratedCreative,
   stampMetaAdCreated,
+  stampMetaAdCreativeChanged,
   stampMetaCreativeCreated,
   stampMetaImageUpload,
   stampMetaPublish,
@@ -43,6 +44,13 @@ function setValues(v: unknown): string[] {
 class FakeLineageTable implements CreativeLineageDb {
   readonly items = new Map<string, Item>();
   readonly calls: string[] = [];
+  /** Per-operation latency (ms) before the operation applies, to reproduce overlapping writes. */
+  latency: Partial<Record<'get' | 'put' | 'update' | 'query', number>> = {};
+
+  private async wait(op: 'get' | 'put' | 'update' | 'query'): Promise<void> {
+    const ms = this.latency[op];
+    if (ms) await new Promise((resolve) => setTimeout(resolve, ms));
+  }
 
   private checkCondition(item: Item | undefined, condition: string | undefined, values: Values): void {
     if (!condition) return;
@@ -59,12 +67,14 @@ class FakeLineageTable implements CreativeLineageDb {
 
   async get(params: AWS.DynamoDB.DocumentClient.GetItemInput) {
     this.calls.push('get');
+    await this.wait('get');
     const item = this.items.get(String(params.Key.creativeId));
     return item ? { Item: structuredClone(item) } : {};
   }
 
   async put(params: AWS.DynamoDB.DocumentClient.PutItemInput) {
     this.calls.push('put');
+    await this.wait('put');
     const id = String(params.Item.creativeId);
     this.checkCondition(this.items.get(id), params.ConditionExpression, {});
     this.items.set(id, structuredClone(params.Item));
@@ -73,6 +83,7 @@ class FakeLineageTable implements CreativeLineageDb {
 
   async update(params: AWS.DynamoDB.DocumentClient.UpdateItemInput) {
     this.calls.push('update');
+    await this.wait('update');
     const id = String(params.Key.creativeId);
     const values = params.ExpressionAttributeValues ?? {};
     const current = this.items.get(id);
@@ -98,6 +109,7 @@ class FakeLineageTable implements CreativeLineageDb {
 
   async query(params: AWS.DynamoDB.DocumentClient.QueryInput) {
     this.calls.push('query');
+    await this.wait('query');
     expect(params.IndexName).toBe('userId-createdAt-index');
     expect(params.KeyConditionExpression).toBe('userId = :userId AND createdAt >= :since');
     expect(params.FilterExpression).toBe('contains(#attr, :value)');
@@ -247,7 +259,7 @@ describe('publish stamping', () => {
     const id = (await recordGeneratedCreative(generated(), undefined, { env: ON, db, now: () => NOW }))!;
     return { db, id };
   }
-  const deps = (db: FakeLineageTable) => ({ env: ON, db, now: () => NOW });
+  const deps = (db: FakeLineageTable) => ({ env: ON, db, now: () => NOW, lookupRetryDelaysMs: [] });
 
   it('links generated image → uploaded hash → Meta creative → ad (the agent-mode sequence)', async () => {
     const { db, id } = await seeded();
@@ -320,7 +332,9 @@ describe('publish stamping', () => {
       deps(db),
     )).resolves.toEqual([id]);
 
-    expect(query).not.toHaveBeenCalled();
+    // The only index read is the swap ending the ad's earlier links; the ad itself is stamped on
+    // the creatives the creative stamp resolved, read back consistently.
+    expect(query.mock.calls.map(([q]) => q.ExpressionAttributeNames?.['#attr'])).toEqual(['metaAdIds']);
     expect(db.record(id).metaAdLinks).toEqual([
       { accountId: '1000', adId: 'ad-3', metaCreativeId: 'mc-3', via: 'swap_creative', linkedAt: NOW.toISOString() },
     ]);
@@ -335,5 +349,118 @@ describe('publish stamping', () => {
     await expect(stampMetaCreativeCreated({ userId: USER, accountId: '1', metaCreativeId: 'mc', params: { image_hash: 'h' } }, deps(db))).resolves.toEqual([]);
     await expect(stampMetaAdCreated({ userId: USER, accountId: '1', metaCreativeId: 'mc', adId: 'ad' }, deps(db))).resolves.toEqual([]);
     warn.mockRestore();
+  });
+});
+
+describe('ad link ends (CodeRabbit: stop each ad link at the next creative change)', () => {
+  const deps = (db: FakeLineageTable) => ({ env: ON, db, now: () => NOW, lookupRetryDelaysMs: [] });
+  const LATER = new Date('2026-09-26T08:00:00.000Z');
+
+  async function linkedToAd(): Promise<{ db: FakeLineageTable; id: string }> {
+    const db = new FakeLineageTable();
+    const id = (await recordGeneratedCreative(generated(), undefined, deps(db)))!;
+    await stampMetaImageUpload({ userId: USER, imageUrl: S3_URL, imageHash: 'hash-1' }, deps(db));
+    await stampMetaCreativeCreated({ userId: USER, accountId: '1000', metaCreativeId: 'mc-1', params: { image_hash: 'hash-1' } }, deps(db));
+    await stampMetaAdCreated({ userId: USER, accountId: '1000', metaCreativeId: 'mc-1', adId: 'ad-1' }, deps(db));
+    return { db, id };
+  }
+
+  it('records the ad id so a later creative change can find the creative', async () => {
+    const { db, id } = await linkedToAd();
+    expect(setValues(db.record(id).metaAdIds)).toEqual(['ad-1']);
+  });
+
+  it('a swap to an image we did not generate ends the generated creative\'s link', async () => {
+    const { db, id } = await linkedToAd();
+    await stampMetaPublish(
+      { userId: USER, accountId: '1000', metaCreativeId: 'mc-stock', adId: 'ad-1', params: { image_hash: 'stock-hash' }, via: 'swap_creative' },
+      { ...deps(db), now: () => LATER },
+    );
+    expect(db.record(id).metaAdLinkEnds).toEqual([{ accountId: '1000', adId: 'ad-1', endedAt: LATER.toISOString() }]);
+    expect(db.record(id).metaAdLinks).toHaveLength(1);
+  });
+
+  it('an AD UPDATE with creative_id ends the old link and links the ad again when it swaps back', async () => {
+    const { db, id } = await linkedToAd();
+    await stampMetaAdCreativeChanged({ userId: USER, accountId: '1000', metaCreativeId: 'mc-stock', adId: 'ad-1' }, { ...deps(db), now: () => LATER });
+    expect(db.record(id).metaAdLinkEnds).toEqual([{ accountId: '1000', adId: 'ad-1', endedAt: LATER.toISOString() }]);
+
+    const back = new Date('2026-09-27T08:00:00.000Z');
+    await expect(stampMetaAdCreativeChanged({ userId: USER, accountId: '1000', metaCreativeId: 'mc-1', adId: 'ad-1' }, { ...deps(db), now: () => back }))
+      .resolves.toEqual([id]);
+    expect(db.record(id).metaAdLinks?.map((l) => [l.via, l.linkedAt])).toEqual([
+      ['create_ad', NOW.toISOString()],
+      ['swap_creative', back.toISOString()],
+    ]);
+  });
+});
+
+describe('write ordering and lookup retry (CodeRabbit: sequence the creative and ad lineage writes)', () => {
+  const noWait = () => Promise.resolve();
+
+  it('an upload stamp started right after generation lands after the record is written', async () => {
+    const db = new FakeLineageTable();
+    db.latency = { put: 30 };
+    const record = recordGeneratedCreative(generated(), undefined, { env: ON, db, now: () => NOW, lookupRetryDelaysMs: [] });
+    const upload = stampMetaImageUpload({ userId: USER, imageUrl: S3_URL, imageHash: 'hash-1' }, { env: ON, db, now: () => NOW });
+    const [id, stamped] = await Promise.all([record, upload]);
+    expect(stamped).toBe(id);
+    expect(setValues(db.record(id!).metaImageHashes)).toEqual(['hash-1']);
+  });
+
+  it('creative and ad stamps dispatched together are written in call order, so the ad is linked', async () => {
+    const db = new FakeLineageTable();
+    const base = { env: ON, db, now: () => NOW, lookupRetryDelaysMs: [] };
+    const id = (await recordGeneratedCreative(generated(), undefined, base))!;
+    await stampMetaImageUpload({ userId: USER, imageUrl: S3_URL, imageHash: 'hash-1' }, base);
+    db.latency = { update: 30 };
+    const creative = stampMetaCreativeCreated({ userId: USER, accountId: '1000', metaCreativeId: 'mc-1', params: { image_hash: 'hash-1' } }, base);
+    const ad = stampMetaAdCreated({ userId: USER, accountId: '1000', metaCreativeId: 'mc-1', adId: 'ad-1' }, base);
+    await Promise.all([creative, ad]);
+    expect(db.record(id).metaAdLinks?.map((l) => l.adId)).toEqual(['ad-1']);
+  });
+
+  it('re-tries a lookup that finds nothing yet (index lag), and gives up after the configured waits', async () => {
+    const db = new FakeLineageTable();
+    const base = { env: ON, db, now: () => NOW, lookupRetryDelaysMs: [] };
+    const id = (await recordGeneratedCreative(generated(), undefined, base))!;
+    await stampMetaImageUpload({ userId: USER, imageUrl: S3_URL, imageHash: 'hash-1' }, base);
+    await stampMetaCreativeCreated({ userId: USER, accountId: '1000', metaCreativeId: 'mc-1', params: { image_hash: 'hash-1' } }, base);
+
+    const query = jest.spyOn(db, 'query').mockResolvedValueOnce({ Items: [] });
+    const sleep = jest.fn(noWait);
+    await expect(stampMetaAdCreated({ userId: USER, accountId: '1000', metaCreativeId: 'mc-1', adId: 'ad-1' }, { ...base, lookupRetryDelaysMs: [2000, 5000], sleep }))
+      .resolves.toEqual([id]);
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(2000);
+
+    query.mockClear();
+    sleep.mockClear();
+    await expect(stampMetaAdCreated({ userId: USER, accountId: '1000', metaCreativeId: 'never', adId: 'ad-9' }, { ...base, lookupRetryDelaysMs: [2000, 5000], sleep }))
+      .resolves.toEqual([]);
+    expect(sleep.mock.calls).toEqual([[2000], [5000]]);
+    expect(query).toHaveBeenCalledTimes(3);
+  });
+
+  it('re-tries only the image hashes that did not resolve', async () => {
+    const db = new FakeLineageTable();
+    const base = { env: ON, db, now: () => NOW, lookupRetryDelaysMs: [] };
+    const id = (await recordGeneratedCreative(generated(), undefined, base))!;
+    await stampMetaImageUpload({ userId: USER, imageUrl: S3_URL, imageHash: 'hash-1' }, base);
+    jest.spyOn(db, 'query').mockResolvedValueOnce({ Items: [] });
+    const sleep = jest.fn(noWait);
+    await expect(stampMetaCreativeCreated(
+      { userId: USER, accountId: '1000', metaCreativeId: 'mc-1', params: { image_hash: 'hash-1' } },
+      { ...base, lookupRetryDelaysMs: [2000], sleep },
+    )).resolves.toEqual([id]);
+    expect(db.record(id).metaCreativeLinks).toHaveLength(1);
+  });
+
+  it('a slow human-eval enqueue does not hold up the user\'s publish stamps', async () => {
+    const db = new FakeLineageTable();
+    const base = { env: ON, db, now: () => NOW, lookupRetryDelaysMs: [] };
+    const never = new Promise<{ candidateId: string } | null>(() => undefined);
+    void recordGeneratedCreative(generated(), never, base);
+    await expect(stampMetaImageUpload({ userId: USER, imageUrl: S3_URL, imageHash: 'hash-1' }, base)).resolves.toBe(creativeIdForS3Key(S3_KEY));
   });
 });
