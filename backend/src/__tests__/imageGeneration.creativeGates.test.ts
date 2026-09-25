@@ -82,6 +82,21 @@ describe('ImageService.generateImage creative gates (ENG-2139)', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('[creative-gates]'), expect.stringContaining('aspect_ratio'));
   });
 
+  it('omits gates when the S3 upload fails and the unmeasured provider artifact is returned', async () => {
+    stubProvider(await pngDataUrl(1080, 1350));
+    jest.mocked(uploadFileToS3).mockResolvedValueOnce({ success: false, error: 'S3 unavailable' });
+
+    const result = await new ImageService().generateImage({
+      prompt: 'ad',
+      filename: 'ad.png',
+      userId: 'user-1',
+      size: '1080x1350',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.gates).toBeUndefined();
+  });
+
   it('flags a size the Gemini 3 path would silently send as 1:1', async () => {
     stubProvider(await pngDataUrl(1024, 1024));
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);

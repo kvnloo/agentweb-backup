@@ -41,6 +41,7 @@ jest.mock("../services/onboardingAdImageChatSessionMirror", () => ({
 import {
   AD_IMAGE_SYSTEM_PROMPT,
   buildSixLayerPromptForVariant,
+  portraitFeedLayout,
   claimAdImageRun,
   extractAdImageBrandContext,
   generateAdImagesForUser,
@@ -152,6 +153,27 @@ describe("onboardingAdImageService", () => {
   });
 
   describe("buildSixLayerPromptForVariant", () => {
+    it("labels the 1080x1350 layout as a 4:5 feed portrait, never a Story (ENG-2139)", () => {
+      const prompt = buildSixLayerPromptForVariant({
+        variantIndex: 0,
+        format: "1080x1350",
+        concept: "VM",
+        copyAngle: "PA",
+        formatArchetype: "A",
+        brand,
+        persona: onePersona,
+      });
+      expect(prompt).toContain("Feed portrait 4:5:");
+      expect(prompt).not.toMatch(/Story 4:5/);
+    });
+
+    it("relabels a stored template row that still says Story 4:5 (ENG-2139)", () => {
+      const stored = ["Story 4:5: UI element occupies upper 60% of tall canvas", "- Lower 40% reserved for CTA"].join("\n");
+      expect(portraitFeedLayout(stored)).toBe(
+        ["Feed portrait 4:5: UI element occupies upper 60% of tall canvas", "- Lower 40% reserved for CTA"].join("\n"),
+      );
+    });
+
     it("includes all 6 layers in order", () => {
       const prompt = buildSixLayerPromptForVariant({
         variantIndex: 0,
