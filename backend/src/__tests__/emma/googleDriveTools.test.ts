@@ -57,8 +57,8 @@ const mockUpdateGoogleSheet = jest.fn();
 // emma/impl/googleDrive.ts directly (extracted from AgentModeService) instead
 // of agentModeService.<method> — mock that module instead for those four.
 // create_google_doc/update_google_doc/create_google_sheet/update_google_sheet
-// are a separate, not-yet-extracted cluster and still route through
-// agentModeService, so those four stay mocked there.
+// were extracted the same way to emma/impl/googleDocsSheets.ts — mock that
+// module instead of agentModeService for those four too.
 jest.mock('../../emma/impl/googleDrive', () => ({
   readGoogleFileById: (...a: any[]) => mockReadGoogleFileById(...a),
   listGoogleDriveFolder: (...a: any[]) => mockListGoogleDriveFolder(...a),
@@ -66,13 +66,15 @@ jest.mock('../../emma/impl/googleDrive', () => ({
   createGoogleDriveFolder: (...a: any[]) => mockCreateGoogleDriveFolder(...a),
 }));
 
+jest.mock('../../emma/impl/googleDocsSheets', () => ({
+  createGoogleDoc: (...a: any[]) => mockCreateGoogleDoc(...a),
+  updateGoogleDoc: (...a: any[]) => mockUpdateGoogleDoc(...a),
+  createGoogleSheet: (...a: any[]) => mockCreateGoogleSheet(...a),
+  updateGoogleSheet: (...a: any[]) => mockUpdateGoogleSheet(...a),
+}));
+
 jest.mock('../../services/agentModeService', () => ({
-  agentModeService: {
-    createGoogleDoc: (...a: any[]) => mockCreateGoogleDoc(...a),
-    updateGoogleDoc: (...a: any[]) => mockUpdateGoogleDoc(...a),
-    createGoogleSheet: (...a: any[]) => mockCreateGoogleSheet(...a),
-    updateGoogleSheet: (...a: any[]) => mockUpdateGoogleSheet(...a),
-  },
+  agentModeService: {},
 }));
 
 jest.mock('../../services/db', () => ({
