@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import axios from "axios";
 import EvalLabelling, { type GoldenCaseView } from "../EvalLabelling";
@@ -104,5 +104,67 @@ describe("EvalLabelling (ENG-2135)", () => {
     renderPage();
     expect(screen.getByText("Admin access required")).toBeInTheDocument();
     expect(mockedAxios.get).not.toHaveBeenCalled();
+  });
+
+  it("ignores a superseded surface load that finishes after the current one", async () => {
+    const creativeCase: GoldenCaseView = {
+      ...CASE,
+      caseId: "creative#candidateId#cand-1",
+      surface: "creative",
+      taskType: "creative_image",
+      sourceRef: { kind: "candidateId", id: "cand-1" },
+      criteria: ["hook"],
+    };
+    let resolveAgent: (value: { data: { cases: GoldenCaseView[] } }) => void = () => undefined;
+    mockedAxios.get.mockImplementation((url: string) => {
+      if (url.endsWith("/status")) return Promise.resolve({ data: { provisioned: true } });
+      if (url.includes("surface=agent")) return new Promise((resolve) => { resolveAgent = resolve; });
+      if (url.includes("surface=creative")) return Promise.resolve({ data: { cases: [creativeCase] } });
+      if (url.includes("/api/human-eval/candidates/cand-1")) return Promise.resolve({ data: { candidate: { reviewType: "creative_image", feedback: [] } } });
+      if (url.includes("/api/admin/chat-sessions")) return Promise.resolve({ data: { sessions: [] } });
+      return Promise.reject(new Error(`unexpected GET ${url}`));
+    });
+    renderPage();
+    await waitFor(() => expect(mockedAxios.get).toHaveBeenCalledWith(expect.stringContaining("surface=agent"), AUTH));
+    fireEvent.click(screen.getByRole("tab", { name: "Creatives" }));
+    expect(await screen.findByText("cand-1")).toBeInTheDocument();
+    resolveAgent({ data: { cases: [CASE] } });
+    await waitFor(() => expect(screen.getByText("1 cases · 0 fully labelled")).toBeInTheDocument());
+    expect(screen.queryByText("session-1")).not.toBeInTheDocument();
+  });
+
+  it("selects a case from the keyboard", async () => {
+    const second: GoldenCaseView = { ...CASE, caseId: "agent#sessionId#session-2", sourceRef: { kind: "sessionId", id: "session-2" } };
+    mockedAxios.get.mockImplementation(async (url: string) => {
+      if (url.endsWith("/status")) return { data: { provisioned: true } };
+      if (url.includes("surface=agent")) return { data: { cases: [CASE, second] } };
+      if (url.includes("sessionId=session-2")) return { data: { sessions: [{ title: "Second session", messages: [] }] } };
+      if (url.includes("sessionId=session-1")) return { data: { sessions: [{ title: "Synthetic session", messages: [] }] } };
+      throw new Error(`unexpected GET ${url}`);
+    });
+    renderPage();
+    await screen.findByText("Synthetic session");
+    const row = screen.getByText("session-2").closest("tr");
+    expect(row).toHaveAttribute("tabindex", "0");
+    fireEvent.keyDown(row as HTMLElement, { key: "Enter" });
+    expect(await screen.findByText("Second session")).toBeInTheDocument();
+  });
+
+  it("keeps the list least-labelled first after a save", async () => {
+    const second: GoldenCaseView = { ...CASE, caseId: "agent#sessionId#session-2", sourceRef: { kind: "sessionId", id: "session-2" } };
+    mockedAxios.get.mockImplementation(async (url: string) => {
+      if (url.endsWith("/status")) return { data: { provisioned: true } };
+      if (url.includes("surface=agent")) return { data: { cases: [CASE, second] } };
+      return { data: { sessions: [{ title: "Synthetic session", messages: [] }] } };
+    });
+    mockedAxios.put.mockResolvedValue({ data: { case: { ...CASE, labels: { task_success: "pass" }, version: 4 } } });
+    renderPage();
+    await screen.findByText("Synthetic session");
+    const firstColumn = () => screen.getAllByRole("row").slice(1).map((r) => within(r).getAllByRole("cell")[0].textContent);
+    expect(firstColumn()[0]).toContain("session-1");
+    fireEvent.click(screen.getByRole("button", { name: "task_success pass" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save labels" }));
+    await screen.findByText("Labels saved.");
+    expect(firstColumn()[0]).toContain("session-2");
   });
 });
