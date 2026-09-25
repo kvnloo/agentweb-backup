@@ -75,7 +75,10 @@ describe('emma tool handlers wire args into the confirmation gate', () => {
     expect(metaService.createAd).not.toHaveBeenCalled();
   });
 
-  it('call_meta_marketing_api: confirm=true (in params) bypasses the gate and writes', async () => {
+  // ENG-1635/1644 gap 5: params.confirm is now fully inert as a trust signal — a Meta write
+  // executes ONLY once the user has approved it through the approval-deck UI, never because
+  // the model set this flag itself. Re-calling with confirm=true must still halt, not write.
+  it('call_meta_marketing_api: confirm=true (in params) is inert — still halts and does not write', async () => {
     (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad_new', name: 'New Ad' });
 
     const result: any = await emmaToolRegistry.execute('call_meta_marketing_api', {
@@ -86,8 +89,9 @@ describe('emma tool handlers wire args into the confirmation gate', () => {
       params: { name: 'New Ad', creative_id: 'creative_1', confirm: true }
     }, ctx);
 
-    expect(result.awaitingUserConfirmation).toBeUndefined();
-    expect(metaService.createAd).toHaveBeenCalledTimes(1);
+    expect(result.awaitingUserConfirmation).toBe(true);
+    expect(result.requiresConfirmation).toBe(true);
+    expect(metaService.createAd).not.toHaveBeenCalled();
   });
 
   // ENG-600
