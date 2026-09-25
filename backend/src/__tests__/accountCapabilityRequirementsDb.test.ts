@@ -12,9 +12,10 @@
 jest.mock('aws-sdk', () => {
   const mockGet = jest.fn();
   const mockUpdate = jest.fn();
+  const mockPut = jest.fn();
   return {
     DynamoDB: {
-      DocumentClient: jest.fn(() => ({ get: mockGet, update: mockUpdate })),
+      DocumentClient: jest.fn(() => ({ get: mockGet, update: mockUpdate, put: mockPut })),
     },
     config: { update: jest.fn() },
   };
@@ -26,6 +27,9 @@ import {
   upsertAccountCapabilityStatus,
   setAccountCapabilityCorrection,
   isSuppressed,
+  getAccountHealthSignalState,
+  putAccountHealthSignalState,
+  ACCOUNT_HEALTH_SIGNAL_CAPABILITY,
   type AccountCapabilityRequirement,
 } from '../services/accountCapabilityRequirementsDb';
 
@@ -251,5 +255,43 @@ describe('isSuppressed — the formula 9 rounds of review caught 2 real bugs in'
     });
     const now = new Date('2026-01-20T00:00:00.000Z').getTime();
     expect(isSuppressed(r, now)).toBe(true);
+  });
+});
+
+// ENG-2143: account-health signal dedupe state. Its own range key so it never creates or touches a
+// paid-ads row, and a version check so only one instance's run can emit a given signal.
+describe('account health signal state', () => {
+  const state = { state: 'at_risk', stateSince: '2026-09-25T00:00:00.000Z', version: 2 };
+
+  it('reads under its own range key and returns null when absent', async () => {
+    mockDynamoDB.get.mockReturnValue(ok({}));
+    expect(await getAccountHealthSignalState('u1')).toBeNull();
+    expect(mockDynamoDB.get).toHaveBeenCalledWith({
+      TableName: 'AW-AccountCapabilityRequirements',
+      Key: { userId: 'u1', capability: ACCOUNT_HEALTH_SIGNAL_CAPABILITY },
+    });
+    expect(ACCOUNT_HEALTH_SIGNAL_CAPABILITY).not.toBe('ad_platform_integration');
+  });
+
+  it('creates only when absent, and updates only at the expected version', async () => {
+    mockDynamoDB.put.mockReturnValue(ok());
+    expect(await putAccountHealthSignalState('u1', state, null)).toBe(true);
+    expect(mockDynamoDB.put.mock.calls[0][0]).toMatchObject({
+      Item: { userId: 'u1', capability: ACCOUNT_HEALTH_SIGNAL_CAPABILITY, ...state },
+      ConditionExpression: 'attribute_not_exists(userId)',
+    });
+    await putAccountHealthSignalState('u1', { ...state, version: 3 }, 2);
+    expect(mockDynamoDB.put.mock.calls[1][0]).toMatchObject({
+      ConditionExpression: 'version = :expected',
+      ExpressionAttributeValues: { ':expected': 2 },
+    });
+  });
+
+  it('reports a lost race as false and rethrows anything else', async () => {
+    const rejecting = (error: Error & { code?: string }) => ({ promise: jest.fn().mockRejectedValue(error) });
+    mockDynamoDB.put.mockReturnValueOnce(rejecting(Object.assign(new Error('lost'), { code: 'ConditionalCheckFailedException' })));
+    expect(await putAccountHealthSignalState('u1', state, 1)).toBe(false);
+    mockDynamoDB.put.mockReturnValueOnce(rejecting(Object.assign(new Error('throttled'), { code: 'ProvisionedThroughputExceededException' })));
+    await expect(putAccountHealthSignalState('u1', state, 1)).rejects.toThrow('throttled');
   });
 });
