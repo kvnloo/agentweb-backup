@@ -2,8 +2,13 @@ import type AWS from 'aws-sdk';
 import { isQualifyingValidation } from '../loops/eval/evalRegistry';
 import { newGoldenCase, type GoldenCase, type LabelValue } from '../loops/eval/goldenSet';
 import type { GoldenSetStore } from '../loops/eval/goldenSetStore';
+import type { ReadOnlyDocReader, ReadRequest } from '../loops/eval/agentGraderLoader';
+import type { SessionForGrading } from '../loops/eval/agentGraders';
 import {
+  agentGraderPrediction,
   computeCriterionAgreement,
+  liveAgentGraders,
+  loadSessionForGrading,
   runValidation,
   sessionJudgeGrader,
   sessionJudgePrediction,
@@ -149,5 +154,70 @@ describe('stored session-judge adapters', () => {
     expect((await graders[1].grade(c)).task_success).toBe('na');
     expect((await graders[2].grade(c)).task_success).toBe('fail');
     expect(get).toHaveBeenCalledWith(expect.objectContaining({ Key: { sessionId: 'sess-1' }, ProjectionExpression: 'satisfactionScore, judgeScores' }));
+  });
+});
+
+describe('agent grader adapters (ENG-2137 graders on golden cases)', () => {
+  const completed: SessionForGrading = {
+    sessionId: 'sess-1',
+    workPlan: { steps: [{ stepCount: 1, status: 'completed', requiredFunctionCalls: ['search_web'] }] },
+    ledger: [{ toolName: 'search_web', args: {}, status: 'success' }],
+    events: [],
+    endsWithRunFailurePlaceholder: false,
+    finalReply: 'Here is what I found.',
+    userTurns: 1,
+  };
+
+  it('maps verdicts to criteria, abstaining on excluded sessions and replies with no claims', () => {
+    expect(agentGraderPrediction('agent-task-success', completed)).toEqual({ task_success: 'pass' });
+    expect(agentGraderPrediction('agent-task-success', { ...completed, workPlan: { steps: [{ status: 'pending' }, { status: 'pending' }] } })).toEqual({ task_success: 'fail' });
+    expect(agentGraderPrediction('agent-task-success', { ...completed, workPlan: undefined })).toEqual({ task_success: 'na' });
+    expect(agentGraderPrediction('agent-tool-correctness', completed)).toEqual({ tool_correctness: 'pass' });
+    expect(agentGraderPrediction('agent-groundedness-offline', completed)).toEqual({ groundedness: 'na' });
+    expect(agentGraderPrediction('agent-task-success', undefined)).toEqual({});
+    expect(() => agentGraderPrediction('session-judge-general', completed)).toThrow(/not an agent grader/);
+  });
+
+  it('registers one adapter per agent grader, each scoring only its own criterion', async () => {
+    const load = jest.fn(async () => completed);
+    const graders = liveAgentGraders(load);
+    expect(graders.map((g) => [g.graderId, g.criteria, g.primaryCriterion])).toEqual([
+      ['agent-task-success', ['task_success'], 'task_success'],
+      ['agent-tool-correctness', ['tool_correctness'], 'tool_correctness'],
+      ['agent-groundedness-offline', ['groundedness'], 'groundedness'],
+    ]);
+    expect(await graders[0].grade(labelled('sess-1', 'pass'))).toEqual({ task_success: 'pass' });
+    expect(load).toHaveBeenCalledWith('sess-1');
+  });
+
+  it('loads one session read-only: key query on sessions and messages, loop events filtered to the session', async () => {
+    const requests: ReadRequest[] = [];
+    const reader: ReadOnlyDocReader = {
+      scan: jest.fn(),
+      query: jest.fn(async (r: ReadRequest) => {
+        requests.push(r);
+        if (r.TableName === 'S') {
+          return { Items: [{ sessionId: 'sess-1', createdAt: '2026-09-20T00:00:00.000Z', updatedAt: '2026-09-21T00:00:00.000Z', workPlan: { steps: [{ status: 'completed' }] } }] };
+        }
+        if (r.TableName === 'M') {
+          return { Items: [{ sessionId: 'sess-1', messageIndex: 1, message: { role: 'assistant', content: 'done' } }, { sessionId: 'sess-1', messageIndex: 0, message: { role: 'user', content: 'go' } }] };
+        }
+        return { Items: [{ loopId: 'agent-mode', subjectId: 'run-1', eventType: 'agent_tool_invoked', ts: '2026-09-20T01:00:00.000Z', dimensions: { sessionId: 'sess-1', toolName: 'search_web' } }] };
+      }),
+    };
+    const s = await loadSessionForGrading(reader, { sessions: 'S', messages: 'M', loopEvents: 'E' }, 'sess-1');
+    expect(s).toMatchObject({ sessionId: 'sess-1', userTurns: 1, finalReply: 'done', workPlan: { steps: [{ status: 'completed' }] } });
+    expect(s?.events).toHaveLength(1);
+    expect(reader.scan).not.toHaveBeenCalled();
+    expect(requests.find((r) => r.TableName === 'E')).toMatchObject({
+      FilterExpression: '#dims.sessionId = :s',
+      ExpressionAttributeNames: { '#dims': 'dimensions' },
+      ExpressionAttributeValues: { ':l': 'agent-mode', ':from': '2026-09-20T00:00:00.000Z', ':s': 'sess-1' },
+    });
+  });
+
+  it('returns undefined for a session that does not exist', async () => {
+    const reader: ReadOnlyDocReader = { scan: jest.fn(), query: jest.fn(async () => ({ Items: [] })) };
+    await expect(loadSessionForGrading(reader, { sessions: 'S', messages: 'M', loopEvents: 'E' }, 'gone')).resolves.toBeUndefined();
   });
 });
