@@ -1,3 +1,4 @@
+import { scheduleBackupModels } from '../services/agentMode/modelSupersession';
 import { isEvaluationUser, EvaluationDenied } from '../services/evaluationPolicy';
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken, isRealAdmin } from '../middleware/auth';
@@ -10219,10 +10220,9 @@ export const agentModeController = {
         getEffectiveLlmUsagePolicy(user.userId),
         agentModeService.getSupportedModels(user.isAdmin === true),
       ]);
-      const supported = new Set(supportedModels);
-      const optimizedModels = usage.policy
-        ? usage.policy.optimizedModelIds.filter((model) => supported.has(model))
-        : supportedModels;
+      const optimizedModels = scheduleBackupModels(
+        usage.policy?.optimizedModelIds ?? supportedModels, supportedModels,
+      );
       // ENG-1211 AC1: nothing below the hard cap may hide a model. Only a paused
       // account has an empty picker; every other state offers the full entitled
       // set. `optimizedModels` is still returned as `scheduleBackupModels` for

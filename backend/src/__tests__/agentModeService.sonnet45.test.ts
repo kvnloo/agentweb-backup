@@ -489,7 +489,12 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         ['claude-opus', ['anthropic.claude-opus-5']],
         ['claude-sonnet', []],
         ['claude-fable', []],
-        [undefined, []],
+        // GPT-6 Sol ("Strong reasoning at half the price of GPT-5.6 Sol") was added
+        // alongside modelSupersession.ts's name-inferred product-line dominance —
+        // neither Sol variant carries an explicit `family`, but both infer to the
+        // same "sol" line, and GPT-6 Sol genuinely dominates (cheaper, equal-or-
+        // better quality). No longer an empty family-less bucket.
+        [undefined, ['openrouter/openai/gpt-5.6-sol']],
       ])('ENG-1786: %s keeps its baseline dominance-only legacy rows', async (family, expected) => {
         // Baseline includes ENG-1784 bands and ENG-1781 Luna pricing.
         // Static legacy rows remain covered by the existing legacy tests.
@@ -592,7 +597,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       it('leaves dominance outcomes unchanged: GPT-5.5 still legacy, Sol still not (AC4)', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
         expect(models.find((m) => m.id === 'gpt-5.5')!.legacy).toBe(true);
-        expect(models.find((m) => m.id === 'openrouter/openai/gpt-5.6-sol')!.legacy).toBeUndefined();
+        expect(models.find((m) => m.id === 'openrouter/openai/gpt-5.6-sol')!.legacy).toBe(true); // Cheaper GPT-6 Sol supersedes it.
       });
     });
 
@@ -700,14 +705,13 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       // Astra is stronger than Sol on v4.2 (55 vs 51), but these distinct
       // product lines must not auto-retire each other.
-      // Enforced structurally — Astra carries no `family` (same treatment as
-      // Sol itself and Kimi K3), so the dominance rule never compares them.
-      it('does not flip GPT-5.6 Sol to legacy, and is not legacy itself (AC3)', async () => {
+      // Inferred Astra and Sol families remain distinct across generations.
+      it('keeps Astra current while GPT-6 Sol supersedes GPT-5.6 Sol (AC3)', async () => {
         const config = (agentModeService as any).llmModels[ASTRA];
         expect(config.family).toBeUndefined();
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
         expect(models.find((m) => m.id === ASTRA)!.legacy).toBeUndefined();
-        expect(models.find((m) => m.id === 'openrouter/openai/gpt-5.6-sol')!.legacy).toBeUndefined();
+        expect(models.find((m) => m.id === 'openrouter/openai/gpt-5.6-sol')!.legacy).toBe(true); // Cheaper GPT-6 Sol supersedes it.
       });
     });
 
@@ -746,7 +750,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(nano.legacy).toBe(true);
       });
 
-      it('flags the far-weaker, same-band GPT-4o Mini as legacy too (dominated by GPT-5.4 Nano)', async () => {
+      it('flags GPT-4o Mini as legacy (dominated at actual prices by GPT-6 Luna)', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
         const mini = models.find((m) => m.id === 'openrouter/openai/gpt-4o-mini')!;
         expect(mini.legacy).toBe(true);
@@ -764,7 +768,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       // family (3.5/3.7 Flash) — it's a distinct "lightest/fastest"
       // positioning, same reasoning as gpt5-chat vs gpt5-nano — so it must
       // never be auto-dominated no matter what lands in the same cost band.
-      it('does NOT flag Gemini 3.1 Flash Lite as legacy — no `family` tag, so never auto-dominated', async () => {
+      it('does NOT flag Gemini 3.1 Flash Lite as legacy — distinct inferred flash-lite family', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(false);
         const flashLite = models.find((m) => m.id === 'gemini-3.1-flash-lite')!;
         expect(flashLite.legacy).toBeUndefined();
@@ -806,19 +810,18 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       // same cost band as Terra, so dominance concluded Terra was
       // redundant — an artifact of a volatile promo price coinciding with
       // a genuinely different product positioning, not a real supersession.
-      // Fix: Sol carries no `family` at all (same treatment as Kimi K3,
-      // which is likewise excluded from a family with its coding-specialized
-      // sibling Kimi K2.7-Code) — it can neither dominate nor be dominated.
+      // Sol and Terra have distinct inferred/explicit product lines.
+      // A newer Sol may supersede an older Sol, but never Terra.
       it('does NOT flag GPT-5.6 Terra as legacy because of GPT-5.6 Sol — different positioning, not a generation', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
         const terra = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-terra')!;
         expect(terra.legacy).toBeUndefined();
       });
 
-      it('GPT-5.6 Sol itself is never auto-flagged legacy (carries no family)', async () => {
+      it('GPT-5.6 Sol is superseded by GPT-6 Sol in its inferred product line', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
         const sol = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-sol')!;
-        expect(sol.legacy).toBeUndefined();
+        expect(sol.legacy).toBe(true);
       });
 
       it('GPT-5.5 is still correctly legacy — GPT-5.6 Terra alone (same "balanced" family) is cheaper AND better', async () => {
