@@ -151,3 +151,49 @@ describe('listUserSessions controller – limit param', () => {
     expect(mockChatbotDb.getUserSessions).not.toHaveBeenCalled();
   });
 });
+
+
+describe('listUserSessions — ENG-2163 admin-activity redaction (F4 controller-level test)', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  // A hydrated session whose second turn is delegated-admin activity in the CHATBOT persisted shape
+  // (admin tool name+result in assistant.metadata.toolCalls; no tool-role message).
+  const hydrated = () => [{
+    sessionId: 's1', pageContent: 'heavy', contextChunks: ['c'], title: 'T1',
+    messages: [
+      { role: 'user', content: 'my normal question' },
+      { role: 'assistant', content: 'normal answer' },
+      { role: 'user', content: 'run get_pr_digest for this internal audit' },
+      { role: 'assistant', content: 'internal roadmap narration', metadata: { toolCalls: [{ id: 'b', name: 'get_pr_digest', result: { payload: 'TOPSECRET203' } }] } },
+    ],
+  }];
+
+  it('CUSTOMER viewer: strips admin tool name, raw result, narration, and the admin prompt; keeps normal content', async () => {
+    (mockChatbotDb.getUserSessions as jest.Mock).mockResolvedValue({ sessions: hydrated() });
+    const req = makeReq({ user: { userId: 'user-123', isAdmin: false } as any });
+    const res = makeRes();
+
+    await listUserSessions(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    const out = JSON.stringify((res.json as jest.Mock).mock.calls[0][0]);
+    expect(out).not.toContain('TOPSECRET203');                       // raw admin result gone
+    expect(out).not.toContain('get_pr_digest');                       // admin tool name gone
+    expect(out).not.toContain('internal roadmap narration');          // admin narration gone
+    expect(out).not.toContain('run get_pr_digest for this internal audit'); // admin prompt gone (F1)
+    expect(out).toContain('my normal question');                      // normal content kept
+    expect(out).toContain('normal answer');
+  });
+
+  it('ADMIN viewer: retains the admin activity', async () => {
+    (mockChatbotDb.getUserSessions as jest.Mock).mockResolvedValue({ sessions: hydrated() });
+    const req = makeReq({ user: { userId: 'admin-1', isAdmin: true } as any });
+    const res = makeRes();
+
+    await listUserSessions(req, res);
+
+    const out = JSON.stringify((res.json as jest.Mock).mock.calls[0][0]);
+    expect(out).toContain('TOPSECRET203');
+    expect(out).toContain('get_pr_digest');
+  });
+});
