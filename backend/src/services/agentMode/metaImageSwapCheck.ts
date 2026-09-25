@@ -53,6 +53,8 @@ export function judgeImageSwap(
   }
   // URL-only swap: Meta hashes the image it ingests, so any hash other than the old one is new.
   if (live.hash !== undefined) return live.hash === expected.oldHash ? 'stale' : 'confirmed';
+  if (live.url !== undefined && live.url === expected.requestedUrl) return 'confirmed';
+  if (live.url !== undefined && live.url === expected.oldUrl) return 'stale';
   return 'unconfirmed';
 }
 

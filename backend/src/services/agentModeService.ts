@@ -44,7 +44,7 @@ import { toolResultError } from '../utils/toolResultError';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage,
-  type CreativeImageReadback, type ImageSwapExpectation,
+  type CreativeImageReadback, type ImageSwapExpectation, type ImageSwapVerdict,
 } from './agentMode/metaImageSwapCheck';
 import { publishWithdrawnMidFlight, readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { isPublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
@@ -20331,6 +20331,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // ENG-2169: read the created creative back before attaching it. If it still carries the old
     // image (or not the requested hash), attaching it would "succeed" while the ad keeps serving
     // the image it was meant to replace — fail loudly instead and leave the ad untouched.
+    let imageVerdict: ImageSwapVerdict | undefined;
     if (imageSwap) {
       let liveImage: CreativeImageReadback | undefined;
       try {
@@ -20341,7 +20342,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         console.warn(`AgentMode: image read-back failed for new creative ${newCreativeId}:`,
           err instanceof Error ? err.message : err);
       }
-      if (liveImage && judgeImageSwap(imageSwap, liveImage) === 'stale') {
+      imageVerdict = judgeImageSwap(imageSwap, liveImage);
+      if (imageVerdict === 'stale' && liveImage) {
         return buildImageSwapNotReflected({ adId, oldCreativeId, newCreativeId, expected: imageSwap, live: liveImage });
       }
     }
@@ -20454,10 +20456,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       message: `Ad updated successfully. Created new creative (${newCreativeId}) with updated ${creativeKeys.join(', ')} `
         + `and swapped it in for the old creative (${oldCreativeId})`
         + (v.liveLinkUrl ? `. Verified live destination URL: ${v.liveLinkUrl}` : '.')
-        + reviewNote,
+        + reviewNote
+        // No proof of a stale image, but no proof of the new one either — never let that read as confirmed.
+        + (imageVerdict && imageVerdict !== 'confirmed'
+          ? ` NOTE: the new creative's image could not be confirmed (${imageVerdict} read-back) — do not tell the `
+            + `user the image changed until it is checked in Ads Manager.`
+          : ''),
       old_creative_id: oldCreativeId,
       new_creative_id: newCreativeId,
       verified: true,
+      ...(imageVerdict && { image_verified: imageVerdict === 'confirmed' }),
       live_link_url: v.liveLinkUrl,
       effective_status: v.effectiveStatus,
       review_feedback: v.reviewFeedback,
