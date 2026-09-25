@@ -14,6 +14,15 @@ export function adConnectionOf(client: ClientHealthFlags): AdConnectionState {
   return client.ad_connection ?? (client.has_ads ? 'connected' : 'never_connected');
 }
 
+/**
+ * Active-campaign text for the detail view. When the campaign read was incomplete the count is a
+ * lower bound (or unknown), never a confirmed number.
+ */
+export function campaignCountLabel(adsLayer: { active_campaigns: number; campaigns_complete?: boolean }): string {
+  if (adsLayer.campaigns_complete !== false) return `${adsLayer.active_campaigns}`;
+  return adsLayer.active_campaigns > 0 ? `${adsLayer.active_campaigns}+ (read incomplete)` : 'Unconfirmed (read incomplete)';
+}
+
 /** Connection state for the detail view's ads layer; older backends only send `connected`. */
 export function adsLayerConnection(adsLayer: { connected: boolean; connection?: AdConnectionState }): AdConnectionState {
   return adsLayer.connection ?? (adsLayer.connected ? 'connected' : 'never_connected');

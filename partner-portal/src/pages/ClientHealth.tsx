@@ -21,6 +21,7 @@ import RefreshIcon from '@mui/icons-material/Refresh';
 import SaveIcon from '@mui/icons-material/Save';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import CancelIcon from '@mui/icons-material/Cancel';
+import RemoveCircleOutlineIcon from '@mui/icons-material/RemoveCircleOutline';
 import ChevronRightIcon from '@mui/icons-material/ChevronRight';
 import CampaignIcon from '@mui/icons-material/Campaign';
 import LanguageIcon from '@mui/icons-material/Language';
@@ -32,6 +33,7 @@ import ShieldIcon from '@mui/icons-material/Shield';
 import {
   adConnectionOf,
   adsLayerConnection,
+  campaignCountLabel,
   deriveQuickStatus,
   quickSummary,
   type AdConnectionState,
@@ -61,6 +63,7 @@ interface AdsLayerHealth {
   token_expired_at?: string;
   ad_account_id?: string;
   active_campaigns: number;
+  campaigns_complete?: boolean;
   campaigns?: Array<{ id: string; name: string; status: string; objective: string }>;
 }
 
@@ -135,6 +138,13 @@ function formatRelativeTime(dateStr: string | null): string {
   if (days === 0) return 'Today';
   if (days === 1) return 'Yesterday';
   return `${days}d ago`;
+}
+
+// ENG-2133: not having Meta yet (or advertising elsewhere) is neutral; only a broken connection is red.
+function AdAccountIcon({ state }: { state: AdConnectionState }) {
+  if (state === 'connected') return <StatusIcon ok />;
+  if (state === 'expired') return <StatusIcon ok={false} />;
+  return <RemoveCircleOutlineIcon sx={{ fontSize: 16, color: 'text.disabled' }} />;
 }
 
 function StatusIcon({ ok }: { ok: boolean }) {
@@ -334,7 +344,9 @@ export default function ClientHealth() {
                     <Typography variant="subtitle2">Meta Ads</Typography>
                     <Typography variant="caption" color="text.secondary">
                       {adsLayerConnection(detail.ads_layer) === 'connected'
-                        ? `${detail.ads_layer.active_campaigns} active`
+                        ? detail.ads_layer.campaigns_complete === false
+                          ? `Campaigns: ${campaignCountLabel(detail.ads_layer)}`
+                          : `${detail.ads_layer.active_campaigns} active`
                         : ADS_INDICATOR[adsLayerConnection(detail.ads_layer)].title}
                     </Typography>
                   </Box>
@@ -396,7 +408,7 @@ export default function ClientHealth() {
                   <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 1 }}>
                     <Typography variant="body2" color="text.secondary">Ad Account</Typography>
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                      <StatusIcon ok={adsLayerConnection(detail.ads_layer) === 'connected'} />
+                      <AdAccountIcon state={adsLayerConnection(detail.ads_layer)} />
                       <Typography variant="body2">
                         {ADS_ACCOUNT_LABEL[adsLayerConnection(detail.ads_layer)]}
                       </Typography>
@@ -405,7 +417,7 @@ export default function ClientHealth() {
                   <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 1 }}>
                     <Typography variant="body2" color="text.secondary">Active Campaigns</Typography>
                     <Typography variant="body2" fontWeight={600}>
-                      {detail.ads_layer.active_campaigns}
+                      {campaignCountLabel(detail.ads_layer)}
                     </Typography>
                   </Box>
                   {detail.ads_layer.campaigns && detail.ads_layer.campaigns.length > 0 && (
