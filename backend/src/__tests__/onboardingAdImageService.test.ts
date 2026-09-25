@@ -48,7 +48,9 @@ import {
   pickFormatSplit,
   startAdImageGenerationForUser,
   triggerAdImageGenerationForUser,
+  type AdImageGeneratorDep,
 } from "../services/onboardingAdImageService";
+import { evaluateCreativeGates } from "../services/creativeGates";
 const { userDb, orgDb } = require("../services/db");
 
 class FakeImageGen {
@@ -215,6 +217,26 @@ describe("onboardingAdImageService", () => {
       expect(prompt).toContain("1080x1350");
     });
 
+    // ENG-421 audit defect (fixed in ENG-2139): 1080x1350 is Meta's 4:5 feed
+    // portrait. Story/Reel is 9:16 1080x1920, so calling this size "Story/Reel"
+    // told the model the wrong placement.
+    it("labels 1080x1350 as a 4:5 feed portrait, not Story/Reel", () => {
+      const prompt = buildSixLayerPromptForVariant({
+        variantIndex: 1,
+        format: "1080x1350",
+        concept: "VM",
+        copyAngle: "PA",
+        formatArchetype: "A",
+        brand,
+        persona: onePersona,
+      });
+      const layer1 = prompt.split("LAYER 1: FORMAT & DIMENSIONS")[1].split("LAYER 2")[0];
+      expect(layer1).toContain("Meta Feed ad — 1080x1350px. Aspect ratio 4:5.");
+      expect(layer1).not.toMatch(/story|reel/i);
+      expect(AD_IMAGE_SYSTEM_PROMPT).toContain("1080 x 1350px (Meta Feed — portrait 4:5)");
+      expect(AD_IMAGE_SYSTEM_PROMPT).not.toMatch(/1350px \(Story\/Reel/);
+    });
+
     it("embeds the persona's pain in Layer 3 (focal point)", () => {
       const prompt = buildSixLayerPromptForVariant({
         variantIndex: 0,
@@ -295,6 +317,31 @@ describe("onboardingAdImageService", () => {
         expect(typeof v.prompt).toBe("string");
         expect(v.imageUrl.length).toBeGreaterThan(0);
       }
+    });
+
+    it("stores the generator's advisory gate result on each successful variant (ENG-2139)", async () => {
+      const gates = evaluateCreativeGates(
+        { bytes: 1000, decoded: true, width: 1080, height: 1080, format: "png", luminanceStdDev: 40 },
+        { requestedSize: "1080x1080" },
+      );
+      let call = 0;
+      const gen: AdImageGeneratorDep = {
+        generateImage: async () => {
+          call += 1;
+          return call === 2
+            ? { success: false, error: "provider down" }
+            : { success: true, imageUrl: `https://s3.example.com/ad-${call}.png`, gates };
+        },
+      };
+
+      const result = await generateAdImagesForUser(creativeDir, brand, [onePersona], "user-1", {
+        imageGen: gen,
+        loadTemplate: async () => { throw new Error("no dynamo in tests"); },
+        globalDirectives: {},
+      });
+
+      expect(result.variants.map((v) => v.gates?.passed)).toEqual([true, undefined, true]);
+      expect(result.variants[1].imageUrl).toContain("placeholder://");
     });
 
     it("uses 60/40 format split — 2 squares, 1 vertical", async () => {
