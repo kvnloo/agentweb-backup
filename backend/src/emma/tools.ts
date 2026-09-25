@@ -413,6 +413,10 @@ For a customer-facing credential reconnect (a disconnected Meta ad account, Inst
           type: 'string',
           description: 'Required, always. A short label naming exactly which account/customer this decision is about (e.g. "TriCityAI · Meta Ad Account 2041725529929988", "JustFitKitchen · Meta retargeting campaign"). Rendered as its own prominent line so the approver never has to infer the account from prose — never omit this, even when businessImpact already mentions it.',
         },
+        subjectContactEmail: {
+          type: 'string',
+          description: 'Optional but include it whenever you know it: the email of the person/account this decision concerns (e.g. the ad account owner). Rendered alongside subjectLabel with the domain highlighted, so the approver can recognize the company at a glance, not just the account id.',
+        },
         businessImpact: {
           type: 'string',
           description: 'One line: why this decision matters right now.',
@@ -522,6 +526,7 @@ For a customer-facing credential reconnect (a disconnected Meta ad account, Inst
         approver: audience === 'team' ? (args?.approver as ApprovalDecisionApprover) : undefined,
         customerId: audience === 'customer' ? args?.customerId : undefined,
         subjectLabel: args?.subjectLabel,
+        subjectContactEmail: args?.subjectContactEmail,
         businessImpact: args?.businessImpact,
         evidencePacket: {
           chatUrl: args?.evidencePacket?.chatUrl,

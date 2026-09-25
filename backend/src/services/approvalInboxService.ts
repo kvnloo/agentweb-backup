@@ -110,6 +110,16 @@ export interface ApprovalDecision {
    *  businessImpact. Rendered as its own prominent line, never folded into
    *  free text a reviewer might not read closely. */
   subjectLabel: string;
+  /** ENG-2159 follow-up: optional, purely informational — the account
+   *  owner's email, if known, shown alongside subjectLabel. Deliberately a
+   *  DIFFERENT field from customerEmail above: customerEmail is tied to
+   *  customerId (routing — who this decision is FOR, customer-audience
+   *  only), this is display-only context about whose account a TEAM
+   *  decision concerns. Carries no routing/execution semantics, so it's
+   *  allowed on any audience, unlike customerId (ticket point 6's hard
+   *  invariant stays about customerId specifically, not about showing
+   *  contact info). */
+  subjectContactEmail?: string;
   businessImpact: string;
   evidencePacket: ApprovalDecisionEvidencePacket;
   /** Present for plan_choice items — the fixed decision-deck option shape,
@@ -152,6 +162,7 @@ export interface CreateApprovalDecisionRequest {
   customerEmail?: string;
   customerName?: string;
   subjectLabel: string;
+  subjectContactEmail?: string;
   businessImpact: string;
   evidencePacket: ApprovalDecisionEvidencePacket;
   options?: AskUserQuestionOption[];
@@ -315,6 +326,7 @@ export class ApprovalInboxService {
       customerName: request.customerName,
       status: isCustomer ? 'pending_customer_response' : 'pending_team_review',
       subjectLabel: request.subjectLabel,
+      subjectContactEmail: request.subjectContactEmail,
       businessImpact: request.businessImpact,
       evidencePacket: request.evidencePacket,
       options: request.options,

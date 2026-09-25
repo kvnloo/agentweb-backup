@@ -55,6 +55,7 @@ describe('stage_pending_decision', () => {
         approver: 'matt',
         gateType: 'plan_choice',
         subjectLabel: 'AgentWeb · Meta Ad Account 123456',
+        subjectContactEmail: 'owner@agentweb.pro',
         businessImpact: 'Decides the ad set strategy for a live campaign.',
         evidencePacket: { chatUrl: 'https://app.agentweb.pro/agent-mode/sess-1', links: ['https://linear.app/x'] },
         options: [
@@ -70,6 +71,7 @@ describe('stage_pending_decision', () => {
       approver: 'matt',
       customerId: undefined,
       subjectLabel: 'AgentWeb · Meta Ad Account 123456',
+      subjectContactEmail: 'owner@agentweb.pro',
       businessImpact: 'Decides the ad set strategy for a live campaign.',
       originSessionId: 'sess-1',
     }));

@@ -95,6 +95,15 @@ describe('approvalInboxService.createDecision', () => {
     expect(decision.subjectLabel).toBe('Vincent Hu · TriCityAI 2041725529929988');
   });
 
+  it('persists subjectContactEmail when provided, and leaves it undefined when omitted (optional, unlike subjectLabel)', async () => {
+    mockDynamoDB.put.mockReturnValue(ok());
+    const withEmail = await service.createDecision(metaWriteRequest({ subjectContactEmail: 'vincent@thinkingai.com' }));
+    expect(withEmail.subjectContactEmail).toBe('vincent@thinkingai.com');
+
+    const withoutEmail = await service.createDecision(metaWriteRequest({ metaWriteManifestDigest: 'digest-no-email' }));
+    expect(withoutEmail.subjectContactEmail).toBeUndefined();
+  });
+
   it('rejects a plan_choice decision with fewer than 2 or more than 4 options', async () => {
     const tooFew = { gateType: 'plan_choice' as const, approver: 'fangfang' as const, subjectLabel: 'Test Account', businessImpact: 'x', evidencePacket: {}, options: [{ id: 'a', label: 'A', consequence: 'x', recommended: true }], expiresAt: FUTURE };
     await expect(service.createDecision(tooFew as any)).rejects.toThrow(ApprovalInboxError);
