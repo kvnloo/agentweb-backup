@@ -59,11 +59,34 @@ async function setMessageRef(approver: ApprovalDecisionApprover, ref: MessageRef
   );
 }
 
+// ENG-2159 follow-up: the domain is derived from the email at render time,
+// never stored separately — a stored domain could drift from the real email
+// if either were edited independently.
+//
+// The domain is repeated OUTSIDE the email, not bolded inline within it —
+// Slack's mrkdwn auto-linkifies a bare email address before processing bold
+// markers, so `local@*domain*` left a literal stray asterisk in the
+// rendered message (the auto-link swallows the formatting, found live
+// previewing this exact string in Block Kit Builder). Showing the domain a
+// second time, fully outside the auto-linked span, is what actually makes
+// the company jump out at a glance without fighting Slack's link detection.
+function formatContactLine(email: string): string {
+  const atIndex = email.indexOf('@');
+  if (atIndex === -1) return `:email: ${email}`;
+  const domain = email.slice(atIndex + 1);
+  return `:email: ${email} — *${domain}*`;
+}
+
 function decisionItemBlocks(decision: ApprovalDecision): any[] {
   const links = decision.evidencePacket?.links?.filter(Boolean) || [];
   if (decision.evidencePacket?.chatUrl) links.unshift(decision.evidencePacket.chatUrl);
 
   const summaryLines = [
+    // ENG-2159: rendered as its own distinct, always-present line — a real
+    // account got mistakenly rejected because the account it concerned was
+    // buried in businessImpact prose (or absent) rather than shown plainly.
+    `:office: *${decision.subjectLabel}*`,
+    decision.subjectContactEmail ? formatContactLine(decision.subjectContactEmail) : undefined,
     `*${decision.businessImpact}*`,
     decision.evidencePacket?.researchSummary,
     links.length > 0 ? links.map((l) => `<${l}|link>`).join(' · ') : undefined,
