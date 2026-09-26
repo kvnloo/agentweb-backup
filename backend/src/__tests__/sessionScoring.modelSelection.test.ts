@@ -1,3 +1,4 @@
+jest.mock('../services/db', () => ({ userDb: { getUserById: jest.fn().mockResolvedValue({ orgId: 'judge-org' }) }, orgDb: { getOrgById: jest.fn().mockResolvedValue({ modelRoles: { scoring_judge: 'gemini-3.8-flash' } }) } }));
 import {
   scoreSession,
   scoreSessionWithJudge,
@@ -107,14 +108,14 @@ describe('SessionScoring - model selection', () => {
 
   it('scoreSession uses the configured default-scoring-model setting', async () => {
     mockGetSetting.mockImplementation(async (key: string) => {
-      if (key === 'default-scoring-model') return { settingValue: 'gemini-3.5-flash' } as any;
+      if (key === 'default-scoring-model') return { settingValue: 'gemini-3.8-flash' } as any;
       return null as any;
     });
     mockCallLLM.mockResolvedValue(makeLLMResponse(5, 'great'));
 
     await scoreSession(messages, messages.length);
 
-    expect(mockCallLLM.mock.calls[0][0]).toBe('gemini-3.5-flash');
+    expect(mockCallLLM.mock.calls[0][0]).toBe('gemini-3.8-flash');
   });
 
   it('scoreSession falls back to the hardcoded default model when no setting exists', async () => {
@@ -145,4 +146,15 @@ describe('SessionScoring - model selection', () => {
 
     await expect(getDefaultScoringModel()).resolves.toBe(DEFAULT_MODEL);
   });
+});
+
+it('uses the organization judge override but preserves an explicit judge model', async () => {
+  mockCallLLM.mockResolvedValue(makeLLMResponse(4, 'good'));
+  const usage = { userId: 'judge-user' };
+  await scoreSession(messages, messages.length, undefined, undefined, usage);
+  expect(mockCallLLM.mock.lastCall?.[0]).toBe('gemini-3.8-flash');
+  await scoreSessionWithJudge(messages, messages.length, baseJudge(), undefined, usage);
+  expect(mockCallLLM.mock.lastCall?.[0]).toBe('gemini-3.8-flash');
+  await scoreSessionWithJudge(messages, messages.length, baseJudge({ llmModel: 'gemini-3.5-flash' }), undefined, usage);
+  expect(mockCallLLM.mock.lastCall?.[0]).toBe('gemini-3.5-flash');
 });

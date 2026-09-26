@@ -56,8 +56,8 @@ describe('price book version (ENG-1250 §5, ENG-1934)', () => {
 
   it('matches the prices it versions — bump LLM_PRICE_BOOK_VERSION and this pin together', () => {
     expect({ version: LLM_PRICE_BOOK_VERSION, fingerprint: fingerprint() }).toEqual({
-      version: '2026-09-22',
-      fingerprint: '3d3cfd20d704772f', // 2026-09-22 second pin: additive rows only (GPT-6 Sol/Luna, Grok 4.7), no existing rate changed, so events already stamped 2026-09-22 still re-derive exactly,
+      version: '2026-09-26',
+      fingerprint: '1a418422ee41b613', // Adds the OpenRouter embedding model alias at the existing rate.
     });
   });
 });

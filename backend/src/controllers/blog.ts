@@ -2,8 +2,8 @@ import { Request, Response } from "express";
 import { imageService } from "../services/imageGeneration";
 import { getSecret } from '../utils/secretsManager';
 import { agentModeService } from '../services/agentModeService';
-import { CONTENT_RESTYLE_MODEL } from '../config';
 import { currentRunFunding, resolveRunFunding, withRunFunding } from '../services/funding/runFunding';
+import { resolveModelForUser } from '../services/modelRoles';
 import axios from "axios";
 import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
@@ -298,7 +298,8 @@ export async function generateBlogContent(
   length: string = "medium",
   researchContext: string = "",
   requirements: string = "",
-  style: string = "default"
+  style: string = "default",
+  userId?: string
 ): Promise<{
   title: string;
   description: string;
@@ -408,27 +409,11 @@ Research Context (use to enhance the draft content):
 ${researchContext}`;
   }
 
-  // Get content model from settings, but don't block content generation if settings are unavailable
-  let contentModel: string | undefined;
-  try {
-    const { settingsService } = await import('../services/settingsService');
-    try {
-      const setting = await settingsService.getSetting('agent_mode_content_model');
-      if (setting && setting.settingValue) {
-        contentModel = setting.settingValue;
-      }
-    } catch (error) {
-      console.error('Error getting content model setting:', error);
-    }
-  } catch (error) {
-    console.error('Error loading settings service:', error);
-  }
-
   try {
 
     // Use LangChain LLM service with dynamic maxTokens based on article length
     const { createLLMService } = await import('../utils/llmService');
-    const modelName = contentModel || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
+    const modelName = await resolveModelForUser(userId, 'content_generation');
     console.log(`[generateBlogContent] Using model: ${modelName}, output format: JSON`);
     const llmService = createLLMService(modelName, 0.8, maxTokens);
     
@@ -496,7 +481,8 @@ export async function restyleContent(
   topic: string,
   tone: string = "professional",
   style: string = "default",
-  includeInlineImages: boolean = false
+  includeInlineImages: boolean = false,
+  userId?: string
 ): Promise<{
   title: string;
   description: string;
@@ -597,7 +583,7 @@ OUTPUT FORMAT (STRICT JSON):
     const systemInstruction = "You are an expert content editor. Restyle content while preserving key information. Always respond with valid JSON only, no markdown code blocks.";
     // ENG-1816 F1: this call previously carried no userId, so its spend booked to
     // "system" and escaped both billing and the funding policy.
-    const response = await agentModeService.callLLM(CONTENT_RESTYLE_MODEL, [
+    const response = await agentModeService.callLLM(await resolveModelForUser(userId, 'content_generation'), [
       { role: 'system', content: systemInstruction },
       { role: 'user', content: prompt },
     ], {
@@ -1355,7 +1341,7 @@ export const generateBlogPost = async (req: AuthRequest, res: Response) => {
       // site actually fire on this entry point too.
       const runFunding = await resolveRunFunding({ userId });
       const blogData = await withRunFunding(runFunding, () =>
-        generateBlogContent(titleDraft, contentDraft, length, researchContext, agentWebRequirements),
+        generateBlogContent(titleDraft, contentDraft, length, researchContext, agentWebRequirements, 'default', userId),
       );
 
       console.log("✅ Content generation complete! Processing AI response...");

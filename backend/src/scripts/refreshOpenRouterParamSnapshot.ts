@@ -11,6 +11,7 @@
  * dated snapshot OpenRouter actually routes to.
  */
 import * as fs from 'fs';
+import { fetchJson, parseEndpointProviders } from '../services/agentMode/frontierMonitor';
 import * as path from 'path';
 import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
 import { resolveOpenRouterUpstreamModelId } from '../utils/openRouterGatewayContract';
@@ -21,18 +22,10 @@ export const SNAPSHOT_PATH = path.join(
 
 /** Fetch one model's endpoints, following OpenRouter aliases, with sorted provider/parameter lists. */
 async function fetchEndpoints(upstreamModel: string) {
-  const res = await fetch(`https://openrouter.ai/api/v1/models/${upstreamModel}/endpoints`);
-  if (!res.ok) throw new Error(`${upstreamModel}: HTTP ${res.status} ${await res.text()}`);
-  const { data } = await res.json() as any;
-  return {
-    resolvedId: data.id as string,
-    endpoints: (data.endpoints as any[])
-      .map(endpoint => ({
-        provider: endpoint.provider_name as string,
-        supported_parameters: [...(endpoint.supported_parameters as string[] ?? [])].sort(),
-      }))
-      .sort((a, b) => a.provider.localeCompare(b.provider)),
-  };
+  const { resolvedId, endpoints } = parseEndpointProviders(
+    await fetchJson(`https://openrouter.ai/api/v1/models/${upstreamModel}/endpoints`),
+  );
+  return { resolvedId, endpoints };
 }
 
 /** Snapshot every non-live registry model's OpenRouter endpoints to SNAPSHOT_PATH. */
