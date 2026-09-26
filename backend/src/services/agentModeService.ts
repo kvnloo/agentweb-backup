@@ -62,7 +62,7 @@ import {
 import {
   assertOpenRouterToolsSupported,
   openRouterIgnoredProviders,
-  openRouterPreferredProviders,
+  OPENROUTER_PROVIDER_PREFERENCES,
   selectOpenRouterSamplingParams,
 } from './agentMode/openRouterRequestParams';
 import {
@@ -2865,9 +2865,7 @@ export class AgentModeService {
       params.response_format = response_format;
     }
 
-    params.provider = { allow_fallbacks: true, require_parameters: true };
-    const preferredProviders = openRouterPreferredProviders(upstreamModel);
-    if (preferredProviders.length > 0) params.provider.order = preferredProviders;
+    params.provider = { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true };
     const ignoredProviders = openRouterIgnoredProviders(upstreamModel);
     if (ignoredProviders.length > 0) {
       // Stopgap for ENG-1702 (parent: ENG-753). Our BYOK Google credential is

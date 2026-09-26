@@ -100,17 +100,15 @@ describe('openRouterIgnoredProviders', () => {
   });
 });
 
-import { openRouterPreferredProviders } from '../openRouterRequestParams';
+import { OPENROUTER_PROVIDER_PREFERENCES } from '../openRouterRequestParams';
 
-describe('openRouterPreferredProviders (cloud-credit routing, 2026-09-22)', () => {
-  it('sends Anthropic to AWS Bedrock', () => {
-    expect(openRouterPreferredProviders('anthropic/claude-opus-5.5')).toEqual(['Amazon Bedrock']);
-  });
-  it('sends OpenAI to Azure', () => {
-    expect(openRouterPreferredProviders('openai/gpt-6-sol')).toEqual(['Azure']);
-  });
-  it('leaves Grok and others on default OpenRouter routing', () => {
-    expect(openRouterPreferredProviders('x-ai/grok-4.7')).toEqual([]);
-    expect(openRouterPreferredProviders('google/gemini-3.8-flash')).toEqual([]);
+describe('shared BYOK policy', () => {
+  it('prefers all configured cloud families without restricting gateway fallbacks', () => {
+    expect(OPENROUTER_PROVIDER_PREFERENCES.allow_fallbacks).toBe(true);
+    expect(OPENROUTER_PROVIDER_PREFERENCES.order).toEqual([
+      'amazon-bedrock', 'azure', 'google-vertex', 'anthropic', 'openai',
+    ]);
+    expect(OPENROUTER_PROVIDER_PREFERENCES).not.toHaveProperty('only');
+    expect(Object.isFrozen(OPENROUTER_PROVIDER_PREFERENCES.order)).toBe(true);
   });
 });
