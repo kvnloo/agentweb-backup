@@ -356,6 +356,7 @@ export async function addLeadsToList(
 
       const { leadImportWriteBudgetMs } = await import('../../utils/leadImportLedger');
       const result = await crmDb.batchCreateLeads(listId, formattedLeads, {
+        origin: 'enrichment_import',
         // A file the user may re-send after a truncated run: dedupe the rows
         // that carry no identity of their own, or every retry duplicates them.
         dedupeByNameCompany: true,
@@ -3302,7 +3303,7 @@ export async function importLeadsFromSearch(
       continue;
     }
 
-    const result = await crmDb.batchCreateLeads(listId, importable);
+    const result = await crmDb.batchCreateLeads(listId, importable, { origin: 'linkedin' });
     cumulativeNew += result.newCount ?? 0;
     cumulativeMerged += result.mergedCount ?? 0;
     if (Array.isArray(result.errors) && result.errors.length) allErrors.push(...result.errors);

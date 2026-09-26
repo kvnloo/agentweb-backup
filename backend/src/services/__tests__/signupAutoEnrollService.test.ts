@@ -295,7 +295,7 @@ describe('enrollSignupIntoFoundersList', () => {
           referrer: 'https://facebook.com/',
           landing_url: 'http://app.example.com/register?utm_source=meta',
         }),
-      })
+      }), 'integration'
     );
   });
 

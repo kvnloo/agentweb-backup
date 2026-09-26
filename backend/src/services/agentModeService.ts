@@ -6391,6 +6391,10 @@ export class AgentModeService {
     'save_org_memory',
     'delete_org_memory',
 
+    // Org notification preferences use the same org-settings authorization.
+    'get_lead_notification_settings',
+    'update_lead_notification_settings',
+
     // Scheduled Chat Management
     'list_scheduled_chats',
     'manage_scheduled_chat',
