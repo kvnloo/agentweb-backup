@@ -268,6 +268,21 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       expect(response.body.message).toBe('Email or phone is required');
     });
 
+    it('allowAnonymousLead: records a submission with no email or phone when the lander opts in', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.createLead as jest.Mock).mockResolvedValue({ leadId: 'lead_anon', listId: 'list_123' });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', allowAnonymousLead: true, brand: 'Rheem', model_number: 'XE50' });
+
+      expect(response.status).toBe(201);
+      const created = (crmDb.createLead as jest.Mock).mock.calls.at(-1)[1];
+      expect(created.email).toBeUndefined();
+      expect(created.customFields.brand).toBe('Rheem');
+      expect(created.customFields.allowAnonymousLead).toBeUndefined();
+    });
+
     it('ENG-2082: a SYNTHETIC phone-only lead is keyed deterministically (the smoke test reads it back)', async () => {
       // A phone-only lander used to be impossible: this route required an email, so every
       // submission was refused before a row was built and the page captured nothing.
