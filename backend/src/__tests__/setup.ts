@@ -87,3 +87,10 @@ if (typeof realFetch === 'function') {
 }
 
 export {};
+
+// Keep the pre-Dynamo route characterizations unchanged while mocking their new I/O.
+if (/[\\/](hubspotAuth|fathomAuth)\.test\.ts$/.test(expect.getState().testPath || '')) {
+  jest.doMock('../services/db', () => ({
+    oauthSessionDb: require('./fixtures/oauthSessionDb').createOAuthSessionDbMock(),
+  }));
+}
