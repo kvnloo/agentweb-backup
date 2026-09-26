@@ -11923,6 +11923,13 @@ export const scheduleTemplateDb = {
 
 const OAUTH_SESSIONS_TABLE = `${TABLE_PREFIX}AW-OAuthSessions`;
 
+export interface PendingOAuthSession {
+  sessionId: string;
+  userId: string;
+  provider: 'hubspot' | 'fathom';
+  payload: unknown;
+}
+
 export const oauthSessionDb = {
   async save(session: {
     sessionId: string;
@@ -11934,7 +11941,7 @@ export const oauthSessionDb = {
     /** Scopes actually GRANTED, when the provider could tell us (ENG-629). */
     granted_scopes?: string[];
     flow: string;
-  }): Promise<void> {
+  } | PendingOAuthSession): Promise<void> {
     const TEN_MINUTES_SECONDS = 10 * 60;
     const ttl = Math.floor(Date.now() / 1000) + TEN_MINUTES_SECONDS;
     try {
@@ -11944,6 +11951,25 @@ export const oauthSessionDb = {
       }).promise();
     } catch (error) {
       handleDynamoDbError(error, 'oauthSessionDb.save');
+    }
+  },
+
+  /** Atomically return and burn a live provider session; TTL deletion is asynchronous. */
+  async consume(sessionId: string, userId: string, provider: PendingOAuthSession['provider']): Promise<PendingOAuthSession | null> {
+    try {
+      const result = await dynamodb.delete({
+        TableName: OAUTH_SESSIONS_TABLE,
+        Key: { sessionId },
+        ConditionExpression: 'userId = :userId AND #provider = :provider AND #ttl > :now',
+        ExpressionAttributeNames: { '#provider': 'provider', '#ttl': 'ttl' },
+        ExpressionAttributeValues: { ':userId': userId, ':provider': provider, ':now': Math.floor(Date.now() / 1000) },
+        ReturnValues: 'ALL_OLD',
+      }).promise();
+      return (result.Attributes as PendingOAuthSession | undefined) ?? null;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return null;
+      handleDynamoDbError(error, 'oauthSessionDb.consume');
+      throw error;
     }
   },
 
