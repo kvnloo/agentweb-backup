@@ -539,7 +539,12 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // normalises `ph` as a first-class match key. This gate was the only thing requiring one.
     const normalizedEmail = typeof email === 'string' ? email.trim() : '';
     const normalizedPhone = typeof phone === 'string' ? phone.trim() : '';
-    if (!normalizedEmail && !normalizedPhone) {
+    // Opt-in exception: a lander whose contact field is deliberately optional (e.g. the
+    // WaterHeater.app free warranty check) sends `allowAnonymousLead: true` so the
+    // submission is still recorded (with its customFields) instead of silently dropped.
+    // Default behaviour for every other caller is unchanged.
+    const allowAnonymousLead = req.body?.allowAnonymousLead === true;
+    if (!normalizedEmail && !normalizedPhone && !allowAnonymousLead) {
       return res.status(400).json({
         success: false,
         message: 'Email or phone is required'
@@ -629,6 +634,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // "anything not handled above", so a newly-handled key MUST be added here too.
       // (`clientIp`/`clientUserAgent` are deliberately NOT handled — see the destructure.)
       'visitorIp', 'visitorUserAgent',
+      'allowAnonymousLead',
     ]);
     const PASSTHROUGH_MAX_KEYS = 50;
     const PASSTHROUGH_MAX_VALUE_LENGTH = 1000;
