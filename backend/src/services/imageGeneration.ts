@@ -1,3 +1,5 @@
+import { IMAGE_MODEL_IDS } from './imageModelRegistry';
+import { resolveModelForUser } from './modelRoles';
 import axios from "axios";
 import { getSecret } from "../utils/secretsManager";
 import { uploadFileToS3 } from "../utils/s3Utils";
@@ -20,19 +22,7 @@ interface ImageGenerationResult {
 }
 
 // Supported image generation models
-const SUPPORTED_MODELS = [
-  "gpt-image-1",
-  "gpt-image-2",
-  "gemini-2.5-flash-image",
-  "gemini-3-pro-image-preview",
-  "gemini-3.1-flash-image",
-  // Legacy preview id — accepted as an alias of gemini-3.1-flash-image so that
-  // persisted settings, in-flight sessions, and scheduled chats created before
-  // the GA migration keep working. Normalized to the GA id before dispatch.
-  "gemini-3.1-flash-image-preview",
-  "gen4_image",
-  "gemini_2.5_flash",
-] as const;
+const SUPPORTED_MODELS = IMAGE_MODEL_IDS;
 
 type SupportedModel = typeof SUPPORTED_MODELS[number];
 
@@ -522,7 +512,7 @@ export class ImageService {
       // Determine which model to use before validation
       // If model not defined, use gemini-3-pro-image-preview as default (supports multiple input images)
       if (!params.imageModel) {
-        params.imageModel = "gemini-3-pro-image-preview";
+        params.imageModel = await resolveModelForUser(params.userId, 'image');
       }
 
       // Normalize legacy/preview ids to their canonical (GA) equivalent so that

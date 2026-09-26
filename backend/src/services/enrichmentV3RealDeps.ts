@@ -1,3 +1,4 @@
+import { resolveModelForUser } from './modelRoles';
 // Real-service adapters that satisfy the v3.1 orchestrator deps
 // (OrchestratorDeps + IdentityResolverDeps).
 //
@@ -769,7 +770,7 @@ export async function extractFieldsViaLLMReal(input: {
       const llm = createLLMService(WEB_SEARCH_MODEL, 0.0);
       parsed = await llm.generateJSONContentWithWebSearch<Record<string, any>>(systemPrompt, userPrompt, { userId, feature: 'enrichment' });
     } else {
-      const llm = createLLMService(EXTRACT_MODEL, 0.0);
+      const llm = createLLMService(await resolveModelForUser(userId, 'enrichment'), 0.0);
       parsed = await llm.generateJSONContent<Record<string, any>>(systemPrompt, userPrompt, 'json', undefined, { userId, feature: 'enrichment' });
     }
     const filled: Record<string, LLMFilledValue> = {};
@@ -1116,7 +1117,7 @@ export async function pickCandidateByContextLLM(
       `Candidates (index: profile):\n${profiles}\n\n` +
       `Is the context specific enough to disambiguate? Which index best matches? Quote the chosen profile's exact words as evidence. Use index -1 if the context is weak or none confidently match.`;
 
-    const llm = createLLMService(EXTRACT_MODEL, 0.0);
+    const llm = createLLMService(await resolveModelForUser(userId, 'enrichment'), 0.0);
     const parsed = await llm.generateJSONContent<{ index?: number; confidence?: string; evidence?: string; context_strength?: string }>(
       systemPrompt, userPrompt, 'json', undefined, { userId, feature: 'enrichment' },
     );
@@ -1387,7 +1388,7 @@ export function buildOrchestratorDeps(
             if (candidates.length === 0) return null;
 
             // LLM picks the best candidate and extracts title + company from headline
-            const llm = createLLMService(EXTRACT_MODEL, 0.1);
+            const llm = createLLMService(await resolveModelForUser(userId, 'enrichment'), 0.1);
             const systemPrompt =
               'You are a lead researcher. Given a lead and LinkedIn search candidates, pick the best match and extract their current title and company.\n\n' +
               'RULES:\n' +
@@ -1648,7 +1649,8 @@ export function buildOrchestratorDeps(
             .map(([k, v]) => [k, sanitize(v.slice(0, 200))])
         );
         const mergedDepValues = { ...nativeValues, ...depValues };
-        const llm = createLLMService(EXTRACT_MODEL, 0.0);
+        const model = await resolveModelForUser(userId, 'enrichment');
+        const llm = createLLMService(model, 0.0);
         const result = await llm.generateJSONContent<{ value: string | null; reasoning: string }>(
           buildSmartFieldEvalSystemPrompt(),
           buildSmartFieldEvalUserPrompt(fieldName, condition, mergedDepValues),
@@ -1659,7 +1661,7 @@ export function buildOrchestratorDeps(
         return {
           value: result?.value != null ? String(result.value) : null,
           reasoning: result?.reasoning ?? '',
-          model: EXTRACT_MODEL,
+          model,
         };
       } catch (err) {
         console.warn('[v3 deps] evaluateSmartField failed:', (err as Error).message);
