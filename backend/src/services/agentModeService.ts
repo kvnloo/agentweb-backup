@@ -28036,7 +28036,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         /\*\*[^*\n]+\*\*/.test(value) ||
         /__[^_\n]+__/.test(value) ||
         /(^|[^*])\*[^*\n]+\*(?!\*)/.test(value) ||
-        /(^|[^_])_[^_\n]+_(?!_)/.test(value) ||
+        /(^|[\s([{>])_[^_\n]+_(?=$|[\s)\]}.!,?:;])/.test(value) ||
         /\[[^\]\n]+\]\([^)\n]+\)/.test(value);
       if (looksLikeMarkup) {
         stats.count += 1;
