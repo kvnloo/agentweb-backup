@@ -449,6 +449,14 @@ const runDrain = async (reason: string): Promise<void> => {
     );
   }
 
+  // A-019: CallTool handlers are now part of cronJobRegistry's in-flight set,
+  // so once the wait above has settled there is no legitimate MCP tool work
+  // left to preserve. Close session transports BEFORE the HTTP listener.
+  const mcpShutdown = (app as any).mcpShutdown as (() => Promise<void>) | undefined;
+  if (mcpShutdown) {
+    await mcpShutdown();
+  }
+
   // 4. Stop accepting new HTTP connections — safe now that in-flight
   //    self-calls above have had their chance to complete.
   server.close((err) => {
