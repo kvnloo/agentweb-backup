@@ -288,6 +288,14 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
     it('ENG-1960: detects common Markdown forms, redacts nested keys, and caps logged paths', async () => {
       const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
       try {
+        const templateWithItems = {
+          ...mockTemplate,
+          arrayVariables: ['items'],
+          html_content: '<html><body><ul>{{#items}}<li>{{item}}</li>{{/items}}</ul></body></html>',
+        };
+        (settingsService.getSetting as jest.Mock).mockResolvedValue({
+          settingValue: JSON.stringify([templateWithItems]),
+        });
         const items = Array.from({ length: 25 }, (_, index) => ({
           [`customer_secret_${index}`]:
             index % 3 === 0 ? '*emphasis*' : index % 3 === 1 ? '`inline code`' : '> quoted text',
@@ -322,7 +330,7 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
         await (agentModeService as any).createHtmlFromTemplate(
           agentModeService.default_model,
           'test-template-id',
-          { title: 'A* Star', content: "Vince's ad" },
+          { title: 'A* Star', content: "Vince's ad — north_america_east" },
           {},
           'user123',
           'session123'
