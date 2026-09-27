@@ -261,14 +261,8 @@ export function setupMcpServer(
   // Export shutdown function for use by main server
   (app as any).mcpShutdown = shutdownAllSessions;
   
-  // Handle graceful shutdown on signals
-  const handleShutdown = async (signal: string) => {
-    console.log(`[MCP] Received ${signal}, initiating graceful shutdown...`);
-    await shutdownAllSessions();
-  };
-
-  process.on('SIGTERM', () => handleShutdown('SIGTERM'));
-  process.on('SIGINT', () => handleShutdown('SIGINT'));
+  // Main server.ts owns SIGTERM/SIGINT ordering. MCP exports mcpShutdown above
+  // but must not race the global drain by closing transports directly on signals.
 
   // Use shared server factory from core module, passing session context
   const createServer = (req?: Request, sessionId?: string) => {
@@ -303,7 +297,12 @@ export function setupMcpServer(
     // before it can enter a transport/handler. Internal self-calls from an
     // already-tracked AgentWeb turn are deliberately exempt: runDrain keeps
     // this listener open specifically so those calls can finish.
-    if (req.body?.method === 'tools/call' && (req as any)._mcpIsInternal !== true && !isCronEnabled()) {
+    const mcpMessages = Array.isArray(req.body) ? req.body : [req.body];
+    if (
+      mcpMessages.some((message: any) => message?.method === 'tools/call') &&
+      (req as any)._mcpIsInternal !== true &&
+      !isCronEnabled()
+    ) {
       return res.status(503).json({ message: 'Instance draining — retry on new instance' });
     }
 
