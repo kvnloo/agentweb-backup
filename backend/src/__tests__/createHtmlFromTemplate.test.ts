@@ -249,6 +249,63 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(promptContent).toContain('&lt;b&gt;Bold&lt;/b&gt;');
     });
 
+    it('ENG-1960: logs markup-like variable paths without mutating the values', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        await (agentModeService as any).createHtmlFromTemplate(
+          agentModeService.default_model,
+          'test-template-id',
+          {
+            title: 'Quarterly report',
+            content: '<ul><li><strong>Revenue</strong></li></ul>',
+          },
+          {
+            items: [{ item: '- first point\n- second point' }],
+          },
+          'user123',
+          'session123'
+        );
+
+        const markupWarning = warnSpy.mock.calls.find(
+          ([message]) => message === '[ENG-1960] create_html_from_template received markup-like variable values'
+        );
+        expect(markupWarning).toBeDefined();
+        expect(markupWarning?.[1]).toEqual({
+          count: 2,
+          paths: ['variable_values.content', 'array_variable_values.items[0].item'],
+        });
+
+        // Detection is observability only. Existing escaping/substitution owns behavior.
+        const [, messages] = (agentModeService.callLLM as jest.Mock).mock.calls[0];
+        expect(messages[0].content).toContain('&lt;ul&gt;&lt;li&gt;&lt;strong&gt;Revenue&lt;/strong&gt;&lt;/li&gt;&lt;/ul&gt;');
+        expect(messages[0].content).toContain('- first point\\n- second point');
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it('ENG-1960: does not flag ordinary punctuation such as a lone asterisk in a name', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        await (agentModeService as any).createHtmlFromTemplate(
+          agentModeService.default_model,
+          'test-template-id',
+          { title: 'A* Star', content: "Vince's ad" },
+          {},
+          'user123',
+          'session123'
+        );
+
+        expect(
+          warnSpy.mock.calls.some(
+            ([message]) => message === '[ENG-1960] create_html_from_template received markup-like variable values'
+          )
+        ).toBe(false);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
     // A single-quoted HTML attribute (e.g. <img src='{{url}}'>) is valid HTML the template
     // author could write, and nothing forbids it. Escaping only &, <, >, " (not ') leaves this
     // vector wide open: a value of `' onerror='alert(1)` breaks out of the attribute without
