@@ -324,6 +324,31 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       }
     });
 
+    it('ENG-1960: detects quoted underscore emphasis without treating identifiers as Markdown', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        await (agentModeService as any).createHtmlFromTemplate(
+          agentModeService.default_model,
+          'test-template-id',
+          { title: '"_urgent_"', content: 'north_america_east' },
+          {},
+          'user123',
+          'session123'
+        );
+
+        const markupWarning = warnSpy.mock.calls.find(
+          ([message]) => message === '[ENG-1960] create_html_from_template received markup-like variable values'
+        );
+        expect(markupWarning?.[1]).toMatchObject({
+          count: 1,
+          paths: ['variable_values.title'],
+          paths_truncated: false,
+        });
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
     it('ENG-1960: does not flag ordinary punctuation such as a lone asterisk in a name', async () => {
       const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
       try {
