@@ -229,6 +229,16 @@ describe('server.ts shutdown sequencing (source-pinned, ENG-1189)', () => {
     expect(drainCallIndex).toBeLessThan(serverCloseIndex);
   });
 
+  it('A-019 closes MCP session transports after in-flight drain and before the HTTP listener', () => {
+    const drainCallIndex = serverSrc.indexOf('generateMarketingResponseWorkerService.shutdown(),');
+    const mcpShutdownIndex = serverSrc.indexOf('await mcpShutdown();');
+    const serverCloseIndex = serverSrc.indexOf('server.close((err)');
+
+    expect(drainCallIndex).toBeGreaterThan(-1);
+    expect(mcpShutdownIndex).toBeGreaterThan(drainCallIndex);
+    expect(serverCloseIndex).toBeGreaterThan(mcpShutdownIndex);
+  });
+
   it('drains the worker/cron/session in-flight work before closing Socket.IO', () => {
     const drainCallIndex = serverSrc.indexOf('generateMarketingResponseWorkerService.shutdown(),');
     const ioCloseIndex = serverSrc.indexOf('io.close((err)');
@@ -252,6 +262,22 @@ describe('server.ts shutdown sequencing (source-pinned, ENG-1189)', () => {
       serverSrc.indexOf("socket.on('message'") + 400
     );
     expect(messageHandlerSection).toMatch(/cronJobRegistry\.track\('chatbotTurn',\s*handleSocketChatMessage/);
+  });
+});
+
+describe('agentModeController generateResponse — drain admission (A-019)', () => {
+  it('returns the drain 503 before any session-generation claim can be taken', () => {
+    const controllerSrc = fs.readFileSync(
+      path.join(__dirname, '../controllers/agentModeController.ts'),
+      'utf8'
+    );
+    const methodIndex = controllerSrc.indexOf('async generateResponse(req: Request, res: Response)');
+    const guardIndex = controllerSrc.indexOf("return res.status(503).json({ message: 'Instance draining — retry on new instance' });", methodIndex);
+    const claimIndex = controllerSrc.indexOf('tryClaimSessionGeneration(sessionId)', methodIndex);
+
+    expect(methodIndex).toBeGreaterThan(-1);
+    expect(guardIndex).toBeGreaterThan(methodIndex);
+    expect(claimIndex).toBeGreaterThan(guardIndex);
   });
 });
 
