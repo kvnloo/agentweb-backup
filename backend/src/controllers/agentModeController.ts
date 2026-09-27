@@ -9262,6 +9262,13 @@ export const agentModeController = {
     // replaced/abandoned some other way would show. Mirrors approvalDeckAnswerMeta.
     let approvalDeckCancelledMeta: { deckId: string } | undefined;
     try {
+      // A-019: do not admit a fresh interactive turn after shutdown drain starts.
+      // This is intentionally before STT, idempotency/session claims, deck writes,
+      // and all provider work. The caller can retry on the replacement instance.
+      if (!isCronEnabled()) {
+        return res.status(503).json({ message: 'Instance draining — retry on new instance' });
+      }
+
       const user = req.user as User;
       const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer, deckAnswer, deckCancel, clientId } = req.body;
       let { userMessage } = req.body;
