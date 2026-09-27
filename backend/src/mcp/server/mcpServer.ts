@@ -19,6 +19,7 @@ import {
 } from './mcpSessionStore';
 import { rehydrateAndServe } from './mcpSessionRehydration';
 import { anonymousUserIdForSession, isAnonymousDiscoveryEnabled, isAnonymouslyPermitted } from "./anonymousTransport";
+import { isCronEnabled } from '../../utils/instanceState';
 
 // Rate limiter for MCP requests authenticated via aw_* API keys
 const mcpRateLimiter = new RateLimiter();
@@ -297,6 +298,14 @@ export function setupMcpServer(
   // Note: express.json() is added here because MCP routes are mounted before global body parser
   app.post("/mcp", express.json(), validateMcpAccessToken, async (req: Request, res: Response) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+    // A-019: once this instance starts draining, refuse NEW external tool work
+    // before it can enter a transport/handler. Internal self-calls from an
+    // already-tracked AgentWeb turn are deliberately exempt: runDrain keeps
+    // this listener open specifically so those calls can finish.
+    if (req.body?.method === 'tools/call' && (req as any)._mcpIsInternal !== true && !isCronEnabled()) {
+      return res.status(503).json({ message: 'Instance draining — retry on new instance' });
+    }
 
     // Log all incoming requests
     console.log(`[MCP-SERVER-DEBUG] POST request - sessionId header: ${sessionId || 'MISSING'}, method: ${req.body?.method || 'unknown'}, has session: ${sessionId ? sessions.has(sessionId) : 'N/A'}`);
