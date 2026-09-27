@@ -28011,6 +28011,39 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
   }
 
+  /**
+   * ENG-1960: detect probable rich-text markup in template VARIABLE VALUES without
+   * rewriting customer data. The upstream tool description asks the model to provide
+   * plain text, but prompt-only enforcement can regress silently.
+   *
+   * This deliberately requires real markup structure: an HTML tag, fenced code,
+   * Markdown heading/list, bold pair, or link. A lone "*" in a name/value is not
+   * enough. Only paths are reported; raw values can contain customer/CRM data and
+   * must not be copied into logs.
+   */
+  private static collectTemplateValueMarkupPaths(value: any, path: string, out: string[]): void {
+    if (typeof value === 'string') {
+      const looksLikeMarkup =
+        /<\/?[a-z][^>]*>/i.test(value) ||
+        /(^|\n)\s{0,3}(?:#{1,6}\s+|[-+*]\s+|\d+[.)]\s+)/m.test(value) ||
+        /```/.test(value) ||
+        /\*\*[^*\n]+\*\*/.test(value) ||
+        /__[^_\n]+__/.test(value) ||
+        /\[[^\]\n]+\]\([^)\n]+\)/.test(value);
+      if (looksLikeMarkup) out.push(path);
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => AgentModeService.collectTemplateValueMarkupPaths(item, `${path}[${index}]`, out));
+      return;
+    }
+    if (value !== null && typeof value === 'object') {
+      Object.entries(value).forEach(([key, item]) =>
+        AgentModeService.collectTemplateValueMarkupPaths(item, path ? `${path}.${key}` : key, out)
+      );
+    }
+  }
+
   /** Convert inline markdown to HTML string. */
   private static inlineToHtml(text: string): string {
     let result = '';
@@ -33646,6 +33679,19 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           template_variables: templateVariables,
           template_array_variables: templateArrayVariables
         };
+      }
+
+      // ENG-1960: make prompt-only plain-text guidance observable. Detection is
+      // intentionally non-mutating: some customer values legitimately contain punctuation
+      // that resembles Markdown, and changing them here would be a data-integrity regression.
+      const markupValuePaths: string[] = [];
+      AgentModeService.collectTemplateValueMarkupPaths(variableValuesObj, 'variable_values', markupValuePaths);
+      AgentModeService.collectTemplateValueMarkupPaths(arrayVariableValuesObj, 'array_variable_values', markupValuePaths);
+      if (markupValuePaths.length > 0) {
+        console.warn('[ENG-1960] create_html_from_template received markup-like variable values', {
+          count: markupValuePaths.length,
+          paths: markupValuePaths,
+        });
       }
 
       // ENG-1877: variable values come from campaign names, CRM data, and other
