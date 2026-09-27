@@ -28021,25 +28021,38 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * enough. Only paths are reported; raw values can contain customer/CRM data and
    * must not be copied into logs.
    */
-  private static collectTemplateValueMarkupPaths(value: any, path: string, out: string[]): void {
+  private static collectTemplateValueMarkup(
+    value: any,
+    path: string,
+    stats: { count: number; paths: string[] },
+    nested = false,
+  ): void {
     if (typeof value === 'string') {
       const looksLikeMarkup =
         /<\/?[a-z][^>]*>/i.test(value) ||
-        /(^|\n)\s{0,3}(?:#{1,6}\s+|[-+*]\s+|\d+[.)]\s+)/m.test(value) ||
+        /(^|\n)\s{0,3}(?:#{1,6}\s+|[-+*]\s+|\d+[.)]\s+|>\s+)/m.test(value) ||
         /```/.test(value) ||
+        /`[^`\n]+`/.test(value) ||
         /\*\*[^*\n]+\*\*/.test(value) ||
         /__[^_\n]+__/.test(value) ||
+        /(^|[^*])\*[^*\n]+\*(?!\*)/.test(value) ||
+        /(^|[^_])_[^_\n]+_(?!_)/.test(value) ||
         /\[[^\]\n]+\]\([^)\n]+\)/.test(value);
-      if (looksLikeMarkup) out.push(path);
+      if (looksLikeMarkup) {
+        stats.count += 1;
+        if (stats.paths.length < 20) stats.paths.push(path);
+      }
       return;
     }
     if (Array.isArray(value)) {
-      value.forEach((item, index) => AgentModeService.collectTemplateValueMarkupPaths(item, `${path}[${index}]`, out));
+      value.forEach((item, index) =>
+        AgentModeService.collectTemplateValueMarkup(item, `${path}[${index}]`, stats, nested)
+      );
       return;
     }
     if (value !== null && typeof value === 'object') {
-      Object.entries(value).forEach(([key, item]) =>
-        AgentModeService.collectTemplateValueMarkupPaths(item, path ? `${path}.${key}` : key, out)
+      Object.values(value).forEach((item) =>
+        AgentModeService.collectTemplateValueMarkup(item, `${path}.<field>`, stats, true)
       );
     }
   }
@@ -33684,13 +33697,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // ENG-1960: make prompt-only plain-text guidance observable. Detection is
       // intentionally non-mutating: some customer values legitimately contain punctuation
       // that resembles Markdown, and changing them here would be a data-integrity regression.
-      const markupValuePaths: string[] = [];
-      AgentModeService.collectTemplateValueMarkupPaths(variableValuesObj, 'variable_values', markupValuePaths);
-      AgentModeService.collectTemplateValueMarkupPaths(arrayVariableValuesObj, 'array_variable_values', markupValuePaths);
-      if (markupValuePaths.length > 0) {
+      const markupStats = { count: 0, paths: [] as string[] };
+      for (const [key, value] of Object.entries(variableValuesObj)) {
+        AgentModeService.collectTemplateValueMarkup(value, `variable_values.${key}`, markupStats);
+      }
+      for (const [key, value] of Object.entries(arrayVariableValuesObj)) {
+        AgentModeService.collectTemplateValueMarkup(value, `array_variable_values.${key}`, markupStats);
+      }
+      if (markupStats.count > 0) {
         console.warn('[ENG-1960] create_html_from_template received markup-like variable values', {
-          count: markupValuePaths.length,
-          paths: markupValuePaths,
+          count: markupStats.count,
+          paths: markupStats.paths,
+          paths_truncated: markupStats.count > markupStats.paths.length,
         });
       }
 
