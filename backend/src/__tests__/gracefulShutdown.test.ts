@@ -219,6 +219,11 @@ describe('server.ts shutdown sequencing (source-pinned, ENG-1189)', () => {
     path.join(__dirname, '../server.ts'),
     'utf8'
   );
+  const mcpServerSrc = fs.readFileSync(
+    path.join(__dirname, '../mcp/server/mcpServer.ts'),
+    'utf8'
+  );
+
 
   it('drains the worker/cron/session in-flight work before closing the HTTP listener', () => {
     const drainCallIndex = serverSrc.indexOf('generateMarketingResponseWorkerService.shutdown(),');
@@ -227,6 +232,12 @@ describe('server.ts shutdown sequencing (source-pinned, ENG-1189)', () => {
     expect(drainCallIndex).toBeGreaterThan(-1);
     expect(serverCloseIndex).toBeGreaterThan(-1);
     expect(drainCallIndex).toBeLessThan(serverCloseIndex);
+  });
+
+  it('A-019 leaves SIGTERM/SIGINT ownership to the main server drain', () => {
+    expect(mcpServerSrc).not.toContain("process.on('SIGTERM'");
+    expect(mcpServerSrc).not.toContain("process.on('SIGINT'");
+    expect(mcpServerSrc).toContain('(app as any).mcpShutdown = shutdownAllSessions');
   });
 
   it('A-019 closes MCP session transports after in-flight drain and before the HTTP listener', () => {
