@@ -235,6 +235,27 @@ describe('MCP Server', () => {
       expect(StreamableHTTPServerTransport).not.toHaveBeenCalled();
     });
 
+    it('A-019: refuses an external JSON-RPC batch when any entry starts tools/call', async () => {
+      mockIsCronEnabled.mockReturnValue(false);
+      mockValidateAgentKey.mockResolvedValue({
+        keyId: 'key-1',
+        userId: 'user-1',
+        rateLimitPerMin: 60,
+      });
+
+      const response = await request(app)
+        .post('/mcp')
+        .set('Authorization', 'Bearer aw_test')
+        .send([
+          { jsonrpc: '2.0', method: 'tools/list', id: 1 },
+          { jsonrpc: '2.0', method: 'tools/call', params: { name: 'test_tool', arguments: {} }, id: 2 },
+        ]);
+
+      expect(response.status).toBe(503);
+      expect(response.body).toEqual({ message: 'Instance draining — retry on new instance' });
+      expect(StreamableHTTPServerTransport).not.toHaveBeenCalled();
+    });
+
     it('A-019: keeps internal self-calls admitted during drain so existing AgentWeb turns can finish', async () => {
       process.env.MCP_ACCESS_TOKEN = TEST_TOKEN;
       mockIsCronEnabled.mockReturnValue(false);
