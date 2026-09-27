@@ -119,6 +119,7 @@ jest.mock('../services/db', () => ({
 import { createMcpServer, mcpToolRegistry, McpSessionContext } from '../mcp/server/mcpServerCore';
 import { McpToolRegistry } from '../mcp/server/registry';
 import { mcpFetch } from '../mcp/server/httpClient';
+import { cronJobRegistry } from '../utils/cronJobRegistry';
 
 const INTERNAL_TOOL_NAMES = [
   'you_search_web',
@@ -270,6 +271,30 @@ describe('MCP Server Security', () => {
         expect.anything(),
         expect.objectContaining({ externalMcp: true })
       );
+      spy.mockRestore();
+    });
+
+    it('A-019: keeps the CallTool handler registered as in-flight until execution settles', async () => {
+      createMcpServer('test-server', {
+        agentUserId: 'external-user',
+        isInternal: false,
+      } as McpSessionContext);
+      expect(callToolHandler).not.toBeNull();
+
+      let release!: (value: any) => void;
+      const pending = new Promise((resolve) => { release = resolve; });
+      const spy = jest.spyOn(mcpToolRegistry, 'execute').mockReturnValue(pending as any);
+
+      const responsePromise = callToolHandler!({
+        params: { name: 'slow_tool', arguments: {} },
+      } as any);
+
+      await Promise.resolve();
+      expect(cronJobRegistry.snapshot()).toMatchObject({ mcpToolCall: 1 });
+
+      release({ ok: true });
+      await responsePromise;
+      expect(cronJobRegistry.snapshot().mcpToolCall).toBeUndefined();
       spy.mockRestore();
     });
 
