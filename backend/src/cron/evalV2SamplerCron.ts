@@ -9,7 +9,8 @@
  *
  * ENG-2196: each score also carries the session's spend (a bounded query per billing user on
  * AW-SpendEvents' billingUserId + occurredAt index) and run wall time, so the snapshots report
- * cost and latency per successful task per model × task type.
+ * cost and latency per successful task per model × task type. The same run writes creative and
+ * account-health snapshots from stored grader output (loops/eval/evalV2Surfaces.ts).
  *
  * Why "last activity on the previous day": a session whose updatedAt is on day D and which is
  * still untouched at run time (17:15 UTC on D+1) has been idle for at least 17 hours, so it is
@@ -63,6 +64,17 @@ import {
   type EvalV2WindowLabel,
   type SampleRun,
 } from '../loops/eval/evalV2Sampler';
+import {
+  aggregateAccountHealth,
+  aggregateCreative,
+  buildSurfaceSnapshotItem,
+  parseSurfaceSnapshotItem,
+  type AccountHealthSnapshot,
+  type CreativeSnapshot,
+  type SurfaceReadStatus,
+  type SurfaceSnapshot,
+} from '../loops/eval/evalV2Surfaces';
+import { ACCOUNT_HEALTH_SIGNAL_CAPABILITY } from '../services/accountCapabilityRequirementsDb';
 import { SPEND_EVENTS_OCCURRED_AT_INDEX, SPEND_EVENTS_TABLE } from '../services/spendEventDb';
 
 export const EVAL_V2_SAMPLER_FLAG = 'EVAL_V2_SAMPLER_ENABLED';
@@ -97,7 +109,34 @@ export interface SamplerDeps {
   clock: ClockPort;
   /** A session user's billing subject (tokenUsageService.resolveBillingUserId); defaults to the user itself. */
   billingUserOf?: (userId: string) => Promise<string>;
+  /** Creative and account-health reads (ENG-2196). Without them only agent snapshots are written. */
+  surfaces?: { reader: SurfaceReader; tables: SurfaceTables };
 }
+
+/** A scan page with its evaluated-item count, so a scan can be bounded by what it read. */
+export interface SurfaceScanPage {
+  Items?: DocItem[];
+  LastEvaluatedKey?: DocItem;
+  ScannedCount?: number;
+}
+
+/** Scans of the two small surface tables only (see surfaceScanReader). */
+export interface SurfaceReader {
+  scan(request: ReadRequest): Promise<SurfaceScanPage>;
+}
+
+export interface SurfaceTables {
+  humanEvalQueue: string;
+  accountCapabilityRequirements: string;
+}
+
+/**
+ * Neither surface table has an index to query by time or kind, so each is read with a filtered,
+ * projected scan that stops after this many evaluated items. On 2026-09-28 AW-HumanEvalQueue held
+ * 1,243 items and AW-AccountCapabilityRequirements 7. Past the bound the snapshot is `truncated`
+ * and reports nothing.
+ */
+export const EVAL_V2_MAX_SURFACE_SCAN_ITEMS = 20000;
 
 export interface SamplerOptions {
   /** EVAL_V2_SAMPLER_ENABLED. A live run refuses without it. */
@@ -274,6 +313,9 @@ export async function runEvalV2Sample(deps: SamplerDeps, opts: SamplerOptions): 
       alreadyScored,
     }));
     snapshotsWritten = (await writeEvalV2Snapshots(deps.dynamo, sampleDate, deps.clock.now())).length;
+    if (deps.surfaces) {
+      snapshotsWritten += (await writeEvalV2SurfaceSnapshots(deps.dynamo, deps.surfaces.reader, deps.surfaces.tables, sampleDate, deps.clock.now())).length;
+    }
   }
 
   return {
@@ -319,6 +361,95 @@ export async function writeEvalV2Snapshots(dynamo: DynamoPort, date: string, now
   return snaps;
 }
 
+async function boundedScan(reader: SurfaceReader, request: ReadRequest, maxScanned: number): Promise<{ items: DocItem[]; truncated: boolean }> {
+  const items: DocItem[] = [];
+  let scanned = 0;
+  let start: DocItem | undefined;
+  do {
+    const page = await reader.scan({ ...request, Limit: Math.min(1000, maxScanned - scanned + 1), ...(start ? { ExclusiveStartKey: start } : {}) });
+    items.push(...(page.Items ?? []));
+    scanned += page.ScannedCount ?? page.Items?.length ?? 0;
+    start = page.LastEvaluatedKey;
+  } while (start && scanned <= maxScanned);
+  return { items, truncated: Boolean(start) };
+}
+
+type SurfaceRead = { status: SurfaceReadStatus; items: DocItem[]; reason?: string };
+
+async function readSurface(reader: SurfaceReader, request: ReadRequest): Promise<SurfaceRead> {
+  try {
+    const { items, truncated } = await boundedScan(reader, request, EVAL_V2_MAX_SURFACE_SCAN_ITEMS);
+    return truncated
+      ? { status: 'truncated', items: [], reason: `${request.TableName} has more than ${EVAL_V2_MAX_SURFACE_SCAN_ITEMS} items` }
+      : { status: 'ok', items };
+  } catch (error) {
+    return { status: 'unavailable', items: [], reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * Recompute and overwrite the 1d and 7d creative and account-health snapshots ending on `date`
+ * (ENG-2196) from stored grader output: gate and rubric results on AW-HumanEvalQueue candidates,
+ * and the account-health classifier's per-account state. A failed or truncated read is written as
+ * such, with no numbers, so the trend shows the gap.
+ */
+export async function writeEvalV2SurfaceSnapshots(
+  dynamo: DynamoPort,
+  reader: SurfaceReader,
+  tables: SurfaceTables,
+  date: string,
+  now: Date,
+): Promise<SurfaceSnapshot[]> {
+  const [creative, accounts] = await Promise.all([
+    readSurface(reader, {
+      TableName: tables.humanEvalQueue,
+      FilterExpression: 'attribute_exists(#cg) OR attribute_exists(#cr)',
+      ProjectionExpression: '#ca, #cg.#p, #cg.#v, #cg.#ck, #cr.#st, #cr.#pc, #cr.#p, #cr.#v',
+      ExpressionAttributeNames: {
+        '#ca': 'createdAt', '#cg': 'creativeGates', '#cr': 'creativeRubric', '#p': 'passed', '#v': 'version',
+        '#ck': 'checks', '#st': 'status', '#pc': 'passedCount',
+      },
+    }),
+    readSurface(reader, {
+      TableName: tables.accountCapabilityRequirements,
+      FilterExpression: '#cap = :cap',
+      ProjectionExpression: '#state, #since, #v',
+      ExpressionAttributeNames: { '#cap': 'capability', '#state': 'state', '#since': 'stateSince', '#v': 'version' },
+      ExpressionAttributeValues: { ':cap': ACCOUNT_HEALTH_SIGNAL_CAPABILITY },
+    }),
+  ]);
+  const snaps: SurfaceSnapshot[] = [];
+  for (const windowLabel of Object.keys(EVAL_V2_WINDOWS) as EvalV2WindowLabel[]) {
+    snaps.push(
+      aggregateCreative(creative.items, { date, windowLabel, now, status: creative.status, ...(creative.reason ? { statusReason: creative.reason } : {}) }),
+      aggregateAccountHealth(accounts.items, { date, windowLabel, now, status: accounts.status, ...(accounts.reason ? { statusReason: accounts.reason } : {}) }),
+    );
+  }
+  for (const snap of snaps) await dynamo.putItem(LOOP_EVENTS_TABLE, buildSurfaceSnapshotItem(snap));
+  return snaps;
+}
+
+/** The last `limit` creative and account-health snapshots for one window, oldest first (GET /eval-v2-trend). */
+export async function readEvalV2SurfaceTrend(
+  dynamo: DynamoPort,
+  opts: { limit?: number; windowLabel?: EvalV2WindowLabel } = {},
+): Promise<{ creative: CreativeSnapshot[]; accountHealth: AccountHealthSnapshot[] }> {
+  const windowLabel = opts.windowLabel ?? '7d';
+  const result = await dynamo.query({
+    tableName: LOOP_EVENTS_TABLE,
+    keyConditionExpression: 'loopId = :l',
+    expressionAttributeValues: { ':l': EVAL_V2_DAILY_LOOP_ID },
+  });
+  const snaps = result.items
+    .flatMap((item) => parseSurfaceSnapshotItem(item as Record<string, unknown>) ?? [])
+    .filter((s) => s.windowLabel === windowLabel)
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const limit = opts.limit ?? 14;
+  const creative = snaps.filter((s): s is CreativeSnapshot => s.surface === 'creative');
+  const accountHealth = snaps.filter((s): s is AccountHealthSnapshot => s.surface === 'account_health');
+  return limit > 0 ? { creative: creative.slice(-limit), accountHealth: accountHealth.slice(-limit) } : { creative, accountHealth };
+}
+
 /** The last `limit` daily snapshots for one window, oldest first (GET /eval-v2-trend). */
 export async function readEvalV2Trend(
   dynamo: DynamoPort,
@@ -353,6 +484,24 @@ export function productionGraderTables(): GraderTables {
   };
 }
 
+export function productionSurfaceTables(): SurfaceTables {
+  return {
+    humanEvalQueue: `${TABLE_PREFIX}AW-HumanEvalQueue`,
+    accountCapabilityRequirements: `${TABLE_PREFIX}AW-AccountCapabilityRequirements`,
+  };
+}
+
+/** Scans limited to the two surface tables; any other table is refused. */
+export function surfaceScanReader(tables: SurfaceTables = productionSurfaceTables(), region = process.env.AWS_REGION || 'us-west-2'): SurfaceReader {
+  const doc = new AWS.DynamoDB.DocumentClient({ region });
+  const allowed = new Set([tables.humanEvalQueue, tables.accountCapabilityRequirements]);
+  return {
+    scan: (request: ReadRequest) => (allowed.has(request.TableName)
+      ? doc.scan(request as AWS.DynamoDB.DocumentClient.ScanInput).promise()
+      : Promise.reject(new Error(`evalV2Sampler: scan of ${request.TableName} refused`))),
+  };
+}
+
 /** DocumentClient queries only. Scans are refused: nothing on this path may scan a table. */
 export function queryOnlyReader(region = process.env.AWS_REGION || 'us-west-2'): ReadOnlyDocReader {
   const doc = new AWS.DynamoDB.DocumentClient({ region });
@@ -374,6 +523,7 @@ export async function runEvalV2SamplerCron(): Promise<void> {
         tables: productionGraderTables(),
         clock: { now: () => new Date() },
         billingUserOf: resolveBillingUserId,
+        surfaces: { reader: surfaceScanReader(), tables: productionSurfaceTables() },
       },
       {
         enabled: samplerEnabled(process.env[EVAL_V2_SAMPLER_FLAG]),
