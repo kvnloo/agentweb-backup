@@ -46,8 +46,11 @@ export function modelCapabilities(id: string): ModelCapability[] {
   return !m ? [] : m.isLive ? ['live-audio'] : m.supportsVision ? ['text', 'vision'] : ['text'];
 }
 
+// enrichment keeps what it ran before model roles: gpt-5-chat-2, which callLLM
+// aliases to gpt-5.5 (ENG-2184). The picker hides gpt-5.5 as superseded, so the
+// default is honoured through the same runnable check as a persisted default.
 const FALLBACKS: Record<ModelRole, string> = {
-  chat: 'gemini-3.8-flash', enrichment: 'gemini-3.1-flash-lite',
+  chat: 'gemini-3.8-flash', enrichment: 'gpt-5.5',
   image: 'gemini-3-pro-image-preview', embedding: 'openai/text-embedding-3-large',
   scoring_judge: 'gemini-3.1-flash-lite', content_generation: 'gemini-3.8-flash',
   research: 'gemini-3.8-flash', voice: 'gemini-3.1-flash-live-preview',
