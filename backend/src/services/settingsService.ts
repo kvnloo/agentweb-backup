@@ -315,6 +315,8 @@ export class SettingsService {
       ConditionExpression: 'settingValue = :expected',
       ExpressionAttributeValues: { ':expected': expectedValue },
     }).promise();
+    // Only reached when the conditional write succeeded (ENG-2145).
+    void recordSettingChange(settingName, 'set', settingValue);
   }
 
   /** Delete counterpart of `setSettingIfValueMatches` — see its doc comment. */
@@ -325,6 +327,7 @@ export class SettingsService {
       ConditionExpression: 'settingValue = :expected',
       ExpressionAttributeValues: { ':expected': expectedValue },
     }).promise();
+    void recordSettingChange(settingName, 'delete', undefined);
   }
 
   async syncPlan(planId: string, direction: 'prod-to-dev' | 'dev-to-prod'): Promise<PredefinedPlan | null> {
@@ -384,6 +387,8 @@ export class SettingsService {
           updatedBy: 'sync-operation'
         }
       }).promise();
+      // ENG-2145: a synced plan is a work-plan change in the target environment.
+      void recordSettingChange('agent-mode-predefined-workplans', 'sync', JSON.stringify(targetPlans));
 
       return planToSync;
     } catch (error) {

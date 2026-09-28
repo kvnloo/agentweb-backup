@@ -134,7 +134,7 @@ export async function recordEvalChange(
 /** For AW-Settings writes: records a marker when the setting is eval-relevant, else does nothing. */
 export async function recordSettingChange(
   settingName: string,
-  action: 'set' | 'delete',
+  action: 'set' | 'delete' | 'sync',
   value: string | undefined,
   deps: { write?: MarkerWriter; now?: () => Date; env?: NodeJS.ProcessEnv } = {},
 ): Promise<boolean> {
