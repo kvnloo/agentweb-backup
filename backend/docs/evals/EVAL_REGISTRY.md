@@ -32,7 +32,7 @@ harness (ENG-2136) produces those runs; record the result on the entry, with evi
 | landing-page-smoke-test | creative | code | — | deterministic |
 | creative-deterministic-gates | creative | code, advisory | — | no |
 | creative-rubric-judge | creative | LLM judge, 7 binary criteria + pairwise, advisory, off by default | anthropic.claude-sonnet-5 (Claude) | no |
-| creative-performance-correlation | creative | outcome: Spearman ρ of rubric score vs settled ad CTR/CPA, read-only report, no data until OPS-3 (ENG-2148) | — | no |
+| creative-performance-correlation | creative | outcome: Spearman ρ of rubric score vs settled ad CTR/CVR/hook rate/CPA/CRM CPL, read-only report, no data until OPS-3 (ENG-2148) | — | no |
 | client-health-assessment | account health | code | — | no |
 | renewal-integration-health | account health | code, off in prod | — | no |
 | account-health-evaluators | account health | code, log-only | — | no |
