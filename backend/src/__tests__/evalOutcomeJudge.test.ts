@@ -3,7 +3,8 @@
  * argument parser is strict (a typo must not start live judge calls) and the report is
  * aggregates only.
  */
-import { parseArgs, summarizeReplay, type JudgedSession } from '../scripts/evalOutcomeJudge';
+import { parseArgs, replaySession, summarizeReplay, type JudgedSession } from '../scripts/evalOutcomeJudge';
+import type { ChatSession } from '../services/chatbotService';
 import { DEFAULT_OUTCOME_JUDGE_MODEL } from '../services/outcomeJudge';
 
 describe('evalOutcomeJudge parseArgs', () => {
@@ -68,5 +69,46 @@ describe('summarizeReplay', () => {
     expect(s.auc).toBeNull();
     expect(s.aucCI).toBeNull();
     expect(s.meetsTarget).toBe(false);
+  });
+});
+
+describe('replaySession (same gates as production before a custom judge)', () => {
+  const STALE = '2026-09-01T00:00:00.000Z';
+  const task = { role: 'user', content: 'Build a Meta campaign for the spring sale and launch it.' };
+  const reply = { role: 'assistant', content: 'The campaign is live: 3 ad sets, $50/day.' };
+  const session = (messages: object[], extra: object = {}): ChatSession =>
+    ({ sessionId: 's-1', messages, messageCount: messages.length, updatedAt: STALE, ...extra }) as unknown as ChatSession;
+  const judge = jest.fn(async (): Promise<{ score: number; taskRequested?: boolean }> => ({ score: 4 }));
+
+  beforeEach(() => judge.mockClear());
+
+  it('drops production cohort exclusions without calling the judge', async () => {
+    const cases: Array<[ChatSession, string]> = [
+      [session([reply]), 'no-user-message'],
+      [session([{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'Hi! How can I help?' }]), 'no-task-session'],
+      [session([task, reply], { sessionType: 'scheduled', pageIdentifier: 'Test: Weekly report|scheduleId:x' }), 'test-run'],
+    ];
+    for (const [s, reason] of cases) {
+      expect(await replaySession(s, judge)).toEqual({ kind: 'cohort_excluded', reason });
+    }
+    expect(judge).not.toHaveBeenCalled();
+  });
+
+  it("gives stale failed and turn-less runs production's fixed 1 without a model call", async () => {
+    const placeholder = { role: 'assistant', content: 'The run did not finish.', metadata: { isRunFailureNotice: true } };
+    expect(await replaySession(session([task, reply, placeholder]), judge)).toEqual({ kind: 'scored', score: 1, failedRun: true });
+    expect(await replaySession(session([task]), judge)).toEqual({ kind: 'scored', score: 1, failedRun: true });
+    expect(judge).not.toHaveBeenCalled();
+  });
+
+  it('skips a turn-less session that is still in flight', async () => {
+    expect(await replaySession(session([task], { updatedAt: new Date().toISOString() }), judge)).toEqual({ kind: 'in_flight' });
+    expect(judge).not.toHaveBeenCalled();
+  });
+
+  it('judges an in-cohort session and honours the judge saying no task was requested', async () => {
+    expect(await replaySession(session([task, reply]), judge)).toEqual({ kind: 'scored', score: 4, failedRun: false });
+    judge.mockResolvedValueOnce({ score: 3, taskRequested: false });
+    expect(await replaySession(session([task, reply]), judge)).toEqual({ kind: 'judge_no_task' });
   });
 });
