@@ -46,6 +46,8 @@ import * as htmlUpdateImpl from './impl/htmlUpdate';
 import * as knowledgeBaseImpl from './impl/knowledgeBase';
 // ENG-2103 (F2): blog tool cluster, same treatment as booksImpl above.
 import * as blogImpl from './impl/blog';
+// ENG-2103 (F2): work plans tool cluster, same treatment as booksImpl above.
+import * as workPlansImpl from './impl/workPlans';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -6695,7 +6697,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createWorkPlan(args.title, args.steps, context?.sessionId, args.autocomplete, context?.isUnattendedRun);
+    return await workPlansImpl.createWorkPlan(args.title, args.steps, context?.sessionId, args.autocomplete, context?.isUnattendedRun);
   }
 });
 
@@ -6728,11 +6730,11 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.applyPredefinedWorkPlan(args.planTitle, context?.sessionId, context?.userId, {
+    return await workPlansImpl.applyPredefinedWorkPlan(args.planTitle, context?.sessionId, context?.userId, {
       force: args.force === true,
       confirmedDeclinedPlan: args.confirmedDeclinedPlan === true,
       isUnattendedRun: context?.isUnattendedRun,
-    });
+    }, agentModeService);
   }
 });
 
@@ -6770,7 +6772,7 @@ emmaToolRegistry.register({
     // completion-recommendation extension's own internal call into
     // agentModeService.recommendPredefinedWorkPlan, never by the model
     // through this input schema.
-    return await agentModeService.recommendPredefinedWorkPlan(
+    return await workPlansImpl.recommendPredefinedWorkPlan(
       args.planId,
       args.reason,
       context?.sessionId,
@@ -6876,7 +6878,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.setWorkPlanStatus(args.updates, context?.sessionId);
+    return await workPlansImpl.setWorkPlanStatus(args.updates, context?.sessionId);
   }
 });
 
@@ -6908,7 +6910,7 @@ emmaToolRegistry.register({
     if (!context?.userId || !context?.sessionId) {
       throw new Error("Missing user or session context");
     }
-    return await agentModeService.sendForReview(
+    return await workPlansImpl.sendForReview(
       args.subject,
       context.sessionId,
       context.userId,
