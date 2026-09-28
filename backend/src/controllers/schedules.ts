@@ -18,6 +18,13 @@ export async function createSchedule(req: AuthenticatedRequest, res: Response) {
       return res.status(400).json({ error: 'Invalid frequency' });
     }
 
+    // Load the task and confirm ownership before creating a schedule against it.
+    // 404 (not 403) so the endpoint does not confirm which task ids exist.
+    const task = await taskDb.getTaskById(taskId);
+    if (!task || task.userId !== userId) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
     const schedule: Schedule = {
       scheduleId: uuidv4(),
       taskId,
