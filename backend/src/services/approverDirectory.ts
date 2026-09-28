@@ -87,3 +87,51 @@ export async function getFallbackApproverSlackUserIds(): Promise<string[]> {
   const raw = setting?.settingValue || process.env.APPROVAL_INBOX_FALLBACK_SLACK_USER_IDS || '';
   return raw.split(',').map((id) => id.trim()).filter(Boolean);
 }
+
+/**
+ * ENG-1853: approver -> AgentWeb login email, and the reverse lookup. Same
+ * DB-setting-with-env-fallback shape as the Slack-id table above, deliberately
+ * a SEPARATE mapping rather than deriving one identity from the other —
+ * partner-portal login (isAdmin) and Slack identity are two independent
+ * systems today (confirmed: nothing in either direction cross-checks them),
+ * and conflating them here would make this table's correctness depend on
+ * both staying in sync by accident. This is the first and only place a real
+ * partner-portal login identity resolves to 'matt' | 'harsha' | 'fangfang' —
+ * `isAdmin` alone grants no approver-specific access.
+ */
+const REVIEWER_EMAIL_SETTING: Record<ApprovalDecisionApprover, string> = {
+  matt: 'approval_inbox_reviewer_matt_email',
+  fangfang: 'approval_inbox_reviewer_fangfang_email',
+  harsha: 'approval_inbox_reviewer_harsha_email',
+};
+
+const REVIEWER_EMAIL_ENV: Record<ApprovalDecisionApprover, string> = {
+  matt: 'APPROVAL_INBOX_MATT_EMAIL',
+  fangfang: 'APPROVAL_INBOX_FANGFANG_EMAIL',
+  harsha: 'APPROVAL_INBOX_HARSHA_EMAIL',
+};
+
+export async function getApproverEmail(approver: ApprovalDecisionApprover): Promise<string | undefined> {
+  try {
+    const setting = await settingsService.getSetting(REVIEWER_EMAIL_SETTING[approver]);
+    return (setting?.settingValue || process.env[REVIEWER_EMAIL_ENV[approver]])?.trim().toLowerCase() || undefined;
+  } catch (err: any) {
+    console.warn(`[approver-directory] failed to resolve ${approver}'s email, continuing without it:`, err?.message || err);
+    return undefined;
+  }
+}
+
+/** The reverse lookup every new Approval Desk route needs: a logged-in
+ *  partner-portal user's email -> which of the three approvers they are, or
+ *  undefined if they're not a named approver at all (an admin who isn't
+ *  Matt/Harsha/Fangfang can still be isAdmin, but has no approver queue). */
+export async function getApproverForEmail(email: string): Promise<ApprovalDecisionApprover | undefined> {
+  const normalized = email.trim().toLowerCase();
+  if (!normalized) return undefined;
+  const approvers: ApprovalDecisionApprover[] = ['matt', 'harsha', 'fangfang'];
+  for (const approver of approvers) {
+    const configured = await getApproverEmail(approver);
+    if (configured && configured === normalized) return approver;
+  }
+  return undefined;
+}

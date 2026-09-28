@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { agentModeService } from '../services/agentModeService';
 import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 import { emmaToolRegistry } from './registry';
@@ -528,6 +529,13 @@ For a customer-facing credential reconnect (a disconnected Meta ad account, Inst
         subjectLabel: args?.subjectLabel,
         subjectContactEmail: args?.subjectContactEmail,
         businessImpact: args?.businessImpact,
+        // stage_pending_decision creates exactly one decision per call, with
+        // no concept of grouping several into one campaign packet — that's
+        // ENG-1853's new async meta_write producer (agentModeService.ts,
+        // callMetaMarketingApi's confirmation halt), not this tool. A single
+        // decision is still a packet of one, per manifestId's own contract
+        // (ApprovalDecision never has an ungrouped decision).
+        manifestId: randomUUID(),
         evidencePacket: {
           chatUrl: args?.evidencePacket?.chatUrl,
           researchSummary: args?.evidencePacket?.researchSummary,

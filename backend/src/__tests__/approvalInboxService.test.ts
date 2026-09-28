@@ -53,6 +53,7 @@ const metaWriteRequest = (overrides: Partial<any> = {}) => ({
   metaWriteDispatch: {
     entity_type: 'AD_SET', action: 'UPDATE', account_id: 'acc-1', resolvedAccountId: 'acc-1', params: { status: 'PAUSED' },
   },
+  manifestId: 'manifest-test-1',
   expiresAt: FUTURE,
   ...overrides,
 });
@@ -161,7 +162,7 @@ describe('approvalInboxService.createDecision', () => {
     const decision = await service.createDecision({
       gateType: 'customer_credential', customerId: 'cust-1', subjectLabel: 'Test Customer · Meta Ad Account act_123', businessImpact: 'Needs a fresh OAuth token.',
       evidencePacket: {}, customerActionUrl: 'https://app.agentweb.pro/settings?tab=connected-accounts',
-      credentialPlatform: 'meta', credentialAccountId: 'act_123', expiresAt: FUTURE,
+      credentialPlatform: 'meta', credentialAccountId: 'act_123', manifestId: 'manifest-test-2', expiresAt: FUTURE,
     } as any);
     expect(decision.audience).toBe('customer');
     expect(decision.status).toBe('pending_customer_response');
@@ -202,7 +203,7 @@ describe('approvalInboxService.createDecision', () => {
     mockDynamoDB.put.mockReturnValue(ok());
     const decision = await service.createDecision({
       gateType: 'customer_credential', customerId: 'cust-1', subjectLabel: 'Test Customer · LinkedIn Ads urn:li:sponsoredAccount:111', businessImpact: 'x', evidencePacket: {},
-      customerActionUrl: 'https://x', credentialPlatform: 'linkedin_ads', credentialAccountId: 'urn:li:sponsoredAccount:111', expiresAt: FUTURE,
+      customerActionUrl: 'https://x', credentialPlatform: 'linkedin_ads', credentialAccountId: 'urn:li:sponsoredAccount:111', manifestId: 'manifest-test-3', expiresAt: FUTURE,
     } as any);
     expect(decision.credentialPlatform).toBe('linkedin_ads');
   });
