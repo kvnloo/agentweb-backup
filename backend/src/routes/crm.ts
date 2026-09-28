@@ -71,7 +71,7 @@ import {
 import { buildConfigServiceDeps } from '../services/enrichmentConfigDeps';
 import { runEnrichment as svcRunEnrichmentV3 } from '../services/crmEnrichmentServiceV3';
 import { buildOrchestratorDeps as buildV3OrchestratorDeps } from '../services/enrichmentV3RealDeps';
-import { sanitizeLeadForResponse } from '../utils/enrichmentMetadataPresentation';
+import { sanitizeLeadForResponse, shouldHideCardRevenueForViewer } from '../utils/enrichmentMetadataPresentation';
 import { getExternalCrmConnection, getMappedAgentwebFields, mappedFieldChanged, resolveSyncStatus } from '../utils/leadSyncStatus';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
@@ -3288,6 +3288,16 @@ router.post('/lists/:listId/leads/export', async (req: Request, res: Response) =
         for (const key of Object.keys(lead.customFields)) {
           customFieldSet.add(key);
         }
+      }
+    }
+
+    // ENG-1388: card revenue is Enigma-licensed internal-use-only data. A CSV
+    // is a file that leaves the system entirely, so a list editor who isn't
+    // Enigma-allowlisted must never get it as a column, regardless of who
+    // originally enriched the lead or how the list is shared.
+    if (shouldHideCardRevenueForViewer(userId)) {
+      for (const key of Array.from(customFieldSet)) {
+        if (isCardRevenueField(key)) customFieldSet.delete(key);
       }
     }
 

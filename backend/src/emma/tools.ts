@@ -7613,11 +7613,18 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
     if (summary.processedCount > 0) {
       try {
         const { crmDb } = await import('../services/db');
-        const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
+        const { sanitizeEnrichmentMetadataForResponse, shouldHideCardRevenueForViewer } = await import('../utils/enrichmentMetadataPresentation');
+        const { isCardRevenueField } = await import('../services/enrichmentGroups');
         const lead: any = await crmDb.getLeadById(args.list_id, args.lead_id);
         const customFields = (lead?.customFields ?? {}) as Record<string, string>;
         const requestedNames = (args.output_fields as Array<{ name: string }>).map(f => f.name);
+        // ENG-1388: the enigma trigger step is already allowlist-gated, but this
+        // readback just reads whatever's now stored — which could be a card
+        // revenue value a DIFFERENT (allowlisted) org member filled earlier.
+        // Never hand it back to a caller who isn't allowlisted themselves.
+        const hideCardRevenueForCaller = shouldHideCardRevenueForViewer(context.userId);
         for (const name of requestedNames) {
+          if (hideCardRevenueForCaller && isCardRevenueField(name)) continue;
           enrichedValues[name] = customFields[name] ?? lead?.[name] ?? null;
         }
         const sanitized = sanitizeEnrichmentMetadataForResponse(
@@ -7627,6 +7634,7 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
           // Only surface metadata for the fields this call enriched.
           const scoped: Record<string, any> = {};
           for (const name of requestedNames) {
+            if (hideCardRevenueForCaller && isCardRevenueField(name)) continue;
             if (sanitized[name] !== undefined) scoped[name] = sanitized[name];
           }
           if (Object.keys(scoped).length > 0) enrichmentMetadata = scoped;

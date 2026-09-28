@@ -13372,7 +13372,8 @@ export class AgentModeService {
   ): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
+      const { sanitizeEnrichmentMetadataForResponse, stripCardRevenueKeys, shouldHideCardRevenueForViewer } = await import('../utils/enrichmentMetadataPresentation');
+      const hideCardRevenueForCaller = shouldHideCardRevenueForViewer(userId);
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
 
       if ((!filters || filters.length === 0) && !options?.search?.trim()) {
@@ -13564,8 +13565,12 @@ export class AgentModeService {
             icpScore: entry.lead.icpMatch?.score || null,
             engagementCount: entry.lead.engagementCount || 0,
             isEngaged: entry.lead.isEngaged || false,
-            customFields: entry.lead.customFields || {},
-            ...(sanitizedEnrichmentMetadata ? { enrichmentMetadata: sanitizedEnrichmentMetadata } : {}),
+            customFields: hideCardRevenueForCaller
+              ? (stripCardRevenueKeys(entry.lead.customFields) ?? {})
+              : (entry.lead.customFields || {}),
+            ...(sanitizedEnrichmentMetadata
+              ? { enrichmentMetadata: hideCardRevenueForCaller ? stripCardRevenueKeys(sanitizedEnrichmentMetadata) : sanitizedEnrichmentMetadata }
+              : {}),
             // ENG-1175. This is the call both launch gates make to answer "did
             // the gclid survive to the stored row?" — Google Pre-Launch Gate
             // step 6.6 and the Meta gate's T11. Without these fields the gate
@@ -13628,7 +13633,7 @@ export class AgentModeService {
   public async getLeadDetails(listId: string, leadId: string, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
+      const { sanitizeEnrichmentMetadataForResponse, stripCardRevenueKeys, shouldHideCardRevenueForViewer } = await import('../utils/enrichmentMetadataPresentation');
 
       // Verify list ownership (org members can access lists owned by other org members)
       let list = await crmDb.getLeadListById(listId);
@@ -13673,6 +13678,10 @@ export class AgentModeService {
       const sanitizedEnrichmentMetadata = sanitizeEnrichmentMetadataForResponse(
         lead.enrichmentMetadata as Record<string, any> | undefined,
       );
+      // ENG-1388: this list may be org-shared, and canOrgMemberAccessList above
+      // has no Enigma-allowlist awareness — strip card revenue for a caller
+      // who isn't allowlisted, same boundary as the customer-portal REST path.
+      const hideCardRevenueForCaller = shouldHideCardRevenueForViewer(userId);
 
       // Check LinkedIn connection status from cache (non-blocking, swallows errors)
       let linkedInConnectionStatus: {
@@ -13751,8 +13760,12 @@ export class AgentModeService {
           notes: lead.notes || '',
           linkedin: lead.linkedin || '',
           linkedInConnectionStatus,
-          customFields: lead.customFields || {},
-          ...(sanitizedEnrichmentMetadata ? { enrichmentMetadata: sanitizedEnrichmentMetadata } : {}),
+          customFields: hideCardRevenueForCaller
+            ? (stripCardRevenueKeys(lead.customFields) ?? {})
+            : (lead.customFields || {}),
+          ...(sanitizedEnrichmentMetadata
+            ? { enrichmentMetadata: hideCardRevenueForCaller ? stripCardRevenueKeys(sanitizedEnrichmentMetadata) : sanitizedEnrichmentMetadata }
+            : {}),
           icpMatch: lead.icpMatch || null,
           isEngaged: lead.isEngaged || false,
           emailDraft: emailDraftPreview,
@@ -15381,8 +15394,15 @@ export class AgentModeService {
       if (lead.notes) {
         emailPrompt += `\n- Notes: ${lead.notes}`;
       }
-      if (lead.customFields && Object.keys(lead.customFields).length > 0) {
-        emailPrompt += `\n- Custom Fields: ${JSON.stringify(lead.customFields, null, 2)}`;
+      // ENG-1388: this draft is meant to be sent to the external lead/prospect,
+      // so card revenue (Enigma, internal-use-only) must never inform it —
+      // unconditionally, regardless of whether the requesting user is
+      // themselves Enigma-allowlisted. That allowlist governs internal
+      // visibility, not what may go into outward-facing content.
+      const { stripCardRevenueKeys } = await import('../utils/enrichmentMetadataPresentation');
+      const emailPromptCustomFields = stripCardRevenueKeys(lead.customFields);
+      if (emailPromptCustomFields && Object.keys(emailPromptCustomFields).length > 0) {
+        emailPrompt += `\n- Custom Fields: ${JSON.stringify(emailPromptCustomFields, null, 2)}`;
       }
 
       // Add engagement history
