@@ -18,8 +18,14 @@ const router = express.Router();
  * were exactly this Blob/text-html shape.
  */
 function isTransientUnipileError(error: any): boolean {
-  if (typeof Blob !== 'undefined' && error?.body instanceof Blob && error.body.type === 'text/html') {
-    return true;
+  if (typeof Blob !== 'undefined' && error?.body instanceof Blob) {
+    // Blob.type carries the raw Content-Type header verbatim, including any
+    // "; charset=..." parameter (verified against Node's native fetch) — compare
+    // on the MIME essence only, or a gateway page served as
+    // "text/html; charset=utf-8" (a common nginx default) silently bypasses this
+    // check and falls back to the old single-attempt, generic-error behavior.
+    const mimeEssence = error.body.type.split(';')[0].trim().toLowerCase();
+    if (mimeEssence === 'text/html') return true;
   }
   const code = error?.code || error?.cause?.code;
   return code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'ECONNREFUSED' || code === 'EAI_AGAIN';

@@ -30,9 +30,15 @@ const app = express();
 app.use(express.json());
 app.use('/api/oauth/linkedin-outreach', linkedInOutreachAuthRouter);
 
-function htmlGatewayError(): any {
+function htmlGatewayError(contentType = 'text/html'): any {
   const error: any = new Error('');
-  error.body = new Blob(['<html>502 Bad Gateway</html>'], { type: 'text/html' });
+  error.body = new Blob(['<html>502 Bad Gateway</html>'], { type: contentType });
+  return error;
+}
+
+function networkError(code: string): any {
+  const error: any = new Error('fetch failed');
+  error.code = code;
   return error;
 }
 
@@ -85,6 +91,54 @@ describe('GET /api/oauth/linkedin-outreach/init', () => {
     expect(res.body.error).toBe('Failed to initialize LinkedIn Outreach connection');
     expect(createHostedAuthLink).toHaveBeenCalledTimes(1);
   });
+
+  it('does not retry a Blob body that is not HTML (e.g. a plain-text session error)', async () => {
+    const createHostedAuthLink = jest.fn().mockRejectedValue(htmlGatewayError('text/plain'));
+    (linkedInOutreachService.getClient as jest.Mock).mockResolvedValue({
+      account: { createHostedAuthLink },
+    });
+
+    const res = await request(app).get('/api/oauth/linkedin-outreach/init');
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe('Failed to initialize LinkedIn Outreach connection');
+    expect(createHostedAuthLink).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries an HTML gateway error even when Content-Type carries a charset parameter', async () => {
+    // Node's fetch puts the raw Content-Type header on Blob.type verbatim — a gateway
+    // page served as "text/html; charset=utf-8" (a common nginx default) must still be
+    // classified transient, not just a bare "text/html".
+    jest.spyOn(global, 'setTimeout').mockImplementation((fn: any) => { fn(); return 0 as any; });
+    const createHostedAuthLink = jest.fn()
+      .mockRejectedValueOnce(htmlGatewayError('text/html; charset=utf-8'))
+      .mockResolvedValue({ url: 'https://unipile.example.com/auth/xyz' });
+    (linkedInOutreachService.getClient as jest.Mock).mockResolvedValue({
+      account: { createHostedAuthLink },
+    });
+
+    const res = await request(app).get('/api/oauth/linkedin-outreach/init');
+
+    expect(res.status).toBe(200);
+    expect(createHostedAuthLink).toHaveBeenCalledTimes(2);
+    jest.restoreAllMocks();
+  }, 10000);
+
+  it('retries a raw network error (e.g. ECONNRESET) and succeeds', async () => {
+    jest.spyOn(global, 'setTimeout').mockImplementation((fn: any) => { fn(); return 0 as any; });
+    const createHostedAuthLink = jest.fn()
+      .mockRejectedValueOnce(networkError('ECONNRESET'))
+      .mockResolvedValue({ url: 'https://unipile.example.com/auth/xyz' });
+    (linkedInOutreachService.getClient as jest.Mock).mockResolvedValue({
+      account: { createHostedAuthLink },
+    });
+
+    const res = await request(app).get('/api/oauth/linkedin-outreach/init');
+
+    expect(res.status).toBe(200);
+    expect(createHostedAuthLink).toHaveBeenCalledTimes(2);
+    jest.restoreAllMocks();
+  }, 10000);
 });
 
 describe('POST /api/oauth/linkedin-outreach/reconnect', () => {
