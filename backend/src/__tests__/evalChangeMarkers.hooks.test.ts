@@ -7,8 +7,9 @@ import type { Request, Response } from 'express';
 
 const mockPut = jest.fn();
 const mockDelete = jest.fn();
+const mockGet = jest.fn();
 jest.mock('aws-sdk', () => ({
-  DynamoDB: { DocumentClient: jest.fn(() => ({ put: mockPut, delete: mockDelete })) },
+  DynamoDB: { DocumentClient: jest.fn(() => ({ put: mockPut, delete: mockDelete, get: mockGet })) },
 }));
 jest.mock('../loops/eval/evalChangeMarkers', () => ({
   recordSettingChange: jest.fn().mockResolvedValue(true),
@@ -58,6 +59,43 @@ describe('settingsService marks eval-relevant writes', () => {
   it('records nothing when the write fails', async () => {
     mockPut.mockReturnValue(fail());
     await expect(settingsService.setSetting('agent_mode_system_prompt', 'x')).rejects.toThrow('ConditionalCheckFailed');
+    expect(recordSettingChange).not.toHaveBeenCalled();
+  });
+});
+
+describe('settingsService marks conditional writes and plan syncs only after they succeed', () => {
+  it('records a compare-and-swap set and delete', async () => {
+    mockPut.mockReturnValue(ok());
+    mockDelete.mockReturnValue(ok());
+    await settingsService.setSettingIfValueMatches('agent_mode_default_model', 'model-b', 'model-a');
+    await settingsService.deleteSettingIfValueMatches('agent_mode_system_prompt', 'old');
+    expect(recordSettingChange).toHaveBeenCalledWith('agent_mode_default_model', 'set', 'model-b');
+    expect(recordSettingChange).toHaveBeenCalledWith('agent_mode_system_prompt', 'delete', undefined);
+  });
+
+  it('records nothing when the condition fails', async () => {
+    mockPut.mockReturnValue(fail());
+    mockDelete.mockReturnValue(fail());
+    await expect(settingsService.setSettingIfValueMatches('agent_mode_default_model', 'b', 'a')).rejects.toThrow();
+    await expect(settingsService.deleteSettingIfValueMatches('agent_mode_system_prompt', 'old')).rejects.toThrow();
+    expect(recordSettingChange).not.toHaveBeenCalled();
+  });
+
+  it('records a synced work plan after it is written, and nothing when the write fails', async () => {
+    const plan = { id: 'p1', title: 'Plan' };
+    mockGet
+      .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Item: { settingValue: JSON.stringify([plan]) } }) })
+      .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) });
+    mockPut.mockReturnValue(ok());
+    await settingsService.syncPlan('p1', 'dev-to-prod');
+    expect(recordSettingChange).toHaveBeenCalledWith('agent-mode-predefined-workplans', 'sync', JSON.stringify([plan]));
+
+    jest.mocked(recordSettingChange).mockClear();
+    mockGet
+      .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Item: { settingValue: JSON.stringify([plan]) } }) })
+      .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) });
+    mockPut.mockReturnValue(fail());
+    await expect(settingsService.syncPlan('p1', 'dev-to-prod')).rejects.toThrow();
     expect(recordSettingChange).not.toHaveBeenCalled();
   });
 });
