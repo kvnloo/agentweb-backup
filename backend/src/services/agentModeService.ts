@@ -3487,7 +3487,19 @@ export class AgentModeService {
       // turn message, and the publish sinks re-read live consent at the write itself.
       const publishAuthorization =
         publishAuthorizationOverride ?? (await this.resolveScheduledPublishAuthorization(currentSession));
-      const publishAuthorized = publishAuthorization.authorized;
+      // ENG-2204: the comment above ("this is the UNATTENDED run path, so it always
+      // passes a resolved boolean") was true only when this function had a single
+      // caller. It is also reached by an ATTENDED turn — a schedule-created session
+      // reopened in the main chat UI (ENG-2072) — where isUnattendedRun is left
+      // undefined. Passing a resolved boolean there manufactured a live "PUBLISH
+      // WITHHELD... turn off Require approval before publishing" message for a user
+      // who never attempted to publish anything (live-confirmed on env2: an attended
+      // turn asking to post to Slack got this unrelated publish-authorization
+      // boilerplate instead of the ordinary ask-first flow). getScheduledSessionOverride
+      // already has a dedicated ATTENDED branch for exactly this (publishAuthorized
+      // undefined -> "Emit the base override... No mandate, no publish block") — it was
+      // simply never reached because this call always supplied a resolved value.
+      const publishAuthorized = isUnattendedRun === true ? publishAuthorization.authorized : undefined;
       // ENG-1245: reason is only ever present on the withheld branch, and only when
       // resolveScheduledPublishAuthorization derived it (an override supplied by a
       // caller elsewhere carries no reason, so this falls back to the pre-existing,
@@ -3495,7 +3507,9 @@ export class AgentModeService {
       const sessionTypeLabel = getScheduledSessionOverride(
         currentSession?.sessionType,
         publishAuthorized,
-        (publishAuthorization as { reason?: PublishAuthorizationWithholdReason }).reason
+        isUnattendedRun === true
+          ? (publishAuthorization as { reason?: PublishAuthorizationWithholdReason }).reason
+          : undefined
       );
       const messages: any[] = [
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
