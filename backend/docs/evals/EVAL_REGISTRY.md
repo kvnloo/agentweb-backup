@@ -23,6 +23,7 @@ harness (ENG-2136) produces those runs; record the result on the entry, with evi
 | agent-task-success | agent | code, offline | — | no |
 | agent-tool-correctness | agent | code, offline | — | no |
 | agent-groundedness-offline | agent | code, offline (finalize-guard lexicon) | — | no |
+| agent-reply-length-fixtures | agent | code, offline (ENG-1312 fixtures, placeholder inputs) | — | no |
 | okareo-no-hallucinated-capabilities-v2 | agent | LLM judge (Okareo) | unknown | calibration set only |
 | enrichment-golden-set | agent | code | — | golden set, CRM enrichment only |
 | human-eval-queue | creative | human (free text) | — | no |
@@ -31,6 +32,7 @@ harness (ENG-2136) produces those runs; record the result on the entry, with evi
 | landing-page-smoke-test | creative | code | — | deterministic |
 | creative-deterministic-gates | creative | code, advisory | — | no |
 | creative-rubric-judge | creative | LLM judge, 7 binary criteria + pairwise, advisory, off by default | anthropic.claude-sonnet-5 (Claude) | no |
+| creative-performance-correlation | creative | outcome: Spearman ρ of rubric score vs settled ad CTR/CPA, read-only report, no data until OPS-3 (ENG-2148) | — | no |
 | client-health-assessment | account health | code | — | no |
 | renewal-integration-health | account health | code, off in prod | — | no |
 | account-health-evaluators | account health | code, log-only | — | no |
@@ -65,7 +67,10 @@ Sources, consumers and known issues for each entry are in `evalRegistry.ts`.
    customer portal's offline `scripts/eval-onboarding-quality.ts`: a Claude Sonnet pairwise judge
    that compares two onboarding pipeline versions layer by layer (including creative direction,
    ad images and ad copy) on fixture pairs. ENG-2140 adds `creative-rubric-judge` (ENG-421's
-   7 criteria as binary checks), which stays off until its flag is turned on.
+   7 criteria as binary checks), which stays off until its flag is turned on. ENG-2141 links each
+   generated creative to the Meta ad it became and records ad-level daily rows, so
+   `creative-performance-correlation` can compare the judge's score with settled CTR/CPA; both
+   stay inert until OPS-3 (ENG-2148).
 10. **Account health mislabelled activation as risk** — a never-connected ad account read as
     blocked / At Risk. Fixed by ENG-2133.
 
@@ -119,6 +124,16 @@ reconstruction from ENG-1710/1714 and says which parts are reconstructed.
 and prints AUC against the deterministic `agent-task-success` label, the share of 5s and
 per-model means (aggregates only). The runValidation harness reads its stored scores for κ
 against the golden set once labels exist (ENG-2135/2136).
+
+## Offline suite and regression gate (ENG-2145)
+
+`loops/scripts/runOfflineEvalSuite.ts` compares the registered replay cases, the ENG-1312 fixtures,
+golden-set agreement and Okareo checks with a versioned baseline (`loops/eval/baselines/*.json`) and
+prints pass / regression / unavailable. It fails closed on any evaluator problem. A metric may block
+only when its grader passes `mayGate` and `EVAL_GATE_BLOCKING=true`, so today it is report-only.
+Prompt, model and skill edits in AW-Settings / AW-Skills make a best-effort write of an `eval_needed`
+marker (`Dev-AW-LoopEvents`, loopId `eval-gate`); a failed marker write never fails the edit, so that
+edit is then missing from the marker feed. Details: `docs/evals/OFFLINE_EVAL_GATE.md`.
 
 ## Known false-positive catalogue (session judges)
 

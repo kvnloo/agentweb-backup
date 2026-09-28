@@ -1,6 +1,6 @@
 import type AWS from 'aws-sdk';
 import { isQualifyingValidation } from '../loops/eval/evalRegistry';
-import { newGoldenCase, type GoldenCase, type LabelValue } from '../loops/eval/goldenSet';
+import { newCreativePairCase, newGoldenCase, type GoldenCase, type LabelValue } from '../loops/eval/goldenSet';
 import type { GoldenSetStore } from '../loops/eval/goldenSetStore';
 import type { ReadOnlyDocReader, ReadRequest } from '../loops/eval/agentGraderLoader';
 import type { SessionForGrading } from '../loops/eval/agentGraders';
@@ -114,6 +114,34 @@ describe('validation runner math (ENG-2135)', () => {
     expect(run.criteria[0]).toMatchObject({ graderAbstained: 1 });
     expect(run.criteria[0].report?.n).toBe(39);
     warn.mockRestore();
+  });
+
+  it('leaves pairwise calibration cases out of a creative grader run (ENG-2142)', async () => {
+    const single = { ...newGoldenCase({ surface: 'creative', taskType: 'creative_image', sourceId: 'c1', seedSource: 's', now: NOW }), split: 'test' as const, labels: { hook: 'pass' as const } };
+    const pair: GoldenCase = {
+      ...newCreativePairCase({
+        candidateIdA: 'c2',
+        pair: { candidateIdB: 'c1', batch: '2026-W39', position: 0, batchSize: 1, category: 'ad', placement: 'unknown', signal: 'unscored' },
+        now: NOW,
+      }),
+      split: 'test',
+      labels: { pairwise_preference: 'A' },
+    };
+    const graded: string[] = [];
+    const grader: GoldenCaseGrader = {
+      graderId: 'creative-rubric-judge',
+      surface: 'creative',
+      criteria: ['hook'],
+      primaryCriterion: 'hook',
+      grade: async (c) => {
+        graded.push(c.caseId);
+        return { hook: 'pass' };
+      },
+    };
+    const run = await runValidation({ graderId: 'creative-rubric-judge', store: storeOf([single, pair]), graders: [grader], bootstrap: { iterations: 10 } });
+    expect(graded).toEqual([single.caseId]);
+    expect(run.cases).toBe(1);
+    expect(run.criteria[0]).toMatchObject({ unlabelled: 0 });
   });
 
   it('rejects an unknown grader, a grader with no adapter, and a surface mismatch', async () => {

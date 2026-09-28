@@ -105,3 +105,40 @@ it.each(['openai/text-embedding-3-large', 'old-azure-deployment', 'openai/text-e
   (orgDb.getOrgById as jest.Mock).mockResolvedValue({ modelRoles: { embedding } });
   expect(await resolveModelForRole('a', 'embedding')).toBe('openai/text-embedding-3-large');
 });
+
+describe('persisted admin defaults hidden by the picker (ENG-2183)', () => {
+  const setting = (key: string, value: string) => (settingsService.getSetting as jest.Mock)
+    .mockImplementation(async (name: string) => (name === key ? { settingValue: value } : null));
+
+  it('honours the preview image alias stored in agent_mode_image_api_default_model', async () => {
+    setting('agent_mode_image_api_default_model', 'gemini-3.1-flash-image-preview');
+    expect(getRoleModelOptions('image')).not.toContain('gemini-3.1-flash-image-preview');
+    expect(await resolveModelForRole(undefined, 'image')).toBe('gemini-3.1-flash-image-preview');
+  });
+
+  it('honours a legacy content model stored in agent_mode_content_model', async () => {
+    setting('agent_mode_content_model', 'anthropic.claude-opus-4-8');
+    expect(getRoleModelOptions('content_generation')).not.toContain('anthropic.claude-opus-4-8');
+    expect(await resolveModelForRole(undefined, 'content_generation')).toBe('anthropic.claude-opus-4-8');
+  });
+
+  it.each(['retired-model', 'constructor', 'gpt-image-1'])('falls back for an unknown or wrong-kind content setting %s', async value => {
+    setting('agent_mode_content_model', value);
+    expect(await resolveModelForRole(undefined, 'content_generation')).toBe('gemini-3.8-flash');
+  });
+
+  it('falls back for an unknown image setting', async () => {
+    setting('agent_mode_image_api_default_model', 'gemini-3.8-flash');
+    expect(await resolveModelForRole(undefined, 'image')).toBe('gemini-3-pro-image-preview');
+  });
+
+  it('falls back for an adminOnly model', async () => {
+    setting('agent_mode_content_model', 'anthropic.claude-opus-4-6-v1');
+    expect(await resolveModelForRole(undefined, 'content_generation')).toBe('gemini-3.8-flash');
+  });
+
+  it('falls back for an internalOnly model', async () => {
+    setting('agent_mode_default_model', 'openrouter/perplexity/sonar-pro-search');
+    expect(await resolveModelForRole(undefined, 'chat')).toBe('gemini-3.8-flash');
+  });
+});

@@ -3,6 +3,7 @@ import { skillService } from "../services/skillService";
 import { userDb } from "../services/db";
 import { findTiersAllowingSkill } from "../services/subscriptionService";
 import { validateWelcomeMessage } from "../utils/welcomeMessageValidation";
+import { recordSkillChange } from "../loops/eval/evalChangeMarkers";
 
 // ENG-173: a published skill that is in no subscription tier's allowedSkills is
 // invisible to every non-wildcard user (list_available_skills filters it out), so the
@@ -30,6 +31,8 @@ export const createSkill = async (req: Request, res: Response) => {
     const args: Parameters<typeof skillService.createSkill> = [name, description, toolNames || [], systemPrompt, isPublished];
     if (welcomeMessage !== undefined) args.push(welcomeMessage);
     const skill = await skillService.createSkill(...args);
+    // ENG-2145: report-only "needs eval" marker for a prompt/tool/model change made in the DB.
+    if (skill) void recordSkillChange(skill.skillId, 'create', req.body);
 
     const warnings = await entitlementWarnings(skill);
     res.status(201).json(warnings ? { ...skill, warnings } : skill);
@@ -106,6 +109,7 @@ export const updateSkill = async (req: Request, res: Response) => {
       skillId,
     };
     await skillService.updateSkill(updatedSkill);
+    void recordSkillChange(skillId, 'update', req.body);
 
     const warnings = await entitlementWarnings(updatedSkill);
     res.status(200).json(warnings ? { ...updatedSkill, warnings } : updatedSkill);
@@ -145,6 +149,7 @@ export const syncSkill = async (req: Request, res: Response) => {
     }
 
     const skill = await skillService.syncSkill(skillId, direction);
+    if (skill) void recordSkillChange(skillId, 'sync', { systemPrompt: skill.systemPrompt });
 
     if (!skill) {
       return res.status(404).json({ message: "Skill not found in source table" });
@@ -167,6 +172,7 @@ export const deleteSkill = async (req: Request, res: Response) => {
     }
 
     await skillService.deleteSkill(skillId);
+    void recordSkillChange(skillId, 'delete', {});
     res.status(200).json({ message: "Skill deleted successfully" });
   } catch (error) {
     console.error("Error deleting skill:", error);

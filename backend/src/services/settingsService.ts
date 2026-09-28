@@ -2,6 +2,7 @@ import AWS from "aws-sdk";
 import dotenv from "dotenv";
 import path from "path";
 import { paginatedScan } from "../utils/dynamoPagination";
+import { recordSettingChange } from "../loops/eval/evalChangeMarkers";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -167,6 +168,9 @@ export class SettingsService {
       };
 
       await dynamodb.put(params).promise();
+      // ENG-2145: a prompt/model/judge row changed outside git — mark it as needing eval.
+      // Report-only and best-effort: never awaited, never fails the write.
+      void recordSettingChange(settingName, 'set', settingValue);
       return setting;
     } catch (error) {
       console.error('Error setting setting:', error);
@@ -262,6 +266,7 @@ export class SettingsService {
       };
 
       await dynamodb.delete(params).promise();
+      void recordSettingChange(settingName, 'delete', undefined);
     } catch (error) {
       console.error('Error deleting setting:', error);
       throw error;
@@ -310,6 +315,8 @@ export class SettingsService {
       ConditionExpression: 'settingValue = :expected',
       ExpressionAttributeValues: { ':expected': expectedValue },
     }).promise();
+    // Only reached when the conditional write succeeded (ENG-2145).
+    void recordSettingChange(settingName, 'set', settingValue);
   }
 
   /** Delete counterpart of `setSettingIfValueMatches` — see its doc comment. */
@@ -320,6 +327,7 @@ export class SettingsService {
       ConditionExpression: 'settingValue = :expected',
       ExpressionAttributeValues: { ':expected': expectedValue },
     }).promise();
+    void recordSettingChange(settingName, 'delete', undefined);
   }
 
   async syncPlan(planId: string, direction: 'prod-to-dev' | 'dev-to-prod'): Promise<PredefinedPlan | null> {
@@ -379,6 +387,8 @@ export class SettingsService {
           updatedBy: 'sync-operation'
         }
       }).promise();
+      // ENG-2145: a synced plan is a work-plan change in the target environment.
+      void recordSettingChange('agent-mode-predefined-workplans', 'sync', JSON.stringify(targetPlans));
 
       return planToSync;
     } catch (error) {

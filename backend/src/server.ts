@@ -1045,6 +1045,24 @@ createTestAccount().then(async () => {
         console.error('[accountHealthClassifierCron] Failed to initialize:', error);
       }
 
+      // Weekly creative calibration batch (ENG-2142): ~20 creative pairs as pairwise golden cases
+      // and one Slack link. Checked daily; each ISO week's batch is written once across instances.
+      // Off unless CREATIVE_CALIBRATION_ENABLED=true (enabling it in prod is an OPS step).
+      if (process.env.CREATIVE_CALIBRATION_ENABLED === 'true') try {
+        const { runCreativeCalibration } = await import('./cron/creativeCalibrationCron');
+        const CREATIVE_CALIBRATION_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        cronJobRegistry.track('creativeCalibrationCron', runCreativeCalibration())
+          .catch(e => console.error('[creativeCalibrationCron] Error on first run:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('creativeCalibrationCron', runCreativeCalibration())
+            .catch(e => console.error('[creativeCalibrationCron] Error:', e));
+        }, CREATIVE_CALIBRATION_INTERVAL_MS);
+        console.log('[creativeCalibrationCron] Initialized — checking daily for the weekly batch');
+      } catch (error) {
+        console.error('[creativeCalibrationCron] Failed to initialize:', error);
+      }
+
       // CRM Auto-Enrichment (ENG-88) — runs every 15 minutes.
       // Ray's manual campaign-monitoring routine included clicking "renew"
       // (the enrich-v3 engine) on managed-campaign lead lists by hand a
@@ -1414,6 +1432,19 @@ createTestAccount().then(async () => {
         } catch (error) {
           console.error('[EvalV2Sampler] Failed to initialize:', error);
         }
+      }
+
+      // Nightly failure replay (ENG-591 AC2, ENG-2145) — 04:30 UTC: the registered replay cases
+      // against current code; a regression is filed once through the ENG-240 intake. Off unless
+      // FAILURE_REPLAY_NIGHTLY_ENABLED=true.
+      try {
+        const { scheduleFailureReplayNightly } = await import('./cron/failureReplayNightlyCron');
+        scheduleFailureReplayNightly({
+          isCronEnabled,
+          track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
+        });
+      } catch (error) {
+        console.error('[FailureReplayNightly] Failed to initialize:', error);
       }
 
       // Weekly Engineering Scoreboard — read-only backend replacement for the

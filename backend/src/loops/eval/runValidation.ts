@@ -118,7 +118,9 @@ export async function runValidation(opts: {
   if (grader.surface !== entry.surface) throw new Error(`${opts.graderId}: adapter surface ${grader.surface} != registry surface ${entry.surface}`);
 
   const split = opts.split ?? 'test';
-  const cases = await opts.store.listCases(entry.surface, { split });
+  // Pairwise creative cases (ENG-2142) carry an A/B/tie preference, not these binary criteria;
+  // their agreement is reported by scripts/creativeCalibrationReport.ts.
+  const cases = (await opts.store.listCases(entry.surface, { split })).filter((c) => c.pair === undefined);
   const predictions = new Map<string, GraderPrediction>();
   let gradeErrors = 0;
   for (const c of cases) {
