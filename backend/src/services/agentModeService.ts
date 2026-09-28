@@ -207,6 +207,7 @@ import {
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { publishWithResolvedBlogPublisher } from './blogPublishers';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
+import { isPlacementId } from './creativePlacementSpecs';
 import { recordGeneratedCreative, stampMetaAdCreated, stampMetaAdCreativeChanged, stampMetaCreativeCreated, stampMetaImageUpload, stampMetaPublish } from './creativeLineage';
 import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
@@ -31021,7 +31022,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     logoImage?: string,
     confirm?: boolean,
     category?: string,
-    metricsVerified?: boolean
+    metricsVerified?: boolean,
+    placement?: string
   ): Promise<any> {
     // ENG-343: the producing flow must self-declare the eval use case — Matt's
     // review feedback differs entirely between ads and organic posts, and a
@@ -31134,7 +31136,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         inputImages: inputImagesForRequest,
         logoImage,
         userId,
-        imageModel: resolvedImageModel
+        imageModel: resolvedImageModel,
+        // ENG-2187: the ad placement, when declared, sizes the creative gates' checks.
+        ...(isPlacementId(placement) ? { placement } : {})
       };
 
       let result: any;
