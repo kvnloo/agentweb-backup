@@ -36,6 +36,16 @@ export interface LlmTransportRetryOptions {
    * the first time this was tried without the injection).
    */
   sleep: (ms: number) => Promise<void>;
+  /**
+   * ENG-2185: called before the normal isRetryableError/backoff decision. If it
+   * mutates `params` and returns true, the transport retries immediately (no
+   * backoff, no isRetryableError check) instead of falling through to the usual
+   * "hope it clears" path — for corrections that are deterministic, e.g. capping
+   * max_tokens to what a spend-limited OpenRouter key's remaining balance
+   * actually affords (the error names the exact number). Optional so a transport
+   * with nothing to correct can ignore it entirely.
+   */
+  adjustParamsForRetry?: (error: unknown, params: { max_tokens?: number }) => boolean;
 }
 
 export interface LlmTransport {
