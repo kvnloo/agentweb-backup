@@ -46,10 +46,19 @@ describe('recording markers', () => {
       loopId: EVAL_GATE_LOOP_ID,
       eventType: EVT_EVAL_NEEDED,
       subjectId: 'setting:agent_mode_system_prompt',
-      tsSession: `${AT.toISOString()}#setting:agent_mode_system_prompt#${EVT_EVAL_NEEDED}`,
       dimensions: { changeKind: 'setting', target: 'agent_mode_system_prompt', category: 'prompt', action: 'set', valueSha: shortHash(prompt), gateMode: 'report_only' },
     });
     expect(JSON.stringify(item)).not.toContain('Secret sauce');
+  });
+
+  it('gives every marker its own sort key under the time prefix, so same-millisecond writes never overwrite each other', () => {
+    const marker = { changeKind: 'setting' as const, target: 'agent_mode_default_model', category: 'model' as const, action: 'set' as const, via: 'settingsService' };
+    const first = buildEvalNeededItem(marker, AT);
+    const second = buildEvalNeededItem(marker, AT);
+    const prefix = `${AT.toISOString()}#setting:agent_mode_default_model#${EVT_EVAL_NEEDED}#`;
+    expect(String(first.tsSession).startsWith(prefix)).toBe(true);
+    expect(String(second.tsSession).startsWith(prefix)).toBe(true);
+    expect(first.tsSession).not.toBe(second.tsSession);
   });
 
   it('writes nothing for an irrelevant setting or when EVAL_CHANGE_MARKERS_ENABLED=false', async () => {
