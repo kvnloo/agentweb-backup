@@ -17,6 +17,9 @@ jest.mock('../services/db', () => ({
 jest.mock('../services/autoHumanEvalService', () => ({
   enqueueAutoHumanEval: jest.fn().mockResolvedValue(null),
 }));
+jest.mock('../services/enigmaCardRevenueEnrichment', () => ({
+  isEnigmaEnrichmentEnabledForUser: jest.fn().mockReturnValue(false),
+}));
 
 import '../emma/tools';
 import { emmaToolRegistry } from '../emma/registry';
@@ -26,6 +29,7 @@ import {
   resolveExecuteLeadIds,
 } from '../emma/enrichmentToolRunner';
 import { crmDb } from '../services/db';
+import { isEnigmaEnrichmentEnabledForUser } from '../services/enigmaCardRevenueEnrichment';
 const { enqueueAutoHumanEval } = jest.requireMock('../services/autoHumanEvalService');
 
 const SUMMARY = {
@@ -348,6 +352,60 @@ describe('enrich_lead_custom', () => {
     expect(meta.siblingLeadId).toBeUndefined();
     expect(meta.siblingListId).toBeUndefined();
     expect(meta.siblingUserId).toBeUndefined();
+  });
+
+  // ENG-1388: the enigma card-revenue TRIGGER is allowlist-gated inside
+  // runEmmaEnrichment, but this readback re-reads whatever's now stored for
+  // the requested output fields — which could be a card-revenue value a
+  // DIFFERENT (allowlisted) org member filled in earlier on a shared list.
+  // Never hand that back to a caller who isn't allowlisted themselves.
+  it('strips card-revenue fields from enrichedValues and enrichmentMetadata for a non-allowlisted caller', async () => {
+    (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(false);
+    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, processedCount: 1 });
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+      leadId: 'lead-7',
+      customFields: { card_revenue_12m: '41999657', industry: 'Software' },
+      enrichmentMetadata: {
+        card_revenue_12m: { source: 'api', provider: 'enigma', confidence: 'medium', enrichedAt: '2026-06-22T00:00:00.000Z' },
+        industry: { source: 'api', provider: 'apollo', confidence: 'high', enrichedAt: '2026-06-22T00:00:00.000Z' },
+      },
+    });
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    const result = await tool.execute(
+      {
+        list_id: 'list-abc',
+        lead_id: 'lead-7',
+        output_fields: [
+          { name: 'card_revenue_12m', instruction: 'find card revenue' },
+          { name: 'industry', instruction: 'find industry' },
+        ],
+      },
+      { userId: 'org-mate-not-allowlisted' },
+    );
+    expect(result.enrichedValues).not.toHaveProperty('card_revenue_12m');
+    expect(result.enrichedValues.industry).toBe('Software');
+    expect(result.enrichmentMetadata).not.toHaveProperty('card_revenue_12m');
+    expect(result.enrichmentMetadata.industry).toBeDefined();
+  });
+
+  it('keeps card-revenue fields in enrichedValues and enrichmentMetadata for an allowlisted caller', async () => {
+    (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(true);
+    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, processedCount: 1 });
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+      leadId: 'lead-7',
+      customFields: { card_revenue_12m: '41999657' },
+      enrichmentMetadata: {
+        card_revenue_12m: { source: 'api', provider: 'enigma', confidence: 'medium', enrichedAt: '2026-06-22T00:00:00.000Z' },
+      },
+    });
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    const result = await tool.execute(
+      { list_id: 'list-abc', lead_id: 'lead-7', output_fields: [{ name: 'card_revenue_12m', instruction: 'find card revenue' }] },
+      { userId: 'allowlisted-admin' },
+    );
+    expect(result.enrichedValues.card_revenue_12m).toBe('41999657');
+    expect(result.enrichmentMetadata.card_revenue_12m).toBeDefined();
+    (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(false);
   });
 
   it('omits enrichmentMetadata when the enriched lead has none', async () => {
