@@ -312,6 +312,15 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         // reconnect prompt instead of a misleading "Connected" badge.
         status = 'disconnected';
         expiryMessage = 'Reconnect required — X revoked the token';
+      } else if (acc.platform === 'hubspot' && (acc.config as any).needs_reconnect) {
+        // Same as X above: HubSpot rejected the refresh token, so the stored grant is
+        // dead. Without this branch the row falls through to the generic
+        // `hasRefreshToken ? 'active'` case and reports "Connected" forever, because
+        // holding a refresh_token is all that case checks — it never learns the token
+        // stopped working. That is exactly how one portal read "Active · Connected"
+        // for 97 days while every CRM sync against it returned 401.
+        status = 'disconnected';
+        expiryMessage = 'Reconnect required — HubSpot revoked the token';
       } else if (adsCapability.ads_capable === false) {
         // The token is valid and unexpired, but the Meta account never granted (or
         // has since lost) ads_read/ads_management, so this ad account cannot serve
