@@ -10,6 +10,11 @@ Part of ENG-2128 (Eval System v2), slice 1. The machine-readable registry is
 least 30 labelled cases and an http(s) link to the run. **No grader qualifies today.** The agreement
 harness (ENG-2136) produces those runs; record the result on the entry, with evidence.
 
+Every entry also carries a `version` (ENG-2196): the grader's version constant in code where one
+exists (a test keeps the two equal), `prompt-sha256:<12 hex>` for a judge whose prompt lives in
+AW-Settings (read 2026-09-28), or `untracked@<date>` when neither code nor config versions it. The
+Eval v2 tab lists every grader with its version.
+
 ## Inventory
 
 | Id | Surface | Type | Model (family) | Validated |
@@ -95,7 +100,25 @@ deterministic agent graders above, and writes to `Dev-AW-LoopEvents`:
 | --- | --- | --- |
 | `eval-v2` | `eval_v2_sample_run#<day>` | the day's frame size, seed and sampled session ids |
 | `eval-v2` | `eval_v2_scored#<day>#<sessionId>` | one per sampled session: verdicts, reasons, counts, `graders` (`id@version`) |
-| `eval-v2-daily` | `<day>#1d`, `<day>#7d` | aggregate per surface × task type × model: n, rate, 95% Wilson CI, `mayGate` per grader |
+| `eval-v2-daily` | `<day>#1d`, `<day>#7d` | aggregate per surface × task type × model: n, rate, 95% Wilson CI, `mayGate` per grader; cost and run time per success; spend attribution |
+| `eval-v2-daily` | `<day>#<window>#creative` | creative gate pass rate (CI, failing checks) and rubric criteria-passed distribution, from AW-HumanEvalQueue results |
+| `eval-v2-daily` | `<day>#<window>#account_health` | account-health state distribution and flip rate, from the classifier's rows in AW-AccountCapabilityRequirements |
+
+**Efficiency (ENG-2196).** Each score carries the session's spend and run wall time. Spend comes
+from one bounded query per billing subject on AW-SpendEvents' `BillingUserOccurredAtIndex` (an org
+member's spend is billed to the org's billing root). Past 5,000 rows for one subject, that
+subject's sessions report spend `truncated`, never a partial sum. Cost per success charges
+failures to successes, as `efficiencyMetrics` does. Read-only prod on 2026-09-28: 42.7% of
+AW-SpendEvents rows (38.8% of cost) have no session id. That spend is enrichment, X engagement,
+landing pages, media generation and bare `agent_task` rows. Interactive and scheduled agent
+sessions (`agent_task:interactive`, `agent_task:scheduled:*`) are 100% attributed. So for chat
+sessions, the gap is media and landing-page generation that runs inside a session without its id.
+
+**Creative and account health (ENG-2196).** Neither source table has an index by time or kind,
+so each is read with a filtered, projected scan that stops at 20,000 evaluated items (on
+2026-09-28 the tables held 1,243 and 7 items). A truncated or failed read writes a snapshot with
+that status and no numbers. A flip is an account whose row version is above 1 and whose
+`stateSince` falls in the window.
 
 Scores are conditional puts on a deterministic key, so each (day, session) is written once; a
 finished day is skipped. A live run refuses without the flag; `scripts/evalV2Sample.ts` dry-runs
@@ -103,9 +126,10 @@ any day read-only. `GET /api/admin/loops/eval-v2-trend` serves the snapshots to 
 **Eval v2** tab, which labels every grader "unvalidated" while `mayGate` is false. No alert reads
 these rates: none of the graders is validated.
 
-The satisfaction score is no longer a headline: the chat-history badges moved to the last column,
-labelled unvalidated, with neutral colours. The judges and their stored scores are unchanged, and
-the Daily Satisfaction Score Report schedule stays paused.
+The satisfaction score is no longer a headline. Since ENG-2196, Chat History has no Satisfaction
+column by default. The column, the lazy judge scoring that fills it and the admin override appear
+only after an admin turns on "Show unvalidated legacy score". The judges and their stored scores
+are unchanged, and the Daily Satisfaction Score Report schedule stays paused.
 
 ## Shadow outcome judge (ENG-2138)
 
