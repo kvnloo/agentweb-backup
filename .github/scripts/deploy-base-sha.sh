@@ -140,8 +140,12 @@ while IFS= read -r run_id; do
     BACKEND_CONCLUSION="$(job_conclusion "${JOBS}" "${DEPLOY_BACKEND_JOB_NAME}")"
     PARTNER_CONCLUSION="$(job_conclusion "${JOBS}" "${DEPLOY_PARTNER_JOB_NAME}")"
 
-    if { [ "${BACKEND_CONCLUSION}" = 'failure' ] || [ "${BACKEND_CONCLUSION}" = 'cancelled' ]; } || \
-       { [ "${PARTNER_CONCLUSION}" = 'failure' ] || [ "${PARTNER_CONCLUSION}" = 'cancelled' ]; }; then
+    # Allowlist, not a denylist: accept only a deploy job that actually
+    # shipped (success) or was legitimately never run (skipped). Anything
+    # else -- failure, cancelled, timed_out, action_required, or no job by
+    # that name at all -- is untrustworthy and must not become the base.
+    deploy_ok() { [ "$1" = 'success' ] || [ "$1" = 'skipped' ]; }
+    if ! deploy_ok "${BACKEND_CONCLUSION}" || ! deploy_ok "${PARTNER_CONCLUSION}"; then
       echo "[deploy-base-sha] run ${run_id} detect-changes succeeded but its own deploy job did not (backend=${BACKEND_CONCLUSION:-n/a} partner=${PARTNER_CONCLUSION:-n/a}); walking past it." >&2
       continue
     fi

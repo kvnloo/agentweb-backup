@@ -228,6 +228,28 @@ jobs_fixture "${d}" 40000007 success success skipped
 run_script "${d}"
 check 'a legitimately skipped deploy job does not disqualify the run' 'base_sha=ggggggg7'
 
+# A denylist of just failure/cancelled would let anything else -- timed_out,
+# action_required, a job that never ran at all -- slide through as trusted.
+# It must be an allowlist of success/skipped instead.
+RUN_BACKEND_DEPLOY_TIMED_OUT='{"databaseId":40000008,"status":"completed","headSha":"hhhhhhh8"}'
+
+d="$(new_fixture_dir)"
+runlist "${d}" "[${RUN_BACKEND_DEPLOY_TIMED_OUT},${RUN_PRIOR_SUCCESS}]"
+jobs_fixture "${d}" 40000008 success timed_out success
+jobs_fixture "${d}" 40000002 success
+run_script "${d}"
+check 'a run whose backend-deploy job timed out is walked past' 'base_sha=bbbbbbb2'
+
+RUN_BACKEND_JOB_MISSING='{"databaseId":40000009,"status":"completed","headSha":"iiiiiii9"}'
+
+d="$(new_fixture_dir)"
+runlist "${d}" "[${RUN_BACKEND_JOB_MISSING},${RUN_PRIOR_SUCCESS}]"
+printf '{"jobs":[{"name":"Detect changed projects","conclusion":"success"},{"name":"Partner portal deploy to production","conclusion":"skipped"}]}' \
+  >"${d}/jobs_40000009.json"
+jobs_fixture "${d}" 40000002 success
+run_script "${d}"
+check 'a run with no backend-deploy job at all is walked past' 'base_sha=bbbbbbb2'
+
 # The currently-in-flight run (this very run) must never be its own base, even
 # if it were somehow reported back as completed by a race.
 RUN_SELF='{"databaseId":99999999,"status":"completed","headSha":"selfselfself"}'
