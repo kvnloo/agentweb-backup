@@ -313,3 +313,77 @@ describe('a flagged account heals itself when the grant works again', () => {
       'user-1', 'hubspot', '245815183', { needs_reconnect: false });
   });
 });
+
+/*
+ * Credentials must never reach the log.
+ *
+ * Axios attaches the OUTGOING request to the error as `config.data`, and for the token
+ * endpoint that body is
+ *   grant_type=refresh_token&refresh_token=…&client_id=…&client_secret=…
+ * so a bare `console.error(msg, refreshErr)` writes the app's HubSpot client secret and
+ * the customer's refresh token into the application log. The first version of this code
+ * did exactly that, and it was caught only because a live env2 run printed the secret to
+ * a terminal. These cases pin the redaction on both the flagged and unflagged paths.
+ */
+describe('refresh-failure logging never carries credentials', () => {
+  const SECRET = 'test-client-secret-DO-NOT-LOG';
+  const REFRESH = 'na1-super-secret-refresh-token';
+
+  /** The shape axios really produces: the request body hangs off `config`. */
+  const axiosLikeError = (status: number, data: unknown) =>
+    Object.assign(new Error(`Request failed with status code ${status}`), {
+      isAxiosError: true,
+      config: {
+        url: 'https://api.hubapi.com/oauth/v1/token',
+        data: `grant_type=refresh_token&refresh_token=${REFRESH}&client_id=cid&client_secret=${SECRET}`,
+      },
+      response: { status, data },
+    });
+
+  let errSpy: jest.SpyInstance;
+  let warnSpy: jest.SpyInstance;
+  beforeEach(() => {
+    errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => { errSpy.mockRestore(); warnSpy.mockRestore(); });
+
+  const logged = () => [...errSpy.mock.calls, ...warnSpy.mock.calls]
+    .flat()
+    .map(a => (typeof a === 'string' ? a : JSON.stringify(a)))
+    .join(' | ');
+
+  it('does not log the client secret or refresh token when flagging a revocation', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
+    mockAxiosPost.mockRejectedValue(axiosLikeError(400, BAD_REFRESH_BODY));
+
+    await expect(HubSpotService.create('user-1')).rejects.toThrow(/needs to be reconnected/i);
+
+    const out = logged();
+    expect(out).not.toContain(SECRET);
+    expect(out).not.toContain(REFRESH);
+    expect(out).not.toContain('client_secret');
+    // and it still says something useful
+    expect(out).toMatch(/status=400/);
+  });
+
+  it('does not log credentials on a transient failure either', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
+    mockAxiosPost.mockRejectedValue(axiosLikeError(503, 'upstream unavailable'));
+
+    await expect(HubSpotService.create('user-1')).rejects.toThrow();
+
+    const out = logged();
+    expect(out).not.toContain(SECRET);
+    expect(out).not.toContain(REFRESH);
+    expect(out).toMatch(/status=503/);
+  });
+
+  it('caps an oversized body so a proxy HTML page cannot flood the log', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
+    mockAxiosPost.mockRejectedValue(axiosLikeError(502, '<html>' + 'x'.repeat(5000) + '</html>'));
+
+    await expect(HubSpotService.create('user-1')).rejects.toThrow();
+    expect(logged()).toContain('truncated');
+  });
+});

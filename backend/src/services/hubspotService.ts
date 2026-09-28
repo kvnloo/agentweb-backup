@@ -210,6 +210,32 @@ async function markHubSpotNeedsReconnect(userId: string, accountId: string): Pro
   }
 }
 
+/**
+ * A refresh failure reduced to the two fields worth logging.
+ *
+ * NEVER log the axios error itself. Axios attaches the outgoing request to the error as
+ * `config.data`, and for this endpoint that body is
+ * `grant_type=refresh_token&refresh_token=...&client_id=...&client_secret=...`
+ * — so `console.error(msg, err)` writes the app's HubSpot CLIENT SECRET and the
+ * customer's refresh token into the application log, where they persist and fan out to
+ * whatever ships logs. Observed doing exactly that during live testing on env2.
+ *
+ * `response.data` is the RESPONSE body and carries no credentials; it is capped anyway so
+ * an HTML error page from a proxy cannot flood the log.
+ */
+function describeRefreshFailure(err: unknown): string {
+  const status = (err as any)?.response?.status;
+  const data = (err as any)?.response?.data;
+  let body: string;
+  try {
+    body = typeof data === 'string' ? data : JSON.stringify(data ?? null);
+  } catch {
+    body = '<unserialisable>';
+  }
+  if (body && body.length > 500) body = `${body.slice(0, 500)}…<truncated>`;
+  return `status=${status ?? 'none'} body=${body}`;
+}
+
 /** Best-effort inverse of markHubSpotNeedsReconnect — see the call site for why it exists. */
 async function clearHubSpotNeedsReconnect(userId: string, accountId: string): Promise<void> {
   try {
@@ -384,8 +410,8 @@ export class HubSpotService {
         // so the next call retries against a connection that may well be healthy.
         if (isRevokedRefreshTokenError(refreshErr)) {
           console.error(
-            `[HubSpotService] Refresh token rejected for account ${accountId} \u2014 marking needs_reconnect`,
-            refreshErr
+            `[HubSpotService] Refresh token rejected for account ${accountId} \u2014 marking `
+            + `needs_reconnect. ${describeRefreshFailure(refreshErr)}`
           );
           await markHubSpotNeedsReconnect(userId, accountId);
           throw new Error(RECONNECT_MESSAGE);
@@ -397,8 +423,7 @@ export class HubSpotService {
         // reporting "Connected", which is the original bug wearing a green test suite.
         console.warn(
           `[HubSpotService] Refresh failed for account ${accountId} and was NOT treated as a `
-          + `revocation (status=${(refreshErr as any)?.response?.status}). Body: `
-          + `${JSON.stringify((refreshErr as any)?.response?.data ?? null)}`
+          + `revocation. ${describeRefreshFailure(refreshErr)}`
         );
         throw refreshErr;
       }
