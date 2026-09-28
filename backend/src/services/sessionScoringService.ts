@@ -1,4 +1,5 @@
 import { resolveModelForUser } from './modelRoles';
+import { OUTCOME_JUDGE_SHADOW_FEATURE, assertOutcomeJudgeModelAllowed, DEFAULT_OUTCOME_JUDGE_MODEL, isInShadowSample } from './outcomeJudge';
 import { chatbotDb, ChatSession, ChatMessage } from "./chatbotService";
 import {
   appendConfirmedPublishNotice,
@@ -1521,6 +1522,8 @@ type ScoringResult = {
    * partial-context judgement is never mistaken for a full-context one (ENG-929).
    */
   transcriptTruncated?: boolean;
+  /** Set for a shadow judge (ENG-2138): the model that produced the score, kept on the stored score. */
+  model?: string;
 };
 
 /** A finite number in `raw`, or undefined if missing/non-numeric. Distinguishes
@@ -1676,8 +1679,42 @@ export interface ScoringJudge {
   name: string;
   systemPrompt: string;
   llmModel?: string;
+  /**
+   * ENG-2138: a shadow judge scores only its sample (`sampleRate`, 0..1; missing = never), on
+   * its own non-Gemini model, metered as system spend. It writes judgeScores[id] like any
+   * judge and never the primary score. See outcomeJudge.ts.
+   */
+  shadow?: boolean;
+  sampleRate?: number;
   createdAt: string;
   updatedAt: string;
+}
+
+/** The one LLM call a judge makes; injectable so offline replays can call the model unmetered. */
+export type ScoringLlmCall = (
+  model: string,
+  messages: Array<{ role: "system" | "user"; content: string }>,
+  options: {
+    temperature: number;
+    max_completion_tokens: number;
+    response_format: { type: "json_object" };
+    taskClass: "nonstandard_consumer";
+    usageContext: { userId?: string; feature?: string; sessionId?: string };
+  }
+) => Promise<{ choices?: Array<{ message?: { content?: string | null } }> }>;
+
+/**
+ * The model a judge runs on. A shadow judge uses its own model (default Sonnet 4.6), validated
+ * but never the per-org scoring_judge role, and refuses the agent's family — including when a
+ * retired id would fall back to the Gemini scoring default.
+ */
+async function resolveJudgeModel(judge: ScoringJudge, userId: string | undefined): Promise<string> {
+  if (judge.shadow) {
+    const model = await resolveScoringModel(judge.llmModel || DEFAULT_OUTCOME_JUDGE_MODEL);
+    assertOutcomeJudgeModelAllowed(model);
+    return model;
+  }
+  return judge.llmModel ? resolveScoringModel(judge.llmModel) : resolveModelForUser(userId, 'scoring_judge');
 }
 
 export async function scoreSessionWithJudge(
@@ -1685,7 +1722,8 @@ export async function scoreSessionWithJudge(
   currentMessageCount: number,
   judge: ScoringJudge,
   sessionType?: string,
-  usageContext?: { userId?: string; feature?: string; sessionId?: string }
+  usageContext?: { userId?: string; feature?: string; sessionId?: string },
+  callLLM?: ScoringLlmCall
 ): Promise<ScoringResult> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
   const capped = capTranscriptForScoring(serializeMessagesForScoring(recentMessages));
@@ -1699,13 +1737,18 @@ export async function scoreSessionWithJudge(
     ? `${header}\n${manifest.text}\n\n${capped.text}`
     : `${manifest.text}\n\n${capped.text}`;
 
-  const { agentModeService } = await import("./agentModeService");
+  const llm: ScoringLlmCall =
+    callLLM ?? (async (...args) => (await import("./agentModeService")).agentModeService.callLLM(...args));
 
   // Per-judge model is persisted without registry validation — same retired-id
   // hazard as the default scoring model above (ENG-744).
-  const judgeModel = judge.llmModel ? await resolveScoringModel(judge.llmModel) : await resolveModelForUser(usageContext?.userId, 'scoring_judge');
+  const judgeModel = await resolveJudgeModel(judge, usageContext?.userId);
+  // A shadow judge is our own evaluation spend: metered per session, never to the customer.
+  const judgeUsage = judge.shadow
+    ? { sessionId: usageContext?.sessionId, feature: OUTCOME_JUDGE_SHADOW_FEATURE }
+    : { ...usageContext, feature: usageContext?.feature || "agent_task" };
 
-  const llmPromise = agentModeService.callLLM(
+  const llmPromise = llm(
     judgeModel,
     [
       // Same appended clauses as the general scorer, so a custom judge cannot
@@ -1737,7 +1780,7 @@ export async function scoreSessionWithJudge(
       max_completion_tokens: SCORING_MAX_COMPLETION_TOKENS,
       response_format: { type: "json_object" },
       taskClass: 'nonstandard_consumer',
-      usageContext: { ...usageContext, feature: usageContext?.feature || "agent_task" },
+      usageContext: judgeUsage,
     }
   );
 
@@ -1772,6 +1815,7 @@ export async function scoreSessionWithJudge(
     dimensions: guarded.dimensions,
     taskRequested: parseTaskRequested(parsed),
     ...(capped.truncated ? { transcriptTruncated: true } : {}),
+    ...(judge.shadow ? { model: judgeModel } : {}),
   };
 }
 
@@ -1840,6 +1884,12 @@ export async function scoreSessionWithJudgeIfNeeded(
   opts?: { force?: boolean }
 ): Promise<NonNullable<ChatSession["judgeScores"]>[string] | null> {
   const messageCount = session.messageCount ?? session.messages?.length ?? 0;
+
+  // ENG-2138: a shadow judge touches only its fixed sample — no model call, no write, no
+  // retraction outside it. `force` (one admin-chosen session) bypasses the sample.
+  if (judge.shadow && !opts?.force && !isInShadowSample(judge, session.sessionId)) {
+    return null;
+  }
 
   const userMessages = (session.messages || []).filter((m: any) => m.role === "user");
   if (userMessages.length < MIN_USER_MESSAGES) {
@@ -1969,6 +2019,7 @@ export async function scoreSessionWithJudgeIfNeeded(
     evaluatedMessageIndex: result.evaluatedMessageIndex,
     judgeName: judge.name,
     ...(result.dimensions ? { dimensions: result.dimensions } : {}),
+    ...(judge.shadow ? { shadow: true, ...(result.model ? { model: result.model } : {}) } : {}),
   };
 
   await chatbotDb.updateSessionJudgeScore(session.sessionId, judge.id, judgeScore);
