@@ -74,6 +74,9 @@ const GRADER_LABELS: Readonly<Record<string, string>> = {
   "agent-task-success": "Task success",
   "agent-tool-correctness": "Tool correctness",
   "agent-groundedness-offline": "Groundedness",
+  "agent-reply-length-adherence": "Requested length",
+  "agent-format-adherence": "Requested format",
+  "agent-act-without-asking": "Acts when told",
 };
 
 const pct = (x: number) => `${Math.round(x * 100)}%`;
