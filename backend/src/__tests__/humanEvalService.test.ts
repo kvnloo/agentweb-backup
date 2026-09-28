@@ -1057,3 +1057,38 @@ describe('HumanEvalService', () => {
     });
   });
 });
+
+describe('listCandidatesByReviewType (ENG-2142 calibration pool)', () => {
+  it('returns every candidate of the type across all scan pages, with no cap', async () => {
+    const item = (candidateId: string, reviewType: HumanEvalCandidate['reviewType']): HumanEvalCandidate => ({
+      candidateId,
+      reviewType,
+      reviewer: 'matt',
+      status: 'pending',
+      outputSummary: 'x',
+      feedback: [],
+      createdAt: '2026-09-15T00:00:00.000Z',
+      updatedAt: '2026-09-15T00:00:00.000Z',
+    });
+    const pages = [
+      Array.from({ length: 150 }, (_, i) => item(`img-${i}`, 'creative_image')),
+      [item('lp-1', 'landing_page'), ...Array.from({ length: 100 }, (_, i) => item(`img-b-${i}`, 'creative_image'))],
+    ];
+    const scan = jest.fn((params: { ExclusiveStartKey?: { page: number }; ExpressionAttributeValues?: Record<string, string> }) => ({
+      promise: async () => {
+        const page = params.ExclusiveStartKey?.page ?? 0;
+        const type = params.ExpressionAttributeValues?.[':reviewType'];
+        return {
+          Items: pages[page].filter((c) => c.reviewType === type),
+          ...(page + 1 < pages.length ? { LastEvaluatedKey: { page: page + 1 } } : {}),
+        };
+      },
+    }));
+    const service = new HumanEvalService({ put: jest.fn(), get: jest.fn(), update: jest.fn(), scan } as unknown as ConstructorParameters<typeof HumanEvalService>[0]);
+    const all = await service.listCandidatesByReviewType('creative_image');
+    expect(all).toHaveLength(250);
+    expect(all.every((c) => c.reviewType === 'creative_image')).toBe(true);
+    expect(scan).toHaveBeenCalledTimes(2);
+    expect(scan).toHaveBeenCalledWith(expect.objectContaining({ FilterExpression: 'reviewType = :reviewType' }));
+  });
+});
