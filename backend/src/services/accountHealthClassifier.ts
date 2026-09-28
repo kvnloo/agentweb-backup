@@ -17,12 +17,7 @@
  * result carries the evidence that produced it and a confidence grade.
  */
 
-import {
-  classifyMetaAdConnection,
-  hasUsableAdToken,
-  type AdConnectionAccount,
-  type AdConnectionState,
-} from './clientHealthService';
+import { classifyAdConnections, type AdConnectionAccount, type AdConnectionSummary } from './clientHealthService';
 import type { AccountCapabilityRequirement } from './accountCapabilityRequirementsDb';
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -72,58 +67,8 @@ export interface AccountHealthEvidence {
   detail: string;
 }
 
-/** Ad-connection state across every ad platform. */
-export interface AdConnectionSummary {
-  state: 'never_connected' | 'connected' | 'expired';
-  meta: AdConnectionState;
-  /** Per non-Meta platform on record. */
-  others: Partial<Record<'google_ads' | 'linkedin_ads', 'connected' | 'expired'>>;
-  /** Latest token expiry across expired accounts, when `state` is `expired`. */
-  expiredAt?: string;
-}
-
-const OTHER_AD_PLATFORMS = ['google_ads', 'linkedin_ads'] as const;
-
-/**
- * Meta goes through clientHealthService.classifyMetaAdConnection (legacy `adAccount`, ad-account
- * type filter); Google Ads and LinkedIn Ads accounts use the same token rule (`hasUsableAdToken`).
- * Any usable account on any platform makes the account connected.
- */
-export function classifyAdConnections(
-  connectedAccounts: ReadonlyArray<AdConnectionAccount | null | undefined> | null | undefined,
-  legacyAdAccount: string | undefined,
-  nowMs: number,
-): AdConnectionSummary {
-  const meta = classifyMetaAdConnection(connectedAccounts, legacyAdAccount, nowMs);
-  const others: AdConnectionSummary['others'] = {};
-  const expiries: number[] = [];
-  if (meta.connection === 'expired' && meta.expiredAt) expiries.push(Date.parse(meta.expiredAt));
-  for (const platform of OTHER_AD_PLATFORMS) {
-    const accounts = (connectedAccounts ?? []).filter(
-      (acc): acc is AdConnectionAccount => acc?.platform === platform,
-    );
-    if (accounts.length === 0) continue;
-    if (accounts.some((acc) => hasUsableAdToken(acc, nowMs))) {
-      others[platform] = 'connected';
-    } else {
-      others[platform] = 'expired';
-      expiries.push(Math.max(...accounts.map((acc) => acc.config?.token_expires_at ?? 0)));
-    }
-  }
-  const otherStates = Object.values(others);
-  if (meta.connection === 'connected' || otherStates.includes('connected')) {
-    return { state: 'connected', meta: meta.connection, others };
-  }
-  if (meta.connection === 'expired' || otherStates.includes('expired')) {
-    return {
-      state: 'expired',
-      meta: meta.connection,
-      others,
-      expiredAt: new Date(Math.max(...expiries)).toISOString(),
-    };
-  }
-  return { state: 'never_connected', meta: meta.connection, others };
-}
+// The all-platform connection rule lives with the Meta one so every surface shares it (ENG-2188).
+export { classifyAdConnections, type AdConnectionSummary };
 
 export type RequirementFields = Pick<AccountCapabilityRequirement, 'requirementSource' | 'requirementVerifiedAt'>;
 

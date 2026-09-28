@@ -18,13 +18,17 @@ import { isEvaluationUser } from './evaluationPolicy';
 
 // 'onboarding' = activation incomplete (no ad account ever connected). ENG-2133: that is not a
 // churn/at-risk signal, so it never shares a status with a connection that broke.
-type HealthStatus = 'healthy' | 'mediocre' | 'at-risk' | 'blocked' | 'onboarding';
+// 'needs-attention' = a setup or reconnect problem (every ad connection expired, or several setup
+// gaps). ENG-2188: neither is behavioural evidence, so neither is 'at-risk'. 'at-risk' is reserved
+// for the ENG-2143 classifier's behavioural evidence and is not produced here.
+type HealthStatus = 'healthy' | 'mediocre' | 'at-risk' | 'blocked' | 'onboarding' | 'needs-attention';
 
 export type AdConnectionState = 'never_connected' | 'connected' | 'expired' | 'other_platform';
 
 /** Non-Meta ad platforms. This service only reads Meta campaigns, but a client advertising here
  * has activated ads and must not read as onboarding. */
-const OTHER_AD_PLATFORMS = new Set(['google_ads', 'linkedin_ads']);
+const OTHER_AD_PLATFORM_LIST = ['google_ads', 'linkedin_ads'] as const;
+const OTHER_AD_PLATFORMS: ReadonlySet<string> = new Set(OTHER_AD_PLATFORM_LIST);
 
 /** The fields the connection classifier reads; ConnectedAccount records satisfy it. */
 export interface AdConnectionAccount {
@@ -49,7 +53,7 @@ export function hasUsableAdToken(acc: AdConnectionAccount, nowMs: number): boole
  * - `connected`: a legacy `adAccount` (read with the shared token, which has no per-client
  *   expiry), or a Meta ad account whose token is unexpired, carries no expiry, or can refresh.
  * - `expired`: Meta ad accounts are on record but every token has expired with no refresh token
- *   — a connection that broke (at-risk), reported with the latest expiry.
+ *   — a connection that broke (reconnect needed), reported with the latest expiry.
  * - `other_platform`: no Meta ad account, but a Google Ads or LinkedIn Ads account is on record —
  *   ads are activated elsewhere, so the Meta layer is not assessed (expiry there is ENG-2143's).
  * - `never_connected`: no ad account on any platform — an activation state, never a risk state.
@@ -72,6 +76,59 @@ export function classifyMetaAdConnection(
   // Every account failed hasUsableAdToken, so each carries a numeric token_expires_at.
   const latestExpiry = Math.max(...metaAdAccounts.map((acc) => acc.config?.token_expires_at ?? 0));
   return { connection: 'expired', expiredAt: new Date(latestExpiry).toISOString() };
+}
+
+/** Ad-connection state across every ad platform. */
+export interface AdConnectionSummary {
+  state: 'never_connected' | 'connected' | 'expired';
+  meta: AdConnectionState;
+  /** Per non-Meta platform on record. */
+  others: Partial<Record<'google_ads' | 'linkedin_ads', 'connected' | 'expired'>>;
+  /** Latest token expiry across expired accounts, when `state` is `expired`. */
+  expiredAt?: string;
+}
+
+/**
+ * Meta goes through classifyMetaAdConnection (legacy `adAccount`, ad-account type filter); Google
+ * Ads and LinkedIn Ads accounts use the same token rule (`hasUsableAdToken`). Any usable account
+ * on any platform makes the account connected; `expired` means every ad account on record has
+ * expired. Shared by the Client Health roster, assess_client_health, the renewal cron and the
+ * ENG-2143 classifier (ENG-2188: one expiry rule for every surface).
+ */
+export function classifyAdConnections(
+  connectedAccounts: ReadonlyArray<AdConnectionAccount | null | undefined> | null | undefined,
+  legacyAdAccount: string | undefined,
+  nowMs: number,
+): AdConnectionSummary {
+  const meta = classifyMetaAdConnection(connectedAccounts, legacyAdAccount, nowMs);
+  const others: AdConnectionSummary['others'] = {};
+  const expiries: number[] = [];
+  if (meta.connection === 'expired' && meta.expiredAt) expiries.push(Date.parse(meta.expiredAt));
+  for (const platform of OTHER_AD_PLATFORM_LIST) {
+    const accounts = (connectedAccounts ?? []).filter(
+      (acc): acc is AdConnectionAccount => acc?.platform === platform,
+    );
+    if (accounts.length === 0) continue;
+    if (accounts.some((acc) => hasUsableAdToken(acc, nowMs))) {
+      others[platform] = 'connected';
+    } else {
+      others[platform] = 'expired';
+      expiries.push(Math.max(...accounts.map((acc) => acc.config?.token_expires_at ?? 0)));
+    }
+  }
+  const otherStates = Object.values(others);
+  if (meta.connection === 'connected' || otherStates.includes('connected')) {
+    return { state: 'connected', meta: meta.connection, others };
+  }
+  if (meta.connection === 'expired' || otherStates.includes('expired')) {
+    return {
+      state: 'expired',
+      meta: meta.connection,
+      others,
+      expiredAt: new Date(Math.max(...expiries)).toISOString(),
+    };
+  }
+  return { state: 'never_connected', meta: meta.connection, others };
 }
 
 /** Both Meta reads share this boundary. A malformed element makes the read incomplete,
@@ -108,6 +165,10 @@ function healthRows(result: any): any[] {
 interface AdsLayerHealth {
   connected: boolean;
   connection: AdConnectionState;
+  /** Across every ad platform (ENG-2188): `expired` only when no ad account on any platform is usable. */
+  connection_all_platforms: AdConnectionSummary['state'];
+  /** Latest expiry across every platform, when `connection_all_platforms` is `expired`. */
+  all_platforms_expired_at?: string;
   token_expired_at?: string;
   ad_account_id?: string;
   active_campaigns: number;
@@ -171,6 +232,7 @@ interface ClientSummary {
   roles: string[];
   has_ads: boolean;
   ad_connection: AdConnectionState;
+  ad_connection_all_platforms: AdConnectionSummary['state'];
   has_lander: boolean;
   has_crm: boolean;
   last_activity: string | null;
@@ -256,11 +318,14 @@ function determineStatus(
   creativeVariety: CreativeVariety
 ): { status: HealthStatus; reasons: string[] } {
   const reasons: string[] = [];
+  const allPlatforms = adsLayer.connection_all_platforms;
 
-  if (adsLayer.connection === 'never_connected') {
+  if (allPlatforms === 'never_connected') {
     reasons.push('Activation incomplete: no ad account connected yet');
+  } else if (allPlatforms === 'expired') {
+    reasons.push(`Every ad account connection has expired (latest ${adsLayer.all_platforms_expired_at}) — reconnect needed`);
   } else if (adsLayer.connection === 'expired') {
-    reasons.push(`Meta ad account connection expired ${adsLayer.token_expired_at} — reconnect needed`);
+    reasons.push(`Meta ad account connection expired ${adsLayer.token_expired_at} — reconnect needed (ads still connected on another platform)`);
   }
   const campaignsUnread = adsLayer.connection === 'connected' && adsLayer.campaigns_complete === false;
   if (campaignsUnread) {
@@ -281,12 +346,13 @@ function determineStatus(
     reasons.push('Potential creative fatigue: limited creative variety');
   }
 
-  // Determine status
+  // Determine status. ENG-2188: an expired connection and setup gaps are reconnect/setup work
+  // ('needs-attention'), not churn evidence, so nothing here returns 'at-risk'.
   let status: HealthStatus;
-  if (adsLayer.connection === 'never_connected') {
+  if (allPlatforms === 'never_connected') {
     status = 'onboarding';
-  } else if (adsLayer.connection === 'expired') {
-    status = 'at-risk';
+  } else if (allPlatforms === 'expired') {
+    status = 'needs-attention';
   } else if (adsLayer.connection === 'connected' && !campaignsUnread &&
              adsLayer.active_campaigns === 0 && !landerLayer.has_lander) {
     status = 'blocked';
@@ -295,7 +361,7 @@ function determineStatus(
   } else if (reasons.length <= 2) {
     status = 'mediocre';
   } else {
-    status = 'at-risk';
+    status = 'needs-attention';
   }
 
   return { status, reasons };
@@ -560,9 +626,12 @@ export async function assessClientHealth(
     }
 
     const adConnection = classifyMetaAdConnection(connectedAccounts, client.adAccount, nowMs);
+    const allPlatforms = classifyAdConnections(connectedAccounts, client.adAccount, nowMs);
     const adsLayer: AdsLayerHealth = {
       connected: !!hasAds,
       connection: adConnection.connection,
+      connection_all_platforms: allPlatforms.state,
+      ...(allPlatforms.expiredAt ? { all_platforms_expired_at: allPlatforms.expiredAt } : {}),
       ...(adConnection.expiredAt ? { token_expired_at: adConnection.expiredAt } : {}),
       ad_account_id: resolvedAdAccountId,
       active_campaigns: activeCampaigns.length,
@@ -796,6 +865,7 @@ export async function listAllClients(callerUserId: string, callerIsAdmin?: boole
     // connection; it is not a client and must not appear in the roster or its health sweep.
     const allUsers = (await userDb.getAllUsers()).filter((u: any) => !isEvaluationUser(u.userId));
     const landingPageSignalCache: LandingPageSignalCache = new Map();
+    const nowMs = Date.now();
 
     const clients: ClientSummary[] = await Promise.all(
       allUsers.map(async (user: any) => {
@@ -828,7 +898,8 @@ export async function listAllClients(callerUserId: string, callerIsAdmin?: boole
           displayName: user.displayName || user.email,
           roles: user.roles || [],
           has_ads: hasAds,
-          ad_connection: classifyMetaAdConnection(accounts, user.adAccount).connection,
+          ad_connection: classifyMetaAdConnection(accounts, user.adAccount, nowMs).connection,
+          ad_connection_all_platforms: classifyAdConnections(accounts, user.adAccount, nowMs).state,
           has_lander: hasLander,
           has_crm: hasCrm,
           last_activity: user.lastLoginTime || null,
