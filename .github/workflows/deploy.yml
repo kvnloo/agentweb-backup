@@ -40,20 +40,43 @@ jobs:
     # ENG-1277: ubuntu-slim ($0.002/min vs $0.006) — a checkout + paths-filter
     # read (or a two-line manual-trigger step), no docker, no build.
     runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      # deploy-base-sha.sh reads prior Deploy runs and their jobs (ENG-2170).
+      actions: read
     outputs:
-      backend: ${{ steps.filter.outputs.backend || steps.manual.outputs.backend }}
-      partner: ${{ steps.filter.outputs.partner || steps.manual.outputs.partner }}
+      backend: ${{ steps.filter.outputs.backend || steps.manual.outputs.backend || steps.push_fallback.outputs.backend }}
+      partner: ${{ steps.filter.outputs.partner || steps.manual.outputs.partner || steps.push_fallback.outputs.partner }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - name: Check changes (push)
+      # ENG-2170: `dorny/paths-filter` with no `base` compares only against
+      # `github.event.before` — the one commit immediately preceding this
+      # push. That is the wrong base whenever an earlier Deploy run never got
+      # to make its own comparison: `concurrency: deploy-production` keeps
+      # only one PENDING run, so a merge landing while a deploy is already
+      # pending cancels the older pending run before `detect-changes` ever
+      # runs. The next run that does execute then only diffs against its own
+      # previous commit, so a component change that only existed in the
+      # cancelled run's diff is silently never deployed. Resolving the base to
+      # the last run that actually completed `detect-changes` closes that gap
+      # — see deploy-base-sha.sh for the full reasoning and its fail-safe.
+      - name: Resolve base SHA for change detection (push)
         if: github.event_name == 'push'
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/deploy-base-sha.sh
+
+      - name: Check changes (push)
+        if: github.event_name == 'push' && steps.base.outputs.resolved == 'true'
         id: filter
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
+          base: ${{ steps.base.outputs.base_sha }}
           # ENG-1658/ENG-743: what gates a deploy has to gate its own changes.
           # `eb-deploy.sh` IS the deploy — it applies the version and decides
           # whether the environment took it — and `deploy.yml` is what runs it,
@@ -85,6 +108,18 @@ jobs:
               - 'partner-portal/**'
               - '.github/workflows/deploy.yml'
               - '.github/scripts/eb-deploy.sh'
+
+      # deploy-base-sha.sh could not name a trustworthy base (no completed
+      # prior run, or the GitHub API was unreachable). Deploying both
+      # components unconditionally is the fail-safe: a redundant deploy is
+      # cheap and idempotent, whereas guessing a base and getting it wrong
+      # reproduces the exact silent-skip this exists to close (ENG-2170).
+      - name: Deploy all (push, base unresolved)
+        if: github.event_name == 'push' && steps.base.outputs.resolved != 'true'
+        id: push_fallback
+        run: |
+          echo "backend=true" >> "$GITHUB_OUTPUT"
+          echo "partner=true" >> "$GITHUB_OUTPUT"
 
       - name: Deploy all (manual trigger)
         if: github.event_name == 'workflow_dispatch'
