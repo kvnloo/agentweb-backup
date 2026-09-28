@@ -1,6 +1,9 @@
 /**
  * Tests for Emma call_hubspot_api tool (defined in emma/tools.ts).
- * Unified tool — business logic in agentModeService.handleHubspotApi.
+ * Unified tool — business logic in emma/impl/adsCrmApis.ts's
+ * handleHubspotApi (ENG-2103 F2: moved out of
+ * agentModeService.handleHubspotApi, which is now just a delegating
+ * wrapper around the same function).
  */
 
 // ── Mocks BEFORE imports ─────────────────────────────────────────────────────
@@ -45,10 +48,15 @@ jest.mock('../../services/contactCaptureHooks', () => ({
 
 const mockHandleHubspotApi = jest.fn();
 
-jest.mock('../../services/agentModeService', () => ({
-  agentModeService: {
-    handleHubspotApi: (...a: any[]) => mockHandleHubspotApi(...a),
-  },
+// ENG-2103 (F2): emma/tools.ts's call_hubspot_api now calls
+// adsCrmApisImpl.handleHubspotApi directly instead of
+// agentModeService.handleHubspotApi. emma/tools.ts uses
+// `import * as adsCrmApisImpl from './impl/adsCrmApis'`, so this must stay a
+// plain object of jest.fn()s (a Proxy mock gets flattened by TS's
+// esModuleInterop helper) — same idiom every prior F2 cluster's tool test
+// established.
+jest.mock('../../emma/impl/adsCrmApis', () => ({
+  handleHubspotApi: (...a: any[]) => mockHandleHubspotApi(...a),
 }));
 
 jest.mock('../../services/db', () => ({
