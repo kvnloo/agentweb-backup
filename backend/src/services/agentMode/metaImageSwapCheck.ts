@@ -48,8 +48,9 @@ export function judgeImageSwap(
 ): ImageSwapVerdict {
   if (!live) return 'unreadable';
   if (expected.requestedHash) {
-    if (live.hash === undefined) return 'unconfirmed';
-    return live.hash === expected.requestedHash ? 'confirmed' : 'stale';
+    // A hash read-back decides it; without one, the exact old image URL is still stale evidence.
+    if (live.hash !== undefined) return live.hash === expected.requestedHash ? 'confirmed' : 'stale';
+    return live.url !== undefined && live.url === expected.oldUrl ? 'stale' : 'unconfirmed';
   }
   // URL-only swap: Meta hashes the image it ingests, so any hash other than the old one is new.
   if (live.hash !== undefined) return live.hash === expected.oldHash ? 'stale' : 'confirmed';
