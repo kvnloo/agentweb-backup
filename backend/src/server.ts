@@ -1434,6 +1434,19 @@ createTestAccount().then(async () => {
         }
       }
 
+      // Nightly failure replay (ENG-591 AC2, ENG-2145) — 04:30 UTC: the registered replay cases
+      // against current code; a regression is filed once through the ENG-240 intake. Off unless
+      // FAILURE_REPLAY_NIGHTLY_ENABLED=true.
+      try {
+        const { scheduleFailureReplayNightly } = await import('./cron/failureReplayNightlyCron');
+        scheduleFailureReplayNightly({
+          isCronEnabled,
+          track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
+        });
+      } catch (error) {
+        console.error('[FailureReplayNightly] Failed to initialize:', error);
+      }
+
       // Weekly Engineering Scoreboard — read-only backend replacement for the
       // laptop launchd job. Runs Mondays at 09:00 UTC, gated by
       // ENGINEERING_SCOREBOARD_LOOP_ENABLED=true. It reads Linear + Weave,
