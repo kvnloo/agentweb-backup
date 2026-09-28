@@ -83,6 +83,27 @@ jest.mock('../emma/impl/linkedin', () => ({
   }),
 }));
 
+// ENG-2103 (F2): twitter_manage_post's handler body now lives in
+// emma/impl/twitter.ts and emma/tools.ts calls it directly instead of
+// through agentModeService — mock it the same call-recording way as
+// emma/impl/blog/linkedin above (a plain object, not a Proxy, so `import *
+// as twitterImpl` in emma/tools.ts doesn't get flattened to an empty object
+// by TS's esModuleInterop wildcard-import helper) so this registry-wide
+// drift guard keeps observing the forwarded hook after the extraction.
+// twitter_outreach is not publish-capable (see
+// utils/schedulePublishAuthorization.ts), so this drift guard never calls
+// it, but it is mocked too for symmetry with the module's full export shape.
+jest.mock('../emma/impl/twitter', () => ({
+  twitterManagePost: jest.fn((...args: any[]) => {
+    mockCalls.push({ method: 'twitterManagePost', args });
+    return Promise.resolve({ success: true });
+  }),
+  twitterOutreach: jest.fn((...args: any[]) => {
+    mockCalls.push({ method: 'twitterOutreach', args });
+    return Promise.resolve({ success: true });
+  }),
+}));
+
 const SENTINEL = jest.fn(async () => null);
 
 /** Does the hook — or the context carrying it — appear anywhere in these arguments? */
