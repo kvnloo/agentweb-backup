@@ -8304,11 +8304,11 @@ emmaToolRegistry.register({
             properties: {
               title: {
                 type: 'string',
-                description: 'Short title for the issue (e.g., "Login page crashes on mobile")'
+                description: 'Short title for the issue (e.g., "Login page crashes on mobile"). For type "bug", always write in English regardless of the conversation language — it goes straight into the internal engineering tracker, not to the user.'
               },
               description: {
                 type: 'string',
-                description: 'Detailed description of the issue including steps to reproduce, expected behavior, and actual behavior'
+                description: 'Detailed description of the issue including steps to reproduce, expected behavior, and actual behavior. For type "bug", always write in English regardless of the conversation language — it goes straight into the internal engineering tracker, not to the user.'
               },
               priority: {
                 type: 'string',
