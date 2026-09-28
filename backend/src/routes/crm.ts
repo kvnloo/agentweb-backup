@@ -3382,7 +3382,19 @@ router.get('/lists/:listId/export-history', async (req: Request, res: Response) 
       return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
-    res.json({ history: list.csvExportHistory || [] });
+    const history = list.csvExportHistory || [];
+    // ENG-1388 (CodeRabbit on agentweb#3108): a past export's fileUrl is a
+    // public S3 link, and export history has no per-entry record of whether
+    // that export included card revenue — the export route only started
+    // excluding it going forward. A non-allowlisted viewer must not be able
+    // to fetch an old export's link through this endpoint just because they
+    // can read the list; fail closed on every entry rather than guess which
+    // ones are safe.
+    const sanitizedHistory = shouldHideCardRevenueForViewer(userId)
+      ? history.map(({ fileUrl, ...rest }: any) => ({ ...rest, fileUrl: null, restricted: true }))
+      : history;
+
+    res.json({ history: sanitizedHistory });
   } catch (error: any) {
     console.error('Error fetching export history:', error);
     res.status(500).json({ message: error.message || 'Failed to fetch export history' });
