@@ -64,6 +64,25 @@ jest.mock('../emma/impl/blog', () => ({
   }),
 }));
 
+// ENG-2103 (F2): post_on_connected_account's handler body now lives in
+// emma/impl/linkedin.ts and emma/tools.ts calls it directly instead of
+// through agentModeService — mock it the same call-recording way as
+// emma/impl/blog above (a plain object, not a Proxy, so `import * as
+// linkedinImpl` in emma/tools.ts doesn't get flattened to an empty object by
+// TS's esModuleInterop wildcard-import helper) so this registry-wide drift
+// guard keeps observing the forwarded hook after the extraction.
+// linkedin_manage_post is the cluster's other publish-capable tool, but it
+// still calls `agentModeService.linkedinManagePost` directly (kept on the
+// class, unmoved — see emma/impl/linkedin.ts's module header), so the
+// Proxy mock above already observes it; nothing else from this module needs
+// mocking here.
+jest.mock('../emma/impl/linkedin', () => ({
+  postOnConnectedAccount: jest.fn((...args: any[]) => {
+    mockCalls.push({ method: 'postOnConnectedAccount', args });
+    return Promise.resolve({ success: true });
+  }),
+}));
+
 const SENTINEL = jest.fn(async () => null);
 
 /** Does the hook — or the context carrying it — appear anywhere in these arguments? */
