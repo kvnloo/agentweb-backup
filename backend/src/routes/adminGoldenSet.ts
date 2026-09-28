@@ -2,7 +2,8 @@
  * Admin golden-set labelling API (ENG-2135) — /api/admin/eval/golden-cases.
  *
  * Lists golden cases per surface and saves binary per-criterion labels to the private store
- * (loops/eval/goldenSetStore.ts). Cases carry ids only; the portal fetches each case's content
+ * (loops/eval/goldenSetStore.ts); a pairwise creative case (ENG-2142 weekly calibration) takes
+ * A / B / tie on its one criterion instead. Cases carry ids only; the portal fetches each case's content
  * through the existing admin APIs when it is shown, so nothing here returns or stores content.
  *
  * Admin-only, and delegated sessions are refused (middleware/admin.ts). Until OPS-2 (ENG-2147)
@@ -76,7 +77,7 @@ export function createAdminGoldenSetRouter(getStore: () => GoldenSetStore = gold
       const store = getStore();
       const existing = await store.getCase(req.params.caseId);
       if (!existing) return res.status(404).json({ error: 'not_found', message: 'Golden case not found' });
-      const update = parseLabelUpdate(existing.surface, req.body);
+      const update = parseLabelUpdate(existing.surface, req.body, existing.pair !== undefined);
       const user = (req as AuthRequest).user;
       const labeller = user?.email || user?.userId || 'unknown-admin';
       const saved = await store.saveLabels(existing.caseId, update, labeller);
