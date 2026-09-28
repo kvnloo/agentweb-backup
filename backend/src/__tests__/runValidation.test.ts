@@ -166,21 +166,25 @@ describe('stored session-judge adapters', () => {
     expect(read).toHaveBeenCalledWith('sess-9');
   });
 
-  it('exposes the general, Fangfang and Matt judges, reading only the stored scores', async () => {
+  it('exposes the general, Fangfang, Matt and shadow outcome judges, reading only the stored scores', async () => {
     const get = jest.fn(() => ({
       promise: async () => ({
         Item: {
           satisfactionScore: { dimensions: { goalCompletion: 5 } },
-          judgeScores: { judge_1779822633705_027n0uoio: { dimensions: { goalCompletion: 1 } } },
+          judgeScores: {
+            judge_1779822633705_027n0uoio: { dimensions: { goalCompletion: 1 } },
+            'outcome-judge-b-shadow': { dimensions: { goalCompletion: 4 } },
+          },
         },
       }),
     }));
     const graders = storedSessionJudgeGraders({ get } as unknown as AWS.DynamoDB.DocumentClient);
-    expect(graders.map((g) => g.graderId)).toEqual(['session-judge-general', 'session-judge-fangfang', 'session-judge-matt']);
+    expect(graders.map((g) => g.graderId)).toEqual(['session-judge-general', 'session-judge-fangfang', 'session-judge-matt', 'session-judge-outcome-b-shadow']);
     const c = labelled('sess-1', 'pass');
     expect((await graders[0].grade(c)).task_success).toBe('pass');
     expect((await graders[1].grade(c)).task_success).toBe('na');
     expect((await graders[2].grade(c)).task_success).toBe('fail');
+    expect((await graders[3].grade(c)).task_success).toBe('pass');
     expect(get).toHaveBeenCalledWith(expect.objectContaining({ Key: { sessionId: 'sess-1' }, ProjectionExpression: 'satisfactionScore, judgeScores' }));
   });
 });

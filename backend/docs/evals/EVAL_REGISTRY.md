@@ -17,6 +17,7 @@ harness (ENG-2136) produces those runs; record the result on the entry, with evi
 | session-judge-general | agent | LLM judge | gemini-3.5-flash (Gemini) | no |
 | session-judge-fangfang | agent | LLM judge | gemini-3.5-flash (Gemini) | no |
 | session-judge-matt | agent | LLM judge | gemini-3.5-flash (Gemini) | no |
+| session-judge-outcome-b-shadow | agent | LLM judge, outcome rubric B, shadow + sampled, off until OPS-1 | anthropic.claude-sonnet-4-6 (Claude) | no |
 | finalize-guard | agent | LLM judge | gemini-3.1-flash-lite (Gemini), off in prod | no |
 | agent-run-verdict | agent | code | — | no |
 | agent-task-success | agent | code, offline | — | no |
@@ -105,6 +106,24 @@ these rates: none of the graders is validated.
 The satisfaction score is no longer a headline: the chat-history badges moved to the last column,
 labelled unvalidated, with neutral colours. The judges and their stored scores are unchanged, and
 the Daily Satisfaction Score Report schedule stays paused.
+
+## Shadow outcome judge (ENG-2138)
+
+Decision D1: ENG-1714's outcome rubric B on Claude Sonnet, in shadow, without touching the primary
+score. It is one row in AW-Settings `scoring-judges` (id `outcome-judge-b-shadow`, `shadow: true`,
+`sampleRate`), appended by OPS-1 (ENG-2146); without the row nothing runs. It uses the custom-judge
+path, so it has the same cohort exclusions and appended ENG-* clauses, and writes only
+`AW-ChatSessions.judgeScores.outcome-judge-b-shadow` (with `shadow: true` and the model). It scores
+only a fixed hash-picked `sampleRate` share of sessions (an admin `force` rescore of one session
+bypasses the sample), refuses a Google model, and is metered as system spend
+(`outcome_judge_shadow`, per session id) rather than to the customer.
+
+The measured rubric B text was never committed; `services/outcomeJudge.ts` holds a
+reconstruction from ENG-1710/1714 and says which parts are reconstructed.
+`scripts/evalOutcomeJudge.ts` re-measures it read-only: it judges a seeded sample of sessions
+and prints AUC against the deterministic `agent-task-success` label, the share of 5s and
+per-model means (aggregates only). The runValidation harness reads its stored scores for κ
+against the golden set once labels exist (ENG-2135/2136).
 
 ## Offline suite and regression gate (ENG-2145)
 

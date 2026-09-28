@@ -24,6 +24,7 @@ import type { GoldenSetStore } from './goldenSetStore';
 import { gradeGroundedness, gradeTaskSuccess, gradeToolCorrectness, type SessionForGrading } from './agentGraders';
 import { buildLoadedSession, groupEventsBySession, type DocItem, type ReadOnlyDocReader, type ReadRequest } from './agentGraderLoader';
 import { LOOP_EVENTS_TABLE } from '../core/sensors/eventTableEventSource';
+import { OUTCOME_SHADOW_JUDGE_ID } from '../../services/outcomeJudge';
 
 export type GraderPrediction = Partial<Record<GoldenCriterion, LabelValue>>;
 
@@ -189,6 +190,7 @@ export function sessionJudgeGrader(graderId: string, read: StoredJudgeReader): G
 export const CUSTOM_JUDGE_IDS: Record<string, string> = {
   'session-judge-fangfang': 'judge_1774188403681_idctslwzu',
   'session-judge-matt': 'judge_1779822633705_027n0uoio',
+  'session-judge-outcome-b-shadow': OUTCOME_SHADOW_JUDGE_ID,
 };
 
 interface StoredScores {
