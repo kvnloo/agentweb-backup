@@ -1,5 +1,5 @@
 import { supersession } from './agentMode/modelSupersession';
-import { LLM_MODEL_REGISTRY } from './agentMode/llmModelRegistry';
+import { LLM_MODEL_REGISTRY, type LLMModelConfig } from './agentMode/llmModelRegistry';
 import { IMAGE_MODEL_IDS } from './imageModelRegistry';
 
 export const MODEL_ROLES = ['chat', 'enrichment', 'image', 'embedding', 'scoring_judge', 'content_generation', 'research', 'voice'] as const;
@@ -12,16 +12,31 @@ const successors = supersession(Object.entries(LLM_MODEL_REGISTRY)
   .filter(([, m]) => !m.isLive && !m.adminOnly && !m.internalOnly)
   .map(([id, m]) => ({ id, ...m })));
 
+// Whether a text/live model can run the role at all. The picker additionally hides
+// superseded and legacy models, which only steers new selections.
+function llmCanRunRole(m: Readonly<LLMModelConfig>, role: ModelRole): boolean {
+  return !m.adminOnly && !m.internalOnly &&
+    (role === 'voice' ? m.isLive === true : !m.isLive) &&
+    (role !== 'chat' && role !== 'research' || m.supportsTools !== false);
+}
+
 export function getRoleModelOptions(role: ModelRole): string[] {
   if (role === 'image') return IMAGE_MODEL_IDS.filter(id => !id.endsWith('-preview') || id === 'gemini-3-pro-image-preview');
   // Same dimensions alone do NOT make two embedding spaces compatible. Only the
   // existing OpenRouter model is selectable until a separate reindex migration exists.
   if (role === 'embedding') return ['openai/text-embedding-3-large'];
   return Object.entries(LLM_MODEL_REGISTRY).filter(([id, m]) =>
-    !successors.has(id) && !m.legacy && !m.adminOnly && !m.internalOnly &&
-    (role === 'voice' ? m.isLive === true : !m.isLive) &&
-    (role !== 'chat' && role !== 'research' || m.supportsTools !== false),
+    !successors.has(id) && !m.legacy && llmCanRunRole(m, role),
   ).map(([id]) => id);
+}
+
+// A persisted admin default is honoured even when the picker hides it (a legacy
+// model, or the image preview alias), as long as the role can still run it.
+function canRunPersistedDefault(role: ModelRole, id: string): boolean {
+  if (role === 'image') return (IMAGE_MODEL_IDS as readonly string[]).includes(id);
+  if (role === 'embedding') return false; // Only the compatible space in getRoleModelOptions.
+  // Own keys only: a setting value such as "constructor" must not match Object.prototype.
+  return Object.prototype.hasOwnProperty.call(LLM_MODEL_REGISTRY, id) && llmCanRunRole(LLM_MODEL_REGISTRY[id], role);
 }
 
 export function modelCapabilities(id: string): ModelCapability[] {
@@ -55,7 +70,7 @@ export async function getRoleDefault(role: ModelRole): Promise<string> {
     } catch { console.warn(`[modelRoles] Default lookup unavailable for ${role}; using registry default`); }
   }
   const options = getRoleModelOptions(role);
-  if (options.includes(candidate)) return candidate;
+  if (options.includes(candidate) || canRunPersistedDefault(role, candidate)) return candidate;
   if (options.includes(FALLBACKS[role])) return FALLBACKS[role];
   throw new Error(`No usable default for model role ${role}`);
 }
