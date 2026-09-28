@@ -158,7 +158,18 @@ const refreshLocks = new Map<string, Promise<{ access_token: string; token_expir
  */
 function isRevokedRefreshTokenError(err: unknown): boolean {
   const status = Number((err as any)?.response?.status);
-  return status === 400 || status === 401;
+  // 401 is unambiguous: the grant is not accepted.
+  if (status === 401) return true;
+  // 400 is NOT. HubSpot's token endpoint answers 400 for client-side failures generally —
+  // a wrong client_id/secret, a malformed body, an unsupported grant_type — and only
+  // sometimes for a dead refresh token. Flagging on the status alone means one rotated
+  // clientSecret in getHubSpotConfig() marks EVERY HubSpot account in the fleet dead in a
+  // single sweep, stopping their syncs and telling each customer to reconnect. So a 400
+  // must say so in the body: HubSpot returns { status: 'BAD_REFRESH_TOKEN', ... }.
+  if (status !== 400) return false;
+  const data = (err as any)?.response?.data;
+  const marker = typeof data === 'string' ? data : JSON.stringify(data ?? '');
+  return /BAD_REFRESH_TOKEN|invalid_grant/i.test(marker);
 }
 
 /**
@@ -179,6 +190,15 @@ async function markHubSpotNeedsReconnect(userId: string, accountId: string): Pro
     await updateAccountConfig(userId, 'hubspot', accountId, { needs_reconnect: true });
   } catch (e) {
     console.error(`[HubSpotService] Failed to mark account ${accountId} needs_reconnect:`, e);
+  }
+}
+
+/** Best-effort inverse of markHubSpotNeedsReconnect — see the call site for why it exists. */
+async function clearHubSpotNeedsReconnect(userId: string, accountId: string): Promise<void> {
+  try {
+    await updateAccountConfig(userId, 'hubspot', accountId, { needs_reconnect: false });
+  } catch (e) {
+    console.error(`[HubSpotService] Failed to clear account ${accountId} needs_reconnect:`, e);
   }
 }
 
@@ -260,11 +280,15 @@ export class HubSpotService {
     const expiresAt: number = config.token_expires_at || 0;
     const portalId: string | undefined = config.hub_id !== undefined ? String(config.hub_id) : account.account_id;
 
-    // Known-dead grant: fail with the reconnect instruction rather than spending a
-    // round-trip to be told the same thing. Cleared when hubspotAuth stores a new grant.
-    if (config.needs_reconnect) {
-      throw new Error(RECONNECT_MESSAGE);
-    }
+    // NOTE: a `needs_reconnect` account is deliberately NOT short-circuited here.
+    //
+    // An earlier version fast-failed to save a round-trip. That made the flag a one-way
+    // door: create() returned before any refresh could run, so the only way out was a
+    // manual re-OAuth — and a single false positive (see isRevokedRefreshTokenError)
+    // bricked a working integration permanently. twitterService's forceRefresh clears its
+    // flag on a successful refresh for the same reason. Letting the refresh attempt
+    // proceed costs one API call on a genuinely dead grant and lets a recovered one heal
+    // itself on the next use.
 
     if (expiresAt - Date.now() > TOKEN_REFRESH_BUFFER_MS) {
       return new HubSpotService(config.access_token, userId, account.account_id, expiresAt, portalId);
@@ -365,6 +389,11 @@ export class HubSpotService {
         refresh_token: refresh_token ?? refreshToken,
         token_expires_at,
       }, accountId);
+
+      // The grant works. Clear any stale `needs_reconnect` so the account stops reporting
+      // "Reconnect required" the moment it recovers — whether it was flagged by a genuine
+      // revocation that the user has since re-authorised, or by a false positive.
+      await clearHubSpotNeedsReconnect(userId, accountId);
 
       return { access_token, token_expires_at };
     })().finally(() => refreshLocks.delete(lockKey));

@@ -274,6 +274,36 @@ describe('HubSpot OAuth Routes', () => {
       );
     });
 
+    /*
+     * The un-bricking half of the revoked-token work.
+     *
+     * hubspotService stamps `needs_reconnect: true` when HubSpot rejects a refresh, and
+     * GET /connected-accounts then reports the row as "Reconnect required". THIS route is
+     * the reconnect. If it does not clear the flag, a freshly re-authorised account keeps
+     * rendering as broken and the user has no way out at all — the flag becomes a one-way
+     * door. Without this test, inverting the clear to `true` passes the whole suite.
+     */
+    it('clears needs_reconnect so a re-authorised account stops reporting Reconnect required', async () => {
+      const tokenSessionId = await setupSession('crm');
+
+      const res = await request(app)
+        .post('/api/oauth/hubspot/connect')
+        .send({ tokenSessionId });
+
+      expect(res.status).toBe(200);
+      expect(mockCreateAccount).toHaveBeenCalledWith(
+        'user-123',
+        'hubspot',
+        expect.objectContaining({
+          config: expect.objectContaining({ needs_reconnect: false }),
+        })
+      );
+      // Explicit: the stored value must be false, not merely absent — connectedAccounts
+      // reads the key directly, and `undefined` would work today only by accident.
+      const stored = mockCreateAccount.mock.calls.at(-1)![2] as any;
+      expect(stored.config.needs_reconnect).toBe(false);
+    });
+
     it('stores hubspot_account_type=marketing in account config', async () => {
       const tokenSessionId = await setupSession('marketing');
 

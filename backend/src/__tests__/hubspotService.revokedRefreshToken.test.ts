@@ -65,9 +65,18 @@ const expiredAccount = (overrides: Record<string, unknown> = {}) => ({
   userId: 'user-1',
 });
 
-const httpError = (status: number) =>
+const BAD_REFRESH_BODY = { status: 'BAD_REFRESH_TOKEN' };
+
+/** No default for `data`: passing undefined must mean "no body", not "the default body". */
+const httpError = (status: number, data: unknown) =>
   Object.assign(new Error(`Request failed with status code ${status}`), {
-    response: { status, data: { status: 'BAD_REFRESH_TOKEN' } },
+    response: { status, data },
+  });
+
+/** A response object with no `data` key at all, which is not the same as data: undefined. */
+const httpErrorNoBody = (status: number) =>
+  Object.assign(new Error(`Request failed with status code ${status}`), {
+    response: { status },
   });
 
 beforeEach(() => {
@@ -79,7 +88,7 @@ beforeEach(() => {
 describe('HubSpot refresh-token revocation', () => {
   it('flags needs_reconnect when HubSpot rejects the refresh token with 400', async () => {
     mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
-    mockAxiosPost.mockRejectedValue(httpError(400));
+    mockAxiosPost.mockRejectedValue(httpError(400, BAD_REFRESH_BODY));
 
     await expect(HubSpotService.create('user-1')).rejects.toThrow(/needs to be reconnected/i);
 
@@ -93,7 +102,7 @@ describe('HubSpot refresh-token revocation', () => {
 
   it('flags needs_reconnect on a 401 from the token endpoint', async () => {
     mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
-    mockAxiosPost.mockRejectedValue(httpError(401));
+    mockAxiosPost.mockRejectedValue(httpError(401, BAD_REFRESH_BODY));
 
     await expect(HubSpotService.create('user-1')).rejects.toThrow(/needs to be reconnected/i);
     expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
@@ -107,8 +116,8 @@ describe('HubSpot refresh-token revocation', () => {
   // The asymmetry that matters: persisting "dead" on a blip would break a live
   // integration and email a customer that it is broken. 5xx / network must not flag.
   it.each([
-    ['a 500 from HubSpot', httpError(500)],
-    ['a 503 from HubSpot', httpError(503)],
+    ['a 500 from HubSpot', httpError(500, BAD_REFRESH_BODY)],
+    ['a 503 from HubSpot', httpError(503, BAD_REFRESH_BODY)],
     ['a network error with no response', new Error('ECONNRESET')],
   ])('does NOT flag needs_reconnect on %s', async (_label, err) => {
     mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
@@ -120,18 +129,9 @@ describe('HubSpot refresh-token revocation', () => {
 
   it('rethrows the original transient error rather than the reconnect message', async () => {
     mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
-    mockAxiosPost.mockRejectedValue(httpError(503));
+    mockAxiosPost.mockRejectedValue(httpError(503, BAD_REFRESH_BODY));
 
     await expect(HubSpotService.create('user-1')).rejects.toThrow(/status code 503/);
-  });
-
-  it('fails fast on an already-flagged account without calling HubSpot', async () => {
-    mockGetAccountsByUserId.mockResolvedValue([
-      expiredAccount({ needs_reconnect: true }),
-    ] as never);
-
-    await expect(HubSpotService.create('user-1')).rejects.toThrow(/needs to be reconnected/i);
-    expect(mockAxiosPost).not.toHaveBeenCalled();
   });
 
   it('refreshes normally and flags nothing when HubSpot accepts the refresh token', async () => {
@@ -141,7 +141,11 @@ describe('HubSpot refresh-token revocation', () => {
     });
 
     await expect(HubSpotService.create('user-1')).resolves.toBeInstanceOf(HubSpotService);
-    expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+    // A successful refresh clears the flag rather than leaving it untouched, so a grant
+    // that recovers stops reporting "Reconnect required" on its next use. What must NOT
+    // happen is it being SET.
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalledWith(
+      'user-1', 'hubspot', '245815183', { needs_reconnect: true });
     expect(mockUpdateAccountTokens).toHaveBeenCalledWith(
       'user-1',
       'hubspot',
@@ -158,5 +162,102 @@ describe('HubSpot refresh-token revocation', () => {
     await expect(HubSpotService.create('user-1')).resolves.toBeInstanceOf(HubSpotService);
     expect(mockAxiosPost).not.toHaveBeenCalled();
     expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+  });
+});
+
+/*
+ * A 400 alone must NOT condemn the grant.
+ *
+ * HubSpot's token endpoint answers 400 for client-side failures generally — a wrong
+ * client_id/secret, a malformed body, an unsupported grant_type — not only for a dead
+ * refresh token. The first version of this code flagged on the status alone, which meant
+ * one rotated clientSecret in getHubSpotConfig() would mark EVERY HubSpot account in the
+ * fleet dead in a single sweep: syncs stopped (externalCrmSyncService), scheduled runs
+ * withheld (scheduledRunAccountGate), and every customer told to reconnect a working
+ * integration. These cases pin the body check that prevents it.
+ */
+describe('a 400 only counts when the body says the refresh token is bad', () => {
+  it.each([
+    ['a bad client secret', { status: 'BAD_CLIENT_CREDENTIALS', message: 'authentication credentials not valid' }],
+    ['a malformed request', { status: 'BAD_REQUEST', message: 'missing grant_type' }],
+    ['a null body', null],
+    ['an unrelated string body', 'Bad Request'],
+  ])('does NOT flag needs_reconnect on a 400 from %s', async (_label, body) => {
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
+    mockAxiosPost.mockRejectedValue(httpError(400, body));
+
+    await expect(HubSpotService.create('user-1')).rejects.toThrow();
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['BAD_REFRESH_TOKEN', { status: 'BAD_REFRESH_TOKEN' }],
+    ['invalid_grant', { error: 'invalid_grant', error_description: 'refresh token expired' }],
+  ])('DOES flag on a 400 carrying %s', async (_label, body) => {
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
+    mockAxiosPost.mockRejectedValue(httpError(400, body));
+
+    await expect(HubSpotService.create('user-1')).rejects.toThrow(/needs to be reconnected/i);
+    expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+      'user-1', 'hubspot', '245815183', { needs_reconnect: true });
+  });
+
+  it('does NOT flag on a 400 whose response carries no body at all', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
+    mockAxiosPost.mockRejectedValue(httpErrorNoBody(400));
+
+    await expect(HubSpotService.create('user-1')).rejects.toThrow();
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+  });
+
+  // Statuses either side of the 400/401 pair, so the boundary itself is pinned.
+  it.each([[403], [404], [429]])('does NOT flag on a %i', async (status) => {
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
+    mockAxiosPost.mockRejectedValue(httpError(status, BAD_REFRESH_BODY));
+
+    await expect(HubSpotService.create('user-1')).rejects.toThrow();
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+  });
+});
+
+/*
+ * The flag must be an open door, not a one-way one.
+ *
+ * An earlier version short-circuited create() on needs_reconnect, so no refresh could ever
+ * run and only a manual re-OAuth cleared it — meaning a single false positive bricked a
+ * working integration for good. twitterService clears its flag on a successful refresh for
+ * exactly this reason.
+ */
+describe('a flagged account heals itself when the grant works again', () => {
+  it('still attempts the refresh instead of short-circuiting', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount({ needs_reconnect: true })] as never);
+    mockAxiosPost.mockResolvedValue({
+      data: { access_token: 'fresh', refresh_token: 'rotated', expires_in: 1800 },
+    });
+
+    await expect(HubSpotService.create('user-1')).resolves.toBeInstanceOf(HubSpotService);
+    expect(mockAxiosPost).toHaveBeenCalled();
+  });
+
+  it('clears needs_reconnect once the refresh succeeds', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount({ needs_reconnect: true })] as never);
+    mockAxiosPost.mockResolvedValue({
+      data: { access_token: 'fresh', refresh_token: 'rotated', expires_in: 1800 },
+    });
+
+    await HubSpotService.create('user-1');
+    expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+      'user-1', 'hubspot', '245815183', { needs_reconnect: false });
+  });
+
+  it('leaves it flagged when the grant is still genuinely dead', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount({ needs_reconnect: true })] as never);
+    mockAxiosPost.mockRejectedValue(httpError(400, { status: 'BAD_REFRESH_TOKEN' }));
+
+    await expect(HubSpotService.create('user-1')).rejects.toThrow(/needs to be reconnected/i);
+    expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+      'user-1', 'hubspot', '245815183', { needs_reconnect: true });
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalledWith(
+      'user-1', 'hubspot', '245815183', { needs_reconnect: false });
   });
 });
