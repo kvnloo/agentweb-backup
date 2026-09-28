@@ -8,6 +8,7 @@ import {
   cohensKappa,
   pairwiseWinRate,
   perClassMetrics,
+  rocAuc,
   toGraderValidation,
   weightedKappa,
   wilsonInterval,
@@ -147,5 +148,25 @@ describe('pairwiseWinRate', () => {
     expect(r.ties).toBe(1);
     expect(r.decisiveCI).toEqual(wilsonInterval(2, 3));
     expect(pairwiseWinRate(['tie']).decisiveCI).toBeNull();
+  });
+});
+
+describe('rocAuc', () => {
+  it('is the share of positive/negative pairs ranked correctly, ties counting half', () => {
+    // Positives 5,4,3 vs negatives 4,2: pairs (5,4)(5,2)(4,4)(4,2)(3,4)(3,2) = 1+1+0.5+1+0+1 = 4.5 of 6.
+    expect(rocAuc(pairs([1, 1, 1, 0, 0], [5, 4, 3, 4, 2]))).toBeCloseTo(0.75, 10);
+  });
+
+  it('is 1 for perfect separation, 0 for inverted, 0.5 for a constant score', () => {
+    expect(rocAuc(pairs([1, 1, 0, 0], [5, 4, 2, 1]))).toBe(1);
+    expect(rocAuc(pairs([1, 1, 0, 0], [1, 2, 4, 5]))).toBe(0);
+    expect(rocAuc(pairs([1, 0, 1, 0], [5, 5, 5, 5]))).toBe(0.5);
+  });
+
+  it('returns 0.5 when a class is missing, so bootstrap resamples stay finite', () => {
+    expect(rocAuc(pairs([1, 1], [5, 3]))).toBe(0.5);
+    const ci = bootstrapCI(pairs([1, 1, 1, 0, 0], [5, 4, 3, 4, 2]), rocAuc, { iterations: 200, seed: 7 });
+    expect(Number.isFinite(ci.low) && Number.isFinite(ci.high)).toBe(true);
+    expect(ci.low).toBeLessThanOrEqual(ci.high);
   });
 });
