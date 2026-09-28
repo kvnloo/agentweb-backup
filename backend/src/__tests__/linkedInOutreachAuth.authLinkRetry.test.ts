@@ -36,6 +36,12 @@ function htmlGatewayError(contentType = 'text/html'): any {
   return error;
 }
 
+function blobError(contentType: string, text: string): any {
+  const error: any = new Error('');
+  error.body = new Blob([text], { type: contentType });
+  return error;
+}
+
 function networkError(code: string): any {
   const error: any = new Error('fetch failed');
   error.code = code;
@@ -92,8 +98,45 @@ describe('GET /api/oauth/linkedin-outreach/init', () => {
     expect(createHostedAuthLink).toHaveBeenCalledTimes(1);
   });
 
-  it('does not retry a Blob body that is not HTML (e.g. a plain-text session error)', async () => {
-    const createHostedAuthLink = jest.fn().mockRejectedValue(htmlGatewayError('text/plain'));
+  it('does not retry a genuine plain-text API error that reads nothing like a gateway page', async () => {
+    const createHostedAuthLink = jest.fn().mockRejectedValue(
+      blobError('text/plain', 'Your session has expired. Please log in again.'),
+    );
+    (linkedInOutreachService.getClient as jest.Mock).mockResolvedValue({
+      account: { createHostedAuthLink },
+    });
+
+    const res = await request(app).get('/api/oauth/linkedin-outreach/init');
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe('Failed to initialize LinkedIn Outreach connection');
+    expect(createHostedAuthLink).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a gateway error page even when Content-Type is not text/html at all', async () => {
+    // Content-Type-based matching alone would miss this — the fallback reads the body
+    // text itself and recognizes gateway-page language regardless of how the response
+    // was labeled, so a future change in Unipile's declared Content-Type (not just a
+    // charset suffix on the known one) doesn't quietly defeat the retry.
+    jest.spyOn(global, 'setTimeout').mockImplementation((fn: any) => { fn(); return 0 as any; });
+    const createHostedAuthLink = jest.fn()
+      .mockRejectedValueOnce(blobError('text/plain', '503 Service Unavailable\nnginx'))
+      .mockResolvedValue({ url: 'https://unipile.example.com/auth/xyz' });
+    (linkedInOutreachService.getClient as jest.Mock).mockResolvedValue({
+      account: { createHostedAuthLink },
+    });
+
+    const res = await request(app).get('/api/oauth/linkedin-outreach/init');
+
+    expect(res.status).toBe(200);
+    expect(createHostedAuthLink).toHaveBeenCalledTimes(2);
+    jest.restoreAllMocks();
+  }, 10000);
+
+  it('does not retry a JSON-typed Blob body even if it happens to be unreadable/odd', async () => {
+    const createHostedAuthLink = jest.fn().mockRejectedValue(
+      blobError('application/json', '{"code":"invalid_request","message":"bad params"}'),
+    );
     (linkedInOutreachService.getClient as jest.Mock).mockResolvedValue({
       account: { createHostedAuthLink },
     });

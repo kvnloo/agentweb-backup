@@ -11,21 +11,35 @@ const router = express.Router();
  *
  * Unipile's SDK (RequestSender.send) throws UnsuccessfulRequestError(body) with NO status
  * code attached at all — only `.body`. A genuine 4xx/validation error from Unipile's own
- * API always comes back as parsed JSON; an HTML page only ever means their nginx/gateway
- * itself is down (a 502/503/504 error page), never a problem with our request. That HTML
- * body — surfaced as a Blob with type text/html — is the one reliable transient signal
- * available here. Confirmed against prod logs twice (ENG-2175, ENG-2180): both incidents
- * were exactly this Blob/text-html shape.
+ * API always comes back as parsed JSON (see LinkedInOutreachService.handleError); a
+ * gateway failure (their nginx/proxy in front of the real API, e.g. a 502/503/504) never
+ * does, since the request never reached the API at all.
+ *
+ * Deliberately content-based, not Content-Type-based, beyond the one shape actually
+ * observed in prod. Pinning this to a single exact Content-Type already broke once — a
+ * charset-suffixed "text/html; charset=utf-8" bypassed a naive strict-equality check — so
+ * for anything that isn't that known shape AND isn't Unipile's own JSON error format, we
+ * read the body text itself and look for gateway-page language. That keeps working even
+ * if Unipile's gateway changes how it labels error pages, or omits a Content-Type
+ * entirely, as long as the page text still reads like a gateway error (every popular
+ * reverse proxy's default error page does: "Bad Gateway", "nginx", a 50[234] code, etc).
+ * Confirmed against real prod incidents twice (ENG-2175, ENG-2180): both were the known
+ * text/html shape, so that case stays a fast path with no body read needed.
  */
-function isTransientUnipileError(error: any): boolean {
+async function isTransientUnipileError(error: any): Promise<boolean> {
   if (typeof Blob !== 'undefined' && error?.body instanceof Blob) {
-    // Blob.type carries the raw Content-Type header verbatim, including any
-    // "; charset=..." parameter (verified against Node's native fetch) — compare
-    // on the MIME essence only, or a gateway page served as
-    // "text/html; charset=utf-8" (a common nginx default) silently bypasses this
-    // check and falls back to the old single-attempt, generic-error behavior.
-    const mimeEssence = error.body.type.split(';')[0].trim().toLowerCase();
+    const mimeEssence = (error.body.type || '').split(';')[0].trim().toLowerCase();
     if (mimeEssence === 'text/html') return true;
+    if (mimeEssence !== 'application/json') {
+      try {
+        const text = (await error.body.text()).toLowerCase();
+        if (/bad gateway|gateway time-?out|service unavailable|\b50[234]\b|\bnginx\b|\bcloudflare\b/.test(text)) {
+          return true;
+        }
+      } catch {
+        // Body unreadable — can't prove this is transient; fall through to network-error checks.
+      }
+    }
   }
   const code = error?.code || error?.cause?.code;
   return code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'ECONNREFUSED' || code === 'EAI_AGAIN';
@@ -44,7 +58,7 @@ async function createHostedAuthLinkWithRetry<T>(fn: () => Promise<T>, maxRetries
     try {
       return await fn();
     } catch (error: any) {
-      if (!isTransientUnipileError(error)) throw error;
+      if (!(await isTransientUnipileError(error))) throw error;
       console.warn(`[LinkedIn Outreach] Transient error generating auth link (attempt ${attempt}/${maxRetries}), retrying:`, error?.message || error);
       await new Promise((resolve) => setTimeout(resolve, delayMs * attempt));
     }
@@ -52,8 +66,8 @@ async function createHostedAuthLinkWithRetry<T>(fn: () => Promise<T>, maxRetries
   return fn(); // last attempt — let any error propagate naturally
 }
 
-function authLinkErrorMessage(error: any, fallback: string): string {
-  return isTransientUnipileError(error)
+async function authLinkErrorMessage(error: any, fallback: string): Promise<string> {
+  return (await isTransientUnipileError(error))
     ? "LinkedIn's connection provider is temporarily unavailable. Please try again in a few minutes."
     : fallback;
 }
@@ -94,7 +108,7 @@ router.get('/init', authenticateToken, async (req: any, res: any) => {
   } catch (error: any) {
     console.error('[LinkedIn Outreach] Error generating auth link:', error);
     res.status(500).json({
-      error: authLinkErrorMessage(error, 'Failed to initialize LinkedIn Outreach connection'),
+      error: await authLinkErrorMessage(error, 'Failed to initialize LinkedIn Outreach connection'),
       details: error.message,
     });
   }
@@ -222,7 +236,7 @@ router.post('/reconnect', authenticateToken, async (req: any, res: any) => {
   } catch (error: any) {
     console.error('[LinkedIn Outreach] Error generating reconnect link:', error);
     res.status(500).json({
-      error: authLinkErrorMessage(error, 'Failed to generate reconnect link'),
+      error: await authLinkErrorMessage(error, 'Failed to generate reconnect link'),
       details: error.message,
     });
   }
