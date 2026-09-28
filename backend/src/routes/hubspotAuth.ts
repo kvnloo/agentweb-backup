@@ -213,6 +213,10 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
         hub_domain: hubInfo.hub_domain,
         hubspot_account_type: accountType,
         granted_scopes: grantedScopes,
+        // A prior grant may have been flagged dead. This IS the reconnect, so clear it
+        // explicitly — mirroring outlookAuth. Leaving it set would make a freshly
+        // authorised account render as "Reconnect required".
+        needs_reconnect: false,
       },
     });
 
