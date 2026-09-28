@@ -189,6 +189,19 @@ describe('Slack approval-inbox decision routing', () => {
     expect(mockResolve).toHaveBeenCalledWith('decision-1', 'edit', 'matt', 'Use a shorter headline.');
   });
 
+  it('review fix: a failed claim (already resolved/expired) surfaces a real error in the modal, not a silent clear', async () => {
+    mockResolve.mockResolvedValue({ claimed: false, reason: 'already_resolved' });
+
+    const response = await request(app)
+      .post('/api/slack/interactions')
+      .type('form')
+      .send({ payload: JSON.stringify(viewSubmissionPayload('reject', 'too late')) });
+
+    expect(response.status).toBe(200);
+    expect(response.body.response_action).toBe('errors');
+    expect(response.body.errors.decision_free_text_input).toContain('already_resolved');
+  });
+
   it('an unauthorized user submitting the modal is silently ignored (clear, no claim)', async () => {
     mockIsAuthorized.mockResolvedValue(false);
 

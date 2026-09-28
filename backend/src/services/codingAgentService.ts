@@ -1,3 +1,4 @@
+import { OPENROUTER_PROVIDER_PREFERENCES } from './agentMode/openRouterRequestParams';
 /**
  * Coding Agent Service
  *
@@ -1666,7 +1667,7 @@ async function callOpenRouter(
   const request = {
     ...params,
     model: upstreamModel,
-    provider: { allow_fallbacks: true, require_parameters: true },
+    provider: { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true },
     plugins: [{ id: 'context-compression' }],
     ...(upstreamModel !== managedFallback ? { fallbacks: [{ model: managedFallback }] } : {}),
     ...(sessionId.length <= 256 ? { session_id: sessionId } : {}),

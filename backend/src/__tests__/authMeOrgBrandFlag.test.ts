@@ -144,6 +144,10 @@ describe('GET /api/auth/me — hasBrandGuidelines on an un-copied org', () => {
     mockedOrgDb.getOrgById.mockResolvedValue({
       ...unCopiedOrg,
       brandGuidelines: { brandData: { brandName: 'Acme Org' } },
+      // /me resolves designSystem org-first the same way (designSystemStatusService),
+      // so it also needs to be populated here or its own owner-fallback read fires —
+      // a second, different-field call this test isn't about.
+      designSystem: { status: 'ready' },
     } as any);
 
     const res = await callAs(MEMBER_ID).expect(200);

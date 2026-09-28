@@ -32,7 +32,10 @@ const formatLeadName = (lead: any) => {
   const firstName = typeof lead.firstName === 'string' ? lead.firstName.trim() : '';
   const lastName = typeof lead.lastName === 'string' ? lead.lastName.trim() : '';
   const fullName = [firstName, lastName].filter(Boolean).join(' ');
-  return fullName || lead.email || lead.leadId || 'Unknown lead';
+  // phone before leadId: a phone-only capture is a contactable human, and falling through
+  // to the leadId puts a database key in front of the owner as the prospect's name.
+  const phone = typeof lead.phone === 'string' ? lead.phone.trim() : '';
+  return fullName || lead.email || phone || lead.leadId || 'Unknown lead';
 };
 
 const buildEventDetails = (eventType: string, eventData: any) => {
@@ -54,9 +57,18 @@ const buildEventDetails = (eventType: string, eventData: any) => {
     if (eventData.company) details.push({ label: 'Company', value: String(eventData.company) });
     if (eventData.phone) details.push({ label: 'Phone', value: String(eventData.phone) });
     if (eventData.autoDraftStatus) {
+      // Anything that is not 'created' used to render "Failed", so changing the status
+      // value to 'skipped_no_email' upstream changed nothing the owner sees — a phone-only
+      // capture still mailed them a failure notice. "Nothing to draft" is not a failure;
+      // the autoSendStatus block below has had the right shape for this all along.
       const draftLabel = eventData.autoDraftStatus === 'created'
         ? 'Created'
-        : 'Failed';
+        : eventData.autoDraftStatus === 'skipped_no_email'
+          // The upstream reason is 'no_contact_channel' — neither an email NOR a LinkedIn
+          // profile. The internal message was corrected to match; this owner-facing label
+          // was not, so it named one of the two missing channels.
+          ? 'Skipped — lead has no email address or LinkedIn profile to draft for'
+          : 'Failed';
       details.push({ label: 'Auto Draft', value: draftLabel });
 
       if (eventData.autoSendStatus === 'sent') {
@@ -140,10 +152,14 @@ const sendAlertEmail = async ({
   ccEmails?: string[];
 }) => {
   const leadName = formatLeadName(lead);
-  const leadEmail = lead.email || 'Unknown email';
+  // Matches the sibling builder below, which already got this right: an absent address is
+  // not "Unknown email", it is nothing to show. Printing the placeholder also flipped
+  // showLeadEmail TRUE precisely when there was no email, so every phone-only lead was
+  // announced to its owner as `<leadId> (Unknown email)`.
+  const leadEmail = lead.email || '';
   const normalizedLeadName = String(leadName).trim().toLowerCase();
   const normalizedLeadEmail = String(leadEmail).trim().toLowerCase();
-  const showLeadEmail = normalizedLeadName !== normalizedLeadEmail;
+  const showLeadEmail = !!leadEmail && normalizedLeadName !== normalizedLeadEmail;
   const eventTime = createdAt ? new Date(createdAt).toLocaleString() : new Date().toLocaleString();
   const subject = `Lead list alert: ${eventType}`;
   const eventDetails = buildEventDetails(eventType, eventData);

@@ -1,6 +1,9 @@
 import { createHash } from 'crypto';
 import { humanEvalService, type HumanEvalAction, type HumanEvalCandidate, type HumanEvalReviewType } from './humanEvalService';
 import { settingsService } from './settingsService';
+import type { CreativeGateResult } from './creativeGates';
+import type { CreativeBrief } from './creativeRubricJudge';
+import { judgeHumanEvalCandidate } from './creativeRubricJudgeRuntime';
 
 export interface AutoHumanEvalInput {
   reviewType: HumanEvalReviewType;
@@ -19,6 +22,10 @@ export interface AutoHumanEvalInput {
    * stored fail-open as 'uncategorized'.
    */
   category?: string;
+  /** Advisory creative gate result from generation (ENG-2139); stored on the candidate. */
+  creativeGates?: CreativeGateResult;
+  /** What the generating flow knows about the creative's brief, for the rubric judge (ENG-2140). */
+  creativeBrief?: Omit<CreativeBrief, 'brand'>;
 }
 
 function dedupeSettingKey(sourceKey: string): string {
@@ -115,6 +122,7 @@ export async function enqueueAutoHumanEval(
       originalRequest: input.originalRequest,
       action: input.action,
       category: input.category,
+      creativeGates: input.creativeGates,
     });
 
     // Round-4 review finding: this sourceKey-marker write is housekeeping, not the actual
@@ -133,6 +141,19 @@ export async function enqueueAutoHumanEval(
       );
     } catch (markerErr: any) {
       console.warn('[auto-human-eval] sourceKey dedupe marker write failed after the candidate was already created (non-fatal):', markerErr?.message || markerErr);
+    }
+
+    // ENG-2140: advisory rubric judge on sampled ad creatives, only when enabled. Not awaited,
+    // and the hook never throws, so it cannot delay or fail the enqueue or the generation.
+    if (input.reviewType === 'creative_image') {
+      void judgeHumanEvalCandidate({
+        candidateId: candidate.candidateId,
+        userId: input.userId,
+        category: input.category,
+        artifactUrl: candidate.artifactUrl ?? input.artifactUrl,
+        creativeGates: input.creativeGates,
+        brief: input.creativeBrief,
+      }).catch(() => undefined);
     }
 
     return candidate;

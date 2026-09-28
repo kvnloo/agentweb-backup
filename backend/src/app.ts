@@ -86,6 +86,7 @@ import adminTrackingMonitorRoutes from "./routes/adminTrackingMonitor";
 import adminRenewalIntegrationHealthRoutes from "./routes/adminRenewalIntegrationHealth";
 import adminPromptTemplatesRoutes from "./routes/adminPromptTemplates";
 import adminScheduleTemplateRoutes from "./routes/adminScheduleTemplateRoutes";
+import adminGoldenSetRoutes from "./routes/adminGoldenSet";
 import supportRoutes from "./routes/support";
 import integrationsRoutes from "./routes/integrations";
 import featurebaseRoutes from "./routes/featurebase";
@@ -110,6 +111,7 @@ import l2DiagnoseRoutes from "./routes/l2Diagnose";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import orgRoutes from "./routes/org";
 import orgMemoryRoutes from "./routes/orgMemory";
+import orgModelRolesRoutes from './routes/orgModelRoles';
 import orgShareSettingsRoutes from "./routes/orgShareSettings";
 import orgMemberRemovalRoutes from "./routes/orgMemberRemoval";
 import testAccountsRoutes from "./routes/testAccounts";
@@ -131,6 +133,7 @@ import charactersRoutes from "./routes/characters";
 import contractorRoutes from "./routes/contractor";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
+import { authenticateAgentRunsSecretOrAdmin } from "./middleware/agentRunsAuth";
 
 
 import { setupMcpServer } from "./mcp/server/mcpServer";
@@ -362,6 +365,17 @@ app.use("/api/users", usersRoutes);
 app.use("/api/tasks", taskRoutes);
 app.use("/api/waitlist", waitlistRoutes);
 app.use("/api/schedules", scheduleRoutes);
+// D78: mounted AHEAD of the catch-all `/api/admin` router below (which applies a blanket
+// authenticateToken/isAdmin via router.use with no path filter, matching this path too) —
+// registration order matters in Express, so a later, more specific mount here would never
+// be reached; a request without a valid admin session would 401 out of the catch-all before
+// this gate's own secret-header check ever ran. Mounting first means this route's own gate
+// decides: a correct AW_AGENT_RUNS_SECRET header authenticates directly (narrowed to one
+// sessionId, limit<=3, never falling through to the catch-all below); no header falls
+// through to this gate's own authenticateToken/isAdmin call, identical to the old behavior,
+// and never reaches the catch-all a second time since this mount already terminates the
+// response either way. See middleware/agentRunsAuth.ts.
+app.use("/api/admin/agent-runs", authenticateAgentRunsSecretOrAdmin(agentRunsRoutes));
 app.use("/api/admin", adminRoutes);
 app.use("/api/admin", adminUsageRoutes);
 app.use("/api/admin", mcpUsageAdminRoutes);
@@ -448,7 +462,6 @@ app.use("/api/admin/lead-magnets", authenticateToken, isAdmin, leadMagnetAdminRo
 app.use("/api/admin/fathom-onboarding", authenticateToken, isAdmin, fathomOnboardingAdminRoutes);
 app.use("/api/admin/onboarding-loop", authenticateToken, isAdmin, onboardingLoopAdminRoutes);
 app.use("/api/admin/loops", authenticateToken, isAdmin, loopHealthRoutes);
-app.use("/api/admin/agent-runs", authenticateToken, isAdmin, agentRunsRoutes);
 app.use("/api/client-health", authenticateToken, isAdmin, clientHealthRoutes);
 // ENG-1551 — lead volume drought monitor. Same double-gate as client-health: middleware +
 // service-layer admin check.
@@ -464,6 +477,8 @@ app.use("/api/admin/tracking-monitor", authenticateToken, isAdmin, adminTracking
 app.use("/api/admin/renewal-integration-health", authenticateToken, isAdmin, adminRenewalIntegrationHealthRoutes);
 app.use("/api/admin/prompt-templates", authenticateToken, isAdmin, adminPromptTemplatesRoutes);
 app.use("/api/admin/schedule-templates", authenticateToken, isAdmin, adminScheduleTemplateRoutes);
+// ENG-2135: golden-set labelling (inert until EVAL_GOLDEN_CASES_TABLE is set by OPS-2).
+app.use("/api/admin/eval/golden-cases", authenticateToken, isAdmin, adminGoldenSetRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/integrations", integrationsRoutes);
 app.use("/api/featurebase", featurebaseRoutes);
@@ -521,6 +536,7 @@ app.use("/api/image-reports", imageReportsRoutes);
 app.use("/api/lead-magnet", leadMagnetRoutes);
 app.use("/api/org", orgRoutes);
 app.use("/api/org", orgMemoryRoutes);
+app.use("/api/orgs/me/model-roles", authenticateToken, orgModelRolesRoutes);
 app.use("/api/orgs/me/share-settings", authenticateToken, orgShareSettingsRoutes);
 app.use("/api/orgs/me/members", authenticateToken, orgMemberRemovalRoutes);
 app.use("/api/characters", charactersRoutes);

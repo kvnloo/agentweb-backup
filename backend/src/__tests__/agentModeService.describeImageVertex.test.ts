@@ -65,7 +65,7 @@ describe('describeImage — Vertex Claude (claude-*) image download', () => {
     );
     // The content block carries a base64 data URI, not the bare URL
     const [, messages] = callLLMSpy.mock.calls[0];
-    const imgBlock = (messages[0].content as any[]).find((c: any) => c.type === 'image_url');
+    const imgBlock = (messages[1].content as any[]).find((c: any) => c.type === 'image_url');
     expect(imgBlock.image_url.url).toMatch(/^data:image\/png;base64,/);
     expect(imgBlock.image_url.url).not.toBe('https://example.com/chart.png');
   });
@@ -81,7 +81,7 @@ describe('describeImage — Vertex Claude (claude-*) image download', () => {
     expect(result.success).toBe(true);
     expect(mockAxiosGet).not.toHaveBeenCalled();
     const [, messages] = callLLMSpy.mock.calls[0];
-    const imgBlock = (messages[0].content as any[]).find((c: any) => c.type === 'image_url');
+    const imgBlock = (messages[1].content as any[]).find((c: any) => c.type === 'image_url');
     expect(imgBlock.image_url.url).toBe(dataUri);
   });
 

@@ -14,6 +14,8 @@
  * `models` fallback, which receives the identical parameter set.
  */
 
+import providerPreferences from '../../config/openRouterProviderPreferences.json';
+
 /** The registry capability flags this decision reads (a subset of LLMModelConfig). */
 export interface OpenRouterParamCapabilities {
   supportsTemperature: boolean;
@@ -56,19 +58,14 @@ export function openRouterIgnoredProviders(upstreamModel: string): string[] {
   return upstreamModel.startsWith('google/gemini-') ? ['Google'] : [];
 }
 
-/**
- * Cloud-credit routing policy (Harsha, 2026-09-22): Anthropic drains AWS,
- * OpenAI drains Azure, everything else (Grok, open models) uses OpenRouter's
- * default routing. Returned as OpenRouter `provider.order`; callLLM keeps
- * `allow_fallbacks: true`, so if our BYOK cloud is down or not yet
- * provisioned for a model, the request still succeeds on another provider
- * rather than failing the customer's turn. Matches endpoint `provider_name`.
+/** Single gateway routing policy; provider credentials live only in OpenRouter BYOK.
+ * https://openrouter.ai/docs/guides/overview/auth/byok
+ * JSON is also loaded by agent-engine from the full repository checkout.
  */
-export function openRouterPreferredProviders(upstreamModel: string): string[] {
-  if (upstreamModel.startsWith('anthropic/')) return ['Amazon Bedrock'];
-  if (upstreamModel.startsWith('openai/')) return ['Azure'];
-  return [];
-}
+export const OPENROUTER_PROVIDER_PREFERENCES = Object.freeze({
+  order: Object.freeze(providerPreferences.order),
+  allow_fallbacks: providerPreferences.allow_fallbacks,
+});
 
 /**
  * Decide `tool_choice` and `temperature` for one OpenRouter request. A field is

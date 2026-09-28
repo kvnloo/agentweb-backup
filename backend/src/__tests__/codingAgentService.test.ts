@@ -1,3 +1,4 @@
+import { OPENROUTER_PROVIDER_PREFERENCES } from '../services/agentMode/openRouterRequestParams';
 import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, LANDING_PAGE_PREVIEW_BRANCH, _isMissingGithubRefError, _describeGithubError, _previewBranchCommitsAheadOfMain, _previewBranchDivergence, _setOpenRouterClientForTest, _setDeploymentSleepForTest, _rollbackEditedFiles } from '../services/codingAgentService';
 import { agentModeService } from '../services/agentModeService';
 import Anthropic from '@anthropic-ai/sdk';
@@ -1706,7 +1707,7 @@ describe('ENG-1451 — coding-agent OpenRouter gateway contract', () => {
     await runCodingAgent('change the heading', context);
 
     expect(gatewayCreate.mock.calls[0][0]).toEqual(expect.objectContaining({
-      provider: { allow_fallbacks: true, require_parameters: true },
+      provider: { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true },
       plugins: [{ id: 'context-compression' }],
       fallbacks: [{ model: 'deepseek/deepseek-v4-flash' }],
       session_id: context.sessionId,

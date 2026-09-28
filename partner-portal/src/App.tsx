@@ -37,6 +37,8 @@ import WorkPlans from './pages/WorkPlans';
 import ScheduleTemplates from './pages/ScheduleTemplates';
 import ClientHealth from './pages/ClientHealth';
 import AgentRunsInspector from './pages/AgentRunsInspector';
+import EvalLabelling from './pages/EvalLabelling';
+import CreativeCalibration from './pages/CreativeCalibration';
 import SandboxAccounts from './pages/SandboxAccounts';
 import PromptTemplates from './pages/PromptTemplates';
 import Api from './pages/Api';
@@ -153,6 +155,22 @@ export default function App() {
                       element={
                         <AdminRoute>
                           <ClientHealth />
+                        </AdminRoute>
+                      }
+                    />
+                    <Route
+                      path="eval-labelling"
+                      element={
+                        <AdminRoute>
+                          <EvalLabelling />
+                        </AdminRoute>
+                      }
+                    />
+                    <Route
+                      path="eval-labelling/calibration"
+                      element={
+                        <AdminRoute>
+                          <CreativeCalibration />
                         </AdminRoute>
                       }
                     />

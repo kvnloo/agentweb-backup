@@ -1,5 +1,6 @@
 import { HumanEvalCandidate, HumanEvalService, parseHumanEvalCategoryFilter } from '../services/humanEvalService';
 import { userDb } from '../services/db';
+import { evaluateCreativeGates } from '../services/creativeGates';
 
 function makeHarness() {
   const items = new Map<string, HumanEvalCandidate>();
@@ -132,6 +133,29 @@ describe('HumanEvalService', () => {
     );
     expect(settings.get('human_eval_thread_C_EVAL_1780000000.123456')).toBe(candidate.candidateId);
     expect(items.get(candidate.candidateId)?.artifactUrl).toBe('https://example.com/ad.png');
+  });
+
+  it('stores the advisory creative gate result on the candidate record (ENG-2139)', async () => {
+    const { service, items } = makeHarness();
+    const creativeGates = evaluateCreativeGates(
+      { bytes: 2048, decoded: true, width: 1024, height: 1024, format: 'png', luminanceStdDev: 1 },
+      { requestedSize: '1080x1920' },
+    );
+
+    const withGates = await service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: 'Image generated: story.png.',
+      artifactUrl: 'https://example.com/story.png',
+      creativeGates,
+    });
+    const withoutGates = await service.createCandidate({
+      reviewType: 'landing_page',
+      outputSummary: 'Landing page generated.',
+    });
+
+    expect(items.get(withGates.candidateId)?.creativeGates).toEqual(creativeGates);
+    expect(items.get(withGates.candidateId)?.creativeGates?.passed).toBe(false);
+    expect(items.get(withoutGates.candidateId)).not.toHaveProperty('creativeGates');
   });
 
   it('uses an interactive share link for associated Agent Mode chats', async () => {
@@ -1031,5 +1055,40 @@ describe('HumanEvalService', () => {
       expect(slack.postSlackMessage).not.toHaveBeenCalled();
       expect(candidate.slackChannel).toBeUndefined();
     });
+  });
+});
+
+describe('listCandidatesByReviewType (ENG-2142 calibration pool)', () => {
+  it('returns every candidate of the type across all scan pages, with no cap', async () => {
+    const item = (candidateId: string, reviewType: HumanEvalCandidate['reviewType']): HumanEvalCandidate => ({
+      candidateId,
+      reviewType,
+      reviewer: 'matt',
+      status: 'pending',
+      outputSummary: 'x',
+      feedback: [],
+      createdAt: '2026-09-15T00:00:00.000Z',
+      updatedAt: '2026-09-15T00:00:00.000Z',
+    });
+    const pages = [
+      Array.from({ length: 150 }, (_, i) => item(`img-${i}`, 'creative_image')),
+      [item('lp-1', 'landing_page'), ...Array.from({ length: 100 }, (_, i) => item(`img-b-${i}`, 'creative_image'))],
+    ];
+    const scan = jest.fn((params: { ExclusiveStartKey?: { page: number }; ExpressionAttributeValues?: Record<string, string> }) => ({
+      promise: async () => {
+        const page = params.ExclusiveStartKey?.page ?? 0;
+        const type = params.ExpressionAttributeValues?.[':reviewType'];
+        return {
+          Items: pages[page].filter((c) => c.reviewType === type),
+          ...(page + 1 < pages.length ? { LastEvaluatedKey: { page: page + 1 } } : {}),
+        };
+      },
+    }));
+    const service = new HumanEvalService({ put: jest.fn(), get: jest.fn(), update: jest.fn(), scan } as unknown as ConstructorParameters<typeof HumanEvalService>[0]);
+    const all = await service.listCandidatesByReviewType('creative_image');
+    expect(all).toHaveLength(250);
+    expect(all.every((c) => c.reviewType === 'creative_image')).toBe(true);
+    expect(scan).toHaveBeenCalledTimes(2);
+    expect(scan).toHaveBeenCalledWith(expect.objectContaining({ FilterExpression: 'reviewType = :reviewType' }));
   });
 });

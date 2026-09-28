@@ -2723,6 +2723,8 @@ const main = async () => {
     await createPromptSignalsTable();
     await createEvaluationsTable();
     await createAccountCapabilityRequirementsTable();
+    await createEvalGoldenCasesTable();
+    await createCreativesTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -3692,6 +3694,88 @@ const createEvaluationsTable = async () => {
     console.log(`Created ${params.TableName} table:`, result);
   } catch (error: any) {
     if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-2135 (ENG-2128 D2) — golden-set case ids + binary labels (loops/eval/goldenSetStore.ts).
+// The app reads the table name from EVAL_GOLDEN_CASES_TABLE, not from this prefix, so the store
+// stays inert until OPS-2 (ENG-2147) creates the table and sets the variable. SurfaceIndex lists
+// one surface's cases (labelling UI, validation runner) without a scan.
+const createEvalGoldenCasesTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-EvalGoldenCases`,
+    AttributeDefinitions: [
+      { AttributeName: 'caseId', AttributeType: 'S' },
+      { AttributeName: 'surface', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'caseId', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'SurfaceIndex',
+        KeySchema: [
+          { AttributeName: 'surface', KeyType: 'HASH' },
+          { AttributeName: 'caseId', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error) {
+    if ((error as AWS.AWSError).code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// ENG-2141 (ENG-2128 T9, decision D3) — creative lineage: one record per agent-mode generated
+// image, with the Meta ad creatives and ads it became (services/creativeLineage.ts). The app
+// reads the table name from CREATIVE_LINEAGE_TABLE and writes only when CREATIVE_LINEAGE_ENABLED
+// is true, so it stays inert until OPS-3 (ENG-2148) creates the table and sets both.
+// HASH creativeId = `cr_` + sha256(S3 key)[:32], so a later step holding the image URL resolves it
+// with a GetItem. userId-createdAt-index serves the publish-time lookups (image hash / Meta
+// creative id → this user's creatives) and a per-user listing without a scan.
+const createCreativesTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-Creatives`,
+    AttributeDefinitions: [
+      { AttributeName: 'creativeId', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'creativeId', KeyType: 'HASH' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'userId-createdAt-index',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error) {
+    if ((error as AWS.AWSError).code === 'ResourceInUseException') {
       console.log(`${params.TableName} table already exists`);
     } else {
       throw error;

@@ -1,0 +1,74 @@
+{
+  "_provenance": "ENG-2141. Meta Graph v25 GET act_<id>/insights?level=ad responses for one date, in the shape the API returns them (decimal strings, action lists as [{action_type, value}], cursor paging). All ids, names and values are synthetic; no customer data.",
+  "accountContext": { "currency": "USD", "timezone_name": "America/Los_Angeles" },
+  "pages": [
+    {
+      "data": [
+        {
+          "ad_id": "120200000000000011",
+          "ad_name": "Generated 4:5 - spring offer",
+          "adset_id": "120200000000000021",
+          "campaign_id": "120200000000000031",
+          "spend": "42.17",
+          "impressions": "3810",
+          "clicks": "61",
+          "ctr": "1.601050",
+          "cpm": "11.068241",
+          "frequency": "1.214286",
+          "actions": [
+            { "action_type": "link_click", "value": "58" },
+            { "action_type": "landing_page_view", "value": "40" },
+            { "action_type": "lead", "value": "3" },
+            { "action_type": "offsite_conversion.fb_pixel_lead", "value": "3" },
+            { "action_type": "onsite_web_lead", "value": "3" }
+          ],
+          "date_start": "2026-08-01",
+          "date_stop": "2026-08-01"
+        },
+        {
+          "ad_id": "120200000000000012",
+          "ad_name": "Generated 9:16 video",
+          "adset_id": "120200000000000021",
+          "campaign_id": "120200000000000031",
+          "spend": "18.40",
+          "impressions": "2204",
+          "clicks": "19",
+          "ctr": "0.862069",
+          "cpm": "8.348457",
+          "frequency": "1.101550",
+          "actions": [
+            { "action_type": "video_view", "value": "911" },
+            { "action_type": "link_click", "value": "17" }
+          ],
+          "video_p25_watched_actions": [{ "action_type": "video_view", "value": "640" }],
+          "video_thruplay_watched_actions": [{ "action_type": "video_view", "value": "212" }],
+          "date_start": "2026-08-01",
+          "date_stop": "2026-08-01"
+        }
+      ],
+      "paging": {
+        "cursors": { "before": "MAZDZD", "after": "MQZDZD" },
+        "next": "https://graph.facebook.com/v25.0/act_1000000000000001/insights?level=ad&after=MQZDZD"
+      }
+    },
+    {
+      "data": [
+        {
+          "ad_id": "120200000000000013",
+          "ad_name": "Existing stock photo",
+          "adset_id": "120200000000000022",
+          "campaign_id": "120200000000000032",
+          "spend": "0.91",
+          "impressions": "97",
+          "clicks": "0",
+          "ctr": "0",
+          "cpm": "9.381443",
+          "frequency": "1",
+          "date_start": "2026-08-01",
+          "date_stop": "2026-08-01"
+        }
+      ],
+      "paging": { "cursors": { "before": "MgZDZD", "after": "MgZDZD" } }
+    }
+  ]
+}

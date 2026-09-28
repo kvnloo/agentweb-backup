@@ -789,6 +789,25 @@ createTestAccount().then(async () => {
       }, 15 * 60 * 1000).unref();
       console.info('[AdsLearning] evaluation scheduled every 15 minutes');
 
+      // ENG-1644 gap-closing: sweep AW-ApprovalDecisions for decisions past
+      // expiresAt that nobody ever answered — flip to 'expired', notify the
+      // origin session. Hourly — decisions expire on a 1-30 day horizon
+      // (review fix: was "1-7 day", stale relative to emma/tools.ts's own
+      // MAX_EXPIRES_IN_DAYS=30 clamp added earlier in this same PR).
+      // Own try/catch (review fix) — an import failure here must not abort
+      // registration of every cron block after it in this boot sequence.
+      try {
+        const { runApprovalExpirySweep } = await import('./cron/approvalExpirySweepCron');
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('ApprovalExpirySweep', runApprovalExpirySweep())
+            .catch(e => console.error('[ApprovalExpirySweep] sweep failed:', e));
+        }, 60 * 60 * 1000).unref();
+        console.info('[ApprovalExpirySweep] sweep scheduled hourly');
+      } catch (error) {
+        console.error('[ApprovalExpirySweep] Failed to initialize:', error);
+      }
+
       // ENG-916: Meta Ads Metrics Snapshot — runs daily at 09:00 UTC (after
       // ActivationCron at 08:00), re-pulling the last 30 dates each run so the
       // final refresh occurs after reporting-day end plus 28 elapsed days.
@@ -1006,6 +1025,42 @@ createTestAccount().then(async () => {
         console.log('[renewalIntegrationHealthCron] Initialized — running daily');
       } catch (error) {
         console.error('[renewalIntegrationHealthCron] Failed to initialize:', error);
+      }
+
+      // Account-health classifier sweep (ENG-2143), the replacement for the renewal cron above:
+      // at-risk → deduped oncall, activation incomplete → CS nudge log. Off unless
+      // ACCOUNT_HEALTH_ALERTS_ENABLED=true (enabling it in prod is an OPS step).
+      if (process.env.ACCOUNT_HEALTH_ALERTS_ENABLED === 'true') try {
+        const { runAccountHealthClassifier } = await import('./cron/accountHealthClassifierCron');
+        const ACCOUNT_HEALTH_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        cronJobRegistry.track('accountHealthClassifierCron', runAccountHealthClassifier())
+          .catch(e => console.error('[accountHealthClassifierCron] Error on first run:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('accountHealthClassifierCron', runAccountHealthClassifier())
+            .catch(e => console.error('[accountHealthClassifierCron] Error:', e));
+        }, ACCOUNT_HEALTH_INTERVAL_MS);
+        console.log('[accountHealthClassifierCron] Initialized — running daily');
+      } catch (error) {
+        console.error('[accountHealthClassifierCron] Failed to initialize:', error);
+      }
+
+      // Weekly creative calibration batch (ENG-2142): ~20 creative pairs as pairwise golden cases
+      // and one Slack link. Checked daily; each ISO week's batch is written once across instances.
+      // Off unless CREATIVE_CALIBRATION_ENABLED=true (enabling it in prod is an OPS step).
+      if (process.env.CREATIVE_CALIBRATION_ENABLED === 'true') try {
+        const { runCreativeCalibration } = await import('./cron/creativeCalibrationCron');
+        const CREATIVE_CALIBRATION_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        cronJobRegistry.track('creativeCalibrationCron', runCreativeCalibration())
+          .catch(e => console.error('[creativeCalibrationCron] Error on first run:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('creativeCalibrationCron', runCreativeCalibration())
+            .catch(e => console.error('[creativeCalibrationCron] Error:', e));
+        }, CREATIVE_CALIBRATION_INTERVAL_MS);
+        console.log('[creativeCalibrationCron] Initialized — checking daily for the weekly batch');
+      } catch (error) {
+        console.error('[creativeCalibrationCron] Failed to initialize:', error);
       }
 
       // CRM Auto-Enrichment (ENG-88) — runs every 15 minutes.
@@ -1343,6 +1398,53 @@ createTestAccount().then(async () => {
         }
       } else {
         console.log('[AgentReliabilitySnapshot] Disabled (AGENT_RELIABILITY_SNAPSHOT_ENABLED=false)');
+      }
+
+      // Online eval sampler (ENG-2144) — daily at 17:15 UTC: a seeded uniform random sample of the
+      // previous day's completed sessions, graded by the deterministic ENG-2137 graders into
+      // Dev-AW-LoopEvents (loopId eval-v2), plus the eval-v2-daily snapshots. Off unless
+      // EVAL_V2_SAMPLER_ENABLED=true (enabling it in prod is OPS-7, ENG-2152); the run itself
+      // refuses to write without the flag. No grader is validated, so it raises no alert.
+      if (process.env.EVAL_V2_SAMPLER_ENABLED === 'true') {
+        try {
+          const EVAL_V2_INTERVAL_MS = 24 * 60 * 60 * 1000;
+          const { runEvalV2SamplerCron } = await import('./cron/evalV2SamplerCron');
+          const nowForEvalV2 = new Date();
+          const nextEvalV2Run = new Date(nowForEvalV2);
+          nextEvalV2Run.setUTCHours(17, 15, 0, 0);
+          if (nextEvalV2Run <= nowForEvalV2) {
+            nextEvalV2Run.setUTCDate(nextEvalV2Run.getUTCDate() + 1);
+          }
+          const msUntilEvalV2 = nextEvalV2Run.getTime() - nowForEvalV2.getTime();
+          console.log(
+            `[EvalV2Sampler] Initialized — first run at 17:15 UTC (in ${Math.round(msUntilEvalV2 / 60000)} min)`,
+          );
+          setTimeout(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('EvalV2Sampler', runEvalV2SamplerCron())
+              .catch(e => console.error('[EvalV2Sampler] Error:', e));
+            setInterval(() => {
+              if (!isCronEnabled()) return;
+              cronJobRegistry.track('EvalV2Sampler', runEvalV2SamplerCron())
+                .catch(e => console.error('[EvalV2Sampler] Error:', e));
+            }, EVAL_V2_INTERVAL_MS);
+          }, msUntilEvalV2);
+        } catch (error) {
+          console.error('[EvalV2Sampler] Failed to initialize:', error);
+        }
+      }
+
+      // Nightly failure replay (ENG-591 AC2, ENG-2145) — 04:30 UTC: the registered replay cases
+      // against current code; a regression is filed once through the ENG-240 intake. Off unless
+      // FAILURE_REPLAY_NIGHTLY_ENABLED=true.
+      try {
+        const { scheduleFailureReplayNightly } = await import('./cron/failureReplayNightlyCron');
+        scheduleFailureReplayNightly({
+          isCronEnabled,
+          track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
+        });
+      } catch (error) {
+        console.error('[FailureReplayNightly] Failed to initialize:', error);
       }
 
       // Weekly Engineering Scoreboard — read-only backend replacement for the

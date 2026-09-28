@@ -1,4 +1,6 @@
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
+import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassification';
+import { resolveModelForUser } from './modelRoles';
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
@@ -42,6 +44,10 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
+import {
+  buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
+  type CreativeImageReadback, type ImageSwapExpectation, type ImageSwapVerdict,
+} from './agentMode/metaImageSwapCheck';
 import { publishWithdrawnMidFlight, readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { isPublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
@@ -62,7 +68,7 @@ import {
 import {
   assertOpenRouterToolsSupported,
   openRouterIgnoredProviders,
-  openRouterPreferredProviders,
+  OPENROUTER_PROVIDER_PREFERENCES,
   selectOpenRouterSamplingParams,
 } from './agentMode/openRouterRequestParams';
 import {
@@ -72,7 +78,6 @@ import {
   type ModelTier,
 } from './agentMode/llmModelRegistry';
 import {
-  assertOpenRouterResponseHasChoices,
   isMalformedOpenRouterResponseError,
 } from './agentMode/openRouterResponseValidation';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice, buildAcceptanceFailureNotice, assetProducingToolsInPlay } from './agentMode/core/synthesisResidue';
@@ -165,8 +170,10 @@ import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { meterUserUsage } from './usageRecorderService';
-import { meterWithResolvedBilling } from './agentMode/deferredBillingMetering';
 import { meterUsageFromResponse } from '../utils/llmClients';
+import { pickTransport } from './funding/transport';
+import { currentRunFunding } from './funding/runFunding';
+import { recordLlmUsage } from './funding/recordLlmUsage';
 import {
   getModelPrice,
   costScoreFromPrice,
@@ -188,6 +195,7 @@ import {
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { publishWithResolvedBlogPublisher } from './blogPublishers';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
+import { recordGeneratedCreative, stampMetaAdCreated, stampMetaAdCreativeChanged, stampMetaCreativeCreated, stampMetaImageUpload, stampMetaPublish } from './creativeLineage';
 import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
@@ -238,7 +246,7 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -533,7 +541,7 @@ import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import type { LeadImportRowOutcome } from '../utils/leadSchema';
-import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution } from '../utils/leadSchema';
+import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor } from '../utils/leadSchema';
 
 type MetaApiResult = {
   success: boolean;
@@ -1025,69 +1033,7 @@ function pdfPageRender(pageData: any): Promise<string> {
 
 export type { ModelTier, ModelProvider } from './agentMode/llmModelRegistry';
 
-/**
- * Cost-score band boundaries backing the picker's tier buckets (Harsha's
- * exact thresholds, revised 2026-08-19 after reviewing the live numbers, and
- * re-cut 2026-09-05 (ENG-1784): "low should have everything 52 and below
- * (very low is fine as it is now), then medium should be 57-53, then pro
- * should be 63-58, frontier is everything above" — so Flagship/"frontier"
- * (≥64) holds Fable 5.1 and GPT-6 Astra (79), GPT-5.6 Sol (71) and Claude
- * Opus 5 (70) together, Pro (58–63) starts at Sonnet 5 / Terra / Kimi K3,
- * Medium (53–57) is Grok 4.6 / Qwen3.8 Max, Cheap (31–52) Luna / Haiku /
- * the Gemini Flash line, Very Cheap (≤30) unchanged) —
- * inclusive lower bound, ordered highest band first. costScore is 0-100 and
- * higher = more expensive (see costScoreFromPrice), so a model's tier is
- * simply whichever band its own cost score falls in. Tier IDs (ultra_premium/
- * ultra_cheap) are unchanged from earlier — only the numeric boundaries and
- * the frontend's DISPLAY labels moved ("Flagship"/"Very Cheap", see
- * modelTiers.ts TIER_LABELS); no backend API contract change.
- */
-export const TIER_COST_SCORE_BANDS: ReadonlyArray<{ tier: ModelTier; minCostScore: number }> = [
-  { tier: 'ultra_premium', minCostScore: 64 },
-  { tier: 'pro', minCostScore: 58 },
-  { tier: 'medium', minCostScore: 53 },
-  { tier: 'cheap', minCostScore: 31 },
-  { tier: 'ultra_cheap', minCostScore: 0 },
-];
-
-/** Derives a model's picker tier bucket from its cost score. */
-export function tierFromCostScore(costScore: number): ModelTier {
-  const band = TIER_COST_SCORE_BANDS.find((b) => costScore >= b.minCostScore);
-  // TIER_COST_SCORE_BANDS' last band has minCostScore: 0, which matches any
-  // costScore >= 0 — so `band` is only undefined for a negative/NaN input.
-  return band?.tier ?? 'ultra_cheap';
-}
-
-/**
- * Quality-score band boundaries backing the picker's quality tier grouping
- * (ENG-1789, 2026-09-06). Independent axis from TIER_COST_SCORE_BANDS above:
- * that one groups by costScore (what we charge), this one groups by
- * qualityScore (AA Intelligence Index v4.3.2, re-snapshotted 2026-09-22).
- * Harsha's directive: "fable + astra are flagship, opus + 5.6 sol are pro,
- * sonnet + 5.6 terra are mid, haiku + 5.6 luna are low." Re-solved against
- * the v4.3.2 scores (Fable 53, Astra 53, Opus 5 51, Sol 47, Terra 42,
- * Sonnet 5 38, Luna 38, Haiku 15), which run ~5-8 points below v4.2. One
- * conflict is unavoidable: Sonnet 5 and GPT-5.6 Luna now tie at 38, so ties
- * resolve to the higher band (Harsha, 2026-09-06) and Luna moves up to mid.
- * ultra_premium >=53, pro >=47, medium >=38, cheap >=15, ultra_cheap below.
- * Same ModelTier union and >= / highest-band-first shape as the cost bands.
- */
-export const QUALITY_SCORE_BANDS: ReadonlyArray<{ tier: ModelTier; minQualityScore: number }> = [
-  { tier: 'ultra_premium', minQualityScore: 53 },
-  { tier: 'pro', minQualityScore: 47 },
-  { tier: 'medium', minQualityScore: 38 },
-  { tier: 'cheap', minQualityScore: 15 },
-  { tier: 'ultra_cheap', minQualityScore: 0 },
-];
-
-/** Derives a model's quality-tier bucket from its qualityScore (independent of cost tier). */
-export function tierFromQualityScore(qualityScore: number): ModelTier {
-  const band = QUALITY_SCORE_BANDS.find((b) => qualityScore >= b.minQualityScore);
-  // Last band has minQualityScore: 0, matching any qualityScore >= 0 — so
-  // `band` is only undefined for a negative/NaN input.
-  return band?.tier ?? 'ultra_cheap';
-}
-
+export { TIER_COST_SCORE_BANDS, QUALITY_SCORE_BANDS, tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassification';
 export { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
 export type { DominanceCandidate } from './agentMode/modelSupersession';
 
@@ -2864,9 +2810,7 @@ export class AgentModeService {
       params.response_format = response_format;
     }
 
-    params.provider = { allow_fallbacks: true, require_parameters: true };
-    const preferredProviders = openRouterPreferredProviders(upstreamModel);
-    if (preferredProviders.length > 0) params.provider.order = preferredProviders;
+    params.provider = { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true };
     const ignoredProviders = openRouterIgnoredProviders(upstreamModel);
     if (ignoredProviders.length > 0) {
       // Stopgap for ENG-1702 (parent: ENG-753). Our BYOK Google credential is
@@ -3035,114 +2979,103 @@ export class AgentModeService {
     // win rather than a regression.
     const isScheduledLlmCall = taskClass === 'scheduled_background';
     const maxAttempts = isScheduledLlmCall ? 3 : 2;
-    let lastError: unknown;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        const res = await client.chat.completions.create(
-          params,
-          { timeout: timeoutMs ?? 5 * 60 * 1000, maxRetries: 0 },
-        );
-        // ENG-1681: see openRouterResponseValidation.ts — converts a response
-        // with no `choices` array into an explicit, retryable error before it
-        // ever reaches the unguarded `response.choices[0].message` downstream.
-        assertOpenRouterResponseHasChoices(res, model);
-        // ENG-1712: resolved provider slot + BYOK flag, log-only (no routing
-        // impact) -- lets a production incident/verification tie a specific
-        // call to the provider it actually landed on without reading
-        // credential material out-of-band.
-        const resolvedMetadata = normalizeOpenRouterResponseMetadata(res);
-        console.log(`AgentMode: OpenRouter call succeeded for model "${model}"`, {
-          provider: resolvedMetadata.provider,
-          is_byok: resolvedMetadata.is_byok,
-          ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
-        });
-        // Fire-and-forget usage metering; it must never break an LLM call.
-        try {
-          const usage: any = (res as any)?.usage;
-          if (usage) {
-            const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
-            meterWithResolvedBilling({
-              userId: usageContext?.userId,
-              billingUserId: usageContext?.billingUserId,
-              sessionId: usageContext?.sessionId,
-              model,
-              provider: providerLabel,
-              feature: usageContext?.feature || 'agent_task',
-              eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
-              inputTokens: normalizedUsage.inputTokens,
-              outputTokens: normalizedUsage.outputTokens,
-              cacheReadTokens: normalizedUsage.cacheReadTokens,
-              cacheWriteTokens: normalizedUsage.cacheWriteTokens,
-              cacheWriteByTtl: usage.cache_creation_by_ttl,
-              costUsdOverride:
-                usage.is_byok === true
-                  ? typeof usage.cost_details?.upstream_inference_cost === 'number' &&
-                    Number.isFinite(usage.cost_details.upstream_inference_cost) &&
-                    usage.cost_details.upstream_inference_cost > 0
-                    ? usage.cost_details.upstream_inference_cost
-                    : undefined
-                  : typeof usage.cost === 'number'
-                    ? usage.cost
-                    : undefined,
-            });
-          }
-        } catch {
-          // Metering must never break an LLM call.
-        }
-        // Keep default responses untouched; annotate only the effort actually sent.
-        return reasoningEffort !== undefined && res.usage
-          ? { ...res, usage: { ...res.usage, reasoning_effort: reasoningEffort } }
-          : res;
-      } catch (error) {
-        lastError = error;
-        // ENG-2185: a spend-limited OpenRouter key rejects a request whose
-        // WORST-CASE cost (input + requested max_tokens) exceeds its remaining
-        // balance, even though actual usage is normally far less (see
-        // AGENT_MODE_MAX_OUTPUT_TOKENS's own comment). The error names exactly
-        // how many tokens the balance affords, so retry with max_tokens capped
-        // to that instead of hard-failing to the generic fallback — this asks
-        // for no additional spend, it just stops over-asking against what's
-        // already there. Not gated on isRetryableLlmCallError: this is a
-        // deterministic correction, not a "hope it clears" retry, so it
-        // doesn't need that classifier — it's still bounded by the same
-        // maxAttempts as every other branch of this loop.
+    // ENG-1816 F1: send/validate/retry mechanics live in OpenRouterPlatformTransport
+    // now (relocated unchanged, not rewritten — see transport/openRouterPlatformTransport.ts).
+    // pickTransport always resolves this same transport today; A2 adds ApiKeyTransport.
+    const res = await pickTransport(currentRunFunding(), model).send(client, model, params, {
+      timeoutMs: timeoutMs ?? 5 * 60 * 1000,
+      maxAttempts,
+      isRetryableError: isRetryableLlmCallError,
+      // Bound to the instance method, not a transport-local timer: this is the seam
+      // agentModeService.openRouterClient.test.ts spies on to assert exact backoff
+      // values without actually waiting.
+      sleep: (ms) => this.sleep(ms),
+      computeBackoff: (error, attempt) => {
+        // Retry-After is only honored for scheduled calls (see maxAttempts comment
+        // above) — an interactive/other caller keeps the original fixed, short
+        // backoff so a live turn still fails fast rather than trusting a
+        // provider-reported wait that could be tens of seconds.
+        const retryAfterMs = isScheduledLlmCall ? getRetryAfterMs(error) : undefined;
+        return {
+          ms: retryAfterMs ?? 1500 * Math.pow(2, attempt - 1),
+          honoredRetryAfter: retryAfterMs !== undefined,
+        };
+      },
+      // ENG-2185: a spend-limited OpenRouter key rejects a request whose
+      // WORST-CASE cost (input + requested max_tokens) exceeds its remaining
+      // balance, even though actual usage is normally far less (see
+      // AGENT_MODE_MAX_OUTPUT_TOKENS's own comment). The error names exactly
+      // how many tokens the balance affords, so retry with max_tokens capped
+      // to that instead of hard-failing to the generic fallback — this asks
+      // for no additional spend, it just stops over-asking against what's
+      // already there.
+      adjustParamsForRetry: (error, retryParams) => {
         const affordableTokens = extractAffordableTokens(error);
-        if (affordableTokens !== null && (typeof params.max_tokens !== 'number' || affordableTokens < params.max_tokens)) {
-          // Small safety margin: the provider's affordable estimate is a
-          // snapshot at request time and can shift slightly if the account is
-          // being drawn down concurrently by other in-flight calls.
-          params.max_tokens = Math.max(1, affordableTokens - 100);
-          console.warn(`AgentMode: OpenRouter call for model "${model}" was rejected for insufficient credits; retrying with max_tokens reduced to ${params.max_tokens}`, {
-            error: error instanceof Error ? error.message : String(error),
-          });
-          continue;
-        }
-        if (attempt < maxAttempts && isRetryableLlmCallError(error)) {
-          // Retry-After is only honored for scheduled calls (see maxAttempts
-          // comment above) — an interactive/other caller keeps the original
-          // fixed, short backoff so a live turn still fails fast rather than
-          // trusting a provider-reported wait that could be tens of seconds.
-          const retryAfterMs = isScheduledLlmCall ? getRetryAfterMs(error) : undefined;
-          const backoffMs = retryAfterMs ?? 1500 * Math.pow(2, attempt - 1);
-          console.warn(`AgentMode: OpenRouter call failed with a transient error for model "${model}"; retrying (attempt ${attempt + 1}/${maxAttempts}) after ${backoffMs}ms${retryAfterMs !== undefined ? ' (honoring Retry-After)' : ''}`, {
-            error: error instanceof Error ? error.message : String(error),
-            // ENG-1712: OpenRouter surfaces the attempted provider/BYOK slot on
-            // some error shapes too (varies by failure type); include when present.
-            ...normalizeOpenRouterErrorMetadata(error),
-          });
-          await this.sleep(backoffMs);
-          continue;
-        }
-        break;
-      }
-    }
-    console.error(`AgentMode: OpenRouter call failed for model "${model}":`, {
-      error: lastError instanceof Error ? lastError.message : String(lastError),
-      stack: lastError instanceof Error ? lastError.stack : undefined,
-      // ENG-1712: same optional provider/BYOK metadata as the retry-warn path.
-      ...normalizeOpenRouterErrorMetadata(lastError),
+        if (affordableTokens === null) return false;
+        if (typeof retryParams.max_tokens === 'number' && affordableTokens >= retryParams.max_tokens) return false;
+        // Small safety margin: the provider's affordable estimate is a snapshot
+        // at request time and can shift slightly if the account is being drawn
+        // down concurrently by other in-flight calls.
+        retryParams.max_tokens = Math.max(1, affordableTokens - 100);
+        console.warn(`AgentMode: OpenRouter call for model "${model}" was rejected for insufficient credits; retrying with max_tokens reduced to ${retryParams.max_tokens}`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return true;
+      },
     });
-    throw lastError;
+
+    // ENG-1712: resolved provider slot + BYOK flag, log-only (no routing
+    // impact) -- lets a production incident/verification tie a specific
+    // call to the provider it actually landed on without reading
+    // credential material out-of-band.
+    const resolvedMetadata = normalizeOpenRouterResponseMetadata(res);
+    console.log(`AgentMode: OpenRouter call succeeded for model "${model}"`, {
+      provider: resolvedMetadata.provider,
+      is_byok: resolvedMetadata.is_byok,
+      ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+    });
+    // Fire-and-forget usage metering; it must never break an LLM call.
+    // ENG-1816 F1: routed through recordLlmUsage, which decides funding ABOVE this
+    // fire-and-forget funnel — see funding/recordLlmUsage.ts for why. Branch on
+    // RunFunding.route, never on usage.is_byok below: that flag also fires for
+    // AgentWeb's own OpenRouter BYOK credential (the Google slot, ENG-1702/753),
+    // indistinguishable on the wire from a customer's BYOK key.
+    try {
+      const usage: any = (res as any)?.usage;
+      if (usage) {
+        const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
+        recordLlmUsage(currentRunFunding(), {
+          userId: usageContext?.userId,
+          billingUserId: usageContext?.billingUserId,
+          sessionId: usageContext?.sessionId,
+          model,
+          provider: providerLabel,
+          feature: usageContext?.feature || 'agent_task',
+          eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
+          inputTokens: normalizedUsage.inputTokens,
+          outputTokens: normalizedUsage.outputTokens,
+          cacheReadTokens: normalizedUsage.cacheReadTokens,
+          cacheWriteTokens: normalizedUsage.cacheWriteTokens,
+          cacheWriteByTtl: usage.cache_creation_by_ttl,
+          costUsdOverride:
+            usage.is_byok === true
+              ? typeof usage.cost_details?.upstream_inference_cost === 'number' &&
+                Number.isFinite(usage.cost_details.upstream_inference_cost) &&
+                usage.cost_details.upstream_inference_cost > 0
+                ? usage.cost_details.upstream_inference_cost
+                : undefined
+              : typeof usage.cost === 'number'
+                ? usage.cost
+                : undefined,
+        }, 'agentModeService.callLLM');
+      }
+    } catch {
+      // Metering must never break an LLM call.
+    }
+    // Keep default responses untouched; annotate only the effort actually sent.
+    return reasoningEffort !== undefined && res.usage
+      ? { ...res, usage: { ...res.usage, reasoning_effort: reasoningEffort } }
+      : res;
   }
 
   /**
@@ -10116,6 +10049,23 @@ export class AgentModeService {
       // Create messages for vision API
       const messages = [
         {
+          role: 'system' as const,
+          // Describe only what is visibly on screen. A vision model has no way to
+          // confirm from a single image whether a depicted product, version number,
+          // or model name currently exists — its training data has a cutoff, and
+          // the subject may simply postdate it (this exact prompt has previously
+          // caused a real AgentWeb screenshot of AgentWeb's own model picker to be
+          // called a "fictional mockup" of models that "don't exist"). Authenticity/
+          // existence verdicts are a caller decision (verified via search or other
+          // tools), never this tool's to assert.
+          content:
+            'You describe images factually. Report only what is visibly present: text, layout, colors, objects, ' +
+            'and composition. Never assert or speculate about whether depicted content — a product, brand, ' +
+            'version number, model name, or claim — is real, fake, fictional, outdated, or currently exists. ' +
+            'You cannot verify that from an image alone, and confident guesses here are frequently wrong. If ' +
+            'something looks unfamiliar, describe it neutrally exactly as shown, without a verdict on its legitimacy.'
+        },
+        {
           role: 'user' as const,
           content: [
             {
@@ -13303,6 +13253,10 @@ export class AgentModeService {
         leads: matchingLeads.map((lead: any) => ({
           leadId: lead.leadId,
           email: lead.email || '',
+          // ENG-2082: a phone-only lead is contactable. Omitting the number here showed the
+          // model a row with NO contact channel at all, which reads as junk — and
+          // `email is_empty` in delete_leads_by_filter matches exactly these rows.
+          phone: lead.phone || '',
           firstName: lead.firstName || '',
           lastName: lead.lastName || '',
           company: lead.company || '',
@@ -13438,7 +13392,8 @@ export class AgentModeService {
   ): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
+      const { sanitizeEnrichmentMetadataForResponse, stripCardRevenueKeys, shouldHideCardRevenueForViewer } = await import('../utils/enrichmentMetadataPresentation');
+      const hideCardRevenueForCaller = shouldHideCardRevenueForViewer(userId);
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
 
       if ((!filters || filters.length === 0) && !options?.search?.trim()) {
@@ -13620,6 +13575,8 @@ export class AgentModeService {
             leadId: entry.lead.leadId,
             ...(isMultiList ? { listId: entry.listId, listName: entry.listName } : {}),
             email: entry.lead.email || '',
+            // ENG-2082: see get_leads — a phone-only lead has a contact channel; show it.
+            phone: entry.lead.phone || '',
             firstName: entry.lead.firstName || '',
             lastName: entry.lead.lastName || '',
             company: entry.lead.company || '',
@@ -13628,8 +13585,12 @@ export class AgentModeService {
             icpScore: entry.lead.icpMatch?.score || null,
             engagementCount: entry.lead.engagementCount || 0,
             isEngaged: entry.lead.isEngaged || false,
-            customFields: entry.lead.customFields || {},
-            ...(sanitizedEnrichmentMetadata ? { enrichmentMetadata: sanitizedEnrichmentMetadata } : {}),
+            customFields: hideCardRevenueForCaller
+              ? (stripCardRevenueKeys(entry.lead.customFields) ?? {})
+              : (entry.lead.customFields || {}),
+            ...(sanitizedEnrichmentMetadata
+              ? { enrichmentMetadata: hideCardRevenueForCaller ? stripCardRevenueKeys(sanitizedEnrichmentMetadata) : sanitizedEnrichmentMetadata }
+              : {}),
             // ENG-1175. This is the call both launch gates make to answer "did
             // the gclid survive to the stored row?" — Google Pre-Launch Gate
             // step 6.6 and the Meta gate's T11. Without these fields the gate
@@ -13692,7 +13653,7 @@ export class AgentModeService {
   public async getLeadDetails(listId: string, leadId: string, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
+      const { sanitizeEnrichmentMetadataForResponse, stripCardRevenueKeys, shouldHideCardRevenueForViewer } = await import('../utils/enrichmentMetadataPresentation');
 
       // Verify list ownership (org members can access lists owned by other org members)
       let list = await crmDb.getLeadListById(listId);
@@ -13737,6 +13698,10 @@ export class AgentModeService {
       const sanitizedEnrichmentMetadata = sanitizeEnrichmentMetadataForResponse(
         lead.enrichmentMetadata as Record<string, any> | undefined,
       );
+      // ENG-1388: this list may be org-shared, and canOrgMemberAccessList above
+      // has no Enigma-allowlist awareness — strip card revenue for a caller
+      // who isn't allowlisted, same boundary as the customer-portal REST path.
+      const hideCardRevenueForCaller = shouldHideCardRevenueForViewer(userId);
 
       // Check LinkedIn connection status from cache (non-blocking, swallows errors)
       let linkedInConnectionStatus: {
@@ -13815,8 +13780,12 @@ export class AgentModeService {
           notes: lead.notes || '',
           linkedin: lead.linkedin || '',
           linkedInConnectionStatus,
-          customFields: lead.customFields || {},
-          ...(sanitizedEnrichmentMetadata ? { enrichmentMetadata: sanitizedEnrichmentMetadata } : {}),
+          customFields: hideCardRevenueForCaller
+            ? (stripCardRevenueKeys(lead.customFields) ?? {})
+            : (lead.customFields || {}),
+          ...(sanitizedEnrichmentMetadata
+            ? { enrichmentMetadata: hideCardRevenueForCaller ? stripCardRevenueKeys(sanitizedEnrichmentMetadata) : sanitizedEnrichmentMetadata }
+            : {}),
           icpMatch: lead.icpMatch || null,
           isEngaged: lead.isEngaged || false,
           emailDraft: emailDraftPreview,
@@ -13972,6 +13941,8 @@ export class AgentModeService {
           matches.push({
             leadId: lead.leadId,
             email: lead.email || '',
+            // ENG-2082: see get_leads — a phone-only lead has a contact channel; show it.
+            phone: lead.phone || '',
             firstName: lead.firstName || '',
             lastName: lead.lastName || '',
             company: lead.company || '',
@@ -14357,7 +14328,13 @@ export class AgentModeService {
               matchCount++;
               if (sampleLeads.length < sampleLimit) {
                 sampleLeads.push({
+                  // ENG-2082: this is the preview for a DESTRUCTIVE op, and `email is_empty`
+                  // matches phone-only leads exactly. Without the number every sample row
+                  // rendered blank, so the operator confirmed a delete against rows that
+                  // looked like empty junk and were in fact contactable leads.
+                  leadId: lead.leadId,
                   email: lead.email || '',
+                  phone: lead.phone || '',
                   firstName: lead.firstName || '',
                   lastName: lead.lastName || '',
                   company: lead.company || ''
@@ -14569,20 +14546,12 @@ export class AgentModeService {
         return { success: false, message: 'Access denied', error: 'You do not have permission to view this list' };
       }
 
-      const defaultStatuses = [
-        { value: 'new', label: 'New', color: 'gray', type: 'active' },
-        { value: 'contacted', label: 'Contacted', color: 'blue', type: 'active' },
-        { value: 'qualified', label: 'Qualified', color: 'indigo', type: 'active' },
-        { value: 'proposal_sent', label: 'Proposal Sent', color: 'purple', type: 'active' },
-        { value: 'negotiating', label: 'Negotiating', color: 'yellow', type: 'active' },
-        { value: 'won', label: 'Won', color: 'green', type: 'won' },
-        { value: 'lost', label: 'Lost', color: 'red', type: 'lost' },
-        { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
-      ];
-
       return {
         success: true,
-        statuses: list.statusConfig || defaultStatuses,
+        // Was a second copy of createLeadList's literal. Shared now, so a list created
+        // before statusConfig was persisted reads back the same vocabulary a list created
+        // today stores — and it honours listType, which the local copy did not.
+        statuses: list.statusConfig || defaultStatusConfigFor((list as any)?.listType),
         listName: list.name,
       };
     } catch (error) {
@@ -15359,6 +15328,36 @@ export class AgentModeService {
         };
       }
 
+      // No contact channel at all, nothing to draft. ENG-2082 opened lead capture to
+      // phone-only submissions, and this runs fire-and-forget from the forward-lead webhook
+      // whenever the list has autoDraftEnabled — so without a guard every phone-only capture
+      // spends two billed LLM calls writing a polished email to a person who has no address
+      // and a LinkedIn note for a lead with no LinkedIn, then reports success.
+      //
+      // Gated on email AND linkedin, not email alone. This function also produces the
+      // LinkedIn connection-request note below, and linkedInInviteCrmMirror creates leads
+      // that have a linkedin and NO email — refusing those would delete a working feature
+      // to fix a new one.
+      //
+      // `skipped` so the caller can tell "nothing to do" from "this broke": webhooks.ts maps
+      // a plain falsy result to autoDraftStatus='failed' and puts the error in the OWNER
+      // ALERT, which would mean every phone-only capture emails its owner a failure notice.
+      // Its sibling autoSend path already has the right word for this — 'skipped_no_email'.
+      // Trimmed on both sides. The note gate below trims and this did not, so
+      // `linkedin: '   '` passed here, closed there, and fell through to the
+      // nothing-generated arm.
+      if (!String(lead.email ?? '').trim() && !String(lead.linkedin ?? '').trim()) {
+        return {
+          success: false,
+          skipped: true,
+          reason: 'no_contact_channel',
+          // The guard widened to email-or-linkedin; the message did not follow it, so a
+          // LinkedIn-less, email-less lead reported a problem it only half had.
+          message: 'No contact channel',
+          error: 'This lead has neither an email address nor a LinkedIn profile — there is nothing to draft.'
+        };
+      }
+
       // Check do-not-contact status
       const { isDoNotContact: isDNC, getDoNotContactReason: getDNCReason } = await import('../utils/leadContactStatus');
       if (isDNC(lead)) {
@@ -15415,8 +15414,15 @@ export class AgentModeService {
       if (lead.notes) {
         emailPrompt += `\n- Notes: ${lead.notes}`;
       }
-      if (lead.customFields && Object.keys(lead.customFields).length > 0) {
-        emailPrompt += `\n- Custom Fields: ${JSON.stringify(lead.customFields, null, 2)}`;
+      // ENG-1388: this draft is meant to be sent to the external lead/prospect,
+      // so card revenue (Enigma, internal-use-only) must never inform it —
+      // unconditionally, regardless of whether the requesting user is
+      // themselves Enigma-allowlisted. That allowlist governs internal
+      // visibility, not what may go into outward-facing content.
+      const { stripCardRevenueKeys } = await import('../utils/enrichmentMetadataPresentation');
+      const emailPromptCustomFields = stripCardRevenueKeys(lead.customFields);
+      if (emailPromptCustomFields && Object.keys(emailPromptCustomFields).length > 0) {
+        emailPrompt += `\n- Custom Fields: ${JSON.stringify(emailPromptCustomFields, null, 2)}`;
       }
 
       // Add engagement history
@@ -15517,66 +15523,75 @@ ${emailDraftFormat === 'text'
   "htmlContent": "Complete HTML email body (well-formatted, professional, email-friendly HTML)"
 }`}`;
 
-      const reportGenerationModel = await this.getReportGenerationDefaultModel();
-      const completion = await this.callLLM(
-        reportGenerationModel,
-        [
+      // The EMAIL draft runs only when there is an address to send to. This function also
+      // produces the LinkedIn connection-request note below, and linkedInInviteCrmMirror
+      // creates leads that have a linkedin and no email — so the guard at the top of this
+      // function cannot refuse them outright. But widening that guard on its own left this
+      // path still running for them: two billed LLM calls producing a polished draft
+      // addressed to nobody, which is the exact harm the guard was added to prevent.
+      let emailDraft: any = null;
+      let emailData: any = null;
+      if (lead.email) {
+        const reportGenerationModel = await this.getReportGenerationDefaultModel();
+        const completion = await this.callLLM(
+          reportGenerationModel,
+          [
+            {
+              role: "system",
+              content: emailDraftFormat === 'text'
+                ? "You are an expert email marketing strategist. Create personalized, professional plain text emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and textContent fields. Use plain text only - no HTML tags or formatting markup."
+                : "You are an expert email marketing strategist. Create personalized, professional emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and htmlContent fields.",
+            },
+            { role: "user", content: emailPrompt },
+          ],
           {
-            role: "system",
-            content: emailDraftFormat === 'text'
-              ? "You are an expert email marketing strategist. Create personalized, professional plain text emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and textContent fields. Use plain text only - no HTML tags or formatting markup."
-              : "You are an expert email marketing strategist. Create personalized, professional emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and htmlContent fields.",
+          temperature: 0.8,
+            max_completion_tokens: 3000,
+            response_format: { type: 'json_object' },
+            usageContext: { userId, sessionId, feature: 'email_draft' },
+            taskClass: 'content_generation',
           },
-          { role: "user", content: emailPrompt },
-        ],
-        {
-        temperature: 0.8,
-          max_completion_tokens: 3000,
-          response_format: { type: 'json_object' },
-          usageContext: { userId, sessionId, feature: 'email_draft' },
-          taskClass: 'content_generation',
-        },
-      );
+        );
 
-      const responseContent = completion.choices[0].message.content;
-      if (!responseContent) {
-        throw new Error('No content generated from LLM');
-      }
-
-      // Parse the JSON response
-      let emailData;
-      try {
-        const cleanedContent = responseContent.replace(/```json\s*|\s*```/g, '').trim();
-        emailData = JSON.parse(cleanedContent);
-      } catch (parseError) {
-        console.error('AgentMode: Error parsing email draft JSON:', parseError);
-        throw new Error('Failed to parse email draft response');
-      }
-
-      // Validate required fields based on format
-      if (emailDraftFormat === 'text') {
-        if (!emailData.subject || !emailData.textContent) {
-          throw new Error('LLM response missing required fields (subject, textContent)');
+        const responseContent = completion.choices[0].message.content;
+        if (!responseContent) {
+          throw new Error('No content generated from LLM');
         }
-      } else {
-        if (!emailData.subject || !emailData.htmlContent) {
-          throw new Error('LLM response missing required fields (subject, htmlContent)');
+
+        // Parse the JSON response
+        try {
+          const cleanedContent = responseContent.replace(/```json\s*|\s*```/g, '').trim();
+          emailData = JSON.parse(cleanedContent);
+        } catch (parseError) {
+          console.error('AgentMode: Error parsing email draft JSON:', parseError);
+          throw new Error('Failed to parse email draft response');
         }
-      }
 
-      // Save draft to lead record with sessionId
-      const now = new Date().toISOString();
-      const emailDraft: any = {
-        subject: emailData.subject,
-        createdAt: existingDraft?.createdAt || now,
-        updatedAt: now,
-        sessionId: sessionId
-      };
+        // Validate required fields based on format
+        if (emailDraftFormat === 'text') {
+          if (!emailData.subject || !emailData.textContent) {
+            throw new Error('LLM response missing required fields (subject, textContent)');
+          }
+        } else {
+          if (!emailData.subject || !emailData.htmlContent) {
+            throw new Error('LLM response missing required fields (subject, htmlContent)');
+          }
+        }
 
-      if (emailDraftFormat === 'text') {
-        emailDraft.textContent = emailData.textContent;
-      } else {
-        emailDraft.htmlContent = emailData.htmlContent;
+        // Save draft to lead record with sessionId
+        const now = new Date().toISOString();
+        emailDraft = {
+          subject: emailData.subject,
+          createdAt: existingDraft?.createdAt || now,
+          updatedAt: now,
+          sessionId: sessionId
+        };
+
+        if (emailDraftFormat === 'text') {
+          emailDraft.textContent = emailData.textContent;
+        } else {
+          emailDraft.htmlContent = emailData.htmlContent;
+        }
       }
 
       // Build activity history section for message prompt (reuse already-fetched engagements)
@@ -15596,9 +15611,20 @@ ${emailDraftFormat === 'text'
       // Create message draft optimised for LinkedIn connection invites. The char limit
       // depends on the sending account tier: 300 for Premium, 200 for free. Resolve the
       // account the same way the send-invite route does (list-assigned → user's own).
+      // The email draft was gated on lead.email; this is the other half, and it was
+      // missing. A commit claimed "the two drafts are independent now — email gated on
+      // lead.email, note on lead.linkedin" and only shipped the first clause, so every
+      // ordinary email-only lead captured into an autoDraft list paid a second billed LLM
+      // call plus two LinkedIn API round trips to write a connection note for a lead with
+      // no LinkedIn URL — and stored it as messageDraft. Exactly the mirror of the harm
+      // the guard was added to stop; the env2 check only exercised the LinkedIn-only
+      // direction, so nothing caught it.
+      const wantsLinkedInNote = !!String((lead as any).linkedin ?? '').trim();
       const { linkedInOutreachService, LinkedInOutreachService } = await import('./linkedInOutreachService');
-      const inviteAccountId = (list as any)?.linkedInAccountId
-        || await linkedInOutreachService.resolveUserOwnedAccountId(userId);
+      const inviteAccountId = wantsLinkedInNote
+        ? ((list as any)?.linkedInAccountId
+          || await linkedInOutreachService.resolveUserOwnedAccountId(userId))
+        : null;
       const inviteCharLimit = inviteAccountId
         ? await linkedInOutreachService.getInviteCharLimitForAccount(userId, inviteAccountId)
         : 200;
@@ -15606,11 +15632,22 @@ ${emailDraftFormat === 'text'
       const leadTitle = (lead as any).title || '';
       const leadCompany = (lead as any).company || '';
       const leadDesc = [leadName || null, leadTitle, leadCompany ? `at ${leadCompany}` : null].filter(Boolean).join(', ');
-      const emailSummary = (emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent || '').slice(0, 300);
+      // `emailData` is null for a LinkedIn-only lead — that is the entire point of
+      // gating the email draft. The line below dereferenced it unconditionally, one line
+      // ABOVE the ternary that correctly handles null, so the LinkedIn-only lead this
+      // block exists to serve threw `Cannot read properties of null (reading
+      // 'textContent')` and produced no note at all. Found on env2, not by the unit
+      // test: that test asserts no email-strategist prompt was sent, which stays true
+      // when the function throws before reaching any prompt.
+      // The `|| ''` also bound to the false branch only, so a text draft with an empty
+      // textContent threw here too.
+      const emailSummary = emailData
+        ? String((emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent) || '').slice(0, 300)
+        : '';
       const messagePrompt = `You are writing a LinkedIn connection request note. The goal is to get the recipient to accept.
 
 Recipient: ${leadDesc}
-Context from their email (use to understand the outreach angle): Subject: ${emailData.subject} — ${emailSummary}
+${emailData ? `Context from their email (use to understand the outreach angle): Subject: ${emailData.subject} — ${emailSummary}` : 'No email draft for this lead (no address on file) — write the note from their profile alone.'}
 ${messageActivityContext}
 
 Write a note that:
@@ -15629,23 +15666,26 @@ Good: "Sarah, Island's browser-isolation is one of the smarter takes on shadow I
 
 Reply with ONLY valid JSON: {"content": "the note text"}`;
 
-      const messageCompletion = await this.callLLM('gemini-3.5-flash', [
-        { role: 'user', content: messagePrompt },
-      ], {
-        temperature: 0.8,
-        max_completion_tokens: 2048,
-        usageContext: { userId, sessionId, feature: 'invite_message' },
-        taskClass: 'content_generation',
-      });
+      const messageCompletion = wantsLinkedInNote
+        ? await this.callLLM('gemini-3.5-flash', [
+          { role: 'user', content: messagePrompt },
+        ], {
+          temperature: 0.8,
+          max_completion_tokens: 2048,
+          usageContext: { userId, sessionId, feature: 'invite_message' },
+          taskClass: 'content_generation',
+        })
+        : null;
 
-      const messageResponseContent = messageCompletion.choices[0].message.content;
-      if (!messageResponseContent) {
+      const messageResponseContent = messageCompletion?.choices?.[0]?.message?.content ?? null;
+      // Only a lead we actually asked for a note about can be missing one.
+      if (wantsLinkedInNote && !messageResponseContent) {
         throw new Error('No message content generated from LLM');
       }
 
       // Parse the JSON response — Gemini may wrap it in markdown or prose
-      let messageData;
-      try {
+      let messageData: any = null;
+      if (messageResponseContent) try {
         const cleanedMsg = messageResponseContent.replace(/```json\s*/g, '').replace(/\s*```/g, '').trim();
         const bs = cleanedMsg.indexOf('{');
         const be = cleanedMsg.lastIndexOf('}');
@@ -15682,28 +15722,50 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         };
       }
 
-      // Update lead with both email draft and message draft
-      await crmDb.updateLead(listId, leadId, {
-        emailDraft: emailDraft,
-        emailDraftFormat: emailDraftFormat,
+      // Update lead with whichever drafts were actually produced. With both gated off
+      // there is nothing to write, and an empty update is not free: it costs a read plus
+      // an UpdateItem that only bumps updatedAt and re-projects the GSIs.
+      const draftUpdates = {
+        ...(emailDraft && { emailDraft, emailDraftFormat }),
         ...(messageDraft && { messageDraft: messageDraft })
-      });
+      };
+      if (Object.keys(draftUpdates).length > 0) {
+        await crmDb.updateLead(listId, leadId, draftUpdates);
+      }
 
       return {
         success: true,
-        message: existingDraft
-          ? 'Email and message drafts updated successfully'
-          : 'Email and message drafts created successfully',
+        // `skipped` when NEITHER draft was produced. webhooks.ts maps `success && !skipped`
+        // to autoDraftStatus='created', so without this the owner alert said "Auto Draft:
+        // Created" over nothing at all — reachable when the note LLM returns parseable but
+        // contentless JSON, or when `linkedin` is whitespace (the entry guard uses raw
+        // truthiness, the note gate trims, so the two disagree on that value).
+        ...(!emailData && !messageDraft ? { skipped: true, reason: 'nothing_generated' } : {}),
+        // Say what actually happened. Each draft is now gated on its own channel, so all
+        // four combinations are reachable and the old two-way message described one.
+        message: emailData && messageDraft
+          ? (existingDraft
+            ? 'Email and message drafts updated successfully'
+            : 'Email and message drafts created successfully')
+          : emailData
+            ? (existingDraft ? 'Email draft updated successfully' : 'Email draft created successfully')
+            : messageDraft
+              ? 'LinkedIn message draft created — no email draft, this lead has no address'
+              : 'No draft created — nothing usable was generated for this lead',
         data: {
-          email: emailDraftFormat === 'text'
-            ? {
-              subject: emailData.subject,
-              textContent: emailData.textContent
-            }
-            : {
-              subject: emailData.subject,
-              htmlContent: emailData.htmlContent
-            },
+          // null, not a fabricated shape: webhooks.ts reads data.email to decide whether to
+          // auto-send, and an object with undefined fields would read as a real draft.
+          email: !emailData
+            ? null
+            : emailDraftFormat === 'text'
+              ? {
+                subject: emailData.subject,
+                textContent: emailData.textContent
+              }
+              : {
+                subject: emailData.subject,
+                htmlContent: emailData.htmlContent
+              },
           message: messageDraft ? { content: messageDraft.content } : null
         }
       };
@@ -17483,6 +17545,8 @@ TRUTHFULNESS RULES (these override tone):
 - An error, timeout, or interruption ENDS the run; it does not undo, roll back, or discard work that already succeeded. Never say or imply that completed work was lost, was not saved, or must be redone.
 - Only tell the user to retry the parts that did NOT succeed. If a publish, deploy, or send succeeded, explicitly tell the user NOT to re-run it.
 - Do not attribute a failure to an operation that appears in the succeeded list.
+- If the succeeded list is absent or says NONE, then NOTHING completed in this run. Do not describe any step — loading, connecting, signing in, navigating, fetching, reading, analyzing — as having happened. Report only that the run failed before any operation completed, plus what the user can do next. Never infer the steps from the user's request: the request describes what was ASKED FOR, never what occurred.
+- A tool on the succeeded list RAN; that is NOT the same as its goal being achieved or the task being done. This message exists BECAUSE the run failed — report it as a failure with what (if anything) completed, never as a success. You are never shown tool RESULTS, so never claim what any tool FOUND, RETURNED, ANALYZED, matched, or PRODUCED (e.g. do not say "I analyzed the guest data" because a search tool ran — you cannot see whether it found anything). And never tell the user to run or retry an internal step; the only action you may suggest is that they resend their request.
 - The numbers beside each operation are HOW MANY TIMES IT RAN — never how many leads, rows, emails, posts, files, or records it handled. You are not shown those quantities. Never restate a run count as a quantity of things: "add_leads_to_list: 3" means that tool ran 3 times, NOT that 3 leads were added. If you do not know how many items an operation processed, say what ran without inventing a number.`;
 
       const parts: string[] = [
@@ -17497,6 +17561,18 @@ TRUTHFULNESS RULES (these override tone):
       }
       if (context.succeededFunctions && Object.keys(context.succeededFunctions).length > 0) {
         parts.push(`Succeeded operations, as {operation: number of times it RAN} — NOT a count of records handled (these COMPLETED — do not report them as lost): ${JSON.stringify(context.succeededFunctions)}`);
+      } else {
+        // An empty ledger used to be expressed by OMITTING this line entirely, which left
+        // the model with only the error and the user's request — and it filled the gap by
+        // narrating the request back as if it had happened. Observed in prod on 2026-09-25
+        // (session 7adc834c-3afc-4120-abbb-77caf573b80a): zero tools dispatched, yet the
+        // user was told "I have successfully loaded your browser cookies and navigated to
+        // the event management page." The existing output guards cannot catch this —
+        // stripUnfoundedEntityCounts only removes unproven QUANTITIES, and the
+        // reconcileFalse* passes only correct false NEGATIVES (work landed, reported as
+        // lost). Nothing corrected a false POSITIVE, so state the absence explicitly
+        // rather than leaving it to be inferred from silence.
+        parts.push('Succeeded operations: NONE. No operation completed in this run — it failed before anything ran. Do not describe any step as completed.');
       }
       if (context.failedFunctions && Object.keys(context.failedFunctions).length > 0) {
         parts.push(`Failed operations, as {operation: number of times it FAILED} — NOT a count of records handled: ${JSON.stringify(context.failedFunctions)}`);
@@ -18981,6 +19057,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         creative_id: newCreativeId,
         status: params.status || 'PAUSED',
       });
+      if (newAd?.id) {
+        // ENG-2141: a copied ad that reuses a generated image is another ad for that creative.
+        void stampMetaPublish({
+          userId, accountId, metaCreativeId: String(newCreativeId), adId: String(newAd.id), params: newCreativeParams, via: 'copy_ad',
+        });
+      }
 
       return {
         success: true,
@@ -19881,6 +19963,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // IG placements require an instagram_user_id in object_story_spec — auto-resolve from the Page.
       resolvedParams = await this.resolvePlacementInstagramActor(resolvedParams, accessToken);
       const creative = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
+      // ENG-2141: link the generated images this creative uses to it (inert unless enabled).
+      if (creative?.id) {
+        void stampMetaCreativeCreated({ userId, accountId, metaCreativeId: String(creative.id), params: resolvedParams });
+      }
 
       return {
         success: true,
@@ -19939,6 +20025,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
       const ad = await metaService.createAd(accountId, accessToken, params);
+      // ENG-2141: link the ad to the generated creatives its Meta creative was built from.
+      if (ad?.id && params.creative_id) {
+        void stampMetaAdCreated({ userId, accountId, metaCreativeId: String(params.creative_id), adId: String(ad.id) });
+      }
 
       return {
         success: true,
@@ -20137,6 +20227,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         }
 
         await recordCreativeLearningReceipt(userId, accountId, adId, newCreativeId, verification.verified);
+        // ENG-2141: the ad's previous creative links end here; link it to the new one if generated.
+        void stampMetaAdCreativeChanged({ userId, accountId, metaCreativeId: String(newCreativeId), adId });
         return {
           success: true,
           message: `Ad updated successfully. Swapped in creative ${newCreativeId}.`,
@@ -20229,6 +20321,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
     // Determine current creative type and extract existing fields
     let newCreativeParams: any;
+    // Set when the caller asked for a new single image / video thumbnail, so the created creative
+    // can be read back before it is attached (ENG-2169).
+    let imageSwap: ImageSwapExpectation | undefined;
 
     if (params.placement_assets) {
       // Placement-customized image creative (asset_feed_spec): map different images to different
@@ -20253,7 +20348,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         name: params.name || `${creativeData.name || 'Creative'} (updated)`,
         page_id: pageId,
         video_id: params.video_id || vd.video_id,
-        image_hash: params.image_hash || vd.image_hash,
+        // A new image_url drops the old thumbnail's hash (ENG-2169).
+        image_hash: selectSwapImageHash(params.image_hash, params.image_url, vd.image_hash),
         image_url: params.image_url || vd.image_url,
         body: params.body || vd.message || creativeData.body || '',
         title: params.title || vd.title || creativeData.title || '',
@@ -20261,6 +20357,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
         url_tags: carriedUrlTags,
       };
+      if (params.image_hash || params.image_url) {
+        imageSwap = { oldHash: vd.image_hash, oldUrl: vd.image_url, requestedHash: params.image_hash, requestedUrl: params.image_url };
+      }
     } else if (existingSpec.link_data?.child_attachments) {
       // Carousel creative – update the main link and optionally per-card links
       const ld = existingSpec.link_data;
@@ -20288,7 +20387,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       newCreativeParams = {
         name: params.name || `${creativeData.name || 'Creative'} (updated)`,
         page_id: pageId,
-        image_hash: params.image_hash || ld.image_hash,
+        // A new image_url drops the old image's hash (ENG-2169).
+        image_hash: selectSwapImageHash(params.image_hash, params.image_url, ld.image_hash),
         image_url: params.image_url || ld.picture || ld.image_url,
         body: params.body || ld.message || creativeData.body || '',
         title: params.title || ld.name || creativeData.title || '',
@@ -20296,6 +20396,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
         url_tags: carriedUrlTags,
       };
+      if (params.image_hash || params.image_url) {
+        imageSwap = {
+          oldHash: ld.image_hash, oldUrl: ld.picture || ld.image_url,
+          requestedHash: params.image_hash, requestedUrl: params.image_url,
+        };
+      }
     } else {
       return {
         success: false,
@@ -20320,6 +20426,26 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         message: 'Failed to create updated creative. The Meta API did not return a creative ID.',
         error: 'CREATIVE_CREATE_FAILED'
       };
+    }
+
+    // ENG-2169: read the created creative back before attaching it. If it still carries the old
+    // image (or not the requested hash), attaching it would "succeed" while the ad keeps serving
+    // the image it was meant to replace — fail loudly instead and leave the ad untouched.
+    let imageVerdict: ImageSwapVerdict | undefined;
+    if (imageSwap) {
+      let liveImage: CreativeImageReadback | undefined;
+      try {
+        const created = await metaService.getAdCreative(accessToken, newCreativeId);
+        liveImage = readCreativeImage(created?.object_story_spec);
+      } catch (err: unknown) {
+        // Best-effort, like verifyCreativeSwap: an unreadable creative is not proof of a stale image.
+        console.warn(`AgentMode: image read-back failed for new creative ${newCreativeId}:`,
+          err instanceof Error ? err.message : err);
+      }
+      imageVerdict = judgeImageSwap(imageSwap, liveImage);
+      if (imageVerdict === 'stale' && liveImage) {
+        return buildImageSwapNotReflected({ adId, oldCreativeId, newCreativeId, expected: imageSwap, live: liveImage });
+      }
     }
 
     console.log(`AgentMode: New creative ${newCreativeId} created. Updating ad ${adId} to use it.`);
@@ -20366,6 +20492,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
 
     const v = verification!;
+    // ENG-2141: the ad now carries this creative (attach calls returned; propagation may lag). Its
+    // performance from here on belongs to the generated images the new creative uses.
+    void stampMetaPublish({
+      userId, accountId, metaCreativeId: String(newCreativeId), adId, params: newCreativeParams, via: 'swap_creative',
+    });
     const reviewNote = v.effectiveStatus
       ? ` Ad review status: ${v.effectiveStatus}${v.reviewFeedback ? ` (${v.reviewFeedback})` : ''}.`
       : '';
@@ -20430,10 +20561,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       message: `Ad updated successfully. Created new creative (${newCreativeId}) with updated ${creativeKeys.join(', ')} `
         + `and swapped it in for the old creative (${oldCreativeId})`
         + (v.liveLinkUrl ? `. Verified live destination URL: ${v.liveLinkUrl}` : '.')
-        + reviewNote,
+        + reviewNote
+        // No proof of a stale image, but no proof of the new one either — never let that read as confirmed.
+        + (imageVerdict && imageVerdict !== 'confirmed'
+          ? ` NOTE: the new creative's image could not be confirmed (${imageVerdict} read-back) — do not tell the `
+            + `user the image changed until it is checked in Ads Manager.`
+          : ''),
       old_creative_id: oldCreativeId,
       new_creative_id: newCreativeId,
       verified: true,
+      ...(imageVerdict && { image_verified: imageVerdict === 'confirmed' }),
       live_link_url: v.liveLinkUrl,
       effective_status: v.effectiveStatus,
       review_feedback: v.reviewFeedback,
@@ -20658,6 +20795,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           image
         };
       }
+      // ENG-2141: a generated image uploaded by its S3 URL gains this hash (inert unless enabled).
+      void stampMetaImageUpload({ userId, imageUrl, imageHash });
       return {
         success: true,
         message: `Image uploaded successfully`,
@@ -30608,7 +30747,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const modelExplicitlyChosen = typeof imageModel === 'string' && imageModel.trim().length > 0;
       const resolvedImageModel = modelExplicitlyChosen
         ? imageModel
-        : await this.getImageApiDefaultModel();
+        : await resolveModelForUser(userId, 'image');
 
       const inputImagesForRequest = inputImages || [];
       const primaryRequest = {
@@ -30738,7 +30877,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           console.warn('Failed to store image generation metadata:', error);
         }
 
-        void enqueueAutoHumanEval({
+        const humanEvalCandidate = enqueueAutoHumanEval({
           reviewType: 'creative_image',
           userId,
           sessionId,
@@ -30749,6 +30888,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
             `Image generated: ${result.filename || filename}. ` +
             `Model: ${imageModelUsed}. Size: ${size || 'default'}. Quality: ${quality || 'default'}.`,
           sourceKey: `image:${sessionId}:${result.filename || filename}:${result.imageUrl}`,
+          creativeGates: result.gates,
+          // ENG-2140: the generation request is the only brief agent mode has; the placement
+          // comes from the gate result.
+          creativeBrief: { generationRequest: prompt },
           action: {
             type: 'agent_mode_image_revision',
             sessionId,
@@ -30757,6 +30900,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
             filename: result.filename || filename,
           },
         });
+        // ENG-2141: creative lineage record (inert unless CREATIVE_LINEAGE_ENABLED + table). Not
+        // awaited and never throws; it links the human-eval candidate once that exists.
+        void recordGeneratedCreative(
+          { userId, artifactUrl: result.imageUrl, sessionId, category, prompt, generatorModel: imageModelUsed, gates: result.gates },
+          humanEvalCandidate,
+        );
 
         // ENG-1027 data-fabrication backstop: the tool-description guidance alone is
         // instruction-following-dependent, and live verification showed the image
@@ -31599,7 +31748,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           titleDraft,
           'professional',
           style,
-          true // includeInlineImages = true for deep research
+          true, // includeInlineImages = true for deep research
+          userId
         );
 
         if (!blogData.title || !blogData.content) {
@@ -31639,7 +31789,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           length,
           researchContext,
           requirements,
-          style
+          style,
+          userId
         );
 
         if (!blogData.title || !blogData.content) {
@@ -35343,7 +35494,17 @@ Reply with ONLY one word: yes or no.`;
           temperature: 0,
           max_completion_tokens: 500,
           taskClass: 'scheduled_background',
-          usageContext: { feature: 'step_removal_authorization_judge' },
+          // ENG-1816 F1: this judge previously carried no userId, so its spend booked
+          // to "system" and escaped both billing and the funding policy. Read the
+          // run's owner from the ambient store instead of threading a new parameter
+          // through this method's signature. billingUserId deliberately omitted: this
+          // reaches meterWithResolvedBilling, which only resolves the org-root billing
+          // subject when billingUserId is absent (ENG-1858) — passing ownerUserId here
+          // would re-suppress that resolution for org members, the exact ENG-1217 bug.
+          usageContext: {
+            feature: 'step_removal_authorization_judge',
+            userId: currentRunFunding()?.ownerUserId,
+          },
         },
       );
       const timeoutPromise = new Promise<never>((_, reject) =>

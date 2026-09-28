@@ -1,0 +1,56 @@
+export type HealthStatus = 'healthy' | 'mediocre' | 'at-risk' | 'blocked' | 'onboarding';
+
+export type AdConnectionState = 'never_connected' | 'connected' | 'expired' | 'other_platform';
+
+export interface ClientHealthFlags {
+  has_ads: boolean;
+  /** Absent on responses from a backend older than ENG-2133. */
+  ad_connection?: AdConnectionState;
+  has_lander: boolean;
+  has_crm: boolean;
+}
+
+export function adConnectionOf(client: ClientHealthFlags): AdConnectionState {
+  return client.ad_connection ?? (client.has_ads ? 'connected' : 'never_connected');
+}
+
+/**
+ * Active-campaign text for the detail view. When the campaign read was incomplete the count is a
+ * lower bound (or unknown), never a confirmed number.
+ */
+export function campaignCountLabel(adsLayer: { active_campaigns: number; campaigns_complete?: boolean }): string {
+  if (adsLayer.campaigns_complete !== false) return `${adsLayer.active_campaigns}`;
+  return adsLayer.active_campaigns > 0 ? `${adsLayer.active_campaigns}+ (read incomplete)` : 'Unconfirmed (read incomplete)';
+}
+
+/** Connection state for the detail view's ads layer; older backends only send `connected`. */
+export function adsLayerConnection(adsLayer: { connected: boolean; connection?: AdConnectionState }): AdConnectionState {
+  return adsLayer.connection ?? (adsLayer.connected ? 'connected' : 'never_connected');
+}
+
+/**
+ * Roster status for one client. ENG-2133 (ENG-2128 T1): never connecting an ad account is
+ * activation (`onboarding`), not churn — it used to render as a red "At Risk". Only a
+ * connection that broke (expired token) is at-risk. Ads on Google/LinkedIn (`other_platform`)
+ * count as activated.
+ */
+export function deriveQuickStatus(client: ClientHealthFlags): HealthStatus {
+  const connection = adConnectionOf(client);
+  if (connection === 'never_connected') return 'onboarding';
+  if (connection === 'expired') return 'at-risk';
+  const issues = [!client.has_lander, !client.has_crm].filter(Boolean).length;
+  if (issues === 0) return 'healthy';
+  return 'mediocre';
+}
+
+export function quickSummary(client: ClientHealthFlags): string {
+  const parts: string[] = [];
+  const connection = adConnectionOf(client);
+  if (connection === 'never_connected') parts.push('Ads not connected yet');
+  if (connection === 'expired') parts.push('Ad connection expired');
+  if (!client.has_lander) parts.push('No lander');
+  if (!client.has_crm) parts.push('No CRM');
+  if (connection === 'other_platform') parts.push('Ads on Google/LinkedIn');
+  if (parts.length === 0) return 'All layers connected';
+  return parts.join(' · ');
+}

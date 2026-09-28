@@ -13,6 +13,8 @@ import {
   resolveSlackMentionsInText,
 } from './slackService';
 import { settingsService } from './settingsService';
+import type { CreativeGateResult } from './creativeGates';
+import type { CreativeRubricResult } from './creativeRubricJudge';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 export const HUMAN_EVAL_QUEUE_TABLE = `${TABLE_PREFIX}AW-HumanEvalQueue`;
@@ -113,6 +115,12 @@ export interface HumanEvalCandidate {
   outputSummary: string;
   originalRequest?: string;
   action?: HumanEvalAction;
+  /** Advisory deterministic image checks from generation time (ENG-2139). Additive: absent on
+   *  older records, on non-image candidates, and when the gates could not run. */
+  creativeGates?: CreativeGateResult;
+  /** Advisory rubric-judge result (ENG-2140), written after creation when the judge is enabled and
+   *  this creative was sampled. Additive: absent otherwise. */
+  creativeRubric?: CreativeRubricResult;
   /** Absent when Slack posting was disabled or failed for this candidate (ENG-1854) — the
    *  candidate still persists and is reviewable via the queue API either way. */
   slackChannel?: string;
@@ -143,6 +151,8 @@ export interface CreateHumanEvalCandidateInput {
   action?: HumanEvalAction;
   /** Optional Ad/Organic Post use-case tag; normalized fail-open (unknown → 'uncategorized'). */
   category?: string;
+  /** Advisory creative gate result to store with the candidate (ENG-2139). */
+  creativeGates?: CreativeGateResult;
 }
 
 interface DynamoLike {
@@ -371,6 +381,7 @@ export class HumanEvalService {
       outputSummary: preparedInput.outputSummary.trim(),
       originalRequest: preparedInput.originalRequest?.trim() || undefined,
       action: preparedInput.action,
+      ...(input.creativeGates ? { creativeGates: input.creativeGates } : {}),
       feedback: [],
       createdAt: now,
       updatedAt: now,
@@ -496,6 +507,17 @@ export class HumanEvalService {
     return true;
   }
 
+  /** Stores the rubric-judge result on an existing candidate (ENG-2140). Never creates an item. */
+  async setCreativeRubric(candidateId: string, result: CreativeRubricResult): Promise<void> {
+    await this.db.update({
+      TableName: HUMAN_EVAL_QUEUE_TABLE,
+      Key: { candidateId },
+      UpdateExpression: 'SET creativeRubric = :rubric',
+      ConditionExpression: 'attribute_exists(candidateId)',
+      ExpressionAttributeValues: { ':rubric': result },
+    }).promise();
+  }
+
   async getCandidate(candidateId: string): Promise<HumanEvalCandidate | null> {
     const result = await this.db.get({
       TableName: HUMAN_EVAL_QUEUE_TABLE,
@@ -544,6 +566,47 @@ export class HumanEvalService {
 
     matches.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
     return matches.slice(0, limit);
+  }
+
+  /**
+   * Every candidate of one review type for one user, across all scan pages (ENG-2140: the prior
+   * creative for pairwise judging). Unlike `listCandidates` there is no result cap, so an older
+   * match is never cut off by newer candidates of other accounts. Offline use only: it scans.
+   */
+  async listCandidatesForUser(userId: string, reviewType: HumanEvalReviewType): Promise<HumanEvalCandidate[]> {
+    const matches: HumanEvalCandidate[] = [];
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await this.db.scan({
+        TableName: HUMAN_EVAL_QUEUE_TABLE,
+        FilterExpression: 'userId = :userId AND reviewType = :reviewType',
+        ExpressionAttributeValues: { ':userId': userId, ':reviewType': reviewType },
+        ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+      }).promise();
+      matches.push(...((result.Items || []) as HumanEvalCandidate[]));
+      lastKey = result.LastEvaluatedKey;
+    } while (lastKey);
+    return matches;
+  }
+
+  /**
+   * Every candidate of one review type, all accounts, across all scan pages (ENG-2142: the weekly
+   * calibration sampler's pool). No result cap, like `listCandidatesForUser`. Offline/cron use only: it scans.
+   */
+  async listCandidatesByReviewType(reviewType: HumanEvalReviewType): Promise<HumanEvalCandidate[]> {
+    const matches: HumanEvalCandidate[] = [];
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await this.db.scan({
+        TableName: HUMAN_EVAL_QUEUE_TABLE,
+        FilterExpression: 'reviewType = :reviewType',
+        ExpressionAttributeValues: { ':reviewType': reviewType },
+        ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+      }).promise();
+      matches.push(...((result.Items || []) as HumanEvalCandidate[]));
+      lastKey = result.LastEvaluatedKey;
+    } while (lastKey);
+    return matches;
   }
 
   private async appendFeedback(candidate: HumanEvalCandidate, feedback: HumanEvalFeedback): Promise<void> {

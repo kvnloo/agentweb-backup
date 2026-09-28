@@ -1,5 +1,6 @@
 import OpenAI from "openai";
-import { getAzureClient } from "../utils/llmClients";
+import { currentRunFunding } from "./funding/runFunding";
+import { embedText } from "../utils/embeddings";
 import { v4 as uuidv4 } from "uuid";
 import AWS from "aws-sdk";
 import dotenv from "dotenv";
@@ -60,22 +61,6 @@ export const dynamodb = new AWS.DynamoDB.DocumentClient({
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
   },
 });
-
-// Metered client for embeddings (knowledge-base semantic search). Uses the
-// separate EMBEDDINGS endpoint/key/api-version the module singleton used. No
-// userId is in scope on this path, so usage is attributed to platform overhead.
-function embeddingsClientFor() {
-  return getAzureClient(
-    { feature: "embeddings" },
-    process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT || "text-embedding-3-large",
-    {
-      endpoint: process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT,
-      apiKey: process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY,
-      apiVersion:
-        process.env.AZURE_OPENAI_EMBEDDINGS_API_VERSION || "2024-08-01-preview",
-    }
-  );
-}
 
 // Interface for message feedback
 export interface MessageFeedback {
@@ -457,6 +442,9 @@ export interface ChatSession {
       instructionCompliance?: number;
       unnecessaryPermissionRequest?: boolean;
     };
+    // ENG-2138: written by a shadow judge (sampled, never the primary score), with its model.
+    shadow?: boolean;
+    model?: string;
   }>;
   // Scores retracted because the session turned out to be outside the
   // satisfaction cohort (zero-task — ENG-830). The original score is MOVED here
@@ -595,27 +583,15 @@ async function findRelevantChunks(
   if (chunks.length === 0) return [];
 
   try {
-    // For simple semantic search, we'll use OpenAI embeddings
-    const queryEmbeddingResponse = await embeddingsClientFor().embeddings.create({
-      model: `${process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT}`,
-      input: query,
-      dimensions: 1536,
-    });
+    const meterCtx = { userId: currentRunFunding()?.ownerUserId, feature: 'embeddings' };
+    const queryEmbedding = await embedText(query, meterCtx);
+    if (!queryEmbedding) return keywordBasedChunkRetrieval(query, chunks, maxChunks);
 
-    const queryEmbedding = queryEmbeddingResponse.data[0].embedding;
-
-    // Get embeddings for all chunks (in a real system, you'd cache these)
     const chunkEmbeddings = await Promise.all(
       chunks.map(async (chunk) => {
-        const response = await embeddingsClientFor().embeddings.create({
-          model: `${process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT}`,
-          input: chunk.content,
-          dimensions: 1536,
-        });
-        return {
-          chunk,
-          embedding: response.data[0].embedding,
-        };
+        const embedding = await embedText(chunk.content, meterCtx);
+        if (!embedding) throw new Error('Chunk embedding unavailable');
+        return { chunk, embedding };
       })
     );
 
@@ -3790,6 +3766,15 @@ export class ChatbotDB {
     llmModel: string,
     policyDecision?: NonNullable<ChatSession['llmUsagePolicyDecision']>,
   ): Promise<ChatSession> {
+    // A stored llmUsagePolicyDecision describes the specific model it was recorded
+    // for. Changing llmModel without a fresh decision to match (task-type model
+    // overrides, admin/plan model swaps, the picker PATCH endpoint) would otherwise
+    // leave the OLD decision in place, now silently mismatched — e.g. llmModel
+    // reporting "gemini-3.8-flash" while llmUsagePolicyDecision still claims
+    // "openrouter/deepseek/deepseek-v4-flash" was "honored", even though every
+    // actual turn ran on the latter. REMOVE it here so a session record can never
+    // pair a decision with a model it doesn't describe; the next real turn through
+    // resolveEffectiveModelForUser re-stamps a correct, matching pair anyway.
     const params = {
       TableName: this.tableName,
       Key: {
@@ -3797,7 +3782,7 @@ export class ChatbotDB {
       },
       UpdateExpression: policyDecision
         ? "SET llmModel = :llmModel, llmUsagePolicyDecision = :policyDecision, adminListPartition = :adminListPartition"
-        : "SET llmModel = :llmModel, adminListPartition = :adminListPartition",
+        : "SET llmModel = :llmModel, adminListPartition = :adminListPartition REMOVE llmUsagePolicyDecision",
       ExpressionAttributeValues: {
         ":llmModel": llmModel,
         ...(policyDecision ? { ":policyDecision": policyDecision } : {}),

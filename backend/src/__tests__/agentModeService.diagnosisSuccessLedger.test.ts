@@ -112,11 +112,21 @@ describe('generateDiagnosticMessage — success ledger and no-lost-work rule (EN
     expect(system).toMatch(/succeeded/i);
   });
 
-  it('omits the success section entirely when nothing succeeded', async () => {
+  /**
+   * REVERSED 2026-09-25. This originally asserted the success section was OMITTED when
+   * nothing succeeded. That omission was never a requirement of ENG-971 — it described the
+   * `if` block that had no `else` — and production showed it is actively harmful: given only
+   * an error and the user's request, the diagnosis agent narrates the request back as
+   * history. Session 7adc834c-3afc-4120-abbb-77caf573b80a was told "I have successfully
+   * loaded your browser cookies and navigated to the event management page" for a turn that
+   * dispatched zero tools. The absence must be stated, not implied by silence. See
+   * agentModeService.diagnosisEmptyLedger.test.ts for the full case.
+   */
+  it('states the absence explicitly when nothing succeeded', async () => {
     const { user } = await promptFor({ ...PROD_CONTEXT, succeededFunctions: {} });
 
-    expect(user).not.toMatch(/Succeeded operations/i);
-    // A run where nothing worked must still report its failures.
+    expect(user).toMatch(/Succeeded operations: NONE/);
+    // Unchanged requirement: a run where nothing worked must still report its failures.
     expect(user).toContain('Failed operations');
   });
 
@@ -126,7 +136,10 @@ describe('generateDiagnosticMessage — success ledger and no-lost-work rule (EN
 
     expect(out).toBe('diagnosed');
     const { user } = { user: (callLLM.mock.calls[0][1] as any[]).find((m) => m.role === 'user').content };
-    expect(user).not.toMatch(/Succeeded operations/i);
+    // The requirement here is tolerance — an older caller that passes no ledger at all must
+    // still produce a diagnosis. Since 2026-09-25 a missing ledger is treated identically to
+    // an empty one: say NONE rather than stay silent (see the reversal note above).
+    expect(user).toMatch(/Succeeded operations: NONE/);
   });
 
   /**

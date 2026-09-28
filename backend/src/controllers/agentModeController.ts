@@ -2,7 +2,8 @@ import { scheduleBackupModels } from '../services/agentMode/modelSupersession';
 import { isEvaluationUser, EvaluationDenied } from '../services/evaluationPolicy';
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken, isRealAdmin } from '../middleware/auth';
-import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch } from '../services/agentModeService';
+import { agentModeService, AgentModeService, normalizeWorkPlanTitleForMatch, ADMIN_SKILL_TOOL_NAMES } from '../services/agentModeService';
+import { filterMessagesForClient as filterMessagesForClientPure } from '../utils/adminOnlyMessageFilter';
 import { ABOUT_AGENTWEB_TEAM, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
 import { computeSessionModelAttribution } from '../utils/sessionModelAttribution';
@@ -37,6 +38,7 @@ import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/age
 import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/finalAnswer';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
+import { resolveRunFunding } from '../services/funding/runFunding';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
@@ -2002,7 +2004,30 @@ async function loadConfirmedArtifactUrls(
   return [];
 }
 
-async function getDiagnosticErrorMessage(
+/**
+ * ENG-2160 (deterministic close): when the run failed before ANY tool completed, there is
+ * literally nothing to diagnose — and handing the LLM only the error + the user's request is
+ * exactly what let it narrate the request back as if it had happened ("I have successfully loaded
+ * your browser cookies..."). On an empty ledger we skip the LLM entirely and emit a fixed,
+ * honest, error-type-aware message. This makes empty-ledger fabrication STRUCTURALLY impossible,
+ * not merely discouraged by a prompt rule (that rule stays as defense-in-depth for other paths).
+ */
+export function deterministicEmptyLedgerMessage(error: unknown): string {
+  switch (classifyErrorType(error)) {
+    case 'rate_limit':
+      return "I hit a temporary capacity limit before I could start on your request, so nothing was done yet. Please try again in a moment.";
+    case 'context_limit':
+      return "This conversation got too long for me to process, so I couldn't start on your request. Try starting a new chat or shortening the request.";
+    case 'content_filter':
+      return "I wasn't able to start on this request. Please try rephrasing it.";
+    case 'transient':
+      return "I ran into a temporary error before I could start on your request, so nothing was done yet. Please try again.";
+    default:
+      return "I ran into an error before I could start on your request, so nothing was done yet. Please try again.";
+  }
+}
+
+export async function getDiagnosticErrorMessage(
   error: unknown,
   sessionId: string,
   userMessage: string,
@@ -2030,6 +2055,20 @@ async function getDiagnosticErrorMessage(
     const artifactUrls = typeof turnStartMs === 'number'
       ? collectConfirmedArtifactUrls(session?.messages as any, turnStartMs)
       : [];
+    // ENG-2160 known residual (reviewed 2026-09-26): the succeeded-diff comes from calledFunctions,
+    // whose per-iteration increment is best-effort (failures are swallowed so an iteration never
+    // aborts). If a side-effecting tool (send_email / DM / meta-ads) succeeded but its counter
+    // write was lost, the diff reads empty here and the user is told "nothing was done yet — try
+    // again", which could induce a duplicate action. Narrow (requires a DB write failure) and
+    // roughly pre-existing; the high-stakes writes (publish / lead-import / artifact) are covered
+    // by the independent ledgers checked below. Not worth gating the fix on.
+    // ENG-2160 deterministic close: nothing completed this turn AND nothing measurable to report →
+    // do not call the LLM at all; return a fixed honest message. Fabrication becomes impossible
+    // because the model never sees this case.
+    const nothingSucceeded = !succeededFunctions || Object.keys(succeededFunctions).length === 0;
+    if (nothingSucceeded && publishLedger.length === 0 && !importTotals?.known && artifactUrls.length === 0) {
+      return { message: deterministicEmptyLedgerMessage(error), publishLedger: [], artifactUrls: [] };
+    }
     const context: DiagnosisContext = {
       errorType: classifyErrorType(error),
       errorMessage: error instanceof Error ? error.message : String(error),
@@ -2421,22 +2460,11 @@ function evaluateScheduleResponse(
 }
 
 // Common function to filter messages for client display
-const filterMessagesForClient = (messages: any[]) => {
-  return messages.filter(message => {
-    // Remove tool messages
-    if (message.role === 'tool') {
-      return false;
-    }
-
-    // Remove assistant messages that have tool_calls (intermediate messages during tool execution)
-    // BUT keep assistant messages that have metadata.toolCalls (final messages with tool execution results)
-    if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0 && !message.metadata?.toolCalls) {
-      return false;
-    }
-
-    return true;
-  });
-};
+// ENG-2163: thin wrapper over the pure, unit-tested util (src/utils/adminOnlyMessageFilter).
+// The util takes the admin-tool name set as a param so it stays dependency-free; the controller
+// supplies the real ADMIN_SKILL_TOOL_NAMES here. Default viewerIsAdmin=false fails CLOSED.
+const filterMessagesForClient = (messages: any[], opts: { viewerIsAdmin?: boolean } = {}) =>
+  filterMessagesForClientPure(messages, { viewerIsAdmin: opts.viewerIsAdmin, adminToolNames: ADMIN_SKILL_TOOL_NAMES });
 
 // Helper function to check if this is the last run of the day for an hourly schedule
 function isLastRunOfDayForHourlySchedule(currentTime: Date, nextRunTime: Date): boolean {
@@ -8491,6 +8519,43 @@ export async function generateSessionResponse(
     if (result) screenshotUrl = result.url;
   }
 
+  // ENG-1816 F1: resolved once here — this is the choke point every AGENT-MODE entry
+  // path (interactive, scheduled via runVerifiedChat, work-plan continuation, API/
+  // MCP) converges on before crossing the worker fork, so none of those call sites
+  // need their own resolveRunFunding call. NOT the only entry into the worker:
+  // controllers/benchmark.ts calls generateMarketingResponseWorkerService.runInWorker
+  // directly for benchmark runs, bypassing this — safe because the worker's own
+  // fallback (generateMarketingResponseWorker.ts) calls resolveRunFunding itself
+  // when none was sent, the same resolution this call site uses, not a hand-built
+  // stand-in for it. Also not the choke point for Emma's *other* turn loop — the
+  // sidebar assistant (chatbotService.generateChatResponse) is resolved separately,
+  // at its own 3 call sites (chatSocketHandler.ts, controllers/chatbot.ts) — and for
+  // internal MCP tool calls, which resolve lazily inside mcp/server/registry.ts's
+  // execute() only when no ambient RunFunding is already active. F1 always resolves
+  // 'agentweb' everywhere; A1+/B1+ make the result meaningful once a real
+  // connection exists to route to.
+  //
+  // KNOWN GAP, not yet closed: liveVoiceService.ts (the Gemini Live voice feature)
+  // calls agentModeService.callLLM/executeTool and its own meterUserUsage directly,
+  // with no RunFunding entry point anywhere in that file — found by a round-3 PR
+  // review, deliberately left unwrapped rather than rushed here, since it's a
+  // long-lived streaming session with a materially different lifecycle from the
+  // request/response and socket-turn paths above, not a same-shape fix. Not a
+  // behavior change today either way: its callLLM path falls back the same as any
+  // other unwrapped path (noteRunFundingUnset + today's billing), and its direct
+  // meterUserUsage call is pre-existing metering this PR never touches. But it must
+  // be closed before any non-agentweb route ships, or a Live Voice user's spend can
+  // never route to their own connection.
+  //
+  // CLOSED (round 4): growthGeniusController.ts's sendMessage had the identical gap
+  // — a real multi-turn chat product, same shape as the sidebar assistant, whose 3
+  // callLLM sites (title, initial turn, tool-follow-up) never entered a RunFunding
+  // scope. Unlike Live Voice this had no architectural reason to defer, so it was
+  // wrapped immediately rather than added to this list. Found by manual review, not
+  // by noteRunFundingUnset — see that function's own comment for why it can't be
+  // trusted to surface gaps like this one.
+  const runFunding = await resolveRunFunding({ userId });
+
   // Generate AI response using worker process to prevent blocking the main event loop
   // This allows health checks to continue working during long-running operations
   const response = await generateMarketingResponseWorkerService.runInWorker(
@@ -8519,6 +8584,9 @@ export async function generateSessionResponse(
       approvedRevisionImageSources,
       requireWorkPlanDisposition: enforceWorkPlanDisposition,
       isUnattendedRun,
+      // ENG-1816 F1: plain data across the fork boundary, same shape as
+      // publishAuthorizationOverride above — never a positional argument.
+      runFunding,
     },
     (progress) => {
       // Emit progress updates via SSE
@@ -9050,9 +9118,12 @@ export const agentModeController = {
       // not expose it at all, so reading a session's own detail page — the natural place
       // to investigate one incident — silently trusted the misleading field.
       const modelAttribution = computeSessionModelAttribution(session.messages, session.llmModel || null);
+      // ENG-2163: a real admin OR an admin viewing via delegation may see admin-tainted turns;
+      // the account owner (customer) viewing their own session may not.
+      const viewerIsAdmin = !!(user?.isAdmin || (req as any).delegateInfo?.isDelegated);
       const filteredSession = {
         ...session,
-        messages: filterMessagesForClient(session.messages),
+        messages: filterMessagesForClient(session.messages, { viewerIsAdmin }),
         hasActiveProgress: progressActive,
         skills,
         ...modelAttribution,
