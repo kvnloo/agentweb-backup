@@ -18,6 +18,7 @@ jest.mock('aws-sdk', () => ({
 
 import {
   adsMetricsDb,
+  buildAdEntityKey,
   buildEntityKey,
   ACCOUNT_DAY_SENTINEL,
   AdsMetricsSnapshotRow,
@@ -182,5 +183,27 @@ describe('ENG-916 adsMetricsDb read path', () => {
 
     expect(result.rows).toHaveLength(1);
     expect(result.rows[0].platform).toBe('google_ads');
+  });
+});
+
+describe('ENG-2141 ad rows', () => {
+  beforeEach(() => mockQuery.mockReset());
+
+  it('reads one ad\'s rows by its own entityKey, with an inclusive date range, oldest-first', async () => {
+    queuePages([{ Items: [{ rowType: 'ad', date: '2026-08-01' }, { rowType: 'ad', date: '2026-08-02' }] }]);
+
+    const result = await adsMetricsDb.getAdSnapshots('meta', '1842363582956923', 'ad9', { since: '2026-08-01', until: '2026-08-31' });
+
+    const q = mockQuery.mock.calls[0][0];
+    expect(q.IndexName).toBeUndefined();
+    expect(q.KeyConditionExpression).toBe('entityKey = :entityKey AND #date BETWEEN :since AND :until');
+    expect(q.ExpressionAttributeValues).toEqual({ ':entityKey': 'meta#1842363582956923#ad#ad9', ':since': '2026-08-01', ':until': '2026-08-31' });
+    expect(q.ExpressionAttributeNames).toEqual({ '#date': 'date' });
+    expect(q.ScanIndexForward).toBe(true);
+    expect(result).toEqual({ rows: [{ rowType: 'ad', date: '2026-08-01' }, { rowType: 'ad', date: '2026-08-02' }], truncated: false });
+  });
+
+  it('keeps an ad key distinct from a campaign key with the same numeric id', () => {
+    expect(buildAdEntityKey('meta', '1842363582956923', '123')).not.toBe(buildEntityKey('meta', '1842363582956923', '123'));
   });
 });

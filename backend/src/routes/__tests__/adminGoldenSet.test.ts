@@ -5,7 +5,7 @@
 
 import express, { type NextFunction, type Request, type Response } from 'express';
 import request from 'supertest';
-import { newGoldenCase } from '../../loops/eval/goldenSet';
+import { newCreativePairCase, newGoldenCase } from '../../loops/eval/goldenSet';
 import { createGoldenSetStore, type GoldenSetStore } from '../../loops/eval/goldenSetStore';
 
 interface TestUser {
@@ -104,6 +104,29 @@ describe('admin golden-set routes: behaviour', () => {
     expect(bad.body.message).toMatch(/not a agent criterion/);
     const missing = await request(app(store)).put(`${base}/nope/labels`).set('x-test-user', ADMIN).send({ labels: {}, expectedVersion: 0 });
     expect(missing.status).toBe(404);
+  });
+
+  it('saves an A / B / tie choice on a pairwise calibration case through the same route (ENG-2142)', async () => {
+    const pair = newCreativePairCase({
+      candidateIdA: 'cand-a',
+      pair: { candidateIdB: 'cand-b', batch: '2026-W39', position: 0, batchSize: 20, category: 'ad', placement: 'unknown', signal: 'unscored' },
+      now: NOW,
+    });
+    const store = fakeStore({
+      getCase: jest.fn(async (id: string) => (id === pair.caseId ? pair : null)),
+      saveLabels: jest.fn(async (_id, update, labeller) => ({ ...pair, labels: update.labels, labeller, version: 1 })),
+    });
+    const path = `${base}/${encodeURIComponent(pair.caseId)}/labels`;
+    const res = await request(app(store)).put(path).set('x-test-user', ADMIN).send({ labels: { pairwise_preference: 'B' }, notes: 'clearer offer', expectedVersion: 0 });
+    expect(res.status).toBe(200);
+    expect(store.saveLabels).toHaveBeenCalledWith(pair.caseId, { labels: { pairwise_preference: 'B' }, notes: 'clearer offer', expectedVersion: 0 }, 'admin@example.com');
+
+    const binary = await request(app(store)).put(path).set('x-test-user', ADMIN).send({ labels: { pairwise_preference: 'pass' }, expectedVersion: 0 });
+    expect(binary.status).toBe(400);
+    const single = await request(app(store)).put(path).set('x-test-user', ADMIN).send({ labels: { hook: 'pass' }, expectedVersion: 0 });
+    expect(single.status).toBe(400);
+    expect(store.saveLabels).toHaveBeenCalledTimes(1);
+    expect((await request(app(store)).put(path).set('x-test-user', CUSTOMER).send({ labels: { pairwise_preference: 'A' }, expectedVersion: 0 })).status).toBe(403);
   });
 
   it('answers 409 when the case changed since the labeller loaded it', async () => {
