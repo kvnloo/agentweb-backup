@@ -152,18 +152,10 @@ describe('agent mode → creative lineage (ENG-2141)', () => {
     jest.mocked(metaService.getAd)
       .mockResolvedValueOnce({ id: 'ad_123', creative: { creative_id: 'old_creative' } })
       .mockResolvedValue({ id: 'ad_123', creative: { creative_id: 'mc-new', object_story_spec: { page_id: 'p', link_data: { link: 'https://x.test' } } } });
-    // Keyed by creativeId, not a single blanket mock. ENG-2169 reads the CREATED creative
-    // back before attaching it (`getAdCreative(accessToken, newCreativeId)`), so a blanket
-    // mock returned the OLD creative — carrying `old-hash` — as the read-back of the new
-    // one. judgeImageSwap correctly called that `stale` and refused the swap, which is the
-    // exact bug ENG-2169 exists to catch. The swap under test here is a genuine one, so the
-    // new creative must read back with the new image: Meta ingests `image_url` and returns
-    // its own hash.
-    jest.mocked(metaService.getAdCreative).mockImplementation(async (_token: string, creativeId: string) => (
-      creativeId === 'mc-new'
-        ? { id: 'mc-new', object_story_spec: { page_id: 'p', link_data: { message: 'm', link: 'https://x.test', name: 'n', image_hash: 'new-hash' } } }
-        : { id: 'old_creative', object_story_spec: { page_id: 'p', link_data: { message: 'm', link: 'https://x.test', name: 'n', image_hash: 'old-hash' } } }
-    ) as any);
+    jest.mocked(metaService.getAdCreative).mockResolvedValue({
+      id: 'old_creative',
+      object_story_spec: { page_id: 'p', link_data: { message: 'm', link: 'https://x.test', name: 'n', image_hash: 'old-hash' } },
+    });
     jest.mocked(metaService.createAdCreative).mockResolvedValue({ id: 'mc-new' });
     jest.mocked(metaService.updateAd).mockResolvedValue({ success: true });
 
