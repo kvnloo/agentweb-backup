@@ -44,6 +44,10 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
+import {
+  buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
+  type CreativeImageReadback, type ImageSwapExpectation, type ImageSwapVerdict,
+} from './agentMode/metaImageSwapCheck';
 import { publishWithdrawnMidFlight, readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { isPublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
@@ -20277,6 +20281,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
     // Determine current creative type and extract existing fields
     let newCreativeParams: any;
+    // Set when the caller asked for a new single image / video thumbnail, so the created creative
+    // can be read back before it is attached (ENG-2169).
+    let imageSwap: ImageSwapExpectation | undefined;
 
     if (params.placement_assets) {
       // Placement-customized image creative (asset_feed_spec): map different images to different
@@ -20301,7 +20308,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         name: params.name || `${creativeData.name || 'Creative'} (updated)`,
         page_id: pageId,
         video_id: params.video_id || vd.video_id,
-        image_hash: params.image_hash || vd.image_hash,
+        // A new image_url drops the old thumbnail's hash (ENG-2169).
+        image_hash: selectSwapImageHash(params.image_hash, params.image_url, vd.image_hash),
         image_url: params.image_url || vd.image_url,
         body: params.body || vd.message || creativeData.body || '',
         title: params.title || vd.title || creativeData.title || '',
@@ -20309,6 +20317,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
         url_tags: carriedUrlTags,
       };
+      if (params.image_hash || params.image_url) {
+        imageSwap = { oldHash: vd.image_hash, oldUrl: vd.image_url, requestedHash: params.image_hash, requestedUrl: params.image_url };
+      }
     } else if (existingSpec.link_data?.child_attachments) {
       // Carousel creative – update the main link and optionally per-card links
       const ld = existingSpec.link_data;
@@ -20336,7 +20347,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       newCreativeParams = {
         name: params.name || `${creativeData.name || 'Creative'} (updated)`,
         page_id: pageId,
-        image_hash: params.image_hash || ld.image_hash,
+        // A new image_url drops the old image's hash (ENG-2169).
+        image_hash: selectSwapImageHash(params.image_hash, params.image_url, ld.image_hash),
         image_url: params.image_url || ld.picture || ld.image_url,
         body: params.body || ld.message || creativeData.body || '',
         title: params.title || ld.name || creativeData.title || '',
@@ -20344,6 +20356,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
         url_tags: carriedUrlTags,
       };
+      if (params.image_hash || params.image_url) {
+        imageSwap = {
+          oldHash: ld.image_hash, oldUrl: ld.picture || ld.image_url,
+          requestedHash: params.image_hash, requestedUrl: params.image_url,
+        };
+      }
     } else {
       return {
         success: false,
@@ -20368,6 +20386,26 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         message: 'Failed to create updated creative. The Meta API did not return a creative ID.',
         error: 'CREATIVE_CREATE_FAILED'
       };
+    }
+
+    // ENG-2169: read the created creative back before attaching it. If it still carries the old
+    // image (or not the requested hash), attaching it would "succeed" while the ad keeps serving
+    // the image it was meant to replace — fail loudly instead and leave the ad untouched.
+    let imageVerdict: ImageSwapVerdict | undefined;
+    if (imageSwap) {
+      let liveImage: CreativeImageReadback | undefined;
+      try {
+        const created = await metaService.getAdCreative(accessToken, newCreativeId);
+        liveImage = readCreativeImage(created?.object_story_spec);
+      } catch (err: unknown) {
+        // Best-effort, like verifyCreativeSwap: an unreadable creative is not proof of a stale image.
+        console.warn(`AgentMode: image read-back failed for new creative ${newCreativeId}:`,
+          err instanceof Error ? err.message : err);
+      }
+      imageVerdict = judgeImageSwap(imageSwap, liveImage);
+      if (imageVerdict === 'stale' && liveImage) {
+        return buildImageSwapNotReflected({ adId, oldCreativeId, newCreativeId, expected: imageSwap, live: liveImage });
+      }
     }
 
     console.log(`AgentMode: New creative ${newCreativeId} created. Updating ad ${adId} to use it.`);
@@ -20483,10 +20521,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       message: `Ad updated successfully. Created new creative (${newCreativeId}) with updated ${creativeKeys.join(', ')} `
         + `and swapped it in for the old creative (${oldCreativeId})`
         + (v.liveLinkUrl ? `. Verified live destination URL: ${v.liveLinkUrl}` : '.')
-        + reviewNote,
+        + reviewNote
+        // No proof of a stale image, but no proof of the new one either — never let that read as confirmed.
+        + (imageVerdict && imageVerdict !== 'confirmed'
+          ? ` NOTE: the new creative's image could not be confirmed (${imageVerdict} read-back) — do not tell the `
+            + `user the image changed until it is checked in Ads Manager.`
+          : ''),
       old_creative_id: oldCreativeId,
       new_creative_id: newCreativeId,
       verified: true,
+      ...(imageVerdict && { image_verified: imageVerdict === 'confirmed' }),
       live_link_url: v.liveLinkUrl,
       effective_status: v.effectiveStatus,
       review_feedback: v.reviewFeedback,
