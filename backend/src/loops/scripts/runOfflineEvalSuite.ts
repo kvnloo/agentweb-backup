@@ -1,6 +1,7 @@
 /**
- * Offline eval suite + regression gate CLI (ENG-2145). For Atem and staging runs; not a GitHub
- * Actions job (product suites do not gate in GitHub CI, repo CLAUDE.md).
+ * Offline eval suite + regression gate CLI (ENG-2145). The gate runs on Atem and staging; product
+ * suites do not gate in GitHub CI (repo CLAUDE.md). A PR that touches prompt/model/skill/eval
+ * sources runs `--target local` report-only through .github/workflows/offline-eval.yml (ENG-2195).
  *
  * Usage (from backend/):
  *   npx ts-node --transpile-only src/loops/scripts/runOfflineEvalSuite.ts --target local
