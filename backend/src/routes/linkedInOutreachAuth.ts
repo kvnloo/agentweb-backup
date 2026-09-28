@@ -6,6 +6,52 @@ import { clearDisconnectFlag } from '../services/linkedInConnectionHealth';
 
 const router = express.Router();
 
+/**
+ * Is this a Unipile-gateway-level blip rather than a real API error?
+ *
+ * Unipile's SDK (RequestSender.send) throws UnsuccessfulRequestError(body) with NO status
+ * code attached at all — only `.body`. A genuine 4xx/validation error from Unipile's own
+ * API always comes back as parsed JSON; an HTML page only ever means their nginx/gateway
+ * itself is down (a 502/503/504 error page), never a problem with our request. That HTML
+ * body — surfaced as a Blob with type text/html — is the one reliable transient signal
+ * available here. Confirmed against prod logs twice (ENG-2175, ENG-2180): both incidents
+ * were exactly this Blob/text-html shape.
+ */
+function isTransientUnipileError(error: any): boolean {
+  if (typeof Blob !== 'undefined' && error?.body instanceof Blob && error.body.type === 'text/html') {
+    return true;
+  }
+  const code = error?.code || error?.cause?.code;
+  return code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'ECONNREFUSED' || code === 'EAI_AGAIN';
+}
+
+/**
+ * Retries a Unipile hosted-auth-link call through brief provider-side blips.
+ *
+ * Bounded to a few seconds total since this sits in the synchronous path of a user's
+ * button click. ENG-2175 and ENG-2180 both showed Unipile outages lasting minutes, which
+ * no bounded retry here can ride out — this only absorbs short blips, not a sustained
+ * vendor outage. Non-transient errors (a real validation/auth failure) are never retried.
+ */
+async function createHostedAuthLinkWithRetry<T>(fn: () => Promise<T>, maxRetries = 3, delayMs = 1000): Promise<T> {
+  for (let attempt = 1; attempt < maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error: any) {
+      if (!isTransientUnipileError(error)) throw error;
+      console.warn(`[LinkedIn Outreach] Transient error generating auth link (attempt ${attempt}/${maxRetries}), retrying:`, error?.message || error);
+      await new Promise((resolve) => setTimeout(resolve, delayMs * attempt));
+    }
+  }
+  return fn(); // last attempt — let any error propagate naturally
+}
+
+function authLinkErrorMessage(error: any, fallback: string): string {
+  return isTransientUnipileError(error)
+    ? "LinkedIn's connection provider is temporarily unavailable. Please try again in a few minutes."
+    : fallback;
+}
+
 // ============================================
 // Routes
 // ============================================
@@ -23,8 +69,9 @@ router.get('/init', authenticateToken, async (req: any, res: any) => {
 
     // Unipile requires expiresOn as ISO 8601 string: "YYYY-MM-DDTHH:MM:SS.sssZ"
     const expiresOn = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    const apiUrl = await linkedInOutreachService.getApiUrl();
 
-    const authLink = await client.account.createHostedAuthLink({
+    const authLink = await createHostedAuthLinkWithRetry(() => client.account.createHostedAuthLink({
       type: 'create',
       providers: ['LINKEDIN'],
       // The SDK types expect a branded datetime string; cast to bypass the
@@ -32,15 +79,18 @@ router.get('/init', authenticateToken, async (req: any, res: any) => {
       expiresOn: expiresOn as any,
       success_redirect_url: `${frontendUrl}/oauth/linkedin-outreach/callback`,
       failure_redirect_url: `${frontendUrl}/oauth/linkedin-outreach/callback?error=connection_failed`,
-      api_url: await linkedInOutreachService.getApiUrl(),
-    });
+      api_url: apiUrl,
+    }));
 
     console.log(`[LinkedIn Outreach] Hosted auth link generated (type=create) for user ${req.user.userId}`);
     res.json({ success: true, url: authLink.url });
 
   } catch (error: any) {
     console.error('[LinkedIn Outreach] Error generating auth link:', error);
-    res.status(500).json({ error: 'Failed to initialize LinkedIn Outreach connection', details: error.message });
+    res.status(500).json({
+      error: authLinkErrorMessage(error, 'Failed to initialize LinkedIn Outreach connection'),
+      details: error.message,
+    });
   }
 });
 
@@ -150,21 +200,25 @@ router.post('/reconnect', authenticateToken, async (req: any, res: any) => {
     const client = await linkedInOutreachService.getClient();
     const frontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
     const expiresOn = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    const apiUrl = await linkedInOutreachService.getApiUrl();
 
-    const authLink = await client.account.createHostedAuthLink({
+    const authLink = await createHostedAuthLinkWithRetry(() => client.account.createHostedAuthLink({
       type: 'reconnect',
       reconnect_account: unipileAccountId,
       expiresOn: expiresOn as any,
       success_redirect_url: `${frontendUrl}/oauth/linkedin-outreach/callback`,
       failure_redirect_url: `${frontendUrl}/oauth/linkedin-outreach/callback?error=connection_failed`,
-      api_url: await linkedInOutreachService.getApiUrl(),
-    } as any);
+      api_url: apiUrl,
+    } as any));
 
     console.log(`[LinkedIn Outreach] Hosted auth link generated (type=reconnect, account=${unipileAccountId}) for user ${req.user.userId}`);
     res.json({ success: true, url: authLink.url });
   } catch (error: any) {
     console.error('[LinkedIn Outreach] Error generating reconnect link:', error);
-    res.status(500).json({ error: 'Failed to generate reconnect link', details: error.message });
+    res.status(500).json({
+      error: authLinkErrorMessage(error, 'Failed to generate reconnect link'),
+      details: error.message,
+    });
   }
 });
 
