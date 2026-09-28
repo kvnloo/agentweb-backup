@@ -174,6 +174,24 @@ function isRevokedRefreshTokenError(err: unknown): boolean {
   // "invalid_request", NOT "invalid_grant" — the BAD_REFRESH_TOKEN alternative below is
   // load-bearing, not belt-and-braces.
   //
+  // That is not the only shape, and an earlier version of this comment wrongly called it
+  // "one measured sample". MISMATCH_REFRESH_TOKEN_CLIENT — "refresh token was not issued
+  // to this client" — has been recorded in this repo since b97814ea4 (2026-06-26):
+  // externalCrmSyncService.ts:571 and externalCrmSync.service.test.ts:1104-1120. It is
+  // also a 400, it also means the grant can never be refreshed, and that commit states
+  // outright that "the user-facing fix for the underlying account is to reconnect
+  // HubSpot" — i.e. precisely what needs_reconnect exists to surface. Matching only
+  // BAD_REFRESH_TOKEN let it render "Active · Connected" forever, which is the original
+  // bug wearing a green test suite. The message text is matched too, because that commit
+  // shows the error reaching callers as a bare message with the body already lost.
+  //
+  // Widening here does NOT reopen the fleet-wide risk: a rotated clientSecret answers
+  // BAD_CLIENT_CREDENTIALS, which still does not match. And a deploy pointed at the wrong
+  // client_id would mismatch every grant at once — but those grants genuinely cannot
+  // refresh, and since create() no longer short-circuits and the clear still runs, the
+  // fleet self-heals within one access-token lifetime once the config is fixed. A false
+  // negative never self-heals.
+  //
   // Why 401 is gated the same way rather than trusted: the refresh POST carries
   // client_id/client_secret, and RFC 6749 §5.2 assigns 401 to `invalid_client` — a
   // statement about the SHARED credential from getHubSpotConfig(), not about one
@@ -185,8 +203,16 @@ function isRevokedRefreshTokenError(err: unknown): boolean {
   // single sweep — externalCrmSyncService stops syncing them and every customer is told
   // to reconnect an integration that works.
   const data = (err as any)?.response?.data;
-  const marker = typeof data === 'string' ? data : JSON.stringify(data ?? '');
-  return /BAD_REFRESH_TOKEN|invalid_grant/i.test(marker);
+  let marker: string;
+  try {
+    // Guarded for the same reason describeRefreshFailure is: a throw here escapes the
+    // catch block it runs inside, replacing the refresh error and skipping BOTH the flag
+    // and the diagnostic warn. Unreachable with axios defaults; one line to keep it so.
+    marker = typeof data === 'string' ? data : JSON.stringify(data ?? '');
+  } catch {
+    marker = '';
+  }
+  return /BAD_REFRESH_TOKEN|MISMATCH_REFRESH_TOKEN_CLIENT|invalid_grant|not issued to this client/i.test(marker);
 }
 
 /**
@@ -208,6 +234,37 @@ async function markHubSpotNeedsReconnect(userId: string, accountId: string): Pro
   } catch (e) {
     console.error(`[HubSpotService] Failed to mark account ${accountId} needs_reconnect:`, e);
   }
+}
+
+/**
+ * Strip credentials off an axios error IN PLACE, before it is thrown or logged.
+ *
+ * Axios hangs the outgoing request off the error as `config` — `config.data` is the form
+ * body, which for every OAuth call here is
+ *   grant_type=…&refresh_token=<customer token>&client_id=…&client_secret=<app secret>
+ * and `config.headers` can carry a bearer token. So ANY `console.error(msg, err)` on a
+ * failed OAuth call writes those to the log.
+ *
+ * Redacting only at the log sites inside this file was not enough — a review found the
+ * same error still reaching `console.error` raw at routes/hubspotAuth.ts (a failed code
+ * exchange, which happens whenever a user double-submits or reuses an authorization code)
+ * and routes/crmSync.ts (`err.response?.data || err` falls through to the raw error when
+ * a network failure means there is no response). Sanitising at the SOURCE makes every
+ * present and future logger safe instead of requiring each to remember.
+ *
+ * Mutates rather than clones: the error is about to be thrown, callers inspect `.response`
+ * and `.message`, and a clone would drop the prototype that `instanceof` checks rely on.
+ */
+export function redactAxiosCredentials<T>(err: T): T {
+  const cfg = (err as any)?.config;
+  if (cfg && typeof cfg === 'object') {
+    if (cfg.data !== undefined) cfg.data = '[redacted: request body carries client_secret]';
+    if (cfg.headers !== undefined) cfg.headers = '[redacted]';
+    if (cfg.auth !== undefined) cfg.auth = '[redacted]';
+    // tokenInfoUrl puts a live access token in the PATH, not the body.
+    if (typeof cfg.url === 'string') cfg.url = cfg.url.replace(/\/[A-Za-z0-9._~-]{20,}$/, '/[redacted]');
+  }
+  return err;
 }
 
 /**
@@ -381,7 +438,13 @@ export class HubSpotService {
     return this._token;
   }
 
-  private async doRefresh(userId: string, accountId: string, refreshToken: string, wasFlagged = false): Promise<void> {
+  /**
+   * `wasFlagged` is REQUIRED, deliberately. With a default it silently took the
+   * non-healing value, so a new call site that forgot it would stop clearing
+   * needs_reconnect and no test would notice — a review found exactly that gap on the
+   * mid-operation path. Making it required turns that mistake into a compile error.
+   */
+  private async doRefresh(userId: string, accountId: string, refreshToken: string, wasFlagged: boolean): Promise<void> {
     const hubspotConfig = await getHubSpotConfig();
     const lockKey = `${userId}:${accountId}`;
 
@@ -413,6 +476,7 @@ export class HubSpotService {
             `[HubSpotService] Refresh token rejected for account ${accountId} \u2014 marking `
             + `needs_reconnect. ${describeRefreshFailure(refreshErr)}`
           );
+          redactAxiosCredentials(refreshErr);
           await markHubSpotNeedsReconnect(userId, accountId);
           throw new Error(RECONNECT_MESSAGE);
         }
@@ -425,7 +489,9 @@ export class HubSpotService {
           `[HubSpotService] Refresh failed for account ${accountId} and was NOT treated as a `
           + `revocation. ${describeRefreshFailure(refreshErr)}`
         );
-        throw refreshErr;
+        // Redacted before it escapes: this rethrow hands the raw AxiosError to callers,
+        // and at least two of them log it whole.
+        throw redactAxiosCredentials(refreshErr);
       }
 
       const { access_token, refresh_token, expires_in } = response.data as {

@@ -223,9 +223,22 @@ describe('a 400 only counts when the body says the refresh token is bad', () => 
     expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
   });
 
+  /*
+   * MISMATCH_REFRESH_TOKEN_CLIENT is NOT hypothetical and NOT a second-guess of HubSpot.
+   * It has been recorded in this repo since b97814ea4 (2026-06-26) —
+   * externalCrmSyncService.ts:571 and externalCrmSync.service.test.ts:1104-1120 — as a
+   * HubSpot 400 whose stated user-facing fix is "reconnect HubSpot". Matching only
+   * BAD_REFRESH_TOKEN let that account report "Active · Connected" forever while a green
+   * suite claimed revocation handling worked.
+   *
+   * The bare-message form is covered too: that commit shows the error reaching callers as
+   * a plain message with the response body already lost.
+   */
   it.each([
     ['BAD_REFRESH_TOKEN', { status: 'BAD_REFRESH_TOKEN' }],
     ['invalid_grant', { error: 'invalid_grant', error_description: 'refresh token expired' }],
+    ['MISMATCH_REFRESH_TOKEN_CLIENT', { status: 'MISMATCH_REFRESH_TOKEN_CLIENT', message: 'refresh token was not issued to this client' }],
+    ['the bare mismatch message', 'refresh token was not issued to this client'],
   ])('DOES flag on a 400 carrying %s', async (_label, body) => {
     mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
     mockAxiosPost.mockRejectedValue(httpError(400, body));
@@ -385,5 +398,109 @@ describe('refresh-failure logging never carries credentials', () => {
 
     await expect(HubSpotService.create('user-1')).rejects.toThrow();
     expect(logged()).toContain('truncated');
+  });
+});
+
+/*
+ * The mid-operation refresh path (token(), reached when a token expires DURING an
+ * operation) threads `wasFlagged` just like create() does — and a review found that half
+ * unpinned: zeroing it there left every test green. `doRefresh` also defaults the
+ * parameter to `false`, the non-healing value, so an unverified call site silently stops
+ * clearing the flag.
+ */
+describe('the mid-operation refresh path heals too', () => {
+  const freshThenExpiring = (overrides: Record<string, unknown> = {}) => ({
+    ...expiredAccount(overrides),
+    config: {
+      ...expiredAccount(overrides).config,
+      // Valid when create() reads it, so create() returns WITHOUT refreshing; the
+      // instance then refreshes mid-operation on first use.
+      token_expires_at: Date.now() + 60 * 60 * 1000,
+      ...overrides,
+    },
+  });
+
+  it('clears needs_reconnect when the mid-operation refresh succeeds', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      freshThenExpiring({ needs_reconnect: true, token_expires_at: Date.now() - 1000 }),
+    ] as never);
+    mockAxiosPost.mockResolvedValue({
+      data: { access_token: 'fresh', refresh_token: 'rotated', expires_in: 1800 },
+    });
+
+    await HubSpotService.create('user-1');
+
+    expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+      'user-1', 'hubspot', '245815183', { needs_reconnect: false });
+  });
+});
+
+/*
+ * Redaction has to happen at the SOURCE, not at each log line.
+ *
+ * The first attempt sanitised the two console calls inside hubspotService and a review
+ * showed that was not enough: the same AxiosError is rethrown to callers and logged whole
+ * elsewhere — routes/hubspotAuth.ts on a failed code exchange, and routes/crmSync.ts,
+ * whose `err.response?.data || err` falls through to the raw error when a network failure
+ * leaves no response. The console spies in the suite above could never have caught those,
+ * because they only watch calls made inside HubSpotService.
+ *
+ * So these assert on the ERROR OBJECT that escapes, which is what every downstream logger
+ * actually receives.
+ */
+describe('the error that escapes carries no credentials', () => {
+  const SECRET = 'escaping-client-secret';
+  const REFRESH = 'na1-escaping-refresh-token';
+  const withConfig = (status: number, data: unknown) =>
+    Object.assign(new Error(`Request failed with status code ${status}`), {
+      isAxiosError: true,
+      config: {
+        url: 'https://api.hubapi.com/oauth/v1/token',
+        data: `grant_type=refresh_token&refresh_token=${REFRESH}&client_id=cid&client_secret=${SECRET}`,
+        headers: { Authorization: `Bearer ${REFRESH}` },
+      },
+      response: { status, data },
+    });
+
+  beforeEach(() => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => { jest.restoreAllMocks(); });
+
+  it('scrubs the rethrown transient error, which callers log whole', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
+    const err = withConfig(503, 'upstream unavailable');
+    mockAxiosPost.mockRejectedValue(err);
+
+    // The transient path rethrows the ORIGINAL error — that object is what
+    // routes/crmSync.ts prints when there is no response body to prefer.
+    await expect(HubSpotService.create('user-1')).rejects.toThrow(/503/);
+
+    const dumped = JSON.stringify({ msg: (err as any).message, config: (err as any).config });
+    expect(dumped).not.toContain(SECRET);
+    expect(dumped).not.toContain(REFRESH);
+  });
+
+  it('scrubs the error even when the refresh is classified as a revocation', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
+    const err = withConfig(400, BAD_REFRESH_BODY);
+    mockAxiosPost.mockRejectedValue(err);
+
+    await expect(HubSpotService.create('user-1')).rejects.toThrow(/needs to be reconnected/i);
+
+    const dumped = JSON.stringify({ config: (err as any).config });
+    expect(dumped).not.toContain(SECRET);
+    expect(dumped).not.toContain(REFRESH);
+  });
+
+  it('keeps the response body, so the diagnostic survives redaction', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
+    const err = withConfig(400, { status: 'BAD_REFRESH_TOKEN', correlationId: 'corr-123' });
+    mockAxiosPost.mockRejectedValue(err);
+
+    await expect(HubSpotService.create('user-1')).rejects.toThrow();
+    // Redaction must not cost the only signal that would ever reveal a wrong classifier.
+    expect(JSON.stringify((err as any).response.data)).toContain('corr-123');
   });
 });

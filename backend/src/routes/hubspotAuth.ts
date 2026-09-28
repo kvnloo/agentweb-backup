@@ -1,4 +1,5 @@
 import express from 'express';
+import { redactAxiosCredentials } from '../services/hubspotService';
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
@@ -222,7 +223,12 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
 
     res.json({ success: true, account });
   } catch (error: any) {
-    console.error('[HubSpot OAuth /connect]', error);
+    // Redacted: this handler's own axios.post sends client_secret in the form body, and
+    // axios attaches that body to the error as `config.data`. Logging the raw error wrote
+    // the app's HubSpot client secret to the log on every failed code exchange — which is
+    // an ordinary event (a reused or expired authorization code, a double-submitted
+    // callback), not an exotic one.
+    console.error('[HubSpot OAuth /connect]', redactAxiosCredentials(error));
     const details = IS_PRODUCTION ? undefined : error.message;
     res.status(500).json({ error: 'Failed to connect HubSpot account', ...(details && { details }) });
   }
