@@ -38,12 +38,18 @@ jest.mock('../services/approvalInboxService', () => ({
   approvalInboxService: {
     listByManifest: jest.fn(),
     recordExecutionResult: jest.fn(),
+    claimDispatch: jest.fn(),
   },
+}));
+
+jest.mock('../services/approvalInboxExecution', () => ({
+  resumeOriginSession: jest.fn(),
 }));
 
 import { AgentModeService } from '../services/agentModeService';
 import { chatbotDb } from '../services/chatbotService';
 import { approvalInboxService } from '../services/approvalInboxService';
+import { resumeOriginSession } from '../services/approvalInboxExecution';
 
 const SESSION_ID = 'sess-inbox-manifest-1';
 const ACCOUNT = '2041725529929988';
@@ -92,6 +98,9 @@ beforeEach(() => {
   service = new AgentModeService();
   jest.spyOn(service as any, 'getMetaCredentials').mockResolvedValue({ accountId: ACCOUNT, accessToken: 'tok' });
 
+  (approvalInboxService.claimDispatch as jest.Mock).mockResolvedValue(true);
+  (resumeOriginSession as jest.Mock).mockResolvedValue(undefined);
+
   sessionState = { sessionId: SESSION_ID, userId: 'user-1' };
   (chatbotDb.getChatSession as jest.Mock).mockImplementation(async () => ({ ...sessionState }));
   (chatbotDb.updateSessionWorkflowRun as jest.Mock).mockImplementation(async (_sid: string, run: any, opts: any) => {
@@ -125,6 +134,7 @@ describe('ENG-1853 executeApprovalInboxMetaWriteManifest', () => {
     ]);
     const outcome = await service.executeApprovalInboxMetaWriteManifest(MANIFEST_ID);
     expect(outcome).toEqual({ outcome: 'not_all_resolved', unresolved: ['d2'] });
+    expect(resumeOriginSession).not.toHaveBeenCalled();
   });
 
   it('refuses when approved items disagree on which session originated them', async () => {
@@ -134,6 +144,7 @@ describe('ENG-1853 executeApprovalInboxMetaWriteManifest', () => {
     ]);
     const outcome = await service.executeApprovalInboxMetaWriteManifest(MANIFEST_ID);
     expect(outcome).toEqual({ outcome: 'mixed_origin_sessions' });
+    expect(resumeOriginSession).not.toHaveBeenCalled();
   });
 
   it('all writes succeeding reconciles to fully_applied and records executed with read-back for every decision', async () => {
@@ -157,6 +168,12 @@ describe('ENG-1853 executeApprovalInboxMetaWriteManifest', () => {
     expect(approvalInboxService.recordExecutionResult).toHaveBeenCalledWith(
       'd2', 'executed', expect.objectContaining({ success: true, appliedObjectId: 'id-AS_2' }),
     );
+
+    // Review fix (critical): the manifest executor must close the loop back
+    // to the originating agent, not just record outcomes nobody reads.
+    expect(resumeOriginSession).toHaveBeenCalledWith(SESSION_ID, expect.any(String));
+    const resumeMessage = (resumeOriginSession as jest.Mock).mock.calls[0][1];
+    expect(resumeMessage).toContain('fully applied');
   });
 
   it('one real Meta-side failure reconciles to partially_applied — the other write still dispatches and is read back', async () => {
@@ -213,5 +230,25 @@ describe('ENG-1853 executeApprovalInboxMetaWriteManifest', () => {
     // Only the first call actually dispatched — the real assertion that
     // matters: Meta was never written to twice.
     expect((service as any).manageMetaAdsAdSets).toHaveBeenCalledTimes(1);
+  });
+
+  it('review fix: a step whose dispatch is already claimed by a concurrent driver never reaches the real Meta write', async () => {
+    // Simulates two concurrent drivers of the SAME workflow run racing on the
+    // same step — claimDispatch is the at-most-once gate that must stop the
+    // loser BEFORE dispatchAuthorizedMetaWrite, not after.
+    (approvalInboxService.claimDispatch as jest.Mock).mockResolvedValue(false);
+    const manageMetaAdsAdSets = jest.spyOn(service as any, 'manageMetaAdsAdSets').mockResolvedValue({ success: true, message: 'created', adSet: { id: 'id-1' } });
+    (approvalInboxService.listByManifest as jest.Mock).mockResolvedValue([decisionFor('d1', 'AS_1')]);
+
+    const outcome = await service.executeApprovalInboxMetaWriteManifest(MANIFEST_ID);
+    // 'contended' is not a checkpointed failure — findNextIndependentStep
+    // keeps offering the same unattempted step back forever, so a
+    // permanently-losing driver never reaches 'completed'
+    // (driveIndependentWorkflowToCompletion gives up after
+    // MAX_CONTENDED_RETRIES and this surfaces as 'conflict', matching the
+    // "someone else is handling it, don't also dispatch" contract). The real
+    // invariant under test: the write itself was never dispatched.
+    expect(outcome).toEqual({ outcome: 'conflict' });
+    expect(manageMetaAdsAdSets).not.toHaveBeenCalled();
   });
 });

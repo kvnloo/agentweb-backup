@@ -160,6 +160,16 @@ export interface ApprovalDecision {
   freeText?: string;
   slack?: { channelId: string; messageTs: string };
   executionResult?: ApprovalDecisionExecutionResult;
+  /** ENG-1853 review fix: set by claimDispatch, at most once — the
+   *  meta_write manifest executor's own at-most-once dispatch gate.
+   *  advanceIndependentWorkflow provides no mutual exclusion between two
+   *  concurrent drivers of the same workflow run picking the same
+   *  un-checkpointed step (unlike the live-deck path, which is protected by
+   *  claimMetaWriteManifestGrant), so without this, two concurrent
+   *  approve-all requests (a client retry, two tabs, two EB instances) could
+   *  both call dispatchAuthorizedMetaWrite for the same real Meta write
+   *  before either checkpoint lands. */
+  dispatchClaimedAt?: string;
 }
 
 export interface CreateApprovalDecisionRequest {
@@ -539,6 +549,35 @@ export class ApprovalInboxService {
         ExpressionAttributeValues: { ':status': 'dispatching', ':now': new Date().toISOString() },
       })
       .promise();
+  }
+
+  /**
+   * ENG-1853 review fix: at-most-once dispatch gate for the meta_write
+   * manifest executor (agentModeService.ts's
+   * buildApprovalInboxMetaWriteWorkflowSteps). A single atomic conditional
+   * update, guarded entirely by its own ConditionExpression — same shape as
+   * claimDecision above — so two concurrent drivers of the same manifest
+   * workflow run racing to execute() the same step can never both proceed to
+   * dispatchAuthorizedMetaWrite: exactly one wins this update, the other's
+   * ConditionalCheckFailedException tells its caller to back off instead of
+   * dispatching a real Meta write a second time.
+   */
+  async claimDispatch(decisionId: string): Promise<boolean> {
+    try {
+      await dynamodb
+        .update({
+          TableName: APPROVAL_DECISIONS_TABLE,
+          Key: { decisionId },
+          UpdateExpression: 'SET dispatchClaimedAt = :now, updatedAt = :now',
+          ConditionExpression: 'attribute_not_exists(dispatchClaimedAt)',
+          ExpressionAttributeValues: { ':now': new Date().toISOString() },
+        })
+        .promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return false;
+      throw error;
+    }
   }
 
   /** Records the outcome of actually executing an approved decision (Phase D) —

@@ -130,6 +130,17 @@ describe('GET /queue', () => {
     const haven = res.body.manifests.find((m: any) => m.manifestId === 'm1');
     expect(haven.itemCount).toBe(2);
   });
+
+  it('excludes pre-existing decisions with no manifestId instead of surfacing a dead-end entry (found live on env1)', async () => {
+    mockListPendingForApprover.mockResolvedValue([
+      decisionFor('legacy-1', 'matt', { manifestId: undefined as any }),
+      decisionFor('d1', 'matt', { manifestId: 'm1' }),
+    ]);
+    const res = await request(app).get('/api/approval-desk/queue').set('Authorization', `Bearer ${mattToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.manifests).toHaveLength(1);
+    expect(res.body.manifests[0].manifestId).toBe('m1');
+  });
 });
 
 describe('GET /manifest/:manifestId — Matt cannot see Harsha\'s items', () => {

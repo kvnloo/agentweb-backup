@@ -39,6 +39,15 @@ router.get('/queue', authenticateToken, isAdmin, async (req, res) => {
     const pending = await approvalInboxService.listPendingForApprover(approver);
     const byManifest = new Map<string, ApprovalDecision[]>();
     for (const decision of pending) {
+      // Live-verified on env1 (2026-09-28): real decisions created before
+      // this PR (ENG-1644's own earlier testing) have no manifestId at all —
+      // the field is additive, not backfilled. Such a row can never appear
+      // in a ManifestIndex query (listByManifest), so surfacing it here
+      // would only produce a queue entry whose "Review" link 404s. These
+      // stay reachable exactly as before, through Slack — this is a NEW
+      // surface, not a replacement, so a pre-existing item simply isn't
+      // part of it yet.
+      if (!decision.manifestId) continue;
       const list = byManifest.get(decision.manifestId) || [];
       list.push(decision);
       byManifest.set(decision.manifestId, list);

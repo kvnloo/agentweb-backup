@@ -151,6 +151,13 @@ import { startWorkflow, advanceIndependentWorkflow, type AdvanceIndependentOutco
 // dependency back on this file (verified), so this is a one-directional
 // import, not a cycle.
 import { approvalInboxService, type ApprovalDecision } from './approvalInboxService';
+// Review fix: the manifest executor below needs the same active-resume
+// primitive approvalInboxExecution.ts already built for the per-decision
+// path — resumeOriginSession is exported from there specifically so this
+// file doesn't grow a second, divergent copy of the same resume/fallback
+// logic. approvalInboxExecution.ts does not import from this file, so this
+// stays a one-directional dependency, not a cycle.
+import { resumeOriginSession } from './approvalInboxExecution';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
 import { settingsService } from './settingsService';
 import {
@@ -21478,11 +21485,31 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * durable approval-inbox decisions sharing one manifestId, instead of a
    * session-scoped PendingApprovalDeck nobody is connected to see. Each
    * write's own createDecision call is idempotent on its digest (existing
-   * `AW-ApprovalDecisions` contract); the manifestId wrapping them is freshly
-   * minted per call, so a genuinely retried iteration that re-halts on the
-   * exact same writes stages the same underlying decisions again under a new
-   * manifestId — acceptable, since in practice this only runs once per real
-   * halted iteration (the turn breaks immediately after).
+   * `AW-ApprovalDecisions` contract).
+   *
+   * Review fix (double-dispatch risk): uses Promise.allSettled, not
+   * Promise.all, and NEVER falls back to the live-deck path once ANYTHING
+   * has been durably staged. The original Promise.all shape meant a single
+   * genuine createDecision failure (not the idempotent-conflict branch,
+   * which createDecision already swallows internally — a real transient
+   * error) discarded every OTHER write that had already succeeded, and the
+   * caller then built a live PendingApprovalDeck covering the full batch —
+   * including the already-staged ones. If that stale deck were ever later
+   * answered, it would dispatch through buildMetaWriteWorkflowSteps'
+   * claimMetaWriteManifestGrant, a completely separate claim mechanism this
+   * path never touches, which would not see the write as consumed and could
+   * dispatch it a second time. Falling back to the live deck is only safe
+   * when NOTHING was staged (nothing durable exists yet to double-claim).
+   *
+   * Review fix (manifestId misreporting): createDecision returns the
+   * EXISTING record (with its ORIGINAL manifestId) on an idempotent hit —
+   * it never adopts a newly-passed manifestId. A retried iteration that
+   * re-stages an already-staged digest would previously still report the
+   * freshly-minted manifestId regardless, which could point the turn's own
+   * "resume" message and the reviewer's queue link at a manifestId that
+   * contains none (or only some) of the decisions it claims to. This now
+   * reads back every real createDecision result and reports the actual
+   * manifestId(s) the staged decisions really landed under.
    *
    * approver defaults to 'matt' — the named reviewer ENG-1644's own seed
    * acceptance cases used for this exact class of decision (Haven/Every).
@@ -21498,34 +21525,64 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // one consistent "how long before this goes stale" answer across every
     // producer of this table.
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-    try {
-      await Promise.all(
-        writeHalts.map((r) =>
-          approvalInboxService.createDecision({
-            gateType: 'meta_write',
-            approver: 'matt',
-            subjectLabel: `Meta Ads · Account ${r?.target?.account_id || r?.metaWriteDispatch?.account_id || 'unknown'}`,
-            businessImpact: r?.confirmationDetail || r?.confirmationPrompt || r?.summary || 'A Meta Ads change is waiting for review.',
-            evidencePacket: { researchSummary: r?.summary },
-            metaWriteManifestDigest: r.metaWriteManifestDigest,
-            metaWriteDispatch: r.metaWriteDispatch,
-            originSessionId: sessionId,
-            manifestId,
-            expiresAt,
-          }),
-        ),
-      );
-    } catch (err: any) {
-      console.error('[agent-mode-service] failed to stage approval-inbox meta_write manifest, falling back to the live deck path:', err?.message || err);
+
+    const settled = await Promise.allSettled(
+      writeHalts.map((r) =>
+        approvalInboxService.createDecision({
+          gateType: 'meta_write',
+          approver: 'matt',
+          subjectLabel: `Meta Ads · Account ${r?.target?.account_id || r?.metaWriteDispatch?.account_id || 'unknown'}`,
+          businessImpact: r?.confirmationDetail || r?.confirmationPrompt || r?.summary || 'A Meta Ads change is waiting for review.',
+          evidencePacket: { researchSummary: r?.summary },
+          metaWriteManifestDigest: r.metaWriteManifestDigest,
+          metaWriteDispatch: r.metaWriteDispatch,
+          originSessionId: sessionId,
+          manifestId,
+          expiresAt,
+        }),
+      ),
+    );
+
+    const staged = settled
+      .filter((s): s is PromiseFulfilledResult<ApprovalDecision> => s.status === 'fulfilled')
+      .map((s) => s.value);
+    const failedCount = settled.length - staged.length;
+
+    if (staged.length === 0) {
+      // Nothing durable exists anywhere for this batch — the live-deck
+      // fallback below is fully safe (nothing it could double-claim).
+      for (const s of settled) {
+        if (s.status === 'rejected') {
+          console.error('[agent-mode-service] failed to stage an approval-inbox meta_write decision, falling back to the live deck path:', s.reason?.message || s.reason);
+        }
+      }
       return null;
     }
-    const count = writeHalts.length;
+    if (failedCount > 0) {
+      // Some writes ARE now durably staged — must not fall back to a live
+      // deck for the rest (see header). The un-staged write(s) are simply
+      // not tracked this iteration; they are not silently duplicated.
+      console.error(
+        `[agent-mode-service] partially failed to stage an approval-inbox meta_write manifest — ${staged.length}/${settled.length} succeeded. ` +
+        `The other ${failedCount} write(s) were NOT staged and will need the model to re-attempt them on a later turn — ` +
+        `never falling back to a live deck here, since that would risk double-dispatching the ${staged.length} write(s) already staged.`,
+      );
+    }
+
+    // staged items may have landed under a PRE-EXISTING manifestId (an
+    // idempotent hit on an already-staged digest, e.g. from an earlier
+    // partial attempt) rather than the manifestId just minted — report
+    // honestly rather than assuming uniformity.
+    const manifestIds = [...new Set(staged.map((d) => d.manifestId))];
+    const reportedManifestId = manifestIds.length === 1 ? manifestIds[0] : manifestId;
+
+    const count = staged.length;
     return {
-      manifestId,
+      manifestId: reportedManifestId,
       turnMessage:
         count === 1
           ? `This change needs review before it runs — queued for the assigned approver in the Approval Desk. I'll resume automatically once it's resolved.`
-          : `This packet of ${count} changes needs review before they run — queued for the assigned approver in the Approval Desk. I'll resume automatically once it's resolved.`,
+          : `This packet of ${count} change${count === 1 ? '' : 's'} needs review before ${count === 1 ? 'it runs' : 'they run'} — queued for the assigned approver in the Approval Desk. I'll resume automatically once it's resolved.`,
     };
   }
 
@@ -22772,6 +22829,24 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         outputs: [],
         requiredParameters: [],
         execute: async (): Promise<Record<string, unknown>> => {
+          // Review fix: advanceIndependentWorkflow provides no mutual
+          // exclusion between two concurrent drivers of the SAME run picking
+          // the same un-checkpointed step (unlike buildMetaWriteWorkflowSteps
+          // above, this builder has no claimMetaWriteManifestGrant call to
+          // fall back on for that protection) — two concurrent approve-all
+          // requests for this manifest (a client retry, two tabs, two EB
+          // instances) could otherwise both reach dispatchAuthorizedMetaWrite
+          // for the same real Meta write before either checkpoint lands.
+          // claimDispatch is this step's own at-most-once gate.
+          const claimed = await approvalInboxService.claimDispatch(decision.decisionId);
+          if (!claimed) {
+            // Same StepContendedError treatment as the live-deck sibling's
+            // 'already_consumed' branch — a concurrent driver already owns
+            // this dispatch, so no checkpoint is written here (a false
+            // 'failed' could win the version race over the other driver's
+            // real 'verified' one).
+            throw new StepContendedError('This write is already being dispatched by a concurrent request.');
+          }
           const dispatchResult = await this.dispatchAuthorizedMetaWrite(
             userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId ?? dispatch.account_id,
             dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
@@ -22782,6 +22857,31 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         verify: AgentModeService.verifyMetaWriteDispatchResult,
       };
     });
+  }
+
+  /** Builds the message resumeOriginSession delivers once a meta_write
+   *  manifest finishes dispatching — mirrors buildResolutionMessage's shape
+   *  in approvalInboxExecution.ts (one line per item, a closing directive)
+   *  but summarizes a whole packet's read-back outcome instead of a single
+   *  decision's verdict. */
+  private static buildManifestResolutionMessage(
+    decisions: ApprovalDecision[],
+    summary: ApprovalDeckExecutionSummary | null,
+  ): string {
+    const status = (summary?.status ?? 'unapplied').replace(/_/g, ' ');
+    const lines = [
+      `[Approval Inbox manifest] ${decisions.length} Meta write(s) in this packet were approved and dispatched — result: ${status}.`,
+    ];
+    for (const decision of decisions) {
+      const item = summary?.items.find((i) => i.stepId === decision.decisionId);
+      if (item?.status === 'verified') {
+        lines.push(`- ${decision.subjectLabel}: applied${item.appliedObjectId ? ` (id ${item.appliedObjectId})` : ''}.`);
+      } else {
+        lines.push(`- ${decision.subjectLabel}: FAILED — ${item?.error || 'no result recorded'}.`);
+      }
+    }
+    lines.push('Use this as the resolved outcome to continue this work.');
+    return lines.join('\n');
   }
 
   /**
@@ -22887,6 +22987,21 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         }
       }),
     );
+
+    // Review fix (critical): this manifest executor recorded every outcome
+    // but never told the origin session about any of it — the turn message
+    // staged at halt time literally promises "I'll resume automatically once
+    // it's resolved," and nothing did, for the exact flagship scenario
+    // (Haven's 5 calls, Every's 7) this ticket exists to fix. Never lets a
+    // resume failure fail the whole approve-all response — the dispatch
+    // itself already succeeded/failed and is already durably recorded above;
+    // resumeOriginSession has its own passive-note fallback and never
+    // throws, but this still guards defensively.
+    try {
+      await resumeOriginSession(originSessionId, AgentModeService.buildManifestResolutionMessage(metaWriteDecisions, summary));
+    } catch (err: any) {
+      console.warn('[agent-mode-service] failed to resume origin session after manifest execution:', originSessionId, err?.message || err);
+    }
 
     return { outcome: 'executed', summary };
   }

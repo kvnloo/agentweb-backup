@@ -60,20 +60,22 @@ function buildResolutionMessage(decision: ApprovalDecision): string {
  *  the primary path anymore for a session that CAN be resumed — a decision
  *  resolved via Slack days after the chat went quiet must not just sit as an
  *  unread note the agent may never come back to read (ENG-1853 Build item 4:
- *  "approval immediately resumes the originating agent"). */
-async function recordPassiveNote(decision: ApprovalDecision, content: string): Promise<void> {
-  if (!decision.originSessionId) return;
+ *  "approval immediately resumes the originating agent"). Exported —
+ *  sessionId-scoped rather than decision-scoped so the meta_write manifest
+ *  executor (agentModeService.ts) can use the exact same fallback shape
+ *  instead of a second copy that could drift. */
+export async function recordPassiveSessionNote(sessionId: string, content: string): Promise<void> {
   // metadata is a strictly-typed, shared shape (chatbotService.ts's
   // ChatMessage) with no index signature — reuses only its existing generic
   // markers (kind/isContextMessage/timestamp) rather than adding
   // approval-inbox-specific fields to a type shared by every message
   // producer in the codebase. The decisionId/gateType/verdict correlators
   // that would otherwise live in metadata are in the content string above.
-  await chatbotDb.addMessageToSession(decision.originSessionId, {
+  await chatbotDb.addMessageToSession(sessionId, {
     role: 'system',
     content,
     metadata: {
-      timestamp: decision.answeredAt || new Date().toISOString(),
+      timestamp: new Date().toISOString(),
       isContextMessage: true,
       kind: 'approval-inbox-resolution',
     },
@@ -81,43 +83,49 @@ async function recordPassiveNote(decision: ApprovalDecision, content: string): P
 }
 
 /**
- * ENG-1853: actively resume the origin session's agent loop with the
- * resolved decision as the turn's input, rather than only leaving a passive
- * note the session might never come back to read. Mirrors
- * scheduleAutoWorkPlanContinuation's own shape exactly (same session-lock
- * discipline, same "never fight a real user turn" rule, same
- * userMessageKind hide-from-UI tag) — that function is the one other place
- * in this codebase that already triggers a full agent turn with no live
- * request behind it, so this reuses its proven pattern rather than
- * inventing a second one.
+ * ENG-1853: actively resume a session's agent loop with messageContent as
+ * the turn's input, rather than only leaving a passive note the session
+ * might never come back to read. Mirrors scheduleAutoWorkPlanContinuation's
+ * own shape exactly (same session-lock discipline, same "never fight a real
+ * user turn" rule, same userMessageKind hide-from-UI tag) — that function is
+ * the one other place in this codebase that already triggers a full agent
+ * turn with no live request behind it, so this reuses its proven pattern
+ * rather than inventing a second one.
  *
- * Falls back to recordPassiveNote on any failure (session not found, a real
- * user turn already in flight, generateSessionResponse itself throwing) —
- * the resolution must always be recorded SOMEWHERE even when the richer
- * active-resume path can't run right now.
+ * Exported and sessionId-scoped (not decision-scoped) — review fix: the
+ * original decision-only shape left the meta_write manifest executor
+ * (agentModeService.ts's executeApprovalInboxMetaWriteManifest) with no way
+ * to resume the origin session at all once a whole packet finished
+ * dispatching, which meant the flagship Haven/Every scenario this ticket was
+ * built around never actually closed the loop — the turn message promised
+ * "I'll resume automatically" and nothing did. Both the per-decision path
+ * below and the manifest executor now share this one primitive.
+ *
+ * Falls back to recordPassiveSessionNote on any failure (session not found,
+ * a real user turn already in flight, generateSessionResponse itself
+ * throwing) — never throws; the resolution must always be recorded
+ * SOMEWHERE even when the richer active-resume path can't run right now.
  */
-async function activelyResumeOriginSession(decision: ApprovalDecision, messageContent: string): Promise<void> {
-  if (!decision.originSessionId) return;
-
-  const session = await chatbotDb.getChatSessionRecord(decision.originSessionId).catch((err) => {
-    console.warn('[approval-inbox-execution] failed to read origin session, falling back to a passive note:', decision.originSessionId, err?.message || err);
+export async function resumeOriginSession(sessionId: string, messageContent: string): Promise<void> {
+  const session = await chatbotDb.getChatSessionRecord(sessionId).catch((err) => {
+    console.warn('[approval-inbox-execution] failed to read origin session, falling back to a passive note:', sessionId, err?.message || err);
     return null;
   });
   if (!session) {
-    await recordPassiveNote(decision, messageContent);
+    await recordPassiveSessionNote(sessionId, messageContent);
     return;
   }
 
-  if (!tryClaimSessionGeneration(decision.originSessionId)) {
-    console.warn(`[approval-inbox-execution] session ${decision.originSessionId} already generating — recording a passive note instead of actively resuming for decision ${decision.decisionId}.`);
-    await recordPassiveNote(decision, messageContent);
+  if (!tryClaimSessionGeneration(sessionId)) {
+    console.warn(`[approval-inbox-execution] session ${sessionId} already generating — recording a passive note instead of actively resuming.`);
+    await recordPassiveSessionNote(sessionId, messageContent);
     return;
   }
 
   try {
     const llmModel = session.llmModel || (await agentModeService.getDefaultModel());
     const resolved = await generateSessionResponse(
-      decision.originSessionId,
+      sessionId,
       messageContent,
       session.userId,
       llmModel,
@@ -139,16 +147,23 @@ async function activelyResumeOriginSession(decision: ApprovalDecision, messageCo
     if (resolved?.content) {
       const { io } = await import('../server');
       io.to(`user:${session.userId}`).emit('session-message-appended', {
-        sessionId: decision.originSessionId,
+        sessionId,
         message: { role: 'assistant', content: resolved.content },
       });
     }
   } catch (err: any) {
-    console.warn('[approval-inbox-execution] active resume failed, recording a passive note instead:', decision.originSessionId, err?.message || err);
-    await recordPassiveNote(decision, messageContent);
+    console.warn('[approval-inbox-execution] active resume failed, recording a passive note instead:', sessionId, err?.message || err);
+    await recordPassiveSessionNote(sessionId, messageContent);
   } finally {
-    releaseSessionGeneration(decision.originSessionId);
+    releaseSessionGeneration(sessionId);
   }
+}
+
+/** Thin decision-scoped wrapper around resumeOriginSession — keeps every
+ *  existing call site in this file unchanged. */
+async function activelyResumeOriginSession(decision: ApprovalDecision, messageContent: string): Promise<void> {
+  if (!decision.originSessionId) return;
+  await resumeOriginSession(decision.originSessionId, messageContent);
 }
 
 /**
