@@ -249,6 +249,7 @@ export async function getUserTokenAllowance(
   effectiveAllowance: number | null;
   costAllowance: number | null;
   llmUsagePolicy: LlmUsagePolicy | null;
+  subscriptionType: string;
 }> {
   const subscriptionTypeName = await getUserSubscriptionType(userId);
   const config = await getSubscriptionTypeConfig(subscriptionTypeName);
@@ -260,7 +261,7 @@ export async function getUserTokenAllowance(
   const bonus = user?.tokenAllowanceBonus || 0;
 
   if (baseAllowance === null || baseAllowance === undefined) {
-    return { allowance: null, bonus, effectiveAllowance: null, costAllowance, llmUsagePolicy };
+    return { allowance: null, bonus, effectiveAllowance: null, costAllowance, llmUsagePolicy, subscriptionType: subscriptionTypeName };
   }
 
   return {
@@ -269,6 +270,7 @@ export async function getUserTokenAllowance(
     effectiveAllowance: baseAllowance + bonus,
     costAllowance,
     llmUsagePolicy,
+    subscriptionType: subscriptionTypeName,
   };
 }
 
@@ -321,7 +323,7 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
 
   const billingUserId = await resolveBillingUserId(userId);
   const usage = await getUserTokenUsage(billingUserId);
-  const [{ allowance, bonus, effectiveAllowance, costAllowance, llmUsagePolicy }, billingUser] = await Promise.all([
+  const [{ allowance, bonus, effectiveAllowance, costAllowance, llmUsagePolicy, subscriptionType }, billingUser] = await Promise.all([
     getUserTokenAllowance(billingUserId),
     userDb.getUserById(billingUserId),
   ]);
@@ -360,6 +362,7 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
     billingUserId,
     billingMonth: usage.month,
     legacyRawCostUsedMicroUsd,
+    tier: subscriptionType,
   });
   const creditAdjustment = getLlmUsageCreditAdjustment(billingUser?.llmUsageCredits, usage.month);
   const adjustedUsage = llmUsagePolicy
