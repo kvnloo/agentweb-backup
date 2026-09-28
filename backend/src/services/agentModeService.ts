@@ -150,7 +150,7 @@ import { startWorkflow, advanceIndependentWorkflow, type AdvanceIndependentOutco
 // against the durable approval-inbox store — approvalInboxService.ts has no
 // dependency back on this file (verified), so this is a one-directional
 // import, not a cycle.
-import { approvalInboxService, type ApprovalDecision } from './approvalInboxService';
+import { approvalInboxService, type ApprovalDecision, type ApprovalDecisionApprover } from './approvalInboxService';
 // Review fix: the manifest executor below needs the same active-resume
 // primitive approvalInboxExecution.ts already built for the per-decision
 // path — resumeOriginSession is exported from there specifically so this
@@ -21599,6 +21599,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // honestly rather than assuming uniformity.
     const manifestIds = [...new Set(staged.map((d) => d.manifestId))];
     const reportedManifestId = manifestIds.length === 1 ? manifestIds[0] : manifestId;
+    if (manifestIds.length > 1) {
+      // Second-review fix: this genuinely CAN'T be made fully correct
+      // without a return-contract change (multiple real manifestIds, no
+      // single one actually contains every staged decision) — nothing
+      // consumes the returned manifestId beyond this point today
+      // (metadata.approvalInboxManifestId is write-only, confirmed via
+      // grep), so a full fix is premature. Logged so this is visible
+      // rather than silently wrong if/when something starts reading it.
+      console.warn(
+        `[agent-mode-service] staged approval-inbox decisions landed under ${manifestIds.length} DIFFERENT pre-existing manifestIds (${manifestIds.join(', ')}) in one staging call — reporting the freshly-minted ${manifestId}, which may not contain every decision just staged.`,
+      );
+    }
 
     const count = staged.length;
     return {
@@ -22926,8 +22938,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * they don't, this refuses rather than guessing which session to drive
    * against — a malformed manifest should fail loud, not dispatch against
    * the wrong session's workflow slot.
+   *
+   * `approver` scopes this to the caller's OWN items only — second-review
+   * fix. Nothing today can actually construct a manifest whose meta_write
+   * decisions span more than one approver (stageApprovalInboxMetaWriteManifest
+   * hardcodes a single approver for every item it stages), but the data
+   * model doesn't forbid it, and without this filter, whichever approver's
+   * approve-all call happens to run would dispatch every OTHER approver's
+   * already-separately-approved items too — items that approver never saw
+   * in their own queue. Defense in depth against a real, if not yet
+   * reachable, cross-approver blast-radius surprise.
    */
-  async executeApprovalInboxMetaWriteManifest(manifestId: string): Promise<
+  async executeApprovalInboxMetaWriteManifest(manifestId: string, approver: ApprovalDecisionApprover): Promise<
     | { outcome: 'no_meta_write_items' }
     | { outcome: 'not_all_resolved'; unresolved: string[] }
     | { outcome: 'no_origin_session' | 'mixed_origin_sessions' }
@@ -22936,8 +22958,41 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     | { outcome: 'executed'; summary: ApprovalDeckExecutionSummary | null }
   > {
     const decisions = await approvalInboxService.listByManifest(manifestId);
-    const metaWriteDecisions = decisions.filter((d) => d.gateType === 'meta_write' && d.verdict === 'approve');
+    const metaWriteDecisions = decisions.filter((d) => d.gateType === 'meta_write' && d.verdict === 'approve' && d.approver === approver);
     if (metaWriteDecisions.length === 0) return { outcome: 'no_meta_write_items' };
+
+    // Second-review fix: a decision can be stuck at 'approved' forever if
+    // executeResolvedDecision's markDispatching call failed transiently (a
+    // DynamoDB blip, or the process restarting between claimDecision and
+    // markDispatching — a rolling deploy landing in that exact window is a
+    // real trigger in a repo that auto-deploys on every merge to main).
+    // Nothing else anywhere retries markDispatching (its only caller is
+    // that one line), and until this PR the frontend rendered an 'approved'
+    // meta_write item as fully answered (green, done) while it silently
+    // blocked the ENTIRE manifest's approve-all forever. Self-heal here:
+    // 'approved' + verdict 'approve' is EXACTLY the state markDispatching
+    // is meant to move past, and markDispatching is safe to call again (an
+    // unconditional update gated only on the row existing) — so retry it
+    // once before concluding anything is genuinely unresolved.
+    const wedged = metaWriteDecisions.filter((d) => d.status === 'approved');
+    if (wedged.length > 0) {
+      await Promise.all(
+        wedged.map((d) =>
+          approvalInboxService.markDispatching(d.decisionId).catch((err: any) => {
+            console.warn('[agent-mode-service] self-heal markDispatching retry failed:', d.decisionId, err?.message || err);
+          }),
+        ),
+      );
+      // Re-read rather than optimistically flipping the in-memory status —
+      // the retry above may itself have failed, and a fresh read is the
+      // only way to know for certain.
+      const refreshed = await approvalInboxService.listByManifest(manifestId);
+      const refreshedById = new Map(refreshed.map((d) => [d.decisionId, d]));
+      for (let i = 0; i < metaWriteDecisions.length; i++) {
+        const fresh = refreshedById.get(metaWriteDecisions[i].decisionId);
+        if (fresh) metaWriteDecisions[i] = fresh;
+      }
+    }
 
     // Defense in depth — the approve-all route is expected to have already
     // enforced "every item in the manifest individually resolved" before
@@ -22982,6 +23037,30 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return { outcome: 'conflict' };
     }
     const summary = this.summarizeApprovalDeckRun(outcome.run);
+
+    // Second-review fix: claimDispatch (inside each workflow step) already
+    // guarantees the real Meta write itself can never be dispatched twice —
+    // but it does NOT stop two concurrent approve-all callers from BOTH
+    // reaching this point once the one real dispatch is checkpointed (a
+    // second driver's own poll loop simply observes the already-verified
+    // checkpoint and returns 'completed' too — traced through
+    // advanceIndependentWorkflow directly). Without this claim, both callers
+    // would redundantly recordExecutionResult and, worse, both call
+    // resumeOriginSession — the in-memory tryClaimSessionGeneration lock
+    // only serializes the actual generateSessionResponse call within a
+    // single process, so a losing caller still falls back to a duplicate
+    // passive note today, and would be a second REAL active resume on any
+    // future multi-instance deployment. Anchored on the manifest's first
+    // decision by id (any deterministic, caller-independent choice works —
+    // every concurrent caller computes the same anchor from the same
+    // metaWriteDecisions list). A losing claim means another caller already
+    // is (or will) finalize this manifest — return the outcome without
+    // repeating recordExecutionResult/resumeOriginSession.
+    const anchorDecisionId = [...metaWriteDecisions].sort((a, b) => a.decisionId.localeCompare(b.decisionId))[0].decisionId;
+    const wonFinalization = await approvalInboxService.claimManifestFinalization(anchorDecisionId);
+    if (!wonFinalization) {
+      return { outcome: 'executed', summary };
+    }
 
     // Populate the previously-unused readBack/execution result per decision —
     // the literal ENG-1635 acceptance criterion ("Read back every external
