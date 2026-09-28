@@ -907,6 +907,7 @@ const createApprovalDecisionsTable = async () => {
       { AttributeName: 'status', AttributeType: 'S' },
       { AttributeName: 'createdAt', AttributeType: 'S' },
       { AttributeName: 'expiresAt', AttributeType: 'S' },
+      { AttributeName: 'manifestId', AttributeType: 'S' },
     ],
     KeySchema: [
       { AttributeName: 'decisionId', KeyType: 'HASH' },
@@ -941,6 +942,20 @@ const createApprovalDecisionsTable = async () => {
         KeySchema: [
           { AttributeName: 'status', KeyType: 'HASH' },
           { AttributeName: 'expiresAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+        ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 },
+      },
+      {
+        // ENG-1853: "every decision in this campaign packet" — a manifest groups
+        // N independent decisions (e.g. Haven's 5, Every's 7) that must be reviewed
+        // and executed together. Added alongside the three existing indexes rather
+        // than replacing originCorrelator (still optional/free-text elsewhere) —
+        // manifestId is the first validated, required grouping key on this table.
+        IndexName: 'ManifestIndex',
+        KeySchema: [
+          { AttributeName: 'manifestId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' },
         ],
         Projection: { ProjectionType: 'ALL' },
         ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 },
