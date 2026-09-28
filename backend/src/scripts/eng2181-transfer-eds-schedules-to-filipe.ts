@@ -24,9 +24,12 @@
  *    (or lack of one) does not transfer to Filipe — same reasoning as the
  *    ENG-827 migration: a consent decision must be made by the person it
  *    binds, never inferred or carried over.
- * 4. Removes Ed's email from `emailNotifications` (run-completion emails
- *    would otherwise keep going to an inbox nobody reads) and adds Filipe's
- *    in its place, if not already present.
+ * 4. ONLY if Ed's email is explicitly listed in `emailNotifications`, swaps
+ *    it for Filipe's. An empty/absent list is left untouched: every
+ *    notification call site in agentModeController already falls back to
+ *    whoever currently owns the schedule (or stays deliberately silent for
+ *    report preflight), so a schedule that never named Ed explicitly must
+ *    not come out of this naming Filipe explicitly either.
  *
  * WHAT THIS DELIBERATELY LEAVES ALONE
  * ------------------------------------
@@ -62,6 +65,7 @@ export interface ScheduleTransfer {
   statusBefore: string;
   emailNotificationsBefore: string[];
   emailNotificationsAfter: string[];
+  emailNotificationsChanged: boolean;
 }
 
 export interface TransferResult {
@@ -86,9 +90,27 @@ const CONSENT_FIELDS_TO_CLEAR = [
   'autopublishAuthorizedBy',
 ];
 
-function withoutEmail(emails: string[] | undefined, email: string): string[] {
-  const lower = email.toLowerCase();
-  return (emails || []).filter((e) => e.toLowerCase() !== lower);
+/**
+ * Swap `fromEmail` for `toEmail` in an `emailNotifications` list — but ONLY if
+ * `fromEmail` is actually in it. An empty/absent list is not "nobody
+ * configured a recipient yet": every notification call site in
+ * agentModeController falls back to the CURRENT owner's account email at send
+ * time (`scheduleUser?.email`, resolved live off `schedule.userId`), and for
+ * report-preflight it's deliberately silent by design. So a schedule that
+ * never named Ed explicitly must not come out of this script naming Filipe
+ * explicitly either — that would turn on notifications nobody asked for, or
+ * pin a hardcoded address where the system was already correctly following
+ * whoever owns the schedule.
+ */
+function swapEmail(emails: string[] | undefined, fromEmail: string, toEmail: string): { after: string[]; changed: boolean } {
+  const list = emails || [];
+  const fromLower = fromEmail.toLowerCase();
+  if (!list.some((e) => e.toLowerCase() === fromLower)) {
+    return { after: list, changed: false };
+  }
+  const without = list.filter((e) => e.toLowerCase() !== fromLower);
+  const after = without.some((e) => e.toLowerCase() === toEmail.toLowerCase()) ? without : [...without, toEmail];
+  return { after, changed: true };
 }
 
 export async function transferEdsSchedulesToFilipe(opts: {
@@ -135,16 +157,18 @@ export async function transferEdsSchedulesToFilipe(opts: {
       alreadyTransferred.push(schedule.scheduleId);
       continue;
     }
-    const emailNotificationsAfter = withoutEmail(schedule.emailNotifications, ED_EMAIL);
-    if (!emailNotificationsAfter.some((e) => e.toLowerCase() === FILIPE_EMAIL.toLowerCase())) {
-      emailNotificationsAfter.push(FILIPE_EMAIL);
-    }
+    const { after: emailNotificationsAfter, changed: emailNotificationsChanged } = swapEmail(
+      schedule.emailNotifications,
+      ED_EMAIL,
+      FILIPE_EMAIL,
+    );
     candidates.push({
       scheduleId: schedule.scheduleId,
       scheduleName: schedule.scheduleName || schedule.name || '(unnamed)',
       statusBefore: schedule.status,
       emailNotificationsBefore: schedule.emailNotifications || [],
       emailNotificationsAfter,
+      emailNotificationsChanged,
     });
   }
 
@@ -163,7 +187,10 @@ export async function transferEdsSchedulesToFilipe(opts: {
         {
           status: 'paused',
           userId: filipe.userId,
-          emailNotifications: c.emailNotificationsAfter,
+          // Only written when Ed's email was actually in the list — an
+          // untouched empty/absent list keeps following whoever owns the
+          // schedule (or stays deliberately silent), exactly as before.
+          ...(c.emailNotificationsChanged ? { emailNotifications: c.emailNotificationsAfter } : {}),
           updatedAt: now,
         } as any,
         {
@@ -217,7 +244,8 @@ async function main() {
   const list = apply ? result.transferred : result.candidates;
   console.log(`\n${apply ? 'TRANSFERRED' : 'WOULD TRANSFER'} (${list.length}):`);
   for (const c of list as ScheduleTransfer[]) {
-    console.log(`  ${c.scheduleId}  "${c.scheduleName}"  status: ${c.statusBefore} -> paused`);
+    const emailNote = c.emailNotificationsChanged ? `  (emailNotifications: ${JSON.stringify(c.emailNotificationsBefore)} -> ${JSON.stringify(c.emailNotificationsAfter)})` : '';
+    console.log(`  ${c.scheduleId}  "${c.scheduleName}"  status: ${c.statusBefore} -> paused${emailNote}`);
   }
 
   if (result.raced.length) {
