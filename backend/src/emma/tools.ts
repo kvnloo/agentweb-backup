@@ -70,6 +70,7 @@ import * as socialAccountsImpl from './impl/socialAccounts';
 // wrapper/native class method is kept as the call site instead of this
 // module.
 import * as linkedinImpl from './impl/linkedin';
+import * as twitterImpl from './impl/twitter';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -1118,7 +1119,7 @@ For CRM logging of sent tweets, optionally pass list_id, lead_id and lead_email.
     if (!context?.userId) {
       throw new Error("Missing user context");
     }
-    return await agentModeService.twitterManagePost(context.userId, args, context);
+    return await twitterImpl.twitterManagePost(context.userId, args, context);
   }
 });
 
@@ -1223,7 +1224,7 @@ For CRM logging of sent DMs, optionally pass list_id, lead_id and lead_email.`,
     if (!context?.userId) {
       throw new Error("Missing user context");
     }
-    return await agentModeService.twitterOutreach(context.userId, args);
+    return await twitterImpl.twitterOutreach(context.userId, args);
   }
 });
 
