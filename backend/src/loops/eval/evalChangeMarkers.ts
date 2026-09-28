@@ -15,7 +15,7 @@
  */
 
 import AWS from 'aws-sdk';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { LOOP_EVENTS_TABLE, eventToItem } from '../core/sensors/eventTableEventSource';
 import { asLoopId, asSubjectId, type LoopId } from '../core/types';
 import type { DynamoAttributeMap } from '../core/ports';
@@ -72,8 +72,13 @@ export function shortHash(value: string): string {
   return createHash('sha256').update(value).digest('hex').slice(0, 12);
 }
 
-export function buildEvalNeededItem(marker: EvalChangeMarker, at: Date): DynamoAttributeMap {
-  return eventToItem(EVAL_GATE_LOOP_ID, {
+/**
+ * One row per change. The sort key keeps eventToItem's `<ts>#<subject>#<eventType>` prefix (so
+ * range reads by time still work) plus a random suffix: two writes to the same target in the same
+ * millisecond must not overwrite each other.
+ */
+export function buildEvalNeededItem(marker: EvalChangeMarker, at: Date, unique: () => string = () => randomUUID().slice(0, 8)): DynamoAttributeMap {
+  const item = eventToItem(EVAL_GATE_LOOP_ID, {
     subjectId: asSubjectId(`${marker.changeKind}:${marker.target}`),
     eventType: EVT_EVAL_NEEDED,
     ts: at,
@@ -88,6 +93,7 @@ export function buildEvalNeededItem(marker: EvalChangeMarker, at: Date): DynamoA
       gateMode: 'report_only',
     },
   });
+  return { ...item, tsSession: `${String(item.tsSession)}#${unique()}` };
 }
 
 export type MarkerWriter = (item: DynamoAttributeMap) => Promise<void>;
