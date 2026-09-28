@@ -21,7 +21,10 @@ import type { PairwiseChoice } from '../loops/eval/agreement';
 import { isoWeekStart, pairwiseAgreement, type PairwiseAgreement, type PairwiseComparison } from '../loops/eval/creativeCalibration';
 import { PAIRWISE_CRITERION, isPairwiseLabel, type GoldenCase } from '../loops/eval/goldenSet';
 import { goldenSetStoreFromEnv, GOLDEN_CASES_TABLE_ENV } from '../loops/eval/goldenSetStore';
-import { DEFAULT_RUBRIC_JUDGE_MODEL } from '../services/creativeRubricJudge';
+import { DEFAULT_RUBRIC_JUDGE_MODEL, type CreativeBrief, type judgeCreativePair as JudgeCreativePairImpl } from '../services/creativeRubricJudge';
+import type { HumanEvalCandidate } from '../services/humanEvalService';
+
+type JudgeCreativePair = typeof JudgeCreativePairImpl;
 
 export interface ReportArgs {
   batches: string[];
@@ -100,6 +103,46 @@ export function formatCalibrationReport(input: {
   return lines.join('\n');
 }
 
+type JudgePairFn = (...args: Parameters<JudgeCreativePair>) => ReturnType<JudgeCreativePair>;
+
+export interface PairJudgingDeps {
+  getCandidate: (candidateId: string) => Promise<HumanEvalCandidate | null>;
+  briefFor: (candidate: HumanEvalCandidate) => Promise<CreativeBrief>;
+  judge: (a: Parameters<JudgeCreativePair>[0], b: Parameters<JudgeCreativePair>[1], brief: CreativeBrief) => ReturnType<JudgePairFn>;
+}
+
+/**
+ * Judge each labelled pair. A failed lookup, brief or judge call on one pair counts as a judge
+ * error for that pair and never stops the rest of the report (CodeRabbit on #3094).
+ */
+export async function judgeLabelledPairs(
+  labelled: ReadonlyArray<{ c: GoldenCase; human: PairwiseChoice }>,
+  deps: PairJudgingDeps,
+): Promise<{ rows: PairwiseComparison[]; judgeErrors: number }> {
+  const rows: PairwiseComparison[] = [];
+  let judgeErrors = 0;
+  for (const { c, human } of labelled) {
+    try {
+      const [a, b] = await Promise.all([deps.getCandidate(c.sourceRef.id), deps.getCandidate(c.pair?.candidateIdB ?? '')]);
+      if (!a?.artifactUrl || !b?.artifactUrl) {
+        judgeErrors++;
+        continue;
+      }
+      const verdict = await deps.judge(
+        { image: { url: a.artifactUrl }, ...(a.creativeGates ? { gates: a.creativeGates } : {}) },
+        { image: { url: b.artifactUrl }, ...(b.creativeGates ? { gates: b.creativeGates } : {}) },
+        await deps.briefFor(a),
+      );
+      if (verdict.status === 'ok') rows.push({ human, judge: verdict.preference });
+      else judgeErrors++;
+    } catch (err: unknown) {
+      judgeErrors++;
+      console.warn(`[creative-calibration] pair ${c.caseId} could not be judged:`, err instanceof Error ? err.message : err);
+    }
+  }
+  return { rows, judgeErrors };
+}
+
 async function main(): Promise<void> {
   const args = parseReportArgs(argv.slice(2));
   const store = goldenSetStoreFromEnv();
@@ -114,23 +157,11 @@ async function main(): Promise<void> {
   const { humanEvalService } = await import('../services/humanEvalService');
   const { judgeCreativePair } = await import('../services/creativeRubricJudge');
   const { briefFor, unmeteredOpenRouterLlm } = await import('./scoreCreativeRubric');
-  const rows: PairwiseComparison[] = [];
-  let judgeErrors = 0;
-  for (const { c, human } of labelled) {
-    const [a, b] = await Promise.all([humanEvalService.getCandidate(c.sourceRef.id), humanEvalService.getCandidate(c.pair?.candidateIdB ?? '')]);
-    if (!a?.artifactUrl || !b?.artifactUrl) {
-      judgeErrors++;
-      continue;
-    }
-    const verdict = await judgeCreativePair(
-      { image: { url: a.artifactUrl }, ...(a.creativeGates ? { gates: a.creativeGates } : {}) },
-      { image: { url: b.artifactUrl }, ...(b.creativeGates ? { gates: b.creativeGates } : {}) },
-      await briefFor(a),
-      { model: args.model, llm: unmeteredOpenRouterLlm },
-    );
-    if (verdict.status === 'ok') rows.push({ human, judge: verdict.preference });
-    else judgeErrors++;
-  }
+  const { rows, judgeErrors } = await judgeLabelledPairs(labelled, {
+    getCandidate: (id) => humanEvalService.getCandidate(id),
+    briefFor,
+    judge: (a, b, brief) => judgeCreativePair(a, b, brief, { model: args.model, llm: unmeteredOpenRouterLlm }),
+  });
   console.log(
     formatCalibrationReport({
       batches: args.batches,
