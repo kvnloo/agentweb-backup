@@ -9,6 +9,10 @@ jest.mock('../services/db', () => ({ userDb: { scanWithFilter: jest.fn() } }));
 jest.mock('../services/paymentHistoryDb', () => ({ paymentHistoryDb: { getByUserId: jest.fn() } }));
 jest.mock('../services/adsMetricsDb', () => ({ adsMetricsDb: { getAccountDaySnapshots: jest.fn() } }));
 jest.mock('../utils/agentModeAlerts', () => ({ sendAgentModeOncallAlert: jest.fn() }));
+jest.mock('../services/emailService', () => ({
+  emailService: { sendEmail: jest.fn(), escapeHtml: (value: string) => value },
+}));
+jest.mock('../services/settingsService', () => ({ settingsService: { getJsonArraySetting: jest.fn() } }));
 jest.mock('../services/accountCapabilityRequirementsDb', () => ({
   getAccountCapabilityRequirement: jest.fn(),
   getAccountHealthSignalState: jest.fn(),
@@ -22,6 +26,8 @@ import { userDb } from '../services/db';
 import { paymentHistoryDb, type PaymentHistoryRecord } from '../services/paymentHistoryDb';
 import { adsMetricsDb } from '../services/adsMetricsDb';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { emailService } from '../services/emailService';
+import { settingsService } from '../services/settingsService';
 import {
   getAccountCapabilityRequirement,
   getAccountHealthSignalState,
@@ -191,6 +197,8 @@ describe('runAccountHealthClassifier', () => {
       return true;
     });
     jest.mocked(sendAgentModeOncallAlert).mockResolvedValue(true);
+    jest.mocked(settingsService.getJsonArraySetting).mockResolvedValue(['cs@example.com']);
+    jest.mocked(emailService.sendEmail).mockResolvedValue('sent');
     jest.mocked(mayGate).mockReturnValue(true);
     jest.mocked(isCronEnabled).mockReturnValue(true);
   });
@@ -262,12 +270,52 @@ describe('runAccountHealthClassifier', () => {
     expect(jest.mocked(sendAgentModeOncallAlert).mock.calls[0][0].context).toMatchObject({ reason: 'escalated' });
   });
 
-  it('never pages oncall for a never-connected account: CS nudge log line only', async () => {
+  it('never pages oncall for a never-connected account: it goes to the CS nudge', async () => {
     users.push({ userId: 'u2', connected_accounts: [], subscription_status: 'active' });
     const summary = await runAccountHealthClassifier({ now: NOW });
     expect(summary).toMatchObject({ csNudges: 1, oncall: 0 });
     expect(sendAgentModeOncallAlert).not.toHaveBeenCalled();
     expect(console.info).toHaveBeenCalledWith(expect.stringContaining('cs_nudge {"userId":"u2","state":"activation_incomplete"'));
+  });
+
+  // ENG-2188: the nudge used to be a console.info line nobody acted on.
+  it('ENG-2188: sends one actionable CS digest email per run for every new activation nudge, once per episode', async () => {
+    users.push({ userId: 'u2', email: 'two@example.com', connected_accounts: [], subscription_status: 'active' });
+    users.push({ userId: 'u3', email: 'three@example.com', connected_accounts: [], subscription_status: 'active' });
+    const summary = await runAccountHealthClassifier({ now: NOW });
+    expect(summary).toMatchObject({ csNudges: 2, csNudgeUndelivered: 0, oncall: 0 });
+    expect(settingsService.getJsonArraySetting).toHaveBeenCalledWith('account_health_cs_emails', []);
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+    const [to, subject, text] = jest.mocked(emailService.sendEmail).mock.calls[0];
+    expect(to).toEqual(['cs@example.com']);
+    expect(subject).toBe('Activation nudges: 2 paying account(s) have not connected an ad account');
+    expect(text).toContain('not churn risk');
+    expect(text).toContain('- two@example.com: no ad account connected yet (ads are a current requirement: urgent)');
+    expect(text).toContain('- three@example.com: no ad account connected yet');
+    expect(store.get('u2')?.lastSignalChannel).toBe('cs_nudge');
+
+    expect(await runAccountHealthClassifier({ now: NOW + DAY_MS })).toMatchObject({ csNudges: 0 });
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('ENG-2188: with no CS recipients configured the nudge is undelivered and retried, never dropped', async () => {
+    users.push({ userId: 'u2', connected_accounts: [], subscription_status: 'active' });
+    jest.mocked(settingsService.getJsonArraySetting).mockResolvedValueOnce([]);
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    expect(await runAccountHealthClassifier({ now: NOW })).toMatchObject({ csNudges: 0, csNudgeUndelivered: 1 });
+    expect(emailService.sendEmail).not.toHaveBeenCalled();
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('account_health_cs_emails is not set'));
+
+    expect(await runAccountHealthClassifier({ now: NOW + DAY_MS })).toMatchObject({ csNudges: 1 });
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('ENG-2188: a failed CS digest send releases the claims so the next run retries', async () => {
+    users.push({ userId: 'u2', connected_accounts: [], subscription_status: 'active' });
+    jest.mocked(emailService.sendEmail).mockResolvedValueOnce('failed');
+    expect(await runAccountHealthClassifier({ now: NOW })).toMatchObject({ csNudgeUndelivered: 1 });
+    expect(await runAccountHealthClassifier({ now: NOW + DAY_MS })).toMatchObject({ csNudges: 1 });
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(2);
   });
 
   it('does not alert when another instance claimed the signal first', async () => {
