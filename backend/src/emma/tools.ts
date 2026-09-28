@@ -44,6 +44,8 @@ import * as htmlCreationImpl from './impl/htmlCreation';
 import * as htmlUpdateImpl from './impl/htmlUpdate';
 // ENG-2103 (F2): knowledge base tool cluster, same treatment as booksImpl above.
 import * as knowledgeBaseImpl from './impl/knowledgeBase';
+// ENG-2103 (F2): blog tool cluster, same treatment as booksImpl above.
+import * as blogImpl from './impl/blog';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -3013,7 +3015,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createBlogArticle(
+    return await blogImpl.createBlogArticle(
       args.title_draft,
       args.content_draft,
       args.length || 'medium',
@@ -3072,7 +3074,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.publishBlogArticle(
+    return await blogImpl.publishBlogArticle(
       args.title,
       args.description,
       args.hero_image_url,
@@ -3151,7 +3153,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.repairBlogArticle(
+    return await blogImpl.repairBlogArticle(
       args.article_url,
       context?.userId,
       context?.sessionId
