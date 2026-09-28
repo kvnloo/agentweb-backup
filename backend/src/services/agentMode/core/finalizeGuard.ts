@@ -185,6 +185,11 @@ export interface FinalizeGuardInput {
   finalText: string;
   ledger: FinalizeLedgerEntry[];
   ports: FinalizeGuardPorts;
+  /**
+   * Shadow mode: detect and report a mismatch but never make the corrective turn.
+   * Its text would be discarded, so the call would only add cost and user-facing latency.
+   */
+  detectOnly?: boolean;
 }
 
 export type FinalizeGuardAction =
@@ -199,6 +204,8 @@ export type FinalizeGuardAction =
   | 'corrected'
   /** mismatch unresolved; a visible truthful correction was appended */
   | 'appended_correction'
+  /** detectOnly (shadow): mismatch found, text delivered unchanged, no corrective turn */
+  | 'detected_mismatch'
   /** the judge call failed; text delivered unchanged (claim_check_error emitted) */
   | 'judge_error';
 
@@ -298,7 +305,7 @@ function splitUnbackedClasses(
 }
 
 export async function runFinalizeGuard(input: FinalizeGuardInput): Promise<FinalizeGuardOutcome> {
-  const { finalText, ledger, ports } = input;
+  const { finalText, ledger, ports, detectOnly } = input;
   const unchanged = (action: FinalizeGuardAction, ambiguousClaimClasses: ClaimClass[] = []): FinalizeGuardOutcome => ({
     finalText,
     action,
@@ -326,6 +333,16 @@ export async function runFinalizeGuard(input: FinalizeGuardInput): Promise<Final
   const { confidentlyUnbacked: mismatched, ambiguous } = splitUnbackedClasses(claims, ledger, ports);
   if (mismatched.length === 0) {
     return unchanged(ambiguous.length > 0 ? 'ambiguous_unmatched' : 'clean', ambiguous);
+  }
+
+  if (detectOnly) {
+    return {
+      finalText,
+      action: 'detected_mismatch',
+      mismatchedClaimClasses: mismatched,
+      ambiguousClaimClasses: ambiguous,
+      claimMismatch: true,
+    };
   }
 
   // 4. ONE corrective turn — targets only the confidently-unbacked classes.
