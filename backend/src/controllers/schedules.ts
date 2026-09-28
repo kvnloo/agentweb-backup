@@ -21,7 +21,13 @@ export async function createSchedule(req: AuthenticatedRequest, res: Response) {
     // Load the task and confirm ownership before creating a schedule against it.
     // 404 (not 403) so the endpoint does not confirm which task ids exist.
     const task = await taskDb.getTaskById(taskId);
-    if (!task || task.userId !== userId) {
+    if (!task) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    // Check if user is admin or owns the task
+    const user = await userDb.getUserById(userId);
+    if (!user?.isAdmin && task.userId !== userId) {
       return res.status(404).json({ error: 'Task not found' });
     }
 
