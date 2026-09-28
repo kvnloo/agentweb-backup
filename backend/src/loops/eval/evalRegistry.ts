@@ -148,6 +148,18 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
     notes: 'No LLM: every lexicon hit counts as a claim, so it over-reports against the runtime guard (which asks a judge). Checks tool status, not external state.',
   },
   {
+    id: 'agent-reply-length-fixtures',
+    surface: 'agent',
+    graderType: 'code',
+    measures: 'pass | fail per ENG-1312 replay fixture: assistant reply within the ENG-1309 char/word threshold',
+    source: 'loops/eval/agentModeReplayFixtures.ts (checkReplayFixture); run by loops/eval/offlineSuiteSources.ts',
+    model: 'none',
+    modelFamily: 'none',
+    consumers: ['offline eval suite (loops/scripts/runOfflineEvalSuite.ts, report-only)'],
+    knownIssues: ['ENG-1309', 'ENG-1312', 'ENG-1314'],
+    notes: 'Deterministic threshold check. Fixture turns are synthetic placeholders until the golden-set store links real sessions (ENG-2135, OPS-2), and a placeholder metric never blocks.',
+  },
+  {
     id: 'okareo-no-hallucinated-capabilities-v2',
     surface: 'agent',
     graderType: 'llm_judge',
