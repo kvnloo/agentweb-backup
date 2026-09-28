@@ -76,15 +76,18 @@ runlist() {
   printf '%s\n' "$2" >"$1/runlist.json"
 }
 
-# jobs <dir> <run_id> <detect-changes conclusion, or "absent">
+# jobs <dir> <run_id> <detect-changes conclusion, or "absent"> \
+#      [backend-deploy conclusion] [partner-deploy conclusion]
+# backend/partner default to "success" when the detect-changes conclusion is
+# not "absent", matching the common case where both deploy jobs ran cleanly.
 jobs_fixture() {
-  local dir="$1" run_id="$2" conclusion="$3"
+  local dir="$1" run_id="$2" conclusion="$3" backend="${4:-success}" partner="${5:-success}"
   if [ "${conclusion}" = "absent" ]; then
     printf '{"jobs":[{"name":"Backend deploy to production","conclusion":"skipped"}]}' \
       >"${dir}/jobs_${run_id}.json"
   else
-    printf '{"jobs":[{"name":"Detect changed projects","conclusion":"%s"},{"name":"Backend deploy to production","conclusion":"success"}]}' \
-      "${conclusion}" >"${dir}/jobs_${run_id}.json"
+    printf '{"jobs":[{"name":"Detect changed projects","conclusion":"%s"},{"name":"Backend deploy to production","conclusion":"%s"},{"name":"Partner portal deploy to production","conclusion":"%s"}]}' \
+      "${conclusion}" "${backend}" "${partner}" >"${dir}/jobs_${run_id}.json"
   fi
 }
 
@@ -189,6 +192,41 @@ jobs_fixture "${d}" 40000004 failure
 jobs_fixture "${d}" 40000002 success
 run_script "${d}"
 check 'a run whose own detect-changes job failed is walked past too' 'base_sha=bbbbbbb2'
+
+# A run whose detect-changes job SUCCEEDED but whose own backend-deploy job
+# then FAILED must also be walked past: trusting that run's head as the new
+# base would let the next run's filter report backend=false even though the
+# backend change that run's own deploy was supposed to ship never landed --
+# the same silent-drop bug via a failed-deploy path instead of a
+# cancelled-pending-run path.
+RUN_BACKEND_DEPLOY_FAILED='{"databaseId":40000005,"status":"completed","headSha":"eeeeeee5"}'
+
+d="$(new_fixture_dir)"
+runlist "${d}" "[${RUN_BACKEND_DEPLOY_FAILED},${RUN_PRIOR_SUCCESS}]"
+jobs_fixture "${d}" 40000005 success failure success
+jobs_fixture "${d}" 40000002 success
+run_script "${d}"
+check 'a run whose backend-deploy job failed is walked past' 'base_sha=bbbbbbb2'
+
+# Same shape, but the partner-deploy job was cancelled instead of failed.
+RUN_PARTNER_DEPLOY_CANCELLED='{"databaseId":40000006,"status":"completed","headSha":"fffffff6"}'
+
+d="$(new_fixture_dir)"
+runlist "${d}" "[${RUN_PARTNER_DEPLOY_CANCELLED},${RUN_PRIOR_SUCCESS}]"
+jobs_fixture "${d}" 40000006 success success cancelled
+jobs_fixture "${d}" 40000002 success
+run_script "${d}"
+check 'a run whose partner-deploy job was cancelled is walked past' 'base_sha=bbbbbbb2'
+
+# A skipped deploy job (the filter legitimately decided not to run it) is NOT
+# a reason to distrust the run -- only failure/cancelled are.
+RUN_PARTNER_SKIPPED='{"databaseId":40000007,"status":"completed","headSha":"ggggggg7"}'
+
+d="$(new_fixture_dir)"
+runlist "${d}" "[${RUN_PARTNER_SKIPPED}]"
+jobs_fixture "${d}" 40000007 success success skipped
+run_script "${d}"
+check 'a legitimately skipped deploy job does not disqualify the run' 'base_sha=ggggggg7'
 
 # The currently-in-flight run (this very run) must never be its own base, even
 # if it were somehow reported back as completed by a race.
