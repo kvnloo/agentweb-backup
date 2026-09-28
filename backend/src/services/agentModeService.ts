@@ -23056,8 +23056,23 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // metaWriteDecisions list). A losing claim means another caller already
     // is (or will) finalize this manifest — return the outcome without
     // repeating recordExecutionResult/resumeOriginSession.
+    // Fail OPEN, not closed: claimManifestFinalization can legitimately
+    // return false (another caller already won), but an unexpected THROW
+    // (a genuine DynamoDB error, not a lost race) must never be allowed to
+    // skip recording/resuming below — the real Meta write has ALREADY
+    // succeeded and been checkpointed by this point, so silently dropping
+    // the finalization step here would leave a genuinely-applied write
+    // permanently stuck unrecorded and the origin session never told,
+    // recoverable only if the reviewer happens to retry. Caught by asking
+    // "what does this code do right now" while answering the standing
+    // safety question before merge, not by any review.
     const anchorDecisionId = [...metaWriteDecisions].sort((a, b) => a.decisionId.localeCompare(b.decisionId))[0].decisionId;
-    const wonFinalization = await approvalInboxService.claimManifestFinalization(anchorDecisionId);
+    let wonFinalization = true;
+    try {
+      wonFinalization = await approvalInboxService.claimManifestFinalization(anchorDecisionId);
+    } catch (err: any) {
+      console.warn('[agent-mode-service] claimManifestFinalization threw (treating as won, proceeding to finalize):', anchorDecisionId, err?.message || err);
+    }
     if (!wonFinalization) {
       return { outcome: 'executed', summary };
     }

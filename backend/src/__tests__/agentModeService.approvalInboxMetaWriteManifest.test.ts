@@ -310,4 +310,19 @@ describe('ENG-1853 executeApprovalInboxMetaWriteManifest', () => {
     expect(approvalInboxService.recordExecutionResult).not.toHaveBeenCalled();
     expect(resumeOriginSession).not.toHaveBeenCalled();
   });
+
+  it('found while answering the pre-merge safety question: claimManifestFinalization THROWING (a real infra error, not a lost race) must fail open, not silently drop a real write\'s outcome', async () => {
+    // The real Meta write has ALREADY succeeded and been checkpointed by the
+    // time this claim runs — dropping recordExecutionResult/resumeOriginSession
+    // here would leave a genuinely-applied write permanently unrecorded with
+    // no automatic recovery.
+    jest.spyOn(service as any, 'manageMetaAdsAdSets').mockResolvedValue({ success: true, message: 'created', adSet: { id: 'id-1' } });
+    (approvalInboxService.listByManifest as jest.Mock).mockResolvedValue([decisionFor('d1', 'AS_1')]);
+    (approvalInboxService.claimManifestFinalization as jest.Mock).mockRejectedValue(new Error('DynamoDB unavailable'));
+
+    const outcome = await service.executeApprovalInboxMetaWriteManifest(MANIFEST_ID, 'matt');
+    expect(outcome.outcome).toBe('executed');
+    expect(approvalInboxService.recordExecutionResult).toHaveBeenCalledWith('d1', 'executed', expect.anything());
+    expect(resumeOriginSession).toHaveBeenCalled();
+  });
 });
