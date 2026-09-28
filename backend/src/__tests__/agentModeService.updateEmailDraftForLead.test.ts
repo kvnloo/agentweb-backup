@@ -1308,4 +1308,51 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       expect(updateCall.messageDraft.content).toBe(reworked);
     });
   });
+
+  // ENG-1388: this draft is generated FOR the external lead/prospect — a
+  // customFields JSON dump was being embedded straight into the LLM prompt,
+  // which could put Enigma card revenue (internal-use-only) into content sent
+  // outside the company. Unlike the other ENG-1388 fixes, this strip is
+  // unconditional: it doesn't matter whether the requesting user is
+  // Enigma-allowlisted, because the allowlist governs internal visibility,
+  // not what may inform outward-facing copy.
+  describe('card revenue exclusion from the email prompt (ENG-1388)', () => {
+    it('never includes card-revenue fields in the LLM prompt, even for an allowlisted requester', async () => {
+      const listId = 'list1';
+      const leadId = 'lead1';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Follow up email';
+
+      const mockList = { listId, name: 'Test List', userId };
+      const mockLead = {
+        leadId,
+        listId,
+        email: 'lead@example.com',
+        firstName: 'John',
+        customFields: { card_revenue_12m: '41999657', card_revenue_period_end: '2026-06-30', industry: 'Software' },
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({ engagements: [] });
+      mockReadBrandGuidelines.mockResolvedValue({ exists: false });
+      mockReadMarketStrategy.mockResolvedValue({ exists: false });
+      mockGetSenderForLead.mockResolvedValue({ fromName: 'Sender' });
+      mockCreate.mockResolvedValue({
+        choices: [{ message: { content: JSON.stringify({ subject: 'Follow Up', htmlContent: '<p>Content</p>' }) } }],
+      });
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(mockLead);
+
+      await (agentModeService as any).updateEmailDraftForLead(listId, leadId, instruction, sessionId, userId, 'html');
+
+      expect(mockCreate).toHaveBeenCalled();
+      const prompt = mockCreate.mock.calls[0][0].messages[1].content;
+      expect(prompt).not.toContain('card_revenue_12m');
+      expect(prompt).not.toContain('41999657');
+      expect(prompt).not.toContain('card_revenue_period_end');
+      expect(prompt).toContain('industry');
+      expect(prompt).toContain('Software');
+    });
+  });
 });
