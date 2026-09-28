@@ -7,6 +7,10 @@
  * `eval_v2_scored` row per session in Dev-AW-LoopEvents (loopId `eval-v2`). Then refresh the
  * `eval-v2-daily` snapshots (1d and 7d) that GET /api/admin/loops/eval-v2-trend serves.
  *
+ * ENG-2196: each score also carries the session's spend (a bounded query per billing user on
+ * AW-SpendEvents' billingUserId + occurredAt index) and run wall time, so the snapshots report
+ * cost and latency per successful task per model × task type.
+ *
  * Why "last activity on the previous day": a session whose updatedAt is on day D and which is
  * still untouched at run time (17:15 UTC on D+1) has been idle for at least 17 hours, so it is
  * complete. The frame does not depend on who opened the dashboard, which is the bias this
@@ -51,6 +55,7 @@ import {
   sampleRunSortKey,
   sampleSeed,
   sampleUniform,
+  sessionRunLatencyMs,
   shiftDate,
   surfaceOf,
   utcDayWindow,
@@ -58,12 +63,18 @@ import {
   type EvalV2WindowLabel,
   type SampleRun,
 } from '../loops/eval/evalV2Sampler';
-import { SPEND_EVENTS_TABLE } from '../services/spendEventDb';
+import { SPEND_EVENTS_OCCURRED_AT_INDEX, SPEND_EVENTS_TABLE } from '../services/spendEventDb';
 
 export const EVAL_V2_SAMPLER_FLAG = 'EVAL_V2_SAMPLER_ENABLED';
 export const EVAL_V2_SAMPLE_SIZE_ENV = 'EVAL_V2_SAMPLE_SIZE';
 export const DEFAULT_EVAL_V2_SAMPLE_SIZE = 50;
 const MAX_EVAL_V2_SAMPLE_SIZE = 500;
+/**
+ * ENG-2196: the spend read stops one row past this many AW-SpendEvents rows for one billing
+ * subject in the window; that subject's sessions then report spend `truncated` (unknown), never a
+ * partial sum. The busiest subject had 4,409 rows in the table's whole history on 2026-09-28.
+ */
+export const EVAL_V2_MAX_SPEND_EVENTS_PER_BILLING_USER = 5000;
 
 export function samplerEnabled(raw: string | undefined): boolean {
   return raw === 'true';
@@ -80,10 +91,12 @@ export function resolveSampleSize(raw: string | undefined): number {
 export interface SamplerDeps {
   /** Writes (and the sample-run / snapshot reads) — Dev-AW-LoopEvents only. */
   dynamo: DynamoPort;
-  /** Reads of sessions, messages and agent-mode events. */
+  /** Reads of sessions, messages, agent-mode events and (bounded, by billing user) spend. */
   reader: ReadOnlyDocReader;
   tables: GraderTables;
   clock: ClockPort;
+  /** A session user's billing subject (tokenUsageService.resolveBillingUserId); defaults to the user itself. */
+  billingUserOf?: (userId: string) => Promise<string>;
 }
 
 export interface SamplerOptions {
@@ -217,7 +230,15 @@ export async function runEvalV2Sample(deps: SamplerDeps, opts: SamplerOptions): 
   }
 
   const items = await sampledItems(deps.reader, deps.tables.sessions, frame, run.sessionIds);
-  const loaded = await loadSessionItems(deps.reader, deps.tables, items, { ...window, includeSpend: false });
+  const loaded = await loadSessionItems(deps.reader, deps.tables, items, {
+    ...window,
+    includeSpend: true,
+    spendQuery: {
+      indexName: SPEND_EVENTS_OCCURRED_AT_INDEX,
+      billingUserOf: deps.billingUserOf ?? (async (userId) => userId),
+      maxEventsPerBillingUser: EVAL_V2_MAX_SPEND_EVENTS_PER_BILLING_USER,
+    },
+  });
   const itemById = new Map(items.map((item) => [String(item.sessionId), item]));
 
   const tallies = emptyTallies();
@@ -225,7 +246,7 @@ export async function runEvalV2Sample(deps: SamplerDeps, opts: SamplerOptions): 
   let alreadyScored = 0;
   const scoredAt = deps.clock.now();
   for (const l of loaded) {
-    const graded = gradeSession(l.session, l.model, undefined);
+    const graded = gradeSession(l.session, l.model, l.spend);
     tallies.task[graded.task.verdict]++;
     tallies.tool[graded.tools.verdict]++;
     tallies.groundedness[graded.groundedness.verdict]++;
@@ -236,6 +257,8 @@ export async function runEvalV2Sample(deps: SamplerDeps, opts: SamplerOptions): 
       frameSize: run.frameSize,
       sampleSize: run.sessionIds.length,
       userTurns: l.session.userTurns,
+      spendStatus: l.spendStatus ?? 'none',
+      runLatencyMs: sessionRunLatencyMs(l.session.events),
     }, scoredAt);
     if (await putIfAbsent(deps.dynamo, item)) written++;
     else alreadyScored++;
@@ -343,8 +366,15 @@ export function queryOnlyReader(region = process.env.AWS_REGION || 'us-west-2'):
 export async function runEvalV2SamplerCron(): Promise<void> {
   try {
     const { awsDynamoAdapter } = await import('../loops/adapters/awsAdapters');
+    const { resolveBillingUserId } = await import('../services/tokenUsageService');
     const result = await runEvalV2Sample(
-      { dynamo: awsDynamoAdapter(), reader: queryOnlyReader(), tables: productionGraderTables(), clock: { now: () => new Date() } },
+      {
+        dynamo: awsDynamoAdapter(),
+        reader: queryOnlyReader(),
+        tables: productionGraderTables(),
+        clock: { now: () => new Date() },
+        billingUserOf: resolveBillingUserId,
+      },
       {
         enabled: samplerEnabled(process.env[EVAL_V2_SAMPLER_FLAG]),
         dryRun: false,

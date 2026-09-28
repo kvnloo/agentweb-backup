@@ -18,7 +18,8 @@
 import type { DynamoAttributeMap } from '../core/ports';
 import type { LoopId } from '../core/types';
 import { asLoopId } from '../core/types';
-import { AGENT_GRADER_VERSIONS, type AgentGraderId, type GradedSession, type TaskVerdict } from './agentGraders';
+import { AGENT_GRADER_VERSIONS, type AgentGraderId, type AgentLoopEvent, type GradedSession, type TaskVerdict } from './agentGraders';
+import type { SpendStatus } from './agentGraderLoader';
 import { wilsonInterval, type Interval } from './agreement';
 import { mayGate } from './evalRegistry';
 
@@ -31,8 +32,8 @@ export const EVT_EVAL_V2_SCORED = 'eval_v2_scored';
 export const EVT_EVAL_V2_SAMPLE_RUN = 'eval_v2_sample_run';
 export const EVT_EVAL_V2_SNAPSHOT = 'eval_v2_snapshot';
 
-/** Bump when the sampling frame or the row shape changes. */
-export const EVAL_V2_SAMPLER_VERSION = 1;
+/** Bump when the sampling frame or the row shape changes. 2: spend and run latency per score (ENG-2196). */
+export const EVAL_V2_SAMPLER_VERSION = 2;
 
 export const EVAL_V2_WINDOWS = { '1d': 1, '7d': 7 } as const;
 export type EvalV2WindowLabel = keyof typeof EVAL_V2_WINDOWS;
@@ -136,6 +137,34 @@ export interface ScoreContext {
   frameSize: number;
   sampleSize: number;
   userTurns: number;
+  /** What the bounded AW-SpendEvents read found for the session (ENG-2196); absent when spend was not read. */
+  spendStatus?: SpendStatus;
+  /** Wall time of the session's runs; absent when no run has both a start and a verdict. */
+  runLatencyMs?: number;
+}
+
+/**
+ * Wall time of a session's agent runs: for each run with both an `agent_run_started` and an
+ * `agent_run_verdict` event, verdict ts - start ts, summed. Undefined when no run has both.
+ */
+export function sessionRunLatencyMs(events: readonly AgentLoopEvent[]): number | undefined {
+  const starts = new Map<string, number>();
+  const ends = new Map<string, number>();
+  for (const e of events) {
+    const at = Date.parse(e.ts);
+    if (Number.isNaN(at)) continue;
+    if (e.eventType === 'agent_run_started') starts.set(e.runId, Math.min(starts.get(e.runId) ?? at, at));
+    else if (e.eventType === 'agent_run_verdict') ends.set(e.runId, Math.max(ends.get(e.runId) ?? at, at));
+  }
+  let total = 0;
+  let runs = 0;
+  for (const [runId, start] of starts) {
+    const end = ends.get(runId);
+    if (end === undefined || end < start) continue;
+    total += end - start;
+    runs++;
+  }
+  return runs > 0 ? total : undefined;
 }
 
 /**
@@ -166,6 +195,11 @@ export function buildScoredEventItem(graded: GradedSession, ctx: ScoreContext, s
       groundednessVerdict: graded.groundedness.verdict,
       unbackedClaimClasses: graded.groundedness.unbackedClaimClasses.join(','),
       userTurns: ctx.userTurns,
+      ...(ctx.spendStatus ? { spendStatus: ctx.spendStatus } : {}),
+      ...(ctx.spendStatus === 'attributed' && graded.efficiency.spend
+        ? { costMicroUsd: graded.efficiency.spend.costMicroUsd, tokens: graded.efficiency.spend.tokens }
+        : {}),
+      ...(ctx.runLatencyMs !== undefined ? { runLatencyMs: ctx.runLatencyMs } : {}),
       frameSize: ctx.frameSize,
       sampleSize: ctx.sampleSize,
       graders: graderVersionTag(),
@@ -185,7 +219,14 @@ export interface EvalV2Score {
   toolCalls: number;
   groundednessVerdict: 'grounded' | 'ungrounded' | 'no_claims';
   graderVersions: Partial<Record<AgentGraderId, number>>;
+  /** Absent when spend was not read (e.g. a row from sampler version 1). */
+  spendStatus?: SpendStatus;
+  /** Present only when spendStatus is `attributed`. */
+  costMicroUsd?: number;
+  runLatencyMs?: number;
 }
+
+const SPEND_STATUSES: ReadonlySet<string> = new Set<SpendStatus>(['attributed', 'none', 'truncated']);
 
 const TASK_VERDICTS: ReadonlySet<string> = new Set<TaskVerdict>(['success', 'failure', 'excluded']);
 const GROUNDEDNESS_VERDICTS: ReadonlySet<string> = new Set(['grounded', 'ungrounded', 'no_claims']);
@@ -211,6 +252,9 @@ export function parseScoredEvent(item: Record<string, unknown>): EvalV2Score | n
     toolCalls: typeof d.toolCalls === 'number' ? d.toolCalls : 0,
     groundednessVerdict: groundednessVerdict as EvalV2Score['groundednessVerdict'],
     graderVersions: parseGraderVersionTag(str('graders')),
+    ...(SPEND_STATUSES.has(str('spendStatus')) ? { spendStatus: str('spendStatus') as SpendStatus } : {}),
+    ...(str('spendStatus') === 'attributed' && typeof d.costMicroUsd === 'number' ? { costMicroUsd: d.costMicroUsd } : {}),
+    ...(typeof d.runLatencyMs === 'number' ? { runLatencyMs: d.runLatencyMs } : {}),
   };
 }
 
@@ -289,12 +333,46 @@ export interface EvalV2Metric {
   mayGate: boolean;
 }
 
+/**
+ * Cost and latency per successful task (ENG-2196), over sessions with a success or failure label.
+ * Cost follows agentGraders.efficiencyMetrics: the spend of every labelled session that has spend
+ * data, divided by its successes, so failures are charged to successes. Sessions whose spend is
+ * unknown (`truncated`, or not read) or unattributed (`none`) are counted, never read as $0.
+ */
+export interface EvalV2Efficiency {
+  graded: number;
+  successes: number;
+  /** Labelled sessions with attributed spend, and the successes among them. */
+  withSpend: number;
+  successesWithSpend: number;
+  /** Labelled sessions with no spend row carrying their session id. */
+  spendNone: number;
+  /** Labelled sessions whose spend was not read, or overflowed the bounded read. */
+  spendUnknown: number;
+  costPerSuccessUsd: number | null;
+  medianSuccessCostUsd: number | null;
+  /** Successes with a measured run wall time. */
+  successesWithLatency: number;
+  latencyPerSuccessP50Ms: number | null;
+  latencyPerSuccessP95Ms: number | null;
+}
+
 export interface EvalV2Group {
   surface: string;
   taskType: string;
   model: string;
   sessions: number;
   metrics: EvalV2Metric[];
+  efficiency: EvalV2Efficiency;
+}
+
+/** How much of the sample's spend could be tied to its sessions (the audit found 43% of rows without a session id). */
+export interface EvalV2SpendAttribution {
+  sessions: number;
+  attributed: number;
+  none: number;
+  truncated: number;
+  notRead: number;
 }
 
 export interface EvalV2DayCoverage {
@@ -315,6 +393,7 @@ export interface EvalV2Snapshot {
   coverage: EvalV2DayCoverage[];
   /** First the whole window (`all`), then each surface × task type × model, largest first. */
   groups: EvalV2Group[];
+  spendAttribution: EvalV2SpendAttribution;
   computedAt: string;
 }
 
@@ -346,6 +425,43 @@ function metricsFor(scores: readonly EvalV2Score[], gate: (graderId: string) => 
   });
 }
 
+/** Nearest-rank percentile. */
+function percentile(xs: readonly number[], p: number): number | null {
+  if (!xs.length) return null;
+  const sorted = [...xs].sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(p * sorted.length) - 1))];
+}
+
+export function efficiencyFor(scores: readonly EvalV2Score[]): EvalV2Efficiency {
+  const graded = scores.filter((s) => s.taskVerdict !== 'excluded');
+  const wins = graded.filter((s) => s.taskVerdict === 'success');
+  const withSpend = graded.filter((s) => s.spendStatus === 'attributed' && s.costMicroUsd !== undefined);
+  const winsWithSpend = withSpend.filter((s) => s.taskVerdict === 'success');
+  const usd = (s: EvalV2Score) => (s.costMicroUsd ?? 0) / 1e6;
+  const latencies = wins.flatMap((s) => (s.runLatencyMs !== undefined ? [s.runLatencyMs] : []));
+  return {
+    graded: graded.length,
+    successes: wins.length,
+    withSpend: withSpend.length,
+    successesWithSpend: winsWithSpend.length,
+    spendNone: graded.filter((s) => s.spendStatus === 'none').length,
+    spendUnknown: graded.filter((s) => s.spendStatus !== 'attributed' && s.spendStatus !== 'none').length,
+    costPerSuccessUsd: winsWithSpend.length ? withSpend.reduce((a, s) => a + usd(s), 0) / winsWithSpend.length : null,
+    medianSuccessCostUsd: percentile(winsWithSpend.map(usd), 0.5),
+    successesWithLatency: latencies.length,
+    latencyPerSuccessP50Ms: percentile(latencies, 0.5),
+    latencyPerSuccessP95Ms: percentile(latencies, 0.95),
+  };
+}
+
+function spendAttributionOf(scores: readonly EvalV2Score[]): EvalV2SpendAttribution {
+  const count = (status: SpendStatus) => scores.filter((s) => s.spendStatus === status).length;
+  const attributed = count('attributed');
+  const none = count('none');
+  const truncated = count('truncated');
+  return { sessions: scores.length, attributed, none, truncated, notRead: scores.length - attributed - none - truncated };
+}
+
 export interface AggregateOptions {
   date: string;
   windowLabel: EvalV2WindowLabel;
@@ -375,6 +491,7 @@ export function aggregateEvalV2(scores: readonly EvalV2Score[], opts: AggregateO
       model: list[0].model,
       sessions: list.length,
       metrics: metricsFor(list, gate),
+      efficiency: efficiencyFor(list),
     }))
     .sort((a, b) =>
       b.sessions - a.sessions ||
@@ -396,7 +513,8 @@ export function aggregateEvalV2(scores: readonly EvalV2Score[], opts: AggregateO
     windowEndDate: opts.date,
     sessions: inWindow.length,
     coverage,
-    groups: [{ surface: ALL, taskType: ALL, model: ALL, sessions: inWindow.length, metrics: metricsFor(inWindow, gate) }, ...cells],
+    groups: [{ surface: ALL, taskType: ALL, model: ALL, sessions: inWindow.length, metrics: metricsFor(inWindow, gate), efficiency: efficiencyFor(inWindow) }, ...cells],
+    spendAttribution: spendAttributionOf(inWindow),
     computedAt: opts.now.toISOString(),
   };
 }
