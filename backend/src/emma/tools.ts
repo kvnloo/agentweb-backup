@@ -42,6 +42,8 @@ import * as mediaVideoImpl from './impl/mediaVideo';
 import * as htmlCreationImpl from './impl/htmlCreation';
 // ENG-2103 (F2): updateHtmlFile tool cluster, same treatment as booksImpl above.
 import * as htmlUpdateImpl from './impl/htmlUpdate';
+// ENG-2103 (F2): knowledge base tool cluster, same treatment as booksImpl above.
+import * as knowledgeBaseImpl from './impl/knowledgeBase';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -5958,7 +5960,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.searchKnowledgeBase(args.query, args.max_results || 5, context?.userId);
+    return await knowledgeBaseImpl.searchKnowledgeBase(args.query, args.max_results || 5, context?.userId);
   }
 });
 
@@ -6021,7 +6023,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     if (args.source === 'discovery') {
-      return await agentModeService.searchForeplayDiscovery(
+      return await knowledgeBaseImpl.searchForeplayDiscovery(
         args.query,
         {
           maxResults: args.max_results || 10,
@@ -6036,7 +6038,7 @@ emmaToolRegistry.register({
         context?.userId
       );
     }
-    return await agentModeService.searchForeplayAds(args.query, args.max_results || 5, context?.userId);
+    return await knowledgeBaseImpl.searchForeplayAds(args.query, args.max_results || 5, context?.userId);
   }
 });
 
@@ -6074,7 +6076,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listKnowledgeBaseFiles(context?.userId, {
+    return await knowledgeBaseImpl.listKnowledgeBaseFiles(context?.userId, {
       modified_after: args?.modified_after,
       modified_before: args?.modified_before,
       limit: args?.limit,
@@ -6115,7 +6117,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.readKnowledgeBaseFiles(args.files, context?.userId);
+    return await knowledgeBaseImpl.readKnowledgeBaseFiles(args.files, context?.userId);
   }
 });
 
@@ -6140,7 +6142,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.materializeKnowledgeBaseAsset(args.kb_identifier, args.file_name, context?.userId);
+    return await knowledgeBaseImpl.materializeKnowledgeBaseAsset(args.kb_identifier, args.file_name, context?.userId);
   }
 });
 
@@ -6173,7 +6175,7 @@ emmaToolRegistry.register({
     if (!context?.userId || !context?.sessionId) {
       throw new Error("Missing user or session context");
     }
-    return await agentModeService.createKnowledgeBase(
+    return await knowledgeBaseImpl.createKnowledgeBase(
       args.name,
       args.content,
       args.knowledgeBaseType || 'private',
@@ -6216,7 +6218,7 @@ emmaToolRegistry.register({
     if (!context?.userId || !context?.sessionId) {
       throw new Error("Missing user or session context");
     }
-    return await agentModeService.updateKnowledgeBaseFile(
+    return await knowledgeBaseImpl.updateKnowledgeBaseFile(
       args.taskId,
       args.fileName,
       args.content,
@@ -6265,7 +6267,7 @@ emmaToolRegistry.register({
     if (!context?.userId || !context?.sessionId) {
       throw new Error("Missing user or session context");
     }
-    return await agentModeService.attachKnowledgeBaseFiles(
+    return await knowledgeBaseImpl.attachKnowledgeBaseFiles(
       args.taskId,
       args.files,
       context.userId,
@@ -6306,7 +6308,7 @@ emmaToolRegistry.register({
     if (!context?.userId) {
       throw new Error("Missing user context");
     }
-    return await agentModeService.writeClickUpDoc(
+    return await knowledgeBaseImpl.writeClickUpDoc(
       args.workspace_id,
       args.name,
       args.content,
