@@ -44,14 +44,24 @@ import { extractJson } from './util/extractJson';
 import { getUnipileCompanyService } from './unipileCompanyServiceFactory';
 import { getUnipileProfileService } from './unipileProfileServiceFactory';
 
-// Logical model defaults preserve existing settings while callLLM normalizes
-// retired IDs and owns OpenRouter transport, fallback, and metering.
-const EXTRACT_MODEL      = process.env.CRM_ENRICH_V3_EXTRACT_MODEL      || 'gpt-5-chat-2';
-const CRITIC_MODEL       = process.env.CRM_ENRICH_V3_CRITIC_MODEL       || 'gpt-5-chat-2';
-// The default deployment (gpt-5-chat-2) rejects ANY non-default temperature with
-// a 400 `unsupported_value` — "Only the default (1) value is supported" — and the
+// Every enrichment LLM call, including the web-search tier and the critic, runs
+// on the caller's enrichment role (org override, else the role default), so one
+// run uses one model and an org override covers the whole pipeline (ENG-2184).
+// The CRM_ENRICH_V3_* env overrides keep their earlier precedence over it.
+// callLLM normalizes retired IDs and owns OpenRouter transport, fallback, and metering.
+// Tier 4 web search is OpenRouter's provider-independent server tool, so it needs
+// only tool support, which every enrichment role option has.
+async function webSearchModel(userId: string | undefined): Promise<string> {
+  return process.env.CRM_ENRICH_V3_WEB_SEARCH_MODEL || process.env.CRM_ENRICH_V3_EXTRACT_MODEL ||
+    resolveModelForUser(userId, 'enrichment');
+}
+async function criticModel(userId: string | undefined): Promise<string> {
+  return process.env.CRM_ENRICH_V3_CRITIC_MODEL || resolveModelForUser(userId, 'enrichment');
+}
+// GPT-5 chat models reject ANY non-default temperature with a 400
+// `unsupported_value` — "Only the default (1) value is supported" — and the
 // critic's catch swallowed it, so the critic never ran at all. `null` omits the
-// parameter. Point CRM_ENRICH_V3_CRITIC_MODEL at a deployment that accepts a
+// parameter. Point CRM_ENRICH_V3_CRITIC_MODEL at a model that accepts a
 // custom temperature and set CRM_ENRICH_V3_CRITIC_TEMPERATURE=0 for a
 // deterministic judge.
 const CRITIC_TEMPERATURE: number | null =
@@ -59,9 +69,6 @@ const CRITIC_TEMPERATURE: number | null =
   process.env.CRM_ENRICH_V3_CRITIC_TEMPERATURE !== ''
     ? Number(process.env.CRM_ENRICH_V3_CRITIC_TEMPERATURE)
     : null;
-// Model used for Tier 4 extraction. OpenRouter executes the provider-independent
-// web-search server tool, so no model-specific search adapter or secret is needed.
-const WEB_SEARCH_MODEL   = process.env.CRM_ENRICH_V3_WEB_SEARCH_MODEL   || EXTRACT_MODEL;
 
 // ─── Identity resolver deps ───────────────────────────────────────────────────
 
@@ -198,7 +205,7 @@ export function buildIdentityDeps(userId: string): IdentityResolverDeps {
 
     resolveCompanyDomainViaWebSearch: async ({ company, domain, linkedin, title, firstName, lastName }) => {
       try {
-        const llm = createLLMService(WEB_SEARCH_MODEL, 0.2);
+        const llm = createLLMService(await webSearchModel(userId), 0.2);
         const systemPrompt =
           'You are a company researcher. Given information about a person or company, find the official company website and company name.\n\n' +
           'LOOKUP PRIORITY (follow in order):\n' +
@@ -767,7 +774,7 @@ export async function extractFieldsViaLLMReal(input: {
   try {
     let parsed: Record<string, any>;
     if (isWebTier) {
-      const llm = createLLMService(WEB_SEARCH_MODEL, 0.0);
+      const llm = createLLMService(await webSearchModel(userId), 0.0);
       parsed = await llm.generateJSONContentWithWebSearch<Record<string, any>>(systemPrompt, userPrompt, { userId, feature: 'enrichment' });
     } else {
       const llm = createLLMService(await resolveModelForUser(userId, 'enrichment'), 0.0);
@@ -888,8 +895,10 @@ async function runCriticReal(input: {
     `Claims to verify:\n${JSON.stringify(claims, null, 2)}\n\n` +
     `Return ONLY JSON like {"field_a": "supported", "field_b": "contradicted"}.`;
 
+  let model: string | undefined;
   try {
-    const llm = createLLMService(CRITIC_MODEL, CRITIC_TEMPERATURE);
+    model = await criticModel(userId);
+    const llm = createLLMService(model, CRITIC_TEMPERATURE);
     const parsed = await llm.generateJSONContent<Record<string, string>>(systemPrompt, userPrompt, 'json', undefined, { userId, feature: 'enrichment' });
     const verdicts: Record<string, any> = {};
     for (const claim of claims) {
@@ -904,7 +913,7 @@ async function runCriticReal(input: {
     // value sails through unchecked — the enrichment still reports ok=true. A
     // 400 here went unnoticed long enough that the critic never ran once.
     console.error(
-      `[v3 deps] CRITIC DISABLED — no verdicts, every web value passes unchecked. model=${CRITIC_MODEL} ` +
+      `[v3 deps] CRITIC DISABLED — no verdicts, every web value passes unchecked. model=${model ?? 'unresolved'} ` +
       `temperature=${CRITIC_TEMPERATURE ?? 'default'}: ${(err as Error).message}`,
     );
     return { verdicts: {} };

@@ -232,6 +232,24 @@ export function agreementReport<L extends string | number>(
   };
 }
 
+/**
+ * ROC AUC of an ordinal score for a binary outcome (ENG-2138: judge score vs deterministic task
+ * success): the probability that a random positive (`truth` 1) scores above a random negative
+ * (`truth` 0), ties counting half (Mann-Whitney U). Takes LabelPairs so `bootstrapCI(pairs,
+ * rocAuc)` gives its interval. With only one class present AUC is undefined; it returns 0.5 so
+ * bootstrap resamples stay finite, and callers check both classes before reporting a value.
+ */
+export function rocAuc(pairs: ReadonlyArray<LabelPair<number>>): number {
+  const pos = pairs.filter((p) => p.truth === 1).map((p) => p.predicted);
+  const neg = pairs.filter((p) => p.truth === 0).map((p) => p.predicted);
+  if (pos.length === 0 || neg.length === 0) return 0.5;
+  let wins = 0;
+  for (const x of pos) {
+    for (const y of neg) wins += x > y ? 1 : x === y ? 0.5 : 0;
+  }
+  return wins / (pos.length * neg.length);
+}
+
 /** One observation for a rank correlation, e.g. x = judge score, y = CTR (ENG-2141). */
 export interface XYPair {
   x: number;
