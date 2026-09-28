@@ -278,10 +278,16 @@ describe('HubSpot OAuth Routes', () => {
      * The un-bricking half of the revoked-token work.
      *
      * hubspotService stamps `needs_reconnect: true` when HubSpot rejects a refresh, and
-     * GET /connected-accounts then reports the row as "Reconnect required". THIS route is
-     * the reconnect. If it does not clear the flag, a freshly re-authorised account keeps
-     * rendering as broken and the user has no way out at all — the flag becomes a one-way
-     * door. Without this test, inverting the clear to `true` passes the whole suite.
+     * GET /connected-accounts then reports the row as "Reconnect required". This route is
+     * the reconnect, so it must not leave that flag standing.
+     *
+     * Being accurate about WHY, because the first version of this comment was not:
+     * createAccount REPLACES `config` wholesale (connectedAccountsDb.ts:483) rather than
+     * merging, so a stale `true` would be dropped even if this line were absent — the
+     * same fact externalCrmSyncService.ts:537 and attioWebhookSubscription.ts:35 rely on.
+     * Writing it explicitly is defence against createAccount ever becoming a merge, and
+     * matches outlookAuth.ts:233. The test pins the value because nothing else does:
+     * inverting it to `true` otherwise passes the entire suite.
      */
     it('clears needs_reconnect so a re-authorised account stops reporting Reconnect required', async () => {
       const tokenSessionId = await setupSession('crm');
@@ -298,8 +304,9 @@ describe('HubSpot OAuth Routes', () => {
           config: expect.objectContaining({ needs_reconnect: false }),
         })
       );
-      // Explicit: the stored value must be false, not merely absent — connectedAccounts
-      // reads the key directly, and `undefined` would work today only by accident.
+      // Every reader of this key in the repo is a truthiness test, so absent and false
+      // are equivalent today. Asserting the literal false keeps the stored shape honest
+      // rather than relying on that staying true.
       const stored = mockCreateAccount.mock.calls.at(-1)![2] as any;
       expect(stored.config.needs_reconnect).toBe(false);
     });

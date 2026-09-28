@@ -158,15 +158,32 @@ const refreshLocks = new Map<string, Promise<{ access_token: string; token_expir
  */
 function isRevokedRefreshTokenError(err: unknown): boolean {
   const status = Number((err as any)?.response?.status);
-  // 401 is unambiguous: the grant is not accepted.
-  if (status === 401) return true;
-  // 400 is NOT. HubSpot's token endpoint answers 400 for client-side failures generally —
-  // a wrong client_id/secret, a malformed body, an unsupported grant_type — and only
-  // sometimes for a dead refresh token. Flagging on the status alone means one rotated
-  // clientSecret in getHubSpotConfig() marks EVERY HubSpot account in the fleet dead in a
-  // single sweep, stopping their syncs and telling each customer to reconnect. So a 400
-  // must say so in the body: HubSpot returns { status: 'BAD_REFRESH_TOKEN', ... }.
-  if (status !== 400) return false;
+  if (status !== 400 && status !== 401) return false;
+
+  // The STATUS never decides this on its own — the BODY has to name the refresh token.
+  //
+  // Measured against live HubSpot from env2 on 2026-09-28, posting a bogus refresh_token
+  // to cfg.tokenUrl with valid client credentials:
+  //
+  //   HTTP 400
+  //   {"status":"BAD_REFRESH_TOKEN","message":"missing or invalid refresh token",
+  //    "correlationId":"01a0e82e-...","error":"invalid_request",
+  //    "error_description":"missing or invalid refresh token"}
+  //
+  // So a revoked grant is a 400 naming BAD_REFRESH_TOKEN. Note `error` is
+  // "invalid_request", NOT "invalid_grant" — the BAD_REFRESH_TOKEN alternative below is
+  // load-bearing, not belt-and-braces.
+  //
+  // Why 401 is gated the same way rather than trusted: the refresh POST carries
+  // client_id/client_secret, and RFC 6749 §5.2 assigns 401 to `invalid_client` — a
+  // statement about the SHARED credential from getHubSpotConfig(), not about one
+  // customer's grant. This repo's own OAuth server implements exactly that split
+  // (mcp/oauth/oauthRoutes.ts: 400 invalid_grant for a dead refresh token, 401
+  // invalid_client for client-auth failure). An ungated 401 therefore reopens the whole
+  // failure this function exists to prevent: one rotated clientSecret, or a bodiless 401
+  // from an ALB/WAF/corporate proxy, flags EVERY HubSpot account in the fleet dead in a
+  // single sweep — externalCrmSyncService stops syncing them and every customer is told
+  // to reconnect an integration that works.
   const data = (err as any)?.response?.data;
   const marker = typeof data === 'string' ? data : JSON.stringify(data ?? '');
   return /BAD_REFRESH_TOKEN|invalid_grant/i.test(marker);
@@ -300,7 +317,7 @@ export class HubSpotService {
 
     // Token is expiring — create provisional instance, refresh, then return it.
     const instance = new HubSpotService(config.access_token, userId, account.account_id, expiresAt, portalId);
-    await instance.doRefresh(userId, account.account_id, config.refresh_token);
+    await instance.doRefresh(userId, account.account_id, config.refresh_token, !!config.needs_reconnect);
     return instance;
   }
 
@@ -334,11 +351,11 @@ export class HubSpotService {
     if (!config.refresh_token) {
       throw new Error('HubSpot access token expired and no refresh token is available. Please reconnect your HubSpot account.');
     }
-    await this.doRefresh(this._userId, this._accountId, config.refresh_token);
+    await this.doRefresh(this._userId, this._accountId, config.refresh_token, !!(config as any).needs_reconnect);
     return this._token;
   }
 
-  private async doRefresh(userId: string, accountId: string, refreshToken: string): Promise<void> {
+  private async doRefresh(userId: string, accountId: string, refreshToken: string, wasFlagged = false): Promise<void> {
     const hubspotConfig = await getHubSpotConfig();
     const lockKey = `${userId}:${accountId}`;
 
@@ -373,6 +390,16 @@ export class HubSpotService {
           await markHubSpotNeedsReconnect(userId, accountId);
           throw new Error(RECONNECT_MESSAGE);
         }
+        // Logged deliberately. The branch above is the only place that learns HubSpot's
+        // revocation shape, and it is pinned to one measured sample. If HubSpot ever
+        // answers a revoked grant differently, THIS is the line that will show it —
+        // otherwise the classifier silently returns false forever and the account goes on
+        // reporting "Connected", which is the original bug wearing a green test suite.
+        console.warn(
+          `[HubSpotService] Refresh failed for account ${accountId} and was NOT treated as a `
+          + `revocation (status=${(refreshErr as any)?.response?.status}). Body: `
+          + `${JSON.stringify((refreshErr as any)?.response?.data ?? null)}`
+        );
         throw refreshErr;
       }
 
@@ -390,10 +417,20 @@ export class HubSpotService {
         token_expires_at,
       }, accountId);
 
-      // The grant works. Clear any stale `needs_reconnect` so the account stops reporting
-      // "Reconnect required" the moment it recovers — whether it was flagged by a genuine
-      // revocation that the user has since re-authorised, or by a false positive.
-      await clearHubSpotNeedsReconnect(userId, accountId);
+      // The grant works — clear a stale `needs_reconnect` so the account stops reporting
+      // "Reconnect required" the moment it recovers, whether it was flagged by a genuine
+      // revocation since re-authorised or by a false positive.
+      //
+      // Guarded, exactly as twitterService.forceRefresh guards its own clear. An
+      // unconditional write here would fire on EVERY refresh — every 30 minutes per
+      // HubSpot customer, since that is the access-token lifetime — and
+      // updateAccountConfig is a consistent read plus a CAS write of the entire
+      // connected_accounts attribute. Doubling the write rate on that attribute also
+      // raises the odds that a concurrent updateAccountTokens loses its CAS twice and
+      // fails closed with ConnectedAccountChanged.
+      if (wasFlagged) {
+        await clearHubSpotNeedsReconnect(userId, accountId);
+      }
 
       return { access_token, token_expires_at };
     })().finally(() => refreshLocks.delete(lockKey));

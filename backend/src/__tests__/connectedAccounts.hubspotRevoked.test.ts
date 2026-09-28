@@ -161,11 +161,20 @@ describe('GET /connected-accounts — HubSpot revoked refresh token', () => {
     expect((await listAccounts()).status).toBe('active');
   });
 
-  // Scope guard: the flag is read per-platform, so it must not leak onto other
-  // providers that happen to carry the same key.
+  /*
+   * Scope guard: the flag is read per-platform, so the new branch must not fire for a
+   * provider that merely carries the same key.
+   *
+   * Deliberately NOT attio. attioWebhookSubscription.ts:68 writes needs_reconnect, and
+   * externalCrmSyncService.isAccountConnected() reads it — so asserting "attio +
+   * needs_reconnect => active" would enshrine the exact Settings-says-Connected /
+   * CRM-Sync-says-Reconnect split this change exists to remove, and decide attio's
+   * behaviour by accident in a hubspot test. gmail never writes the key, so it isolates
+   * the scoping question without answering a different one.
+   */
   it('does not apply the HubSpot branch to a different platform', async () => {
     (connectedAccountsDb.getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([
-      { ...hubspotAccount({ needs_reconnect: true }), platform: 'attio' },
+      { ...hubspotAccount({ needs_reconnect: true }), platform: 'gmail' },
     ]);
 
     expect((await listAccounts()).status).toBe('active');

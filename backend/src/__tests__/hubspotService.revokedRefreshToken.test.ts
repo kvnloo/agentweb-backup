@@ -100,7 +100,7 @@ describe('HubSpot refresh-token revocation', () => {
     );
   });
 
-  it('flags needs_reconnect on a 401 from the token endpoint', async () => {
+  it('flags needs_reconnect on a 401 that names the refresh token', async () => {
     mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
     mockAxiosPost.mockRejectedValue(httpError(401, BAD_REFRESH_BODY));
 
@@ -111,6 +111,39 @@ describe('HubSpot refresh-token revocation', () => {
       '245815183',
       { needs_reconnect: true }
     );
+  });
+
+  /*
+   * A 401 must NOT condemn the grant on its own — the same rule as a 400, for a sharper
+   * reason. The refresh POST carries client_id/client_secret, and RFC 6749 §5.2 assigns
+   * 401 to `invalid_client`: a statement about the SHARED credential from
+   * getHubSpotConfig(), not about one customer's grant. This repo's own OAuth server
+   * splits them exactly that way (mcp/oauth/oauthRoutes.ts). An ungated 401 means one
+   * rotated clientSecret — or a bodiless 401 from a proxy — flags every HubSpot account
+   * in the fleet dead at once.
+   *
+   * Measured against live HubSpot: a revoked refresh token answers 400, not 401, so
+   * nothing real is lost by gating this arm.
+   */
+  it.each([
+    ['invalid_client (a bad shared clientSecret)', { status: 'BAD_CLIENT_CREDENTIALS', message: 'authentication credentials not valid' }],
+    ['an RFC 6749 invalid_client body', { error: 'invalid_client' }],
+    ['an unrelated string body', 'Unauthorized'],
+    ['a null body', null],
+  ])('does NOT flag on a 401 from %s', async (_label, body) => {
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
+    mockAxiosPost.mockRejectedValue(httpError(401, body));
+
+    await expect(HubSpotService.create('user-1')).rejects.toThrow();
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+  });
+
+  it('does NOT flag on a bodiless 401, e.g. from a proxy or WAF', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
+    mockAxiosPost.mockRejectedValue(httpErrorNoBody(401));
+
+    await expect(HubSpotService.create('user-1')).rejects.toThrow();
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
   });
 
   // The asymmetry that matters: persisting "dead" on a blip would break a live
@@ -237,6 +270,25 @@ describe('a flagged account heals itself when the grant works again', () => {
 
     await expect(HubSpotService.create('user-1')).resolves.toBeInstanceOf(HubSpotService);
     expect(mockAxiosPost).toHaveBeenCalled();
+  });
+
+  /*
+   * The clear is guarded on the flag having been set, mirroring twitterService.forceRefresh.
+   * Unconditional, it would write on EVERY refresh — every 30 minutes per HubSpot customer,
+   * that being the access-token lifetime — and updateAccountConfig is a consistent read plus
+   * a CAS write of the whole connected_accounts attribute. That doubles the write rate on
+   * the attribute and raises the odds a concurrent updateAccountTokens loses its CAS twice
+   * and fails closed with ConnectedAccountChanged.
+   */
+  it('does NOT write the config at all when refreshing an unflagged account', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
+    mockAxiosPost.mockResolvedValue({
+      data: { access_token: 'fresh', refresh_token: 'rotated', expires_in: 1800 },
+    });
+
+    await HubSpotService.create('user-1');
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+    expect(mockUpdateAccountTokens).toHaveBeenCalled();
   });
 
   it('clears needs_reconnect once the refresh succeeds', async () => {
