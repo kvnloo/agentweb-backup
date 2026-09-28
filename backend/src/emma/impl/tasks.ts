@@ -37,34 +37,33 @@
  * `getPreviousTaskResults` function directly; createImageTaskFromPrompt
  * keeps calling `this.getPreviousTaskResults(...)`, unaffected.
  *
- * EXCLUSION RE-VERIFIED, WITH A CORRECTION TO THE BRIEF: the brief for this
- * cluster excluded `createImageTaskFromPrompt` on the theory that it makes a
- * direct `this.callLLM` call around line 12699 of the pre-extraction file.
- * Independently re-checked line by line: `createImageTaskFromPrompt` runs
- * from its `public async` declaration to its own closing brace with ZERO
- * `this.callLLM`/`this.generateImage`/`this.describeImage`/
- * `this.callVisionLLMWithTimeout` calls anywhere in its body. The
- * `this.callLLM` call actually at that line number belongs to a completely
- * different, unrelated method, `generateSessionTitle`, which merely starts
- * two lines after createImageTaskFromPrompt's closing brace — adjacent in
- * the file, not nested inside it. createImageTaskFromPrompt's only
- * dependencies are `this.getPreviousTaskResults` (handled above, a plain
- * delegating wrapper) and `taskDb.createTask`/`taskDb.createTaskExecution`
- * (pure DB calls) — by the same criteria used everywhere else in this
- * series, it appears independently safe to move. It was NOT moved and NOT
- * modified here regardless of this finding, per an explicit instruction to
- * leave it untouched for this round; this note records the finding for
- * whoever picks up the next cluster or revisits this one.
+ * `createImageTaskFromPrompt` (ADDED IN A FOLLOW-UP PASS, same session): the
+ * original cluster 14 brief excluded it on the theory that it makes a direct
+ * `this.callLLM` call around line 12699 of the pre-extraction file. Verified
+ * line by line that this was a false positive — the `this.callLLM` call at
+ * that line number belongs to a completely different, unrelated method,
+ * `generateSessionTitle` (declared without an access-modifier keyword, which
+ * is why the brief's own boundary-detection grep mistook the two methods for
+ * one), which merely starts two lines after createImageTaskFromPrompt's
+ * closing brace. createImageTaskFromPrompt's only real dependencies are
+ * `getPreviousTaskResults` (already exported above) and
+ * `taskDb.createTask`/`taskDb.createTaskExecution` (pure DB calls) — moved
+ * here on the same verbatim basis as the other four methods once this was
+ * confirmed. `emma/tools.ts`'s `create_image_task_from_prompt` tool and
+ * `routes/emmaApi.ts`'s `POST /image-task-from-prompt` handler both repointed
+ * to call this module directly; `AgentModeService.prototype
+ * .createImageTaskFromPrompt` kept as a one-line delegating wrapper (the
+ * route calls it on a real instance, not via the tool registry).
  *
  * No other hidden `this.callLLM`/`this.generateImage`/`this.describeImage`/
- * `this.callVisionLLMWithTimeout` coupling was found anywhere in the 5 moved
+ * `this.callVisionLLMWithTimeout` coupling was found anywhere in the 6 moved
  * methods (grepped every method body individually before moving it).
  *
  * `AgentModeService.prototype.<name>` now delegates to these functions
  * rather than duplicating them for listTaskTemplates, createTaskFromTemplate,
- * createTaskFromPrompt and createRevision — ALL FOUR keep a one-line
- * delegating wrapper (none deleted), because each has a real caller beyond
- * `emma/tools.ts`, found by grepping the whole backend:
+ * createTaskFromPrompt, createRevision, and createImageTaskFromPrompt — ALL
+ * FIVE keep a one-line delegating wrapper (none deleted), because each has a
+ * real caller beyond `emma/tools.ts`, found by grepping the whole backend:
  *   - `listTaskTemplates`: `routes/emmaApi.ts`'s `GET /task-templates`
  *     handler, and `agentModeService.listTaskTemplates.test.ts` (calls the
  *     real method directly on a real instance, 5 call sites).
@@ -80,6 +79,8 @@
  *     `agentModeService.createRevision.test.ts`, actually tests the
  *     unrelated `extractMinimalToolResult`/task-id-extraction logic, not
  *     `createRevision` itself).
+ *   - `createImageTaskFromPrompt`: `routes/emmaApi.ts`'s
+ *     `POST /image-task-from-prompt` handler.
  * `waitForTaskCompletion`, by contrast, was DELETED from the class rather
  * than kept as a wrapper: it was `public`, but grepping the whole backend
  * found zero callers beyond the two methods above (both moving here) — the
@@ -87,12 +88,13 @@
  * `MockAgentModeService` test double that never imports the real class, not
  * on `AgentModeService.prototype.waitForTaskCompletion`.
  *
- * No `jest.spyOn` on any of the 5 in-scope methods (or the 3 helpers) exists
+ * No `jest.spyOn` on any of the 6 in-scope methods (or the 3 helpers) exists
  * anywhere in the backend, confirmed by grep — no stale-mock spy regressions
  * to fix for this cluster.
  *
  * Transitive-import traps: `chatbotDb` (`getPreviousTaskResults` only) and
- * `taskDb`/`taskTemplateDb` (every method here) are both lazily imported.
+ * `taskDb`/`taskTemplateDb` (every method here, including
+ * `createImageTaskFromPrompt`) are both lazily imported.
  * `chatbotService.ts` is one of this series' four explicitly-named traps
  * (circularly imports `agentModeService.ts` back) — lazy-`require`'d here,
  * the same idiom `emma/impl/workPlans.ts` established for it. `services/db.ts`
@@ -760,6 +762,86 @@ export async function createRevision(taskId: string, executionId: string, revisi
     return {
       success: false,
       message: 'Failed to create revision. Please try again.',
+      status: 'error'
+    };
+  }
+}
+
+// [DEPRECATED] per emma/tools.ts's own tool description ("Use 'generate_image'
+// instead for creating and revising images."). Added in a follow-up pass —
+// see module header for why it was originally excluded and why that was a
+// false positive (generateSessionTitle's this.callLLM call, not this one's).
+export async function createImageTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true): Promise<any> {
+  try {
+    const { taskDb } = await import('../../services/db');
+
+    // Format the prompt using the same format as handleCreateAdImageTask
+    let formattedPrompt = "Please create high-quality ad images that align with the below context and target the specified audience. The images should be professional, engaging, and suitable for various marketing channels. Use download_image to download reference images and generate_image to create the result images. Valid size values for generate_image include \"1024x1024\", \"1536x1024\", \"1024x1536\", \"auto\". Valid quality values for generate_image include \"low\", \"medium\", \"high\" (defaults to medium if not specified). DO NOT browse the internet for other images.\n\n";
+
+    // Add the user's image prompt
+    if (prompt.trim()) {
+      formattedPrompt += `Image Prompt:\n${prompt.trim()}\n\n`;
+    }
+
+    // Attach previous task results if requested
+    if (attachPreviousTaskResults) {
+      const previousResults = await getPreviousTaskResults(userId, sessionId);
+      if (previousResults) {
+        formattedPrompt += previousResults;
+      }
+    }
+
+    // Create image generation task with standard settings
+    const task = {
+      taskId: Date.now().toString(),
+      userId,
+      name: taskName,
+      prompt: formattedPrompt,
+      status: 'active',
+      emailNotification: false,
+      isInteractive: false,
+      isDeepResearch: false,
+      isComplexTask: false,
+      extractPageContent: false,
+      outputAsJson: false,
+      outputAsHtml: false, // Images don't need HTML output
+      useSharedBrowser: false,
+      turnOffHeadless: true,
+      useKnowledgeBase: false,
+      updateKnowledgeBase: false,
+      updateLeadList: false,
+      createVideo: false,
+      category: category,
+      description: `Image generation task: ${taskName}`,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    // Save task to database
+    await taskDb.createTask(task);
+
+    // Create task execution
+    const execution = await taskDb.createTaskExecution({
+      executionId: Date.now().toString(),
+      taskId: task.taskId,
+      userId: userId,
+      status: 'pending',
+      startTime: new Date().toISOString()
+    });
+
+    return {
+      success: true,
+      message: `Image generation task "${taskName}" has been created successfully. The task will start running shortly.`,
+      status: 'pending',
+      taskId: task.taskId,
+      executionId: execution?.executionId,
+      taskName: taskName
+    };
+  } catch (error) {
+    console.error('AgentMode: Error creating image task from prompt:', error);
+    return {
+      success: false,
+      message: 'Failed to create image generation task. Please try again.',
       status: 'error'
     };
   }

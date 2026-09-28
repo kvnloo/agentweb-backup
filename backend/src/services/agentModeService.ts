@@ -12188,80 +12188,14 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
   }
 
   // Create image generation task from raw prompt
+  // ENG-2103 (F2): body moved verbatim to emma/impl/tasks.ts (added in a
+  // follow-up pass to the task-management cluster — see that module's header
+  // comment for why it was initially excluded and why that was a false
+  // positive). Kept as a delegating wrapper because routes/emmaApi.ts's
+  // `POST /image-task-from-prompt` handler calls it directly on a real
+  // instance.
   public async createImageTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true): Promise<any> {
-    try {
-
-      // Format the prompt using the same format as handleCreateAdImageTask
-      let formattedPrompt = "Please create high-quality ad images that align with the below context and target the specified audience. The images should be professional, engaging, and suitable for various marketing channels. Use download_image to download reference images and generate_image to create the result images. Valid size values for generate_image include \"1024x1024\", \"1536x1024\", \"1024x1536\", \"auto\". Valid quality values for generate_image include \"low\", \"medium\", \"high\" (defaults to medium if not specified). DO NOT browse the internet for other images.\n\n";
-
-      // Add the user's image prompt
-      if (prompt.trim()) {
-        formattedPrompt += `Image Prompt:\n${prompt.trim()}\n\n`;
-      }
-
-      // Attach previous task results if requested
-      if (attachPreviousTaskResults) {
-        const previousResults = await this.getPreviousTaskResults(userId, sessionId);
-        if (previousResults) {
-          formattedPrompt += previousResults;
-        }
-      }
-
-      // Create image generation task with standard settings
-      const task = {
-        taskId: Date.now().toString(),
-        userId,
-        name: taskName,
-        prompt: formattedPrompt,
-        status: 'active',
-        emailNotification: false,
-        isInteractive: false,
-        isDeepResearch: false,
-        isComplexTask: false,
-        extractPageContent: false,
-        outputAsJson: false,
-        outputAsHtml: false, // Images don't need HTML output
-        useSharedBrowser: false,
-        turnOffHeadless: true,
-        useKnowledgeBase: false,
-        updateKnowledgeBase: false,
-        updateLeadList: false,
-        createVideo: false,
-        category: category,
-        description: `Image generation task: ${taskName}`,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      };
-
-      // Save task to database
-      await taskDb.createTask(task);
-
-      // Create task execution
-      const execution = await taskDb.createTaskExecution({
-        executionId: Date.now().toString(),
-        taskId: task.taskId,
-        userId: userId,
-        status: 'pending',
-        startTime: new Date().toISOString()
-      });
-
-
-      return {
-        success: true,
-        message: `Image generation task "${taskName}" has been created successfully. The task will start running shortly.`,
-        status: 'pending',
-        taskId: task.taskId,
-        executionId: execution?.executionId,
-        taskName: taskName
-      };
-    } catch (error) {
-      console.error('AgentMode: Error creating image task from prompt:', error);
-      return {
-        success: false,
-        message: 'Failed to create image generation task. Please try again.',
-        status: 'error'
-      };
-    }
+    return tasksImpl.createImageTaskFromPrompt(taskName, prompt, category, userId, sessionId, attachPreviousTaskResults);
   }
 
   async generateSessionTitle(userMessage: string, usageContext?: LLMUsageContext): Promise<string> {

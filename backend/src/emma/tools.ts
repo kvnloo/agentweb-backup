@@ -5114,7 +5114,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createImageTaskFromPrompt(
+    return await tasksImpl.createImageTaskFromPrompt(
       args.task_name,
       args.prompt,
       args.category,

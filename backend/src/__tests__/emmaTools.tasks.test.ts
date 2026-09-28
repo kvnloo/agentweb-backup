@@ -5,11 +5,11 @@
  * emmaTools.knowledgeBase.test.ts/emmaTools.leads.test.ts/
  * emmaTools.workPlans.test.ts.
  *
- * `create_image_task_from_prompt` is deliberately NOT covered here — it is
- * EXCLUDED from this cluster (stays calling
- * agentModeService.createImageTaskFromPrompt unchanged) and is out of scope
- * for this test file. The mocked agentModeService below is a throwing Proxy
- * specifically so that if any of the 4 tools covered here ever called back
+ * `create_image_task_from_prompt` was added in a follow-up pass (it was
+ * initially excluded from this cluster on a false-positive callLLM-coupling
+ * theory — see emma/impl/tasks.ts's module header for the correction) and is
+ * now covered here like the other 4. The mocked agentModeService below is a
+ * throwing Proxy so that if any of the 5 tools covered here ever called back
  * into the class (a regression), the test would fail loudly instead of
  * silently succeeding against the real service.
  */
@@ -19,9 +19,10 @@ jest.mock('../emma/impl/tasks', () => ({
   createTaskFromTemplate: jest.fn(),
   createTaskFromPrompt: jest.fn(),
   createRevision: jest.fn(),
+  createImageTaskFromPrompt: jest.fn(),
 }));
 
-// agentModeService.<taskMethod> must NOT be called by these 4 tools anymore
+// agentModeService.<taskMethod> must NOT be called by these 5 tools anymore
 // — mock the whole module so a regression (a call site accidentally left
 // pointed at the class) would throw instead of silently succeeding against
 // the real service.
@@ -142,6 +143,27 @@ describe('Task management tool cluster delegates to emma/impl/tasks.ts (ENG-2103
     );
 
     expect(mockTasks.createRevision).toHaveBeenCalledWith('task-1', 'exec-1', 'Make it blue', 'u1', 'report.html');
+    expect(result).toBe(expected);
+  });
+
+  it('create_image_task_from_prompt forwards task_name/prompt/category/user/session/attach flag and returns the result unchanged', async () => {
+    const expected = { success: true, taskId: 't4' };
+    mockTasks.createImageTaskFromPrompt.mockResolvedValue(expected);
+
+    const tool = emmaToolRegistry.getTool('create_image_task_from_prompt')!;
+    const result = await tool.execute(
+      {
+        task_name: 'Ad images',
+        prompt: 'Bright, modern product shots',
+        category: 'Creatives',
+        attach_previous_task_results: true,
+      },
+      { userId: 'u1', sessionId: 's1' }
+    );
+
+    expect(mockTasks.createImageTaskFromPrompt).toHaveBeenCalledWith(
+      'Ad images', 'Bright, modern product shots', 'Creatives', 'u1', 's1', true
+    );
     expect(result).toBe(expected);
   });
 });
