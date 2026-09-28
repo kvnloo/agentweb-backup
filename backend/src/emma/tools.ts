@@ -82,6 +82,13 @@ import * as twitterImpl from './impl/twitter';
 // bags, so those keep calling `agentModeService.<method>` (the class's own
 // delegating wrapper, which injects the private dependencies internally).
 import * as adsApisImpl from './impl/adsApis';
+// ENG-2103 (F2), cluster 19: Google Ads + HubSpot/Attio CRM passthrough
+// tools. handleCallGoogleAdsApi/handleCallGoogleAdsReportingApi/
+// handleHubspotApi call the module directly. handleAttioApi is re-exported
+// from the module (its real body already lives in
+// services/agentMode/attioTools.ts, a pre-existing self-contained
+// extraction) so this file gets one uniform import for the whole cluster.
+import * as adsCrmApisImpl from './impl/adsCrmApis';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -9739,7 +9746,7 @@ ACTION MATRIX:
     },
   },
   execute: async (args: any, context: any) => {
-    return await agentModeService.handleCallGoogleAdsApi(context?.userId || context?.agentUserId, args, {
+    return await adsCrmApisImpl.handleCallGoogleAdsApi(context?.userId || context?.agentUserId, args, {
       sessionId: context?.sessionId,
       ...(args.client_id ? { clientScope: { clientId: args.client_id, toolName: 'call_google_ads_api' } } : {}),
     });
@@ -9782,7 +9789,7 @@ GAQL EXAMPLES:
     },
   },
   execute: async (args: any, context: any) => {
-    return await agentModeService.handleCallGoogleAdsReportingApi(context?.userId || context?.agentUserId, args, {
+    return await adsCrmApisImpl.handleCallGoogleAdsReportingApi(context?.userId || context?.agentUserId, args, {
       ...(args.client_id ? { clientScope: { clientId: args.client_id, toolName: 'call_google_ads_reporting_api' } } : {}),
     });
   },
@@ -9944,7 +9951,7 @@ TYPICAL WORKFLOW:
   execute: async (args: any, context?: any) => {
     const userId = context?.userId;
     if (!userId) return { success: false, error: 'Authentication required: no user context.' };
-    return agentModeService.handleHubspotApi(userId, args);
+    return adsCrmApisImpl.handleHubspotApi(userId, args);
   },
 });
 
@@ -9991,7 +9998,7 @@ ENTITY_TYPE + ACTION MATRIX:
   execute: async (args: any, context?: any) => {
     const userId = context?.userId;
     if (!userId) return { success: false, error: 'Authentication required: no user context.' };
-    return agentModeService.handleAttioApi(userId, args);
+    return adsCrmApisImpl.handleAttioApi(userId, args);
   },
 });
 
