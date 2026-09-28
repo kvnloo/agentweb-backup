@@ -1,4 +1,4 @@
-import { judgeImageSwap, readCreativeImage } from '../metaImageSwapCheck';
+import { judgeImageSwap, readCreativeImage, selectSwapImageHash } from '../metaImageSwapCheck';
 
 describe('metaImageSwapCheck (ENG-2169)', () => {
   describe('readCreativeImage', () => {
@@ -40,10 +40,31 @@ describe('metaImageSwapCheck (ENG-2169)', () => {
       expect(judgeImageSwap(urlOnly, { url: 'https://cdn/old.jpg' })).toBe('stale');
     });
 
+    it('treats the exact old URL as stale when a hash swap reads back no hash', () => {
+      const hashWithOldUrl = { ...hashGiven, oldUrl: 'https://cdn/old.jpg' };
+      expect(judgeImageSwap(hashWithOldUrl, { url: 'https://cdn/old.jpg' })).toBe('stale');
+      // The hash still decides when it is present, whatever the URL says.
+      expect(judgeImageSwap(hashWithOldUrl, { hash: 'new_hash', url: 'https://cdn/old.jpg' })).toBe('confirmed');
+    });
+
     it('is unconfirmed when the read-back identifies no image', () => {
       expect(judgeImageSwap(urlOnly, {})).toBe('unconfirmed');
       expect(judgeImageSwap(urlOnly, { url: 'https://fbcdn/other.jpg' })).toBe('unconfirmed');
       expect(judgeImageSwap(hashGiven, { url: 'https://fbcdn/other.jpg' })).toBe('unconfirmed');
+    });
+  });
+
+  describe('selectSwapImageHash', () => {
+    it('uses the requested hash when given', () => {
+      expect(selectSwapImageHash('new_hash', 'https://cdn/new.jpg', 'old_hash')).toBe('new_hash');
+    });
+
+    it('drops the current hash when only a new image URL is requested', () => {
+      expect(selectSwapImageHash(undefined, 'https://cdn/new.jpg', 'old_hash')).toBeUndefined();
+    });
+
+    it('keeps the current hash when no new image is requested', () => {
+      expect(selectSwapImageHash(undefined, undefined, 'old_hash')).toBe('old_hash');
     });
   });
 });
