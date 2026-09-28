@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { getHubSpotConfig } from '../config/integrations';
-import { getAccountsByUserId, getAccountById, updateAccountTokens, updateAccountConfig } from './connectedAccountsDb';
+import { getAccountsByUserId, getAccountById, updateAccountTokens } from './connectedAccountsDb';
 
 // Module-level axios instance with a 15-second timeout for all HubSpot API calls.
 // Falls back to the base axios object when axios.create returns falsy (e.g., in jest auto-mock).
@@ -146,47 +146,6 @@ const TOKEN_REFRESH_BUFFER_MS = 60 * 1000; // refresh 60s before expiry
 // Value is { access_token, token_expires_at } so waiting callers get both.
 const refreshLocks = new Map<string, Promise<{ access_token: string; token_expires_at: number }>>();
 
-/**
- * Does this refresh failure mean the refresh token is permanently dead?
- *
- * Only a definitive rejection from HubSpot's token endpoint counts: 400 (HubSpot's
- * BAD_REFRESH_TOKEN) or 401. Everything else — 5xx, a timeout, DNS, a proxy hiccup —
- * is transient and must NOT be flagged, because the flag hard-fails every subsequent
- * call and tells a paying customer their integration is broken. That asymmetry is the
- * same one linkedInOutreachService documents for its 403 case: wrongly persisting
- * "disconnected" is far worse than retrying a live connection.
- */
-function isRevokedRefreshTokenError(err: unknown): boolean {
-  const status = Number((err as any)?.response?.status);
-  return status === 400 || status === 401;
-}
-
-/**
- * Flag the stored connection as needing a fresh OAuth grant.
- *
- * Without this the connection is indistinguishable from a healthy one: the row keeps a
- * `refresh_token`, and GET /api/oauth/connected-accounts reports any account holding one
- * as `active` / "Connected" (deliberately — auto-renewing accounts should not surface a
- * 30-minute access-token expiry). A revoked refresh token therefore renders as Connected
- * indefinitely. That is how this account sat dead from 2026-06-16 to 2026-09-28 — 97 days —
- * while the UI said Connected and every sync 401'd. Same failure class the Meta Ads branch
- * of that handler calls out for ENG-1158.
- *
- * Best-effort: a failure to write the flag must not mask the auth error being reported.
- */
-async function markHubSpotNeedsReconnect(userId: string, accountId: string): Promise<void> {
-  try {
-    await updateAccountConfig(userId, 'hubspot', accountId, { needs_reconnect: true });
-  } catch (e) {
-    console.error(`[HubSpotService] Failed to mark account ${accountId} needs_reconnect:`, e);
-  }
-}
-
-/** Message shown wherever a dead HubSpot grant surfaces. One wording, one place. */
-const RECONNECT_MESSAGE =
-  'Your HubSpot account needs to be reconnected. Go to Settings \u2192 Connected Accounts and reconnect HubSpot.';
-
-
 // ─── Module-level account resolver ───────────────────────────────────────────
 // Used by both the static factory and the mid-operation refresh path.
 
@@ -260,12 +219,6 @@ export class HubSpotService {
     const expiresAt: number = config.token_expires_at || 0;
     const portalId: string | undefined = config.hub_id !== undefined ? String(config.hub_id) : account.account_id;
 
-    // Known-dead grant: fail with the reconnect instruction rather than spending a
-    // round-trip to be told the same thing. Cleared when hubspotAuth stores a new grant.
-    if (config.needs_reconnect) {
-      throw new Error(RECONNECT_MESSAGE);
-    }
-
     if (expiresAt - Date.now() > TOKEN_REFRESH_BUFFER_MS) {
       return new HubSpotService(config.access_token, userId, account.account_id, expiresAt, portalId);
     }
@@ -326,31 +279,16 @@ export class HubSpotService {
     }
 
     const refreshPromise = (async () => {
-      let response;
-      try {
-        response = await axiosInstance.post(
-          hubspotConfig.tokenUrl,
-          new URLSearchParams({
-            grant_type: 'refresh_token',
-            refresh_token: refreshToken,
-            client_id: hubspotConfig.clientId,
-            client_secret: hubspotConfig.clientSecret,
-          }).toString(),
-          { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-        );
-      } catch (refreshErr) {
-        // Only a definitive rejection is persisted; transient failures rethrow untouched
-        // so the next call retries against a connection that may well be healthy.
-        if (isRevokedRefreshTokenError(refreshErr)) {
-          console.error(
-            `[HubSpotService] Refresh token rejected for account ${accountId} \u2014 marking needs_reconnect`,
-            refreshErr
-          );
-          await markHubSpotNeedsReconnect(userId, accountId);
-          throw new Error(RECONNECT_MESSAGE);
-        }
-        throw refreshErr;
-      }
+      const response = await axiosInstance.post(
+        hubspotConfig.tokenUrl,
+        new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: refreshToken,
+          client_id: hubspotConfig.clientId,
+          client_secret: hubspotConfig.clientSecret,
+        }).toString(),
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+      );
 
       const { access_token, refresh_token, expires_in } = response.data as {
         access_token: string;
