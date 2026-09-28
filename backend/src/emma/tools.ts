@@ -48,6 +48,8 @@ import * as knowledgeBaseImpl from './impl/knowledgeBase';
 import * as blogImpl from './impl/blog';
 // ENG-2103 (F2): work plans tool cluster, same treatment as booksImpl above.
 import * as workPlansImpl from './impl/workPlans';
+// ENG-2103 (F2): task management tool cluster, same treatment as booksImpl above.
+import * as tasksImpl from './impl/tasks';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -4969,7 +4971,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listTaskTemplates();
+    return await tasksImpl.listTaskTemplates();
   }
 });
 
@@ -5015,7 +5017,7 @@ emmaToolRegistry.register({
     if (typeof parameters === 'string') {
       try { parameters = JSON.parse(args.parameters_json); } catch (e) { }
     }
-    return await agentModeService.createTaskFromTemplate(
+    return await tasksImpl.createTaskFromTemplate(
       args.template_id,
       parameters,
       context?.userId,
@@ -5068,7 +5070,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createTaskFromPrompt(
+    return await tasksImpl.createTaskFromPrompt(
       args.task_name,
       args.prompt,
       args.category,
@@ -5153,7 +5155,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createRevision(
+    return await tasksImpl.createRevision(
       args.task_id,
       args.execution_id,
       args.revision_prompt,
