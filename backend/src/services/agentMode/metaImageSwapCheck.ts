@@ -34,6 +34,18 @@ interface ObjectStorySpecImage {
   video_data?: { image_hash?: string; image_url?: string };
 }
 
+/**
+ * The image_hash for the rebuilt creative. Meta's builder prefers image_hash over image_url, so a
+ * new image_url must never inherit the current creative's hash — the swap would keep the old image.
+ */
+export function selectSwapImageHash(
+  requestedHash: string | undefined,
+  requestedUrl: string | undefined,
+  currentHash: string | undefined,
+): string | undefined {
+  return requestedHash || (requestedUrl ? undefined : currentHash);
+}
+
 /** Pull the single image / video thumbnail identity out of a creative's object_story_spec. */
 export function readCreativeImage(spec: ObjectStorySpecImage | undefined | null): CreativeImageReadback {
   return {

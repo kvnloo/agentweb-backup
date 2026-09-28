@@ -45,7 +45,7 @@ import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
 import {
-  buildImageSwapNotReflected, judgeImageSwap, readCreativeImage,
+  buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
   type CreativeImageReadback, type ImageSwapExpectation, type ImageSwapVerdict,
 } from './agentMode/metaImageSwapCheck';
 import { publishWithdrawnMidFlight, readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
@@ -20291,9 +20291,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         name: params.name || `${creativeData.name || 'Creative'} (updated)`,
         page_id: pageId,
         video_id: params.video_id || vd.video_id,
-        // Meta's builder prefers image_hash over image_url, so a new image_url must never inherit
-        // the old thumbnail's hash — the new creative would keep the old image (ENG-2169).
-        image_hash: params.image_hash || (params.image_url ? undefined : vd.image_hash),
+        // A new image_url drops the old thumbnail's hash (ENG-2169).
+        image_hash: selectSwapImageHash(params.image_hash, params.image_url, vd.image_hash),
         image_url: params.image_url || vd.image_url,
         body: params.body || vd.message || creativeData.body || '',
         title: params.title || vd.title || creativeData.title || '',
@@ -20331,8 +20330,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       newCreativeParams = {
         name: params.name || `${creativeData.name || 'Creative'} (updated)`,
         page_id: pageId,
-        // Same hash-first rule as the video branch above: a new image_url drops the old hash (ENG-2169).
-        image_hash: params.image_hash || (params.image_url ? undefined : ld.image_hash),
+        // A new image_url drops the old image's hash (ENG-2169).
+        image_hash: selectSwapImageHash(params.image_hash, params.image_url, ld.image_hash),
         image_url: params.image_url || ld.picture || ld.image_url,
         body: params.body || ld.message || creativeData.body || '',
         title: params.title || ld.name || creativeData.title || '',
