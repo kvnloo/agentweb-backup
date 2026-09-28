@@ -10,6 +10,10 @@ import { dripSequenceDb } from '../services/dripSequenceDb';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
 
 // Mock dependencies
+jest.mock('../services/orgLeadNotificationService', () => ({
+  dispatchLeadCreated: jest.fn().mockResolvedValue(undefined),
+  dispatchLeadsCreated: jest.fn().mockResolvedValue(undefined),
+}));
 jest.mock('../services/db', () => ({
   crmDb: {
     getLeadListById: jest.fn(),
@@ -262,6 +266,21 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       // ENG-2082: a lead needs SOMETHING contactable, not an email specifically. This
       // payload carries neither, so it is still refused.
       expect(response.body.message).toBe('Email or phone is required');
+    });
+
+    it('allowAnonymousLead: records a submission with no email or phone when the lander opts in', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.createLead as jest.Mock).mockResolvedValue({ leadId: 'lead_anon', listId: 'list_123' });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', allowAnonymousLead: true, brand: 'Rheem', model_number: 'XE50' });
+
+      expect(response.status).toBe(201);
+      const created = (crmDb.createLead as jest.Mock).mock.calls.at(-1)[1];
+      expect(created.email).toBeUndefined();
+      expect(created.customFields.brand).toBe('Rheem');
+      expect(created.customFields.allowAnonymousLead).toBeUndefined();
     });
 
     it('ENG-2082: a SYNTHETIC phone-only lead is keyed deterministically (the smoke test reads it back)', async () => {
@@ -1705,6 +1724,36 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       expect(response.status).toBe(201);
       await new Promise((r) => setTimeout(r, 200));
       expect(externalCrmSyncService.autoSyncLead).not.toHaveBeenCalled();
+    });
+
+    // The org lead NOTIFICATION sat above the synthetic gate, so it fired for smoke-test
+    // leads — a real Slack/email alert to a human about a lead that does not exist.
+    // `!isNew` is now exclusively the smoke-test adopt path for a phone-only capture
+    // (deterministicLeadId was narrowed to synthetic numbers), and buildSmokeTestPhone
+    // draws from only 100 reserved numbers, so collisions — and therefore these
+    // notifications — are routine by construction rather than rare.
+    it('does not send an org lead notification for a synthetic re-submission', async () => {
+      const { dispatchLeadCreated } = require('../services/orgLeadNotificationService');
+      (dispatchLeadCreated as jest.Mock).mockClear?.();
+      // An ADOPT, which is the ONLY way to reach `!isNew`: the conditional create loses to
+      // an earlier submission of the same synthetic number and throws leadAlreadyExists,
+      // then the row is read back. Resolving createLead instead leaves isNew true and the
+      // notification is never reached — which is how the first version of this test passed
+      // with the gate deleted.
+      (crmDb.createLead as jest.Mock).mockRejectedValue(
+        Object.assign(new Error('exists'), { leadAlreadyExists: true }),
+      );
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead_ph_existing', listId: 'list_123', phone: '(415) 555-0142',
+      });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', phone: '(415) 555-0142' });
+
+      expect([200, 201]).toContain(response.status);
+      await new Promise((r) => setTimeout(r, 200));
+      expect(dispatchLeadCreated).not.toHaveBeenCalled();
     });
 
     it('skips the cascade for a lead recognised by its PHONE, when the address cannot carry the marker', async () => {

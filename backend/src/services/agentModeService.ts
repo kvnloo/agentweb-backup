@@ -1,4 +1,6 @@
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
+import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassification';
+import { resolveModelForUser } from './modelRoles';
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
@@ -42,6 +44,10 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
+import {
+  buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
+  type CreativeImageReadback, type ImageSwapExpectation, type ImageSwapVerdict,
+} from './agentMode/metaImageSwapCheck';
 import { publishWithdrawnMidFlight, readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { isPublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
@@ -62,7 +68,7 @@ import {
 import {
   assertOpenRouterToolsSupported,
   openRouterIgnoredProviders,
-  openRouterPreferredProviders,
+  OPENROUTER_PROVIDER_PREFERENCES,
   selectOpenRouterSamplingParams,
 } from './agentMode/openRouterRequestParams';
 import {
@@ -189,6 +195,7 @@ import {
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { publishWithResolvedBlogPublisher } from './blogPublishers';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
+import { recordGeneratedCreative, stampMetaAdCreated, stampMetaAdCreativeChanged, stampMetaCreativeCreated, stampMetaImageUpload, stampMetaPublish } from './creativeLineage';
 import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
@@ -239,7 +246,7 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -1026,69 +1033,7 @@ function pdfPageRender(pageData: any): Promise<string> {
 
 export type { ModelTier, ModelProvider } from './agentMode/llmModelRegistry';
 
-/**
- * Cost-score band boundaries backing the picker's tier buckets (Harsha's
- * exact thresholds, revised 2026-08-19 after reviewing the live numbers, and
- * re-cut 2026-09-05 (ENG-1784): "low should have everything 52 and below
- * (very low is fine as it is now), then medium should be 57-53, then pro
- * should be 63-58, frontier is everything above" — so Flagship/"frontier"
- * (≥64) holds Fable 5.1 and GPT-6 Astra (79), GPT-5.6 Sol (71) and Claude
- * Opus 5 (70) together, Pro (58–63) starts at Sonnet 5 / Terra / Kimi K3,
- * Medium (53–57) is Grok 4.6 / Qwen3.8 Max, Cheap (31–52) Luna / Haiku /
- * the Gemini Flash line, Very Cheap (≤30) unchanged) —
- * inclusive lower bound, ordered highest band first. costScore is 0-100 and
- * higher = more expensive (see costScoreFromPrice), so a model's tier is
- * simply whichever band its own cost score falls in. Tier IDs (ultra_premium/
- * ultra_cheap) are unchanged from earlier — only the numeric boundaries and
- * the frontend's DISPLAY labels moved ("Flagship"/"Very Cheap", see
- * modelTiers.ts TIER_LABELS); no backend API contract change.
- */
-export const TIER_COST_SCORE_BANDS: ReadonlyArray<{ tier: ModelTier; minCostScore: number }> = [
-  { tier: 'ultra_premium', minCostScore: 64 },
-  { tier: 'pro', minCostScore: 58 },
-  { tier: 'medium', minCostScore: 53 },
-  { tier: 'cheap', minCostScore: 31 },
-  { tier: 'ultra_cheap', minCostScore: 0 },
-];
-
-/** Derives a model's picker tier bucket from its cost score. */
-export function tierFromCostScore(costScore: number): ModelTier {
-  const band = TIER_COST_SCORE_BANDS.find((b) => costScore >= b.minCostScore);
-  // TIER_COST_SCORE_BANDS' last band has minCostScore: 0, which matches any
-  // costScore >= 0 — so `band` is only undefined for a negative/NaN input.
-  return band?.tier ?? 'ultra_cheap';
-}
-
-/**
- * Quality-score band boundaries backing the picker's quality tier grouping
- * (ENG-1789, 2026-09-06). Independent axis from TIER_COST_SCORE_BANDS above:
- * that one groups by costScore (what we charge), this one groups by
- * qualityScore (AA Intelligence Index v4.3.2, re-snapshotted 2026-09-22).
- * Harsha's directive: "fable + astra are flagship, opus + 5.6 sol are pro,
- * sonnet + 5.6 terra are mid, haiku + 5.6 luna are low." Re-solved against
- * the v4.3.2 scores (Fable 53, Astra 53, Opus 5 51, Sol 47, Terra 42,
- * Sonnet 5 38, Luna 38, Haiku 15), which run ~5-8 points below v4.2. One
- * conflict is unavoidable: Sonnet 5 and GPT-5.6 Luna now tie at 38, so ties
- * resolve to the higher band (Harsha, 2026-09-06) and Luna moves up to mid.
- * ultra_premium >=53, pro >=47, medium >=38, cheap >=15, ultra_cheap below.
- * Same ModelTier union and >= / highest-band-first shape as the cost bands.
- */
-export const QUALITY_SCORE_BANDS: ReadonlyArray<{ tier: ModelTier; minQualityScore: number }> = [
-  { tier: 'ultra_premium', minQualityScore: 53 },
-  { tier: 'pro', minQualityScore: 47 },
-  { tier: 'medium', minQualityScore: 38 },
-  { tier: 'cheap', minQualityScore: 15 },
-  { tier: 'ultra_cheap', minQualityScore: 0 },
-];
-
-/** Derives a model's quality-tier bucket from its qualityScore (independent of cost tier). */
-export function tierFromQualityScore(qualityScore: number): ModelTier {
-  const band = QUALITY_SCORE_BANDS.find((b) => qualityScore >= b.minQualityScore);
-  // Last band has minQualityScore: 0, matching any qualityScore >= 0 — so
-  // `band` is only undefined for a negative/NaN input.
-  return band?.tier ?? 'ultra_cheap';
-}
-
+export { TIER_COST_SCORE_BANDS, QUALITY_SCORE_BANDS, tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassification';
 export { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
 export type { DominanceCandidate } from './agentMode/modelSupersession';
 
@@ -2865,9 +2810,7 @@ export class AgentModeService {
       params.response_format = response_format;
     }
 
-    params.provider = { allow_fallbacks: true, require_parameters: true };
-    const preferredProviders = openRouterPreferredProviders(upstreamModel);
-    if (preferredProviders.length > 0) params.provider.order = preferredProviders;
+    params.provider = { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true };
     const ignoredProviders = openRouterIgnoredProviders(upstreamModel);
     if (ignoredProviders.length > 0) {
       // Stopgap for ENG-1702 (parent: ENG-753). Our BYOK Google credential is
@@ -13429,7 +13372,8 @@ export class AgentModeService {
   ): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
+      const { sanitizeEnrichmentMetadataForResponse, stripCardRevenueKeys, shouldHideCardRevenueForViewer } = await import('../utils/enrichmentMetadataPresentation');
+      const hideCardRevenueForCaller = shouldHideCardRevenueForViewer(userId);
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
 
       if ((!filters || filters.length === 0) && !options?.search?.trim()) {
@@ -13621,8 +13565,12 @@ export class AgentModeService {
             icpScore: entry.lead.icpMatch?.score || null,
             engagementCount: entry.lead.engagementCount || 0,
             isEngaged: entry.lead.isEngaged || false,
-            customFields: entry.lead.customFields || {},
-            ...(sanitizedEnrichmentMetadata ? { enrichmentMetadata: sanitizedEnrichmentMetadata } : {}),
+            customFields: hideCardRevenueForCaller
+              ? (stripCardRevenueKeys(entry.lead.customFields) ?? {})
+              : (entry.lead.customFields || {}),
+            ...(sanitizedEnrichmentMetadata
+              ? { enrichmentMetadata: hideCardRevenueForCaller ? stripCardRevenueKeys(sanitizedEnrichmentMetadata) : sanitizedEnrichmentMetadata }
+              : {}),
             // ENG-1175. This is the call both launch gates make to answer "did
             // the gclid survive to the stored row?" — Google Pre-Launch Gate
             // step 6.6 and the Meta gate's T11. Without these fields the gate
@@ -13685,7 +13633,7 @@ export class AgentModeService {
   public async getLeadDetails(listId: string, leadId: string, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
+      const { sanitizeEnrichmentMetadataForResponse, stripCardRevenueKeys, shouldHideCardRevenueForViewer } = await import('../utils/enrichmentMetadataPresentation');
 
       // Verify list ownership (org members can access lists owned by other org members)
       let list = await crmDb.getLeadListById(listId);
@@ -13730,6 +13678,10 @@ export class AgentModeService {
       const sanitizedEnrichmentMetadata = sanitizeEnrichmentMetadataForResponse(
         lead.enrichmentMetadata as Record<string, any> | undefined,
       );
+      // ENG-1388: this list may be org-shared, and canOrgMemberAccessList above
+      // has no Enigma-allowlist awareness — strip card revenue for a caller
+      // who isn't allowlisted, same boundary as the customer-portal REST path.
+      const hideCardRevenueForCaller = shouldHideCardRevenueForViewer(userId);
 
       // Check LinkedIn connection status from cache (non-blocking, swallows errors)
       let linkedInConnectionStatus: {
@@ -13808,8 +13760,12 @@ export class AgentModeService {
           notes: lead.notes || '',
           linkedin: lead.linkedin || '',
           linkedInConnectionStatus,
-          customFields: lead.customFields || {},
-          ...(sanitizedEnrichmentMetadata ? { enrichmentMetadata: sanitizedEnrichmentMetadata } : {}),
+          customFields: hideCardRevenueForCaller
+            ? (stripCardRevenueKeys(lead.customFields) ?? {})
+            : (lead.customFields || {}),
+          ...(sanitizedEnrichmentMetadata
+            ? { enrichmentMetadata: hideCardRevenueForCaller ? stripCardRevenueKeys(sanitizedEnrichmentMetadata) : sanitizedEnrichmentMetadata }
+            : {}),
           icpMatch: lead.icpMatch || null,
           isEngaged: lead.isEngaged || false,
           emailDraft: emailDraftPreview,
@@ -15367,7 +15323,10 @@ export class AgentModeService {
       // a plain falsy result to autoDraftStatus='failed' and puts the error in the OWNER
       // ALERT, which would mean every phone-only capture emails its owner a failure notice.
       // Its sibling autoSend path already has the right word for this — 'skipped_no_email'.
-      if (!lead.email && !lead.linkedin) {
+      // Trimmed on both sides. The note gate below trims and this did not, so
+      // `linkedin: '   '` passed here, closed there, and fell through to the
+      // nothing-generated arm.
+      if (!String(lead.email ?? '').trim() && !String(lead.linkedin ?? '').trim()) {
         return {
           success: false,
           skipped: true,
@@ -15435,8 +15394,15 @@ export class AgentModeService {
       if (lead.notes) {
         emailPrompt += `\n- Notes: ${lead.notes}`;
       }
-      if (lead.customFields && Object.keys(lead.customFields).length > 0) {
-        emailPrompt += `\n- Custom Fields: ${JSON.stringify(lead.customFields, null, 2)}`;
+      // ENG-1388: this draft is meant to be sent to the external lead/prospect,
+      // so card revenue (Enigma, internal-use-only) must never inform it —
+      // unconditionally, regardless of whether the requesting user is
+      // themselves Enigma-allowlisted. That allowlist governs internal
+      // visibility, not what may go into outward-facing content.
+      const { stripCardRevenueKeys } = await import('../utils/enrichmentMetadataPresentation');
+      const emailPromptCustomFields = stripCardRevenueKeys(lead.customFields);
+      if (emailPromptCustomFields && Object.keys(emailPromptCustomFields).length > 0) {
+        emailPrompt += `\n- Custom Fields: ${JSON.stringify(emailPromptCustomFields, null, 2)}`;
       }
 
       // Add engagement history
@@ -15749,6 +15715,12 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
 
       return {
         success: true,
+        // `skipped` when NEITHER draft was produced. webhooks.ts maps `success && !skipped`
+        // to autoDraftStatus='created', so without this the owner alert said "Auto Draft:
+        // Created" over nothing at all — reachable when the note LLM returns parseable but
+        // contentless JSON, or when `linkedin` is whitespace (the entry guard uses raw
+        // truthiness, the note gate trims, so the two disagree on that value).
+        ...(!emailData && !messageDraft ? { skipped: true, reason: 'nothing_generated' } : {}),
         // Say what actually happened. Each draft is now gated on its own channel, so all
         // four combinations are reachable and the old two-way message described one.
         message: emailData && messageDraft
@@ -17553,6 +17525,8 @@ TRUTHFULNESS RULES (these override tone):
 - An error, timeout, or interruption ENDS the run; it does not undo, roll back, or discard work that already succeeded. Never say or imply that completed work was lost, was not saved, or must be redone.
 - Only tell the user to retry the parts that did NOT succeed. If a publish, deploy, or send succeeded, explicitly tell the user NOT to re-run it.
 - Do not attribute a failure to an operation that appears in the succeeded list.
+- If the succeeded list is absent or says NONE, then NOTHING completed in this run. Do not describe any step — loading, connecting, signing in, navigating, fetching, reading, analyzing — as having happened. Report only that the run failed before any operation completed, plus what the user can do next. Never infer the steps from the user's request: the request describes what was ASKED FOR, never what occurred.
+- A tool on the succeeded list RAN; that is NOT the same as its goal being achieved or the task being done. This message exists BECAUSE the run failed — report it as a failure with what (if anything) completed, never as a success. You are never shown tool RESULTS, so never claim what any tool FOUND, RETURNED, ANALYZED, matched, or PRODUCED (e.g. do not say "I analyzed the guest data" because a search tool ran — you cannot see whether it found anything). And never tell the user to run or retry an internal step; the only action you may suggest is that they resend their request.
 - The numbers beside each operation are HOW MANY TIMES IT RAN — never how many leads, rows, emails, posts, files, or records it handled. You are not shown those quantities. Never restate a run count as a quantity of things: "add_leads_to_list: 3" means that tool ran 3 times, NOT that 3 leads were added. If you do not know how many items an operation processed, say what ran without inventing a number.`;
 
       const parts: string[] = [
@@ -17567,6 +17541,18 @@ TRUTHFULNESS RULES (these override tone):
       }
       if (context.succeededFunctions && Object.keys(context.succeededFunctions).length > 0) {
         parts.push(`Succeeded operations, as {operation: number of times it RAN} — NOT a count of records handled (these COMPLETED — do not report them as lost): ${JSON.stringify(context.succeededFunctions)}`);
+      } else {
+        // An empty ledger used to be expressed by OMITTING this line entirely, which left
+        // the model with only the error and the user's request — and it filled the gap by
+        // narrating the request back as if it had happened. Observed in prod on 2026-09-25
+        // (session 7adc834c-3afc-4120-abbb-77caf573b80a): zero tools dispatched, yet the
+        // user was told "I have successfully loaded your browser cookies and navigated to
+        // the event management page." The existing output guards cannot catch this —
+        // stripUnfoundedEntityCounts only removes unproven QUANTITIES, and the
+        // reconcileFalse* passes only correct false NEGATIVES (work landed, reported as
+        // lost). Nothing corrected a false POSITIVE, so state the absence explicitly
+        // rather than leaving it to be inferred from silence.
+        parts.push('Succeeded operations: NONE. No operation completed in this run — it failed before anything ran. Do not describe any step as completed.');
       }
       if (context.failedFunctions && Object.keys(context.failedFunctions).length > 0) {
         parts.push(`Failed operations, as {operation: number of times it FAILED} — NOT a count of records handled: ${JSON.stringify(context.failedFunctions)}`);
@@ -19051,6 +19037,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         creative_id: newCreativeId,
         status: params.status || 'PAUSED',
       });
+      if (newAd?.id) {
+        // ENG-2141: a copied ad that reuses a generated image is another ad for that creative.
+        void stampMetaPublish({
+          userId, accountId, metaCreativeId: String(newCreativeId), adId: String(newAd.id), params: newCreativeParams, via: 'copy_ad',
+        });
+      }
 
       return {
         success: true,
@@ -19951,6 +19943,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // IG placements require an instagram_user_id in object_story_spec — auto-resolve from the Page.
       resolvedParams = await this.resolvePlacementInstagramActor(resolvedParams, accessToken);
       const creative = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
+      // ENG-2141: link the generated images this creative uses to it (inert unless enabled).
+      if (creative?.id) {
+        void stampMetaCreativeCreated({ userId, accountId, metaCreativeId: String(creative.id), params: resolvedParams });
+      }
 
       return {
         success: true,
@@ -20009,6 +20005,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
       const ad = await metaService.createAd(accountId, accessToken, params);
+      // ENG-2141: link the ad to the generated creatives its Meta creative was built from.
+      if (ad?.id && params.creative_id) {
+        void stampMetaAdCreated({ userId, accountId, metaCreativeId: String(params.creative_id), adId: String(ad.id) });
+      }
 
       return {
         success: true,
@@ -20207,6 +20207,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         }
 
         await recordCreativeLearningReceipt(userId, accountId, adId, newCreativeId, verification.verified);
+        // ENG-2141: the ad's previous creative links end here; link it to the new one if generated.
+        void stampMetaAdCreativeChanged({ userId, accountId, metaCreativeId: String(newCreativeId), adId });
         return {
           success: true,
           message: `Ad updated successfully. Swapped in creative ${newCreativeId}.`,
@@ -20299,6 +20301,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
     // Determine current creative type and extract existing fields
     let newCreativeParams: any;
+    // Set when the caller asked for a new single image / video thumbnail, so the created creative
+    // can be read back before it is attached (ENG-2169).
+    let imageSwap: ImageSwapExpectation | undefined;
 
     if (params.placement_assets) {
       // Placement-customized image creative (asset_feed_spec): map different images to different
@@ -20323,7 +20328,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         name: params.name || `${creativeData.name || 'Creative'} (updated)`,
         page_id: pageId,
         video_id: params.video_id || vd.video_id,
-        image_hash: params.image_hash || vd.image_hash,
+        // A new image_url drops the old thumbnail's hash (ENG-2169).
+        image_hash: selectSwapImageHash(params.image_hash, params.image_url, vd.image_hash),
         image_url: params.image_url || vd.image_url,
         body: params.body || vd.message || creativeData.body || '',
         title: params.title || vd.title || creativeData.title || '',
@@ -20331,6 +20337,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
         url_tags: carriedUrlTags,
       };
+      if (params.image_hash || params.image_url) {
+        imageSwap = { oldHash: vd.image_hash, oldUrl: vd.image_url, requestedHash: params.image_hash, requestedUrl: params.image_url };
+      }
     } else if (existingSpec.link_data?.child_attachments) {
       // Carousel creative – update the main link and optionally per-card links
       const ld = existingSpec.link_data;
@@ -20358,7 +20367,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       newCreativeParams = {
         name: params.name || `${creativeData.name || 'Creative'} (updated)`,
         page_id: pageId,
-        image_hash: params.image_hash || ld.image_hash,
+        // A new image_url drops the old image's hash (ENG-2169).
+        image_hash: selectSwapImageHash(params.image_hash, params.image_url, ld.image_hash),
         image_url: params.image_url || ld.picture || ld.image_url,
         body: params.body || ld.message || creativeData.body || '',
         title: params.title || ld.name || creativeData.title || '',
@@ -20366,6 +20376,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
         url_tags: carriedUrlTags,
       };
+      if (params.image_hash || params.image_url) {
+        imageSwap = {
+          oldHash: ld.image_hash, oldUrl: ld.picture || ld.image_url,
+          requestedHash: params.image_hash, requestedUrl: params.image_url,
+        };
+      }
     } else {
       return {
         success: false,
@@ -20390,6 +20406,26 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         message: 'Failed to create updated creative. The Meta API did not return a creative ID.',
         error: 'CREATIVE_CREATE_FAILED'
       };
+    }
+
+    // ENG-2169: read the created creative back before attaching it. If it still carries the old
+    // image (or not the requested hash), attaching it would "succeed" while the ad keeps serving
+    // the image it was meant to replace — fail loudly instead and leave the ad untouched.
+    let imageVerdict: ImageSwapVerdict | undefined;
+    if (imageSwap) {
+      let liveImage: CreativeImageReadback | undefined;
+      try {
+        const created = await metaService.getAdCreative(accessToken, newCreativeId);
+        liveImage = readCreativeImage(created?.object_story_spec);
+      } catch (err: unknown) {
+        // Best-effort, like verifyCreativeSwap: an unreadable creative is not proof of a stale image.
+        console.warn(`AgentMode: image read-back failed for new creative ${newCreativeId}:`,
+          err instanceof Error ? err.message : err);
+      }
+      imageVerdict = judgeImageSwap(imageSwap, liveImage);
+      if (imageVerdict === 'stale' && liveImage) {
+        return buildImageSwapNotReflected({ adId, oldCreativeId, newCreativeId, expected: imageSwap, live: liveImage });
+      }
     }
 
     console.log(`AgentMode: New creative ${newCreativeId} created. Updating ad ${adId} to use it.`);
@@ -20436,6 +20472,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
 
     const v = verification!;
+    // ENG-2141: the ad now carries this creative (attach calls returned; propagation may lag). Its
+    // performance from here on belongs to the generated images the new creative uses.
+    void stampMetaPublish({
+      userId, accountId, metaCreativeId: String(newCreativeId), adId, params: newCreativeParams, via: 'swap_creative',
+    });
     const reviewNote = v.effectiveStatus
       ? ` Ad review status: ${v.effectiveStatus}${v.reviewFeedback ? ` (${v.reviewFeedback})` : ''}.`
       : '';
@@ -20500,10 +20541,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       message: `Ad updated successfully. Created new creative (${newCreativeId}) with updated ${creativeKeys.join(', ')} `
         + `and swapped it in for the old creative (${oldCreativeId})`
         + (v.liveLinkUrl ? `. Verified live destination URL: ${v.liveLinkUrl}` : '.')
-        + reviewNote,
+        + reviewNote
+        // No proof of a stale image, but no proof of the new one either — never let that read as confirmed.
+        + (imageVerdict && imageVerdict !== 'confirmed'
+          ? ` NOTE: the new creative's image could not be confirmed (${imageVerdict} read-back) — do not tell the `
+            + `user the image changed until it is checked in Ads Manager.`
+          : ''),
       old_creative_id: oldCreativeId,
       new_creative_id: newCreativeId,
       verified: true,
+      ...(imageVerdict && { image_verified: imageVerdict === 'confirmed' }),
       live_link_url: v.liveLinkUrl,
       effective_status: v.effectiveStatus,
       review_feedback: v.reviewFeedback,
@@ -20728,6 +20775,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           image
         };
       }
+      // ENG-2141: a generated image uploaded by its S3 URL gains this hash (inert unless enabled).
+      void stampMetaImageUpload({ userId, imageUrl, imageHash });
       return {
         success: true,
         message: `Image uploaded successfully`,
@@ -30678,7 +30727,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const modelExplicitlyChosen = typeof imageModel === 'string' && imageModel.trim().length > 0;
       const resolvedImageModel = modelExplicitlyChosen
         ? imageModel
-        : await this.getImageApiDefaultModel();
+        : await resolveModelForUser(userId, 'image');
 
       const inputImagesForRequest = inputImages || [];
       const primaryRequest = {
@@ -30808,7 +30857,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           console.warn('Failed to store image generation metadata:', error);
         }
 
-        void enqueueAutoHumanEval({
+        const humanEvalCandidate = enqueueAutoHumanEval({
           reviewType: 'creative_image',
           userId,
           sessionId,
@@ -30820,6 +30869,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
             `Model: ${imageModelUsed}. Size: ${size || 'default'}. Quality: ${quality || 'default'}.`,
           sourceKey: `image:${sessionId}:${result.filename || filename}:${result.imageUrl}`,
           creativeGates: result.gates,
+          // ENG-2140: the generation request is the only brief agent mode has; the placement
+          // comes from the gate result.
+          creativeBrief: { generationRequest: prompt },
           action: {
             type: 'agent_mode_image_revision',
             sessionId,
@@ -30828,6 +30880,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
             filename: result.filename || filename,
           },
         });
+        // ENG-2141: creative lineage record (inert unless CREATIVE_LINEAGE_ENABLED + table). Not
+        // awaited and never throws; it links the human-eval candidate once that exists.
+        void recordGeneratedCreative(
+          { userId, artifactUrl: result.imageUrl, sessionId, category, prompt, generatorModel: imageModelUsed, gates: result.gates },
+          humanEvalCandidate,
+        );
 
         // ENG-1027 data-fabrication backstop: the tool-description guidance alone is
         // instruction-following-dependent, and live verification showed the image
@@ -31670,7 +31728,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           titleDraft,
           'professional',
           style,
-          true // includeInlineImages = true for deep research
+          true, // includeInlineImages = true for deep research
+          userId
         );
 
         if (!blogData.title || !blogData.content) {
@@ -31710,7 +31769,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           length,
           researchContext,
           requirements,
-          style
+          style,
+          userId
         );
 
         if (!blogData.title || !blogData.content) {

@@ -29,13 +29,13 @@ export interface CatalogCandidate { id: string; config: LLMModelConfig; price: M
 /** OpenRouter prices are per token. Only supported text/tool product lines enter this catalog.
  * Source: https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties
  */
-export function discoverNewModels(payload: unknown, registry: Registry = LLM_MODEL_REGISTRY): CatalogCandidate[] {
+export function discoverNewModels(payload: unknown, registry: Registry = LLM_MODEL_REGISTRY, additionIds: readonly string[] = []): CatalogCandidate[] {
   const known = new Set(Object.keys(registry).map(upstream));
   return parseOpenRouter(payload).filter(m => !known.has(upstream(m.id)) &&
-    Object.keys(registry).some(id => upstream(id).split('/')[0] === upstream(m.id).split('/')[0]
-      && inferFamily(id) === inferFamily(m.id)));
+    (additionIds.includes(m.id) || Object.keys(registry).some(id => upstream(id).split('/')[0] === upstream(m.id).split('/')[0]
+      && inferFamily(id) === inferFamily(m.id))));
 }
-function parseOpenRouter(payload: unknown): CatalogCandidate[] {
+export function parseOpenRouter(payload: unknown): CatalogCandidate[] {
   const result = new Map<string, CatalogCandidate>();
   for (const value of rows(payload)) {
     const row = object(value), p = object(row?.pricing), architecture = object(row?.architecture);
@@ -112,6 +112,7 @@ export function refreshScores(registry: Registry, payload: unknown | undefined, 
 export async function refreshModelCatalog(options: {
   fetch?: typeof fetch; aaApiKey?: string; registry?: Registry;
   prices?: Readonly<Record<string, ModelPrice>>; date?: string;
+  catalog?: unknown; aa?: unknown; additionIds?: readonly string[];
 } = {}) {
   const request = options.fetch ?? fetch;
   const registry = options.registry ?? LLM_MODEL_REGISTRY, prices = options.prices ?? MODEL_PRICING;
@@ -122,9 +123,10 @@ export async function refreshModelCatalog(options: {
     if (!res.ok) throw new Error(`Catalog fetch failed: ${new URL(url).hostname} HTTP ${res.status}`);
     return res.json() as Promise<unknown>;
   };
-  const catalog = await get('https://openrouter.ai/api/v1/models');
-  const aa = apiKey ? await get('https://artificialanalysis.ai/api/v2/data/llms/models', { 'x-api-key': apiKey }) : undefined;
-  const additions = discoverNewModels(catalog, registry);
+  const catalog = options.catalog ?? await get('https://openrouter.ai/api/v1/models');
+  const aa = options.aa ?? (apiKey ? await get('https://artificialanalysis.ai/api/v2/data/llms/models', { 'x-api-key': apiKey }) : undefined);
+  const additions = discoverNewModels(catalog, registry, options.additionIds)
+    .filter(m => !options.additionIds || options.additionIds.includes(m.id));
   const next: Record<string, Readonly<LLMModelConfig>> = { ...registry };
   const registryChanges: Record<string, Partial<LLMModelConfig>> = {};
   const pricingChanges: Record<string, ModelPrice> = {};

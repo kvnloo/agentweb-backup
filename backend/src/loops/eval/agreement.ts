@@ -3,6 +3,7 @@
  *
  * Pure functions: callers pass paired labels (human truth, grader prediction) from a golden set
  * and get back Cohen's kappa, per-class precision/recall, and confidence intervals with n.
+ * Spearman's ρ (ENG-2141) compares a grader's score with an outcome, e.g. judge score vs ad CTR.
  * `toGraderValidation` turns a result into the `validation` record the eval registry
  * (evalRegistry.ts) reads through `mayGate`.
  */
@@ -164,13 +165,22 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-/** Percentile bootstrap CI for any pair statistic (default: Cohen's kappa). */
-export function bootstrapCI<L extends string | number>(
-  pairs: ReadonlyArray<LabelPair<L>>,
-  statistic: (sample: ReadonlyArray<LabelPair<L>>) => number = cohensKappa,
-  opts: { iterations?: number; seed?: number; level?: number } = {},
-): Interval {
-  assertPairs(pairs);
+interface BootstrapOptions {
+  iterations?: number;
+  seed?: number;
+  level?: number;
+}
+
+/**
+ * Percentile bootstrap over any list. Resamples whose statistic is undefined (not finite, e.g. a
+ * correlation of a resample in which one variable is constant) are dropped and counted rather than
+ * sorted in as numbers; `interval` is null when every resample was undefined.
+ */
+function percentileBootstrap<T>(
+  items: ReadonlyArray<T>,
+  statistic: (sample: ReadonlyArray<T>) => number,
+  opts: BootstrapOptions,
+): { interval: Interval | null; dropped: number } {
   const iterations = opts.iterations ?? 2000;
   const level = opts.level ?? 0.95;
   if (!Number.isInteger(iterations) || iterations <= 0) {
@@ -179,15 +189,31 @@ export function bootstrapCI<L extends string | number>(
   if (!(level > 0 && level < 1)) throw new Error('bootstrapCI: level must be strictly between 0 and 1');
   const rand = mulberry32(opts.seed ?? 2128);
   const stats: number[] = [];
+  let dropped = 0;
   for (let it = 0; it < iterations; it++) {
-    const sample: LabelPair<L>[] = [];
-    for (let i = 0; i < pairs.length; i++) sample.push(pairs[Math.floor(rand() * pairs.length)]);
-    stats.push(statistic(sample));
+    const sample: T[] = [];
+    for (let i = 0; i < items.length; i++) sample.push(items[Math.floor(rand() * items.length)]);
+    const value = statistic(sample);
+    if (Number.isFinite(value)) stats.push(value);
+    else dropped++;
   }
+  if (stats.length === 0) return { interval: null, dropped };
   stats.sort((x, y) => x - y);
   const tail = (1 - level) / 2;
   const at = (q: number) => stats[Math.min(stats.length - 1, Math.max(0, Math.floor(q * stats.length)))];
-  return { low: at(tail), high: at(1 - tail) };
+  return { interval: { low: at(tail), high: at(1 - tail) }, dropped };
+}
+
+/** Percentile bootstrap CI for any pair statistic (default: Cohen's kappa). */
+export function bootstrapCI<L extends string | number>(
+  pairs: ReadonlyArray<LabelPair<L>>,
+  statistic: (sample: ReadonlyArray<LabelPair<L>>) => number = cohensKappa,
+  opts: BootstrapOptions = {},
+): Interval {
+  assertPairs(pairs);
+  const { interval } = percentileBootstrap(pairs, statistic, opts);
+  if (!interval) throw new Error('bootstrapCI: the statistic was undefined on every resample');
+  return interval;
 }
 
 /** Full agreement report for nominal labels: kappa with bootstrap CI, observed agreement, per class, n. */
@@ -204,6 +230,89 @@ export function agreementReport<L extends string | number>(
     kappaCI: bootstrapCI(pairs, cohensKappa, opts),
     perClass: perClassMetrics(pairs),
   };
+}
+
+/**
+ * ROC AUC of an ordinal score for a binary outcome (ENG-2138: judge score vs deterministic task
+ * success): the probability that a random positive (`truth` 1) scores above a random negative
+ * (`truth` 0), ties counting half (Mann-Whitney U). Takes LabelPairs so `bootstrapCI(pairs,
+ * rocAuc)` gives its interval. With only one class present AUC is undefined; it returns 0.5 so
+ * bootstrap resamples stay finite, and callers check both classes before reporting a value.
+ */
+export function rocAuc(pairs: ReadonlyArray<LabelPair<number>>): number {
+  const pos = pairs.filter((p) => p.truth === 1).map((p) => p.predicted);
+  const neg = pairs.filter((p) => p.truth === 0).map((p) => p.predicted);
+  if (pos.length === 0 || neg.length === 0) return 0.5;
+  let wins = 0;
+  for (const x of pos) {
+    for (const y of neg) wins += x > y ? 1 : x === y ? 0.5 : 0;
+  }
+  return wins / (pos.length * neg.length);
+}
+
+/** One observation for a rank correlation, e.g. x = judge score, y = CTR (ENG-2141). */
+export interface XYPair {
+  x: number;
+  y: number;
+}
+
+/** 1-based ranks; tied values share the mean of the positions they occupy. */
+export function averageRanks(values: ReadonlyArray<number>): number[] {
+  const order = values.map((v, i) => ({ v, i })).sort((a, b) => a.v - b.v);
+  const ranks = new Array<number>(values.length);
+  for (let start = 0; start < order.length; ) {
+    let end = start;
+    while (end + 1 < order.length && order[end + 1].v === order[start].v) end++;
+    const rank = (start + end) / 2 + 1;
+    for (let k = start; k <= end; k++) ranks[order[k].i] = rank;
+    start = end + 1;
+  }
+  return ranks;
+}
+
+function pearson(xs: ReadonlyArray<number>, ys: ReadonlyArray<number>): number {
+  const n = xs.length;
+  const mx = xs.reduce((a, b) => a + b, 0) / n;
+  const my = ys.reduce((a, b) => a + b, 0) / n;
+  let sxy = 0;
+  let sxx = 0;
+  let syy = 0;
+  for (let i = 0; i < n; i++) {
+    sxy += (xs[i] - mx) * (ys[i] - my);
+    sxx += (xs[i] - mx) ** 2;
+    syy += (ys[i] - my) ** 2;
+  }
+  return sxx === 0 || syy === 0 ? NaN : sxy / Math.sqrt(sxx * syy);
+}
+
+/**
+ * Spearman's rank correlation ρ: Pearson's r on average ranks, which is the tie-correct form (the
+ * 1 - 6Σd²/(n(n²-1)) shortcut is exact only without ties, and judge scores on a 0-7 scale are
+ * mostly ties). NaN when either variable is constant, where ρ is undefined.
+ */
+export function spearmanRho(pairs: ReadonlyArray<XYPair>): number {
+  if (pairs.length < 2) throw new Error('spearmanRho: at least two pairs are required');
+  for (const { x, y } of pairs) {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error(`spearmanRho: non-finite value (${x}, ${y})`);
+  }
+  return pearson(averageRanks(pairs.map((p) => p.x)), averageRanks(pairs.map((p) => p.y)));
+}
+
+export interface CorrelationReport {
+  n: number;
+  /** null when undefined (a constant variable). */
+  rho: number | null;
+  /** Percentile bootstrap CI; null when ρ is undefined on every resample. */
+  ci: Interval | null;
+  /** Resamples dropped because ρ was undefined on them (reported, never silently absorbed). */
+  undefinedResamples: number;
+}
+
+/** Spearman ρ with n and a seeded percentile bootstrap CI. */
+export function spearmanReport(pairs: ReadonlyArray<XYPair>, opts: BootstrapOptions = {}): CorrelationReport {
+  const rho = spearmanRho(pairs);
+  const boot = percentileBootstrap(pairs, spearmanRho, opts);
+  return { n: pairs.length, rho: Number.isFinite(rho) ? rho : null, ci: boot.interval, undefinedResamples: boot.dropped };
 }
 
 export type PairwiseChoice = 'A' | 'B' | 'tie';

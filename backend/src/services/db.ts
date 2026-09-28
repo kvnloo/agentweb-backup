@@ -820,6 +820,7 @@ export interface User {
 }
 
 export interface Organization {
+  modelRoles?: import('./modelRoles').ModelRoles;
   leadNotifications?: LeadNotificationsConfig;
   /**
    * Optimistic-concurrency counter for owner-losing operations. Absent until
@@ -8518,11 +8519,24 @@ export const crmDb = {
           if (derivedDomain) {
             item.domain = derivedDomain;
           }
-          // Contactable = an email OR a phone. Same rule computeLifecycle applies, so the
-          // stored value cannot contradict the computed one for a phone-only lead.
-          if (emailValue || String(lead.phone ?? '').trim()) {
-            item.lifecycle = 'inbox';
-          }
+          // NO lifecycle stamp — the same reasoning as updateLead and setLeadFields above,
+          // which this originally contradicted. An earlier version of this block wrote
+          // `lifecycle = 'inbox'` for any contactable lead, and that is worse here than
+          // anywhere else: this is the path the HubSpot pull, the Attio pull and CSV import
+          // use, so it creates most leads. askCrmService reads
+          // `lead.lifecycle ?? computeLifecycle(...)`, nothing in production advances a
+          // stored value (lifecycleService.applyAndUpdate has no production callers), and
+          // backfill-crm-scores.ts only writes `if (lead.lifecycle == null)` — so every
+          // bulk-imported lead would have answered "inbox" for the rest of its life, no
+          // matter what it became. Before this PR those rows stored nothing and were
+          // computed correctly; stamping them would have been a regression.
+          //
+          // `domain` above is different and is kept: it is derived once from the email and
+          // nothing recomputes it, so storing it cannot disagree with anything.
+          //
+          // The `lifecycle is_empty` delete-filter footgun that motivated stamping is real
+          // but is not solved by freezing the value — it needs the filter to evaluate the
+          // computed lifecycle. Tracked on ENG-2155.
 
           return {
             PutRequest: {
@@ -11479,6 +11493,37 @@ export const orgDb = {
   // that has no updatedAt yet). An overlapping writer then surfaces as a
   // ConditionalCheckFailedException instead of a silent last-writer-wins
   // that erases the other writer's grants.
+  async updateModelRoles(
+    orgId: string,
+    settings: import('./modelRoles').ModelRoles,
+    expectedUpdatedAt: string | undefined,
+  ): Promise<string> {
+    const nowMs = Date.now();
+    const expectedMs = expectedUpdatedAt === undefined ? Number.NaN : Date.parse(expectedUpdatedAt);
+    // `updatedAt` is the compare-and-swap revision for this whole-document
+    // write. It must advance even when two writes land in the same millisecond
+    // (or this process's clock trails the stored revision), otherwise the next
+    // stale writer can match the old token and silently overwrite this write.
+    const nextUpdatedAt = new Date(
+      Number.isFinite(expectedMs) && expectedMs >= nowMs ? expectedMs + 1 : nowMs,
+    ).toISOString();
+    await dynamodb.update({
+      TableName: ORGS_TABLE,
+      Key: { orgId },
+      UpdateExpression: "SET modelRoles = :s, updatedAt = :u",
+      ConditionExpression:
+        expectedUpdatedAt !== undefined
+          ? "attribute_exists(orgId) AND updatedAt = :expected"
+          : "attribute_exists(orgId) AND attribute_not_exists(updatedAt)",
+      ExpressionAttributeValues: {
+        ":s": settings,
+        ":u": nextUpdatedAt,
+        ...(expectedUpdatedAt !== undefined ? { ":expected": expectedUpdatedAt } : {}),
+      },
+    }).promise();
+    return nextUpdatedAt;
+  },
+
   async updateShareSettings(
     orgId: string,
     settings: OrgShareSettings,
@@ -11878,6 +11923,13 @@ export const scheduleTemplateDb = {
 
 const OAUTH_SESSIONS_TABLE = `${TABLE_PREFIX}AW-OAuthSessions`;
 
+export interface PendingOAuthSession {
+  sessionId: string;
+  userId: string;
+  provider: 'hubspot' | 'fathom';
+  payload: unknown;
+}
+
 export const oauthSessionDb = {
   async save(session: {
     sessionId: string;
@@ -11889,7 +11941,7 @@ export const oauthSessionDb = {
     /** Scopes actually GRANTED, when the provider could tell us (ENG-629). */
     granted_scopes?: string[];
     flow: string;
-  }): Promise<void> {
+  } | PendingOAuthSession): Promise<void> {
     const TEN_MINUTES_SECONDS = 10 * 60;
     const ttl = Math.floor(Date.now() / 1000) + TEN_MINUTES_SECONDS;
     try {
@@ -11899,6 +11951,25 @@ export const oauthSessionDb = {
       }).promise();
     } catch (error) {
       handleDynamoDbError(error, 'oauthSessionDb.save');
+    }
+  },
+
+  /** Atomically return and burn a live provider session; TTL deletion is asynchronous. */
+  async consume(sessionId: string, userId: string, provider: PendingOAuthSession['provider']): Promise<PendingOAuthSession | null> {
+    try {
+      const result = await dynamodb.delete({
+        TableName: OAUTH_SESSIONS_TABLE,
+        Key: { sessionId },
+        ConditionExpression: 'userId = :userId AND #provider = :provider AND #ttl > :now',
+        ExpressionAttributeNames: { '#provider': 'provider', '#ttl': 'ttl' },
+        ExpressionAttributeValues: { ':userId': userId, ':provider': provider, ':now': Math.floor(Date.now() / 1000) },
+        ReturnValues: 'ALL_OLD',
+      }).promise();
+      return (result.Attributes as PendingOAuthSession | undefined) ?? null;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return null;
+      handleDynamoDbError(error, 'oauthSessionDb.consume');
+      throw error;
     }
   },
 

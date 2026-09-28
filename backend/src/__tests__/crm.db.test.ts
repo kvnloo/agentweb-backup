@@ -591,6 +591,33 @@ describe('CRM Database Service', () => {
       expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(2);
     });
 
+    // F3: the CAP had no test at all. Three tests covered the paging loop and none covered
+    // what happens when it runs out with a cursor still in hand — so `throw err` could be
+    // reverted to `return null` with 276 tests green. All three CONSUMER tests inject a
+    // hand-built `{ lookupExhausted: true }` error, so they pass whether or not this
+    // function ever throws one. This pins the contract at the layer that produces it.
+    it('THROWS a tagged error when the page cap is reached, rather than returning null', async () => {
+      // Every page returns a cursor and no match, so the loop exhausts MAX_PAGES.
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: [], LastEvaluatedKey: { leadId: 'p' } }),
+      });
+
+      await expect(crmDb.getLeadByHubSpotContactId('list_123', 'c99')).rejects.toMatchObject({
+        lookupExhausted: true,
+      });
+      // Null here is what mints the duplicate: callers act on it by CREATING.
+      expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(20);
+    });
+
+    it('the exhausted error names the list and contact so the log is actionable', async () => {
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: [], LastEvaluatedKey: { leadId: 'p' } }),
+      });
+
+      await expect(crmDb.getLeadByHubSpotContactId('list_abc', 'c42'))
+        .rejects.toThrow(/list_abc.*c42|c42.*list_abc/);
+    });
+
     it('stops on the first page when the match is there', async () => {
       mockDocumentClientMethods.query.mockReturnValueOnce({
         promise: jest.fn().mockResolvedValue({ Items: [{ leadId: 'found' }], LastEvaluatedKey: { leadId: 'p1' } }),
@@ -625,10 +652,14 @@ describe('CRM Database Service', () => {
       // `lead.lifecycle ?? computeLifecycle(...)`, so a stored value freezes the live
       // computation — and nothing in production advances it. A lead with an open deal
       // would start answering "inbox" instead of "in_deal".
-      // Asserted through ExpressionAttributeNames: the expression only ever contains the
-      // PLACEHOLDER (#derivedLifecycleAttr), so grepping it for the word "lifecycle" would
-      // pass even with the stamp reinstated.
+      // BOTH forms, because a stamp can be written either way and the earlier version of
+      // this assertion only caught one. A PLACEHOLDER stamp (#derivedLifecycleAttr) shows
+      // up in ExpressionAttributeNames; a BARE stamp does not — and bare is legal here,
+      // since `lifecycle` is not a DynamoDB reserved word (unlike `domain`). Checking only
+      // the names map let `SET lifecycle = if_not_exists(lifecycle, :x)` be reinstated with
+      // the whole suite green.
       expect(Object.values(call.ExpressionAttributeNames ?? {})).not.toContain('lifecycle');
+      expect(String(call.UpdateExpression)).not.toMatch(/(^|[^#\w])lifecycle\b/);
       expect(call.ExpressionAttributeValues[':derivedLifecycle']).toBeUndefined();
     });
 
@@ -986,8 +1017,11 @@ describe('CRM Database Service', () => {
       expect(call.UpdateExpression).toContain('#derivedDomainAttr = :derivedDomain');
       expect(call.UpdateExpression).not.toMatch(/(^|[^#\w])domain = /);
       expect(call.ExpressionAttributeValues[':derivedDomain']).toBe('example.com');
-      // Same reasoning as updateLead: no lifecycle stamp on the update path.
+      // Same reasoning as updateLead, and the same both-forms check: a bare
+      // `lifecycle = …` stamp populates neither map, so the names assertion alone bound
+      // nothing.
       expect(Object.values(call.ExpressionAttributeNames ?? {})).not.toContain('lifecycle');
+      expect(String(call.UpdateExpression)).not.toMatch(/(^|[^#\w])lifecycle\b/);
       expect(call.ExpressionAttributeValues[':derivedLifecycle']).toBeUndefined();
       mergeSpy.mockRestore();
     });

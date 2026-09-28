@@ -63,6 +63,48 @@ describe('crmDb.createLead — userId + nameCompanyKey', () => {
     expect(lastPutItem().userId).toBe('user-42');
   });
 
+  // F6: `phone: leadData.phone` in createLead's buildLeadCrmFields call was unpinned —
+  // deleting it left 1,640 tests green. leadSchema tests buildLeadCrmFields in isolation
+  // and the bulk-path test covers batchCreateLeads; nothing covered the WIRING between
+  // them. createLead is the path landing-page capture and the lead-forwarding webhook use,
+  // which is ENG-2082's entire motivation.
+  it('stamps lifecycle inbox for a PHONE-ONLY lead (the ENG-2082 wiring)', async () => {
+    getPromiseMock
+      .mockResolvedValueOnce({ Item: { listId: 'list-1', userId: 'user-1' } })
+      .mockResolvedValue({ Item: null });
+
+    await crmDb.createLead('list-1', { phone: '2125550147', firstName: 'Grace' });
+
+    const item = lastPutItem();
+    expect(item.lifecycle).toBe('inbox');
+    // No email, so no domain to derive.
+    expect(item.domain).toBeUndefined();
+  });
+
+  it('still stamps inbox for an emailed lead, and derives its domain', async () => {
+    getPromiseMock
+      .mockResolvedValueOnce({ Item: { listId: 'list-1', userId: 'user-1' } })
+      .mockResolvedValue({ Item: null });
+
+    await crmDb.createLead('list-1', { email: 'Ada@Example.com', firstName: 'Ada' });
+
+    const item = lastPutItem();
+    expect(item.lifecycle).toBe('inbox');
+    expect(item.domain).toBe('example.com');
+  });
+
+  it('stamps nothing for a lead with neither an email nor a phone', async () => {
+    getPromiseMock
+      .mockResolvedValueOnce({ Item: { listId: 'list-1', userId: 'user-1' } })
+      .mockResolvedValue({ Item: null });
+
+    await crmDb.createLead('list-1', { linkedin: 'https://linkedin.com/in/nobody' });
+
+    const item = lastPutItem();
+    expect(item.lifecycle).toBeUndefined();
+    expect(item.domain).toBeUndefined();
+  });
+
   it('writes nameCompanyKey when all of firstName/lastName/company are set', async () => {
     getPromiseMock
       .mockResolvedValueOnce({ Item: { listId: 'list-1', userId: 'user-1' } })

@@ -50,13 +50,25 @@ export function sanitizeEnrichmentMetadataForResponse(
 }
 
 /** Drops any card-revenue key from a plain field-keyed map (customFields or enrichmentMetadata). */
-function stripCardRevenueKeys<V>(map: Record<string, V> | undefined | null): Record<string, V> | undefined {
+export function stripCardRevenueKeys<V>(map: Record<string, V> | undefined | null): Record<string, V> | undefined {
   if (!map || typeof map !== 'object') return map as undefined;
   const out: Record<string, V> = {};
   for (const [field, value] of Object.entries(map)) {
     if (!isCardRevenueField(field)) out[field] = value;
   }
   return out;
+}
+
+/**
+ * True when card-revenue fields must be hidden from this viewer: a
+ * `viewerUserId` was given and it isn't on the Enigma allowlist. Every
+ * customer-facing read (REST, Emma tools, CSV export) is already behind
+ * `authenticateToken`, so `viewerUserId` is always a real id there — pass it
+ * at every such call site. Omitting it preserves the old no-filtering
+ * behaviour, for internal-only callers that don't serve a specific viewer.
+ */
+export function shouldHideCardRevenueForViewer(viewerUserId: string | undefined | null): boolean {
+  return !!viewerUserId && !isEnigmaEnrichmentEnabledForUser(viewerUserId);
 }
 
 /**
@@ -74,7 +86,7 @@ export function sanitizeLeadForResponse<T extends { enrichmentMetadata?: any; cu
   viewerUserId?: string,
 ): T | null | undefined {
   if (!lead) return lead;
-  const hideCardRevenue = !!viewerUserId && !isEnigmaEnrichmentEnabledForUser(viewerUserId);
+  const hideCardRevenue = shouldHideCardRevenueForViewer(viewerUserId);
   if (!lead.enrichmentMetadata && !hideCardRevenue) return lead;
   return {
     ...lead,

@@ -60,6 +60,31 @@ export function phoneDigits(phone: unknown): string {
   return digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
 }
 
+/**
+ * The fewest digits that can identify a person.
+ *
+ * Seven, because that is a local subscriber number without an area code — the shortest
+ * thing a human can meaningfully be reached on. The portal mirrors this constant; if the
+ * two disagree, one surface merges rows the other splits.
+ */
+export const MIN_DEDUPABLE_PHONE_DIGITS = 7;
+
+/**
+ * Is this phone specific enough to MERGE two rows on?
+ *
+ * Merging is destructive in a way splitting is not: a split row is a cosmetic annoyance,
+ * but two different people collapsed into one means the second disappears from the Inbox
+ * and its list memberships are grafted onto the first. So the bar is "could this plausibly
+ * be one person's number", not "is this non-empty".
+ *
+ * Without the floor, `+1` and `1` both reduce to `1`, and EVERY lead across an account
+ * that carried only a country code collapsed into a single row. A visitor who tabs through
+ * a phone field after typing the prefix produces exactly that.
+ */
+export function isDedupablePhone(phone: unknown): boolean {
+  return phoneDigits(phone).length >= MIN_DEDUPABLE_PHONE_DIGITS;
+}
+
 // 415-555-0100..0199 — the NANP's reserved fictional range inside a real area code. Valid
 // enough for a lander's own phone validation to accept, and provably unroutable, so no real
 // visitor can hold one. That is what makes it safe to key suppression off.

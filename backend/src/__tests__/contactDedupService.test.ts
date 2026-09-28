@@ -146,6 +146,45 @@ describe('contactDedupService', () => {
       expect(result.contacts.every((c) => c.email === '')).toBe(true);
     });
 
+    // The mirror of the portal's floor. `+1` and `1` both reduce to `1`, so without it every
+    // lead across the account carrying only a country code collapsed into ONE contact — the
+    // rest disappear and their list memberships are grafted onto the survivor. A merge is
+    // destructive in a way a split is not.
+    it('does NOT collapse two people whose phones are only a country code', async () => {
+      asMock(crmDb.getLeadListsByUserId).mockResolvedValue([{ listId: 'L1', name: 'Inbound', listType: 'sales' }]);
+      asMock(crmDb.getLeadsByListId).mockResolvedValue({
+        items: [
+          { leadId: 'a', phone: '+1', firstName: 'Ann', lastName: 'Alpha' },
+          { leadId: 'b', phone: '1', firstName: 'Ben', lastName: 'Beta' },
+        ],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+
+      const result = await dedupContactsForUser({ userId: 'u1' });
+
+      expect(result.total).toBe(2);
+      const keys = result.contacts.map((c) => c.dedupKey).sort();
+      expect(keys).toEqual(['lead:L1/a', 'lead:L1/b']);
+      expect(keys).not.toContain('phone:1');
+    });
+
+    it('still merges two rows that share a REAL number', async () => {
+      asMock(crmDb.getLeadListsByUserId).mockResolvedValue([{ listId: 'L1', name: 'Inbound', listType: 'sales' }]);
+      asMock(crmDb.getLeadsByListId).mockResolvedValue({
+        items: [
+          { leadId: 'a', phone: '(212) 555-0147' },
+          { leadId: 'b', phone: '+1 212 555 0147' },
+        ],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+
+      const result = await dedupContactsForUser({ userId: 'u1' });
+      expect(result.total).toBe(1);
+      expect(result.contacts[0].dedupKey).toBe('phone:2125550147');
+    });
+
     it('ENG-2082: a phone-only contact is named by its number, not left blank', async () => {
       asMock(crmDb.getLeadListsByUserId).mockResolvedValue([{ listId: 'L1', name: 'Inbound', listType: 'sales' }]);
       asMock(crmDb.getLeadsByListId).mockResolvedValue({

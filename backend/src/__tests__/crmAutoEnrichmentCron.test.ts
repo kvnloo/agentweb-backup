@@ -34,8 +34,13 @@ function baseConfig(overrides: Partial<EnrichmentConfig> = {}): EnrichmentConfig
 // A default email, because the cron now agrees with the engine's precondition: a lead with
 // no email, no LinkedIn and no full name can never be enriched, so it is not selected.
 // Pass `{ email: undefined }` to build the identity-less shape deliberately.
+//
+// NOT @example.com. That is a reserved documentation domain and one of the
+// PLACEHOLDER_DOMAINS the resolver strips before its own identity check — so a lead whose
+// only signal is an @example.com address is, correctly, unenrichable. Using it as the
+// default made every "ordinary lead" fixture describe a lead the engine would reject.
 function lead(leadId: string, overrides: Record<string, any> = {}) {
-  return { leadId, listId: 'list-1', email: `${leadId}@example.com`, ...overrides };
+  return { leadId, listId: 'list-1', email: `${leadId}@acme-corp.io`, ...overrides };
 }
 
 function makeDeps(overrides: Partial<CrmAutoEnrichmentCronDeps> = {}): CrmAutoEnrichmentCronDeps {
@@ -246,6 +251,48 @@ describe('runCrmAutoEnrichmentCron', () => {
 
     expect(deps.runEnrichment).not.toHaveBeenCalled();
   });
+
+    // A PLACEHOLDER-domain address is not an identity signal: resolveIdentity zeroes it
+    // before its own check, so selecting on it produces a lead the engine rejects without
+    // stamping enrichmentMetadata — reselected every tick, forever, burning the
+    // MAX_LEADS_PER_LIST_PER_RUN budget. Same infinite loop as the no-signal case, which
+    // is why the cron uses the resolver's own predicate rather than a non-empty test.
+    it('does not select a lead whose only signal is a placeholder-domain email', async () => {
+      const deps = makeDeps({
+        getAutoEnrichEnabledLists: jest.fn().mockResolvedValue([{ listId: 'list-1', userId: 'u1' }]),
+        getAllLeadsByListId: jest.fn().mockResolvedValue([
+          lead('placeholder-only', { email: 'queue-verify@example.com' }),
+          lead('real', { email: 'ada@acme-corp.io' }),
+        ]),
+      });
+
+      await runCrmAutoEnrichmentCron(deps);
+
+      const ids = (deps.runEnrichment as jest.Mock).mock.calls.flatMap(
+        (c: any[]) => c[0]?.leadIds ?? [],
+      );
+      expect(ids).toContain('real');
+      expect(ids).not.toContain('placeholder-only');
+    });
+
+    it('DOES select a placeholder-domain lead that has another real signal', async () => {
+      const deps = makeDeps({
+        getAutoEnrichEnabledLists: jest.fn().mockResolvedValue([{ listId: 'list-1', userId: 'u1' }]),
+        getAllLeadsByListId: jest.fn().mockResolvedValue([
+          lead('has-name', {
+            email: 'queue-verify@example.com', firstName: 'Ada', lastName: 'Lovelace',
+          }),
+        ]),
+      });
+
+      await runCrmAutoEnrichmentCron(deps);
+
+      const ids = (deps.runEnrichment as jest.Mock).mock.calls.flatMap(
+        (c: any[]) => c[0]?.leadIds ?? [],
+      );
+      // The email is ignored as identity; name+company still resolves.
+      expect(ids).toContain('has-name');
+    });
 
   it('still selects an identity-less-email lead that has a LinkedIn or a full name', async () => {
     const deps = makeDeps({

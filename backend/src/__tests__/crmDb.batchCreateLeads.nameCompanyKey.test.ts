@@ -114,12 +114,17 @@ describe('crmDb.batchCreateLeads — nameCompanyKey (new-lead path)', () => {
   });
 });
 
-// ENG-2082 / ENG-2155: the bulk path never called buildLeadCrmFields and derived neither
-// field, so the HubSpot pull, the Attio pull and CSV import — the paths that create most
-// leads — all produced rows with no `domain` and no `lifecycle`. The missing lifecycle is
-// the `lifecycle is_empty` delete-filter footgun that justified deriving it on the
-// single-lead path in the first place.
-describe('crmDb.batchCreateLeads — derived domain and lifecycle', () => {
+// ENG-2082 / ENG-2155: the bulk path never called buildLeadCrmFields, so the HubSpot pull,
+// the Attio pull and CSV import — the paths that create most leads — produced rows with no
+// `domain`.
+//
+// `domain` is derived here. `lifecycle` deliberately is NOT: askCrmService reads
+// `lead.lifecycle ?? computeLifecycle(...)`, nothing in production advances a stored
+// value, so stamping it would pin every bulk-imported lead to `inbox` permanently — the
+// exact regression updateLead and setLeadFields strip the stamp to avoid. A first version
+// of this work stamped it and these tests asserted that; they now assert the opposite,
+// because the reasoning three hundred lines up in the same file says so.
+describe('crmDb.batchCreateLeads — derives domain, and deliberately does NOT stamp lifecycle', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     queryPromiseMock.mockResolvedValue({ Items: [] });
@@ -127,25 +132,28 @@ describe('crmDb.batchCreateLeads — derived domain and lifecycle', () => {
     batchWritePromiseMock.mockResolvedValue({});
   });
 
-  it('derives domain from the email, and stamps lifecycle inbox', async () => {
+  it('derives domain from the email, and stores NO lifecycle', async () => {
     await crmDb.batchCreateLeads('list-1', [
       { email: 'Ada@Example.COM', firstName: 'Ada' },
     ]);
 
     const items = batchedItems();
     expect(items[0].domain).toBe('example.com');
-    expect(items[0].lifecycle).toBe('inbox');
+    // A stored value would freeze askCrmService's computation for the life of the row.
+    expect(items[0].lifecycle).toBeUndefined();
+    expect('lifecycle' in items[0]).toBe(false);
   });
 
-  // The whole point of ENG-2082: a phone-only capture is contactable and inbound.
-  it('stamps lifecycle for a PHONE-ONLY lead, which has no email to derive a domain from', async () => {
+  // A phone-only capture has no email, so there is no domain to derive — and no lifecycle
+  // either, for the reason above. It is still fully contactable; that is computed on read.
+  it('stores neither field for a PHONE-ONLY lead', async () => {
     await crmDb.batchCreateLeads('list-1', [
       { phone: '2125559876', firstName: 'Grace' },
     ]);
 
     const items = batchedItems();
-    expect(items[0].lifecycle).toBe('inbox');
     expect(items[0].domain).toBeUndefined();
+    expect(items[0].lifecycle).toBeUndefined();
   });
 
   it('leaves both off a lead with neither an email nor a phone', async () => {
@@ -168,10 +176,10 @@ describe('crmDb.batchCreateLeads — derived domain and lifecycle', () => {
     const items = batchedItems();
     const byId = (pred: (i: any) => boolean) => items.find(pred);
     expect(byId((i) => i.email === 'a@alpha.io')?.domain).toBe('alpha.io');
-    expect(byId((i) => i.email === 'a@alpha.io')?.lifecycle).toBe('inbox');
     expect(byId((i) => i.phone === '5551234567')?.domain).toBeUndefined();
-    expect(byId((i) => i.phone === '5551234567')?.lifecycle).toBe('inbox');
-    expect(byId((i) => i.firstName === 'Neither')?.lifecycle).toBeUndefined();
+    expect(byId((i) => i.firstName === 'Neither')?.domain).toBeUndefined();
+    // No row carries a lifecycle, whatever channels it has.
+    expect(items.every((i: any) => i.lifecycle === undefined)).toBe(true);
   });
 
   // Agreement holds for the inputs this path DERIVES from — an email and a phone. It is
@@ -193,11 +201,13 @@ describe('crmDb.batchCreateLeads — derived domain and lifecycle', () => {
 
       await crmDb.batchCreateLeads('list-1', [lead]);
       const bulk = batchedItems()[0];
-      // buildLeadCrmFields takes (email, extensions) — the same two inputs the bulk path
-      // now reads, so a disagreement here means the two creation paths have drifted.
+      // buildLeadCrmFields takes (email, extensions). DOMAIN must agree — it is derived
+      // once and nothing recomputes it. LIFECYCLE deliberately must NOT: the single-create
+      // path stamps it (pre-existing), the bulk path refuses to, because freezing it on
+      // the highest-volume path is the regression this test file previously encoded.
       const single = buildLeadCrmFields((lead as any).email, { phone: (lead as any).phone });
-      expect(bulk.lifecycle).toBe(single.lifecycle);
       expect(bulk.domain).toBe(single.domain);
+      expect(bulk.lifecycle).toBeUndefined();
     }
   });
 
@@ -212,7 +222,7 @@ describe('crmDb.batchCreateLeads — derived domain and lifecycle', () => {
 
     const items = batchedItems();
     expect(items[0].domain).toBe('real-domain.com');
-    expect(items[0].lifecycle).toBe('inbox');
+    expect(items[0].lifecycle).toBeUndefined();
   });
 
   it('refuses to store a junk lifecycle smuggled through the bulk path', async () => {
@@ -221,7 +231,8 @@ describe('crmDb.batchCreateLeads — derived domain and lifecycle', () => {
     ]);
 
     const items = batchedItems();
-    expect(items[0].lifecycle).toBe('inbox');
+    // Not stored at all — so a junk value cannot be either.
+    expect(items[0].lifecycle).toBeUndefined();
   });
 });
 

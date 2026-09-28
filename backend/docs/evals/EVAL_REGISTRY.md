@@ -17,11 +17,13 @@ harness (ENG-2136) produces those runs; record the result on the entry, with evi
 | session-judge-general | agent | LLM judge | gemini-3.5-flash (Gemini) | no |
 | session-judge-fangfang | agent | LLM judge | gemini-3.5-flash (Gemini) | no |
 | session-judge-matt | agent | LLM judge | gemini-3.5-flash (Gemini) | no |
+| session-judge-outcome-b-shadow | agent | LLM judge, outcome rubric B, shadow + sampled, off until OPS-1 | anthropic.claude-sonnet-4-6 (Claude) | no |
 | finalize-guard | agent | LLM judge | gemini-3.1-flash-lite (Gemini), off in prod | no |
 | agent-run-verdict | agent | code | — | no |
 | agent-task-success | agent | code, offline | — | no |
 | agent-tool-correctness | agent | code, offline | — | no |
 | agent-groundedness-offline | agent | code, offline (finalize-guard lexicon) | — | no |
+| agent-reply-length-fixtures | agent | code, offline (ENG-1312 fixtures, placeholder inputs) | — | no |
 | okareo-no-hallucinated-capabilities-v2 | agent | LLM judge (Okareo) | unknown | calibration set only |
 | enrichment-golden-set | agent | code | — | golden set, CRM enrichment only |
 | human-eval-queue | creative | human (free text) | — | no |
@@ -29,6 +31,8 @@ harness (ENG-2136) produces those runs; record the result on the entry, with evi
 | image-prompt-like-rate | creative | human (likes) | — | no |
 | landing-page-smoke-test | creative | code | — | deterministic |
 | creative-deterministic-gates | creative | code, advisory | — | no |
+| creative-rubric-judge | creative | LLM judge, 7 binary criteria + pairwise, advisory, off by default | anthropic.claude-sonnet-5 (Claude) | no |
+| creative-performance-correlation | creative | outcome: Spearman ρ of rubric score vs settled ad CTR/CPA, read-only report, no data until OPS-3 (ENG-2148) | — | no |
 | client-health-assessment | account health | code | — | no |
 | renewal-integration-health | account health | code, off in prod | — | no |
 | account-health-evaluators | account health | code, log-only | — | no |
@@ -47,8 +51,8 @@ Sources, consumers and known issues for each entry are in `evalRegistry.ts`.
 3. **The general judge cannot rank sessions.** ENG-1710/1714: AUC 0.67 against relaxed task
    completion, 83.6% of scores are 5, frustrated vs calm sessions 4.63 vs 4.69.
 4. **Scores are a biased sample.** 8,462 of 19,293 sessions (44%) carry a score, written lazily
-   when an admin opens the dashboard or `get_chat_history sync=true` backfills. There is no
-   random sampler (ENG-2144).
+   when an admin opens the dashboard or `get_chat_history sync=true` backfills. ENG-2144 adds
+   a random sampler (below), off until OPS-7 (ENG-2152).
 5. **Almost no human labels exist.** 10 sessions carry `satisfactionScore.adminOverride`. No
    κ/agreement code exists anywhere. The Fangfang/Matt judges were never compared with
    Fangfang's or Matt's own judgments.
@@ -62,7 +66,11 @@ Sources, consumers and known issues for each entry are in `evalRegistry.ts`.
    Slack feedback from a single reviewer. The only automated creative comparison is the
    customer portal's offline `scripts/eval-onboarding-quality.ts`: a Claude Sonnet pairwise judge
    that compares two onboarding pipeline versions layer by layer (including creative direction,
-   ad images and ad copy) on fixture pairs.
+   ad images and ad copy) on fixture pairs. ENG-2140 adds `creative-rubric-judge` (ENG-421's
+   7 criteria as binary checks), which stays off until its flag is turned on. ENG-2141 links each
+   generated creative to the Meta ad it became and records ad-level daily rows, so
+   `creative-performance-correlation` can compare the judge's score with settled CTR/CPA; both
+   stay inert until OPS-3 (ENG-2148).
 10. **Account health mislabelled activation as risk** — a never-connected ad account read as
     blocked / At Risk. Fixed by ENG-2133.
 
@@ -75,6 +83,57 @@ failure classes, plus ad-platform writes never read back — the grader side of 
 successful task. `scripts/evalAgentGraders.ts` runs them read-only over a date range and prints
 results per model × task type with n and a Wilson CI. None is validated; pass^k needs the sandbox
 (ENG-1906).
+
+## Online sampler (ENG-2144)
+
+`cron/evalV2SamplerCron.ts` runs daily at 17:15 UTC when `EVAL_V2_SAMPLER_ENABLED=true`. It takes a
+seeded uniform random sample of `EVAL_V2_SAMPLE_SIZE` (default 50) of the sessions whose last
+activity fell on the previous UTC day (AdminUpdatedAtIndex query), grades them with the three
+deterministic agent graders above, and writes to `Dev-AW-LoopEvents`:
+
+| loopId | Sort key | Row |
+| --- | --- | --- |
+| `eval-v2` | `eval_v2_sample_run#<day>` | the day's frame size, seed and sampled session ids |
+| `eval-v2` | `eval_v2_scored#<day>#<sessionId>` | one per sampled session: verdicts, reasons, counts, `graders` (`id@version`) |
+| `eval-v2-daily` | `<day>#1d`, `<day>#7d` | aggregate per surface × task type × model: n, rate, 95% Wilson CI, `mayGate` per grader |
+
+Scores are conditional puts on a deterministic key, so each (day, session) is written once; a
+finished day is skipped. A live run refuses without the flag; `scripts/evalV2Sample.ts` dry-runs
+any day read-only. `GET /api/admin/loops/eval-v2-trend` serves the snapshots to the partner-portal
+**Eval v2** tab, which labels every grader "unvalidated" while `mayGate` is false. No alert reads
+these rates: none of the graders is validated.
+
+The satisfaction score is no longer a headline: the chat-history badges moved to the last column,
+labelled unvalidated, with neutral colours. The judges and their stored scores are unchanged, and
+the Daily Satisfaction Score Report schedule stays paused.
+
+## Shadow outcome judge (ENG-2138)
+
+Decision D1: ENG-1714's outcome rubric B on Claude Sonnet, in shadow, without touching the primary
+score. It is one row in AW-Settings `scoring-judges` (id `outcome-judge-b-shadow`, `shadow: true`,
+`sampleRate`), appended by OPS-1 (ENG-2146); without the row nothing runs. It uses the custom-judge
+path, so it has the same cohort exclusions and appended ENG-* clauses, and writes only
+`AW-ChatSessions.judgeScores.outcome-judge-b-shadow` (with `shadow: true` and the model). It scores
+only a fixed hash-picked `sampleRate` share of sessions (an admin `force` rescore of one session
+bypasses the sample), refuses a Google model, and is metered as system spend
+(`outcome_judge_shadow`, per session id) rather than to the customer.
+
+The measured rubric B text was never committed; `services/outcomeJudge.ts` holds a
+reconstruction from ENG-1710/1714 and says which parts are reconstructed.
+`scripts/evalOutcomeJudge.ts` re-measures it read-only: it judges a seeded sample of sessions
+and prints AUC against the deterministic `agent-task-success` label, the share of 5s and
+per-model means (aggregates only). The runValidation harness reads its stored scores for κ
+against the golden set once labels exist (ENG-2135/2136).
+
+## Offline suite and regression gate (ENG-2145)
+
+`loops/scripts/runOfflineEvalSuite.ts` compares the registered replay cases, the ENG-1312 fixtures,
+golden-set agreement and Okareo checks with a versioned baseline (`loops/eval/baselines/*.json`) and
+prints pass / regression / unavailable. It fails closed on any evaluator problem. A metric may block
+only when its grader passes `mayGate` and `EVAL_GATE_BLOCKING=true`, so today it is report-only.
+Prompt, model and skill edits in AW-Settings / AW-Skills make a best-effort write of an `eval_needed`
+marker (`Dev-AW-LoopEvents`, loopId `eval-gate`); a failed marker write never fails the edit, so that
+edit is then missing from the marker feed. Details: `docs/evals/OFFLINE_EVAL_GATE.md`.
 
 ## Known false-positive catalogue (session judges)
 

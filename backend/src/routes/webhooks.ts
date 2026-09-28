@@ -539,7 +539,12 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // normalises `ph` as a first-class match key. This gate was the only thing requiring one.
     const normalizedEmail = typeof email === 'string' ? email.trim() : '';
     const normalizedPhone = typeof phone === 'string' ? phone.trim() : '';
-    if (!normalizedEmail && !normalizedPhone) {
+    // Opt-in exception: a lander whose contact field is deliberately optional (e.g. the
+    // WaterHeater.app free warranty check) sends `allowAnonymousLead: true` so the
+    // submission is still recorded (with its customFields) instead of silently dropped.
+    // Default behaviour for every other caller is unchanged.
+    const allowAnonymousLead = req.body?.allowAnonymousLead === true;
+    if (!normalizedEmail && !normalizedPhone && !allowAnonymousLead) {
       return res.status(400).json({
         success: false,
         message: 'Email or phone is required'
@@ -629,6 +634,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // "anything not handled above", so a newly-handled key MUST be added here too.
       // (`clientIp`/`clientUserAgent` are deliberately NOT handled — see the destructure.)
       'visitorIp', 'visitorUserAgent',
+      'allowAnonymousLead',
     ]);
     const PASSTHROUGH_MAX_KEYS = 50;
     const PASSTHROUGH_MAX_VALUE_LENGTH = 1000;
@@ -966,7 +972,16 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // Inserts already notify at the CRM write boundary. Every accepted repeat form
     // submission also notifies, even when it merges into an unchanged existing row.
     // A server-generated event ID keeps distinct submissions separate on recovery.
-    if (!isNew) {
+    //
+    // Gated on the synthetic check for the same reason as the cascade far below: this is a
+    // real org lead notification (Slack/email) and the smoke test must not send one. It
+    // sits ABOVE that gate, so it was firing — and `!isNew` is now EXCLUSIVELY the
+    // smoke-test adopt path for a phone-only capture, since deterministicLeadId was
+    // narrowed to synthetic numbers. buildSmokeTestPhone picks one of only 100 reserved
+    // numbers at random, so collisions are routine by construction and every colliding
+    // resubmission notified a real human about a fake lead. The gate's own comment claims
+    // it skips "the whole cascade"; this is the part that escaped it.
+    if (!isNew && !isSmokeTestLead(lead) && !isSmokeTestLead(leadData)) {
       const submission = { submissionId: crypto.randomUUID(), submittedAt: new Date().toISOString() };
       void import('../services/orgLeadNotificationService')
         .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, submission))
@@ -1714,13 +1729,16 @@ export async function processHubspotWebhookJob(payload: HubspotJobPayload): Prom
             try {
               lead = await crmDb.getLeadByHubSpotContactId(list.listId, String(objectId));
             } catch (lookupErr: any) {
-              if (lookupErr?.lookupExhausted) {
-                // We cannot prove the lead is absent, and the creation branch below would
-                // mint a duplicate on that assumption. Skip this list instead.
-                console.warn(`[HubSpot Webhook] ${lookupErr.message} — skipping list ${list.listId}`);
-                continue;
-              }
-              lead = null;
+              // ANY failure means we cannot prove the lead is absent, and the branches
+              // below act on that assumption. `lookupExhausted` is only the page-cap case;
+              // a throttle or timeout used to fall through as `lead = null`. Less severe
+              // here than in crmWebhook — creation is gated on data.isCreation — but the
+              // edit is still applied to the wrong row or dropped, so skip either way.
+              const why = lookupErr?.lookupExhausted
+                ? lookupErr.message
+                : `contact-id lookup failed (${lookupErr?.message || lookupErr})`;
+              console.warn(`[HubSpot Webhook] ${why} — skipping list ${list.listId}`);
+              continue;
             }
           }
 

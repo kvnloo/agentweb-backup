@@ -150,6 +150,11 @@ export const portalRouteCatalog: readonly PortalRouteCatalogEntry[] = [
     surface: 'primary',
     header: { audience: 'admin', order: 100 },
   }),
+  route('eval-labelling', 'Eval Labelling', '/eval-labelling', 'Label golden-set cases for grader validation', 'admin', 'Label a case', 'Unprovisioned store and empty surfaces are handled by the page', {
+    surface: 'primary',
+    header: { audience: 'admin', order: 102 },
+  }),
+  route('creative-calibration', 'Creative Calibration', '/eval-labelling/calibration', 'Compare pairs of generated ads for the weekly judge calibration', 'admin', 'Pick the better ad', 'Unprovisioned store and an empty batch are handled by the page'),
   route('sandbox-accounts', 'Sandbox Accounts', '/sandbox-accounts', 'Provision and manage simulated-Meta accounts for candidates or demos', 'admin', 'Create a sandbox account', 'Empty account list offers Create', {
     surface: 'primary',
     header: { audience: 'admin', order: 105 },
@@ -283,7 +288,7 @@ export interface GroupedHeaderNavigation {
 
 const DIRECT_HEADER_IDS = ['home', 'tasks', 'workflows', 'admin', 'release'] as const;
 const BUILD_HEADER_IDS = ['templates', 'html-templates', 'prompt-templates', 'skills', 'work-plans', 'schedule-templates'] as const;
-const OPERATE_HEADER_IDS = ['gtm-ops', 'client-health', 'agent-runs', 'sandbox-accounts', 'contractor-accesses', 'config'] as const;
+const OPERATE_HEADER_IDS = ['gtm-ops', 'client-health', 'agent-runs', 'eval-labelling', 'sandbox-accounts', 'contractor-accesses', 'config'] as const;
 
 /** Groups visible destinations without changing their routes or access rules. */
 export function getGroupedHeaderNavigation(

@@ -1,3 +1,4 @@
+import { resolveModelForUser } from './modelRoles';
 import { getAccountsByUserId, ConnectedAccount, EngagementMemory, saveEngagementMemory } from './connectedAccountsDb';
 import { socialPlatformService } from './socialPlatformService';
 import { linkedInService } from './linkedInService';
@@ -198,7 +199,6 @@ export async function getPostsForUser(
 
 // ─── Engagement Memory Generation ─────────────────────────────────────────────
 
-const MEMORY_MODEL = 'gemini-3.1-flash-lite';
 
 const GENERATE_MEMORY_PROMPT = `You are an expert profile analyst. Based on the LinkedIn profile and recent posts provided, create a concise engagement persona profile in markdown format.
 
@@ -320,7 +320,7 @@ export async function generateEngagementMemory(
 
   // Call Gemini flash-lite
   const { agentModeService } = await import('./agentModeService');
-  const response = await agentModeService.callLLM(MEMORY_MODEL, [
+  const response = await agentModeService.callLLM(await resolveModelForUser(userId, 'content_generation'), [
     { role: 'system', content: systemPrompt },
     { role: 'user', content: userContent },
   ], {

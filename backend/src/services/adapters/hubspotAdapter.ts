@@ -288,6 +288,21 @@ export class HubspotAdapter implements CrmAdapter {
                 // gained an address, upsertContact matched on email instead, created
                 // contact B, and overwrote our stored id. Contact A was orphaned in the
                 // customer's HubSpot: a real person, now a duplicate nobody updates again.
+                //
+                // SCOPE, stated plainly: this is pushLeadsPerLead. `batchEnabled()` defaults
+                // TRUE (HUBSPOT_BATCH_PUSH_ENABLED is set nowhere), so in production this
+                // path is reached only for EMAIL-LESS leads — which is the ENG-2082
+                // population and the point of the fix. A lead that HAS an email goes to
+                // pushLeadsBatched, whose Stage 1 partitions on email alone, upserts by
+                // email, and overwrites the stored id at Stage 3. So the orphaning described
+                // above is closed for a lead that never had an address and is NOT closed for
+                // one that later gains it.
+                //
+                // Fixing the batched half means routing stored-id leads to
+                // batchUpdateContacts (which exists) AND handling its all-or-nothing partial
+                // failure — one contact the customer deleted in HubSpot would otherwise 404
+                // an entire 100-lead batch, where the per-lead path falls back to create on
+                // 404/410. That is its own change with its own failure modes: ENG-2167.
                 const existingContactId: string | undefined =
                     lead.syncMetadata?.hubspot_contact_id || lead.customFields?.hubspot_contact_id;
                 const upsertOrCreate = async () => {

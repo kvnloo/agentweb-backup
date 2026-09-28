@@ -125,9 +125,9 @@ describe('getAllAvailableConnectedAccounts', () => {
     }
   });
 
-  it('returns exactly 14 items now that calendly is included', () => {
+  it('returns exactly 15 items now that calendly and linkedin_ads are included', () => {
     const result = getAllAvailableConnectedAccounts();
-    expect(result).toHaveLength(14);
+    expect(result).toHaveLength(15);
   });
 
   it('matches partner-portal\'s actual AVAILABLE_CONNECTED_ACCOUNTS ids, read live from its source file, so the "select all -> save" path can never silently drop a platform again', () => {
@@ -170,6 +170,6 @@ describe('getAllAvailableConnectedAccounts', () => {
     first.push('mutated-should-not-leak');
     const second = getAllAvailableConnectedAccounts();
     expect(second).not.toContain('mutated-should-not-leak');
-    expect(second).toHaveLength(14);
+    expect(second).toHaveLength(15);
   });
 });

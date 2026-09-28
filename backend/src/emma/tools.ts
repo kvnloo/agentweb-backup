@@ -409,6 +409,14 @@ For a customer-facing credential reconnect (a disconnected Meta ad account, Inst
           enum: ['plan_choice', 'customer_credential', 'customer_confirmation'],
           description: '"plan_choice" for a team approver picking between options. "customer_credential" for a customer credential-reconnect ask — never used with audience="team". "customer_confirmation" is not supported yet and will be refused.',
         },
+        subjectLabel: {
+          type: 'string',
+          description: 'Required, always. A short label naming exactly which account/customer this decision is about (e.g. "TriCityAI · Meta Ad Account 2041725529929988", "JustFitKitchen · Meta retargeting campaign"). Rendered as its own prominent line so the approver never has to infer the account from prose — never omit this, even when businessImpact already mentions it.',
+        },
+        subjectContactEmail: {
+          type: 'string',
+          description: 'Optional but include it whenever you know it: the email of the person/account this decision concerns (e.g. the ad account owner). Rendered alongside subjectLabel with the domain highlighted, so the approver can recognize the company at a glance, not just the account id.',
+        },
         businessImpact: {
           type: 'string',
           description: 'One line: why this decision matters right now.',
@@ -461,7 +469,7 @@ For a customer-facing credential reconnect (a disconnected Meta ad account, Inst
           description: 'How many days this decision stays open before expiring. Defaults to 7. Clamped to a maximum of 30 — a larger value is silently reduced to 30, so do not promise the customer/approver a longer window than that.',
         },
       },
-      required: ['audience', 'gateType', 'businessImpact', 'evidencePacket'],
+      required: ['audience', 'gateType', 'subjectLabel', 'businessImpact', 'evidencePacket'],
     },
   },
   execute: async (args: any, context: any) => {
@@ -517,6 +525,8 @@ For a customer-facing credential reconnect (a disconnected Meta ad account, Inst
         gateType,
         approver: audience === 'team' ? (args?.approver as ApprovalDecisionApprover) : undefined,
         customerId: audience === 'customer' ? args?.customerId : undefined,
+        subjectLabel: args?.subjectLabel,
+        subjectContactEmail: args?.subjectContactEmail,
         businessImpact: args?.businessImpact,
         evidencePacket: {
           chatUrl: args?.evidencePacket?.chatUrl,
@@ -7603,11 +7613,18 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
     if (summary.processedCount > 0) {
       try {
         const { crmDb } = await import('../services/db');
-        const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
+        const { sanitizeEnrichmentMetadataForResponse, shouldHideCardRevenueForViewer } = await import('../utils/enrichmentMetadataPresentation');
+        const { isCardRevenueField } = await import('../services/enrichmentGroups');
         const lead: any = await crmDb.getLeadById(args.list_id, args.lead_id);
         const customFields = (lead?.customFields ?? {}) as Record<string, string>;
         const requestedNames = (args.output_fields as Array<{ name: string }>).map(f => f.name);
+        // ENG-1388: the enigma trigger step is already allowlist-gated, but this
+        // readback just reads whatever's now stored — which could be a card
+        // revenue value a DIFFERENT (allowlisted) org member filled earlier.
+        // Never hand it back to a caller who isn't allowlisted themselves.
+        const hideCardRevenueForCaller = shouldHideCardRevenueForViewer(context.userId);
         for (const name of requestedNames) {
+          if (hideCardRevenueForCaller && isCardRevenueField(name)) continue;
           enrichedValues[name] = customFields[name] ?? lead?.[name] ?? null;
         }
         const sanitized = sanitizeEnrichmentMetadataForResponse(
@@ -7617,6 +7634,7 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
           // Only surface metadata for the fields this call enriched.
           const scoped: Record<string, any> = {};
           for (const name of requestedNames) {
+            if (hideCardRevenueForCaller && isCardRevenueField(name)) continue;
             if (sanitized[name] !== undefined) scoped[name] = sanitized[name];
           }
           if (Object.keys(scoped).length > 0) enrichmentMetadata = scoped;
