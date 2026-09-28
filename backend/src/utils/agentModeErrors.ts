@@ -46,6 +46,12 @@ const CAN_ONLY_AFFORD_MARKER = 'can only afford';
 // Anchored, no backtracking: only ever scans the whitespace/digits immediately
 // after the marker, regardless of how long the rest of the message is.
 const LEADING_DIGITS_PATTERN = /^\s*(\d+)/;
+// Real OpenRouter messages are a few hundred chars; this is ample headroom
+// without doing unbounded toLowerCase/slice work on a pathological input
+// (CodeRabbit follow-up on PR #3117 — the backtracking regex was the real
+// risk and is fixed below, but the linear scan itself should still be capped
+// rather than proportional to an attacker- or provider-controlled length).
+const MAX_ERROR_MESSAGE_SCAN_LENGTH = 2000;
 
 /**
  * Bounded (`indexOf`, not backtracking regex) so an attacker- or
@@ -56,12 +62,13 @@ const LEADING_DIGITS_PATTERN = /^\s*(\d+)/;
  * request path, worth fixing before it ever reaches production traffic.
  */
 function parseAffordableTokens(text: string): number | null {
-  const lowered = text.toLowerCase();
+  const bounded = text.length > MAX_ERROR_MESSAGE_SCAN_LENGTH ? text.slice(0, MAX_ERROR_MESSAGE_SCAN_LENGTH) : text;
+  const lowered = bounded.toLowerCase();
   const creditsIndex = lowered.indexOf(REQUIRES_MORE_CREDITS_MARKER);
   if (creditsIndex === -1) return null;
   const affordIndex = lowered.indexOf(CAN_ONLY_AFFORD_MARKER, creditsIndex);
   if (affordIndex === -1) return null;
-  const digitsMatch = text.slice(affordIndex + CAN_ONLY_AFFORD_MARKER.length).match(LEADING_DIGITS_PATTERN);
+  const digitsMatch = bounded.slice(affordIndex + CAN_ONLY_AFFORD_MARKER.length).match(LEADING_DIGITS_PATTERN);
   if (!digitsMatch) return null;
   const affordable = Number(digitsMatch[1]);
   return Number.isFinite(affordable) && affordable >= 0 ? affordable : null;
@@ -72,9 +79,12 @@ function parseAffordableTokens(text: string): number | null {
 export function extractAffordableTokens(error: unknown): number | null {
   if (!error) return null;
   const message = error instanceof Error ? error.message : String(error);
-  const originalMessage = typeof error === 'object' && error !== null && 'originalMessage' in error
-    ? String((error as { originalMessage: unknown }).originalMessage)
-    : '';
+  // Only a genuine string originalMessage — never coerce an arbitrary wrapped
+  // value (a large object's `.toString()` could itself be unbounded work).
+  const rawOriginalMessage = typeof error === 'object' && error !== null
+    ? (error as { originalMessage?: unknown }).originalMessage
+    : undefined;
+  const originalMessage = typeof rawOriginalMessage === 'string' ? rawOriginalMessage : '';
   return parseAffordableTokens(message) ?? parseAffordableTokens(originalMessage);
 }
 
