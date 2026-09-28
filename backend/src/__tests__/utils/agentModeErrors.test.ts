@@ -3,7 +3,8 @@ import {
   isSessionLimitError,
   isContextLimitError,
   isTransientLLMError,
-  isWorkerShutdownError
+  isWorkerShutdownError,
+  extractAffordableTokens
 } from '../../utils/agentModeErrors';
 
 describe('agentModeErrors utils', () => {
@@ -349,6 +350,53 @@ describe('agentModeErrors utils', () => {
         originalMessage: 'context length exceeded',
       });
       expect(isContextLimitError(wrappedError)).toBe(true);
+    });
+  });
+
+  // ENG-2185: prod session f6c882d0… (2026-09-25) — a spend-limited OpenRouter
+  // key rejected a request with this exact message; the affordable-tokens
+  // number is what a capped retry needs to turn the failure into a success.
+  describe('extractAffordableTokens', () => {
+    it('should return null for falsy/unrelated errors', () => {
+      expect(extractAffordableTokens(null)).toBeNull();
+      expect(extractAffordableTokens(undefined)).toBeNull();
+      expect(extractAffordableTokens(new Error('some other error'))).toBeNull();
+    });
+
+    it('should extract the affordable token count from the real production message', () => {
+      const err = new Error(
+        'This request requires more credits, or fewer max_tokens. You requested up to 32000 tokens, but can only afford 24420. To increase, visit https://openrouter.ai/workspaces/default/keys/abc123 and adjust the key\'s monthly limit',
+      );
+      expect(extractAffordableTokens(err)).toBe(24420);
+    });
+
+    it('should be case-insensitive', () => {
+      const err = new Error('REQUIRES MORE CREDITS. YOU REQUESTED... BUT CAN ONLY AFFORD 100');
+      expect(extractAffordableTokens(err)).toBe(100);
+    });
+
+    it('should detect the pattern via originalMessage on a wrapped error', () => {
+      const wrappedError = Object.assign(new Error('wrapped'), {
+        originalMessage: 'requires more credits, or fewer max_tokens... can only afford 500',
+      });
+      expect(extractAffordableTokens(wrappedError)).toBe(500);
+    });
+
+    it('should return null when the message names credits but not an affordable count', () => {
+      expect(extractAffordableTokens(new Error('requires more credits, please upgrade your plan'))).toBeNull();
+    });
+
+    // CodeRabbit (PR #3117): an earlier version matched both markers with a single
+    // regex and an unbounded greedy `.*` between them — quadratic on a long
+    // non-matching message (benchmarked at ~1.43s for 160KB). Pins that a large,
+    // adversarial-shaped message that never actually matches still resolves
+    // near-instantly, on both the primary message and the originalMessage path.
+    it('should resolve near-instantly on a large non-matching message (no catastrophic backtracking)', () => {
+      const huge = 'requires more credits, '.repeat(20_000); // ~480KB, never contains the second marker
+      const start = Date.now();
+      expect(extractAffordableTokens(new Error(huge))).toBeNull();
+      expect(extractAffordableTokens(Object.assign(new Error('wrapped'), { originalMessage: huge }))).toBeNull();
+      expect(Date.now() - start).toBeLessThan(200);
     });
   });
 });
