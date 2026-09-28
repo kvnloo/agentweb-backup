@@ -861,8 +861,9 @@ async function writeLeadOutcome(
   input: RunEnrichmentInput,
   deps: OrchestratorDeps,
   runId: string,
-): Promise<{ ok: true } | { ok: false; reason: 'update' }> {
-  if (input.mode === 'preview') return { ok: true };
+): Promise<{ ok: true; wrote: boolean } | { ok: false; reason: 'update' }> {
+  // Preview writes nothing by definition; the preview path counts its own samples above.
+  if (input.mode === 'preview') return { ok: true, wrote: false };
   const { fillIfEmpty, alwaysOverwrite } = bucketByOverwritePolicy(lead, outcome.fills, input.config);
 
   // Split each fill by destination — standard CRM columns write to the lead's
@@ -898,7 +899,10 @@ async function writeLeadOutcome(
         ifNotExists: false,
       });
     }
-    return { ok: true };
+    // `wrote` distinguishes "enriched" from "ran and found nothing". Both used to report
+    // ok:true and be counted as processed, so a run over leads the providers could not fill
+    // announced "500 enriched, 0 skipped, 0 failed" having changed nothing at all.
+    return { ok: true, wrote: allFills.length > 0 };
   } catch (err) {
     return { ok: false, reason: 'update' };
   }
@@ -1036,6 +1040,8 @@ export async function runEnrichment(
   const tierBreakdown: Record<string, TierCount> = {};
   const previewSamples: NonNullable<RunEnrichmentResult['preview']> = [];
   let processed = 0;
+  // Leads that ran cleanly and produced no fill — neither enriched nor failed.
+  let filledNothing = 0;
   let identityResolutionFailed = 0;
   const skippedLeadIds: string[] = [];
   let apolloFailed = 0;
@@ -1188,7 +1194,12 @@ export async function runEnrichment(
       );
       for (const { writeResult, leadBreakdown } of writeResults) {
         if (writeResult.ok) {
+          // `processed` keeps meaning "completed without failing" — it is also the progress
+          // counter, and a run that fills nothing must still show N/N rather than 0/N.
+          // filledNothing is tracked ALONGSIDE it purely so the summary can tell the two
+          // apart instead of announcing "500 enriched" over a run that changed nothing.
           processed += 1;
+          if (!writeResult.wrote) filledNothing += 1;
           for (const { key, fromCache } of leadBreakdown) {
             const counts = (sourceBreakdown[key] ??= { live: 0, cached: 0 });
             if (fromCache) counts.cached++;
@@ -1203,7 +1214,8 @@ export async function runEnrichment(
     const completedSoFar = Math.min(i + CONCURRENCY, leads.length);
     const skippedSoFar = identityResolutionFailed;
     const hardFailedSoFar = llmOrParseFailed + updateFailed;
-    const parts = [`${processed} enriched`];
+    const parts = [`${Math.max(0, processed - filledNothing)} enriched`];
+    if (filledNothing > 0) parts.push(`${filledNothing} no new data`);
     if (skippedSoFar > 0) parts.push(`${skippedSoFar} skipped`);
     if (hardFailedSoFar > 0) parts.push(`${hardFailedSoFar} failed`);
     emitToRooms(progressEvent, {

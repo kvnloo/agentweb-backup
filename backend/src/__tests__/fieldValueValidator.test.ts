@@ -123,3 +123,44 @@ describe('linkedinUrlOrUndef', () => {
     expect(linkedinUrlOrUndef('companyLinkedin', 'https://www.linkedin.com/in/janedoe')).toBeUndefined();
   });
 });
+
+// ENG-2082: `email` is the partition key of the email-index GSI, and a phone-only lead has
+// none — so leadValueIsEmpty is true, bucketByOverwritePolicy stops blocking, and a Tier-4
+// web-LLM guess can reach the write boundary for the first time.
+describe('isValidFieldValue — email shape', () => {
+  it('accepts a real address, in every field-name spelling', () => {
+    for (const f of ['email', 'email_address', 'emailAddress', 'work_email']) {
+      expect(isValidFieldValue(f, 'ada@example.com')).toBe(true);
+    }
+    expect(isValidFieldValue('email', 'ada.lovelace+tag@sub.example.co.uk')).toBe(true);
+  });
+
+  it('rejects the shapes an LLM emits when it has nothing', () => {
+    for (const v of [
+      'Not found', 'N/A', 'unknown', '', '   ',
+      'john at acme dot com',
+      'email: ada@example.com',
+      'ada@example',        // no TLD
+      'ada@.com',
+      '@example.com',
+      'ada@@example.com',
+      'ada example@com',    // space
+      'a@x.com, b@y.com',   // two addresses
+      'a@x.com; b@y.com',
+      '<ada@example.com>',
+    ]) {
+      expect(isValidFieldValue('email', v)).toBe(false);
+    }
+  });
+
+  it('rejects an absurdly long value rather than keying a row on it', () => {
+    expect(isValidFieldValue('email', `${'a'.repeat(250)}@example.com`)).toBe(false);
+  });
+
+  it('does not start validating unrelated fields', () => {
+    expect(isValidFieldValue('email_validation_status', 'whatever')).toBe(true);
+    expect(isValidFieldValue('emailDomain', 'not an email')).toBe(true);
+    expect(isValidFieldValue('company', 'Not found')).toBe(true);
+  });
+});
+

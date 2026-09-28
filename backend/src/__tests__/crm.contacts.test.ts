@@ -127,6 +127,30 @@ describe('GET /api/crm/contacts', () => {
     expect(mockRes.status).toHaveBeenCalledWith(400);
   });
 
+  // ENG-2082: phone-only contacts are INCLUDED now, so total can be smaller than rawCount
+  // for a reason the caller cannot see. The service computes noEmailCount; this route has
+  // to forward it. It did not — the response enumerates its fields, and adding the count
+  // to the intermediate object changed nothing. Caught live, not by a unit test.
+  it('forwards noEmailCount to the caller', async () => {
+    asMock(dedupContactsForUser).mockResolvedValue({
+      contacts: [
+        { dedupKey: 'phone:2125559876', email: '', name: '2125559876', company: '', heatScore: 0,
+          lastContactAt: '', lists: [{ listId: 'L1', name: 'Sales' }], primaryLead: { leadId: '1' } },
+      ],
+      total: 1,
+      rawCount: 3,
+      noEmailCount: 2,
+      listsCount: 1,
+    });
+
+    mockReq.query = { listType: 'sales' };
+    await handler!(mockReq, mockRes);
+
+    expect(mockRes.json).toHaveBeenCalledWith(
+      expect.objectContaining({ rawCount: 3, noEmailCount: 2 }),
+    );
+  });
+
   it('returns 200 with deduped result on happy path', async () => {
     asMock(dedupContactsForUser).mockResolvedValue({
       contacts: [

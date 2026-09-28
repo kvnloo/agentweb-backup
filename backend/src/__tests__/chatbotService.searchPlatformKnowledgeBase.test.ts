@@ -56,7 +56,21 @@ jest.mock('../utils/secretsManager', () => ({
   getSecret: jest.fn().mockResolvedValue('fake-key'),
 }));
 
-import { searchPlatformKnowledgeBase } from '../services/chatbotService';
+jest.mock('../utils/embeddings', () => ({ embedText: jest.fn() }));
+jest.mock('../services/docsKnowledgeSource', () => ({
+  fetchMintlifyDocsContent: jest.fn().mockResolvedValue('docs'),
+  chunkDocsContent: jest.fn(() => [
+    { id: 'keyword', content: 'billing support' },
+    { id: 'semantic', content: 'payments' },
+  ]),
+}));
+
+jest.mock('../services/funding/runFunding', () => ({
+  currentRunFunding: jest.fn(() => ({ ownerUserId: 'run-owner' })),
+}));
+
+import { embedText } from '../utils/embeddings';
+import { loadKnowledgeBase, searchKnowledgeBase, searchPlatformKnowledgeBase } from '../services/chatbotService';
 
 function vertexResult(content: string) {
   return {
@@ -195,5 +209,35 @@ describe('searchPlatformKnowledgeBase — ENG-1222 timeout guard', () => {
 
     expect(results).toHaveLength(1);
     expect(results[0].content).toBe('fast result');
+  });
+});
+
+
+describe('knowledge-base embeddings through the shared helper', () => {
+  beforeEach(async () => {
+    (embedText as jest.Mock).mockReset();
+    await loadKnowledgeBase();
+  });
+
+  it('embeds both the query and chunks, ranking by semantic similarity', async () => {
+    (embedText as jest.Mock)
+      .mockResolvedValueOnce([1, 0])
+      .mockResolvedValueOnce([0, 1])
+      .mockResolvedValueOnce([1, 0]);
+    expect((await searchKnowledgeBase('billing', 1)).map(chunk => chunk.id)).toEqual(['semantic']);
+    expect(embedText).toHaveBeenNthCalledWith(1, 'billing', { userId: 'run-owner', feature: 'embeddings' });
+    expect(embedText).toHaveBeenNthCalledWith(2, 'billing support', { userId: 'run-owner', feature: 'embeddings' });
+    expect(embedText).toHaveBeenNthCalledWith(3, 'payments', { userId: 'run-owner', feature: 'embeddings' });
+  });
+
+  it('falls back to keywords when the query cannot be embedded', async () => {
+    (embedText as jest.Mock).mockResolvedValue(null);
+    expect((await searchKnowledgeBase('billing', 1)).map(chunk => chunk.id)).toEqual(['keyword']);
+    expect(embedText).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to keywords when any chunk cannot be embedded', async () => {
+    (embedText as jest.Mock).mockResolvedValueOnce([1, 0]).mockResolvedValue(null);
+    expect((await searchKnowledgeBase('billing', 1)).map(chunk => chunk.id)).toEqual(['keyword']);
   });
 });

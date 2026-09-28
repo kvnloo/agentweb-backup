@@ -1,3 +1,4 @@
+import { resolveModelForUser } from './modelRoles';
 import { chatbotDb, ChatSession, ChatMessage } from "./chatbotService";
 import {
   appendConfirmedPublishNotice,
@@ -1616,7 +1617,7 @@ export async function scoreSession(
     AWAITING_USER_REPLY_CLAUSE;
   // Persisted setting — validate before calling, or a retired id throws
   // `Invalid model` and the session silently goes unscored (ENG-744).
-  const model = await resolveScoringModel(await getDefaultScoringModel());
+  const model = await resolveModelForUser(usageContext?.userId, 'scoring_judge');
 
   const llmPromise = agentModeService.callLLM(
     model,
@@ -1702,7 +1703,7 @@ export async function scoreSessionWithJudge(
 
   // Per-judge model is persisted without registry validation — same retired-id
   // hazard as the default scoring model above (ENG-744).
-  const judgeModel = await resolveScoringModel(judge.llmModel || SCORING_MODEL);
+  const judgeModel = judge.llmModel ? await resolveScoringModel(judge.llmModel) : await resolveModelForUser(usageContext?.userId, 'scoring_judge');
 
   const llmPromise = agentModeService.callLLM(
     judgeModel,

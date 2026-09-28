@@ -1,0 +1,65 @@
+import crypto from 'crypto';
+import { oauthSessionDb, PendingOAuthSession } from './db';
+
+export const OAUTH_FLOW_SESSION_TTL_MS = 10 * 60 * 1000;
+
+export interface LocalOAuthFlowSession {
+  userId: string;
+  expires: number;
+  /** Local shadows must never resurrect a session consumed on another instance. */
+  persisted?: boolean;
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+const isStrings = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every(item => typeof item === 'string');
+
+// Validate both provider payloads at the shared persistence boundary before route use.
+function isValidPayload(value: unknown, provider: PendingOAuthSession['provider'], userId: string): boolean {
+  if (!isRecord(value) || value.userId !== userId ||
+      typeof value.expires !== 'number' || !Number.isFinite(value.expires) || value.expires <= Date.now() ||
+      !isRecord(value.tokens)) return false;
+  const tokens = value.tokens;
+  if (typeof tokens.access_token !== 'string' || !tokens.access_token.trim() ||
+      typeof tokens.expires_in !== 'number' || !Number.isFinite(tokens.expires_in) ||
+      (tokens.refresh_token !== undefined && typeof tokens.refresh_token !== 'string')) return false;
+  if (provider === 'fathom') return true;
+  return isRecord(value.hubInfo) && typeof value.hubInfo.hub_id === 'number' &&
+    Number.isFinite(value.hubInfo.hub_id) && typeof value.hubInfo.hub_domain === 'string' &&
+    typeof value.hubInfo.user === 'string' && (value.accountType === 'crm' || value.accountType === 'marketing') &&
+    isStrings(value.grantedScopes) && isStrings(value.missingScopes);
+}
+
+/** Expand phase: retain the process-local representation alongside the shared row. */
+export async function storeOAuthFlowSession<T extends LocalOAuthFlowSession>(
+  provider: PendingOAuthSession['provider'],
+  local: Map<string, T>,
+  session: T,
+): Promise<string> {
+  const sessionId = crypto.randomBytes(32).toString('hex');
+  await oauthSessionDb.save({ sessionId, userId: session.userId, provider, payload: session });
+  local.set(sessionId, { ...session, persisted: true });
+  return sessionId;
+}
+
+export async function consumeOAuthFlowSession<T extends LocalOAuthFlowSession>(
+  provider: PendingOAuthSession['provider'],
+  local: Map<string, T>,
+  sessionId: string,
+  userId: string,
+): Promise<T | null> {
+  if (typeof sessionId !== 'string' || !sessionId.trim()) return null;
+  // Errors propagate to the route's 500 handler; an outage is not a missing row.
+  const stored = await oauthSessionDb.consume(sessionId, userId, provider);
+  if (stored) {
+    local.delete(sessionId);
+    if (!isValidPayload(stored.payload, provider, userId)) return null;
+    return stored.payload as T;
+  }
+  const legacy = local.get(sessionId);
+  if (!legacy || legacy.userId !== userId) return null;
+  local.delete(sessionId);
+  if (legacy.persisted || legacy.expires <= Date.now()) return null;
+  return legacy;
+}

@@ -108,7 +108,16 @@ export async function summarizeSessionIfNeeded(
     return null;
   }
 
-  const simplifiedMessages = (session.messages || [])
+  // ENG-2163: the summary is served to the customer verbatim via the customer-reachable
+  // `account_summary` tool, so it must not paraphrase delegated-admin activity. Redact admin
+  // tool results + admin-tainted assistant narration from the input first. adminToolNames comes
+  // from agentModeService via a lazy import to avoid a static cycle (this file already lazy-imports
+  // agentModeService for callLLM below).
+  const { redactAdminActivity } = await import("../utils/adminOnlyMessageFilter");
+  const { ADMIN_SKILL_TOOL_NAMES } = await import("./agentModeService");
+  const redactedMessages = redactAdminActivity(session.messages || [], { adminToolNames: ADMIN_SKILL_TOOL_NAMES });
+
+  const simplifiedMessages = redactedMessages
     .filter((m: any) => m.role === "user" || m.role === "assistant")
     .map((m: any) => ({
       role: m.role,

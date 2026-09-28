@@ -46,9 +46,6 @@ process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS = '';
 process.env.SLACK_SIGNING_SECRET = '';
 
 // Set Azure OpenAI embeddings environment variables for tests
-process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY = process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY || 'test-embeddings-api-key';
-process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT = process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT || 'https://test-embeddings.openai.azure.com';
-process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT = process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT || 'text-embedding-ada-002';
 
 // Set Google OAuth environment variables for tests (required by passport-google-oauth20)
 process.env.GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || 'test-google-client-id';
@@ -87,3 +84,10 @@ if (typeof realFetch === 'function') {
 }
 
 export {};
+
+// Keep the pre-Dynamo route characterizations unchanged while mocking their new I/O.
+if (/[\\/](hubspotAuth|fathomAuth)\.test\.ts$/.test(expect.getState().testPath || '')) {
+  jest.doMock('../services/db', () => ({
+    oauthSessionDb: require('./fixtures/oauthSessionDb').createOAuthSessionDbMock(),
+  }));
+}

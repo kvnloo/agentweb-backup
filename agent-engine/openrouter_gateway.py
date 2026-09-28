@@ -5,6 +5,9 @@ for attribution and backwards compatibility. Only this module translates them
 to OpenRouter upstream IDs and constructs a client.
 """
 
+import json
+from pathlib import Path
+
 import asyncio
 import queue
 import threading
@@ -14,6 +17,11 @@ from pydantic import SecretStr
 
 import secrets_manager
 
+
+# Deployment uses a full repo checkout (deploy/RUNBOOK.md). Same policy as Emma TS.
+OPENROUTER_PROVIDER_PREFERENCES = json.loads(
+    (Path(__file__).resolve().parents[1] / "backend/src/config/openRouterProviderPreferences.json").read_text()
+)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _BROWSER_RAW_TOOL_MODELS = {"deepseek-r1", "deepseek-reasoner"}
@@ -315,12 +323,10 @@ def create_openrouter_llm(model: str):
         # support `tools`/`response_format` even with require_parameters=false,
         # so routing isn't fully unconstrained today. REQUEST_TIMEOUT_SECONDS
         # above is the actual fix for the slow/degraded-provider hang this
-        # ticket investigates; scoping provider selection further (e.g.
-        # `provider.order`/`provider.only` allow-listing known-good providers
-        # per model family) is a plausible follow-up but needs live-traffic
-        # validation this investigation couldn't do (no OPENROUTER_API_KEY
-        # access), so it's deliberately left out of this change.
-        "provider": {"allow_fallbacks": True},
+        # ticket investigates. Provider order prefers BYOK clouds but is not
+        # an allow-list; OpenRouter still owns failover.
+        "provider": {**OPENROUTER_PROVIDER_PREFERENCES,
+                     "order": list(OPENROUTER_PROVIDER_PREFERENCES["order"])},
         "plugins": [{"id": "context-compression"}],
     }
     kwargs = {

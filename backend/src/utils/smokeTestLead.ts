@@ -1,3 +1,5 @@
+import * as crypto from "crypto";
+
 /**
  * ENG-449 gap #3: the automated post-deploy smoke test (landingPageSmokeTest.ts) submits a
  * REAL lead through a customer's REAL lead-capture form to verify the pipeline actually
@@ -58,6 +60,31 @@ export function phoneDigits(phone: unknown): string {
   return digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
 }
 
+/**
+ * The fewest digits that can identify a person.
+ *
+ * Seven, because that is a local subscriber number without an area code — the shortest
+ * thing a human can meaningfully be reached on. The portal mirrors this constant; if the
+ * two disagree, one surface merges rows the other splits.
+ */
+export const MIN_DEDUPABLE_PHONE_DIGITS = 7;
+
+/**
+ * Is this phone specific enough to MERGE two rows on?
+ *
+ * Merging is destructive in a way splitting is not: a split row is a cosmetic annoyance,
+ * but two different people collapsed into one means the second disappears from the Inbox
+ * and its list memberships are grafted onto the first. So the bar is "could this plausibly
+ * be one person's number", not "is this non-empty".
+ *
+ * Without the floor, `+1` and `1` both reduce to `1`, and EVERY lead across an account
+ * that carried only a country code collapsed into a single row. A visitor who tabs through
+ * a phone field after typing the prefix produces exactly that.
+ */
+export function isDedupablePhone(phone: unknown): boolean {
+  return phoneDigits(phone).length >= MIN_DEDUPABLE_PHONE_DIGITS;
+}
+
 // 415-555-0100..0199 — the NANP's reserved fictional range inside a real area code. Valid
 // enough for a lander's own phone validation to accept, and provably unroutable, so no real
 // visitor can hold one. That is what makes it safe to key suppression off.
@@ -68,8 +95,28 @@ const PHONE_PATTERN = new RegExp(`^${PHONE_AREA}${PHONE_EXCHANGE}${PHONE_BLOCK}\
 
 /** Builds the synthetic phone. Only the low two digits vary — the CRM key is never the phone. */
 export function buildSmokeTestPhone(): string {
-  const tail = String(Date.now() % 100).padStart(2, "0");
+  // Random, not Date.now() % 100. The reserved block gives 100 numbers either way, but a
+  // clock-derived tail collides with itself on a 100 ms cycle, and a collision here is not
+  // harmless: the colliding row already exists, so the conditional create loses, the adopt
+  // path returns no new row, and `createdAt >= submittedAtIso` can never hold — a permanent
+  // false `ok: false` for that list.
+  const tail = String(Math.floor(Math.random() * 100)).padStart(2, "0");
   return `${PHONE_AREA}${PHONE_EXCHANGE}${PHONE_BLOCK}${tail}`;
+}
+
+/**
+ * The deterministic lead id a phone-only capture is written under.
+ *
+ * Lives here, beside phoneDigits, for the same reason phoneDigits does: webhooks.ts MINTS
+ * this id and landingPageSmokeTest.ts must READ it back, and if the two ever derive it
+ * differently the smoke test silently stops finding the row it just created. Returns "" when
+ * the phone carries no digits, which is the caller's signal that there is no deterministic
+ * id to use.
+ */
+export function phoneLeadId(phone: unknown): string {
+  const digits = phoneDigits(phone);
+  if (!digits) return "";
+  return `lead_ph_${crypto.createHash("sha256").update(digits).digest("hex").slice(0, 24)}`;
 }
 
 export function isSmokeTestPhone(phone: string | undefined | null): boolean {
