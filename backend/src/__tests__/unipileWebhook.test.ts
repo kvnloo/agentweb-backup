@@ -70,16 +70,21 @@ prodLikeAppWithFix.use(express.json({ limit: '50mb' }));
 prodLikeAppWithFix.use(express.urlencoded({ limit: '50mb', extended: true }));
 prodLikeAppWithFix.use('/api/webhooks/unipile', unipileWebhookRouter);
 
-function postTo(targetApp: express.Express, body: any, headers: Record<string, string> = {}, contentType?: string) {
-  let req = request(targetApp).post(PATH);
-  for (const [k, v] of Object.entries(headers)) req = req.set(k, v);
-  if (contentType) req = req.type(contentType);
-  return req.send(typeof body === 'string' ? body : JSON.stringify(body));
-}
-
 const payload = (message: string, accountId = 'acc_1', accountType: string | undefined = 'LINKEDIN') => ({
   AccountStatus: { account_id: accountId, account_type: accountType, message },
 });
+
+function postTo(
+  targetApp: express.Express,
+  body: ReturnType<typeof payload>,
+  headers: Record<string, string> = {},
+  contentType?: string,
+) {
+  let req = request(targetApp).post(PATH);
+  for (const [k, v] of Object.entries(headers)) req = req.set(k, v);
+  if (contentType) req = req.type(contentType);
+  return req.send(JSON.stringify(body));
+}
 
 describe('mapAccountStatusMessage', () => {
   it.each([
@@ -269,15 +274,19 @@ describe('body parsing against the real production middleware chain (ENG-2180)',
     });
   });
 
-  it('with the fix: a delivery with no content-type at all is still parsed correctly', async () => {
+  it('with the fix: a delivery whose content-type defaults to application/x-www-form-urlencoded is still parsed as JSON', async () => {
+    // Clearing the Content-Type override doesn't make superagent send no header —
+    // empirically verified it falls back to superagent's own default of
+    // "application/x-www-form-urlencoded" for a raw string body. That default is
+    // worth its own case: it's the exact content-type express.urlencoded() would
+    // otherwise claim, i.e. precisely the pre-fix failure mode, reached here via a
+    // client that never sets Content-Type at all rather than one that explicitly
+    // (and wrongly) declares text/plain.
     const res = await request(prodLikeAppWithFix)
       .post(PATH)
       .set('unipile-auth', SECRET)
       .set('Content-Type', '')
       .send(JSON.stringify(payload('OK', 'acc_1')));
-    // supertest/superagent refuses an empty Content-Type override and falls back
-    // to its own default; what matters is the route still parses correctly and
-    // reaches the health pipeline rather than 400ing on a malformed body.
     expect(res.status).toBe(200);
     expect(mockRecordUnipileAccountHealth).toHaveBeenCalledWith({
       accountId: 'acc_1',
