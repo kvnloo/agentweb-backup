@@ -20,14 +20,21 @@
 # The fix
 # -------
 # Diff against the head SHA of the most recent PRIOR Deploy run whose
-# `detect-changes` job actually completed. That run's filter step (or the
-# workflow_dispatch fallback, which deploys everything) correctly decided
-# what needed deploying as of its head, so resuming the comparison from there
-# is correct by induction -- regardless of whether backend-deploy or
-# partner-deploy themselves later succeeded, failed, or were skipped by the
-# filter. A run whose own `detect-changes` job never completed (queued and
-# then cancelled, or failed outright) is walked past, because in either case
-# its own comparison never happened either -- exactly the gap this closes.
+# `detect-changes` job actually completed AND whose own backend-deploy /
+# partner-deploy jobs (whichever the filter decided to run) actually
+# succeeded. That run's filter step (or the workflow_dispatch fallback,
+# which deploys everything) correctly decided what needed deploying as of
+# its head, and that decision was actually carried out, so resuming the
+# comparison from there is correct by induction. A run whose own
+# `detect-changes` job never completed (queued and then cancelled, or failed
+# outright) is walked past, because in either case its own comparison never
+# happened either. Likewise, a run whose detect-changes job DID succeed but
+# whose backend-deploy or partner-deploy job then failed or was cancelled is
+# walked past too: trusting that run's head as the new base would report
+# `false` for a component on the next run's filter even though the code that
+# component's deploy job was supposed to ship never actually landed --
+# reproducing this same silent-drop bug via a failed-deploy path instead of
+# a cancelled-pending-run path.
 #
 # Fail-safe
 # ---------
@@ -49,6 +56,8 @@
 #   DEPLOY_BRANCH            default main
 #   DEPLOY_BASE_LOOKBACK     prior runs to inspect, default 20
 #   DEPLOY_DETECT_JOB_NAME   default "Detect changed projects"
+#   DEPLOY_BACKEND_JOB_NAME  default "Backend deploy to production"
+#   DEPLOY_PARTNER_JOB_NAME  default "Partner portal deploy to production"
 #   DEPLOY_CURRENT_RUN_ID    exclude this run id from consideration (defaults
 #                            to $GITHUB_RUN_ID; override for local testing)
 
@@ -59,6 +68,8 @@ DEPLOY_WORKFLOW="${DEPLOY_WORKFLOW:-Deploy}"
 DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
 DEPLOY_BASE_LOOKBACK="${DEPLOY_BASE_LOOKBACK:-20}"
 DEPLOY_DETECT_JOB_NAME="${DEPLOY_DETECT_JOB_NAME:-Detect changed projects}"
+DEPLOY_BACKEND_JOB_NAME="${DEPLOY_BACKEND_JOB_NAME:-Backend deploy to production}"
+DEPLOY_PARTNER_JOB_NAME="${DEPLOY_PARTNER_JOB_NAME:-Partner portal deploy to production}"
 DEPLOY_CURRENT_RUN_ID="${DEPLOY_CURRENT_RUN_ID:-${GITHUB_RUN_ID:-}}"
 
 RESOLVED='false'
@@ -117,6 +128,21 @@ while IFS= read -r run_id; do
     '[.jobs[] | select(.name == $name)][0].conclusion // ""')"
 
   if [ "${CONCLUSION}" = 'success' ]; then
+    # detect-changes succeeded, but that alone doesn't mean this run's own
+    # deploys actually shipped. If backend-deploy or partner-deploy ran (i.e.
+    # wasn't skipped by the filter) and then failed or was cancelled, this
+    # run's head is not a trustworthy base -- see "The fix" above.
+    BACKEND_CONCLUSION="$(printf '%s' "${JOBS}" | jq -r --arg name "${DEPLOY_BACKEND_JOB_NAME}" \
+      '[.jobs[] | select(.name == $name)][0].conclusion // ""')"
+    PARTNER_CONCLUSION="$(printf '%s' "${JOBS}" | jq -r --arg name "${DEPLOY_PARTNER_JOB_NAME}" \
+      '[.jobs[] | select(.name == $name)][0].conclusion // ""')"
+
+    if { [ "${BACKEND_CONCLUSION}" = 'failure' ] || [ "${BACKEND_CONCLUSION}" = 'cancelled' ]; } || \
+       { [ "${PARTNER_CONCLUSION}" = 'failure' ] || [ "${PARTNER_CONCLUSION}" = 'cancelled' ]; }; then
+      echo "[deploy-base-sha] run ${run_id} detect-changes succeeded but its own deploy job did not (backend=${BACKEND_CONCLUSION:-n/a} partner=${PARTNER_CONCLUSION:-n/a}); walking past it." >&2
+      continue
+    fi
+
     SHA="$(printf '%s' "${RUNS}" | jq -r --arg id "${run_id}" \
       '[.[] | select((.databaseId | tostring) == $id)][0].headSha // ""')"
     if [ -n "${SHA}" ]; then
