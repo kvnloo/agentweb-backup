@@ -41,7 +41,31 @@ export function isContextLimitError(error: unknown): boolean {
 // instead of hard-failing while the key sits well short of its configured
 // limit. This does not request any additional spend — it only avoids
 // over-asking against a budget that was already there.
-const INSUFFICIENT_CREDITS_PATTERN = /requires more credits.*can only afford (\d+)/is;
+const REQUIRES_MORE_CREDITS_MARKER = 'requires more credits';
+const CAN_ONLY_AFFORD_MARKER = 'can only afford';
+// Anchored, no backtracking: only ever scans the whitespace/digits immediately
+// after the marker, regardless of how long the rest of the message is.
+const LEADING_DIGITS_PATTERN = /^\s*(\d+)/;
+
+/**
+ * Bounded (`indexOf`, not backtracking regex) so an attacker- or
+ * provider-controlled error message can't cost more than a couple of linear
+ * scans of its length. A prior version used a single regex with an unbounded
+ * greedy `.*` between the two markers — CodeRabbit's own benchmark on PR #3117
+ * measured that at ~1.43s for a 160KB non-matching message on this exact
+ * request path, worth fixing before it ever reaches production traffic.
+ */
+function parseAffordableTokens(text: string): number | null {
+  const lowered = text.toLowerCase();
+  const creditsIndex = lowered.indexOf(REQUIRES_MORE_CREDITS_MARKER);
+  if (creditsIndex === -1) return null;
+  const affordIndex = lowered.indexOf(CAN_ONLY_AFFORD_MARKER, creditsIndex);
+  if (affordIndex === -1) return null;
+  const digitsMatch = text.slice(affordIndex + CAN_ONLY_AFFORD_MARKER.length).match(LEADING_DIGITS_PATTERN);
+  if (!digitsMatch) return null;
+  const affordable = Number(digitsMatch[1]);
+  return Number.isFinite(affordable) && affordable >= 0 ? affordable : null;
+}
 
 /** The max_tokens value OpenRouter says the remaining balance affords, or null
  * if `error` isn't this specific insufficient-credits shape. */
@@ -51,10 +75,7 @@ export function extractAffordableTokens(error: unknown): number | null {
   const originalMessage = typeof error === 'object' && error !== null && 'originalMessage' in error
     ? String((error as { originalMessage: unknown }).originalMessage)
     : '';
-  const match = message.match(INSUFFICIENT_CREDITS_PATTERN) || originalMessage.match(INSUFFICIENT_CREDITS_PATTERN);
-  if (!match) return null;
-  const affordable = Number(match[1]);
-  return Number.isFinite(affordable) && affordable >= 0 ? affordable : null;
+  return parseAffordableTokens(message) ?? parseAffordableTokens(originalMessage);
 }
 
 export function isWorkerShutdownError(error: unknown): boolean {

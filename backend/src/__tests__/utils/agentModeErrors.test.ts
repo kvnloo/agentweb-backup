@@ -385,5 +385,18 @@ describe('agentModeErrors utils', () => {
     it('should return null when the message names credits but not an affordable count', () => {
       expect(extractAffordableTokens(new Error('requires more credits, please upgrade your plan'))).toBeNull();
     });
+
+    // CodeRabbit (PR #3117): an earlier version matched both markers with a single
+    // regex and an unbounded greedy `.*` between them — quadratic on a long
+    // non-matching message (benchmarked at ~1.43s for 160KB). Pins that a large,
+    // adversarial-shaped message that never actually matches still resolves
+    // near-instantly, on both the primary message and the originalMessage path.
+    it('should resolve near-instantly on a large non-matching message (no catastrophic backtracking)', () => {
+      const huge = 'requires more credits, '.repeat(20_000); // ~480KB, never contains the second marker
+      const start = Date.now();
+      expect(extractAffordableTokens(new Error(huge))).toBeNull();
+      expect(extractAffordableTokens(Object.assign(new Error('wrapped'), { originalMessage: huge }))).toBeNull();
+      expect(Date.now() - start).toBeLessThan(200);
+    });
   });
 });
