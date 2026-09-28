@@ -25,19 +25,44 @@ import { isPublishCapableTool } from '../utils/schedulePublishAuthorization';
  * Any of the three satisfies this. Doing none of them does not.
  */
 
+// Shared across both mocks below so the drift guard observes the forwarded
+// hook regardless of which module actually owns a given tool's handler body.
+const mockCalls: any[] = [];
+
 jest.mock('../services/agentModeService', () => {
-  const calls: any[] = [];
   const handler: ProxyHandler<any> = {
     get: (_t, prop) => {
-      if (prop === '__calls') return calls;
+      if (prop === '__calls') return mockCalls;
       return (...args: any[]) => {
-        calls.push({ method: String(prop), args });
+        mockCalls.push({ method: String(prop), args });
         return Promise.resolve({ success: true });
       };
     },
   };
   return { agentModeService: new Proxy({}, handler), AgentModeService: jest.fn() };
 });
+
+// ENG-2103 (F2): publish_blog_article's handler body now lives in
+// emma/impl/blog.ts and emma/tools.ts calls it directly instead of through
+// agentModeService — mock it the same call-recording way (a plain object, not
+// a Proxy, so `import * as blogImpl` in emma/tools.ts doesn't get flattened
+// to an empty object by TS's esModuleInterop wildcard-import helper) so this
+// registry-wide drift guard keeps observing the forwarded hook after the
+// extraction.
+jest.mock('../emma/impl/blog', () => ({
+  createBlogArticle: jest.fn((...args: any[]) => {
+    mockCalls.push({ method: 'createBlogArticle', args });
+    return Promise.resolve({ success: true });
+  }),
+  publishBlogArticle: jest.fn((...args: any[]) => {
+    mockCalls.push({ method: 'publishBlogArticle', args });
+    return Promise.resolve({ success: true });
+  }),
+  repairBlogArticle: jest.fn((...args: any[]) => {
+    mockCalls.push({ method: 'repairBlogArticle', args });
+    return Promise.resolve({ success: true });
+  }),
+}));
 
 const SENTINEL = jest.fn(async () => null);
 
