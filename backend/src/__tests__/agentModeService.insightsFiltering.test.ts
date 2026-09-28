@@ -6,6 +6,7 @@ import path from 'path';
 // Mock dependencies
 jest.mock('axios');
 jest.mock('fs', () => ({
+  ...jest.requireActual('fs'),
   promises: {
     writeFile: jest.fn().mockResolvedValue(undefined),
     mkdir: jest.fn().mockResolvedValue(undefined),
