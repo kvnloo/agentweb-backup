@@ -2670,7 +2670,14 @@ describe('CRM Routes', () => {
   });
 
   describe('GET /api/crm/lists/:listId/export-history', () => {
-    it('should return export history for a list', async () => {
+    it('should return export history for a list, for an Enigma-allowlisted requester', async () => {
+      // ENG-1388 (CodeRabbit on #3108): a stored export's fileUrl carries
+      // whatever the list had at export time, potentially including card
+      // revenue, and history has no per-entry record of that — so a
+      // non-allowlisted requester now gets fileUrl redacted (see the
+      // dedicated describe block below). This test pins the unrestricted
+      // case: an allowlisted requester still sees the real link.
+      (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(true);
       const mockHistory = [
         {
           exportId: 'exp_1',
@@ -2700,6 +2707,40 @@ describe('CRM Routes', () => {
       }
 
       expect(mockResponse.json).toHaveBeenCalledWith({ history: mockHistory });
+      (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(false);
+    });
+
+    // ENG-1388: a past export's fileUrl is a public S3 link, and history
+    // carries no record of whether that specific export included card
+    // revenue — the export route only started excluding it going forward.
+    // A non-allowlisted viewer must not be able to fetch an old export's
+    // link through this endpoint just because they can read the list.
+    it('redacts fileUrl on every history entry for a non-allowlisted requester', async () => {
+      (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(false);
+      const mockHistory = [
+        { exportId: 'exp_1', recordCount: 10, exportedAt: '2026-02-18T00:00:00.000Z', fileUrl: 'https://s3.amazonaws.com/bucket/export.csv', filename: 'export.csv' },
+        { exportId: 'exp_2', recordCount: 5, exportedAt: '2026-02-10T00:00:00.000Z', fileUrl: 'https://s3.amazonaws.com/bucket/old.csv', filename: 'old.csv' },
+      ];
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id', csvExportHistory: mockHistory };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/export-history' && r.route?.methods?.get
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      const responseArg = (mockResponse.json as jest.Mock).mock.calls[0][0];
+      expect(responseArg.history).toHaveLength(2);
+      for (const entry of responseArg.history) {
+        expect(entry.fileUrl).toBeNull();
+        expect(entry.restricted).toBe(true);
+      }
+      // Non-sensitive fields survive so the UI can still list past exports.
+      expect(responseArg.history[0].exportId).toBe('exp_1');
+      expect(responseArg.history[0].recordCount).toBe(10);
     });
 
     it('should return empty array when no export history exists', async () => {
