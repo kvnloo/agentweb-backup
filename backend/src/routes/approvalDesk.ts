@@ -154,7 +154,7 @@ router.post('/manifest/:manifestId/approve-all', authenticateToken, isAdmin, asy
       });
     }
 
-    const outcome = await agentModeService.executeApprovalInboxMetaWriteManifest(req.params.manifestId);
+    const outcome = await agentModeService.executeApprovalInboxMetaWriteManifest(req.params.manifestId, approver);
     if (outcome.outcome === 'executed') {
       return res.json({ success: true, ...outcome });
     }
@@ -164,7 +164,24 @@ router.post('/manifest/:manifestId/approve-all', authenticateToken, isAdmin, asy
     if (outcome.outcome === 'no_meta_write_items') {
       return res.json({ success: true, outcome: outcome.outcome, summary: null });
     }
-    return res.status(409).json({ success: false, ...outcome });
+    // Second-review fix: every other outcome used to come back with no
+    // message/error field at all, so the frontend's generic
+    // "Failed to execute this manifest." was the only thing a reviewer ever
+    // saw — including for 'not_all_resolved', which can legitimately
+    // recur if an earlier verdict call's markDispatching transiently
+    // failed (that decision self-heals here now, but a genuinely repeated
+    // failure still deserves a real message instead of a silent 409).
+    const message =
+      outcome.outcome === 'not_all_resolved'
+        ? `${outcome.unresolved.length} item(s) in your slice of this manifest are approved but not yet ready to dispatch — retrying usually resolves this; if it keeps happening, contact engineering with decision id(s) ${outcome.unresolved.join(', ')}.`
+        : outcome.outcome === 'mixed_origin_sessions'
+        ? 'This manifest’s items disagree on which chat session they came from — cannot safely resume any one session. Contact engineering.'
+        : outcome.outcome === 'no_origin_session'
+        ? 'The chat session this manifest came from could not be found — the writes were not dispatched.'
+        : outcome.outcome === 'already_executed'
+        ? 'This manifest was already dispatched.'
+        : 'Another request for this manifest is already in progress — try again shortly.';
+    return res.status(409).json({ success: false, message, ...outcome });
   } catch (error: any) {
     console.error('[approval-desk] failed to execute approve-all:', error?.message || error);
     return res.status(500).json({ success: false, error: 'Failed to execute this manifest.' });
