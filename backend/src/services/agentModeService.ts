@@ -3623,7 +3623,15 @@ export class AgentModeService {
       // publishing tools' own "get explicit approval first" text. Placed here it is the
       // last thing before the model answers, and it is the same authorization object the
       // dispatch guard enforces.
-      if (currentSession?.sessionType === 'scheduled') {
+      // ENG-2204: gate on isUnattendedRun === true, not just sessionType — a schedule-
+      // created session reopened in the attended chat UI keeps sessionType 'scheduled'
+      // but leaves isUnattendedRun undefined (per its own doc comment above: "every
+      // other caller of generateMarketingResponse is an attended interactive path and
+      // leaves this undefined"). This directive now carries a live-approval bypass
+      // (SLACK NOTIFICATIONS IN UNATTENDED RUNS) that must never reach an attended turn,
+      // so undefined must be excluded, not just false — same strict-true discriminator
+      // already used at the Meta-write approval-deck gate below.
+      if (currentSession?.sessionType === 'scheduled' && isUnattendedRun === true) {
         const publishDirective = getUnattendedExecutionDirective(
           'scheduled',
           isAdmin,

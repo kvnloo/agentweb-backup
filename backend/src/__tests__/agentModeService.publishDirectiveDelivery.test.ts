@@ -96,7 +96,14 @@ async function capture(session: any, schedule: any, captureOptions?: (options: a
     [{ role: 'user', content: 'Draft and post today\'s update.' }] as any,
     'test-user',
     service.default_model,
-    'sess-1'
+    'sess-1',
+    // Positional params through isUnattendedRun (ENG-2204): ADMITTED_SESSION represents
+    // a session runScheduledChat actually dispatched, so isUnattendedRun must be true
+    // here to match — the directive is now gated on this, not just sessionType, so an
+    // omitted/undefined value here would silently stop testing the real delivery path.
+    false, undefined, undefined, false, undefined, undefined, undefined, false, false,
+    undefined, undefined, undefined, false,
+    true
   );
 
   return sent;
