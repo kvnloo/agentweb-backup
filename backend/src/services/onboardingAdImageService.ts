@@ -63,6 +63,7 @@ import type { BrandLogoProbeDeps } from "./agentMode/brandLogo";
 import type { ICPPersona } from "./icpStatusService";
 import type { CreativeDirResult } from "./creativeDirStatusService";
 import type { CreativeGateResult } from "./creativeGates";
+import { recordGeneratedCreative } from "./creativeLineage";
 import {
   ARCHETYPES,
   AESTHETIC_RULES,
@@ -703,6 +704,17 @@ export async function generateAdImagesForUser(
         console.warn(
           `[onboardingAdImageService] variant ${t.index + 1} failed: ${r.error}`
         );
+      } else if (r.imageUrl) {
+        // ENG-2194: a lineage record, so a later publish of this variant (agent mode or the
+        // create-ad dialog) links it to its ad. Inert unless enabled; never throws.
+        void recordGeneratedCreative({
+          userId,
+          artifactUrl: r.imageUrl,
+          category: "ad",
+          prompt: t.prompt,
+          generatorModel: DEFAULT_IMAGE_MODEL,
+          gates: r.gates,
+        });
       }
       return variant;
     })
