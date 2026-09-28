@@ -191,6 +191,7 @@ import {
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { publishWithResolvedBlogPublisher } from './blogPublishers';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
+import { recordGeneratedCreative, stampMetaAdCreated, stampMetaAdCreativeChanged, stampMetaCreativeCreated, stampMetaImageUpload, stampMetaPublish } from './creativeLineage';
 import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
@@ -19012,6 +19013,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         creative_id: newCreativeId,
         status: params.status || 'PAUSED',
       });
+      if (newAd?.id) {
+        // ENG-2141: a copied ad that reuses a generated image is another ad for that creative.
+        void stampMetaPublish({
+          userId, accountId, metaCreativeId: String(newCreativeId), adId: String(newAd.id), params: newCreativeParams, via: 'copy_ad',
+        });
+      }
 
       return {
         success: true,
@@ -19912,6 +19919,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // IG placements require an instagram_user_id in object_story_spec — auto-resolve from the Page.
       resolvedParams = await this.resolvePlacementInstagramActor(resolvedParams, accessToken);
       const creative = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
+      // ENG-2141: link the generated images this creative uses to it (inert unless enabled).
+      if (creative?.id) {
+        void stampMetaCreativeCreated({ userId, accountId, metaCreativeId: String(creative.id), params: resolvedParams });
+      }
 
       return {
         success: true,
@@ -19970,6 +19981,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
       const ad = await metaService.createAd(accountId, accessToken, params);
+      // ENG-2141: link the ad to the generated creatives its Meta creative was built from.
+      if (ad?.id && params.creative_id) {
+        void stampMetaAdCreated({ userId, accountId, metaCreativeId: String(params.creative_id), adId: String(ad.id) });
+      }
 
       return {
         success: true,
@@ -20168,6 +20183,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         }
 
         await recordCreativeLearningReceipt(userId, accountId, adId, newCreativeId, verification.verified);
+        // ENG-2141: the ad's previous creative links end here; link it to the new one if generated.
+        void stampMetaAdCreativeChanged({ userId, accountId, metaCreativeId: String(newCreativeId), adId });
         return {
           success: true,
           message: `Ad updated successfully. Swapped in creative ${newCreativeId}.`,
@@ -20397,6 +20414,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
 
     const v = verification!;
+    // ENG-2141: the ad now carries this creative (attach calls returned; propagation may lag). Its
+    // performance from here on belongs to the generated images the new creative uses.
+    void stampMetaPublish({
+      userId, accountId, metaCreativeId: String(newCreativeId), adId, params: newCreativeParams, via: 'swap_creative',
+    });
     const reviewNote = v.effectiveStatus
       ? ` Ad review status: ${v.effectiveStatus}${v.reviewFeedback ? ` (${v.reviewFeedback})` : ''}.`
       : '';
@@ -20689,6 +20711,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           image
         };
       }
+      // ENG-2141: a generated image uploaded by its S3 URL gains this hash (inert unless enabled).
+      void stampMetaImageUpload({ userId, imageUrl, imageHash });
       return {
         success: true,
         message: `Image uploaded successfully`,
@@ -30769,7 +30793,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           console.warn('Failed to store image generation metadata:', error);
         }
 
-        void enqueueAutoHumanEval({
+        const humanEvalCandidate = enqueueAutoHumanEval({
           reviewType: 'creative_image',
           userId,
           sessionId,
@@ -30792,6 +30816,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
             filename: result.filename || filename,
           },
         });
+        // ENG-2141: creative lineage record (inert unless CREATIVE_LINEAGE_ENABLED + table). Not
+        // awaited and never throws; it links the human-eval candidate once that exists.
+        void recordGeneratedCreative(
+          { userId, artifactUrl: result.imageUrl, sessionId, category, prompt, generatorModel: imageModelUsed, gates: result.gates },
+          humanEvalCandidate,
+        );
 
         // ENG-1027 data-fabrication backstop: the tool-description guidance alone is
         // instruction-following-dependent, and live verification showed the image

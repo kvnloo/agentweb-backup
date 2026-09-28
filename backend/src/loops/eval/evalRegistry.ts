@@ -254,6 +254,18 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
     notes: 'Advisory (ENG-2140): never blocks generation. Off unless CREATIVE_RUBRIC_JUDGE_ENABLED=true with CREATIVE_RUBRIC_JUDGE_SAMPLE_RATE > 0 (unset in prod). Runs only after the deterministic gates pass. Not yet validated against human labels (ENG-2136 harness, per-criterion kappa).',
   },
   {
+    id: 'creative-performance-correlation',
+    surface: 'creative',
+    graderType: 'outcome',
+    measures: 'Spearman rho (n, 95% bootstrap CI) between the rubric judge\'s passed-criteria count and settled Meta ad CTR, and CPA per currency, for generated creatives linked to their live ads',
+    source: 'loops/eval/creativePerformance.ts; report scripts/creativePerformanceCorrelation.ts; lineage services/creativeLineage.ts; ad rows cron/metaMetricsSnapshotCron.ts',
+    model: 'none',
+    modelFamily: 'none',
+    consumers: ['scripts/creativePerformanceCorrelation.ts (printed report, read-only)'],
+    knownIssues: [],
+    notes: 'ENG-2141. No data until OPS-3 (ENG-2148) creates AW-Creatives and sets CREATIVE_LINEAGE_ENABLED + CREATIVE_LINEAGE_TABLE + META_AD_LEVEL_SNAPSHOTS_ENABLED, and linked ads pass Meta\'s 28-day settling window. Leads are Meta-reported (no ad-level CRM join). Validates the rubric judge against outcomes; it is not itself a human-agreement validation.',
+  },
+  {
     id: 'client-health-assessment',
     surface: 'account_health',
     graderType: 'code',

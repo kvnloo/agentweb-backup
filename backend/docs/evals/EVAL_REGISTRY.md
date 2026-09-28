@@ -31,6 +31,7 @@ harness (ENG-2136) produces those runs; record the result on the entry, with evi
 | landing-page-smoke-test | creative | code | — | deterministic |
 | creative-deterministic-gates | creative | code, advisory | — | no |
 | creative-rubric-judge | creative | LLM judge, 7 binary criteria + pairwise, advisory, off by default | anthropic.claude-sonnet-5 (Claude) | no |
+| creative-performance-correlation | creative | outcome: Spearman ρ of rubric score vs settled ad CTR/CPA, read-only report, no data until OPS-3 (ENG-2148) | — | no |
 | client-health-assessment | account health | code | — | no |
 | renewal-integration-health | account health | code, off in prod | — | no |
 | account-health-evaluators | account health | code, log-only | — | no |
@@ -65,7 +66,10 @@ Sources, consumers and known issues for each entry are in `evalRegistry.ts`.
    customer portal's offline `scripts/eval-onboarding-quality.ts`: a Claude Sonnet pairwise judge
    that compares two onboarding pipeline versions layer by layer (including creative direction,
    ad images and ad copy) on fixture pairs. ENG-2140 adds `creative-rubric-judge` (ENG-421's
-   7 criteria as binary checks), which stays off until its flag is turned on.
+   7 criteria as binary checks), which stays off until its flag is turned on. ENG-2141 links each
+   generated creative to the Meta ad it became and records ad-level daily rows, so
+   `creative-performance-correlation` can compare the judge's score with settled CTR/CPA; both
+   stay inert until OPS-3 (ENG-2148).
 10. **Account health mislabelled activation as risk** — a never-connected ad account read as
     blocked / At Risk. Fixed by ENG-2133.
 
