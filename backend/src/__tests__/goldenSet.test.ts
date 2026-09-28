@@ -3,12 +3,15 @@ import {
   GOLDEN_CRITERIA,
   GoldenCaseValidationError,
   isFullyLabelled,
+  newCreativePairCase,
   newGoldenCase,
   parseGoldenCase,
   parseLabelUpdate,
   splitForCaseId,
   TEST_SPLIT_FRACTION,
   MAX_NOTE_CHARS,
+  PAIRWISE_CRITERION,
+  type CreativePairRef,
 } from '../loops/eval/goldenSet';
 
 const NOW = new Date('2026-09-25T00:00:00.000Z');
@@ -64,6 +67,52 @@ describe('golden case schema (ENG-2135)', () => {
     expect(() => parseLabelUpdate('account_health', { labels: { task_success: 'pass' }, expectedVersion: 0 })).toThrow(/not a account_health criterion/);
     expect(() => parseLabelUpdate('agent', { labels: {}, expectedVersion: 'x' })).toThrow(/expectedVersion/);
     expect(() => parseLabelUpdate('agent', { labels: {}, notes: 'x'.repeat(MAX_NOTE_CHARS + 1), expectedVersion: 0 })).toThrow(/notes/);
+  });
+});
+
+describe('pairwise creative cases (ENG-2142)', () => {
+  const PAIR: CreativePairRef = { candidateIdB: 'cand-b', batch: '2026-W39', position: 0, batchSize: 20, category: 'ad', placement: 'meta_feed_portrait', signal: 'uncertain' };
+  const pairCase = () => newCreativePairCase({ candidateIdA: 'cand-a', pair: PAIR, now: NOW });
+
+  it('builds a creative case over two candidates with the one pairwise criterion and no content', () => {
+    const c = pairCase();
+    expect(c).toMatchObject({
+      caseId: 'creative#candidatePair#cand-a#cand-b',
+      surface: 'creative',
+      taskType: 'creative_pairwise',
+      sourceRef: { kind: 'candidateId', id: 'cand-a' },
+      criteria: [PAIRWISE_CRITERION],
+      labels: {},
+      seedSource: 'weekly_calibration:2026-W39',
+      pair: PAIR,
+    });
+    expect(parseGoldenCase(c)).toEqual(c);
+    expect(isFullyLabelled({ ...c, labels: { pairwise_preference: 'tie' } })).toBe(true);
+  });
+
+  it('takes A, B or tie on a pairwise case and nothing else', () => {
+    for (const choice of ['A', 'B', 'tie']) {
+      expect(parseGoldenCase({ ...pairCase(), labels: { pairwise_preference: choice } }).labels).toEqual({ pairwise_preference: choice });
+      expect(parseLabelUpdate('creative', { labels: { pairwise_preference: choice }, expectedVersion: 0 }, true).labels).toEqual({ pairwise_preference: choice });
+    }
+    expect(() => parseLabelUpdate('creative', { labels: { pairwise_preference: 'pass' }, expectedVersion: 0 }, true)).toThrow(/A, B or tie/);
+    expect(() => parseLabelUpdate('creative', { labels: { hook: 'pass' }, expectedVersion: 0 }, true)).toThrow(/not a pairwise creative criterion/);
+    expect(() => parseGoldenCase({ ...pairCase(), criteria: ['hook'] })).toThrow(/not a pairwise creative criterion/);
+  });
+
+  it('keeps the pairwise criterion and A/B values off single cases', () => {
+    const single = newGoldenCase({ surface: 'creative', taskType: 'creative_image', sourceId: 'cand-a', seedSource: 's', now: NOW });
+    expect(() => parseLabelUpdate('creative', { labels: { pairwise_preference: 'A' }, expectedVersion: 0 })).toThrow(/not a creative criterion/);
+    expect(() => parseLabelUpdate('creative', { labels: { hook: 'A' }, expectedVersion: 0 })).toThrow(/pass, fail or na/);
+    expect(() => parseGoldenCase({ ...single, criteria: [PAIRWISE_CRITERION] })).toThrow(/not a creative criterion/);
+  });
+
+  it('rejects a pair on another surface, a pair of one creative with itself and a malformed pair', () => {
+    expect(() => parseGoldenCase({ ...agentCase(), pair: PAIR })).toThrow(/only valid on creative/);
+    expect(() => parseGoldenCase({ ...pairCase(), pair: { ...PAIR, candidateIdB: 'cand-a' } })).toThrow(/must differ/);
+    expect(() => parseGoldenCase({ ...pairCase(), pair: { ...PAIR, signal: 'maybe' } })).toThrow(/pair.signal/);
+    expect(() => parseGoldenCase({ ...pairCase(), pair: { ...PAIR, position: -1 } })).toThrow(/pair.position/);
+    expect(() => parseGoldenCase({ ...pairCase(), pair: { ...PAIR, batch: '' } })).toThrow(/pair.batch/);
   });
 });
 

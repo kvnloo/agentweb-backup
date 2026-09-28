@@ -201,4 +201,30 @@ describe("EvalLabelling (ENG-2135)", () => {
     await screen.findByText("Labels saved.");
     expect(firstColumn()[0]).toContain("session-2");
   });
+
+  it("leaves pairwise calibration cases to their own page and links to it (ENG-2142)", async () => {
+    const single: GoldenCaseView = { ...CASE, caseId: "creative#candidateId#cand-1", surface: "creative", taskType: "creative_image", sourceRef: { kind: "candidateId", id: "cand-1" }, criteria: ["hook"] };
+    const pair: GoldenCaseView = {
+      ...single,
+      caseId: "creative#candidatePair#cand-2#cand-3",
+      taskType: "creative_pairwise",
+      sourceRef: { kind: "candidateId", id: "cand-2" },
+      criteria: ["pairwise_preference"],
+      pair: { candidateIdB: "cand-3", batch: "2026-W39", position: 0, batchSize: 1, category: "ad", placement: "unknown", signal: "unscored" },
+    };
+    mockedAxios.get.mockImplementation(async (url: string) => {
+      if (url.endsWith("/status")) return { data: { provisioned: true } };
+      if (url.includes("surface=agent")) return { data: { cases: [] } };
+      if (url.includes("surface=creative")) return { data: { cases: [single, pair] } };
+      if (url.includes("/api/human-eval/candidates/")) return { data: { candidate: { reviewType: "creative_image", feedback: [] } } };
+      throw new Error(`unexpected GET ${url}`);
+    });
+    renderPage();
+    expect(screen.getByRole("link", { name: "weekly creative calibration" })).toHaveAttribute("href", "/eval-labelling/calibration");
+    fireEvent.click(screen.getByRole("tab", { name: "Creatives" }));
+    expect(await screen.findByText("1 cases · 0 fully labelled")).toBeInTheDocument();
+    expect(screen.getByText("cand-1")).toBeInTheDocument();
+    expect(screen.queryByText("cand-2")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "pairwise_preference pass" })).not.toBeInTheDocument();
+  });
 });

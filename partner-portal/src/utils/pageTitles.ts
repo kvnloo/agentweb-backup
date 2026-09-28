@@ -14,6 +14,7 @@ const routeTitles: Record<string, string> = {
   '/admin': 'Admin Dashboard',
   '/agent-runs': 'AgentRun Inspector',
   '/eval-labelling': 'Eval Labelling',
+  '/eval-labelling/calibration': 'Creative Calibration',
   '/profile': 'User Profile',
   '/config': 'Configuration Page',
   '/workflows': 'Workflows Dashboard',

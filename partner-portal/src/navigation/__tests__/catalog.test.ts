@@ -23,6 +23,7 @@ const EXPECTED_REGISTERED_ROUTES = [
   '/client-health',
   '/agent-runs',
   '/eval-labelling',
+  '/eval-labelling/calibration',
   '/sandbox-accounts',
   '/prompt-templates',
   '/tasks/create',
