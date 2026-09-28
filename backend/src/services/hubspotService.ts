@@ -185,8 +185,14 @@ function isRevokedRefreshTokenError(err: unknown): boolean {
   // bug wearing a green test suite. The message text is matched too, because that commit
   // shows the error reaching callers as a bare message with the body already lost.
   //
-  // Widening here does NOT reopen the fleet-wide risk: a rotated clientSecret answers
-  // BAD_CLIENT_CREDENTIALS, which still does not match. And a deploy pointed at the wrong
+  // Widening here does NOT reopen the fleet-wide risk. Measured live against HubSpot on
+  // 2026-09-28 with a REAL refresh token and a wrong client_secret:
+  //
+  //   HTTP 400 {"status":"BAD_CLIENT_SECRET", ... "error":"invalid_client"}
+  //
+  // which this regex does not match. (HubSpot validates the refresh token BEFORE the
+  // client, so probing with a bogus token returns BAD_REFRESH_TOKEN whatever the
+  // credentials — a real token is required to observe this shape at all.) And a deploy pointed at the wrong
   // client_id would mismatch every grant at once — but those grants genuinely cannot
   // refresh, and since create() no longer short-circuits and the clear still runs, the
   // fleet self-heals within one access-token lifetime once the config is fixed. A false

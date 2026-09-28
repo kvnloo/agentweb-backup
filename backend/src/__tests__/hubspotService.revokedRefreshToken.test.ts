@@ -126,7 +126,11 @@ describe('HubSpot refresh-token revocation', () => {
    * nothing real is lost by gating this arm.
    */
   it.each([
-    ['invalid_client (a bad shared clientSecret)', { status: 'BAD_CLIENT_CREDENTIALS', message: 'authentication credentials not valid' }],
+    // The REAL shape, measured against live HubSpot with a valid refresh token and a
+    // wrong client_secret — not an invented constant. This is the fleet-wide scenario:
+    // if this ever matched, one rotated secret would flag every HubSpot account dead.
+    ['invalid_client — the measured rotated-secret response', { status: 'BAD_CLIENT_SECRET', error: 'invalid_client', message: 'authentication credentials not valid' }],
+    ['BAD_CLIENT_CREDENTIALS (kept: a plausible sibling code)', { status: 'BAD_CLIENT_CREDENTIALS', message: 'authentication credentials not valid' }],
     ['an RFC 6749 invalid_client body', { error: 'invalid_client' }],
     ['an unrelated string body', 'Unauthorized'],
     ['a null body', null],
@@ -211,7 +215,7 @@ describe('HubSpot refresh-token revocation', () => {
  */
 describe('a 400 only counts when the body says the refresh token is bad', () => {
   it.each([
-    ['a bad client secret', { status: 'BAD_CLIENT_CREDENTIALS', message: 'authentication credentials not valid' }],
+    ['a bad client secret (measured shape)', { status: 'BAD_CLIENT_SECRET', error: 'invalid_client' }],
     ['a malformed request', { status: 'BAD_REQUEST', message: 'missing grant_type' }],
     ['a null body', null],
     ['an unrelated string body', 'Bad Request'],
