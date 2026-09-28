@@ -60,7 +60,7 @@ export interface EvalChangeMarker {
   target: string;
   category: EvalChangeCategory;
   action: EvalChangeAction;
-  /** Which code path wrote it, e.g. `settingsService`, `admin skill route`. */
+  /** Which code path wrote it, e.g. `settingsService`, `skillService`. */
   via: string;
   /** Skill fields the write touched (skills only). */
   fields?: string[];
@@ -152,8 +152,31 @@ export function evalRelevantSkillFields(body: Readonly<Record<string, unknown>>)
 }
 
 /**
- * For admin skill writes. A create or update records a marker only when it touches an
- * eval-relevant field; delete, approve (a skill goes public) and sync always do.
+ * The eval-relevant fields whose value differs between the stored skill row (`before`, absent for
+ * a new row) and the row just written (`after`), with their new values. Tool lists compare as sets.
+ */
+export function changedEvalSkillFields(
+  before: Readonly<Record<string, unknown>> | undefined,
+  after: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  const changed: Record<string, unknown> = {};
+  for (const field of EVAL_RELEVANT_SKILL_FIELDS) {
+    if (after[field] === undefined) continue;
+    if (before && sameFieldValue(before[field], after[field])) continue;
+    changed[field] = after[field];
+  }
+  return changed;
+}
+
+function sameFieldValue(a: unknown, b: unknown): boolean {
+  if (Array.isArray(a) && Array.isArray(b)) return JSON.stringify([...a].map(String).sort()) === JSON.stringify([...b].map(String).sort());
+  return a === b;
+}
+
+/**
+ * For skill writes (every caller goes through skillService, ENG-2195). A create or update records
+ * a marker only when it touches an eval-relevant field; delete, approve (a skill goes public) and
+ * sync always do.
  */
 export async function recordSkillChange(
   skillId: string,
@@ -165,7 +188,7 @@ export async function recordSkillChange(
   if ((action === 'create' || action === 'update') && fields.length === 0) return false;
   const prompt = typeof body.systemPrompt === 'string' ? body.systemPrompt : undefined;
   return recordEvalChange(
-    { changeKind: 'skill', target: skillId, category: 'skill', action, via: 'admin skill route', ...(fields.length ? { fields } : {}), ...(prompt !== undefined ? { value: prompt } : {}) },
+    { changeKind: 'skill', target: skillId, category: 'skill', action, via: 'skillService', ...(fields.length ? { fields } : {}), ...(prompt !== undefined ? { value: prompt } : {}) },
     deps,
   );
 }
