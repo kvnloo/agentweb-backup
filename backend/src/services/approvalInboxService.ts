@@ -144,6 +144,13 @@ export interface ApprovalDecision {
   credentialAccountId?: string;
   originSessionId?: string;
   originCorrelator?: string;
+  /** ENG-1853: required. Groups N independent decisions that must be reviewed
+   *  and executed together as one campaign/account packet (e.g. Haven's 5
+   *  calls, Every's 7) — the "one decision surface per campaign/account" the
+   *  ticket asks for. Every decision has exactly one manifestId, even a
+   *  single-item one (a packet of one is still a packet) — no optional/null
+   *  case, so callers never have to branch on "is this grouped or not." */
+  manifestId: string;
   createdAt: string;
   expiresAt: string;
   updatedAt: string;
@@ -153,6 +160,16 @@ export interface ApprovalDecision {
   freeText?: string;
   slack?: { channelId: string; messageTs: string };
   executionResult?: ApprovalDecisionExecutionResult;
+  /** ENG-1853 review fix: set by claimDispatch, at most once — the
+   *  meta_write manifest executor's own at-most-once dispatch gate.
+   *  advanceIndependentWorkflow provides no mutual exclusion between two
+   *  concurrent drivers of the same workflow run picking the same
+   *  un-checkpointed step (unlike the live-deck path, which is protected by
+   *  claimMetaWriteManifestGrant), so without this, two concurrent
+   *  approve-all requests (a client retry, two tabs, two EB instances) could
+   *  both call dispatchAuthorizedMetaWrite for the same real Meta write
+   *  before either checkpoint lands. */
+  dispatchClaimedAt?: string;
 }
 
 export interface CreateApprovalDecisionRequest {
@@ -173,6 +190,8 @@ export interface CreateApprovalDecisionRequest {
   credentialAccountId?: string;
   originSessionId?: string;
   originCorrelator?: string;
+  /** Required — see ApprovalDecision.manifestId. */
+  manifestId: string;
   /** ISO timestamp. Required — every decision must have a real expiry (ticket
    *  point 1: "...expiry, evidence packet, exact options..."). */
   expiresAt: string;
@@ -240,6 +259,9 @@ function validateCreateRequest(request: CreateApprovalDecisionRequest): void {
   }
   if (typeof request.expiresAt !== 'string' || request.expiresAt.trim() === '') {
     throw new ApprovalInboxError('expiresAt must be a non-empty ISO timestamp');
+  }
+  if (typeof request.manifestId !== 'string' || request.manifestId.trim() === '') {
+    throw new ApprovalInboxError('manifestId must be a non-empty string — every decision belongs to a packet, even a packet of one');
   }
 
   const isCustomer = request.gateType === 'customer_credential' || request.gateType === 'customer_confirmation';
@@ -337,6 +359,7 @@ export class ApprovalInboxService {
       credentialAccountId: request.credentialAccountId,
       originSessionId: request.originSessionId,
       originCorrelator: request.originCorrelator,
+      manifestId: request.manifestId,
       createdAt: now,
       expiresAt: request.expiresAt,
       updatedAt: now,
@@ -505,6 +528,58 @@ export class ApprovalInboxService {
     return (result.Items as ApprovalDecision[] | undefined) ?? [];
   }
 
+  /**
+   * ENG-1853: a meta_write decision that's been individually claimed but is
+   * waiting on the REST of its manifest before the whole packet dispatches
+   * together — status only, deliberately does NOT touch executionResult
+   * (that field is reserved for the real, final dispatch outcome once the
+   * manifest-level orchestrator actually runs; writing a placeholder result
+   * here would misrepresent "nothing has executed yet" as if something had).
+   * Unconditional for the same reason recordExecutionResult below is —
+   * claimDecision already made the claim itself at-most-once.
+   */
+  async markDispatching(decisionId: string): Promise<void> {
+    await dynamodb
+      .update({
+        TableName: APPROVAL_DECISIONS_TABLE,
+        Key: { decisionId },
+        UpdateExpression: 'SET #status = :status, updatedAt = :now',
+        ConditionExpression: 'attribute_exists(decisionId)',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':status': 'dispatching', ':now': new Date().toISOString() },
+      })
+      .promise();
+  }
+
+  /**
+   * ENG-1853 review fix: at-most-once dispatch gate for the meta_write
+   * manifest executor (agentModeService.ts's
+   * buildApprovalInboxMetaWriteWorkflowSteps). A single atomic conditional
+   * update, guarded entirely by its own ConditionExpression — same shape as
+   * claimDecision above — so two concurrent drivers of the same manifest
+   * workflow run racing to execute() the same step can never both proceed to
+   * dispatchAuthorizedMetaWrite: exactly one wins this update, the other's
+   * ConditionalCheckFailedException tells its caller to back off instead of
+   * dispatching a real Meta write a second time.
+   */
+  async claimDispatch(decisionId: string): Promise<boolean> {
+    try {
+      await dynamodb
+        .update({
+          TableName: APPROVAL_DECISIONS_TABLE,
+          Key: { decisionId },
+          UpdateExpression: 'SET dispatchClaimedAt = :now, updatedAt = :now',
+          ConditionExpression: 'attribute_not_exists(dispatchClaimedAt)',
+          ExpressionAttributeValues: { ':now': new Date().toISOString() },
+        })
+        .promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return false;
+      throw error;
+    }
+  }
+
   /** Records the outcome of actually executing an approved decision (Phase D) —
    *  unconditional, since by this point claimDecision has already made this
    *  at-most-once; this just records what happened. */
@@ -591,6 +666,30 @@ export class ApprovalInboxService {
 
   async listPendingForCustomer(customerId: string, limit = 50): Promise<ApprovalDecision[]> {
     return this.listPendingByIndex('CustomerIndex', 'customerId', customerId, 'pending_customer_response', limit);
+  }
+
+  /**
+   * ENG-1853: every decision in one packet, any status — unlike
+   * listPendingByIndex's siblings above, this deliberately does NOT filter to
+   * a single pending status, because the caller's whole point is usually to
+   * check whether EVERY item in the manifest has already resolved (e.g. "is
+   * this packet fully approved yet?"), which requires seeing the resolved
+   * ones too. A manifest is small by construction (Haven's 5, Every's 7 —
+   * nothing like ApproverIndex/CustomerIndex's potentially-large history), so
+   * this is a single unpaginated query, not the bounded multi-page shape
+   * above.
+   */
+  async listByManifest(manifestId: string): Promise<ApprovalDecision[]> {
+    const result = await dynamodb
+      .query({
+        TableName: APPROVAL_DECISIONS_TABLE,
+        IndexName: 'ManifestIndex',
+        KeyConditionExpression: 'manifestId = :manifestId',
+        ExpressionAttributeValues: { ':manifestId': manifestId },
+        ScanIndexForward: true,
+      })
+      .promise();
+    return (result.Items as ApprovalDecision[] | undefined) ?? [];
   }
 
   /**
