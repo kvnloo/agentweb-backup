@@ -32,8 +32,13 @@ jest.mock('../config/aws', () => ({
   },
 }));
 
+jest.mock('../services/enigmaCardRevenueEnrichment', () => ({
+  isEnigmaEnrichmentEnabledForUser: jest.fn().mockReturnValue(false),
+}));
+
 import { Request, Response } from 'express';
 import { crmDb, userDb, orgDb } from '../services/db';
+import { isEnigmaEnrichmentEnabledForUser } from '../services/enigmaCardRevenueEnrichment';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { agentModeService } from '../services/agentModeService';
@@ -2587,6 +2592,80 @@ describe('CRM Routes', () => {
       expect(mockResponse.json).toHaveBeenCalledWith(
         expect.objectContaining({ message: 'Failed to upload CSV to storage' })
       );
+    });
+
+    // ENG-1388: card revenue is Enigma-licensed internal-use-only data. A CSV
+    // export leaves the system as a downloadable file, so it must never carry
+    // a card-revenue column/value for a requester who isn't Enigma-allowlisted
+    // — found live: the export route's only gate was list-editor access, with
+    // no allowlist awareness at all.
+    describe('card revenue exclusion (ENG-1388)', () => {
+      afterEach(() => {
+        (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(false);
+      });
+
+      it('excludes card-revenue columns and values for a non-allowlisted requester', async () => {
+        (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(false);
+        const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id', fieldNames: [] };
+        const mockLeads = [
+          {
+            leadId: 'lead1',
+            email: 'john@example.com',
+            customFields: { card_revenue_12m: '41999657', card_revenue_period_end: '2026-06-30', industry: 'Software' },
+          },
+        ];
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({ items: mockLeads, lastEvaluatedKey: null, hasMore: false });
+        (crmDb.updateLeadList as jest.Mock).mockResolvedValue({});
+        mockUploadFileToS3.mockResolvedValue({ success: true, url: 'https://s3.amazonaws.com/bucket/export.csv', key: 'export.csv' });
+
+        mockRequest.params = { listId: 'list1' };
+        mockRequest.body = {};
+        const handler = router.stack.find((r: any) =>
+          r.route?.path === '/lists/:listId/leads/export' && r.route?.methods?.post
+        );
+        if (handler && handler.route) {
+          await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+        }
+
+        const csvBuffer: Buffer = mockUploadFileToS3.mock.calls[0][0];
+        const csvContent = csvBuffer.toString('utf-8');
+        expect(csvContent).not.toContain('card_revenue_12m');
+        expect(csvContent).not.toContain('card_revenue_period_end');
+        expect(csvContent).not.toContain('41999657');
+        expect(csvContent).toContain('industry');
+        expect(csvContent).toContain('Software');
+      });
+
+      it('includes card-revenue columns and values for an allowlisted requester', async () => {
+        (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(true);
+        const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id', fieldNames: [] };
+        const mockLeads = [
+          {
+            leadId: 'lead1',
+            email: 'john@example.com',
+            customFields: { card_revenue_12m: '41999657', industry: 'Software' },
+          },
+        ];
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({ items: mockLeads, lastEvaluatedKey: null, hasMore: false });
+        (crmDb.updateLeadList as jest.Mock).mockResolvedValue({});
+        mockUploadFileToS3.mockResolvedValue({ success: true, url: 'https://s3.amazonaws.com/bucket/export.csv', key: 'export.csv' });
+
+        mockRequest.params = { listId: 'list1' };
+        mockRequest.body = {};
+        const handler = router.stack.find((r: any) =>
+          r.route?.path === '/lists/:listId/leads/export' && r.route?.methods?.post
+        );
+        if (handler && handler.route) {
+          await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+        }
+
+        const csvBuffer: Buffer = mockUploadFileToS3.mock.calls[0][0];
+        const csvContent = csvBuffer.toString('utf-8');
+        expect(csvContent).toContain('card_revenue_12m');
+        expect(csvContent).toContain('41999657');
+      });
     });
   });
 
