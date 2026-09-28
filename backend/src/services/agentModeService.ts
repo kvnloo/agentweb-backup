@@ -3012,6 +3012,10 @@ export class AgentModeService {
       adjustParamsForRetry: (error, retryParams) => {
         const affordableTokens = extractAffordableTokens(error);
         if (affordableTokens === null) return false;
+        // A key with truly zero balance left would still get rejected at
+        // max_tokens=1 (the retry's own floor below) — that's not a useful
+        // fallback, just a wasted attempt against the same rejection.
+        if (affordableTokens === 0) return false;
         if (typeof retryParams.max_tokens === 'number' && affordableTokens >= retryParams.max_tokens) return false;
         // Small safety margin: the provider's affordable estimate is a snapshot
         // at request time and can shift slightly if the account is being drawn

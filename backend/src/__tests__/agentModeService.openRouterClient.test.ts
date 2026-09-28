@@ -1315,6 +1315,23 @@ describe('callLLM insufficient-credits retry (ENG-2185)', () => {
     expect(create).toHaveBeenCalledTimes(1);
   });
 
+  // CodeRabbit (PR #3117): a key with truly zero balance left would still get
+  // rejected at max_tokens=1 (the retry's own floor) — retrying is a wasted
+  // attempt against the identical rejection, not a useful fallback.
+  it('does not retry when the provider reports zero affordable tokens', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockRejectedValue(creditError(100, 0));
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as unknown as OpenAI);
+
+    await expect(
+      service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }], { max_completion_tokens: 100 }),
+    ).rejects.toThrow(/requires more credits/i);
+
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
   it('is bounded by the same maxAttempts as every other retry path, not unbounded', async () => {
     const service = new AgentModeService();
     const create = jest.fn()
