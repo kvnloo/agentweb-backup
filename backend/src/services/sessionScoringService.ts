@@ -1373,7 +1373,7 @@ async function surfaceFailedRun(session: ChatSession): Promise<void> {
  * assistant output. There is nothing to send to the LLM judge, so we score it
  * 1/5 across all dimensions directly with an explanatory reason.
  */
-function buildFailedRunResult(messageCount: number): ScoringResult {
+export function buildFailedRunResult(messageCount: number): ScoringResult {
   return {
     score: 1,
     reason: FAILED_RUN_REASON,
@@ -1878,22 +1878,21 @@ async function retractJudgeScore(session: ChatSession, judgeId: string): Promise
   }
 }
 
-export async function scoreSessionWithJudgeIfNeeded(
-  session: ChatSession,
-  judge: ScoringJudge,
-  opts?: { force?: boolean }
-): Promise<NonNullable<ChatSession["judgeScores"]>[string] | null> {
-  const messageCount = session.messageCount ?? session.messages?.length ?? 0;
+/** Why a session is outside every judge's cohort; `retract` = drop a score it already carries. */
+export interface JudgeCohortExclusion {
+  reason: Extract<ScoringSkipReason, "no-user-message" | "no-task-session" | "publish-gate-withheld" | "test-run" | "blocked-external">;
+  retract: boolean;
+}
 
-  // ENG-2138: a shadow judge touches only its fixed sample — no model call, no write, no
-  // retraction outside it. `force` (one admin-chosen session) bypasses the sample.
-  if (judge.shadow && !opts?.force && !isInShadowSample(judge, session.sessionId)) {
-    return null;
-  }
-
+/**
+ * The custom-judge cohort rules of scoreSessionWithJudgeIfNeeded, as a pure function so offline
+ * replays (scripts/evalOutcomeJudge.ts) judge exactly the population production does (ENG-2138).
+ * Null means the session is in the cohort. Order matters and matches the original checks.
+ */
+export function judgeCohortExclusion(session: ChatSession): JudgeCohortExclusion | null {
   const userMessages = (session.messages || []).filter((m: any) => m.role === "user");
   if (userMessages.length < MIN_USER_MESSAGES) {
-    return null;
+    return { reason: "no-user-message", retract: false };
   }
 
   // No-task session (greeting-only, interruption, bare acknowledgement): no goal
@@ -1910,8 +1909,7 @@ export async function scoreSessionWithJudgeIfNeeded(
   // keeping it forever (scoring skips it from now on, so nothing would ever
   // overwrite it).
   if (isNoTaskSession(session.messages, session.pageIdentifier) && hasAssistantTurn(session.messages)) {
-    await retractJudgeScore(session, judge.id);
-    return null;
+    return { reason: "no-task-session", retract: true };
   }
 
   // A genuinely-withheld scheduled publish gate (ENG-995): pull it out of the
@@ -1920,15 +1918,14 @@ export async function scoreSessionWithJudgeIfNeeded(
   // same reasoning as isNoTaskSession above, so an existing divergent score is
   // retracted rather than kept forever.
   if (isPublishGateWithheldSession(session)) {
-    await retractJudgeScore(session, judge.id);
-    return null;
+    return { reason: "publish-gate-withheld", retract: true };
   }
 
   // Manual "Test this schedule" runs sort before blocked-external (CodeRabbit
   // local review on #2983): a Test: QA run that ends in a block report is a
   // test run, not a platform gap.
   if (isTestScheduledSession(session)) {
-    return null;
+    return { reason: "test-run", retract: false };
   }
 
   // ENG-1165: blocked by something outside the agent's control (unsigned-in
@@ -1938,7 +1935,55 @@ export async function scoreSessionWithJudgeIfNeeded(
   // the publish-gate hold above, so all judges agree and the platform gap
   // stays countable via the skip reason instead of hiding in goalCompletion.
   if (isBlockedExternalSessionForSession(session) && hasAssistantTurn(session.messages)) {
-    await retractJudgeScore(session, judge.id);
+    return { reason: "blocked-external", retract: true };
+  }
+
+  return null;
+}
+
+/**
+ * How an in-cohort session is scored: "in-flight" (skip for now, score later), "failed-run"
+ * (deterministic score 1, no model call) or "judge". Pure; shared with offline replays.
+ *
+ * Abandoned run recovered by the reconciler/backstop (ENG-764): the transcript ends
+ * on a run-failure placeholder, so the process died mid-flight and never emitted its
+ * final summary. The real work may have been correct, but this is an infra failure —
+ * score it as a deterministic failed run rather than feeding the (placeholder-stripped)
+ * truncated transcript to the LLM judge, which would mis-score it low for a "transcript
+ * that cuts off after a tool call". The reconciler already left the placeholder note.
+ * Still deferred within the grace window in case the reconciler's resume/retry is
+ * racing to continue the same session (ENG-479).
+ */
+export function judgeScoringPath(session: ChatSession): "in-flight" | "failed-run" | "judge" {
+  if (endsWithRunFailurePlaceholder(session.messages)) {
+    return classifyTurnlessSession(session) === "in-flight" ? "in-flight" : "failed-run";
+  }
+  if (!hasAssistantTurn(session.messages)) {
+    // No assistant turn yet: skip if still in-flight, flag as failed if stale.
+    return classifyTurnlessSession(session) === "in-flight" ? "in-flight" : "failed-run";
+  }
+  if (transcriptEndsMidToolLoop(session.messages)) {
+    return classifyTurnlessSession(session) === "in-flight" ? "in-flight" : "judge";
+  }
+  return "judge";
+}
+
+export async function scoreSessionWithJudgeIfNeeded(
+  session: ChatSession,
+  judge: ScoringJudge,
+  opts?: { force?: boolean }
+): Promise<NonNullable<ChatSession["judgeScores"]>[string] | null> {
+  const messageCount = session.messageCount ?? session.messages?.length ?? 0;
+
+  // ENG-2138: a shadow judge touches only its fixed sample — no model call, no write, no
+  // retraction outside it. `force` (one admin-chosen session) bypasses the sample.
+  if (judge.shadow && !opts?.force && !isInShadowSample(judge, session.sessionId)) {
+    return null;
+  }
+
+  const exclusion = judgeCohortExclusion(session);
+  if (exclusion) {
+    if (exclusion.retract) await retractJudgeScore(session, judge.id);
     return null;
   }
 
@@ -1968,40 +2013,15 @@ export async function scoreSessionWithJudgeIfNeeded(
     return null;
   }
 
-  // Abandoned run recovered by the reconciler/backstop (ENG-764): the transcript ends
-  // on a run-failure placeholder, so the process died mid-flight and never emitted its
-  // final summary. The real work may have been correct, but this is an infra failure —
-  // score it as a deterministic failed run rather than feeding the (placeholder-stripped)
-  // truncated transcript to the LLM judge, which would mis-score it low for a "transcript
-  // that cuts off after a tool call". The reconciler already left the placeholder note.
-  // Still deferred within the grace window in case the reconciler's resume/retry is
-  // racing to continue the same session (ENG-479).
-  let result: ScoringResult;
-  if (endsWithRunFailurePlaceholder(session.messages)) {
-    if (classifyTurnlessSession(session) === "in-flight") {
-      return null;
-    }
-    result = buildFailedRunResult(messageCount);
-  } else if (!hasAssistantTurn(session.messages)) {
-    // No assistant turn yet: skip if still in-flight, flag as failed if stale.
-    if (classifyTurnlessSession(session) === "in-flight") {
-      return null;
-    }
-    result = buildFailedRunResult(messageCount);
-  } else if (transcriptEndsMidToolLoop(session.messages)) {
-    if (classifyTurnlessSession(session) === "in-flight") {
-      return null;
-    }
-    result = await scoreSessionWithJudge(session.messages || [], messageCount, judge, session.sessionType, {
-      userId: session.userId,
-      sessionId: session.sessionId,
-    });
-  } else {
-    result = await scoreSessionWithJudge(session.messages || [], messageCount, judge, session.sessionType, {
-      userId: session.userId,
-      sessionId: session.sessionId,
-    });
-  }
+  const path = judgeScoringPath(session);
+  if (path === "in-flight") return null;
+  const result: ScoringResult =
+    path === "failed-run"
+      ? buildFailedRunResult(messageCount)
+      : await scoreSessionWithJudge(session.messages || [], messageCount, judge, session.sessionType, {
+          userId: session.userId,
+          sessionId: session.sessionId,
+        });
 
   // Backstop for zero-task phrasings the static lists cannot enumerate: the
   // judge itself reported that the user never asked for anything, so the

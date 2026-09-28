@@ -5,7 +5,11 @@
  * It lists the sessions last active in [--from, --to] that have a work plan (AdminUpdatedAtIndex
  * query), draws a seeded uniform sample, grades each deterministically, and judges only the
  * sessions with a success/failure label (never-engaged, zero-tool and unfinished runs are
- * excluded by the grader). It then prints how well the judge score separates them: ROC AUC with
+ * excluded by the grader). Each labelled session then goes through the same gates production
+ * applies before a custom judge (judgeCohortExclusion, judgeScoringPath): cohort exclusions are
+ * counted and dropped, and a failed run gets production's fixed score of 1 without a model call,
+ * so the numbers describe the population the shadow judge scores in production.
+ * It then prints how well the judge score separates them: ROC AUC with
  * a bootstrap CI, the share of 5s, the score histogram, mean score by label and per agent model.
  * The ticket's bar is AUC >= 0.75 and < 15% at 5 (ENG-1710 measured the original rubric B on
  * claude-sonnet-4.6 at 0.79 and 2.6%).
@@ -40,9 +44,15 @@ import {
 import { sampleUniform } from '../loops/eval/evalV2Sampler';
 import { LOOP_EVENTS_TABLE } from '../loops/core/sensors/eventTableEventSource';
 import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
-import type { ChatMessage } from '../services/chatbotService';
+import type { ChatMessage, ChatSession } from '../services/chatbotService';
 import { DEFAULT_OUTCOME_JUDGE_MODEL, buildOutcomeShadowJudgeRow } from '../services/outcomeJudge';
-import type { ScoringLlmCall } from '../services/sessionScoringService';
+import {
+  buildFailedRunResult,
+  judgeCohortExclusion,
+  judgeScoringPath,
+  scoreSessionWithJudge,
+  type ScoringLlmCall,
+} from '../services/sessionScoringService';
 import { SPEND_EVENTS_TABLE } from '../services/spendEventDb';
 
 const USAGE =
@@ -157,6 +167,47 @@ export function summarizeReplay(rows: readonly JudgedSession[]): ReplaySummary {
   };
 }
 
+export type ReplayOutcome =
+  | { kind: 'scored'; score: number; failedRun: boolean }
+  | { kind: 'cohort_excluded'; reason: string }
+  | { kind: 'in_flight' }
+  | { kind: 'judge_no_task' };
+
+/**
+ * One session through the same gates production applies before a custom judge scores it
+ * (scoreSessionWithJudgeIfNeeded): the cohort exclusions, then in-flight / failed-run / judge.
+ * A failed run takes production's deterministic score with no model call. Production-state
+ * checks (shadow sample, already scored) are left out: the replay judges every labelled session.
+ */
+export async function replaySession(
+  session: ChatSession,
+  judge: (session: ChatSession) => Promise<{ score: number; taskRequested?: boolean }>,
+): Promise<ReplayOutcome> {
+  const exclusion = judgeCohortExclusion(session);
+  if (exclusion) return { kind: 'cohort_excluded', reason: exclusion.reason };
+  const path = judgeScoringPath(session);
+  if (path === 'in-flight') return { kind: 'in_flight' };
+  if (path === 'failed-run') {
+    return { kind: 'scored', score: buildFailedRunResult(session.messages?.length ?? 0).score, failedRun: true };
+  }
+  const result = await judge(session);
+  return result.taskRequested === false ? { kind: 'judge_no_task' } : { kind: 'scored', score: result.score, failedRun: false };
+}
+
+/** The AW-ChatSessions attributes the cohort gates read (no message text is printed from them). */
+const GATE_ATTRIBUTES = ['sessionId', 'userId', 'createdAt', 'updatedAt', 'sessionType', 'pageIdentifier', 'title', 'publishAdmission'];
+
+async function readGateFields(reader: ReadOnlyDocReader, table: string, sessionId: string): Promise<DocItem | undefined> {
+  const page = await reader.query({
+    TableName: table,
+    KeyConditionExpression: '#k = :s',
+    ProjectionExpression: GATE_ATTRIBUTES.map((_, i) => `#a${i}`).join(', '),
+    ExpressionAttributeNames: { '#k': 'sessionId', ...Object.fromEntries(GATE_ATTRIBUTES.map((a, i) => [`#a${i}`, a])) },
+    ExpressionAttributeValues: { ':s': sessionId },
+  });
+  return page.Items?.[0];
+}
+
 function documentReader(): ReadOnlyDocReader {
   const doc = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || 'us-west-2' });
   return {
@@ -223,7 +274,6 @@ async function replay(args: Extract<Args, { mode: 'replay' }>): Promise<void> {
   const loaded = await loadSessionItems(reader, tables, drawn, { from: args.from, to: args.to, includeSpend: false });
   const graded = loaded.map((l) => gradeSession(l.session, l.model, undefined));
   const labelled = graded.filter((g) => g.task.verdict !== 'excluded');
-  const sessionTypeOf = new Map(drawn.map((item) => [String(item.sessionId), typeof item.sessionType === 'string' ? item.sessionType : undefined]));
 
   console.log(`Window ${args.from} .. ${args.to}: ${frame.length} sessions, ${withPlan.length} with a work plan, ${drawn.length} drawn (seed ${args.seed}).`);
   console.log(`Deterministic label: ${labelled.length} labelled (${labelled.filter((g) => g.task.verdict === 'success').length} success), ${graded.length - labelled.length} excluded.`);
@@ -235,16 +285,23 @@ async function replay(args: Extract<Args, { mode: 'replay' }>): Promise<void> {
   const judge = buildOutcomeShadowJudgeRow({ sampleRate: 1, model: args.model });
   const cost = { usd: 0 };
   const call = await unmeteredJudgeCall(cost);
-  const { scoreSessionWithJudge } = await import('../services/sessionScoringService');
   const rows: JudgedSession[] = [];
   const skipped: Record<string, number> = {};
   const note = (why: string) => { skipped[why] = (skipped[why] ?? 0) + 1; };
+  let failedRuns = 0;
   for (const g of labelled) {
     try {
-      const messages = await readMessages(reader, tables.messages, g.sessionId);
-      const result = await scoreSessionWithJudge(messages, messages.length, judge, sessionTypeOf.get(g.sessionId), { sessionId: g.sessionId }, call);
-      if (result.taskRequested === false) note('judge_no_task');
-      else rows.push({ success: g.task.verdict === 'success', score: result.score, model: g.model });
+      const [item, messages] = await Promise.all([
+        readGateFields(reader, tables.sessions, g.sessionId),
+        readMessages(reader, tables.messages, g.sessionId),
+      ]);
+      const session = { ...item, sessionId: g.sessionId, messages, messageCount: messages.length } as unknown as ChatSession;
+      const outcome = await replaySession(session, (s) =>
+        scoreSessionWithJudge(messages, messages.length, judge, s.sessionType, { sessionId: g.sessionId }, call));
+      if (outcome.kind === 'scored') {
+        if (outcome.failedRun) failedRuns++;
+        rows.push({ success: g.task.verdict === 'success', score: outcome.score, model: g.model });
+      } else note(outcome.kind === 'cohort_excluded' ? `cohort_excluded:${outcome.reason}` : outcome.kind);
     } catch (err) {
       // Error class only: a parse error message can quote the model's reply.
       note(err instanceof SyntaxError ? 'unparseable_reply' : err instanceof Error ? err.name : 'error');
@@ -252,7 +309,7 @@ async function replay(args: Extract<Args, { mode: 'replay' }>): Promise<void> {
   }
 
   const s = summarizeReplay(rows);
-  console.log(`\nJudged ${s.judged} (${s.successes} success) on ${args.model}; not scored: ${JSON.stringify(skipped)}; reported cost $${cost.usd.toFixed(2)}.`);
+  console.log(`\nScored ${s.judged} (${s.successes} success; ${failedRuns} failed runs at production's fixed 1, no model call) on ${args.model}; not scored: ${JSON.stringify(skipped)}; reported cost $${cost.usd.toFixed(2)}.`);
   console.log(`AUC vs deterministic success: ${fixed(s.auc)} ${s.aucCI ? `[95% CI ${fixed(s.aucCI.low)}-${fixed(s.aucCI.high)}]` : ''} (target >= ${TARGET_AUC})`);
   console.log(`Share at 5: ${pct(s.shareAt5)} (target < ${TARGET_MAX_SHARE_AT_5 * 100}%)   histogram 1..5: ${JSON.stringify(s.histogram)}`);
   console.log(`Mean score: success ${fixed(s.meanScore.success)} / failure ${fixed(s.meanScore.failure)}`);
