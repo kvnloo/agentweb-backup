@@ -86,6 +86,12 @@ emit() {
   printf 'base_sha=%s\n' "${BASE_SHA}"
 }
 
+# job_conclusion <jobs json> <job name> -> that job's conclusion, or "" if the
+# run has no job by that name (cancelled-while-pending runs have none).
+job_conclusion() {
+  printf '%s' "$1" | jq -r --arg name "$2" '[.jobs[] | select(.name == $name)][0].conclusion // ""'
+}
+
 # Captured separately from the assignment: under `set -uo pipefail` a command
 # substitution's status is only readable on its own line.
 RUNS="$(gh run list \
@@ -124,18 +130,15 @@ while IFS= read -r run_id; do
     continue
   fi
 
-  CONCLUSION="$(printf '%s' "${JOBS}" | jq -r --arg name "${DEPLOY_DETECT_JOB_NAME}" \
-    '[.jobs[] | select(.name == $name)][0].conclusion // ""')"
+  CONCLUSION="$(job_conclusion "${JOBS}" "${DEPLOY_DETECT_JOB_NAME}")"
 
   if [ "${CONCLUSION}" = 'success' ]; then
     # detect-changes succeeded, but that alone doesn't mean this run's own
     # deploys actually shipped. If backend-deploy or partner-deploy ran (i.e.
     # wasn't skipped by the filter) and then failed or was cancelled, this
     # run's head is not a trustworthy base -- see "The fix" above.
-    BACKEND_CONCLUSION="$(printf '%s' "${JOBS}" | jq -r --arg name "${DEPLOY_BACKEND_JOB_NAME}" \
-      '[.jobs[] | select(.name == $name)][0].conclusion // ""')"
-    PARTNER_CONCLUSION="$(printf '%s' "${JOBS}" | jq -r --arg name "${DEPLOY_PARTNER_JOB_NAME}" \
-      '[.jobs[] | select(.name == $name)][0].conclusion // ""')"
+    BACKEND_CONCLUSION="$(job_conclusion "${JOBS}" "${DEPLOY_BACKEND_JOB_NAME}")"
+    PARTNER_CONCLUSION="$(job_conclusion "${JOBS}" "${DEPLOY_PARTNER_JOB_NAME}")"
 
     if { [ "${BACKEND_CONCLUSION}" = 'failure' ] || [ "${BACKEND_CONCLUSION}" = 'cancelled' ]; } || \
        { [ "${PARTNER_CONCLUSION}" = 'failure' ] || [ "${PARTNER_CONCLUSION}" = 'cancelled' ]; }; then
@@ -151,9 +154,7 @@ while IFS= read -r run_id; do
       break
     fi
   fi
-done <<EOF
-${CANDIDATES}
-EOF
+done <<<"${CANDIDATES}"
 
 if [ "${RESOLVED}" != 'true' ]; then
   echo "[deploy-base-sha] no run in the last ${DEPLOY_BASE_LOOKBACK} completed with a successful '${DEPLOY_DETECT_JOB_NAME}' job; falling back to deploying every component unconditionally." >&2
