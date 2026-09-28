@@ -1447,6 +1447,19 @@ createTestAccount().then(async () => {
         console.error('[FailureReplayNightly] Failed to initialize:', error);
       }
 
+      // Offline eval suite on "needs eval" markers (ENG-2195) — hourly: when prompt/model/skill
+      // markers appeared since the last run, run the deterministic suite and record the verdict in
+      // Dev-AW-LoopEvents. Off unless EVAL_MARKER_SUITE_ENABLED=true.
+      try {
+        const { scheduleEvalMarkerSuite } = await import('./cron/evalMarkerSuiteCron');
+        scheduleEvalMarkerSuite({
+          isCronEnabled,
+          track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
+        });
+      } catch (error) {
+        console.error('[EvalMarkerSuite] Failed to initialize:', error);
+      }
+
       // Weekly Engineering Scoreboard — read-only backend replacement for the
       // laptop launchd job. Runs Mondays at 09:00 UTC, gated by
       // ENGINEERING_SCOREBOARD_LOOP_ENABLED=true. It reads Linear + Weave,
