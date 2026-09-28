@@ -39,6 +39,64 @@ describe('Schedules Controller', () => {
     app.use('/api/schedules', scheduleRoutes);
   });
 
+  describe('POST /api/schedules', () => {
+    const taskId = 'task-123';
+    const userId = 'test-user-1';
+    const otherUserId = 'test-user-2';
+
+    const mockTask = {
+      taskId,
+      userId,
+      name: 'Test Task',
+      prompt: 'Test prompt',
+      status: 'active',
+      createdAt: new Date().toISOString()
+    };
+
+    it('should create schedule when user owns the task', async () => {
+      mockTaskDb.getTaskById.mockResolvedValue(mockTask);
+      mockScheduleDb.createSchedule.mockResolvedValue(undefined);
+
+      const response = await request(app)
+        .post('/api/schedules')
+        .set('Authorization', 'Bearer test-token')
+        .send({ taskId, frequency: 'daily' });
+
+      expect(response.status).toBe(201);
+      expect(mockTaskDb.getTaskById).toHaveBeenCalledWith(taskId);
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalled();
+    });
+
+    it('should return 404 without creating a schedule when the task belongs to another user', async () => {
+      mockTaskDb.getTaskById.mockResolvedValue({
+        ...mockTask,
+        userId: otherUserId // Task owned by a different user
+      });
+
+      const response = await request(app)
+        .post('/api/schedules')
+        .set('Authorization', 'Bearer test-token')
+        .send({ taskId, frequency: 'daily' });
+
+      expect(response.status).toBe(404);
+      expect(response.body.error).toBe('Task not found');
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+    });
+
+    it('should return 404 without creating a schedule when the task does not exist', async () => {
+      mockTaskDb.getTaskById.mockResolvedValue(undefined);
+
+      const response = await request(app)
+        .post('/api/schedules')
+        .set('Authorization', 'Bearer test-token')
+        .send({ taskId, frequency: 'daily' });
+
+      expect(response.status).toBe(404);
+      expect(response.body.error).toBe('Task not found');
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+    });
+  });
+
   describe('GET /api/schedules/task/:taskId', () => {
     const taskId = 'task-123';
     const userId = 'test-user-1';
