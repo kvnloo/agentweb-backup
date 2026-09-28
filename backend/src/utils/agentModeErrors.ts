@@ -32,6 +32,31 @@ export function isContextLimitError(error: unknown): boolean {
   return CONTEXT_LIMIT_PATTERNS.some((pattern) => pattern.test(message) || pattern.test(originalMessage));
 }
 
+// ENG-2185: OpenRouter's admission control on a spend-limited key rejects a
+// request whose WORST-CASE cost (input tokens + requested max_tokens) exceeds
+// the remaining balance — even though actual usage is normally far less (see
+// AGENT_MODE_MAX_OUTPUT_TOKENS's own comment: "Models only emit what they
+// need"). The message names exactly how many tokens the remaining balance
+// covers, so capping max_tokens to that and retrying can still succeed
+// instead of hard-failing while the key sits well short of its configured
+// limit. This does not request any additional spend — it only avoids
+// over-asking against a budget that was already there.
+const INSUFFICIENT_CREDITS_PATTERN = /requires more credits.*can only afford (\d+)/is;
+
+/** The max_tokens value OpenRouter says the remaining balance affords, or null
+ * if `error` isn't this specific insufficient-credits shape. */
+export function extractAffordableTokens(error: unknown): number | null {
+  if (!error) return null;
+  const message = error instanceof Error ? error.message : String(error);
+  const originalMessage = typeof error === 'object' && error !== null && 'originalMessage' in error
+    ? String((error as { originalMessage: unknown }).originalMessage)
+    : '';
+  const match = message.match(INSUFFICIENT_CREDITS_PATTERN) || originalMessage.match(INSUFFICIENT_CREDITS_PATTERN);
+  if (!match) return null;
+  const affordable = Number(match[1]);
+  return Number.isFinite(affordable) && affordable >= 0 ? affordable : null;
+}
+
 export function isWorkerShutdownError(error: unknown): boolean {
   if (!error) return false;
   const message = error instanceof Error ? error.message : String(error);

@@ -496,7 +496,7 @@ import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } fro
 import { resolvePinnedPublicAddress, fetchBufferFollowingRedirects, assertPublicHostname, DEFAULT_MAX_IMAGE_BYTES } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
-import { isTransientLLMError } from '../utils/agentModeErrors';
+import { isTransientLLMError, extractAffordableTokens } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
 import { computeRunVerdict, type RunTerminalInfo } from '../loops/instances/agent-mode/runRecorder';
 // OTel spine (ENG-141) — inert no-ops unless exporter env config is present.
@@ -3095,6 +3095,28 @@ export class AgentModeService {
           : res;
       } catch (error) {
         lastError = error;
+        // ENG-2185: a spend-limited OpenRouter key rejects a request whose
+        // WORST-CASE cost (input + requested max_tokens) exceeds its remaining
+        // balance, even though actual usage is normally far less (see
+        // AGENT_MODE_MAX_OUTPUT_TOKENS's own comment). The error names exactly
+        // how many tokens the balance affords, so retry with max_tokens capped
+        // to that instead of hard-failing to the generic fallback — this asks
+        // for no additional spend, it just stops over-asking against what's
+        // already there. Not gated on isRetryableLlmCallError: this is a
+        // deterministic correction, not a "hope it clears" retry, so it
+        // doesn't need that classifier — it's still bounded by the same
+        // maxAttempts as every other branch of this loop.
+        const affordableTokens = extractAffordableTokens(error);
+        if (affordableTokens !== null && (typeof params.max_tokens !== 'number' || affordableTokens < params.max_tokens)) {
+          // Small safety margin: the provider's affordable estimate is a
+          // snapshot at request time and can shift slightly if the account is
+          // being drawn down concurrently by other in-flight calls.
+          params.max_tokens = Math.max(1, affordableTokens - 100);
+          console.warn(`AgentMode: OpenRouter call for model "${model}" was rejected for insufficient credits; retrying with max_tokens reduced to ${params.max_tokens}`, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          continue;
+        }
         if (attempt < maxAttempts && isRetryableLlmCallError(error)) {
           // Retry-After is only honored for scheduled calls (see maxAttempts
           // comment above) — an interactive/other caller keeps the original
