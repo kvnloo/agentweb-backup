@@ -59,6 +59,17 @@ import * as tasksImpl from './impl/tasks';
 // legal way to reach, so their delegating wrapper on the class is kept as the
 // call site instead of this module.
 import * as socialAccountsImpl from './impl/socialAccounts';
+// ENG-2103 (F2): LinkedIn posting & outreach tool cluster, same treatment as
+// booksImpl above — EXCEPT linkedin_outreach and linkedin_manage_post, which
+// still call `agentModeService.<method>` directly (see
+// emma/impl/linkedin.ts's module header): linkedinOutreach depends on
+// AgentModeService's private resolveEmployersForSizeFilter (a real
+// this.callLLM coupling), which this file has no legal way to reach, and
+// linkedinManagePost was kept entirely on the class (a sibling-method-spy
+// test-compatibility issue, not a callLLM one) — so their delegating
+// wrapper/native class method is kept as the call site instead of this
+// module.
+import * as linkedinImpl from './impl/linkedin';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -4912,7 +4923,7 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     // ENG-827: the context carries `assertPublishStillAuthorized`, which the handler
     // runs immediately before the post becomes real — see postOnConnectedAccount.
-    return await agentModeService.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context);
+    return await linkedinImpl.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context);
   }
 });
 
