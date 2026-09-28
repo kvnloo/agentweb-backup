@@ -2,7 +2,7 @@ import request from 'supertest';
 import express from 'express';
 import scheduleRoutes from '../routes/schedules';
 import { scheduleDb } from '../services/scheduleDb';
-import { taskDb, userDb } from '../services/db';
+import { taskDb, userDb, orgDb } from '../services/db';
 import { authenticateToken } from '../middleware/auth';
 
 // Mock the dependencies
@@ -14,6 +14,7 @@ const mockedAuthenticateToken = authenticateToken as jest.MockedFunction<typeof 
 const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
 const mockTaskDb = taskDb as jest.Mocked<typeof taskDb>;
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
+const mockOrgDb = orgDb as jest.Mocked<typeof orgDb>;
 
 let app: express.Application;
 
@@ -37,6 +38,95 @@ describe('Schedules Controller', () => {
     });
     
     app.use('/api/schedules', scheduleRoutes);
+  });
+
+  describe('POST /api/schedules', () => {
+    const taskId = 'task-123';
+    const userId = 'test-user-1';
+    const otherUserId = 'test-user-2';
+
+    const mockTask = {
+      taskId,
+      userId,
+      name: 'Test Task',
+      prompt: 'Test prompt',
+      status: 'active',
+      createdAt: new Date().toISOString()
+    };
+
+    it('should create schedule when user owns the task', async () => {
+      mockTaskDb.getTaskById.mockResolvedValue(mockTask);
+      mockUserDb.getUserById.mockResolvedValue({
+        userId,
+        email: 'test@example.com',
+        isAdmin: false
+      });
+      mockScheduleDb.createSchedule.mockResolvedValue(undefined);
+
+      const response = await request(app)
+        .post('/api/schedules')
+        .set('Authorization', 'Bearer test-token')
+        .send({ taskId, frequency: 'daily' });
+
+      expect(response.status).toBe(201);
+      expect(mockTaskDb.getTaskById).toHaveBeenCalledWith(taskId);
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalled();
+    });
+
+    it('should allow an admin to create a schedule for another user\'s task', async () => {
+      mockTaskDb.getTaskById.mockResolvedValue({
+        ...mockTask,
+        userId: otherUserId // Task owned by a different user
+      });
+      mockUserDb.getUserById.mockResolvedValue({
+        userId: 'admin-user',
+        email: 'admin@example.com',
+        isAdmin: true
+      });
+      mockScheduleDb.createSchedule.mockResolvedValue(undefined);
+
+      const response = await request(app)
+        .post('/api/schedules')
+        .set('Authorization', 'Bearer test-token')
+        .send({ taskId, frequency: 'daily' });
+
+      expect(response.status).toBe(201);
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalled();
+    });
+
+    it('should return 404 without creating a schedule when the task belongs to another user', async () => {
+      mockTaskDb.getTaskById.mockResolvedValue({
+        ...mockTask,
+        userId: otherUserId // Task owned by a different user
+      });
+      mockUserDb.getUserById.mockResolvedValue({
+        userId,
+        email: 'test@example.com',
+        isAdmin: false
+      });
+
+      const response = await request(app)
+        .post('/api/schedules')
+        .set('Authorization', 'Bearer test-token')
+        .send({ taskId, frequency: 'daily' });
+
+      expect(response.status).toBe(404);
+      expect(response.body.error).toBe('Task not found');
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+    });
+
+    it('should return 404 without creating a schedule when the task does not exist', async () => {
+      mockTaskDb.getTaskById.mockResolvedValue(undefined);
+
+      const response = await request(app)
+        .post('/api/schedules')
+        .set('Authorization', 'Bearer test-token')
+        .send({ taskId, frequency: 'daily' });
+
+      expect(response.status).toBe(404);
+      expect(response.body.error).toBe('Task not found');
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+    });
   });
 
   describe('GET /api/schedules/task/:taskId', () => {
@@ -633,6 +723,241 @@ describe('Schedules Controller', () => {
       expect(response.status).toBe(200);
       expect(response.body.length).toBe(2);
       expect(response.body).toEqual(schedulesByDifferentUsers);
+    });
+  });
+
+  describe('Org-share access (knowledgeBase feature)', () => {
+    const taskId = 'task-123';
+    const scheduleId = 'schedule-123';
+    const ownerId = 'task-owner';
+    const orgId = 'org-1';
+    const orgOwnerId = 'org-owner-id';
+
+    const mockTask = {
+      taskId,
+      userId: ownerId,
+      name: 'Test Task',
+      prompt: 'Test prompt',
+      status: 'active',
+      createdAt: new Date().toISOString()
+    };
+
+    const mockSchedule = {
+      scheduleId,
+      taskId,
+      userId: ownerId,
+      frequency: 'daily',
+      status: 'active',
+      nextRunTime: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    const asActingUser = (userId: string) => {
+      mockedAuthenticateToken.mockImplementation(async (req, res, next) => {
+        (req as any).user = { userId, email: `${userId}@example.com` };
+        next();
+        return undefined;
+      });
+    };
+
+    const orgSharingEnabled = () => ({
+      orgId,
+      ownerUserId: orgOwnerId,
+      shareSettings: { knowledgeBase: { enabled: true, editors: [] } }
+    });
+
+    const orgSharingDisabled = () => ({
+      orgId,
+      ownerUserId: orgOwnerId,
+      shareSettings: { knowledgeBase: { enabled: false, editors: [] } }
+    });
+
+    const orgWithEditor = (editorUserId: string) => ({
+      orgId,
+      ownerUserId: orgOwnerId,
+      shareSettings: { knowledgeBase: { enabled: false, editors: [editorUserId] } }
+    });
+
+    beforeEach(() => {
+      mockTaskDb.getTaskById.mockResolvedValue(mockTask);
+    });
+
+    it('createSchedule: org admin can schedule an org-mate\'s task when sharing is enabled', async () => {
+      const orgAdminId = 'org-admin';
+      asActingUser(orgAdminId);
+      mockUserDb.getUserById.mockImplementation(async (id: string) =>
+        id === orgAdminId
+          ? { userId: orgAdminId, email: 'a@example.com', isAdmin: false, orgId, orgRole: 'admin' as any }
+          : { userId: ownerId, email: 'o@example.com', isAdmin: false, orgId }
+      );
+      mockOrgDb.getOrgById.mockResolvedValue(orgSharingEnabled() as any);
+      mockScheduleDb.createSchedule.mockResolvedValue(undefined);
+
+      const response = await request(app)
+        .post('/api/schedules')
+        .set('Authorization', 'Bearer test-token')
+        .send({ taskId, frequency: 'daily' });
+
+      expect(response.status).toBe(201);
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalled();
+    });
+
+    it('createSchedule: a plain org member (not editor/admin) is still blocked even when sharing is enabled', async () => {
+      const memberId = 'org-plain-member';
+      asActingUser(memberId);
+      mockUserDb.getUserById.mockImplementation(async (id: string) =>
+        id === memberId
+          ? { userId: memberId, email: 'm@example.com', isAdmin: false, orgId, orgRole: 'member' as any }
+          : { userId: ownerId, email: 'o@example.com', isAdmin: false, orgId }
+      );
+      mockOrgDb.getOrgById.mockResolvedValue(orgSharingEnabled() as any);
+
+      const response = await request(app)
+        .post('/api/schedules')
+        .set('Authorization', 'Bearer test-token')
+        .send({ taskId, frequency: 'daily' });
+
+      // Viewing is fanned out to plain members when enabled, but editing (including
+      // scheduling) still requires org:content:manage or a listed editor.
+      expect(response.status).toBe(404);
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+    });
+
+    it('createSchedule: a listed editor can schedule the task even when the feature is otherwise disabled', async () => {
+      const editorId = 'org-editor';
+      asActingUser(editorId);
+      mockUserDb.getUserById.mockImplementation(async (id: string) =>
+        id === editorId
+          ? { userId: editorId, email: 'e@example.com', isAdmin: false, orgId, orgRole: 'member' as any }
+          : { userId: ownerId, email: 'o@example.com', isAdmin: false, orgId }
+      );
+      mockOrgDb.getOrgById.mockResolvedValue(orgWithEditor(editorId) as any);
+      mockScheduleDb.createSchedule.mockResolvedValue(undefined);
+
+      const response = await request(app)
+        .post('/api/schedules')
+        .set('Authorization', 'Bearer test-token')
+        .send({ taskId, frequency: 'daily' });
+
+      expect(response.status).toBe(201);
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalled();
+    });
+
+    it('getSchedulesByTaskId: a plain org member CAN view schedules when sharing is enabled', async () => {
+      const memberId = 'org-plain-member';
+      asActingUser(memberId);
+      mockUserDb.getUserById.mockResolvedValue({ userId: memberId, email: 'm@example.com', isAdmin: false, orgId });
+      mockOrgDb.getOrgById.mockResolvedValue(orgSharingEnabled() as any);
+      mockScheduleDb.getSchedulesByTaskId.mockResolvedValue([mockSchedule]);
+
+      const response = await request(app)
+        .get(`/api/schedules/task/${taskId}`)
+        .set('Authorization', 'Bearer test-token');
+
+      expect(response.status).toBe(200);
+      expect(mockScheduleDb.getSchedulesByTaskId).toHaveBeenCalledWith(taskId);
+    });
+
+    it('getSchedulesByTaskId: a plain org member is blocked when sharing is disabled', async () => {
+      const memberId = 'org-plain-member';
+      asActingUser(memberId);
+      mockUserDb.getUserById.mockResolvedValue({ userId: memberId, email: 'm@example.com', isAdmin: false, orgId });
+      mockOrgDb.getOrgById.mockResolvedValue(orgSharingDisabled() as any);
+
+      const response = await request(app)
+        .get(`/api/schedules/task/${taskId}`)
+        .set('Authorization', 'Bearer test-token');
+
+      expect(response.status).toBe(403);
+      expect(mockScheduleDb.getSchedulesByTaskId).not.toHaveBeenCalled();
+    });
+
+    it('updateSchedule: an org admin can update a schedule on an org-mate\'s task', async () => {
+      const orgAdminId = 'org-admin';
+      asActingUser(orgAdminId);
+      mockScheduleDb.getScheduleById.mockResolvedValue(mockSchedule);
+      mockUserDb.getUserById.mockImplementation(async (id: string) =>
+        id === orgAdminId
+          ? { userId: orgAdminId, email: 'a@example.com', isAdmin: false, orgId, orgRole: 'admin' as any }
+          : { userId: ownerId, email: 'o@example.com', isAdmin: false, orgId }
+      );
+      mockOrgDb.getOrgById.mockResolvedValue(orgSharingEnabled() as any);
+      mockScheduleDb.updateSchedule.mockResolvedValue(undefined);
+
+      const response = await request(app)
+        .put(`/api/schedules/${scheduleId}`)
+        .set('Authorization', 'Bearer test-token')
+        .send({ status: 'paused' });
+
+      expect(response.status).toBe(200);
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalled();
+    });
+
+    it('deleteSchedule: a listed editor can delete a schedule on an org-mate\'s task', async () => {
+      const editorId = 'org-editor';
+      asActingUser(editorId);
+      mockScheduleDb.getScheduleById.mockResolvedValue(mockSchedule);
+      mockUserDb.getUserById.mockImplementation(async (id: string) =>
+        id === editorId
+          ? { userId: editorId, email: 'e@example.com', isAdmin: false, orgId, orgRole: 'member' as any }
+          : { userId: ownerId, email: 'o@example.com', isAdmin: false, orgId }
+      );
+      mockOrgDb.getOrgById.mockResolvedValue(orgWithEditor(editorId) as any);
+      mockScheduleDb.deleteSchedule.mockResolvedValue(undefined);
+
+      const response = await request(app)
+        .delete(`/api/schedules/${scheduleId}`)
+        .set('Authorization', 'Bearer test-token');
+
+      expect(response.status).toBe(200);
+      expect(mockScheduleDb.deleteSchedule).toHaveBeenCalled();
+    });
+
+    it('createSchedule: a different org entirely stays blocked (cross-tenant, not just cross-user)', async () => {
+      const outsiderId = 'outsider-different-org';
+      asActingUser(outsiderId);
+      mockUserDb.getUserById.mockImplementation(async (id: string) =>
+        id === outsiderId
+          ? { userId: outsiderId, email: 'x@example.com', isAdmin: false, orgId: 'org-2', orgRole: 'admin' as any }
+          : { userId: ownerId, email: 'o@example.com', isAdmin: false, orgId }
+      );
+
+      const response = await request(app)
+        .post('/api/schedules')
+        .set('Authorization', 'Bearer test-token')
+        .send({ taskId, frequency: 'daily' });
+
+      // resolveTaskOrgContext only resolves an org when ownerOrgId === actingUser.orgId,
+      // so a same-privilege admin of a DIFFERENT org never even reaches orgDb.getOrgById.
+      expect(response.status).toBe(404);
+      expect(mockOrgDb.getOrgById).not.toHaveBeenCalled();
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+    });
+
+    it('createSchedule: an orgless (solo) task owner is never treated as if their task belongs to the acting admin\'s own org', async () => {
+      // Regression for a bug CodeRabbit caught on this PR: ownerOrgId must come
+      // ONLY from the task owner's own orgId. Falling back to the acting user's
+      // orgId when the owner has none would make a solo user's task look
+      // org-shared with whichever org the acting admin happens to belong to.
+      const soloOwnerId = 'solo-owner-no-org';
+      const orgAdminId = 'org-admin';
+      asActingUser(orgAdminId);
+      mockTaskDb.getTaskById.mockResolvedValue({ ...mockTask, userId: soloOwnerId });
+      mockUserDb.getUserById.mockImplementation(async (id: string) =>
+        id === orgAdminId
+          ? { userId: orgAdminId, email: 'a@example.com', isAdmin: false, orgId, orgRole: 'admin' as any }
+          : { userId: soloOwnerId, email: 's@example.com', isAdmin: false } // no orgId at all
+      );
+
+      const response = await request(app)
+        .post('/api/schedules')
+        .set('Authorization', 'Bearer test-token')
+        .send({ taskId, frequency: 'daily' });
+
+      expect(response.status).toBe(404);
+      expect(mockOrgDb.getOrgById).not.toHaveBeenCalled();
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
     });
   });
 });
