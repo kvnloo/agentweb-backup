@@ -338,6 +338,16 @@ app.use("/api/integrations/featurebase/webhook", express.raw({ type: "applicatio
 // WhatsApp Cloud API webhook: Meta signs the exact payload bytes as X-Hub-Signature-256,
 // so the HMAC must be computed over the raw Buffer, not a re-serialized parse (ENG-273).
 app.use("/api/webhooks/whatsapp", express.raw({ type: "application/json" }));
+// Unipile account_status webhook (ENG-1197): Unipile's deliveries do not carry a
+// Content-Type of exactly "application/json", so the global express.json() below
+// (which only parses when that type matches) leaves req.body empty, and the
+// request then falls through to express.urlencoded() — which parses the raw JSON
+// text as a single URL-encoded key with an empty value, logged forever as
+// "Malformed payload" (ENG-2180: confirmed in prod, 100% of deliveries across
+// every connected account, since this webhook was introduced). This route needs
+// no raw Buffer (auth is a plain shared header, not an HMAC over the body), so
+// force JSON parsing regardless of the declared content-type instead.
+app.use("/api/webhooks/unipile", express.json({ type: () => true, limit: "1mb" }));
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());
