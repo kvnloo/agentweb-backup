@@ -181,12 +181,16 @@ async function readMessages(reader: ReadOnlyDocReader, table: string, sessionId:
   return orderedMessages(rows) as unknown as ChatMessage[];
 }
 
-/** OpenRouter without the usage ledger (this script writes nothing); adds each call's reported cost to `cost.usd`. */
-function unmeteredJudgeCall(cost: { usd: number }): ScoringLlmCall {
+/**
+ * OpenRouter without the usage ledger (this script writes nothing); adds each call's reported
+ * cost to `cost.usd`. The client is created up front, so a missing key fails the run once
+ * instead of once per session.
+ */
+async function unmeteredJudgeCall(cost: { usd: number }): Promise<ScoringLlmCall> {
+  const { agentModeService } = await import('../services/agentModeService');
+  const { resolveOpenRouterUpstreamModelId } = await import('../utils/openRouterGatewayContract');
+  const client = await agentModeService.getOpenRouterClient();
   return async (model, messages, options) => {
-    const { agentModeService } = await import('../services/agentModeService');
-    const { resolveOpenRouterUpstreamModelId } = await import('../utils/openRouterGatewayContract');
-    const client = await agentModeService.getOpenRouterClient();
     const res = await client.chat.completions.create({
       model: resolveOpenRouterUpstreamModelId(model),
       messages,
@@ -230,7 +234,7 @@ async function replay(args: Extract<Args, { mode: 'replay' }>): Promise<void> {
 
   const judge = buildOutcomeShadowJudgeRow({ sampleRate: 1, model: args.model });
   const cost = { usd: 0 };
-  const call = unmeteredJudgeCall(cost);
+  const call = await unmeteredJudgeCall(cost);
   const { scoreSessionWithJudge } = await import('../services/sessionScoringService');
   const rows: JudgedSession[] = [];
   const skipped: Record<string, number> = {};
