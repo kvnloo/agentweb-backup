@@ -71,6 +71,17 @@ import * as socialAccountsImpl from './impl/socialAccounts';
 // module.
 import * as linkedinImpl from './impl/linkedin';
 import * as twitterImpl from './impl/twitter';
+// ENG-2103 (F2): Meta/LinkedIn ads APIs tool cluster. Only
+// callLinkedInMarketingApi/callLinkedInAdsInsightsApi are repointed directly
+// here — the other 7 entry points in this cluster (callMetaAdsInsightsApiWrapper,
+// listMetaAdsCampaignsNew, getMetaAdsMetrics, callMetaMarketingApi,
+// launchTargetedAudienceCampaign, launchRetargetingCampaign) all depend on
+// `AgentModeService`'s PRIVATE `getMetaCredentials` (and, for
+// callMetaMarketingApi/launchAudienceCampaign, several more private
+// methods) — this file has no legal way to construct their dependency
+// bags, so those keep calling `agentModeService.<method>` (the class's own
+// delegating wrapper, which injects the private dependencies internally).
+import * as adsApisImpl from './impl/adsApis';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -2274,7 +2285,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.callLinkedInMarketingApi(
+    return await adsApisImpl.callLinkedInMarketingApi(
       context?.userId,
       args.entity_type,
       args.action,
@@ -2358,7 +2369,7 @@ COMMON FIELDS: impressions, clicks, costInLocalCurrency, totalEngagements, video
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.callLinkedInAdsInsightsApi(
+    return await adsApisImpl.callLinkedInAdsInsightsApi(
       context?.userId,
       args.account_id,
       {
