@@ -12,8 +12,8 @@
  *   4. subscription 'trialing'                        → 'trialing'
  *   5. has open Deal (stage not Won/Lost)             → 'in_deal'
  *   6. has AW-Users record, no deal, no sub           → 'signed_up'
- *   7. has email                                      → 'inbox'
- *   8. domain-only, no email                          → 'unknown'
+ *   7. has email OR phone                              → 'inbox'
+ *   8. domain-only, no email and no phone             → 'unknown'
  *
  * The compute function is pure and deterministic. The applyAndUpdate wrapper
  * (async, injected persistors) reads signals, computes, and — if the lifecycle
@@ -36,6 +36,12 @@ export type LifecycleStage =
 
 export interface LifecycleSignals {
   email?: string | null;
+  /**
+   * ENG-2082: a phone-only capture is inbound and contactable. Without it the visibility
+   * fallback below returns 'unknown' — the junk bucket — for a lead the customer just paid
+   * an ad click for, and 'unknown' is excluded from the inbox views they actually work.
+   */
+  phone?: string | null;
   domain?: string | null;
   hasUserRecord?: boolean;
   subscriptionState?: SubscriptionState;
@@ -73,7 +79,7 @@ export function computeLifecycle(
   signals: LifecycleSignals,
   now: Date = new Date()
 ): LifecycleStage {
-  const { subscriptionState, hasUserRecord, email, domain, currentLifecycle } = signals;
+  const { subscriptionState, hasUserRecord, email, phone, domain, currentLifecycle } = signals;
   const activityAge = msAgo(signals.lastActivityAt, now);
   const usageAge = msAgo(signals.lastUsageAt, now);
 
@@ -104,6 +110,7 @@ export function computeLifecycle(
 
   // Rule 7 & 8: visibility fallback.
   if (email && email.trim()) return 'inbox';
+  if (phone && String(phone).trim()) return 'inbox';
   if (domain && domain.trim()) return 'unknown';
   return 'unknown';
 }

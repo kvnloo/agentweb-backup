@@ -8,7 +8,7 @@ import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
 import { parsePendingKinds } from '../utils/metaConversionPending';
-import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, LeadImportRowOutcome } from "../utils/leadSchema";
+import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, extractDomainFromEmail, defaultStatusConfigFor, isValidLeadLifecycle, LeadImportRowOutcome } from "../utils/leadSchema";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
@@ -820,6 +820,7 @@ export interface User {
 }
 
 export interface Organization {
+  modelRoles?: import('./modelRoles').ModelRoles;
   leadNotifications?: LeadNotificationsConfig;
   /**
    * Optimistic-concurrency counter for owner-losing operations. Absent until
@@ -5364,21 +5365,7 @@ export const crmDb = {
           autoDraftInstruction: typeof autoDraftInstruction === 'string' ? autoDraftInstruction.trim() : '',
           autoSendEnabled: autoSendEnabled === true, // Default: auto send disabled
           engagedOnly: false,
-          statusConfig: statusConfig || (listType === 'customers' ? [
-            { value: 'onboarding', label: 'Onboarding', color: 'blue', type: 'active' },
-            { value: 'active', label: 'Active', color: 'green', type: 'active' },
-            { value: 'at_risk', label: 'At Risk', color: 'yellow', type: 'active' },
-            { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
-          ] : [
-            { value: 'new', label: 'New', color: 'gray', type: 'active' },
-            { value: 'contacted', label: 'Contacted', color: 'blue', type: 'active' },
-            { value: 'qualified', label: 'Qualified', color: 'indigo', type: 'active' },
-            { value: 'proposal_sent', label: 'Proposal Sent', color: 'purple', type: 'active' },
-            { value: 'negotiating', label: 'Negotiating', color: 'yellow', type: 'active' },
-            { value: 'won', label: 'Won', color: 'green', type: 'won' },
-            { value: 'lost', label: 'Lost', color: 'red', type: 'lost' },
-            { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
-          ]),
+          statusConfig: statusConfig || defaultStatusConfigFor(listType),
           ...(listType ? { listType } : {}),
           ...(isSystemManaged ? { isSystemManaged: true } : {}),
         },
@@ -6524,6 +6511,7 @@ export const crmDb = {
       // isPrimary, dealIds[], accountOwnerUserId, expectedClose, closedDate.
       const crmFields = buildLeadCrmFields(emailValue, {
         domain: leadData.domain,
+        phone: leadData.phone,
         accountOwnerUserId: leadData.accountOwnerUserId,
         pocEmails: leadData.pocEmails,
         priority: leadData.priority,
@@ -7300,17 +7288,51 @@ export const crmDb = {
 
   async getLeadByHubSpotContactId(listId: string, contactId: string) {
     try {
-      const params: any = {
-        TableName: `${TABLE_PREFIX}AW-Leads`,
-        KeyConditionExpression: 'listId = :listId',
-        FilterExpression: 'syncMetadata.hubspot_contact_id = :contactId',
-        ExpressionAttributeValues: {
-          ':listId': listId,
-          ':contactId': contactId,
-        },
-      };
-      const result = await dynamodb.query(params).promise();
-      return result.Items?.[0] ?? null;
+      // PAGINATED, deliberately. There is no index on syncMetadata.hubspot_contact_id, so
+      // this is a partition Query with a FilterExpression — DynamoDB applies the filter
+      // AFTER reading, and caps each page at 1MB regardless. A single query therefore only
+      // searches the first ~1MB of the list: on any list bigger than that the match can sit
+      // on a later page and the caller gets null. For the reverse-sync callers that false
+      // negative is the whole bug they are trying to avoid — they would create a duplicate
+      // lead carrying a hubspot_contact_id that already exists on another row.
+      // BOUNDED, mirroring getLeadByAttioRecordId below. Unbounded, a MISS walks the whole
+      // list — and this now sits on the `||` fallback of every HubSpot webhook whose email
+      // lookup missed, which is the common case, once per linked list. A bulk import into a
+      // customer's HubSpot fires thousands of those.
+      const MAX_PAGES = 20;
+      let lastEvaluatedKey: any = undefined;
+      let pages = 0;
+      do {
+        const params: any = {
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          KeyConditionExpression: 'listId = :listId',
+          FilterExpression: 'syncMetadata.hubspot_contact_id = :contactId',
+          ExpressionAttributeValues: {
+            ':listId': listId,
+            ':contactId': contactId,
+          },
+          ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+        };
+        const result = await dynamodb.query(params).promise();
+        if (result.Items?.length) return result.Items[0];
+        lastEvaluatedKey = result.LastEvaluatedKey;
+        pages++;
+      } while (lastEvaluatedKey && pages < MAX_PAGES);
+      if (lastEvaluatedKey) {
+        // THROW, do not return null. A caller cannot tell "no such lead" from "I stopped
+        // looking" if both are null — and it acts on null by CREATING the lead, which mints
+        // the duplicate carrying an already-used hubspot_contact_id that this lookup exists
+        // to prevent. On a list big enough to need >20 filtered pages that is the likely
+        // outcome, not the unlikely one.
+        const err: any = new Error(
+          `getLeadByHubSpotContactId exhausted ${MAX_PAGES} pages in list ${listId} looking for ` +
+          `contact ${contactId} — cannot prove the lead is absent.`,
+        );
+        err.lookupExhausted = true;
+        console.warn(`[crmDb] ${err.message}`);
+        throw err;
+      }
+      return null;
     } catch (error) {
       handleDynamoDbError(error, "getLeadByHubSpotContactId");
       throw error;
@@ -7517,9 +7539,82 @@ export const crmDb = {
           // Only set email if it's not empty (GSI key cannot be empty string)
           setExpressions.push('email = :email');
           expressionAttributeValues[':email'] = emailValue;
+          // Derived from email, same as createLead does via buildLeadCrmFields and as
+          // setLeadFields now does. This path is the ORDINARY one — a person editing the
+          // lead, or any caller using updateLead — and it was left out of the first pass at
+          // this fix, which only covered the enrichment write. Caught by live-testing: a
+          // phone-only lead given an address came back with domain and lifecycle both null.
+          // Skipped when the caller states either explicitly.
+          // `domain` is a DynamoDB RESERVED KEYWORD and must go through a name
+          // placeholder. Unit tests cannot catch this — they mock dynamodb.update and never
+          // validate expression syntax — so the first version of this threw
+          // ValidationException against a real table and 500'd every lead update that
+          // carried an email. Same trap the `system` attribute is commented about above.
+          //
+          // The explicit-value arms below exist because these guards used to reference
+          // fields updateLead had no handler for: passing `domain` suppressed the
+          // derivation AND was silently dropped, so the caller got neither.
+          if ((updates as any).domain === undefined) {
+            const derivedDomain = extractDomainFromEmail(emailValue);
+            if (derivedDomain) {
+              expressionAttributeNames['#derivedDomainAttr'] = 'domain';
+              setExpressions.push('#derivedDomainAttr = :derivedDomain');
+              expressionAttributeValues[':derivedDomain'] = derivedDomain;
+            }
+          }
+          // NO lifecycle stamp here, deliberately. An earlier version wrote
+          // `lifecycle = if_not_exists(lifecycle, 'inbox')` alongside the domain
+          // derivation. That looked harmless and was not: askCrmService reads
+          // `lead.lifecycle ?? computeLifecycle(...)`, so a STORED value short-circuits the
+          // live computation — and nothing in production advances the stored one
+          // (lifecycleService.applyAndUpdate has no production callers). A lead with an
+          // open deal, once enriched with an email, would answer "inbox" where it had
+          // answered "in_deal".
+          //
+          // The justification for stamping it here was that a missing lifecycle made the
+          // row invisible to getLeadsByStatus — which is false; that function reads
+          // `status`. Creation still derives lifecycle (buildLeadCrmFields), which is
+          // pre-existing behaviour and has no prior value to freeze.
         } else {
           // Remove email attribute if it's being set to empty/null
           removeExpressions.push('email');
+        }
+      }
+
+      // Explicit domain / lifecycle. Without these, the guards in the email block above
+      // suppressed the derived value for a field that was then never written at all.
+      if ((updates as any).domain !== undefined) {
+        const domainValue = String((updates as any).domain ?? '').trim().toLowerCase();
+        if (domainValue) {
+          expressionAttributeNames['#domainAttr'] = 'domain';
+          setExpressions.push('#domainAttr = :domainAttr');
+          expressionAttributeValues[':domainAttr'] = domainValue;
+        } else {
+          expressionAttributeNames['#domainAttr'] = 'domain';
+          removeExpressions.push('#domainAttr');
+        }
+      }
+      if ((updates as any).lifecycle !== undefined) {
+        const lifecycleValue = String((updates as any).lifecycle ?? '').trim();
+        if (lifecycleValue) {
+          // Membership is checked HERE, not only at the route. createLead validates via
+          // buildLeadCrmFields and throws; before this handler existed a `lifecycle` key
+          // on an update was silently dropped, so nothing had to validate it. Now that it
+          // is written, an arbitrary string would become permanent for the lead —
+          // askCrmService reads `lead.lifecycle ?? computeLifecycle(...)`, so a stored
+          // junk value outranks the live computation forever.
+          if (!isValidLeadLifecycle(lifecycleValue)) {
+            throw new Error(`Invalid lead lifecycle: ${lifecycleValue}`);
+          }
+          expressionAttributeNames['#lifecycleAttr'] = 'lifecycle';
+          setExpressions.push('#lifecycleAttr = :lifecycleAttr');
+          expressionAttributeValues[':lifecycleAttr'] = lifecycleValue;
+        } else {
+          // Symmetry with `domain` directly above, which REMOVEs on empty. Clearing the
+          // attribute is the only way back to the computed value, and the previous
+          // version hit no branch at all: neither written nor cleared, silently.
+          expressionAttributeNames['#lifecycleAttr'] = 'lifecycle';
+          removeExpressions.push('#lifecycleAttr');
         }
       }
 
@@ -8404,6 +8499,44 @@ export const crmDb = {
           if (nameCompanyKey) {
             item.nameCompanyKey = nameCompanyKey;
           }
+
+          // ENG-2082 / ENG-2155: this path never derived either field. It never calls
+          // buildLeadCrmFields, so every lead created by the HubSpot pull, the Attio pull
+          // or a CSV import landed with no `domain` and no `lifecycle` — which is the
+          // `lifecycle is_empty` delete-filter footgun that justified deriving them on the
+          // single-lead path, left wide open on the path that creates most leads. The two
+          // creation paths now agree; the predicates below mirror buildLeadCrmFields
+          // exactly (leadSchema.ts) rather than re-deciding the rule here.
+          // DERIVED ONLY — a caller-supplied `domain`/`lifecycle` is ignored here, which
+          // is a deliberate divergence from createLead (it honours both via
+          // buildLeadCrmFields). Neither is in this function's input type, but
+          // crm.ts's bulk-import spreads `...rest` from the request body, so both can
+          // arrive at runtime. `lifecycle` is a one-way door — askCrmService reads
+          // `lead.lifecycle ?? computeLifecycle(...)`, so a stored value outranks the
+          // computation for the life of the lead — and accepting an unvalidated one from
+          // a bulk import is not a door worth opening. Pinned by test.
+          const derivedDomain = emailValue ? extractDomainFromEmail(emailValue) : null;
+          if (derivedDomain) {
+            item.domain = derivedDomain;
+          }
+          // NO lifecycle stamp — the same reasoning as updateLead and setLeadFields above,
+          // which this originally contradicted. An earlier version of this block wrote
+          // `lifecycle = 'inbox'` for any contactable lead, and that is worse here than
+          // anywhere else: this is the path the HubSpot pull, the Attio pull and CSV import
+          // use, so it creates most leads. askCrmService reads
+          // `lead.lifecycle ?? computeLifecycle(...)`, nothing in production advances a
+          // stored value (lifecycleService.applyAndUpdate has no production callers), and
+          // backfill-crm-scores.ts only writes `if (lead.lifecycle == null)` — so every
+          // bulk-imported lead would have answered "inbox" for the rest of its life, no
+          // matter what it became. Before this PR those rows stored nothing and were
+          // computed correctly; stamping them would have been a regression.
+          //
+          // `domain` above is different and is kept: it is derived once from the email and
+          // nothing recomputes it, so storing it cannot disagree with anything.
+          //
+          // The `lifecycle is_empty` delete-filter footgun that motivated stamping is real
+          // but is not solved by freezing the value — it needs the filter to evaluate the
+          // computed lifecycle. Tracked on ENG-2155.
 
           return {
             PutRequest: {
@@ -9835,9 +9968,61 @@ export const crmDb = {
         'lastName' in options.topLevel ||
         'company' in options.topLevel
       );
+    // EVERY key goes through a generated name placeholder. DynamoDB has ~570 reserved
+    // words and `domain` is one of them — a bare `SET domain = :x` throws
+    // ValidationException, which unit tests cannot see because they mock dynamodb.update
+    // and never validate expression syntax. That already shipped once from this file. An
+    // allowlist of "the reserved ones we remembered" is the same bug waiting; escaping
+    // unconditionally is the only version that cannot rot as callers add fields.
+    // The VALUE placeholder is generated too, not just the name. DynamoDB restricts a
+    // placeholder to [A-Za-z0-9_] after the colon, so the previous `:tl_${k}` produced a
+    // syntax ValidationException for any key carrying a `-`, `.` or space — the same class
+    // of failure, out of the same loop, that escaping the name was added to stop. No
+    // current caller passes such a key; indexing both halves means none ever can.
+    let tlIdx = 0;
     for (const [k, v] of Object.entries(options.topLevel ?? {})) {
-      attrValues[`:tl_${k}`] = v;
-      setClauses.push(ine ? `${k} = if_not_exists(${k}, :tl_${k})` : `${k} = :tl_${k}`);
+      const i = tlIdx++;
+      const nameRef = `#tl${i}`;
+      const valueRef = `:tl${i}`;
+      attrNames[nameRef] = k;
+      attrValues[valueRef] = v;
+      setClauses.push(
+        ine ? `${nameRef} = if_not_exists(${nameRef}, ${valueRef})` : `${nameRef} = ${valueRef}`,
+      );
+    }
+
+    // Same treatment as nameCompanyKey below: `domain` and `lifecycle` are DERIVED from
+    // email, and creation derives them via buildLeadCrmFields — which is called from
+    // exactly one place (createLead). Every later write of an email therefore left the row
+    // half-built: in email-index but with no domain and, worse, no lifecycle, so it was
+    // with neither, so nothing downstream that reads them can see it. ENG-2082 made this
+    // routine, because a phone-only lead starts with no email and enrichment is exactly
+    // what fills one in later.
+    //
+    // NB: an earlier version of this comment claimed the row becomes "invisible to
+    // getLeadsByStatus(listId, lifecycle)". That is wrong and worth not repeating —
+    // getLeadsByStatus queries the `status` attribute on listId-status-index and never
+    // reads `lifecycle` at all. sequences.ts:228 does pass a lifecycle value into it, but
+    // that is a separate defect (the two vocabularies are disjoint: status is
+    // contacted/new/qualified/…, lifecycle is inbox/signed_up), filed on its own.
+    if (options.topLevel && 'email' in options.topLevel && String(options.topLevel.email ?? '').trim()) {
+      if (!('domain' in options.topLevel)) {
+        const derivedDomain = extractDomainFromEmail(String(options.topLevel.email));
+        if (derivedDomain) {
+          // Name placeholder: `domain` is a DynamoDB reserved keyword. See updateLead.
+          attrNames['#derivedDomainAttr'] = 'domain';
+          attrValues[':derivedDomain'] = derivedDomain;
+          setClauses.push(
+            ine
+              ? '#derivedDomainAttr = if_not_exists(#derivedDomainAttr, :derivedDomain)'
+              : '#derivedDomainAttr = :derivedDomain',
+          );
+        }
+      }
+      // lifecycle is only ever BACKFILLED here, never rewritten: a lead already at paying
+      // or in_deal must not be knocked back to inbox just because its address changed.
+      // No lifecycle stamp — see the matching note in updateLead. A stored value
+      // short-circuits askCrmService's live computation and nothing advances it.
     }
 
     // Recompute nameCompanyKey when firstName/lastName/company is in topLevel.
@@ -11308,6 +11493,37 @@ export const orgDb = {
   // that has no updatedAt yet). An overlapping writer then surfaces as a
   // ConditionalCheckFailedException instead of a silent last-writer-wins
   // that erases the other writer's grants.
+  async updateModelRoles(
+    orgId: string,
+    settings: import('./modelRoles').ModelRoles,
+    expectedUpdatedAt: string | undefined,
+  ): Promise<string> {
+    const nowMs = Date.now();
+    const expectedMs = expectedUpdatedAt === undefined ? Number.NaN : Date.parse(expectedUpdatedAt);
+    // `updatedAt` is the compare-and-swap revision for this whole-document
+    // write. It must advance even when two writes land in the same millisecond
+    // (or this process's clock trails the stored revision), otherwise the next
+    // stale writer can match the old token and silently overwrite this write.
+    const nextUpdatedAt = new Date(
+      Number.isFinite(expectedMs) && expectedMs >= nowMs ? expectedMs + 1 : nowMs,
+    ).toISOString();
+    await dynamodb.update({
+      TableName: ORGS_TABLE,
+      Key: { orgId },
+      UpdateExpression: "SET modelRoles = :s, updatedAt = :u",
+      ConditionExpression:
+        expectedUpdatedAt !== undefined
+          ? "attribute_exists(orgId) AND updatedAt = :expected"
+          : "attribute_exists(orgId) AND attribute_not_exists(updatedAt)",
+      ExpressionAttributeValues: {
+        ":s": settings,
+        ":u": nextUpdatedAt,
+        ...(expectedUpdatedAt !== undefined ? { ":expected": expectedUpdatedAt } : {}),
+      },
+    }).promise();
+    return nextUpdatedAt;
+  },
+
   async updateShareSettings(
     orgId: string,
     settings: OrgShareSettings,
@@ -11707,6 +11923,13 @@ export const scheduleTemplateDb = {
 
 const OAUTH_SESSIONS_TABLE = `${TABLE_PREFIX}AW-OAuthSessions`;
 
+export interface PendingOAuthSession {
+  sessionId: string;
+  userId: string;
+  provider: 'hubspot' | 'fathom';
+  payload: unknown;
+}
+
 export const oauthSessionDb = {
   async save(session: {
     sessionId: string;
@@ -11718,7 +11941,7 @@ export const oauthSessionDb = {
     /** Scopes actually GRANTED, when the provider could tell us (ENG-629). */
     granted_scopes?: string[];
     flow: string;
-  }): Promise<void> {
+  } | PendingOAuthSession): Promise<void> {
     const TEN_MINUTES_SECONDS = 10 * 60;
     const ttl = Math.floor(Date.now() / 1000) + TEN_MINUTES_SECONDS;
     try {
@@ -11728,6 +11951,25 @@ export const oauthSessionDb = {
       }).promise();
     } catch (error) {
       handleDynamoDbError(error, 'oauthSessionDb.save');
+    }
+  },
+
+  /** Atomically return and burn a live provider session; TTL deletion is asynchronous. */
+  async consume(sessionId: string, userId: string, provider: PendingOAuthSession['provider']): Promise<PendingOAuthSession | null> {
+    try {
+      const result = await dynamodb.delete({
+        TableName: OAUTH_SESSIONS_TABLE,
+        Key: { sessionId },
+        ConditionExpression: 'userId = :userId AND #provider = :provider AND #ttl > :now',
+        ExpressionAttributeNames: { '#provider': 'provider', '#ttl': 'ttl' },
+        ExpressionAttributeValues: { ':userId': userId, ':provider': provider, ':now': Math.floor(Date.now() / 1000) },
+        ReturnValues: 'ALL_OLD',
+      }).promise();
+      return (result.Attributes as PendingOAuthSession | undefined) ?? null;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return null;
+      handleDynamoDbError(error, 'oauthSessionDb.consume');
+      throw error;
     }
   },
 

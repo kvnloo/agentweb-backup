@@ -5,6 +5,16 @@ export type EntityType = 'company' | 'person';
 export type EnrichmentCacheSource = 'web_search' | 'linkedin' | 'existing_data';
 
 export interface LeadInfo {
+  /**
+   * Tenant scope for the WEAK person key below; the strong email key stays global on
+   * purpose, because two rows sharing an address really are the same person and the
+   * cached profile is the same profile. `listId` is the fallback and is always present
+   * (it is the table's partition key) — measured against production, 11.9% of AW-Leads
+   * rows carry no userId, so scoping on userId alone would have silently disabled this
+   * cache for one lead in eight.
+   */
+  userId?: string;
+  listId?: string;
   email?: string;
   company?: string;
   website?: string;
@@ -204,13 +214,32 @@ export function buildPersonCanonicalKey(lead: LeadInfo): string | null {
     return `person:${lead.email.trim().toLowerCase()}`;
   }
 
-  // Priority 2: domain (from website or company) + normalized full name
+  // Priority 2: domain (from website or company) + normalized full name.
+  //
+  // TENANT-SCOPED, unlike priority 1. `person:<domain>:<name>` is a guess at identity, not
+  // a proof of one — two different people called John Smith at two different customers'
+  // "Acme" collapse onto it. AW-EnrichmentRawCache is keyed on canonicalId + fieldGroup
+  // with no tenant dimension (db.ts:9530), so one customer's cached LinkedIn profile blob
+  // was served to another customer's unrelated lead for the 90-day TTL. ENG-2082 made the
+  // weak branch far more common: a phone-only capture has no email, so it can never reach
+  // priority 1.
+  //
+  // Scope prefers userId and falls back to listId — a list belongs to one customer, so
+  // either bounds the blast radius. With neither we do not cache at all rather than share
+  // globally: a cache miss costs a provider call, a wrong hit costs someone else's data.
   const domain =
     (lead.website ? extractDomainFromUrl(lead.website) : null) ??
     normalizeCompanyName(lead.company ?? '');
   const name = normalizeName(`${lead.firstName ?? ''} ${lead.lastName ?? ''}`);
 
-  if (domain && name) return `person:${domain}:${name}`;
+  if (domain && name) {
+    const owner =
+      (typeof lead.userId === 'string' && lead.userId.trim()) ||
+      (typeof lead.listId === 'string' && lead.listId.trim()) ||
+      '';
+    if (!owner) return null;
+    return `person:u:${owner}:${domain}:${name}`;
+  }
 
   return null;
 }

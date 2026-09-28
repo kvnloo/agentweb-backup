@@ -133,7 +133,27 @@ async function handleHubSpotEvent(
     // can't resolve its email. Find the lead by stored hubspot_contact_id instead.
     if (data.isDeleted) {
       if (config.deleteOnPull) {
-        const lead = await crmDb.getLeadByHubSpotContactId(listId, objectId);
+        // THIRD call site. The other two catch `lookupExhausted`; this one did not, and an
+        // uncaught throw here does not just skip this contact — it escapes
+        // handleHubSpotEvent into the fire-and-forget wrapper, abandoning every remaining
+        // objectId in the same batch. HubSpot already has its 200, so nothing retries and
+        // those events are gone. Before the cap started throwing this returned null and the
+        // loop simply moved on, which is the behaviour restored here.
+        let lead: any = null;
+        try {
+          lead = await crmDb.getLeadByHubSpotContactId(listId, objectId);
+        } catch (lookupErr: any) {
+          // Same reasoning as the property-change branch, and the same blast radius as
+          // before: a throw here escapes handleHubSpotEvent into the fire-and-forget
+          // wrapper and abandons every remaining objectId in this delivery — HubSpot
+          // already has its 200, so nothing retries. The previous version only caught the
+          // page-cap case, so a throttle still took the whole batch down.
+          const why = lookupErr?.lookupExhausted
+            ? lookupErr.message
+            : `contact-id lookup failed (${lookupErr?.message || lookupErr})`;
+          console.warn(`[CrmWebhook/HubSpot] ${why} — cannot confirm which lead objectId=${objectId} refers to; not deleting.`);
+          continue;
+        }
         console.log(`[CrmWebhook/HubSpot] deletion lookup for objectId=${objectId}: lead=${lead?.leadId ?? 'not found'}`);
         if (lead) {
           await crmDb.deleteLead(listId, lead.leadId);
@@ -180,7 +200,34 @@ async function handleHubSpotEvent(
     }
     leadFields.syncMetadata = { hubspot_contact_id: objectId };
 
-    const lead = await crmDb.getLeadByEmail(listId, email.toLowerCase());
+    // Email first, then the contact id we stored when WE pushed this lead. Email alone is
+    // not an identity for a lead that has none — an ENG-2082 lead syncs to HubSpot with a
+    // hubspot_contact_id and no address, so once HubSpot returns one this missed and
+    // created a SECOND row carrying the same hubspot_contact_id. Worse here than in
+    // webhooks.ts: that path at least gates creation on data.isCreation, this one does not,
+    // so a bare property change was enough to duplicate the lead.
+    let lead = await crmDb.getLeadByEmail(listId, email.toLowerCase());
+    if (!lead) {
+      try {
+        lead = await crmDb.getLeadByHubSpotContactId(listId, String(objectId));
+      } catch (lookupErr: any) {
+        // ANY failure here means we could not prove the lead is absent, and this path has
+        // no isCreation gate — falling through to `if (!lead) createLead` mints a second
+        // row carrying an already-used hubspot_contact_id, which is the exact duplicate
+        // this lookup exists to prevent.
+        //
+        // `lookupExhausted` is only the page-cap case. A throttle, a timeout or anything
+        // handleDynamoDbError rethrows used to land on `lead = null` and create — under
+        // precisely the load the cap was designed for, since a bulk import into the
+        // customer's HubSpot fires thousands of these, each missing on email and walking
+        // the partition. Skipping loses an edit; creating corrupts the list.
+        const why = lookupErr?.lookupExhausted
+          ? lookupErr.message
+          : `contact-id lookup failed (${lookupErr?.message || lookupErr})`;
+        console.warn(`[CrmWebhook/HubSpot] ${why} — skipping objectId=${objectId}`);
+        continue;
+      }
+    }
 
     if (!lead) {
       // New contact in HubSpot — create it in our list
@@ -197,7 +244,12 @@ async function handleHubSpotEvent(
         : undefined;
 
       const updates: Record<string, any> = { ...leadFields };
-      delete updates.email;
+      // Keep the address ONLY when the lead does not already have one — i.e. when it was
+      // resolved by hubspot_contact_id, which is exactly the case this delete was written
+      // before. Dropping it unconditionally assumed "we found it BY email, so email already
+      // matches"; the contact-id fallback broke that assumption and left the row
+      // permanently address-less.
+      if (lead?.email) delete updates.email;
       delete updates.syncMetadata;
       delete updates.customFields;
       if (mergedCustomFields) updates.customFields = mergedCustomFields;

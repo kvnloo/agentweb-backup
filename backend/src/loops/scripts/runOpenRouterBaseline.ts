@@ -1,3 +1,4 @@
+import { OPENROUTER_PROVIDER_PREFERENCES } from '../../services/agentMode/openRouterRequestParams';
 /**
  * Execute ENG-1423's synthetic incumbent-model baseline fixtures.
  *
@@ -91,7 +92,7 @@ async function executeFixture(
   client: any,
   fetchDetail: (generationId: string, timeoutMs?: number) => Promise<GenerationDetailResponse>,
 ): Promise<BaselineArtifact> {
-  const request = buildBaselineRequest(fixture, logicalModel);
+  const request = { ...buildBaselineRequest(fixture, logicalModel), provider: OPENROUTER_PROVIDER_PREFERENCES };
   let responseId: string | undefined;
   const artifact = await observeBaselineFixture(fixture.fixtureId, logicalModel, async () => {
     const response: any = await client.chat.completions.create(request, { timeout: 45_000, maxRetries: 0 });

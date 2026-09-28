@@ -33,6 +33,7 @@
 
 import * as crypto from 'crypto';
 import { isSmokeTestLead } from '../utils/smokeTestLead';
+import { defaultStatusConfigFor } from '../utils/leadSchema';
 
 export type LeadStatusType = 'active' | 'won' | 'lost' | 'churned';
 
@@ -59,16 +60,17 @@ export const META_WON_NO_VALUE_EVENT = 'CRMWonDeal';
  *  statusConfig existed (or created without one). Kept in sync deliberately: a list with
  *  no config still has statuses, and treating it as "no conversions possible" would
  *  silently relay nothing for exactly the oldest accounts. */
-const DEFAULT_LEAD_STATUS_CONFIG: LeadStatusConfigEntry[] = [
-  { value: 'new', label: 'New', color: 'gray', type: 'active' },
-  { value: 'contacted', label: 'Contacted', color: 'blue', type: 'active' },
-  { value: 'qualified', label: 'Qualified', color: 'indigo', type: 'active' },
-  { value: 'proposal_sent', label: 'Proposal Sent', color: 'purple', type: 'active' },
-  { value: 'negotiating', label: 'Negotiating', color: 'yellow', type: 'active' },
-  { value: 'won', label: 'Won', color: 'green', type: 'won' },
-  { value: 'lost', label: 'Lost', color: 'red', type: 'lost' },
-  { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
-];
+// Sourced from leadSchema, which is where createLeadList and getLeadListStatuses also
+// read it — this was a fourth hand-maintained copy of the same eight statuses.
+//
+// KNOWN GAP, deliberately not closed here: this resolves the PROSPECT default because
+// mapStatusToMetaEvent is not given the list's `listType`. A customers list with no
+// stored statusConfig therefore reads `onboarding/active/at_risk/churned` everywhere else
+// and `new/contacted/qualified/...` here. Threading listType through `ctx` is a behaviour
+// change on the revenue-relay path and belongs in its own PR, not slipped into this one.
+// Before this de-duplication all four copies agreed — and all four were equally wrong for
+// a customers list — so nothing regresses by centralising the literal.
+const DEFAULT_LEAD_STATUS_CONFIG = defaultStatusConfigFor() as LeadStatusConfigEntry[];
 
 const normalize = (value: unknown): string =>
   typeof value === 'string' ? value.trim().toLowerCase().replace(/[\s-]+/g, '_') : '';
