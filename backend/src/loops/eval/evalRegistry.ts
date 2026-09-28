@@ -88,6 +88,18 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
     notes: 'Its prompt is byte-identical to default-scoring-prompt on the same model (sha256 4507a38770f1, 2026-09-25), so it is not an independent judge: agreement between it and the general judge carries no signal.',
   },
   {
+    id: 'session-judge-outcome-b-shadow',
+    surface: 'agent',
+    graderType: 'llm_judge',
+    measures: 'Session outcome 1-5 (was the requested task delivered, with evidence) with goalCompletion/dataAccuracy/outputQuality; rationale before score; ENG-1714 rubric B (reconstructed text)',
+    source: 'services/outcomeJudge.ts (rubric, sampling, model guard) via services/sessionScoringService.ts custom-judge path; AW-Settings scoring-judges row outcome-judge-b-shadow (OPS-1, ENG-2146); offline scripts/evalOutcomeJudge.ts',
+    model: 'anthropic.claude-sonnet-4-6 via OpenRouter (row llmModel; Google models refused)',
+    modelFamily: 'claude',
+    consumers: ['AW-ChatSessions.judgeScores[outcome-judge-b-shadow] (shadow: true, sampled)', 'scripts/evalOutcomeJudge.ts (offline, read-only)'],
+    knownIssues: ['ENG-1710', 'ENG-1714', 'ENG-2138'],
+    notes: 'Shadow (D1): never writes satisfactionScore, runs only on its sampleRate share of sessions, metered as system spend (outcome_judge_shadow). Off until OPS-1 appends the row. ENG-1710 measured the original rubric B at AUC 0.79 vs relaxed completion with 2.6% at 5; this reconstructed text is not yet re-measured.',
+  },
+  {
     id: 'finalize-guard',
     surface: 'agent',
     graderType: 'llm_judge',
