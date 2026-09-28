@@ -112,8 +112,9 @@ the Daily Satisfaction Score Report schedule stays paused.
 golden-set agreement and Okareo checks with a versioned baseline (`loops/eval/baselines/*.json`) and
 prints pass / regression / unavailable. It fails closed on any evaluator problem. A metric may block
 only when its grader passes `mayGate` and `EVAL_GATE_BLOCKING=true`, so today it is report-only.
-Prompt, model and skill edits in AW-Settings / AW-Skills write `eval_needed` markers
-(`Dev-AW-LoopEvents`, loopId `eval-gate`). Details: `docs/evals/OFFLINE_EVAL_GATE.md`.
+Prompt, model and skill edits in AW-Settings / AW-Skills make a best-effort write of an `eval_needed`
+marker (`Dev-AW-LoopEvents`, loopId `eval-gate`); a failed marker write never fails the edit, so that
+edit is then missing from the marker feed. Details: `docs/evals/OFFLINE_EVAL_GATE.md`.
 
 ## Known false-positive catalogue (session judges)
 

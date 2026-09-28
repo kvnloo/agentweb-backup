@@ -79,8 +79,8 @@ time, and the verdict is not changed. Paste that output into the PR or the ticke
   (`settingsService`) records a marker. So does every admin skill create, update, delete, approve or sync
   that touches `systemPrompt`, `toolNames`, `llmModel`, `isPublished` or `maxIterations`. Each marker is
   one `eval_needed` row in `Dev-AW-LoopEvents` (loopId `eval-gate`). It holds the setting name or skill
-  id, the change kind and a 12-character sha256 of the new value, never the text. The marker never
-  blocks the write. `--changes-since <iso>` lists the markers; `EVAL_CHANGE_MARKERS_ENABLED=false` turns
+  id, the change kind and a 12-character sha256 of the new value, never the text. The marker write is
+  best-effort: it never blocks the edit, and a failed marker write leaves that edit out of the feed. `--changes-since <iso>` lists the markers; `EVAL_CHANGE_MARKERS_ENABLED=false` turns
   them off.
 
 ## Suite inventory (ENG-782 AC3 and AC4)
