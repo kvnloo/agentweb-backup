@@ -5375,15 +5375,20 @@ export class AgentModeService {
           const guardOutcome = await runFinalizeGuard({
             finalText: content,
             ledger: finalizeLedger,
+            // Shadow never makes the corrective turn: its text would be discarded.
+            detectOnly: finalizeGuardMode === 'shadow',
             ports: {
-              // ENG-1858: attributed to this run's user/billing subject.
+              // ENG-1858: enforce mode is attributed to this run's user/billing subject.
+              // Shadow mode is our own measurement, so it is system spend (no userId).
               judgeExtractClaims: (text, candidateClasses) =>
-                this.judgeFinalizeClaims(text, candidateClasses, {
-                  userId,
-                  billingUserId,
-                  sessionId,
-                  feature: meteringFeature('finalize_guard_judge', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)),
-                }),
+                this.judgeFinalizeClaims(text, candidateClasses, finalizeGuardMode === 'shadow'
+                  ? { sessionId, feature: 'finalize_guard_shadow_judge' }
+                  : {
+                    userId,
+                    billingUserId,
+                    sessionId,
+                    feature: meteringFeature('finalize_guard_judge', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)),
+                  }),
               requestCorrection: ({ finalText, systemNote }) =>
                 this.requestFinalizeCorrection(finalText, systemNote, llmModel, {
                   userId,
@@ -5406,33 +5411,31 @@ export class AgentModeService {
               ambiguousClaimClasses: guardOutcome.ambiguousClaimClasses,
             });
           }
-          if (guardOutcome.finalText !== content) {
-            if (finalizeGuardMode === 'shadow') {
-              // Shadow mode: log what WOULD have changed, but the user-visible
-              // message and the persisted transcript are left untouched.
-              console.warn(`AgentMode: finalize guard SHADOW ${guardOutcome.action} in session ${sessionId} (message NOT modified)`, {
-                claimClasses: guardOutcome.mismatchedClaimClasses,
-              });
-            } else {
-              console.warn(`AgentMode: finalize guard ${guardOutcome.action} in session ${sessionId}`, {
-                claimClasses: guardOutcome.mismatchedClaimClasses,
-              });
-              content = guardOutcome.finalText;
-              // Keep the persisted transcript consistent with what the user sees:
-              // correct the LAST assistant message in place (same message count) and
-              // stamp guard metadata so the correction is auditable in the session.
-              for (let i = messages.length - 1; i >= 0; i--) {
-                if ((messages[i] as any).role === 'assistant') {
-                  (messages[i] as any).content = content;
-                  (messages[i] as any).metadata = {
-                    ...(messages[i] as any).metadata,
-                    finalizeGuard: {
-                      action: guardOutcome.action,
-                      claimClasses: guardOutcome.mismatchedClaimClasses,
-                    },
-                  };
-                  break;
-                }
+          if (guardOutcome.action === 'detected_mismatch') {
+            // Shadow mode: report the mismatch; the user-visible message and the
+            // persisted transcript are left untouched.
+            console.warn(`AgentMode: finalize guard SHADOW ${guardOutcome.action} in session ${sessionId} (message NOT modified)`, {
+              claimClasses: guardOutcome.mismatchedClaimClasses,
+            });
+          } else if (guardOutcome.finalText !== content) {
+            console.warn(`AgentMode: finalize guard ${guardOutcome.action} in session ${sessionId}`, {
+              claimClasses: guardOutcome.mismatchedClaimClasses,
+            });
+            content = guardOutcome.finalText;
+            // Keep the persisted transcript consistent with what the user sees:
+            // correct the LAST assistant message in place (same message count) and
+            // stamp guard metadata so the correction is auditable in the session.
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if ((messages[i] as any).role === 'assistant') {
+                (messages[i] as any).content = content;
+                (messages[i] as any).metadata = {
+                  ...(messages[i] as any).metadata,
+                  finalizeGuard: {
+                    action: guardOutcome.action,
+                    claimClasses: guardOutcome.mismatchedClaimClasses,
+                  },
+                };
+                break;
               }
             }
           }
