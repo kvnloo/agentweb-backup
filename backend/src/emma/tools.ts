@@ -50,6 +50,15 @@ import * as blogImpl from './impl/blog';
 import * as workPlansImpl from './impl/workPlans';
 // ENG-2103 (F2): task management tool cluster, same treatment as booksImpl above.
 import * as tasksImpl from './impl/tasks';
+// ENG-2103 (F2): social posts & connected-account analytics tool cluster, same
+// treatment as booksImpl above — EXCEPT get_post_analytics,
+// list_connected_account_posts, and load_connected_account_metrics, which
+// still call `agentModeService.<method>` directly (see
+// emma/impl/socialAccounts.ts's module header): those 3 methods depend on
+// AgentModeService's private resolveAccessibleAccount, which this file has no
+// legal way to reach, so their delegating wrapper on the class is kept as the
+// call site instead of this module.
+import * as socialAccountsImpl from './impl/socialAccounts';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -3204,7 +3213,7 @@ emmaToolRegistry.register({
     // Note: The backend createSocialMediaPosts currently expects an array of posts.
     // If the tool is supposed to generate them first, we might need a middle layer.
     // For now, mirroring the existing (buggy?) behavior but ensuring we pass sessionId.
-    return await agentModeService.createSocialMediaPosts(args.posts, context?.userId, context?.sessionId);
+    return await socialAccountsImpl.createSocialMediaPosts(args.posts, context?.userId, context?.sessionId);
   }
 });
 
@@ -4810,7 +4819,7 @@ If asked to try something in "the test account", choose by test_account. If none
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listConnectedAccounts(context?.userId, args.platform);
+    return await socialAccountsImpl.listConnectedAccounts(context?.userId, args.platform);
   }
 });
 
@@ -5182,7 +5191,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getTaskSubscriberMetrics(args.task_id, context?.userId);
+    return await socialAccountsImpl.getTaskSubscriberMetrics(args.task_id, context?.userId);
   }
 });
 
@@ -5207,7 +5216,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getTaskSubscriberEngagementEvents(args.task_id, args.email_subject, context?.userId);
+    return await socialAccountsImpl.getTaskSubscriberEngagementEvents(args.task_id, args.email_subject, context?.userId);
   }
 });
 
