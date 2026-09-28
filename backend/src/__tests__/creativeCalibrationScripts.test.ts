@@ -7,7 +7,8 @@
 jest.mock('../cron/creativeCalibrationCron', () => ({ runCreativeCalibration: jest.fn() }));
 
 import { parseBatchArgs } from '../scripts/creativeCalibrationBatch';
-import { formatCalibrationReport, labelledPairs, parseReportArgs } from '../scripts/creativeCalibrationReport';
+import { formatCalibrationReport, judgeLabelledPairs, labelledPairs, parseReportArgs } from '../scripts/creativeCalibrationReport';
+import type { HumanEvalCandidate } from '../services/humanEvalService';
 import { pairwiseAgreement } from '../loops/eval/creativeCalibration';
 import { newCreativePairCase, newGoldenCase, type GoldenCase } from '../loops/eval/goldenSet';
 
@@ -81,5 +82,39 @@ describe('creativeCalibrationReport', () => {
     expect(text).toContain('Decisive pairs only (no tie on either side): 66.7% of n=3');
     expect(text).toContain('A win rate (ties half): human 62.5%, judge 75.0%');
     expect(formatCalibrationReport({ batches: ['2026-W39'], inBatch: 2, humanChoices: [], judgeErrors: 0, agreement: null })).toContain('Agreement: n/a');
+  });
+});
+
+describe('judgeLabelledPairs (#3094 review)', () => {
+  const pairCase = (id: string, a: string, b: string) =>
+    ({ caseId: id, sourceRef: { kind: 'candidateId', id: a }, pair: { candidateIdB: b } } as unknown as GoldenCase);
+  const candidate = (id: string) => ({ candidateId: id, artifactUrl: `https://files.example.com/${id}.png` } as unknown as HumanEvalCandidate);
+
+  it('counts a failed lookup as a judge error and keeps judging the remaining pairs', async () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const labelled = [
+      { c: pairCase('p1', 'broken', 'b1'), human: 'A' as const },
+      { c: pairCase('p2', 'a2', 'b2'), human: 'B' as const },
+    ];
+    const result = await judgeLabelledPairs(labelled, {
+      getCandidate: async (id) => {
+        if (id === 'broken') throw new Error('DynamoDB unavailable');
+        return candidate(id);
+      },
+      briefFor: async () => ({}) as never,
+      judge: async () => ({ status: 'ok', preference: 'B' }) as never,
+    });
+    expect(result.judgeErrors).toBe(1);
+    expect(result.rows).toEqual([{ human: 'B', judge: 'B' }]);
+  });
+
+  it('counts a failed brief lookup the same way', async () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const result = await judgeLabelledPairs([{ c: pairCase('p1', 'a1', 'b1'), human: 'tie' }], {
+      getCandidate: async (id) => candidate(id),
+      briefFor: async () => { throw new Error('brand lookup failed'); },
+      judge: async () => ({ status: 'ok', preference: 'A' }) as never,
+    });
+    expect(result).toEqual({ rows: [], judgeErrors: 1 });
   });
 });
