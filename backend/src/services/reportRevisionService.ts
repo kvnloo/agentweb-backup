@@ -1,3 +1,4 @@
+import { resolveModelForUser } from './modelRoles';
 import AWS from 'aws-sdk';
 import { taskDb } from './db';
 import { agentModeService } from './agentModeService';
@@ -308,13 +309,15 @@ You MUST use the write_revised_report function to provide the complete revised H
       { role: 'user', content: userPrompt }
     ];
 
+    const model = await resolveModelForUser(userId, 'content_generation');
+
     // Retry up to 3 times
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         console.log(`Attempt ${attempt} to generate revised report...`);
 
         const response = await agentModeService.callLLM(
-          process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5.5',
+          model,
           messages,
           {
           tools,

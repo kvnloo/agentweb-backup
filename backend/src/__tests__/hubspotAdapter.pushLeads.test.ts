@@ -160,6 +160,109 @@ describe('HubspotAdapter.pushLeads — email validation', () => {
     expect(result.errorCount).toBe(0);
   });
 
+  // ENG-2082: a lead first synced WITHOUT an email got contact A by id. When it later
+  // gained an address the branch was chosen by email alone, so upsertContact matched on
+  // the address, created contact B, and overwrote our stored id — orphaning A in the
+  // customer's HubSpot as a duplicate nobody updates again.
+  it('updates the stored contact id even once the lead HAS an email', async () => {
+    const leads = [
+      {
+        leadId: 'l1', listId: 'list_1', firstName: 'Foo', email: 'foo@example.com',
+        syncMetadata: { hubspot_contact_id: 'c99' },
+      },
+    ];
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    expect(mockUpsertContact).not.toHaveBeenCalled();
+    expect(mockCreateContact).not.toHaveBeenCalled();
+    expect(mockUpdateContact).toHaveBeenCalledWith('c99', expect.objectContaining({ email: 'foo@example.com' }));
+    expect(result.updatedCount).toBe(1);
+    expect(result.newCount).toBe(0);
+  });
+
+  // Preferring the stored id must not cost us recovery: upsert used to recreate a contact
+  // that had been deleted in HubSpot, and it still has to.
+  it('falls back to upsert when the stored contact id no longer resolves', async () => {
+    mockUpdateContact.mockRejectedValueOnce(Object.assign(new Error('not found'), { response: { status: 404 } }));
+    const leads = [
+      {
+        leadId: 'l1', listId: 'list_1', firstName: 'Foo', email: 'foo@example.com',
+        syncMetadata: { hubspot_contact_id: 'gone' },
+      },
+    ];
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    expect(mockUpdateContact).toHaveBeenCalledWith('gone', expect.anything());
+    expect(mockUpsertContact).toHaveBeenCalledTimes(1);
+    expect(result.errorCount).toBe(0);
+    expect(result.successCount).toBe(1);
+  });
+
+  it('falls back to create when the stored id is stale and there is no email', async () => {
+    mockUpdateContact.mockRejectedValueOnce(Object.assign(new Error('gone'), { response: { status: 410 } }));
+    const leads = [
+      { leadId: 'l1', listId: 'list_1', firstName: 'Foo', syncMetadata: { hubspot_contact_id: 'gone' } },
+    ];
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    expect(mockCreateContact).toHaveBeenCalledTimes(1);
+    expect(mockUpsertContact).not.toHaveBeenCalled();
+    expect(result.errorCount).toBe(0);
+  });
+
+  // The fallback is for a contact that is GONE. Treating every failure as gone turns a
+  // rate limit into "create a new contact" — forking the record this branch exists to keep
+  // whole. hubspotService retries a 429 once and then throws, so a sustained limit lands
+  // here.
+  it('does NOT fall back on a 429 — it reports the error instead of forking the contact', async () => {
+    mockUpdateContact.mockRejectedValueOnce(Object.assign(new Error('rate limited'), { response: { status: 429 } }));
+    const leads = [
+      {
+        leadId: 'l1', listId: 'list_1', firstName: 'Foo', email: 'foo@example.com',
+        syncMetadata: { hubspot_contact_id: 'c99' },
+      },
+    ];
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    expect(mockUpsertContact).not.toHaveBeenCalled();
+    expect(mockCreateContact).not.toHaveBeenCalled();
+    expect(result.errorCount).toBe(1);
+    expect(result.newCount).toBe(0);
+  });
+
+  it('stamps sync_failed when the stored-contact update fails for a non-404 reason', async () => {
+    mockUpdateContact.mockRejectedValueOnce(Object.assign(new Error('rate limited'), { response: { status: 429 } }));
+    const leads = [
+      { leadId: 'l1', listId: 'list_1', firstName: 'Foo', email: 'foo@example.com',
+        syncMetadata: { hubspot_contact_id: 'c99' } },
+    ];
+
+    await adapter.pushLeads(auth, leads, makeConfig());
+
+    // Without this the lead keeps reading `synced` in the CRM after a sustained 429 and
+    // never shows under the sync-failed filter — a silent sync outage.
+    const stamped = (crmDb.updateLead as jest.Mock).mock.calls
+      .map((c: any[]) => c[2])
+      .find((u: any) => u?.syncMetadata?.syncStatus === 'sync_failed');
+    expect(stamped).toBeDefined();
+  });
+
+  it('does NOT fall back on a 500 either', async () => {
+    mockUpdateContact.mockRejectedValueOnce(Object.assign(new Error('boom'), { response: { status: 500 } }));
+    const leads = [
+      { leadId: 'l1', listId: 'list_1', firstName: 'Foo', syncMetadata: { hubspot_contact_id: 'c99' } },
+    ];
+
+    const result = await adapter.pushLeads(auth, leads, makeConfig());
+
+    expect(mockCreateContact).not.toHaveBeenCalled();
+    expect(result.errorCount).toBe(1);
+  });
+
   it('skips an email-less lead that has no mappable properties (nothing to push)', async () => {
     // Only an email mapping is configured, and the lead has no email → no props.
     const leads = [{ leadId: 'l1', listId: 'list_1' }];

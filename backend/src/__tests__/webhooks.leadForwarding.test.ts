@@ -10,6 +10,10 @@ import { dripSequenceDb } from '../services/dripSequenceDb';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
 
 // Mock dependencies
+jest.mock('../services/orgLeadNotificationService', () => ({
+  dispatchLeadCreated: jest.fn().mockResolvedValue(undefined),
+  dispatchLeadsCreated: jest.fn().mockResolvedValue(undefined),
+}));
 jest.mock('../services/db', () => ({
   crmDb: {
     getLeadListById: jest.fn(),
@@ -264,7 +268,22 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       expect(response.body.message).toBe('Email or phone is required');
     });
 
-    it('ENG-2082: accepts a phone-only lead and keys it deterministically on the number', async () => {
+    it('allowAnonymousLead: records a submission with no email or phone when the lander opts in', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.createLead as jest.Mock).mockResolvedValue({ leadId: 'lead_anon', listId: 'list_123' });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', allowAnonymousLead: true, brand: 'Rheem', model_number: 'XE50' });
+
+      expect(response.status).toBe(201);
+      const created = (crmDb.createLead as jest.Mock).mock.calls.at(-1)[1];
+      expect(created.email).toBeUndefined();
+      expect(created.customFields.brand).toBe('Rheem');
+      expect(created.customFields.allowAnonymousLead).toBeUndefined();
+    });
+
+    it('ENG-2082: a SYNTHETIC phone-only lead is keyed deterministically (the smoke test reads it back)', async () => {
       // A phone-only lander used to be impossible: this route required an email, so every
       // submission was refused before a row was built and the page captured nothing.
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
@@ -287,6 +306,31 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       // `email` is omitted entirely, never written as '': it keys the email-index GSI and
       // DynamoDB rejects an empty string for an index key attribute.
       expect('email' in created).toBe(false);
+    });
+
+    it('ENG-2123: a REAL phone-only lead gets an ordinary timestamp id, not a deterministic one', async () => {
+      // leadId is the RANGE key and getLeadsByListId pages it with ScanIndexForward:false,
+      // so a `lead_ph_…` id ('p' = 0x70, above every digit) sorts ABOVE every
+      // lead_<timestamp>_… row — pinning phone-only leads to the top of the customer's list
+      // in hash order forever, and pushing email leads off page one once the 1MB page cap
+      // is reached. Synthetic numbers keep the deterministic id because the smoke test has
+      // to read its own row back; real captures must not pay for that.
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.createLead as jest.Mock).mockResolvedValue({
+        leadId: 'lead_1790000000000_abc', listId: 'list_123', phone: '2125559876', customFields: {},
+      });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', phone: '+1 (212) 555-9876' });
+
+      expect(response.status).toBe(201);
+      const [, created] = (crmDb.createLead as jest.Mock).mock.calls[0];
+      expect(created.leadId).toBeUndefined();
+      expect(created.failIfExists).toBeUndefined();
+      // still a phone-only row: email omitted, never ''
+      expect('email' in created).toBe(false);
+      expect(created.phone).toBeTruthy();
     });
 
     it('ENG-2082: the same number in a different format collapses onto the same row', async () => {
@@ -347,6 +391,96 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
+    });
+
+    it('ENG-2082: a repeat submission keeps the ORIGINAL forwardedAt but takes the NEW source', async () => {
+      // Two system-stamped keys, opposite handling. forwardedAt is minted by this handler on
+      // every submission (existingLead is null on the adopt path), so the merged copy is
+      // never the visitor's data and the stored one must win — it is the lead's capture time
+      // and the owner alert renders it. `source` IS caller-supplied when the lander sends
+      // one, so reverting it would silently discard step 2 of a multi-step form, which is the
+      // data-loss incident this file documents.
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      const race: any = new Error('Lead already exists for this deterministic key');
+      race.leadAlreadyExists = true;
+      (crmDb.createLead as jest.Mock).mockRejectedValueOnce(race);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead_ph_existing', listId: 'list_123', phone: '4155550142', firstName: '',
+        customFields: { forwardedAt: '2020-01-01T00:00:00.000Z', source: 'hero-form' },
+      });
+
+      await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', phone: '4155550142', source: 'qualify-form', qualified: 'yes' });
+
+      expect(crmDb.updateLead).toHaveBeenCalled();
+      const [, , updates] = (crmDb.updateLead as jest.Mock).mock.calls[0];
+      expect(updates.customFields.forwardedAt).toBe('2020-01-01T00:00:00.000Z');
+      expect(updates.customFields.source).toBe('qualify-form');
+      expect(updates.customFields.qualified).toBe('yes');
+    });
+
+    it('the EMAIL path also keeps a stored source when the submission omits one', async () => {
+      // Same defect, far more common path: `source` defaults to 'api' whenever the caller
+      // omits it, and the email branch spreads incoming over existing unconditionally.
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+        leadId: 'lead_existing', listId: 'list_123', email: 'x@example.com', firstName: '',
+        customFields: { forwardedAt: '2020-01-01T00:00:00.000Z', source: 'hero-form' },
+      });
+
+      await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', email: 'x@example.com', qualified: 'yes' });
+
+      const [, , updates] = (crmDb.updateLead as jest.Mock).mock.calls[0];
+      expect(updates.customFields.qualified).toBe('yes');
+      expect(updates.customFields.source).toBe('hero-form');
+    });
+
+    it('the EMAIL path still lets a submission that NAMES a source overwrite the stored one', async () => {
+      // The other direction of the same guard, and the one a blanket restore would break:
+      // the adopt path has both directions covered, the email path only had the omitted
+      // case. Without `callerSuppliedSource` this reverts to 'hero-form' and a multi-step
+      // lander can never record which step converted.
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+        leadId: 'lead_existing', listId: 'list_123', email: 'x@example.com', firstName: '',
+        customFields: { forwardedAt: '2020-01-01T00:00:00.000Z', source: 'hero-form' },
+      });
+
+      await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', email: 'x@example.com', source: 'qualify-form', qualified: 'yes' });
+
+      const [, , updates] = (crmDb.updateLead as jest.Mock).mock.calls[0];
+      expect(updates.customFields.source).toBe('qualify-form');
+      expect(updates.customFields.forwardedAt).toBe('2020-01-01T00:00:00.000Z');
+    });
+
+    it('ENG-2082: a repeat submission that omits source must not clobber the stored one', async () => {
+      // `source` is never absent from incomingCustomFields — the destructure defaults it to
+      // 'api'. So restoring only forwardedAt means that synthesized default overwrites a
+      // real stored value whenever any OTHER field changes. Step 1 of a multi-step lander
+      // posts source "hero-form"; step 2 posts only the qualification answer; the row ends
+      // up reading "api". Same data loss as before, moved one case over.
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      const race: any = new Error('Lead already exists for this deterministic key');
+      race.leadAlreadyExists = true;
+      (crmDb.createLead as jest.Mock).mockRejectedValueOnce(race);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead_ph_existing', listId: 'list_123', phone: '4155550142', firstName: '',
+        customFields: { forwardedAt: '2020-01-01T00:00:00.000Z', source: 'hero-form' },
+      });
+
+      await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', phone: '4155550142', qualified: 'yes' });
+
+      const [, , updates] = (crmDb.updateLead as jest.Mock).mock.calls[0];
+      expect(updates.customFields.qualified).toBe('yes');
+      expect(updates.customFields.forwardedAt).toBe('2020-01-01T00:00:00.000Z');
+      expect(updates.customFields.source).toBe('hero-form');
     });
 
     it('ENG-2082: a repeat phone submission merges its new data instead of discarding it', async () => {
@@ -1590,6 +1724,36 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       expect(response.status).toBe(201);
       await new Promise((r) => setTimeout(r, 200));
       expect(externalCrmSyncService.autoSyncLead).not.toHaveBeenCalled();
+    });
+
+    // The org lead NOTIFICATION sat above the synthetic gate, so it fired for smoke-test
+    // leads — a real Slack/email alert to a human about a lead that does not exist.
+    // `!isNew` is now exclusively the smoke-test adopt path for a phone-only capture
+    // (deterministicLeadId was narrowed to synthetic numbers), and buildSmokeTestPhone
+    // draws from only 100 reserved numbers, so collisions — and therefore these
+    // notifications — are routine by construction rather than rare.
+    it('does not send an org lead notification for a synthetic re-submission', async () => {
+      const { dispatchLeadCreated } = require('../services/orgLeadNotificationService');
+      (dispatchLeadCreated as jest.Mock).mockClear?.();
+      // An ADOPT, which is the ONLY way to reach `!isNew`: the conditional create loses to
+      // an earlier submission of the same synthetic number and throws leadAlreadyExists,
+      // then the row is read back. Resolving createLead instead leaves isNew true and the
+      // notification is never reached — which is how the first version of this test passed
+      // with the gate deleted.
+      (crmDb.createLead as jest.Mock).mockRejectedValue(
+        Object.assign(new Error('exists'), { leadAlreadyExists: true }),
+      );
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead_ph_existing', listId: 'list_123', phone: '(415) 555-0142',
+      });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_123', phone: '(415) 555-0142' });
+
+      expect([200, 201]).toContain(response.status);
+      await new Promise((r) => setTimeout(r, 200));
+      expect(dispatchLeadCreated).not.toHaveBeenCalled();
     });
 
     it('skips the cascade for a lead recognised by its PHONE, when the address cannot carry the marker', async () => {

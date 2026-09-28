@@ -1,5 +1,19 @@
 import { Request, Response } from 'express';
 import { AuthenticatedRequest } from '../middleware/auth';
+import { redactAdminActivity } from '../utils/adminOnlyMessageFilter';
+import { ADMIN_SKILL_TOOL_NAMES } from '../services/agentModeService';
+
+// ENG-2163: redact delegated-admin activity from a session before returning it to a viewer.
+// The chatbot serve paths historically return raw messages and read the SAME store as agent mode,
+// so a customer can fetch a session where an admin ran admin tools. Fails closed (non-admin) when
+// delegateInfo is absent. Mutates and returns the session for convenience.
+function redactSessionForViewer<T extends { messages?: any[] } | null | undefined>(session: T, req: AuthenticatedRequest): T {
+  if (session && Array.isArray((session as any).messages)) {
+    const viewerIsAdmin = !!(req.user?.isAdmin || (req as any).delegateInfo?.isDelegated);
+    (session as any).messages = redactAdminActivity((session as any).messages, { viewerIsAdmin, adminToolNames: ADMIN_SKILL_TOOL_NAMES });
+  }
+  return session;
+}
 import { chatbotDb, generateChatResponse } from '../services/chatbotService';
 import { checkTokenUsage, toCustomerTokenUsage } from '../services/tokenUsageService';
 import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
@@ -61,12 +75,14 @@ export const listUserSessions = async (req: AuthenticatedRequest, res: Response)
     const limitParam = req.query.limit ? parseInt(req.query.limit as string, 10) : undefined;
     const result = await chatbotDb.getUserSessions(userId, undefined, limitParam);
     
-    // Remove page content from response to reduce payload size
+    // Remove page content from response to reduce payload size.
+    // ENG-2163: getUserSessions fully HYDRATES messages, so this list is a transcript dump —
+    // redact delegated-admin activity per session for a non-admin viewer.
     const sanitizedSessions = result.sessions.map(session => {
       const { pageContent, contextChunks, ...rest } = session;
-      return rest;
+      return redactSessionForViewer(rest, req);
     });
-    
+
     res.status(200).json(sanitizedSessions);
   } catch (error) {
     console.error('Error listing chat sessions:', error);
@@ -85,7 +101,14 @@ export const listEmmaSessions = async (req: AuthenticatedRequest, res: Response)
     const pageId = (req.query.pageIdentifier as string) || 'customer-portal';
     const sessions = await chatbotDb.getEmmaSessions(userId, limit, pageId);
     // Strip heavy fields not needed for the history list
-    const sanitized = sessions.map(({ pageContent, contextChunks, ...rest }: any) => rest);
+    const viewerIsAdminList = !!(req.user?.isAdmin || (req as any).delegateInfo?.isDelegated);
+    const sanitized = sessions.map(({ pageContent, contextChunks, ...rest }: any) => {
+      // ENG-2163: this list returns full message bodies — redact admin activity per session.
+      if (Array.isArray(rest.messages)) {
+        rest.messages = redactAdminActivity(rest.messages, { viewerIsAdmin: viewerIsAdminList, adminToolNames: ADMIN_SKILL_TOOL_NAMES });
+      }
+      return rest;
+    });
     res.status(200).json(sanitized);
   } catch (error) {
     console.error('Error listing Emma sessions:', error);
@@ -111,7 +134,15 @@ export const getChatSession = async (req: AuthenticatedRequest, res: Response) =
     
     // Remove chunked context from response to reduce payload size
     const { contextChunks, ...sanitizedSession } = session;
-    
+
+    // ENG-2163: this endpoint reads the SAME session store as agent mode and is owner-gated
+    // only, so a customer can fetch a session in which a delegated admin ran admin tools. Redact
+    // that admin activity for a non-admin viewer (fails closed when delegateInfo is absent).
+    const viewerIsAdmin = !!(req.user?.isAdmin || (req as any).delegateInfo?.isDelegated);
+    if (Array.isArray((sanitizedSession as any).messages)) {
+      (sanitizedSession as any).messages = redactAdminActivity((sanitizedSession as any).messages, { viewerIsAdmin, adminToolNames: ADMIN_SKILL_TOOL_NAMES });
+    }
+
     res.status(200).json(sanitizedSession);
   } catch (error) {
     console.error('Error getting chat session:', error);
@@ -196,7 +227,7 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
 
       res.status(200).json({
         ...formattedResponse,  // content, toolCalls (if present)
-        session: updatedSession
+        session: redactSessionForViewer(updatedSession, req)
       });
     } catch (error) {
       console.error('Error in chatbot service:', error);
@@ -209,7 +240,7 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
       // Use 'content' key to match the normal response format
       res.status(200).json({
         content: "I'm sorry, I encountered an error processing your request. Please try again.",
-        session: currentSession,
+        session: redactSessionForViewer(currentSession, req),
         error: true
       });
     }
@@ -306,7 +337,7 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
     const updatedSession = await chatbotDb.getChatSession(sessionId);
     const formattedResponse = typeof response === 'string' ? { content: response } : response;
 
-    sendEvent({ type: 'complete', ...formattedResponse, session: updatedSession });
+    sendEvent({ type: 'complete', ...formattedResponse, session: redactSessionForViewer(updatedSession, req) });
   } catch (error) {
     console.error('Error in chatbot stream:', error);
     // getChatSession can itself throw (e.g. DB down). Wrap to avoid unhandled rejection
@@ -320,7 +351,7 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
     sendEvent({
       type: 'complete',
       content: "I'm sorry, I encountered an error processing your request. Please try again.",
-      session: currentSession,
+      session: redactSessionForViewer(currentSession, req),
       error: true
     });
   } finally {

@@ -1,0 +1,4 @@
+{
+  "order": ["amazon-bedrock", "azure", "google-vertex", "anthropic", "openai"],
+  "allow_fallbacks": true
+}

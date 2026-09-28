@@ -64,7 +64,8 @@ def test_gateway_client_delegates_fallback_and_compression_to_openrouter(monkeyp
     # real action of every task, on every model. tool_choice alone still guarantees
     # single-tool-call behavior for this usage pattern.
     assert captured["extra_body"] == {
-        "provider": {"allow_fallbacks": True},
+        "provider": {"order": ["amazon-bedrock", "azure", "google-vertex", "anthropic", "openai"],
+                     "allow_fallbacks": True},
         "plugins": [{"id": "context-compression"}],
     }
 
