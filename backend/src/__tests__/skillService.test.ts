@@ -41,6 +41,14 @@ describe('SkillService', () => {
       v4: jest.fn(() => 'test-skill-id-123'),
     }));
 
+    // ENG-2195: skillService records "needs eval" markers through the same (mocked) DocumentClient.
+    // These tests read the skill write's own params, so keep marker puts out of mockPut; the
+    // marker behaviour is covered in skillService.evalMarkers.test.ts.
+    jest.doMock('../loops/eval/evalChangeMarkers', () => ({
+      ...jest.requireActual('../loops/eval/evalChangeMarkers'),
+      recordSkillChange: jest.fn().mockResolvedValue(false),
+    }));
+
     // Import the module after mocking
     const module = require('../services/skillService');
     skillService = module.skillService;
