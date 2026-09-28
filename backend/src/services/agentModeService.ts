@@ -146,6 +146,18 @@ import {
   StepContendedError,
 } from './agentMode/core/workflow';
 import { startWorkflow, advanceIndependentWorkflow, type AdvanceIndependentOutcome } from './agentMode/workflowRunner';
+// ENG-1853: the manifest-level meta_write executor below reads/records
+// against the durable approval-inbox store — approvalInboxService.ts has no
+// dependency back on this file (verified), so this is a one-directional
+// import, not a cycle.
+import { approvalInboxService, type ApprovalDecision } from './approvalInboxService';
+// Review fix: the manifest executor below needs the same active-resume
+// primitive approvalInboxExecution.ts already built for the per-decision
+// path — resumeOriginSession is exported from there specifically so this
+// file doesn't grow a second, divergent copy of the same resume/fallback
+// logic. approvalInboxExecution.ts does not import from this file, so this
+// stays a one-directional dependency, not a cycle.
+import { resumeOriginSession } from './approvalInboxExecution';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
 import { settingsService } from './settingsService';
 import {
@@ -504,7 +516,7 @@ import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } fro
 import { resolvePinnedPublicAddress, fetchBufferFollowingRedirects, assertPublicHostname, DEFAULT_MAX_IMAGE_BYTES } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
-import { isTransientLLMError } from '../utils/agentModeErrors';
+import { isTransientLLMError, extractAffordableTokens } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
 import { computeRunVerdict, type RunTerminalInfo } from '../loops/instances/agent-mode/runRecorder';
 // OTel spine (ENG-141) — inert no-ops unless exporter env config is present.
@@ -2979,7 +2991,6 @@ export class AgentModeService {
     // win rather than a regression.
     const isScheduledLlmCall = taskClass === 'scheduled_background';
     const maxAttempts = isScheduledLlmCall ? 3 : 2;
-
     // ENG-1816 F1: send/validate/retry mechanics live in OpenRouterPlatformTransport
     // now (relocated unchanged, not rewritten — see transport/openRouterPlatformTransport.ts).
     // pickTransport always resolves this same transport today; A2 adds ApiKeyTransport.
@@ -3001,6 +3012,31 @@ export class AgentModeService {
           ms: retryAfterMs ?? 1500 * Math.pow(2, attempt - 1),
           honoredRetryAfter: retryAfterMs !== undefined,
         };
+      },
+      // ENG-2185: a spend-limited OpenRouter key rejects a request whose
+      // WORST-CASE cost (input + requested max_tokens) exceeds its remaining
+      // balance, even though actual usage is normally far less (see
+      // AGENT_MODE_MAX_OUTPUT_TOKENS's own comment). The error names exactly
+      // how many tokens the balance affords, so retry with max_tokens capped
+      // to that instead of hard-failing to the generic fallback — this asks
+      // for no additional spend, it just stops over-asking against what's
+      // already there.
+      adjustParamsForRetry: (error, retryParams) => {
+        const affordableTokens = extractAffordableTokens(error);
+        if (affordableTokens === null) return false;
+        // A key with truly zero balance left would still get rejected at
+        // max_tokens=1 (the retry's own floor below) — that's not a useful
+        // fallback, just a wasted attempt against the same rejection.
+        if (affordableTokens === 0) return false;
+        if (typeof retryParams.max_tokens === 'number' && affordableTokens >= retryParams.max_tokens) return false;
+        // Small safety margin: the provider's affordable estimate is a snapshot
+        // at request time and can shift slightly if the account is being drawn
+        // down concurrently by other in-flight calls.
+        retryParams.max_tokens = Math.max(1, affordableTokens - 100);
+        console.warn(`AgentMode: OpenRouter call for model "${model}" was rejected for insufficient credits; retrying with max_tokens reduced to ${retryParams.max_tokens}`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return true;
       },
     });
 
@@ -5121,6 +5157,41 @@ export class AgentModeService {
           }
         }
 
+        // ENG-1853: the real fix for 1635/1644's gap. A PendingApprovalDeck
+        // only ever renders through a connected chat UI — a genuinely
+        // unattended (scheduled/test) run has no live user to show one to,
+        // which is exactly why Haven/Every's real writes could never
+        // actually get staged for review before this. Stage each halted
+        // write from this iteration as a durable approval-inbox decision
+        // instead, all sharing one manifestId — the packet those real
+        // fixtures need (Haven's 5 calls, Every's 7), reviewed and dispatched
+        // together via the Approval Desk rather than one at a time. A live,
+        // attended run (isUnattendedRun false/undefined) falls through to
+        // the existing deck path below completely unaffected.
+        if (isUnattendedRun === true && writeHalts.length > 0 && sessionId) {
+          const staged = await this.stageApprovalInboxMetaWriteManifest(sessionId, writeHalts as any[]);
+          if (staged) {
+            content = staged.turnMessage;
+            (messages as any[]).push({
+              role: 'assistant',
+              content: staged.turnMessage,
+              llm: llmModel,
+              metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true, approvalInboxManifestId: staged.manifestId },
+            });
+            if (onProgress) {
+              runEmitter.emitLegacy({ iteration, status: 'complete', toolCalls: toolCalls.slice() });
+            }
+            break;
+          }
+          // staged === null: the durable write failed — fall through to the
+          // live deck path below as a safety net rather than silently
+          // dropping the halt (matches every other fallback contract in this
+          // seam). Nobody is watching this session live either way, but a
+          // deck at least leaves a durable, re-visitable record in the
+          // session's own message history instead of losing the halt
+          // entirely.
+        }
+
         const approvalDeck: PendingApprovalDeck | null =
           sessionId && otherHalts.length === 0
             ? this.buildApprovalDeckForIteration(writeHalts, questionDeckHalts)
@@ -5304,15 +5375,20 @@ export class AgentModeService {
           const guardOutcome = await runFinalizeGuard({
             finalText: content,
             ledger: finalizeLedger,
+            // Shadow never makes the corrective turn: its text would be discarded.
+            detectOnly: finalizeGuardMode === 'shadow',
             ports: {
-              // ENG-1858: attributed to this run's user/billing subject.
+              // ENG-1858: enforce mode is attributed to this run's user/billing subject.
+              // Shadow mode is our own measurement, so it is system spend (no userId).
               judgeExtractClaims: (text, candidateClasses) =>
-                this.judgeFinalizeClaims(text, candidateClasses, {
-                  userId,
-                  billingUserId,
-                  sessionId,
-                  feature: meteringFeature('finalize_guard_judge', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)),
-                }),
+                this.judgeFinalizeClaims(text, candidateClasses, finalizeGuardMode === 'shadow'
+                  ? { sessionId, feature: 'finalize_guard_shadow_judge' }
+                  : {
+                    userId,
+                    billingUserId,
+                    sessionId,
+                    feature: meteringFeature('finalize_guard_judge', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)),
+                  }),
               requestCorrection: ({ finalText, systemNote }) =>
                 this.requestFinalizeCorrection(finalText, systemNote, llmModel, {
                   userId,
@@ -5335,33 +5411,31 @@ export class AgentModeService {
               ambiguousClaimClasses: guardOutcome.ambiguousClaimClasses,
             });
           }
-          if (guardOutcome.finalText !== content) {
-            if (finalizeGuardMode === 'shadow') {
-              // Shadow mode: log what WOULD have changed, but the user-visible
-              // message and the persisted transcript are left untouched.
-              console.warn(`AgentMode: finalize guard SHADOW ${guardOutcome.action} in session ${sessionId} (message NOT modified)`, {
-                claimClasses: guardOutcome.mismatchedClaimClasses,
-              });
-            } else {
-              console.warn(`AgentMode: finalize guard ${guardOutcome.action} in session ${sessionId}`, {
-                claimClasses: guardOutcome.mismatchedClaimClasses,
-              });
-              content = guardOutcome.finalText;
-              // Keep the persisted transcript consistent with what the user sees:
-              // correct the LAST assistant message in place (same message count) and
-              // stamp guard metadata so the correction is auditable in the session.
-              for (let i = messages.length - 1; i >= 0; i--) {
-                if ((messages[i] as any).role === 'assistant') {
-                  (messages[i] as any).content = content;
-                  (messages[i] as any).metadata = {
-                    ...(messages[i] as any).metadata,
-                    finalizeGuard: {
-                      action: guardOutcome.action,
-                      claimClasses: guardOutcome.mismatchedClaimClasses,
-                    },
-                  };
-                  break;
-                }
+          if (guardOutcome.action === 'detected_mismatch') {
+            // Shadow mode: report the mismatch; the user-visible message and the
+            // persisted transcript are left untouched.
+            console.warn(`AgentMode: finalize guard SHADOW ${guardOutcome.action} in session ${sessionId} (message NOT modified)`, {
+              claimClasses: guardOutcome.mismatchedClaimClasses,
+            });
+          } else if (guardOutcome.finalText !== content) {
+            console.warn(`AgentMode: finalize guard ${guardOutcome.action} in session ${sessionId}`, {
+              claimClasses: guardOutcome.mismatchedClaimClasses,
+            });
+            content = guardOutcome.finalText;
+            // Keep the persisted transcript consistent with what the user sees:
+            // correct the LAST assistant message in place (same message count) and
+            // stamp guard metadata so the correction is auditable in the session.
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if ((messages[i] as any).role === 'assistant') {
+                (messages[i] as any).content = content;
+                (messages[i] as any).metadata = {
+                  ...(messages[i] as any).metadata,
+                  finalizeGuard: {
+                    action: guardOutcome.action,
+                    claimClasses: guardOutcome.mismatchedClaimClasses,
+                  },
+                };
+                break;
               }
             }
           }
@@ -21432,6 +21506,113 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
   }
 
+  /**
+   * ENG-1853: the async-run sibling of buildMetaWriteApprovalDeckFromHalts —
+   * stages every halted Meta write from one unattended-run iteration as
+   * durable approval-inbox decisions sharing one manifestId, instead of a
+   * session-scoped PendingApprovalDeck nobody is connected to see. Each
+   * write's own createDecision call is idempotent on its digest (existing
+   * `AW-ApprovalDecisions` contract).
+   *
+   * Review fix (double-dispatch risk): uses Promise.allSettled, not
+   * Promise.all, and NEVER falls back to the live-deck path once ANYTHING
+   * has been durably staged. The original Promise.all shape meant a single
+   * genuine createDecision failure (not the idempotent-conflict branch,
+   * which createDecision already swallows internally — a real transient
+   * error) discarded every OTHER write that had already succeeded, and the
+   * caller then built a live PendingApprovalDeck covering the full batch —
+   * including the already-staged ones. If that stale deck were ever later
+   * answered, it would dispatch through buildMetaWriteWorkflowSteps'
+   * claimMetaWriteManifestGrant, a completely separate claim mechanism this
+   * path never touches, which would not see the write as consumed and could
+   * dispatch it a second time. Falling back to the live deck is only safe
+   * when NOTHING was staged (nothing durable exists yet to double-claim).
+   *
+   * Review fix (manifestId misreporting): createDecision returns the
+   * EXISTING record (with its ORIGINAL manifestId) on an idempotent hit —
+   * it never adopts a newly-passed manifestId. A retried iteration that
+   * re-stages an already-staged digest would previously still report the
+   * freshly-minted manifestId regardless, which could point the turn's own
+   * "resume" message and the reviewer's queue link at a manifestId that
+   * contains none (or only some) of the decisions it claims to. This now
+   * reads back every real createDecision result and reports the actual
+   * manifestId(s) the staged decisions really landed under.
+   *
+   * approver defaults to 'matt' — the named reviewer ENG-1644's own seed
+   * acceptance cases used for this exact class of decision (Haven/Every).
+   * Not yet configurable per-account; a real per-account assignment is
+   * future work, not silently invented here.
+   */
+  private async stageApprovalInboxMetaWriteManifest(
+    sessionId: string,
+    writeHalts: any[],
+  ): Promise<{ manifestId: string; turnMessage: string } | null> {
+    const manifestId = uuidv4();
+    // Same default window stage_pending_decision uses for a team decision —
+    // one consistent "how long before this goes stale" answer across every
+    // producer of this table.
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+    const settled = await Promise.allSettled(
+      writeHalts.map((r) =>
+        approvalInboxService.createDecision({
+          gateType: 'meta_write',
+          approver: 'matt',
+          subjectLabel: `Meta Ads · Account ${r?.target?.account_id || r?.metaWriteDispatch?.account_id || 'unknown'}`,
+          businessImpact: r?.confirmationDetail || r?.confirmationPrompt || r?.summary || 'A Meta Ads change is waiting for review.',
+          evidencePacket: { researchSummary: r?.summary },
+          metaWriteManifestDigest: r.metaWriteManifestDigest,
+          metaWriteDispatch: r.metaWriteDispatch,
+          originSessionId: sessionId,
+          manifestId,
+          expiresAt,
+        }),
+      ),
+    );
+
+    const staged = settled
+      .filter((s): s is PromiseFulfilledResult<ApprovalDecision> => s.status === 'fulfilled')
+      .map((s) => s.value);
+    const failedCount = settled.length - staged.length;
+
+    if (staged.length === 0) {
+      // Nothing durable exists anywhere for this batch — the live-deck
+      // fallback below is fully safe (nothing it could double-claim).
+      for (const s of settled) {
+        if (s.status === 'rejected') {
+          console.error('[agent-mode-service] failed to stage an approval-inbox meta_write decision, falling back to the live deck path:', s.reason?.message || s.reason);
+        }
+      }
+      return null;
+    }
+    if (failedCount > 0) {
+      // Some writes ARE now durably staged — must not fall back to a live
+      // deck for the rest (see header). The un-staged write(s) are simply
+      // not tracked this iteration; they are not silently duplicated.
+      console.error(
+        `[agent-mode-service] partially failed to stage an approval-inbox meta_write manifest — ${staged.length}/${settled.length} succeeded. ` +
+        `The other ${failedCount} write(s) were NOT staged and will need the model to re-attempt them on a later turn — ` +
+        `never falling back to a live deck here, since that would risk double-dispatching the ${staged.length} write(s) already staged.`,
+      );
+    }
+
+    // staged items may have landed under a PRE-EXISTING manifestId (an
+    // idempotent hit on an already-staged digest, e.g. from an earlier
+    // partial attempt) rather than the manifestId just minted — report
+    // honestly rather than assuming uniformity.
+    const manifestIds = [...new Set(staged.map((d) => d.manifestId))];
+    const reportedManifestId = manifestIds.length === 1 ? manifestIds[0] : manifestId;
+
+    const count = staged.length;
+    return {
+      manifestId: reportedManifestId,
+      turnMessage:
+        count === 1
+          ? `This change needs review before it runs — queued for the assigned approver in the Approval Desk. I'll resume automatically once it's resolved.`
+          : `This packet of ${count} change${count === 1 ? '' : 's'} needs review before ${count === 1 ? 'it runs' : 'they run'} — queued for the assigned approver in the Approval Desk. I'll resume automatically once it's resolved.`,
+    };
+  }
+
   /** Build a question-only deck from ALREADY-PARTITIONED question-deck halts.
    *  Each halt's questionDeckPayload is an array (present_question_deck can
    *  front-load several questions in one call) — if the model somehow made
@@ -22592,49 +22773,264 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           );
           return { dispatchResult: dispatchResult as unknown as Record<string, unknown> };
         },
-        verify: async (executeResult): Promise<WorkflowStepVerification> => {
-          const result = executeResult.dispatchResult as MetaApiResult | undefined;
-          if (!result || result.success !== true) {
-            // `message` is the enriched, actionable text (enrichMetaError — e.g. "Your ad
-            // set budget must be more than ₹94.91" with the Meta code/subcode) whenever the
-            // underlying write method built one; `error` is the raw SDK message (e.g. just
-            // "Invalid parameter") and was being checked FIRST, so the `||` chain always
-            // short-circuited on it and silently discarded the enriched text before it ever
-            // reached the deck outcome summary / answerAck. Found live: a repeatedly-failing
-            // ad-set create (real cause: account currency's minimum budget) got silently
-            // re-proposed identically 3 times with no explanation ever surfaced, because
-            // Emma never actually received anything more specific than "Invalid parameter."
-            return { verified: false, error: result?.message || result?.error || 'Meta write failed' };
-          }
-          // Reuses whatever read-back mismatch detection the underlying write
-          // method already performs (Phase 1's existing resolver — today,
-          // AD_SET CREATE's bid_strategy/budget/timing comparison; not yet a
-          // uniform contract across every entity_type/action). A write method
-          // with no built-in read-back has nothing further to check here
-          // beyond its own reported success, which is what the check above
-          // already gates on.
-          if (
-            result.readBackVerified === true &&
-            Array.isArray(result.readBackMismatches) &&
-            result.readBackMismatches.length > 0
-          ) {
-            return {
-              verified: false,
-              mismatches: result.readBackMismatches.map((m: any) => ({
-                parameter: m.parameter, requested: m.requested, applied: m.applied,
-              })),
-            };
-          }
-          return {
-            verified: true,
-            verifiedFields: {
-              appliedObjectId: AgentModeService.extractDispatchedObjectId(result),
-              ...(result.readBackVerified === true ? { readBack: result.readBack } : {}),
-            },
-          };
-        },
+        verify: AgentModeService.verifyMetaWriteDispatchResult,
       };
     });
+  }
+
+  /**
+   * ENG-1853: shared verify() body for a meta_write workflow step, extracted
+   * out of buildMetaWriteWorkflowSteps (byte-for-byte unchanged behavior) so
+   * buildApprovalInboxMetaWriteWorkflowSteps below can use the exact same
+   * read-back/mismatch contract rather than a second copy that could drift.
+   */
+  private static async verifyMetaWriteDispatchResult(executeResult: Record<string, unknown>): Promise<WorkflowStepVerification> {
+    const result = executeResult.dispatchResult as MetaApiResult | undefined;
+    if (!result || result.success !== true) {
+      // `message` is the enriched, actionable text (enrichMetaError — e.g. "Your ad
+      // set budget must be more than ₹94.91" with the Meta code/subcode) whenever the
+      // underlying write method built one; `error` is the raw SDK message (e.g. just
+      // "Invalid parameter") and was being checked FIRST, so the `||` chain always
+      // short-circuited on it and silently discarded the enriched text before it ever
+      // reached the deck outcome summary / answerAck. Found live: a repeatedly-failing
+      // ad-set create (real cause: account currency's minimum budget) got silently
+      // re-proposed identically 3 times with no explanation ever surfaced, because
+      // Emma never actually received anything more specific than "Invalid parameter."
+      return { verified: false, error: result?.message || result?.error || 'Meta write failed' };
+    }
+    // Reuses whatever read-back mismatch detection the underlying write
+    // method already performs (Phase 1's existing resolver — today,
+    // AD_SET CREATE's bid_strategy/budget/timing comparison; not yet a
+    // uniform contract across every entity_type/action). A write method
+    // with no built-in read-back has nothing further to check here
+    // beyond its own reported success, which is what the check above
+    // already gates on.
+    if (
+      result.readBackVerified === true &&
+      Array.isArray(result.readBackMismatches) &&
+      result.readBackMismatches.length > 0
+    ) {
+      return {
+        verified: false,
+        mismatches: result.readBackMismatches.map((m: any) => ({
+          parameter: m.parameter, requested: m.requested, applied: m.applied,
+        })),
+      };
+    }
+    return {
+      verified: true,
+      verifiedFields: {
+        appliedObjectId: AgentModeService.extractDispatchedObjectId(result),
+        ...(result.readBackVerified === true ? { readBack: result.readBack } : {}),
+      },
+    };
+  }
+
+  /**
+   * ENG-1853: build one WorkflowStepDefinition per meta_write decision in an
+   * approval-inbox manifest. UNLIKE buildMetaWriteWorkflowSteps above,
+   * execute() does NOT call claimMetaWriteManifestGrant — that function's
+   * grants are session-scoped, same-session preview-then-confirm, and this
+   * digest was already claimed once, durably, when the reviewer approved it
+   * (approvalInboxService.claimDecision, atomic, at-most-once). Re-deriving a
+   * grant here would re-check authorization against an already-consumed
+   * digest and fail by construction (claimMetaWriteManifestGrant's own
+   * 'already_consumed' branch). The decision's own already-claimed verdict —
+   * status 'dispatching', set by approvalInboxExecution.executeResolvedDecision
+   * only on an 'approve' verdict — IS the authorization for this step.
+   *
+   * Confirmed with pheonix (who built the underlying ENG-1644 schema):
+   * decisionId === metaWriteManifestDigest for a meta_write decision was a
+   * deliberate Phase A choice specifically to make this reuse possible.
+   */
+  private buildApprovalInboxMetaWriteWorkflowSteps(
+    userId: string,
+    originSessionId: string,
+    decisions: ApprovalDecision[],
+  ): WorkflowStepDefinition[] {
+    return decisions.map((decision) => {
+      const dispatch = decision.metaWriteDispatch!;
+      return {
+        id: decision.decisionId,
+        inputs: [],
+        outputs: [],
+        requiredParameters: [],
+        execute: async (): Promise<Record<string, unknown>> => {
+          // Review fix: advanceIndependentWorkflow provides no mutual
+          // exclusion between two concurrent drivers of the SAME run picking
+          // the same un-checkpointed step (unlike buildMetaWriteWorkflowSteps
+          // above, this builder has no claimMetaWriteManifestGrant call to
+          // fall back on for that protection) — two concurrent approve-all
+          // requests for this manifest (a client retry, two tabs, two EB
+          // instances) could otherwise both reach dispatchAuthorizedMetaWrite
+          // for the same real Meta write before either checkpoint lands.
+          // claimDispatch is this step's own at-most-once gate.
+          const claimed = await approvalInboxService.claimDispatch(decision.decisionId);
+          if (!claimed) {
+            // Same StepContendedError treatment as the live-deck sibling's
+            // 'already_consumed' branch — a concurrent driver already owns
+            // this dispatch, so no checkpoint is written here (a false
+            // 'failed' could win the version race over the other driver's
+            // real 'verified' one).
+            throw new StepContendedError('This write is already being dispatched by a concurrent request.');
+          }
+          const dispatchResult = await this.dispatchAuthorizedMetaWrite(
+            userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId ?? dispatch.account_id,
+            dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
+            false, originSessionId,
+          );
+          return { dispatchResult: dispatchResult as unknown as Record<string, unknown> };
+        },
+        verify: AgentModeService.verifyMetaWriteDispatchResult,
+      };
+    });
+  }
+
+  /** Builds the message resumeOriginSession delivers once a meta_write
+   *  manifest finishes dispatching — mirrors buildResolutionMessage's shape
+   *  in approvalInboxExecution.ts (one line per item, a closing directive)
+   *  but summarizes a whole packet's read-back outcome instead of a single
+   *  decision's verdict. */
+  private static buildManifestResolutionMessage(
+    decisions: ApprovalDecision[],
+    summary: ApprovalDeckExecutionSummary | null,
+  ): string {
+    const status = (summary?.status ?? 'unapplied').replace(/_/g, ' ');
+    const lines = [
+      `[Approval Inbox manifest] ${decisions.length} Meta write(s) in this packet were approved and dispatched — result: ${status}.`,
+    ];
+    for (const decision of decisions) {
+      const item = summary?.items.find((i) => i.stepId === decision.decisionId);
+      if (item?.status === 'verified') {
+        lines.push(`- ${decision.subjectLabel}: applied${item.appliedObjectId ? ` (id ${item.appliedObjectId})` : ''}.`);
+      } else {
+        lines.push(`- ${decision.subjectLabel}: FAILED — ${item?.error || 'no result recorded'}.`);
+      }
+    }
+    lines.push('Use this as the resolved outcome to continue this work.');
+    return lines.join('\n');
+  }
+
+  /**
+   * ENG-1853: the actual fix for 1635/1644's gap — dispatches an approved
+   * approval-inbox manifest's meta_write items together, as one packet, and
+   * reads every one of them back. Called once by the approve-all route, after
+   * every decision in the manifest has already been individually resolved
+   * (each meta_write item reaching 'dispatching' via
+   * approvalInboxExecution.executeResolvedDecision as the reviewer answered
+   * it one at a time) — never per-item, since Haven's 5 calls must dispatch
+   * and reconcile as one unit, not fire the moment each button is clicked.
+   *
+   * Drives the independent-step workflow engine against the packet's OWN
+   * origin session — matches every one of 1635/1644/1853's own wording
+   * ("resumes the originating agent", "exact agent execution"). Every
+   * meta_write decision in a manifest is expected to share one
+   * originSessionId (they were all staged from the same halted turn); if
+   * they don't, this refuses rather than guessing which session to drive
+   * against — a malformed manifest should fail loud, not dispatch against
+   * the wrong session's workflow slot.
+   */
+  async executeApprovalInboxMetaWriteManifest(manifestId: string): Promise<
+    | { outcome: 'no_meta_write_items' }
+    | { outcome: 'not_all_resolved'; unresolved: string[] }
+    | { outcome: 'no_origin_session' | 'mixed_origin_sessions' }
+    | { outcome: 'conflict' }
+    | { outcome: 'already_executed' }
+    | { outcome: 'executed'; summary: ApprovalDeckExecutionSummary | null }
+  > {
+    const decisions = await approvalInboxService.listByManifest(manifestId);
+    const metaWriteDecisions = decisions.filter((d) => d.gateType === 'meta_write' && d.verdict === 'approve');
+    if (metaWriteDecisions.length === 0) return { outcome: 'no_meta_write_items' };
+
+    // Defense in depth — the approve-all route is expected to have already
+    // enforced "every item in the manifest individually resolved" before
+    // calling here; this refuses again rather than trusting the caller.
+    const unresolved = metaWriteDecisions.filter((d) => d.status !== 'dispatching').map((d) => d.decisionId);
+    if (unresolved.length > 0) return { outcome: 'not_all_resolved', unresolved };
+
+    const originSessionIds = new Set(metaWriteDecisions.map((d) => d.originSessionId).filter(Boolean));
+    if (originSessionIds.size === 0) return { outcome: 'no_origin_session' };
+    if (originSessionIds.size > 1) return { outcome: 'mixed_origin_sessions' };
+    const originSessionId = [...originSessionIds][0] as string;
+
+    const session = await chatbotDb.getChatSession(originSessionId);
+    if (!session) return { outcome: 'no_origin_session' };
+
+    const steps = this.buildApprovalInboxMetaWriteWorkflowSteps(session.userId, originSessionId, metaWriteDecisions);
+    const definition = { workflowId: `approval-inbox-manifest-${manifestId}`, steps };
+
+    // A run for this exact manifest already existing and 'completed' means a
+    // previous call already dispatched this packet — approve-all must be
+    // idempotent (a double-click, or a retried request after the response
+    // was lost) rather than re-dispatching real Meta writes a second time.
+    if (session.workflowRun?.workflowId === definition.workflowId && session.workflowRun.status === 'completed') {
+      return { outcome: 'already_executed' };
+    }
+
+    const started = await startWorkflow(originSessionId, definition, undefined).catch(() => null);
+    if (!started) {
+      // Either this exact manifest run is already mid-flight (a concurrent
+      // approve-all call) or the session has some OTHER active run (e.g. a
+      // live chat deck) — either way, drive whatever's actually running
+      // rather than silently doing nothing, since a stuck prior attempt at
+      // this same manifest must not block it forever (same reasoning as
+      // resumeStuckApprovalDeckWorkflowRun above, generalized to this
+      // manifest's own workflowId).
+      const fresh = await chatbotDb.getChatSession(originSessionId);
+      if (fresh?.workflowRun?.workflowId !== definition.workflowId) return { outcome: 'conflict' };
+    }
+
+    const outcome = await this.driveIndependentWorkflowToCompletion(originSessionId, definition);
+    if (outcome.kind === 'conflict' || outcome.kind === 'no_active_run' || outcome.kind === 'contended') {
+      return { outcome: 'conflict' };
+    }
+    const summary = this.summarizeApprovalDeckRun(outcome.run);
+
+    // Populate the previously-unused readBack/execution result per decision —
+    // the literal ENG-1635 acceptance criterion ("Read back every external
+    // object and reconcile it to the manifest... Emit one result: fully
+    // applied, partially applied, or unapplied").
+    const summaryByStepId = new Map((summary?.items ?? []).map((i) => [i.stepId, i]));
+    await Promise.all(
+      metaWriteDecisions.map(async (decision) => {
+        const item = summaryByStepId.get(decision.decisionId);
+        const success = item?.status === 'verified';
+        try {
+          await approvalInboxService.recordExecutionResult(
+            decision.decisionId,
+            success ? 'executed' : 'execution_failed',
+            {
+              success,
+              message: success
+                ? 'Dispatched to Meta and read back successfully.'
+                : (item?.error || (item?.mismatches ? `Read-back mismatch: ${JSON.stringify(item.mismatches)}` : 'Dispatch did not complete.')),
+              appliedObjectId: item?.appliedObjectId,
+              readBack: item,
+              at: new Date().toISOString(),
+            },
+          );
+        } catch (err: any) {
+          console.warn('[agent-mode-service] failed to record approval-inbox manifest execution result:', decision.decisionId, err?.message || err);
+        }
+      }),
+    );
+
+    // Review fix (critical): this manifest executor recorded every outcome
+    // but never told the origin session about any of it — the turn message
+    // staged at halt time literally promises "I'll resume automatically once
+    // it's resolved," and nothing did, for the exact flagship scenario
+    // (Haven's 5 calls, Every's 7) this ticket exists to fix. Never lets a
+    // resume failure fail the whole approve-all response — the dispatch
+    // itself already succeeded/failed and is already durably recorded above;
+    // resumeOriginSession has its own passive-note fallback and never
+    // throws, but this still guards defensively.
+    try {
+      await resumeOriginSession(originSessionId, AgentModeService.buildManifestResolutionMessage(metaWriteDecisions, summary));
+    } catch (err: any) {
+      console.warn('[agent-mode-service] failed to resume origin session after manifest execution:', originSessionId, err?.message || err);
+    }
+
+    return { outcome: 'executed', summary };
   }
 
   /**
