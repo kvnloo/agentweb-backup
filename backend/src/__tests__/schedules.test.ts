@@ -55,6 +55,11 @@ describe('Schedules Controller', () => {
 
     it('should create schedule when user owns the task', async () => {
       mockTaskDb.getTaskById.mockResolvedValue(mockTask);
+      mockUserDb.getUserById.mockResolvedValue({
+        userId,
+        email: 'test@example.com',
+        isAdmin: false
+      });
       mockScheduleDb.createSchedule.mockResolvedValue(undefined);
 
       const response = await request(app)
@@ -67,10 +72,36 @@ describe('Schedules Controller', () => {
       expect(mockScheduleDb.createSchedule).toHaveBeenCalled();
     });
 
+    it('should allow an admin to create a schedule for another user\'s task', async () => {
+      mockTaskDb.getTaskById.mockResolvedValue({
+        ...mockTask,
+        userId: otherUserId // Task owned by a different user
+      });
+      mockUserDb.getUserById.mockResolvedValue({
+        userId: 'admin-user',
+        email: 'admin@example.com',
+        isAdmin: true
+      });
+      mockScheduleDb.createSchedule.mockResolvedValue(undefined);
+
+      const response = await request(app)
+        .post('/api/schedules')
+        .set('Authorization', 'Bearer test-token')
+        .send({ taskId, frequency: 'daily' });
+
+      expect(response.status).toBe(201);
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalled();
+    });
+
     it('should return 404 without creating a schedule when the task belongs to another user', async () => {
       mockTaskDb.getTaskById.mockResolvedValue({
         ...mockTask,
         userId: otherUserId // Task owned by a different user
+      });
+      mockUserDb.getUserById.mockResolvedValue({
+        userId,
+        email: 'test@example.com',
+        isAdmin: false
       });
 
       const response = await request(app)
