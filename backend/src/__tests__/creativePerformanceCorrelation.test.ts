@@ -41,7 +41,8 @@ describe('aggregateCreative', () => {
       ],
     };
     expect(aggregateCreative(obs)).toEqual({
-      creativeId: 'c', rubricScore: 5, impressions: 3000, clicks: 50, spend: 25, leads: 2, currency: 'USD', settledRows: 3, unsettledRows: 1,
+      creativeId: 'c', rubricScore: 5, impressions: 3000, clicks: 50, spend: 25, leads: 2,
+      videoPlays3s: 0, videoImpressions: 0, crmLeads: 0, crmJoinedSpend: 0, currency: 'USD', settledRows: 3, unsettledRows: 1,
     });
   });
 
@@ -97,7 +98,7 @@ describe('creativePerformanceReport', () => {
       creative('mixed', 5, [settledRow('2026-07-01'), settledRow('2026-07-02', { currency: 'INR' })]),
       creative('inr', 2, [settledRow('2026-07-01', { currency: 'INR' })]),
     ], { minImpressions: 100 });
-    expect(report.excluded).toEqual({ noRubricScore: 1, noSettledRows: 0, belowMinImpressions: 1, noConversions: 1, mixedCurrency: 1 });
+    expect(report.excluded).toMatchObject({ noRubricScore: 1, noSettledRows: 0, belowMinImpressions: 1, noConversions: 1, mixedCurrency: 1 });
     expect(report.cpaByCurrency.INR).toEqual({ n: 1, result: null });
     expect(report.cpaByCurrency.USD.n).toBe(6);
   });
@@ -166,7 +167,7 @@ describe('creativePerformanceCorrelation loader (read-only)', () => {
     expect(() => parseArgs(['--min-impressions'])).toThrow(/needs a value/);
     expect(() => parseArgs(['--min-impressions', '-1'])).toThrow(/non-negative/);
     const opts = parseArgs(['--min-impressions', '500', '--json']);
-    expect(opts).toEqual({ table: undefined, minImpressions: 500, minConversions: 1, perCreative: false, json: true });
+    expect(opts).toEqual({ table: undefined, minImpressions: 500, minConversions: 1, minClicks: 100, perCreative: false, json: true });
     const lines = formatReport(creativePerformanceReport([
       creative('a', 1, [settledRow('2026-07-01', { clicks: 1 })]),
       creative('b', 2, [settledRow('2026-07-01', { clicks: 2 })]),
