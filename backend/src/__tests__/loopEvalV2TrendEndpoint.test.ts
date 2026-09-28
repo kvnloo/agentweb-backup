@@ -87,6 +87,16 @@ describe('GET /api/admin/loops/eval-v2-trend', () => {
     expect(metric.ci.high).toBe(1);
   });
 
+  it('serves the creative and account-health snapshots and every registry grader with its version (ENG-2196)', async () => {
+    const res = await get({ userId: 'a', isAdmin: true });
+    expect(res.body.creative).toEqual([]);
+    expect(res.body.accountHealth).toEqual([]);
+    const registry = res.body.registry as Array<{ id: string; surface: string; version: string; mayGate: boolean }>;
+    expect(registry.length).toBeGreaterThan(20);
+    expect(registry.every((g) => typeof g.version === 'string' && g.version.length > 0 && g.mayGate === false)).toBe(true);
+    expect(registry.find((g) => g.id === 'creative-deterministic-gates')).toMatchObject({ surface: 'creative', version: '2026-09-25.1' });
+  });
+
   it('reads the 1d window on request and reports the sampler flag', async () => {
     process.env.EVAL_V2_SAMPLER_ENABLED = 'true';
     const res = await get({ userId: 'a', isAdmin: true }).query({ window: '1d' });
