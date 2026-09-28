@@ -934,6 +934,31 @@ describe('Schedules Controller', () => {
       expect(mockOrgDb.getOrgById).not.toHaveBeenCalled();
       expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
     });
+
+    it('createSchedule: an orgless (solo) task owner is never treated as if their task belongs to the acting admin\'s own org', async () => {
+      // Regression for a bug CodeRabbit caught on this PR: ownerOrgId must come
+      // ONLY from the task owner's own orgId. Falling back to the acting user's
+      // orgId when the owner has none would make a solo user's task look
+      // org-shared with whichever org the acting admin happens to belong to.
+      const soloOwnerId = 'solo-owner-no-org';
+      const orgAdminId = 'org-admin';
+      asActingUser(orgAdminId);
+      mockTaskDb.getTaskById.mockResolvedValue({ ...mockTask, userId: soloOwnerId });
+      mockUserDb.getUserById.mockImplementation(async (id: string) =>
+        id === orgAdminId
+          ? { userId: orgAdminId, email: 'a@example.com', isAdmin: false, orgId, orgRole: 'admin' as any }
+          : { userId: soloOwnerId, email: 's@example.com', isAdmin: false } // no orgId at all
+      );
+
+      const response = await request(app)
+        .post('/api/schedules')
+        .set('Authorization', 'Bearer test-token')
+        .send({ taskId, frequency: 'daily' });
+
+      expect(response.status).toBe(404);
+      expect(mockOrgDb.getOrgById).not.toHaveBeenCalled();
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+    });
   });
 });
 

@@ -18,7 +18,13 @@ async function resolveTaskOrgContext(
   actingUser: { userId: string; orgId?: string; orgRole?: OrgRole }
 ) {
   const ownerUser = taskOwnerId !== actingUser.userId ? await userDb.getUserById(taskOwnerId) : null;
-  const ownerOrgId = ownerUser?.orgId ?? actingUser.orgId;
+  // Only ever the OWNER's org — never fall back to the acting user's own org.
+  // canEditItem/canViewItem's first check already grants access when the
+  // acting user owns the task, so this only runs for a genuinely different
+  // owner; falling back here would make an orgless (solo) owner's task look
+  // like it belongs to the acting user's own org, letting any admin/editor
+  // of an unrelated org edit or schedule it (CodeRabbit, PR #3111).
+  const ownerOrgId = ownerUser?.orgId;
   const org = (actingUser.orgId && ownerOrgId === actingUser.orgId)
     ? await orgDb.getOrgById(actingUser.orgId)
     : null;
