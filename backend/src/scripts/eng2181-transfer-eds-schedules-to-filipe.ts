@@ -46,9 +46,14 @@
  *   # writes nothing
  *   npx ts-node src/scripts/eng2181-transfer-eds-schedules-to-filipe.ts
  *
- *   # Apply
+ *   # Apply — also writes a JSON manifest of exactly what moved into
+ *   # Filipe's account, meant to be handed to whoever messages him (e.g. in
+ *   # the XCures group) so they can name the schedules instead of speaking
+ *   # about the change in the abstract. Defaults to
+ *   # eng2181-transfer-manifest.json in the current directory; override with
+ *   # --manifest <path>.
  *   npx ts-node src/scripts/eng2181-transfer-eds-schedules-to-filipe.ts \
- *       --apply --confirmed-by "Harsha"
+ *       --apply --confirmed-by "Harsha" [--manifest ./eng2181-transfer-manifest.json]
  */
 
 import { scheduleDb, userDb } from '../services/db';
@@ -62,10 +67,20 @@ export const EXPECTED_FILIPE_USER_ID = 'f958eb3e-4e82-4227-8aa8-634476498a62';
 export interface ScheduleTransfer {
   scheduleId: string;
   scheduleName: string;
+  /** Owner-authored summary, if any — the most useful line for naming the schedule in a customer message. */
+  description: string;
+  frequency: string;
   statusBefore: string;
   emailNotificationsBefore: string[];
   emailNotificationsAfter: string[];
   emailNotificationsChanged: boolean;
+}
+
+/** Just enough to name a previously-transferred schedule in the manifest — never written to again. */
+export interface AlreadyTransferredSchedule {
+  scheduleId: string;
+  scheduleName: string;
+  description: string;
 }
 
 export interface TransferResult {
@@ -74,8 +89,8 @@ export interface TransferResult {
   scanned: number;
   /** Ed's active/paused schedules eligible for transfer. */
   candidates: ScheduleTransfer[];
-  /** Already owned by Filipe — left alone. */
-  alreadyTransferred: string[];
+  /** Already owned by Filipe — left alone, but still named here for a complete manifest. */
+  alreadyTransferred: AlreadyTransferredSchedule[];
   /** Written when `apply` is set; equals `candidates` minus any that raced. */
   transferred: ScheduleTransfer[];
   /** A schedule changed underneath the read — not transferred. */
@@ -149,12 +164,13 @@ export async function transferEdsSchedulesToFilipe(opts: {
 
   const schedules = (await getSchedulesByUserId(ed.userId)) || [];
   const candidates: ScheduleTransfer[] = [];
-  const alreadyTransferred: string[] = [];
+  const alreadyTransferred: AlreadyTransferredSchedule[] = [];
 
   for (const schedule of schedules) {
     if (!schedule?.scheduleId) continue;
+    const scheduleName = schedule.scheduleName || schedule.name || '(unnamed)';
     if (schedule.userId === filipe.userId) {
-      alreadyTransferred.push(schedule.scheduleId);
+      alreadyTransferred.push({ scheduleId: schedule.scheduleId, scheduleName, description: schedule.description || '' });
       continue;
     }
     const { after: emailNotificationsAfter, changed: emailNotificationsChanged } = swapEmail(
@@ -164,7 +180,9 @@ export async function transferEdsSchedulesToFilipe(opts: {
     );
     candidates.push({
       scheduleId: schedule.scheduleId,
-      scheduleName: schedule.scheduleName || schedule.name || '(unnamed)',
+      scheduleName,
+      description: schedule.description || '',
+      frequency: schedule.frequency || '',
       statusBefore: schedule.status,
       emailNotificationsBefore: schedule.emailNotifications || [],
       emailNotificationsAfter,
@@ -219,6 +237,8 @@ async function main() {
   const apply = argv.includes('--apply');
   const confirmedByIndex = argv.indexOf('--confirmed-by');
   const confirmedBy = confirmedByIndex >= 0 ? argv[confirmedByIndex + 1] : '';
+  const manifestIndex = argv.indexOf('--manifest');
+  const manifestPath = manifestIndex >= 0 ? argv[manifestIndex + 1] : 'eng2181-transfer-manifest.json';
 
   if (apply && !confirmedBy) {
     console.error('Refusing to apply without --confirmed-by "<name of the person approving this>".');
@@ -238,7 +258,7 @@ async function main() {
 
   if (result.alreadyTransferred.length) {
     console.log(`\nALREADY FILIPE'S — left alone (${result.alreadyTransferred.length}):`);
-    for (const id of result.alreadyTransferred) console.log(`  ${id}`);
+    for (const s of result.alreadyTransferred) console.log(`  ${s.scheduleId}  "${s.scheduleName}"`);
   }
 
   const list = apply ? result.transferred : result.candidates;
@@ -251,6 +271,35 @@ async function main() {
   if (result.raced.length) {
     console.log(`\nRACED — schedule changed mid-run, not transferred (${result.raced.length}):`);
     for (const id of result.raced) console.log(`  ${id}`);
+  }
+
+  // ENG-2181: whoever messages Filipe (e.g. in the XCures group) needs to name
+  // exactly what moved into his account, not describe the change in the
+  // abstract. Written on apply only — a dry run hasn't moved anything yet, so
+  // there is nothing real to hand off. Includes schedules transferred by an
+  // earlier run of this script too, so the manifest is always the complete
+  // "everything that came from Ed's account" list, not just this run's delta.
+  if (apply) {
+    const manifest = {
+      generatedAt: new Date().toISOString(),
+      confirmedBy,
+      ed: { email: ED_EMAIL, userId: result.edUserId },
+      filipe: { email: FILIPE_EMAIL, userId: result.filipeUserId },
+      transferredThisRun: result.transferred.map((c) => ({
+        scheduleId: c.scheduleId,
+        scheduleName: c.scheduleName,
+        description: c.description,
+        frequency: c.frequency,
+        statusBeforeTransfer: c.statusBefore,
+      })),
+      transferredInAnEarlierRun: result.alreadyTransferred,
+      notTransferred: result.raced.map((scheduleId) => ({
+        scheduleId,
+        reason: 'changed underneath this run — re-run the script to pick it up',
+      })),
+    };
+    require('fs').writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+    console.log(`\nWrote manifest of everything now in Filipe's account to ${manifestPath}`);
   }
 
   console.log(
