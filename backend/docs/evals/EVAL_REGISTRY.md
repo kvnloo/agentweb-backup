@@ -22,6 +22,7 @@ harness (ENG-2136) produces those runs; record the result on the entry, with evi
 | agent-task-success | agent | code, offline | — | no |
 | agent-tool-correctness | agent | code, offline | — | no |
 | agent-groundedness-offline | agent | code, offline (finalize-guard lexicon) | — | no |
+| agent-reply-length-fixtures | agent | code, offline (ENG-1312 fixtures, placeholder inputs) | — | no |
 | okareo-no-hallucinated-capabilities-v2 | agent | LLM judge (Okareo) | unknown | calibration set only |
 | enrichment-golden-set | agent | code | — | golden set, CRM enrichment only |
 | human-eval-queue | creative | human (free text) | — | no |
@@ -104,6 +105,16 @@ these rates: none of the graders is validated.
 The satisfaction score is no longer a headline: the chat-history badges moved to the last column,
 labelled unvalidated, with neutral colours. The judges and their stored scores are unchanged, and
 the Daily Satisfaction Score Report schedule stays paused.
+
+## Offline suite and regression gate (ENG-2145)
+
+`loops/scripts/runOfflineEvalSuite.ts` compares the registered replay cases, the ENG-1312 fixtures,
+golden-set agreement and Okareo checks with a versioned baseline (`loops/eval/baselines/*.json`) and
+prints pass / regression / unavailable. It fails closed on any evaluator problem. A metric may block
+only when its grader passes `mayGate` and `EVAL_GATE_BLOCKING=true`, so today it is report-only.
+Prompt, model and skill edits in AW-Settings / AW-Skills make a best-effort write of an `eval_needed`
+marker (`Dev-AW-LoopEvents`, loopId `eval-gate`); a failed marker write never fails the edit, so that
+edit is then missing from the marker feed. Details: `docs/evals/OFFLINE_EVAL_GATE.md`.
 
 ## Known false-positive catalogue (session judges)
 

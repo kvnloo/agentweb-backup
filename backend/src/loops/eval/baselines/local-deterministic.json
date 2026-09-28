@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "baselineId": "local-deterministic-v1",
+  "suiteVersion": 1,
+  "createdAt": "2026-09-25T19:17:50.257Z",
+  "target": "local",
+  "source": "runOfflineEvalSuite --target local on origin/main 9801c1cb3 + ENG-2145 (no credentials, no network)",
+  "metrics": [
+    {
+      "metricId": "failure-replay:agent-tool-correctness",
+      "graderId": "agent-tool-correctness",
+      "graderVersion": "1",
+      "kind": "deterministic",
+      "category": "quality",
+      "n": 2,
+      "passes": 2,
+      "threshold": 0,
+      "minN": 2,
+      "placeholder": false
+    },
+    {
+      "metricId": "replay-fixture-length",
+      "graderId": "agent-reply-length-fixtures",
+      "graderVersion": "1",
+      "kind": "deterministic",
+      "category": "quality",
+      "n": 3,
+      "passes": 3,
+      "threshold": 0,
+      "minN": 3,
+      "placeholder": true
+    }
+  ]
+}
