@@ -23,6 +23,7 @@ import { postSlackMessage } from '../services/slackService';
 import { isCronEnabled } from '../utils/instanceState';
 import {
   buildCalibrationPairs,
+  CALIBRATION_REVIEW_TYPES,
   calibrationWindow,
   DEFAULT_CALIBRATION_BATCH_SIZE,
   isoWeekOf,
@@ -59,7 +60,8 @@ export interface CreativeCalibrationDeps {
 
 async function loadCreativeCandidates(): Promise<CalibrationCandidate[]> {
   const { humanEvalService } = await import('../services/humanEvalService');
-  return humanEvalService.listCandidatesByReviewType('creative_image');
+  const perType = await Promise.all(CALIBRATION_REVIEW_TYPES.map((t) => humanEvalService.listCandidatesByReviewType(t)));
+  return perType.flat();
 }
 
 function defaultDeps(): CreativeCalibrationDeps {

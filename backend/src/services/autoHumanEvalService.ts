@@ -26,6 +26,8 @@ export interface AutoHumanEvalInput {
   creativeGates?: CreativeGateResult;
   /** What the generating flow knows about the creative's brief, for the rubric judge (ENG-2140). */
   creativeBrief?: Omit<CreativeBrief, 'brand'>;
+  /** Landing pages: the generated page source for the rubric judge, read only if sampled (ENG-2192). */
+  loadLandingPageSource?: () => Promise<string | undefined>;
 }
 
 function dedupeSettingKey(sourceKey: string): string {
@@ -143,15 +145,19 @@ export async function enqueueAutoHumanEval(
       console.warn('[auto-human-eval] sourceKey dedupe marker write failed after the candidate was already created (non-fatal):', markerErr?.message || markerErr);
     }
 
-    // ENG-2140: advisory rubric judge on sampled ad creatives, only when enabled. Not awaited,
-    // and the hook never throws, so it cannot delay or fail the enqueue or the generation.
-    if (input.reviewType === 'creative_image') {
+    // ENG-2140 / ENG-2192: advisory rubric judge on sampled generated images and landing pages,
+    // only when enabled. Not awaited, and the hook never throws, so it cannot delay or fail the
+    // enqueue or the generation.
+    if (input.reviewType === 'creative_image' || input.reviewType === 'landing_page') {
       void judgeHumanEvalCandidate({
         candidateId: candidate.candidateId,
         userId: input.userId,
+        reviewType: input.reviewType,
         category: input.category,
         artifactUrl: candidate.artifactUrl ?? input.artifactUrl,
+        createdAt: candidate.createdAt,
         creativeGates: input.creativeGates,
+        ...(input.loadLandingPageSource ? { loadLandingPageSource: input.loadLandingPageSource } : {}),
         brief: input.creativeBrief,
       }).catch(() => undefined);
     }
