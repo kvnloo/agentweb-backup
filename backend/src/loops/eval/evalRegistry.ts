@@ -323,7 +323,7 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
     modelFamily: 'none',
     consumers: ['needs-review log (at_risk; oncall alert only once mayGate is true) and CS nudge log (activation_incomplete), only when ACCOUNT_HEALTH_ALERTS_ENABLED=true'],
     knownIssues: ['ENG-2016', 'ENG-1342', 'ENG-1913', 'ENG-2149'],
-    notes: 'Replaces renewal-integration-health. Not validated: the 2026-09-25 backtest has single-digit churn positives, so its precision CI is too wide to gate. Current-requirement fields arrive with OPS-4 (ENG-2149); no live campaign-delivery source yet, so zero delivery is not evaluated live.',
+    notes: 'Replaces renewal-integration-health. Not validated: the 2026-09-29 backtest (93 pairs, 8 churned, 5 cutoffs) predicted 1 at-risk, which did not churn: precision 0/1, recall 0/8 [0.00, 0.32]. Behavioural signals (spend drop, results drop, negative feedback) fire rarely because ad snapshots mostly start 2026-08-15; see EVAL_REGISTRY.md. Current-requirement fields arrive with OPS-4 (ENG-2149); no live campaign-delivery source yet, so zero delivery is not evaluated live.',
   },
   {
     id: 'crm-contact-lifecycle',

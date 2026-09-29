@@ -9,7 +9,11 @@ import {
   evaluateZeroDelivery,
   resolveCurrentRequirement,
   billingCycleKey,
+  buildAdDays,
+  evaluateAdTrend,
+  evaluateFeedback,
   type AccountHealthSignals,
+  type AdDayInput,
   type CampaignDeliveryInput,
 } from '../services/accountHealthClassifier';
 
@@ -249,5 +253,96 @@ describe('billingCycleKey', () => {
     expect(billingCycleKey('2026-10-10T08:00:00.000Z', NOW)).toBe('2026-10-10');
     expect(billingCycleKey(undefined, NOW)).toBe('month:2026-09');
     expect(billingCycleKey('not a date', NOW)).toBe('month:2026-09');
+  });
+});
+
+/** `days` consecutive collected days ending the day before NOW, oldest first. */
+function adDays(days: number, spendFor: (daysAgo: number) => number, leadsFor: (daysAgo: number) => number = () => 0): AdDayInput[] {
+  const out: AdDayInput[] = [];
+  for (let daysAgo = days; daysAgo >= 1; daysAgo--) {
+    out.push({ date: new Date(NOW - daysAgo * DAY_MS).toISOString().slice(0, 10), spend: spendFor(daysAgo), leads: leadsFor(daysAgo) });
+  }
+  return out;
+}
+
+describe('buildAdDays (account-day rows carry spend 0; spend comes from campaign rows)', () => {
+  it('marks account-day dates as collected, sums campaign spend and account-day leads per date', () => {
+    expect(buildAdDays(
+      [{ date: '2026-09-01', totalLeadCount: 2 }, { date: '2026-09-01', totalLeadCount: 1 }, { date: '2026-09-02', totalLeadCount: 0 }],
+      [{ date: '2026-09-01', spend: 10 }, { date: '2026-09-01', spend: 5 }, { date: '2026-09-03', spend: 7 }],
+    )).toEqual([
+      { date: '2026-09-01', spend: 15, leads: 3 },
+      { date: '2026-09-02', spend: 0, leads: 0 },
+      { date: '2026-09-03', spend: 7, leads: 0 },
+    ]);
+  });
+});
+
+describe('ad trend: spend drop and results drop (ENG-2143 audit)', () => {
+  it('flags spend cut by half or more against the prior 14 days', () => {
+    const [evidence] = evaluateAdTrend(adDays(28, (d) => (d > 14 ? 100 : 40)), NOW);
+    expect(evidence).toMatchObject({ code: 'spend_drop', kind: 'risk' });
+    expect(evidence.detail).toContain('fell 60%');
+  });
+
+  it('does not flag a smaller dip', () => {
+    expect(evaluateAdTrend(adDays(28, (d) => (d > 14 ? 100 : 60)), NOW).map((e) => e.code)).toEqual(['ad_trend_steady']);
+  });
+
+  it('flags leads that stopped while spend continued, only against a real lead baseline', () => {
+    const stopped = evaluateAdTrend(adDays(28, () => 50, (d) => (d > 14 && d % 4 === 0 ? 1 : 0)), NOW);
+    expect(stopped.map((e) => e.code)).toEqual(['results_drop']);
+    // Never had leads: nothing to compare, so no results verdict.
+    expect(evaluateAdTrend(adDays(28, () => 50), NOW).map((e) => e.code)).toEqual(['ad_trend_steady']);
+  });
+
+  it('does not judge a trend from too few collected days, or without prior spend (unread is not zero)', () => {
+    expect(evaluateAdTrend(adDays(20, (d) => (d > 14 ? 100 : 0)), NOW).map((e) => e.code)).toEqual(['ad_trend_not_evaluable']);
+    expect(evaluateAdTrend(adDays(28, () => 0), NOW).map((e) => e.code)).toEqual(['ad_trend_not_evaluable']);
+  });
+
+  it('a spend drop makes a connected account at_risk (medium confidence); unread metrics decide nothing', () => {
+    const result = classifyAccountHealth(signals({ adDays: adDays(28, (d) => (d > 14 ? 100 : 0)) }));
+    expect(result).toMatchObject({ state: 'at_risk', confidence: 'medium' });
+    expect(classifyAccountHealth(signals({ adDays: null })).state).toBe('healthy');
+    expect(codes(signals({ adDays: null }))).toContain('ad_trend_not_evaluable');
+  });
+});
+
+describe('explicit negative feedback', () => {
+  const rating = (type: string, daysAgo: number) => ({ type, timestamp: ago(daysAgo * DAY_MS) });
+
+  it('is a risk when thumbs-down are at least 3 and outnumber thumbs-up in the last 30 days', () => {
+    expect(evaluateFeedback([rating('dislike', 1), rating('dislike', 2), rating('dislike', 3), rating('like', 4)], NOW))
+      .toMatchObject({ code: 'negative_feedback', kind: 'risk' });
+    expect(classifyAccountHealth(signals({ feedback: [rating('dislike', 1), rating('dislike', 2), rating('dislike', 3)] })).state)
+      .toBe('at_risk');
+  });
+
+  it('ignores ratings outside the window and a thumbs-up majority', () => {
+    expect(evaluateFeedback([rating('dislike', 31), rating('dislike', 40), rating('dislike', 45)], NOW).code).toBe('feedback_clear');
+    expect(evaluateFeedback([rating('dislike', 1), rating('dislike', 2), rating('dislike', 3), ...[1, 2, 3].map((d) => rating('like', d))], NOW).code)
+      .toBe('feedback_clear');
+  });
+});
+
+describe('pixel tracking is activation evidence, never risk (D6)', () => {
+  it('a connected account whose ads land on pages without an owned pixel is activation_incomplete', () => {
+    const result = classifyAccountHealth(signals({ tracking: { destinationsWithoutOwnedPixel: 2, landingPagesWithoutOwnedPixel: 0 } }));
+    expect(result).toMatchObject({ state: 'activation_incomplete', confidence: 'medium' });
+    expect(result.evidence.find((e) => e.code === 'tracking_not_set_up')?.kind).toBe('activation');
+  });
+
+  it('owned pixels, or an unread check, leave the account healthy', () => {
+    expect(classifyAccountHealth(signals({ tracking: { destinationsWithoutOwnedPixel: 0, landingPagesWithoutOwnedPixel: 0 } })).state).toBe('healthy');
+    expect(codes(signals({ tracking: null }))).toContain('tracking_not_read');
+  });
+
+  it('a real risk still wins over tracking setup', () => {
+    const result = classifyAccountHealth(signals({
+      subscriptionStatus: 'past_due',
+      tracking: { destinationsWithoutOwnedPixel: 1, landingPagesWithoutOwnedPixel: 1 },
+    }));
+    expect(result.state).toBe('at_risk');
   });
 });

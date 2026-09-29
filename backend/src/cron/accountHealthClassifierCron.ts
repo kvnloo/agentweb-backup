@@ -35,7 +35,11 @@ import {
   type AccountHealthSignalState,
 } from '../services/accountCapabilityRequirementsDb';
 import {
+  buildAdDays,
   classifyAccountHealth,
+  type AdDayInput,
+  type FeedbackInput,
+  type TrackingInput,
   type AccountHealthClassification,
   type AccountHealthSignals,
   type EvidenceCode,
@@ -43,6 +47,8 @@ import {
 import type { AdConnectionAccount } from '../services/clientHealthService';
 import { mayGate } from '../loops/eval/evalRegistry';
 import { isCronEnabled } from '../utils/instanceState';
+import { chatbotDb } from '../services/chatbotService';
+import { monitorUserTracking } from '../services/metaTrackingMonitor';
 
 const TAG = '[accountHealthClassifierCron]';
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -168,18 +174,51 @@ export interface GatheredAccountHealth {
 }
 
 /**
- * 30-day ad spend from Meta account-day snapshots. null when unread or truncated, never a fake zero.
- * Summed across account currencies, so it only answers "was anything spent" (> 0), not how much.
+ * The last 30 days of collected ad days (Meta snapshots). null when unread or truncated, never a
+ * fake zero. Spend comes from the campaign rows: account-day rows always store spend 0.
  */
-async function readRecentAdSpend(userId: string, nowMs: number): Promise<number | null> {
+async function readAdDays(userId: string, nowMs: number): Promise<AdDayInput[] | null> {
   try {
     const since = new Date(nowMs - 30 * DAY_MS).toISOString().slice(0, 10);
     const until = new Date(nowMs).toISOString().slice(0, 10);
-    const result = await adsMetricsDb.getAccountDaySnapshots(userId, since, until);
-    if (result.truncated) return null;
-    return result.rows.reduce((sum, row) => sum + (Number.isFinite(row.spend) ? row.spend : 0), 0);
+    const [accountDays, campaigns] = await Promise.all([
+      adsMetricsDb.getAccountDaySnapshots(userId, since, until),
+      adsMetricsDb.getSnapshotsByUserDateRange(userId, since, until),
+    ]);
+    if (accountDays.truncated || campaigns.truncated) return null;
+    return buildAdDays(accountDays.rows, campaigns.rows);
   } catch (error) {
-    console.error(`${TAG} ad spend read failed for user ${userId}:`, error);
+    console.error(`${TAG} ad metrics read failed for user ${userId}:`, error);
+    return null;
+  }
+}
+
+/** Ratings on sessions active in the feedback window. null when unread or too large to read. */
+async function readFeedback(userId: string, nowMs: number): Promise<FeedbackInput[] | null> {
+  try {
+    return await chatbotDb.getRecentSessionFeedback(userId, new Date(nowMs - 30 * DAY_MS).toISOString());
+  } catch (error) {
+    console.error(`${TAG} feedback read failed for user ${userId}:`, error);
+    return null;
+  }
+}
+
+/**
+ * The Meta tracking monitor's pixel findings, run capture-only (dryRun: no alert, no suppression
+ * state). Only for accounts with a Meta ad account; null when nothing could be read.
+ */
+async function readTracking(user: AccountHealthUser): Promise<TrackingInput | null> {
+  const hasMeta = (user.connected_accounts ?? []).some((acc) => acc?.platform === 'meta' && acc.config?.account_type === 'ad_account');
+  if (!hasMeta) return null;
+  try {
+    const summary = await monitorUserTracking(user, { dryRun: true });
+    if (summary.accountsChecked === 0) return null;
+    return {
+      destinationsWithoutOwnedPixel: summary.destinationAlerts,
+      landingPagesWithoutOwnedPixel: summary.landingPageAlerts,
+    };
+  } catch (error) {
+    console.error(`${TAG} tracking check failed for user ${user.userId}:`, error);
     return null;
   }
 }
@@ -189,7 +228,7 @@ async function readRecentAdSpend(userId: string, nowMs: number): Promise<number 
  * reports as a gap rather than as evidence either way.
  */
 export async function gatherAccountHealthSignals(user: AccountHealthUser, nowMs: number): Promise<GatheredAccountHealth> {
-  const [capabilityRow, payments, recentAdSpend] = await Promise.all([
+  const [capabilityRow, payments, adDays, feedback, tracking] = await Promise.all([
     getAccountCapabilityRequirement(user.userId, 'ad_platform_integration').catch((error: unknown) => {
       console.error(`${TAG} capability read failed for user ${user.userId}:`, error);
       return null;
@@ -198,8 +237,12 @@ export async function gatherAccountHealthSignals(user: AccountHealthUser, nowMs:
       console.error(`${TAG} payment history read failed for user ${user.userId}:`, error);
       return null;
     }),
-    readRecentAdSpend(user.userId, nowMs),
+    readAdDays(user.userId, nowMs),
+    readFeedback(user.userId, nowMs),
+    readTracking(user),
   ]);
+  // Summed across account currencies, so it only answers "was anything spent" (> 0), not how much.
+  const recentAdSpend = adDays ? adDays.reduce((sum, day) => sum + day.spend, 0) : null;
   return {
     capabilityRow,
     signals: {
@@ -215,6 +258,9 @@ export async function gatherAccountHealthSignals(user: AccountHealthUser, nowMs:
       campaigns: null,
       recentAdSpend,
       lastActiveAt: user.lastActiveAt,
+      adDays,
+      feedback,
+      tracking,
     },
   };
 }
