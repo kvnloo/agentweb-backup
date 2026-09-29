@@ -50,7 +50,7 @@ import { MAX_READ_ONLY_PRESS_ATTEMPTS, isReadOnlyOnlyUnmet, shouldStopPressingFo
 import { MAX_SEND_PRESS_ATTEMPTS, isSendOnlyUnmet, shouldStopPressingForSend } from '../utils/sendPressCircuitBreaker';
 import { isReadOnlyToolName, isWriteToolCall } from '../utils/toolWriteClassification';
 import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
-import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
+import { resolvePublishAuthorized, extractScheduleId, resolveSlackSendAuthorized, filterSlackSendFromRequiredIfWithheld } from '../utils/schedulePublishApproval';
 import { meteringFeature } from '../services/llmUsageAttributionService';
 import type { LLMUsageContext } from '../utils/llmService';
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
@@ -6520,6 +6520,11 @@ export async function runScheduledChat(
     // scope. `tools` is empty when unauthorized, so this still drops every publish
     // requirement in that case.
     let publishAuthorization = resolveSchedulePublishAuthorization(schedule);
+    // ENG-2204 follow-up: resolved once at admission, same as publishAuthorization above —
+    // Slack has no mid-run revocation action, so a single fresh read here is the whole
+    // gate (see filterSlackSendFromRequiredIfWithheld's doc comment for the incident this
+    // closes).
+    const slackSendAuthorized = resolveSlackSendAuthorized(schedule);
     // ENG-827: stamp the admitted authorization on the session before the first turn.
     //
     // The dispatch-time guard re-reads the schedule so a revocation stops an in-flight
@@ -6554,7 +6559,10 @@ export async function runScheduledChat(
     // admitted value and is narrowed — never widened — by each mid-run re-check, so it
     // also ends up holding the final state the run's record must be reported against.
     let effectivePublishAuthorization = publishAuthorization;
-    const requiredFunctions = filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, publishAuthorization)
+    const requiredFunctions = filterSlackSendFromRequiredIfWithheld(
+      filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, publishAuthorization),
+      slackSendAuthorized
+    )
       .map((funcName: string) => ({
         functionName: funcName,
         minCount: functionCallMinCalls[funcName] || 1
@@ -6861,7 +6869,10 @@ export async function runScheduledChat(
     // ONE of an equivalence pair (e.g. post_on_connected_account but not
     // twitter_manage_post) is scoped identically here and in the checker — not the
     // wider, unfiltered `requiredFunctionNames` computed earlier in this function.
-    const heldToFunctionNames = filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization);
+    const heldToFunctionNames = filterSlackSendFromRequiredIfWithheld(
+      filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization),
+      slackSendAuthorized
+    );
     heldToFunctionNames.forEach((functionName: string) => {
       finalFunctionCallDetails[functionName] = {
         // ENG-1045 (Greptile): a resumed run's requirement can be satisfied by a call
@@ -7556,7 +7567,10 @@ export async function runScheduledChat(
     // `sendScheduledChatResultEmail` (not merely internal logging), so "safe direction of
     // error" is the actual guarantee being relied on here, not "nobody sees it".
     const recoveredAdmittedAuthorization = resolveSchedulePublishAuthorization(schedule);
-    const recoveredHeldToNames = filterRequiredFunctionsToAuthorizedScope(schedule.requiredFunctionCalls, recoveredAdmittedAuthorization);
+    const recoveredHeldToNames = filterSlackSendFromRequiredIfWithheld(
+      filterRequiredFunctionsToAuthorizedScope(schedule.requiredFunctionCalls, recoveredAdmittedAuthorization),
+      resolveSlackSendAuthorized(schedule)
+    );
 
     // The entire block below reads a real, external, potentially-malformed record (the
     // session) inside an error handler — the one place a second, NEW failure would be
