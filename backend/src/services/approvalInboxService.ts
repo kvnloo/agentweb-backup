@@ -170,6 +170,13 @@ export interface ApprovalDecision {
    *  both call dispatchAuthorizedMetaWrite for the same real Meta write
    *  before either checkpoint lands. */
   dispatchClaimedAt?: string;
+  /** ENG-1853 second-review fix: set by claimManifestFinalization, at most
+   *  once per manifest (stamped on one deterministic anchor decision) — the
+   *  gate that stops two concurrent approve-all callers from both recording
+   *  execution results and both resuming the origin session once a
+   *  manifest's real dispatch work is done. See claimManifestFinalization's
+   *  own header for the exact race this closes. */
+  manifestFinalizedAt?: string;
 }
 
 export interface CreateApprovalDecisionRequest {
@@ -570,6 +577,50 @@ export class ApprovalInboxService {
           Key: { decisionId },
           UpdateExpression: 'SET dispatchClaimedAt = :now, updatedAt = :now',
           ConditionExpression: 'attribute_not_exists(dispatchClaimedAt)',
+          ExpressionAttributeValues: { ':now': new Date().toISOString() },
+        })
+        .promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return false;
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-1853 second-review fix: at-most-once FINALIZATION gate for a
+   * meta_write manifest's post-dispatch side effects (recording every
+   * decision's execution result + actively resuming the origin session) —
+   * a sibling of claimDispatch above, but scoped to the whole manifest
+   * rather than one write.
+   *
+   * Real gap found by an independent review: claimDispatch alone prevents
+   * two concurrent `approve-all` requests for the same manifest from both
+   * dispatching the same real Meta write, but it does NOT stop both
+   * requests from each independently reaching 'completed' once the one
+   * real dispatch is checkpointed (a second driver's own poll loop simply
+   * observes the already-verified checkpoint and returns 'completed' too —
+   * traced through advanceIndependentWorkflow directly, not assumed). Both
+   * would then call recordExecutionResult a second, redundant time AND both
+   * call resumeOriginSession — the in-memory tryClaimSessionGeneration lock
+   * only serializes the actual generateSessionResponse call within a
+   * single process, so a second/duplicate passive note (or, on a
+   * multi-instance deployment, a second REAL active resume) could still
+   * happen. This claim, anchored on one deterministic decision in the
+   * manifest (the caller passes whichever one it likes, as long as every
+   * caller for the same manifestId passes the SAME anchor), ensures only
+   * one caller ever proceeds past dispatch to record results and resume —
+   * every other concurrent caller sees `false` and returns the outcome
+   * without repeating those side effects.
+   */
+  async claimManifestFinalization(anchorDecisionId: string): Promise<boolean> {
+    try {
+      await dynamodb
+        .update({
+          TableName: APPROVAL_DECISIONS_TABLE,
+          Key: { decisionId: anchorDecisionId },
+          UpdateExpression: 'SET manifestFinalizedAt = :now, updatedAt = :now',
+          ConditionExpression: 'attribute_not_exists(manifestFinalizedAt)',
           ExpressionAttributeValues: { ':now': new Date().toISOString() },
         })
         .promise();

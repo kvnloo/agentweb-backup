@@ -239,6 +239,7 @@ describe('enqueueAutoHumanEval', () => {
       expect(mockJudgeCandidate).toHaveBeenCalledWith({
         candidateId: 'candidate-1',
         userId: 'user-1',
+        reviewType: 'creative_image',
         category: 'ad',
         artifactUrl: 'https://example.com/ad.png',
         creativeGates,
@@ -246,8 +247,34 @@ describe('enqueueAutoHumanEval', () => {
       });
     });
 
-    it('does not call the hook for other review types or when no candidate was created', async () => {
-      await enqueueAutoHumanEval({ reviewType: 'landing_page', outputSummary: 'LP generated', sourceKey: 'landing-page:p1' });
+    it('passes the stored candidate\'s createdAt, for the prior-best lookup (ENG-2192)', async () => {
+      mockCreateCandidate.mockResolvedValueOnce({ candidateId: 'candidate-1', reviewType: 'creative_image', createdAt: '2026-09-28T10:00:00.000Z' });
+
+      await enqueueAutoHumanEval(imageInput);
+
+      expect(mockJudgeCandidate).toHaveBeenCalledWith(expect.objectContaining({ createdAt: '2026-09-28T10:00:00.000Z' }));
+    });
+
+    it('hands a landing page and its lazy source loader to the judge hook (ENG-2192)', async () => {
+      const loadLandingPageSource = jest.fn(async () => 'source');
+      await enqueueAutoHumanEval({
+        reviewType: 'landing_page',
+        userId: 'user-1',
+        artifactUrl: 'https://acme.example.com',
+        outputSummary: 'LP generated',
+        sourceKey: 'landing-page:p1',
+        creativeBrief: { generationRequest: 'Demo page' },
+        loadLandingPageSource,
+      });
+
+      expect(mockJudgeCandidate).toHaveBeenCalledWith(
+        expect.objectContaining({ reviewType: 'landing_page', artifactUrl: 'https://acme.example.com', loadLandingPageSource }),
+      );
+      expect(loadLandingPageSource).not.toHaveBeenCalled();
+    });
+
+    it('does not call the hook for lead enrichment or when no candidate was created', async () => {
+      await enqueueAutoHumanEval({ reviewType: 'lead_enrichment', outputSummary: 'Enriched', sourceKey: 'enrich:run-1' });
       mockCreateCandidate.mockRejectedValueOnce(new Error('dynamo down'));
       await enqueueAutoHumanEval({ ...imageInput, sourceKey: 'image:session-4:other.png' });
 

@@ -3157,6 +3157,7 @@ Returns for each client:
 - displayName, email, roles
 - has_ads: whether a Meta ad account is on record (it may have expired — see ad_connection)
 - ad_connection: never_connected (no ad account anywhere: activation, not churn) / connected / expired (Meta connection broke) / other_platform (ads on Google Ads or LinkedIn Ads, no Meta)
+- ad_connection_all_platforms: never_connected / connected / expired across Meta, Google Ads and LinkedIn Ads — expired means no ad account on any platform is usable (reconnect needed; a setup problem, not churn)
 - has_lander: whether they have landing pages (productDomain or seoDomains)
 - has_crm: whether they have CRM integrations (email domain, LinkedIn)
 - last_activity: last login timestamp
@@ -3195,10 +3196,11 @@ Returns a structured health assessment with:
 - **Lander layer**: Landing page / website presence (productDomain, seoDomains)
 - **Lead quality layer**: CRM / lead capture integrations (email domain, LinkedIn)
 - **Creative variety**: Distinct creatives, cannibalization warnings, fatigue indicators
-- **Overall status**: healthy / mediocre / at-risk / blocked / onboarding with reasons
+- **Overall status**: healthy / mediocre / needs-attention / blocked / onboarding with reasons
   - onboarding = activation incomplete (no ad account ever connected). This is NOT churn or at-risk — treat it as an activation nudge.
   - ads_layer.connection other_platform = ads run on Google Ads or LinkedIn Ads; the Meta layer is not assessed and this is not a problem.
-  - at-risk from the ads layer means a connection that broke (token expired; ads_layer.token_expired_at).
+  - needs-attention = setup or reconnect work: every ad connection expired (ads_layer.connection_all_platforms, all_platforms_expired_at) or several setup gaps. This is NOT churn or at-risk evidence — never describe it as churn risk.
+  - This tool never returns at-risk: churn risk needs behavioural evidence (spend, results, payments, feedback) and is not assessed here.
 
 Use this to quickly diagnose a client's marketing funnel completeness.`,
     inputSchema: {
