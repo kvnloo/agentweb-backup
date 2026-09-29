@@ -6,17 +6,27 @@
  * `file_url` argument, not grow per-tool alias/missing-arg logic.
  */
 
+// ENG-2103 (F2 design-decision-list follow-up): create_html_from_template's
+// execute() now binds callLLM/getDefaultModel/resolveGenerationModel straight
+// off the agentModeService singleton (all three are public) and calls
+// emma/impl/htmlCreation.ts directly — createHtmlFromTemplate itself is no
+// longer called on agentModeService from this tool (see
+// emmaTools.createHtmlFromTemplate.test.ts for its own dedicated coverage).
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
-    createHtmlFromTemplate: jest.fn(),
+    callLLM: jest.fn(),
+    getDefaultModel: jest.fn(),
+    resolveGenerationModel: jest.fn(),
   },
 }));
 
 // ENG-2103 (F2): create_html_file's execute() calls emma/impl/htmlCreation.ts
-// directly (not agentModeService) — mock it separately.
+// directly (not agentModeService) — mock it separately. createHtmlFromTemplate
+// is also in this module now (F2 design-decision-list follow-up).
 jest.mock('../emma/impl/htmlCreation', () => ({
   createHtmlFile: jest.fn(),
   createHtmlTemplate: jest.fn(),
+  createHtmlFromTemplate: jest.fn(),
 }));
 
 // ENG-2103 (F2): update_html_file's execute() calls emma/impl/htmlUpdate.ts
@@ -33,7 +43,6 @@ jest.mock('../emma/impl/misc', () => ({
 }));
 
 import { emmaToolRegistry } from '../emma/registry';
-import { agentModeService } from '../services/agentModeService';
 import * as htmlCreationImpl from '../emma/impl/htmlCreation';
 import * as htmlUpdateImpl from '../emma/impl/htmlUpdate';
 import * as miscImpl from '../emma/impl/misc';
@@ -189,7 +198,7 @@ describe('HTML Emma tools contract cleanup', () => {
     const tool = emmaToolRegistry.getTool('create_html_from_template');
     if (!tool) throw new Error('Tool create_html_from_template not found');
 
-    (agentModeService.createHtmlFromTemplate as jest.Mock).mockResolvedValue({ success: true, s3_url: 'https://example.com/template.html' });
+    (htmlCreationImpl.createHtmlFromTemplate as jest.Mock).mockResolvedValue({ success: true, s3_url: 'https://example.com/template.html' });
 
     const result = await tool.execute(
       {
@@ -200,14 +209,20 @@ describe('HTML Emma tools contract cleanup', () => {
       { llmModel: 'anthropic.claude-sonnet-4-6', userId: 'user-123', sessionId: 'sess-1' }
     );
 
-    expect(agentModeService.createHtmlFromTemplate).toHaveBeenCalledWith(
+    const callArgs = (htmlCreationImpl.createHtmlFromTemplate as jest.Mock).mock.calls[0];
+    expect(callArgs.slice(0, 6)).toEqual([
       'anthropic.claude-sonnet-4-6',
       'tpl_123',
       { title: 'Hello' },
       { links_n: [] },
       'user-123',
       'sess-1'
-    );
+    ]);
+    // Trailing args are the 3 injected LLM-gateway functions
+    // (callLLM/getDefaultModel/resolveGenerationModel), bound off the
+    // agentModeService singleton — see emmaTools.createHtmlFromTemplate.test.ts
+    // for dedicated coverage that they're genuinely live bindings, not stale.
+    expect(callArgs).toHaveLength(9);
     expect(result).toEqual({ success: true, s3_url: 'https://example.com/template.html' });
   });
 });
