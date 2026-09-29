@@ -5,6 +5,7 @@ import { getMetaAccessToken } from "../utils/secretsManager";
 import { applyLeadMetrics, finalizeLeadCosts } from "../utils/metaActionFamilies";
 import { sandboxManagementUrl } from "../services/sandboxManagementUrl";
 import { isEvaluationUser } from "../services/evaluationPolicy";
+import { stampMetaImageUpload, stampMetaPublish } from "../services/creativeLineage";
 
 const router = express.Router();
 
@@ -888,6 +889,16 @@ router.post("/create-ad", async (req, res) => {
     if (createAdData.error) {
       console.error("Ad creation API Error details:", createAdData.error);
       throw new Error(`Graph API Error: ${createAdData.error.message} (Code: ${createAdData.error.code})`);
+    }
+
+    // ENG-2194: link a generated image published from the dialog to its Meta creative and ad, as
+    // agent mode does (inert unless CREATIVE_LINEAGE_ENABLED + table; never throws).
+    if (creativeResult.id && createAdData.id) {
+      void stampMetaImageUpload({ userId, imageUrl, imageHash });
+      void stampMetaPublish({
+        userId, accountId: CLEAN_ACCOUNT_ID(adAccountId), metaCreativeId: String(creativeResult.id),
+        adId: String(createAdData.id), params: { image_hash: imageHash }, via: 'create_ad',
+      });
     }
     
     // Generate ad management URL using Facebook Ads Manager — a sandbox account's ad
