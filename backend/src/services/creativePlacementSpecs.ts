@@ -95,6 +95,11 @@ export const PLACEMENT_SPECS: Readonly<Record<PlacementId, PlacementSpec>> = {
   },
 };
 
+/** True for a key of `PLACEMENT_SPECS`; validates a placement arriving from a tool call or storage. */
+export function isPlacementId(value: unknown): value is PlacementId {
+  return typeof value === 'string' && Object.prototype.hasOwnProperty.call(PLACEMENT_SPECS, value);
+}
+
 /** Parses "1080x1350" / "1080 x 1350" into pixels; anything else is null. */
 export function parsePixelSize(size: string | undefined): { width: number; height: number } | null {
   const m = size?.trim().match(/^(\d+)\s*x\s*(\d+)$/i);
@@ -118,6 +123,21 @@ export function placementForSize(size: string | undefined): PlacementSpec | unde
   const px = parsePixelSize(size);
   if (!px) return undefined;
   return Object.values(PLACEMENT_SPECS).find((s) => s.width === px.width && s.height === px.height);
+}
+
+/**
+ * The Meta placement a bare ratio (or a pixel size that is not a placement's exact size) is for
+ * (ENG-2187): agent mode asks for "1:1" / "1024x1024" / "4:5", never a placement, so without this
+ * the size and file-limit checks never ran. Only Meta placements are considered: a 1:1 request
+ * would otherwise match Google's square image too, and agent-mode ads are published to Meta. If
+ * more than one Meta placement ever shares a ratio, the strictest (largest minimum, then smallest
+ * upload limit) is assumed. Ratios no Meta placement uses (16:9, 3:2, 3:4, …) return undefined.
+ */
+export function metaPlacementForAspect(aspect: number | null): PlacementSpec | undefined {
+  if (aspect === null) return undefined;
+  return Object.values(PLACEMENT_SPECS)
+    .filter((s) => s.platform === 'meta' && aspectDeviation(aspect, s.width / s.height) <= s.aspectTolerance)
+    .sort((a, b) => b.minWidth * b.minHeight - a.minWidth * a.minHeight || a.maxBytes - b.maxBytes)[0];
 }
 
 /** Width/height the caller asked for, from a pixel size or a ratio; null for "auto"/absent/garbage. */

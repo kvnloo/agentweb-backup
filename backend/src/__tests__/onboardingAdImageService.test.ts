@@ -52,6 +52,7 @@ import {
   type AdImageGeneratorDep,
 } from "../services/onboardingAdImageService";
 import { evaluateCreativeGates } from "../services/creativeGates";
+import { adImageReadyPatch } from "../services/adImageStatusService";
 const { userDb, orgDb } = require("../services/db");
 
 class FakeImageGen {
@@ -364,6 +365,41 @@ describe("onboardingAdImageService", () => {
 
       expect(result.variants.map((v) => v.gates?.passed)).toEqual([true, undefined, true]);
       expect(result.variants[1].imageUrl).toContain("placeholder://");
+    });
+
+    it("keeps each variant's gates and attribution through the ready patch that is stored (ENG-2187)", async () => {
+      const placements: Array<string | undefined> = [];
+      const gen: AdImageGeneratorDep = {
+        generateImage: async (params) => {
+          placements.push(params.placement);
+          return {
+            success: true,
+            imageUrl: `https://s3.example.com/${params.filename}`,
+            gates: evaluateCreativeGates(
+              { bytes: 1000, decoded: true, width: 1080, height: 1080, format: "png", luminanceStdDev: 40 },
+              { requestedSize: params.size, placement: params.placement },
+            ),
+          };
+        },
+      };
+
+      const result = await generateAdImagesForUser(creativeDir, brand, [onePersona], "user-1", {
+        imageGen: gen,
+        loadTemplate: async () => { throw new Error("no dynamo in tests"); },
+        globalDirectives: {},
+      });
+      const patch = adImageReadyPatch({ adImageStatus: "running" }, result);
+
+      expect(placements).toEqual(["meta_feed_square", "meta_feed_square", "meta_feed_portrait"]);
+      const stored = patch?.adImageResult?.variants ?? [];
+      expect(stored).toHaveLength(3);
+      for (const [i, v] of stored.entries()) {
+        expect(v.gates).toEqual(result.variants[i].gates);
+        expect(v.archetype).toBe(result.variants[i].archetype);
+        expect(v.concept).toBe(result.variants[i].concept);
+        expect(v.promptVersion).toBe(result.variants[i].promptVersion);
+      }
+      expect(stored.map((v) => v.gates?.placement)).toEqual(["meta_feed_square", "meta_feed_square", "meta_feed_portrait"]);
     });
 
     it("uses 60/40 format split — 2 squares, 1 vertical", async () => {
