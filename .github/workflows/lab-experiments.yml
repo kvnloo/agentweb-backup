@@ -33,4 +33,4 @@ jobs:
         run: node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit --passWithNoTests src/__tests__/experiments\.
       - name: Lifecycle regression slice
         working-directory: backend
-        run: node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit src/__tests__/sequences.test.ts src/services/__tests__/askCrmService.test.ts
+        run: node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit src/__tests__/sequences.test.ts src/services/__tests__/askCrmService.test.ts src/__tests__/agentModeService.filterFieldDrift.test.ts src/__tests__/lifecycleFilterSemantics.test.ts
