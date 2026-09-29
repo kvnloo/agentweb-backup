@@ -892,3 +892,116 @@ describe('POST /:sequenceId/steps/test-email', () => {
     });
   });
 });
+
+/*
+ * Cross-tenant authorization.
+ *
+ * Two routes read CRM rows addressed entirely by ids from the request body/path. A
+ * review found (a) the explicit-enroll fix had NO regression guard — deleting the whole
+ * auth block left 71/71 green — and (b) verify-variables had no authorization at all,
+ * returning another tenant's totalLeads, per-variable coverage, and a skip-reason key
+ * whose name leaks whether their sequence has a LinkedIn step.
+ *
+ * The deny path was unexercised repo-wide because the harness mocks
+ * canOrgMemberAccessList -> true unconditionally. These drive it false.
+ */
+describe('cross-tenant authorization', () => {
+  const crmDbMock = require('../services/db').crmDb;
+  const seqDbMock = require('../services/dripSequenceDb').dripSequenceDb ?? dripSequenceDb;
+
+  afterEach(() => {
+    crmDbMock.canOrgMemberAccessList.mockResolvedValue(true);
+    crmDbMock.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-123' });
+  });
+
+  describe('POST /:sequenceId/enrollments (explicit)', () => {
+    it('refuses the whole call when a listId is not accessible, and reads no lead', async () => {
+      crmDbMock.canOrgMemberAccessList.mockResolvedValue(false);
+      (crmDbMock.getLeadById as jest.Mock).mockClear();
+
+      const res = await request(app)
+        .post('/seq_1/enrollments')
+        .send({ leads: [{ listId: 'other-tenant-list', leadId: 'victim-lead', leadEmail: '' }] });
+
+      expect(res.status).toBe(403);
+      // The oracle this closes: a skipped-count difference would reveal whether the
+      // victim's lead exists or has an email. Nothing may be read at all.
+      expect(crmDbMock.getLeadById).not.toHaveBeenCalled();
+      expect(dripSequenceDb.bulkEnroll).not.toHaveBeenCalled();
+    });
+
+    it('refuses the WHOLE call when only one of several lists is inaccessible', async () => {
+      crmDbMock.canOrgMemberAccessList
+        .mockResolvedValueOnce(true)
+        .mockResolvedValueOnce(false);
+      (crmDbMock.getLeadById as jest.Mock).mockClear();
+
+      const res = await request(app).post('/seq_1/enrollments').send({
+        leads: [
+          { listId: 'list-1', leadId: 'mine', leadEmail: 'a@x.com' },
+          { listId: 'other-tenant-list', leadId: 'theirs', leadEmail: '' },
+        ],
+      });
+
+      // Partial success is indistinguishable from "that lead was unreachable" — the
+      // same oracle, wearing a 200.
+      expect(res.status).toBe(403);
+      expect(dripSequenceDb.bulkEnroll).not.toHaveBeenCalled();
+    });
+
+    it('a missing list is refused, not treated as accessible', async () => {
+      crmDbMock.getLeadListById.mockResolvedValue(null);
+      const res = await request(app)
+        .post('/seq_1/enrollments')
+        .send({ leads: [{ listId: 'nope', leadId: 'l', leadEmail: 'a@x.com' }] });
+      expect(res.status).toBe(403);
+    });
+  });
+
+  describe('POST /:sequenceId/steps/verify-variables', () => {
+    it('refuses a sequence owned by another tenant, and reads no leads', async () => {
+      dripSequenceDb.getSequence.mockResolvedValue({ ...mockSequence, userId: 'someone-else' });
+      (crmDbMock.getLeadsByListId as jest.Mock).mockClear();
+
+      const res = await request(app)
+        .post('/seq_1/steps/verify-variables')
+        .send({ listId: 'list-1', subject: 'Hi {{firstName}}', htmlContent: '' });
+
+      expect(res.status).toBe(403);
+      expect(crmDbMock.getLeadsByListId).not.toHaveBeenCalled();
+    });
+
+    it('refuses a list the caller cannot access, and reads no leads', async () => {
+      dripSequenceDb.getSequence.mockResolvedValue(mockSequence);
+      crmDbMock.canOrgMemberAccessList.mockResolvedValue(false);
+      (crmDbMock.getLeadsByListId as jest.Mock).mockClear();
+
+      const res = await request(app)
+        .post('/seq_1/steps/verify-variables')
+        .send({ listId: 'other-tenant-list', subject: 'Hi {{firstName}}', htmlContent: '' });
+
+      expect(res.status).toBe(403);
+      expect(crmDbMock.getLeadsByListId).not.toHaveBeenCalled();
+    });
+
+    it('404s an unknown sequence rather than reading anything', async () => {
+      dripSequenceDb.getSequence.mockResolvedValue(null);
+      (crmDbMock.getLeadsByListId as jest.Mock).mockClear();
+
+      const res = await request(app)
+        .post('/seq_1/steps/verify-variables')
+        .send({ listId: 'list-1', subject: 'Hi', htmlContent: '' });
+
+      expect(res.status).toBe(404);
+      expect(crmDbMock.getLeadsByListId).not.toHaveBeenCalled();
+    });
+
+    it('still works for the owner', async () => {
+      dripSequenceDb.getSequence.mockResolvedValue(mockSequence);
+      const res = await request(app)
+        .post('/seq_1/steps/verify-variables')
+        .send({ listId: 'list-1', subject: 'Hi {{firstName}}', htmlContent: '' });
+      expect(res.status).toBe(200);
+    });
+  });
+});

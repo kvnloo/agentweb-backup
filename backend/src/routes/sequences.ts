@@ -767,6 +767,35 @@ router.post(
         return res.status(401).json({ message: 'Unauthorized' });
       }
 
+      // AUTHORIZE BEFORE READING ANYTHING.
+      //
+      // This route read three things belonging to whoever the ids pointed at, with no
+      // ownership check of any kind: the list's leads, the sequence definition, and — in
+      // the else-branch — the sequence's enrollments and then each enrolled lead. Both
+      // ids come straight from the request, so a caller could aim it at another tenant
+      // and read back `totalLeads`, per-variable coverage counts, and a skip-reason key
+      // whose NAME leaks whether the victim's sequence contains a LinkedIn step.
+      //
+      // The sibling enrol-by-list route has always done exactly these two checks. This
+      // one is a copy of that check, not an invention.
+      //
+      // The 'test' sentinel keeps its existing meaning: no sequence to authorize.
+      const hasSequence = !!req.params.sequenceId && req.params.sequenceId !== 'test';
+      const sequenceForVerify = hasSequence
+        ? await dripSequenceDb.getSequence(req.params.sequenceId).catch(() => null)
+        : null;
+      if (hasSequence) {
+        if (!sequenceForVerify) return res.status(404).json({ error: 'Sequence not found' });
+        if (sequenceForVerify.userId !== userId) return res.status(403).json({ error: 'Forbidden' });
+      }
+      if (listId) {
+        const list = await crmDb.getLeadListById(listId).catch(() => null);
+        if (!list) return res.status(404).json({ error: 'List not found' });
+        if (!(await crmDb.canOrgMemberAccessList(userId, list))) {
+          return res.status(403).json({ error: 'Forbidden' });
+        }
+      }
+
       const allTemplate = (subject || '') + (htmlContent || '');
       const variables = extractVariables(allTemplate);
 
@@ -787,11 +816,7 @@ router.post(
         verifyTotalLeads = leads.length;
         // Mirrors the enrol routes exactly — including their channel awareness, or this
         // screen reports coverage over a different population again.
-        verifyChannels = requiredChannels(
-          req.params.sequenceId && req.params.sequenceId !== 'test'
-            ? await dripSequenceDb.getSequence(req.params.sequenceId).catch(() => null)
-            : null,
-        );
+        verifyChannels = requiredChannels(sequenceForVerify);
         leads = leads.filter((l: any) => leadIsReachable(l, verifyChannels));
       } else if (req.params.sequenceId && req.params.sequenceId !== 'test') {
         // Verify against the sequence's enrolled leads
