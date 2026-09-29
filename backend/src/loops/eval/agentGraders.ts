@@ -776,7 +776,21 @@ const NEGATED = /\b(?:no|not|don'?t|do not|without|avoid|instead of|rather than)
 const TABLE_REQUEST = /\b(?:(?:in|as|into|using|use|with|make|create|build|give me|show(?: me)?|put (?:it|this|that|them|these|those|everything) in|format(?:ted)? (?:it |this )?as|organi[sz]e (?:it|this|them|these) (?:in|into))\s+(?:a |an )?(?:\w+ )?table\b|table format\b|tabular\b)/i;
 const LIST_REQUEST = /\b(?:bullet(?:ed)?[ -]?(?:points?|list|form|format)|in bullets|as bullets|bulleted)\b/i;
 /** A table or list meant for a file, sheet or other system, not for the chat reply. */
-const EXTERNAL_TARGET = /\b(?:sheets?|spreadsheet|excel|csv|google|doc(?:ument)?|pdf|airtable|notion|database|crm|hubspot|slides?|deck|presentation|email|landing page|website|post)\b/i;
+const EXTERNAL_TARGET_WORD = /\b(?:sheets?|spreadsheet|excel|csv|google|doc(?:ument)?|pdf|airtable|notion|database|crm|hubspot|slides?|deck|presentation|email|landing page|website|post)\b/i;
+/**
+ * The external keyword instead names the INPUT being formatted ("the CSV data below", "this
+ * spreadsheet export") rather than a destination — the tell is the keyword sitting directly
+ * before a data-ish noun. Only this specific, narrow pattern is carved out of
+ * EXTERNAL_TARGET_WORD: everything else keeps the original broad "any external system named
+ * nearby" reading, since a genuine destination is usually phrased loosely ("in Airtable",
+ * "to our CRM") and a false negative here (missing a real destination) is worse than the
+ * false positive this fixes (a table request for pasted CSV data wrongly excluded).
+ */
+const EXTERNAL_SOURCE_DATA = /\b(?:sheets?|spreadsheet|excel|csv|google|doc(?:ument)?|pdf|airtable|notion|database|crm|hubspot|slides?|deck|presentation|email|landing page|website|post)\s+(?:data|file|export|list|records?|rows?|report)\b/i;
+
+function isExternalTarget(sentence: string): boolean {
+  return EXTERNAL_TARGET_WORD.test(sentence) && !EXTERNAL_SOURCE_DATA.test(sentence);
+}
 /** Tools whose output is the deliverable, so its format is not in the chat reply. */
 const PRODUCING_TOOL = /(create|generate|write|draft|update|publish|post|send|export|save|upload|doc|sheet|slide|email|blog|article|image|video|landing)/i;
 
@@ -793,7 +807,7 @@ export function parseFormatRequest(userText: string): FormatRequest | undefined 
   if (userText.length > DIRECT_INSTRUCTION_MAX_CHARS) return undefined;
   for (const [kind, re] of [['table', TABLE_REQUEST], ['list', LIST_REQUEST]] as const) {
     const m = firstUnnegated(re, userText);
-    if (m && !EXTERNAL_TARGET.test(sentenceOf(userText, m.index))) return kind;
+    if (m && !isExternalTarget(sentenceOf(userText, m.index))) return kind;
   }
   return undefined;
 }
