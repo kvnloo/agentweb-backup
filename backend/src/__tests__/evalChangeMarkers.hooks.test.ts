@@ -1,7 +1,7 @@
 /**
- * ENG-2145: AW-Settings writes (settingsService) and admin skill writes (skillController) record a
- * "needs eval" marker after the write succeeds, and never when it fails. Report-only: the write's
- * own result is unchanged.
+ * ENG-2145: AW-Settings writes (settingsService) record a "needs eval" marker after the write
+ * succeeds, and never when it fails. Report-only: the write's own result is unchanged. Skill writes
+ * are marked inside skillService (ENG-2195, skillService.evalMarkers.test.ts), not by the routes.
  */
 import type { Request, Response } from 'express';
 
@@ -100,33 +100,18 @@ describe('settingsService marks conditional writes and plan syncs only after the
   });
 });
 
-describe('admin skill routes mark prompt/tool/model changes', () => {
-  it('records an update with the request body', async () => {
-    jest.mocked(skillService.getSkill).mockResolvedValue({ skillId: 's1', name: 'n', description: 'd', toolNames: [], isPublished: true, createdAt: '', updatedAt: '' });
+describe('admin skill routes leave marker recording to skillService (ENG-2195)', () => {
+  // skillService is mocked here, so any marker seen would be a second, controller-level one.
+  it('records nothing itself on create, update or delete', async () => {
+    const stored = { skillId: 's1', name: 'n', description: 'd', toolNames: [], isPublished: true, createdAt: '', updatedAt: '' };
+    jest.mocked(skillService.createSkill).mockResolvedValue(stored);
+    jest.mocked(skillService.getSkill).mockResolvedValue(stored);
     jest.mocked(skillService.updateSkill).mockResolvedValue('2026-09-26T00:00:00.000Z');
-    const body = { systemPrompt: 'new', toolNames: ['a'] };
-    await updateSkill({ params: { skillId: 's1' }, body } as unknown as Request, res());
-    expect(recordSkillChange).toHaveBeenCalledWith('s1', 'update', body);
-  });
-
-  it('records a create and a delete', async () => {
-    jest.mocked(skillService.createSkill).mockResolvedValue({ skillId: 's2', name: 'n', description: 'd', toolNames: [], isPublished: true, createdAt: '', updatedAt: '' });
-    const body = { name: 'n', description: 'd', systemPrompt: 'p', isPublished: true };
-    await createSkill({ body } as unknown as Request, res());
-    expect(recordSkillChange).toHaveBeenCalledWith('s2', 'create', body);
-
-    jest.mocked(skillService.getSkill).mockResolvedValue({ skillId: 's2', name: 'n', description: 'd', toolNames: [], isPublished: true, createdAt: '', updatedAt: '' });
     jest.mocked(skillService.deleteSkill).mockResolvedValue(undefined);
-    await deleteSkill({ params: { skillId: 's2' } } as unknown as Request, res());
-    expect(recordSkillChange).toHaveBeenCalledWith('s2', 'delete', {});
-  });
-
-  it('records nothing when the skill write fails', async () => {
-    jest.mocked(skillService.getSkill).mockResolvedValue({ skillId: 's1', name: 'n', description: 'd', toolNames: [], isPublished: true, createdAt: '', updatedAt: '' });
-    jest.mocked(skillService.updateSkill).mockRejectedValue(new Error('boom'));
-    const r = res();
-    await updateSkill({ params: { skillId: 's1' }, body: { systemPrompt: 'x' } } as unknown as Request, r);
-    expect(r.status).toHaveBeenCalledWith(500);
+    await createSkill({ body: { name: 'n', description: 'd', systemPrompt: 'p', isPublished: true } } as unknown as Request, res());
+    await updateSkill({ params: { skillId: 's1' }, body: { systemPrompt: 'new', toolNames: ['a'] } } as unknown as Request, res());
+    await deleteSkill({ params: { skillId: 's1' } } as unknown as Request, res());
+    expect(skillService.updateSkill).toHaveBeenCalled();
     expect(recordSkillChange).not.toHaveBeenCalled();
   });
 });

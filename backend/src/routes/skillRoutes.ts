@@ -9,7 +9,6 @@ import {
   getSyncStatus,
 } from "../controllers/skillController";
 import { skillService } from "../services/skillService";
-import { recordSkillChange } from "../loops/eval/evalChangeMarkers";
 
 const router = express.Router();
 
@@ -34,8 +33,6 @@ router.get("/pending-review", async (req, res) => {
 router.post("/:skillId/approve", async (req, res) => {
   try {
     const skill = await skillService.approveSkill(req.params.skillId);
-    // ENG-2145: an approved skill goes public — report-only "needs eval" marker.
-    void recordSkillChange(skill.skillId, 'approve', { systemPrompt: skill.systemPrompt, isPublished: skill.isPublished });
     res.json(skill);
   } catch (error: any) {
     if (error.message === 'Skill not found') return res.status(404).json({ message: error.message });
