@@ -149,16 +149,26 @@ const refreshLocks = new Map<string, Promise<{ access_token: string; token_expir
 /**
  * Does this refresh failure mean the refresh token is permanently dead?
  *
- * Only a definitive rejection from HubSpot's token endpoint counts: 400 (HubSpot's
- * BAD_REFRESH_TOKEN) or 401. Everything else — 5xx, a timeout, DNS, a proxy hiccup —
+ * Only a definitive rejection from HubSpot's token endpoint counts, and the BODY decides:
+ * any 4xx whose payload names the refresh token. The status alone never decides — an
+ * earlier 400/401 allow-list missed a real production 403 BAD_SCOPES. Everything else — 5xx, a timeout, DNS, a proxy hiccup —
  * is transient and must NOT be flagged, because the flag hard-fails every subsequent
  * call and tells a paying customer their integration is broken. That asymmetry is the
  * same one linkedInOutreachService documents for its 403 case: wrongly persisting
  * "disconnected" is far worse than retrying a live connection.
  */
 function isRevokedRefreshTokenError(err: unknown): boolean {
+  // Any 4xx. NOT an allow-list of 400/401.
+  //
+  // The body is the discriminator — once it must name the refresh token, restricting the
+  // STATUS adds no false-positive protection and only creates places for a real
+  // revocation to hide. A review said exactly that, with a mutation proving the widening
+  // was free, and I kept the allow-list anyway. Production answered within minutes: see
+  // the BAD_SCOPES note below.
+  //
+  // 5xx stays excluded — that is HubSpot failing, not the grant.
   const status = Number((err as any)?.response?.status);
-  if (status !== 400 && status !== 401) return false;
+  if (!(status >= 400 && status < 500)) return false;
 
   // The STATUS never decides this on its own — the BODY has to name the refresh token.
   //
@@ -190,9 +200,26 @@ function isRevokedRefreshTokenError(err: unknown): boolean {
   //
   //   HTTP 400 {"status":"BAD_CLIENT_SECRET", ... "error":"invalid_client"}
   //
+  // BAD_SCOPES, measured in PRODUCTION on 2026-09-28 against portal 245815183:
+  //
+  //   HTTP 403 {"status":"BAD_SCOPES","message":"missing or invalid scopes", ...}
+  //
+  // Note the 403. That grant holds 19 legacy scopes (content, social, automation, forms,
+  // crm.lists.read …) while the app now requests crm.objects.contacts/deals. Scopes are
+  // fixed at grant time, so this can NEVER succeed — only re-authorisation clears it,
+  // which makes it a revocation for our purposes. It is also the actual reason that
+  // portal reported "Active · Connected" for 97 days, which means the 400/401 version of
+  // this function would not have caught the very incident it was written for.
+  //
   // which this regex does not match. (HubSpot validates the refresh token BEFORE the
   // client, so probing with a bogus token returns BAD_REFRESH_TOKEN whatever the
-  // credentials — a real token is required to observe this shape at all.) And a deploy pointed at the wrong
+  // credentials — a real token is required to observe this shape at all.)
+  //
+  // Full order, measured: refresh token -> client -> scopes. That second hop is why an
+  // environment configured with a different HubSpot client secret cannot reach the
+  // BAD_SCOPES case at all — every refresh there stops at BAD_CLIENT_SECRET.
+  //
+  // And a deploy pointed at the wrong
   // client_id would mismatch every grant at once — but those grants genuinely cannot
   // refresh, and since create() no longer short-circuits and the clear still runs, the
   // fleet self-heals within one access-token lifetime once the config is fixed. A false
@@ -218,7 +245,7 @@ function isRevokedRefreshTokenError(err: unknown): boolean {
   } catch {
     marker = '';
   }
-  return /BAD_REFRESH_TOKEN|MISMATCH_REFRESH_TOKEN_CLIENT|invalid_grant|not issued to this client/i.test(marker);
+  return /BAD_REFRESH_TOKEN|MISMATCH_REFRESH_TOKEN_CLIENT|BAD_SCOPES|invalid_grant|not issued to this client/i.test(marker);
 }
 
 /**
@@ -285,6 +312,12 @@ export function redactAxiosCredentials<T>(err: T): T {
  *
  * `response.data` is the RESPONSE body and carries no credentials; it is capped anyway so
  * an HTML error page from a proxy cannot flood the log.
+ *
+ * Deliberately NOT the same threat model as agentModeService.redactHubSpotMessage. That
+ * one guards resource-endpoint bodies, which can echo an ACCESS token, so it strips
+ * token-shaped runs. This is the token endpoint, whose error bodies do not echo the
+ * credential — and a refresh token can be a 36-char UUID, which would slip a bare-run
+ * rule anyway. Do not unify the two on the assumption they do the same job.
  */
 function describeRefreshFailure(err: unknown): string {
   const status = (err as any)?.response?.status;
@@ -370,6 +403,16 @@ export class HubSpotService {
   }
 
   /** HubSpot portal (hub) ID for this connection. Needed for public form submission. */
+  /**
+   * The OAuth account this instance was built from, or undefined on the fromToken
+   * (pasted private-app key) path. Callers that must know WHICH connection served a call
+   * read this instead of re-deriving it — re-derivation cannot distinguish the two paths
+   * and, when kept on the service as shared state, races with concurrent calls.
+   */
+  get accountId(): string | undefined {
+    return this._accountId;
+  }
+
   get portalId(): string | undefined {
     return this._portalId;
   }

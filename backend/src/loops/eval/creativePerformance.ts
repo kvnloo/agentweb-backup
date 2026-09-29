@@ -3,13 +3,16 @@
  *
  * Pure: callers pass, per generated creative, its rubric-judge score and the daily ad rows of the
  * Meta ads it became; this returns Spearman's ρ (with n and a bootstrap CI) between the score and
- * CTR, and between the score and CPA. The loader is scripts/creativePerformanceCorrelation.ts.
+ * CTR, CVR (Meta-reported leads / clicks), hook rate (3-second video plays / impressions), CPA
+ * (Meta-reported leads) and CPL (CRM leads joined by utm_content, ENG-2194). The loader is
+ * scripts/creativePerformanceCorrelation.ts.
  *
  * Only SETTLED rows count (isMetaRowSettled: Meta revises insights for 28 days, ENG-1550), and only
  * rows from the day the ad started carrying the creative until the day its creative next changed.
  * Everything excluded is counted, never silently dropped.
  *
- * Reading the sign: a useful judge correlates POSITIVELY with CTR and NEGATIVELY with CPA.
+ * Reading the sign: a useful judge correlates POSITIVELY with CTR, CVR and hook rate, and
+ * NEGATIVELY with CPA and CPL.
  */
 
 import { isMetaRowSettled } from '../../services/adsMetricsDb';
@@ -25,6 +28,10 @@ export interface AdDayMetrics {
   impressions: number;
   clicks: number;
   platformLeadCount: number;
+  /** CRM leads joined to the ad (AdsMetricsAdRow.crmLeadCount); absent when the row was not joined. */
+  crmLeadCount?: number;
+  /** Read for `videoPlays3s` (3-second plays); absent on rows written before it was captured. */
+  platformMetrics?: Record<string, number>;
 }
 
 export interface LinkedAdMetrics {
@@ -50,8 +57,10 @@ export interface CreativeObservation {
 export interface CorrelationOptions {
   /** Minimum settled impressions for a creative's CTR to count (default 1000). */
   minImpressions?: number;
-  /** Minimum settled Meta-reported leads for a creative's CPA to count (default 1). */
+  /** Minimum settled leads for a creative's CPA (Meta-reported) or CPL (CRM) to count (default 1). */
   minConversions?: number;
+  /** Minimum settled clicks for a creative's CVR to count (default 100). */
+  minClicks?: number;
   iterations?: number;
   seed?: number;
 }
@@ -65,8 +74,22 @@ export interface CreativeAggregate {
   clicks: number;
   spend: number;
   leads: number;
+  /** 3-second video plays, and the impressions of the rows that reported them (hook rate = plays / those). */
+  videoPlays3s: number;
+  videoImpressions: number;
+  /** CRM leads, and the spend of the rows that carried the CRM join (CPL = that spend / crmLeads). */
+  crmLeads: number;
+  crmJoinedSpend: number;
   /** The single currency of the settled rows, or null when they span several (or there are none). */
   currency: string | null;
+  /**
+   * The single currency of the settled, CRM-joined rows (the rows `crmLeads`/`crmJoinedSpend` are
+   * built from), or null when those rows span several currencies (or there are none). CPL eligibility
+   * must use this, not `currency`: a settled row with no CRM join contributes to `currency` but not to
+   * `crmJoinedSpend`, so an older unjoined row in a different currency would otherwise make a
+   * perfectly single-currency CRM pairing look mixed and drop a valid CPL point.
+   */
+  crmCurrency: string | null;
   settledRows: number;
   unsettledRows: number;
 }
@@ -86,10 +109,22 @@ export interface CreativePerformanceReport {
     belowMinImpressions: number;
     noConversions: number;
     mixedCurrency: number;
+    /** CVR: fewer than minClicks settled clicks. */
+    belowMinClicks: number;
+    /** Hook rate: fewer than minImpressions settled impressions with 3-second plays (image ads have none). */
+    noVideoPlays: number;
+    /** CPL: fewer than minConversions CRM leads on joined rows. */
+    noCrmLeads: number;
+    /** CPL: CRM leads, but in more than one currency. */
+    crmMixedCurrency: number;
   };
   ctr: MetricCorrelation;
+  cvr: MetricCorrelation;
+  hookRate: MetricCorrelation;
   /** CPA is only comparable within one currency, so it is reported per currency. */
   cpaByCurrency: Record<string, MetricCorrelation>;
+  /** Same rule as CPA, on CRM leads. */
+  cplByCurrency: Record<string, MetricCorrelation>;
   aggregates: CreativeAggregate[];
 }
 
@@ -113,11 +148,17 @@ export function aggregateCreative(obs: CreativeObservation): CreativeAggregate {
     clicks: 0,
     spend: 0,
     leads: 0,
+    videoPlays3s: 0,
+    videoImpressions: 0,
+    crmLeads: 0,
+    crmJoinedSpend: 0,
     currency: null,
+    crmCurrency: null,
     settledRows: 0,
     unsettledRows: 0,
   };
   const currencies = new Set<string>();
+  const crmCurrencies = new Set<string>();
   for (const ad of obs.ads) {
     const from = firstOwnDate(ad);
     for (const row of ad.rows) {
@@ -131,10 +172,21 @@ export function aggregateCreative(obs: CreativeObservation): CreativeAggregate {
       agg.clicks += row.clicks;
       agg.spend += row.spend;
       agg.leads += row.platformLeadCount;
+      const plays = row.platformMetrics?.videoPlays3s;
+      if (typeof plays === 'number') {
+        agg.videoPlays3s += plays;
+        agg.videoImpressions += row.impressions;
+      }
+      if (typeof row.crmLeadCount === 'number') {
+        agg.crmLeads += row.crmLeadCount;
+        agg.crmJoinedSpend += row.spend;
+        crmCurrencies.add(row.currency);
+      }
       currencies.add(row.currency);
     }
   }
   agg.currency = currencies.size === 1 ? [...currencies][0] : null;
+  agg.crmCurrency = crmCurrencies.size === 1 ? [...crmCurrencies][0] : null;
   return agg;
 }
 
@@ -143,42 +195,67 @@ function correlate(pairs: XYPair[], opts: CorrelationOptions): MetricCorrelation
   return { n: pairs.length, result: spearmanReport(pairs, { iterations: opts.iterations, seed: opts.seed }) };
 }
 
+function correlateByCurrency(pairsByCurrency: Map<string, XYPair[]>, opts: CorrelationOptions): Record<string, MetricCorrelation> {
+  const out: Record<string, MetricCorrelation> = {};
+  for (const [currency, pairs] of [...pairsByCurrency.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    out[currency] = correlate(pairs, opts);
+  }
+  return out;
+}
+
+function pushPair(map: Map<string, XYPair[]>, currency: string, pair: XYPair): void {
+  const list = map.get(currency) ?? [];
+  list.push(pair);
+  map.set(currency, list);
+}
+
 export function creativePerformanceReport(
   observations: ReadonlyArray<CreativeObservation>,
   opts: CorrelationOptions = {},
 ): CreativePerformanceReport {
   const minImpressions = opts.minImpressions ?? 1000;
   const minConversions = opts.minConversions ?? 1;
+  const minClicks = opts.minClicks ?? 100;
   const aggregates = observations.map(aggregateCreative);
-  const excluded = { noRubricScore: 0, noSettledRows: 0, belowMinImpressions: 0, noConversions: 0, mixedCurrency: 0 };
+  const excluded = {
+    noRubricScore: 0, noSettledRows: 0, belowMinImpressions: 0, noConversions: 0, mixedCurrency: 0,
+    belowMinClicks: 0, noVideoPlays: 0, noCrmLeads: 0, crmMixedCurrency: 0,
+  };
   const ctrPairs: XYPair[] = [];
+  const cvrPairs: XYPair[] = [];
+  const hookPairs: XYPair[] = [];
   const cpaPairs = new Map<string, XYPair[]>();
+  const cplPairs = new Map<string, XYPair[]>();
 
   for (const a of aggregates) {
     if (a.rubricScore === null) { excluded.noRubricScore++; continue; }
     if (a.settledRows === 0) { excluded.noSettledRows++; continue; }
-    if (a.impressions >= minImpressions && a.impressions > 0) {
-      ctrPairs.push({ x: a.rubricScore, y: a.clicks / a.impressions });
-    } else {
-      excluded.belowMinImpressions++;
-    }
-    if (a.leads < minConversions || a.leads <= 0) { excluded.noConversions++; continue; }
-    if (a.currency === null) { excluded.mixedCurrency++; continue; }
-    const list = cpaPairs.get(a.currency) ?? [];
-    list.push({ x: a.rubricScore, y: a.spend / a.leads });
-    cpaPairs.set(a.currency, list);
+    const x = a.rubricScore;
+    if (a.impressions >= minImpressions && a.impressions > 0) ctrPairs.push({ x, y: a.clicks / a.impressions });
+    else excluded.belowMinImpressions++;
+    if (a.clicks >= minClicks && a.clicks > 0) cvrPairs.push({ x, y: a.leads / a.clicks });
+    else excluded.belowMinClicks++;
+    if (a.videoImpressions >= minImpressions && a.videoImpressions > 0) hookPairs.push({ x, y: a.videoPlays3s / a.videoImpressions });
+    else excluded.noVideoPlays++;
+
+    if (a.crmLeads < minConversions || a.crmLeads <= 0) excluded.noCrmLeads++;
+    else if (a.crmCurrency === null) excluded.crmMixedCurrency++;
+    else pushPair(cplPairs, a.crmCurrency, { x, y: a.crmJoinedSpend / a.crmLeads });
+
+    if (a.leads < minConversions || a.leads <= 0) excluded.noConversions++;
+    else if (a.currency === null) excluded.mixedCurrency++;
+    else pushPair(cpaPairs, a.currency, { x, y: a.spend / a.leads });
   }
 
-  const cpaByCurrency: Record<string, MetricCorrelation> = {};
-  for (const [currency, pairs] of [...cpaPairs.entries()].sort(([a], [b]) => a.localeCompare(b))) {
-    cpaByCurrency[currency] = correlate(pairs, opts);
-  }
   return {
     creativesConsidered: observations.length,
     unsettledRowsExcluded: aggregates.reduce((sum, a) => sum + a.unsettledRows, 0),
     excluded,
     ctr: correlate(ctrPairs, opts),
-    cpaByCurrency,
+    cvr: correlate(cvrPairs, opts),
+    hookRate: correlate(hookPairs, opts),
+    cpaByCurrency: correlateByCurrency(cpaPairs, opts),
+    cplByCurrency: correlateByCurrency(cplPairs, opts),
     aggregates,
   };
 }

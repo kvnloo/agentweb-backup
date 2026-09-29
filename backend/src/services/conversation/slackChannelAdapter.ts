@@ -59,8 +59,6 @@ export const slackChannelAdapter: ConversationChannelAdapter = {
     );
   },
 
-
-
   async postReply(ref: ConversationRef, text: string): Promise<void> {
     await postThreadResponse(ref.conversationId, ref.threadId, text);
   },

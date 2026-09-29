@@ -23,15 +23,26 @@ import {
   Card,
   CardContent,
   Chip,
+  Dialog,
+  IconButton,
   LinearProgress,
   Link,
   Stack,
+  useMediaQuery,
+  useTheme,
   TextField,
   Typography,
 } from '@mui/material';
 import FactCheckIcon from '@mui/icons-material/FactCheck';
+import CloseIcon from '@mui/icons-material/Close';
+import ZoomInIcon from '@mui/icons-material/ZoomIn';
 import { buildApiUrl } from '../config';
 import { useAuth } from '../contexts/AuthContext';
+
+const VIDEO_EXTENSIONS = /\.(mp4|webm|mov|m4v|ogv)(\?|#|$)/i;
+function isVideoUrl(src: string): boolean {
+  return VIDEO_EXTENSIONS.test(src);
+}
 
 type Verdict = 'approve' | 'reject' | 'edit';
 
@@ -136,18 +147,75 @@ function ManifestQueue() {
   );
 }
 
+// A single creative preview cell — image or video, sized large enough to
+// actually judge a crop/legibility problem (not a thumbnail), with a
+// hover affordance and click-to-zoom into a full-size dialog. Review fix
+// (found live by Manan on the deployed page): the original 160×180
+// thumbnail grid was too small to see anything and had no zoom at all.
+function CreativeThumb({ src, alt, onZoom }: { src: string; alt: string; onZoom: (src: string) => void }) {
+  const video = isVideoUrl(src);
+  return (
+    <Box
+      onClick={() => onZoom(src)}
+      role="button"
+      tabIndex={0}
+      aria-label={`Zoom in on ${alt}`}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onZoom(src);
+        }
+      }}
+      sx={{
+        position: 'relative',
+        width: '100%',
+        height: 260,
+        bgcolor: 'action.hover',
+        borderRadius: 1,
+        overflow: 'hidden',
+        cursor: 'zoom-in',
+        '&:hover .zoom-affordance': { opacity: 1 },
+        '&:focus-visible': { outline: '2px solid', outlineColor: 'primary.main', outlineOffset: 2 },
+      }}
+    >
+      {video ? (
+        <Box component="video" src={src} muted preload="metadata" sx={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+      ) : (
+        <Box component="img" src={src} alt={alt} sx={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+      )}
+      <Box
+        className="zoom-affordance"
+        sx={{
+          position: 'absolute',
+          inset: 0,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          bgcolor: 'rgba(0,0,0,0.35)',
+          opacity: 0,
+          transition: 'opacity 0.15s',
+          pointerEvents: 'none',
+        }}
+      >
+        <ZoomInIcon sx={{ color: 'common.white', fontSize: 36 }} />
+      </Box>
+    </Box>
+  );
+}
+
 // What you need to know about one call — read-only, lives in the packet
 // column (left). Includes the creative compare/preview behavior: every
-// screenshot the evidence packet carries renders side by side, per the
+// screenshot the evidence packet carries renders side by side, large
+// enough to actually inspect, and click-to-zoom to full size — per the
 // prototype's own "a real crop problem is visible without downloading
-// anything" finding (artifact-eng1853-prototype) — this was previously
-// collected (evidencePacket.screenshots) but never rendered anywhere.
-function EvidenceCard({ index, decision }: { index: number; decision: ApprovalDecisionView }) {
+// anything" finding (artifact-eng1853-prototype).
+function EvidenceCard({ index, decision, fullScreenZoom }: { index: number; decision: ApprovalDecisionView; fullScreenZoom: boolean }) {
   const answered = RESOLVED_STATUSES.has(decision.status);
+  const [zoomedSrc, setZoomedSrc] = useState<string | null>(null);
   return (
     <Card variant="outlined" id={`call-${decision.decisionId}`}>
       <CardContent>
-        <Stack spacing={1}>
+        <Stack spacing={1.5}>
           <Stack direction="row" justifyContent="space-between" alignItems="flex-start">
             <Typography variant="subtitle1">{index}. {decision.subjectLabel}</Typography>
             <Chip size="small" label={decision.status.replace(/_/g, ' ')} color={statusColor(decision, answered)} />
@@ -159,15 +227,9 @@ function EvidenceCard({ index, decision }: { index: number; decision: ApprovalDe
             </Typography>
           )}
           {decision.evidencePacket?.screenshots && decision.evidencePacket.screenshots.length > 0 && (
-            <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 1 }}>
+            <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 1.5 }}>
               {decision.evidencePacket.screenshots.map((src) => (
-                <Box
-                  key={src}
-                  component="img"
-                  src={src}
-                  alt={`${decision.subjectLabel} — creative preview`}
-                  sx={{ width: '100%', height: 180, objectFit: 'contain', bgcolor: 'action.hover', borderRadius: 1 }}
-                />
+                <CreativeThumb key={src} src={src} alt={`${decision.subjectLabel} — creative preview`} onZoom={setZoomedSrc} />
               ))}
             </Box>
           )}
@@ -191,6 +253,22 @@ function EvidenceCard({ index, decision }: { index: number; decision: ApprovalDe
           )}
         </Stack>
       </CardContent>
+
+      <Dialog open={zoomedSrc !== null} onClose={() => setZoomedSrc(null)} maxWidth="lg" fullWidth fullScreen={fullScreenZoom}>
+        <Box sx={{ position: 'relative', bgcolor: 'common.black', height: fullScreenZoom ? '100%' : 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <IconButton
+            onClick={() => setZoomedSrc(null)}
+            sx={{ position: 'absolute', top: 8, right: 8, color: 'common.white', bgcolor: 'rgba(0,0,0,0.4)', '&:hover': { bgcolor: 'rgba(0,0,0,0.6)' }, zIndex: 1 }}
+          >
+            <CloseIcon />
+          </IconButton>
+          {zoomedSrc && (isVideoUrl(zoomedSrc) ? (
+            <Box component="video" src={zoomedSrc} controls sx={{ width: '100%', maxHeight: '85vh', display: 'block' }} />
+          ) : (
+            <Box component="img" src={zoomedSrc} alt="Creative, full size" sx={{ width: '100%', maxHeight: '85vh', objectFit: 'contain', display: 'block' }} />
+          ))}
+        </Box>
+      </Dialog>
     </Card>
   );
 }
@@ -232,9 +310,9 @@ function DecisionRailItem({
     <Box
       component="a"
       href={`#call-${decision.decisionId}`}
-      sx={{ display: 'block', textDecoration: 'none', color: 'inherit', py: 1.25, borderBottom: 1, borderColor: 'divider' }}
+      sx={{ display: 'block', textDecoration: 'none', color: 'inherit', py: 1.75, borderBottom: 1, borderColor: 'divider' }}
     >
-      <Stack spacing={0.75}>
+      <Stack spacing={1}>
         <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1}>
           <Typography variant="body2" sx={{ fontWeight: 600 }}>
             {index}. {decision.subjectLabel}
@@ -247,7 +325,7 @@ function DecisionRailItem({
             {decision.verdict ? `Chose: ${decision.verdict}` : ''}
           </Typography>
         ) : (
-          <Stack spacing={0.75} onClick={(e) => e.preventDefault()}>
+          <Stack spacing={1} onClick={(e) => e.preventDefault()}>
             <Stack direction="row" spacing={1}>
               <Button
                 size="small"
@@ -274,7 +352,7 @@ function DecisionRailItem({
               )}
             </Stack>
             {showNote && (
-              <Stack spacing={0.5}>
+              <Stack spacing={0.75} sx={{ mt: 0.5, pt: 1, borderTop: 1, borderColor: 'divider' }}>
                 {/* A note attaches to Approve/Reject above regardless of gate
                     type — claimDecision persists freeText and it's surfaced
                     back to the agent session either way (ENG-1853 review
@@ -284,14 +362,16 @@ function DecisionRailItem({
                     reject). Only the dedicated edit-verdict submit below
                     stays non-meta_write — meta_write has no 'edited' state. */}
                 <TextField
-                  label={decision.gateType === 'meta_write' ? 'Note (optional, attaches to Approve/Reject above)' : 'What exactly should change?'}
+                  label={decision.gateType === 'meta_write' ? 'Note (optional)' : 'What exactly should change?'}
                   size="small"
                   multiline
-                  minRows={1}
+                  minRows={2}
+                  fullWidth
                   value={freeText}
                   disabled={disabled || acting !== null}
                   onChange={(e) => setFreeText(e.target.value)}
                   inputProps={{ maxLength: 2000 }}
+                  helperText={decision.gateType === 'meta_write' ? 'Attaches to Approve/Reject above.' : undefined}
                   autoFocus
                 />
                 {decision.gateType !== 'meta_write' && (
@@ -321,6 +401,11 @@ function ManifestDetail({ manifestId }: { manifestId: string }) {
   const [approvingAll, setApprovingAll] = useState(false);
   const [approveAllError, setApproveAllError] = useState<string | null>(null);
   const [approveAllResult, setApproveAllResult] = useState<string | null>(null);
+  const theme = useTheme();
+  // Review fix: compute once per packet, not once per decision — an
+  // EvidenceCard per decision each running its own useMediaQuery would
+  // register N redundant matchMedia listeners for the same breakpoint.
+  const fullScreenZoom = useMediaQuery(theme.breakpoints.down('sm'));
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -382,8 +467,8 @@ function ManifestDetail({ manifestId }: { manifestId: string }) {
 
   return (
     <Box sx={{ p: 3 }}>
-      <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
-        <FactCheckIcon />
+      <Stack direction="row" alignItems="flex-start" spacing={1} sx={{ mb: 1 }}>
+        <FactCheckIcon sx={{ mt: 0.5, flexShrink: 0 }} />
         <Typography variant="h5">{decisions[0]?.subjectLabel || 'Approval packet'}</Typography>
       </Stack>
       <Link component={RouterLink} to="/approval-desk" sx={{ display: 'inline-block', mb: 2 }}>← Back to queue</Link>
@@ -399,7 +484,7 @@ function ManifestDetail({ manifestId }: { manifestId: string }) {
         <Box sx={{ flex: 1, minWidth: 0 }}>
           <Stack spacing={2}>
             {decisions.map((d, i) => (
-              <EvidenceCard key={d.decisionId} index={i + 1} decision={d} />
+              <EvidenceCard key={d.decisionId} index={i + 1} decision={d} fullScreenZoom={fullScreenZoom} />
             ))}
           </Stack>
         </Box>

@@ -260,10 +260,58 @@ describe('a 400 only counts when the body says the refresh token is bad', () => 
     expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
   });
 
-  // Statuses either side of the 400/401 pair, so the boundary itself is pinned.
-  it.each([[403], [404], [429]])('does NOT flag on a %i', async (status) => {
+  /*
+   * The boundary is 4xx vs 5xx, NOT 400/401 vs the rest.
+   *
+   * The previous version of this test asserted that a body reading BAD_REFRESH_TOKEN
+   * must be IGNORED when it arrives as a 403 — it pinned a false negative in place. A
+   * review said so; the status allow-list was kept anyway; and production then returned
+   * a 403 for a genuinely unusable grant within minutes of the deploy. The status never
+   * had a vote worth casting: the body is the discriminator.
+   */
+  it.each([[400], [401], [403], [404], [429]])(
+    'DOES flag on a %i whose body names the refresh token', async (status) => {
+      mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
+      mockAxiosPost.mockRejectedValue(httpError(status, BAD_REFRESH_BODY));
+
+      await expect(HubSpotService.create('user-1')).rejects.toThrow(/needs to be reconnected/i);
+      expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+        'user-1', 'hubspot', '245815183', { needs_reconnect: true });
+    });
+
+  it.each([[500], [502], [503], [504]])(
+    'does NOT flag on a %i even when the body names the refresh token — that is HubSpot failing, not the grant',
+    async (status) => {
+      mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
+      mockAxiosPost.mockRejectedValue(httpError(status, BAD_REFRESH_BODY));
+
+      await expect(HubSpotService.create('user-1')).rejects.toThrow();
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+    });
+
+  /*
+   * The exact production response, byte-for-byte, from portal 245815183 on 2026-09-28.
+   * This grant holds 19 legacy scopes while the app requests crm.objects.*; scopes are
+   * fixed at grant time, so no refresh will ever succeed and only re-auth clears it.
+   * It is the real cause of the 97-day "Active · Connected", and the shipped 400/401
+   * gate did not catch it.
+   */
+  it('flags the MEASURED production 403 BAD_SCOPES', async () => {
     mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
-    mockAxiosPost.mockRejectedValue(httpError(status, BAD_REFRESH_BODY));
+    mockAxiosPost.mockRejectedValue(httpError(403, {
+      status: 'BAD_SCOPES',
+      message: 'missing or invalid scopes',
+      correlationId: '01a0e8c7-03f9-7bae-836e-32f7555b0000',
+    }));
+
+    await expect(HubSpotService.create('user-1')).rejects.toThrow(/needs to be reconnected/i);
+    expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+      'user-1', 'hubspot', '245815183', { needs_reconnect: true });
+  });
+
+  it('still does NOT flag a 403 whose body says nothing about the grant', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount()] as never);
+    mockAxiosPost.mockRejectedValue(httpError(403, { status: 'RATE_LIMIT', message: 'slow down' }));
 
     await expect(HubSpotService.create('user-1')).rejects.toThrow();
     expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
@@ -506,5 +554,65 @@ describe('the error that escapes carries no credentials', () => {
     await expect(HubSpotService.create('user-1')).rejects.toThrow();
     // Redaction must not cost the only signal that would ever reveal a wrong classifier.
     expect(JSON.stringify((err as any).response.data)).toContain('corr-123');
+  });
+});
+
+/*
+ * The invariant the marketing pre-flight in agentModeService rests on.
+ *
+ * That guard reads `svc.accountId` to know whether an OAuth grant or a pasted
+ * private-app key served a call. `_portalId` sits one line below `_accountId` in the
+ * same class and is the plausible wrong answer — and returning it would be SILENT in
+ * production too, because /connect writes `account_id: String(hubInfo.hub_id)` and
+ * `config.hub_id` from the same value, so the two agree on every row that flow creates.
+ * They diverge only on a migrated or hand-made row: exactly the kind nobody tests with.
+ *
+ * The diagnostic suite cannot pin this — it mocks hubspotService wholesale. This suite
+ * loads the real class, so it is the only place the invariant can be held.
+ */
+describe('accountId distinguishes the OAuth path from the pasted-token path', () => {
+  beforeEach(() => { jest.clearAllMocks(); });
+
+  it('create() sets accountId to the ACCOUNT id, not the portal id', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([{
+      ...expiredAccount(),
+      account_id: 'acct-999',
+      // Deliberately different from account_id so returning _portalId would be caught.
+      config: { ...expiredAccount().config, hub_id: 111222, token_expires_at: Date.now() + 3600_000 },
+    }] as never);
+
+    const svc = await HubSpotService.create('user-1');
+    expect(svc.accountId).toBe('acct-999');
+    expect(svc.accountId).not.toBe(svc.portalId);
+  });
+
+  /*
+   * The REFRESH path constructs its own instance (hubspotService.ts:439), separately
+   * from the fresh-token early return above it. The test below sets a future expiry, so
+   * it only ever exercised the early return — mutating the refresh-path construction to
+   * pass portalId stayed green across all 47 tests.
+   *
+   * That path is the routine one in production: any access token within 60s of expiry.
+   * If it passed the wrong id the pre-flight would judge the wrong account on exactly
+   * those calls, silently, for the same portalId === account_id reason the sibling test
+   * exists to break.
+   */
+  it('sets accountId on the REFRESH path too, not just the fresh-token path', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([{
+      ...expiredAccount(),
+      account_id: 'acct-999',
+      config: { ...expiredAccount().config, hub_id: 111222 },   // already expired -> refresh path
+    }] as never);
+    mockAxiosPost.mockResolvedValue({
+      data: { access_token: 'fresh', refresh_token: 'rotated', expires_in: 1800 },
+    });
+
+    const svc = await HubSpotService.create('user-1');
+    expect(svc.accountId).toBe('acct-999');
+    expect(svc.accountId).not.toBe(svc.portalId);
+  });
+
+  it('fromToken() leaves accountId undefined — that is how the fallback is recognised', () => {
+    expect(HubSpotService.fromToken('pat-na1-some-key').accountId).toBeUndefined();
   });
 });

@@ -20,6 +20,7 @@ import { meteredV0 } from "./v0Metering";
 // runtime-safe because durableLandingService only imports a TYPE from this module.
 import { STUCK_CEILING_MS } from "./durableLandingService";
 import { enqueueAutoHumanEval } from "./autoHumanEvalService";
+import { runLandingPagePageSpeedCheck } from "./landingPagePageSpeedCheck";
 import { landingPageSourceForJudge, type GeneratedFile } from "./landingPageJudgeSource";
 import { getPersistedBrandLogoUrl } from "./agentMode/brandLogo";
 import { getLandingPageLaunchReadiness } from "../utils/landingPageLaunchReadiness";
@@ -707,6 +708,27 @@ export interface GeneratedLandingPage {
      * (chat.waterheater.app/text?handoff_id=...) accepted in place of a CRM row.
      * Persisted so the handoff can be verified against the chat/handoff backend. */
     handoffId?: string;
+    /**
+     * ENG-2193: did the synthetic UTM params this run appended to the navigation URL make it
+     * onto the resulting lead's own attribution fields? Set only when the check actually ran
+     * (an email-keyed lead landed); absent — not `false` — on a phone-only lander, a page with
+     * no lead at all, or when the run predates this check. Advisory: never affects `ok`.
+     */
+    utmPropagated?: boolean;
+    utmPropagationDetail?: string;
+  };
+  /**
+   * ENG-2193: PageSpeed Insights (Lighthouse) performance/accessibility check on the deployed
+   * page. Same fire-and-forget contract as `smokeTestResult` — written by
+   * `runLandingPagePageSpeedCheck` (`landingPagePageSpeedCheck.ts`) after deploy, absent until
+   * that first run completes. Advisory only; nothing reads this to gate anything.
+   */
+  pageSpeedResult?: {
+    ok: boolean;
+    performanceScore?: number;
+    accessibilityScore?: number;
+    checkedAt: string;
+    error?: string;
   };
   /**
    * ENG-1238: externally-deployed/imported page marker. Records registered via
@@ -2836,6 +2858,7 @@ async function addPageToExistingRepo(
         return m.runGenerationSmokeTest(deployedSubPage);
       })
       .catch((err) => console.warn(`[V0 SERVICE] Smoke test dispatch failed: ${err?.message}`));
+    dispatchLandingPagePageSpeedCheck(deployedSubPage.id, deployedSubPage.deployedUrl);
 
     return deployedSubPage;
   } catch (error: any) {
@@ -3794,6 +3817,7 @@ export async function deployLandingPage(
     void import("./landingPageSmokeTest")
       .then((m) => m.runGenerationSmokeTest(deployedRecord))
       .catch((err) => console.warn(`[V0 SERVICE] Smoke test dispatch failed: ${err?.message}`));
+    dispatchLandingPagePageSpeedCheck(deployedRecord.id, deployedRecord.deployedUrl);
 
     return deployedRecord;
   } catch (error: any) {
@@ -7047,6 +7071,43 @@ export async function updateLandingPageSmokeTestResult(
   } catch (error: any) {
     console.warn(`[V0 SERVICE] Could not persist smoke test result for page ${id}: ${error?.message}`);
   }
+}
+
+/**
+ * ENG-2193: persists the result of the post-deploy PageSpeed Insights check
+ * (runLandingPagePageSpeedCheck, landingPagePageSpeedCheck.ts). Fire-and-forget by design —
+ * mirrors updateLandingPageSmokeTestResult above for the same reason.
+ */
+export async function updateLandingPagePageSpeedResult(
+  id: string,
+  result: NonNullable<GeneratedLandingPage["pageSpeedResult"]>
+): Promise<void> {
+  try {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "SET pageSpeedResult = :result, updatedAt = :now",
+        ExpressionAttributeValues: {
+          ":result": result,
+          ":now": new Date().toISOString(),
+        },
+      })
+      .promise();
+  } catch (error) {
+    console.warn(`[V0 SERVICE] Could not persist PageSpeed result for page ${id}: ${error instanceof Error ? error.message : error}`);
+  }
+}
+
+/**
+ * ENG-2193: fire-and-forget PageSpeed check dispatch, called alongside the smoke test dispatch
+ * at both post-deploy call sites below. Never throws — a failed check still writes a
+ * `{ok:false, error}` result (see runLandingPagePageSpeedCheck), and a failed WRITE only warns.
+ */
+function dispatchLandingPagePageSpeedCheck(id: string, url: string | undefined): void {
+  void runLandingPagePageSpeedCheck(url)
+    .then((result) => updateLandingPagePageSpeedResult(id, result))
+    .catch((err) => console.warn(`[V0 SERVICE] PageSpeed check dispatch failed: ${err?.message}`));
 }
 
 /**

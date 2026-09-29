@@ -21,7 +21,7 @@
  */
 import { chromium } from "playwright";
 import { findChromeExecutable, PUPPETEER_LAUNCH_ARGS } from "../utils/browserUtils";
-import { buildSmokeTestEmail, buildSmokeTestPhone, isSmokeTestLead, phoneDigits,
+import { buildSmokeTestEmail, buildSmokeTestPhone, buildSmokeTestUtm, isSmokeTestLead, phoneDigits,
   phoneLeadId,
 } from "../utils/smokeTestLead";
 import { crmDb } from "./db";
@@ -216,7 +216,11 @@ async function pollForLeadByPhone(
   submittedAtIso: string,
   /** True only when claimSmokeTestPhone proved this id empty before the form was submitted. */
   idWasClaimed: boolean
-): Promise<{ leadId: string } | null> {
+  // Return type includes LeadAttributionSnapshot's (all-optional) fields purely so this and
+  // pollForLead's result share one type at their common call site below — a phone-matched
+  // lead never actually carries them populated; the UTM check only ever runs on the
+  // email-matched path (see that call site's `emailFilled` guard).
+): Promise<({ leadId: string } & LeadAttributionSnapshot) | null> {
   // Shared with the suppression sites so an E.164 phone can never match in one place and
   // miss in the other.
   const wanted = phoneDigits(phone);
@@ -297,10 +301,68 @@ async function pollForLeadByPhone(
   return null;
 }
 
-async function pollForLead(listId: string, email: string): Promise<{ leadId: string } | null> {
+/** The subset of a lead row's attribution fields the ENG-2193 UTM-propagation check reads. */
+export interface LeadAttributionSnapshot {
+  utmSource?: string;
+  utmMedium?: string;
+  firstTouchUtmSource?: string;
+  firstTouchUtmMedium?: string;
+  firstTouchUtmCampaign?: string;
+}
+
+/** Reads only the fields `utmPropagationVerdict` needs off a raw (untyped) Dynamo lead row,
+ *  without asserting the row's overall shape — `AW-Leads` rows come back as `any` from `crmDb`,
+ *  and most fields on them are irrelevant here. */
+function extractLeadAttribution(lead: Record<string, unknown>): LeadAttributionSnapshot {
+  const utmSource = typeof lead.utmSource === "string" ? lead.utmSource : undefined;
+  const utmMedium = typeof lead.utmMedium === "string" ? lead.utmMedium : undefined;
+  const firstTouch = lead.firstTouch;
+  const utm =
+    firstTouch && typeof firstTouch === "object"
+      ? (firstTouch as Record<string, unknown>).utm
+      : undefined;
+  const utmRecord = utm && typeof utm === "object" ? (utm as Record<string, unknown>) : undefined;
+  return {
+    utmSource,
+    utmMedium,
+    firstTouchUtmSource: typeof utmRecord?.source === "string" ? utmRecord.source : undefined,
+    firstTouchUtmMedium: typeof utmRecord?.medium === "string" ? utmRecord.medium : undefined,
+    firstTouchUtmCampaign: typeof utmRecord?.campaign === "string" ? utmRecord.campaign : undefined,
+  };
+}
+
+/**
+ * Did the UTM params injected into the navigation URL make it all the way through the
+ * landing page's own capture middleware and onto the resulting lead? Pure — snapshot in,
+ * verdict out — so it's testable without a real lead row.
+ */
+export function utmPropagationVerdict(
+  expected: { source: string; medium: string; campaign: string },
+  lead: LeadAttributionSnapshot,
+): { propagated: boolean; detail: string } {
+  const sourceOk = lead.utmSource === expected.source || lead.firstTouchUtmSource === expected.source;
+  const mediumOk = lead.utmMedium === expected.medium || lead.firstTouchUtmMedium === expected.medium;
+  const campaignOk = lead.firstTouchUtmCampaign === expected.campaign;
+  if (sourceOk && mediumOk && campaignOk) {
+    return { propagated: true, detail: "lead attribution carries the injected UTM params" };
+  }
+  return {
+    propagated: false,
+    detail:
+      `lead attribution does not match the injected UTM params ` +
+      `(utmSource=${lead.utmSource ?? lead.firstTouchUtmSource ?? "unset"}, ` +
+      `utmMedium=${lead.utmMedium ?? lead.firstTouchUtmMedium ?? "unset"}, ` +
+      `firstTouch.utm.campaign=${lead.firstTouchUtmCampaign ?? "unset"})`,
+  };
+}
+
+async function pollForLead(
+  listId: string,
+  email: string,
+): Promise<({ leadId: string } & LeadAttributionSnapshot) | null> {
   for (let attempt = 0; attempt < pollMaxAttempts; attempt++) {
     const lead = await crmDb.getLeadByEmail(listId, email);
-    if (lead) return lead as { leadId: string };
+    if (lead) return { leadId: (lead as { leadId: string }).leadId, ...extractLeadAttribution(lead) };
     if (attempt < pollMaxAttempts - 1) {
       await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
     }
@@ -1161,6 +1223,10 @@ async function runGenerationSmokeTestNow(
   let authFormOnly = false;
   let iframeCount = 0;
   let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+  // ENG-2193: set only when the check actually ran (an email-keyed lead landed AND the UTM
+  // params were successfully appended to the navigation URL) — absent, not false, otherwise.
+  let utmPropagated: boolean | undefined;
+  let utmPropagationDetail: string | undefined;
 
   try {
     const executablePath = findChromeExecutable();
@@ -1220,7 +1286,27 @@ async function runGenerationSmokeTestNow(
       });
     }
 
-    await browserPage.goto(deployedUrl, { waitUntil: "networkidle", timeout: 30_000 });
+    // ENG-2193: append synthetic UTM params to the navigation URL so the lead this run
+    // captures can be checked, below, for whether the page's own capture middleware
+    // (v0Service.injectLeadCaptureAttribution) actually propagated them. `navigateUrl` falls
+    // back to the bare `deployedUrl` when it cannot be parsed as an absolute URL — navigating
+    // still proceeds, and the UTM check is simply skipped rather than reporting a false
+    // negative caused by our own URL construction, not the page.
+    const smokeTestUtm = buildSmokeTestUtm();
+    let navigateUrl = deployedUrl;
+    let utmInjectedInNavigation = false;
+    try {
+      const withUtm = new URL(deployedUrl);
+      withUtm.searchParams.set("utm_source", smokeTestUtm.source);
+      withUtm.searchParams.set("utm_medium", smokeTestUtm.medium);
+      withUtm.searchParams.set("utm_campaign", smokeTestUtm.campaign);
+      navigateUrl = withUtm.toString();
+      utmInjectedInNavigation = true;
+    } catch {
+      // deployedUrl isn't an absolute URL — see comment above.
+    }
+
+    await browserPage.goto(navigateUrl, { waitUntil: "networkidle", timeout: 30_000 });
 
     // Fill EVERY fillable field, not just email. Modern landers are React-controlled
     // multi-field forms (name/phone/zip + selects) with client-side validation that blocks
@@ -1440,6 +1526,13 @@ async function runGenerationSmokeTestNow(
       : await pollForLeadByPhone(leadListId, testPhone, submittedAtIso, phoneIdClaimed);
     if (lead) {
       leadCaptured = true;
+      // Email-keyed only: pollForLeadByPhone doesn't return attribution fields, and a
+      // phone-only lander is a rarer shape not worth widening that path for here.
+      if (emailFilled && utmInjectedInNavigation) {
+        const verdict = utmPropagationVerdict(smokeTestUtm, lead);
+        utmPropagated = verdict.propagated;
+        utmPropagationDetail = verdict.detail;
+      }
       await crmDb.deleteLead(leadListId, lead.leadId);
     } else if (redirectedToHandoff) {
       // The form accepted the submission and handed off (chat/agent redirect with a
@@ -1497,6 +1590,10 @@ async function runGenerationSmokeTestNow(
     ...(noFormOnPage ? { noFormOnPage } : {}),
     ...(authFormOnly ? { authFormOnly } : {}),
     ...(iframeCount ? { iframeCount } : {}),
+    // ENG-2193: advisory only — never folded into `ok` above (see the field's own doc comment
+    // on GeneratedLandingPage).
+    ...(utmPropagated !== undefined ? { utmPropagated } : {}),
+    ...(utmPropagationDetail ? { utmPropagationDetail } : {}),
   };
 
   await updateLandingPageSmokeTestResult(page.id, result);
