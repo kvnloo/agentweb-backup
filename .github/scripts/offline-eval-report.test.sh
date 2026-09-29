@@ -119,6 +119,16 @@ else
   fail "an unwritable job summary is the one failure" "exit=${summary_exit}"
 fi
 
+# Whether workflow file $1 declares an actual dependency on the offline-eval job: a `needs:`
+# naming it, inline or as a list item, or a workflow_run trigger naming its display name. A
+# workflow that merely mentions the SCRIPT by name (tests.yml runs offline-eval-report.test.sh as
+# a step) must not count — that shape was the CodeRabbit-caught false positive (ENG-2195, PR
+# #3123 thread 4122002243): a bare `offline-eval-report` substring match flagged tests.yml as a
+# dependent of the job it doesn't depend on, and this check could never pass.
+depends_on_offline_eval() {
+  grep -Eq 'needs:.*\boffline-eval\b|^[[:space:]]*-[[:space:]]*offline-eval[[:space:]]*$|Offline eval \(report-only\)' "$1"
+}
+
 # --- the workflow -------------------------------------------------------------
 
 workflow="$(cat "${WORKFLOW}")"
@@ -151,19 +161,71 @@ else
 fi
 
 # ENG-1039: nothing may wait on this job; it must not sit in front of a build or suite.
-# A dependency is a `needs:` naming the job id, inline or as a list item, or a
-# workflow_run trigger on this workflow. (tests.yml running this test file is not one.)
 dependents=""
 for f in "${WORKFLOW_DIR}"/*.yml; do
   [ "${f}" = "${WORKFLOW}" ] && continue
-  if grep -Eq 'needs:.*\boffline-eval\b|^[[:space:]]*-[[:space:]]*offline-eval[[:space:]]*$|Offline eval \(report-only\)' "${f}"; then
-    dependents="${dependents} $(basename "${f}")"
-  fi
+  if depends_on_offline_eval "${f}"; then dependents="${dependents} $(basename "${f}")"; fi
 done
 if [ -z "${dependents}" ]; then
   pass "no other workflow depends on the offline eval job"
 else
   fail "no other workflow depends on the offline eval job" "found in:${dependents}"
+fi
+
+# The same check, isolated from the real repo's workflow files: reproduces the exact false
+# positive CodeRabbit caught (a workflow merely running the test script by name) and the real
+# needs-based shapes it must still catch, so this stays covered even if tests.yml's own content
+# changes later.
+fixture_dir="${WORKDIR}/fixture-workflows"
+mkdir -p "${fixture_dir}"
+
+cat >"${fixture_dir}/mentions-script-name.yml" <<'YML'
+jobs:
+  ci-scripts-tests:
+    steps:
+      - name: Run CI/deploy control checks
+        run: |
+          bash .github/scripts/offline-eval-report.test.sh
+YML
+if ! depends_on_offline_eval "${fixture_dir}/mentions-script-name.yml"; then
+  pass "a workflow that only runs the test script by name is not a dependent"
+else
+  fail "a workflow that only runs the test script by name is not a dependent" "false-positive reproduced"
+fi
+
+cat >"${fixture_dir}/needs-inline.yml" <<'YML'
+jobs:
+  downstream:
+    needs: [detect-changes, offline-eval]
+YML
+if depends_on_offline_eval "${fixture_dir}/needs-inline.yml"; then
+  pass "an inline needs: [...] naming the job is caught"
+else
+  fail "an inline needs: [...] naming the job is caught"
+fi
+
+cat >"${fixture_dir}/needs-list.yml" <<'YML'
+jobs:
+  downstream:
+    needs:
+      - offline-eval
+YML
+if depends_on_offline_eval "${fixture_dir}/needs-list.yml"; then
+  pass "a block-style needs: list naming the job is caught"
+else
+  fail "a block-style needs: list naming the job is caught"
+fi
+
+cat >"${fixture_dir}/workflow-run-trigger.yml" <<'YML'
+on:
+  workflow_run:
+    workflows: ["Offline eval (report-only)"]
+    types: [completed]
+YML
+if depends_on_offline_eval "${fixture_dir}/workflow-run-trigger.yml"; then
+  pass "a workflow_run trigger naming the job's display name is caught"
+else
+  fail "a workflow_run trigger naming the job's display name is caught"
 fi
 
 printf '\n%d tests, %d failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
