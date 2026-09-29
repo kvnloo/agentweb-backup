@@ -2,6 +2,7 @@
  * ENG-2139: `ImageService.generateImage` runs the creative gates on the final bytes and
  * attaches the verdict to its result — advisory only, a failing gate never fails generation.
  */
+import axios from 'axios';
 import sharp from 'sharp';
 import { ImageService } from '../services/imageGeneration';
 import { uploadFileToS3 } from '../utils/s3Utils';
@@ -18,6 +19,10 @@ interface ProviderResult {
 
 interface GeminiProvider {
   generateWithGoogleGemini3Pro(params: { size?: string }): Promise<ProviderResult>;
+}
+
+interface RunwayProvider {
+  generateWithRunwayML(params: { size?: string }, model: string): Promise<ProviderResult>;
 }
 
 async function pngDataUrl(width: number, height: number, flat = false): Promise<string> {
@@ -114,6 +119,86 @@ describe('ImageService.generateImage creative gates (ENG-2139)', () => {
     expect(result.gates?.checks.find((c) => c.id === 'aspect_fallback')).toMatchObject({
       status: 'fail',
       reason: expect.stringContaining('unsupported_ratio'),
+    });
+  });
+
+  it('checks dimensions and file size for a 1:1 agent-mode request against Meta feed square (ENG-2187)', async () => {
+    stubProvider(await pngDataUrl(640, 640));
+
+    const result = await new ImageService().generateImage({
+      prompt: 'ad',
+      filename: 'ad.png',
+      userId: 'user-1',
+      size: '1:1',
+      imageModel: 'gemini-3-pro-image-preview',
+      removeC2PA: false,
+    });
+
+    expect(result.gates).toMatchObject({ placement: 'meta_feed_square', placementSource: 'ratio', passed: true });
+    const statuses = Object.fromEntries((result.gates?.checks ?? []).map((c) => [c.id, c.status]));
+    expect(statuses).toMatchObject({ dimensions: 'pass', file_size: 'pass' });
+  });
+
+  it('holds the image against the placement the caller named (ENG-2187)', async () => {
+    stubProvider(await pngDataUrl(640, 640));
+
+    const result = await new ImageService().generateImage({
+      prompt: 'ad',
+      filename: 'ad.png',
+      userId: 'user-1',
+      size: '1:1',
+      placement: 'google_square_marketing_image',
+      removeC2PA: false,
+    });
+
+    expect(result.gates).toMatchObject({ placement: 'google_square_marketing_image', placementSource: 'requested' });
+  });
+
+  describe('remote-URL provider (Runway)', () => {
+    const remoteUrl = 'https://runway.example.com/output/ad.png';
+
+    function stubRunway(): void {
+      jest
+        .spyOn(ImageService.prototype as unknown as RunwayProvider, 'generateWithRunwayML')
+        .mockResolvedValue({ success: true, imageUrl: remoteUrl, filename: 'ad.png' });
+    }
+
+    it('gates the downloaded image and still returns the remote URL (ENG-2187)', async () => {
+      stubRunway();
+      jest.mocked(uploadFileToS3).mockClear();
+      const png = Buffer.from((await pngDataUrl(600, 750)).split(',')[1], 'base64');
+      const get = jest.spyOn(axios, 'get').mockResolvedValue({ data: png });
+
+      const result = await new ImageService().generateImage({
+        prompt: 'ad',
+        filename: 'ad.png',
+        userId: 'user-1',
+        size: '1080x1350',
+        imageModel: 'gen4_image',
+      });
+
+      expect(get).toHaveBeenCalledWith(remoteUrl, expect.objectContaining({ responseType: 'arraybuffer' }));
+      expect(result).toMatchObject({ success: true, imageUrl: remoteUrl });
+      expect(result.gates).toMatchObject({ passed: true, placement: 'meta_feed_portrait', width: 600, height: 750 });
+      expect(uploadFileToS3).not.toHaveBeenCalled();
+    });
+
+    it('records the image as not checked when the download fails (ENG-2187)', async () => {
+      stubRunway();
+      jest.spyOn(axios, 'get').mockRejectedValue(new Error('403 Forbidden'));
+      jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+      const result = await new ImageService().generateImage({
+        prompt: 'ad',
+        filename: 'ad.png',
+        userId: 'user-1',
+        size: '1344:768',
+        imageModel: 'gen4_image',
+      });
+
+      expect(result).toMatchObject({ success: true, imageUrl: remoteUrl });
+      expect(result.gates?.notChecked).toContain('403 Forbidden');
+      expect(result.gates?.checks.every((c) => c.status === 'skipped')).toBe(true);
     });
   });
 });
