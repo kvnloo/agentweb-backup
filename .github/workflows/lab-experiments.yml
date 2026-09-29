@@ -30,4 +30,7 @@ jobs:
         run: NODE_OPTIONS="--max-old-space-size=4096" npm run build
       - name: Experiment tests
         working-directory: backend
-        run: node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit src/__tests__/experiments\.
+        run: node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit --passWithNoTests src/__tests__/experiments\.
+      - name: Lifecycle regression slice
+        working-directory: backend
+        run: node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit src/__tests__/sequences.test.ts src/services/__tests__/askCrmService.test.ts
