@@ -559,6 +559,7 @@ import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecond
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import type { LeadImportRowOutcome } from '../utils/leadSchema';
 import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor } from '../utils/leadSchema';
+import { matchLifecyclePresenceFilter } from '../utils/lifecycleFilterSemantics';
 
 type MetaApiResult = {
   success: boolean;
@@ -13437,6 +13438,9 @@ export class AgentModeService {
 
     return filters.every((filter: any) => {
       const { field, operator, value } = filter;
+      const lifecyclePresenceMatch = matchLifecyclePresenceFilter(field, operator);
+      if (lifecyclePresenceMatch !== undefined) return lifecyclePresenceMatch;
+
       let fieldValue: any;
       if (field === 'icpScore') {
         fieldValue = lead.icpMatch?.score;
@@ -14386,6 +14390,8 @@ export class AgentModeService {
       const leadMatchesFilters = (lead: any): boolean => {
         return filters.every((filter: any) => {
           const { field, operator, value } = filter;
+          const lifecyclePresenceMatch = matchLifecyclePresenceFilter(field, operator);
+          if (lifecyclePresenceMatch !== undefined) return lifecyclePresenceMatch;
 
           let fieldValue: any;
           if (field === 'icpScore') {
