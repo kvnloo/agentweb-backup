@@ -4,11 +4,11 @@
  * (not agentModeService.<method>) and forward args unchanged. Same pattern
  * as emmaTools.leads.test.ts / emmaTools.brandMarketStrategy.test.ts.
  *
- * generate_video's execute() also calls
- * agentModeService.getVideoApiDefaultModel() (a separate, not-yet-extracted
- * method) when the caller omits videoModel — that call is deliberately left
- * able to resolve via the proxy's default branch below, since this cluster
- * does not own it.
+ * generate_video's execute() also calls videoImpl.getVideoApiDefaultModel()
+ * (ENG-2103 F2 cluster 21, extracted separately from this cluster — see
+ * emma/impl/video.ts) when the caller omits videoModel. Not mocked here:
+ * every generate_video test below supplies videoModel explicitly, so that
+ * branch is never exercised in this suite.
  */
 
 jest.mock('../emma/impl/mediaVideo', () => ({
@@ -31,10 +31,12 @@ const MEDIA_VIDEO_CLUSTER_METHODS = [
 ];
 
 // agentModeService.<mediaVideoClusterMethod> must NOT be called by these 10
-// tools anymore. generate_video's execute() also calls
-// agentModeService.getVideoApiDefaultModel() directly — a different,
-// not-yet-extracted method — so the proxy below only throws for the 10
-// names this cluster actually owns.
+// tools anymore. generate_video's execute() no longer calls
+// agentModeService.getVideoApiDefaultModel() at all (repointed to
+// videoImpl.getVideoApiDefaultModel() by ENG-2103 F2 cluster 21) — the proxy
+// below only throws for the 10 names this cluster actually owns; any other
+// prop falling through to its default branch is otherwise-unexercised jest.fn()
+// filler, not a real production call path.
 jest.mock('../services/agentModeService', () => ({
   agentModeService: new Proxy(
     {},
