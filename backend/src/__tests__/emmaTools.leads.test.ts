@@ -4,9 +4,6 @@
  * forward args unchanged. Same pattern as emmaTools.googleDrive.test.ts /
  * emmaTools.htmlTools.test.ts.
  *
- * update_email_draft_for_lead is deliberately NOT covered here — it remains
- * on agentModeService (this.callLLM-coupled, flagged rather than extracted).
- *
  * ENG-2103 (F2 design-decision-list follow-up, Pattern A):
  * import_leads_from_search is now ALSO covered — it used to remain on
  * agentModeService for the identical this.callLLM-shaped reason as
@@ -18,6 +15,16 @@
  * create_html_from_template. It's covered in its own describe block below,
  * separate from the 19-method cluster loop, since it needs a `callLLM`
  * assertion the other 19 don't.
+ *
+ * ENG-2103 (F2 design-decision-list follow-up, Pattern A, later round):
+ * update_email_draft_for_lead is now ALSO covered, in its own describe block
+ * below — it moved to emma/impl/leads.ts too, with `callLLM`,
+ * `getReportGenerationDefaultModel`, and `getSenderForLead` all injected
+ * (`callLLM`/`getReportGenerationDefaultModel` are `public` on
+ * AgentModeService; `getSenderForLead` is bound off the singleton the same
+ * way even though its real body still lives on the class — see
+ * emma/impl/leads.ts's own header comment for why it wasn't promoted to a
+ * shared module this round).
  */
 
 jest.mock('../emma/impl/leads', () => ({
@@ -41,6 +48,7 @@ jest.mock('../emma/impl/leads', () => ({
   addLeadEngagement: jest.fn(),
   sendEmailToLead: jest.fn(),
   importLeadsFromSearch: jest.fn(),
+  updateEmailDraftForLead: jest.fn(),
 }));
 
 const LEADS_CLUSTER_METHODS = [
@@ -52,25 +60,32 @@ const LEADS_CLUSTER_METHODS = [
 ];
 
 // agentModeService.<leadsClusterMethod> must NOT be called by these 19 tools
-// anymore, and agentModeService.importLeadsFromSearch must not be called by
-// import_leads_from_search anymore either (it's repointed to leadsImpl this
-// round). update_email_draft_for_lead still legitimately calls
-// agentModeService directly (not part of this cluster) — a bare jest.fn()
-// through the proxy's default branch. `callLLM` is also allowed through the
-// default branch — import_leads_from_search's real execute() binds
-// `agentModeService.callLLM` and forwards it to leadsImpl, so it must
-// resolve to a real function, not throw.
+// anymore, and agentModeService.importLeadsFromSearch/updateEmailDraftForLead
+// must not be called by import_leads_from_search/update_email_draft_for_lead
+// anymore either (both are repointed to leadsImpl). `callLLM`,
+// `getReportGenerationDefaultModel`, and `getSenderForLead` are allowed
+// through as stable target properties — the real execute() bodies bind them
+// off the singleton and forward them to leadsImpl, so they must resolve to
+// real (and, for assertion purposes, IDENTICAL) functions, not throw.
 jest.mock('../services/agentModeService', () => ({
   agentModeService: new Proxy(
-    // `callLLM` is a stable target property (not returned fresh per access
-    // like the fallback branch below) so import_leads_from_search's
-    // `agentModeService.callLLM.bind(agentModeService)` and this test's own
-    // `agentModeService.callLLM` assertion resolve to the SAME jest.fn().
-    { callLLM: jest.fn().mockResolvedValue({ success: true }) },
+    // Stable target properties (not returned fresh per access like the
+    // fallback branch below) so a tool's `agentModeService.<fn>.bind(...)`
+    // and this test's own `agentModeService.<fn>` assertion resolve to the
+    // SAME jest.fn().
+    {
+      callLLM: jest.fn().mockResolvedValue({ success: true }),
+      getReportGenerationDefaultModel: jest.fn().mockResolvedValue('gpt-5.5'),
+      getSenderForLead: jest.fn().mockResolvedValue(null),
+    },
     {
       get(target: any, prop) {
         if (prop in target) return target[prop];
-        if (LEADS_CLUSTER_METHODS.includes(String(prop)) || prop === 'importLeadsFromSearch') {
+        if (
+          LEADS_CLUSTER_METHODS.includes(String(prop)) ||
+          prop === 'importLeadsFromSearch' ||
+          prop === 'updateEmailDraftForLead'
+        ) {
           return () => {
             throw new Error(`agentModeService.${String(prop)} should not be called by the leads/CRM cluster after ENG-2103 F2`);
           };
@@ -406,5 +421,49 @@ describe('import_leads_from_search calls leadsImpl.importLeadsFromSearch with ag
       emmaToolRegistry.getTool('import_leads_from_search')!.execute({ list_id: 'L1', title: 'CTO' }, {})
     ).rejects.toThrow('Authentication required');
     expect(mockLeads.importLeadsFromSearch).not.toHaveBeenCalled();
+  });
+});
+
+// ENG-2103 (F2 design-decision-list follow-up, Pattern A, later round):
+// separate describe block — update_email_draft_for_lead isn't one of the 19
+// LEADS_CLUSTER_METHODS (it has its own callLLM/getReportGenerationDefaultModel/
+// getSenderForLead-binding assertions the others don't need).
+describe('update_email_draft_for_lead calls leadsImpl.updateEmailDraftForLead with agentModeService.callLLM/getReportGenerationDefaultModel/getSenderForLead bound (ENG-2103 F2)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('forwards the mapped args plus the three bound gateway functions, and returns the result unchanged', async () => {
+    const expected = { success: true, data: { email: { subject: 's', textContent: 't' } } };
+    mockLeads.updateEmailDraftForLead.mockResolvedValue(expected);
+
+    const result = await emmaToolRegistry.getTool('update_email_draft_for_lead')!.execute(
+      { list_id: 'L1', lead_id: 'LD1', instruction: 'Write a welcome email', email_format: 'text' },
+      { sessionId: 's1', userId: 'u1' }
+    );
+
+    expect(mockLeads.updateEmailDraftForLead).toHaveBeenCalledTimes(1);
+    const [listId, leadId, instruction, sessionId, userId, emailFormat, passedCallLLM, passedGetReportModel, passedGetSenderForLead] =
+      mockLeads.updateEmailDraftForLead.mock.calls[0];
+    expect(listId).toBe('L1');
+    expect(leadId).toBe('LD1');
+    expect(instruction).toBe('Write a welcome email');
+    expect(sessionId).toBe('s1');
+    expect(userId).toBe('u1');
+    expect(emailFormat).toBe('text');
+    expect(typeof passedCallLLM).toBe('function');
+    expect(typeof passedGetReportModel).toBe('function');
+    expect(typeof passedGetSenderForLead).toBe('function');
+    expect(result).toBe(expected);
+
+    // Each bound function must actually be the real agentModeService method,
+    // not a stand-in — prove it by calling it and checking the underlying
+    // mock saw it (same discipline as import_leads_from_search's own test).
+    await passedCallLLM('m', [], {} as any);
+    expect(agentModeService.callLLM).toHaveBeenCalledWith('m', [], {});
+    await passedGetReportModel();
+    expect(agentModeService.getReportGenerationDefaultModel).toHaveBeenCalledTimes(1);
+    await passedGetSenderForLead('u1', undefined, undefined, undefined);
+    expect(agentModeService.getSenderForLead).toHaveBeenCalledWith('u1', undefined, undefined, undefined);
   });
 });
