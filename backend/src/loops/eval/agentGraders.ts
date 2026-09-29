@@ -19,6 +19,7 @@ import {
   type FinalizeLedgerEntry,
 } from '../../services/agentMode/core/finalizeGuard';
 import { mediaGenProducedAsset } from '../../services/agentMode/core/toolDispatch';
+import { isReadOnlyToolName } from '../../utils/toolWriteClassification';
 import { toolResultError } from '../../utils/toolResultError';
 import { wilsonInterval, type Interval } from './agreement';
 
@@ -840,7 +841,19 @@ const ASKS_TO_PROCEED = /\b(?:(?:shall|should|can|may) I (?:go ahead|proceed|sta
 /** An offer to do something: a permission request only when the reply is little else. */
 const OFFERS = /\b(?:would you like me to|do you want me to|want me to|should I|shall I)\b/i;
 const OFFER_ONLY_MAX_WORDS = 80;
-const WH_START = /^\s*(?:which|what|who|where|when|how)\b/i;
+/**
+ * A wh-word within roughly the first few words of the sentence — catches both a bare clarifying
+ * question ("Which account should I use?") and one prefixed by a stock phrase ("Please confirm
+ * which account to update?", which would otherwise match ASKS_TO_PROCEED's bare "please confirm"
+ * and be misread as asking permission to proceed, when it is really asking which target to act
+ * on). Checking only the literal start of the sentence missed the prefixed form.
+ */
+const WH_EARLY_WORD_WINDOW = 5;
+const WH_WORD = /\b(?:which|what|who|where|when|how)\b/i;
+function startsWithClarifyingWh(sentence: string): boolean {
+  const lead = sentence.trim().split(/\s+/).slice(0, WH_EARLY_WORD_WINDOW).join(' ');
+  return WH_WORD.test(lead);
+}
 /** Confirming a spend, publish, send or irreversible step is correct even after "go ahead" (ENG-1312 rule). */
 const CONSEQUENTIAL = /(?:\$\s?\d|\bbudgets?\b|\bspend\b|\bbid\b|\bpublish|\bsend\b|\bsending\b|\blaunch|\bgo live\b|\bdelete|\bremove|\bcharge|\bpay(?:ment)?\b|\bactivate|\bunpause|\benable\b)/i;
 
@@ -853,11 +866,18 @@ function questionSentences(reply: string): string[] {
 /** The reply's permission request, if it makes one (a which/what clarifying question does not count). */
 export function permissionRequest(reply: string): string | undefined {
   const offerOnly = wordCount(reply) <= OFFER_ONLY_MAX_WORDS;
-  return questionSentences(reply).find((s) => !WH_START.test(s) && (ASKS_TO_PROCEED.test(s) || (offerOnly && OFFERS.test(s))));
+  return questionSentences(reply).find((s) => !startsWithClarifyingWh(s) && (ASKS_TO_PROCEED.test(s) || (offerOnly && OFFERS.test(s))));
 }
 
+/**
+ * A tool call that actually did the requested work: not a plan-management call, and not a
+ * read-only lookup (list/search/get/…) either — reading context or checking existing state is
+ * not the same as having performed the action the user asked for (ENG-1276's read/write
+ * classifier, reused here rather than a second one: a turn that only listed documents and then
+ * asked whether to create the draft never acted).
+ */
 function isWorkTool(name: string): boolean {
-  return !PLAN_MANAGEMENT_TOOLS.has(name);
+  return !PLAN_MANAGEMENT_TOOLS.has(name) && !isReadOnlyToolName(name);
 }
 
 function adherenceOf(
