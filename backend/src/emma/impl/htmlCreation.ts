@@ -69,10 +69,87 @@
  * key, unmodified from the original source.
  */
 
+/**
+ * ENG-2103 (F2) DESIGN-DECISION-LIST FOLLOW-UP (round 3, "Pattern A") — adds
+ * `createHtmlFromTemplate`, the method this file's own header above flagged
+ * as excluded, specifically for its direct `this.callLLM` coupling. Read in
+ * full, confirmed to make exactly ONE `this.callLLM` call (the
+ * template-variable substitution step). Two more `AgentModeService` instance
+ * methods are used to pick which model that call gets: `getDefaultModel`
+ * (no model pinned by the caller) and `resolveGenerationModel` (ENG-46: falls
+ * a stale/removed model id back to a served one before it reaches
+ * `callLLM`). All three are genuine LLM-gateway/routing infrastructure — the
+ * same "never a candidate for extraction, same category as callLLM itself"
+ * reasoning already applied to `describeImage`/`generateImage` — so, per
+ * Pattern A, they are injected as bound function parameters rather than
+ * moved or reimplemented:
+ *
+ *   - `callLLM` — narrowed to `CreateHtmlFromTemplateLlmCall`, a structural
+ *     type covering only the one call shape this method actually sends (one
+ *     user message; `temperature`/`response_format`/`max_completion_tokens`/
+ *     `taskClass`/`usageContext` — 5 of `callLLM`'s real, much larger
+ *     `LLMCallOptions` fields). `LLMCallOptions` is a private, unexported
+ *     interface in agentModeService.ts, and this module must not import that
+ *     file anyway, so this is a deliberately local, narrower type — not a
+ *     copy of the whole signature.
+ *   - `getDefaultModel` / `resolveGenerationModel` — injected as
+ *     `GetDefaultModelFn`/`ResolveGenerationModelFn`, each matching the real
+ *     `public` instance method's signature exactly. Both are `public` on the
+ *     class (confirmed by reading agentModeService.ts directly), so
+ *     `emma/tools.ts` binds them straight off the `agentModeService`
+ *     singleton with no class-side delegating wrapper needed in between —
+ *     unlike `AccountResolver`/`EmployerSizeFilterResolver`, whose underlying
+ *     methods are `private`.
+ *
+ * `AgentModeService.prototype.findTemplateById` and its private helper
+ * `getTemplatesForUser` existed ONLY for this method (whole-backend grep:
+ * zero other callers, zero test spies) — moved here as a local, non-exported
+ * `findTemplateById`, built on `emma/impl/shared/htmlTemplates.ts`'s
+ * `getTemplatesForUser` (the same shared reader `emma/impl/htmlTools.ts`'s
+ * `listHtmlTemplates` already uses), and DELETED from the class outright —
+ * the "genuinely dead, not kept as an unnecessary stub" treatment this series
+ * has used throughout.
+ *
+ * The five `private static` HTML-escaping delegates on `AgentModeService`
+ * (`escapeHtml`/`unescapeHtml`/`deepEscapeHtmlValues`/`escapeRegExp`/
+ * `collectRawToEscapedMap` — see `emma/impl/shared/htmlEscaping.ts`'s own
+ * header) were shared between this method and `emma/impl/googleDocsSheets.ts`'s
+ * markdown pipeline. Four of the five (`unescapeHtml`/`deepEscapeHtmlValues`/
+ * `escapeRegExp`/`collectRawToEscapedMap`) had this method as their ONLY
+ * caller anywhere in the backend — imported here directly from the shared
+ * module instead, and deleted from the class. `escapeHtml` already had zero
+ * callers anywhere in agentModeService.ts BEFORE this round (pre-existing,
+ * unrelated dead code) — left untouched per the "don't remove pre-existing
+ * dead code" rule; only its now-stale doc comment was corrected.
+ *
+ * `AgentModeService.prototype.createHtmlFromTemplate` stays as a delegating
+ * wrapper (not deleted): `routes/emmaApi.ts`'s `POST
+ * /create-html-from-template` calls it directly on the class singleton, and
+ * `createHtmlFromTemplate.test.ts` calls it directly on a real instance
+ * (including `jest.spyOn(agentModeService, 'callLLM')`, still observed since
+ * the wrapper reads `this.callLLM` fresh on every call). `emma/tools.ts` was
+ * repointed to call this module directly, supplying all three injected
+ * functions bound straight off the `agentModeService` singleton.
+ *
+ * Metering/RunFunding audit: zero matches for currentRunFunding or
+ * billingUserId in this method — its one `usageContext` is
+ * `{ userId, sessionId, feature: 'html_template' }`, unmodified from the
+ * original source.
+ */
+
 import { randomUUID } from 'crypto';
 import { extractVariables } from '../../utils/templateParser';
 import { isTransientLLMError } from '../../utils/agentModeErrors';
 import { makeToolUsageCallback } from './shared/toolUsageMetering';
+import { getTemplatesForUser } from './shared/htmlTemplates';
+import {
+  unescapeHtml,
+  deepEscapeHtmlValues,
+  escapeRegExp,
+  collectRawToEscapedMap,
+} from './shared/htmlEscaping';
+import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
+import type { LLMUsageContext } from '../../utils/llmService';
 
 async function sleep(ms: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, ms));
@@ -1099,4 +1176,454 @@ async function computeSafeTextRanges(html: string): Promise<Array<{ start: numbe
     parser.write(html);
     parser.end();
     return ranges;
+  }
+
+/**
+ * Find a template by id, searching the user's own templates first, then
+ * public ones. Moved verbatim from `AgentModeService.prototype.
+ * findTemplateById` — its only caller anywhere in the backend was
+ * `createHtmlFromTemplate` (confirmed by a whole-backend grep), so it's a
+ * local, non-exported helper here rather than a public export.
+ */
+async function findTemplateById(templateId: string, userId: string): Promise<{ template: any | null, isPublic: boolean }> {
+  const { userTemplates, publicTemplates } = await getTemplatesForUser(userId);
+
+  const userMatch = userTemplates.find((t: any) => t.template_id === templateId);
+  if (userMatch) {
+    return { template: userMatch, isPublic: false };
+  }
+
+  const publicMatch = publicTemplates.find((t: any) => t.template_id === templateId);
+  if (publicMatch) {
+    return { template: publicMatch, isPublic: true };
+  }
+
+  return { template: null, isPublic: false };
+}
+
+/**
+ * ENG-46: structured, greppable, observability-only signal for a model
+ * fallback (see `ResolveGenerationModelFn` below). Reimplemented here as a
+ * trivial local console.warn wrapper — same "not worth a shared-module
+ * promotion for one function" treatment this file already gives `sleep`
+ * above — rather than exporting agentModeService.ts's own (non-exported)
+ * module-scope helper of the same name, which still has its own, unrelated
+ * caller left on the class.
+ */
+function recordCreateHtmlFromTemplateModelFallback(
+  runId: string,
+  sessionId: string,
+  requestedModel: string,
+  resolvedModel: string,
+): void {
+  try {
+    console.warn('[agent-mode] model fallback', {
+      runId,
+      sessionId,
+      requestedModel: requestedModel || '(none)',
+      resolvedModel,
+    });
+  } catch (err) {
+    console.error('[agent-mode] model-fallback telemetry failed (swallowed):', err);
+  }
+}
+
+/**
+ * Narrow structural type for the ONE `this.callLLM` call this method makes
+ * (the template-variable substitution step) — not
+ * `AgentModeService.prototype.callLLM`'s full signature, which has many more
+ * options fields this call site never passes. `LLMCallOptions` itself is a
+ * private, unexported interface in agentModeService.ts, and this module must
+ * not import that file anyway (the whole point of the extraction), so this
+ * type is deliberately local: it covers exactly the 5 options fields sent
+ * below (`temperature`, `response_format`, `max_completion_tokens`,
+ * `taskClass`, `usageContext`) and the 2 response fields read
+ * (`choices[0].finish_reason`, `choices[0].message.content`).
+ */
+export type CreateHtmlFromTemplateLlmCall = (
+  model: string,
+  messages: Array<{ role: 'user'; content: string }>,
+  options: {
+    temperature: number;
+    response_format: { type: 'json_object' };
+    max_completion_tokens: number;
+    taskClass: GatewayTaskClass;
+    usageContext: LLMUsageContext;
+  },
+) => Promise<{
+  choices: Array<{ finish_reason: string; message: { content: string | null } }>;
+}>;
+
+/** Matches `AgentModeService.prototype.getDefaultModel`'s real signature exactly. */
+export type GetDefaultModelFn = () => Promise<string>;
+
+/** Matches `AgentModeService.prototype.resolveGenerationModel`'s real signature exactly. */
+export type ResolveGenerationModelFn = (
+  model: string,
+) => { model: string; fellBack: boolean; requestedModel: string };
+
+// Create HTML from template with variable substitution
+export async function createHtmlFromTemplate(
+    llmModel: string,
+    templateId: string,
+    variableValues: Record<string, string> | undefined,
+    arrayVariableValues: Record<string, string[]> | undefined,
+    userId: string,
+    sessionId: string,
+    callLLM: CreateHtmlFromTemplateLlmCall,
+    getDefaultModel: GetDefaultModelFn,
+    resolveGenerationModel: ResolveGenerationModelFn,
+  ): Promise<any> {
+    try {
+      // Get the template from user or public store
+      const { template } = await findTemplateById(templateId, userId);
+
+      if (!template) {
+        return {
+          success: false,
+          message: `Template '${templateId}' not found`
+        };
+      }
+
+      // Validate template structure first
+      if (!template.html_content || !template.subject) {
+        return {
+          success: false,
+          message: 'Invalid template structure: missing html_content or subject'
+        };
+      }
+      if (!llmModel) {
+        llmModel = await getDefaultModel();
+      } else {
+        // ENG-46 sibling path: this method is reached with the SESSION's model
+        // (emma create_html_from_template tool / route), so a stale/removed id
+        // (e.g. gpt-5.1) would otherwise throw an opaque "Invalid model" inside
+        // callLLM here too. Resolve it up front so template substitution falls
+        // back to a served model instead of failing.
+        const templateModelResolution = resolveGenerationModel(llmModel);
+        if (templateModelResolution.fellBack) {
+          recordCreateHtmlFromTemplateModelFallback('create-html-from-template', sessionId || '', llmModel, templateModelResolution.model);
+        }
+        llmModel = templateModelResolution.model;
+      }
+      // Validate that all required variables are provided
+      const templateVariables = template.variables || [];
+      const templateArrayVariables = template.arrayVariables || [];
+
+      // Parameters are already objects
+      const variableValuesObj = variableValues || {};
+      const arrayVariableValuesObj = arrayVariableValues || {};
+
+      // Check for missing regular variables
+      const missingVariables = templateVariables.filter((variable: string) =>
+        !(variable in variableValuesObj)
+      );
+
+      // Check for missing array variables
+      const missingArrayVariables = templateArrayVariables.filter((variable: string) =>
+        !(variable in arrayVariableValuesObj)
+      );
+
+      // Check for extra variables that aren't in the template
+      const extraVariables = Object.keys(variableValuesObj).filter(variable =>
+        !templateVariables.includes(variable)
+      );
+
+      const extraArrayVariables = Object.keys(arrayVariableValuesObj).filter(variable =>
+        !templateArrayVariables.includes(variable)
+      );
+
+      // Build validation error message
+      const validationErrors = [];
+
+      if (missingVariables.length > 0) {
+        validationErrors.push(`Missing required variables: ${missingVariables.join(', ')}`);
+      }
+
+      if (missingArrayVariables.length > 0) {
+        validationErrors.push(`Missing required array variables: ${missingArrayVariables.join(', ')}`);
+      }
+
+      if (extraVariables.length > 0) {
+        validationErrors.push(`Extra variables provided: ${extraVariables.join(', ')}`);
+      }
+
+      if (extraArrayVariables.length > 0) {
+        validationErrors.push(`Extra array variables provided: ${extraArrayVariables.join(', ')}`);
+      }
+
+      // Validate array variable values are actually arrays
+      const invalidArrayVariables = Object.entries(arrayVariableValuesObj).filter(([key, value]) =>
+        !Array.isArray(value)
+      );
+
+      if (invalidArrayVariables.length > 0) {
+        validationErrors.push(`Array variable items must be an array: ${invalidArrayVariables.map(([key]) => key).join(', ')}`);
+      }
+
+      if (validationErrors.length > 0) {
+        return {
+          success: false,
+          message: validationErrors.join('; '),
+          errors: validationErrors,
+          template_variables: templateVariables,
+          template_array_variables: templateArrayVariables
+        };
+      }
+
+      // ENG-1877: variable values come from campaign names, CRM data, and other
+      // caller-supplied strings — none of it trusted HTML. The LLM is instructed below
+      // to copy values through verbatim ("EXACT REPLACEMENT"), so an unescaped `<script>`
+      // or `<img onerror=...>` in a value reaches the rendered report unchanged. Escaping
+      // here (not on the LLM's output afterward) is the only point where "this came from
+      // a value" and "this is the template's own static markup" are still distinguishable
+      // — post-hoc sanitizing final_html can't tell the two apart.
+      const escapedVariableValuesObj = Object.fromEntries(
+        Object.entries(variableValuesObj).map(([key, value]) => [key, deepEscapeHtmlValues(value)])
+      );
+      const escapedArrayVariableValuesObj = Object.fromEntries(
+        Object.entries(arrayVariableValuesObj).map(([key, values]) => [
+          key,
+          deepEscapeHtmlValues(values),
+        ])
+      );
+
+      // Raw (pre-escape) values that actually contained a dangerous character, mapped to
+      // their escaped form — used to CORRECT the LLM's OUTPUT below if it resurfaces.
+      // Escaping the prompt only proves the request was safe; it does not prove the
+      // model didn't decode an entity back to raw HTML.
+      const rawToEscapedMap = new Map<string, string>();
+      collectRawToEscapedMap(variableValuesObj, rawToEscapedMap);
+      collectRawToEscapedMap(arrayVariableValuesObj, rawToEscapedMap);
+
+      // Use LLM to handle variable substitution
+      const substitutionPrompt = `You are a template engine. Your task is to replace variables in HTML templates with provided values while preserving the exact same format and structure.
+
+TEMPLATE HTML:
+${template.html_content}
+
+TEMPLATE SUBJECT:
+${template.subject}
+
+VARIABLE VALUES:
+${JSON.stringify(escapedVariableValuesObj, null, 2)}
+
+ARRAY VARIABLE VALUES:
+${JSON.stringify(escapedArrayVariableValuesObj, null, 2)}
+
+CRITICAL INSTRUCTIONS:
+1. PRESERVE THE EXACT FORMAT: Keep the same HTML structure, tags, classes, and styling as the original template
+2. REPLACE VARIABLES: Replace all {{variable_name}} placeholders with corresponding values
+3. ARRAY VARIABLES: For array variables, repeat the surrounding HTML structure for each array item
+   - If {{array_var}} is inside a <li> tag, repeat the <li> tag for each array item
+   - If {{array_var}} is inside a <div> tag, repeat the <div> tag for each array item
+   - Maintain the exact same HTML structure around the array variable
+4. VALID HTML: Ensure the final HTML is valid and well-formatted
+5. NO STRUCTURAL CHANGES: Do not add new HTML elements, change classes, or modify the template structure (except for empty array handling as described below)
+6. EMPTY ARRAY VARIABLES: If an array variable has an empty array (no data), you must add text within that section to indicate there is no data, remove the array variables from the HTML structure and keep the rest of the HTML structure intact. For example, for array variable "features_n", if there is no data, all variables "features_1", "features_2", etc. must be removed from the HTML structure as they together indicate the array variable.
+7. EXACT REPLACEMENT: Only replace {{}} placeholders, keep everything else identical
+
+RESPONSE FORMAT:
+You must return a valid JSON object with exactly these two fields:
+{
+  "final_html": "final HTML content with variables replaced but structure preserved",
+  "final_subject": "final subject with variables replaced"
+}
+
+IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
+
+      // Try with increasing token limits — large HTML templates need room for the full output
+      const tokenLimits = [32768, 65536];
+      let substitutionData: any = null;
+
+      for (const maxTokens of tokenLimits) {
+        const substitutionResponse = await callLLM(llmModel, [
+          {
+            role: 'user',
+            content: substitutionPrompt
+          }
+        ], {
+          temperature: 0.1,
+          response_format: { type: 'json_object' },
+          max_completion_tokens: maxTokens,
+          taskClass: 'content_generation',
+          // ENG-1858: the user's template work — attribute it to them, not "system".
+          usageContext: { userId, sessionId, feature: 'html_template' },
+        });
+
+        const finishReason = substitutionResponse.choices[0].finish_reason;
+        const substitutionResult = substitutionResponse.choices[0].message.content;
+
+        if (!substitutionResult) {
+          throw new Error('LLM did not return substitution result');
+        }
+
+        // If the response was truncated (length = hit token limit), retry with more tokens
+        if (finishReason === 'length') {
+          console.warn(`createHtmlFromTemplate: Response truncated at ${maxTokens} tokens, retrying with more...`);
+          continue;
+        }
+
+        try {
+          substitutionData = JSON.parse(substitutionResult);
+        } catch (parseError) {
+          // Some models (e.g. Gemini) wrap JSON in markdown code blocks — strip and retry
+          const codeBlockMatch = substitutionResult.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
+          if (codeBlockMatch) {
+            try {
+              substitutionData = JSON.parse(codeBlockMatch[1].trim());
+            } catch (innerParseError) {
+              console.error('createHtmlFromTemplate: Failed to parse JSON even after stripping code block wrapper. Raw response (first 500 chars):', substitutionResult.substring(0, 500));
+              // If we have more token limits to try, continue; otherwise throw
+              if (maxTokens < tokenLimits[tokenLimits.length - 1]) continue;
+              throw new Error('LLM returned invalid JSON for variable substitution');
+            }
+          } else {
+            console.error('createHtmlFromTemplate: Failed to parse LLM response as JSON. Raw response (first 500 chars):', substitutionResult.substring(0, 500));
+            if (maxTokens < tokenLimits[tokenLimits.length - 1]) continue;
+            throw new Error('LLM returned invalid JSON for variable substitution');
+          }
+        }
+
+        // Successfully parsed — break out of retry loop
+        if (substitutionData) break;
+      }
+
+      if (!substitutionData || !substitutionData.final_html || !substitutionData.final_subject) {
+        throw new Error('LLM substitution result missing final_html or final_subject fields');
+      }
+
+      let finalHtml = substitutionData.final_html;
+      let finalSubject = substitutionData.final_subject;
+
+      // ENG-1877: correct the output if the model reproduced a value's RAW, unescaped
+      // form instead of the escaped one we sent it — escaping the prompt only proves the
+      // REQUEST was safe, not that the model preserved it through generation. Auto-
+      // correcting (rather than rejecting outright) means a model that imperfectly
+      // handles escaping on some OTHER template degrades to "silently corrected", not
+      // "report generation hard-fails" — this function is shared by ~35 existing
+      // templates across the platform, most never tested against this change, and a
+      // reject-on-detect design would turn any of their LLM's occasional imperfect
+      // escaping into a customer-visible outage for reasons unrelated to security.
+      //
+      // Applied to finalHtml ONLY, never finalSubject — per docs/html-templates.md,
+      // `subject` is a real email subject line (round-4 review finding), never rendered
+      // as HTML, so it has no injection surface to correct in the first place; escaping
+      // it at all just corrupts a real customer-visible field with literal entity text.
+      //
+      // Two more round-4 findings fixed here: (1) longest-value-first ordering — when one
+      // flagged value is a literal substring of another (plausible with real HTML-snippet
+      // data), correcting the shorter one first destroys the exact string the longer one's
+      // pattern needs, silently no-oping its own correction. (2) a replacer FUNCTION, not
+      // a plain string — `String.replace` treats `$&`, `$$`, etc. in a plain replacement
+      // string as special patterns; an escaped value that happens to contain `$` next to
+      // certain characters could reinject the raw matched text, un-doing the very
+      // escaping this loop exists to enforce. A function's return value is used literally,
+      // with no `$`-pattern interpretation.
+      //
+      // Case-insensitive: a model reproducing `<SCRIPT>` instead of `<script>` is still a
+      // browser-executable tag — an exact-case match would let that trivial reformatting
+      // evade correction entirely. A false correction is possible if a raw dangerous
+      // substring coincidentally already existed in the template's own static markup, but
+      // replacing that one occurrence with its escaped form is a far safer failure mode
+      // than either a silently reopened injection or a hard failure.
+      const correctionsByLengthDesc = [...rawToEscapedMap.entries()].sort(
+        ([a], [b]) => b.length - a.length
+      );
+      for (const [rawValue, escapedValue] of correctionsByLengthDesc) {
+        const pattern = new RegExp(escapeRegExp(rawValue), 'gi');
+        finalHtml = finalHtml.replace(pattern, () => escapedValue);
+      }
+
+      // finalSubject is plain text (never HTML-rendered), so any HTML entity that leaked
+      // through from the escaped prompt values doesn't protect anything — it just shows
+      // literal "&amp;"/"&#39;" etc. in a real customer's email subject. Decode them back.
+      finalSubject = unescapeHtml(finalSubject);
+
+      // Verify the substitution was correct
+      const remainingPlaceholders = finalHtml.match(/\{\{[^}]+\}\}/g) || [];
+      const remainingSubjectPlaceholders = finalSubject.match(/\{\{[^}]+\}\}/g) || [];
+
+      if (remainingPlaceholders.length > 0 || remainingSubjectPlaceholders.length > 0) {
+        console.warn('Warning: Some variables were not substituted:', {
+          htmlPlaceholders: remainingPlaceholders,
+          subjectPlaceholders: remainingSubjectPlaceholders
+        });
+      }
+
+      // Verify HTML structure is preserved (basic check)
+      const originalTagCount = (template.html_content.match(/<[^>]+>/g) || []).length;
+      const finalTagCount = (finalHtml.match(/<[^>]+>/g) || []).length;
+
+      // Allow for some variation due to array repetition, but flag significant changes
+      const tagDifference = Math.abs(originalTagCount - finalTagCount);
+      if (tagDifference > originalTagCount * 0.5) { // More than 50% change in tag count
+        console.warn('Warning: Significant HTML structure change detected:', {
+          originalTagCount,
+          finalTagCount,
+          difference: tagDifference
+        });
+      }
+
+      // Upload to S3
+      const { uploadFileToS3 } = await import('../../utils/s3Utils');
+      const rawName = (template.template_name || 'template').toLowerCase();
+      const slug = rawName.replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'template';
+      const idSuffix = (template.template_id || templateId || '').slice(0, 8);
+      const suffix = idSuffix ? `_${idSuffix}` : '';
+      const filename = `html_${slug}${suffix}.html`;
+      const uploadResult = await uploadFileToS3(finalHtml, filename, userId, 'text/html');
+
+      if (!uploadResult.success || !uploadResult.url) {
+        throw new Error(uploadResult.error || 'Failed to upload to S3');
+      }
+
+      const s3Url = uploadResult.url;
+
+      return {
+        success: true,
+        s3_url: s3Url,
+        final_subject: finalSubject,
+        template_id: template.template_id,
+        template_name: template.template_name,
+        filename: filename
+      };
+    } catch (error) {
+      console.error('Error creating email HTML from template:', error);
+
+      // Return specific error messages based on the error type
+      if (error instanceof Error) {
+        if (error.message.includes('Failed to process template with LLM') || error.message.includes('OpenAI API error')) {
+          return {
+            success: false,
+            message: 'Failed to process template with LLM',
+            error: error.message
+          };
+        } else if (error.message.includes('LLM returned invalid JSON')) {
+          return {
+            success: false,
+            message: 'Failed to parse LLM response',
+            error: error.message
+          };
+        } else if (error.message.includes('missing final_html or final_subject')) {
+          return {
+            success: false,
+            message: 'LLM response missing final_html',
+            error: error.message
+          };
+        } else if (error.message.includes('Failed to upload to S3') || error.message.includes('S3 upload failed')) {
+          return {
+            success: false,
+            message: 'Failed to upload to S3',
+            error: error.message
+          };
+        }
+      }
+
+      return {
+        success: false,
+        message: 'Failed to create email HTML from template',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
   }

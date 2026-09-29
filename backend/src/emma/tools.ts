@@ -3408,7 +3408,19 @@ emmaToolRegistry.register({
       };
     }
 
-    return await agentModeService.createHtmlFromTemplate(context?.llmModel, args.template_id, variableValues, arrayVariableValues, context?.userId, context?.sessionId);
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): calls
+    // emma/impl/htmlCreation.ts directly, not agentModeService.
+    // createHtmlFromTemplate — that class method still exists (routes/
+    // emmaApi.ts and a dedicated test call it directly), but `callLLM`/
+    // `getDefaultModel`/`resolveGenerationModel` are all `public` on
+    // AgentModeService, so this tool can bind them straight off the
+    // singleton without going through the class's own delegating wrapper.
+    return await htmlCreationImpl.createHtmlFromTemplate(
+      context?.llmModel, args.template_id, variableValues, arrayVariableValues, context?.userId, context?.sessionId,
+      agentModeService.callLLM.bind(agentModeService),
+      agentModeService.getDefaultModel.bind(agentModeService),
+      agentModeService.resolveGenerationModel.bind(agentModeService),
+    );
   }
 });
 

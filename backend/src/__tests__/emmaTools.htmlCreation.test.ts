@@ -14,9 +14,14 @@ jest.mock('../emma/impl/htmlCreation', () => ({
 const HTML_CREATION_CLUSTER_METHODS = ['createHtmlFile', 'createHtmlTemplate'];
 
 // agentModeService.<htmlCreationClusterMethod> must NOT be called by these 2
-// tools anymore. updateHtmlFile and createHtmlFromTemplate are NOT part of
-// this cluster and stay on agentModeService, so the proxy below only throws
-// for the 2 names this cluster owns.
+// tools anymore. updateHtmlFile stays on agentModeService (a different
+// module). createHtmlFromTemplate's implementation also lives in
+// emma/impl/htmlCreation.ts as of the F2 design-decision-list follow-up
+// round (see emmaTools.createHtmlFromTemplate.test.ts for its own dispatch
+// coverage) — its class-side wrapper still exists for other real callers, so
+// it's deliberately excluded from this list too: `agentModeService.
+// createHtmlFromTemplate` is a legitimate thing for OTHER code to call, just
+// not from these two tools' own execute() bodies.
 jest.mock('../services/agentModeService', () => ({
   agentModeService: new Proxy(
     {},

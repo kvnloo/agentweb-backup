@@ -6,10 +6,13 @@
  * methods. All five are pure functions of their arguments.
  *
  * Shared by two call sites: `emma/impl/googleDocsSheets.ts`'s markdown-to-HTML
- * pipeline (this extraction) and `AgentModeService.prototype.createHtmlFromTemplate`
- * (a different, not-yet-extracted "HTML/landing pages" cluster).
- * `AgentModeService`'s own copies now delegate here so both share one
- * implementation.
+ * pipeline (this extraction) and `emma/impl/htmlCreation.ts`'s
+ * `createHtmlFromTemplate` (moved there in the F2 design-decision-list
+ * follow-up round; originally deferred on `AgentModeService` for its direct
+ * `this.callLLM` coupling). `unescapeHtml`/`deepEscapeHtmlValues`/
+ * `escapeRegExp`/`collectRawToEscapedMap` are now imported directly by that
+ * module; only `escapeHtml` still has a delegating `private static` copy on
+ * `AgentModeService` (pre-existing, currently uncalled there).
  */
 
 export function escapeHtml(s: string): string {

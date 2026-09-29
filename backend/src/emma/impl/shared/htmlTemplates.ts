@@ -3,11 +3,14 @@
  *
  * Extracted verbatim from `AgentModeService.prototype.getTemplatesForUser`.
  * Shared by `emma/impl/htmlTools.ts`'s `listHtmlTemplates` (this extraction)
- * and `AgentModeService.prototype.findTemplateById` (used internally by
- * `createHtmlFromTemplate`, a different, not-yet-extracted cluster — deferred
- * because it calls `this.callLLM` directly, the core LLM gateway, which needs
- * its own design decision rather than the "promote a pure helper" treatment
- * every other extraction so far has used).
+ * and `emma/impl/htmlCreation.ts`'s `findTemplateById` (used internally by
+ * `createHtmlFromTemplate`). `findTemplateById` originally lived on
+ * `AgentModeService`, deferred there because `createHtmlFromTemplate` calls
+ * `this.callLLM` directly, the core LLM gateway, which needed its own design
+ * decision rather than the "promote a pure helper" treatment every other
+ * extraction so far used — the F2 design-decision-list follow-up round
+ * resolved that (Pattern A: `callLLM` injected as a bound function
+ * parameter) and moved both into `emma/impl/htmlCreation.ts`.
  */
 
 export async function getTemplatesForUser(userId: string): Promise<{ userTemplates: any[], publicTemplates: any[] }> {

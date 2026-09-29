@@ -42,11 +42,15 @@
  * `formatCSSExtractionResult` (private, used only by `extractCSSFromURL`, zero
  * test references) was deleted from the class after moving.
  *
- * `getTemplatesForUser` is shared with `AgentModeService.prototype.findTemplateById`
- * (used by the deferred `createHtmlFromTemplate`) — promoted to
- * `emma/impl/shared/htmlTemplates.ts`, same treatment as every other
- * cross-cluster helper this effort has found, with `AgentModeService`'s own
- * copy turned into a thin delegating method.
+ * `getTemplatesForUser` was shared with `AgentModeService.prototype.
+ * findTemplateById` (used by the then-deferred `createHtmlFromTemplate`) —
+ * promoted to `emma/impl/shared/htmlTemplates.ts`, same treatment as every
+ * other cross-cluster helper this effort has found, with `AgentModeService`'s
+ * own copy turned into a thin delegating method. Update: the F2
+ * design-decision-list follow-up round later moved `createHtmlFromTemplate`
+ * itself (and `findTemplateById` with it) into `emma/impl/htmlCreation.ts`,
+ * which now imports `getTemplatesForUser` from this shared module directly —
+ * `AgentModeService.prototype.findTemplateById` no longer exists.
  *
  * `uploadFileToS3` (from `../utils/s3Utils`) constructs a real `AWS.S3` client
  * at module load, but — unlike `settingsService.ts`/`chatbotService.ts`'s
