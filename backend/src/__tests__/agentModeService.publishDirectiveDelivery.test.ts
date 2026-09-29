@@ -313,4 +313,55 @@ describe('ENG-827 — the unattended publish directive is delivered, and deliver
     const combined = messages.map((m: any) => (typeof m.content === 'string' ? m.content : '')).join('\n');
     expect(combined).not.toContain('PUBLISH WITHHELD');
   });
+
+  // ENG-2204 owner opt-out (requireSlackApproval), end-to-end through the REAL call
+  // site — not just the pure getUnattendedExecutionDirective function in isolation
+  // (agentModeService.scheduledSessionContext.test.ts covers that). This is the exact
+  // gap the earlier "ATTENDED reopen" tests exist to close for the attended path:
+  // proving the call site actually resolves and wires the flag through, not just that
+  // the prompt-building function behaves correctly when handed the right arguments.
+  describe('unattended dispatch with the Slack-send opt-out (ENG-2204)', () => {
+    it('authorized by default: an unattended dispatch on a schedule with no opt-out gets the override', async () => {
+      const messages = await capture(ADMITTED_SESSION, {
+        scheduleId: SCHEDULE_ID,
+        requiredFunctionCalls: ['post_on_connected_account'],
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+        // requireSlackApproval intentionally absent — every pre-existing schedule row.
+      });
+
+      const combined = messages.map((m: any) => (typeof m.content === 'string' ? m.content : '')).join('\n');
+      expect(combined.toLowerCase()).toContain('call slack_send_message directly');
+    });
+
+    it('withheld: an unattended dispatch on a schedule with requireSlackApproval=true never gets the override', async () => {
+      const messages = await capture(ADMITTED_SESSION, {
+        scheduleId: SCHEDULE_ID,
+        requiredFunctionCalls: ['post_on_connected_account'],
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+        requireSlackApproval: true,
+      });
+
+      const combined = messages.map((m: any) => (typeof m.content === 'string' ? m.content : '')).join('\n');
+      expect(combined.toLowerCase()).not.toContain('call slack_send_message directly');
+      expect(combined).toContain('SLACK NOTIFICATIONS IN UNATTENDED RUNS — WITHHELD');
+      // Independent of publish authorization: withholding Slack sends specifically
+      // must not accidentally also withhold or alter the (unrelated) publish block.
+      expect(combined).toContain('PUBLISH AUTHORIZATION — this schedule publishes without approval');
+    });
+
+    it('a truthy non-boolean on the schedule row does not withhold (strict === true, matches the write-path guarantee)', async () => {
+      const messages = await capture(ADMITTED_SESSION, {
+        scheduleId: SCHEDULE_ID,
+        requiredFunctionCalls: ['post_on_connected_account'],
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+        requireSlackApproval: 'true' as any, // a stringified boolean, not the real thing
+      });
+
+      const combined = messages.map((m: any) => (typeof m.content === 'string' ? m.content : '')).join('\n');
+      expect(combined.toLowerCase()).toContain('call slack_send_message directly');
+    });
+  });
 });

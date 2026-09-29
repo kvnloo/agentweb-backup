@@ -526,6 +526,34 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
       expect(getUnattendedExecutionDirective('regular', false, 'unknown')).toBe('');
       expect(getUnattendedExecutionDirective(undefined, false, 'unknown')).toBe('');
     });
+
+    // ENG-2204 owner opt-out (requireSlackApproval): a schedule-level kill switch,
+    // resolved by the caller and passed as the 5th param — see
+    // resolveScheduledSlackSendAuthorized/resolveSlackSendAuthorized.
+    it('omitting the 5th param defaults to authorized (every pre-existing call site keeps working)', () => {
+      const directive = getUnattendedExecutionDirective('scheduled', false, 'unknown');
+      expect(directive.toLowerCase()).toContain('call slack_send_message directly');
+    });
+
+    it('slackSendAuthorized=true (explicit) behaves identically to the default', () => {
+      const directive = getUnattendedExecutionDirective('scheduled', false, 'unknown', undefined, true);
+      expect(directive.toLowerCase()).toContain('call slack_send_message directly');
+      expect(directive).not.toContain('WITHHELD');
+    });
+
+    it('slackSendAuthorized=false withholds the override and tells the model not to send', () => {
+      const directive = getUnattendedExecutionDirective('scheduled', false, 'unknown', undefined, false);
+      expect(directive.toLowerCase()).not.toContain('call slack_send_message directly');
+      expect(directive).toContain('SLACK NOTIFICATIONS IN UNATTENDED RUNS — WITHHELD');
+      expect(directive).toContain('Do NOT call slack_send_message');
+    });
+
+    it('slackSendAuthorized=false is independent of publish authorization state', () => {
+      for (const auth of ['authorized', 'withheld', 'unknown'] as const) {
+        const directive = getUnattendedExecutionDirective('scheduled', false, auth, ['post_on_connected_account'], false);
+        expect(directive.toLowerCase()).not.toContain('call slack_send_message directly');
+      }
+    });
   });
 });
 
