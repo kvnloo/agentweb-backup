@@ -195,6 +195,22 @@ describe('format adherence', () => {
     // A read-only tool does not deliver the format; the reply still must.
     expect(gradeFormatAdherence([turn('Show me the results in a table', 'CTR was 2%.', ['call_google_ads_reporting_api'])]).verdict).toBe('fail');
   });
+
+  it('reads an external keyword naming the INPUT data, not a destination (CodeRabbit PR #3136, thread 4130329036)', () => {
+    expect(parseFormatRequest('use a table for the CSV data below')).toBe('table');
+    // The generalized carve-out: "data" is not the only qualifier that marks a source.
+    expect(parseFormatRequest('give me this as bullet points for the spreadsheet rows above')).toBe('list');
+    // A genuine destination — no source-data qualifier next to the keyword — is still excluded.
+    expect(parseFormatRequest('Create a table in Airtable for leads')).toBeUndefined();
+    expect(parseFormatRequest('Put this into our CRM as a table')).toBeUndefined();
+  });
+
+  it('fails when the requested format is missing, even with a source-data mention nearby', () => {
+    expect(gradeFormatAdherence([turn('use a table for the CSV data below', 'The totals were 12 and 34.')])).toMatchObject({
+      verdict: 'fail',
+      reason: 'table_missing',
+    });
+  });
 });
 
 describe('acting when told to', () => {
