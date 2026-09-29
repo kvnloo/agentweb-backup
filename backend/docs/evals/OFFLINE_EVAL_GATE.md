@@ -94,10 +94,18 @@ time, and the verdict is not changed. Paste that output into the PR or the ticke
   best-effort: it never blocks the edit, and a failed marker write leaves that edit out of the feed. `--changes-since <iso>` lists the markers; `EVAL_CHANGE_MARKERS_ENABLED=false` turns
   them off.
 - **Marker consumer (ENG-2195):** `cron/evalMarkerSuiteCron.ts` checks hourly for markers written since its
-  last run. When there are any, it runs the deterministic local suite and records one `eval_suite_verdict`
-  row in `Dev-AW-LoopEvents` (loopId `eval-gate-runs`): verdict, mode, marker count and categories, the
-  per-metric status, and `markersThrough`, which is the next run's cursor. It is report-only: a non-pass
-  verdict is logged as a warning and nothing is filed. It runs only with `EVAL_MARKER_SUITE_ENABLED=true`.
+  last run. Resuming is overlap + identity dedupe, not a pure "greater than cursor" range read: a marker's
+  sort key orders by the wall-clock instant `recordEvalChange` was *called*, but every marker write is
+  fire-and-forget (`void recordSkillChange(...)`, never awaited), so two writes can complete out of that
+  order — a marker with an earlier timestamp can become queryable after the cursor already advanced past a
+  later one. Every tick therefore re-queries a 10-minute overlap window behind its high-water mark
+  (`EVAL_MARKER_OVERLAP_MS`) and skips only the specific marker keys (`processedKeys`) it already handled
+  in that window, so a late-arriving straggler is still caught. When there are new markers, it runs the
+  deterministic local suite and records one `eval_suite_verdict` row in `Dev-AW-LoopEvents` (loopId
+  `eval-gate-runs`): verdict, mode, marker count and categories, the per-metric status, `markersThrough`
+  (the high-water mark) and `processedKeys` (pruned to the current overlap window, so the row stays small).
+  It is report-only: a non-pass verdict is logged as a warning and nothing is filed. It runs only with
+  `EVAL_MARKER_SUITE_ENABLED=true`.
 
 ## Suite inventory (ENG-782 AC3 and AC4)
 
