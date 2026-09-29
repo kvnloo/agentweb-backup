@@ -150,7 +150,7 @@ import { startWorkflow, advanceIndependentWorkflow, type AdvanceIndependentOutco
 // against the durable approval-inbox store — approvalInboxService.ts has no
 // dependency back on this file (verified), so this is a one-directional
 // import, not a cycle.
-import { approvalInboxService, type ApprovalDecision } from './approvalInboxService';
+import { approvalInboxService, type ApprovalDecision, type ApprovalDecisionApprover } from './approvalInboxService';
 // Review fix: the manifest executor below needs the same active-resume
 // primitive approvalInboxExecution.ts already built for the per-decision
 // path — resumeOriginSession is exported from there specifically so this
@@ -21602,6 +21602,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // honestly rather than assuming uniformity.
     const manifestIds = [...new Set(staged.map((d) => d.manifestId))];
     const reportedManifestId = manifestIds.length === 1 ? manifestIds[0] : manifestId;
+    if (manifestIds.length > 1) {
+      // Second-review fix: this genuinely CAN'T be made fully correct
+      // without a return-contract change (multiple real manifestIds, no
+      // single one actually contains every staged decision) — nothing
+      // consumes the returned manifestId beyond this point today
+      // (metadata.approvalInboxManifestId is write-only, confirmed via
+      // grep), so a full fix is premature. Logged so this is visible
+      // rather than silently wrong if/when something starts reading it.
+      console.warn(
+        `[agent-mode-service] staged approval-inbox decisions landed under ${manifestIds.length} DIFFERENT pre-existing manifestIds (${manifestIds.join(', ')}) in one staging call — reporting the freshly-minted ${manifestId}, which may not contain every decision just staged.`,
+      );
+    }
 
     const count = staged.length;
     return {
@@ -22865,7 +22877,30 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           // instances) could otherwise both reach dispatchAuthorizedMetaWrite
           // for the same real Meta write before either checkpoint lands.
           // claimDispatch is this step's own at-most-once gate.
-          const claimed = await approvalInboxService.claimDispatch(decision.decisionId);
+          // Third-review fix: claimDispatch itself can THROW for a genuine
+          // transient reason (not the normal "someone else already claimed
+          // it" case) — the ORIGINAL code let that propagate straight out
+          // of execute(), which advanceIndependentWorkflow treats as a real
+          // step failure and permanently checkpoints as 'failed', even
+          // though dispatchAuthorizedMetaWrite was NEVER called — the write
+          // was never attempted, yet gets permanently recorded as having
+          // failed, with no retry path anywhere (independent steps are
+          // never re-offered once checkpointed). Unlike the finalization
+          // claim (where the real write has ALREADY happened by the time it
+          // runs, so failing open is correct), failing open HERE would risk
+          // an actual double Meta write if two callers both hit a transient
+          // claimDispatch error and both proceed to dispatch — the opposite
+          // mistake. The correct response to "I don't know whether I hold
+          // the claim" is the same as "I definitely lost the race":
+          // StepContendedError, which records no checkpoint at all and lets
+          // a later retry of approve-all attempt this exact step again.
+          let claimed: boolean;
+          try {
+            claimed = await approvalInboxService.claimDispatch(decision.decisionId);
+          } catch (err: any) {
+            console.warn('[agent-mode-service] claimDispatch threw (treating as contended, not failed):', decision.decisionId, err?.message || err);
+            claimed = false;
+          }
           if (!claimed) {
             // Same StepContendedError treatment as the live-deck sibling's
             // 'already_consumed' branch — a concurrent driver already owns
@@ -22929,8 +22964,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * they don't, this refuses rather than guessing which session to drive
    * against — a malformed manifest should fail loud, not dispatch against
    * the wrong session's workflow slot.
+   *
+   * `approver` scopes this to the caller's OWN items only — second-review
+   * fix. Nothing today can actually construct a manifest whose meta_write
+   * decisions span more than one approver (stageApprovalInboxMetaWriteManifest
+   * hardcodes a single approver for every item it stages), but the data
+   * model doesn't forbid it, and without this filter, whichever approver's
+   * approve-all call happens to run would dispatch every OTHER approver's
+   * already-separately-approved items too — items that approver never saw
+   * in their own queue. Defense in depth against a real, if not yet
+   * reachable, cross-approver blast-radius surprise.
    */
-  async executeApprovalInboxMetaWriteManifest(manifestId: string): Promise<
+  async executeApprovalInboxMetaWriteManifest(manifestId: string, approver: ApprovalDecisionApprover): Promise<
     | { outcome: 'no_meta_write_items' }
     | { outcome: 'not_all_resolved'; unresolved: string[] }
     | { outcome: 'no_origin_session' | 'mixed_origin_sessions' }
@@ -22939,8 +22984,75 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     | { outcome: 'executed'; summary: ApprovalDeckExecutionSummary | null }
   > {
     const decisions = await approvalInboxService.listByManifest(manifestId);
-    const metaWriteDecisions = decisions.filter((d) => d.gateType === 'meta_write' && d.verdict === 'approve');
+    const metaWriteDecisions = decisions.filter((d) => d.gateType === 'meta_write' && d.verdict === 'approve' && d.approver === approver);
     if (metaWriteDecisions.length === 0) return { outcome: 'no_meta_write_items' };
+
+    // Third-review fix: this MUST run before the unresolved check below, not
+    // after — found by tracing a real two-call sequence, not a single-pass
+    // read. A successful dispatch moves every decision's status from
+    // 'dispatching' to 'executed'/'execution_failed' (recordExecutionResult,
+    // further down). Both of those fail `status !== 'dispatching'`, so the
+    // OLD ordering meant every retry of an already-fully-dispatched manifest
+    // (a client retry after a lost response, a double-click — precisely what
+    // the already_executed check below exists to catch, per its own
+    // original comment) fell into 'not_all_resolved' first and never
+    // reached the already_executed check at all — that check was dead code
+    // for its own stated purpose. originSessionId/session need to be
+    // resolved here, ahead of self-heal, so this can run first.
+    const originSessionIdsForCheck = new Set(metaWriteDecisions.map((d) => d.originSessionId).filter(Boolean));
+    if (originSessionIdsForCheck.size === 1) {
+      const candidateSessionId = [...originSessionIdsForCheck][0] as string;
+      const candidateSession = await chatbotDb.getChatSession(candidateSessionId);
+      const candidateWorkflowId = `approval-inbox-manifest-${manifestId}`;
+      if (candidateSession?.workflowRun?.workflowId === candidateWorkflowId && candidateSession.workflowRun.status === 'completed') {
+        return { outcome: 'already_executed' };
+      }
+    }
+
+    // Second-review fix: a decision can be stuck at 'approved' forever if
+    // executeResolvedDecision's markDispatching call failed transiently (a
+    // DynamoDB blip, or the process restarting between claimDecision and
+    // markDispatching — a rolling deploy landing in that exact window is a
+    // real trigger in a repo that auto-deploys on every merge to main).
+    // Nothing else anywhere retries markDispatching (its only caller is
+    // that one line), and until this PR the frontend rendered an 'approved'
+    // meta_write item as fully answered (green, done) while it silently
+    // blocked the ENTIRE manifest's approve-all forever. Self-heal here:
+    // 'approved' + verdict 'approve' is EXACTLY the state markDispatching
+    // is meant to move past, and markDispatching is safe to call again (an
+    // unconditional update gated only on the row existing) — so retry it
+    // once before concluding anything is genuinely unresolved.
+    const wedged = metaWriteDecisions.filter((d) => d.status === 'approved');
+    if (wedged.length > 0) {
+      const healedIds = new Set<string>();
+      await Promise.all(
+        wedged.map((d) =>
+          approvalInboxService.markDispatching(d.decisionId)
+            .then(() => { healedIds.add(d.decisionId); })
+            .catch((err: any) => {
+              console.warn('[agent-mode-service] self-heal markDispatching retry failed:', d.decisionId, err?.message || err);
+            }),
+        ),
+      );
+      // Re-read to pick up anything that changed for reasons other than the
+      // retry above — but listByManifest queries a GSI, which cannot be a
+      // strongly-consistent read. Third-review fix: without the override
+      // below, a markDispatching call that just SUCCEEDED could still read
+      // back as stale 'approved' here purely from GSI propagation lag,
+      // making a genuinely-healed item look unresolved. Trust the write's
+      // own success signal (we know the update landed) over a possibly-
+      // lagging read for exactly the ids that succeeded above.
+      const refreshed = await approvalInboxService.listByManifest(manifestId);
+      const refreshedById = new Map(refreshed.map((d) => [d.decisionId, d]));
+      for (let i = 0; i < metaWriteDecisions.length; i++) {
+        const id = metaWriteDecisions[i].decisionId;
+        const fresh = refreshedById.get(id);
+        if (fresh) metaWriteDecisions[i] = fresh;
+        if (healedIds.has(id) && metaWriteDecisions[i].status === 'approved') {
+          metaWriteDecisions[i] = { ...metaWriteDecisions[i], status: 'dispatching' };
+        }
+      }
+    }
 
     // Defense in depth — the approve-all route is expected to have already
     // enforced "every item in the manifest individually resolved" before
@@ -22985,6 +23097,73 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return { outcome: 'conflict' };
     }
     const summary = this.summarizeApprovalDeckRun(outcome.run);
+
+    // Second-review fix: claimDispatch (inside each workflow step) already
+    // guarantees the real Meta write itself can never be dispatched twice —
+    // but it does NOT stop two concurrent approve-all callers from BOTH
+    // reaching this point once the one real dispatch is checkpointed (a
+    // second driver's own poll loop simply observes the already-verified
+    // checkpoint and returns 'completed' too — traced through
+    // advanceIndependentWorkflow directly). Without this claim, both callers
+    // would redundantly recordExecutionResult and, worse, both call
+    // resumeOriginSession — the in-memory tryClaimSessionGeneration lock
+    // only serializes the actual generateSessionResponse call within a
+    // single process, so a losing caller still falls back to a duplicate
+    // passive note today, and would be a second REAL active resume on any
+    // future multi-instance deployment. Anchored on the manifest's first
+    // decision by id (any deterministic, caller-independent choice works —
+    // every concurrent caller computes the same anchor from the same
+    // metaWriteDecisions list). A losing claim means another caller already
+    // is (or will) finalize this manifest — return the outcome without
+    // repeating recordExecutionResult/resumeOriginSession.
+    // Fail OPEN, not closed, as a LAST resort only: claimManifestFinalization
+    // can legitimately return false (another caller already won), but an
+    // unexpected THROW (a genuine DynamoDB error, not a lost race) must
+    // never be allowed to skip recording/resuming below — the real Meta
+    // write has ALREADY succeeded and been checkpointed by this point, so
+    // silently dropping the finalization step here would leave a
+    // genuinely-applied write permanently stuck unrecorded and the origin
+    // session never told, recoverable only if the reviewer happens to
+    // retry. Caught by asking "what does this code do right now" while
+    // answering the standing safety question before merge, not by any
+    // review.
+    //
+    // Third-review fix: fail-open alone isn't quite right either — every
+    // concurrent caller for this manifest writes to the exact SAME single
+    // item (the anchor), which is precisely the condition under which a
+    // burst of conditional updates is most likely to hit transient
+    // throttling — i.e. exactly the high-concurrency scenario this claim
+    // exists to protect, not a rare unrelated outage. Failing open on the
+    // FIRST throw would silently reintroduce the double-finalization race
+    // under that exact condition. A short bounded retry absorbs a brief
+    // throttling blip (on top of whatever the AWS SDK's own default retry
+    // already absorbed inside each individual call) before conceding and
+    // falling back to fail-open as a genuine last resort.
+    const anchorDecisionId = [...metaWriteDecisions].sort((a, b) => a.decisionId.localeCompare(b.decisionId))[0].decisionId;
+    const FINALIZATION_CLAIM_RETRIES = 3;
+    let wonFinalization = true;
+    let claimSucceeded = false;
+    let lastClaimError: any;
+    for (let attempt = 0; attempt < FINALIZATION_CLAIM_RETRIES && !claimSucceeded; attempt++) {
+      try {
+        wonFinalization = await approvalInboxService.claimManifestFinalization(anchorDecisionId);
+        claimSucceeded = true;
+      } catch (err: any) {
+        lastClaimError = err;
+        if (attempt < FINALIZATION_CLAIM_RETRIES - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)));
+        }
+      }
+    }
+    if (!claimSucceeded) {
+      console.warn(
+        '[agent-mode-service] claimManifestFinalization threw on every retry (treating as won, proceeding to finalize):',
+        anchorDecisionId, lastClaimError?.message || lastClaimError,
+      );
+    }
+    if (!wonFinalization) {
+      return { outcome: 'executed', summary };
+    }
 
     // Populate the previously-unused readBack/execution result per decision —
     // the literal ENG-1635 acceptance criterion ("Read back every external
