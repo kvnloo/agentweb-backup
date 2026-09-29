@@ -728,10 +728,19 @@ export function parseLengthRequest(userText: string): LengthRequest | undefined 
   return all.length === 1 ? all[0] : undefined;
 }
 
-/** Chat replies may be HTML or markdown: tags become line breaks, markup is not words. */
+/**
+ * Chat replies may be HTML or markdown: tags become line breaks, markup is not words.
+ * Paragraph-LEVEL boundaries (`<p>`, `<div>`, headings, 2+ consecutive `<br>`) become a blank
+ * line, so paragraphCount doesn't undercount an HTML reply (3 `<p>` elements measuring as 1
+ * paragraph because `</p>` collapsed to a single newline like any other line break). A lone
+ * `<br>` or a list item stays a simple line break — a list, or a soft break inside one block of
+ * text, is not itself a new paragraph.
+ */
 function plainText(reply: string): string {
   return reply
-    .replace(/<\s*(br|\/p|\/li|\/h\d|\/tr|\/div)\s*\/?>/gi, '\n')
+    .replace(/(?:<\s*br\s*\/?>\s*){2,}/gi, '\n\n')
+    .replace(/<\s*\/?\s*(p|div|h[1-6])\b[^>]*>/gi, '\n\n')
+    .replace(/<\s*(br|\/li|\/tr)\s*\/?>/gi, '\n')
     .replace(/<[^>]+>/g, ' ')
     .replace(/\n\s*\n/g, '\n\n');
 }
