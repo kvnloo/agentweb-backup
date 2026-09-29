@@ -6,6 +6,7 @@
 import type AWS from 'aws-sdk';
 import type { DynamoAttributeMap } from '../loops/core/ports';
 import { EVAL_GATE_LOOP_ID } from '../loops/eval/evalChangeMarkers';
+import * as offlineSuiteModule from '../loops/eval/offlineSuite';
 import type { OfflineSuiteResult } from '../loops/eval/offlineSuite';
 import {
   EVAL_GATE_RUNS_LOOP_ID,
@@ -137,10 +138,31 @@ describe('runEvalMarkerSuite', () => {
 
 describe('runLocalOfflineSuite', () => {
   it('runs the committed deterministic suite offline and passes on current code', async () => {
-    const result = await runLocalOfflineSuite({});
+    const result = await runLocalOfflineSuite();
     expect(result.target).toBe('local');
     expect(result.mode).toBe('report_only');
     expect(result.verdict).toBe('pass');
+  });
+
+  it('passes a literal non-blocking gate config even when EVAL_GATE_BLOCKING=true is set in this process (ENG-2195 CodeRabbit)', async () => {
+    // This job's own contract is always report-only; a stray EVAL_GATE_BLOCKING in the cron's
+    // environment (it is a runner-env var today, not an EB one, but nothing enforces that) must
+    // not reach the suite as a blocking gate. No registry grader is validated today, so an
+    // end-to-end check of `result.mode`/`blocks` alone would pass whether or not this is fixed
+    // (see the sibling `runOfflineSuite` unit tests for what a validated grader would do); this
+    // asserts directly on the gate config the suite actually receives.
+    const spy = jest.spyOn(offlineSuiteModule, 'runOfflineSuite');
+    const original = process.env.EVAL_GATE_BLOCKING;
+    process.env.EVAL_GATE_BLOCKING = 'true';
+    try {
+      await runLocalOfflineSuite();
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy.mock.calls[0][0].gate).toEqual({ blockingFlag: false });
+    } finally {
+      if (original === undefined) delete process.env.EVAL_GATE_BLOCKING;
+      else process.env.EVAL_GATE_BLOCKING = original;
+      spy.mockRestore();
+    }
   });
 });
 
