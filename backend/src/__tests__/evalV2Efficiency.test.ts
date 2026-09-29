@@ -235,7 +235,12 @@ describe('runEvalV2Sample — efficiency per model × task type', () => {
     const reader = fakeReader({ frame, events, spendByBilling: { 'user-x': [spendRow('x', 3_000_000)] } });
     const dynamo = new FakeDynamo();
     await runEvalV2Sample(
-      { dynamo, reader, tables: TABLES, clock: { now: () => new Date('2026-09-25T17:15:00.000Z') } },
+      {
+        dynamo, reader, tables: TABLES, clock: { now: () => new Date('2026-09-25T17:15:00.000Z') },
+        // No org membership in this fixture, so identity resolution is correct here; the omitted-
+        // dependency case (no fallback to the raw userId) has its own test below.
+        billingUserOf: async (userId) => userId,
+      },
       { enabled: true, dryRun: false, sampleSize: 2 },
     );
     expect(reader.calls.some((c) => c.TableName === 'P' && c.IndexName === SPEND_INDEX)).toBe(true);
@@ -252,5 +257,29 @@ describe('runEvalV2Sample — efficiency per model × task type', () => {
     const cellX = week.groups.find((g) => g.model === 'model-a');
     expect(cellX).toMatchObject({ taskType: 'ads' });
     expect(cellX?.efficiency).toMatchObject({ successes: 1, successesWithSpend: 1, costPerSuccessUsd: 3, latencyPerSuccessP50Ms: 60_000 });
+  });
+
+  it('reports truncated, not none, when billingUserOf is not wired in at all (ENG-2196 CodeRabbit)', async () => {
+    // A spend row happens to exist under the raw userId itself — if the sampler ever fell back to
+    // querying under it when no resolver was provided, this would misattribute that row as this
+    // session's own spend, exactly like the already-fixed failed-lookup case.
+    const frame: DocItem[] = [{
+      sessionId: 'x', userId: 'user-x', createdAt: '2026-09-24T01:00:00.000Z', updatedAt: '2026-09-24T02:00:00.000Z',
+      portalType: 'agent', sessionType: 'regular', workPlan: { title: 'Launch ads', steps: [{ stepCount: 1, status: 'completed' }] },
+    }];
+    const reader = fakeReader({ frame, spendByBilling: { 'user-x': [spendRow('x', 3_000_000)] } });
+    const dynamo = new FakeDynamo();
+    // No billingUserOf in deps at all — the omitted-dependency case, distinct from a resolver that
+    // is provided but rejects.
+    await runEvalV2Sample(
+      { dynamo, reader, tables: TABLES, clock: { now: () => new Date('2026-09-25T17:15:00.000Z') } },
+      { enabled: true, dryRun: false, sampleSize: 1 },
+    );
+
+    const [x] = [...dynamo.rows.values()].filter((r) => r.eventType === 'eval_v2_scored').map((r) => r.dimensions as Record<string, unknown>);
+    expect(x).toMatchObject({ spendStatus: 'truncated' });
+    expect(x).not.toHaveProperty('costMicroUsd');
+    // Never queried under the raw userId as a fallback billing subject.
+    expect(reader.calls.some((c) => c.TableName === 'P')).toBe(false);
   });
 });
