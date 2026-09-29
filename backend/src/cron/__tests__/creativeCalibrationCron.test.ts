@@ -39,6 +39,9 @@ function memoryStore(provisioned = true): GoldenSetStore & { rows: Map<string, G
     saveLabels: async () => {
       throw new Error('not used');
     },
+    saveDraft: async () => {
+      throw new Error('not used');
+    },
   };
 }
 
