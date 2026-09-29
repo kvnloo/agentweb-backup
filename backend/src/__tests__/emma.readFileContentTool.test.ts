@@ -8,7 +8,6 @@
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
-    readFileContent: jest.fn(),
     createHtmlFromTemplate: jest.fn(),
   },
 }));
@@ -26,10 +25,18 @@ jest.mock('../emma/impl/htmlUpdate', () => ({
   updateHtmlFile: jest.fn(),
 }));
 
+// ENG-2103 (F2), cluster 22: read_file_content's execute() calls
+// emma/impl/misc.ts's readFileContent directly (not agentModeService) —
+// mock it separately.
+jest.mock('../emma/impl/misc', () => ({
+  readFileContent: jest.fn(),
+}));
+
 import { emmaToolRegistry } from '../emma/registry';
 import { agentModeService } from '../services/agentModeService';
 import * as htmlCreationImpl from '../emma/impl/htmlCreation';
 import * as htmlUpdateImpl from '../emma/impl/htmlUpdate';
+import * as miscImpl from '../emma/impl/misc';
 
 // Import tools.ts to ensure tools are registered.
 import '../emma/tools';
@@ -60,7 +67,7 @@ describe('read_file_content Emma tool', () => {
     const tool = emmaToolRegistry.getTool(toolName);
     if (!tool) throw new Error(`Tool ${toolName} not found`);
 
-    (agentModeService.readFileContent as jest.Mock).mockResolvedValue({
+    (miscImpl.readFileContent as jest.Mock).mockResolvedValue({
       success: true,
       content: 'hello from attachment'
     });
@@ -70,7 +77,7 @@ describe('read_file_content Emma tool', () => {
       { userId: 'user-123', sessionId: 'sess-1' }
     );
 
-    expect(agentModeService.readFileContent).toHaveBeenCalledWith('https://example.com/pasted-text.txt');
+    expect(miscImpl.readFileContent).toHaveBeenCalledWith('https://example.com/pasted-text.txt');
     expect(result).toEqual({
       content: [{ type: 'text', text: 'hello from attachment' }]
     });
@@ -80,7 +87,7 @@ describe('read_file_content Emma tool', () => {
     const tool = emmaToolRegistry.getTool(toolName);
     if (!tool) throw new Error(`Tool ${toolName} not found`);
 
-    (agentModeService.readFileContent as jest.Mock).mockResolvedValue({
+    (miscImpl.readFileContent as jest.Mock).mockResolvedValue({
       success: false,
       message: 'file_url is required and must be a non-empty HTTP or HTTPS URL.',
       error: 'Missing file_url'
@@ -88,7 +95,7 @@ describe('read_file_content Emma tool', () => {
 
     const result = await tool.execute({}, { userId: 'user-123', sessionId: 'sess-1' });
 
-    expect(agentModeService.readFileContent).toHaveBeenCalledWith(undefined);
+    expect(miscImpl.readFileContent).toHaveBeenCalledWith(undefined);
     expect(result).toMatchObject({ isError: true });
     expect(result.content?.[0]?.text).toContain('file_url is required');
   });

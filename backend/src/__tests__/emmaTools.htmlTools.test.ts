@@ -11,11 +11,18 @@ jest.mock('../emma/impl/htmlTools', () => ({
   listHtmlTemplates: jest.fn(),
 }));
 
+// ENG-2103 (F2), cluster 22: read_page_source's non-extraction branch now
+// calls emma/impl/misc.ts's readFileContent directly (moved off
+// agentModeService in this cluster) — mocked here so the
+// "does not call extractCSSFromURL" case below doesn't fall through to a
+// REAL axios fetch of https://example.com. Mirrors the { success: true }
+// default the old agentModeService Proxy mock returned for any unlisted prop.
+jest.mock('../emma/impl/misc', () => ({
+  readFileContent: jest.fn().mockResolvedValue({ success: true }),
+}));
+
 // agentModeService.<htmlToolsMethod> must NOT be called by these tools
-// anymore for the three moved methods. read_page_source's non-extraction
-// branch still legitimately calls agentModeService.readFileContent (a
-// different, not-yet-extracted method), so the mock below only throws for
-// the three names this cluster actually owns.
+// anymore for the three moved methods.
 jest.mock('../services/agentModeService', () => ({
   agentModeService: new Proxy(
     {},
