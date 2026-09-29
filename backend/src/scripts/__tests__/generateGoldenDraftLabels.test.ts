@@ -65,7 +65,7 @@ function llmJsonResponse(payload: Record<string, unknown>) {
   return { choices: [{ message: { content: JSON.stringify(payload) } }] };
 }
 
-describe('generateGoldenDraftLabels (ENG-2200)', () => {
+describe('generateGoldenDraftLabels (ENG-2208)', () => {
   describe('draftLabelsForCase: building and validating a draft', () => {
     it('builds a valid GoldenCaseDraft from the LLM JSON response and it round-trips through parseDraft', async () => {
       const c = agentCase('s1');
@@ -147,6 +147,39 @@ describe('generateGoldenDraftLabels (ENG-2200)', () => {
         status: 'skipped',
         reason: expect.stringContaining('missing'),
       });
+    });
+
+    it('skips (never throws) when content resolution itself throws, e.g. a DynamoDB error (CodeRabbit finding, PR #3149)', async () => {
+      const c = agentCase('s1');
+      const deps = baseDeps({
+        getChatSession: async () => {
+          throw new Error('ProvisionedThroughputExceededException');
+        },
+      });
+      await expect(draftLabelsForCase(deps, c, DEFAULT_DRAFT_LABEL_MODEL)).resolves.toMatchObject({
+        status: 'skipped',
+        reason: expect.stringContaining('ProvisionedThroughputExceededException'),
+      });
+    });
+
+    it('rejects a draft that omits any of the case criteria — an empty or partial LLM reply must not "poison" the case for future runs (CodeRabbit finding, PR #3149)', async () => {
+      const c = agentCase('s1');
+      const session: ChatSession = { sessionId: 's1', userId: 'u1', messages: [], createdAt: NOW.toISOString(), updatedAt: NOW.toISOString() };
+
+      const empty = baseDeps({ getChatSession: async () => session, callLLM: async () => llmJsonResponse({}) });
+      await expect(draftLabelsForCase(empty, c, DEFAULT_DRAFT_LABEL_MODEL)).resolves.toMatchObject({
+        status: 'skipped',
+        reason: expect.stringContaining('omitted criteria'),
+      });
+
+      const partial = baseDeps({
+        getChatSession: async () => session,
+        callLLM: async () => llmJsonResponse({ task_success: { label: 'pass', rationale: 'ok' } }),
+      });
+      const result = await draftLabelsForCase(partial, c, DEFAULT_DRAFT_LABEL_MODEL);
+      expect(result.status).toBe('skipped');
+      expect(result.reason).toContain('tool_correctness');
+      expect(result.draft).toBeUndefined();
     });
   });
 
@@ -252,10 +285,48 @@ describe('generateGoldenDraftLabels (ENG-2200)', () => {
         requirement: 'required',
         billingCycle: '2026-09-29',
       };
-      // @ts-expect-error regression guard (ENG-2200): classifyAccountHealth's own verdict must be
+      // @ts-expect-error regression guard (ENG-2208): classifyAccountHealth's own verdict must be
       // structurally impossible to pass into the drafting prompt — it is exactly what the golden
       // label is meant to independently validate, so it cannot type-check as AccountHealthSignals.
       buildAccountHealthContentText(classification);
+    });
+
+    it('never leaks connected-account credentials into the prompt text (CodeRabbit finding, PR #3149)', () => {
+      const signals: AccountHealthSignals = {
+        nowMs: NOW.getTime(),
+        connectedAccounts: [
+          {
+            platform: 'meta',
+            account_id: 'act_super_secret_account_id',
+            account_name: 'Jane Doe Ad Account',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'EAABsbCS1secretaccesstoken',
+              refresh_token: 'refresh_super_secret_token',
+              token_expires_at: NOW.getTime() + 1000,
+              scopes: ['ads_management', 'business_management'],
+            },
+          },
+        ] as unknown as AccountHealthSignals['connectedAccounts'],
+        requirement: null,
+        payments: null,
+        campaigns: null,
+        recentAdSpend: null,
+      };
+
+      const text = buildAccountHealthContentText(signals);
+
+      expect(text).not.toContain('secretaccesstoken');
+      expect(text).not.toContain('refresh_super_secret_token');
+      expect(text).not.toContain('act_super_secret_account_id');
+      expect(text).not.toContain('Jane Doe Ad Account');
+      expect(text).not.toContain('ads_management');
+      expect(text).not.toContain('access_token');
+      expect(text).not.toContain('refresh_token');
+      expect(text).not.toContain('scopes');
+      // The criteria-relevant, non-identifying shape is still present.
+      expect(text).toContain('"platform": "meta"');
+      expect(text).toContain('"hasUsableToken": true');
     });
   });
 
@@ -353,6 +424,36 @@ describe('generateGoldenDraftLabels (ENG-2200)', () => {
       expect(summary).toEqual({ processed: 2, drafted: 1, skipped: 1 });
       expect(saveDraft).toHaveBeenCalledTimes(1);
       expect(saveDraft).toHaveBeenCalledWith(drafted.caseId, expect.objectContaining({ model: DEFAULT_DRAFT_LABEL_MODEL }));
+    });
+
+    it('run(): a single failing store.saveDraft does not stop the batch — the remaining cases still process (CodeRabbit finding, PR #3149)', async () => {
+      const failsToSave = agentCase('a1');
+      const savesFine = agentCase('a2');
+      const session: ChatSession = { sessionId: 'x', userId: 'u1', messages: [{ role: 'user', content: 'hi' }], createdAt: NOW.toISOString(), updatedAt: NOW.toISOString() };
+      const saveDraft = jest.fn(async (caseId: string, draft: unknown) => {
+        if (caseId === failsToSave.caseId) throw new Error('ConditionalCheckFailedException');
+        return { ...savesFine, draft } as GoldenCase;
+      });
+      const deps = baseDeps({
+        getChatSession: async () => session,
+        callLLM: async () =>
+          llmJsonResponse({
+            task_success: { label: 'pass', rationale: 'ok' },
+            tool_correctness: { label: 'pass', rationale: 'ok' },
+            groundedness: { label: 'na', rationale: 'ok' },
+            instruction_compliance: { label: 'pass', rationale: 'ok' },
+            argued_with_instruction: { label: 'fail', rationale: 'ok' },
+            escalated_when_not_required: { label: 'fail', rationale: 'ok' },
+            failed_to_escalate: { label: 'fail', rationale: 'ok' },
+          }),
+        store: { listCases: async (surface) => (surface === 'agent' ? [failsToSave, savesFine] : []), saveDraft },
+      });
+      const opts: CliOptions = { model: DEFAULT_DRAFT_LABEL_MODEL, force: false, dryRun: false };
+
+      const summary = await run(deps, opts);
+
+      expect(summary).toEqual({ processed: 2, drafted: 1, skipped: 1 });
+      expect(saveDraft).toHaveBeenCalledTimes(2);
     });
   });
 

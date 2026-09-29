@@ -25,7 +25,8 @@ import { chatbotDb, type ChatMessage, type ChatSession } from '../services/chatb
 import { humanEvalService, type HumanEvalCandidate } from '../services/humanEvalService';
 import { userDb, type User } from '../services/db';
 import { gatherAccountHealthSignals, type AccountHealthUser } from '../cron/accountHealthClassifierCron';
-import type { AccountHealthSignals } from '../services/accountHealthClassifier';
+import type { AccountHealthSignals, CampaignDeliveryInput } from '../services/accountHealthClassifier';
+import type { AdConnectionAccount } from '../services/clientHealthService';
 import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
 import {
   criteriaFor,
@@ -127,6 +128,62 @@ export async function resolveCreativeContent(
 }
 
 /**
+ * A criteria-relevant, allowlisted view of one connected account: never account_id, account_name,
+ * scopes, access_token or refresh_token — `signals.connectedAccounts` carries those as live,
+ * unencrypted OAuth credentials (AW-Users `connected_accounts[].config`), and this text is about
+ * to be sent to an external LLM.
+ */
+interface AccountHealthPromptAccount {
+  platform?: string;
+  accountType?: string;
+  hasUsableToken: boolean;
+  tokenExpiresAt?: number;
+}
+
+/** Same allowlisting for a delivery row: campaignId is an identifier this drafting task has no need for. */
+type AccountHealthPromptCampaign = Omit<CampaignDeliveryInput, 'campaignId'>;
+
+interface AccountHealthPromptView {
+  nowMs: number;
+  hasLegacyAdAccount: boolean;
+  connectedAccounts: AccountHealthPromptAccount[];
+  requirement: AccountHealthSignals['requirement'];
+  subscriptionStatus?: string;
+  currentPeriodEnd?: string;
+  payments: AccountHealthSignals['payments'];
+  campaigns: AccountHealthPromptCampaign[] | null;
+  recentAdSpend: AccountHealthSignals['recentAdSpend'];
+  lastActiveAt?: string | null;
+  adDays?: AccountHealthSignals['adDays'];
+  feedback?: AccountHealthSignals['feedback'];
+  tracking?: AccountHealthSignals['tracking'];
+}
+
+export function toAccountHealthPromptView(signals: AccountHealthSignals): AccountHealthPromptView {
+  const accounts = (signals.connectedAccounts ?? []).filter((a): a is AdConnectionAccount => a != null);
+  return {
+    nowMs: signals.nowMs,
+    hasLegacyAdAccount: Boolean(signals.legacyAdAccount),
+    connectedAccounts: accounts.map((a) => ({
+      platform: a.platform,
+      accountType: a.config?.account_type,
+      hasUsableToken: typeof a.config?.token_expires_at !== 'number' || a.config.token_expires_at > signals.nowMs || Boolean(a.config?.refresh_token),
+      tokenExpiresAt: a.config?.token_expires_at,
+    })),
+    requirement: signals.requirement,
+    subscriptionStatus: signals.subscriptionStatus,
+    currentPeriodEnd: signals.currentPeriodEnd,
+    payments: signals.payments,
+    campaigns: signals.campaigns ? signals.campaigns.map(({ campaignId: _campaignId, ...rest }) => rest) : null,
+    recentAdSpend: signals.recentAdSpend,
+    lastActiveAt: signals.lastActiveAt,
+    adDays: signals.adDays,
+    feedback: signals.feedback,
+    tracking: signals.tracking,
+  };
+}
+
+/**
  * account_health surface (sourceRef.kind === 'userId'): ONLY the gathered signals, never
  * classifyAccountHealth's output. The parameter type below is AccountHealthSignals, not
  * AccountHealthClassification — it is structurally impossible to pass the classifier's own
@@ -134,7 +191,7 @@ export async function resolveCreativeContent(
  * to independently validate.
  */
 export function buildAccountHealthContentText(signals: AccountHealthSignals): string {
-  return JSON.stringify(signals, null, 2);
+  return JSON.stringify(toAccountHealthPromptView(signals), null, 2);
 }
 
 export async function resolveAccountHealthContent(
@@ -206,7 +263,12 @@ export interface DraftResult {
 
 /** Resolves content, calls the LLM, and validates its output. Never throws — a bad case is a skip. */
 export async function draftLabelsForCase(deps: GenerateDraftDeps, c: GoldenCase, model: string): Promise<DraftResult> {
-  const resolved = await resolveContent(deps, c, deps.now().getTime());
+  let resolved: ContentResolution;
+  try {
+    resolved = await resolveContent(deps, c, deps.now().getTime());
+  } catch (error) {
+    return { status: 'skipped', reason: `content resolution failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
   if (!resolved.ok) return { status: 'skipped', reason: resolved.reason };
 
   const messages = [
@@ -237,12 +299,17 @@ export async function draftLabelsForCase(deps: GenerateDraftDeps, c: GoldenCase,
     return { status: 'skipped', reason: `malformed LLM JSON: ${error instanceof Error ? error.message : String(error)}` };
   }
 
+  let draft: GoldenCaseDraft;
   try {
-    const draft = parseDraft(c.surface, c.criteria, { labels, model, generatedAt: deps.now().toISOString() });
-    return { status: 'drafted', draft };
+    draft = parseDraft(c.surface, c.criteria, { labels, model, generatedAt: deps.now().toISOString() });
   } catch (error) {
     return { status: 'skipped', reason: error instanceof GoldenCaseValidationError ? error.message : String(error) };
   }
+  // A missing criterion (empty or partial LLM reply) would otherwise save a draft that still
+  // blocks selectCandidateCases from re-attempting this case on the next run without --force.
+  const missing = c.criteria.filter((criterion) => draft.labels[criterion] === undefined);
+  if (missing.length > 0) return { status: 'skipped', reason: `LLM omitted criteria: ${missing.join(', ')}` };
+  return { status: 'drafted', draft };
 }
 
 /** Non-pairwise, not already fully labelled, and no existing draft unless --force. */
@@ -284,12 +351,18 @@ export async function run(deps: GenerateDraftDeps, opts: CliOptions): Promise<Ru
       summary.skipped++;
       console.log(`[generateGoldenDraftLabels] ${c.caseId}: skipped (${result.reason})`);
     } else {
-      summary.drafted++;
       if (opts.dryRun) {
+        summary.drafted++;
         console.log(`[generateGoldenDraftLabels] ${c.caseId}: would draft (dry-run) ${JSON.stringify(result.draft)}`);
       } else {
-        await deps.store.saveDraft(c.caseId, result.draft as GoldenCaseDraft);
-        console.log(`[generateGoldenDraftLabels] ${c.caseId}: drafted`);
+        try {
+          await deps.store.saveDraft(c.caseId, result.draft as GoldenCaseDraft);
+          summary.drafted++;
+          console.log(`[generateGoldenDraftLabels] ${c.caseId}: drafted`);
+        } catch (error) {
+          summary.skipped++;
+          console.log(`[generateGoldenDraftLabels] ${c.caseId}: save failed (${error instanceof Error ? error.message : String(error)})`);
+        }
       }
     }
     await deps.sleep(LLM_CALL_DELAY_MS);
