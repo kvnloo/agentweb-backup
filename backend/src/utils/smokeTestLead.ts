@@ -137,3 +137,20 @@ export function isSmokeTestLead(
   if (!lead) return false;
   return isSmokeTestEmail(lead.email) || isSmokeTestPhone(lead.phone);
 }
+
+/**
+ * ENG-2193: synthetic UTM params the smoke test appends to the deployed URL before
+ * navigating, to verify the landing page's own capture middleware
+ * (`v0Service.injectLeadCaptureAttribution`) actually stamps them onto the resulting lead.
+ * `medium: "paid"` matches ENG-239's acceptance criteria for the UTM contract (see
+ * `utils/adUtm.ts`'s header) rather than an arbitrary value, so this exercises the exact
+ * channel real ad traffic uses. The campaign embeds the same run-unique timestamp
+ * `buildSmokeTestEmail` uses, so a captured value can be traced back to one specific run.
+ */
+export function buildSmokeTestUtm(): { source: string; medium: string; campaign: string } {
+  return {
+    source: "agentweb-smoketest",
+    medium: "paid",
+    campaign: `smoketest-${Date.now()}`,
+  };
+}

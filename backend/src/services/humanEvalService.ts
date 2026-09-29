@@ -13,7 +13,7 @@ import {
   resolveSlackMentionsInText,
 } from './slackService';
 import { settingsService } from './settingsService';
-import type { CreativeGateResult } from './creativeGates';
+import type { CreativeGateCheck, CreativeGateResult } from './creativeGates';
 import type { CreativeRubricResult, StoredCreativePairwise } from './creativeRubricJudge';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
@@ -529,6 +529,33 @@ export class HumanEvalService {
       UpdateExpression: 'SET creativePairwise = :pairwise',
       ConditionExpression: 'attribute_exists(candidateId)',
       ExpressionAttributeValues: { ':pairwise': result },
+    }).promise();
+  }
+
+  /**
+   * Merges additional deterministic-check results onto an existing candidate's `creativeGates`
+   * (ENG-2193: OCR/spelling/brand-colour/logo/policy-keyword checks, computed out-of-band by
+   * `creativeContentCheckRunner.ts` after the structural gates already stored at creation time).
+   * A no-op — not an error — when the candidate has no `creativeGates` yet (generation never
+   * produced structural gates, e.g. a Runway download failure), since there is nothing to extend.
+   * Never creates an item.
+   */
+  async appendCreativeGateChecks(candidateId: string, checks: CreativeGateCheck[]): Promise<void> {
+    if (checks.length === 0) return;
+    const candidate = await this.getCandidate(candidateId);
+    if (!candidate?.creativeGates) return;
+    const mergedChecks = [...candidate.creativeGates.checks, ...checks];
+    const merged: CreativeGateResult = {
+      ...candidate.creativeGates,
+      checks: mergedChecks,
+      passed: mergedChecks.every((c) => c.status !== 'fail'),
+    };
+    await this.db.update({
+      TableName: HUMAN_EVAL_QUEUE_TABLE,
+      Key: { candidateId },
+      UpdateExpression: 'SET creativeGates = :gates',
+      ConditionExpression: 'attribute_exists(candidateId)',
+      ExpressionAttributeValues: { ':gates': merged },
     }).promise();
   }
 
