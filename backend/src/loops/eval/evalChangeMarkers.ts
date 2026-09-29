@@ -152,8 +152,20 @@ export function evalRelevantSkillFields(body: Readonly<Record<string, unknown>>)
 }
 
 /**
+ * Sentinel marking a field that was set in `before` and is gone in `after` — a removal, not "no
+ * change". A defined value (never `undefined`) so it still passes `evalRelevantSkillFields`'s own
+ * `!== undefined` check and correctly makes a create/update with nothing else changed still
+ * eval-relevant.
+ */
+export const SKILL_FIELD_REMOVED = '__removed__' as const;
+
+/**
  * The eval-relevant fields whose value differs between the stored skill row (`before`, absent for
- * a new row) and the row just written (`after`), with their new values. Tool lists compare as sets.
+ * a new row) and the row just written (`after`), with their new values. Tool lists compare as
+ * sets. A field present in `before` but absent from `after` is a removal, marked
+ * `SKILL_FIELD_REMOVED`: `SkillService.putSkill` is a full-item replacement write, so a caller
+ * that omits a field it previously set genuinely clears it in the stored row — the same real
+ * change as setting a new value, and just as eval-relevant (ENG-2195 CodeRabbit).
  */
 export function changedEvalSkillFields(
   before: Readonly<Record<string, unknown>> | undefined,
@@ -161,8 +173,12 @@ export function changedEvalSkillFields(
 ): Record<string, unknown> {
   const changed: Record<string, unknown> = {};
   for (const field of EVAL_RELEVANT_SKILL_FIELDS) {
-    if (after[field] === undefined) continue;
-    if (before && sameFieldValue(before[field], after[field])) continue;
+    const hadBefore = before !== undefined && before[field] !== undefined;
+    if (after[field] === undefined) {
+      if (hadBefore) changed[field] = SKILL_FIELD_REMOVED;
+      continue;
+    }
+    if (hadBefore && sameFieldValue(before![field], after[field])) continue;
     changed[field] = after[field];
   }
   return changed;
@@ -186,7 +202,10 @@ export async function recordSkillChange(
 ): Promise<boolean> {
   const fields = evalRelevantSkillFields(body);
   if ((action === 'create' || action === 'update') && fields.length === 0) return false;
-  const prompt = typeof body.systemPrompt === 'string' ? body.systemPrompt : undefined;
+  // A removed systemPrompt is not prompt text to hash — `fields` above already carries the
+  // removal (SKILL_FIELD_REMOVED is a defined value), so the marker still fires without a
+  // misleading valueSha standing in for content that no longer exists.
+  const prompt = typeof body.systemPrompt === 'string' && body.systemPrompt !== SKILL_FIELD_REMOVED ? body.systemPrompt : undefined;
   return recordEvalChange(
     { changeKind: 'skill', target: skillId, category: 'skill', action, via: 'skillService', ...(fields.length ? { fields } : {}), ...(prompt !== undefined ? { value: prompt } : {}) },
     deps,
