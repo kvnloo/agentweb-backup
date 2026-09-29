@@ -28,6 +28,8 @@ import {
   LinearProgress,
   Link,
   Stack,
+  useMediaQuery,
+  useTheme,
   TextField,
   Typography,
 } from '@mui/material';
@@ -210,6 +212,11 @@ function CreativeThumb({ src, alt, onZoom }: { src: string; alt: string; onZoom:
 function EvidenceCard({ index, decision }: { index: number; decision: ApprovalDecisionView }) {
   const answered = RESOLVED_STATUSES.has(decision.status);
   const [zoomedSrc, setZoomedSrc] = useState<string | null>(null);
+  const theme = useTheme();
+  // Review fix (found live on a phone-width viewport): a centered `maxWidth`
+  // dialog left most of a phone screen as dead backdrop instead of actually
+  // giving the reviewer room to inspect the creative — full-screen on mobile.
+  const fullScreenZoom = useMediaQuery(theme.breakpoints.down('sm'));
   return (
     <Card variant="outlined" id={`call-${decision.decisionId}`}>
       <CardContent>
@@ -252,11 +259,11 @@ function EvidenceCard({ index, decision }: { index: number; decision: ApprovalDe
         </Stack>
       </CardContent>
 
-      <Dialog open={zoomedSrc !== null} onClose={() => setZoomedSrc(null)} maxWidth="lg" fullWidth>
-        <Box sx={{ position: 'relative', bgcolor: 'common.black' }}>
+      <Dialog open={zoomedSrc !== null} onClose={() => setZoomedSrc(null)} maxWidth="lg" fullWidth fullScreen={fullScreenZoom}>
+        <Box sx={{ position: 'relative', bgcolor: 'common.black', height: fullScreenZoom ? '100%' : 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           <IconButton
             onClick={() => setZoomedSrc(null)}
-            sx={{ position: 'absolute', top: 8, right: 8, color: 'common.white', bgcolor: 'rgba(0,0,0,0.4)', '&:hover': { bgcolor: 'rgba(0,0,0,0.6)' } }}
+            sx={{ position: 'absolute', top: 8, right: 8, color: 'common.white', bgcolor: 'rgba(0,0,0,0.4)', '&:hover': { bgcolor: 'rgba(0,0,0,0.6)' }, zIndex: 1 }}
           >
             <CloseIcon />
           </IconButton>
@@ -460,8 +467,8 @@ function ManifestDetail({ manifestId }: { manifestId: string }) {
 
   return (
     <Box sx={{ p: 3 }}>
-      <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
-        <FactCheckIcon />
+      <Stack direction="row" alignItems="flex-start" spacing={1} sx={{ mb: 1 }}>
+        <FactCheckIcon sx={{ mt: 0.5, flexShrink: 0 }} />
         <Typography variant="h5">{decisions[0]?.subjectLabel || 'Approval packet'}</Typography>
       </Stack>
       <Link component={RouterLink} to="/approval-desk" sx={{ display: 'inline-block', mb: 2 }}>← Back to queue</Link>
