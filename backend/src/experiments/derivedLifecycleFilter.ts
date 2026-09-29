@@ -1,54 +1,23 @@
-import {
-  computeLifecycle,
-  type LifecycleSignals,
-  type LifecycleStage,
-} from '../services/lifecycleService';
-
 export type VirtualFilterOperator =
   | 'equals'
   | 'not_equals'
   | 'is_empty'
   | 'is_not_empty';
 
-export interface LifecycleFilterLead extends LifecycleSignals {
-  lifecycle?: LifecycleStage | null;
-}
-
 export interface VirtualLifecycleFilter {
   operator: VirtualFilterOperator;
-  value?: LifecycleStage;
+  value?: string;
 }
 
-export function derivedLifecycleValue(
-  lead: LifecycleFilterLead,
-  now: Date = new Date(),
-): LifecycleStage {
-  return computeLifecycle(
-    {
-      ...lead,
-      currentLifecycle: lead.lifecycle ?? lead.currentLifecycle,
-    },
-    now,
-  );
-}
-
-export function matchesDerivedLifecycleFilter(
-  lead: LifecycleFilterLead,
+/**
+ * Finding A11a: lifecycle is a total semantic field, so storage absence is never
+ * semantic emptiness. Equality is deliberately NOT resolved here because a lead row
+ * alone lacks the authoritative user/activity/deal signals.
+ */
+export function matchesLifecyclePresenceFilter(
   filter: VirtualLifecycleFilter,
-  now: Date = new Date(),
-): boolean {
-  const lifecycle = derivedLifecycleValue(lead, now);
-
-  switch (filter.operator) {
-    case 'equals':
-      return lifecycle === filter.value;
-    case 'not_equals':
-      return lifecycle !== filter.value;
-    case 'is_empty':
-      // Lifecycle is a total derived function: every lead resolves to a stage,
-      // including 'unknown'. Persisted attribute absence is not semantic emptiness.
-      return false;
-    case 'is_not_empty':
-      return true;
-  }
+): boolean | undefined {
+  if (filter.operator === 'is_empty') return false;
+  if (filter.operator === 'is_not_empty') return true;
+  return undefined;
 }
