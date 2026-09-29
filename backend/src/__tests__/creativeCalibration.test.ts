@@ -132,6 +132,16 @@ describe('pairing', () => {
     expect(pairs.map((p) => p.a.candidateId)).toEqual(['inside']);
   });
 
+  it('pairs a landing page with the account\'s previous landing page, never with an image (ENG-2192)', () => {
+    const lp = (id: string, createdAt: string) => cand(id, 'u1', createdAt, { reviewType: 'landing_page', category: undefined, artifactUrl: `https://lp.test/${id}` });
+    const pairs = buildCalibrationPairs(
+      [lp('lp-old', '2026-08-01T00:00:00Z'), lp('lp-prev', '2026-09-10T00:00:00Z'), cand('img', 'u1', '2026-09-12T00:00:00Z'), lp('lp-new', '2026-09-16T00:00:00Z')],
+      window,
+    );
+
+    expect(pairs.map((p) => [p.a.candidateId, p.b.candidateId, p.category, p.placement])).toEqual([['lp-new', 'lp-prev', 'landing_page', 'unknown']]);
+  });
+
   it('ranks the judge signal: passed-but-a-reviewer-replied, then close scores, then unscored, then clear', () => {
     const at = '2026-09-15T00:00:00Z';
     expect(pairSignal(cand('a', 'u', at, { creativeRubric: rubric(7), feedback: [{}] }), cand('b', 'u', at, { creativeRubric: rubric(2) }))).toBe('disagree');

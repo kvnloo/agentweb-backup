@@ -23,15 +23,26 @@ import {
   Card,
   CardContent,
   Chip,
+  Dialog,
+  IconButton,
   LinearProgress,
   Link,
   Stack,
+  useMediaQuery,
+  useTheme,
   TextField,
   Typography,
 } from '@mui/material';
 import FactCheckIcon from '@mui/icons-material/FactCheck';
+import CloseIcon from '@mui/icons-material/Close';
+import ZoomInIcon from '@mui/icons-material/ZoomIn';
 import { buildApiUrl } from '../config';
 import { useAuth } from '../contexts/AuthContext';
+
+const VIDEO_EXTENSIONS = /\.(mp4|webm|mov|m4v|ogv)(\?|#|$)/i;
+function isVideoUrl(src: string): boolean {
+  return VIDEO_EXTENSIONS.test(src);
+}
 
 type Verdict = 'approve' | 'reject' | 'edit';
 
@@ -41,7 +52,7 @@ interface ApprovalDecisionView {
   subjectLabel: string;
   subjectContactEmail?: string;
   businessImpact: string;
-  evidencePacket: { chatUrl?: string; researchSummary?: string; links?: string[] };
+  evidencePacket: { chatUrl?: string; researchSummary?: string; links?: string[]; screenshots?: string[] };
   options?: Array<{ id: string; label: string; consequence: string; recommended?: boolean; why?: string }>;
   status: string;
   verdict?: Verdict;
@@ -66,6 +77,10 @@ function apiMessage(error: unknown, fallback: string): string {
 }
 
 const RESOLVED_STATUSES = new Set(['approved', 'rejected', 'edited', 'dispatching', 'executed', 'execution_failed']);
+
+function statusColor(decision: ApprovalDecisionView, answered: boolean): 'error' | 'success' | 'default' {
+  return decision.status === 'execution_failed' ? 'error' : answered ? 'success' : 'default';
+}
 
 function ManifestQueue() {
   const { token, user } = useAuth();
@@ -132,16 +147,148 @@ function ManifestQueue() {
   );
 }
 
-function DecisionCard({
+// A single creative preview cell — image or video, sized large enough to
+// actually judge a crop/legibility problem (not a thumbnail), with a
+// hover affordance and click-to-zoom into a full-size dialog. Review fix
+// (found live by Manan on the deployed page): the original 160×180
+// thumbnail grid was too small to see anything and had no zoom at all.
+function CreativeThumb({ src, alt, onZoom }: { src: string; alt: string; onZoom: (src: string) => void }) {
+  const video = isVideoUrl(src);
+  return (
+    <Box
+      onClick={() => onZoom(src)}
+      role="button"
+      tabIndex={0}
+      aria-label={`Zoom in on ${alt}`}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onZoom(src);
+        }
+      }}
+      sx={{
+        position: 'relative',
+        width: '100%',
+        height: 260,
+        bgcolor: 'action.hover',
+        borderRadius: 1,
+        overflow: 'hidden',
+        cursor: 'zoom-in',
+        '&:hover .zoom-affordance': { opacity: 1 },
+        '&:focus-visible': { outline: '2px solid', outlineColor: 'primary.main', outlineOffset: 2 },
+      }}
+    >
+      {video ? (
+        <Box component="video" src={src} muted preload="metadata" sx={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+      ) : (
+        <Box component="img" src={src} alt={alt} sx={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+      )}
+      <Box
+        className="zoom-affordance"
+        sx={{
+          position: 'absolute',
+          inset: 0,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          bgcolor: 'rgba(0,0,0,0.35)',
+          opacity: 0,
+          transition: 'opacity 0.15s',
+          pointerEvents: 'none',
+        }}
+      >
+        <ZoomInIcon sx={{ color: 'common.white', fontSize: 36 }} />
+      </Box>
+    </Box>
+  );
+}
+
+// What you need to know about one call — read-only, lives in the packet
+// column (left). Includes the creative compare/preview behavior: every
+// screenshot the evidence packet carries renders side by side, large
+// enough to actually inspect, and click-to-zoom to full size — per the
+// prototype's own "a real crop problem is visible without downloading
+// anything" finding (artifact-eng1853-prototype).
+function EvidenceCard({ index, decision, fullScreenZoom }: { index: number; decision: ApprovalDecisionView; fullScreenZoom: boolean }) {
+  const answered = RESOLVED_STATUSES.has(decision.status);
+  const [zoomedSrc, setZoomedSrc] = useState<string | null>(null);
+  return (
+    <Card variant="outlined" id={`call-${decision.decisionId}`}>
+      <CardContent>
+        <Stack spacing={1.5}>
+          <Stack direction="row" justifyContent="space-between" alignItems="flex-start">
+            <Typography variant="subtitle1">{index}. {decision.subjectLabel}</Typography>
+            <Chip size="small" label={decision.status.replace(/_/g, ' ')} color={statusColor(decision, answered)} />
+          </Stack>
+          <Typography variant="body2">{decision.businessImpact}</Typography>
+          {decision.evidencePacket?.researchSummary && (
+            <Typography variant="body2" color="text.secondary" sx={{ whiteSpace: 'pre-wrap' }}>
+              {decision.evidencePacket.researchSummary}
+            </Typography>
+          )}
+          {decision.evidencePacket?.screenshots && decision.evidencePacket.screenshots.length > 0 && (
+            <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 1.5 }}>
+              {decision.evidencePacket.screenshots.map((src) => (
+                <CreativeThumb key={src} src={src} alt={`${decision.subjectLabel} — creative preview`} onZoom={setZoomedSrc} />
+              ))}
+            </Box>
+          )}
+          {decision.evidencePacket?.links?.map((l) => (
+            <Link key={l} href={l} target="_blank" rel="noopener">{l}</Link>
+          ))}
+          {decision.options && decision.options.length > 0 && (
+            <Stack spacing={0.5}>
+              {decision.options.map((o) => (
+                <Typography key={o.id} variant="body2">
+                  <strong>{o.label}</strong>{o.recommended ? ' (recommended)' : ''} — {o.consequence}
+                </Typography>
+              ))}
+            </Stack>
+          )}
+          {answered && (
+            <Alert severity={decision.status === 'execution_failed' ? 'error' : 'success'} sx={{ mt: 1 }}>
+              {decision.verdict ? `You chose: ${decision.verdict}.` : ''}
+              {decision.executionResult?.message ? ` ${decision.executionResult.message}` : ''}
+            </Alert>
+          )}
+        </Stack>
+      </CardContent>
+
+      <Dialog open={zoomedSrc !== null} onClose={() => setZoomedSrc(null)} maxWidth="lg" fullWidth fullScreen={fullScreenZoom}>
+        <Box sx={{ position: 'relative', bgcolor: 'common.black', height: fullScreenZoom ? '100%' : 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <IconButton
+            onClick={() => setZoomedSrc(null)}
+            sx={{ position: 'absolute', top: 8, right: 8, color: 'common.white', bgcolor: 'rgba(0,0,0,0.4)', '&:hover': { bgcolor: 'rgba(0,0,0,0.6)' }, zIndex: 1 }}
+          >
+            <CloseIcon />
+          </IconButton>
+          {zoomedSrc && (isVideoUrl(zoomedSrc) ? (
+            <Box component="video" src={zoomedSrc} controls sx={{ width: '100%', maxHeight: '85vh', display: 'block' }} />
+          ) : (
+            <Box component="img" src={zoomedSrc} alt="Creative, full size" sx={{ width: '100%', maxHeight: '85vh', objectFit: 'contain', display: 'block' }} />
+          ))}
+        </Box>
+      </Dialog>
+    </Card>
+  );
+}
+
+// What you must decide about one call — lives in the sticky rail (right),
+// compact by design so every call in the packet is visible at once without
+// pagination or a per-item modal, per the prototype's own density finding.
+function DecisionRailItem({
+  index,
   decision,
   disabled,
   onAnswer,
 }: {
+  index: number;
   decision: ApprovalDecisionView;
   disabled: boolean;
   onAnswer: (verdict: Verdict, freeText?: string) => Promise<void>;
 }) {
   const [freeText, setFreeText] = useState('');
+  const [showNote, setShowNote] = useState(false);
   const [acting, setActing] = useState<Verdict | null>(null);
   const answered = RESOLVED_STATUSES.has(decision.status);
 
@@ -156,93 +303,93 @@ function DecisionCard({
 
   // Approval language states the actual effect, never a generic "Submit" —
   // per the prototype's own taste-gate finding.
-  const approveLabel = decision.gateType === 'meta_write' ? 'Approve this change' : 'Go with this';
-  const rejectLabel = decision.gateType === 'meta_write' ? 'Reject it' : 'Send back';
+  const approveLabel = decision.gateType === 'meta_write' ? 'Approve' : 'Go with this';
+  const rejectLabel = decision.gateType === 'meta_write' ? 'Reject' : 'Send back';
 
   return (
-    <Card variant="outlined">
-      <CardContent>
-        <Stack spacing={1}>
-          <Stack direction="row" justifyContent="space-between" alignItems="flex-start">
-            <Typography variant="subtitle1">{decision.subjectLabel}</Typography>
-            <Chip
-              size="small"
-              label={decision.status.replace(/_/g, ' ')}
-              color={
-                decision.status === 'execution_failed' ? 'error'
-                  : answered ? 'success'
-                  : 'default'
-              }
-            />
-          </Stack>
-          <Typography variant="body2">{decision.businessImpact}</Typography>
-          {decision.evidencePacket?.researchSummary && (
-            <Typography variant="body2" color="text.secondary" sx={{ whiteSpace: 'pre-wrap' }}>
-              {decision.evidencePacket.researchSummary}
-            </Typography>
-          )}
-          {decision.evidencePacket?.links?.map((l) => (
-            <Link key={l} href={l} target="_blank" rel="noopener">{l}</Link>
-          ))}
-          {decision.options && decision.options.length > 0 && (
-            <Stack spacing={0.5}>
-              {decision.options.map((o) => (
-                <Typography key={o.id} variant="body2">
-                  <strong>{o.label}</strong>{o.recommended ? ' (recommended)' : ''} — {o.consequence}
-                </Typography>
-              ))}
-            </Stack>
-          )}
+    <Box
+      component="a"
+      href={`#call-${decision.decisionId}`}
+      sx={{ display: 'block', textDecoration: 'none', color: 'inherit', py: 1.75, borderBottom: 1, borderColor: 'divider' }}
+    >
+      <Stack spacing={1}>
+        <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1}>
+          <Typography variant="body2" sx={{ fontWeight: 600 }}>
+            {index}. {decision.subjectLabel}
+          </Typography>
+          <Chip size="small" label={decision.status.replace(/_/g, ' ')} color={statusColor(decision, answered)} />
+        </Stack>
 
-          {answered ? (
-            <Alert severity={decision.status === 'execution_failed' ? 'error' : 'success'} sx={{ mt: 1 }}>
-              {decision.verdict ? `You chose: ${decision.verdict}.` : ''}
-              {decision.executionResult?.message ? ` ${decision.executionResult.message}` : ''}
-            </Alert>
-          ) : (
-            <Stack spacing={1} sx={{ mt: 1 }}>
-              <TextField
-                label="Correction note (used only if you send this back)"
+        {answered ? (
+          <Typography variant="caption" color="text.secondary">
+            {decision.verdict ? `Chose: ${decision.verdict}` : ''}
+          </Typography>
+        ) : (
+          <Stack spacing={1} onClick={(e) => e.preventDefault()}>
+            <Stack direction="row" spacing={1}>
+              <Button
                 size="small"
-                multiline
-                minRows={1}
-                value={freeText}
+                variant="contained"
+                color="success"
                 disabled={disabled || acting !== null}
-                onChange={(e) => setFreeText(e.target.value)}
-                inputProps={{ maxLength: 2000 }}
-              />
-              <Stack direction="row" spacing={1}>
-                <Button
-                  variant="contained"
-                  color="success"
-                  disabled={disabled || acting !== null}
-                  onClick={() => void act('approve')}
-                >
-                  {acting === 'approve' ? 'Saving…' : approveLabel}
+                onClick={() => void act('approve')}
+              >
+                {acting === 'approve' ? 'Saving…' : approveLabel}
+              </Button>
+              <Button
+                size="small"
+                variant="outlined"
+                color="error"
+                disabled={disabled || acting !== null}
+                onClick={() => void act('reject')}
+              >
+                {acting === 'reject' ? 'Saving…' : rejectLabel}
+              </Button>
+              {!showNote && (
+                <Button size="small" disabled={disabled || acting !== null} onClick={() => setShowNote(true)}>
+                  + note
                 </Button>
-                <Button
-                  variant="outlined"
-                  color="error"
+              )}
+            </Stack>
+            {showNote && (
+              <Stack spacing={0.75} sx={{ mt: 0.5, pt: 1, borderTop: 1, borderColor: 'divider' }}>
+                {/* A note attaches to Approve/Reject above regardless of gate
+                    type — claimDecision persists freeText and it's surfaced
+                    back to the agent session either way (ENG-1853 review
+                    fix: an earlier version of this hid the note entirely for
+                    meta_write, silently dropping a reviewer's "wrong
+                    account, use $50 not $100" context on a real ad-spend
+                    reject). Only the dedicated edit-verdict submit below
+                    stays non-meta_write — meta_write has no 'edited' state. */}
+                <TextField
+                  label={decision.gateType === 'meta_write' ? 'Note (optional)' : 'What exactly should change?'}
+                  size="small"
+                  multiline
+                  minRows={2}
+                  fullWidth
+                  value={freeText}
                   disabled={disabled || acting !== null}
-                  onClick={() => void act('reject')}
-                >
-                  {acting === 'reject' ? 'Saving…' : rejectLabel}
-                </Button>
+                  onChange={(e) => setFreeText(e.target.value)}
+                  inputProps={{ maxLength: 2000 }}
+                  helperText={decision.gateType === 'meta_write' ? 'Attaches to Approve/Reject above.' : undefined}
+                  autoFocus
+                />
                 {decision.gateType !== 'meta_write' && (
                   <Button
+                    size="small"
                     variant="outlined"
                     disabled={disabled || acting !== null || !freeText}
                     onClick={() => void act('edit')}
                   >
-                    {acting === 'edit' ? 'Saving…' : 'Send back with a correction'}
+                    {acting === 'edit' ? 'Saving…' : 'Send back with this correction'}
                   </Button>
                 )}
               </Stack>
-            </Stack>
-          )}
-        </Stack>
-      </CardContent>
-    </Card>
+            )}
+          </Stack>
+        )}
+      </Stack>
+    </Box>
   );
 }
 
@@ -254,6 +401,11 @@ function ManifestDetail({ manifestId }: { manifestId: string }) {
   const [approvingAll, setApprovingAll] = useState(false);
   const [approveAllError, setApproveAllError] = useState<string | null>(null);
   const [approveAllResult, setApproveAllResult] = useState<string | null>(null);
+  const theme = useTheme();
+  // Review fix: compute once per packet, not once per decision — an
+  // EvidenceCard per decision each running its own useMediaQuery would
+  // register N redundant matchMedia listeners for the same breakpoint.
+  const fullScreenZoom = useMediaQuery(theme.breakpoints.down('sm'));
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -286,7 +438,8 @@ function ManifestDetail({ manifestId }: { manifestId: string }) {
     }
   };
 
-  const allAnswered = decisions.length > 0 && decisions.every((d) => RESOLVED_STATUSES.has(d.status));
+  const answeredCount = decisions.filter((d) => RESOLVED_STATUSES.has(d.status)).length;
+  const allAnswered = decisions.length > 0 && answeredCount === decisions.length;
   const hasMetaWrite = decisions.some((d) => d.gateType === 'meta_write');
 
   const approveAll = async () => {
@@ -314,8 +467,8 @@ function ManifestDetail({ manifestId }: { manifestId: string }) {
 
   return (
     <Box sx={{ p: 3 }}>
-      <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
-        <FactCheckIcon />
+      <Stack direction="row" alignItems="flex-start" spacing={1} sx={{ mb: 1 }}>
+        <FactCheckIcon sx={{ mt: 0.5, flexShrink: 0 }} />
         <Typography variant="h5">{decisions[0]?.subjectLabel || 'Approval packet'}</Typography>
       </Stack>
       <Link component={RouterLink} to="/approval-desk" sx={{ display: 'inline-block', mb: 2 }}>← Back to queue</Link>
@@ -323,26 +476,67 @@ function ManifestDetail({ manifestId }: { manifestId: string }) {
       {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
       {loading && <LinearProgress sx={{ mb: 2 }} />}
 
-      <Stack spacing={2}>
-        {decisions.map((d) => (
-          <DecisionCard key={d.decisionId} decision={d} disabled={approvingAll} onAnswer={(v, ft) => answer(d.decisionId, v, ft)} />
-        ))}
-      </Stack>
-
-      {hasMetaWrite && (
-        <Box sx={{ position: 'sticky', bottom: 0, mt: 3, py: 2, bgcolor: 'background.paper', borderTop: 1, borderColor: 'divider' }}>
-          {approveAllError && <Alert severity="error" sx={{ mb: 1 }}>{approveAllError}</Alert>}
-          {approveAllResult && <Alert severity="success" sx={{ mb: 1 }}>{approveAllResult}</Alert>}
-          <Button
-            variant="contained"
-            size="large"
-            disabled={!allAnswered || approvingAll}
-            onClick={() => void approveAll()}
-          >
-            {approvingAll ? 'Executing…' : allAnswered ? 'Approve All — dispatch and read back' : 'Answer every item to enable Approve All'}
-          </Button>
+      {/* Packet on the left (what you need to know), decisions on the right
+          in a sticky rail (what you must decide) — per the prototype's own
+          information-hierarchy finding (artifact-eng1853-prototype). Stacks
+          to a single column on small screens. */}
+      <Box sx={{ display: 'flex', flexDirection: { xs: 'column', md: 'row' }, gap: 3, alignItems: 'flex-start' }}>
+        <Box sx={{ flex: 1, minWidth: 0 }}>
+          <Stack spacing={2}>
+            {decisions.map((d, i) => (
+              <EvidenceCard key={d.decisionId} index={i + 1} decision={d} fullScreenZoom={fullScreenZoom} />
+            ))}
+          </Stack>
         </Box>
-      )}
+
+        <Box
+          sx={{
+            width: { xs: '100%', md: 360 },
+            flexShrink: 0,
+            position: { md: 'sticky' },
+            top: { md: 16 },
+            maxHeight: { md: 'calc(100vh - 32px)' },
+            overflowY: { md: 'auto' },
+            border: 1,
+            borderColor: 'divider',
+            borderRadius: 1,
+            bgcolor: 'background.paper',
+          }}
+        >
+          <Box sx={{ px: 2, pt: 1.5, pb: 1, borderBottom: 1, borderColor: 'divider' }}>
+            <Stack direction="row" justifyContent="space-between" alignItems="baseline">
+              <Typography variant="subtitle2">The calls</Typography>
+              <Typography variant="caption" color="text.secondary">{answeredCount}/{decisions.length} answered</Typography>
+            </Stack>
+          </Box>
+          <Box sx={{ px: 2 }}>
+            {decisions.map((d, i) => (
+              <DecisionRailItem
+                key={d.decisionId}
+                index={i + 1}
+                decision={d}
+                disabled={approvingAll}
+                onAnswer={(v, ft) => answer(d.decisionId, v, ft)}
+              />
+            ))}
+          </Box>
+
+          {hasMetaWrite && (
+            <Box sx={{ p: 2 }}>
+              {approveAllError && <Alert severity="error" sx={{ mb: 1 }}>{approveAllError}</Alert>}
+              {approveAllResult && <Alert severity="success" sx={{ mb: 1 }}>{approveAllResult}</Alert>}
+              <Button
+                fullWidth
+                variant="contained"
+                disabled={!allAnswered || approvingAll}
+                onClick={() => void approveAll()}
+              >
+                {approvingAll ? 'Executing…' : allAnswered ? 'Approve All — dispatch and read back' : 'Answer every item to enable Approve All'}
+              </Button>
+            </Box>
+          )}
+        </Box>
+      </Box>
     </Box>
   );
 }

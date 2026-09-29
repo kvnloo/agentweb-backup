@@ -14,7 +14,7 @@ const C = Date.parse('2026-06-01T00:00:00.000Z');
 const at = (days: number) => new Date(C + days * DAY_MS).toISOString();
 
 function data(overrides: Partial<BacktestData> = {}): BacktestData {
-  return { users: [], payments: [], requirements: new Map(), spend: [], ...overrides };
+  return { users: [], payments: [], requirements: new Map(), spend: [], accountDays: [], feedback: [], ...overrides };
 }
 
 describe('buildCutoffPopulation', () => {
@@ -39,9 +39,9 @@ describe('buildCutoffPopulation', () => {
       30 * DAY_MS,
     );
     expect(result.cases).toEqual([
-      { cutoff: '2026-06-01', truth: 'churned', state: 'at_risk' },
-      { cutoff: '2026-06-01', truth: 'retained', state: 'activation_incomplete' },
-      { cutoff: '2026-06-01', truth: 'retained', state: 'activation_incomplete' },
+      { cutoff: '2026-06-01', truth: 'churned', state: 'at_risk', signals: ['payment_failed', 'ads_never_connected'] },
+      { cutoff: '2026-06-01', truth: 'retained', state: 'activation_incomplete', signals: ['ads_never_connected'] },
+      { cutoff: '2026-06-01', truth: 'retained', state: 'activation_incomplete', signals: ['ads_never_connected'] },
     ]);
   });
 
@@ -57,6 +57,8 @@ describe('buildCutoffPopulation', () => {
           { userId: 'free', createdAt: at(-90) },
         ],
         payments: [
+          // 'undated' has Stripe activity but no cancel event, so its cancellation cannot be placed.
+          { userId: 'undated', timestamp: at(-40), eventType: 'payment_succeeded' },
           { userId: 'gone', timestamp: at(-3), eventType: 'subscription_canceled' },
           { userId: 'back', timestamp: at(-3), eventType: 'subscription_canceled' },
           { userId: 'back', timestamp: at(-1), eventType: 'payment_succeeded' },
@@ -149,13 +151,73 @@ describe('buildCutoffPopulation', () => {
   });
 });
 
+describe('buildCutoffPopulation: behavioural signals and cancellation dating (ENG-2143 audit)', () => {
+  const liveMeta = { platform: 'meta', created_at: at(-60), config: { account_type: 'ad_account', token_expires_at: C + 90 * DAY_MS } };
+  const day = (daysBefore: number) => at(-daysBefore).slice(0, 10);
+
+  it('places a cancellation with no Stripe event, from an account created before the payment log, before the log', () => {
+    const result = buildCutoffPopulation(
+      data({
+        users: [
+          { userId: 'pre-log', createdAt: at(-200), subscription_status: 'canceled' },
+          // Created after the log began: it cannot have canceled before it, so it stays undated.
+          { userId: 'post-log', createdAt: at(-50), subscription_status: 'canceled' },
+          // An admin credit grant is not a Stripe event.
+          { userId: 'credited', createdAt: at(-200), subscription_status: 'canceled' },
+        ],
+        payments: [
+          { userId: 'someone-else', timestamp: at(-100), eventType: 'payment_succeeded' },
+          { userId: 'credited', timestamp: at(-20), eventType: 'admin_credit_grant' },
+        ],
+      }),
+      C,
+      30 * DAY_MS,
+    );
+    expect(result).toMatchObject({ canceledBeforePaymentLog: 2, excludedUndatedCancel: 1 });
+    expect(result.cases).toHaveLength(0);
+  });
+
+  it('reads spend from campaign rows (account-day rows store 0) and flags a spend drop as of the cutoff', () => {
+    const accountDays = Array.from({ length: 28 }, (_, i) => ({ userId: 'u', date: day(i + 1), totalLeadCount: 0 }));
+    const spend = Array.from({ length: 28 }, (_, i) => ({ userId: 'u', date: day(i + 1), spend: i + 1 > 14 ? 100 : 10 }));
+    // After the cutoff: must not be seen.
+    spend.push({ userId: 'u', date: at(2).slice(0, 10), spend: 5000 });
+    const result = buildCutoffPopulation(
+      data({
+        users: [{ userId: 'u', createdAt: at(-90), subscription_status: 'active', connected_accounts: [liveMeta] }],
+        payments: [{ userId: 'u', timestamp: at(-10), eventType: 'payment_succeeded' }],
+        spend,
+        accountDays,
+      }),
+      C,
+      30 * DAY_MS,
+    );
+    expect(result.cases).toEqual([{ cutoff: '2026-06-01', truth: 'retained', state: 'at_risk', signals: ['spend_drop'] }]);
+  });
+
+  it('counts explicit ratings only up to the cutoff', () => {
+    const dislike = (days: number) => ({ userId: 'u', type: 'dislike', timestamp: at(days) });
+    const build = (feedback: ReturnType<typeof dislike>[]) => buildCutoffPopulation(
+      data({
+        users: [{ userId: 'u', createdAt: at(-90), subscription_status: 'active', connected_accounts: [liveMeta] }],
+        payments: [{ userId: 'u', timestamp: at(-10), eventType: 'payment_succeeded' }],
+        feedback,
+      }),
+      C,
+      30 * DAY_MS,
+    ).cases[0];
+    expect(build([dislike(-1), dislike(-2), dislike(-3)])).toMatchObject({ state: 'at_risk', signals: ['negative_feedback'] });
+    expect(build([dislike(1), dislike(2), dislike(3)])).toMatchObject({ state: 'healthy', signals: [] });
+  });
+});
+
 describe('scoreBacktest', () => {
   it('reports precision/recall with Wilson CIs and a state-by-truth table', () => {
     const metrics = scoreBacktest([
-      { cutoff: 'c', truth: 'churned', state: 'at_risk' },
-      { cutoff: 'c', truth: 'churned', state: 'activation_incomplete' },
-      { cutoff: 'c', truth: 'retained', state: 'healthy' },
-      { cutoff: 'c', truth: 'retained', state: 'at_risk' },
+      { cutoff: 'c', truth: 'churned', state: 'at_risk', signals: [] },
+      { cutoff: 'c', truth: 'churned', state: 'activation_incomplete', signals: [] },
+      { cutoff: 'c', truth: 'retained', state: 'healthy', signals: [] },
+      { cutoff: 'c', truth: 'retained', state: 'at_risk', signals: [] },
     ]);
     expect(metrics).toMatchObject({ n: 4, positives: 2, predictedPositives: 2, tp: 1, precision: 0.5, recall: 0.5 });
     expect(metrics.precisionCI?.low).toBeCloseTo(0.0945, 3);
@@ -164,7 +226,7 @@ describe('scoreBacktest', () => {
   });
 
   it('reports n/a rather than a number when nothing was predicted or nothing churned', () => {
-    const metrics = scoreBacktest([{ cutoff: 'c', truth: 'retained', state: 'healthy' }]);
+    const metrics = scoreBacktest([{ cutoff: 'c', truth: 'retained', state: 'healthy', signals: [] }]);
     expect(metrics).toMatchObject({ precision: null, precisionCI: null, recall: null, recallCI: null });
     expect(scoreBacktest([])).toMatchObject({ n: 0, precision: null, recall: null });
   });
@@ -175,5 +237,19 @@ describe('defaultCutoffs', () => {
     const now = Date.parse('2026-09-25T15:00:00.000Z');
     const cutoffs = defaultCutoffs(30 * DAY_MS, now, Date.parse('2026-06-01T00:00:00.000Z'));
     expect(cutoffs.map((c) => new Date(c).toISOString().slice(0, 10))).toEqual(['2026-06-27', '2026-07-27', '2026-08-26']);
+  });
+});
+
+describe('scoreBacktest signal counts', () => {
+  it('reports how many pairs each signal fired on and how many of those churned', () => {
+    const metrics = scoreBacktest([
+      { cutoff: 'c', truth: 'churned', state: 'at_risk', signals: ['spend_drop', 'spend_drop'] },
+      { cutoff: 'c', truth: 'retained', state: 'at_risk', signals: ['spend_drop'] },
+      { cutoff: 'c', truth: 'retained', state: 'activation_incomplete', signals: ['ads_never_connected'] },
+    ]);
+    expect(metrics.signalCounts).toEqual({
+      spend_drop: { fired: 2, churned: 1 },
+      ads_never_connected: { fired: 1, churned: 0 },
+    });
   });
 });

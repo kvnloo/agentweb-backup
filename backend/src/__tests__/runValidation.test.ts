@@ -155,8 +155,8 @@ describe('validation runner math (ENG-2135)', () => {
 
 describe('stored session-judge adapters', () => {
   it('maps 1-5 dimensions to pass at >= 4 and abstains on a missing dimension', () => {
-    expect(sessionJudgePrediction({ goalCompletion: 4, dataAccuracy: 3 })).toEqual({ task_success: 'pass', groundedness: 'fail', instruction_compliance: 'na' });
-    expect(sessionJudgePrediction(undefined)).toEqual({ task_success: 'na', groundedness: 'na', instruction_compliance: 'na' });
+    expect(sessionJudgePrediction({ goalCompletion: 4, dataAccuracy: 3 })).toEqual({ task_success: 'pass', groundedness: 'fail', instruction_compliance: 'na', argued_with_instruction: 'na', escalated_when_not_required: 'na', failed_to_escalate: 'na' });
+    expect(sessionJudgePrediction(undefined)).toEqual({ task_success: 'na', groundedness: 'na', instruction_compliance: 'na', argued_with_instruction: 'na', escalated_when_not_required: 'na', failed_to_escalate: 'na' });
   });
 
   it('grades a case by its session id', async () => {
@@ -189,6 +189,24 @@ describe('stored session-judge adapters', () => {
   });
 });
 
+describe('outcome rubric behaviour criteria (ENG-2189)', () => {
+  it('maps the shadow judge\'s booleans onto the golden criteria, true = pass (it happened)', () => {
+    expect(sessionJudgePrediction({ arguedWithInstruction: true, escalatedWhenNotRequired: false })).toMatchObject({
+      argued_with_instruction: 'pass',
+      escalated_when_not_required: 'fail',
+      failed_to_escalate: 'na',
+    });
+  });
+
+  it('scores the behaviour criteria for the shadow judge only; the Gemini judges never ask for them', () => {
+    const read = async () => undefined;
+    expect(sessionJudgeGrader('session-judge-outcome-b-shadow', read).criteria).toEqual([
+      'task_success', 'groundedness', 'instruction_compliance', 'argued_with_instruction', 'escalated_when_not_required', 'failed_to_escalate',
+    ]);
+    expect(sessionJudgeGrader('session-judge-general', read).criteria).toEqual(['task_success', 'groundedness', 'instruction_compliance']);
+  });
+});
+
 describe('agent grader adapters (ENG-2137 graders on golden cases)', () => {
   const completed: SessionForGrading = {
     sessionId: 'sess-1',
@@ -207,6 +225,12 @@ describe('agent grader adapters (ENG-2137 graders on golden cases)', () => {
     expect(agentGraderPrediction('agent-tool-correctness', completed)).toEqual({ tool_correctness: 'pass' });
     expect(agentGraderPrediction('agent-groundedness-offline', completed)).toEqual({ groundedness: 'na' });
     expect(agentGraderPrediction('agent-task-success', undefined)).toEqual({});
+    // ENG-2189: the adherence checks label instruction_compliance, abstaining when no instruction applies.
+    expect(agentGraderPrediction('agent-format-adherence', completed)).toEqual({ instruction_compliance: 'na' });
+    const asked = { ...completed, turns: [{ userText: 'go ahead', replyText: 'Shall I proceed with the research?', toolNames: [] }] };
+    expect(agentGraderPrediction('agent-act-without-asking', asked)).toEqual({ instruction_compliance: 'fail' });
+    const short = { ...completed, turns: [{ userText: 'in under 100 words', replyText: 'Short answer.', toolNames: [] }] };
+    expect(agentGraderPrediction('agent-reply-length-adherence', short)).toEqual({ instruction_compliance: 'pass' });
     expect(() => agentGraderPrediction('session-judge-general', completed)).toThrow(/not an agent grader/);
   });
 
@@ -217,6 +241,9 @@ describe('agent grader adapters (ENG-2137 graders on golden cases)', () => {
       ['agent-task-success', ['task_success'], 'task_success'],
       ['agent-tool-correctness', ['tool_correctness'], 'tool_correctness'],
       ['agent-groundedness-offline', ['groundedness'], 'groundedness'],
+      ['agent-reply-length-adherence', ['instruction_compliance'], 'instruction_compliance'],
+      ['agent-format-adherence', ['instruction_compliance'], 'instruction_compliance'],
+      ['agent-act-without-asking', ['instruction_compliance'], 'instruction_compliance'],
     ]);
     expect(await graders[0].grade(labelled('sess-1', 'pass'))).toEqual({ task_success: 'pass' });
     expect(load).toHaveBeenCalledWith('sess-1');

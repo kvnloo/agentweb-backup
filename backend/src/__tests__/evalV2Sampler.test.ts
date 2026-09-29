@@ -76,7 +76,7 @@ describe('scored event rows', () => {
       ts: '2026-09-25T17:15:00.000Z',
     });
     expect(item.dimensions).toMatchObject({
-      graders: 'agent-task-success@1,agent-tool-correctness@1,agent-groundedness-offline@1',
+      graders: 'agent-task-success@1,agent-tool-correctness@2,agent-groundedness-offline@1,agent-reply-length-adherence@1,agent-format-adherence@1,agent-act-without-asking@1',
       taskType: 'ads',
       model: 'gemini-3.8-flash',
       frameSize: 56,
@@ -92,6 +92,14 @@ describe('scored event rows', () => {
     for (const v of Object.values(dims)) expect(['string', 'number', 'boolean']).toContain(typeof v);
   });
 
+  it('stores the adherence verdicts and reason codes, never the turn text (ENG-2189)', () => {
+    const turns = [{ userText: 'SECRET brief: show me this in a table', replyText: 'SECRET numbers without a table', toolNames: [] }];
+    const item = buildScoredEventItem(gradeSession({ ...session, turns }, 'm', undefined), ctx, new Date('2026-09-25T17:15:00Z'));
+    expect(JSON.stringify(item)).not.toContain('SECRET');
+    expect(item.dimensions).toMatchObject({ formatVerdict: 'fail', formatReason: 'table_missing', lengthVerdict: 'not_applicable', permissionReason: 'no_act_instruction' });
+    expect(parseScoredEvent(item as Record<string, unknown>)?.adherence).toEqual({ length: 'not_applicable', format: 'fail', permission: 'not_applicable' });
+  });
+
   it('round-trips through parseScoredEvent and rejects other rows', () => {
     const parsed = parseScoredEvent(buildScoredEventItem(graded, ctx, new Date('2026-09-25T17:15:00Z')) as Record<string, unknown>);
     expect(parsed).toEqual({
@@ -104,7 +112,8 @@ describe('scored event rows', () => {
       toolVerdict: 'pass',
       toolCalls: 1,
       groundednessVerdict: graded.groundedness.verdict,
-      graderVersions: { 'agent-task-success': 1, 'agent-tool-correctness': 1, 'agent-groundedness-offline': 1 },
+      adherence: { length: 'not_applicable', format: 'not_applicable', permission: 'not_applicable' },
+      graderVersions: { 'agent-task-success': 1, 'agent-tool-correctness': 2, 'agent-groundedness-offline': 1, 'agent-reply-length-adherence': 1, 'agent-format-adherence': 1, 'agent-act-without-asking': 1 },
     });
     expect(parseScoredEvent({ eventType: 'agent_run_verdict', dimensions: {} })).toBeNull();
     expect(parseScoredEvent({ eventType: 'eval_v2_scored', dimensions: { sessionId: 'x', sampleDate: 'd', taskVerdict: 'maybe' } })).toBeNull();
@@ -163,6 +172,19 @@ describe('aggregateEvalV2', () => {
     expect(tools).toMatchObject({ n: 3, passes: 2, notApplicable: 1 });
     const grounded = all.metrics.find((m) => m.graderId === 'agent-groundedness-offline');
     expect(grounded).toMatchObject({ n: 3, passes: 2, notApplicable: 1 });
+  });
+
+  it('reports the adherence checks per group, counting pre-v2 rows (no adherence) as not applicable (ENG-2189)', () => {
+    const rows = [
+      score({ sessionId: 'a', adherence: { length: 'pass', format: 'not_applicable', permission: 'fail' } }),
+      score({ sessionId: 'b', adherence: { length: 'fail', format: 'pass', permission: 'not_applicable' } }),
+      score({ sessionId: 'c' }),
+    ];
+    const all = aggregateEvalV2(rows, { date: '2026-09-24', windowLabel: '1d', now }).groups[0];
+    const metric = (id: string) => all.metrics.find((m) => m.graderId === id);
+    expect(metric('agent-reply-length-adherence')).toMatchObject({ n: 2, passes: 1, rate: 0.5, ci: wilsonInterval(1, 2), notApplicable: 1, mayGate: false });
+    expect(metric('agent-format-adherence')).toMatchObject({ n: 1, passes: 1, notApplicable: 2 });
+    expect(metric('agent-act-without-asking')).toMatchObject({ n: 1, passes: 0, notApplicable: 2 });
   });
 
   it('splits by surface × task type × model, largest cell first', () => {
@@ -235,6 +257,9 @@ describe('mayGate gating (ENG-2128 principle 2)', () => {
       ['agent-task-success', false],
       ['agent-tool-correctness', true],
       ['agent-groundedness-offline', false],
+      ['agent-reply-length-adherence', false],
+      ['agent-format-adherence', false],
+      ['agent-act-without-asking', false],
     ]);
   });
 });

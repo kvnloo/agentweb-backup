@@ -13,8 +13,8 @@ import {
   resolveSlackMentionsInText,
 } from './slackService';
 import { settingsService } from './settingsService';
-import type { CreativeGateResult } from './creativeGates';
-import type { CreativeRubricResult } from './creativeRubricJudge';
+import type { CreativeGateCheck, CreativeGateResult } from './creativeGates';
+import type { CreativeRubricResult, StoredCreativePairwise } from './creativeRubricJudge';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 export const HUMAN_EVAL_QUEUE_TABLE = `${TABLE_PREFIX}AW-HumanEvalQueue`;
@@ -121,6 +121,9 @@ export interface HumanEvalCandidate {
   /** Advisory rubric-judge result (ENG-2140), written after creation when the judge is enabled and
    *  this creative was sampled. Additive: absent otherwise. */
   creativeRubric?: CreativeRubricResult;
+  /** Advisory runtime pairwise verdict vs the account's prior best creative for the same placement
+   *  (ENG-2192), written after `creativeRubric` when a prior best exists. Additive: absent otherwise. */
+  creativePairwise?: StoredCreativePairwise;
   /** Absent when Slack posting was disabled or failed for this candidate (ENG-1854) — the
    *  candidate still persists and is reviewable via the queue API either way. */
   slackChannel?: string;
@@ -518,6 +521,44 @@ export class HumanEvalService {
     }).promise();
   }
 
+  /** Stores the runtime pairwise verdict on an existing candidate (ENG-2192). Never creates an item. */
+  async setCreativePairwise(candidateId: string, result: StoredCreativePairwise): Promise<void> {
+    await this.db.update({
+      TableName: HUMAN_EVAL_QUEUE_TABLE,
+      Key: { candidateId },
+      UpdateExpression: 'SET creativePairwise = :pairwise',
+      ConditionExpression: 'attribute_exists(candidateId)',
+      ExpressionAttributeValues: { ':pairwise': result },
+    }).promise();
+  }
+
+  /**
+   * Merges additional deterministic-check results onto an existing candidate's `creativeGates`
+   * (ENG-2193: OCR/spelling/brand-colour/logo/policy-keyword checks, computed out-of-band by
+   * `creativeContentCheckRunner.ts` after the structural gates already stored at creation time).
+   * A no-op — not an error — when the candidate has no `creativeGates` yet (generation never
+   * produced structural gates, e.g. a Runway download failure), since there is nothing to extend.
+   * Never creates an item.
+   */
+  async appendCreativeGateChecks(candidateId: string, checks: CreativeGateCheck[]): Promise<void> {
+    if (checks.length === 0) return;
+    const candidate = await this.getCandidate(candidateId);
+    if (!candidate?.creativeGates) return;
+    const mergedChecks = [...candidate.creativeGates.checks, ...checks];
+    const merged: CreativeGateResult = {
+      ...candidate.creativeGates,
+      checks: mergedChecks,
+      passed: mergedChecks.every((c) => c.status !== 'fail'),
+    };
+    await this.db.update({
+      TableName: HUMAN_EVAL_QUEUE_TABLE,
+      Key: { candidateId },
+      UpdateExpression: 'SET creativeGates = :gates',
+      ConditionExpression: 'attribute_exists(candidateId)',
+      ExpressionAttributeValues: { ':gates': merged },
+    }).promise();
+  }
+
   async getCandidate(candidateId: string): Promise<HumanEvalCandidate | null> {
     const result = await this.db.get({
       TableName: HUMAN_EVAL_QUEUE_TABLE,
@@ -571,7 +612,8 @@ export class HumanEvalService {
   /**
    * Every candidate of one review type for one user, across all scan pages (ENG-2140: the prior
    * creative for pairwise judging). Unlike `listCandidates` there is no result cap, so an older
-   * match is never cut off by newer candidates of other accounts. Offline use only: it scans.
+   * match is never cut off by newer candidates of other accounts. It scans, so the only runtime
+   * caller is the sampled, flag-gated pairwise judge (ENG-2192), once per judged creative.
    */
   async listCandidatesForUser(userId: string, reviewType: HumanEvalReviewType): Promise<HumanEvalCandidate[]> {
     const matches: HumanEvalCandidate[] = [];
