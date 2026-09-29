@@ -5404,11 +5404,18 @@ emmaToolRegistry.register({
     // selected model. (`args.llmModel` was never populated — the schema doesn't
     // expose it and the registry doesn't merge context into args.)
     // ENG-1858: meter the vision call to the calling user instead of "system".
-    return await agentModeService.describeImage(undefined, args.image_url, args.prompt, {
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): calls
+    // emma/impl/mediaVideo.ts directly, not agentModeService.describeImage —
+    // that class method still exists (routes/emmaApi.ts and several
+    // dedicated tests call it directly), but `callLLM`/`getVisionModel` are
+    // both `public` on AgentModeService, so this tool can bind them straight
+    // off the singleton without going through the class's own delegating
+    // wrapper.
+    return await mediaVideoImpl.describeImage(undefined, args.image_url, args.prompt, {
       userId: context?.userId || context?.agentUserId,
       sessionId: context?.sessionId,
       feature: 'describe_image',
-    });
+    }, agentModeService.callLLM.bind(agentModeService), agentModeService.getVisionModel.bind(agentModeService));
   }
 });
 
@@ -5604,7 +5611,14 @@ emmaToolRegistry.register({
     // generateImage — so a provider timeout produced zero deliverables. generateImage
     // now resolves the admin default itself and only suppresses the fallback for a
     // genuinely LLM-specified model.
-    return await agentModeService.generateImage(
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): calls
+    // emma/impl/mediaVideo.ts directly, not agentModeService.generateImage —
+    // that class method still exists (routes/emmaApi.ts and several
+    // dedicated tests call it directly), but `callLLM`/`getVisionModel` are
+    // both `public` on AgentModeService, so this tool can bind them straight
+    // off the singleton without going through the class's own delegating
+    // wrapper.
+    return await mediaVideoImpl.generateImage(
       args.prompt,
       args.filename,
       args.size || '1024x1024',
@@ -5617,7 +5631,9 @@ emmaToolRegistry.register({
       args.confirm,
       args.category,
       args.metrics_verified,
-      args.placement
+      args.placement,
+      agentModeService.callLLM.bind(agentModeService),
+      agentModeService.getVisionModel.bind(agentModeService),
     );
   }
 });

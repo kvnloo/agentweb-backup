@@ -1,6 +1,7 @@
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
 import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassification';
-import { resolveModelForUser } from './modelRoles';
+// ENG-2103 (F2 design-decision-list follow-up, Pattern A): resolveModelForUser's
+// only call site, generateImage, moved to emma/impl/mediaVideo.ts.
 import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
 import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
@@ -68,20 +69,10 @@ import {
   isMalformedOpenRouterResponseError,
 } from './agentMode/openRouterResponseValidation';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice, buildAcceptanceFailureNotice, assetProducingToolsInPlay } from './agentMode/core/synthesisResidue';
-import {
-  getPersistedBrandLogoUrlForUser,
-  missingBrandLogoToolResult,
-  promptCreatesLogo,
-  promptRequestsLogo,
-} from './agentMode/brandLogo';
+// ENG-2103 (F2 design-decision-list follow-up, Pattern A): agentMode/brandLogo's
+// 4 exports and agentMode/dataFabricationGuard's 5 exports were used only by
+// generateImage, which moved to emma/impl/mediaVideo.ts (imports them there directly).
 import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory } from './agentMode/core/toolDispatch';
-import {
-  describeImageReportsFabricatedMetrics,
-  FABRICATED_METRICS_CHECK_PROMPT,
-  FABRICATED_METRICS_CHECK_TIMEOUT_MS,
-  FABRICATED_METRICS_WARNING,
-  promptRisksFabricatedMetrics,
-} from './agentMode/dataFabricationGuard';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
@@ -171,9 +162,11 @@ import {
   costScoreFromPrice,
   cacheWriteCost,
   CacheWriteByTtl,
-  imageGenerationCostUsd,
 } from '../utils/llmPricing';
-import { normalizeImageModel } from './imageGeneration';
+// ENG-2103 (F2 design-decision-list follow-up, Pattern A): imageGenerationCostUsd
+// (from ../utils/llmPricing) and normalizeImageModel (from ./imageGeneration)
+// were used only by generateImage/getImageGenerationFallbackModel, which
+// moved to emma/impl/mediaVideo.ts (imports them there directly).
 // ENG-2103 (F2 design-decision-list follow-up, Pattern A): enqueueFindEmailJobForNewLeads's
 // only caller, importLeadsFromSearch, moved to emma/impl/leads.ts — it now
 // imports agentModeService.autoEnrich directly (as a namespace, so tests can
@@ -223,11 +216,11 @@ import {
   estimateLlmCost as sharedEstimateLlmCost,
   makeToolUsageCallback as sharedMakeToolUsageCallback,
 } from '../emma/impl/shared/toolUsageMetering';
-// ENG-2103 (F2 design-decision-list follow-up, Pattern A): withTimeoutOrReject
-// moved to this shared module — generateImage's data-fabrication check (kept
-// on this class forever) and emma/impl/linkedin.ts's resolveEmployersForSizeFilter
-// (moved this round) both need it; see that module's own header comment.
-import { withTimeoutOrReject } from '../emma/impl/shared/withTimeoutOrReject';
+// ENG-2103 (F2 design-decision-list follow-up, Pattern A): withTimeoutOrReject's
+// two real callers (generateImage's data-fabrication check,
+// resolveEmployersForSizeFilter) have both since moved out of this class —
+// generateImage to emma/impl/mediaVideo.ts (this round), resolveEmployersForSizeFilter
+// to emma/impl/linkedin.ts (an earlier round) — so this class no longer imports it.
 // ENG-2103 (F2): leads/CRM tool cluster, same treatment as googleDriveImpl/htmlToolsImpl.
 import * as leadsImpl from '../emma/impl/leads';
 import { getCrmSenders as sharedGetCrmSenders } from '../emma/impl/shared/crmSenders';
@@ -286,9 +279,13 @@ import * as miscImpl from '../emma/impl/misc';
 // delegating-wrapper signatures on this class keep the same public type as
 // before, byte-identical to callers.
 import { SearchPurpose } from '../search/searchProvider';
-import { enqueueAutoHumanEval } from './autoHumanEvalService';
-import { declaredPlacementField } from './agentMode/generateImagePlacement';
-import { recordGeneratedCreative, stampMetaAdCreated, stampMetaAdCreativeChanged, stampMetaCreativeCreated, stampMetaImageUpload, stampMetaPublish } from './creativeLineage';
+// ENG-2103 (F2 design-decision-list follow-up, Pattern A): enqueueAutoHumanEval
+// (./autoHumanEvalService) and declaredPlacementField (./agentMode/generateImagePlacement)
+// were used only by generateImage, which moved to emma/impl/mediaVideo.ts
+// (imports them there directly — enqueueAutoHumanEval lazily, since
+// autoHumanEvalService.ts statically imports settingsService.ts, which
+// constructs a real AWS.DynamoDB.DocumentClient at module scope).
+import { stampMetaAdCreated, stampMetaAdCreativeChanged, stampMetaCreativeCreated, stampMetaImageUpload, stampMetaPublish } from './creativeLineage';
 import { CitationRegistry } from '../utils/citations';
 import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 import { parseTimecodeToSeconds } from '../emma/impl/video';
@@ -491,7 +488,11 @@ import { HubSpotService } from './hubspotService';
 import { handleAttioApi as handleAttioApiImpl } from './agentMode/attioTools';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
-import { fetchBufferFollowingRedirects, assertPublicHostname, DEFAULT_MAX_IMAGE_BYTES } from '../utils/ssrfGuard';
+// ENG-2103 (F2 design-decision-list follow-up, Pattern A): fetchBufferFollowingRedirects/
+// DEFAULT_MAX_IMAGE_BYTES were used only by describeImage, which moved to
+// emma/impl/mediaVideo.ts (imports them there directly). assertPublicHostname
+// was already unused before this move (pre-existing, left as-is).
+import { assertPublicHostname } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
 import { isTransientLLMError, extractAffordableTokens } from '../utils/agentModeErrors';
@@ -2259,9 +2260,6 @@ export class AgentModeService {
     return blocks.length > 0 ? blocks : [{ type: 'text', text: '.' }];
   }
 
-  /** Media types the vision APIs decode natively. */
-  private static readonly VISION_NATIVE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
-
   // ENG-1670: a scheduled run's own tool-calling loop can fire several Gemini
   // calls back-to-back within one turn (prod-verified: 4 calls in ~22s on the
   // "LinkedIn Post Factory" schedule) with nothing pacing them — the schedule
@@ -2273,41 +2271,10 @@ export class AgentModeService {
   // blanket delay on every model or every turn.
   private static readonly SCHEDULED_GEMINI_ITERATION_PACING_MS = 1500;
 
-  /**
-   * Normalize uploaded image bytes to a vision-decodable representation. This
-   * remains local image hygiene; text/tool model routing is handled separately.
-   */
-  private static async normalizeImageForVision(
-    buffer: Buffer,
-    contentType: string,
-  ): Promise<{ buffer: Buffer; contentType: string; undecodable?: boolean; detectedFormat?: string }> {
-    let normalizedContentType = (contentType || '').toLowerCase().trim();
-    if (normalizedContentType === 'image/jpg') normalizedContentType = 'image/jpeg';
-    if (AgentModeService.VISION_NATIVE_MEDIA_TYPES.has(normalizedContentType)) {
-      return { buffer, contentType: normalizedContentType };
-    }
-
-    try {
-      const sharp = (await import('sharp')).default;
-      const metadata = await sharp(buffer).metadata();
-      const mediaTypeByFormat: Record<string, string> = {
-        jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp',
-      };
-      const detectedContentType = metadata.format ? mediaTypeByFormat[metadata.format] : undefined;
-      if (detectedContentType) {
-        return { buffer, contentType: detectedContentType, detectedFormat: metadata.format };
-      }
-
-      const png = await sharp(buffer).png().toBuffer();
-      return { buffer: png, contentType: 'image/png', detectedFormat: metadata.format };
-    } catch (err) {
-      console.error(
-        'AgentMode: normalizeImageForVision failed to decode/convert image; using original:',
-        err instanceof Error ? err.message : err,
-      );
-      return { buffer, contentType: contentType || 'image/png', undecodable: true };
-    }
-  }
+  // ENG-2103 (F2 design-decision-list follow-up, Pattern A): VISION_NATIVE_MEDIA_TYPES
+  // and normalizeImageForVision moved verbatim to emma/impl/mediaVideo.ts
+  // (exclusive to describeImage, which moved there too). See that module's
+  // own header comment for the full reasoning.
 
   private llmModels: Record<string, LLMModelConfig> = createLlmModelRegistry();
 
@@ -2847,67 +2814,12 @@ export class AgentModeService {
     return sharedEstimateLlmCost(model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, cacheWriteByTtl);
   }
 
-  /** Cost per image generation in USD (fixed per-generation pricing, sourced from llmPricing). */
-  private estimateImageGenerationCost(model: string): number {
-    return imageGenerationCostUsd(model);
-  }
-
-  private isRetryableMediaToolError(error: unknown): boolean {
-    if (!error) return false;
-    const message = error instanceof Error ? error.message : String(error);
-    const nonRetryablePatterns = [
-      /api key/i,
-      /auth/i,
-      /unauthori[sz]ed/i,
-      /forbidden/i,
-      /permission/i,
-      /invalid/i,
-      /unsupported/i,
-      /content.?filter/i,
-      /safety/i,
-      /policy/i,
-      /blocked/i,
-      /service is not available/i,
-    ];
-    if (nonRetryablePatterns.some((pattern) => pattern.test(message))) {
-      return false;
-    }
-
-    return isTransientLLMError(error) || /timed out|timeout|overloaded|upstream|network/i.test(message);
-  }
-
-  private getImageGenerationFallbackModel(
-    currentModel: string | undefined,
-    inputImages: string[] | undefined,
-    logoImage: string | undefined,
-    modelExplicitlyChosen: boolean = false
-  ): string | undefined {
-    // Keep generation fallback narrow. Telemetry showed the painful cases were
-    // product-fidelity workflows and explicit model choices; silently switching
-    // providers there changes output semantics. Only recover when the caller left
-    // model selection to us and the request is fresh text-to-image.
-    //
-    // ENG-510: gate on whether the model was an explicit per-request choice — NOT
-    // merely on a model string being present. The admin-configured default is
-    // resolved to a concrete id before generation, but that is a system default,
-    // not a user choice, so a transient timeout on it must still fail over.
-    if (modelExplicitlyChosen) {
-      return undefined;
-    }
-
-    const editsExistingImage = (Array.isArray(inputImages) && inputImages.length > 0) || !!logoImage;
-    if (editsExistingImage) {
-      return undefined;
-    }
-
-    // Pick the first alternate that isn't the model we just failed on (compare on
-    // the normalized id so e.g. the legacy "...-preview" alias matches its GA id).
-    const normalizedCurrent = normalizeImageModel(currentModel);
-    const fallbackOrder = ['gpt-image-2', 'gemini-3.1-flash-image', 'gemini-2.5-flash-image'];
-    return fallbackOrder.find(
-      (model) => model !== currentModel && model !== normalizedCurrent
-    );
-  }
+  // ENG-2103 (F2 design-decision-list follow-up, Pattern A): estimateImageGenerationCost/
+  // getImageGenerationFallbackModel moved (as thin delegating wrappers further
+  // down, next to generateImage) to emma/impl/mediaVideo.ts. isRetryableMediaToolError
+  // moved and deleted from the class outright (zero test dependency beyond doc
+  // comments, confirmed by whole-backend grep) — called as a plain local
+  // function inside emma/impl/mediaVideo.ts's generateImage.
 
   /**
    * ENG-803: does this scheduled run's schedule allow it to publish externally?
@@ -9606,268 +9518,28 @@ export class AgentModeService {
     }
   }
 
-  /**
-   * Bound a describe_image vision LLM call so a slow or hung vision model fails
-   * fast instead of consuming the whole agent-mode generation wall-clock budget
-   * (ENG-294). Without this, a single un-bounded vision call can stall for the
-   * client's 5-minute per-request timeout — and with callLLM's internal retries
-   * plus the fallback model, one image could burn 10+ minutes and blow the run's
-   * GENERATION_TIMEOUT_MS (default 10 min). Reported by a CSV→CRM sync that OCR'd
-   * contact screenshots and timed out repeatedly (6 failed describe_image calls).
-   *
-   * The timeout REJECTS with a "timed out" error, which isRetryableMediaToolError()
-   * classifies as retryable — so a primary-model timeout routes to the fallback
-   * model rather than aborting the whole tool call. Set the timeout to exactly 0
-   * (via AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS=0) to disable the bound entirely.
-   *
-   * Parsing fails CLOSED: a malformed override (non-numeric like "90s", negative,
-   * or NaN) falls back to the default bound rather than silently disabling it —
-   * otherwise a typo would recreate the exact unbounded-call bug this exists to
-   * prevent. Only a clean, explicit 0 disables the timeout.
-   */
-  private static readonly DEFAULT_DESCRIBE_IMAGE_TIMEOUT_MS = 90000;
-
-  private async callVisionLLMWithTimeout(model: string, messages: any[], options: any): Promise<any> {
-    const timeoutMs = AgentModeService.resolveDescribeImageTimeoutMs();
-    if (timeoutMs <= 0) {
-      return this.callLLM(model, messages, options);
-    }
-    let timer: NodeJS.Timeout | undefined;
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timer = setTimeout(
-        () => reject(new Error(`describe_image vision call to "${model}" timed out after ${timeoutMs}ms`)),
-        timeoutMs
-      );
-    });
-    try {
-      return await Promise.race([this.callLLM(model, messages, options), timeoutPromise]);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  }
-
-  /**
-   * Resolve the describe_image timeout (ms) from AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS.
-   * Fails closed: unset/empty/malformed/negative values yield the default bound; only
-   * a clean, explicit non-negative integer (including 0, which disables) is honored.
-   */
-  static resolveDescribeImageTimeoutMs(): number {
-    const raw = process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS;
-    if (raw === undefined || raw.trim() === '') {
-      return AgentModeService.DEFAULT_DESCRIBE_IMAGE_TIMEOUT_MS;
-    }
-    // Number() (not parseInt) so partial junk like "90s" becomes NaN instead of 90.
-    const parsed = Number(raw.trim());
-    if (!Number.isFinite(parsed) || parsed < 0) {
-      return AgentModeService.DEFAULT_DESCRIBE_IMAGE_TIMEOUT_MS;
-    }
-    return parsed;
-  }
-
-  /**
-   * Analyze an image with a vision-capable LLM.
-   *
-   * @param llmModel - Optional. When omitted (the agent-mode `describe_image` tool
-   *   intentionally passes nothing here), the configured vision model
-   *   (`agent_mode_vision_model`) is used. describe_image is a vision utility, so it
-   *   runs on its own dedicated vision model — independent of the chat/default model.
-   */
+  // ENG-2103 (F2 design-decision-list follow-up, Pattern A): body moved
+  // verbatim to emma/impl/mediaVideo.ts, along with callVisionLLMWithTimeout
+  // (private, confirmed by whole-backend grep to have exactly ONE caller,
+  // this method — deleted from the class, not wrapped) and
+  // resolveDescribeImageTimeoutMs/DEFAULT_DESCRIBE_IMAGE_TIMEOUT_MS (also
+  // moved; resolveDescribeImageTimeoutMs is no longer reachable off this
+  // class — agentModeService.describeImageTimeout.test.ts was retargeted to
+  // the module export). `callLLM`/`getVisionModel` are injected — both
+  // `public` on this class, so this wrapper binds them straight off `this`.
+  // Kept as a class method (not deleted) because routes/emmaApi.ts's POST
+  // /describe-media (non-video branch) and several dedicated tests
+  // (describeImageTimeout/describeImageFastFail/describeImageGeminiInline/
+  // describeImageVertex/visionModel/eng1858.usageAttribution) call
+  // agentModeService.describeImage(...) directly on a real instance.
+  // emma/tools.ts's describe_image tool is repointed to call the module
+  // directly. See emma/impl/mediaVideo.ts's own header comment for the full
+  // reasoning, including the sibling-function-spy fix this move required.
   public async describeImage(llmModel: string | undefined, imageUrl: string, prompt?: string, usageContext?: LLMUsageContext): Promise<any> {
-    try {
-      if (!imageUrl) {
-        return {
-          success: false,
-          message: 'No image URL provided'
-        };
-      }
-      if (!llmModel) {
-        llmModel = await this.getVisionModel();
-      }
-      // Use custom prompt or default
-      const analysisPrompt = prompt || 'Please analyze and describe this image in detail. Focus on visual elements, composition, colors, text, and any marketing or branding elements you can identify.';
-
-      // Vision models here require the image as inline bytes rather than a bare URL:
-      //  - Bedrock Converse API (anthropic.*) requires base64 data URIs.
-      //  - Anthropic-on-Vertex (claude-*) can take a url source, but our images are
-      //    typically private S3 objects Anthropic's fetcher cannot reach, so we
-      //    download and presign them into a base64 data URI here.
-      //  - Gemini (gemini-*) receives a non-data URL as `fileData.fileUri`. Gemini
-      //    DOES fetch these URLs successfully for ordinary screenshots (verified in
-      //    prod: 100+ sessions served by gemini-3.5-flash straight from an S3 URL),
-      //    but it rejects an un-downscaled 4K image (3072x5504, ~16MB from
-      //    gemini-3.1-flash-image) with a hard 400 INVALID_ARGUMENT. In prod that
-      //    oversize class failed on Gemini 100% of the time across every session
-      //    that attempted it. Downloading + downscaling + inlining here keeps the
-      //    payload self-contained and within Gemini's limits (ENG-834).
-      //    NOTE: until the native Gemini adapter landed (ENG-737, 2026-07-30) the
-      //    OpenAI-compat transport reported this as "400 status code (no body)",
-      //    which isRetryableMediaToolError() treats as retryable — so the Claude
-      //    fallback below silently rescued every one of these. The native adapter
-      //    surfaces Google's raw "...INVALID_ARGUMENT" JSON, which matches that
-      //    method's /invalid/i non-retryable pattern, so the fallback stopped
-      //    firing and the long-standing oversize bug became user-visible.
-      // Download the image and convert to a (downscaled) data URI for these models.
-      let resolvedImageUrl = imageUrl;
-      if (
-        (llmModel.startsWith('anthropic.') ||
-          llmModel.startsWith('claude-') ||
-          llmModel.startsWith('gemini-')) &&
-        !imageUrl.startsWith('data:')
-      ) {
-        try {
-          const axios = (await import('axios')).default;
-          // For private S3 URLs from our bucket, generate a presigned URL so the download succeeds
-          const { presignS3Url, isS3Url } = await import('../utils/s3Utils');
-          const isOwnS3 = isS3Url(imageUrl);
-          const fetchUrl = isOwnS3 ? (presignS3Url(imageUrl) ?? imageUrl) : imageUrl;
-          // Normalize content-type: strip any charset/extra params and trim whitespace.
-          // Do NOT default a missing/empty header to a native type here — that would
-          // short-circuit sharp detection and embed non-PNG bytes as image/png (ENG-370).
-          // Pass the raw/empty type through so normalizeImageForVision decodes via sharp.
-          let contentType: string;
-          let imageBuffer: Buffer;
-          if (isOwnS3) {
-            // Our own presigned S3 object: no redirects, no SSRF surface. Still
-            // size-capped — a user can put an arbitrarily large object in their
-            // own bucket, and the >4MB resize below only runs once the whole
-            // thing is already resident in memory, so the cap has to be enforced
-            // by the transport rather than after the fact (Greptile).
-            // `as any`: this repo's axios typings predate maxContentLength on the
-            // config interface (same workaround as the guarded fetch helper).
-            const imgResp = await axios.get<ArrayBuffer>(fetchUrl, {
-              responseType: 'arraybuffer',
-              timeout: 30000,
-              maxContentLength: DEFAULT_MAX_IMAGE_BYTES,
-              maxBodyLength: DEFAULT_MAX_IMAGE_BYTES,
-            } as any);
-            contentType = (imgResp.headers['content-type'] || '').split(';')[0].trim();
-            imageBuffer = Buffer.from(imgResp.data as ArrayBuffer);
-          } else {
-            // describe_image is an agent-callable foundation tool fed image URLs
-            // from untrusted content, so this server-side fetch of an agent-supplied
-            // URL is a reachable SSRF vector (cloud metadata, RFC1918/loopback).
-            // fetchBufferFollowingRedirects validates that the host resolves to a
-            // public IP and pins the connection to that exact address (DNS-rebinding
-            // safe) on EVERY hop — so redirects can be followed without reopening
-            // the bypass. Flatly refusing redirects would be safe but false-blocks
-            // ordinary one-hop image links such as Google Drive `uc?export=view`
-            // (ENG-834).
-            const fetched = await fetchBufferFollowingRedirects(fetchUrl);
-            contentType = fetched.contentType;
-            imageBuffer = fetched.buffer;
-          }
-          let finalContentType = contentType;
-          // Normalize to a vision-decodable format so the declared media type always
-          // matches the bytes. Fixes HEIC/AVIF/TIFF/BMP/SVG logos and mislabeled or
-          // octet-stream content-types that otherwise fail silently downstream (ENG-370).
-          const normalized = await AgentModeService.normalizeImageForVision(imageBuffer, contentType);
-          if (normalized.undecodable) {
-            // sharp could not decode these bytes, so no vision API can either.
-            // Fast-fail with actionable re-upload guidance instead of burning vision
-            // retries and agent workarounds on an unreadable file (ENG-370).
-            console.warn(
-              `AgentMode: describeImage could not decode uploaded image (content-type "${contentType || 'none'}"); fast-failing with re-upload guidance`
-            );
-            return {
-              success: false,
-              retryable: false,
-              message:
-                `The uploaded file could not be read as an image${contentType ? ` (its content type was "${contentType}")` : ''} — ` +
-                'it may be corrupted or in a format that cannot be decoded. Please re-upload the logo as a PNG or JPEG and try again.',
-              error: 'Image could not be decoded',
-            };
-          }
-          imageBuffer = normalized.buffer;
-          finalContentType = normalized.contentType;
-          // Auto-resize if image exceeds 4MB to stay under Bedrock's 5MB limit
-          if (imageBuffer.length > 4 * 1024 * 1024) {
-            try {
-              const sharp = (await import('sharp')).default;
-              imageBuffer = await sharp(imageBuffer)
-                .resize({ width: 1200, withoutEnlargement: true })
-                .jpeg({ quality: 85 })
-                .toBuffer();
-              finalContentType = 'image/jpeg';
-              console.log(`AgentMode: describeImage resized large image to ${imageBuffer.length} bytes (JPEG 85%, max 1200px wide)`);
-            } catch (resizeError) {
-              console.error('AgentMode: Failed to resize image, proceeding with original:', resizeError instanceof Error ? resizeError.message : resizeError);
-            }
-          }
-          const base64 = imageBuffer.toString('base64');
-          resolvedImageUrl = `data:${finalContentType};base64,${base64}`;
-          console.log(`AgentMode: describeImage downloaded image, final size=${imageBuffer.length} bytes, contentType="${finalContentType}", dataUri prefix="${resolvedImageUrl.substring(0, 40)}"`);
-        } catch (downloadError) {
-          console.error('AgentMode: Failed to download image for Bedrock, falling back to URL:', downloadError instanceof Error ? downloadError.message : downloadError);
-        }
-      }
-
-      // Create messages for vision API
-      const messages = [
-        {
-          role: 'system' as const,
-          // Describe only what is visibly on screen. A vision model has no way to
-          // confirm from a single image whether a depicted product, version number,
-          // or model name currently exists — its training data has a cutoff, and
-          // the subject may simply postdate it (this exact prompt has previously
-          // caused a real AgentWeb screenshot of AgentWeb's own model picker to be
-          // called a "fictional mockup" of models that "don't exist"). Authenticity/
-          // existence verdicts are a caller decision (verified via search or other
-          // tools), never this tool's to assert.
-          content:
-            'You describe images factually. Report only what is visibly present: text, layout, colors, objects, ' +
-            'and composition. Never assert or speculate about whether depicted content — a product, brand, ' +
-            'version number, model name, or claim — is real, fake, fictional, outdated, or currently exists. ' +
-            'You cannot verify that from an image alone, and confident guesses here are frequently wrong. If ' +
-            'something looks unfamiliar, describe it neutrally exactly as shown, without a verdict on its legitimacy.'
-        },
-        {
-          role: 'user' as const,
-          content: [
-            {
-              type: 'text' as const,
-              text: analysisPrompt
-            },
-            {
-              type: 'image_url' as const,
-              image_url: { url: resolvedImageUrl }
-            }
-          ]
-        }
-      ];
-
-      const visionModelUsed = llmModel;
-      // This is one OpenRouter request. Provider failover occurs inside its
-      // gateway, so AgentWeb never makes a second vision completion itself.
-      const response = await this.callVisionLLMWithTimeout(visionModelUsed, messages, {
-        max_completion_tokens: 2000,
-        // ENG-1858: vision analysis is the requesting user's work, not "system".
-        usageContext: usageContext ?? { feature: 'describe_image' },
-      });
-
-      const description = response.choices[0]?.message?.content || 'Unable to analyze image';
-
-      return {
-        success: true,
-        description: description,
-        imageUrl: imageUrl,
-        model: visionModelUsed,
-      };
-
-    } catch (error) {
-      console.error('AgentMode: Error describing image:', error);
-      // This is a catch-all: besides bad image bytes it also receives transient
-      // network/provider failures that escaped the vision-call fallback flow. Do
-      // NOT hard-code retryable:false here (that would make the agent give up on a
-      // request that could succeed on retry) and do not assert the file itself is
-      // the problem — only the undecodable-bytes fast-fail above is truly terminal.
-      return {
-        success: false,
-        message:
-          'Failed to analyze the image. It may be temporarily unavailable, inaccessible, or in a ' +
-          'format that cannot be read. If it is a logo file, try re-uploading it as a PNG or JPEG.',
-        error: error instanceof Error ? error.message : 'Unknown error'
-      };
-    }
+    return mediaVideoImpl.describeImage(
+      llmModel, imageUrl, prompt, usageContext,
+      this.callLLM.bind(this), this.getVisionModel.bind(this),
+    );
   }
 
   /**
@@ -16735,9 +16407,19 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return miscImpl.readFileContent(fileUrl);
   }
 
-  /**
-   * Generate an image using AI image generation models
-   */
+  // ENG-2103 (F2 design-decision-list follow-up, Pattern A): body moved
+  // verbatim to emma/impl/mediaVideo.ts. `callLLM`/`getVisionModel` are
+  // injected once at this class boundary — `generateImage` itself never
+  // calls `this.callLLM` directly (its only LLM-reaching path is the
+  // data-fabrication check through `describeImage`, which the module now
+  // calls as a plain same-module function, not a second injection point).
+  // Kept as a class method (not deleted) because routes/emmaApi.ts's POST
+  // /generate-image and agentModeService.generateImage.test.ts/
+  // .generateImage.brandLogo.test.ts's many direct real-instance calls all
+  // call agentModeService.generateImage(...) directly. emma/tools.ts's
+  // generate_image tool is repointed to call the module directly. See
+  // emma/impl/mediaVideo.ts's own header comment for the full reasoning,
+  // including the sibling-function-spy fix this move required.
   public async generateImage(
     prompt: string,
     filename: string,
@@ -16753,335 +16435,36 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     metricsVerified?: boolean,
     placement?: string
   ): Promise<any> {
-    // ENG-343: the producing flow must self-declare the eval use case — Matt's
-    // review feedback differs entirely between ads and organic posts, and a
-    // prompt-text classifier was explicitly ruled out. Missing/invalid input
-    // fails visibly (recorded decision 2026-07-27 on ENG-343) so the caller gets
-    // fixed instead of a falsely categorized candidate reaching the eval queue.
-    if (category !== 'ad' && category !== 'organic_post') {
-      return {
-        success: false,
-        error: 'invalid_category',
-        message:
-          `generate_image requires category: 'ad' | 'organic_post' (got ${JSON.stringify(category)}). ` +
-          `Declare the use case: 'ad' for paid ad creatives, 'organic_post' for organic social content.`
-      };
-    }
+    return mediaVideoImpl.generateImage(
+      prompt, filename, size, quality, inputImages, userId, sessionId,
+      imageModel, logoImage, confirm, category, metricsVerified, placement,
+      this.callLLM.bind(this), this.getVisionModel.bind(this),
+    );
+  }
 
-    // Human-in-the-loop gate for image EDITING (inputImages present). Editing the
-    // wrong source images is the wrong-set mistake from the satisfaction incident,
-    // so before regenerating/editing existing images we surface the exact source
-    // image(s) to the user (rendered as thumbnails via markdown) and wait for
-    // explicit approval. Text-to-image (no inputImages) is fresh creation and is
-    // NOT gated. The agent loop halts on `awaitingUserConfirmation`; on approval the
-    // model re-calls with confirm=true. `confirm` never reaches the image service.
-    if (Array.isArray(inputImages) && inputImages.length > 0 && confirm !== true) {
-      const thumbs = inputImages.map((url, i) => `![source image ${i + 1}](${url})`).join('\n');
-      const summary = `Edit/regenerate ${inputImages.length} existing image(s) and save the result as "${filename}".`;
-      return {
-        success: true,
-        requiresConfirmation: true,
-        awaitingUserConfirmation: true,
-        summary,
-        confirmationPrompt:
-          `Based on your request, here's the image edit I'm about to make — ` +
-          `please check these are the right source image(s) before I proceed:\n\n` +
-          `${summary}\n\n${thumbs}\n\n` +
-          `Reply "yes" / "confirm" to go ahead, or tell me which image(s) to use instead.`,
-        // Per-item body (no intro/footer) used when several edits are batched in one turn.
-        confirmationDetail: `${summary}\n\n${thumbs}`,
-        // Model-facing instruction for the resumed turn (mirrors the Meta gate): once
-        // the user approves the shown source image(s), re-call generate_image with the
-        // SAME arguments plus confirm=true. If the user names different images, edit
-        // those instead (which will re-confirm).
-        message: `Image edit requires user confirmation: ${summary} The source image(s) have been shown to the user. ` +
-          `Do NOT proceed until the user approves. Once approved, call generate_image again with the same arguments plus confirm=true. ` +
-          `If the user asks for different source images, use those instead.`,
-        target: { action: 'EDIT_IMAGE', filename, inputImages }
-      } as any;
-    }
+  /**
+   * ENG-2103 (F2): pure-function body moved to emma/impl/mediaVideo.ts.
+   * Kept as a thin `private` delegating wrapper only because
+   * agentModeService.generateImage.test.ts binds it off the real instance
+   * (`(agentModeService as any).estimateImageGenerationCost.bind(agentModeService)`).
+   */
+  private estimateImageGenerationCost(model: string): number {
+    return mediaVideoImpl.estimateImageGenerationCost(model);
+  }
 
-    try {
-      // ENG-326: branded text-to-image asks must composite the account's REAL
-      // persisted logo — never one the model invents. When the prompt asks for
-      // a logo and the model didn't pass logo_image, prefer the persisted
-      // brand logo (AC-2); when none is persisted, ask the user / point at
-      // brand config instead of generating (AC-3). Edits (inputImages) are
-      // out of scope — the source images already carry the branding.
-      //
-      // ENG-393: this gate is for COMPOSITING an existing brand logo, not for
-      // CREATING one. A prompt that asks to design a brand-new logo from
-      // scratch ("create a logo for X") must NOT be gated — an account with no
-      // logo yet legitimately wants to generate its first one, and blocking
-      // that also blocks landing-page generation. Let creation asks through;
-      // compositing asks ("add our logo to this banner") still gate.
-      if (
-        !logoImage &&
-        (!Array.isArray(inputImages) || inputImages.length === 0) &&
-        promptRequestsLogo(prompt) &&
-        !promptCreatesLogo(prompt)
-      ) {
-        const persistedLogo = await getPersistedBrandLogoUrlForUser(userId);
-        if (!persistedLogo) {
-          return missingBrandLogoToolResult();
-        }
-        logoImage = persistedLogo;
-        console.log(
-          `AgentMode: generate_image prompt asks for a logo — compositing the persisted brand logo (${persistedLogo})`
-        );
-      }
-
-      // Import the image generation service
-      const { imageService } = await import('./imageGeneration');
-
-      // Check if the service is available
-      const isAvailable = await imageService.isAvailable();
-      if (!isAvailable) {
-        return {
-          success: false,
-          message: 'Image generation service is not available. Please check API key configuration in AWS Secrets Manager.',
-          error: 'Service unavailable'
-        };
-      }
-
-      // ENG-510: distinguish an LLM-specified model from a system-resolved default.
-      // Only a genuine per-request choice should suppress the transient-timeout
-      // fallback; the admin-configured default is a system preference, not a
-      // semantic lock, so a timeout on it must still fail over to another provider
-      // instead of delivering zero images. Resolving the default here (rather than
-      // in the tool handler) preserves that distinction end-to-end.
-      const modelExplicitlyChosen = typeof imageModel === 'string' && imageModel.trim().length > 0;
-      const resolvedImageModel = modelExplicitlyChosen
-        ? imageModel
-        : await resolveModelForUser(userId, 'image');
-
-      const inputImagesForRequest = inputImages || [];
-      const primaryRequest = {
-        prompt,
-        filename,
-        size,
-        quality,
-        inputImages: inputImagesForRequest,
-        logoImage,
-        userId,
-        imageModel: resolvedImageModel,
-        // ENG-2187: the ad placement, when declared, sizes the creative gates' checks.
-        ...declaredPlacementField(placement)
-      };
-
-      let result: any;
-      let imageModelUsed = resolvedImageModel || 'gemini-3-pro-image-preview';
-      let fallbackUsed = false;
-      let primaryError: string | undefined;
-
-      try {
-        result = await imageService.generateImage(primaryRequest);
-      } catch (primaryFailure: any) {
-        primaryError = primaryFailure instanceof Error ? primaryFailure.message : String(primaryFailure);
-        const fallbackModel = this.getImageGenerationFallbackModel(resolvedImageModel, inputImagesForRequest, logoImage, modelExplicitlyChosen);
-        if (!fallbackModel || !this.isRetryableMediaToolError(primaryError)) {
-          throw primaryFailure;
-        }
-
-        console.warn(
-          `AgentMode: Image generation with "${imageModelUsed}" threw a retryable error; trying fallback "${fallbackModel}":`,
-          primaryError
-        );
-        try {
-          const fallbackQuality = quality === 'high' ? 'medium' : quality;
-          result = await imageService.generateImage({
-            ...primaryRequest,
-            quality: fallbackQuality,
-            imageModel: fallbackModel
-          });
-          imageModelUsed = fallbackModel;
-          fallbackUsed = true;
-          if (result.success && result.imageUrl) {
-            quality = fallbackQuality;
-          }
-        } catch (fallbackError: any) {
-          const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
-          return {
-            success: false,
-            message: `Image generation failed after primary and fallback attempts: ${fallbackMessage}`,
-            error: fallbackMessage,
-            primaryError,
-            fallbackModel
-          };
-        }
-      }
-
-      if (!(result.success && result.imageUrl) && !fallbackUsed) {
-        primaryError = result.error || 'Failed to generate image';
-        const fallbackModel = this.getImageGenerationFallbackModel(resolvedImageModel, inputImagesForRequest, logoImage, modelExplicitlyChosen);
-        if (fallbackModel && this.isRetryableMediaToolError(primaryError)) {
-          console.warn(
-            `AgentMode: Image generation with "${imageModelUsed}" failed with a retryable error; trying fallback "${fallbackModel}":`,
-            primaryError
-          );
-          try {
-            const fallbackQuality = quality === 'high' ? 'medium' : quality;
-            result = await imageService.generateImage({
-              ...primaryRequest,
-              quality: fallbackQuality,
-              imageModel: fallbackModel
-            });
-            imageModelUsed = fallbackModel;
-            fallbackUsed = true;
-            if (result.success && result.imageUrl) {
-              quality = fallbackQuality;
-            }
-          } catch (fallbackError: any) {
-            const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
-            return {
-              success: false,
-              message: `Image generation failed after primary and fallback attempts: ${fallbackMessage}`,
-              error: fallbackMessage,
-              primaryError,
-              fallbackModel
-            };
-          }
-        }
-      }
-
-      if (result.success && result.imageUrl) {
-        // Session cost accounting (agent-mode chat). The per-user burn shadow record is
-        // fired once at the generation SOURCE (imageService.generateImage) so every caller
-        // is metered exactly once — see llmPricing.imageGenerationCostUsd (ENG-200).
-        const imageCost = this.estimateImageGenerationCost(imageModelUsed);
-        chatbotDb.addToolCostToSession(sessionId, imageCost, 'generateImage').catch((err) =>
-          console.error('AgentMode: Failed to add image cost to session:', err)
-        );
-
-        // Save the image URL to the session for reference
-        const imageData = {
-          url: result.imageUrl,
-          filename: result.filename,
-          generatedAt: new Date().toISOString(),
-          prompt: prompt,
-          size: size,
-          quality: quality
-        };
-
-        // Store image data in session metadata (optional)
-        try {
-          await chatbotDb.addMessageToSession(sessionId, {
-            role: 'system',
-            content: `Image generated: ${result.filename}`,
-            metadata: {
-              timestamp: new Date().toISOString(),
-              // Stable marker so extractGeneratedImageFilenames can detect generated
-              // images without relying solely on the content-string format.
-              kind: 'image-generated',
-              imageFilename: result.filename,
-              // ENG-510: carry the URL on this immediately-persisted marker so a completed
-              // image is discoverable (scanMessagesForAssets) even if the whole-turn cap
-              // kills the turn before the end-of-turn toolCalls stamp runs — graceful
-              // partial delivery instead of losing finished work. De-duped by URL.
-              imageUrl: result.imageUrl
-            }
-          });
-        } catch (error) {
-          console.warn('Failed to store image generation metadata:', error);
-        }
-
-        const humanEvalCandidate = enqueueAutoHumanEval({
-          reviewType: 'creative_image',
-          userId,
-          sessionId,
-          category,
-          artifactUrl: result.imageUrl,
-          originalRequest: prompt,
-          outputSummary:
-            `Image generated: ${result.filename || filename}. ` +
-            `Model: ${imageModelUsed}. Size: ${size || 'default'}. Quality: ${quality || 'default'}.`,
-          sourceKey: `image:${sessionId}:${result.filename || filename}:${result.imageUrl}`,
-          creativeGates: result.gates,
-          // ENG-2140: the generation request is the only brief agent mode has; the placement
-          // comes from the gate result.
-          creativeBrief: { generationRequest: prompt },
-          action: {
-            type: 'agent_mode_image_revision',
-            sessionId,
-            userId,
-            artifactUrl: result.imageUrl,
-            filename: result.filename || filename,
-          },
-        });
-        // ENG-2141: creative lineage record (inert unless CREATIVE_LINEAGE_ENABLED + table). Not
-        // awaited and never throws; it links the human-eval candidate once that exists.
-        void recordGeneratedCreative(
-          { userId, artifactUrl: result.imageUrl, sessionId, category, prompt, generatorModel: imageModelUsed, gates: result.gates },
-          humanEvalCandidate,
-        );
-
-        // ENG-1027 data-fabrication backstop: the tool-description guidance alone is
-        // instruction-following-dependent, and live verification showed the image
-        // model can invent metrics even in prompts that never asked for real data
-        // (a bare "metrics preview" dashboard element is enough). For prompts shaped
-        // like a dashboard/table that Emma hasn't declared use verified real values
-        // (metricsVerified), run one bounded describe_image check against the actual
-        // output and surface a warning so Emma discloses rather than silently
-        // presenting invented numbers. Timeboxed tighter than describe_image's own
-        // 90s ENG-294 bound — this is an added, best-effort safety net the user never
-        // explicitly asked for, not worth spending that much turn budget on.
-        let dataReliabilityWarning: string | undefined;
-        if (promptRisksFabricatedMetrics(prompt, metricsVerified)) {
-          console.log(`AgentMode: generate_image data-fabrication check triggered (session ${sessionId})`);
-          try {
-            const visionCheck = await withTimeoutOrReject(
-              // ENG-1858: the check is part of this user's image generation.
-              this.describeImage(undefined, result.imageUrl, FABRICATED_METRICS_CHECK_PROMPT, { userId, sessionId, feature: 'describe_image' }),
-              FABRICATED_METRICS_CHECK_TIMEOUT_MS,
-              'generate_image data-fabrication check'
-            );
-            if (visionCheck?.success && describeImageReportsFabricatedMetrics(visionCheck.description)) {
-              dataReliabilityWarning = FABRICATED_METRICS_WARNING;
-              console.log(`AgentMode: generate_image data-fabrication check WARNED (session ${sessionId})`);
-            } else {
-              console.log(`AgentMode: generate_image data-fabrication check clear (session ${sessionId})`);
-            }
-          } catch (visionErr) {
-            console.warn('AgentMode: generate_image data-fabrication check failed/timed out (non-fatal):', visionErr);
-          }
-        }
-
-        return {
-          success: true,
-          message: `✅ Image "${result.filename}" generated successfully!`,
-          imageUrl: result.imageUrl,
-          filename: result.filename,
-          prompt: prompt,
-          size: size,
-          quality: quality,
-          imageModel: imageModelUsed,
-          ...(dataReliabilityWarning ? { dataReliabilityWarning } : {}),
-          ...(fallbackUsed ? { fallbackUsed: true, primaryError } : {})
-        };
-      } else {
-        if (fallbackUsed) {
-          return {
-            success: false,
-            message: `Image generation failed after primary and fallback attempts: ${result.error || 'Fallback image generation failed'}`,
-            error: result.error,
-            primaryError
-          };
-        }
-        return {
-          success: false,
-          message: result.error || 'Failed to generate image',
-          error: result.error
-        };
-      }
-
-    } catch (error: any) {
-      console.error('AgentMode: Error generating image:', error);
-      return {
-        success: false,
-        message: 'Failed to generate image',
-        error: error.message
-      };
-    }
+  /**
+   * ENG-2103 (F2): pure-function body moved to emma/impl/mediaVideo.ts.
+   * Kept as a thin `private` delegating wrapper only because
+   * agentModeService.generateImage.test.ts binds it off the real instance
+   * (`(agentModeService as any).getImageGenerationFallbackModel.bind(agentModeService)`).
+   */
+  private getImageGenerationFallbackModel(
+    currentModel: string | undefined,
+    inputImages: string[] | undefined,
+    logoImage: string | undefined,
+    modelExplicitlyChosen: boolean = false
+  ): string | undefined {
+    return mediaVideoImpl.getImageGenerationFallbackModel(currentModel, inputImages, logoImage, modelExplicitlyChosen);
   }
 
   // ENG-2103 (F2): leads/CRM-style delegation. Bodies moved verbatim to
@@ -18550,9 +17933,10 @@ Reply with ONLY one word: yes or no.`;
 // EMPLOYER_PROFILE_LOOKUP_TIMEOUT_MS/EMPLOYER_PROFILE_LOOKUP_CONCURRENCY
 // moved to emma/impl/linkedin.ts along with their only caller,
 // resolveEmployersForSizeFilter. withTimeoutOrReject itself moved to
-// emma/impl/shared/withTimeoutOrReject.ts (imported above) since it has a
-// second real caller that stays on this class forever (generateImage's
-// data-fabrication check).
+// emma/impl/shared/withTimeoutOrReject.ts, since it had a second real
+// caller, generateImage's data-fabrication check — generateImage has since
+// moved to emma/impl/mediaVideo.ts too (a later design-decision-list round),
+// which imports withTimeoutOrReject directly; this class no longer does.
 
 // ENG-2103 (F2 design-decision-list follow-up, Pattern A):
 // parseCompanyFromTitle and batchParseCompaniesFromTitlesWithLLM moved
