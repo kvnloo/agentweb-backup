@@ -132,6 +132,12 @@ const mockRunGenerationSmokeTest = jest.fn().mockResolvedValue(undefined);
 jest.mock("../services/landingPageSmokeTest", () => ({
   runGenerationSmokeTest: (...args: any[]) => mockRunGenerationSmokeTest(...args),
 }));
+// ENG-2193: dispatched fire-and-forget alongside the smoke test above — mocked the same way so
+// these tests never make a real PageSpeed Insights / Secrets Manager call.
+const mockRunLandingPagePageSpeedCheck = jest.fn().mockResolvedValue({ ok: false, checkedAt: "2026-01-01T00:00:00.000Z", error: "mocked" });
+jest.mock("../services/landingPagePageSpeedCheck", () => ({
+  runLandingPagePageSpeedCheck: (...args: any[]) => mockRunLandingPagePageSpeedCheck(...args),
+}));
 
 // Mock fs for filesystem fallback tests
 const mockFsExistsSync = jest.fn().mockReturnValue(false);
@@ -1997,6 +2003,11 @@ describe("v0Service - deployLandingPage", () => {
     expect(mockRunGenerationSmokeTest).toHaveBeenCalledWith(
       expect.objectContaining({ id: "page-1", status: "deployed" })
     );
+    // ENG-2193: dispatched alongside the smoke test, same fire-and-forget contract. Asserted
+    // against this run's own `result.deployedUrl` (not a hardcoded literal) — the domain the
+    // mocked healing call resolves to is shared mutable module state across this file's many
+    // tests and isn't this test's concern.
+    expect(mockRunLandingPagePageSpeedCheck).toHaveBeenCalledWith(result.deployedUrl);
   });
 
   it("FAIL: chats.downloadVersion throws → throws deployment error", async () => {
