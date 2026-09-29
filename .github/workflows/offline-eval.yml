@@ -1,0 +1,68 @@
+name: Offline eval (report-only)
+
+# ENG-2195: a pull request that changes prompt, model, skill or eval sources
+# runs the deterministic offline eval suite (`--target local`: committed
+# baseline, no credentials, no network, no LLM) and reports the verdict in the
+# job summary.
+#
+# This is a report, not a gate, and not a product suite:
+#   - offline-eval-report.sh exits 0 whatever the verdict and strips
+#     EVAL_GATE_BLOCKING, so this check cannot fail on a regression; a
+#     non-pass verdict is a warning annotation on the PR;
+#   - it is its own workflow with no `needs` in either direction, so it sits in
+#     front of nothing (ENG-1039) and is not a required check;
+#   - it runs only when the paths below change.
+# The blocking gate stays on Atem and staging (backend/docs/evals/OFFLINE_EVAL_GATE.md).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      # Prompts: Emma's system prompt, the session judge, creative-rubric and other prompt modules.
+      - 'backend/src/docs/agentModeSystemPrompt.ts'
+      - 'backend/src/services/sessionScoringService.ts'
+      - 'backend/src/services/**/*[Pp]rompt*.ts'
+      # Model registries.
+      - 'backend/src/services/agentMode/llmModelRegistry.ts'
+      - 'backend/src/services/imageModelRegistry.ts'
+      # Skill definitions: the service every skill write goes through, the hardening
+      # rewrites and the seed/patch/rewrite scripts that edit stored skills.
+      - 'backend/src/services/skillService.ts'
+      - 'backend/src/services/skillHardening/**'
+      - 'backend/src/scripts/*[Ss]kill*.ts'
+      - 'backend/src/scripts/rewrite-*.ts'
+      # The suite itself: graders, replay cases, fixtures, baselines and the CLI.
+      - 'backend/src/loops/eval/**'
+      - 'backend/src/loops/scripts/runOfflineEvalSuite.ts'
+      - '.github/workflows/offline-eval.yml'
+      - '.github/scripts/offline-eval-report.sh'
+
+permissions:
+  contents: read
+
+jobs:
+  offline-eval:
+    name: Offline eval suite (report-only)
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci --ignore-scripts
+      - name: Run the offline eval suite and report
+        env:
+          # No AWS credentials exist in this job; this also stops the SDK probing instance metadata.
+          AWS_EC2_METADATA_DISABLED: 'true'
+        run: bash .github/scripts/offline-eval-report.sh
