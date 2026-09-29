@@ -207,7 +207,7 @@ import {
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { publishWithResolvedBlogPublisher } from './blogPublishers';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
-import { isPlacementId } from './creativePlacementSpecs';
+import { declaredPlacementField } from './agentMode/generateImagePlacement';
 import { recordGeneratedCreative, stampMetaAdCreated, stampMetaAdCreativeChanged, stampMetaCreativeCreated, stampMetaImageUpload, stampMetaPublish } from './creativeLineage';
 import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
@@ -31317,7 +31317,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         userId,
         imageModel: resolvedImageModel,
         // ENG-2187: the ad placement, when declared, sizes the creative gates' checks.
-        ...(isPlacementId(placement) ? { placement } : {})
+        ...declaredPlacementField(placement)
       };
 
       let result: any;
