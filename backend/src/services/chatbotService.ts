@@ -441,6 +441,10 @@ export interface ChatSession {
       concision?: number;
       instructionCompliance?: number;
       unnecessaryPermissionRequest?: boolean;
+      // ENG-2189: binary criteria from the outcome rubric (shadow judge) only.
+      arguedWithInstruction?: boolean;
+      escalatedWhenNotRequired?: boolean;
+      failedToEscalate?: boolean;
     };
     // ENG-2138: written by a shadow judge (sampled, never the primary score), with its model.
     shadow?: boolean;

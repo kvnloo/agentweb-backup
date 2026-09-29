@@ -9,7 +9,7 @@
  */
 
 import { isRunFailurePlaceholder, type ResumeMessage } from '../../services/agentMode/core/resumePlan';
-import type { AgentLoopEvent, GraderWorkPlan, LedgerCall, SessionForGrading, SessionSpend } from './agentGraders';
+import type { AgentLoopEvent, GraderTurn, GraderWorkPlan, LedgerCall, SessionForGrading, SessionSpend } from './agentGraders';
 
 export type DocItem = Record<string, unknown>;
 
@@ -165,6 +165,61 @@ export function finalReplyOf(messages: readonly ResumeMessage[]): string | undef
   return undefined;
 }
 
+/**
+ * `{id, name}` of every tool call an assistant turn made, from whichever shape is present:
+ * the OpenAI-style top-level `tool_calls` (`{id, function: {name}}`) or the persister's own
+ * `metadata.toolCalls` (`{id, name, arguments, result, error}` — see toLedger above).
+ */
+function toolCallIdsAndNames(m: ResumeMessage): Array<{ id?: string; name?: string }> {
+  const fromMeta = Array.isArray(m.metadata?.toolCalls) ? m.metadata.toolCalls : [];
+  const fromTop = Array.isArray(m.tool_calls) ? m.tool_calls : [];
+  return [...fromMeta, ...fromTop].map((raw) => {
+    const call = rec(raw);
+    return { id: strOf(call?.id), name: strOf(call?.name) ?? strOf(rec(call?.function)?.name) };
+  });
+}
+
+/**
+ * Every assistant tool_call id → its name, across the whole session. A `tool` message's own
+ * `name` field is missing on some stored rows (ChatMessage.name is optional); the id it answers
+ * (`tool_call_id`) still resolves the name from the assistant turn that made the call.
+ */
+function toolNamesById(messages: readonly ResumeMessage[]): Map<string, string> {
+  const byId = new Map<string, string>();
+  for (const m of messages) {
+    if (m.role !== 'assistant') continue;
+    for (const { id, name } of toolCallIdsAndNames(m)) {
+      if (id && name && !byId.has(id)) byId.set(id, name);
+    }
+  }
+  return byId;
+}
+
+/**
+ * One GraderTurn per user message: its text, the tools that ran before the next user message
+ * (tool-result messages), and the last assistant text in between that is not a crash placeholder.
+ */
+export function toTurns(messages: readonly ResumeMessage[]): GraderTurn[] {
+  const namesById = toolNamesById(messages);
+  const turns: GraderTurn[] = [];
+  let current: GraderTurn | undefined;
+  for (const m of messages) {
+    if (m.role === 'user') {
+      current = { userText: textOf(m.content), toolNames: [] };
+      turns.push(current);
+    } else if (!current) {
+      continue;
+    } else if (m.role === 'tool') {
+      const name = strOf(rec(m)?.name) ?? (m.tool_call_id ? namesById.get(m.tool_call_id) : undefined);
+      if (name) current.toolNames.push(name);
+    } else if (m.role === 'assistant' && !isRunFailurePlaceholder(m)) {
+      const text = textOf(m.content).trim();
+      if (text) current.replyText = text;
+    }
+  }
+  return turns;
+}
+
 /** Same rule as sessionScoringService.endsWithRunFailurePlaceholder: the last non-system turn. */
 export function endsWithRunFailurePlaceholder(messages: readonly ResumeMessage[]): boolean {
   const nonSystem = messages.filter((m) => m.role !== 'system');
@@ -261,6 +316,7 @@ export function buildLoadedSession(
       endsWithRunFailurePlaceholder: endsWithRunFailurePlaceholder(messages),
       ...(finalReply ? { finalReply } : {}),
       userTurns: messages.filter((m) => m.role === 'user').length,
+      turns: toTurns(messages),
     },
     model: sessionModel(events, spend),
     ...(spend ? { spend: { costMicroUsd: spend.costMicroUsd, tokens: spend.tokens } } : {}),

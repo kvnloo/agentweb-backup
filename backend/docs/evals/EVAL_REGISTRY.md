@@ -23,6 +23,9 @@ harness (ENG-2136) produces those runs; record the result on the entry, with evi
 | agent-task-success | agent | code, offline | — | no |
 | agent-tool-correctness | agent | code, offline | — | no |
 | agent-groundedness-offline | agent | code, offline (finalize-guard lexicon) | — | no |
+| agent-reply-length-adherence | agent | code, real turns (ENG-2189) | — | no |
+| agent-format-adherence | agent | code, real turns (ENG-2189) | — | no |
+| agent-act-without-asking | agent | code, real turns (ENG-2189) | — | no |
 | agent-reply-length-fixtures | agent | code, offline (ENG-1312 fixtures, placeholder inputs) | — | no |
 | okareo-no-hallucinated-capabilities-v2 | agent | LLM judge (Okareo) | unknown | calibration set only |
 | enrichment-golden-set | agent | code | — | golden set, CRM enrichment only |
@@ -88,12 +91,54 @@ successful task. `scripts/evalAgentGraders.ts` runs them read-only over a date r
 results per model × task type with n and a Wilson CI. None is validated; pass^k needs the sandbox
 (ENG-1906).
 
+## Instruction adherence and escalation (ENG-2189)
+
+Three more deterministic graders in `loops/eval/agentGraders.ts` read each user turn and the
+agent's reply to it (AW-ChatMessages: the last assistant text before the next user message, and
+the tool-result messages in between). Each gives one pass / fail / not-applicable verdict per
+session with a reason code, and the rate is taken over the sessions it applied to:
+
+| Grader | Applies when the user message… | Fails when |
+| --- | --- | --- |
+| `agent-reply-length-adherence` | states a numeric limit ("in 3 sentences", "under 100 words", "maximum of 2 pages", "a 150-word summary") | the reply is over 1.5× the limit plus slack (25 words, 2 sentences, 1 paragraph; a page is 500 words) |
+| `agent-format-adherence` | asks for a table or a bulleted list in chat | the reply has no markdown / HTML table or list |
+| `agent-act-without-asking` | says to act ("go ahead", "just do it", "don't ask", "you have my approval") | the turn ran no work tool and the reply asks permission instead |
+
+They are kept conservative, so a miss is not applicable rather than a failure:
+- Vague asks ("keep it short") and per-item limits ("3 posts, each under 100 words") are not read.
+- Neither is anything in a message over 1,000 characters. In a pasted brief or a scheduled task
+  spec, a limit usually covers one part of the output. A 7-day prod run found every "one
+  sentence" hit inside one ~12k-character scheduled spec.
+- A table or list meant for a sheet, doc or deck is not checked, and neither is a turn that ran a
+  content-producing tool.
+- A which/what clarifying question is not a permission request.
+- Confirming a spend, publish, send or irreversible step passes (the ENG-1312 rule).
+
+`scripts/evalAgentGraders.ts` prints each rate with n and a 95% Wilson CI, overall and per
+model × task type. The eval-v2 sampler stores the verdicts and reason codes (sampler v2, never
+message text) and adds the three rates to every group. Rows written before v2 count as not
+applicable.
+
+The argues-with-user and escalation behaviours need judgement, so they are binary criteria on the
+shadow outcome judge (rubric `2026-09-28.reconstructed-2`, in `dimensions`):
+- `arguedWithInstruction`;
+- `escalatedWhenNotRequired`;
+- `failedToEscalate`.
+
+The golden-set agent criteria of the same names (`argued_with_instruction`,
+`escalated_when_not_required`, `failed_to_escalate`) make them labellable in EvalLabelling. For
+these three, `pass` means the behaviour happened, the same convention as the account-health
+states. The runValidation harness pairs them with the stored judge booleans (true = pass), and the
+three deterministic graders with `instruction_compliance`. The report prints the judge rates from
+`judgeScores.outcome-judge-b-shadow`; they stay at n=0 until OPS-1 (ENG-2146) enables the judge.
+None of the six is validated, so none may gate.
+
 ## Online sampler (ENG-2144)
 
 `cron/evalV2SamplerCron.ts` runs daily at 17:15 UTC when `EVAL_V2_SAMPLER_ENABLED=true`. It takes a
 seeded uniform random sample of `EVAL_V2_SAMPLE_SIZE` (default 50) of the sessions whose last
-activity fell on the previous UTC day (AdminUpdatedAtIndex query), grades them with the three
-deterministic agent graders above, and writes to `Dev-AW-LoopEvents`:
+activity fell on the previous UTC day (AdminUpdatedAtIndex query), grades them with the deterministic
+agent graders above (ENG-2137 and ENG-2189), and writes to `Dev-AW-LoopEvents`:
 
 | loopId | Sort key | Row |
 | --- | --- | --- |

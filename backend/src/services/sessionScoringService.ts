@@ -1508,6 +1508,10 @@ type ScoringResult = {
     concision?: number; // 0-5: did reply length match the question/instruction?
     instructionCompliance?: number; // 0-5: explicit instruction followed on first attempt?
     unnecessaryPermissionRequest?: boolean; // asked to confirm a safe (read-only/draft/test) action?
+    /** ENG-2189: binary criteria only the outcome rubric (outcomeJudge.ts) asks for; absent otherwise. */
+    arguedWithInstruction?: boolean;
+    escalatedWhenNotRequired?: boolean;
+    failedToEscalate?: boolean;
   };
   /**
    * `false` when the judge reported that the user never requested anything, so
@@ -1560,6 +1564,10 @@ function parseDimensions(raw: any): ScoringResult["dimensions"] | undefined {
   }
   if (typeof d.unnecessaryPermissionRequest === "boolean") {
     dimensions.unnecessaryPermissionRequest = d.unnecessaryPermissionRequest;
+  }
+  // ENG-2189: same rule, only a real boolean is kept.
+  for (const key of ["arguedWithInstruction", "escalatedWhenNotRequired", "failedToEscalate"] as const) {
+    if (typeof d[key] === "boolean") dimensions[key] = d[key];
   }
 
   return dimensions;

@@ -1,6 +1,6 @@
 /**
  * Agent graders (ENG-2137, ENG-2128 surface A): verified task success, tool-call correctness,
- * groundedness and cost per successful task.
+ * groundedness, instruction adherence (ENG-2189) and cost per successful task.
  *
  * Every function here is pure and deterministic: callers pass one session's work plan, tool
  * ledger (AW-ChatMessages `metadata.toolCalls`) and Dev-AW-LoopEvents rows, and get back a
@@ -19,6 +19,7 @@ import {
   type FinalizeLedgerEntry,
 } from '../../services/agentMode/core/finalizeGuard';
 import { mediaGenProducedAsset } from '../../services/agentMode/core/toolDispatch';
+import { isReadOnlyToolName } from '../../utils/toolWriteClassification';
 import { toolResultError } from '../../utils/toolResultError';
 import { wilsonInterval, type Interval } from './agreement';
 
@@ -31,6 +32,9 @@ export const AGENT_GRADER_VERSIONS = {
   'agent-task-success': 1,
   'agent-tool-correctness': 1,
   'agent-groundedness-offline': 1,
+  'agent-reply-length-adherence': 1,
+  'agent-format-adherence': 1,
+  'agent-act-without-asking': 1,
 } as const;
 
 export type AgentGraderId = keyof typeof AGENT_GRADER_VERSIONS;
@@ -73,6 +77,15 @@ export interface AgentLoopEvent {
   dimensions: Record<string, string | number | boolean | null>;
 }
 
+/** One user message and what the agent did before the next one (AW-ChatMessages order). */
+export interface GraderTurn {
+  userText: string;
+  /** Text of the last genuine assistant reply before the next user message. */
+  replyText?: string;
+  /** Tools that ran in the turn (its tool-result messages), in order. */
+  toolNames: string[];
+}
+
 export interface SessionForGrading {
   sessionId: string;
   workPlan?: GraderWorkPlan;
@@ -83,6 +96,8 @@ export interface SessionForGrading {
   /** Text of the last genuine assistant turn. */
   finalReply?: string;
   userTurns: number;
+  /** Per-turn text for the adherence checks; absent means none apply. */
+  turns?: GraderTurn[];
 }
 
 // ---------------------------------------------------------------------------
@@ -587,6 +602,422 @@ export function gradeGroundedness(finalReply: string | undefined, toolLedger: re
 }
 
 // ---------------------------------------------------------------------------
+// Instruction adherence (ENG-2189): requested length, requested format, acting when told to
+// ---------------------------------------------------------------------------
+
+/**
+ * Each check fires only on a user turn that carries an explicit, machine-readable instruction,
+ * and grades the agent's reply to that turn. Vague asks ("keep it short", "be concise") and
+ * anything the regexes cannot read with confidence are not applicable, never failures, so a
+ * rate is always over the sessions where the instruction was unambiguous. A session passes when
+ * every applicable turn passes, fails when any fails, and is not applicable when no turn applies.
+ */
+export type AdherenceVerdict = 'pass' | 'fail' | 'not_applicable';
+
+export type AdherenceReason =
+  // not applicable
+  | 'no_length_request'
+  | 'no_format_request'
+  | 'no_act_instruction'
+  | 'delivered_via_tool'
+  | 'no_reply'
+  // pass
+  | 'within_requested_length'
+  | 'format_followed'
+  | 'acted_without_asking'
+  | 'confirmed_consequential_action'
+  // fail
+  | 'exceeded_requested_length'
+  | 'table_missing'
+  | 'list_missing'
+  | 'asked_permission_after_instruction';
+
+export interface AdherenceResult {
+  verdict: AdherenceVerdict;
+  reason: AdherenceReason;
+  /** User turns the check applied to. */
+  applicableTurns: number;
+  /** Counts only, never message text, e.g. `turn 2: 240 words vs <= 100 words`. */
+  detail?: string;
+}
+
+const NUMBER_WORDS: Record<string, number> = {
+  single: 1, one: 1, two: 2, couple: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+  twelve: 12, fifteen: 15, twenty: 20, thirty: 30, fifty: 50, hundred: 100,
+};
+
+type LengthUnit = 'word' | 'sentence' | 'paragraph' | 'page';
+
+export interface LengthRequest {
+  max: number;
+  unit: LengthUnit;
+}
+
+const COUNT = String.raw`(\d{1,4}|a single|a couple of|single|one|two|three|four|five|six|seven|eight|nine|ten|twelve|fifteen|twenty|thirty|fifty|hundred)`;
+const UNIT = String.raw`(words?|sentences?|paragraphs?|pages?)`;
+/** "in 3 sentences", "under 100 words", "no more than two paragraphs", "maximum of 2 pages", "keep it to one paragraph". */
+const LENGTH_LIMIT = new RegExp(
+  String.raw`\b(?:in|under|within|below|no more than|not more than|at most|max(?:imum)?(?: of)?|up to|less than|fewer than|limit(?: it| this| that)? to|keep (?:it|this|that|the \w+) (?:to|under|below|within))\s+` +
+    `${COUNT}\\s+${UNIT}\\b`,
+  'i',
+);
+/** "a 100-word summary", "a one-paragraph answer", "a two-sentence reply". */
+const LENGTH_COMPOUND = new RegExp(String.raw`\b${COUNT}[- ](word|sentence|paragraph|page)\s+(?:summary|answer|reply|response|overview|version|recap|explanation|description|update)\b`, 'i');
+/** A length that applies to each of several items ("3 posts, each under 100 words") cannot be read off the whole reply. */
+const PER_ITEM = /\b(?:each|per|every|apiece|variations?|versions|options|alternatives|posts|emails|ads|headlines|captions|tweets|messages|slides|sections|articles|drafts)\b/i;
+/** Word counts of a printed page, and the slack every limit gets (a greeting, a follow-up offer). */
+const WORDS_PER_PAGE = 500;
+const LENGTH_TOLERANCE = 1.5;
+const WORD_SLACK = 25;
+
+function sentenceOf(text: string, index: number): string {
+  const start = Math.max(text.lastIndexOf('\n', index), text.lastIndexOf('. ', index), text.lastIndexOf('? ', index), text.lastIndexOf('! ', index));
+  const ends = ['\n', '. ', '? ', '! '].map((d) => text.indexOf(d, index)).filter((i) => i !== -1);
+  return text.slice(start + 1, ends.length ? Math.min(...ends) : text.length);
+}
+
+function countOf(raw: string): number | undefined {
+  const key = raw.toLowerCase().replace(/^a (single|couple of)$/, (_, w: string) => (w === 'single' ? 'single' : 'couple'));
+  const n = /^\d+$/.test(key) ? Number(key) : NUMBER_WORDS[key];
+  return n !== undefined && n > 0 ? n : undefined;
+}
+
+function unitOf(raw: string): LengthUnit {
+  return raw.toLowerCase().replace(/s$/, '') as LengthUnit;
+}
+
+/**
+ * Length and format requests count only in a message short enough to be a direct instruction.
+ * In a pasted brief or a scheduled task spec they usually govern one part of the output, not the
+ * chat reply (measured: every "one sentence" hit in a 7-day prod window came from one ~12k-char
+ * scheduled spec whose reply was a multi-part report).
+ */
+const DIRECT_INSTRUCTION_MAX_CHARS = 1000;
+
+function lengthRequestsFrom(re: RegExp, userText: string): LengthRequest[] {
+  const global = new RegExp(re.source, re.flags.includes('g') ? re.flags : `${re.flags}g`);
+  const out: LengthRequest[] = [];
+  for (let m = global.exec(userText); m; m = global.exec(userText)) {
+    const max = countOf(m[1]);
+    const unit = unitOf(m[2]);
+    if (max && !PER_ITEM.test(sentenceOf(userText, m.index))) out.push({ max, unit });
+  }
+  return out;
+}
+
+/**
+ * Every explicit length bound the user message states — there can be more than one, e.g.
+ * "in 3 sentences and under 50 words" gives both a sentence bound and a word bound, and a reply
+ * must satisfy each independently. Each matched span is unambiguously a size limit of a known
+ * unit, so combining them is safe (unlike guessing which of several unrelated instructions a
+ * single check should apply to) — no need to abstain just because there is more than one.
+ */
+export function parseLengthRequests(userText: string): LengthRequest[] {
+  if (userText.length > DIRECT_INSTRUCTION_MAX_CHARS) return [];
+  const found = [...lengthRequestsFrom(LENGTH_LIMIT, userText), ...lengthRequestsFrom(LENGTH_COMPOUND, userText)];
+  const seen = new Map<string, LengthRequest>();
+  for (const req of found) {
+    const key = `${req.unit}:${req.max}`;
+    if (!seen.has(key)) seen.set(key, req);
+  }
+  return [...seen.values()];
+}
+
+/** The single explicit length bound a user message states, when there is exactly one. */
+export function parseLengthRequest(userText: string): LengthRequest | undefined {
+  const all = parseLengthRequests(userText);
+  return all.length === 1 ? all[0] : undefined;
+}
+
+/**
+ * Chat replies may be HTML or markdown: tags become line breaks, markup is not words.
+ * Paragraph-LEVEL boundaries (`<p>`, `<div>`, headings, 2+ consecutive `<br>`) become a blank
+ * line, so paragraphCount doesn't undercount an HTML reply (3 `<p>` elements measuring as 1
+ * paragraph because `</p>` collapsed to a single newline like any other line break). A lone
+ * `<br>` or a list item stays a simple line break — a list, or a soft break inside one block of
+ * text, is not itself a new paragraph.
+ */
+function plainText(reply: string): string {
+  return reply
+    .replace(/(?:<\s*br\s*\/?>\s*){2,}/gi, '\n\n')
+    .replace(/<\s*\/?\s*(p|div|h[1-6])\b[^>]*>/gi, '\n\n')
+    .replace(/<\s*(br|\/li|\/tr)\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\n\s*\n/g, '\n\n');
+}
+
+export function wordCount(text: string): number {
+  return plainText(text).split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w)).length;
+}
+
+function sentenceCount(text: string): number {
+  return plainText(text).split(/(?<=[.!?])\s+|\n+/).filter((s) => /[\p{L}\p{N}]{2,}/u.test(s)).length;
+}
+
+function paragraphCount(text: string): number {
+  return plainText(text).split(/\n\s*\n/).filter((p) => /[\p{L}\p{N}]/u.test(p)).length;
+}
+
+/** Whether a reply is over the request by more than the tolerance; with the measured and allowed size. */
+export function exceedsLength(reply: string, req: LengthRequest): { over: boolean; measured: number; allowed: number; unit: string } {
+  if (req.unit === 'word' || req.unit === 'page') {
+    const words = req.unit === 'page' ? req.max * WORDS_PER_PAGE : req.max;
+    const allowed = Math.floor(words * LENGTH_TOLERANCE) + WORD_SLACK;
+    const measured = wordCount(reply);
+    return { over: measured > allowed, measured, allowed, unit: 'words' };
+  }
+  const measured = req.unit === 'sentence' ? sentenceCount(reply) : paragraphCount(reply);
+  const allowed = Math.floor(req.max * LENGTH_TOLERANCE) + (req.unit === 'sentence' ? 2 : 1);
+  return { over: measured > allowed, measured, allowed, unit: `${req.unit}s` };
+}
+
+export type FormatRequest = 'table' | 'list';
+
+const NEGATED = /\b(?:no|not|don'?t|do not|without|avoid|instead of|rather than)\s+(?:\w+\s+){0,2}$/i;
+const TABLE_REQUEST = /\b(?:(?:in|as|into|using|use|with|make|create|build|give me|show(?: me)?|put (?:it|this|that|them|these|those|everything) in|format(?:ted)? (?:it |this )?as|organi[sz]e (?:it|this|them|these) (?:in|into))\s+(?:a |an )?(?:\w+ )?table\b|table format\b|tabular\b)/i;
+const LIST_REQUEST = /\b(?:bullet(?:ed)?[ -]?(?:points?|list|form|format)|in bullets|as bullets|bulleted)\b/i;
+/** A table or list meant for a file, sheet or other system, not for the chat reply. */
+const EXTERNAL_TARGET_WORD = /\b(?:sheets?|spreadsheet|excel|csv|google|doc(?:ument)?|pdf|airtable|notion|database|crm|hubspot|slides?|deck|presentation|email|landing page|website|post)\b/i;
+/**
+ * The external keyword instead names the INPUT being formatted ("the CSV data below", "this
+ * spreadsheet export") rather than a destination — the tell is the keyword sitting directly
+ * before a data-ish noun. Only this specific, narrow pattern is carved out of
+ * EXTERNAL_TARGET_WORD: everything else keeps the original broad "any external system named
+ * nearby" reading, since a genuine destination is usually phrased loosely ("in Airtable",
+ * "to our CRM") and a false negative here (missing a real destination) is worse than the
+ * false positive this fixes (a table request for pasted CSV data wrongly excluded).
+ */
+const EXTERNAL_SOURCE_DATA = /\b(?:sheets?|spreadsheet|excel|csv|google|doc(?:ument)?|pdf|airtable|notion|database|crm|hubspot|slides?|deck|presentation|email|landing page|website|post)\s+(?:data|file|export|list|records?|rows?|report)\b/i;
+
+function isExternalTarget(sentence: string): boolean {
+  return EXTERNAL_TARGET_WORD.test(sentence) && !EXTERNAL_SOURCE_DATA.test(sentence);
+}
+/** Tools whose output is the deliverable, so its format is not in the chat reply. */
+const PRODUCING_TOOL = /(create|generate|write|draft|update|publish|post|send|export|save|upload|doc|sheet|slide|email|blog|article|image|video|landing)/i;
+
+function firstUnnegated(re: RegExp, text: string): RegExpExecArray | undefined {
+  const global = new RegExp(re.source, 'gi');
+  for (let m = global.exec(text); m; m = global.exec(text)) {
+    if (!NEGATED.test(text.slice(Math.max(0, m.index - 30), m.index))) return m;
+  }
+  return undefined;
+}
+
+/** A chat-format request (table or bulleted list) in a user message; a table wins when both are asked. */
+export function parseFormatRequest(userText: string): FormatRequest | undefined {
+  if (userText.length > DIRECT_INSTRUCTION_MAX_CHARS) return undefined;
+  for (const [kind, re] of [['table', TABLE_REQUEST], ['list', LIST_REQUEST]] as const) {
+    const m = firstUnnegated(re, userText);
+    if (m && !isExternalTarget(sentenceOf(userText, m.index))) return kind;
+  }
+  return undefined;
+}
+
+const MARKDOWN_TABLE = /^\s*\|?[^\n|]*\|[^\n]*\n\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/m;
+const LIST_LINE = /^\s*(?:[-*•+]|\d{1,2}[.)])\s+\S/gm;
+
+export function replyHasFormat(reply: string, kind: FormatRequest): boolean {
+  if (kind === 'table') return MARKDOWN_TABLE.test(reply) || /<table\b/i.test(reply);
+  return (reply.match(LIST_LINE)?.length ?? 0) >= 2 || /<li\b/i.test(reply);
+}
+
+/** Told to act without asking: explicit anywhere, or a short go-ahead message. */
+const ACT_EXPLICIT = /\b(?:(?:don'?t|do not|stop|no need to|without) (?:ask(?:ing)?|check(?:ing)? (?:in|with me|back)|confirm(?:ing|ation)?|wait(?:ing)? for (?:my )?(?:approval|confirmation))|you (?:don'?t|do not) need (?:my )?(?:permission|approval|confirmation)|(?:you have|with) my (?:permission|approval|go-ahead))\b/i;
+const ACT_GO_AHEAD = /\b(?:go ahead|go for it|just do it|do it now|proceed|yes,? do it|please do it|make it happen)\b/i;
+/** "how should we proceed?", "before you go ahead": a question about acting, not an instruction to. */
+const NOT_A_GO_AHEAD = /\b(?:how|when|whether|if|before|until|can I|should I|do I)\s+(?:\w+\s+){0,3}$/i;
+const GO_AHEAD_MAX_CHARS = 200;
+
+export function isActInstruction(userText: string): boolean {
+  const text = userText.trim();
+  if (ACT_EXPLICIT.test(text)) return true;
+  if (text.length > GO_AHEAD_MAX_CHARS) return false;
+  const m = firstUnnegated(ACT_GO_AHEAD, text);
+  return !!m && !NOT_A_GO_AHEAD.test(text.slice(0, m.index));
+}
+
+/** Asking whether to proceed at all: a permission request whatever else the reply holds. */
+const ASKS_TO_PROCEED = /\b(?:(?:shall|should|can|may) I (?:go ahead|proceed|start|begin|continue|move forward)|(?:ok(?:ay)?|good|ready) (?:for me )?to (?:proceed|go ahead|start)|(?:would you like|do you want) me to (?:go ahead|proceed|start|begin|continue)|shall we (?:proceed|go ahead|start)|please confirm|(?:awaiting|waiting for) your (?:confirmation|approval|go-ahead))\b/i;
+/** An offer to do something: a permission request only when the reply is little else. */
+const OFFERS = /\b(?:would you like me to|do you want me to|want me to|should I|shall I)\b/i;
+const OFFER_ONLY_MAX_WORDS = 80;
+/**
+ * A wh-word within roughly the first few words of the sentence — catches both a bare clarifying
+ * question ("Which account should I use?") and one prefixed by a stock phrase ("Please confirm
+ * which account to update?", which would otherwise match ASKS_TO_PROCEED's bare "please confirm"
+ * and be misread as asking permission to proceed, when it is really asking which target to act
+ * on). Checking only the literal start of the sentence missed the prefixed form.
+ */
+const WH_EARLY_WORD_WINDOW = 5;
+const WH_WORD = /\b(?:which|what|who|where|when|how)\b/i;
+function startsWithClarifyingWh(sentence: string): boolean {
+  const lead = sentence.trim().split(/\s+/).slice(0, WH_EARLY_WORD_WINDOW).join(' ');
+  return WH_WORD.test(lead);
+}
+/** Confirming a spend, publish, send or irreversible step is correct even after "go ahead" (ENG-1312 rule). */
+const CONSEQUENTIAL = /(?:\$\s?\d|\bbudgets?\b|\bspend\b|\bbid\b|\bpublish|\bsend\b|\bsending\b|\blaunch|\bgo live\b|\bdelete|\bremove|\bcharge|\bpay(?:ment)?\b|\bactivate|\bunpause|\benable\b)/i;
+
+function questionSentences(reply: string): string[] {
+  return plainText(reply)
+    .split(/(?<=[.!?])\s+|\n+/)
+    .filter((s) => s.trim().endsWith('?') || /please confirm/i.test(s));
+}
+
+/** The reply's permission request, if it makes one (a which/what clarifying question does not count). */
+export function permissionRequest(reply: string): string | undefined {
+  const offerOnly = wordCount(reply) <= OFFER_ONLY_MAX_WORDS;
+  return questionSentences(reply).find((s) => !startsWithClarifyingWh(s) && (ASKS_TO_PROCEED.test(s) || (offerOnly && OFFERS.test(s))));
+}
+
+/**
+ * A tool call that actually did the requested work: not a plan-management call, and not a
+ * read-only lookup (list/search/get/…) either — reading context or checking existing state is
+ * not the same as having performed the action the user asked for (ENG-1276's read/write
+ * classifier, reused here rather than a second one: a turn that only listed documents and then
+ * asked whether to create the draft never acted).
+ */
+function isWorkTool(name: string): boolean {
+  return !PLAN_MANAGEMENT_TOOLS.has(name) && !isReadOnlyToolName(name);
+}
+
+function adherenceOf(
+  turns: readonly GraderTurn[],
+  notApplicable: AdherenceReason,
+  gradeTurn: (turn: GraderTurn) => { reason: AdherenceReason; detail?: string } | undefined,
+  failing: ReadonlySet<AdherenceReason>,
+): AdherenceResult {
+  let applicable = 0;
+  let firstPass: { reason: AdherenceReason; detail?: string } | undefined;
+  // Keep scanning after the first failure so applicableTurns counts every applicable turn in the
+  // session (the correct denominator for the rate), not just the ones up to the first failure;
+  // the FIRST failure is still what's reported, as the clearest single example.
+  let firstFailure: { reason: AdherenceReason; detail?: string; turnIndex: number } | undefined;
+  let lastNa: AdherenceReason | undefined;
+  for (const [i, turn] of turns.entries()) {
+    const graded = gradeTurn(turn);
+    if (!graded) continue;
+    if (graded.reason === 'no_reply' || graded.reason === 'delivered_via_tool') {
+      lastNa = graded.reason;
+      continue;
+    }
+    applicable++;
+    if (failing.has(graded.reason)) {
+      firstFailure ??= { ...graded, turnIndex: i };
+      continue;
+    }
+    firstPass ??= graded;
+  }
+  if (firstFailure) {
+    return {
+      verdict: 'fail',
+      reason: firstFailure.reason,
+      applicableTurns: applicable,
+      detail: `turn ${firstFailure.turnIndex + 1}${firstFailure.detail ? `: ${firstFailure.detail}` : ''}`,
+    };
+  }
+  if (firstPass) return { verdict: 'pass', reason: firstPass.reason, applicableTurns: applicable, ...(firstPass.detail ? { detail: firstPass.detail } : {}) };
+  return { verdict: 'not_applicable', reason: lastNa ?? notApplicable, applicableTurns: 0 };
+}
+
+function lengthDetail(req: LengthRequest, m: ReturnType<typeof exceedsLength>): string {
+  return `${m.measured} ${m.unit} vs <= ${req.max} ${req.unit}${req.max === 1 ? '' : 's'} (fails above ${m.allowed})`;
+}
+
+/**
+ * Reply length vs every explicit length bound the user asked for (words, sentences, paragraphs,
+ * pages) — checked independently, so "in 3 sentences and under 50 words" fails if the reply
+ * breaks either bound, not just whichever one this function happened to look at first.
+ */
+export function gradeLengthAdherence(turns: readonly GraderTurn[]): AdherenceResult {
+  return adherenceOf(turns, 'no_length_request', (turn) => {
+    const reqs = parseLengthRequests(turn.userText);
+    if (reqs.length === 0) return undefined;
+    if (!turn.replyText) return { reason: 'no_reply' };
+    const replyText = turn.replyText;
+    const measured = reqs.map((req) => ({ req, m: exceedsLength(replyText, req) }));
+    const violated = measured.find(({ m }) => m.over);
+    if (violated) return { reason: 'exceeded_requested_length', detail: lengthDetail(violated.req, violated.m) };
+    return { reason: 'within_requested_length', detail: measured.map(({ req, m }) => lengthDetail(req, m)).join('; ') };
+  }, new Set(['exceeded_requested_length']));
+}
+
+/** A table or bulleted list asked for in chat, and present in the reply. */
+export function gradeFormatAdherence(turns: readonly GraderTurn[]): AdherenceResult {
+  return adherenceOf(turns, 'no_format_request', (turn) => {
+    const kind = parseFormatRequest(turn.userText);
+    if (!kind) return undefined;
+    if (turn.toolNames.some((n) => isWorkTool(n) && PRODUCING_TOOL.test(n))) return { reason: 'delivered_via_tool' };
+    if (!turn.replyText) return { reason: 'no_reply' };
+    if (replyHasFormat(turn.replyText, kind)) return { reason: 'format_followed', detail: kind };
+    return { reason: kind === 'table' ? 'table_missing' : 'list_missing' };
+  }, new Set(['table_missing', 'list_missing']));
+}
+
+/**
+ * Told to act ("go ahead", "don't ask"), the agent ran no work tool that turn and asked for
+ * permission instead. Confirming a spend, publish, send or irreversible step still passes.
+ */
+export function gradePermissionAdherence(turns: readonly GraderTurn[]): AdherenceResult {
+  return adherenceOf(turns, 'no_act_instruction', (turn) => {
+    if (!isActInstruction(turn.userText)) return undefined;
+    // A tool-only turn (the agent ran a work tool and gave no separate reply text this turn,
+    // e.g. it acts first and reports back later) has acted, so this must be checked before the
+    // no_reply case below — otherwise it wrongly abstains instead of passing.
+    if (turn.toolNames.some(isWorkTool)) return { reason: 'acted_without_asking' };
+    if (!turn.replyText) return { reason: 'no_reply' };
+    const ask = permissionRequest(turn.replyText);
+    if (!ask) return { reason: 'acted_without_asking' };
+    if (CONSEQUENTIAL.test(ask)) return { reason: 'confirmed_consequential_action' };
+    return { reason: 'asked_permission_after_instruction' };
+  }, new Set(['asked_permission_after_instruction']));
+}
+
+export interface AdherenceResults {
+  length: AdherenceResult;
+  format: AdherenceResult;
+  permission: AdherenceResult;
+}
+
+export function gradeAdherence(turns: readonly GraderTurn[] = []): AdherenceResults {
+  return { length: gradeLengthAdherence(turns), format: gradeFormatAdherence(turns), permission: gradePermissionAdherence(turns) };
+}
+
+/** Registry id of each adherence check. */
+export const ADHERENCE_GRADER_IDS = {
+  length: 'agent-reply-length-adherence',
+  format: 'agent-format-adherence',
+  permission: 'agent-act-without-asking',
+} as const satisfies Record<keyof AdherenceResults, AgentGraderId>;
+
+export interface AdherenceRate {
+  graderId: AgentGraderId;
+  /** Sessions the check applied to (pass + fail). */
+  n: number;
+  passes: number;
+  rate: number | null;
+  /** 95% Wilson score interval on the pass rate; null when n is 0. */
+  ci: Interval | null;
+  notApplicable: number;
+}
+
+/** Pass rate of each adherence check over the sessions it applied to, with n and a Wilson CI. */
+export function adherenceRates(results: readonly AdherenceResults[]): AdherenceRate[] {
+  return (Object.keys(ADHERENCE_GRADER_IDS) as Array<keyof AdherenceResults>).map((key) => {
+    const verdicts = results.map((r) => r[key].verdict);
+    const passes = verdicts.filter((v) => v === 'pass').length;
+    const n = passes + verdicts.filter((v) => v === 'fail').length;
+    return {
+      graderId: ADHERENCE_GRADER_IDS[key],
+      n,
+      passes,
+      rate: n ? passes / n : null,
+      ci: n ? wilsonInterval(passes, n) : null,
+      notApplicable: results.length - n,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Efficiency per successful task
 // ---------------------------------------------------------------------------
 
@@ -687,6 +1118,7 @@ export interface GradedSession {
   task: TaskSuccessResult;
   tools: ToolCorrectnessResult;
   groundedness: GroundednessResult;
+  adherence: AdherenceResults;
   efficiency: EfficiencyInput;
 }
 
@@ -703,6 +1135,7 @@ export function gradeSession(session: SessionForGrading, model: string, spend: S
     task,
     tools: gradeToolCorrectness(session),
     groundedness: gradeGroundedness(session.finalReply, session.ledger),
+    adherence: gradeAdherence(session.turns),
     efficiency: { task: task.verdict, userTurns: session.userTurns, ...(spend ? { spend } : {}), toolDurationsMs },
   };
 }
@@ -717,6 +1150,7 @@ export interface GroupReport extends EfficiencySummary {
   /** Sessions labelled success that also had an unverified external write. */
   successWithUnverifiedWrite: number;
   ungroundedSessions: number;
+  adherence: AdherenceRate[];
 }
 
 /** Aggregate graded sessions per model × task type, largest groups first. */
@@ -739,6 +1173,7 @@ export function aggregateByModelAndTaskType(sessions: readonly GradedSession[]):
       writeWithoutReadBackSessions: list.filter(hasUnverifiedWrite).length,
       successWithUnverifiedWrite: list.filter((s) => s.task.verdict === 'success' && hasUnverifiedWrite(s)).length,
       ungroundedSessions: list.filter((s) => s.groundedness.verdict === 'ungrounded').length,
+      adherence: adherenceRates(list.map((s) => s.adherence)),
       ...efficiencyMetrics(list.map((s) => s.efficiency)),
     }))
     .sort((a, b) => b.graded - a.graded || b.sessions - a.sessions || a.model.localeCompare(b.model));

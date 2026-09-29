@@ -19,10 +19,20 @@ import type { EvalSurface } from './evalRegistry';
 
 export const GOLDEN_CASE_SCHEMA_VERSION = 1;
 
-/** Per-surface binary criteria. Agent: ENG-2128 surface A. Creative: the ENG-421 launch-ready
- * floor. Account: the ENG-2133 truth states — `pass` means the state applies to the account. */
+/** Per-surface binary criteria. Agent: ENG-2128 surface A; the last three (ENG-2189) are
+ * behaviours, where `pass` means the behaviour happened, as the shadow judge's true. Creative: the
+ * ENG-421 launch-ready floor. Account: the ENG-2133 truth states — `pass` means the state applies
+ * to the account. */
 export const GOLDEN_CRITERIA = {
-  agent: ['task_success', 'tool_correctness', 'groundedness', 'instruction_compliance'],
+  agent: [
+    'task_success',
+    'tool_correctness',
+    'groundedness',
+    'instruction_compliance',
+    'argued_with_instruction',
+    'escalated_when_not_required',
+    'failed_to_escalate',
+  ],
   creative: ['hook', 'offer', 'proof_integrity', 'brand_fidelity', 'format_readiness', 'policy_risk', 'buyer_usefulness'],
   account_health: ['activation_incomplete', 'at_risk', 'healthy'],
 } as const satisfies Record<EvalSurface, readonly string[]>;

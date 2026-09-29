@@ -18,7 +18,15 @@
 import type { DynamoAttributeMap } from '../core/ports';
 import type { LoopId } from '../core/types';
 import { asLoopId } from '../core/types';
-import { AGENT_GRADER_VERSIONS, type AgentGraderId, type GradedSession, type TaskVerdict } from './agentGraders';
+import {
+  ADHERENCE_GRADER_IDS,
+  AGENT_GRADER_VERSIONS,
+  type AdherenceResults,
+  type AdherenceVerdict,
+  type AgentGraderId,
+  type GradedSession,
+  type TaskVerdict,
+} from './agentGraders';
 import { wilsonInterval, type Interval } from './agreement';
 import { mayGate } from './evalRegistry';
 
@@ -32,7 +40,7 @@ export const EVT_EVAL_V2_SAMPLE_RUN = 'eval_v2_sample_run';
 export const EVT_EVAL_V2_SNAPSHOT = 'eval_v2_snapshot';
 
 /** Bump when the sampling frame or the row shape changes. */
-export const EVAL_V2_SAMPLER_VERSION = 1;
+export const EVAL_V2_SAMPLER_VERSION = 2;
 
 export const EVAL_V2_WINDOWS = { '1d': 1, '7d': 7 } as const;
 export type EvalV2WindowLabel = keyof typeof EVAL_V2_WINDOWS;
@@ -165,6 +173,13 @@ export function buildScoredEventItem(graded: GradedSession, ctx: ScoreContext, s
       toolFindingKinds: findingKinds.join(','),
       groundednessVerdict: graded.groundedness.verdict,
       unbackedClaimClasses: graded.groundedness.unbackedClaimClasses.join(','),
+      // ENG-2189 (sampler v2): instruction-adherence verdicts and reason codes.
+      lengthVerdict: graded.adherence.length.verdict,
+      lengthReason: graded.adherence.length.reason,
+      formatVerdict: graded.adherence.format.verdict,
+      formatReason: graded.adherence.format.reason,
+      permissionVerdict: graded.adherence.permission.verdict,
+      permissionReason: graded.adherence.permission.reason,
       userTurns: ctx.userTurns,
       frameSize: ctx.frameSize,
       sampleSize: ctx.sampleSize,
@@ -184,11 +199,15 @@ export interface EvalV2Score {
   toolVerdict: 'pass' | 'fail';
   toolCalls: number;
   groundednessVerdict: 'grounded' | 'ungrounded' | 'no_claims';
+  /** ENG-2189; rows written before sampler v2 have none, and count as not applicable. */
+  adherence?: Partial<Record<keyof AdherenceResults, AdherenceVerdict>>;
   graderVersions: Partial<Record<AgentGraderId, number>>;
 }
 
 const TASK_VERDICTS: ReadonlySet<string> = new Set<TaskVerdict>(['success', 'failure', 'excluded']);
 const GROUNDEDNESS_VERDICTS: ReadonlySet<string> = new Set(['grounded', 'ungrounded', 'no_claims']);
+const ADHERENCE_VERDICTS: ReadonlySet<string> = new Set<AdherenceVerdict>(['pass', 'fail', 'not_applicable']);
+const ADHERENCE_KEYS = Object.keys(ADHERENCE_GRADER_IDS) as Array<keyof AdherenceResults>;
 
 /** A stored `eval_v2_scored` row back into a score, or null for any other or malformed row. */
 export function parseScoredEvent(item: Record<string, unknown>): EvalV2Score | null {
@@ -200,6 +219,11 @@ export function parseScoredEvent(item: Record<string, unknown>): EvalV2Score | n
   const groundednessVerdict = str('groundednessVerdict');
   if (!str('sessionId') || !str('sampleDate') || !TASK_VERDICTS.has(taskVerdict)) return null;
   if ((toolVerdict !== 'pass' && toolVerdict !== 'fail') || !GROUNDEDNESS_VERDICTS.has(groundednessVerdict)) return null;
+  const adherence: NonNullable<EvalV2Score['adherence']> = {};
+  for (const key of ADHERENCE_KEYS) {
+    const verdict = str(`${key}Verdict`);
+    if (ADHERENCE_VERDICTS.has(verdict)) adherence[key] = verdict as AdherenceVerdict;
+  }
   return {
     sessionId: str('sessionId'),
     sampleDate: str('sampleDate'),
@@ -210,6 +234,7 @@ export function parseScoredEvent(item: Record<string, unknown>): EvalV2Score | n
     toolVerdict,
     toolCalls: typeof d.toolCalls === 'number' ? d.toolCalls : 0,
     groundednessVerdict: groundednessVerdict as EvalV2Score['groundednessVerdict'],
+    adherence,
     graderVersions: parseGraderVersionTag(str('graders')),
   };
 }
@@ -272,6 +297,10 @@ const METRIC_OUTCOMES: ReadonlyArray<{ graderId: AgentGraderId; outcome: (s: Eva
     graderId: 'agent-groundedness-offline',
     outcome: (s) => (s.groundednessVerdict === 'no_claims' ? 'not_applicable' : s.groundednessVerdict === 'grounded' ? 'pass' : 'fail'),
   },
+  ...ADHERENCE_KEYS.map((key) => ({
+    graderId: ADHERENCE_GRADER_IDS[key],
+    outcome: (s: EvalV2Score): Outcome => s.adherence?.[key] ?? 'not_applicable',
+  })),
 ];
 
 export interface EvalV2Metric {

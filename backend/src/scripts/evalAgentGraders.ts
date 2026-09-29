@@ -5,6 +5,10 @@
  * and writes nothing, anywhere. Output carries session ids, tool names and counts only, never
  * message text or work-plan titles.
  *
+ * ENG-2189 adds the instruction-adherence checks (pass rate over the sessions each applies to,
+ * with n and a 95% Wilson CI) and the shadow outcome judge's binary criteria (share of its
+ * scored sessions where each behaviour happened), read from judgeScores[outcome-judge-b-shadow].
+ *
  * Usage (default AWS profile; NODE_ENV=development reads the Dev- tables):
  *   npx ts-node --transpile-only src/scripts/evalAgentGraders.ts --from 2026-09-18 --to 2026-09-25 \
  *     [--limit 500] [--per-session] [--json]
@@ -14,8 +18,17 @@
  */
 
 import AWS from 'aws-sdk';
-import { aggregateByModelAndTaskType, gradeSession, type GradedSession, type GroupReport } from '../loops/eval/agentGraders';
-import { loadSessionsForGrading, type ReadOnlyDocReader, type ReadRequest } from '../loops/eval/agentGraderLoader';
+import {
+  adherenceRates,
+  aggregateByModelAndTaskType,
+  gradeSession,
+  type AdherenceRate,
+  type GradedSession,
+  type GroupReport,
+} from '../loops/eval/agentGraders';
+import { loadSessionsForGrading, type DocItem, type ReadOnlyDocReader, type ReadRequest } from '../loops/eval/agentGraderLoader';
+import { wilsonInterval, type Interval } from '../loops/eval/agreement';
+import { OUTCOME_SHADOW_JUDGE_ID } from '../services/outcomeJudge';
 import { LOOP_EVENTS_TABLE } from '../loops/core/sensors/eventTableEventSource';
 import { SPEND_EVENTS_TABLE } from '../services/spendEventDb';
 
@@ -117,6 +130,77 @@ const HEADER = [
   'tool p50/p95'.padStart(13),
 ].join(' ');
 
+/** The outcome rubric's binary criteria (ENG-2189), as stored in the shadow judge's dimensions. */
+export const JUDGE_CRITERIA = ['arguedWithInstruction', 'escalatedWhenNotRequired', 'failedToEscalate'] as const;
+
+export interface JudgeCriterionRate {
+  criterion: (typeof JUDGE_CRITERIA)[number];
+  /** Scored sessions with a boolean for this criterion. */
+  n: number;
+  /** Of those, sessions where the behaviour happened (true). */
+  happened: number;
+  rate: number | null;
+  ci: Interval | null;
+}
+
+/** Share of shadow-judged sessions where each behaviour happened, with n and a Wilson CI. */
+export function judgeCriteriaRates(dimensions: ReadonlyArray<Record<string, unknown> | undefined>): JudgeCriterionRate[] {
+  return JUDGE_CRITERIA.map((criterion) => {
+    const answers = dimensions.flatMap((d) => (typeof d?.[criterion] === 'boolean' ? [d[criterion] as boolean] : []));
+    const happened = answers.filter(Boolean).length;
+    const n = answers.length;
+    return { criterion, n, happened, rate: n ? happened / n : null, ci: n ? wilsonInterval(happened, n) : null };
+  });
+}
+
+/** Read-only: the shadow judge's stored dimensions on sessions updated in the window. */
+async function readShadowJudgeDimensions(reader: ReadOnlyDocReader, sessionsTable: string, window: { from: string; to: string }): Promise<Array<Record<string, unknown>>> {
+  const out: Array<Record<string, unknown>> = [];
+  let start: DocItem | undefined;
+  do {
+    const page = await reader.query({
+      TableName: sessionsTable,
+      IndexName: 'AdminUpdatedAtIndex',
+      KeyConditionExpression: 'adminListPartition = :p AND updatedAt BETWEEN :from AND :to',
+      FilterExpression: 'attribute_exists(judgeScores.#judge)',
+      ProjectionExpression: 'judgeScores.#judge.dimensions',
+      ExpressionAttributeNames: { '#judge': OUTCOME_SHADOW_JUDGE_ID },
+      ExpressionAttributeValues: { ':p': 'all', ':from': window.from, ':to': window.to },
+      ...(start ? { ExclusiveStartKey: start } : {}),
+    });
+    for (const item of page.Items ?? []) {
+      const scores = item.judgeScores as Record<string, { dimensions?: Record<string, unknown> }> | undefined;
+      out.push(scores?.[OUTCOME_SHADOW_JUDGE_ID]?.dimensions ?? {});
+    }
+    start = page.LastEvaluatedKey;
+  } while (start);
+  return out;
+}
+
+const rateWithCI = (r: { rate: number | null; ci: Interval | null; n: number }) =>
+  `${pct(r.rate)}${r.ci ? ` [${pct(r.ci.low)}-${pct(r.ci.high)}]` : ''} n=${r.n}`;
+
+function printAdherence(graded: readonly GradedSession[], groups: readonly GroupReport[]): void {
+  console.log('\nInstruction adherence (ENG-2189): pass rate over the sessions each check applied to, 95% Wilson CI.');
+  for (const r of adherenceRates(graded.map((s) => s.adherence))) {
+    console.log(`  ${r.graderId.padEnd(30)} ${rateWithCI(r).padEnd(24)} fail=${r.n - r.passes} not_applicable=${r.notApplicable}`);
+  }
+  console.log('Adherence reasons:', tally(graded.flatMap((s) => [
+    `length:${s.adherence.length.reason}`,
+    `format:${s.adherence.format.reason}`,
+    `permission:${s.adherence.permission.reason}`,
+  ])));
+  const short = (r: AdherenceRate) => (r.n ? rateWithCI(r) : '-');
+  for (const g of groups.filter((x) => x.adherence.some((r) => r.n > 0))) {
+    console.log(`  ${g.model.padEnd(36).slice(0, 36)} ${g.taskType.padEnd(12)} ${g.adherence.map(short).join(' | ')}`);
+  }
+}
+
+function printJudgeCriteria(rates: readonly JudgeCriterionRate[]): void {
+  console.log(`\nShadow judge criteria (${OUTCOME_SHADOW_JUDGE_ID}, ENG-2189): share of its scored sessions where the behaviour happened.`);
+  for (const r of rates) console.log(`  ${r.criterion.padEnd(26)} ${r.n ? `${rateWithCI(r)} happened=${r.happened}` : 'n=0 (no shadow scores in the window)'}`);
+}
+
 function tally<T extends string>(values: readonly T[]): Record<string, number> {
   const out: Record<string, number> = {};
   for (const v of values) out[v] = (out[v] ?? 0) + 1;
@@ -137,10 +221,12 @@ function printSummary(graded: readonly GradedSession[], groups: readonly GroupRe
 
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv.slice(2));
+  const reader = documentReader();
+  const sessionsTable = `${TABLE_PREFIX}AW-ChatSessions`;
   const loaded = await loadSessionsForGrading(
-    documentReader(),
+    reader,
     {
-      sessions: `${TABLE_PREFIX}AW-ChatSessions`,
+      sessions: sessionsTable,
       messages: `${TABLE_PREFIX}AW-ChatMessages`,
       loopEvents: LOOP_EVENTS_TABLE,
       spendEvents: SPEND_EVENTS_TABLE,
@@ -159,15 +245,20 @@ async function main(): Promise<void> {
         task: s.task,
         tools: { verdict: s.tools.verdict, toolCalls: s.tools.toolCalls, mutations: s.tools.mutations, findings: s.tools.findings },
         groundedness: s.groundedness,
+        adherence: s.adherence,
       }));
     }
     return;
   }
+  const judgeCriteria = judgeCriteriaRates(await readShadowJudgeDimensions(reader, sessionsTable, opts));
   if (opts.json) {
-    console.log(JSON.stringify({ from: opts.from, to: opts.to, sessions: graded.length, groups }, null, 2));
+    const adherence = adherenceRates(graded.map((s) => s.adherence));
+    console.log(JSON.stringify({ from: opts.from, to: opts.to, sessions: graded.length, adherence, judgeCriteria, groups }, null, 2));
     return;
   }
   printSummary(graded, groups, opts);
+  printAdherence(graded, groups);
+  printJudgeCriteria(judgeCriteria);
 }
 
 if (require.main === module) {
