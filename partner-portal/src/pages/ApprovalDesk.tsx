@@ -209,14 +209,9 @@ function CreativeThumb({ src, alt, onZoom }: { src: string; alt: string; onZoom:
 // enough to actually inspect, and click-to-zoom to full size — per the
 // prototype's own "a real crop problem is visible without downloading
 // anything" finding (artifact-eng1853-prototype).
-function EvidenceCard({ index, decision }: { index: number; decision: ApprovalDecisionView }) {
+function EvidenceCard({ index, decision, fullScreenZoom }: { index: number; decision: ApprovalDecisionView; fullScreenZoom: boolean }) {
   const answered = RESOLVED_STATUSES.has(decision.status);
   const [zoomedSrc, setZoomedSrc] = useState<string | null>(null);
-  const theme = useTheme();
-  // Review fix (found live on a phone-width viewport): a centered `maxWidth`
-  // dialog left most of a phone screen as dead backdrop instead of actually
-  // giving the reviewer room to inspect the creative — full-screen on mobile.
-  const fullScreenZoom = useMediaQuery(theme.breakpoints.down('sm'));
   return (
     <Card variant="outlined" id={`call-${decision.decisionId}`}>
       <CardContent>
@@ -406,6 +401,11 @@ function ManifestDetail({ manifestId }: { manifestId: string }) {
   const [approvingAll, setApprovingAll] = useState(false);
   const [approveAllError, setApproveAllError] = useState<string | null>(null);
   const [approveAllResult, setApproveAllResult] = useState<string | null>(null);
+  const theme = useTheme();
+  // Review fix: compute once per packet, not once per decision — an
+  // EvidenceCard per decision each running its own useMediaQuery would
+  // register N redundant matchMedia listeners for the same breakpoint.
+  const fullScreenZoom = useMediaQuery(theme.breakpoints.down('sm'));
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -484,7 +484,7 @@ function ManifestDetail({ manifestId }: { manifestId: string }) {
         <Box sx={{ flex: 1, minWidth: 0 }}>
           <Stack spacing={2}>
             {decisions.map((d, i) => (
-              <EvidenceCard key={d.decisionId} index={i + 1} decision={d} />
+              <EvidenceCard key={d.decisionId} index={i + 1} decision={d} fullScreenZoom={fullScreenZoom} />
             ))}
           </Stack>
         </Box>
