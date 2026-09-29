@@ -93,6 +93,10 @@ import * as adsCrmApisImpl from './impl/adsCrmApis';
 // you_search_web, you_search_news, google_search_web, perform_deep_research).
 // All 5 tools.ts call sites repointed to call the module directly.
 import * as searchResearchImpl from './impl/searchResearch';
+// ENG-2103 (F2), cluster 21: video tools cluster (getVideoApiDefaultModel,
+// describeVideo). Both tools.ts call sites repointed to call the module
+// directly.
+import * as videoImpl from './impl/video';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -5328,7 +5332,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.describeVideo(args.video_file_url, args.prompt, {
+    return await videoImpl.describeVideo(args.video_file_url, args.prompt, {
       return_transcript: args.return_transcript,
       return_scenes: args.return_scenes,
       start_time: args.start_time,
@@ -5598,7 +5602,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     // If the LLM didn't specify a model, fall back to the admin-configured video API default
-    const videoModel = args.videoModel || await agentModeService.getVideoApiDefaultModel();
+    const videoModel = args.videoModel || await videoImpl.getVideoApiDefaultModel();
     return await mediaVideoImpl.generateVideo(
       args.prompt,
       args.filename,

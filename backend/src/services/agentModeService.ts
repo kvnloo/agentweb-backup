@@ -246,6 +246,11 @@ import * as adsCrmApisImpl from '../emma/impl/adsCrmApis';
 // youSearchWeb, youSearchNews, googleSearchWeb, performDeepResearchTool), same
 // treatment as adsCrmApisImpl above.
 import * as searchResearchImpl from '../emma/impl/searchResearch';
+// ENG-2103 (F2), cluster 21: video tools cluster (getVideoApiDefaultModel —
+// deleted, zero callers beyond emma/tools.ts's generate_video, now repointed
+// to call the module directly; describeVideo — kept as a delegating wrapper;
+// waitForGeminiFileActive — deleted, exclusive to describeVideo).
+import * as videoImpl from '../emma/impl/video';
 // SearchPurpose (but not SearchResultSource — no longer referenced after this
 // cluster's extraction) is still needed: youSearchWeb/googleSearchWeb's own
 // delegating-wrapper signatures on this class keep the same public type as
@@ -254,6 +259,7 @@ import { SearchPurpose } from '../search/searchProvider';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
 import { CitationRegistry } from '../utils/citations';
 import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
+import { parseTimecodeToSeconds } from '../emma/impl/video';
 import {
   applyOpenRouterCacheBreakpoints,
   resolveOpenRouterUpstreamModelId,
@@ -331,41 +337,11 @@ export { extractToolContent } from '../utils/extractToolContent';
 import { extractToolContent } from '../utils/extractToolContent';
 import { extractToolResponseHeader } from '../utils/toolResponseS3Ref';
 
-/**
- * Normalize a video timecode to a numeric number of seconds.
- *
- * Gemini localizes timestamps far more reliably when asked for the MM:SS format
- * (per Google's video-understanding docs), so describe_video requests MM:SS /
- * HH:MM:SS strings and uses this to convert them back to the numeric seconds the
- * transcript/scene schema (and all downstream consumers) expect. Already-numeric
- * values pass through unchanged for backward compatibility.
- *
- * Returns undefined for null/undefined/unparseable input so callers can drop the
- * field rather than emit a misleading 0.
- */
-export function parseTimecodeToSeconds(value: unknown): number | undefined {
-  if (value === null || value === undefined) return undefined;
-  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
-  if (typeof value !== 'string') return undefined;
-
-  const trimmed = value.trim();
-  if (trimmed === '') return undefined;
-
-  // Plain numeric string (e.g. "10", "5.5")
-  if (/^\d+(\.\d+)?$/.test(trimmed)) {
-    const n = parseFloat(trimmed);
-    return Number.isFinite(n) ? n : undefined;
-  }
-
-  // Colon-separated timecode: MM:SS or HH:MM:SS (seconds may be fractional)
-  if (/^\d+(:\d{1,2}){1,2}(\.\d+)?$/.test(trimmed)) {
-    const parts = trimmed.split(':').map(p => parseFloat(p));
-    if (parts.some(p => !Number.isFinite(p))) return undefined;
-    return parts.reduce((acc, p) => acc * 60 + p, 0);
-  }
-
-  return undefined;
-}
+// ENG-2103 (F2): body moved verbatim to emma/impl/video.ts — exclusive to
+// describeVideo (confirmed by whole-backend grep; the only other reference is
+// a test's __testHooks.parseTimecodeToSeconds access, kept working via this
+// re-export, the same idiom already used below for normalizeMetaCampaignIds).
+export { parseTimecodeToSeconds };
 
 // Moved to utils/metaCampaignIds.ts (ENG-821) — it is pure, and emma/tools.ts
 // needs it at dispatch time while 140 test files jest.mock this module.
@@ -1324,7 +1300,10 @@ export class AgentModeService {
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
   private imageGenerationDefaultModelSettingName = 'agent_mode_image_generation_default_model';
   private imageApiDefaultModelSettingName = 'agent_mode_image_api_default_model';
-  private videoApiDefaultModelSettingName = 'agent_mode_video_api_default_model';
+  // ENG-2103 (F2): videoApiDefaultModelSettingName removed — its only use
+  // (getVideoApiDefaultModel) moved to emma/impl/video.ts, which inlines the
+  // literal 'agent_mode_video_api_default_model' directly per the F2 design
+  // draft §3.2.
   private videoGenerationDefaultModelSettingName = 'agent_mode_video_generation_default_model';
   private customerSupportDefaultModelSettingName = 'agent_mode_customer_support_default_model';
   private codingAgentDefaultModelSettingName = 'agent_mode_coding_agent_default_model';
@@ -2149,27 +2128,12 @@ export class AgentModeService {
     return undefined;
   }
 
-  // Supported video API models
-  static readonly VIDEO_API_MODELS = ['veo-3.1-generate-preview', 'veo-3-generate-preview', 'seedance-2.0'];
-
-  async getVideoApiDefaultModel(): Promise<string | undefined> {
-    try {
-      const setting = await settingsService.getSetting(this.videoApiDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (AgentModeService.VIDEO_API_MODELS.includes(configuredModel)) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported video API default model "${configuredModel}" in settings; using hardcoded default.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting video API default model setting:', error);
-    }
-    // Seedance 2.0 is the product default for all video generation (Veo is an
-    // automatic fallback inside the video service). Return it explicitly so the
-    // model is never undefined in logs / cost estimation.
-    return 'seedance-2.0';
-  }
+  // ENG-2103 (F2): getVideoApiDefaultModel (bare `async`, no access-modifier
+  // keyword) and its VIDEO_API_MODELS static field moved verbatim to
+  // emma/impl/video.ts and DELETED here outright (not kept as a wrapper) —
+  // confirmed by whole-backend grep to have zero callers beyond
+  // emma/tools.ts's generate_video, now repointed to call the module
+  // directly. No test spies on it directly.
 
   async getVideoGenerationDefaultModel(): Promise<string> {
     try {
@@ -9910,6 +9874,29 @@ export class AgentModeService {
     }
   }
 
+  /**
+   * ENG-2103 (F2): body moved verbatim to emma/impl/video.ts, along with
+   * waitForGeminiFileActive (was public, DELETED here outright — confirmed by
+   * whole-backend grep to have exactly one caller, this method, despite being
+   * public) and parseTimecodeToSeconds (a module-level function in this file,
+   * exclusive to this method — re-exported above for the one remaining
+   * external reference, a test's __testHooks.parseTimecodeToSeconds access).
+   *
+   * Zero this.callLLM/this.generateImage/this.describeImage/
+   * this.callVisionLLMWithTimeout coupling — worth flagging as a DIFFERENT
+   * shape, not an exclusion: this method never went through
+   * AgentModeService's own callLLM gateway even before this move — it always
+   * called Gemini's video-understanding API directly via a lazy
+   * getGeminiClient()/aiClient.models.generateContent(), metering the
+   * response by hand (ENG-200/ENG-1961).
+   *
+   * Kept as a delegating wrapper — real caller beyond emma/tools.ts is
+   * routes/emmaApi.ts's POST /describe-media (type === 'video' branch), plus
+   * agentModeService.describeVideo.test.ts's many direct real-instance calls
+   * and routes.emmaApi.test.ts's whole-module mock (describeVideo: jest.fn()).
+   * emma/tools.ts's describe_video tool is repointed to call the module
+   * directly.
+   */
   public async describeVideo(
     videoFileUrl: string,
     prompt?: string,
@@ -9924,345 +9911,7 @@ export class AgentModeService {
       sessionId?: string;
     }
   ): Promise<any> {
-    let tempDirPath: string | null = null;
-    let uploadedFileName: string | null = null;
-    let aiClient: any = null;
-
-    try {
-      if (!videoFileUrl) {
-        return {
-          success: false,
-          message: 'No video URL provided'
-        };
-      }
-
-      try {
-        const parsedUrl = new URL(videoFileUrl);
-        const ext = path.extname(parsedUrl.pathname).toLowerCase().replace(/^\./, '');
-        if (IMAGE_EXTENSIONS.has(ext)) {
-          return {
-            success: false,
-            message: `This appears to be an image file (.${ext}), not a video. Please use the 'describe_image' tool instead to analyze images.`
-          };
-        }
-      } catch {
-        // URL parsing failed — continue and let downstream handling deal with it
-      }
-
-      const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-      const geminiSecretName = `${environment}/AgentWeb/GeminiAPIKey`;
-      const geminiApiKey = await getSecret(geminiSecretName);
-
-      if (!geminiApiKey || !geminiApiKey.trim()) {
-        return {
-          success: false,
-          message: 'Gemini API key is empty'
-        };
-      }
-
-      // Un-metered Gemini client: the wrapped factory only RECORDS burn, so to
-      // actually CHARGE describe_video spend to the user's cap we meter the
-      // response ourselves via meterUsageFromResponse below (ENG-200). No userId
-      // → that meter degrades to a burn-only "system" record (absorbed).
-      const { getGeminiClient } = await import('../utils/llmClients');
-      aiClient = await getGeminiClient({ userId: options?.userId, feature: 'agent_task' }, geminiApiKey.trim(), { metered: false });
-
-      const modelName = 'gemini-3-flash-preview';
-
-      // Build structured prompt based on requested output fields
-      const wantTranscript = options?.return_transcript === true;
-      const wantScenes = options?.return_scenes === true;
-      const wantStructured = wantTranscript || wantScenes;
-      const timeRange = (options?.start_time || options?.end_time)
-        ? `Focus your analysis on the segment from ${options.start_time || 'the beginning'} to ${options.end_time || 'the end'} of the video.`
-        : '';
-
-      let analysisPrompt: string;
-      if (wantStructured) {
-        const fields: string[] = ['description: a concise overall description of the video'];
-        if (wantTranscript) {
-          fields.push('transcript: an array of objects with {start: string, end: string, text: string} for all spoken content, where start/end are timestamps in MM:SS format (or HH:MM:SS if over an hour)');
-        }
-        if (wantScenes) {
-          fields.push('scenes: an array of objects with {start: string, end: string, title: string, description: string} identifying distinct scene segments, where start/end are timestamps in MM:SS format (or HH:MM:SS if over an hour)');
-        }
-        fields.push('duration: total video duration as a timestamp in MM:SS format (or HH:MM:SS if over an hour)');
-        analysisPrompt = [
-          prompt || 'Analyze this video thoroughly.',
-          timeRange,
-          // Gemini localizes timestamps most accurately in MM:SS (per Google's
-          // video-understanding guidance); we parse them back to numeric seconds.
-          'For every timestamp, use the MM:SS format (e.g. 01:15 for 1 minute 15 seconds), and base each one on the actual moment it occurs in the video.',
-          `Return ONLY a JSON object (no markdown fences) with these fields: ${fields.join('; ')}.`
-        ].filter(Boolean).join(' ');
-      } else {
-        analysisPrompt = [
-          prompt || 'Please describe this video in detail. Focus on key events, visual elements, and any spoken content.',
-          timeRange
-        ].filter(Boolean).join(' ');
-      }
-
-      const url = new URL(videoFileUrl);
-      const hostname = (url.hostname || '').toLowerCase();
-      const isYoutube = hostname.includes('youtube.com') || hostname.includes('youtu.be');
-
-      let contents: any;
-
-      if (isYoutube) {
-        contents = [
-          {
-            role: 'user',
-            parts: [
-              {
-                fileData: {
-                  fileUri: videoFileUrl
-                }
-              },
-              { text: analysisPrompt }
-            ]
-          }
-        ];
-      } else {
-        const maxSizeMb = parseInt(process.env.MAX_DOWNLOADED_VIDEO_SIZE_MB || '100', 10);
-        const maxSizeBytes = maxSizeMb * 1024 * 1024;
-
-        const response = await axios.get(videoFileUrl, { responseType: 'stream' });
-        const responseStream = response.data as Readable;
-        const contentLengthHeader = response.headers['content-length'];
-        const declaredSize = contentLengthHeader ? parseInt(contentLengthHeader.toString(), 10) : 0;
-        if (declaredSize && declaredSize > maxSizeBytes) {
-          return {
-            success: false,
-            message: `Video file too large for analysis: ${Math.round(declaredSize / (1024 * 1024))} MB exceeds limit of ${maxSizeMb} MB`
-          };
-        }
-
-        const contentTypeHeader = (response.headers['content-type'] || '').toString();
-        const urlExtension = path.extname(url.pathname).toLowerCase();
-        const mimeTypeMap: Record<string, string> = {
-          '.mp4': 'video/mp4',
-          '.mov': 'video/quicktime',
-          '.webm': 'video/webm',
-          '.ogg': 'video/ogg',
-          '.m4v': 'video/x-m4v',
-          '.avi': 'video/x-msvideo'
-        };
-        const fallbackMimeType = mimeTypeMap[urlExtension] || 'video/mp4';
-        const mimeType = contentTypeHeader.startsWith('video/') ? contentTypeHeader : fallbackMimeType;
-
-        // Reject if Content-Type indicates this is an image, not a video
-        if (contentTypeHeader.startsWith('image/')) {
-          return {
-            success: false,
-            message: `This appears to be an image file (${contentTypeHeader}), not a video. Please use the 'describe_image' tool instead to analyze images.`
-          };
-        }
-
-        tempDirPath = await fs.mkdtemp(path.join(os.tmpdir(), 'agentweb-video-'));
-        const fileExtension = urlExtension || '.mp4';
-        const tempFilePath = path.join(tempDirPath, `video${fileExtension}`);
-
-        const writer = createWriteStream(tempFilePath);
-        let downloadedBytes = 0;
-        await new Promise<void>((resolve, reject) => {
-          responseStream.on('data', (chunk: Buffer) => {
-            downloadedBytes += chunk.length;
-            if (downloadedBytes > maxSizeBytes) {
-              responseStream.destroy(new Error('Video file too large'));
-            }
-          });
-          responseStream.on('error', reject);
-          writer.on('error', reject);
-          writer.on('finish', resolve);
-          responseStream.pipe(writer);
-        });
-
-        if (downloadedBytes === 0) {
-          return {
-            success: false,
-            message: 'Downloaded video file is empty'
-          };
-        }
-
-        if (downloadedBytes > maxSizeBytes) {
-          return {
-            success: false,
-            message: `Video file too large for analysis: ${Math.round(downloadedBytes / (1024 * 1024))} MB exceeds limit of ${maxSizeMb} MB`
-          };
-        }
-
-        const uploadResponse = await aiClient.files.upload({
-          file: tempFilePath,
-          config: { mimeType }
-        });
-
-        const fileUri = uploadResponse.uri || uploadResponse.file?.uri;
-        const uploadedMime = uploadResponse.mimeType || uploadResponse.file?.mimeType || mimeType;
-        uploadedFileName = uploadResponse.name || uploadResponse.file?.name || fileUri || null;
-
-        if (!fileUri) {
-          return {
-            success: false,
-            message: 'Failed to upload video to Gemini Files API'
-          };
-        }
-
-        if (uploadedFileName) {
-          await this.waitForGeminiFileActive(aiClient, uploadedFileName);
-        }
-
-        contents = [
-          {
-            role: 'user',
-            parts: [
-              {
-                fileData: {
-                  fileUri,
-                  mimeType: uploadedMime
-                }
-              },
-              { text: analysisPrompt }
-            ]
-          }
-        ];
-      }
-
-      const response = await aiClient.models.generateContent({
-        model: modelName,
-        contents
-      });
-
-      // Charge (record + deduct when a userId is present; absorb under "system"
-      // otherwise). The client above is un-metered, so this is the single meter.
-      // ENG-1961: named `describe_video` rather than the catch-all `agent_task`,
-      // and carrying the session, so this spend is attributable the same way
-      // describeImage's is. The user was already correct (ENG-200).
-      meterUsageFromResponse(
-        {
-          userId: options?.userId,
-          ...(options?.sessionId ? { sessionId: options.sessionId } : {}),
-          model: modelName,
-          provider: 'gemini',
-          feature: 'describe_video',
-        },
-        response
-      );
-
-      const rawText = response.text;
-
-      if (!rawText) {
-        return {
-          success: false,
-          message: 'No description returned from Gemini'
-        };
-      }
-
-      // When structured output was requested, try to parse JSON from Gemini
-      if (wantStructured) {
-        try {
-          // Strip optional markdown code fences Gemini may add despite instructions
-          const jsonText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
-          const parsed = JSON.parse(jsonText);
-
-          // Gemini is prompted for MM:SS timestamps (most accurate); convert them
-          // back to the numeric seconds the transcript/scene schema expects.
-          const normalizeSegments = (segments: any): any => {
-            if (!Array.isArray(segments)) return segments;
-            return segments.map(seg => {
-              if (!seg || typeof seg !== 'object') return seg;
-              const start = parseTimecodeToSeconds(seg.start);
-              const end = parseTimecodeToSeconds(seg.end);
-              return {
-                ...seg,
-                ...(start !== undefined ? { start } : {}),
-                ...(end !== undefined ? { end } : {}),
-              };
-            });
-          };
-          const normalizedDuration = parseTimecodeToSeconds(parsed.duration);
-
-          return {
-            success: true,
-            description: parsed.description || rawText,
-            ...(wantTranscript && parsed.transcript !== undefined ? { transcript: normalizeSegments(parsed.transcript) } : {}),
-            ...(wantScenes && parsed.scenes !== undefined ? { scenes: normalizeSegments(parsed.scenes) } : {}),
-            ...(normalizedDuration !== undefined ? { duration: normalizedDuration } : {}),
-            videoUrl: videoFileUrl
-          };
-        } catch {
-          // Gemini returned non-JSON despite instruction — fall back to plain description
-          return {
-            success: true,
-            description: rawText,
-            videoUrl: videoFileUrl
-          };
-        }
-      }
-
-      return {
-        success: true,
-        description: rawText,
-        videoUrl: videoFileUrl
-      };
-    } catch (error) {
-      console.error('AgentMode: Error describing video:', error);
-      return {
-        success: false,
-        message: 'Failed to analyze video. Please check that the URL is accessible and contains a valid video.',
-        error: error instanceof Error ? error.message : 'Unknown error'
-      };
-    } finally {
-      if (aiClient && uploadedFileName) {
-        try {
-          await aiClient.files.delete({ name: uploadedFileName });
-        } catch (cleanupError) {
-          try {
-            await (aiClient.files as any).delete(uploadedFileName);
-          } catch (fallbackError) {
-            console.warn('AgentMode: Failed to delete uploaded Gemini file:', fallbackError);
-          }
-        }
-      }
-
-      if (tempDirPath) {
-        try {
-          await fs.rm(tempDirPath, { recursive: true, force: true });
-        } catch (cleanupError) {
-          console.warn('AgentMode: Failed to clean up temp video file:', cleanupError);
-        }
-      }
-    }
-  }
-
-  public async waitForGeminiFileActive(aiClient: any, fileName: string): Promise<void> {
-    const maxAttempts = 30;
-    const delayMs = 2000;
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        let fileInfo: any;
-        try {
-          fileInfo = await aiClient.files.get({ name: fileName });
-        } catch {
-          fileInfo = await aiClient.files.get(fileName);
-        }
-
-        const state = fileInfo?.state || fileInfo?.file?.state;
-        if (state === 'ACTIVE') {
-          return;
-        }
-
-        if (state === 'FAILED') {
-          throw new Error('Gemini file processing failed');
-        }
-      } catch (error) {
-        if (attempt === maxAttempts) {
-          throw error;
-        }
-      }
-
-      await new Promise(resolve => setTimeout(resolve, delayMs));
-    }
+    return videoImpl.describeVideo(videoFileUrl, prompt, options);
   }
 
   // ENG-2103 (F2): body moved verbatim to emma/impl/searchResearch.ts, along
