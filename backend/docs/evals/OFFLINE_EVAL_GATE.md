@@ -1,8 +1,9 @@
 # Offline eval suite and regression gate (ENG-2145)
 
 Implements ENG-782 items 2 and 3 under the contract Harsha approved on 2026-08-31, and decision D4 of
-ENG-2128. The gate runs on Atem or against staging. It is not a GitHub Actions job: GitHub CI runs builds
-and invariant checks only, and product suites never gate merges there (repo `CLAUDE.md`).
+ENG-2128. The gate runs on Atem or against staging. It never gates a merge in GitHub Actions: GitHub CI runs
+builds and invariant checks only, and product suites never gate merges there (repo `CLAUDE.md`). The one
+GitHub job that runs the suite (below) reports and cannot fail on the verdict.
 
 ## Run it
 
@@ -70,18 +71,41 @@ time, and the verdict is not changed. Paste that output into the PR or the ticke
 
 ## Triggers
 
-- **PRs and staging runs:** run the CLI on Atem. A PR that changes prompts, models, skills or tool schemas
-  should cite the report.
+- **PRs (automatic, report-only, ENG-2195):** `.github/workflows/offline-eval.yml` runs
+  `--target local` on a pull request that changes a prompt, model-registry, skill or eval source (the
+  workflow's `paths` list). It needs no credentials and makes no network or LLM call. It writes the report to
+  the job summary and raises a warning annotation when the verdict is not `pass`, but it always exits 0: it
+  strips `EVAL_GATE_BLOCKING`, is its own workflow, waits on nothing and nothing waits on it, and is not a
+  required check. `.github/scripts/offline-eval-report.test.sh` pins that shape. The local suite covers the
+  replay cases and fixtures only; a prompt or model change still needs the staging lane for a real verdict.
+- **Staging runs:** run the CLI on Atem. A PR that changes prompts, models, skills or tool schemas
+  should cite the staging report.
 - **Nightly:** `cron/failureReplayNightlyCron.ts` replays the registered cases at 04:30 UTC and files a
   regression once through the ENG-240 intake. It runs only with `FAILURE_REPLAY_NIGHTLY_ENABLED=true`
   (ENG-591 AC2).
 - **Database edits:** every AW-Settings write to a prompt, model, judge, work-plan, skill or tool setting
-  (`settingsService`) records a marker. So does every admin skill create, update, delete, approve or sync
-  that touches `systemPrompt`, `toolNames`, `llmModel`, `isPublished` or `maxIterations`. Each marker is
+  (`settingsService`) records a marker. So does every skill create, update, delete, approve or sync in
+  `skillService` (ENG-2195), whoever the caller is: the admin routes, the user skill routes, Emma's skill
+  tools, agent mode and the seed/patch/rewrite scripts. A create or update is marked only when it changes
+  `systemPrompt`, `toolNames`, `llmModel`, `isPublished` or `maxIterations` (compared against the row the
+  write replaced); a delete is marked only when the skill existed. Each marker is
   one `eval_needed` row in `Dev-AW-LoopEvents` (loopId `eval-gate`). It holds the setting name or skill
   id, the change kind and a 12-character sha256 of the new value, never the text. The marker write is
   best-effort: it never blocks the edit, and a failed marker write leaves that edit out of the feed. `--changes-since <iso>` lists the markers; `EVAL_CHANGE_MARKERS_ENABLED=false` turns
   them off.
+- **Marker consumer (ENG-2195):** `cron/evalMarkerSuiteCron.ts` checks hourly for markers written since its
+  last run. Resuming is overlap + identity dedupe, not a pure "greater than cursor" range read: a marker's
+  sort key orders by the wall-clock instant `recordEvalChange` was *called*, but every marker write is
+  fire-and-forget (`void recordSkillChange(...)`, never awaited), so two writes can complete out of that
+  order — a marker with an earlier timestamp can become queryable after the cursor already advanced past a
+  later one. Every tick therefore re-queries a 10-minute overlap window behind its high-water mark
+  (`EVAL_MARKER_OVERLAP_MS`) and skips only the specific marker keys (`processedKeys`) it already handled
+  in that window, so a late-arriving straggler is still caught. When there are new markers, it runs the
+  deterministic local suite and records one `eval_suite_verdict` row in `Dev-AW-LoopEvents` (loopId
+  `eval-gate-runs`): verdict, mode, marker count and categories, the per-metric status, `markersThrough`
+  (the high-water mark) and `processedKeys` (pruned to the current overlap window, so the row stays small).
+  It is report-only: a non-pass verdict is logged as a warning and nothing is filed. It runs only with
+  `EVAL_MARKER_SUITE_ENABLED=true`.
 
 ## Suite inventory (ENG-782 AC3 and AC4)
 

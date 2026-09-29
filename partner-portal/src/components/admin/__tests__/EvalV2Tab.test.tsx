@@ -169,3 +169,141 @@ describe("EvalV2Tab (ENG-2144)", () => {
     expect(mockedAxios.get).not.toHaveBeenCalled();
   });
 });
+
+const efficiency = (over: Record<string, number | null> = {}) => ({
+  graded: 3,
+  successes: 2,
+  withSpend: 3,
+  successesWithSpend: 2,
+  spendNone: 0,
+  spendUnknown: 0,
+  costPerSuccessUsd: 1.234,
+  medianSuccessCostUsd: 1,
+  successesWithLatency: 2,
+  latencyPerSuccessP50Ms: 45_000,
+  latencyPerSuccessP95Ms: 150_000,
+  ...over,
+});
+
+const rateWithCI = (passes: number, n: number, ci: { low: number; high: number } | null) => ({ n, passes, rate: n ? passes / n : null, ci });
+
+const CREATIVE = {
+  date: "2026-09-24",
+  windowStartDate: "2026-09-18",
+  windowEndDate: "2026-09-24",
+  status: "ok",
+  creatives: 4,
+  gates: { ...rateWithCI(2, 4, { low: 0.15, high: 0.85 }), versions: ["2026-09-25.1"], failedChecks: { aspect_ratio: 2 }, mayGate: false },
+  rubric: {
+    versions: ["2026-09-25.1"],
+    judged: 2,
+    errors: 1,
+    skipped: 0,
+    passedCountDistribution: [0, 0, 0, 0, 0, 1, 0, 1],
+    floorMet: rateWithCI(1, 2, { low: 0.09, high: 0.91 }),
+    mayGate: false,
+  },
+};
+
+const ACCOUNT_HEALTH = {
+  date: "2026-09-24",
+  windowStartDate: "2026-09-18",
+  windowEndDate: "2026-09-24",
+  status: "ok",
+  accounts: 4,
+  byState: { activation_incomplete: 1, at_risk: 1, healthy: 2, insufficient_evidence: 0, other: 0 },
+  flips: rateWithCI(1, 4, { low: 0.05, high: 0.7 }),
+  mayGate: false,
+};
+
+const REGISTRY = [
+  { id: "session-judge-general", surface: "agent", graderType: "llm_judge", measures: "satisfaction", version: "prompt-sha256:4507a38770f1", modelFamily: "gemini", mayGate: false },
+  { id: "creative-deterministic-gates", surface: "creative", graderType: "code", measures: "gates", version: "2026-09-25.1", modelFamily: "none", mayGate: false },
+];
+
+const SURFACES_RESPONSE = {
+  ...RESPONSE,
+  snapshots: RESPONSE.snapshots.map((snap) => ({
+    ...snap,
+    spendAttribution: { sessions: snap.sessions, attributed: 40, none: 8, truncated: 1, notRead: 1 },
+    groups: snap.groups.map((g, i) => ({ ...g, efficiency: i === 0 ? efficiency() : efficiency({ costPerSuccessUsd: null, successesWithSpend: 0 }) })),
+  })),
+  creative: [CREATIVE],
+  accountHealth: [ACCOUNT_HEALTH],
+  registry: REGISTRY,
+};
+
+describe("EvalV2Tab — efficiency, creative, account health and registry (ENG-2196)", () => {
+  beforeEach(() => {
+    jest.resetAllMocks();
+    mockToken = "fake-token";
+  });
+
+  it("shows cost and run time per success per row, and how much spend was tied to a session", async () => {
+    mockedAxios.get.mockResolvedValue({ data: SURFACES_RESPONSE });
+    render(<EvalV2Tab />);
+    const all = await screen.findByTestId("eval-v2-row-0");
+    expect(within(all).getByText("$1.23")).toBeInTheDocument();
+    expect(within(all).getByText("n=2 of 2")).toBeInTheDocument();
+    expect(within(all).getByText("45.0 s")).toBeInTheDocument();
+    expect(within(all).getByText("p95 2.5 min n=2")).toBeInTheDocument();
+    // No success with spend: no cost, said outright rather than $0.
+    expect(within(screen.getByTestId("eval-v2-row-1")).getByText("– (no spend)")).toBeInTheDocument();
+    expect(screen.getByTestId("eval-v2-spend-attribution")).toHaveTextContent("Spend tied to the session for 40 of 50 sampled sessions (8 with no spend row carrying their id, 2 not read)");
+  });
+
+  it("shows the creative gate pass rate with CI, failing checks and the rubric distribution", async () => {
+    mockedAxios.get.mockResolvedValue({ data: SURFACES_RESPONSE });
+    render(<EvalV2Tab />);
+    const gates = await screen.findByTestId("eval-v2-creative-gates");
+    expect(within(gates).getByText("50%")).toBeInTheDocument();
+    expect(within(gates).getByText("[15%–85%] n=4")).toBeInTheDocument();
+    expect(within(gates).getByText("failing: aspect_ratio 2")).toBeInTheDocument();
+    const rubric = screen.getByTestId("eval-v2-creative-rubric");
+    expect(within(rubric).getByText("0:0 1:0 2:0 3:0 4:0 5:1 6:0 7:1")).toBeInTheDocument();
+    expect(rubric).toHaveTextContent("1 errors, 0 skipped");
+  });
+
+  it("shows the account-health state distribution and flip rate", async () => {
+    mockedAxios.get.mockResolvedValue({ data: SURFACES_RESPONSE });
+    render(<EvalV2Tab />);
+    const section = await screen.findByTestId("eval-v2-account-health");
+    expect(section).toHaveTextContent("4 classified accounts");
+    expect(section).toHaveTextContent("activation_incomplete 1, at_risk 1, healthy 2");
+    expect(within(section).getByText("25%")).toBeInTheDocument();
+  });
+
+  it("shows no numbers for a surface whose read was truncated", async () => {
+    mockedAxios.get.mockResolvedValue({
+      data: { ...SURFACES_RESPONSE, creative: [{ ...CREATIVE, status: "truncated", statusReason: "too many items", creatives: 0 }] },
+    });
+    render(<EvalV2Tab />);
+    const section = await screen.findByTestId("eval-v2-creative");
+    expect(section).toHaveTextContent("Read stopped at its bound; no numbers are shown: too many items");
+    expect(screen.queryByTestId("eval-v2-creative-gates")).not.toBeInTheDocument();
+  });
+
+  it("lists every registry grader with its version and validation state", async () => {
+    mockedAxios.get.mockResolvedValue({ data: SURFACES_RESPONSE });
+    render(<EvalV2Tab />);
+    const row = await screen.findByTestId("eval-v2-registry-session-judge-general");
+    expect(within(row).getByText("prompt-sha256:4507a38770f1")).toBeInTheDocument();
+    expect(within(row).getByText("no")).toBeInTheDocument();
+    expect(within(screen.getByTestId("eval-v2-registry-creative-deterministic-gates")).getByText("2026-09-25.1")).toBeInTheDocument();
+  });
+
+  it("says the legacy satisfaction score is unvalidated", async () => {
+    mockedAxios.get.mockResolvedValue({ data: RESPONSE });
+    render(<EvalV2Tab />);
+    expect(await screen.findByTestId("eval-v2-satisfaction-note")).toHaveTextContent("Satisfaction score is an unvalidated LLM-judge score");
+  });
+
+  it("still renders against a backend without the ENG-2196 fields", async () => {
+    mockedAxios.get.mockResolvedValue({ data: RESPONSE });
+    render(<EvalV2Tab />);
+    expect(await screen.findByText("No creative snapshots yet.")).toBeInTheDocument();
+    expect(screen.getByText("No account-health snapshots yet.")).toBeInTheDocument();
+    expect(screen.queryByTestId("eval-v2-registry")).not.toBeInTheDocument();
+    expect(within(screen.getByTestId("eval-v2-row-0")).getByText("– (no spend)")).toBeInTheDocument();
+  });
+});

@@ -22,6 +22,7 @@ export interface ReadRequest {
   ExpressionAttributeNames?: Record<string, string>;
   ExpressionAttributeValues?: Record<string, unknown>;
   ExclusiveStartKey?: DocItem;
+  Limit?: number;
 }
 
 export interface ReadPage {
@@ -42,11 +43,20 @@ export interface GraderTables {
   spendEvents: string;
 }
 
+/**
+ * What the spend read found for a session: settled rows carrying its id (`attributed`), none
+ * (`none`), or more rows for its billing subject than the bounded read allows (`truncated`: the
+ * cost is unknown, never a partial sum).
+ */
+export type SpendStatus = 'attributed' | 'none' | 'truncated';
+
 export interface LoadedSession {
   session: SessionForGrading;
   /** The model that ran the session (see sessionModel). */
   model: string;
   spend?: SessionSpend;
+  /** Set only when spend was read. */
+  spendStatus?: SpendStatus;
 }
 
 // ---------------------------------------------------------------------------
@@ -393,10 +403,89 @@ export interface LoadItemsOptions {
   /** Parallel AW-ChatMessages queries. */
   concurrency?: number;
   /**
-   * Read AW-SpendEvents for cost per success. That table has no session index, so this is a
-   * scan; the online sampler leaves it off.
+   * Read AW-SpendEvents for cost per success. That table has no session index: without
+   * `spendQuery` this is a scan (offline scripts only); with it, a bounded query per billing user.
    */
   includeSpend: boolean;
+  spendQuery?: BoundedSpendQuery;
+}
+
+/**
+ * The online sampler's spend read (ENG-2196): one query per billing subject on the
+ * billingUserId + occurredAt index, stopping one row past `maxEventsPerBillingUser`.
+ */
+export interface BoundedSpendQuery {
+  indexName: string;
+  /** The billing subject of a session's user: an org member's spend lands on the org's billing root. */
+  billingUserOf: (userId: string) => Promise<string>;
+  maxEventsPerBillingUser: number;
+}
+
+const SPEND_PROJECTION = {
+  ProjectionExpression: '#refs, costMicroUsd, quantity, #unit, operation, lifecycle',
+  ExpressionAttributeNames: { '#refs': 'references', '#unit': 'unit' },
+};
+
+/**
+ * Spend rows of the sessions' billing subjects in [from, to], and the sessions whose billing
+ * subject is unresolved or overflowed the bound — either way, `spendStatus` must read
+ * `truncated` (spend unknown), never `none` (confirmed no spend). A session with no `userId`, or
+ * whose `billingUserOf` lookup fails, has not been checked at all: querying under the raw
+ * `userId` as a fallback would misattribute an org member's spend to a billing subject nothing
+ * was ever charged to, and silently reporting `none` would read as "we checked and there was no
+ * spend" when the truth is "we never found out" (ENG-2196 CodeRabbit).
+ */
+async function readSpendBounded(
+  reader: ReadOnlyDocReader,
+  table: string,
+  sessionItems: readonly DocItem[],
+  window: { from: string; to: string },
+  q: BoundedSpendQuery,
+): Promise<{ rows: DocItem[]; truncated: Set<string> }> {
+  const sessionsByBilling = new Map<string, string[]>();
+  const billingOf = new Map<string, string>();
+  const unresolved = new Set<string>();
+  for (const item of sessionItems) {
+    const userId = strOf(item.userId);
+    if (!userId) {
+      unresolved.add(String(item.sessionId));
+      continue;
+    }
+    let billing = billingOf.get(userId);
+    if (billing === undefined) {
+      billing = await q.billingUserOf(userId).catch(() => '');
+      billingOf.set(userId, billing);
+    }
+    if (!billing) {
+      unresolved.add(String(item.sessionId));
+      continue;
+    }
+    const list = sessionsByBilling.get(billing) ?? [];
+    list.push(String(item.sessionId));
+    sessionsByBilling.set(billing, list);
+  }
+  const rows: DocItem[] = [];
+  const truncated = new Set<string>(unresolved);
+  for (const [billingUserId, sessionIds] of sessionsByBilling) {
+    const got: DocItem[] = [];
+    let start: DocItem | undefined;
+    do {
+      const page = await reader.query({
+        TableName: table,
+        IndexName: q.indexName,
+        KeyConditionExpression: 'billingUserId = :u AND occurredAt BETWEEN :from AND :to',
+        ...SPEND_PROJECTION,
+        ExpressionAttributeValues: { ':u': billingUserId, ':from': window.from, ':to': `${window.to}￿` },
+        Limit: q.maxEventsPerBillingUser - got.length + 1,
+        ...(start ? { ExclusiveStartKey: start } : {}),
+      });
+      got.push(...(page.Items ?? []));
+      start = page.LastEvaluatedKey;
+    } while (start && got.length <= q.maxEventsPerBillingUser);
+    if (got.length > q.maxEventsPerBillingUser) sessionIds.forEach((id) => truncated.add(id));
+    else rows.push(...got);
+  }
+  return { rows, truncated };
 }
 
 /**
@@ -418,24 +507,25 @@ export async function loadSessionItems(
     return created && created < min ? created : min;
   }, options.from);
   const eventsFrom = earliest < floor ? floor : earliest;
-  const [eventRows, spendRows] = await Promise.all([
+  const [eventRows, spendRead] = await Promise.all([
     readAll(reader, 'query', {
       TableName: tables.loopEvents,
       KeyConditionExpression: 'loopId = :l AND tsSession BETWEEN :from AND :to',
       ExpressionAttributeValues: { ':l': 'agent-mode', ':from': eventsFrom, ':to': `${options.to}￿` },
     }),
-    options.includeSpend
-      ? readAll(reader, 'scan', {
-        TableName: tables.spendEvents,
-        FilterExpression: 'occurredAt BETWEEN :from AND :to AND attribute_exists(#refs.sessionId)',
-        ProjectionExpression: '#refs, costMicroUsd, quantity, #unit, operation, lifecycle',
-        ExpressionAttributeNames: { '#refs': 'references', '#unit': 'unit' },
-        ExpressionAttributeValues: { ':from': eventsFrom, ':to': `${options.to}￿` },
-      })
-      : Promise.resolve([]),
+    !options.includeSpend
+      ? Promise.resolve({ rows: [], truncated: new Set<string>() })
+      : options.spendQuery
+        ? readSpendBounded(reader, tables.spendEvents, sessionItems, { from: eventsFrom, to: options.to }, options.spendQuery)
+        : readAll(reader, 'scan', {
+          TableName: tables.spendEvents,
+          FilterExpression: 'occurredAt BETWEEN :from AND :to AND attribute_exists(#refs.sessionId)',
+          ...SPEND_PROJECTION,
+          ExpressionAttributeValues: { ':from': eventsFrom, ':to': `${options.to}￿` },
+        }).then((rows) => ({ rows, truncated: new Set<string>() })),
   ]);
   const events = groupEventsBySession(eventRows);
-  const spend = spendBySession(spendRows);
+  const spend = spendBySession(spendRead.rows);
 
   return mapLimit(sessionItems, options.concurrency ?? 4, async (item) => {
     const sessionId = String(item.sessionId);
@@ -444,7 +534,10 @@ export async function loadSessionItems(
       KeyConditionExpression: 'sessionId = :s',
       ExpressionAttributeValues: { ':s': sessionId },
     });
-    return buildLoadedSession(item, messageRows, events.get(sessionId) ?? [], spend.get(sessionId));
+    const truncated = spendRead.truncated.has(sessionId);
+    const loaded = buildLoadedSession(item, messageRows, events.get(sessionId) ?? [], truncated ? undefined : spend.get(sessionId));
+    if (!options.includeSpend) return loaded;
+    return { ...loaded, spendStatus: truncated ? 'truncated' : loaded.spend ? 'attributed' : 'none' };
   });
 }
 
