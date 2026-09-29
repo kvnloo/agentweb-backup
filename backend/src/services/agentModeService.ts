@@ -36482,8 +36482,10 @@ Reply with ONLY one word: yes or no.`;
    * identical requirement is reported "missing" despite the tool genuinely having
    * been called earlier in this exact session (prod session 18bc82a6-...:
    * read_brand_guidelines/read_market_strategy called once near the start, then
-   * set_work_plan_status blocked step 5 three times in a row with "Required
-   * function calls have not been made yet").
+   * set_work_plan_status blocked step 5 five times across the session (a mid-run
+   * 600s generation timeout split it into two segments; the issue's own AgentRun
+   * dossier only captured the latter four) with "Required function calls have
+   * not been made yet").
    */
   private static readonly NON_CONSUMABLE_REQUIRED_FUNCTION_CALLS = new Set<string>([
     'read_brand_guidelines',
