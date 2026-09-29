@@ -888,6 +888,10 @@ function adherenceOf(
 ): AdherenceResult {
   let applicable = 0;
   let firstPass: { reason: AdherenceReason; detail?: string } | undefined;
+  // Keep scanning after the first failure so applicableTurns counts every applicable turn in the
+  // session (the correct denominator for the rate), not just the ones up to the first failure;
+  // the FIRST failure is still what's reported, as the clearest single example.
+  let firstFailure: { reason: AdherenceReason; detail?: string; turnIndex: number } | undefined;
   let lastNa: AdherenceReason | undefined;
   for (const [i, turn] of turns.entries()) {
     const graded = gradeTurn(turn);
@@ -898,9 +902,18 @@ function adherenceOf(
     }
     applicable++;
     if (failing.has(graded.reason)) {
-      return { verdict: 'fail', reason: graded.reason, applicableTurns: applicable, detail: `turn ${i + 1}${graded.detail ? `: ${graded.detail}` : ''}` };
+      firstFailure ??= { ...graded, turnIndex: i };
+      continue;
     }
     firstPass ??= graded;
+  }
+  if (firstFailure) {
+    return {
+      verdict: 'fail',
+      reason: firstFailure.reason,
+      applicableTurns: applicable,
+      detail: `turn ${firstFailure.turnIndex + 1}${firstFailure.detail ? `: ${firstFailure.detail}` : ''}`,
+    };
   }
   if (firstPass) return { verdict: 'pass', reason: firstPass.reason, applicableTurns: applicable, ...(firstPass.detail ? { detail: firstPass.detail } : {}) };
   return { verdict: 'not_applicable', reason: lastNa ?? notApplicable, applicableTurns: 0 };
