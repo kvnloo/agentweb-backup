@@ -101,7 +101,12 @@ function CreativePanel({ candidateId, side, token }: { candidateId: string; side
         {error && <Alert severity="error">{error}</Alert>}
         {candidate && (
           <Stack spacing={1}>
-            {candidate.artifactUrl ? (
+            {candidate.artifactUrl && candidate.reviewType === 'landing_page' ? (
+              // ENG-2192: landing pages are calibrated too; open the live page, it is not an image.
+              <Button variant="outlined" href={candidate.artifactUrl} target="_blank" rel="noopener noreferrer">
+                Open landing page
+              </Button>
+            ) : candidate.artifactUrl ? (
               <Box component="img" src={candidate.artifactUrl} alt={`${side} creative`} sx={{ width: '100%', maxHeight: 520, objectFit: 'contain', bgcolor: 'action.hover', borderRadius: 1 }} />
             ) : (
               <Alert severity="warning">This creative has no image.</Alert>
