@@ -12,11 +12,13 @@
  *
  * State machine: idle → running → ready | failed; ready/failed → running.
  *
- * Result shape: 3 image variants — id, imageUrl, prompt.
+ * Result shape: 3 image variants — id, imageUrl, prompt, plus the optional
+ * promptVersion / archetype / concept attribution and the advisory `gates`.
  */
 
 import { randomUUID } from "crypto";
-import type { CreativeGateResult } from "./creativeGates";
+import { parseCreativeGateResult, type CreativeGateResult } from "./creativeGates";
+import type { CreativeRubricResult, StoredCreativePairwise } from "./creativeRubricJudge";
 
 export type AdImageStatus = "idle" | "running" | "ready" | "failed";
 
@@ -54,6 +56,13 @@ export interface AdImageVariant {
    * on placeholders and on rows generated before the gates shipped.
    */
   gates?: CreativeGateResult;
+  /**
+   * Advisory rubric-judge verdict on this image (ENG-2192), and a pairwise verdict against the
+   * previous run's best variant for the same placement. Written after the run is stored, only
+   * when the judge is enabled and this variant was sampled (creativeRubricOnboarding.ts).
+   */
+  creativeRubric?: CreativeRubricResult;
+  creativePairwise?: StoredCreativePairwise;
 }
 
 export interface AdImageResult {
@@ -102,6 +111,9 @@ export const MAX_AD_IMAGE_VARIANTS = 3;
 const MAX_ID_LEN = 64;
 const MAX_URL_LEN = 1024;
 const MAX_PROMPT_LEN = 2000;
+const MAX_PROMPT_VERSION_LEN = 128;
+const MAX_ARCHETYPE_LEN = 16;
+const MAX_CONCEPT_LEN = 200;
 const MAX_ERROR_LEN = 512;
 
 /**
@@ -201,10 +213,19 @@ export function sanitizeAdImageResult(raw: unknown): AdImageResult {
     ) {
       continue;
     }
+    // ENG-2187: the optional attribution + gate fields used to be dropped here, so no stored
+    // variant carried `gates`, and the reject feedback loop never saw a `concept`/`archetype`.
+    const gates = parseCreativeGateResult(v.gates);
     out.push({
       id: v.id.slice(0, MAX_ID_LEN),
       imageUrl: v.imageUrl.slice(0, MAX_URL_LEN),
       prompt: v.prompt.slice(0, MAX_PROMPT_LEN),
+      ...(typeof v.promptVersion === "string"
+        ? { promptVersion: v.promptVersion.slice(0, MAX_PROMPT_VERSION_LEN) }
+        : {}),
+      ...(typeof v.archetype === "string" ? { archetype: v.archetype.slice(0, MAX_ARCHETYPE_LEN) } : {}),
+      ...(typeof v.concept === "string" ? { concept: v.concept.slice(0, MAX_CONCEPT_LEN) } : {}),
+      ...(gates ? { gates } : {}),
     });
     if (out.length >= MAX_AD_IMAGE_VARIANTS) break;
   }

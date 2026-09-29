@@ -1028,7 +1028,7 @@ createTestAccount().then(async () => {
       }
 
       // Account-health classifier sweep (ENG-2143), the replacement for the renewal cron above:
-      // at-risk → deduped oncall, activation incomplete → CS nudge log. Off unless
+      // at-risk → deduped oncall, activation incomplete → CS nudge digest email. Off unless
       // ACCOUNT_HEALTH_ALERTS_ENABLED=true (enabling it in prod is an OPS step).
       if (process.env.ACCOUNT_HEALTH_ALERTS_ENABLED === 'true') try {
         const { runAccountHealthClassifier } = await import('./cron/accountHealthClassifierCron');

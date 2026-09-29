@@ -37,6 +37,7 @@ import {
   deriveQuickStatus,
   quickSummary,
   type AdConnectionState,
+  type AllPlatformsConnectionState,
   type HealthStatus,
 } from '../utils/clientHealthStatus';
 
@@ -52,6 +53,7 @@ interface ClientSummary {
   roles: string[];
   has_ads: boolean;
   ad_connection?: AdConnectionState;
+  ad_connection_all_platforms?: AllPlatformsConnectionState;
   has_lander: boolean;
   has_crm: boolean;
   last_activity: string | null;
@@ -107,6 +109,8 @@ const STATUS_CONFIG: Record<
   'at-risk': { label: 'At Risk', color: 'error' },
   blocked: { label: 'Blocked', color: 'default' },
   onboarding: { label: 'Onboarding', color: 'info' },
+  // ENG-2188: setup / reconnect work, not churn — amber, never the red "At Risk".
+  'needs-attention': { label: 'Needs attention', color: 'warning' },
 };
 
 // ENG-2133: a never-connected ad account is activation (neutral), not a red failure.
@@ -706,12 +710,10 @@ export default function ClientHealth() {
             </Card>
             <Card>
               <CardContent sx={{ textAlign: 'center', py: 2, '&:last-child': { pb: 2 } }}>
-                <Typography variant="h4" fontWeight={700} color="error.main">
-                  {clients.filter(
-                    (c) => deriveQuickStatus(c) === 'at-risk' || deriveQuickStatus(c) === 'blocked'
-                  ).length}
+                <Typography variant="h4" fontWeight={700} color="warning.dark">
+                  {clients.filter((c) => deriveQuickStatus(c) === 'needs-attention').length}
                 </Typography>
-                <Typography variant="caption" color="text.secondary">At Risk / Blocked</Typography>
+                <Typography variant="caption" color="text.secondary">Needs attention</Typography>
               </CardContent>
             </Card>
           </Box>

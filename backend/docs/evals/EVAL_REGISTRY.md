@@ -31,12 +31,12 @@ harness (ENG-2136) produces those runs; record the result on the entry, with evi
 | image-prompt-like-rate | creative | human (likes) | — | no |
 | landing-page-smoke-test | creative | code | — | deterministic |
 | creative-deterministic-gates | creative | code, advisory | — | no |
-| creative-rubric-judge | creative | LLM judge, 7 binary criteria + pairwise, advisory, off by default | anthropic.claude-sonnet-5 (Claude) | no |
+| creative-rubric-judge | creative | LLM judge, binary ENG-421 criteria per surface (ad image, organic image, ad copy, landing page) + runtime pairwise vs prior best, advisory, off by default | anthropic.claude-sonnet-5 (Claude) | no |
 | creative-performance-correlation | creative | outcome: Spearman ρ of rubric score vs settled ad CTR/CPA, read-only report, no data until OPS-3 (ENG-2148) | — | no |
 | client-health-assessment | account health | code | — | no |
 | renewal-integration-health | account health | code, off in prod | — | no |
 | account-health-evaluators | account health | code, log-only | — | no |
-| account-health-classifier | account health | code, off until `ACCOUNT_HEALTH_ALERTS_ENABLED` (ENG-2143) | — | no (backtest n too small) |
+| account-health-classifier | account health | code, off until `ACCOUNT_HEALTH_ALERTS_ENABLED` (ENG-2143) | — | no (backtest: precision 0/1, recall 0/8) |
 | crm-contact-lifecycle | account health (CRM contacts) | code | — | no |
 
 Sources, consumers and known issues for each entry are in `evalRegistry.ts`.
@@ -67,7 +67,11 @@ Sources, consumers and known issues for each entry are in `evalRegistry.ts`.
    customer portal's offline `scripts/eval-onboarding-quality.ts`: a Claude Sonnet pairwise judge
    that compares two onboarding pipeline versions layer by layer (including creative direction,
    ad images and ad copy) on fixture pairs. ENG-2140 adds `creative-rubric-judge` (ENG-421's
-   7 criteria as binary checks), which stays off until its flag is turned on. ENG-2141 links each
+   7 criteria as binary checks), which stays off until its flag is turned on. ENG-2192 extends it,
+   under the same flag and sample rate, to organic images, onboarding images and ad copy (stored on
+   the AW-Users variants) and deployed landing pages (judged from their generated source), with a
+   runtime pairwise verdict against the account's prior best ad; video keyframes are not scored
+   yet. ENG-2141 links each
    generated creative to the Meta ad it became and records ad-level daily rows, so
    `creative-performance-correlation` can compare the judge's score with settled CTR/CPA; both
    stay inert until OPS-3 (ENG-2148).
@@ -134,6 +138,76 @@ only when its grader passes `mayGate` and `EVAL_GATE_BLOCKING=true`, so today it
 Prompt, model and skill edits in AW-Settings / AW-Skills make a best-effort write of an `eval_needed`
 marker (`Dev-AW-LoopEvents`, loopId `eval-gate`); a failed marker write never fails the edit, so that
 edit is then missing from the marker feed. Details: `docs/evals/OFFLINE_EVAL_GATE.md`.
+
+## Account-health classifier backtest (ENG-2143)
+
+Re-run 2026-09-29, read-only, with `scripts/eng2143-account-health-backtest.ts`. The cutoffs were
+the audit's (2026-05-01, 05-31, 06-30, 07-30, 08-29), with a 30-day horizon. The unit is an
+(account, cutoff) pair, so pooled pairs are not independent accounts. CIs are Wilson 95%.
+
+| | n | churned | predicted at_risk | tp | precision | recall |
+| --- | --- | --- | --- | --- | --- | --- |
+| Before (main `e2980e11e`) | 93 | 8 | 0 | 0 | n/a | 0.00 [0.00, 0.32] |
+| After (behavioural signals) | 93 | 8 | 1 | 0 | 0.00 [0.00, 0.79] | 0.00 [0.00, 0.32] |
+
+Per cutoff (after), as n / churned / predicted / tp:
+
+| Cutoff | n / churned / predicted / tp |
+| --- | --- |
+| 05-01 | 18 / 4 / 0 / 0 |
+| 05-31 | 17 / 2 / 1 / 0 |
+| 06-30 | 17 / 0 / 0 / 0 |
+| 07-30 | 19 / 1 / 0 / 0 |
+| 08-29 | 22 / 1 / 0 / 0 |
+
+**Not validated. The ≥ 0.8 precision target is not met, and it cannot be measured on this data.**
+One account was predicted at-risk, and it did not churn.
+
+The signals added, with how many pooled pairs each fired on:
+
+- `spend_drop` (risk): the last 14 days of spend is ≤ 50% of the prior 14 days. It fired on 0
+  pairs, because snapshots only start 2026-07-02 for one account and 2026-08-15 or later for the other
+  five. No window before 08-29 has a collected prior window, so the trend is never evaluable in
+  the backtest.
+- `results_drop` (risk): leads stop for 14 days while spend continues, after at least 3 leads in
+  the prior window. It fired on 0 pairs, for the same reason.
+- `negative_feedback` (risk): at least 3 thumbs-down in 30 days, outnumbering thumbs-up. The
+  ratings are image thumbs on sessions (264 in prod, from 2026-03). It fired on 1 pair, which was
+  retained.
+- `tracking_not_set_up` (activation, never risk): taken from the Meta tracking monitor. The
+  monitor keeps no history, so it cannot be backtested.
+- `ads_never_connected` (activation) fired on 66 pairs, 4 of which churned. It is activation by
+  decision D6, not a churn prediction.
+
+Thresholds were fixed before the run and were not tuned to the 8 churned accounts. Missed
+commitments were **not added**:
+
+- The only due-versus-done record is AW-GTMPlan work items.
+- All 289 of their due dates fall between 2026-01-14 and 2026-04-10, before every cutoff.
+- The DRI defaults to the customer's own email, so they do not record AgentWeb's commitments.
+
+Results against a *promised* outcome are also not measurable. No numeric promise is stored: the
+closest is the LLM-extracted `winMetric` text from Fathom sales calls. So `results_drop` compares
+against the account's own recent leads instead.
+
+The 18 undated cancellations per cutoff are now placed:
+
+- AW-PaymentHistory keeps no raw Stripe event, and AW-Users no cancel timestamp, so no stored
+  field holds `canceled_at`.
+- All 18 accounts have no Stripe-sourced payment event since the log began (first row
+  2026-04-06), and were created before it.
+- Every webhook since then writes one: a cancellation writes `subscription_canceled`, a renewal
+  writes `payment_succeeded`.
+- So they canceled, and stopped paying, before the log began. The script counts them as
+  `canceled_before_payment_log` (already churned) at every cutoff, not as missing positives.
+
+Fixed in the same change: the live sweep and the backtest read ad spend from `account_day`
+snapshot rows, which store spend 0 by design. So "ad spend in the last 30 days" was always 0.
+Spend now comes from the campaign rows.
+
+Routing is unchanged (decision D8): until `mayGate('account-health-classifier')` is true,
+`at_risk` goes to needs-review, never oncall. Revisit when churn positives reach a size where a
+precision CI can clear 0.8. With 8 positives it cannot.
 
 ## Known false-positive catalogue (session judges)
 
