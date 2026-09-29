@@ -11,6 +11,10 @@ jest.mock('../services/adsMetricsDb', () => ({
   adsMetricsDb: { getAccountDaySnapshots: jest.fn(), getSnapshotsByUserDateRange: jest.fn() },
 }));
 jest.mock('../utils/agentModeAlerts', () => ({ sendAgentModeOncallAlert: jest.fn() }));
+jest.mock('../services/emailService', () => ({
+  emailService: { sendEmail: jest.fn(), escapeHtml: (value: string) => value },
+}));
+jest.mock('../services/settingsService', () => ({ settingsService: { getJsonArraySetting: jest.fn() } }));
 jest.mock('../services/accountCapabilityRequirementsDb', () => ({
   getAccountCapabilityRequirement: jest.fn(),
   getAccountHealthSignalState: jest.fn(),
@@ -26,6 +30,8 @@ import { userDb } from '../services/db';
 import { paymentHistoryDb, type PaymentHistoryRecord } from '../services/paymentHistoryDb';
 import { adsMetricsDb } from '../services/adsMetricsDb';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { emailService } from '../services/emailService';
+import { settingsService } from '../services/settingsService';
 import {
   getAccountCapabilityRequirement,
   getAccountHealthSignalState,
@@ -35,6 +41,7 @@ import {
   type AccountHealthSignalState,
 } from '../services/accountCapabilityRequirementsDb';
 import {
+  CS_NUDGE_PENDING_TIMEOUT_MS,
   decideAccountHealthSignal,
   gatherAccountHealthSignals,
   runAccountHealthClassifier,
@@ -69,12 +76,22 @@ function classify(overrides: Partial<AccountHealthSignals> = {}, nowMs: number =
   });
 }
 
-/** Runs `decide` over a sequence of classifications, persisting `next` like the cron does. */
+/**
+ * Runs `decide` over a sequence of classifications, persisting `next` like the cron does. A
+ * claimed cs_nudge is auto-finalized to `delivered` before the next step, matching a normal run
+ * where the digest send (and its finalize) follows the claim in the same process — this helper is
+ * for dedup/routing semantics, not delivery-recovery, which the `cs_nudge delivery recovery`
+ * describe block below covers with an explicit unfinalized (still-`pending`) claim.
+ */
 function replay(results: Array<{ at: number; overrides?: Partial<AccountHealthSignals> }>) {
   let state: AccountHealthSignalState | null = null;
   return results.map(({ at, overrides }) => {
     const decision = decideAccountHealthSignal(state, classify(overrides, at), iso(at), { oncallAllowed: true });
-    if (decision.next) state = decision.next;
+    if (decision.next) {
+      state = decision.next.csNudgeDeliveryStatus === 'pending'
+        ? { ...decision.next, csNudgeDeliveryStatus: 'delivered' }
+        : decision.next;
+    }
     return decision;
   });
 }
@@ -165,6 +182,50 @@ describe('decideAccountHealthSignal', () => {
     const paymentAndExpired = classify({ payments: [{ eventType: 'payment_failed', timestamp: iso(NOW - DAY_MS) }] });
     expect(decideAccountHealthSignal(null, paymentAndExpired, iso(NOW), { correctionActive: true, oncallAllowed: true }).channel).toBe('oncall');
   });
+
+  // CodeRabbit #3128: the claim (`putAccountHealthSignalState`, in the per-user loop) was
+  // persisted well before the batched digest email was even attempted (after the whole scan
+  // loop). A process stop in between (crash, deploy, OOM) left the claim looking "already
+  // handled" forever, with no way to recover it — the nudge was silently lost.
+  describe('cs_nudge delivery recovery', () => {
+    // billingCycle here is '2026-10-10' (the date portion of classify()'s default currentPeriodEnd),
+    // not a month fallback — matches what activation() below actually recomputes.
+    const pendingClaim = (claimedAt: number, overrides: Partial<AccountHealthSignalState> = {}): AccountHealthSignalState => ({
+      state: 'activation_incomplete',
+      stateSince: iso(claimedAt),
+      lastEpisodeKey: `activation_incomplete|2026-10-10|${iso(claimedAt)}`,
+      lastSignalCodes: ['ads_never_connected'],
+      lastSignalAt: iso(claimedAt),
+      lastSignalChannel: 'cs_nudge',
+      csNudgeDeliveryStatus: 'pending',
+      version: 1,
+      ...overrides,
+    });
+    const activation = () => classify({ connectedAccounts: [] }, NOW);
+
+    it('recovers a claim left pending past the timeout, as a retry (the process never reached the digest send)', () => {
+      const claimedAt = NOW - CS_NUDGE_PENDING_TIMEOUT_MS - 1;
+      const decision = decideAccountHealthSignal(pendingClaim(claimedAt), activation(), iso(NOW));
+      expect(decision).toMatchObject({ channel: 'cs_nudge', emit: true, reason: 'retry' });
+      expect(decision.next).toMatchObject({ state: 'activation_incomplete', csNudgeDeliveryStatus: 'pending', version: 2 });
+    });
+
+    it('does not recover a pending claim still inside the timeout window (a run genuinely in flight)', () => {
+      const claimedAt = NOW - CS_NUDGE_PENDING_TIMEOUT_MS + 1000;
+      const decision = decideAccountHealthSignal(pendingClaim(claimedAt), activation(), iso(NOW));
+      expect(decision).toMatchObject({ emit: false, reason: 'unchanged', next: null });
+    });
+
+    it('never re-sends a claim already confirmed delivered, however old', () => {
+      const claimedAt = NOW - 10 * CS_NUDGE_PENDING_TIMEOUT_MS;
+      const decision = decideAccountHealthSignal(
+        pendingClaim(claimedAt, { csNudgeDeliveryStatus: 'delivered' }),
+        activation(),
+        iso(NOW),
+      );
+      expect(decision).toMatchObject({ emit: false, reason: 'unchanged', next: null });
+    });
+  });
 });
 
 function monitorSummary(overrides: Partial<MonitorSummary>): MonitorSummary {
@@ -216,6 +277,8 @@ describe('runAccountHealthClassifier', () => {
       return true;
     });
     jest.mocked(sendAgentModeOncallAlert).mockResolvedValue(true);
+    jest.mocked(settingsService.getJsonArraySetting).mockResolvedValue(['cs@example.com']);
+    jest.mocked(emailService.sendEmail).mockResolvedValue('sent');
     jest.mocked(mayGate).mockReturnValue(true);
     jest.mocked(isCronEnabled).mockReturnValue(true);
     jest.mocked(adsMetricsDb.getSnapshotsByUserDateRange).mockResolvedValue({ rows: [], truncated: false });
@@ -290,12 +353,107 @@ describe('runAccountHealthClassifier', () => {
     expect(jest.mocked(sendAgentModeOncallAlert).mock.calls[0][0].context).toMatchObject({ reason: 'escalated' });
   });
 
-  it('never pages oncall for a never-connected account: CS nudge log line only', async () => {
+  it('never pages oncall for a never-connected account: it goes to the CS nudge', async () => {
     users.push({ userId: 'u2', connected_accounts: [], subscription_status: 'active' });
     const summary = await runAccountHealthClassifier({ now: NOW });
     expect(summary).toMatchObject({ csNudges: 1, oncall: 0 });
     expect(sendAgentModeOncallAlert).not.toHaveBeenCalled();
     expect(console.info).toHaveBeenCalledWith(expect.stringContaining('cs_nudge {"userId":"u2","state":"activation_incomplete"'));
+  });
+
+  // ENG-2188: the nudge used to be a console.info line nobody acted on.
+  it('ENG-2188: sends one actionable CS digest email per run for every new activation nudge, once per episode', async () => {
+    users.push({ userId: 'u2', email: 'two@example.com', connected_accounts: [], subscription_status: 'active' });
+    users.push({ userId: 'u3', email: 'three@example.com', connected_accounts: [], subscription_status: 'active' });
+    const summary = await runAccountHealthClassifier({ now: NOW });
+    expect(summary).toMatchObject({ csNudges: 2, csNudgeUndelivered: 0, oncall: 0 });
+    expect(settingsService.getJsonArraySetting).toHaveBeenCalledWith('account_health_cs_emails', []);
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+    const [to, subject, text] = jest.mocked(emailService.sendEmail).mock.calls[0];
+    expect(to).toEqual(['cs@example.com']);
+    expect(subject).toBe('Activation nudges: 2 paying account(s) have not connected an ad account');
+    expect(text).toContain('not churn risk');
+    expect(text).toContain('- two@example.com: no ad account connected yet (ads are a current requirement: urgent)');
+    expect(text).toContain('- three@example.com: no ad account connected yet');
+    expect(store.get('u2')?.lastSignalChannel).toBe('cs_nudge');
+
+    expect(await runAccountHealthClassifier({ now: NOW + DAY_MS })).toMatchObject({ csNudges: 0 });
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('ENG-2188: with no CS recipients configured the nudge is undelivered and retried, never dropped', async () => {
+    users.push({ userId: 'u2', connected_accounts: [], subscription_status: 'active' });
+    jest.mocked(settingsService.getJsonArraySetting).mockResolvedValueOnce([]);
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    expect(await runAccountHealthClassifier({ now: NOW })).toMatchObject({ csNudges: 0, csNudgeUndelivered: 1 });
+    expect(emailService.sendEmail).not.toHaveBeenCalled();
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('account_health_cs_emails is not set'));
+
+    expect(await runAccountHealthClassifier({ now: NOW + DAY_MS })).toMatchObject({ csNudges: 1 });
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('ENG-2188: a failed CS digest send releases the claims so the next run retries', async () => {
+    users.push({ userId: 'u2', connected_accounts: [], subscription_status: 'active' });
+    jest.mocked(emailService.sendEmail).mockResolvedValueOnce('failed');
+    expect(await runAccountHealthClassifier({ now: NOW })).toMatchObject({ csNudgeUndelivered: 1 });
+    expect(await runAccountHealthClassifier({ now: NOW + DAY_MS })).toMatchObject({ csNudges: 1 });
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(2);
+  });
+
+  // CodeRabbit #3128: the claim used to be persisted (and count as "handled") well before the
+  // batched digest was even attempted. Simulates the gap a process stop leaves behind — a claim
+  // durably written by a run that never reached the send — by seeding the store directly, the way
+  // a crashed prior process would have left it, rather than going through a live run.
+  it('ENG-2188 CodeRabbit: recovers a CS nudge whose process stopped between the claim and the digest send', async () => {
+    users.push({ userId: 'u2', email: 'two@example.com', connected_accounts: [], subscription_status: 'active' });
+    const claimedAt = NOW - CS_NUDGE_PENDING_TIMEOUT_MS - 1;
+    store.set('u2', {
+      state: 'activation_incomplete',
+      stateSince: iso(claimedAt),
+      lastEpisodeKey: `activation_incomplete|month:2026-08|${iso(claimedAt)}`,
+      lastSignalCodes: ['ads_never_connected'],
+      lastSignalAt: iso(claimedAt),
+      lastSignalChannel: 'cs_nudge',
+      csNudgeDeliveryStatus: 'pending',
+      version: 1,
+    });
+
+    const summary = await runAccountHealthClassifier({ now: NOW });
+
+    expect(summary).toMatchObject({ csNudges: 1, csNudgeUndelivered: 0 });
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+    expect(jest.mocked(emailService.sendEmail).mock.calls[0][2]).toContain('two@example.com');
+    // version 3: 1 (seeded) -> 2 (this run's claim) -> 3 (finalized once the digest sent).
+    expect(store.get('u2')).toMatchObject({ csNudgeDeliveryStatus: 'delivered', version: 3 });
+
+    // Recovered and delivered: a later run must not recover or resend it again.
+    expect(await runAccountHealthClassifier({ now: NOW + 3 * CS_NUDGE_PENDING_TIMEOUT_MS })).toMatchObject({ csNudges: 0 });
+    expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('ENG-2188 CodeRabbit: a pending claim inside the recovery timeout is left alone (a run genuinely still in flight)', async () => {
+    users.push({ userId: 'u2', connected_accounts: [], subscription_status: 'active' });
+    const claimedAt = NOW - CS_NUDGE_PENDING_TIMEOUT_MS + 1000;
+    // Same month as NOW (no current_period_end on this user, so billingCycleKey falls back to
+    // the current UTC month): this must be the episode the live classification would recompute,
+    // so the claim reads as truly unchanged rather than accidentally as a new billing cycle.
+    store.set('u2', {
+      state: 'activation_incomplete',
+      stateSince: iso(claimedAt),
+      lastEpisodeKey: `activation_incomplete|month:2026-09|${iso(claimedAt)}`,
+      lastSignalCodes: ['ads_never_connected'],
+      lastSignalAt: iso(claimedAt),
+      lastSignalChannel: 'cs_nudge',
+      csNudgeDeliveryStatus: 'pending',
+      version: 1,
+    });
+
+    const summary = await runAccountHealthClassifier({ now: NOW });
+
+    expect(summary).toMatchObject({ csNudges: 0, csNudgeUndelivered: 0, silent: 1 });
+    expect(emailService.sendEmail).not.toHaveBeenCalled();
+    expect(store.get('u2')).toMatchObject({ csNudgeDeliveryStatus: 'pending', version: 1 });
   });
 
   it('does not alert when another instance claimed the signal first', async () => {

@@ -9,7 +9,14 @@
  *    eval registry (`mayGate`); until then a needs-review log line. At most once per account + billing cycle + episode, again
  *    only when new risk evidence appears (ENG-2016 AC3). A human correction on the account's
  *    capability row still suppresses a connection/delivery-only alert (ENG-2016 AC4).
- *  - `activation_incomplete` → a CS nudge log line. Never oncall, never churn (decision D6).
+ *  - `activation_incomplete` → a CS nudge: one email digest per run to the AW-Settings
+ *    `account_health_cs_emails` list (ENG-2188). Never oncall, never churn (decision D6). With no
+ *    list configured, or a failed send, the claims are released so the nudges are retried rather
+ *    than silently dropped. Each claim is written `pending` before the digest is even attempted
+ *    (claiming the episode is what stops two instances both queueing it) and finalized to
+ *    `delivered` only once the digest actually sends — a claim left `pending` past
+ *    `CS_NUDGE_PENDING_TIMEOUT_MS` is recovered by a later sweep instead of being lost if the
+ *    process stops between the claim and the send (crash, deploy, OOM).
  *  - `insufficient_evidence` → a needs-review log line (ENG-2016 AC2).
  *  - `healthy` → nothing.
  *
@@ -26,6 +33,8 @@ import { paymentHistoryDb } from '../services/paymentHistoryDb';
 import { adsMetricsDb } from '../services/adsMetricsDb';
 import { isEvaluationUser } from '../services/evaluationPolicy';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { emailService } from '../services/emailService';
+import { settingsService } from '../services/settingsService';
 import {
   getAccountCapabilityRequirement,
   getAccountHealthSignalState,
@@ -87,6 +96,29 @@ export interface AccountHealthSignalDecision {
 /** Only connection/delivery risks are about the ad capability a human correction covers. */
 const CORRECTABLE_RISKS: ReadonlySet<EvidenceCode> = new Set(['ads_connection_expired', 'zero_delivery']);
 
+/** AW-Settings key (JSON array of addresses) for the CS activation-nudge digest (ENG-2188). */
+export const CS_NUDGE_EMAILS_SETTING = 'account_health_cs_emails';
+
+/**
+ * How long a claimed-but-unconfirmed cs_nudge is trusted before the next sweep treats it as lost
+ * and retries it (CodeRabbit #3128: a process stop between the per-user claim write and the
+ * batched digest send at the end of the run otherwise loses the nudge forever, because the claim
+ * already reads as "handled"). Comfortably longer than a sweep normally takes, short enough that
+ * a redeploy or a retry the same day recovers it rather than waiting a full cron interval.
+ */
+export const CS_NUDGE_PENDING_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * True when `prev` is a cs_nudge claim that was never confirmed delivered and is older than the
+ * recovery timeout. `lastSignalAt` doubles as "claimed at" here — the same field the claim write
+ * below stamps with `nowIso`.
+ */
+function isStalePendingCsNudge(prev: AccountHealthSignalState | null, nowMs: number): boolean {
+  if (!prev || prev.lastSignalChannel !== 'cs_nudge' || prev.csNudgeDeliveryStatus !== 'pending') return false;
+  const claimedAt = prev.lastSignalAt ? Date.parse(prev.lastSignalAt) : NaN;
+  return !Number.isFinite(claimedAt) || nowMs - claimedAt > CS_NUDGE_PENDING_TIMEOUT_MS;
+}
+
 /** The registry id whose validation decides whether at-risk may page oncall (ENG-2128 principle 2). */
 export const ACCOUNT_HEALTH_GRADER_ID = 'account-health-classifier';
 
@@ -117,6 +149,13 @@ export function decideAccountHealthSignal(
   nowIso: string,
   opts: { correctionActive?: boolean; oncallAllowed?: boolean } = {},
 ): AccountHealthSignalDecision {
+  // A stale pending cs_nudge is treated exactly like a released claim (see releaseClaim): the
+  // signal/episode fields are dropped, keeping only state/stateSince/version, so the decision
+  // below naturally recomputes as if this account had never been signalled this episode.
+  const effectivePrev = isStalePendingCsNudge(prev, Date.parse(nowIso))
+    ? { state: prev!.state, stateSince: prev!.stateSince, version: prev!.version }
+    : prev;
+
   const channel = channelFor(result, opts.correctionActive ?? false, opts.oncallAllowed ?? false);
   const codes = result.evidence
     .filter((e) => e.kind === 'risk' || e.kind === 'activation' || e.kind === 'gap')
@@ -124,25 +163,25 @@ export function decideAccountHealthSignal(
     .sort();
   // "Could not tell" (typically one failed read) is not a transition: it must not end an open
   // at-risk or activation episode, or the next good read would re-alert as a new episode.
-  if (result.state === 'insufficient_evidence' && (prev?.state === 'at_risk' || prev?.state === 'activation_incomplete')) {
+  if (result.state === 'insufficient_evidence' && (effectivePrev?.state === 'at_risk' || effectivePrev?.state === 'activation_incomplete')) {
     return { channel, emit: false, reason: 'unchanged', codes, next: null };
   }
-  const sameState = prev?.state === result.state;
-  const stateSince = sameState && prev ? prev.stateSince : nowIso;
+  const sameState = effectivePrev?.state === result.state;
+  const stateSince = sameState && effectivePrev ? effectivePrev.stateSince : nowIso;
   const episodeKey = `${result.state}|${result.billingCycle}|${stateSince}`;
-  const priorCodes = prev?.lastEpisodeKey === episodeKey ? (prev.lastSignalCodes ?? []) : [];
+  const priorCodes = effectivePrev?.lastEpisodeKey === episodeKey ? (effectivePrev.lastSignalCodes ?? []) : [];
 
   let reason: AccountHealthSignalReason;
   if (!sameState) reason = 'new_episode';
-  else if (!prev?.lastEpisodeKey) reason = 'retry';
-  else if (prev.lastEpisodeKey !== episodeKey) reason = 'new_billing_cycle';
+  else if (!effectivePrev?.lastEpisodeKey) reason = 'retry';
+  else if (effectivePrev.lastEpisodeKey !== episodeKey) reason = 'new_billing_cycle';
   else if (codes.some((c) => !priorCodes.includes(c))) reason = 'new_evidence';
-  else if (channel === 'oncall' && prev.lastSignalChannel !== 'oncall') reason = 'escalated';
+  else if (channel === 'oncall' && effectivePrev.lastSignalChannel !== 'oncall') reason = 'escalated';
   else reason = 'unchanged';
 
   const emit = channel !== 'none' && reason !== 'unchanged';
   if (!emit && sameState) return { channel, emit, reason, codes, next: null };
-  const version = (prev?.version ?? 0) + 1;
+  const version = (effectivePrev?.version ?? 0) + 1;
   const next: AccountHealthSignalState = emit
     ? {
         state: result.state,
@@ -151,6 +190,8 @@ export function decideAccountHealthSignal(
         lastSignalCodes: [...new Set([...priorCodes, ...codes])].sort(),
         lastSignalAt: nowIso,
         lastSignalChannel: channel,
+        // Claimed, not yet confirmed sent — see sendCsNudgeDigest / finalizeCsNudgeDelivered.
+        ...(channel === 'cs_nudge' ? { csNudgeDeliveryStatus: 'pending' as const } : {}),
         version,
       }
     : { state: result.state, stateSince, version };
@@ -303,11 +344,83 @@ function formatAlert(user: AccountHealthUser, result: AccountHealthClassificatio
   };
 }
 
+interface PendingSignal {
+  user: AccountHealthUser;
+  result: AccountHealthClassification;
+  claimed: AccountHealthSignalState;
+  prev: AccountHealthSignalState | null;
+}
+
+function formatCsNudgeLine(n: PendingSignal): string {
+  const lastActive = n.result.evidence.find((e) => e.code === 'recently_active' || e.code === 'inactive' || e.code === 'activity_unknown');
+  const urgency = n.result.requirement === 'required' ? ' (ads are a current requirement: urgent)' : '';
+  return `${n.user.email || n.user.userId}: no ad account connected yet${urgency}; ${lastActive?.detail ?? 'activity unknown'}; billing cycle ${n.result.billingCycle}`;
+}
+
+/**
+ * One email per run with every new activation nudge, so a first run over a backlog is one message,
+ * not one per account. Returns false when nothing was delivered (no recipients, or the send failed).
+ */
+async function sendCsNudgeDigest(nudges: PendingSignal[], nowIso: string): Promise<boolean> {
+  const recipients = await settingsService.getJsonArraySetting<string>(CS_NUDGE_EMAILS_SETTING, []);
+  if (recipients.length === 0) {
+    console.warn(`${TAG} ${nudges.length} cs_nudge(s) undelivered: AW-Settings ${CS_NUDGE_EMAILS_SETTING} is not set`);
+    return false;
+  }
+  const subject = `Activation nudges: ${nudges.length} paying account(s) have not connected an ad account`;
+  const intro =
+    'These paying accounts have never connected an ad account (Meta, Google Ads or LinkedIn Ads). ' +
+    'This is onboarding, not churn risk. Next step for CS: help the customer connect an ad account ' +
+    'in Settings > Connected Accounts.';
+  const lines = nudges.map(formatCsNudgeLine);
+  const text = `${intro}\n\n${lines.map((l) => `- ${l}`).join('\n')}\n\nAccount-health sweep ${nowIso}`;
+  const html =
+    `<p>${emailService.escapeHtml(intro)}</p><ul>` +
+    lines.map((l) => `<li>${emailService.escapeHtml(l)}</li>`).join('') +
+    `</ul><p style="color:#6c757d;font-size:12px">Account-health sweep ${emailService.escapeHtml(nowIso)}</p>`;
+  return (await emailService.sendEmail(recipients, subject, text, html)) === 'sent';
+}
+
+/** Undo a claim whose signal was not delivered, so the next run retries instead of treating it as sent. */
+async function releaseClaim(userId: string, claimed: AccountHealthSignalState, prev: AccountHealthSignalState | null): Promise<void> {
+  await putAccountHealthSignalState(
+    userId,
+    {
+      ...claimed,
+      lastEpisodeKey: prev?.lastEpisodeKey,
+      lastSignalCodes: prev?.lastSignalCodes,
+      lastSignalAt: prev?.lastSignalAt,
+      lastSignalChannel: prev?.lastSignalChannel,
+      csNudgeDeliveryStatus: prev?.csNudgeDeliveryStatus,
+      version: claimed.version + 1,
+    },
+    claimed.version,
+  ).catch((releaseError: unknown) => console.error(`${TAG} claim release failed for user ${userId}:`, releaseError));
+}
+
+/**
+ * Finalizes a cs_nudge claim to `delivered` once the digest actually went out, so a later sweep's
+ * `isStalePendingCsNudge` check never recovers (and re-sends) a nudge that was genuinely sent.
+ * Best-effort: the CAS write only fails if something else already touched this exact version,
+ * which the recovery timeout makes rare; a failure here means the next sweep may resend once,
+ * which is a duplicate email, not a lost one.
+ */
+async function finalizeCsNudgeDelivered(userId: string, claimed: AccountHealthSignalState): Promise<void> {
+  await putAccountHealthSignalState(
+    userId,
+    { ...claimed, csNudgeDeliveryStatus: 'delivered', version: claimed.version + 1 },
+    claimed.version,
+  ).catch((error: unknown) => console.error(`${TAG} cs_nudge delivery finalize failed for user ${userId}:`, error));
+}
+
 export interface AccountHealthSweepSummary {
   scanned: number;
   byState: Record<AccountHealthClassification['state'], number>;
   oncall: number;
+  /** CS nudges delivered in this run's digest. */
   csNudges: number;
+  /** CS nudges claimed but not delivered (no recipient list, or the send failed); retried next run. */
+  csNudgeUndelivered: number;
   needsReview: number;
   /** Classified but nothing to emit (healthy, or already signalled this episode). */
   silent: number;
@@ -327,6 +440,7 @@ export async function runAccountHealthClassifier(
     byState: { activation_incomplete: 0, at_risk: 0, healthy: 0, insufficient_evidence: 0 },
     oncall: 0,
     csNudges: 0,
+    csNudgeUndelivered: 0,
     needsReview: 0,
     silent: 0,
     lostRace: 0,
@@ -364,6 +478,7 @@ export async function runAccountHealthClassifier(
     return summary;
   }
 
+  const pendingNudges: PendingSignal[] = [];
   for (const user of users) {
     if (!user?.userId || isEvaluationUser(user.userId)) continue;
     summary.scanned++;
@@ -390,9 +505,9 @@ export async function runAccountHealthClassifier(
       if (!decision.emit) continue;
 
       const logLine = JSON.stringify({ userId: user.userId, state: result.state, reason: decision.reason, codes: decision.codes, billingCycle: result.billingCycle });
-      if (decision.channel === 'cs_nudge') {
-        summary.csNudges++;
+      if (decision.channel === 'cs_nudge' && decision.next) {
         console.info(`${TAG} cs_nudge ${logLine}`);
+        pendingNudges.push({ user, result, claimed: decision.next, prev });
       } else if (decision.channel === 'needs_review') {
         summary.needsReview++;
         console.info(`${TAG} needs_review ${logLine}`);
@@ -404,19 +519,7 @@ export async function runAccountHealthClassifier(
         } catch (error) {
           summary.alertFailed++;
           console.error(`${TAG} alert send failed for user ${user.userId}:`, error);
-          // Release the claim so the next run retries instead of treating the alert as delivered.
-          await putAccountHealthSignalState(
-            user.userId,
-            {
-              ...claimed,
-              lastEpisodeKey: prev?.lastEpisodeKey,
-              lastSignalCodes: prev?.lastSignalCodes,
-              lastSignalAt: prev?.lastSignalAt,
-              lastSignalChannel: prev?.lastSignalChannel,
-              version: claimed.version + 1,
-            },
-            claimed.version,
-          ).catch((releaseError: unknown) => console.error(`${TAG} claim release failed for user ${user.userId}:`, releaseError));
+          await releaseClaim(user.userId, claimed, prev);
         }
       }
     } catch (error) {
@@ -425,11 +528,28 @@ export async function runAccountHealthClassifier(
     }
   }
 
+  if (pendingNudges.length > 0) {
+    let delivered = false;
+    try {
+      delivered = await sendCsNudgeDigest(pendingNudges, nowIso);
+    } catch (error) {
+      console.error(`${TAG} cs_nudge digest failed:`, error);
+    }
+    if (delivered) {
+      summary.csNudges += pendingNudges.length;
+      await Promise.all(pendingNudges.map((n) => finalizeCsNudgeDelivered(n.user.userId, n.claimed)));
+    } else {
+      summary.csNudgeUndelivered += pendingNudges.length;
+      for (const n of pendingNudges) await releaseClaim(n.user.userId, n.claimed, n.prev);
+    }
+  }
+
   console.log(
     `${TAG} ${dryRun ? '[DRY RUN] ' : ''}scanned=${summary.scanned} ` +
       `at_risk=${summary.byState.at_risk} activation_incomplete=${summary.byState.activation_incomplete} ` +
       `insufficient_evidence=${summary.byState.insufficient_evidence} healthy=${summary.byState.healthy} ` +
-      `oncall=${summary.oncall} csNudges=${summary.csNudges} needsReview=${summary.needsReview} ` +
+      `oncall=${summary.oncall} csNudges=${summary.csNudges} csNudgeUndelivered=${summary.csNudgeUndelivered} ` +
+      `needsReview=${summary.needsReview} ` +
       `silent=${summary.silent} lostRace=${summary.lostRace} alertFailed=${summary.alertFailed} ` +
       `evaluationFailed=${summary.evaluationFailed}`,
   );
