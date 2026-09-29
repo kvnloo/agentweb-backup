@@ -95,6 +95,22 @@ describe('handleSessionResponse — FAIL cases', () => {
     chatbotDb.createOrReuseInteractiveShare.mockResolvedValue('https://ishare/1');
   });
 
+  it('still persists the error message when posting the error reply also fails', async () => {
+    // The realistic case: generation failed because the transport is down, so the
+    // error reply fails too. Persistence must still happen and nothing may escape.
+    generateSessionResponse.mockRejectedValue(new Error('boom'));
+    const adapter = makeAdapter({
+      postReply: jest.fn().mockRejectedValue(new Error('slack 503')),
+    });
+
+    await expect(handleSessionResponse(baseParams(), adapter)).resolves.toBeUndefined();
+
+    expect(chatbotDb.addMessageToSession).toHaveBeenCalledWith('s1', expect.objectContaining({
+      role: 'assistant',
+      content: 'Sorry, I encountered an error processing your request. Please try again.',
+    }));
+  });
+
   it('reports the failure into the thread when attachment resolution throws', async () => {
     // main widened this try (ENG-1644-era refactor) so a failure before generation
     // cannot escape and leak the caller's claimed progress indicator.

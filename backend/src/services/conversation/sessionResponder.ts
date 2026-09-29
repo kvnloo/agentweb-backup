@@ -128,7 +128,15 @@ export async function handleSessionResponse(
       }
     }
 
-    await adapter.postReply(ref, 'Sorry, I encountered an error while processing your request. Please try again.');
+    // CodeRabbit, PR #2393: when generation failed *because* the transport is failing,
+    // this reply usually fails too. Unguarded, the rejection escaped and skipped the
+    // persistence below, so iShare viewers saw an orphaned user message — and the
+    // "never throws" contract above would have been a lie for every future transport.
+    try {
+      await adapter.postReply(ref, 'Sorry, I encountered an error while processing your request. Please try again.');
+    } catch (replyError) {
+      console.error('❌ Failed to post the error reply:', replyError);
+    }
 
     // Save error message to session so ishare viewers see the failure rather than an orphaned user message
     try {
