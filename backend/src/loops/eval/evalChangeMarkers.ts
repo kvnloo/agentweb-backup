@@ -60,7 +60,7 @@ export interface EvalChangeMarker {
   target: string;
   category: EvalChangeCategory;
   action: EvalChangeAction;
-  /** Which code path wrote it, e.g. `settingsService`, `admin skill route`. */
+  /** Which code path wrote it, e.g. `settingsService`, `skillService`. */
   via: string;
   /** Skill fields the write touched (skills only). */
   fields?: string[];
@@ -152,8 +152,47 @@ export function evalRelevantSkillFields(body: Readonly<Record<string, unknown>>)
 }
 
 /**
- * For admin skill writes. A create or update records a marker only when it touches an
- * eval-relevant field; delete, approve (a skill goes public) and sync always do.
+ * Sentinel marking a field that was set in `before` and is gone in `after` — a removal, not "no
+ * change". A defined value (never `undefined`) so it still passes `evalRelevantSkillFields`'s own
+ * `!== undefined` check and correctly makes a create/update with nothing else changed still
+ * eval-relevant.
+ */
+export const SKILL_FIELD_REMOVED = '__removed__' as const;
+
+/**
+ * The eval-relevant fields whose value differs between the stored skill row (`before`, absent for
+ * a new row) and the row just written (`after`), with their new values. Tool lists compare as
+ * sets. A field present in `before` but absent from `after` is a removal, marked
+ * `SKILL_FIELD_REMOVED`: `SkillService.putSkill` is a full-item replacement write, so a caller
+ * that omits a field it previously set genuinely clears it in the stored row — the same real
+ * change as setting a new value, and just as eval-relevant (ENG-2195 CodeRabbit).
+ */
+export function changedEvalSkillFields(
+  before: Readonly<Record<string, unknown>> | undefined,
+  after: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  const changed: Record<string, unknown> = {};
+  for (const field of EVAL_RELEVANT_SKILL_FIELDS) {
+    const hadBefore = before !== undefined && before[field] !== undefined;
+    if (after[field] === undefined) {
+      if (hadBefore) changed[field] = SKILL_FIELD_REMOVED;
+      continue;
+    }
+    if (hadBefore && sameFieldValue(before![field], after[field])) continue;
+    changed[field] = after[field];
+  }
+  return changed;
+}
+
+function sameFieldValue(a: unknown, b: unknown): boolean {
+  if (Array.isArray(a) && Array.isArray(b)) return JSON.stringify([...a].map(String).sort()) === JSON.stringify([...b].map(String).sort());
+  return a === b;
+}
+
+/**
+ * For skill writes (every caller goes through skillService, ENG-2195). A create or update records
+ * a marker only when it touches an eval-relevant field; delete, approve (a skill goes public) and
+ * sync always do.
  */
 export async function recordSkillChange(
   skillId: string,
@@ -163,20 +202,36 @@ export async function recordSkillChange(
 ): Promise<boolean> {
   const fields = evalRelevantSkillFields(body);
   if ((action === 'create' || action === 'update') && fields.length === 0) return false;
-  const prompt = typeof body.systemPrompt === 'string' ? body.systemPrompt : undefined;
+  // A removed systemPrompt is not prompt text to hash — `fields` above already carries the
+  // removal (SKILL_FIELD_REMOVED is a defined value), so the marker still fires without a
+  // misleading valueSha standing in for content that no longer exists.
+  const prompt = typeof body.systemPrompt === 'string' && body.systemPrompt !== SKILL_FIELD_REMOVED ? body.systemPrompt : undefined;
   return recordEvalChange(
-    { changeKind: 'skill', target: skillId, category: 'skill', action, via: 'admin skill route', ...(fields.length ? { fields } : {}), ...(prompt !== undefined ? { value: prompt } : {}) },
+    { changeKind: 'skill', target: skillId, category: 'skill', action, via: 'skillService', ...(fields.length ? { fields } : {}), ...(prompt !== undefined ? { value: prompt } : {}) },
     deps,
   );
 }
 
 export interface EvalChangeMarkerRow {
   ts: string;
+  /**
+   * The row's full sort key (`<ts>#<subjectId>#<eventType>#<random suffix>`). Two markers can
+   * share `ts` down to the millisecond — buildEvalNeededItem appends a random suffix precisely so
+   * concurrent writes never collide — so only `tsSession` identifies and orders a marker
+   * uniquely; a resume cursor built from `ts` alone can silently skip a same-millisecond sibling
+   * of the marker it last covered (ENG-2195 CodeRabbit).
+   */
+  tsSession: string;
   subjectId: string;
   dimensions: Record<string, unknown>;
 }
 
-/** Read-only: `eval_needed` markers recorded since `sinceIso` (oldest first). */
+/**
+ * Read-only: `eval_needed` markers with a sort key >= `since` (oldest first). `since` is usually
+ * a plain ISO date (the CLI's `--changes-since`), but a resume cursor may instead pass a
+ * previously-returned row's full `tsSession` — DynamoDB compares the sort key as a plain string
+ * either way, and a bare ISO date sorts before any marker recorded at or after it.
+ */
 export async function listEvalChangeMarkers(
   query: (params: AWS.DynamoDB.DocumentClient.QueryInput) => Promise<AWS.DynamoDB.DocumentClient.QueryOutput>,
   sinceIso: string,
@@ -192,7 +247,12 @@ export async function listEvalChangeMarkers(
     });
     for (const item of page.Items ?? []) {
       if (item.eventType !== EVT_EVAL_NEEDED) continue;
-      rows.push({ ts: String(item.ts), subjectId: String(item.subjectId), dimensions: (item.dimensions ?? {}) as Record<string, unknown> });
+      rows.push({
+        ts: String(item.ts),
+        tsSession: String(item.tsSession),
+        subjectId: String(item.subjectId),
+        dimensions: (item.dimensions ?? {}) as Record<string, unknown>,
+      });
     }
     startKey = page.LastEvaluatedKey;
   } while (startKey);

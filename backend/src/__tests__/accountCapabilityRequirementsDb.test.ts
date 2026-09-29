@@ -273,6 +273,12 @@ describe('account health signal state', () => {
     expect(ACCOUNT_HEALTH_SIGNAL_CAPABILITY).not.toBe('ad_platform_integration');
   });
 
+  // ENG-2188 (CodeRabbit #3128): the field the cs_nudge digest-delivery recovery check reads.
+  it('round-trips csNudgeDeliveryStatus', async () => {
+    mockDynamoDB.get.mockReturnValue(ok({ Item: { ...state, lastSignalChannel: 'cs_nudge', csNudgeDeliveryStatus: 'pending' } }));
+    expect(await getAccountHealthSignalState('u1')).toMatchObject({ lastSignalChannel: 'cs_nudge', csNudgeDeliveryStatus: 'pending' });
+  });
+
   it('creates only when absent, and updates only at the expected version', async () => {
     mockDynamoDB.put.mockReturnValue(ok());
     expect(await putAccountHealthSignalState('u1', state, null)).toBe(true);

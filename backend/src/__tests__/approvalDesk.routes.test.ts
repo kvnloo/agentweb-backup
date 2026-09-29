@@ -215,7 +215,16 @@ describe('POST /manifest/:manifestId/approve-all', () => {
 
     const res = await request(app).post('/api/approval-desk/manifest/m1/approve-all').set('Authorization', `Bearer ${mattToken}`);
     expect(res.status).toBe(200);
-    expect(mockExecuteManifest).toHaveBeenCalledWith('m1');
+    expect(mockExecuteManifest).toHaveBeenCalledWith('m1', 'matt');
     expect(res.body.summary.status).toBe('fully_applied');
+  });
+
+  it('second-review fix: a not_all_resolved outcome from the executor itself carries a real message, not a bare 409', async () => {
+    mockListByManifest.mockResolvedValue([decisionFor('d1', 'matt', { status: 'dispatching' })]);
+    mockExecuteManifest.mockResolvedValue({ outcome: 'not_all_resolved', unresolved: ['d1'] });
+
+    const res = await request(app).post('/api/approval-desk/manifest/m1/approve-all').set('Authorization', `Bearer ${mattToken}`);
+    expect(res.status).toBe(409);
+    expect(res.body.message).toEqual(expect.stringContaining('d1'));
   });
 });

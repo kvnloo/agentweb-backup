@@ -21,7 +21,16 @@ import { agreementReport, toGraderValidation, type AgreementReport, type LabelPa
 import { getGrader, type EvalSurface } from './evalRegistry';
 import type { GoldenCase, GoldenCriterion, GoldenSplit, LabelValue } from './goldenSet';
 import type { GoldenSetStore } from './goldenSetStore';
-import { gradeGroundedness, gradeTaskSuccess, gradeToolCorrectness, type SessionForGrading } from './agentGraders';
+import {
+  gradeFormatAdherence,
+  gradeGroundedness,
+  gradeLengthAdherence,
+  gradePermissionAdherence,
+  gradeTaskSuccess,
+  gradeToolCorrectness,
+  type AdherenceResult,
+  type SessionForGrading,
+} from './agentGraders';
 import { buildLoadedSession, groupEventsBySession, type DocItem, type ReadOnlyDocReader, type ReadRequest } from './agentGraderLoader';
 import { LOOP_EVENTS_TABLE } from '../core/sensors/eventTableEventSource';
 import { OUTCOME_SHADOW_JUDGE_ID } from '../../services/outcomeJudge';
@@ -157,6 +166,10 @@ export interface StoredJudgeDimensions {
   goalCompletion?: number;
   dataAccuracy?: number;
   instructionCompliance?: number;
+  /** ENG-2189: the outcome rubric's binary criteria (true = it happened). */
+  arguedWithInstruction?: boolean;
+  escalatedWhenNotRequired?: boolean;
+  failedToEscalate?: boolean;
 }
 
 /** Reads a session judge's stored dimensions; undefined when that judge never scored the session. */
@@ -167,20 +180,32 @@ function dimensionLabel(value: number | undefined): LabelValue {
   return value >= JUDGE_PASS_THRESHOLD ? 'pass' : 'fail';
 }
 
-/** Maps a session judge's stored 1-5 dimensions onto agent criteria. It has no tool-correctness dimension. */
+/** A behaviour criterion's label: `pass` = it happened (golden-set convention for these criteria). */
+function flagLabel(value: boolean | undefined): LabelValue {
+  return typeof value === 'boolean' ? (value ? 'pass' : 'fail') : 'na';
+}
+
+/** Maps a session judge's stored dimensions onto agent criteria. It has no tool-correctness dimension. */
 export function sessionJudgePrediction(dims: StoredJudgeDimensions | undefined): GraderPrediction {
   return {
     task_success: dimensionLabel(dims?.goalCompletion),
     groundedness: dimensionLabel(dims?.dataAccuracy),
     instruction_compliance: dimensionLabel(dims?.instructionCompliance),
+    argued_with_instruction: flagLabel(dims?.arguedWithInstruction),
+    escalated_when_not_required: flagLabel(dims?.escalatedWhenNotRequired),
+    failed_to_escalate: flagLabel(dims?.failedToEscalate),
   };
 }
+
+const SESSION_JUDGE_CRITERIA: GoldenCriterion[] = ['task_success', 'groundedness', 'instruction_compliance'];
+/** Only the outcome rubric asks for these (ENG-2189); the other judges would abstain on every case. */
+const OUTCOME_RUBRIC_CRITERIA: GoldenCriterion[] = ['argued_with_instruction', 'escalated_when_not_required', 'failed_to_escalate'];
 
 export function sessionJudgeGrader(graderId: string, read: StoredJudgeReader): GoldenCaseGrader {
   return {
     graderId,
     surface: 'agent',
-    criteria: ['task_success', 'groundedness', 'instruction_compliance'],
+    criteria: graderId === 'session-judge-outcome-b-shadow' ? [...SESSION_JUDGE_CRITERIA, ...OUTCOME_RUBRIC_CRITERIA] : SESSION_JUDGE_CRITERIA,
     primaryCriterion: 'task_success',
     grade: async (c) => sessionJudgePrediction(await read(c.sourceRef.id)),
   };
@@ -266,9 +291,12 @@ export async function loadSessionForGrading(reader: ReadOnlyDocReader, tables: A
   return buildLoadedSession(item, messageRows, groupEventsBySession(eventRows).get(sessionId) ?? [], undefined).session;
 }
 
-/** Maps each agent grader's verdict onto its criterion; `excluded` / `no_claims` abstain. */
+const adherenceLabel = ({ verdict }: AdherenceResult): LabelValue => (verdict === 'not_applicable' ? 'na' : verdict);
+
+/** Maps each agent grader's verdict onto its criterion; `excluded` / `no_claims` / not applicable abstain. */
 export function agentGraderPrediction(graderId: string, session: SessionForGrading | undefined): GraderPrediction {
   if (!session) return {};
+  const turns = session.turns ?? [];
   switch (graderId) {
     case 'agent-task-success': {
       const { verdict } = gradeTaskSuccess(session);
@@ -280,6 +308,12 @@ export function agentGraderPrediction(graderId: string, session: SessionForGradi
       const { verdict } = gradeGroundedness(session.finalReply, session.ledger);
       return { groundedness: verdict === 'grounded' ? 'pass' : verdict === 'ungrounded' ? 'fail' : 'na' };
     }
+    case 'agent-reply-length-adherence':
+      return { instruction_compliance: adherenceLabel(gradeLengthAdherence(turns)) };
+    case 'agent-format-adherence':
+      return { instruction_compliance: adherenceLabel(gradeFormatAdherence(turns)) };
+    case 'agent-act-without-asking':
+      return { instruction_compliance: adherenceLabel(gradePermissionAdherence(turns)) };
     default:
       throw new Error(`not an agent grader: ${graderId}`);
   }
@@ -289,6 +323,10 @@ const AGENT_GRADER_CRITERIA: Record<string, GoldenCriterion> = {
   'agent-task-success': 'task_success',
   'agent-tool-correctness': 'tool_correctness',
   'agent-groundedness-offline': 'groundedness',
+  // ENG-2189: each is one explicit-instruction check, compared with the human instruction_compliance label.
+  'agent-reply-length-adherence': 'instruction_compliance',
+  'agent-format-adherence': 'instruction_compliance',
+  'agent-act-without-asking': 'instruction_compliance',
 };
 
 export function liveAgentGraders(load: (sessionId: string) => Promise<SessionForGrading | undefined>): GoldenCaseGrader[] {

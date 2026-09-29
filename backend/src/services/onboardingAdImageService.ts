@@ -64,6 +64,7 @@ import type { ICPPersona } from "./icpStatusService";
 import type { CreativeDirResult } from "./creativeDirStatusService";
 import type { CreativeGateResult } from "./creativeGates";
 import { recordGeneratedCreative } from "./creativeLineage";
+import type { PlacementId } from "./creativePlacementSpecs";
 import {
   ARCHETYPES,
   AESTHETIC_RULES,
@@ -78,6 +79,12 @@ const AD_IMAGE_VARIANT_COUNT = 3;
 
 /** 60% of variants are square (1080x1080), 40% vertical (1080x1350). */
 type AdImageFormat = "1080x1080" | "1080x1350";
+
+/** The Meta placement each onboarding format is generated for; the creative gates check against it (ENG-2187). */
+const FORMAT_PLACEMENT: Readonly<Record<AdImageFormat, PlacementId>> = {
+  "1080x1080": "meta_feed_square",
+  "1080x1350": "meta_feed_portrait",
+};
 
 /** Hard per-variant timeout. Beyond this we patch with placeholder. */
 const PER_VARIANT_TIMEOUT_MS = 180_000;
@@ -464,6 +471,8 @@ export interface AdImageGeneratorDep {
     userId: string;
     size?: string;
     imageModel?: string;
+    /** Ad placement the variant is for, so the creative gates check its size limits (ENG-2187). */
+    placement?: PlacementId;
     /**
      * URL of the brand logo to condition the generation on. When provided,
      * `imageService.generateImage` adds the logo as a real image input
@@ -505,6 +514,7 @@ async function generateWithTimeout(
         filename,
         userId,
         size: format,
+        placement: FORMAT_PLACEMENT[format],
         imageModel: DEFAULT_IMAGE_MODEL,
         ...(logoUrl ? { logoImage: logoUrl } : {}),
       }),
@@ -1207,6 +1217,20 @@ export async function triggerAdImageGenerationForUser(
     await userDb.updateUser(userId, finalPatch, {
       condition: axisOwnershipCondition(readAxisIdentity(current)),
     });
+    // ENG-2192: advisory rubric verdicts on the stored variants (inert unless
+    // CREATIVE_RUBRIC_JUDGE_ENABLED + sample rate). Not awaited; never throws.
+    const { adImageCompletedAt, adImageResult } = patch;
+    if (adImageCompletedAt && adImageResult) {
+      const previous = {
+        completedAt: typeof u.adImageCompletedAt === "string" ? u.adImageCompletedAt : undefined,
+        variants: Array.isArray(u.adImageResult?.variants) ? (u.adImageResult.variants as AdImageVariant[]) : [],
+      };
+      void import("./creativeRubricOnboarding")
+        .then((m) =>
+          m.judgeOnboardingAdImages({ userId, completedAt: adImageCompletedAt, variants: adImageResult.variants, previous })
+        )
+        .catch(() => undefined);
+    }
   } catch (err) {
     if (!isConditionalCheckFailure(err)) throw err;
     // eslint-disable-next-line no-console

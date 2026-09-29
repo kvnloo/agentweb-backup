@@ -9,20 +9,32 @@
  * Default cutoffs: back-to-back windows ending today (see defaultCutoffs).
  * Unit: one (account, cutoff) pair. Population at cutoff C: accounts that had a subscription
  * (AW-Users subscription_status set), existed at C, had not already canceled by C, and whose
- * cancellation, if any, is dated by an AW-PaymentHistory `subscription_canceled` event (a
- * `canceled` status with no dated event cannot be placed in time and is excluded, counted).
+ * cancellation, if any, is dated by an AW-PaymentHistory `subscription_canceled` event.
+ * No stored field holds Stripe's `canceled_at` (AW-PaymentHistory keeps no raw event, AW-Users no
+ * cancel timestamp). A `canceled` account with no Stripe-sourced payment event at all, created
+ * before the payment log began, is placed before that start: every Stripe webhook since then
+ * writes one (a cancellation writes `subscription_canceled`, every renewal `payment_succeeded`),
+ * so it canceled — and stopped paying — before the log began, and is already churned at any
+ * cutoff after it. Any other `canceled` status with no dated event is excluded, counted.
  * Truth: churned = a `subscription_canceled` event in (C, C + horizon]. Prediction: churned =
  * the classifier says `at_risk`.
  *
- * Signals are rebuilt as of C: payment events and ad spend up to C, ad accounts connected by C
+ * Signals are rebuilt as of C: payment events, ad days (campaign-row spend, account-day leads)
+ * and explicit ratings up to C, ad accounts connected by C
  * with token expiry judged at C (an ad connection with no created_at excludes the pair), activity
  * only when last seen before C. Current subscription
  * status is NOT used (it would leak the outcome). Known approximations: refresh tokens and the
  * legacy `adAccount` field are current values; no campaign-level delivery exists, so zero
- * delivery is never evaluated; requirement fields do not exist before OPS-4.
+ * delivery is never evaluated; requirement fields do not exist before OPS-4; the tracking
+ * monitor keeps no history, so pixel findings are never available as of C.
  */
 import AWS from "aws-sdk";
-import { classifyAccountHealth, type AccountHealthState } from "../services/accountHealthClassifier";
+import {
+  buildAdDays,
+  classifyAccountHealth,
+  type AccountHealthState,
+  type EvidenceCode,
+} from "../services/accountHealthClassifier";
 import type { AdConnectionAccount } from "../services/clientHealthService";
 import { AD_HEALTH_PLATFORMS } from "../services/accountHealthService";
 import type { RequirementFields } from "../services/accountHealthClassifier";
@@ -46,10 +58,24 @@ export interface BacktestPayment {
   eventType: string;
 }
 
+/** A campaign snapshot row's spend (account-day rows store spend 0 by design). */
 export interface BacktestSpendRow {
   userId: string;
   date: string;
   spend: number;
+}
+
+/** An account-day snapshot row: marks the date as collected and carries its lead count. */
+export interface BacktestLeadRow {
+  userId: string;
+  date: string;
+  totalLeadCount?: number;
+}
+
+export interface BacktestFeedback {
+  userId: string;
+  type: string;
+  timestamp: string;
 }
 
 export interface BacktestData {
@@ -57,7 +83,19 @@ export interface BacktestData {
   payments: BacktestPayment[];
   requirements: Map<string, RequirementFields>;
   spend: BacktestSpendRow[];
+  accountDays: BacktestLeadRow[];
+  feedback: BacktestFeedback[];
 }
+
+/** Payment events Stripe webhooks write; admin credit grants/adjustments are not Stripe's. */
+const STRIPE_EVENT_TYPES = new Set([
+  "subscription_created",
+  "subscription_updated",
+  "subscription_canceled",
+  "payment_succeeded",
+  "payment_failed",
+  "refund",
+]);
 
 export type Outcome = "churned" | "retained";
 
@@ -65,11 +103,15 @@ export interface BacktestCase {
   cutoff: string;
   truth: Outcome;
   state: AccountHealthState;
+  /** The risk and activation evidence codes that fired. */
+  signals: EvidenceCode[];
 }
 
 export interface CutoffPopulation {
   cases: BacktestCase[];
   excludedUndatedCancel: number;
+  /** Canceled with no Stripe event and created before the payment log: churned before it began. */
+  canceledBeforePaymentLog: number;
   excludedAlreadyChurned: number;
   excludedNotYetPaying: number;
   /** An ad connection with no created_at may postdate the cutoff, so the pair is not scored. */
@@ -86,9 +128,19 @@ const byUser = <T extends { userId: string }>(rows: readonly T[]): Map<string, T
 export function buildCutoffPopulation(data: BacktestData, cutoffMs: number, horizonMs: number): CutoffPopulation {
   const payments = byUser(data.payments);
   const spend = byUser(data.spend);
+  const accountDays = byUser(data.accountDays);
+  const feedback = byUser(data.feedback);
   const firstSpendDate = data.spend.reduce<string | null>((min, r) => (min === null || r.date < min ? r.date : min), null);
+  const paymentLogStart = Math.min(...data.payments.map((p) => Date.parse(p.timestamp)).filter(Number.isFinite));
   const cutoffIso = new Date(cutoffMs).toISOString();
-  const out: CutoffPopulation = { cases: [], excludedUndatedCancel: 0, excludedAlreadyChurned: 0, excludedNotYetPaying: 0, excludedUndatedConnection: 0 };
+  const out: CutoffPopulation = {
+    cases: [],
+    excludedUndatedCancel: 0,
+    canceledBeforePaymentLog: 0,
+    excludedAlreadyChurned: 0,
+    excludedNotYetPaying: 0,
+    excludedUndatedConnection: 0,
+  };
 
   for (const user of data.users) {
     if (!user.subscription_status || user.userId.startsWith("eval_")) continue;
@@ -103,7 +155,9 @@ export function buildCutoffPopulation(data: BacktestData, cutoffMs: number, hori
       .map((e) => e.at);
 
     if (user.subscription_status === "canceled" && cancels.length === 0) {
-      out.excludedUndatedCancel++;
+      const noStripeEvent = !events.some((e) => STRIPE_EVENT_TYPES.has(e.eventType));
+      if (noStripeEvent && createdMs < paymentLogStart && paymentLogStart <= cutoffMs) out.canceledBeforePaymentLog++;
+      else out.excludedUndatedCancel++;
       continue;
     }
     const lastCancelBefore = Math.max(-Infinity, ...cancels.filter((t) => t <= cutoffMs));
@@ -133,6 +187,9 @@ export function buildCutoffPopulation(data: BacktestData, cutoffMs: number, hori
             .filter((r) => r.date >= windowStart && r.date < cutoffDate)
             .reduce((sum, r) => sum + r.spend, 0)
         : null;
+    const cutoffDay = <T extends { date: string }>(rows: readonly T[]) => rows.filter((r) => r.date < cutoffDate);
+    // Ad days exist only where snapshots were collected, so earlier cutoffs read "not evaluable".
+    const adDays = buildAdDays(cutoffDay(accountDays.get(user.userId) ?? []), cutoffDay(spend.get(user.userId) ?? []));
     const requirement = data.requirements.get(user.userId) ?? null;
     const verifiedMs = requirement?.requirementVerifiedAt ? Date.parse(requirement.requirementVerifiedAt) : NaN;
 
@@ -147,8 +204,12 @@ export function buildCutoffPopulation(data: BacktestData, cutoffMs: number, hori
       campaigns: null,
       recentAdSpend,
       lastActiveAt: user.lastActiveAt && Date.parse(user.lastActiveAt) <= cutoffMs ? user.lastActiveAt : null,
+      adDays,
+      feedback: (feedback.get(user.userId) ?? []).filter((f) => Date.parse(f.timestamp) <= cutoffMs),
+      tracking: null,
     });
-    out.cases.push({ cutoff: cutoffDate, truth, state: result.state });
+    const signals = result.evidence.filter((e) => e.kind === "risk" || e.kind === "activation").map((e) => e.code);
+    out.cases.push({ cutoff: cutoffDate, truth, state: result.state, signals });
   }
   return out;
 }
@@ -163,12 +224,22 @@ export interface BacktestMetrics {
   recall: number | null;
   recallCI: Interval | null;
   stateByTruth: Record<Outcome, Record<AccountHealthState, number>>;
+  /** Per risk/activation code: pairs it fired on, and how many of those churned. */
+  signalCounts: Record<string, { fired: number; churned: number }>;
 }
 
 export function scoreBacktest(cases: readonly BacktestCase[]): BacktestMetrics {
   const empty = (): Record<AccountHealthState, number> => ({ activation_incomplete: 0, at_risk: 0, healthy: 0, insufficient_evidence: 0 });
   const stateByTruth: Record<Outcome, Record<AccountHealthState, number>> = { churned: empty(), retained: empty() };
-  for (const c of cases) stateByTruth[c.truth][c.state]++;
+  const signalCounts: BacktestMetrics["signalCounts"] = {};
+  for (const c of cases) {
+    stateByTruth[c.truth][c.state]++;
+    for (const code of new Set(c.signals)) {
+      const counts = (signalCounts[code] ??= { fired: 0, churned: 0 });
+      counts.fired++;
+      if (c.truth === "churned") counts.churned++;
+    }
+  }
   const positives = cases.filter((c) => c.truth === "churned").length;
   const predictedPositives = cases.filter((c) => c.state === "at_risk").length;
   const tp = stateByTruth.churned.at_risk;
@@ -184,6 +255,7 @@ export function scoreBacktest(cases: readonly BacktestCase[]): BacktestMetrics {
     recall: churned?.recall ?? null,
     recallCI: positives > 0 ? wilsonInterval(tp, positives) : null,
     stateByTruth,
+    signalCounts,
   };
 }
 
@@ -203,7 +275,7 @@ async function scanAll<T>(
 
 async function loadData(): Promise<BacktestData> {
   const dynamodb = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || "us-west-2" });
-  const [users, payments, capabilityRows, spend] = await Promise.all([
+  const [users, payments, capabilityRows, snapshots, ratedSessions] = await Promise.all([
     scanAll<BacktestUser>(dynamodb, {
       TableName: `${PREFIX}AW-Users`,
       ProjectionExpression: "userId, createdAt, subscription_status, adAccount, lastActiveAt, connected_accounts",
@@ -216,23 +288,38 @@ async function loadData(): Promise<BacktestData> {
     scanAll<RequirementFields & { userId: string; capability: string }>(dynamodb, {
       TableName: `${PREFIX}AW-AccountCapabilityRequirements`,
     }),
-    scanAll<BacktestSpendRow>(dynamodb, {
+    scanAll<BacktestSpendRow & BacktestLeadRow & { rowType: string }>(dynamodb, {
       TableName: `${PREFIX}AW-AdsMetricsSnapshots`,
-      FilterExpression: "rowType = :accountDay",
-      ProjectionExpression: "userId, #date, spend",
+      FilterExpression: "rowType IN (:accountDay, :campaign)",
+      ProjectionExpression: "userId, #date, spend, totalLeadCount, rowType",
       ExpressionAttributeNames: { "#date": "date" },
-      ExpressionAttributeValues: { ":accountDay": "account_day" },
+      ExpressionAttributeValues: { ":accountDay": "account_day", ":campaign": "campaign" },
+    }),
+    scanAll<{ userId?: string; feedbacks?: Record<string, { type?: string; timestamp?: string }> }>(dynamodb, {
+      TableName: `${PREFIX}AW-ChatSessions`,
+      FilterExpression: "attribute_exists(feedbacks)",
+      ProjectionExpression: "userId, feedbacks",
     }),
   ]);
   const requirements = new Map<string, RequirementFields>();
   for (const row of capabilityRows) {
     if (row.capability === "ad_platform_integration") requirements.set(row.userId, row);
   }
+  const feedback: BacktestFeedback[] = [];
+  for (const session of ratedSessions) {
+    for (const rating of Object.values(session.feedbacks ?? {})) {
+      if (session.userId && rating?.type && rating.timestamp) {
+        feedback.push({ userId: session.userId, type: rating.type, timestamp: rating.timestamp });
+      }
+    }
+  }
   return {
     users: users.filter((u) => !u.userId.startsWith("deleted_")),
     payments: payments.filter((p) => p.userId !== "__dedup__"),
     requirements,
-    spend,
+    spend: snapshots.filter((r) => r.rowType === "campaign"),
+    accountDays: snapshots.filter((r) => r.rowType === "account_day"),
+    feedback,
   };
 }
 
@@ -247,6 +334,7 @@ function report(label: string, metrics: BacktestMetrics): void {
   for (const truth of ["churned", "retained"] as const) {
     console.log(`  ${truth.padEnd(8)} ${JSON.stringify(metrics.stateByTruth[truth])}`);
   }
+  console.log(`  signals  ${JSON.stringify(metrics.signalCounts)}`);
 }
 
 /**
@@ -271,7 +359,8 @@ async function main(): Promise<void> {
   const cutoffs = explicit.length > 0 ? explicit : defaultCutoffs(horizonMs, Date.now(), firstEvent);
   console.log(
     `[eng2143-backtest] read-only: users=${data.users.length} payment_events=${data.payments.length} ` +
-      `capability_rows=${data.requirements.size} spend_rows=${data.spend.length} horizon=${horizonDays}d`,
+      `capability_rows=${data.requirements.size} campaign_spend_rows=${data.spend.length} ` +
+      `account_day_rows=${data.accountDays.length} ratings=${data.feedback.length} horizon=${horizonDays}d`,
   );
   const all: BacktestCase[] = [];
   for (const cutoff of cutoffs) {
@@ -279,7 +368,8 @@ async function main(): Promise<void> {
     all.push(...population.cases);
     report(`cutoff ${new Date(cutoff).toISOString().slice(0, 10)}`, scoreBacktest(population.cases));
     console.log(
-      `  excluded: undated_cancel=${population.excludedUndatedCancel} already_churned=${population.excludedAlreadyChurned} ` +
+      `  excluded: undated_cancel=${population.excludedUndatedCancel} canceled_before_payment_log=${population.canceledBeforePaymentLog} ` +
+        `already_churned=${population.excludedAlreadyChurned} ` +
         `not_yet_paying=${population.excludedNotYetPaying} undated_connection=${population.excludedUndatedConnection}`,
     );
   }

@@ -248,10 +248,15 @@ export function creativePerformanceReport(
   };
 }
 
-/** Rubric criteria passed from a stored ENG-2140 `creativeRubric`, or null unless it is an ok single-mode result. */
+/**
+ * Rubric criteria passed from a stored ENG-2140 `creativeRubric`, or null unless it is an ok single-mode
+ * result on the 7-criterion ad floor. Other surfaces (ENG-2192: organic images score out of 5) are not
+ * comparable with it, so they are left out.
+ */
 export function readRubricScore(rubric: unknown): number | null {
   if (!rubric || typeof rubric !== 'object') return null;
-  const r = rubric as { mode?: unknown; status?: unknown; passedCount?: unknown };
+  const r = rubric as { mode?: unknown; status?: unknown; passedCount?: unknown; surface?: unknown };
   if (r.mode !== 'single' || r.status !== 'ok') return null;
+  if (r.surface !== undefined && r.surface !== 'ad_image') return null;
   return typeof r.passedCount === 'number' && Number.isFinite(r.passedCount) ? r.passedCount : null;
 }
