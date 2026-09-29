@@ -345,22 +345,27 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     );
   });
 
-  // ENG-2127: the lifecycle filter is handed to getLeadsByStatus, which queries the
-  // `status` attribute and never reads `lifecycle`. The vocabularies are disjoint, so it
-  // matches nothing — and an empty array is a legitimate result, so the caller used to
-  // report "0 enrolled" with no indication that the filter itself is broken.
-  it('refuses a lifecycle filter instead of silently enrolling nobody', async () => {
+  // ENG-2127: lifecycle is derived state. A lifecycle-only filter must read the full
+  // list and compute the stage instead of querying listId-status-index with the wrong
+  // vocabulary.
+  it('derives lifecycle and enrolls only matching leads', async () => {
     const crmDbMock = require('../services/db').crmDb;
     crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({ items: [] });
+    crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+      { leadId: 'inbox-1', email: 'a@example.com' },
+      { leadId: 'unknown-1', company: 'No contact channel' },
+    ]);
 
     const res = await request(app)
       .post('/seq_1/enrollments/by-list')
       .send({ listId: 'list-1', lifecycle: 'inbox' });
 
-    expect(res.status).toBe(400);
-    expect(res.body.error).toBe('lifecycle_filter_unsupported');
-    expect(res.body.message).toMatch(/matches nothing/);
-    expect(dripSequenceDb.bulkEnroll).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(crmDbMock.getLeadsByStatus).not.toHaveBeenCalled();
+    expect(crmDbMock.getAllLeadsByListId).toHaveBeenCalledWith('list-1');
+    expect(dripSequenceDb.bulkEnroll).toHaveBeenCalledWith([
+      expect.objectContaining({ leadId: 'inbox-1', leadEmail: 'a@example.com' }),
+    ]);
   });
 
   // at_risk and churned are BOTH lifecycle stages AND default lead statuses (db.ts:5364),
@@ -411,34 +416,57 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
   // ...and the fallback is listType-aware: `at_risk` is a default status only for a
   // customers list. On a prospect list it is a lifecycle stage and nothing else, so the
   // guard must still fire — otherwise the widening has simply disabled it.
-  it('still rejects a lifecycle-only value on a list with no stored statusConfig', async () => {
+  it('treats a lifecycle-only value as derived state when it is not a list status', async () => {
     const crmDbMock = require('../services/db').crmDb;
     crmDbMock.getLeadListById = jest.fn().mockResolvedValue({
       listId: 'list-1', userId: 'user-123',
     });
     crmDbMock.canOrgMemberAccessList = jest.fn().mockResolvedValue(true);
     crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({ items: [] });
+    crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+      {
+        leadId: 'risk-1',
+        email: 'risk@example.com',
+        lifecycle: 'paying',
+        subscriptionState: 'past_due',
+      },
+    ]);
 
     const res = await request(app)
       .post('/seq_1/enrollments/by-list')
       .send({ listId: 'list-1', lifecycle: 'at_risk' });
 
-    expect(res.status).toBe(400);
-    expect(res.body.error).toBe('lifecycle_filter_unsupported');
+    expect(res.status).toBe(200);
+    expect(crmDbMock.getLeadsByStatus).not.toHaveBeenCalled();
+    expect(dripSequenceDb.bulkEnroll).toHaveBeenCalledWith([
+      expect.objectContaining({ leadId: 'risk-1' }),
+    ]);
 
-    // but on a customers list the same value IS a default status
+    // On a customers list the same legacy value is a real default status, so preserve the
+    // historical status-filter interpretation.
     crmDbMock.getLeadListById = jest.fn().mockResolvedValue({
       listId: 'list-1', userId: 'user-123', listType: 'customers',
     });
+    crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({ items: [] });
     const customers = await request(app)
       .post('/seq_1/enrollments/by-list')
       .send({ listId: 'list-1', lifecycle: 'at_risk' });
 
     expect(customers.status).toBe(200);
-    expect(customers.body.error).toBeUndefined();
+    expect(crmDbMock.getLeadsByStatus).toHaveBeenCalledWith('list-1', 'at_risk');
   });
 
-  it('still enrols normally when a lifecycle filter does return leads', async () => {
+  it('rejects an unknown lifecycle value instead of silently returning zero', async () => {
+    const res = await request(app)
+      .post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1', lifecycle: 'definitely_not_a_stage' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_lifecycle_filter');
+    expect(dripSequenceDb.bulkEnroll).not.toHaveBeenCalled();
+  });
+
+  it('accepts an explicit status filter without overloading lifecycle', async () => {
     const crmDbMock = require('../services/db').crmDb;
     crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({
       items: [{ leadId: 'l1', email: 'a@example.com' }],
@@ -446,9 +474,10 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
 
     const res = await request(app)
       .post('/seq_1/enrollments/by-list')
-      .send({ listId: 'list-1', lifecycle: 'inbox' });
+      .send({ listId: 'list-1', status: 'qualified' });
 
     expect(res.status).toBe(200);
+    expect(crmDbMock.getLeadsByStatus).toHaveBeenCalledWith('list-1', 'qualified');
     expect(dripSequenceDb.bulkEnroll).toHaveBeenCalled();
   });
 
