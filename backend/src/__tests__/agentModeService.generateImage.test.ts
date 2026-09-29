@@ -254,6 +254,32 @@ describe('AgentModeService - generate_image function', () => {
     });
   });
 
+  describe('Placement parameter (ENG-2187)', () => {
+    const call = (placement: string | undefined) =>
+      (agentModeService as unknown as {
+        generateImage: (...args: unknown[]) => Promise<{ success: boolean }>;
+      }).generateImage(
+        'Ad prompt', 'ad.png', '1:1', 'medium', [], 'user123', 'session123',
+        'gemini-3-pro-image-preview', undefined, undefined, 'ad', undefined, placement,
+      );
+
+    it('passes a declared placement to the image service so the gates size against it', async () => {
+      mockImageService.generateImage.mockResolvedValue({ success: true, imageUrl: 'https://example.com/a.png', filename: 'ad.png' });
+
+      await call('meta_story_reel');
+
+      expect(mockImageService.generateImage).toHaveBeenCalledWith(expect.objectContaining({ placement: 'meta_story_reel' }));
+    });
+
+    it('drops an unknown placement instead of passing it on', async () => {
+      mockImageService.generateImage.mockResolvedValue({ success: true, imageUrl: 'https://example.com/a.png', filename: 'ad.png' });
+
+      await call('tiktok_feed');
+
+      expect(mockImageService.generateImage.mock.calls[0][0]).not.toHaveProperty('placement');
+    });
+  });
+
   describe('Model Parameter Handling', () => {
     it('should pass imageModel parameter to imageService', async () => {
       mockImageService.generateImage.mockResolvedValue({

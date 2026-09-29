@@ -6,8 +6,8 @@ import { uploadFileToS3 } from "../utils/s3Utils";
 import { getOpenAIClient, getGeminiClient } from "../utils/llmClients";
 import { recordUsage, meterUserUsage } from "./usageRecorderService";
 import { imageGenerationCostUsd, LLM_PRICE_BOOK_PROVENANCE } from "../utils/llmPricing";
-import { runCreativeGates, type CreativeGateResult } from "./creativeGates";
-import { resolveGeminiAspectRatio } from "./creativePlacementSpecs";
+import { notCheckedGateResult, runCreativeGates, type CreativeGateResult } from "./creativeGates";
+import { resolveGeminiAspectRatio, type PlacementId } from "./creativePlacementSpecs";
 
 interface ImageGenerationResult {
   success: boolean;
@@ -15,11 +15,16 @@ interface ImageGenerationResult {
   filename?: string;
   error?: string;
   /**
-   * Advisory deterministic checks on the rendered image (ENG-2139). Absent when the provider
-   * returned a remote URL instead of image bytes (Runway) or the gates could not run.
+   * Advisory deterministic checks on the rendered image (ENG-2139). A provider that returns a
+   * remote URL (Runway) is gated after download, or marked `notChecked` (ENG-2187). Absent only
+   * when the gates themselves threw or the S3 upload failed.
    */
   gates?: CreativeGateResult;
 }
+
+/** Bounds for downloading a provider's remote image to gate it (ENG-2187). */
+const REMOTE_GATE_DOWNLOAD_TIMEOUT_MS = 20_000;
+const REMOTE_GATE_MAX_BYTES = 30 * 1024 * 1024;
 
 // Supported image generation models
 const SUPPORTED_MODELS = IMAGE_MODEL_IDS;
@@ -72,6 +77,12 @@ interface ImageGenerationParams {
   /** Overrides the recorded feature, e.g. `platform:workplan_thumbnail` (ENG-1961). */
   meterFeature?: string;
   imageModel?: string; // Optional model parameter - must be one of the supported models
+  /**
+   * The ad placement the image is for, when the caller knows it (ENG-2187). The creative gates
+   * hold the image against this placement's size and file limits; otherwise they infer one from
+   * `size`.
+   */
+  placement?: PlacementId;
   removeC2PA?: boolean; // Optional parameter to remove C2PA metadata, defaults to true
 }
 
@@ -590,8 +601,10 @@ export class ImageService {
             const base64Data = result.imageUrl.split(',')[1];
             imageBuffer = Buffer.from(base64Data, 'base64');
           } else {
-            // It's already a URL, we can't upload it
-            return result;
+            // It's already a URL (Runway), we can't upload it. Gate it from a bounded download
+            // instead, or record that it was not checked (ENG-2187).
+            const gates = await this.runRemoteAdvisoryGates(result.imageUrl, params, modelToUse);
+            return gates ? { ...result, gates } : result;
           }
           
           // Remove C2PA metadata if removeC2PA is true (defaults to true)
@@ -600,7 +613,7 @@ export class ImageService {
             imageBuffer = await this.removeC2PAMetadata(imageBuffer);
           }
           
-          const gates = await this.runAdvisoryGates(imageBuffer, params.size, modelToUse);
+          const gates = await this.runAdvisoryGates(imageBuffer, params.size, modelToUse, params.placement);
 
           // Upload to S3
           const uploadResult = await uploadFileToS3(
@@ -1150,12 +1163,14 @@ export class ImageService {
   private async runAdvisoryGates(
     imageBuffer: Buffer,
     size: string | undefined,
-    model: string
+    model: string,
+    placement?: PlacementId
   ): Promise<CreativeGateResult | undefined> {
     try {
       const mapsSizeToAspect = model === "gemini-3-pro-image-preview" || model === "gemini-3.1-flash-image";
       const gates = await runCreativeGates(imageBuffer, {
         requestedSize: size,
+        ...(placement ? { placement } : {}),
         ...(mapsSizeToAspect ? { aspectResolution: resolveGeminiAspectRatio(size) } : {}),
       });
       if (!gates.passed) {
@@ -1167,6 +1182,36 @@ export class ImageService {
       console.warn("[creative-gates] evaluation failed (ignored):", err instanceof Error ? err.message : err);
       return undefined;
     }
+  }
+
+  /**
+   * ENG-2187: gates for a provider that returns a remote URL instead of bytes (Runway). Downloads
+   * the image once, bounded in time and size, and gates the bytes; when the download fails the
+   * result says `notChecked` with the reason rather than the image going ungated silently.
+   * Never throws and never fails the generation.
+   */
+  private async runRemoteAdvisoryGates(
+    imageUrl: string,
+    params: ImageGenerationParams,
+    model: string
+  ): Promise<CreativeGateResult | undefined> {
+    let imageBuffer: Buffer;
+    try {
+      const response = await axios.get<ArrayBuffer>(imageUrl, {
+        responseType: "arraybuffer",
+        timeout: REMOTE_GATE_DOWNLOAD_TIMEOUT_MS,
+        maxContentLength: REMOTE_GATE_MAX_BYTES,
+      });
+      imageBuffer = Buffer.from(response.data);
+    } catch (err) {
+      const reason = `remote image could not be downloaded to check: ${err instanceof Error ? err.message : String(err)}`;
+      console.warn(`[creative-gates] not checked (${model}): ${reason}`);
+      return notCheckedGateResult(
+        { requestedSize: params.size, ...(params.placement ? { placement: params.placement } : {}) },
+        reason
+      );
+    }
+    return this.runAdvisoryGates(imageBuffer, params.size, model, params.placement);
   }
 
   /**
