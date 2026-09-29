@@ -102,6 +102,32 @@ describe('gradeLengthAdherence', () => {
   it('is not applicable when the requested turn got no reply', () => {
     expect(gradeLengthAdherence([turn('Answer in under 100 words')])).toMatchObject({ verdict: 'not_applicable', reason: 'no_reply' });
   });
+
+  it('checks every bound when the user gives more than one, failing if either is broken (CodeRabbit PR #3136, thread 4130329024)', () => {
+    // Satisfies the sentence bound (2 <= 3) but breaks the word bound (240 > 75).
+    const tooManyWords = gradeLengthAdherence([turn('Answer in 3 sentences and under 50 words.', 'One sentence here. ' + words(240))]);
+    expect(tooManyWords).toMatchObject({ verdict: 'fail', reason: 'exceeded_requested_length' });
+    expect(tooManyWords.detail).toContain('words vs <= 50 words');
+    // Breaks the sentence bound (8 > 6, allowed for max 3) even though the word count is fine.
+    const tooManySentences = gradeLengthAdherence([turn('Answer in 3 sentences and under 50 words.', 'One. Two. Three. Four. Five. Six. Seven. Eight.')]);
+    expect(tooManySentences).toMatchObject({ verdict: 'fail', reason: 'exceeded_requested_length' });
+    expect(tooManySentences.detail).toContain('sentences vs <= 3 sentences');
+    // Satisfies both.
+    expect(gradeLengthAdherence([turn('Answer in 3 sentences and under 50 words.', 'One. Two. Three.')]).verdict).toBe('pass');
+  });
+
+  // Adversarial pass beyond the CodeRabbit finding:
+  it('is exact-boundary tolerant: right at the allowed slack passes, one word over fails', () => {
+    // 10 words -> allowed = floor(10*1.5)+25 = 40.
+    expect(gradeLengthAdherence([turn('Answer in under 10 words', words(40))]).verdict).toBe('pass');
+    expect(gradeLengthAdherence([turn('Answer in under 10 words', words(41))]).verdict).toBe('fail');
+  });
+
+  it('does not conflate an unrelated number in the reply with the bound (only the user text is parsed)', () => {
+    // The reply mentions "3 sentences" but the actual instruction was a word limit; only the
+    // user's own text is ever parsed for a bound, never the reply.
+    expect(gradeLengthAdherence([turn('Answer in under 100 words', 'I found 3 sentences worth flagging. ' + words(50))]).verdict).toBe('pass');
+  });
 });
 
 describe('format adherence', () => {
