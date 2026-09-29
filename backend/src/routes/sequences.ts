@@ -50,11 +50,24 @@ function requiredChannels(sequence: any): Set<string> {
   // to email rather than to the empty set, which would mean "reachable on no channels" —
   // i.e. filter nothing — and silently widen the population this screen reports on.
   if (steps.length === 0) return new Set<string>(['email']);
-  // Lower-cased: nothing validates `step.channel` on create/update, so a mis-cased
-  // 'Email' used to match no branch. Under the old every-channel rule that failed OPEN
-  // (everyone enrolled, and the worker's `channel === 'linkedin' ? … : email` delivered
-  // them as email anyway); under at-least-one it fails CLOSED and enrols nobody.
-  return new Set<string>(steps.map((st: any) => String(st?.channel ?? 'email').trim().toLowerCase()));
+  // Mirror the WORKER'S dispatch exactly, rather than mapping the stored value.
+  //
+  // dripSequenceWorker does `channel === 'linkedin' ? sendLinkedInStep : sendEmailStep`,
+  // so everything that is not literally 'linkedin' is an EMAIL step as far as delivery
+  // is concerned. Mapping the raw value here instead produced a set the reachability
+  // test could never satisfy: `channel: 'sms'`, a typo like 'linkedln', or an empty
+  // string from an unselected dropdown all yielded {'sms'} / {''} , which matches
+  // neither branch, so the route enrolled NOBODY while the worker would have emailed
+  // them. Note `?? 'email'` does not catch '' — only null/undefined — so an empty
+  // string was the easiest way to hit it.
+  //
+  // Lower-casing alone fixed only the mis-cased case ('Email'); this fixes the general
+  // one. Erring toward email matches what actually gets sent, so the route can no
+  // longer be stricter than the thing it is gating.
+  return new Set<string>(steps.map((st: any) => {
+    const raw = String(st?.channel ?? '').trim().toLowerCase();
+    return raw === 'linkedin' ? 'linkedin' : 'email';
+  }));
 }
 
 /**

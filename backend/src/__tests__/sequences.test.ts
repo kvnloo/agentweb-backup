@@ -1005,3 +1005,59 @@ describe('cross-tenant authorization', () => {
     });
   });
 });
+
+/*
+ * The route's channel set must mirror the WORKER'S dispatch, not the stored value.
+ *
+ * dripSequenceWorker does `channel === 'linkedin' ? sendLinkedInStep : sendEmailStep`,
+ * so anything that is not literally 'linkedin' is delivered as email. Mapping the raw
+ * value here produced sets like {'sms'} or {''} that the reachability test can never
+ * satisfy — so the route enrolled NOBODY while the worker would have emailed everyone.
+ * `?? 'email'` does not catch '', so an unselected dropdown was enough to trigger it.
+ */
+describe('unknown channels fall back to email, matching the worker', () => {
+  const crmDbMock = require('../services/db').crmDb;
+
+  beforeEach(() => {
+    crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+      { leadId: 'l1', listId: 'list-1', email: 'a@example.com' },
+      { leadId: 'l2', listId: 'list-1', email: 'b@example.com' },
+    ]);
+  });
+
+  it.each([
+    ['an empty string (unselected dropdown)', ''],
+    ['a typo', 'linkedln'],
+    ['an unsupported channel', 'sms'],
+    ['a non-string', 0 as any],
+    ['null', null as any],
+  ])('still enrols email-reachable leads when channel is %s', async (_label, channel) => {
+    dripSequenceDb.getSequence.mockResolvedValue({
+      ...mockSequence,
+      steps: [{ stepId: 's1', stepNumber: 1, name: 'x', delayDays: 0, channel, subject: 'Hi', bodyHtml: 'y' }],
+    });
+
+    const res = await request(app).post('/seq_1/enrollments/by-list').send({ listId: 'list-1' });
+
+    expect(res.status).toBe(200);
+    // Both leads have valid addresses and the worker would email them. Refusing here
+    // is a silent lost send, reported as if it were clean data.
+    expect(res.body.enrollableLeads).toBe(2);
+  });
+
+  it('still routes a genuine linkedin step to linkedin', async () => {
+    dripSequenceDb.getSequence.mockResolvedValue({
+      ...mockSequence,
+      steps: [{ stepId: 's1', stepNumber: 1, name: 'x', delayDays: 0, channel: 'LinkedIn', messageText: 'hi' }],
+    });
+    crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+      { leadId: 'l1', listId: 'list-1', email: 'a@example.com' },
+    ]);
+
+    const res = await request(app).post('/seq_1/enrollments/by-list').send({ listId: 'list-1' });
+
+    // Email-only lead, LinkedIn-only sequence -> genuinely unreachable.
+    expect(res.body.enrollableLeads).toBe(0);
+    expect(res.body.skippedUnreachable).toBe(1);
+  });
+});
