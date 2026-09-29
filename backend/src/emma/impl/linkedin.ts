@@ -25,7 +25,9 @@
  * source rather than trusting a boundary grep. (A second method,
  * `linkedinManagePost`, was ALSO excluded in the original cluster-16 pass —
  * see the "ENG-2103 (F2) FOLLOW-UP" note right after this list for why that
- * exclusion was later closed instead.):
+ * exclusion was later closed instead. Item 1 below, `resolveEmployersForSizeFilter`,
+ * was ALSO later closed — see the "ENG-2103 (F2 design-decision-list
+ * follow-up, Pattern A)" note further down this header for why and how.):
  *
  * 1. `resolveEmployersForSizeFilter` — a REAL, one-hop-removed
  *    `this.callLLM` coupling, the same shape as the video cluster's
@@ -190,6 +192,46 @@
  * in (see above) needed zero test-file changes for the same reason — the 5
  * dispatch tests spy on the class instance's sibling methods, which stayed
  * exactly where they were.
+ *
+ * ENG-2103 (F2 design-decision-list follow-up, Pattern A):
+ * `resolveEmployersForSizeFilter` (item 1 of the exclusion list above) moved
+ * in. Its real coupling was always to `this.callLLM` via module-scope
+ * `batchParseCompaniesFromTitlesWithLLM`, never to its own identity — once
+ * that's supplied as an injected `callLLM` parameter (the same
+ * `this.callLLM.bind(this)` shape as `createHtmlFromTemplate`), the function
+ * has no remaining reason to stay off this module. It is now a
+ * non-exported, module-scope function (matching `linkedInPublicIdFromUrl`'s
+ * treatment above) — confirmed by whole-backend grep that nothing outside
+ * this module ever called `AgentModeService.prototype.resolveEmployersForSizeFilter`
+ * directly and no test spied on it. Since its only caller, `linkedinOutreach`,
+ * now lives in the SAME module, the `EmployerSizeFilterResolver`
+ * injected-function-parameter indirection this file used while the two
+ * lived apart is now unnecessary and has been removed — `linkedinOutreach`
+ * calls `resolveEmployersForSizeFilter` as a plain internal function call,
+ * and instead takes `callLLM` as its own injected parameter (forwarded
+ * through to `resolveEmployersForSizeFilter`). `parseCompanyFromTitle` and
+ * `batchParseCompaniesFromTitlesWithLLM` themselves are imported from the
+ * new `emma/impl/shared/companyTitleParsing.ts` (promoted there, not just
+ * moved here, because `emma/impl/leads.ts`'s `importLeadsFromSearch` — moved
+ * in the same round — needs them too, and the two land in different
+ * modules). `withTimeoutOrReject` and the two
+ * `EMPLOYER_PROFILE_LOOKUP_*` constants moved with the function:
+ * `withTimeoutOrReject` itself is imported from the new
+ * `emma/impl/shared/withTimeoutOrReject.ts` (promoted rather than moved
+ * outright, since `AgentModeService.prototype.generateImage`'s
+ * data-fabrication check is a second real caller that stays on the class
+ * forever); the two constants are local to this module, unused elsewhere.
+ *
+ * `AgentModeService.prototype.linkedinOutreach`'s delegating wrapper now
+ * supplies `this.callLLM.bind(this)` instead of the collapsed
+ * `this.resolveEmployersForSizeFilter.bind(this)` injection. `callLLM` is
+ * `public` on `AgentModeService`, so `emma/tools.ts`'s `linkedin_outreach`
+ * tool is now repointed to call `linkedinOutreach` on this module directly
+ * (`agentModeService.callLLM.bind(agentModeService)`) instead of going
+ * through the class wrapper — the same treatment `create_html_from_template`
+ * already established. `linkedin_manage_post` is UNCHANGED by this note —
+ * it still calls `agentModeService.linkedinManagePost` for the unrelated
+ * sibling-method-spy reason documented in the FOLLOW-UP section above.
  */
 import { linkedInOutreachService } from '../../services/linkedInOutreachService';
 import {
@@ -212,23 +254,110 @@ import {
   type AccountRoutingDisclosure,
 } from '../../services/agentMode/linkedInAccountRouting';
 import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
+import { withTimeoutOrReject } from './shared/withTimeoutOrReject';
+import { parseCompanyFromTitle, batchParseCompaniesFromTitlesWithLLM } from './shared/companyTitleParsing';
+import type { AgentModeService } from '../../services/agentModeService';
+
+// Mirrors LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS /
+// COMPANY_SIZE_LOOKUP_CONCURRENCY (kept as separate local constants rather
+// than importing that class here — this file already reaches the singleton
+// via the top-level `linkedInOutreachService` import, and the class itself
+// is only ever pulled in via dynamic import for a handful of static helpers).
+const EMPLOYER_PROFILE_LOOKUP_TIMEOUT_MS = 30_000;
+const EMPLOYER_PROFILE_LOOKUP_CONCURRENCY = 5;
 
 /**
- * Injected resolver for `linkedinOutreach`'s `search-people` company-size
- * post-filter. `AgentModeService.prototype.resolveEmployersForSizeFilter`
- * stays PRIVATE on the class (see module header — it has a real,
- * one-hop-removed `this.callLLM` coupling via
- * `batchParseCompaniesFromTitlesWithLLM`), so `linkedinOutreach` receives it
- * as an explicit function parameter, supplied ONLY by
- * `AgentModeService.prototype.linkedinOutreach`'s delegating wrapper via
- * `this.resolveEmployersForSizeFilter.bind(this)` — the sole code that can
- * legally read a private sibling method.
+ * ENG-1558 follow-up: classic search-people results almost never carry
+ * `work_experience` (confirmed live — every item across two production
+ * test searches omitted it; see outreachProspectPreviewService's own
+ * "search results often omit it" comment), so calling
+ * filterByCompanySize directly on raw search items resolves an employer
+ * for ~0% of candidates and excludes everyone as unverifiable regardless
+ * of the requested bounds. importLeadsFromSearch already avoids this with
+ * a 4-tier resolution chain (work_experience → title-regex → batched LLM
+ * → Unipile getProfile) before its own company-size filter; this mirrors
+ * that same chain for the single search-people call so the two paths
+ * agree, and reshapes the result as `work_experience` since that's what
+ * filterByCompanySize's employerOf() reads.
+ *
+ * Non-exported — its only caller, `linkedinOutreach`, lives in this same
+ * module (see this module's own header comment for why the two are no
+ * longer bridged by an injected-function-parameter indirection).
  */
-export type EmployerSizeFilterResolver = (
+async function resolveEmployersForSizeFilter(
   items: any[],
   accountId: string,
   userId: string,
-) => Promise<Array<{ work_experience: Array<{ company: string; current: true }> }>>;
+  callLLM: Pick<AgentModeService, 'callLLM'>['callLLM'],
+): Promise<Array<{ work_experience: Array<{ company: string; current: true }> }>> {
+  const names: Array<string | null> = items.map((item: any) => {
+    if (item?.work_experience?.length) {
+      const current = item.work_experience.find((w: any) => w?.current) || item.work_experience[0];
+      if (current?.company) return current.company;
+    }
+    return null;
+  });
+
+  items.forEach((item: any, i: number) => {
+    if (!names[i] && typeof item?.headline === 'string') {
+      const parsed = parseCompanyFromTitle(item.headline);
+      if (parsed) names[i] = parsed;
+    }
+  });
+
+  const llmIndices: number[] = [];
+  const llmTitles: string[] = [];
+  items.forEach((item: any, i: number) => {
+    if (!names[i] && typeof item?.headline === 'string' && item.headline) {
+      llmIndices.push(i);
+      llmTitles.push(item.headline);
+    }
+  });
+  if (llmTitles.length > 0) {
+    try {
+      const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, { callLLM }, userId);
+      for (let k = 0; k < llmIndices.length; k++) {
+        const v = results[k];
+        if (v && v !== 'NONE') names[llmIndices[k]] = v;
+      }
+    } catch (e: any) {
+      console.warn('[resolveEmployersForSizeFilter] LLM batch company-parse failed:', e?.message ?? String(e));
+    }
+  }
+
+  // CodeRabbit: an unbounded Promise.all here would let one hung Unipile
+  // request stall the whole interactive search-people turn — the same
+  // failure mode filterByCompanySize already guards against with a timeout
+  // + chunked concurrency. Mirror that here rather than reintroducing it.
+  const lookupTargets = items
+    .map((item: any, i: number) => ({ item, i }))
+    .filter(({ item, i }) => !names[i] && item?.public_identifier && accountId);
+  for (let start = 0; start < lookupTargets.length; start += EMPLOYER_PROFILE_LOOKUP_CONCURRENCY) {
+    const batch = lookupTargets.slice(start, start + EMPLOYER_PROFILE_LOOKUP_CONCURRENCY);
+    await Promise.all(batch.map(async ({ item, i }) => {
+      try {
+        const { getUnipileProfileService } = await import('../../services/unipileProfileServiceFactory');
+        const profile = await withTimeoutOrReject(
+          getUnipileProfileService().getProfile(item.public_identifier, accountId),
+          EMPLOYER_PROFILE_LOOKUP_TIMEOUT_MS,
+          `LinkedIn profile lookup for ${item.public_identifier}`,
+        );
+        const raw = (profile as any)?.rawData ?? profile;
+        const exp = raw?.work_experience;
+        if (Array.isArray(exp) && exp.length) {
+          const cur = exp.find((w: any) => w?.current) || exp[0];
+          if (cur?.company) names[i] = cur.company;
+        }
+      } catch (e: any) {
+        console.warn('[resolveEmployersForSizeFilter] getProfile fallback failed:', e?.message ?? String(e));
+      }
+    }));
+  }
+
+  return names.map((name) => ({
+    work_experience: name ? [{ company: name, current: true as const }] : [],
+  }));
+}
 
 /**
  * ENG-975. Shared by every agent-facing surface that can hit a LinkedIn
@@ -900,7 +1029,7 @@ function linkedInSearchUnavailableResponse() {
 }
 
 export async function linkedinOutreach(
-  resolveEmployersForSizeFilter: EmployerSizeFilterResolver,
+  callLLM: Pick<AgentModeService, 'callLLM'>['callLLM'],
   userId: string,
   args: any,
 ): Promise<any> {
@@ -1157,7 +1286,7 @@ export async function linkedinOutreach(
           const wantsSizeFilter = company_size_min != null || company_size_max != null;
           let sizeFilterInput = usableItems;
           if (wantsSizeFilter) {
-            const resolved = await resolveEmployersForSizeFilter(usableItems, account_id, userId);
+            const resolved = await resolveEmployersForSizeFilter(usableItems, account_id, userId, callLLM);
             // CodeRabbit: only fill in the synthetic work_experience when the
             // item didn't already carry a usable one — otherwise this
             // overwrites a real Tier-1 work_experience (with `position`, etc.)

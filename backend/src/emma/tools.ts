@@ -34,6 +34,10 @@ import * as googleDocsSheetsImpl from './impl/googleDocsSheets';
 // ENG-2103 (F2): HTML/landing-page misc tool cluster, same treatment as booksImpl above.
 import * as htmlToolsImpl from './impl/htmlTools';
 // ENG-2103 (F2): leads/CRM tool cluster, same treatment as booksImpl above.
+// ENG-2103 (F2 design-decision-list follow-up, Pattern A): import_leads_from_search
+// also now calls leadsImpl directly (see below) — `callLLM` is `public` on
+// AgentModeService, so this file can bind it straight off the singleton, same
+// treatment as create_html_from_template.
 import * as leadsImpl from './impl/leads';
 // ENG-2103 (F2): brand guidelines / market strategy tool cluster, same treatment as booksImpl above.
 import * as brandMarketStrategyImpl from './impl/brandMarketStrategy';
@@ -61,15 +65,17 @@ import * as tasksImpl from './impl/tasks';
 // call site instead of this module.
 import * as socialAccountsImpl from './impl/socialAccounts';
 // ENG-2103 (F2): LinkedIn posting & outreach tool cluster, same treatment as
-// booksImpl above — EXCEPT linkedin_outreach and linkedin_manage_post, which
-// still call `agentModeService.<method>` directly (see
-// emma/impl/linkedin.ts's module header): linkedinOutreach depends on
-// AgentModeService's private resolveEmployersForSizeFilter (a real
-// this.callLLM coupling), which this file has no legal way to reach, and
-// linkedinManagePost was kept entirely on the class (a sibling-method-spy
-// test-compatibility issue, not a callLLM one) — so their delegating
-// wrapper/native class method is kept as the call site instead of this
-// module.
+// booksImpl above — EXCEPT linkedin_manage_post, which still calls
+// `agentModeService.linkedinManagePost` directly (see emma/impl/linkedin.ts's
+// module header): it was kept entirely on the class (a sibling-method-spy
+// test-compatibility issue, not a callLLM one), so its native class method is
+// kept as the call site instead of this module. ENG-2103 (F2
+// design-decision-list follow-up, Pattern A): linkedin_outreach now ALSO
+// calls linkedinImpl directly — resolveEmployersForSizeFilter's real
+// this.callLLM coupling moved in with it, and `callLLM` is `public` on
+// AgentModeService, so this file can bind it straight off the singleton
+// without going through the class's own delegating wrapper (same treatment
+// as create_html_from_template).
 import * as linkedinImpl from './impl/linkedin';
 import * as twitterImpl from './impl/twitter';
 // ENG-2103 (F2): Meta/LinkedIn ads APIs tool cluster. Only
@@ -1132,7 +1138,14 @@ For target person identification (send-invite, send-message, get-profile, update
         return { success: false, message: 'Provide only one of profile_url or provider_id, not both.' };
       }
     }
-    return await agentModeService.linkedinOutreach(context.userId, args);
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): calls
+    // emma/impl/linkedin.ts directly, not agentModeService.linkedinOutreach —
+    // that class method still exists (routes/emmaApi.ts, crmEnrichmentService.ts
+    // and a large number of direct-instance tests call it directly), but
+    // `callLLM` is `public` on AgentModeService, so this tool can bind it
+    // straight off the singleton without going through the class's own
+    // delegating wrapper.
+    return await linkedinImpl.linkedinOutreach(agentModeService.callLLM.bind(agentModeService), context.userId, args);
   }
 });
 
@@ -9694,7 +9707,13 @@ Response keys:
   execute: async (args: any, context: any) => {
     if (!context?.userId) throw new Error('Authentication required');
     const limit = Math.min(args.limit ?? 20, 500);
-    return agentModeService.importLeadsFromSearch(context.userId, {
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): calls
+    // emma/impl/leads.ts directly, not agentModeService.importLeadsFromSearch —
+    // that class method still exists (routes/crm.ts and a dedicated test call
+    // it directly), but `callLLM` is `public` on AgentModeService, so this
+    // tool can bind it straight off the singleton, same treatment as
+    // create_html_from_template.
+    return leadsImpl.importLeadsFromSearch(agentModeService.callLLM.bind(agentModeService), context.userId, {
       listId: args.list_id,
       keywords: args.keywords,
       search_url: args.search_url,

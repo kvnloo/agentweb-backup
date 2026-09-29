@@ -17,9 +17,6 @@
  *    the email body/subject. Same shape of coupling as `createHtmlFromTemplate`
  *    (Google Docs/Sheets round) — needs its own "how does an extracted module
  *    reach the LLM gateway" design decision, not a mechanical move.
- *  - `importLeadsFromSearch` (far from this cluster in the source file, near
- *    line 36752) does an "LLM batch company-parse" — same `this.callLLM`-shaped
- *    issue.
  *
  * No metering/LLM calls exist anywhere in the 19 methods actually moved here
  * (grepped for llmService, generateJSONContent, callLLM, meterUserUsage,
@@ -45,6 +42,76 @@
  *    directly (a real production caller found by grepping the whole backend,
  *    not just this cluster) — promoted to `emma/impl/shared/crmSenders.ts`,
  *    with `AgentModeService`'s own copy turned into a thin delegating method.
+ *
+ * ENG-2103 (F2 design-decision-list follow-up, Pattern A) — `importLeadsFromSearch`
+ * added. Originally excluded from this cluster (far from it in the source
+ * file, near line 36752 pre-extraction) because it does an "LLM batch
+ * company-parse" via module-scope `batchParseCompaniesFromTitlesWithLLM(titles,
+ * this, userId)` — the same `this.callLLM`-shaped coupling as
+ * `updateEmailDraftForLead` above. Unlike `updateEmailDraftForLead`,
+ * `batchParseCompaniesFromTitlesWithLLM` was ALREADY shaped for injection
+ * (`gateway: Pick<AgentModeService, 'callLLM'> | null`, never read `this`
+ * directly) — its only real change here is where it lives, not its logic —
+ * so this method's own coupling is a plain injected-`callLLM`-parameter
+ * (Pattern A) move, not a design decision of its own.
+ *
+ * `batchParseCompaniesFromTitlesWithLLM` and its Tier-2 regex sibling
+ * `parseCompanyFromTitle` are ALSO needed by `emma/impl/linkedin.ts`'s
+ * `resolveEmployersForSizeFilter` (moved in the same round) — since the two
+ * target methods land in different modules, both helpers were promoted
+ * verbatim to `emma/impl/shared/companyTitleParsing.ts` rather than
+ * duplicated or living in just one of the two. `buildFindReason` and
+ * `computeFindLeadsCriteriaHash` (module-scope in `agentModeService.ts`,
+ * confirmed by whole-file grep to have exactly one caller each —
+ * `importLeadsFromSearch` itself) moved here verbatim as non-exported local
+ * helpers. `isAnonymizedSearchLead` (already a standalone `utils/` export,
+ * shared with `outreachOnboardingSaveService.ts`) is now a static import
+ * here instead of in `agentModeService.ts`. `mergeCustomFields` was already
+ * imported by this module (`updateLead`'s own use) and is reused as-is.
+ * `LINKEDIN_SEARCH_UNAVAILABLE_GUIDANCE` is imported LAZILY from `./linkedin`
+ * inside the function body (`await import('./linkedin')`), NOT as a static
+ * top-level import — a static import was tried first and failed
+ * `leads.moduleIsolation.test.ts`'s "does not construct a DynamoDB client at
+ * module scope" assertion, because `emma/impl/linkedin.ts` itself statically
+ * imports `services/linkedInOutreachService.ts`, which statically imports
+ * `services/db.ts` (a pre-existing, already-documented transitive load in
+ * `linkedin.ts`'s own header — not new — but one `leads.ts` had never
+ * inherited before this round, since it had no prior static dependency on
+ * `linkedin.ts`). The constant already lived at `linkedin.ts` (cluster 16),
+ * exported specifically because this method reads it (see that module's own
+ * header comment); this is the first round it's actually consumed from its
+ * new home rather than the old `agentModeService.ts` re-export.
+ * `linkedInOutreachService` is imported lazily inside the function body,
+ * matching this module's own established idiom (see `getLeadDetails`'s
+ * LinkedIn-connection-status lookup above) rather than a new static
+ * top-level import. `enqueueFindEmailJobForNewLeads` (the post-import
+ * auto-enrich glue, a standalone export of `agentModeService.autoEnrich.ts`
+ * — never actually defined in `agentModeService.ts` itself) was previously
+ * called there ONLY via that file's own `__testHooks` re-export,
+ * specifically so `agentModeService.importLeadsFromSearch.consolidated.test.ts`
+ * could `jest.spyOn` it; here it's imported LAZILY as a namespace
+ * (`const autoEnrichModule = await import('../../services/agentModeService.autoEnrich')`)
+ * — also required to be lazy, not static, for the identical reason:
+ * `agentModeService.autoEnrich.ts` statically imports
+ * `services/crmFindEmailRunner.ts` → `services/enrichmentIdentityResolver.ts`
+ * → `services/crmEnrichmentService.ts`, which statically imports
+ * `services/agentModeService.ts` itself — a REAL (value-level, not just
+ * type-level) circular import if taken statically. Node/Jest resolve a lazy
+ * `await import(...)` to the exact same cached module instance a test's own
+ * static `import * as autoEnrichModule from '...'` already loaded, so
+ * `jest.spyOn(autoEnrichModule, 'enqueueFindEmailJobForNewLeads')` in the
+ * test still intercepts this call correctly — confirmed by running that
+ * test. `__testHooks` in `agentModeService.ts` no longer re-exports
+ * `enqueueFindEmailJobForNewLeads` (orphan cleanup: it had no other caller).
+ *
+ * Kept as a delegating wrapper on `AgentModeService` — real caller beyond
+ * `emma/tools.ts`: `routes/crm.ts`'s `POST /lists/:listId/leads/find` route
+ * (confirmed by whole-backend grep), plus direct real-instance test calls in
+ * `agentModeService.importLeadsFromSearch.consolidated.test.ts`. The class
+ * wrapper now supplies `this.callLLM.bind(this)` as the injected `callLLM`
+ * parameter; `emma/tools.ts`'s `import_leads_from_search` tool is repointed
+ * to call this module directly (`callLLM` is `public` on `AgentModeService`,
+ * same treatment as `create_html_from_template`).
  */
 import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor } from '../../utils/leadSchema';
 import type { LeadImportRowOutcome } from '../../utils/leadSchema';
@@ -52,6 +119,9 @@ import { providerLabel } from '../../services/crmSenderTypes';
 import { mergeCustomFields } from '../../utils/customFieldsGuard';
 import { recoverLeadFromWrongList } from '../../services/agentMode/leadRecovery';
 import { getCrmSenders } from './shared/crmSenders';
+import { isAnonymizedSearchLead } from '../../utils/anonymizedLinkedInLead';
+import { parseCompanyFromTitle, batchParseCompaniesFromTitlesWithLLM } from './shared/companyTitleParsing';
+import type { AgentModeService } from '../../services/agentModeService';
 
 export async function getLeadLists(userId: string): Promise<any> {
     try {
@@ -2155,3 +2225,561 @@ export async function sendEmailToLead(listId: string, leadId: string, userId: st
       };
     }
   }
+
+/**
+ * Build a short, human-readable audit string describing why a lead was
+ * discovered. Written to lead.system.findReason (NOT customFields, which
+ * leaks into CSV exports and email-template variables). Returns null when
+ * only free-text keywords were used — in that case there's no structured
+ * filter worth capturing.
+ *
+ * Capped at 200 chars; long over-flow strings are sliced with an ellipsis
+ * marker so DynamoDB items stay small.
+ *
+ * ENG-2103 (F2 design-decision-list follow-up, Pattern A): moved verbatim
+ * from module scope in agentModeService.ts along with its only caller,
+ * importLeadsFromSearch, below.
+ */
+function buildFindReason(filters: {
+  keywords?: string;
+  title?: string;
+  company?: string;
+  location?: string;
+  industry?: string;
+  school?: string;
+  search_url?: string;
+}): string | null {
+  const parts: string[] = [];
+  if (filters.title) parts.push(`title=${filters.title}`);
+  if (filters.company) parts.push(`company=${filters.company}`);
+  if (filters.location) parts.push(`location=${filters.location}`);
+  if (filters.industry) parts.push(`industry=${filters.industry}`);
+  if (filters.school) parts.push(`school=${filters.school}`);
+  if (filters.search_url) parts.push('from-url');
+  if (parts.length === 0) return null;
+  const joined = parts.join('; ');
+  return joined.length > 200 ? joined.slice(0, 197) + '...' : joined;
+}
+
+/**
+ * Stable hash of the find-leads filter set, used as the key in the per-list
+ * `searchCursors` map so the next top-up loop with the same criteria resumes
+ * from the cursor we persisted last time.
+ *
+ * ENG-2103 (F2 design-decision-list follow-up, Pattern A): moved verbatim
+ * from module scope in agentModeService.ts along with its only caller,
+ * importLeadsFromSearch, below.
+ */
+function computeFindLeadsCriteriaHash(filters: {
+  keywords?: string;
+  search_url?: string;
+  title?: string;
+  company?: string;
+  company_id?: string;
+  location?: string;
+  location_id?: string;
+  industry?: string;
+  industry_id?: string;
+  school?: string;
+  school_id?: string;
+}): string {
+  const orderedKeys = [
+    'keywords', 'search_url', 'title', 'company', 'company_id',
+    'location', 'location_id', 'industry', 'industry_id', 'school', 'school_id',
+  ] as const;
+  const obj: Record<string, string> = {};
+  for (const k of orderedKeys) {
+    const v = (filters as any)[k];
+    if (v !== undefined && v !== null && v !== '') obj[k] = String(v);
+  }
+  // SHA-1 of canonical JSON, truncated to 16 hex chars — collision risk is
+  // negligible for the per-list cardinality we expect here.
+  return require('crypto').createHash('sha1').update(JSON.stringify(obj)).digest('hex').slice(0, 16);
+}
+
+/**
+ * ENG-1049/ENG-975/ENG-1002/ENG-1558: search LinkedIn for people and import
+ * the results directly into a CRM lead list, with a 4-tier company
+ * resolution chain, a top-up pagination loop, dedup-aware trimming to
+ * exactly `limit` new leads, and an optional post-import auto-enrich queue.
+ * See this module's own header comment for the ENG-2103 (F2
+ * design-decision-list follow-up, Pattern A) move notes — moved verbatim
+ * from `AgentModeService.prototype.importLeadsFromSearch`, with `callLLM`
+ * injected instead of reading `this`.
+ */
+export async function importLeadsFromSearch(
+  callLLM: Pick<AgentModeService, 'callLLM'>['callLLM'],
+  userId: string,
+  args: {
+    listId: string;
+    keywords?: string;
+    search_url?: string;
+    title?: string;
+    company?: string;
+    company_id?: string;
+    location?: string;
+    location_id?: string;
+    industry?: string;
+    industry_id?: string;
+    school?: string;
+    school_id?: string;
+    cursor?: string;
+    limit?: number;
+    auto_enrich?: boolean;
+    /** When set, every imported lead in this batch gets
+     *  `lead.system.icpSource = icpSource` so the UI can attribute the
+     *  lead back to the persona that sourced it. Distinct from the
+     *  `lead.icpMatch` scoring field (post-import scoring). */
+    icpSource?: string;
+    /** ENG-1558: post-filter on each lead's resolved employer headcount —
+     *  same semantics as search-people's company_size_min/max. Applied AFTER
+     *  the 4-tier company-resolution chain below (not on raw work_experience
+     *  alone), so a lead whose company only resolved via title-parse/LLM/
+     *  profile fallback is still correctly sized instead of excluded early. */
+    company_size_min?: number;
+    company_size_max?: number;
+  },
+): Promise<any> {
+  const {
+    listId, keywords, search_url, title, company, company_id,
+    location, location_id, industry, industry_id, school, school_id,
+    cursor, limit = 20, auto_enrich = false, icpSource,
+    company_size_min, company_size_max,
+  } = args;
+
+  if (!listId) return { success: false, error: 'listId is required' };
+  // Accept any of: keywords / search_url / cursor / structured filter.
+  // Mirrors the search-people handler gate after Stage 2 + the keyword-synth fix.
+  const hasFilter = !!(title || company || company_id
+    || location || location_id || industry || industry_id || school || school_id);
+  if (!keywords && !search_url && !cursor && !hasFilter) {
+    return { success: false, error: 'At least one search filter is required: keywords, search_url, cursor, or a structured filter (title, company, location, industry, school)' };
+  }
+
+  const { linkedInOutreachService } = await import('../../services/linkedInOutreachService');
+
+  // Access check (ENG-1049): this function creates leads (batchCreateLeads
+  // below), and is called directly by the import_leads_from_search Emma tool
+  // — bypassing the canDestructiveCrmList check that crm.ts's POST
+  // /lists/:listId/leads/find route applies before calling this same method.
+  // Without this, any same-org member could import leads into another
+  // member's list via Emma chat.
+  try {
+    const { crmDb: accessCrmDb } = await import('../../services/db');
+    const accessList = await accessCrmDb.getLeadListById(listId);
+    if (!accessList) {
+      return { success: false, error: 'The specified lead list does not exist' };
+    }
+    const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('../../services/crmAccessControl');
+    if (!(await canDestructiveCrmList(userId, accessList))) {
+      return { success: false, error: CRM_EDITOR_REQUIRED_MESSAGE };
+    }
+  } catch (err) {
+    // Fail closed — an access-check failure must never silently allow the
+    // write. Distinct from the cosmetic, fail-soft list lookups below.
+    return { success: false, error: 'Failed to verify list access' };
+  }
+
+  // Resolve account: user's own or platform-wide fallback
+  const accountId = await linkedInOutreachService.resolveAccountId(userId);
+  if (!accountId) {
+    return {
+      success: false,
+      error: 'No LinkedIn account is available for lead discovery. Ask your admin to configure platform-wide outreach accounts, or connect your own LinkedIn account in Settings → Connected Accounts.',
+    };
+  }
+
+  // Build the audit string ONCE — same for every lead in this batch since
+  // every lead in this loop came from the same set of filters.
+  const findReason = buildFindReason({
+    keywords, title, company, location, industry, school, search_url,
+  });
+
+  // Hash criteria so we can persist a per-(list, criteria) cursor and pick
+  // up where the previous top-up loop stopped on a future call.
+  const criteriaHash = computeFindLeadsCriteriaHash({
+    keywords, search_url, title, company, company_id,
+    location, location_id, industry, industry_id, school, school_id,
+  });
+
+  const { crmDb } = await import('../../services/db');
+
+  // Initial cursor: caller-provided wins; otherwise resume from any cursor
+  // we previously persisted for this exact criteria set on this list.
+  let activeCursor: string | undefined = cursor;
+  let preLoopList: any = null;
+  try {
+    preLoopList = await crmDb.getLeadListById(listId);
+    if (!activeCursor) {
+      const stored = (preLoopList as any)?.searchCursors?.[criteriaHash];
+      if (stored?.cursor) activeCursor = stored.cursor as string;
+    }
+  } catch {
+    // List read failure here is recoverable — fall through with no stored cursor.
+  }
+
+  // Top-up loop. Keep paginating until we've added `limit` *new* leads
+  // (post-dedup), the search exhausts, or we hit the safety cap.
+  const MAX_ITERATIONS = 20;
+  let cumulativeNew = 0;
+  let cumulativeMerged = 0;
+  let totalFetched = 0;
+  let iterationCount = 0;
+  // `nextCursor` is the cursor we'll pass to the *next* searchPeople call.
+  // `lastFetchCursor` is the cursor we passed to the *most recent* call —
+  // tracked separately so that, if we end up trimming on the final page,
+  // we can resume *that* page on the next call (the deleted-from-CRM leads
+  // re-appear as "new" through dedup, so no candidate is permanently lost).
+  let nextCursor: string | null | undefined = activeCursor ?? null;
+  let lastFetchCursor: string | null | undefined = nextCursor;
+  let safetyCapHit = false;
+  let searchError: string | null = null;
+  let searchUnavailable = false;
+  const allErrors: string[] = [];
+  // `lead` is the mapped payload the record was written from — the response
+  // preview is derived from this so it can only ever describe real writes.
+  const allCreated: Array<{ leadId: string; email?: string; lead?: any }> = [];
+  // Out-of-network "LinkedIn Member" hits dropped before the write.
+  let anonymizedSkipped = 0;
+  // ENG-1558: leads dropped by the company_size_min/max post-filter
+  // (outside the requested range, or an unverifiable employer).
+  let companySizeFiltered = 0;
+  // ENG-1558 follow-up: consecutive pages the size filter emptied
+  // completely. A narrow company_size range against a market where it's
+  // genuinely rare could otherwise burn all MAX_ITERATIONS pages — each
+  // costing a full searchPeople call plus per-employer lookups — before
+  // giving up. Bail out well before that once the filter has clearly
+  // proven unproductive, rather than paying the full cap's cost every time.
+  let consecutiveEmptiedBySizeFilter = 0;
+  const SIZE_FILTER_EARLY_EXIT_AFTER = 3;
+  let earlyExitOnSizeFilter = false;
+
+  while (iterationCount < MAX_ITERATIONS) {
+    iterationCount++;
+    lastFetchCursor = nextCursor;
+    let searchResult: any;
+    try {
+      // Structured filters (location/industry/school) are auto-resolved to
+      // LinkedIn entity IDs by linkedInOutreachService when only free text
+      // is supplied; pre-resolved *_id always wins.
+      searchResult = await linkedInOutreachService.searchPeople(accountId, {
+        keywords,
+        url: search_url,
+        title,
+        company,
+        company_id,
+        location,
+        location_id,
+        industry,
+        industry_id,
+        school,
+        school_id,
+        cursor: lastFetchCursor ?? undefined,
+      });
+    } catch (e: any) {
+      searchError = e?.message ? String(e.message) : String(e);
+      break;
+    }
+
+    const items = Array.isArray(searchResult?.items) ? searchResult.items : [];
+    nextCursor = searchResult?.cursor ?? null;
+
+    if (items.length === 0) {
+      // ENG-975: breaking here with nothing imported reports "No results found
+      // for the given search criteria." — which is also exactly what a schedule
+      // whose account has lost people-search capability produces, making a
+      // silent no-op look like an honest empty. Only the FIRST fetch of this
+      // call is ambiguous; a later page running dry is normal exhaustion.
+      //
+      // That first fetch is ambiguous even when it resumes from a cursor. A
+      // recurring schedule persists its cursor per (list, criteria) and picks
+      // it up on the next run without the caller ever passing one, so keying
+      // off "no cursor" would exempt precisely the repeat-schedule case this
+      // bug was reported from. The probe settles it either way: an exhausted
+      // search on a healthy account answers 'ok' and still reports the plain
+      // empty, at the cost of one broad query per account per 10 minutes.
+      if (iterationCount === 1
+        && await linkedInOutreachService.probeSearchCapability(accountId) === 'degraded') {
+        searchUnavailable = true;
+        const { LINKEDIN_SEARCH_UNAVAILABLE_GUIDANCE } = await import('./linkedin');
+        searchError = LINKEDIN_SEARCH_UNAVAILABLE_GUIDANCE;
+      }
+      break;
+    }
+    totalFetched += items.length;
+
+    // Map Unipile search result fields → CRM lead fields, then resolve
+    // missing companies through a 4-tier fallback chain. Each tier runs
+    // only on leads still missing `company`:
+    //   1. item.work_experience[].company (sync, from search result)
+    //   2. parseCompanyFromTitle (regex, sync, instant)
+    //   3. batchParseCompaniesFromTitlesWithLLM (ONE Gemini Flash call for all titles in the batch)
+    //   4. Unipile getProfile via cache-first wrapper (HTTP, free on cache hit, parallel)
+
+    // Phase 1: sync map for Tier 1 (work_experience) + Tier 2 (regex).
+    const leads: any[] = items.map((item: any) => {
+      const lead: any = {};
+      if (item.name) {
+        const parts = (item.name as string).trim().split(/\s+/);
+        lead.firstName = parts[0] || '';
+        lead.lastName = parts.slice(1).join(' ') || '';
+      } else {
+        if (item.first_name) lead.firstName = item.first_name;
+        if (item.last_name) lead.lastName = item.last_name;
+      }
+      if (item.public_identifier) {
+        lead.linkedin = `https://www.linkedin.com/in/${item.public_identifier}`;
+      } else if (item.profile_url) {
+        const baseUrl = (item.profile_url as string).split('?')[0];
+        lead.linkedin = baseUrl;
+      }
+      if (item.headline) lead.title = item.headline;
+      if (item.work_experience?.length) {
+        const current = item.work_experience.find((w: any) => w.current) || item.work_experience[0];
+        if (current?.company && !lead.company) lead.company = current.company;
+        if (current?.position && !lead.title) lead.title = current.position;
+      }
+      if (!lead.company && lead.title) {
+        const parsed = parseCompanyFromTitle(lead.title);
+        if (parsed) lead.company = parsed;
+      }
+      if (item.location) {
+        lead.customFields = mergeCustomFields(
+          lead.customFields,
+          { location: item.location },
+          { source: 'agentMode.importLeadsFromSearch' },
+        );
+      }
+      // sys is sidecar — see Phase 0b lead.system top-level field.
+      const sys: Record<string, any> = {};
+      if (findReason) sys.findReason = findReason;
+      if (icpSource) sys.icpSource = icpSource;
+      if (Object.keys(sys).length > 0) {
+        lead.system = { ...(lead.system ?? {}), ...sys };
+      }
+      return lead;
+    });
+
+    // Phase 1b (ENG-1002): drop anonymized / identity-less hits BEFORE any
+    // further work. LinkedIn returns out-of-network profiles as the
+    // placeholder "LinkedIn Member" with no public identifier; persisting
+    // one produces a nameless, emailless, un-linkable record that can never
+    // be dedup'd — so every subsequent run of the same search creates
+    // another copy. Skipping them also means the top-up loop keeps
+    // paginating until it finds `limit` genuinely usable leads.
+    const candidates: Array<{ lead: any; item: any }> = [];
+    for (let i = 0; i < leads.length; i++) {
+      if (isAnonymizedSearchLead(leads[i])) {
+        anonymizedSkipped++;
+        continue;
+      }
+      candidates.push({ lead: leads[i], item: items[i] });
+    }
+    let importable: any[] = candidates.map((c) => c.lead);
+    if (importable.length === 0) {
+      if (!nextCursor) break;
+      continue;
+    }
+
+    // Phase 2: Tier 3 — one batched Gemini Flash call for all titles still
+    // missing a company. Skipped entirely when no candidates remain.
+    const llmIndices: number[] = [];
+    const llmTitles: string[] = [];
+    for (let i = 0; i < importable.length; i++) {
+      if (!importable[i].company && typeof importable[i].title === 'string' && importable[i].title) {
+        llmIndices.push(i);
+        llmTitles.push(importable[i].title);
+      }
+    }
+    if (llmTitles.length > 0) {
+      try {
+        const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, { callLLM }, userId);
+        for (let k = 0; k < llmIndices.length; k++) {
+          const v = results[k];
+          if (v && v !== 'NONE') importable[llmIndices[k]].company = v;
+        }
+      } catch (e: any) {
+        console.warn('[importLeadsFromSearch] LLM batch company-parse failed:', e?.message ?? String(e));
+      }
+    }
+
+    // Phase 3: Tier 4 — Unipile getProfile for still-empty leads, parallel.
+    await Promise.all(candidates.map(async ({ lead, item }) => {
+      if (lead.company || !item.public_identifier || !accountId) return;
+      try {
+        const { getUnipileProfileService } = await import('../../services/unipileProfileServiceFactory');
+        const profile = await getUnipileProfileService().getProfile(item.public_identifier, accountId);
+        const raw = (profile as any)?.rawData ?? profile;
+        const exp = raw?.work_experience;
+        if (Array.isArray(exp) && exp.length) {
+          const cur = exp.find((w: any) => w.current) || exp[0];
+          if (cur?.company) lead.company = cur.company;
+        }
+      } catch (e: any) {
+        console.warn('[importLeadsFromSearch] getProfile fallback failed:', e?.message ?? String(e));
+      }
+    }));
+
+    // Phase 3.5 (ENG-1558): company-size post-filter, run AFTER every
+    // resolution tier above so lead.company reflects the best available
+    // employer name — filtering on Tier-1 (work_experience) alone, like
+    // search-people does, would wrongly exclude leads whose company only
+    // resolved via title-parse/LLM/profile fallback. Adapts each lead's
+    // flat `.company` string into the work_experience shape
+    // filterByCompanySize expects, tagging each with its array index so
+    // the kept subset can be mapped back without disturbing `importable`'s
+    // order (batchCreateLeads' returned sourceIndex must match).
+    if (company_size_min != null || company_size_max != null) {
+      const preFilterCount = importable.length;
+      const sizableItems = importable.map((lead: any, idx: number) => ({
+        __idx: idx,
+        work_experience: lead.company ? [{ company: lead.company, current: true }] : [],
+      }));
+      const { items: kept } = await linkedInOutreachService.filterByCompanySize(
+        sizableItems,
+        { min: company_size_min, max: company_size_max },
+        accountId,
+      );
+      const keepIdx = new Set(kept.map((it: any) => it.__idx));
+      companySizeFiltered += importable.length - keepIdx.size;
+      importable = importable.filter((_: any, i: number) => keepIdx.has(i));
+
+      if (preFilterCount > 0 && importable.length === 0) {
+        consecutiveEmptiedBySizeFilter++;
+        if (consecutiveEmptiedBySizeFilter >= SIZE_FILTER_EARLY_EXIT_AFTER) {
+          // The filter has proven unproductive several pages running —
+          // stop paying for more searchPeople + per-employer lookup calls
+          // rather than grinding to MAX_ITERATIONS on a range that's
+          // clearly not matching this market.
+          earlyExitOnSizeFilter = true;
+          break;
+        }
+      } else {
+        consecutiveEmptiedBySizeFilter = 0;
+      }
+    }
+    if (importable.length === 0) {
+      if (!nextCursor) break;
+      continue;
+    }
+
+    const result = await crmDb.batchCreateLeads(listId, importable);
+    cumulativeNew += result.newCount ?? 0;
+    cumulativeMerged += result.mergedCount ?? 0;
+    if (Array.isArray(result.errors) && result.errors.length) allErrors.push(...result.errors);
+    const created = Array.isArray((result as any).created) ? (result as any).created : [];
+    // Carry the source row alongside each created id so the response preview
+    // is built from the records that were actually written — not from every
+    // candidate we looked at (ENG-1002). Rows that dedup'd into an existing
+    // lead, or that were unchanged no-ops, never appear in `created`.
+    for (const entry of created) {
+      const source = typeof entry?.sourceIndex === 'number' ? importable[entry.sourceIndex] : undefined;
+      allCreated.push({ ...entry, lead: source });
+    }
+
+    if (cumulativeNew >= limit) break;
+    if (!nextCursor) break;
+  }
+
+  // Did we exit because we hit the safety cap with more pages still
+  // available? (Surfaces when iteration ran the full count without hitting
+  // limit and a cursor remains.)
+  if (iterationCount >= MAX_ITERATIONS && cumulativeNew < limit && nextCursor) {
+    safetyCapHit = true;
+  }
+
+  // Trim post-hoc to exactly `limit` new leads. Trailing IDs in
+  // `allCreated` come from the last batch insert in iteration order, so
+  // dropping `excess` from the end gives a stable, predictable trim.
+  let trimmedCount = 0;
+  if (cumulativeNew > limit) {
+    const excess = cumulativeNew - limit;
+    const toTrim = allCreated.slice(allCreated.length - excess);
+    for (const entry of toTrim) {
+      try {
+        await crmDb.deleteLead(listId, entry.leadId);
+      } catch (e: any) {
+        allErrors.push(`Failed to trim lead ${entry.leadId}: ${e?.message || e}`);
+      }
+    }
+    allCreated.splice(allCreated.length - excess, excess);
+    cumulativeNew -= excess;
+    trimmedCount = excess;
+  }
+
+  // Resume cursor — the value we both surface to callers and persist:
+  //  - If we trimmed on the final page, resume from THAT page's fetch
+  //    cursor (lastFetchCursor) so the next call re-fetches it. The
+  //    just-deleted leads come back through dedup as "new", so no candidate
+  //    is permanently lost across calls.
+  //  - Otherwise we advanced cleanly through every page we processed, so
+  //    resume from `nextCursor` (the cursor returned by the last fetch).
+  const resumeCursor: string | null = (trimmedCount > 0 ? lastFetchCursor : nextCursor) ?? null;
+  try {
+    await crmDb.setLeadListSearchCursor(listId, criteriaHash, resumeCursor);
+  } catch {
+    // Persistence failure is non-fatal — the loop already imported the leads.
+  }
+
+  // Surface the post-import list count.
+  let listTotalAfterImport = 0;
+  try {
+    const list = await crmDb.getLeadListById(listId);
+    listTotalAfterImport = (list as any)?.leadCount ?? 0;
+  } catch {
+    // List read failure must not fail the import — count of 0 signals
+    // "unknown" to the caller and they can re-fetch separately.
+  }
+
+  const response: any = {
+    success: true,
+    imported: cumulativeNew,
+    skipped: cumulativeMerged,
+    list_total_after_import: listTotalAfterImport,
+    errors: allErrors,
+    total: totalFetched,
+    cursor: resumeCursor,
+    iterations: iterationCount,
+    trimmed: trimmedCount,
+    anonymizedSkipped,
+    companySizeFiltered,
+    safetyCapHit,
+  };
+  if (searchError) response.searchError = searchError;
+  if (searchUnavailable) response.searchUnavailable = true;
+  if (earlyExitOnSizeFilter) response.earlyExitOnSizeFilter = true;
+  if (cumulativeNew === 0 && totalFetched === 0 && !searchError) {
+    response.message = 'No results found for the given search criteria.';
+  } else if (earlyExitOnSizeFilter) {
+    // ENG-1558 follow-up: distinct from (and takes priority over) the
+    // generic "excluded all, search exhausted normally" message below —
+    // this stopped BEFORE exhausting, so there may be more matches the
+    // cursor can still reach.
+    response.message = cumulativeNew > 0
+      ? `Imported ${cumulativeNew} lead(s), then stopped early after ${SIZE_FILTER_EARLY_EXIT_AFTER} consecutive pages where the company_size filter excluded every result. There may be more matches — resume from the returned cursor, or widen the range.`
+      : `Stopped after ${SIZE_FILTER_EARLY_EXIT_AFTER} consecutive pages where every result was excluded by the company_size filter (out of range, or an unverifiable employer) — this looks like a narrow niche for this market, not an empty search. Widen the company_size range, or drop it to import the unfiltered results.`;
+  } else if (cumulativeNew === 0 && anonymizedSkipped > 0 && !searchError) {
+    response.message = `${anonymizedSkipped} search result(s) were out-of-network LinkedIn profiles with no name or profile URL and were not imported. Widen the search or connect a LinkedIn account with closer network reach.`;
+  } else if (cumulativeNew === 0 && companySizeFiltered > 0 && !searchError) {
+    // ENG-1558: same transparency principle as the anonymized-skip case
+    // above — a company-size ask that excluded every candidate is a
+    // narrow-niche result, not an empty search and not an outage.
+    response.message = `${companySizeFiltered} search result(s) were excluded because their employer's size either fell outside the requested range or couldn't be verified. Widen the company_size range, or drop it to import the unfiltered results.`;
+  }
+  // Preview strictly the records that were written and survived trimming.
+  response.importedLeads = allCreated.slice(0, 5).map((c) => c.lead).filter(Boolean);
+
+  if (auto_enrich && cumulativeNew > 0) {
+    const newLeadIds: string[] = allCreated.map((c) => c.leadId);
+    if (newLeadIds.length > 0) {
+      const autoEnrichModule = await import('../../services/agentModeService.autoEnrich');
+      const job = await autoEnrichModule.enqueueFindEmailJobForNewLeads(userId, listId, newLeadIds);
+      // Guard on jobId rather than truthiness — autoEnrich returns a
+      // sentinel { jobId: '', queued: 0, reason: 'quota-exhausted' } in
+      // the no-budget path that we must not surface as a job id.
+      if (job?.jobId) response.autoEnrichJobId = job.jobId;
+    }
+  }
+
+  return response;
+}
