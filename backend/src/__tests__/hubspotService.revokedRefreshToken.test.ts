@@ -586,6 +586,32 @@ describe('accountId distinguishes the OAuth path from the pasted-token path', ()
     expect(svc.accountId).not.toBe(svc.portalId);
   });
 
+  /*
+   * The REFRESH path constructs its own instance (hubspotService.ts:439), separately
+   * from the fresh-token early return above it. The test below sets a future expiry, so
+   * it only ever exercised the early return — mutating the refresh-path construction to
+   * pass portalId stayed green across all 47 tests.
+   *
+   * That path is the routine one in production: any access token within 60s of expiry.
+   * If it passed the wrong id the pre-flight would judge the wrong account on exactly
+   * those calls, silently, for the same portalId === account_id reason the sibling test
+   * exists to break.
+   */
+  it('sets accountId on the REFRESH path too, not just the fresh-token path', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([{
+      ...expiredAccount(),
+      account_id: 'acct-999',
+      config: { ...expiredAccount().config, hub_id: 111222 },   // already expired -> refresh path
+    }] as never);
+    mockAxiosPost.mockResolvedValue({
+      data: { access_token: 'fresh', refresh_token: 'rotated', expires_in: 1800 },
+    });
+
+    const svc = await HubSpotService.create('user-1');
+    expect(svc.accountId).toBe('acct-999');
+    expect(svc.accountId).not.toBe(svc.portalId);
+  });
+
   it('fromToken() leaves accountId undefined — that is how the fallback is recognised', () => {
     expect(HubSpotService.fromToken('pat-na1-some-key').accountId).toBeUndefined();
   });

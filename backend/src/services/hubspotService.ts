@@ -312,6 +312,12 @@ export function redactAxiosCredentials<T>(err: T): T {
  *
  * `response.data` is the RESPONSE body and carries no credentials; it is capped anyway so
  * an HTML error page from a proxy cannot flood the log.
+ *
+ * Deliberately NOT the same threat model as agentModeService.redactHubSpotMessage. That
+ * one guards resource-endpoint bodies, which can echo an ACCESS token, so it strips
+ * token-shaped runs. This is the token endpoint, whose error bodies do not echo the
+ * credential — and a refresh token can be a 36-char UUID, which would slip a bare-run
+ * rule anyway. Do not unify the two on the assumption they do the same job.
  */
 function describeRefreshFailure(err: unknown): string {
   const status = (err as any)?.response?.status;

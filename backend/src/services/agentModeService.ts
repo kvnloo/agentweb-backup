@@ -42809,7 +42809,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // bare string body from a proxy or WAF, `{context:{detail}}`, and a top-level array.
     // Having accepted that a token can ride in free text, the coverage has to match the
     // threat model rather than the one sentence that was reported.
-    if (depth > 6) return body;
+    // Fail CLOSED. Returning the raw sub-tree here would hand back tokens intact — a
+    // theoretical leak in a control whose whole premise is that free text can carry a
+    // credential. Losing a deeply nested diagnostic is the cheaper failure. Real HubSpot
+    // bodies are depth <= 3, so this is unreachable either way.
+    if (depth > 6) return '<depth-capped>';
     if (typeof body === 'string') return AgentModeService.redactHubSpotMessage(body);
     if (Array.isArray(body)) return body.map((v) => AgentModeService.redactHubSpotBody(v, depth + 1));
     if (!body || typeof body !== 'object') return body ?? null;
