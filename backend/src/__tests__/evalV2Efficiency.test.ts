@@ -243,7 +243,7 @@ describe('runEvalV2Sample — efficiency per model × task type', () => {
     const scores = [...dynamo.rows.values()].filter((r) => r.eventType === 'eval_v2_scored').map((r) => r.dimensions as Record<string, unknown>);
     const x = scores.find((d) => d.sessionId === 'x');
     const y = scores.find((d) => d.sessionId === 'y');
-    expect(x).toMatchObject({ spendStatus: 'attributed', costMicroUsd: 3_000_000, runLatencyMs: 60_000, model: 'model-a', samplerVersion: 2 });
+    expect(x).toMatchObject({ spendStatus: 'attributed', costMicroUsd: 3_000_000, runLatencyMs: 60_000, model: 'model-a', samplerVersion: 3 });
     expect(y).toMatchObject({ spendStatus: 'none' });
     expect(y).not.toHaveProperty('costMicroUsd');
 

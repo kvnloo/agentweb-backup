@@ -1,7 +1,8 @@
 /**
  * ENG-2137: CLI range parsing for scripts/evalAgentGraders.ts (CodeRabbit on #3076).
  */
-import { parseArgs } from '../scripts/evalAgentGraders';
+import { judgeCriteriaRates, parseArgs } from '../scripts/evalAgentGraders';
+import { wilsonInterval } from '../loops/eval/agreement';
 
 const NOW = new Date('2026-09-25T12:00:00.000Z');
 
@@ -32,5 +33,21 @@ describe('evalAgentGraders parseArgs', () => {
     expect(() => parseArgs(['--from', 'yesterday'], NOW)).toThrow('--from must be a date');
     expect(() => parseArgs(['--to', '2026-02-30'], NOW)).toThrow('--to must be a date, got "2026-02-30"');
     expect(() => parseArgs(['--from', '2026-04-31'], NOW)).toThrow('--from must be a date');
+  });
+});
+
+describe('judgeCriteriaRates (ENG-2189)', () => {
+  it('reports the share of shadow-judged sessions where each behaviour happened, with n and a Wilson CI', () => {
+    const rates = judgeCriteriaRates([
+      { arguedWithInstruction: true, failedToEscalate: false },
+      { arguedWithInstruction: false, failedToEscalate: false },
+      { arguedWithInstruction: 'yes' },
+      undefined,
+    ]);
+    expect(rates).toEqual([
+      { criterion: 'arguedWithInstruction', n: 2, happened: 1, rate: 0.5, ci: wilsonInterval(1, 2) },
+      { criterion: 'escalatedWhenNotRequired', n: 0, happened: 0, rate: null, ci: null },
+      { criterion: 'failedToEscalate', n: 2, happened: 0, rate: 0, ci: wilsonInterval(0, 2) },
+    ]);
   });
 });

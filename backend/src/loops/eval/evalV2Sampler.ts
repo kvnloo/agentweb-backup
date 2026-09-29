@@ -18,7 +18,16 @@
 import type { DynamoAttributeMap } from '../core/ports';
 import type { LoopId } from '../core/types';
 import { asLoopId } from '../core/types';
-import { AGENT_GRADER_VERSIONS, type AgentGraderId, type AgentLoopEvent, type GradedSession, type TaskVerdict } from './agentGraders';
+import {
+  ADHERENCE_GRADER_IDS,
+  AGENT_GRADER_VERSIONS,
+  type AdherenceResults,
+  type AdherenceVerdict,
+  type AgentGraderId,
+  type AgentLoopEvent,
+  type GradedSession,
+  type TaskVerdict,
+} from './agentGraders';
 import type { SpendStatus } from './agentGraderLoader';
 import { wilsonInterval, type Interval } from './agreement';
 import { mayGate } from './evalRegistry';
@@ -32,8 +41,12 @@ export const EVT_EVAL_V2_SCORED = 'eval_v2_scored';
 export const EVT_EVAL_V2_SAMPLE_RUN = 'eval_v2_sample_run';
 export const EVT_EVAL_V2_SNAPSHOT = 'eval_v2_snapshot';
 
-/** Bump when the sampling frame or the row shape changes. 2: spend and run latency per score (ENG-2196). */
-export const EVAL_V2_SAMPLER_VERSION = 2;
+/**
+ * Bump when the sampling frame or the row shape changes. 2: adherence verdicts per score
+ * (ENG-2189). 3: spend and run latency per score (ENG-2196) — bumped again on merge, since both
+ * ENG-2189 and ENG-2196 independently claimed 2 for two different row-shape additions.
+ */
+export const EVAL_V2_SAMPLER_VERSION = 3;
 
 export const EVAL_V2_WINDOWS = { '1d': 1, '7d': 7 } as const;
 export type EvalV2WindowLabel = keyof typeof EVAL_V2_WINDOWS;
@@ -194,6 +207,13 @@ export function buildScoredEventItem(graded: GradedSession, ctx: ScoreContext, s
       toolFindingKinds: findingKinds.join(','),
       groundednessVerdict: graded.groundedness.verdict,
       unbackedClaimClasses: graded.groundedness.unbackedClaimClasses.join(','),
+      // ENG-2189 (sampler v2): instruction-adherence verdicts and reason codes.
+      lengthVerdict: graded.adherence.length.verdict,
+      lengthReason: graded.adherence.length.reason,
+      formatVerdict: graded.adherence.format.verdict,
+      formatReason: graded.adherence.format.reason,
+      permissionVerdict: graded.adherence.permission.verdict,
+      permissionReason: graded.adherence.permission.reason,
       userTurns: ctx.userTurns,
       ...(ctx.spendStatus ? { spendStatus: ctx.spendStatus } : {}),
       ...(ctx.spendStatus === 'attributed' && graded.efficiency.spend
@@ -218,6 +238,8 @@ export interface EvalV2Score {
   toolVerdict: 'pass' | 'fail';
   toolCalls: number;
   groundednessVerdict: 'grounded' | 'ungrounded' | 'no_claims';
+  /** ENG-2189; rows written before sampler v2 have none, and count as not applicable. */
+  adherence?: Partial<Record<keyof AdherenceResults, AdherenceVerdict>>;
   graderVersions: Partial<Record<AgentGraderId, number>>;
   /** Absent when spend was not read (e.g. a row from sampler version 1). */
   spendStatus?: SpendStatus;
@@ -230,6 +252,8 @@ const SPEND_STATUSES: ReadonlySet<string> = new Set<SpendStatus>(['attributed', 
 
 const TASK_VERDICTS: ReadonlySet<string> = new Set<TaskVerdict>(['success', 'failure', 'excluded']);
 const GROUNDEDNESS_VERDICTS: ReadonlySet<string> = new Set(['grounded', 'ungrounded', 'no_claims']);
+const ADHERENCE_VERDICTS: ReadonlySet<string> = new Set<AdherenceVerdict>(['pass', 'fail', 'not_applicable']);
+const ADHERENCE_KEYS = Object.keys(ADHERENCE_GRADER_IDS) as Array<keyof AdherenceResults>;
 
 /** A stored `eval_v2_scored` row back into a score, or null for any other or malformed row. */
 export function parseScoredEvent(item: Record<string, unknown>): EvalV2Score | null {
@@ -241,6 +265,11 @@ export function parseScoredEvent(item: Record<string, unknown>): EvalV2Score | n
   const groundednessVerdict = str('groundednessVerdict');
   if (!str('sessionId') || !str('sampleDate') || !TASK_VERDICTS.has(taskVerdict)) return null;
   if ((toolVerdict !== 'pass' && toolVerdict !== 'fail') || !GROUNDEDNESS_VERDICTS.has(groundednessVerdict)) return null;
+  const adherence: NonNullable<EvalV2Score['adherence']> = {};
+  for (const key of ADHERENCE_KEYS) {
+    const verdict = str(`${key}Verdict`);
+    if (ADHERENCE_VERDICTS.has(verdict)) adherence[key] = verdict as AdherenceVerdict;
+  }
   return {
     sessionId: str('sessionId'),
     sampleDate: str('sampleDate'),
@@ -251,6 +280,7 @@ export function parseScoredEvent(item: Record<string, unknown>): EvalV2Score | n
     toolVerdict,
     toolCalls: typeof d.toolCalls === 'number' ? d.toolCalls : 0,
     groundednessVerdict: groundednessVerdict as EvalV2Score['groundednessVerdict'],
+    adherence,
     graderVersions: parseGraderVersionTag(str('graders')),
     ...(SPEND_STATUSES.has(str('spendStatus')) ? { spendStatus: str('spendStatus') as SpendStatus } : {}),
     ...(str('spendStatus') === 'attributed' && typeof d.costMicroUsd === 'number' ? { costMicroUsd: d.costMicroUsd } : {}),
@@ -316,6 +346,10 @@ const METRIC_OUTCOMES: ReadonlyArray<{ graderId: AgentGraderId; outcome: (s: Eva
     graderId: 'agent-groundedness-offline',
     outcome: (s) => (s.groundednessVerdict === 'no_claims' ? 'not_applicable' : s.groundednessVerdict === 'grounded' ? 'pass' : 'fail'),
   },
+  ...ADHERENCE_KEYS.map((key) => ({
+    graderId: ADHERENCE_GRADER_IDS[key],
+    outcome: (s: EvalV2Score): Outcome => s.adherence?.[key] ?? 'not_applicable',
+  })),
 ];
 
 export interface EvalV2Metric {

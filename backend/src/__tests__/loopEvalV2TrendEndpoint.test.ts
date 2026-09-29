@@ -81,6 +81,9 @@ describe('GET /api/admin/loops/eval-v2-trend', () => {
       ['agent-task-success', false],
       ['agent-tool-correctness', false],
       ['agent-groundedness-offline', false],
+      ['agent-reply-length-adherence', false],
+      ['agent-format-adherence', false],
+      ['agent-act-without-asking', false],
     ]);
     const metric = res.body.snapshots[0].groups[0].metrics[0];
     expect(metric).toMatchObject({ graderId: 'agent-task-success', n: 1, passes: 1, mayGate: false });

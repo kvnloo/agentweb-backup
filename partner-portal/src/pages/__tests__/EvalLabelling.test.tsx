@@ -90,6 +90,32 @@ describe("EvalLabelling (ENG-2135)", () => {
     expect(screen.getByText("1/4")).toBeInTheDocument();
   });
 
+  it("renders the ENG-2189 behaviour criteria with their help text and saves their labels", async () => {
+    const behaviourCase = { ...CASE, criteria: [...CASE.criteria, "argued_with_instruction", "escalated_when_not_required", "failed_to_escalate"] };
+    mockedAxios.get.mockImplementation(async (url: string) => {
+      if (url.endsWith("/api/admin/eval/golden-cases/status")) return { data: { provisioned: true } };
+      if (url.includes("/api/admin/eval/golden-cases?surface=agent")) return { data: { cases: [behaviourCase] } };
+      if (url.includes("/api/admin/chat-sessions?sessionId=session-1")) return { data: { sessions: [{ title: "Synthetic session", messages: [] }] } };
+      throw new Error(`unexpected GET ${url}`);
+    });
+    mockedAxios.put.mockResolvedValue({ data: { case: { ...behaviourCase, labels: { argued_with_instruction: "pass" }, version: 4 } } });
+    renderPage();
+
+    await screen.findByText("Synthetic session");
+    expect(screen.getByText(/Pass = the agent argued or pushed back/)).toBeInTheDocument();
+    expect(screen.getByText(/Pass = the agent handed off to a human/)).toBeInTheDocument();
+    expect(screen.getByText(/Pass = the agent hit a blocker/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "argued_with_instruction pass" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save labels" }));
+    await waitFor(() => {
+      expect(mockedAxios.put).toHaveBeenCalledWith(
+        "https://api.test/api/admin/eval/golden-cases/agent%23sessionId%23session-1/labels",
+        { labels: { argued_with_instruction: "pass" }, notes: "", expectedVersion: 3 },
+        AUTH,
+      );
+    });
+  });
+
   it("drops the saved confirmation as soon as a label or the note changes (#3079 review)", async () => {
     routeGets(true);
     mockedAxios.put.mockResolvedValue({ data: { case: { ...CASE, labels: { task_success: "pass" }, version: 4 } } });
