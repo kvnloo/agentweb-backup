@@ -5462,6 +5462,11 @@ emmaToolRegistry.register({
           enum: ['ad', 'organic_post'],
           description: "REQUIRED use-case declaration for the human eval queue: 'ad' when the image is a paid ad creative (Meta/Google/LinkedIn ads, retargeting creatives), 'organic_post' when it is organic social/content imagery (feed posts, blog headers, non-paid content). Reviewer feedback differs entirely between the two, so declare it from the request's context — never guess randomly; if the user's intent is genuinely unclear, ask them which use case the image is for before generating."
         },
+        placement: {
+          type: 'string',
+          enum: ['meta_feed_square', 'meta_feed_portrait', 'meta_story_reel', 'google_square_marketing_image', 'google_marketing_image'],
+          description: "Optional, for ad creatives: the ad placement the image is for. The generated image is checked against that placement's minimum size and file limit. Omit when unknown; a Meta placement is then assumed from the size ratio (1:1 feed square, 4:5 feed portrait, 9:16 story/reel)."
+        },
         metrics_verified: {
           type: 'boolean',
           description: "Set true ONLY when your prompt describes a dashboard/table/metrics-shaped layout AND every number/percentage/dollar figure in it came directly from a real tool result earlier in this conversation (e.g. get_meta_ads_metrics, call_meta_marketing_api). Leave false or omit for any illustrative, placeholder, or self-written figure — including a plausible-looking value you wrote yourself with no real source (e.g. a progress-bar percentage). Omitting this on a data-shaped prompt triggers an automatic post-generation reliability check; setting it true when the values are genuinely real skips that check instead of risking a false 'unverified' caution on accurate data."
@@ -5489,7 +5494,8 @@ emmaToolRegistry.register({
       args.logo_image,
       args.confirm,
       args.category,
-      args.metrics_verified
+      args.metrics_verified,
+      args.placement
     );
   }
 });
@@ -8304,11 +8310,11 @@ emmaToolRegistry.register({
             properties: {
               title: {
                 type: 'string',
-                description: 'Short title for the issue (e.g., "Login page crashes on mobile")'
+                description: 'Short title for the issue (e.g., "Login page crashes on mobile"). For type "bug", always write in English regardless of the conversation language — it goes straight into the internal engineering tracker, not to the user.'
               },
               description: {
                 type: 'string',
-                description: 'Detailed description of the issue including steps to reproduce, expected behavior, and actual behavior'
+                description: 'Detailed description of the issue including steps to reproduce, expected behavior, and actual behavior. For type "bug", always write in English regardless of the conversation language — it goes straight into the internal engineering tracker, not to the user.'
               },
               priority: {
                 type: 'string',

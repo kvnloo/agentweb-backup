@@ -119,6 +119,30 @@ describe('shadow outcome judge (ENG-2138)', () => {
     expect(result).toEqual(expect.objectContaining({ shadow: true, score: 4 }));
   });
 
+  it('asks for the three behaviour criteria and stores only real booleans from the reply (ENG-2189)', async () => {
+    for (const field of ['arguedWithInstruction', 'escalatedWhenNotRequired', 'failedToEscalate']) {
+      expect(OUTCOME_RUBRIC_B_PROMPT).toContain(`"${field}": <true|false>`);
+    }
+    mockCallLLM.mockResolvedValue({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            reason: 'Argued instead of doing the edit.',
+            score: 2,
+            dimensions: { goalCompletion: 2, dataAccuracy: 4, outputQuality: 2, arguedWithInstruction: true, escalatedWhenNotRequired: false, failedToEscalate: 'no' },
+          }),
+        },
+      }],
+    } as never);
+
+    await scoreSessionWithJudgeIfNeeded(session(), shadowJudge());
+
+    const stored = mockUpdateJudgeScore.mock.calls[0][2];
+    expect(stored.dimensions).toMatchObject({ arguedWithInstruction: true, escalatedWhenNotRequired: false });
+    expect(stored.dimensions).not.toHaveProperty('failedToEscalate');
+    expect(mockUpdateSatisfaction).not.toHaveBeenCalled();
+  });
+
   it('skips a session outside the sample unless an admin forces that one session', async () => {
     const judge = shadowJudge({ sampleRate: 0.5 });
     const outside = Array.from({ length: 50 }, (_, i) => `sess-${i}`).find((id) => !isInShadowSample(judge, id));

@@ -108,6 +108,16 @@ describe('judgeLabelledPairs (#3094 review)', () => {
     expect(result.rows).toEqual([{ human: 'B', judge: 'B' }]);
   });
 
+  it('leaves landing-page pairs to the human labels: no judge call, no error (ENG-2192)', async () => {
+    const judge = jest.fn(async () => ({ status: 'ok', preference: 'A' }) as never);
+    const lpCase = { ...pairCase('lp', 'a1', 'b1'), pair: { candidateIdB: 'b1', category: 'landing_page' } } as unknown as GoldenCase;
+
+    const result = await judgeLabelledPairs([{ c: lpCase, human: 'A' }], { getCandidate: async (id) => candidate(id), briefFor: async () => ({}), judge });
+
+    expect(result).toEqual({ rows: [], judgeErrors: 0 });
+    expect(judge).not.toHaveBeenCalled();
+  });
+
   it('counts a failed brief lookup the same way', async () => {
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const result = await judgeLabelledPairs([{ c: pairCase('p1', 'a1', 'b1'), human: 'tie' }], {

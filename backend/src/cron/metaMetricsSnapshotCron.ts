@@ -11,7 +11,7 @@ import {
 } from "../services/adsMetricsDb";
 import { leadTotals, type MetaAction } from "../utils/metaActionFamilies";
 import { META_GRAPH_TIMEOUT_MS } from "../utils/metaApiFetch";
-import { promoteAttributionFromCustomFields } from "../types/attribution";
+import { promoteAttributionFromCustomFields, type AttributionTouch } from "../types/attribution";
 import { isEvaluationUser } from "../services/evaluationPolicy";
 
 /**
@@ -591,6 +591,40 @@ function sumActionValues(actions: MetaAction[] | undefined): number | null {
   return total;
 }
 
+/**
+ * ENG-2194: 3-second video plays. Meta reports them as the `video_view` entry of `actions` (Ads
+ * Manager's "3-second video plays"); `video_play_actions` counts every play start, however short,
+ * so it would overstate a hook rate. Null when the ad reported none (image ads).
+ */
+function threeSecondVideoPlays(actions: MetaAction[] | undefined): number | null {
+  return sumActionValues(actions?.filter((a) => a?.action_type === "video_view"));
+}
+
+/** The parts of an AW-Leads item the ad-level CRM join reads. */
+export interface CrmLeadAttributionFields {
+  customFields?: unknown;
+  firstTouch?: AttributionTouch;
+}
+
+/**
+ * ENG-2194: CRM leads per ad, joined on `utm_content`, which our ads carry as Meta's `{{ad.id}}`
+ * macro (utils/adUtm.ts). Resolved through promoteAttributionFromCustomFields exactly like the
+ * campaign join, and bounded the same way: only ads Meta reported for this date can match, so a
+ * lead whose utm_content is anything else (a campaign id, free text) is simply not counted here.
+ */
+export function countCrmLeadsByAd(
+  leads: ReadonlyArray<CrmLeadAttributionFields>,
+  reportedAdIds: ReadonlySet<string>
+): Map<string, number> {
+  const byAd = new Map<string, number>();
+  for (const lead of leads) {
+    const content = promoteAttributionFromCustomFields(lead.customFields, lead.firstTouch)?.utm?.content;
+    const adId = typeof content === "string" ? content.trim() : "";
+    if (adId && reportedAdIds.has(adId)) byAd.set(adId, (byAd.get(adId) ?? 0) + 1);
+  }
+  return byAd;
+}
+
 export interface AdSnapshotResult {
   adRowsWritten: number;
 }
@@ -602,8 +636,9 @@ export interface AdSnapshotResult {
  * behaviour as the campaign rows, so each date is rewritten until Meta has settled it; readers
  * decide settledness per row with isMetaRowSettled.
  *
- * Leads here are Meta-reported (the `actions` lead family, counted once). The CRM lead join the
- * campaign rows carry has no ad-level equivalent, so it is not attempted.
+ * `platformLeadCount` is Meta-reported (the `actions` lead family, counted once). When the day's
+ * CRM leads are passed, `crmLeadCount` is the ad-level CRM join (countCrmLeadsByAd, ENG-2194); it is
+ * omitted when they are not, so "not joined" never reads as "zero CRM leads".
  */
 export async function snapshotMetaAdMetricsForDate(
   userId: string,
@@ -611,7 +646,9 @@ export async function snapshotMetaAdMetricsForDate(
   resolvedCredentials: ResolvedMetaCredentials,
   accountContext: MetaAccountContext,
   /** Same meaning and position rule as snapshotMetaMetricsForDate's `snapshotSource`. */
-  snapshotSource: "daily" | "backfill" = "daily"
+  snapshotSource: "daily" | "backfill" = "daily",
+  /** This date's CRM leads (getLeadsByDateForUser bucket); omit to skip the CRM join. */
+  crmLeadsForDate?: ReadonlyArray<CrmLeadAttributionFields>
 ): Promise<AdSnapshotResult> {
   const { accountId, accessToken } = resolvedCredentials;
   const insightsUrl =
@@ -621,6 +658,9 @@ export async function snapshotMetaAdMetricsForDate(
     `&time_range={'since':'${dateStr}','until':'${dateStr}'}` +
     `&level=ad&access_token=${accessToken}`;
   const adRows = await fetchAllInsightsPages<AdInsightsRow>(insightsUrl, dateStr);
+  const crmLeadsByAd = crmLeadsForDate
+    ? countCrmLeadsByAd(crmLeadsForDate, new Set(adRows.filter((r) => r?.ad_id).map((r) => String(r.ad_id))))
+    : null;
 
   const capturedAt = new Date().toISOString();
   let written = 0;
@@ -636,6 +676,8 @@ export async function snapshotMetaAdMetricsForDate(
       const value = sumActionValues(r[field]);
       if (value !== null) platformMetrics[key] = value;
     }
+    const plays3s = threeSecondVideoPlays(r.actions);
+    if (plays3s !== null) platformMetrics.videoPlays3s = plays3s;
     await adsMetricsDb.putAdSnapshot({
       entityKey: buildAdEntityKey(PLATFORM, accountId, adId),
       date: dateStr,
@@ -655,6 +697,7 @@ export async function snapshotMetaAdMetricsForDate(
       impressions: parseInt(r.impressions ?? "", 10) || 0,
       clicks: parseInt(r.clicks ?? "", 10) || 0,
       platformLeadCount: leadTotals(r.actions).total,
+      ...(crmLeadsByAd ? { crmLeadCount: crmLeadsByAd.get(adId) ?? 0 } : {}),
       platformMetrics,
       snapshotSource,
       capturedAt,
@@ -805,7 +848,9 @@ export async function runMetaMetricsSnapshot(): Promise<void> {
       // campaign rows, and a failed campaign read does not skip the ad rows.
       if (adLevel) {
         try {
-          const { adRowsWritten } = await snapshotMetaAdMetricsForDate(canonicalUserId, dateStr, credentials, accountContext);
+          const { adRowsWritten } = await snapshotMetaAdMetricsForDate(
+            canonicalUserId, dateStr, credentials, accountContext, "daily", leadsByDate.get(dateStr) ?? []
+          );
           console.log(`[MetaMetricsSnapshotCron] account ${accountId} ${dateStr}: wrote ${adRowsWritten} ad rows`);
         } catch (error) {
           console.error(`[MetaMetricsSnapshotCron] CRITICAL ERROR (ad level) for account ${accountId} ${dateStr}:`, error);

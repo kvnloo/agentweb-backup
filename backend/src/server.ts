@@ -1028,7 +1028,7 @@ createTestAccount().then(async () => {
       }
 
       // Account-health classifier sweep (ENG-2143), the replacement for the renewal cron above:
-      // at-risk → deduped oncall, activation incomplete → CS nudge log. Off unless
+      // at-risk → deduped oncall, activation incomplete → CS nudge digest email. Off unless
       // ACCOUNT_HEALTH_ALERTS_ENABLED=true (enabling it in prod is an OPS step).
       if (process.env.ACCOUNT_HEALTH_ALERTS_ENABLED === 'true') try {
         const { runAccountHealthClassifier } = await import('./cron/accountHealthClassifierCron');
@@ -1445,6 +1445,19 @@ createTestAccount().then(async () => {
         });
       } catch (error) {
         console.error('[FailureReplayNightly] Failed to initialize:', error);
+      }
+
+      // Offline eval suite on "needs eval" markers (ENG-2195) — hourly: when prompt/model/skill
+      // markers appeared since the last run, run the deterministic suite and record the verdict in
+      // Dev-AW-LoopEvents. Off unless EVAL_MARKER_SUITE_ENABLED=true.
+      try {
+        const { scheduleEvalMarkerSuite } = await import('./cron/evalMarkerSuiteCron');
+        scheduleEvalMarkerSuite({
+          isCronEnabled,
+          track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
+        });
+      } catch (error) {
+        console.error('[EvalMarkerSuite] Failed to initialize:', error);
       }
 
       // Weekly Engineering Scoreboard — read-only backend replacement for the

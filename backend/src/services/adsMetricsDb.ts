@@ -170,11 +170,19 @@ export interface AdsMetricsAdRow {
   clicks: number;
   /**
    * Leads as the PLATFORM reports them for this ad (Meta's lead family, counted once — see
-   * utils/metaActionFamilies.ts). Not the CRM join the campaign rows carry: leads reach the CRM
-   * tagged by campaign, not by ad, so there is no ad-level CRM equivalent (ENG-916).
+   * utils/metaActionFamilies.ts). Not the CRM join; that is `crmLeadCount`.
    */
   platformLeadCount: number;
-  /** Meta: ctr, cpm, frequency; videoP25Watched / videoThruplayWatched only when Meta returned them. */
+  /**
+   * CRM leads created this date whose `utm_content` is this ad's id (ENG-2194; our Meta ads carry
+   * `utm_content={{ad.id}}`, utils/adUtm.ts). Absent on rows written without the join (before it
+   * existed), which is not the same as zero.
+   */
+  crmLeadCount?: number;
+  /**
+   * Meta: ctr, cpm, frequency; videoP25Watched / videoThruplayWatched / videoPlays3s (3-second
+   * plays, ENG-2194) only when Meta returned them.
+   */
   platformMetrics: Record<string, number>;
 
   snapshotSource: "daily" | "backfill";

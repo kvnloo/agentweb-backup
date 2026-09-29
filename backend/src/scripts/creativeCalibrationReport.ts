@@ -122,6 +122,8 @@ export async function judgeLabelledPairs(
   const rows: PairwiseComparison[] = [];
   let judgeErrors = 0;
   for (const { c, human } of labelled) {
+    // The pairwise judge compares images; landing-page pairs (ENG-2192) are human-labelled only.
+    if (c.pair?.category === 'landing_page') continue;
     try {
       const [a, b] = await Promise.all([deps.getCandidate(c.sourceRef.id), deps.getCandidate(c.pair?.candidateIdB ?? '')]);
       if (!a?.artifactUrl || !b?.artifactUrl) {

@@ -407,8 +407,8 @@ In addition to the overall score, rate three specific dimensions (1-5 each):
 - dataAccuracy: Did the output contain plausible, consistent, and factually coherent data? Penalize hallucinated facts, made-up numbers, or self-contradictions.
 - outputQuality: Was the output well-structured, specific, and actionable? Penalize vague, generic, or poorly formatted responses.
 
-Respond with ONLY valid JSON:
-{"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}}`;
+Respond with ONLY valid JSON, with the reason before the score:
+{"reason": "<brief explanation>", "score": <1-5>, "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}}`;
 
 const MAX_MESSAGES_FOR_SCORING = 50;
 const MIN_USER_MESSAGES = 1;
@@ -485,8 +485,8 @@ ADDITIONAL REQUIRED FIELD — "taskRequested":
 - When in any doubt, set it to true.
 - A session marked false is removed from satisfaction reporting entirely, so never use false for a session where the user actually wanted something — even if the assistant handled it badly.
 
-Include it in the SAME JSON object as the other fields, e.g.:
-{"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}, "taskRequested": <true|false>}`;
+Include it in the SAME JSON object as the other fields, with "reason" before "score", e.g.:
+{"reason": "<brief explanation>", "score": <1-5>, "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}, "taskRequested": <true|false>}`;
 
 /**
  * ENG-1312: the judge originally scored only goalCompletion / dataAccuracy /
@@ -513,8 +513,8 @@ ADDITIONAL REQUIRED DIMENSIONS — include these in the SAME "dimensions" object
 ADDITIONAL SCORING RULE for outputQuality — pushback is not automatically excellent:
 When the user gives an explicit instruction that does NOT involve spending money, publishing, sending, or an otherwise irreversible action, and the assistant responds by arguing, countering, or otherwise not complying instead of doing what was asked — even if the assistant's reasoning is well-articulated — outputQuality for that turn's session may NOT score 5. Score it 3 or lower. A brief, single-sentence note of disagreement ALONGSIDE actually complying (do the thing, then note a concern in one sentence) is not pushback under this rule and is not penalized by it. EXCEPTION: this cap does NOT apply when noncompliance is a valid safety refusal — the instruction itself was harmful, illegal, or privacy-violating (e.g. asking the assistant to expose another user's private data, bypass a security control, or perform something clearly unsafe) and refusing was the correct response. A required safety refusal remains eligible for outputQuality 5. This cap also does NOT apply when the assistant declines to make an entire final reply nothing but bare punctuation/JSON-structure debris (see the output-integrity guard rule below) — that is guard-required behavior, not pushback, and remains eligible for outputQuality 5.
 
-Include the new fields in the SAME JSON object as the other fields, e.g.:
-{"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>, "concision": <0-5>, "instructionCompliance": <0-5>, "unnecessaryPermissionRequest": <true|false>}}`;
+Include the new fields in the SAME JSON object as the other fields, with "reason" before "score", e.g.:
+{"reason": "<brief explanation>", "score": <1-5>, "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>, "concision": <0-5>, "instructionCompliance": <0-5>, "unnecessaryPermissionRequest": <true|false>}}`;
 
 /**
  * ENG-1245: judges scored a REAL "Require approval before publishing" hold
@@ -639,8 +639,8 @@ ADDITIONAL REQUIRED FIELD — "assertsToolDerivedData":
 - Set "assertsToolDerivedData": false when the response contains no such tool-attributed data — general knowledge, reasoning, a plain conversational reply, or content the assistant clearly marked as illustrative/example/placeholder rather than real.
 - This field is checked by code against the tool call manifest above: if you set it true but the manifest shows zero matching tool calls, the response's dataAccuracy score will be treated as fabricated regardless of what "reason" text you write, so answer honestly.
 
-Include it in the SAME JSON object as the other fields, e.g.:
-{"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}, "assertsToolDerivedData": <true|false>}`;
+Include it in the SAME JSON object as the other fields, with "reason" before "score", e.g.:
+{"reason": "<brief explanation>", "score": <1-5>, "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}, "assertsToolDerivedData": <true|false>}`;
 
 /**
  * ENG-1164: an internal QA "serialization test" session instructed the assistant
@@ -1508,6 +1508,10 @@ type ScoringResult = {
     concision?: number; // 0-5: did reply length match the question/instruction?
     instructionCompliance?: number; // 0-5: explicit instruction followed on first attempt?
     unnecessaryPermissionRequest?: boolean; // asked to confirm a safe (read-only/draft/test) action?
+    /** ENG-2189: binary criteria only the outcome rubric (outcomeJudge.ts) asks for; absent otherwise. */
+    arguedWithInstruction?: boolean;
+    escalatedWhenNotRequired?: boolean;
+    failedToEscalate?: boolean;
   };
   /**
    * `false` when the judge reported that the user never requested anything, so
@@ -1560,6 +1564,10 @@ function parseDimensions(raw: any): ScoringResult["dimensions"] | undefined {
   }
   if (typeof d.unnecessaryPermissionRequest === "boolean") {
     dimensions.unnecessaryPermissionRequest = d.unnecessaryPermissionRequest;
+  }
+  // ENG-2189: same rule, only a real boolean is kept.
+  for (const key of ["arguedWithInstruction", "escalatedWhenNotRequired", "failedToEscalate"] as const) {
+    if (typeof d[key] === "boolean") dimensions[key] = d[key];
   }
 
   return dimensions;

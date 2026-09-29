@@ -79,6 +79,47 @@ export interface SchedulePublishApprovalInput {
 }
 
 /**
+ * ENG-2204: the shape this resolver reads for the unattended Slack-send override — same
+ * opt-out convention as SchedulePublishApprovalInput above, for a different axis of
+ * consent (an internal Slack channel the owner/admin already configured, not a public
+ * account under the owner's name — see the SLACK NOTIFICATIONS override's own comment
+ * in agentModeSystemPrompt.ts for why this is intentionally NOT folded into the
+ * publish-authorization tri-state above).
+ */
+export interface ScheduleSlackSendApprovalInput {
+  /** Owner opt-OUT. True means "never let an unattended run send Slack messages without a
+   *  live approval" — i.e. keep this schedule on the pre-ENG-2204 behavior. Human-writable
+   *  only (kept off the manage_scheduled_chat MCP allowlist, same reasoning as
+   *  requirePublishApproval). */
+  requireSlackApproval?: boolean;
+}
+
+/**
+ * Whether an unattended run on this schedule may call slack_send_message directly
+ * (without a live approval) when its task asks for it.
+ *
+ * A pure predicate, mirroring resolvePublishAuthorized's shape exactly: designed to be
+ * callable from any orchestrating call site the same way — currently only
+ * agentModeService.ts's main call site actually does. agentModeController.ts's
+ * mid-run publish-revocation-notice call site (a rarer path that also emits this
+ * directive's text) does NOT yet call it — see the "known, accepted gap" comment at
+ * that call site for why — so it still defaults to authorized there regardless of a
+ * schedule's real opt-out. Kept as a pure predicate (the caller fetches the schedule
+ * and passes it in) rather than an async orchestrating helper, so this otherwise
+ * DB-free utility file doesn't need to import scheduleDb just to serve one call site.
+ *
+ * Same polarity/fail-closed conventions as resolvePublishAuthorized purely for
+ * consistency: absent/false = authorized (matches this ticket's fix — no existing
+ * schedule's behavior changes), explicit true = withheld. A null/undefined schedule
+ * (the record could not be read or does not exist) withholds rather than authorizes —
+ * an unconfirmed permission is treated as withheld, same reasoning as publish.
+ */
+export function resolveSlackSendAuthorized(schedule?: ScheduleSlackSendApprovalInput | null): boolean {
+  if (!schedule) return false;
+  return schedule.requireSlackApproval !== true;
+}
+
+/**
  * Whether an unattended run on this schedule may publish externally.
  *
  * TWO DIFFERENT ABSENCES, TWO DIFFERENT ANSWERS — this distinction is the whole

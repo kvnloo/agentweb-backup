@@ -4307,6 +4307,14 @@ async function runVerifiedChatInner(
               ? ` except for: ${narrowed.tools.join(', ')}.`
               : ' — you are no longer authorized to publish with any tool.') +
             '\n' +
+            // ENG-2204: known, accepted gap — this call doesn't resolve/pass
+            // slackSendAuthorized (defaults to true), so an owner's Slack opt-out is
+            // not honored in THIS specific re-injection. Scoped narrowly: only fires
+            // on a mid-run publish-consent REVOCATION (rare), and doing it properly
+            // would mean threading scheduleId/session lookup through
+            // runVerifiedChatInner's signature for one edge case. The primary
+            // directive injection (agentModeService.ts, every turn's system prompt)
+            // already resolves and respects the real opt-out.
             getUnattendedExecutionDirective('scheduled', false, narrowed.authorized ? 'authorized' : 'withheld', narrowed.tools);
           console.log(
             `AgentMode: publish consent narrowed mid-run for session ${sessionId} — ` +
@@ -8007,7 +8015,24 @@ export async function runScheduleSelfImprovement(params: {
     'Rules for any improved prompt: keep the same overall goal and any {{variables}} exactly as they are; only refine the wording/instructions to make future runs more reliable. Do not invent new variables. If the current prompt is already good, make no change and simply explain why.',
   ].join('\n');
 
-  await generateSessionResponse(sessionId, reflectionPrompt, userId, llmModel);
+  // ENG-2204: this reflection turn is only ever reached from runScheduledChat
+  // (line ~7068, gated on schedule.selfImprove), unattended, on both real cron
+  // dispatches and manual test runs. It was never on generateSessionResponse's
+  // own documented list of intentionally-unmigrated callers (Slack, chatbot
+  // replies, GTM plan turns, onboarding) — it was simply missed when
+  // isUnattendedRun was introduced. Passing it explicitly as `true` here
+  // matters now that agentModeService.ts's unattended-directive gate checks
+  // `isUnattendedRun === true` rather than sessionType alone: without it, this
+  // genuinely-unattended turn would silently lose both the Slack-send override
+  // and the pre-existing publish-authorization mandate.
+  await generateSessionResponse(
+    sessionId, reflectionPrompt, userId, llmModel,
+    // positions 5-19 (attachments .. approvalDeckCancelledMeta): all optional /
+    // default-safe when undefined — only isUnattendedRun (position 20) matters here.
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    /* isUnattendedRun */ true
+  );
 }
 
 // Helper function to set up SSE connection
@@ -12329,6 +12354,7 @@ export const agentModeController = {
         selfImprove,
         fullAutonomy,
         requirePublishApproval,
+        requireSlackApproval,
         timezone
       } = req.body;
 
@@ -12420,6 +12446,13 @@ export const agentModeController = {
         // and absent from the manage_scheduled_chat MCP allowlist, so only a human
         // can set it.
         requirePublishApproval: requirePublishApproval === true,
+        // ENG-2204: owner opt-OUT for the unattended Slack-send override, same
+        // polarity/rationale as requirePublishApproval above. Default false =
+        // authorized (an unattended run calls slack_send_message directly when its
+        // task asks for it), matching this ticket's fix. Absent from the
+        // manage_scheduled_chat MCP allowlist so only a human can set it — same
+        // reasoning as requirePublishApproval's own comment above.
+        requireSlackApproval: requireSlackApproval === true,
         // ENG-1131 follow-up: owner opt-OUT for the proactive "LinkedIn search
         // blocked/recovered" transition email specifically — does not affect the
         // schedule-card badge, per-run emails, or run history, which stay on.
@@ -12585,6 +12618,7 @@ export const agentModeController = {
         selfImprove,
         fullAutonomy,
         requirePublishApproval,
+        requireSlackApproval,
         disableSourcingBlockAlerts,
         timezone
       } = req.body;
@@ -12678,6 +12712,13 @@ export const agentModeController = {
         // this one authorizes an irreversible public post, so it is not.
         ...(requirePublishApproval !== undefined
           ? { requirePublishApproval: requirePublishApproval === true }
+          : {}),
+        // ENG-2204: same write-only-if-present rationale as requirePublishApproval
+        // immediately above — this field decides whether an unattended run may call
+        // slack_send_message directly, so a read-modify-write here has the identical
+        // race (an unrelated update silently reverting an owner's just-set opt-out).
+        ...(requireSlackApproval !== undefined
+          ? { requireSlackApproval: requireSlackApproval === true }
           : {}),
         // ENG-1131 follow-up: partial-update safe, same pattern as selfImprove —
         // preserve the existing value when this request doesn't touch it.
@@ -15642,6 +15683,7 @@ export const agentModeController = {
         frequencyIntervalDays: overrideInterval,
         emailNotifications: overrideEmails,
         variableValues, runCount, llmModel: overrideModel, llmBackupModel: overrideBackupModel,
+        requiredFunctionCalls: overrideRequiredFunctionCalls,
       } = req.body;
 
       const template = await scheduleTemplateDb.getTemplateById(templateId);
@@ -15712,7 +15754,9 @@ export const agentModeController = {
         description: template.description || '',
         startingMessage: template.startingMessage,
         keywords: template.keywords || [],
-        requiredFunctionCalls: template.requiredFunctionCalls || [],
+        requiredFunctionCalls: Array.isArray(overrideRequiredFunctionCalls)
+          ? overrideRequiredFunctionCalls
+          : (template.requiredFunctionCalls || []),
         functionCallMinCalls: template.functionCallMinCalls || {},
         emailNotifications: emails,
         dailyDigest: frequency === 'hourly' ? (template.dailyDigest || false) : false,

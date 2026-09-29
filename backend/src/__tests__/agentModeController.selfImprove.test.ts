@@ -172,6 +172,25 @@ describe('runScheduleSelfImprovement', () => {
     expect(sentMessage).toContain('sched-1');
     expect(sentMessage).toContain('{{variables}}');
   });
+
+  // ENG-2204: this reflection turn is only ever reached from runScheduledChat,
+  // unattended, on both real cron dispatches and manual test runs — it was never on
+  // generateSessionResponse's own documented list of intentionally-unmigrated callers.
+  // agentModeService.ts's unattended-directive gate now checks isUnattendedRun === true
+  // rather than sessionType alone, so this genuinely-unattended turn silently lost the
+  // Slack-send override and the publish-authorization mandate until this was fixed —
+  // caught live-testing on env2, not by any existing test. Asserts the actual worker
+  // params, the same object generateMarketingResponse reads isUnattendedRun from.
+  it('marks the reflection turn as unattended so it still gets the Slack/publish directives', async () => {
+    await runScheduleSelfImprovement({
+      schedule: baseSchedule,
+      sessionId: 'sess-1',
+      userId: 'user-1',
+      llmModel: 'gpt-5-chat-2',
+    });
+
+    expect(mockWorker.runInWorker.mock.calls[0][0].isUnattendedRun).toBe(true);
+  });
 });
 
 describe('runScheduledChat self-improve trigger', () => {
