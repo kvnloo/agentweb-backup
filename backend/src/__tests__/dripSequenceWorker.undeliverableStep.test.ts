@@ -347,3 +347,89 @@ describe('an enrollment that delivered nothing', () => {
     );
   });
 });
+
+/*
+ * The worker-side behaviours this PR introduced, none of which had coverage.
+ *
+ * Each is load-bearing and each was VACUOUS: the suite passed with the code reverted.
+ */
+describe('worker behaviours that had no coverage', () => {
+  it('normalises a mis-cased channel, so a LinkedIn step is not sent as a blank email', async () => {
+    // Authored as 'LinkedIn'. Without lower-casing here it fails `=== 'linkedin'` and
+    // falls down the EMAIL branch — a blank email, counted as sent, and stamped into
+    // lastEmailSentAt.
+    mockDb.getSequence.mockResolvedValue({
+      ...mixedSequence,
+      steps: [{ stepId: 's1', stepNumber: 1, name: 'DM', channel: 'LinkedIn', delayDays: 0, messageText: 'hi' }],
+    } as any);
+    mockDb.getAllDueEnrollments.mockResolvedValue([
+      enrollmentAt(0, 'https://www.linkedin.com/in/ada/') as any,
+    ]);
+    mockCrmDb.getLeadById.mockResolvedValue({
+      leadId: 'lead-1', linkedin: 'https://www.linkedin.com/in/ada/',
+    } as any);
+
+    await processDueEnrollments();
+
+    expect(mockLinkedIn.sendMessage).toHaveBeenCalled();
+    expect(mockSendAsSender).not.toHaveBeenCalled();
+  });
+
+  it('stamps delivered=false when the sequence ends with no step left to send', async () => {
+    // currentStep past the end: this branch sends nothing, so it must not claim a send.
+    mockDb.getSequence.mockResolvedValue(mixedSequence as any);
+    mockDb.getAllDueEnrollments.mockResolvedValue([enrollmentAt(9, 'a@example.org') as any]);
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'lead-1', email: 'a@example.org' } as any);
+
+    await processDueEnrollments();
+
+    expect(mockDb.completeEnrollment).toHaveBeenCalledWith(
+      'e1', expect.any(String), 'completed', 'email', false,
+    );
+  });
+
+  it('looks up engagement by the LIVE lead address, not the dedup identity', async () => {
+    // The identity of an address-less lead is its LinkedIn URL, which matches no Resend
+    // event — so a sequence set to stop on 'replied' kept sending to someone who had
+    // already replied.
+    mockDb.getSequence.mockResolvedValue({
+      ...mixedSequence,
+      exitConditions: { onUnsubscribe: true, onEmailEngagement: ['replied'] },
+    } as any);
+    mockDb.getAllDueEnrollments.mockResolvedValue([
+      enrollmentAt(0, 'https://www.linkedin.com/in/ada/') as any,
+    ]);
+    // The lead HAS gained an address since enrolment.
+    mockCrmDb.getLeadById.mockResolvedValue({
+      leadId: 'lead-1', email: 'ada@example.org', linkedin: 'https://www.linkedin.com/in/ada/',
+    } as any);
+    mockUserDb.getUserById.mockResolvedValue({
+      userId: 'user-1', email: 'me@x.com', emailDomain: 'x.com',
+    } as any);
+
+    await processDueEnrollments();
+
+    expect(mockEmailEventsDb.getEventsByEmailDomainAndLeadEmail)
+      .toHaveBeenCalledWith('x.com', 'ada@example.org');
+  });
+
+  it('loads the lead when onEmailEngagement is the ONLY exit condition', async () => {
+    // onEmailEngagement was missing from the load condition, so `lead` stayed null and
+    // the engagement key fell back to the enrollment identity — the exit could never fire.
+    mockDb.getSequence.mockResolvedValue({
+      ...mixedSequence,
+      exitConditions: { onEmailEngagement: ['replied'] },
+    } as any);
+    mockDb.getAllDueEnrollments.mockResolvedValue([enrollmentAt(0, 'a@example.org') as any]);
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'lead-1', email: 'live@example.org' } as any);
+    mockUserDb.getUserById.mockResolvedValue({
+      userId: 'user-1', email: 'me@x.com', emailDomain: 'x.com',
+    } as any);
+
+    await processDueEnrollments();
+
+    expect(mockCrmDb.getLeadById).toHaveBeenCalled();
+    expect(mockEmailEventsDb.getEventsByEmailDomainAndLeadEmail)
+      .toHaveBeenCalledWith('x.com', 'live@example.org');
+  });
+});
