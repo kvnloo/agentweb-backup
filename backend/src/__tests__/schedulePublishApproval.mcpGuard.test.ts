@@ -53,3 +53,19 @@ describe('manage_scheduled_chat MCP surface — publish approval is not model-wr
     }
   });
 });
+
+/**
+ * ENG-2204 — same bidirectional-guard reasoning as above, for the Slack-send-approval
+ * opt-out this ticket adds. A model able to write `requireSlackApproval: true` could
+ * silence its own unattended Slack sends and then truthfully cite the withheld block
+ * as its reason for never sending — the identical self-authorization/self-silencing
+ * risk ENG-803's guard exists to prevent, just for a different field.
+ */
+describe('manage_scheduled_chat MCP surface — Slack-send approval is not model-writable (ENG-2204)', () => {
+  const source = fs.readFileSync(API_TOOLS, 'utf8');
+
+  it('never exposes requireSlackApproval to the model', () => {
+    expect(source).not.toContain('requireSlackApproval');
+    expect(source).not.toContain('require_slack_approval');
+  });
+});
