@@ -38,6 +38,11 @@ jest.mock("../services/onboardingAdImageChatSessionMirror", () => ({
     .mockResolvedValue("mocked-onboarding-session-id"),
 }));
 
+jest.mock("../services/creativeRubricOnboarding", () => ({
+  judgeOnboardingAdImages: jest.fn(async () => null),
+}));
+
+import { judgeOnboardingAdImages } from "../services/creativeRubricOnboarding";
 import {
   AD_IMAGE_SYSTEM_PROMPT,
   buildSixLayerPromptForVariant,
@@ -52,6 +57,7 @@ import {
   type AdImageGeneratorDep,
 } from "../services/onboardingAdImageService";
 import { evaluateCreativeGates } from "../services/creativeGates";
+import { adImageReadyPatch } from "../services/adImageStatusService";
 const { userDb, orgDb } = require("../services/db");
 
 class FakeImageGen {
@@ -366,6 +372,41 @@ describe("onboardingAdImageService", () => {
       expect(result.variants[1].imageUrl).toContain("placeholder://");
     });
 
+    it("keeps each variant's gates and attribution through the ready patch that is stored (ENG-2187)", async () => {
+      const placements: Array<string | undefined> = [];
+      const gen: AdImageGeneratorDep = {
+        generateImage: async (params) => {
+          placements.push(params.placement);
+          return {
+            success: true,
+            imageUrl: `https://s3.example.com/${params.filename}`,
+            gates: evaluateCreativeGates(
+              { bytes: 1000, decoded: true, width: 1080, height: 1080, format: "png", luminanceStdDev: 40 },
+              { requestedSize: params.size, placement: params.placement },
+            ),
+          };
+        },
+      };
+
+      const result = await generateAdImagesForUser(creativeDir, brand, [onePersona], "user-1", {
+        imageGen: gen,
+        loadTemplate: async () => { throw new Error("no dynamo in tests"); },
+        globalDirectives: {},
+      });
+      const patch = adImageReadyPatch({ adImageStatus: "running" }, result);
+
+      expect(placements).toEqual(["meta_feed_square", "meta_feed_square", "meta_feed_portrait"]);
+      const stored = patch?.adImageResult?.variants ?? [];
+      expect(stored).toHaveLength(3);
+      for (const [i, v] of stored.entries()) {
+        expect(v.gates).toEqual(result.variants[i].gates);
+        expect(v.archetype).toBe(result.variants[i].archetype);
+        expect(v.concept).toBe(result.variants[i].concept);
+        expect(v.promptVersion).toBe(result.variants[i].promptVersion);
+      }
+      expect(stored.map((v) => v.gates?.placement)).toEqual(["meta_feed_square", "meta_feed_square", "meta_feed_portrait"]);
+    });
+
     it("uses 60/40 format split — 2 squares, 1 vertical", async () => {
       const gen = new FakeImageGen(okResponder);
       await generateAdImagesForUser(
@@ -618,6 +659,38 @@ describe("onboardingAdImageService", () => {
       for (const p of gen.lastParams) {
         expect(p.logoImage).toBe("https://s3/brand/logo.png");
       }
+    });
+
+    it("hands the stored run, and the run it replaced, to the rubric judge hook (ENG-2192)", async () => {
+      const previousVariants = [{ id: "variant-1", imageUrl: "https://s3/old-1.png", prompt: "old" }];
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { brandName: "Linear", logoUrl: "https://s3/brand/logo.png" } },
+          adImageStartedAt: RUN_AT,
+          adImageCompletedAt: "2026-08-01T00:00:00.000Z",
+          adImageResult: { variants: previousVariants },
+        })
+        .mockResolvedValueOnce({ userId: "u1", adImageStatus: "running", adImageStartedAt: RUN_AT });
+      userDb.updateUser.mockResolvedValue({});
+
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: new FakeImageGen(okResponder) as unknown as AdImageGeneratorDep,
+        verifyLogoUrl: async () => true,
+      });
+      await new Promise((resolve) => setImmediate(resolve)); // the hook is dispatched, not awaited
+
+      const written = userDb.updateUser.mock.calls[0][1];
+      expect(written.adImageStatus).toBe("ready");
+      expect(jest.mocked(judgeOnboardingAdImages)).toHaveBeenCalledWith({
+        userId: "u1",
+        completedAt: written.adImageCompletedAt,
+        variants: written.adImageResult.variants,
+        previous: { completedAt: "2026-08-01T00:00:00.000Z", variants: previousVariants },
+      });
     });
 
     it("fails the run pointing at brand config when no logo is persisted — never generates (AC-3)", async () => {

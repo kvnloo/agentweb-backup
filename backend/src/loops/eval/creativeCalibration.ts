@@ -12,6 +12,10 @@
  * known, otherwise the prior creative of the same account and category with no placement either.
  * That is the comparison `judgeCreativePair` makes, so human and judge answer the same question.
  *
+ * ENG-2192: generated landing pages (review type `landing_page`) are drawn too, each paired with
+ * the account's previous landing page, in their own `landing_page` stratum. Ad copy is not: no
+ * human-eval candidate type holds copy (onboarding copy verdicts live on the AW-Users variants).
+ *
  * Selection is deterministic per batch (ISO week): ties are broken by a hash of the batch and the
  * pair, never by Math.random, so every instance and every re-run draws the same batch and the
  * idempotent store write never duplicates it. Pairs are spread round-robin over strata
@@ -77,6 +81,13 @@ export function calibrationWindow(batch: string): { start: Date; end: Date } {
 
 // ── pairs ────────────────────────────────────────────────────────────────────
 
+/** The human-eval review types the sampler draws pairs from; a pair never mixes two types. */
+export const CALIBRATION_REVIEW_TYPES = ['creative_image', 'landing_page'] as const;
+
+function isCalibrationReviewType(reviewType: string): boolean {
+  return (CALIBRATION_REVIEW_TYPES as readonly string[]).includes(reviewType);
+}
+
 /** The AW-HumanEvalQueue fields the sampler reads. Feedback is only counted, never read. */
 export interface CalibrationCandidate extends PriorCandidateLike {
   category?: string;
@@ -99,6 +110,7 @@ function placementOf(c: CalibrationCandidate): string | undefined {
 }
 
 function categoryOf(c: CalibrationCandidate): string {
+  if (c.reviewType === 'landing_page') return 'landing_page';
   return c.category === 'ad' || c.category === 'organic_post' ? c.category : 'uncategorized';
 }
 
@@ -107,14 +119,15 @@ function rubricPasses(c: CalibrationCandidate): number | null {
 }
 
 /** B for creative A, or null. Same placement when A's is known; otherwise the latest earlier
- * creative of the same account and category whose placement is unknown too. */
+ * creative of the same account, review type and category whose placement is unknown too (landing
+ * pages never have one). */
 export function priorFor<C extends CalibrationCandidate>(a: C, pool: readonly C[]): C | null {
-  if (placementOf(a)) return selectPriorBest(a, pool);
+  if (a.reviewType === 'creative_image' && placementOf(a)) return selectPriorBest(a, pool);
   if (!a.userId) return null;
   const priors = pool.filter(
     (c) =>
       c.candidateId !== a.candidateId &&
-      c.reviewType === 'creative_image' &&
+      c.reviewType === a.reviewType &&
       c.userId === a.userId &&
       !!c.artifactUrl &&
       !placementOf(c) &&
@@ -155,7 +168,7 @@ export function buildCalibrationPairs<C extends CalibrationCandidate>(
   const end = window.end.toISOString();
   const byUser = new Map<string, C[]>();
   for (const c of candidates) {
-    if (c.reviewType !== 'creative_image' || !c.userId || !c.artifactUrl || isEvaluationUser(c.userId)) continue;
+    if (!isCalibrationReviewType(c.reviewType) || !c.userId || !c.artifactUrl || isEvaluationUser(c.userId)) continue;
     const list = byUser.get(c.userId) ?? [];
     list.push(c);
     byUser.set(c.userId, list);
