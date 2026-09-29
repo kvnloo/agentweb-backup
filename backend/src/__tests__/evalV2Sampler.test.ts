@@ -76,7 +76,7 @@ describe('scored event rows', () => {
       ts: '2026-09-25T17:15:00.000Z',
     });
     expect(item.dimensions).toMatchObject({
-      graders: 'agent-task-success@1,agent-tool-correctness@1,agent-groundedness-offline@1,agent-reply-length-adherence@1,agent-format-adherence@1,agent-act-without-asking@1',
+      graders: 'agent-task-success@1,agent-tool-correctness@2,agent-groundedness-offline@1,agent-reply-length-adherence@1,agent-format-adherence@1,agent-act-without-asking@1',
       taskType: 'ads',
       model: 'gemini-3.8-flash',
       frameSize: 56,
@@ -113,7 +113,7 @@ describe('scored event rows', () => {
       toolCalls: 1,
       groundednessVerdict: graded.groundedness.verdict,
       adherence: { length: 'not_applicable', format: 'not_applicable', permission: 'not_applicable' },
-      graderVersions: { 'agent-task-success': 1, 'agent-tool-correctness': 1, 'agent-groundedness-offline': 1, 'agent-reply-length-adherence': 1, 'agent-format-adherence': 1, 'agent-act-without-asking': 1 },
+      graderVersions: { 'agent-task-success': 1, 'agent-tool-correctness': 2, 'agent-groundedness-offline': 1, 'agent-reply-length-adherence': 1, 'agent-format-adherence': 1, 'agent-act-without-asking': 1 },
     });
     expect(parseScoredEvent({ eventType: 'agent_run_verdict', dimensions: {} })).toBeNull();
     expect(parseScoredEvent({ eventType: 'eval_v2_scored', dimensions: { sessionId: 'x', sampleDate: 'd', taskVerdict: 'maybe' } })).toBeNull();
