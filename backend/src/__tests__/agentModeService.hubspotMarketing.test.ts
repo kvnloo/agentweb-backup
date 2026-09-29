@@ -89,7 +89,9 @@ jest.mock('../services/connectedAccountsDb', () => ({
 jest.mock('../config/integrations', () => ({
   getHubSpotConfig: jest.fn().mockResolvedValue({ clientId: 'x', clientSecret: 'y', tokenUrl: 'u', redirectUri: 'r', scopes: [], authorizationUrl: 'a', tokenInfoUrl: 't' }),
   INTEGRATION_CONFIG: {
-    hubspot: { scopes: [] },
+    // Real config: an empty stub makes the marketing pre-flight silently no-op, so this
+    // suite — which owns every marketing action — could not see the guard at all.
+    hubspot: jest.requireActual('../config/integrations').INTEGRATION_CONFIG.hubspot,
     linkedinAds: { apiVersion: '202603', apiBaseUrl: 'https://api.linkedin.com', scopes: [], redirectUri: '', authorizationUrl: '', tokenUrl: '', profileUrl: '' },
     linkedin: { scopes: [], redirectUri: '', authorizationUrl: '', tokenUrl: '', profileUrl: '' },
     meta: { scopes: [], redirectUri: '', authorizationUrl: '', tokenUrl: '' },
