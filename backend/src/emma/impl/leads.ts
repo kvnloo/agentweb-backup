@@ -46,7 +46,7 @@
  *    not just this cluster) — promoted to `emma/impl/shared/crmSenders.ts`,
  *    with `AgentModeService`'s own copy turned into a thin delegating method.
  */
-import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution } from '../../utils/leadSchema';
+import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor } from '../../utils/leadSchema';
 import type { LeadImportRowOutcome } from '../../utils/leadSchema';
 import { providerLabel } from '../../services/crmSenderTypes';
 import { mergeCustomFields } from '../../utils/customFieldsGuard';
@@ -470,6 +470,10 @@ export async function getLeads(listId: string, userId: string, options: {
         leads: matchingLeads.map((lead: any) => ({
           leadId: lead.leadId,
           email: lead.email || '',
+          // ENG-2082: a phone-only lead is contactable. Omitting the number here showed the
+          // model a row with NO contact channel at all, which reads as junk — and
+          // `email is_empty` in delete_leads_by_filter matches exactly these rows.
+          phone: lead.phone || '',
           firstName: lead.firstName || '',
           lastName: lead.lastName || '',
           company: lead.company || '',
@@ -605,7 +609,8 @@ export async function searchLeads(
   ): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
-      const { sanitizeEnrichmentMetadataForResponse } = await import('../../utils/enrichmentMetadataPresentation');
+      const { sanitizeEnrichmentMetadataForResponse, stripCardRevenueKeys, shouldHideCardRevenueForViewer } = await import('../../utils/enrichmentMetadataPresentation');
+      const hideCardRevenueForCaller = shouldHideCardRevenueForViewer(userId);
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
 
       if ((!filters || filters.length === 0) && !options?.search?.trim()) {
@@ -787,6 +792,8 @@ export async function searchLeads(
             leadId: entry.lead.leadId,
             ...(isMultiList ? { listId: entry.listId, listName: entry.listName } : {}),
             email: entry.lead.email || '',
+            // ENG-2082: see get_leads — a phone-only lead has a contact channel; show it.
+            phone: entry.lead.phone || '',
             firstName: entry.lead.firstName || '',
             lastName: entry.lead.lastName || '',
             company: entry.lead.company || '',
@@ -795,8 +802,12 @@ export async function searchLeads(
             icpScore: entry.lead.icpMatch?.score || null,
             engagementCount: entry.lead.engagementCount || 0,
             isEngaged: entry.lead.isEngaged || false,
-            customFields: entry.lead.customFields || {},
-            ...(sanitizedEnrichmentMetadata ? { enrichmentMetadata: sanitizedEnrichmentMetadata } : {}),
+            customFields: hideCardRevenueForCaller
+              ? (stripCardRevenueKeys(entry.lead.customFields) ?? {})
+              : (entry.lead.customFields || {}),
+            ...(sanitizedEnrichmentMetadata
+              ? { enrichmentMetadata: hideCardRevenueForCaller ? stripCardRevenueKeys(sanitizedEnrichmentMetadata) : sanitizedEnrichmentMetadata }
+              : {}),
             // ENG-1175. This is the call both launch gates make to answer "did
             // the gclid survive to the stored row?" — Google Pre-Launch Gate
             // step 6.6 and the Meta gate's T11. Without these fields the gate
@@ -859,7 +870,11 @@ function getEmailContentPreview(emailContent: any, maxLength: number): string | 
 export async function getLeadDetails(listId: string, leadId: string, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
-      const { sanitizeEnrichmentMetadataForResponse } = await import('../../utils/enrichmentMetadataPresentation');
+      const { sanitizeEnrichmentMetadataForResponse, stripCardRevenueKeys, shouldHideCardRevenueForViewer } = await import('../../utils/enrichmentMetadataPresentation');
+      // ENG-1388: this list may be org-shared, and canOrgMemberAccessList above
+      // has no Enigma-allowlist awareness — strip card revenue for a caller
+      // who isn't allowlisted, same boundary as the customer-portal REST path.
+      const hideCardRevenueForCaller = shouldHideCardRevenueForViewer(userId);
 
       // Verify list ownership (org members can access lists owned by other org members)
       let list = await crmDb.getLeadListById(listId);
@@ -982,8 +997,12 @@ export async function getLeadDetails(listId: string, leadId: string, userId: str
           notes: lead.notes || '',
           linkedin: lead.linkedin || '',
           linkedInConnectionStatus,
-          customFields: lead.customFields || {},
-          ...(sanitizedEnrichmentMetadata ? { enrichmentMetadata: sanitizedEnrichmentMetadata } : {}),
+          customFields: hideCardRevenueForCaller
+            ? (stripCardRevenueKeys(lead.customFields) ?? {})
+            : (lead.customFields || {}),
+          ...(sanitizedEnrichmentMetadata
+            ? { enrichmentMetadata: hideCardRevenueForCaller ? stripCardRevenueKeys(sanitizedEnrichmentMetadata) : sanitizedEnrichmentMetadata }
+            : {}),
           icpMatch: lead.icpMatch || null,
           isEngaged: lead.isEngaged || false,
           emailDraft: emailDraftPreview,
@@ -1139,6 +1158,8 @@ export async function getLeadsNeedingFollowup(listId: string, userId: string, op
           matches.push({
             leadId: lead.leadId,
             email: lead.email || '',
+            // ENG-2082: see get_leads — a phone-only lead has a contact channel; show it.
+            phone: lead.phone || '',
             firstName: lead.firstName || '',
             lastName: lead.lastName || '',
             company: lead.company || '',
@@ -1524,7 +1545,13 @@ export async function deleteLeadsByFilter(listId: string, filters: Array<{ field
               matchCount++;
               if (sampleLeads.length < sampleLimit) {
                 sampleLeads.push({
+                  // ENG-2082: this is the preview for a DESTRUCTIVE op, and `email is_empty`
+                  // matches phone-only leads exactly. Without the number every sample row
+                  // rendered blank, so the operator confirmed a delete against rows that
+                  // looked like empty junk and were in fact contactable leads.
+                  leadId: lead.leadId,
                   email: lead.email || '',
+                  phone: lead.phone || '',
                   firstName: lead.firstName || '',
                   lastName: lead.lastName || '',
                   company: lead.company || ''
@@ -1736,20 +1763,12 @@ export async function getLeadListStatuses(listId: string, userId: string): Promi
         return { success: false, message: 'Access denied', error: 'You do not have permission to view this list' };
       }
 
-      const defaultStatuses = [
-        { value: 'new', label: 'New', color: 'gray', type: 'active' },
-        { value: 'contacted', label: 'Contacted', color: 'blue', type: 'active' },
-        { value: 'qualified', label: 'Qualified', color: 'indigo', type: 'active' },
-        { value: 'proposal_sent', label: 'Proposal Sent', color: 'purple', type: 'active' },
-        { value: 'negotiating', label: 'Negotiating', color: 'yellow', type: 'active' },
-        { value: 'won', label: 'Won', color: 'green', type: 'won' },
-        { value: 'lost', label: 'Lost', color: 'red', type: 'lost' },
-        { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
-      ];
-
       return {
         success: true,
-        statuses: list.statusConfig || defaultStatuses,
+        // Was a second copy of createLeadList's literal. Shared now, so a list created
+        // before statusConfig was persisted reads back the same vocabulary a list created
+        // today stores — and it honours listType, which the local copy did not.
+        statuses: list.statusConfig || defaultStatusConfigFor((list as any)?.listType),
         listName: list.name,
       };
     } catch (error) {

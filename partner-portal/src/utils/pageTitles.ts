@@ -13,6 +13,8 @@ const routeTitles: Record<string, string> = {
   '/templates': 'Templates Library',
   '/admin': 'Admin Dashboard',
   '/agent-runs': 'AgentRun Inspector',
+  '/eval-labelling': 'Eval Labelling',
+  '/eval-labelling/calibration': 'Creative Calibration',
   '/profile': 'User Profile',
   '/config': 'Configuration Page',
   '/workflows': 'Workflows Dashboard',

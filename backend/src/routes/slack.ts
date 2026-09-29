@@ -36,19 +36,14 @@ import { createRevisionExecutionFromSlack } from "../controllers/tasks";
 import { isSessionLimitError } from "../utils/agentModeErrors";
 import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
 import { getEmmaBotUserId, handleLoopApprovalReaction } from "../services/loopSlackApprovalDispatcher";
-import { renderCitationMarkers } from "../utils/citations";
 import { agentModeService } from '../services/agentModeService';
+import { handleSessionResponse } from "../services/conversation/sessionResponder";
+import { slackChannelAdapter, renderOutboundForSlack } from "../services/conversation/slackChannelAdapter";
+import type { ConversationRef } from "../services/conversation/channelPort";
 
-// ENG-351: resolve Emma's {{cite:N}} markers to Slack-clickable source links. The citation metadata
-// rides on the response's last assistant message; render as markdown links, which postThreadResponse's
-// markdown→mrkdwn converter turns into "<url|Source>". Falls back to stripping when no citations.
-function citeForSlack(response: any): string {
-  const content: string = response?.content || '';
-  const citations = [...(response?.responseMessages || [])]
-    .reverse()
-    .find((m: any) => m?.role === 'assistant')?.metadata?.citations;
-  return renderCitationMarkers(content, Array.isArray(citations) ? citations : [], 'markdown');
-}
+// ENG-351 citation rendering now lives with the Slack channel adapter (ENG-272 extraction);
+// aliased here for the other Slack reply paths in this file.
+const citeForSlack = renderOutboundForSlack;
 
 const router = express.Router();
 
@@ -216,8 +211,14 @@ or if no email found:
 }
 
 /**
- * Helper: handles the shared post-session-creation flow for Slack sessions.
- * Sets title, associates thread, saves mapping, generates response, posts to Slack.
+ * Slack entry point into the transport-agnostic session response pipeline.
+ *
+ * The pipeline lives in services/conversation/sessionResponder.ts (ENG-272). This
+ * translates Slack's (channel, ts, threadTs) addressing into a ConversationRef and
+ * keeps the assistant-status claim on this side of the port on purpose: the
+ * activeSlackTurns ref-count is shared with handleMappedSlackThreadResponse below,
+ * so moving it behind the port would either duplicate the counter or make one path
+ * clear a status while the other is still working.
  */
 async function handleSlackSessionResponse(params: {
   session: any;
@@ -231,183 +232,17 @@ async function handleSlackSessionResponse(params: {
   files?: any[];
   threadTs?: string;
 }) {
-  const { session, user, channel, ts, rawMessage, userMessage, adminEmail, isAdminChannel, files, threadTs } = params;
+  const { channel, ts, threadTs, ...rest } = params;
   const responseThreadTs = threadTs || ts;
-  const { chatbotDb } = await import('../services/chatbotService');
-  const { settingsService } = await import('../services/settingsService');
-  const { ensureGtmWorkItemForSlackSession } = await import('../services/gtmPlanService');
-
-  // Set session title based on raw message (without username prefix)
-  const sessionTitle = rawMessage.length > 50
-    ? rawMessage.substring(0, 47) + '...'
-    : rawMessage;
-  await chatbotDb.updateSessionTitle(session.sessionId, sessionTitle);
-
-  // Track this Slack session as a GTM Tracker work item
-  let gtmTrackerLink: string | null = null;
-  try {
-    const gtmResult = await ensureGtmWorkItemForSlackSession({
-      userId: user.userId,
-      sessionId: session.sessionId,
-      rawMessage,
-      adminEmail,
-    });
-    if (gtmResult) {
-      await chatbotDb.updateSessionGtmWorkItem(session.sessionId, gtmResult);
-      const deepLinkParams = `?planId=${gtmResult.planId}&phaseId=${gtmResult.phaseId}`;
-      if (isAdminChannel) {
-        // Admin-channel sessions: link to partner portal GTM ops page
-        const partnerPortalUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-        gtmTrackerLink = `${partnerPortalUrl}/gtm-ops${deepLinkParams}`;
-      } else {
-        // Regular user sessions: link to customer portal GTM plan page
-        const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-        gtmTrackerLink = `${customerFrontendUrl}/gtm-plan${deepLinkParams}`;
-      }
-      console.log(`📊 Slack session ${session.sessionId} tracked in GTM plan ${gtmResult.planId}`);
-    }
-  } catch (gtmError) {
-    console.error('⚠️ Non-blocking: Failed to track Slack session in GTM Tracker:', gtmError);
-  }
-
-  // Associate the session with this Slack thread
-  const slackThread = { channel, threadTs: responseThreadTs };
-  await chatbotDb.updateSessionSlackThread(session.sessionId, slackThread);
-
-  // Save thread-to-session mapping for future thread replies
-  const threadMappingKey = `slack_thread_${channel}_${responseThreadTs}`;
-  await settingsService.setSetting(
-    threadMappingKey,
-    JSON.stringify({ sessionId: session.sessionId, userId: user.userId }),
-    `Slack thread to session mapping`,
-    'system'
-  );
-
-  // Create interactive share link so user can optionally continue in the portal
-  const ishareLink = await chatbotDb.createOrReuseInteractiveShare(session.sessionId);
-  console.log('🔗 iShare link created for Slack session:', ishareLink);
+  const ref: ConversationRef = {
+    transport: 'slack',
+    conversationId: channel,
+    threadId: responseThreadTs,
+  };
 
   await claimSlackAssistantStatus(channel, responseThreadTs);
   try {
-    // Every operation after the status claim belongs to this scope so imports,
-    // model setup, and attachment failures cannot leak an active turn.
-    const { generateSessionResponse } = await import('../controllers/agentModeController');
-    const { agentModeService } = await import('../services/agentModeService');
-    const { cronJobRegistry } = await import('../utils/cronJobRegistry');
-
-    const llmModel = session.llmModel || await agentModeService.getDefaultModel();
-    if (!session.llmModel) await chatbotDb.updateSessionLlmModel(session.sessionId, llmModel);
-
-    const attachments: any[] = [];
-    if (files && files.length > 0) {
-      for (const file of files) {
-        try {
-          // Slack Connect / ext-shared channels omit url_private and send a stub
-          // (file_access: 'check_file_info') — hydrate it via files.info first (ENG-323).
-          const fileUrl = await resolveSlackFileUrl(file);
-          const fileBuffer = await downloadSlackFile(fileUrl);
-          const { uploadFileToS3 } = await import('../utils/s3Utils');
-          const uploadResult = await uploadFileToS3(
-            fileBuffer,
-            file.name || 'attachment',
-            user.userId,
-            file.mimetype || 'application/octet-stream'
-          );
-          if (!uploadResult.success || !uploadResult.url) {
-            console.error('❌ Failed to upload Slack file to S3');
-            continue;
-          }
-          attachments.push({
-            url: uploadResult.url,
-            filename: file.name || 'attachment',
-            size: file.size,
-            mimetype: file.mimetype || 'application/octet-stream',
-          });
-        } catch (fileError) {
-          console.error('❌ Error downloading Slack file:', fileError);
-        }
-      }
-    }
-    // ENG-1189: this turn's tool calls self-call back into this process via
-    // mcpFetch — tracked so a deploy mid-run waits for it instead of
-    // abandoning it against a closed listener.
-    const response = await cronJobRegistry.track('slackAgentTurn', generateSessionResponse(
-      session.sessionId,
-      userMessage,
-      user.userId,
-      llmModel,
-      attachments
-    ));
-
-    // Post Emma's response to the Slack thread
-    if (response.content) {
-      await postThreadResponse(channel, responseThreadTs, citeForSlack(response));
-    } else {
-      // Generation succeeded but produced no text content — log and post a fallback so the
-      // user gets feedback instead of silence. This can happen when the LLM returns only tool
-      // calls with no final summary text, or when the content variable was never populated.
-      console.error(`❌ Slack session ${session.sessionId}: generateSessionResponse succeeded but response.content is empty`);
-      await postThreadResponse(channel, responseThreadTs, 'I completed the task but was unable to format a response. Please check the portal for results or try again.');
-    }
-
-    // Post iShare link and GTM Tracker link as a separate follow-up message
-    if (ishareLink) {
-      const { WebClient } = await import('@slack/web-api');
-      const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-
-      const contextElements: any[] = [
-        {
-          type: 'mrkdwn',
-          text: `:speech_balloon: Continue chat by simply reply or <${ishareLink}|click to chat in AgentWeb portal>`
-        }
-      ];
-      if (gtmTrackerLink) {
-        contextElements.push({
-          type: 'mrkdwn',
-          text: `:bar_chart: <${gtmTrackerLink}|Manage all sessions in GTM Tracker>`
-        });
-      }
-
-      await slackClient.chat.postMessage({
-        channel,
-        thread_ts: responseThreadTs,
-        text: `Continue chat by simply reply or click to chat in AgentWeb portal: ${ishareLink}`,
-        blocks: [
-          {
-            type: 'context',
-            elements: contextElements
-          }
-        ]
-      });
-    }
-  } catch (genError) {
-    console.error('❌ Error generating agent response for Slack session:', genError);
-
-    // Persist partial token usage from messages accumulated before the error
-    if ((genError as any)?.partialUsageMessages?.length) {
-      try {
-        const { chatbotDb } = await import('../services/chatbotService');
-        await chatbotDb.addMessagesToSession(session.sessionId, (genError as any).partialUsageMessages);
-        console.log(`Slack session: Persisted partial usage from ${(genError as any).partialUsageMessages.length} messages for failed session ${session.sessionId}`);
-      } catch (usageErr) {
-        console.error('Failed to persist partial usage for Slack session:', usageErr);
-      }
-    }
-
-    await postThreadResponse(channel, responseThreadTs, 'Sorry, I encountered an error while processing your request. Please try again.');
-
-    // Save error message to session so ishare viewers see the failure rather than an orphaned user message
-    try {
-      const { chatbotDb: chatbotDbForError } = await import('../services/chatbotService');
-      await chatbotDbForError.addMessageToSession(session.sessionId, {
-        role: 'assistant',
-        content: 'Sorry, I encountered an error processing your request. Please try again.',
-        timestamp: new Date().toISOString(),
-        metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
-      });
-    } catch (saveError) {
-      console.error('❌ Error saving error message to session:', saveError);
-    }
+    await handleSessionResponse({ ...rest, ref }, slackChannelAdapter);
   } finally {
     await releaseSlackAssistantStatus(channel, responseThreadTs);
   }
@@ -1422,7 +1257,18 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
           return res.status(200).json({ response_action: 'clear' });
         }
 
-        await resolveApprovalDecision(decisionId, verdict, user.username || user.id, freeText);
+        // Review fix: the sibling approve_decision button path already
+        // checks result.claimed and surfaces a real error — this modal
+        // path was discarding the result and always clearing, silently
+        // closing as if it succeeded even when the claim genuinely failed
+        // (already resolved, expired, etc).
+        const result = await resolveApprovalDecision(decisionId, verdict, user.username || user.id, freeText);
+        if (!result.claimed) {
+          return res.status(200).json({
+            response_action: 'errors',
+            errors: { decision_free_text_input: `Could not submit — ${result.reason}.` },
+          });
+        }
         return res.status(200).json({ response_action: 'clear' });
       }
 

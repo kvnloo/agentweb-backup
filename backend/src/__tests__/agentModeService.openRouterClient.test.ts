@@ -1,3 +1,4 @@
+import { OPENROUTER_PROVIDER_PREFERENCES } from '../services/agentMode/openRouterRequestParams';
 jest.mock('../services/db', () => ({
   getSession: jest.fn(),
   saveMessage: jest.fn(),
@@ -40,6 +41,7 @@ jest.mock('openai', () => jest.fn().mockImplementation((config: any) => ({ _conf
 import { AgentModeService } from '../services/agentModeService';
 import { getSecret } from '../utils/secretsManager';
 import { resolveOpenRouterUpstreamModelId } from '../utils/openRouterGatewayContract';
+import type OpenAI from 'openai';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const MockOpenAI = require('openai') as jest.Mock;
 const mockGetSecret = getSecret as jest.Mock;
@@ -276,7 +278,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect((service as any).llmModels['gpt-5.4'].supportsTemperature).toBe(false);
     expect(request).toEqual(expect.objectContaining({
       model: 'openai/gpt-5.4',
-      provider: { allow_fallbacks: true, require_parameters: true, order: ['Azure'] },
+      provider: { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true },
       usage: { include: true },
     }));
     expect(request).not.toHaveProperty('temperature');
@@ -423,7 +425,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
       model: 'openai/gpt-5.5',
       tools: [{ type: 'openrouter:web_search' }],
-      provider: { allow_fallbacks: true, require_parameters: true, order: ['Azure'] },
+      provider: { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true },
     }));
     expect(create.mock.calls[0][0]).not.toHaveProperty('tool_choice');
     expect(create).toHaveBeenCalledTimes(1);
@@ -535,7 +537,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
       model: 'perplexity/sonar-deep-research',
       models: ['perplexity/sonar-pro-search'],
-      provider: { allow_fallbacks: true, require_parameters: true },
+      provider: { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true },
       usage: { include: true },
     }));
     expect(create).toHaveBeenCalledTimes(1);
@@ -651,7 +653,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
 
     const request = create.mock.calls[0][0];
     expect(request.provider).toEqual({
-      allow_fallbacks: true,
+      ...OPENROUTER_PROVIDER_PREFERENCES,
       require_parameters: true,
       ignore: ['Google'],
     });
@@ -1171,7 +1173,7 @@ describe('ENG-1788: opt-in reasoning effort', () => {
   it('characterizes the unset request byte-for-byte and preserves the response', async () => {
     const result = await service.callLLM(model, messages);
     expect(JSON.stringify(create.mock.calls[0][0])).toBe(
-      '{"model":"openai/gpt-6-astra","messages":[{"role":"user","content":"Hello"}],"provider":{"allow_fallbacks":true,"require_parameters":true,"order":["Azure"]},"usage":{"include":true},"plugins":[{"id":"context-compression"}]}',
+      '{"model":"openai/gpt-6-astra","messages":[{"role":"user","content":"Hello"}],"provider":{"order":["amazon-bedrock","azure","google-vertex","anthropic","openai"],"allow_fallbacks":true,"require_parameters":true},"usage":{"include":true},"plugins":[{"id":"context-compression"}]}',
     );
     expect(result).toEqual({
       id: 'completion-effort', model: 'openai/gpt-6-astra',
@@ -1248,5 +1250,106 @@ describe('ENG-1788: opt-in reasoning effort', () => {
     const span = { setAttribute: jest.fn(), setStatus: jest.fn(), end: jest.fn() };
     endChatSpan(span, { model, response: result });
     expect(span.setAttribute).not.toHaveBeenCalledWith('agentweb.reasoning_effort', expect.anything());
+  });
+});
+
+// ENG-2185: prod session f6c882d0… (2026-09-25) — a spend-limited OpenRouter key
+// rejected gemini-3.8-flash calls with this exact message 6x in 33 minutes,
+// hard-failing to the generic "I apologize... try again" fallback every time.
+describe('callLLM insufficient-credits retry (ENG-2185)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    process.env.OPENROUTER_API_KEY = 'test-openrouter-key';
+  });
+
+  afterEach(() => {
+    delete process.env.OPENROUTER_API_KEY;
+  });
+
+  const creditError = (requested: number, affordable: number) => new Error(
+    `This request requires more credits, or fewer max_tokens. You requested up to ${requested} tokens, `
+    + `but can only afford ${affordable}. To increase, visit https://openrouter.ai/workspaces/default/keys/abc `
+    + `and adjust the key's monthly limit`,
+  );
+
+  it('retries with max_tokens capped to the affordable amount instead of hard-failing', async () => {
+    const service = new AgentModeService();
+    // The loop reuses and mutates the SAME `params` object across attempts, so
+    // a plain jest.fn() mock's `.mock.calls` would end up storing the final,
+    // already-mutated reference for every call — snapshot max_tokens at the
+    // moment each call actually happens instead.
+    const seenMaxTokens: unknown[] = [];
+    const create = jest.fn().mockImplementation(async (params: { max_tokens?: number }) => {
+      seenMaxTokens.push(params.max_tokens);
+      if (seenMaxTokens.length === 1) throw creditError(32000, 24420);
+      return { choices: [{ message: { content: 'ok' } }], usage: {} };
+    });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as unknown as OpenAI);
+
+    const result = await service.callLLM(
+      'gpt-5.4',
+      [{ role: 'user', content: 'Hello' }],
+      { max_completion_tokens: 32000 },
+    );
+
+    expect(create).toHaveBeenCalledTimes(2);
+    // 24420 minus the safety margin, since the affordable estimate is a
+    // snapshot that can shift slightly before the retry lands.
+    expect(seenMaxTokens).toEqual([32000, 24320]);
+    expect((result.choices as Array<{ message: { content: string } }>)[0].message.content).toBe('ok');
+  });
+
+  it('does not treat a same-or-larger affordable amount as a reason to retry', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockRejectedValue(creditError(100, 999999));
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as unknown as OpenAI);
+
+    await expect(
+      service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }], { max_completion_tokens: 100 }),
+    ).rejects.toThrow(/requires more credits/i);
+
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  // CodeRabbit (PR #3117): a key with truly zero balance left would still get
+  // rejected at max_tokens=1 (the retry's own floor) — retrying is a wasted
+  // attempt against the identical rejection, not a useful fallback.
+  it('does not retry when the provider reports zero affordable tokens', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockRejectedValue(creditError(100, 0));
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as unknown as OpenAI);
+
+    await expect(
+      service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }], { max_completion_tokens: 100 }),
+    ).rejects.toThrow(/requires more credits/i);
+
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it('is bounded by the same maxAttempts as every other retry path, not unbounded', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn()
+      .mockRejectedValueOnce(creditError(32000, 20000))
+      .mockRejectedValueOnce(creditError(20000, 10000));
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as unknown as OpenAI);
+
+    await expect(
+      service.callLLM(
+        'gpt-5.4',
+        [{ role: 'user', content: 'Hello' }],
+        { max_completion_tokens: 32000, taskClass: 'interactive_chat' },
+      ),
+    ).rejects.toThrow(/can only afford 10000/);
+
+    // interactive_chat => maxAttempts=2, so exactly 2 attempts total.
+    expect(create).toHaveBeenCalledTimes(2);
   });
 });

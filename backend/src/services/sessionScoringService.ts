@@ -1,3 +1,5 @@
+import { resolveModelForUser } from './modelRoles';
+import { OUTCOME_JUDGE_SHADOW_FEATURE, assertOutcomeJudgeModelAllowed, DEFAULT_OUTCOME_JUDGE_MODEL, isInShadowSample } from './outcomeJudge';
 import { chatbotDb, ChatSession, ChatMessage } from "./chatbotService";
 import {
   appendConfirmedPublishNotice,
@@ -405,8 +407,8 @@ In addition to the overall score, rate three specific dimensions (1-5 each):
 - dataAccuracy: Did the output contain plausible, consistent, and factually coherent data? Penalize hallucinated facts, made-up numbers, or self-contradictions.
 - outputQuality: Was the output well-structured, specific, and actionable? Penalize vague, generic, or poorly formatted responses.
 
-Respond with ONLY valid JSON:
-{"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}}`;
+Respond with ONLY valid JSON, with the reason before the score:
+{"reason": "<brief explanation>", "score": <1-5>, "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}}`;
 
 const MAX_MESSAGES_FOR_SCORING = 50;
 const MIN_USER_MESSAGES = 1;
@@ -483,8 +485,8 @@ ADDITIONAL REQUIRED FIELD — "taskRequested":
 - When in any doubt, set it to true.
 - A session marked false is removed from satisfaction reporting entirely, so never use false for a session where the user actually wanted something — even if the assistant handled it badly.
 
-Include it in the SAME JSON object as the other fields, e.g.:
-{"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}, "taskRequested": <true|false>}`;
+Include it in the SAME JSON object as the other fields, with "reason" before "score", e.g.:
+{"reason": "<brief explanation>", "score": <1-5>, "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}, "taskRequested": <true|false>}`;
 
 /**
  * ENG-1312: the judge originally scored only goalCompletion / dataAccuracy /
@@ -511,8 +513,8 @@ ADDITIONAL REQUIRED DIMENSIONS — include these in the SAME "dimensions" object
 ADDITIONAL SCORING RULE for outputQuality — pushback is not automatically excellent:
 When the user gives an explicit instruction that does NOT involve spending money, publishing, sending, or an otherwise irreversible action, and the assistant responds by arguing, countering, or otherwise not complying instead of doing what was asked — even if the assistant's reasoning is well-articulated — outputQuality for that turn's session may NOT score 5. Score it 3 or lower. A brief, single-sentence note of disagreement ALONGSIDE actually complying (do the thing, then note a concern in one sentence) is not pushback under this rule and is not penalized by it. EXCEPTION: this cap does NOT apply when noncompliance is a valid safety refusal — the instruction itself was harmful, illegal, or privacy-violating (e.g. asking the assistant to expose another user's private data, bypass a security control, or perform something clearly unsafe) and refusing was the correct response. A required safety refusal remains eligible for outputQuality 5. This cap also does NOT apply when the assistant declines to make an entire final reply nothing but bare punctuation/JSON-structure debris (see the output-integrity guard rule below) — that is guard-required behavior, not pushback, and remains eligible for outputQuality 5.
 
-Include the new fields in the SAME JSON object as the other fields, e.g.:
-{"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>, "concision": <0-5>, "instructionCompliance": <0-5>, "unnecessaryPermissionRequest": <true|false>}}`;
+Include the new fields in the SAME JSON object as the other fields, with "reason" before "score", e.g.:
+{"reason": "<brief explanation>", "score": <1-5>, "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>, "concision": <0-5>, "instructionCompliance": <0-5>, "unnecessaryPermissionRequest": <true|false>}}`;
 
 /**
  * ENG-1245: judges scored a REAL "Require approval before publishing" hold
@@ -637,8 +639,8 @@ ADDITIONAL REQUIRED FIELD — "assertsToolDerivedData":
 - Set "assertsToolDerivedData": false when the response contains no such tool-attributed data — general knowledge, reasoning, a plain conversational reply, or content the assistant clearly marked as illustrative/example/placeholder rather than real.
 - This field is checked by code against the tool call manifest above: if you set it true but the manifest shows zero matching tool calls, the response's dataAccuracy score will be treated as fabricated regardless of what "reason" text you write, so answer honestly.
 
-Include it in the SAME JSON object as the other fields, e.g.:
-{"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}, "assertsToolDerivedData": <true|false>}`;
+Include it in the SAME JSON object as the other fields, with "reason" before "score", e.g.:
+{"reason": "<brief explanation>", "score": <1-5>, "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}, "assertsToolDerivedData": <true|false>}`;
 
 /**
  * ENG-1164: an internal QA "serialization test" session instructed the assistant
@@ -1371,7 +1373,7 @@ async function surfaceFailedRun(session: ChatSession): Promise<void> {
  * assistant output. There is nothing to send to the LLM judge, so we score it
  * 1/5 across all dimensions directly with an explanatory reason.
  */
-function buildFailedRunResult(messageCount: number): ScoringResult {
+export function buildFailedRunResult(messageCount: number): ScoringResult {
   return {
     score: 1,
     reason: FAILED_RUN_REASON,
@@ -1506,6 +1508,10 @@ type ScoringResult = {
     concision?: number; // 0-5: did reply length match the question/instruction?
     instructionCompliance?: number; // 0-5: explicit instruction followed on first attempt?
     unnecessaryPermissionRequest?: boolean; // asked to confirm a safe (read-only/draft/test) action?
+    /** ENG-2189: binary criteria only the outcome rubric (outcomeJudge.ts) asks for; absent otherwise. */
+    arguedWithInstruction?: boolean;
+    escalatedWhenNotRequired?: boolean;
+    failedToEscalate?: boolean;
   };
   /**
    * `false` when the judge reported that the user never requested anything, so
@@ -1520,6 +1526,8 @@ type ScoringResult = {
    * partial-context judgement is never mistaken for a full-context one (ENG-929).
    */
   transcriptTruncated?: boolean;
+  /** Set for a shadow judge (ENG-2138): the model that produced the score, kept on the stored score. */
+  model?: string;
 };
 
 /** A finite number in `raw`, or undefined if missing/non-numeric. Distinguishes
@@ -1556,6 +1564,10 @@ function parseDimensions(raw: any): ScoringResult["dimensions"] | undefined {
   }
   if (typeof d.unnecessaryPermissionRequest === "boolean") {
     dimensions.unnecessaryPermissionRequest = d.unnecessaryPermissionRequest;
+  }
+  // ENG-2189: same rule, only a real boolean is kept.
+  for (const key of ["arguedWithInstruction", "escalatedWhenNotRequired", "failedToEscalate"] as const) {
+    if (typeof d[key] === "boolean") dimensions[key] = d[key];
   }
 
   return dimensions;
@@ -1616,7 +1628,7 @@ export async function scoreSession(
     AWAITING_USER_REPLY_CLAUSE;
   // Persisted setting — validate before calling, or a retired id throws
   // `Invalid model` and the session silently goes unscored (ENG-744).
-  const model = await resolveScoringModel(await getDefaultScoringModel());
+  const model = await resolveModelForUser(usageContext?.userId, 'scoring_judge');
 
   const llmPromise = agentModeService.callLLM(
     model,
@@ -1675,8 +1687,42 @@ export interface ScoringJudge {
   name: string;
   systemPrompt: string;
   llmModel?: string;
+  /**
+   * ENG-2138: a shadow judge scores only its sample (`sampleRate`, 0..1; missing = never), on
+   * its own non-Gemini model, metered as system spend. It writes judgeScores[id] like any
+   * judge and never the primary score. See outcomeJudge.ts.
+   */
+  shadow?: boolean;
+  sampleRate?: number;
   createdAt: string;
   updatedAt: string;
+}
+
+/** The one LLM call a judge makes; injectable so offline replays can call the model unmetered. */
+export type ScoringLlmCall = (
+  model: string,
+  messages: Array<{ role: "system" | "user"; content: string }>,
+  options: {
+    temperature: number;
+    max_completion_tokens: number;
+    response_format: { type: "json_object" };
+    taskClass: "nonstandard_consumer";
+    usageContext: { userId?: string; feature?: string; sessionId?: string };
+  }
+) => Promise<{ choices?: Array<{ message?: { content?: string | null } }> }>;
+
+/**
+ * The model a judge runs on. A shadow judge uses its own model (default Sonnet 4.6), validated
+ * but never the per-org scoring_judge role, and refuses the agent's family — including when a
+ * retired id would fall back to the Gemini scoring default.
+ */
+async function resolveJudgeModel(judge: ScoringJudge, userId: string | undefined): Promise<string> {
+  if (judge.shadow) {
+    const model = await resolveScoringModel(judge.llmModel || DEFAULT_OUTCOME_JUDGE_MODEL);
+    assertOutcomeJudgeModelAllowed(model);
+    return model;
+  }
+  return judge.llmModel ? resolveScoringModel(judge.llmModel) : resolveModelForUser(userId, 'scoring_judge');
 }
 
 export async function scoreSessionWithJudge(
@@ -1684,7 +1730,8 @@ export async function scoreSessionWithJudge(
   currentMessageCount: number,
   judge: ScoringJudge,
   sessionType?: string,
-  usageContext?: { userId?: string; feature?: string; sessionId?: string }
+  usageContext?: { userId?: string; feature?: string; sessionId?: string },
+  callLLM?: ScoringLlmCall
 ): Promise<ScoringResult> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
   const capped = capTranscriptForScoring(serializeMessagesForScoring(recentMessages));
@@ -1698,13 +1745,18 @@ export async function scoreSessionWithJudge(
     ? `${header}\n${manifest.text}\n\n${capped.text}`
     : `${manifest.text}\n\n${capped.text}`;
 
-  const { agentModeService } = await import("./agentModeService");
+  const llm: ScoringLlmCall =
+    callLLM ?? (async (...args) => (await import("./agentModeService")).agentModeService.callLLM(...args));
 
   // Per-judge model is persisted without registry validation — same retired-id
   // hazard as the default scoring model above (ENG-744).
-  const judgeModel = await resolveScoringModel(judge.llmModel || SCORING_MODEL);
+  const judgeModel = await resolveJudgeModel(judge, usageContext?.userId);
+  // A shadow judge is our own evaluation spend: metered per session, never to the customer.
+  const judgeUsage = judge.shadow
+    ? { sessionId: usageContext?.sessionId, feature: OUTCOME_JUDGE_SHADOW_FEATURE }
+    : { ...usageContext, feature: usageContext?.feature || "agent_task" };
 
-  const llmPromise = agentModeService.callLLM(
+  const llmPromise = llm(
     judgeModel,
     [
       // Same appended clauses as the general scorer, so a custom judge cannot
@@ -1736,7 +1788,7 @@ export async function scoreSessionWithJudge(
       max_completion_tokens: SCORING_MAX_COMPLETION_TOKENS,
       response_format: { type: "json_object" },
       taskClass: 'nonstandard_consumer',
-      usageContext: { ...usageContext, feature: usageContext?.feature || "agent_task" },
+      usageContext: judgeUsage,
     }
   );
 
@@ -1771,6 +1823,7 @@ export async function scoreSessionWithJudge(
     dimensions: guarded.dimensions,
     taskRequested: parseTaskRequested(parsed),
     ...(capped.truncated ? { transcriptTruncated: true } : {}),
+    ...(judge.shadow ? { model: judgeModel } : {}),
   };
 }
 
@@ -1833,16 +1886,21 @@ async function retractJudgeScore(session: ChatSession, judgeId: string): Promise
   }
 }
 
-export async function scoreSessionWithJudgeIfNeeded(
-  session: ChatSession,
-  judge: ScoringJudge,
-  opts?: { force?: boolean }
-): Promise<NonNullable<ChatSession["judgeScores"]>[string] | null> {
-  const messageCount = session.messageCount ?? session.messages?.length ?? 0;
+/** Why a session is outside every judge's cohort; `retract` = drop a score it already carries. */
+export interface JudgeCohortExclusion {
+  reason: Extract<ScoringSkipReason, "no-user-message" | "no-task-session" | "publish-gate-withheld" | "test-run" | "blocked-external">;
+  retract: boolean;
+}
 
+/**
+ * The custom-judge cohort rules of scoreSessionWithJudgeIfNeeded, as a pure function so offline
+ * replays (scripts/evalOutcomeJudge.ts) judge exactly the population production does (ENG-2138).
+ * Null means the session is in the cohort. Order matters and matches the original checks.
+ */
+export function judgeCohortExclusion(session: ChatSession): JudgeCohortExclusion | null {
   const userMessages = (session.messages || []).filter((m: any) => m.role === "user");
   if (userMessages.length < MIN_USER_MESSAGES) {
-    return null;
+    return { reason: "no-user-message", retract: false };
   }
 
   // No-task session (greeting-only, interruption, bare acknowledgement): no goal
@@ -1859,8 +1917,7 @@ export async function scoreSessionWithJudgeIfNeeded(
   // keeping it forever (scoring skips it from now on, so nothing would ever
   // overwrite it).
   if (isNoTaskSession(session.messages, session.pageIdentifier) && hasAssistantTurn(session.messages)) {
-    await retractJudgeScore(session, judge.id);
-    return null;
+    return { reason: "no-task-session", retract: true };
   }
 
   // A genuinely-withheld scheduled publish gate (ENG-995): pull it out of the
@@ -1869,15 +1926,14 @@ export async function scoreSessionWithJudgeIfNeeded(
   // same reasoning as isNoTaskSession above, so an existing divergent score is
   // retracted rather than kept forever.
   if (isPublishGateWithheldSession(session)) {
-    await retractJudgeScore(session, judge.id);
-    return null;
+    return { reason: "publish-gate-withheld", retract: true };
   }
 
   // Manual "Test this schedule" runs sort before blocked-external (CodeRabbit
   // local review on #2983): a Test: QA run that ends in a block report is a
   // test run, not a platform gap.
   if (isTestScheduledSession(session)) {
-    return null;
+    return { reason: "test-run", retract: false };
   }
 
   // ENG-1165: blocked by something outside the agent's control (unsigned-in
@@ -1887,7 +1943,55 @@ export async function scoreSessionWithJudgeIfNeeded(
   // the publish-gate hold above, so all judges agree and the platform gap
   // stays countable via the skip reason instead of hiding in goalCompletion.
   if (isBlockedExternalSessionForSession(session) && hasAssistantTurn(session.messages)) {
-    await retractJudgeScore(session, judge.id);
+    return { reason: "blocked-external", retract: true };
+  }
+
+  return null;
+}
+
+/**
+ * How an in-cohort session is scored: "in-flight" (skip for now, score later), "failed-run"
+ * (deterministic score 1, no model call) or "judge". Pure; shared with offline replays.
+ *
+ * Abandoned run recovered by the reconciler/backstop (ENG-764): the transcript ends
+ * on a run-failure placeholder, so the process died mid-flight and never emitted its
+ * final summary. The real work may have been correct, but this is an infra failure —
+ * score it as a deterministic failed run rather than feeding the (placeholder-stripped)
+ * truncated transcript to the LLM judge, which would mis-score it low for a "transcript
+ * that cuts off after a tool call". The reconciler already left the placeholder note.
+ * Still deferred within the grace window in case the reconciler's resume/retry is
+ * racing to continue the same session (ENG-479).
+ */
+export function judgeScoringPath(session: ChatSession): "in-flight" | "failed-run" | "judge" {
+  if (endsWithRunFailurePlaceholder(session.messages)) {
+    return classifyTurnlessSession(session) === "in-flight" ? "in-flight" : "failed-run";
+  }
+  if (!hasAssistantTurn(session.messages)) {
+    // No assistant turn yet: skip if still in-flight, flag as failed if stale.
+    return classifyTurnlessSession(session) === "in-flight" ? "in-flight" : "failed-run";
+  }
+  if (transcriptEndsMidToolLoop(session.messages)) {
+    return classifyTurnlessSession(session) === "in-flight" ? "in-flight" : "judge";
+  }
+  return "judge";
+}
+
+export async function scoreSessionWithJudgeIfNeeded(
+  session: ChatSession,
+  judge: ScoringJudge,
+  opts?: { force?: boolean }
+): Promise<NonNullable<ChatSession["judgeScores"]>[string] | null> {
+  const messageCount = session.messageCount ?? session.messages?.length ?? 0;
+
+  // ENG-2138: a shadow judge touches only its fixed sample — no model call, no write, no
+  // retraction outside it. `force` (one admin-chosen session) bypasses the sample.
+  if (judge.shadow && !opts?.force && !isInShadowSample(judge, session.sessionId)) {
+    return null;
+  }
+
+  const exclusion = judgeCohortExclusion(session);
+  if (exclusion) {
+    if (exclusion.retract) await retractJudgeScore(session, judge.id);
     return null;
   }
 
@@ -1917,40 +2021,15 @@ export async function scoreSessionWithJudgeIfNeeded(
     return null;
   }
 
-  // Abandoned run recovered by the reconciler/backstop (ENG-764): the transcript ends
-  // on a run-failure placeholder, so the process died mid-flight and never emitted its
-  // final summary. The real work may have been correct, but this is an infra failure —
-  // score it as a deterministic failed run rather than feeding the (placeholder-stripped)
-  // truncated transcript to the LLM judge, which would mis-score it low for a "transcript
-  // that cuts off after a tool call". The reconciler already left the placeholder note.
-  // Still deferred within the grace window in case the reconciler's resume/retry is
-  // racing to continue the same session (ENG-479).
-  let result: ScoringResult;
-  if (endsWithRunFailurePlaceholder(session.messages)) {
-    if (classifyTurnlessSession(session) === "in-flight") {
-      return null;
-    }
-    result = buildFailedRunResult(messageCount);
-  } else if (!hasAssistantTurn(session.messages)) {
-    // No assistant turn yet: skip if still in-flight, flag as failed if stale.
-    if (classifyTurnlessSession(session) === "in-flight") {
-      return null;
-    }
-    result = buildFailedRunResult(messageCount);
-  } else if (transcriptEndsMidToolLoop(session.messages)) {
-    if (classifyTurnlessSession(session) === "in-flight") {
-      return null;
-    }
-    result = await scoreSessionWithJudge(session.messages || [], messageCount, judge, session.sessionType, {
-      userId: session.userId,
-      sessionId: session.sessionId,
-    });
-  } else {
-    result = await scoreSessionWithJudge(session.messages || [], messageCount, judge, session.sessionType, {
-      userId: session.userId,
-      sessionId: session.sessionId,
-    });
-  }
+  const path = judgeScoringPath(session);
+  if (path === "in-flight") return null;
+  const result: ScoringResult =
+    path === "failed-run"
+      ? buildFailedRunResult(messageCount)
+      : await scoreSessionWithJudge(session.messages || [], messageCount, judge, session.sessionType, {
+          userId: session.userId,
+          sessionId: session.sessionId,
+        });
 
   // Backstop for zero-task phrasings the static lists cannot enumerate: the
   // judge itself reported that the user never asked for anything, so the
@@ -1968,6 +2047,7 @@ export async function scoreSessionWithJudgeIfNeeded(
     evaluatedMessageIndex: result.evaluatedMessageIndex,
     judgeName: judge.name,
     ...(result.dimensions ? { dimensions: result.dimensions } : {}),
+    ...(judge.shadow ? { shadow: true, ...(result.model ? { model: result.model } : {}) } : {}),
   };
 
   await chatbotDb.updateSessionJudgeScore(session.sessionId, judge.id, judgeScore);

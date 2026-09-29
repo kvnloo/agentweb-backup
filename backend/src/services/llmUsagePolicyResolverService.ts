@@ -64,6 +64,7 @@ export async function getEffectiveLlmUsagePolicy(userId: string): Promise<{
     billingUserId,
     billingMonth: usage.month,
     legacyRawCostUsedMicroUsd,
+    tier: subscriptionType,
   });
   const adjustment = getLlmUsageCreditAdjustment(billingUser?.llmUsageCredits, usage.month);
   const adjusted = basePolicy

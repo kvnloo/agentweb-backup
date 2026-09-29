@@ -74,6 +74,9 @@ function adAccount(overrides: Partial<{ platform: string; expiresAt: number }> =
   };
 }
 
+/** A connection that existed and has expired on every platform: the only shape that can still flag (ENG-2188). */
+const EXPIRED = [adAccount({ expiresAt: NOW - DAY_MS })];
+
 function user(overrides: Record<string, any> = {}) {
   return {
     userId: 'u1',
@@ -163,8 +166,8 @@ describe('runRenewalIntegrationHealthCheck', () => {
 
   it('continues scanning and flags other users when the alert for one user fails', async () => {
     (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
-      user({ userId: 'u5', connected_accounts: [] }),
-      user({ userId: 'u6', connected_accounts: [] }),
+      user({ userId: 'u5', connected_accounts: EXPIRED }),
+      user({ userId: 'u6', connected_accounts: EXPIRED }),
     ]);
     mockSendAlert.mockRejectedValueOnce(new Error('email down')).mockResolvedValueOnce(undefined);
 
@@ -184,8 +187,8 @@ describe('runRenewalIntegrationHealthCheck', () => {
    */
   it('continues scanning and flags other users when evaluating one user throws', async () => {
     (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
-      user({ userId: 'broken-user', connected_accounts: [] }),
-      user({ userId: 'fine-user', connected_accounts: [] }),
+      user({ userId: 'broken-user', connected_accounts: EXPIRED }),
+      user({ userId: 'fine-user', connected_accounts: EXPIRED }),
     ]);
     mockGetAllowedConnectedAccounts
       .mockRejectedValueOnce(new Error('unexpected malformed user data'))
@@ -226,17 +229,49 @@ describe('runRenewalIntegrationHealthCheck', () => {
       expect(summary.flagged).toBe(0);
     });
 
-    it('flags a paid-ads customer with no ad account connected', async () => {
+    // ENG-2188: this test previously asserted flagged=1. A paid-ads customer who never connected
+    // an ad account is activation (the classifier cron's CS nudge), not renewal risk.
+    it('never flags a paid-ads customer who never connected an ad account (activation, not risk)', async () => {
       (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
         user({ userId: 'paid-ads-user', emmaHelpInterests: ['paid_ads'], connected_accounts: [] }),
       ]);
 
       const summary = await runRenewalIntegrationHealthCheck();
 
+      expect(summary.flagged).toBe(0);
+      expect(mockSendAlert).not.toHaveBeenCalled();
+      expect(mockGetAllowedConnectedAccounts).not.toHaveBeenCalled();
+    });
+
+    it('flags a paid-ads customer whose ad connection existed and has expired', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({ userId: 'paid-ads-user', emmaHelpInterests: ['paid_ads'], connected_accounts: EXPIRED }),
+      ]);
+
+      const summary = await runRenewalIntegrationHealthCheck();
+
       expect(summary.flagged).toBe(1);
       expect(mockSendAlert).toHaveBeenCalledWith(expect.objectContaining({
+        subject: expect.stringMatching(/^Renewal reconnect needed: /),
         context: expect.objectContaining({ userId: 'paid-ads-user' }),
       }));
+    });
+
+    it('does not flag an expired Meta token while Google Ads can still refresh (every platform is checked)', async () => {
+      (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
+        user({
+          userId: 'google-user',
+          connected_accounts: [
+            ...EXPIRED,
+            { platform: 'google_ads', account_id: 'g-1', config: { account_type: 'google_ads', refresh_token: 'r', token_expires_at: NOW - DAY_MS } },
+          ],
+        }),
+      ]);
+
+      const summary = await runRenewalIntegrationHealthCheck();
+
+      expect(summary.flagged).toBe(0);
+      expect(mockSendAlert).not.toHaveBeenCalled();
     });
 
     // ENG-1907: a sandbox account is provisioned with subscription_status 'active' and would
@@ -244,8 +279,8 @@ describe('runRenewalIntegrationHealthCheck', () => {
     // design and no real ad account, i.e. exactly the shape that flags. Never alert on it.
     it('never flags a sandbox (eval_) principal, even in the exact shape that flags a customer', async () => {
       (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
-        user({ userId: 'eval_9b9b9b9b-0000-4000-8000-000000000000', emmaHelpInterests: ['paid_ads'], connected_accounts: [] }),
-        user({ userId: 'paid-ads-user', emmaHelpInterests: ['paid_ads'], connected_accounts: [] }),
+        user({ userId: 'eval_9b9b9b9b-0000-4000-8000-000000000000', emmaHelpInterests: ['paid_ads'], connected_accounts: EXPIRED }),
+        user({ userId: 'paid-ads-user', emmaHelpInterests: ['paid_ads'], connected_accounts: EXPIRED }),
       ]);
 
       const summary = await runRenewalIntegrationHealthCheck();
@@ -260,12 +295,10 @@ describe('runRenewalIntegrationHealthCheck', () => {
     // ENG-1270 AC3 named both ThinkingAI and TransAmerica as required regression
     // fixtures; only TransAmerica ever got one. ThinkingAI's real pre-fix state
     // (per the issue's own description): paid-ads customer, no Meta ad account
-    // connected, ~6 days from renewal. This shape is deliberately the same as
-    // the generic "flags a paid-ads customer with no ad account connected" test
-    // above — the point of a named fixture isn't new code coverage, it's that
-    // ThinkingAI's specific real incident stays protected by name even if that
-    // generic test is ever weakened or removed.
-    it('flags the ThinkingAI-shaped account: paid-ads intent, no ad account connected, ~6 days from renewal', async () => {
+    // connected, ~6 days from renewal. ENG-2188: with no ad account on any platform
+    // that is activation (a CS nudge from the classifier cron), not a renewal-risk
+    // alert; this test previously asserted flagged=1.
+    it('treats the ThinkingAI-shaped account (paid-ads intent, no ad account connected, ~6 days from renewal) as activation', async () => {
       (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
         user({
           userId: 'thinkingai-user',
@@ -277,10 +310,11 @@ describe('runRenewalIntegrationHealthCheck', () => {
 
       const summary = await runRenewalIntegrationHealthCheck();
 
-      expect(summary.flagged).toBe(1);
-      expect(mockSendAlert).toHaveBeenCalledWith(expect.objectContaining({
-        context: expect.objectContaining({ userId: 'thinkingai-user' }),
-      }));
+      expect(summary.flagged).toBe(0);
+      expect(mockSendAlert).not.toHaveBeenCalled();
+      expect(mockUpsertCapabilityStatus).toHaveBeenCalledWith(
+        null, 'thinkingai-user', 'ad_platform_integration', 'unhealthy', 'emma_help_interests',
+      );
     });
   });
 
@@ -300,7 +334,7 @@ describe('runRenewalIntegrationHealthCheck', () => {
           userId: 'tfaconnect-user',
           email: 'jennifer.sun@tfaconnect.com',
           emmaHelpInterests: ['paid_ads'],
-          connected_accounts: [],
+          connected_accounts: EXPIRED,
         }),
       ]);
 
@@ -314,7 +348,7 @@ describe('runRenewalIntegrationHealthCheck', () => {
     it('still flags a paid-ads customer with no ad account connected when their plan explicitly permits ad integration (no regression)', async () => {
       mockGetAllowedConnectedAccounts.mockResolvedValueOnce(['meta', 'gmail']);
       (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
-        user({ userId: 'entitled-user', emmaHelpInterests: ['paid_ads'], connected_accounts: [] }),
+        user({ userId: 'entitled-user', emmaHelpInterests: ['paid_ads'], connected_accounts: EXPIRED }),
       ]);
 
       const summary = await runRenewalIntegrationHealthCheck();
@@ -326,7 +360,7 @@ describe('runRenewalIntegrationHealthCheck', () => {
     it('still flags an unrestricted-plan customer with no ad account connected (allowedConnectedAccounts undefined/["*"])', async () => {
       mockGetAllowedConnectedAccounts.mockResolvedValueOnce(UNRESTRICTED_CONNECTED_ACCOUNTS);
       (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
-        user({ userId: 'unrestricted-user', emmaHelpInterests: ['paid_ads'], connected_accounts: [] }),
+        user({ userId: 'unrestricted-user', emmaHelpInterests: ['paid_ads'], connected_accounts: EXPIRED }),
       ]);
 
       const summary = await runRenewalIntegrationHealthCheck();
@@ -344,7 +378,7 @@ describe('runRenewalIntegrationHealthCheck', () => {
   describe('alert content is enriched (ENG-1541)', () => {
     it('states the customer outcome from their stated goal', async () => {
       (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
-        user({ userId: 'goal-user', goal: 'paid_ads', emmaHelpInterests: [], connected_accounts: [] }),
+        user({ userId: 'goal-user', goal: 'paid_ads', emmaHelpInterests: [], connected_accounts: EXPIRED }),
       ]);
 
       await runRenewalIntegrationHealthCheck();
@@ -356,7 +390,7 @@ describe('runRenewalIntegrationHealthCheck', () => {
 
     it('falls back to Emma help interests when there is no matching goal field', async () => {
       (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
-        user({ userId: 'interest-user', emmaHelpInterests: ['paid_ads'], connected_accounts: [] }),
+        user({ userId: 'interest-user', emmaHelpInterests: ['paid_ads'], connected_accounts: EXPIRED }),
       ]);
 
       await runRenewalIntegrationHealthCheck();
@@ -380,7 +414,7 @@ describe('runRenewalIntegrationHealthCheck', () => {
           userId: 'stale-goal-user',
           goal: 'seo', // truthy, but NOT 'paid_ads' -- must not be reported as the reason
           emmaHelpInterests: ['paid_ads'], // this is the real trigger
-          connected_accounts: [],
+          connected_accounts: EXPIRED,
         }),
       ]);
 
@@ -398,7 +432,7 @@ describe('runRenewalIntegrationHealthCheck', () => {
           goal: undefined,
           emmaHelpInterests: ['brand'], // present, but does not contain 'paid_ads'
           onboardingEvents: [{ event: 'goal_selected', ts: '', data: { goal: 'paid_ads' } }],
-          connected_accounts: [],
+          connected_accounts: EXPIRED,
         }),
       ]);
 
@@ -429,16 +463,17 @@ describe('runRenewalIntegrationHealthCheck', () => {
       );
     });
 
-    it('says "no ad platform account on record" when the account was never connected', async () => {
+    // ENG-2188: this used to alert with "no ad platform account on record"; a never-connected
+    // account no longer reaches the alert at all.
+    it('sends no alert at all when the account was never connected', async () => {
       (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
         user({ userId: 'never-connected-user', connected_accounts: [] }),
       ]);
 
-      await runRenewalIntegrationHealthCheck();
+      const summary = await runRenewalIntegrationHealthCheck();
 
-      const call = mockSendAlert.mock.calls[0][0];
-      expect(call.context.lastAdAccountSignal).toBe('no ad platform account on record');
-      expect(call.message).toContain('Last known signal: no ad platform account on record');
+      expect(summary.flagged).toBe(0);
+      expect(mockSendAlert).not.toHaveBeenCalled();
     });
 
     it('states the most recent ad token expiry when one is on record', async () => {
@@ -457,7 +492,7 @@ describe('runRenewalIntegrationHealthCheck', () => {
 
     it('always names the customer as next actor with a concrete instruction, and never fabricates a confidence score', async () => {
       (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
-        user({ userId: 'next-actor-user', connected_accounts: [] }),
+        user({ userId: 'next-actor-user', connected_accounts: EXPIRED }),
       ]);
 
       await runRenewalIntegrationHealthCheck();
@@ -474,7 +509,7 @@ describe('runRenewalIntegrationHealthCheck', () => {
 
   /**
    * ENG-1541 — the shared decision function the admin dry-run route calls.
-   * Same four branches `runRenewalIntegrationHealthCheck`'s loop takes, tested
+   * Same five branches `runRenewalIntegrationHealthCheck`'s loop takes, tested
    * directly rather than only through the scan loop, since this is now the
    * function a production-proof caller depends on being correct in isolation.
    */
@@ -487,6 +522,7 @@ describe('runRenewalIntegrationHealthCheck', () => {
         decision: 'skipped_no_paid_ads_intent',
         hasPaidAdsIntent: false,
         hasHealthyAdIntegration: false,
+        adConnection: 'never_connected',
         hasAdIntegrationEntitlement: null,
       });
       expect(mockGetAllowedConnectedAccounts).not.toHaveBeenCalled();
@@ -516,6 +552,19 @@ describe('runRenewalIntegrationHealthCheck', () => {
         decision: 'skipped_healthy_integration',
         hasPaidAdsIntent: true,
         hasHealthyAdIntegration: true,
+        adConnection: 'connected',
+        hasAdIntegrationEntitlement: null,
+      });
+      expect(mockGetAllowedConnectedAccounts).not.toHaveBeenCalled();
+    });
+
+    it('skipped_activation_incomplete: paid-ads intent but no ad account on any platform — never would_flag (ENG-2188)', async () => {
+      const evaluation = await evaluateRenewalIntegrationHealth(user({ userId: 'never-user', connected_accounts: [] }));
+      expect(evaluation).toEqual({
+        decision: 'skipped_activation_incomplete',
+        hasPaidAdsIntent: true,
+        hasHealthyAdIntegration: false,
+        adConnection: 'never_connected',
         hasAdIntegrationEntitlement: null,
       });
       expect(mockGetAllowedConnectedAccounts).not.toHaveBeenCalled();
@@ -524,12 +573,13 @@ describe('runRenewalIntegrationHealthCheck', () => {
     it('skipped_no_ad_entitlement: paid-ads intent, unhealthy, but the plan excludes every ad platform (TFAConnect shape)', async () => {
       mockGetAllowedConnectedAccounts.mockResolvedValueOnce(['linkedin', 'gmail', 'calendly']);
       const evaluation = await evaluateRenewalIntegrationHealth(
-        user({ userId: 'tfaconnect-user', connected_accounts: [] }),
+        user({ userId: 'tfaconnect-user', connected_accounts: EXPIRED }),
       );
       expect(evaluation).toEqual({
         decision: 'skipped_no_ad_entitlement',
         hasPaidAdsIntent: true,
         hasHealthyAdIntegration: false,
+        adConnection: 'expired',
         hasAdIntegrationEntitlement: false,
       });
       expect(mockGetAllowedConnectedAccounts).toHaveBeenCalledWith('tfaconnect-user');
@@ -538,12 +588,13 @@ describe('runRenewalIntegrationHealthCheck', () => {
     it('would_flag: paid-ads intent, unhealthy, plan explicitly permits ad integration', async () => {
       mockGetAllowedConnectedAccounts.mockResolvedValueOnce(['meta', 'gmail']);
       const evaluation = await evaluateRenewalIntegrationHealth(
-        user({ userId: 'entitled-user', connected_accounts: [] }),
+        user({ userId: 'entitled-user', connected_accounts: EXPIRED }),
       );
       expect(evaluation).toEqual({
         decision: 'would_flag',
         hasPaidAdsIntent: true,
         hasHealthyAdIntegration: false,
+        adConnection: 'expired',
         hasAdIntegrationEntitlement: true,
       });
     });
@@ -551,14 +602,14 @@ describe('runRenewalIntegrationHealthCheck', () => {
     it('would_flag: paid-ads intent, unhealthy, unrestricted plan (allowedConnectedAccounts undefined/["*"])', async () => {
       mockGetAllowedConnectedAccounts.mockResolvedValueOnce(UNRESTRICTED_CONNECTED_ACCOUNTS);
       const evaluation = await evaluateRenewalIntegrationHealth(
-        user({ userId: 'unrestricted-user', connected_accounts: [] }),
+        user({ userId: 'unrestricted-user', connected_accounts: EXPIRED }),
       );
       expect(evaluation.decision).toBe('would_flag');
       expect(evaluation.hasAdIntegrationEntitlement).toBe(true);
     });
 
     it('never calls the real scan or sends an alert — pure decision, no side effects', async () => {
-      await evaluateRenewalIntegrationHealth(user({ connected_accounts: [] }));
+      await evaluateRenewalIntegrationHealth(user({ connected_accounts: EXPIRED }));
       expect(userDb.scanWithFilter).not.toHaveBeenCalled();
       expect(mockSendAlert).not.toHaveBeenCalled();
     });
@@ -597,7 +648,7 @@ describe('runRenewalIntegrationHealthCheck', () => {
 
     it('writes status "not_entitled" for a skipped_no_ad_entitlement decision', async () => {
       (userDb.scanWithFilter as jest.Mock).mockResolvedValue([
-        user({ userId: 'u12', connected_accounts: [] }),
+        user({ userId: 'u12', connected_accounts: EXPIRED }),
       ]);
       mockGetAllowedConnectedAccounts.mockResolvedValueOnce(['linkedin', 'gmail']);
 

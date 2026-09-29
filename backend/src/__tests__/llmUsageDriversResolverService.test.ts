@@ -516,6 +516,72 @@ describe("quality.status grounded in the AA Index (ENG-1563)", () => {
   });
 });
 
+/**
+ * ENG-2190 (ENG-1564's reserved slot) — task_verified overrides the AA-benchmark tier when the
+ * eval-v2 feed has one, never blends with it. `resolveUsageDrivers`'s default path (no injected
+ * lookup) already proves the inert state: the "AC5: task_verified ... never emitted" case above
+ * runs with no mock of taskVerifiedFeed at all and still never sees the status, because the real
+ * evalRegistry has no validated grader. These cases inject `taskVerifiedLookup` to prove the
+ * override and the fallback without waiting on a real validation to exist.
+ */
+describe("task_verified feed wiring (ENG-2190)", () => {
+  /** A minimal SupportedModelInfo-shaped row — only the fields the resolver reads. */
+  const scored = (id: string, qualityScore: number) => ({
+    id,
+    name: id,
+    tier: "medium" as const,
+    description: "",
+    provider: "anthropic" as const,
+    qualityScore,
+    qualityScoreSource: "Artificial Analysis Intelligence Index v4.1.1",
+  });
+  /** Pins the catalog to exactly one candidate so top-level != alternative ambiguity can't leak into an assertion. */
+  const singleCandidatePolicy = (toModel: string) =>
+    policyFor({ policy: { ...policyFor().policy, optimizedModelIds: [toModel] } });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockBillingQuery.mockResolvedValue([]);
+    soloAccount();
+    mockPolicy.mockResolvedValue(singleCandidatePolicy(HAIKU));
+    mockQuery.mockResolvedValue(opusLedger());
+    mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);
+    // AA would otherwise call this pair benchmark_lower — the point of these
+    // cases is that task_verified, when present, wins over that regardless.
+    mockModelsMeta.mockResolvedValue([scored(OPUS, 80), scored(HAIKU, 40)]);
+  });
+
+  it("fully overrides the AA-benchmark tier, with no benchmark field surviving alongside it", async () => {
+    const { recommendations } = await resolveUsageDrivers("u1", {
+      today: "2026-08-11",
+      taskVerifiedLookup: async (fromModel, toModel) =>
+        fromModel === OPUS && toModel === HAIKU
+          ? { status: "task_verified", source: "task_eval", reason: "measured on your sampled sessions" }
+          : undefined,
+    });
+
+    expect(recommendations[0]).toMatchObject({ fromModel: OPUS, toModel: HAIKU });
+    expect(recommendations[0].quality).toEqual({
+      status: "task_verified",
+      source: "task_eval",
+      reason: "measured on your sampled sessions",
+    });
+    // Same AC4 shape guarantee as the AA tiers: exactly the three provenance
+    // fields, nothing from the benchmark computation smuggled alongside it.
+    expect(Object.keys(recommendations[0].quality).sort()).toEqual(["reason", "source", "status"]);
+  });
+
+  it("falls back to the AA-benchmark tier when the feed has no verified pair", async () => {
+    const { recommendations } = await resolveUsageDrivers("u1", {
+      today: "2026-08-11",
+      taskVerifiedLookup: async () => undefined,
+    });
+
+    expect(recommendations[0].quality.status).toBe("benchmark_lower");
+    expect(recommendations[0].quality.source).toBe("artificial_analysis");
+  });
+});
+
 describe("resolveUsageDrivers", () => {
   it("caps recommendation confidence when the ledger cannot account for the counter", async () => {
     // Greptile, PR #2407: the driver resolver "consumes that incomplete ledger

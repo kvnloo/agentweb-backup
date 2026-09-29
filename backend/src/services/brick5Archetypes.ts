@@ -4,7 +4,7 @@
  * Format Archetypes).
  *
  * Each archetype defines:
- *   - LAYOUT STRUCTURE for Feed (1080x1080) and Story (1080x1350)
+ *   - LAYOUT STRUCTURE for Feed 1:1 (1080x1080) and Feed portrait 4:5 (1080x1350)
  *   - TEXT BUDGET (what text is allowed on canvas + the rule)
  *
  * The image-generation service injects the chosen archetype's LAYOUT
@@ -38,7 +38,10 @@ export interface ArchetypeTemplate {
   name: string;
   /** Verbatim LAYOUT STRUCTURE block for the Feed 1:1 format. */
   feedLayout: string;
-  /** Verbatim LAYOUT STRUCTURE block for the Story 4:5 format. */
+  /**
+   * Verbatim LAYOUT STRUCTURE block for the 4:5 feed portrait format (1080x1350). The key name is
+   * historical (it is persisted in AW-PromptTemplates); it is not a 9:16 Story layout.
+   */
   storyLayout: string;
   /** Verbatim TEXT BUDGET block (allowed/disallowed elements + the Rule line). */
   textBudget: string;
@@ -56,7 +59,7 @@ export const ARCHETYPES: Record<Archetype, ArchetypeTemplate> = {
       "- All UI text legible at ad size",
     ].join("\n"),
     storyLayout: [
-      "Story 4:5: UI element occupies upper 60% of tall canvas",
+      "Feed portrait 4:5: UI element occupies upper 60% of tall canvas",
       "- Device frame centered, slight tilt (max 3°) for dynamism",
       "- Lower 40% reserved for label and CTA",
       "- Background: subtle gradient from neutral to brand color descending",
@@ -80,7 +83,7 @@ export const ARCHETYPES: Record<Archetype, ArchetypeTemplate> = {
       "- Secondary stat or label at 20% opacity, bottom-left",
     ].join("\n"),
     storyLayout: [
-      "Story 4:5: Hero metric occupies top third in massive type (120px+)",
+      "Feed portrait 4:5: Hero metric occupies top third in massive type (120px+)",
       "- Supporting chart or comparison in middle third",
       "- Source label or context in bottom third",
       "- Background: full-bleed gradient, dark to slightly lighter top-to-bottom",
@@ -107,7 +110,7 @@ export const ARCHETYPES: Record<Archetype, ArchetypeTemplate> = {
       "- Depth of field: sharp subject, softly blurred environment",
     ].join("\n"),
     storyLayout: [
-      "Story 4:5: Full-bleed lifestyle image occupies upper 65% of tall canvas",
+      "Feed portrait 4:5: Full-bleed lifestyle image occupies upper 65% of tall canvas",
       "- Cinematic crop — horizon line sits at upper-third",
       "- Frosted or gradient overlay on lower 40% for text legibility",
       "- Product or prop anchored at vertical midpoint of image",
@@ -133,7 +136,7 @@ export const ARCHETYPES: Record<Archetype, ArchetypeTemplate> = {
       "- Background desaturated or heavily darkened for contrast",
     ].join("\n"),
     storyLayout: [
-      "Story 4:5: Atmospheric image, portrait-oriented, fills full canvas",
+      "Feed portrait 4:5: Atmospheric image, portrait-oriented, fills full canvas",
       "- Headline vertically centered in upper 50%, oversized type",
       "- Lower 45% reserved for subheadline + CTA",
       "- Overlay: dark gradient from 40% at top to 75% at bottom",
@@ -160,7 +163,7 @@ export const ARCHETYPES: Record<Archetype, ArchetypeTemplate> = {
       "- Thin dividing lines between blocks",
     ].join("\n"),
     storyLayout: [
-      "Story 4:5:",
+      "Feed portrait 4:5:",
       "TOP ZONE: Star rating + customer count — top 12%",
       "UPPER-MID: USP headline — large, 2 lines, centered — 25–45%",
       "LOWER-MID: 3 benefit blocks stacked vertically",
@@ -189,7 +192,7 @@ export const ARCHETYPES: Record<Archetype, ArchetypeTemplate> = {
       "- CTA button flush bottom center",
     ].join("\n"),
     storyLayout: [
-      "Story 4:5:",
+      "Feed portrait 4:5:",
       "TOP: Logo — 10% from top",
       "HEADLINE: Large, centered, 3 lines allowed",
       "BENEFITS: 3 stacked rows, ~18% canvas height each",
@@ -218,7 +221,7 @@ export const ARCHETYPES: Record<Archetype, ArchetypeTemplate> = {
       "BOTTOM BAR: \"As Seen In\" + 3–4 media logos, evenly spaced",
     ].join("\n"),
     storyLayout: [
-      "Story 4:5:",
+      "Feed portrait 4:5:",
       "TOP: Star rating — large, 10% from top",
       "HERO QUOTE: Oversized, centered — 30% of canvas",
       "ATTRIBUTION: Name + role below quote",
@@ -249,7 +252,7 @@ export const ARCHETYPES: Record<Archetype, ArchetypeTemplate> = {
       "LOWER: 2×2 image grid filling remaining 40% of canvas (4px gaps)",
     ].join("\n"),
     storyLayout: [
-      "Story 4:5:",
+      "Feed portrait 4:5:",
       "TOP: Logo centered — top 8%",
       "HEADLINE: Bold, centered, 2 lines — 15–28%",
       "CTA BUTTON: Large, pill-shaped — 30–38%",
@@ -277,7 +280,7 @@ export const ARCHETYPES: Record<Archetype, ArchetypeTemplate> = {
       "BOTTOM: Shared CTA bar spanning full width — bottom 15%",
     ].join("\n"),
     storyLayout: [
-      "Story 4:5:",
+      "Feed portrait 4:5:",
       "TOP HALF (0–48%): \"Before\" panel — full width, problem imagery",
       "DIVIDER: Horizontal line with central arrow chip",
       "BOTTOM HALF (52–85%): \"After\" panel — full width, solution imagery",
@@ -306,7 +309,7 @@ export const ARCHETYPES: Record<Archetype, ArchetypeTemplate> = {
       "BOTTOM THIRD OVERLAY: Outcome headline spans full width on translucent bar",
     ].join("\n"),
     storyLayout: [
-      "Story 4:5:",
+      "Feed portrait 4:5:",
       "TOP 45%: Before image, full width",
       "TRANSITION BAND: Brand-color strip with outcome label centered",
       "MIDDLE 40%: After image, full width, vibrant",
@@ -335,7 +338,7 @@ export const ARCHETYPES: Record<Archetype, ArchetypeTemplate> = {
       "BOTTOM: Thin CTA bar, full width",
     ].join("\n"),
     storyLayout: [
-      "Story 4:5:",
+      "Feed portrait 4:5:",
       "TOP: Social handle + verified badge — top 8%",
       "SUBTITLE: \"Before → After\" label, centered — 12%",
       "GRID: 2×2 panels — 16–85% of canvas",
@@ -364,7 +367,7 @@ export const ARCHETYPES: Record<Archetype, ArchetypeTemplate> = {
       "BOTTOM: CTA button full-width, right-panel brand color",
     ].join("\n"),
     storyLayout: [
-      "Story 4:5:",
+      "Feed portrait 4:5:",
       "TOP HEADER: Split label bar — \"Others\" (left, muted) / \"[Brand]\" (right, colored)",
       "3 COMPARISON ROWS stacked — each: ✗ pain (left) | ✓ benefit (right) | center divider",
       "Rows separated by thin lines",

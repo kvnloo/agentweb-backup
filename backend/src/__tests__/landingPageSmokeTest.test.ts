@@ -41,6 +41,8 @@ function emitResponse({
 }
 
 /** The default single-email-field lander shape returned by the mocked discovery. */
+import { phoneLeadId } from "../utils/smokeTestLead";
+
 const SINGLE_EMAIL_FIELD = {
   scope: 'form[data-agentweb-smoke-form="1"] ',
   fields: [
@@ -101,9 +103,11 @@ jest.mock("../utils/browserUtils", () => ({
 const mockGetLeadByEmail = jest.fn();
 const mockDeleteLead = jest.fn();
 const mockGetLeadsByListId = jest.fn();
+const mockGetLeadById = jest.fn();
 jest.mock("../services/db", () => ({
   crmDb: {
     getLeadByEmail: (...args: any[]) => mockGetLeadByEmail(...args),
+    getLeadById: (...args: any[]) => mockGetLeadById(...args),
     deleteLead: (...args: any[]) => mockDeleteLead(...args),
     getLeadsByListId: (...args: any[]) => mockGetLeadsByListId(...args),
   },
@@ -124,6 +128,7 @@ import {
   setSmokeTestPollConfig,
   setSmokeTestConcurrency,
   syntheticValueFor,
+  utmPropagationVerdict,
 } from "../services/landingPageSmokeTest";
 
 const BASE_PAGE = {
@@ -144,6 +149,10 @@ describe("runGenerationSmokeTest", () => {
     jest.clearAllMocks();
     mockGetLeadByEmail.mockReset();
     mockGetLeadByEmail.mockResolvedValue(null);
+    // Persistent implementations survive jest.clearAllMocks(), which clears calls only —
+    // the leak this file has been bitten by more than once. Reset it with the others.
+    mockGetLeadById.mockReset();
+    mockGetLeadById.mockResolvedValue(null);
     mockGetLeadsByListId.mockReset();
     mockGetLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false });
     (mockPage.evaluate as jest.Mock).mockResolvedValue(SINGLE_EMAIL_FIELD);
@@ -175,8 +184,10 @@ describe("runGenerationSmokeTest", () => {
     expect(mockLaunch).toHaveBeenCalledWith(
       expect.objectContaining({ executablePath: "/usr/bin/google-chrome" })
     );
+    // ENG-2193: navigates with synthetic UTM params appended (see the "UTM propagation"
+    // describe block below for the dedicated coverage) — still the same page, same options.
     expect(mockPage.goto).toHaveBeenCalledWith(
-      "https://test-page.vercel.app",
+      expect.stringMatching(/^https:\/\/test-page\.vercel\.app\/\?utm_source=/),
       expect.objectContaining({ waitUntil: "networkidle" })
     );
     expect(mockPage.fill).toHaveBeenCalledWith(
@@ -196,6 +207,93 @@ describe("runGenerationSmokeTest", () => {
     expect(result.ok).toBe(true);
     expect(result.leadCaptured).toBe(true);
     expect(result.pixelFired).toBeUndefined();
+  });
+
+  describe("UTM propagation (ENG-2193)", () => {
+    /** Reads the utm_* params the run actually navigated with, off the captured goto() URL. */
+    function navigatedUtm(): { source: string | null; medium: string | null; campaign: string | null } {
+      const navigatedUrl = new URL((mockPage.goto as jest.Mock).mock.calls[0][0]);
+      return {
+        source: navigatedUrl.searchParams.get("utm_source"),
+        medium: navigatedUrl.searchParams.get("utm_medium"),
+        campaign: navigatedUrl.searchParams.get("utm_campaign"),
+      };
+    }
+
+    it("navigates with synthetic utm_source/utm_medium/utm_campaign appended to the deployed URL", async () => {
+      mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+
+      await runGenerationSmokeTest({ ...BASE_PAGE });
+
+      const utm = navigatedUtm();
+      expect(utm.source).toBe("agentweb-smoketest");
+      expect(utm.medium).toBe("paid"); // ENG-239's UTM contract requires utm_medium=paid
+      expect(utm.campaign).toMatch(/^smoketest-\d+$/);
+    });
+
+    it("reports utmPropagated:true when the resulting lead carries the injected UTM params", async () => {
+      // Reads the campaign the run actually generated off the goto() call, rather than
+      // asserting against a fixed value — buildSmokeTestUtm() embeds Date.now().
+      mockGetLeadByEmail.mockImplementationOnce(async () => {
+        const utm = navigatedUtm();
+        return {
+          leadId: "lead-abc",
+          utmSource: utm.source,
+          utmMedium: utm.medium,
+          firstTouch: { utm: { campaign: utm.campaign } },
+        };
+      });
+
+      await runGenerationSmokeTest({ ...BASE_PAGE });
+
+      const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+      expect(result.utmPropagated).toBe(true);
+      expect(result.utmPropagationDetail).toContain("carries the injected UTM params");
+      // Advisory only — never affects the overall verdict.
+      expect(result.ok).toBe(true);
+    });
+
+    it("reports utmPropagated:false when the resulting lead has no matching attribution (ENG-239: capture not wired up)", async () => {
+      // The realistic "capture never ran" case: a lead lands, but with no utm fields at all.
+      mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+
+      await runGenerationSmokeTest({ ...BASE_PAGE });
+
+      const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+      expect(result.utmPropagated).toBe(false);
+      expect(result.utmPropagationDetail).toContain("does not match the injected UTM params");
+      // Still advisory only — a real capture gap must not turn a healthy smoke test red.
+      expect(result.ok).toBe(true);
+    });
+
+    it("leaves utmPropagated unset when there is no email-keyed lead to check (phone/handoff path)", async () => {
+      (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+        scope: "",
+        fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+        selects: [],
+        checkables: [],
+        submitSelector: null,
+        disclosureTriggers: [],
+        skippedRequired: 0,
+        noFormOnPage: false,
+        authFormOnly: false,
+        iframeCount: 0,
+      });
+      mockPage.click.mockImplementationOnce(async () => {
+        emitResponse({ url: "https://campaign.waterheater.app/api/hero-estimate", status: 200 });
+      });
+      (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
+      (mockPage.url as jest.Mock)
+        .mockReturnValueOnce("https://campaign.waterheater.app/")
+        .mockReturnValueOnce("https://chat.waterheater.app/text?handoff_id=abc123");
+
+      await runGenerationSmokeTest({ ...BASE_PAGE });
+
+      const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+      expect(result.leadCaptured).toBe(true); // the handoff path itself still works
+      expect(result.utmPropagated).toBeUndefined();
+      expect(result.utmPropagationDetail).toBeUndefined();
+    });
   });
 
   it("SUCCESS: lead lands + pixel fires (fbq('track','Lead',...) call observed) → ok:true", async () => {
@@ -761,6 +859,51 @@ describe("runGenerationSmokeTest", () => {
     expect(mockUpdateLandingPageSmokeTestResult.mock.calls[0][1].ok).toBe(true);
   });
 
+  it("finds the phone-only lead by its deterministic id, not by hoping it is on page one", async () => {
+    // getLeadsByListId sorts on leadId, the table's RANGE key, so "newest first" only ever
+    // held because createLead mints `lead_<timestamp>_<rand>`. ENG-2082 added a second shape,
+    // `lead_ph_<sha256>`, whose 'p' sorts above every digit — so on a phone-only lander EVERY
+    // row is lead_ph_*, ordered by random hash, and ours is frequently not on page one.
+    // Missing it reports a false ok:false AND strands the synthetic row in a real CRM.
+    // Here the page deliberately does NOT contain our row; only the point lookup finds it.
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD,
+      fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+    });
+    mockGetLeadsByListId.mockResolvedValue({ items: [] });
+    // Stateful, because the id is now looked up twice for different reasons. The first call
+    // is claimSmokeTestPhone proving the id is FREE before the form is submitted; every call
+    // after that is the poll looking for the row the submission created. Returning a row to
+    // the claim would (correctly) make it redraw.
+    //
+    // The row deliberately carries a STALE createdAt: having claimed the id, the poll must
+    // accept it on identity alone, which is the adopted-row case — webhooks.ts reuses an
+    // existing row on a phone collision without rewriting createdAt.
+    let claimChecked = false;
+    mockGetLeadById.mockImplementation(async (_listId: string, leadId: string) => {
+      if (!claimChecked) {
+        claimChecked = true;
+        return null;
+      }
+      return { leadId, phone: "415-555-0142", createdAt: "2020-01-01T00:00:00.000Z" };
+    });
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    expect(mockGetLeadById).toHaveBeenCalledWith(
+      BASE_PAGE.leadListId,
+      expect.stringMatching(/^lead_ph_[0-9a-f]{24}$/),
+      // Consistent: this read chases a key webhooks.ts may have written moments ago, and an
+      // eventually-consistent miss here is indistinguishable from "no such lead".
+      { consistentRead: true }
+    );
+    // Found means cleaned up — the whole point is not leaving it in the customer's CRM.
+    expect(mockDeleteLead).toHaveBeenCalledWith(
+      BASE_PAGE.leadListId,
+      expect.stringMatching(/^lead_ph_[0-9a-f]{24}$/)
+    );
+  });
+
   it("CLEANUP: a lander with no email field still gets its synthetic lead deleted, by phone", async () => {
     // The lander invents its own placeholder address (observed live:
     // noemail+<ts>@waterheater.app), so isSmokeTestEmail never matches and pollForLead
@@ -800,20 +943,65 @@ describe("runGenerationSmokeTest", () => {
       ...SINGLE_EMAIL_FIELD,
       fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
     });
-    mockGetLeadsByListId.mockImplementation(async () => {
+    const staleRow = () => {
       const digits = String(
         ((mockPage.fill as jest.Mock).mock.calls.find((c) => c[0] === "#phone") || [])[1] || ""
       ).replace(/\D/g, "");
-      return {
-        items: [{ leadId: "older", phone: digits, createdAt: "2000-01-01T00:00:00.000Z" }],
-        lastEvaluatedKey: null,
-        hasMore: false,
-      };
-    });
+      return { leadId: "older", phone: digits, createdAt: "2000-01-01T00:00:00.000Z" };
+    };
+    mockGetLeadsByListId.mockImplementation(async () => ({
+      items: [staleRow()],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    }));
+    // The row DynamoDB would actually return. A stranded row from a previous run lives at
+    // lead_ph_<sha(phone)> — webhooks.ts keys it there — which is exactly the id the point
+    // lookup queries. Stubbing this to null (the shared beforeEach default) made the test
+    // pass without ever exercising that branch.
+    mockGetLeadById.mockImplementation(async (_listId: string, leadId: string) => ({
+      ...staleRow(),
+      leadId,
+    }));
 
     await runGenerationSmokeTest({ ...BASE_PAGE });
 
+    // Nothing landed this run, so this must be a FAIL — and the stranded row is the only
+    // evidence the previous run failed, so it must survive. Accepting it would report green
+    // over a broken capture pipeline and then delete the trace.
     expect(mockDeleteLead).not.toHaveBeenCalled();
+    const persisted = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(persisted.ok).toBe(false);
+  });
+
+  it("SATURATED LIST: the fallback phone is not one the claim already proved occupied", async () => {
+    // Every id is taken, so the claim exhausts its 8 draws and gives up. It must NOT then
+    // submit the last number it probed: webhooks.ts would adopt that existing row without
+    // rewriting createdAt, the poll's freshness rule could never match, and the run would be
+    // a CERTAIN false FAIL that strands another row — deepening the saturation that caused
+    // it. (An unprobed draw is not likely to be free either — 8 hits out of 100 implies
+    // ~90% occupancy — but it is the only move that can succeed at all.)
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD,
+      fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+    });
+    mockGetLeadById.mockImplementation(async (_listId: string, leadId: string) => ({
+      leadId, phone: "4155550199", createdAt: "2000-01-01T00:00:00.000Z",
+    }));
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    const probedIds = mockGetLeadById.mock.calls.slice(0, 8).map((c: any[]) => c[1]);
+    expect(probedIds).toHaveLength(8);
+    // Genuinely redrawing a new number each attempt, not re-probing one id.
+    expect(new Set(probedIds).size).toBeGreaterThan(1);
+
+    const filled = String(
+      ((mockPage.fill as jest.Mock).mock.calls.find((c) => c[0] === "#phone") || [])[1] || ""
+    );
+    expect(filled).toMatch(/^41555501\d{2}$/);
+    const filledId = phoneLeadId(filled);
+    expect(filledId).toBeTruthy();
+    expect(probedIds).not.toContain(filledId);
   });
 
   it("DIAGNOSIS: an iframe-embedded form is not reported as 'no lead form'", async () => {
@@ -1117,6 +1305,26 @@ describe("runGenerationSmokeTest", () => {
     expect(persisted.noFormOnPage).toBe(true);
   });
 
+  it("ENG-2081: the classification survives a throw AFTER the fill", async () => {
+    // The three fields used to be copied out at the END of the try block — after submit, the
+    // URL wait, the lead poll and the delete. pollForLead does not catch DynamoDB errors, so
+    // a throttle there sent execution to the outer catch with the fields still at their
+    // defaults: the record then read `ok:false, leadCaptured:false` with no classification,
+    // which is a CRM fault to whoever reads it. They are captured right after the fill now.
+    (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+      ...SINGLE_EMAIL_FIELD,
+      iframeCount: 2,
+    });
+    mockGetLeadByEmail.mockRejectedValue(new Error("ProvisionedThroughputExceeded"));
+
+    await runGenerationSmokeTest({ ...BASE_PAGE });
+
+    const persisted = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+    expect(persisted.ok).toBe(false);
+    // The evidence that explains the failure must outlive the failure itself.
+    expect(persisted.iframeCount).toBe(2);
+  });
+
   it("DIAGNOSIS: an auth-only page says so, instead of blaming the CRM", async () => {
     (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
       scope: "", fields: [], selects: [], checkables: [], submitSelector: null,
@@ -1227,5 +1435,43 @@ describe("runGenerationSmokeTest", () => {
     await Promise.all([p1, p2]);
 
     expect(events).toEqual(["launch-1", "close-1", "launch-2"]);
+  });
+});
+
+describe("utmPropagationVerdict (pure, ENG-2193)", () => {
+  const expected = { source: "agentweb-smoketest", medium: "paid", campaign: "smoketest-123" };
+
+  it("propagated: matches via the denormalized utmSource/utmMedium fields + firstTouch.utm.campaign", () => {
+    const verdict = utmPropagationVerdict(expected, {
+      utmSource: "agentweb-smoketest",
+      utmMedium: "paid",
+      firstTouchUtmCampaign: "smoketest-123",
+    });
+    expect(verdict).toEqual({ propagated: true, detail: expect.stringContaining("carries the injected UTM params") });
+  });
+
+  it("propagated: also matches via firstTouch.utm.source/medium alone (no denormalized fields)", () => {
+    const verdict = utmPropagationVerdict(expected, {
+      firstTouchUtmSource: "agentweb-smoketest",
+      firstTouchUtmMedium: "paid",
+      firstTouchUtmCampaign: "smoketest-123",
+    });
+    expect(verdict.propagated).toBe(true);
+  });
+
+  it("not propagated: no attribution fields at all", () => {
+    const verdict = utmPropagationVerdict(expected, {});
+    expect(verdict.propagated).toBe(false);
+    expect(verdict.detail).toContain("does not match the injected UTM params");
+    expect(verdict.detail).toContain("unset");
+  });
+
+  it("not propagated: campaign mismatch even when source/medium match", () => {
+    const verdict = utmPropagationVerdict(expected, {
+      utmSource: "agentweb-smoketest",
+      utmMedium: "paid",
+      firstTouchUtmCampaign: "some-other-campaign",
+    });
+    expect(verdict.propagated).toBe(false);
   });
 });

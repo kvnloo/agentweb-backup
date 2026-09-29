@@ -61,6 +61,28 @@ async function retrieveTokenSession(sessionId: string, userId: string) {
     return session;
 }
 
+/**
+ * ENG-1644 gap-closing: if the customer had a pending reconnect decision for
+ * this exact account, this real reconnect resolves it. Dynamic import —
+ * approvalInboxCustomerNotify.ts transitively pulls in
+ * emailService/chatbotService/agentModeService, too heavy to load statically
+ * into this lightweight OAuth route file. safeAutoResolveCredentialDecision
+ * itself never throws, but the import statement can — own try/catch (review
+ * fix) so that can't abort a response after earlier accounts in the same
+ * loop already connected. The wrapper's own logic lives once in
+ * approvalInboxCustomerNotify.ts, not duplicated per file (review fix — this
+ * local copy was flagged as duplicated 3x across this file, linkedinAuth.ts,
+ * and linkedInAdsAuth.ts by 4 independent review passes).
+ */
+async function safeAutoResolve(label: string, userId: string, platform: string, accountId: string): Promise<void> {
+    try {
+        const { safeAutoResolveCredentialDecision } = await import('../services/approvalInboxCustomerNotify');
+        await safeAutoResolveCredentialDecision(label, userId, platform, accountId);
+    } catch (err: any) {
+        console.warn(`[${label}] auto-resolve module failed to load:`, err?.message || err);
+    }
+}
+
 // ============================================
 // Routes
 // ============================================
@@ -347,6 +369,8 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
                 }
             });
             connectedAccounts.push(account);
+
+            await safeAutoResolve('Meta Connect Ad Accounts', userId, 'meta', adAccount.account_id);
         }
 
         res.json({ success: true, connectedAccounts });
@@ -390,6 +414,11 @@ router.post('/connect-instagram', authenticateToken, async (req: any, res) => {
                 scopes: session.scopes
             }
         });
+
+        // ENG-1644 gap-closing (review fix): missed on the first pass —
+        // Instagram is a distinct platform from Meta ad accounts in this
+        // reconnect system, same treatment as /connect-ad-accounts above.
+        await safeAutoResolve('Meta Connect Instagram', userId, 'instagram', instagramAccount.id);
 
         res.json({ success: true, connectedAccount: account });
 

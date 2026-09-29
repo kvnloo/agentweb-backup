@@ -23,6 +23,7 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { isValidLeadLifecycle, LEAD_LIFECYCLES } from '../utils/leadSchema';
 import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValidation';
 import { syncContact, SyncInput } from '../services/contactSyncService';
 import { isCardRevenueField } from '../services/enrichmentGroups';
@@ -70,7 +71,7 @@ import {
 import { buildConfigServiceDeps } from '../services/enrichmentConfigDeps';
 import { runEnrichment as svcRunEnrichmentV3 } from '../services/crmEnrichmentServiceV3';
 import { buildOrchestratorDeps as buildV3OrchestratorDeps } from '../services/enrichmentV3RealDeps';
-import { sanitizeLeadForResponse } from '../utils/enrichmentMetadataPresentation';
+import { sanitizeLeadForResponse, shouldHideCardRevenueForViewer } from '../utils/enrichmentMetadataPresentation';
 import { getExternalCrmConnection, getMappedAgentwebFields, mappedFieldChanged, resolveSyncStatus } from '../utils/leadSyncStatus';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
@@ -146,6 +147,17 @@ async function autoEnrollListIntoSequences(userId: string, listId: string): Prom
 // In-memory cache for CRM data files uploaded to S3
 // Key: `${userId}:${listId}`, Value: { leadsUrl, eventsUrl, expiresAt }
 const crmDataFileCache = new Map<string, { leadsUrl: string; eventsUrl: string; expiresAt: number }>();
+
+/**
+ * Columns the /analyze leads CSV ALWAYS carries, in this order, whether or not any lead in
+ * the list happens to have them. The header used to be a union of the keys present across
+ * the list, so a list where every lead is phone-only (ENG-2082) shipped a CSV with no
+ * `email` column while the prompt promised one — and the generated pandas hit a KeyError.
+ * Shared with the prompt below so the two can never drift again.
+ */
+const CRM_ANALYZE_CORE_LEAD_FIELDS = [
+  'leadId', 'email', 'phone', 'firstName', 'lastName', 'company', 'title', 'status', 'stage',
+];
 const CRM_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 /**
@@ -1044,12 +1056,16 @@ router.get('/contacts', async (req: Request, res: Response) => {
     // Merge deduped contacts across users, re-dedup by email
     const contactMap = new Map<string, any>();
     let rawCount = 0;
+    let noEmailCount = 0;
     let listsCount = 0;
     for (const r of perUserResults) {
       rawCount += r.rawCount;
+      noEmailCount += r.noEmailCount ?? 0;
       listsCount += r.listsCount;
       for (const c of r.contacts) {
-        const key = c.email?.toLowerCase() ?? '';
+        // dedupKey, never email: an email-less contact carries `email: ''`, so keying on
+        // the address here would merge every phone-only contact across every user into one.
+        const key = c.dedupKey || c.email?.toLowerCase() || '';
         if (!contactMap.has(key)) contactMap.set(key, c);
       }
     }
@@ -1064,7 +1080,10 @@ router.get('/contacts', async (req: Request, res: Response) => {
     const total = contacts.length;
     if (parsedLimit !== undefined) contacts = contacts.slice(0, parsedLimit);
 
-    const result = { contacts, total, rawCount, listsCount };
+    // noEmailCount travels with the rest. Live-testing the phone-only work showed the
+    // service computing it and this route quietly dropping it, so the UI still had no way
+    // to explain a total that is smaller than rawCount.
+    const result = { contacts, total, rawCount, listsCount, noEmailCount };
     const durationMs = Date.now() - started;
     const primaryResult = perUserResults[0];
 
@@ -1072,6 +1091,10 @@ router.get('/contacts', async (req: Request, res: Response) => {
       contacts: result.contacts,
       total: result.total,
       rawCount: result.rawCount,
+      // How many of rawCount have no email. They are INCLUDED in contacts (ENG-2082), so
+      // without this the caller sees total < rawCount and cannot explain the difference.
+      // Adding it to `result` alone was not enough — this response enumerates its fields.
+      noEmailCount: result.noEmailCount,
       listsCount: result.listsCount,
       durationMs,
       ...(primaryResult?.nextCursor !== undefined && { nextCursor: primaryResult.nextCursor }),
@@ -2733,6 +2756,22 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
+    // `lifecycle` became a writable attribute on this route when updateLead grew an
+    // explicit handler for it; before that the key was silently dropped. It outranks the
+    // live computation in askCrmService permanently, so it is validated at the edge as a
+    // 400 rather than reaching updateLead's throw and surfacing as a 500.
+    if (updates?.lifecycle !== undefined && updates.lifecycle !== null) {
+      // Trimmed for the check because updateLead trims before storing — validating the
+      // raw value would 400 on "  paying  " while the layer below would have accepted it.
+      // An empty value is the explicit CLEAR, not an invalid stage.
+      const proposedLifecycle = String(updates.lifecycle).trim();
+      if (proposedLifecycle && !isValidLeadLifecycle(proposedLifecycle)) {
+        return res.status(400).json({
+          message: `Invalid lifecycle "${String(updates.lifecycle)}". Expected one of: ${LEAD_LIFECYCLES.join(', ')}.`,
+        });
+      }
+    }
+
     if (updates?.selectedSenderId !== undefined) {
       const normalizedSenderId = normalizeSenderId(updates.selectedSenderId);
       if (normalizedSenderId !== null && typeof normalizedSenderId !== 'string') {
@@ -3252,6 +3291,16 @@ router.post('/lists/:listId/leads/export', async (req: Request, res: Response) =
       }
     }
 
+    // ENG-1388: card revenue is Enigma-licensed internal-use-only data. A CSV
+    // is a file that leaves the system entirely, so a list editor who isn't
+    // Enigma-allowlisted must never get it as a column, regardless of who
+    // originally enriched the lead or how the list is shared.
+    if (shouldHideCardRevenueForViewer(userId)) {
+      for (const key of Array.from(customFieldSet)) {
+        if (isCardRevenueField(key)) customFieldSet.delete(key);
+      }
+    }
+
     const customFields = Array.from(customFieldSet).sort();
     const allColumns = [...standardFields, ...customFields];
 
@@ -3333,7 +3382,19 @@ router.get('/lists/:listId/export-history', async (req: Request, res: Response) 
       return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
-    res.json({ history: list.csvExportHistory || [] });
+    const history = list.csvExportHistory || [];
+    // ENG-1388 (CodeRabbit on agentweb#3108): a past export's fileUrl is a
+    // public S3 link, and export history has no per-entry record of whether
+    // that export included card revenue — the export route only started
+    // excluding it going forward. A non-allowlisted viewer must not be able
+    // to fetch an old export's link through this endpoint just because they
+    // can read the list; fail closed on every entry rather than guess which
+    // ones are safe.
+    const sanitizedHistory = shouldHideCardRevenueForViewer(userId)
+      ? history.map(({ fileUrl, ...rest }: any) => ({ ...rest, fileUrl: null, restricted: true }))
+      : history;
+
+    res.json({ history: sanitizedHistory });
   } catch (error: any) {
     console.error('Error fetching export history:', error);
     res.status(500).json({ message: error.message || 'Failed to fetch export history' });
@@ -6788,6 +6849,12 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
 
     // Separate eligible leads from skipped ones (do-not-contact includes unsubscribed + DNC)
     const skippedDoNotContact = leads.filter((l: any) => isDoNotContact(l)).length;
+    // Counted and reported, not silently dropped. The `l.email &&` below has always
+    // excluded address-less leads, but no bucket accounted for them — so total, sent,
+    // failed and the three skipped* counts did not sum to the list size, and the gap was
+    // invisible. The PREVIEW endpoint already reports noEmailCount; this is the send
+    // endpoint catching up. ENG-2082 turns the gap from a rarity into a routine one.
+    const skippedNoEmail = leads.filter((l: any) => !l.email && !isDoNotContact(l)).length;
     let eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
 
     // ENG-1194: malformed addresses and provider-disallowed test domains (e.g.
@@ -6966,6 +7033,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       skippedMissingVars,
       skippedUndeliverable,
       skippedInvalid,
+      skippedNoEmail,
       skippedDueToLimit,
       skippedLeadIds,
       stoppedEarlyReason,
@@ -7332,9 +7400,15 @@ router.post('/lists/:listId/analyze', async (req: Request, res: Response) => {
         }
       }
       // Put core identity fields first for readability, then remaining fields alphabetically
-      const coreFields = ['leadId', 'email', 'firstName', 'lastName', 'company', 'title', 'status', 'stage'];
+      const coreFields = CRM_ANALYZE_CORE_LEAD_FIELDS;
       const remainingFields = [...leadKeySet].filter(k => !coreFields.includes(k)).sort();
-      const leadHeaders = [...coreFields.filter(k => leadKeySet.has(k)), ...remainingFields];
+      // Core columns are emitted unconditionally, not only when some lead happens to have
+      // them. leadKeySet is a union across the list, so a list where EVERY lead is
+      // phone-only (ENG-2082 makes that a normal shape for a phone-first lander) produced a
+      // CSV with no `email` column at all — while the prompt below promises one, so the
+      // generated pandas code does df['email'] and dies with a KeyError. escapeCell already
+      // renders a missing value as an empty cell, so the column costs nothing when unused.
+      const leadHeaders = [...coreFields, ...remainingFields];
 
       const escapeCell = (v: any): string => {
         if (v === undefined || v === null) return '';
@@ -7399,7 +7473,9 @@ router.post('/lists/:listId/analyze', async (req: Request, res: Response) => {
     const { agentModeService } = await import('../services/agentModeService');
     const result = await agentModeService.performDataAnalysis(
       [leadsUrl, eventsUrl],
-      `You are analyzing CRM data for the lead list "${list.name}".\n\nFile 1 (crm_leads_*.csv): leads with fields leadId, email, firstName, lastName, company, title, status, stage, isICP, engagementCount, createdAt.\nFile 2 (crm_email_events_*.csv): email events with fields eventId, leadEmail, eventType (email.sent, email.delivered, email.opened, email.clicked, email.bounced), emailId, createdAt.\n\nUser instruction: ${instruction}`,
+      // Names the columns the CSV is GUARANTEED to carry, from the same constant the
+      // header is built from, rather than a hardcoded list that drifted away from it.
+      `You are analyzing CRM data for the lead list "${list.name}".\n\nFile 1 (crm_leads_*.csv): leads with at least these fields ${CRM_ANALYZE_CORE_LEAD_FIELDS.join(', ')} (further columns may be present; a blank cell means the lead has no value for it — note that a lead may legitimately have a phone and no email).\nFile 2 (crm_email_events_*.csv): email events with fields eventId, leadEmail, eventType (email.sent, email.delivered, email.opened, email.clicked, email.bounced), emailId, createdAt.\n\nUser instruction: ${instruction}`,
       userId
     );
 

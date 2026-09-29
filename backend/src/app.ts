@@ -26,6 +26,8 @@ import stripeConnectRoutes from "./routes/stripeConnect";
 import brandRoutes from "./routes/brand";
 import marketStrategyRoutes from "./routes/marketStrategy";
 import slackRoutes from "./routes/slack";
+import teamsRoutes from "./routes/teamsMessages";
+import approvalDeskRoutes from "./routes/approvalDesk";
 import metaRoutes from "./routes/meta";
 import metaV2Routes from "./routes/metaV2";
 import blogRoutes from "./routes/blog";
@@ -86,6 +88,7 @@ import adminTrackingMonitorRoutes from "./routes/adminTrackingMonitor";
 import adminRenewalIntegrationHealthRoutes from "./routes/adminRenewalIntegrationHealth";
 import adminPromptTemplatesRoutes from "./routes/adminPromptTemplates";
 import adminScheduleTemplateRoutes from "./routes/adminScheduleTemplateRoutes";
+import adminGoldenSetRoutes from "./routes/adminGoldenSet";
 import supportRoutes from "./routes/support";
 import integrationsRoutes from "./routes/integrations";
 import featurebaseRoutes from "./routes/featurebase";
@@ -110,6 +113,7 @@ import l2DiagnoseRoutes from "./routes/l2Diagnose";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import orgRoutes from "./routes/org";
 import orgMemoryRoutes from "./routes/orgMemory";
+import orgModelRolesRoutes from './routes/orgModelRoles';
 import orgShareSettingsRoutes from "./routes/orgShareSettings";
 import orgMemberRemovalRoutes from "./routes/orgMemberRemoval";
 import testAccountsRoutes from "./routes/testAccounts";
@@ -396,6 +400,11 @@ app.use("/api/html-templates", authenticateToken, htmlTemplatesRoutes);
 app.use("/api/domains", domainRoutes);
 app.use("/api/market-strategy", marketStrategyRoutes);
 app.use("/api/slack", slackRoutes);
+// ENG-272: Teams' Bot Framework endpoint authenticates with a bearer JWT, not an HMAC over the
+// raw bytes, and CloudAdapter reads the parsed body — so this belongs here, after
+// express.json(), and NOT in the raw-body block above with Slack and WhatsApp.
+app.use("/api/teams", teamsRoutes);
+app.use("/api/approval-desk", approvalDeskRoutes);
 app.use("/api/meta", metaRoutes);
 app.use("/api/meta/v2", metaV2Routes);
 app.use("/api/blog", blogRoutes);
@@ -475,6 +484,8 @@ app.use("/api/admin/tracking-monitor", authenticateToken, isAdmin, adminTracking
 app.use("/api/admin/renewal-integration-health", authenticateToken, isAdmin, adminRenewalIntegrationHealthRoutes);
 app.use("/api/admin/prompt-templates", authenticateToken, isAdmin, adminPromptTemplatesRoutes);
 app.use("/api/admin/schedule-templates", authenticateToken, isAdmin, adminScheduleTemplateRoutes);
+// ENG-2135: golden-set labelling (inert until EVAL_GOLDEN_CASES_TABLE is set by OPS-2).
+app.use("/api/admin/eval/golden-cases", authenticateToken, isAdmin, adminGoldenSetRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/integrations", integrationsRoutes);
 app.use("/api/featurebase", featurebaseRoutes);
@@ -532,6 +543,7 @@ app.use("/api/image-reports", imageReportsRoutes);
 app.use("/api/lead-magnet", leadMagnetRoutes);
 app.use("/api/org", orgRoutes);
 app.use("/api/org", orgMemoryRoutes);
+app.use("/api/orgs/me/model-roles", authenticateToken, orgModelRolesRoutes);
 app.use("/api/orgs/me/share-settings", authenticateToken, orgShareSettingsRoutes);
 app.use("/api/orgs/me/members", authenticateToken, orgMemberRemovalRoutes);
 app.use("/api/characters", charactersRoutes);

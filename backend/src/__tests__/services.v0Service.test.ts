@@ -99,10 +99,24 @@ jest.mock("axios", () => ({
   patch: (...args: any[]) => mockAxiosPatch(...args),
 }));
 
-// Mock uuid
+// Mock uuid.
+//
+// This used to return one constant for every call, which quietly defeated the id-scoped
+// smoke-test assertions further down: filtering the mock calls by `result.id` excluded
+// nothing when every page in the file carried the same id, so those assertions were
+// exactly as load-sensitive as the bare toHaveBeenCalledTimes(1) they replaced.
+//
+// Every call is unique. The four tests that used to assert the literal
+// `"test-uuid-1234"` now assert MINTED_ID instead — what they were really checking is
+// that a FRESH id was minted rather than an existing record's id being recycled, and the
+// regex says that without pinning a particular value.
+let uuidCounter = 0;
 jest.mock("uuid", () => ({
-  v4: () => "test-uuid-1234",
+  v4: () => `test-uuid-${++uuidCounter}`,
 }));
+
+/** A freshly minted id, as opposed to one recycled from an existing record. */
+const MINTED_ID = /^test-uuid-\d+$/;
 
 // Mock settingsService
 const mockGetSetting = jest.fn().mockResolvedValue(null);
@@ -117,6 +131,12 @@ jest.mock("../services/autoHumanEvalService", () => ({
 const mockRunGenerationSmokeTest = jest.fn().mockResolvedValue(undefined);
 jest.mock("../services/landingPageSmokeTest", () => ({
   runGenerationSmokeTest: (...args: any[]) => mockRunGenerationSmokeTest(...args),
+}));
+// ENG-2193: dispatched fire-and-forget alongside the smoke test above — mocked the same way so
+// these tests never make a real PageSpeed Insights / Secrets Manager call.
+const mockRunLandingPagePageSpeedCheck = jest.fn().mockResolvedValue({ ok: false, checkedAt: "2026-01-01T00:00:00.000Z", error: "mocked" });
+jest.mock("../services/landingPagePageSpeedCheck", () => ({
+  runLandingPagePageSpeedCheck: (url: string | undefined) => mockRunLandingPagePageSpeedCheck(url),
 }));
 
 // Mock fs for filesystem fallback tests
@@ -186,6 +206,12 @@ import {
   LandingPageNotDeployableError,
   findUnparseableModule,
   setCaptureRouteGateConfig,
+  validatePixelLeadEvent,
+  validateBridgeOutRedirect,
+  captureRouteGateMaxMs,
+  buildLandingPageMiddleware,
+  hasLeadCaptureForm,
+  validateGoogleAdsConversion,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord, getVercelBuildErrors, isNonErrorBuildLine } from "../services/v0Service";
@@ -798,7 +824,7 @@ describe("v0Service - generateLandingPage", () => {
       expect.objectContaining({ responseMode: "async" })
     );
     expect(result.userId).toBe("user-1");
-    expect(result.id).toBe("test-uuid-1234");
+    expect(result.id).toMatch(MINTED_ID);
   });
 
   it("SUCCESS: no brand → still generates", async () => {
@@ -812,7 +838,7 @@ describe("v0Service - generateLandingPage", () => {
     );
 
     expect(mockChatsCreate).toHaveBeenCalledTimes(1);
-    expect(result.id).toBe("test-uuid-1234");
+    expect(result.id).toMatch(MINTED_ID);
   });
 
   describe("ENG-1141: metaPixelOverride at chat-creation time", () => {
@@ -920,7 +946,7 @@ describe("v0Service - generateLandingPage", () => {
 
       const result = await generateLandingPage("user-1", "Create page", "Resolver threw", {});
 
-      expect(result.id).toBe("test-uuid-1234");
+      expect(result.id).toMatch(MINTED_ID);
       expect(result.metaPixelId).toBeUndefined();
       resolveSpy.mockRestore();
     });
@@ -990,7 +1016,7 @@ describe("v0Service - generateLandingPage", () => {
     const result = await generateLandingPage("user-1", "Retry page", "Retry", {});
 
     // New uuid is minted — the chat-bearing failed record is left alone.
-    expect(result.id).toBe("test-uuid-1234");
+    expect(result.id).toMatch(MINTED_ID);
   });
 
   it("SUCCESS: recycles the newest orphan AND archives the older orphan backlog", async () => {
@@ -1977,6 +2003,11 @@ describe("v0Service - deployLandingPage", () => {
     expect(mockRunGenerationSmokeTest).toHaveBeenCalledWith(
       expect.objectContaining({ id: "page-1", status: "deployed" })
     );
+    // ENG-2193: dispatched alongside the smoke test, same fire-and-forget contract. Asserted
+    // against this run's own `result.deployedUrl` (not a hardcoded literal) — the domain the
+    // mocked healing call resolves to is shared mutable module state across this file's many
+    // tests and isn't this test's concern.
+    expect(mockRunLandingPagePageSpeedCheck).toHaveBeenCalledWith(result.deployedUrl);
   });
 
   it("FAIL: chats.downloadVersion throws → throws deployment error", async () => {
@@ -5550,7 +5581,137 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       });
       await new Promise((r) => setImmediate(r));
 
-      expect(mockRunGenerationSmokeTest).toHaveBeenCalledTimes(1);
+      // Scoped to THIS page — see the note on the sibling assertion below: the mock is
+      // module-scoped and a deferred dispatch from another test can otherwise inflate it.
+      const callsForThisPage = (mockRunGenerationSmokeTest as jest.Mock).mock.calls
+        .filter((c: any[]) => c[0]?.id === result.id);
+      expect(callsForThisPage).toHaveLength(1);
+    });
+
+    it("a SUCCESSFUL sync build releases the gate immediately, with no settle wait", async () => {
+      // The settle window exists only for outcomes that do NOT prove the route is live.
+      // pollVercelDeployment returns success | error | timeout — never "ready" — so a
+      // comparison against "ready" is always true and makes every build, including the
+      // clean ones, pay the settle. With settleMs well above a microtask here, the smoke
+      // test must already have run by the next tick; if the settle fires, it has not.
+      setCaptureRouteGateConfig(60_000, 5_000);
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Items: [existingSiteRecord] }),
+      });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+
+      // The sync commit's own build, READY for our exact commit — the proof-of-live case.
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          deployments: [
+            { uid: "dpl_sync", readyState: "READY", meta: { githubCommitSha: "sync_commit_sha" } },
+          ],
+        },
+      });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create pricing page with a lead form",
+        "Pricing",
+        {},
+        "list_pricing"
+      );
+
+      expect(result.status).toBe("deployed");
+      await new Promise((r) => setImmediate(r));
+      // Scoped to THIS page — see the note on the sibling assertion below: the mock is
+      // module-scoped and a deferred dispatch from another test can otherwise inflate it.
+      const callsForThisPage = (mockRunGenerationSmokeTest as jest.Mock).mock.calls
+        .filter((c: any[]) => c[0]?.id === result.id);
+      expect(callsForThisPage).toHaveLength(1);
+    });
+
+    it("an 'up-to-date' sync does NOT prove the route is deployed, so the gate still settles", async () => {
+      // The concurrent sub-page add this gate exists for: a sibling committed the identical
+      // LIST_BY_PATH moments earlier, so our sync finds nothing to do and returns
+      // { committed: false, reason: "up-to-date" }. That proves the map is in the REPO, not
+      // that it is DEPLOYED — the sibling's build is typically still running. "up-to-date"
+      // matched neither branch of the if/else, so the gate stayed Promise.resolve() and the
+      // smoke test fired against a route that did not yet carry this page's path.
+      // 20ms, not seconds: the assertion only needs the settle to outlast a microtask, and a
+      // multi-second timer here outlives the test — leaving runGenerationSmokeTest chained
+      // behind it to fire inside whichever test is running when it lands. mockRunGenerationSmokeTest
+      // is module-scoped and clearAllMocks() clears calls, not pending work.
+      setCaptureRouteGateConfig(60_000, 20);
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Items: [existingSiteRecord] }),
+      });
+
+      // All four reads match what the sync would write, so it no-ops. The capture route is
+      // deliberately present-but-unparseable, which satisfies captureRouteUpToDate via the
+      // `captureRouteUnreadable` arm and also sets captureRouteSkipped.
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from(buildLandingPageMiddleware()).toString("base64") },
+      });
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          content: Buffer.from(
+            "const LIST_BY_PATH: Record<string, string> = /* corrupted by hand"
+          ).toString("base64"),
+        },
+      });
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from("{}").toString("base64") },
+      });
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from(buildTrackingHelper()).toString("base64") },
+      });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create pricing page with a lead form",
+        "Pricing",
+        {},
+        "list_pricing"
+      );
+
+      expect(result.status).toBe("deployed");
+      // Nothing was committed, so there is no build to poll — but the settle must still run.
+      await new Promise((r) => setImmediate(r));
+      expect(mockRunGenerationSmokeTest).not.toHaveBeenCalled();
+
+      // Then WAIT IT OUT. The 20ms settle above is the whole point of the test, but leaving
+      // it in flight made this test the polluter its own comment describes: the dispatch
+      // landed inside whichever test was running 20ms later, and clearAllMocks() clears
+      // recorded calls, not pending timers. Draining here both removes the leak and turns
+      // the settle from an unobserved side effect into the assertion it should always have
+      // been — the gate must resolve, not hang.
+      await new Promise((r) => setTimeout(r, 80));
+      expect(mockRunGenerationSmokeTest).toHaveBeenCalledWith(
+        expect.objectContaining({ id: result.id, status: "deployed" }),
+      );
+    });
+
+    it("the gate cap is derived from the poll's real budget, not a frozen literal", () => {
+      // A literal exactly equal to vercelPollMaxAttempts * vercelPollIntervalMs is always
+      // slightly short of the poll's real wall clock (it does an axios round trip per
+      // attempt), which made the settle on the timeout branch unreachable — the cap always
+      // won that race. Deriving it also means setVercelPollConfig cannot silently falsify it.
+      // The settle is NOT part of this — it runs after the race, not inside it, so the cap
+      // budgeting for it would just delay the poll's own deadline by 45s for nothing.
+      setCaptureRouteGateConfig(null, 1_000);
+      setVercelPollConfig(5_000, 60);
+      expect(captureRouteGateMaxMs()).toBe(60 * 5_000 + 60_000);
+
+      setVercelPollConfig(1_000, 10);
+      expect(captureRouteGateMaxMs()).toBe(10 * 1_000 + 60_000);
     });
 
     it("ENG-449: a capture-route sync that never commits does not strand the smoke test", async () => {
@@ -5577,7 +5738,13 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
 
       expect(result.status).toBe("deployed");
       await new Promise((r) => setImmediate(r));
-      expect(mockRunGenerationSmokeTest).toHaveBeenCalledTimes(1);
+      // Counted for THIS page, not globally. A bare toHaveBeenCalledTimes(1) made the test
+      // load-sensitive: mockRunGenerationSmokeTest is module-scoped and a sibling test's
+      // deferred dispatch could land inside this one, so it passed alone and failed at
+      // --maxWorkers=4. Scoping by id also asserts the dispatch was for the right page.
+      const callsForThisPage = (mockRunGenerationSmokeTest as jest.Mock).mock.calls
+        .filter((c: any[]) => c[0]?.id === result.id);
+      expect(callsForThisPage).toHaveLength(1);
     });
 
     it("SUCCESS: new sub-page has no leadListId → sync still commits siblings, new page's own path stays absent", async () => {
@@ -6549,6 +6716,91 @@ export default function SyntheticV0PageForDeployment() {
   });
 });
 
+describe("the enhancement validators must read the same files the ENG-2080 gate does", () => {
+  const f = (path: string, src: string) => [{ path, content: Buffer.from(src) }];
+
+  it("validatePixelLeadEvent sees a form emitted as .jsx", () => {
+    // hasLeadCaptureForm was widened to .jsx/.js. Leaving these three narrow is worse than
+    // leaving both narrow: the gate opens on a page whose form the validator cannot read, so
+    // it fires a BILLED correction asking v0 to add tracking that is already present, and
+    // re-fails identically every retry.
+    expect(
+      validatePixelLeadEvent(
+        f("components/lead-form.jsx", `fbq('track', 'Lead', {}, { eventID: id });`)
+      ).ok
+    ).toBe(true);
+  });
+
+  it("a .js config file must NOT satisfy any of them", () => {
+    // These checks grep the JOINED source of every file they accept, so including `.js`
+    // meant a file that merely MENTIONS the pattern satisfied them. Both of these were
+    // observed true against the deployed build before `.js` was excluded: a missing pixel
+    // read as present, and a form-less page read as having a capture form — which
+    // re-enables the very correction rounds ENG-2080 removed. v0 emits page components as
+    // .tsx/.jsx; `.js` in a generated zip is configuration, not the form.
+    const nextConfig = f(
+      "next.config.js",
+      "module.exports = { /* fbq('track','Lead') mentioned in a comment */ };"
+    );
+    expect(validatePixelLeadEvent(nextConfig).ok).toBe(false);
+
+    const serviceWorker = f("public/sw.js", `self.addEventListener('fetch', e => { /* "/api/capture" */ });`);
+    expect(hasLeadCaptureForm(serviceWorker)).toBe(false);
+
+    const adsConfig = f("tailwind.config.js", "module.exports = { /* gtag('event','conversion') */ };");
+    expect(validateGoogleAdsConversion(adsConfig).ok).toBe(false);
+  });
+
+  it("a real .js page source is still read — the exclusion is by path, not extension", () => {
+    // Excluding `.js` wholesale also blinded these to app/page.js, which MODULE_EXTENSIONS
+    // and detectIncompleteSyntheticPage both treat as a real page shape and which survives
+    // remapFilesForSubPage. Naming the non-source paths keeps the config false positives out
+    // without reopening that blind spot.
+    const page = f(
+      "app/page.js",
+      `export default function P(){
+         const submit = async () => {
+           await fetch("/api/capture", { method: "POST" });
+           fbq('track','Lead',{},{eventID:id});
+         };
+         return <form onSubmit={submit}><input type="email" name="email"/></form>; }`
+    );
+    expect(hasLeadCaptureForm(page)).toBe(true);
+    expect(validatePixelLeadEvent(page).ok).toBe(true);
+    expect(validateCaptureFormHasContactField(page).ok).toBe(true);
+  });
+
+  it("the exclusion is *.config.*, not a list of six names", () => {
+    // The first version named next/tailwind/postcss/eslint/vite/jest. v0 also emits sanity,
+    // contentlayer and playwright configs, and a name list silently readmits each new one —
+    // the same false positive, one release later.
+    // next.config.mjs is deliberately NOT in this list: .mjs fails the extension gate before
+    // either config regex is consulted, so it would pass identically under the old six-name
+    // rule — a decoration, not an assertion.
+    for (const path of ["sanity.config.js", "contentlayer.config.js", "playwright.config.ts", "foo/bar.config.jsx"]) {
+      expect(hasLeadCaptureForm(f(path, `module.exports = { proxy: "/api/capture" };`))).toBe(false);
+    }
+    // A file merely NAMED config.js is page source, not configuration.
+    expect(hasLeadCaptureForm(f("app/config.js", `fetch("/api/capture")`))).toBe(true);
+  });
+
+  it("a service worker is not page source wherever it is emitted", () => {
+    // `public/` is the conventional home and is start-anchored, so a worker at the repo root
+    // or under a sub-app slipped through the path check.
+    for (const path of ["sw.js", "service-worker.js", "my-app/public/sw.js", "sw.jsx", "app/service-worker.tsx"]) {
+      expect(hasLeadCaptureForm(f(path, `self.addEventListener('fetch', e => { /* "/api/capture" */ });`))).toBe(false);
+    }
+  });
+
+  it("validateBridgeOutRedirect sees a redirect emitted as .jsx", () => {
+    expect(
+      validateBridgeOutRedirect(
+        f("components/lead-form.jsx", 'window.location.href = `https://x.test/book?email=${encodeURIComponent(e)}`;'),
+        "https://x.test/book"
+      ).ok
+    ).toBe(true);
+  });
+});
 
 describe('getPreviewDeploymentUrl commit matching', () => {
   beforeEach(() => { mockAxiosGet.mockReset(); mockAxiosPatch.mockReset(); mockAxiosPost.mockReset(); });

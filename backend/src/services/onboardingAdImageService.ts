@@ -62,6 +62,9 @@ import {
 import type { BrandLogoProbeDeps } from "./agentMode/brandLogo";
 import type { ICPPersona } from "./icpStatusService";
 import type { CreativeDirResult } from "./creativeDirStatusService";
+import type { CreativeGateResult } from "./creativeGates";
+import { recordGeneratedCreative } from "./creativeLineage";
+import type { PlacementId } from "./creativePlacementSpecs";
 import {
   ARCHETYPES,
   AESTHETIC_RULES,
@@ -76,6 +79,12 @@ const AD_IMAGE_VARIANT_COUNT = 3;
 
 /** 60% of variants are square (1080x1080), 40% vertical (1080x1350). */
 type AdImageFormat = "1080x1080" | "1080x1350";
+
+/** The Meta placement each onboarding format is generated for; the creative gates check against it (ENG-2187). */
+const FORMAT_PLACEMENT: Readonly<Record<AdImageFormat, PlacementId>> = {
+  "1080x1080": "meta_feed_square",
+  "1080x1350": "meta_feed_portrait",
+};
 
 /** Hard per-variant timeout. Beyond this we patch with placeholder. */
 const PER_VARIANT_TIMEOUT_MS = 180_000;
@@ -111,7 +120,9 @@ export interface AdImageBrandContext extends IcpBrandContext {
  *   aws dynamodb get-item --table-name AW-WorkPlans --region us-west-2 \
  *     --key '{"planId":{"S":"plan_1768351741814_jgc2wwlxa"}}'
  *
- * The descriptive content is unchanged. We treat this as the SYSTEM PROMPT
+ * The descriptive content is unchanged except one label: the plan called
+ * 1080x1350 "Story/Reel", but that is Meta's 4:5 feed portrait — Story/Reel
+ * is 9:16 1080x1920 (ENG-421 audit, fixed in ENG-2139). We treat this as the SYSTEM PROMPT
  * for prompt-construction guidance — every per-variant user prompt that we
  * pass to Gemini is built to match this 6-layer schema.
  */
@@ -134,7 +145,7 @@ export const AD_IMAGE_SYSTEM_PROMPT = [
   "  Common formats:",
   "  Only consider formats in these the two porportions with the following frequency 60%/40%:",
   "  - 1080x1080px (Meta Feed — square)",
-  "  - 1080 x 1350px (Story/Reel — vertical)",
+  "  - 1080 x 1350px (Meta Feed — portrait 4:5)",
   "LAYER 2: BACKGROUND / SETTING",
   '  "SETTING: [Ultra-specific scene description]"',
   "  Include:",
@@ -237,6 +248,16 @@ const DEFAULT_AESTHETIC: Aesthetic = "minimal-typographic";
  * "Your checkout is leaking revenue right now — every declined card,
  * every abandoned cart, every manual payout..." rendered onto the image.
  */
+/**
+ * The 4:5 layout block is stored under the historical key `storyLayout` (seeded into
+ * AW-PromptTemplates, so the key stays) and older rows label it "Story 4:5:". 1080x1350 is Meta's
+ * 4:5 feed portrait, not a Story (9:16), so relabel the block before it reaches the model
+ * (ENG-2139). Covers stored rows without a template edit.
+ */
+export function portraitFeedLayout(layout: string): string {
+  return layout.replace(/^Story 4:5:/gm, "Feed portrait 4:5:");
+}
+
 export function buildSixLayerPromptForVariant(
   inputs: SixLayerPromptInputs,
   /**
@@ -286,7 +307,7 @@ export function buildSixLayerPromptForVariant(
   const personaPain = persona?.pain || "";
 
   const isFeed = format === "1080x1080";
-  const layoutBlock = isFeed ? archetype.feedLayout : archetype.storyLayout;
+  const layoutBlock = isFeed ? archetype.feedLayout : portraitFeedLayout(archetype.storyLayout);
 
   const lines: string[] = [];
 
@@ -302,7 +323,7 @@ export function buildSixLayerPromptForVariant(
   lines.push(
     isFeed
       ? `Create a photorealistic square Meta Feed ad — 1080x1080px. Aspect ratio 1:1.`
-      : `Create a photorealistic portrait Story/Reel Meta ad — 1080x1350px. Aspect ratio 4:5.`,
+      : `Create a photorealistic portrait Meta Feed ad — 1080x1350px. Aspect ratio 4:5.`,
   );
   lines.push(``);
 
@@ -450,6 +471,8 @@ export interface AdImageGeneratorDep {
     userId: string;
     size?: string;
     imageModel?: string;
+    /** Ad placement the variant is for, so the creative gates check its size limits (ENG-2187). */
+    placement?: PlacementId;
     /**
      * URL of the brand logo to condition the generation on. When provided,
      * `imageService.generateImage` adds the logo as a real image input
@@ -465,6 +488,7 @@ export interface AdImageGeneratorDep {
     imageUrl?: string;
     filename?: string;
     error?: string;
+    gates?: CreativeGateResult;
   }>;
 }
 
@@ -481,7 +505,7 @@ async function generateWithTimeout(
   format: AdImageFormat,
   timeoutMs: number,
   logoUrl?: string
-): Promise<{ success: boolean; imageUrl?: string; error?: string }> {
+): Promise<{ success: boolean; imageUrl?: string; error?: string; gates?: CreativeGateResult }> {
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
@@ -490,6 +514,7 @@ async function generateWithTimeout(
         filename,
         userId,
         size: format,
+        placement: FORMAT_PLACEMENT[format],
         imageModel: DEFAULT_IMAGE_MODEL,
         ...(logoUrl ? { logoImage: logoUrl } : {}),
       }),
@@ -682,12 +707,24 @@ export async function generateAdImagesForUser(
         promptVersion: `${PROMPT_BUILDER_VERSION}/${t.promptVersion}`,
         archetype: t.archetype,
         concept: t.concept,
+        ...(r.success && r.gates ? { gates: r.gates } : {}),
       };
       if (!r.success) {
         // eslint-disable-next-line no-console
         console.warn(
           `[onboardingAdImageService] variant ${t.index + 1} failed: ${r.error}`
         );
+      } else if (r.imageUrl) {
+        // ENG-2194: a lineage record, so a later publish of this variant (agent mode or the
+        // create-ad dialog) links it to its ad. Inert unless enabled; never throws.
+        void recordGeneratedCreative({
+          userId,
+          artifactUrl: r.imageUrl,
+          category: "ad",
+          prompt: t.prompt,
+          generatorModel: DEFAULT_IMAGE_MODEL,
+          gates: r.gates,
+        });
       }
       return variant;
     })
@@ -1180,6 +1217,20 @@ export async function triggerAdImageGenerationForUser(
     await userDb.updateUser(userId, finalPatch, {
       condition: axisOwnershipCondition(readAxisIdentity(current)),
     });
+    // ENG-2192: advisory rubric verdicts on the stored variants (inert unless
+    // CREATIVE_RUBRIC_JUDGE_ENABLED + sample rate). Not awaited; never throws.
+    const { adImageCompletedAt, adImageResult } = patch;
+    if (adImageCompletedAt && adImageResult) {
+      const previous = {
+        completedAt: typeof u.adImageCompletedAt === "string" ? u.adImageCompletedAt : undefined,
+        variants: Array.isArray(u.adImageResult?.variants) ? (u.adImageResult.variants as AdImageVariant[]) : [],
+      };
+      void import("./creativeRubricOnboarding")
+        .then((m) =>
+          m.judgeOnboardingAdImages({ userId, completedAt: adImageCompletedAt, variants: adImageResult.variants, previous })
+        )
+        .catch(() => undefined);
+    }
   } catch (err) {
     if (!isConditionalCheckFailure(err)) throw err;
     // eslint-disable-next-line no-console

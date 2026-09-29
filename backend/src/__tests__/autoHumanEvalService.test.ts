@@ -13,15 +13,30 @@ jest.mock('../services/settingsService', () => ({
   },
 }));
 
+jest.mock('../services/creativeRubricJudgeRuntime', () => ({
+  judgeHumanEvalCandidate: jest.fn(),
+}));
+
+jest.mock('../services/creativeContentCheckRunner', () => ({
+  runContentChecksForCandidate: jest.fn(),
+}));
+
 import { enqueueAutoHumanEval, claimArtifactForHumanEval, releaseArtifactClaim } from '../services/autoHumanEvalService';
 import { humanEvalService } from '../services/humanEvalService';
 import { settingsService } from '../services/settingsService';
+import { evaluateCreativeGates } from '../services/creativeGates';
+import { judgeHumanEvalCandidate } from '../services/creativeRubricJudgeRuntime';
+import { runContentChecksForCandidate } from '../services/creativeContentCheckRunner';
 
 const mockCreateCandidate = humanEvalService.createCandidate as jest.Mock;
 const mockGetSetting = settingsService.getSetting as jest.Mock;
 const mockSetSetting = settingsService.setSetting as jest.Mock;
 const mockClaimSetMember = settingsService.claimSetMember as jest.Mock;
 const mockReleaseSetMember = settingsService.releaseSetMember as jest.Mock;
+const mockJudgeCandidate = jest.mocked(judgeHumanEvalCandidate);
+const mockRunContentChecks = jest.mocked(runContentChecksForCandidate);
+
+const ORIGINAL_CONTENT_CHECKS_FLAG = process.env.CREATIVE_CONTENT_CHECKS_ENABLED;
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -34,6 +49,12 @@ beforeEach(() => {
   mockSetSetting.mockResolvedValue(undefined);
   mockClaimSetMember.mockResolvedValue(true);
   mockReleaseSetMember.mockResolvedValue(undefined);
+  mockJudgeCandidate.mockResolvedValue(null);
+  mockRunContentChecks.mockResolvedValue(undefined);
+});
+
+afterAll(() => {
+  process.env.CREATIVE_CONTENT_CHECKS_ENABLED = ORIGINAL_CONTENT_CHECKS_FLAG;
 });
 
 describe('enqueueAutoHumanEval', () => {
@@ -103,6 +124,22 @@ describe('enqueueAutoHumanEval', () => {
       reviewType: 'creative_image',
       category: 'ad',
     }));
+  });
+
+  it('passes the generation-time creative gate result through to createCandidate (ENG-2139)', async () => {
+    const creativeGates = evaluateCreativeGates(
+      { bytes: 2048, decoded: true, width: 1080, height: 1350, format: 'png', luminanceStdDev: 30 },
+      { requestedSize: '1080x1350' },
+    );
+
+    await enqueueAutoHumanEval({
+      reviewType: 'creative_image',
+      outputSummary: 'Ad image generated.',
+      sourceKey: 'image:session-3:ad.png',
+      creativeGates,
+    });
+
+    expect(mockCreateCandidate).toHaveBeenCalledWith(expect.objectContaining({ creativeGates }));
   });
 
   it('omits category when the enqueueing flow is ambiguous', async () => {
@@ -191,6 +228,146 @@ describe('enqueueAutoHumanEval', () => {
 
     expect(result?.candidateId).toBe('candidate-1');
     expect(mockReleaseSetMember).not.toHaveBeenCalled();
+  });
+
+  describe('creative rubric judge hook (ENG-2140)', () => {
+    const creativeGates = evaluateCreativeGates(
+      { bytes: 2048, decoded: true, width: 1080, height: 1350, format: 'png', luminanceStdDev: 30 },
+      { requestedSize: '1080x1350' },
+    );
+    const imageInput = {
+      reviewType: 'creative_image' as const,
+      userId: 'user-1',
+      category: 'ad',
+      artifactUrl: 'https://example.com/ad.png',
+      outputSummary: 'Ad image generated.',
+      sourceKey: 'image:session-4:ad.png',
+      creativeGates,
+      creativeBrief: { generationRequest: 'A 4:5 demo ad' },
+    };
+
+    it('hands a stored image candidate, its gates and brief to the judge hook', async () => {
+      await enqueueAutoHumanEval(imageInput);
+
+      expect(mockJudgeCandidate).toHaveBeenCalledWith({
+        candidateId: 'candidate-1',
+        userId: 'user-1',
+        reviewType: 'creative_image',
+        category: 'ad',
+        artifactUrl: 'https://example.com/ad.png',
+        creativeGates,
+        brief: { generationRequest: 'A 4:5 demo ad' },
+      });
+    });
+
+    it('passes the stored candidate\'s createdAt, for the prior-best lookup (ENG-2192)', async () => {
+      mockCreateCandidate.mockResolvedValueOnce({ candidateId: 'candidate-1', reviewType: 'creative_image', createdAt: '2026-09-28T10:00:00.000Z' });
+
+      await enqueueAutoHumanEval(imageInput);
+
+      expect(mockJudgeCandidate).toHaveBeenCalledWith(expect.objectContaining({ createdAt: '2026-09-28T10:00:00.000Z' }));
+    });
+
+    it('hands a landing page and its lazy source loader to the judge hook (ENG-2192)', async () => {
+      const loadLandingPageSource = jest.fn(async () => 'source');
+      await enqueueAutoHumanEval({
+        reviewType: 'landing_page',
+        userId: 'user-1',
+        artifactUrl: 'https://acme.example.com',
+        outputSummary: 'LP generated',
+        sourceKey: 'landing-page:p1',
+        creativeBrief: { generationRequest: 'Demo page' },
+        loadLandingPageSource,
+      });
+
+      expect(mockJudgeCandidate).toHaveBeenCalledWith(
+        expect.objectContaining({ reviewType: 'landing_page', artifactUrl: 'https://acme.example.com', loadLandingPageSource }),
+      );
+      expect(loadLandingPageSource).not.toHaveBeenCalled();
+    });
+
+    it('does not call the hook for lead enrichment or when no candidate was created', async () => {
+      await enqueueAutoHumanEval({ reviewType: 'lead_enrichment', outputSummary: 'Enriched', sourceKey: 'enrich:run-1' });
+      mockCreateCandidate.mockRejectedValueOnce(new Error('dynamo down'));
+      await enqueueAutoHumanEval({ ...imageInput, sourceKey: 'image:session-4:other.png' });
+
+      expect(mockJudgeCandidate).not.toHaveBeenCalled();
+    });
+
+    it('neither waits on nor fails because of the judge', async () => {
+      mockJudgeCandidate.mockReturnValueOnce(new Promise(() => undefined));
+      await expect(enqueueAutoHumanEval(imageInput)).resolves.toMatchObject({ candidateId: 'candidate-1' });
+
+      mockJudgeCandidate.mockRejectedValueOnce(new Error('judge exploded'));
+      const result = await enqueueAutoHumanEval({ ...imageInput, sourceKey: 'image:session-4:second.png' });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(result?.candidateId).toBe('candidate-1');
+      expect(mockReleaseSetMember).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe('content checks hook (ENG-2193)', () => {
+  const imageInput = {
+    reviewType: 'creative_image' as const,
+    userId: 'user-1',
+    category: 'ad',
+    artifactUrl: 'https://example.com/ad.png',
+    outputSummary: 'Ad image generated.',
+    sourceKey: 'image:session-5:ad.png',
+    adCopyText: 'Shop the sale',
+  };
+
+  afterEach(() => {
+    delete process.env.CREATIVE_CONTENT_CHECKS_ENABLED;
+  });
+
+  it('dispatches the content-checks runner for a stored image candidate when the flag is on', async () => {
+    process.env.CREATIVE_CONTENT_CHECKS_ENABLED = 'true';
+
+    await enqueueAutoHumanEval(imageInput);
+
+    expect(mockRunContentChecks).toHaveBeenCalledWith({
+      candidateId: 'candidate-1',
+      artifactUrl: 'https://example.com/ad.png',
+      userId: 'user-1',
+      adCopyText: 'Shop the sale',
+    });
+  });
+
+  it('does not dispatch when the flag is off (default)', async () => {
+    delete process.env.CREATIVE_CONTENT_CHECKS_ENABLED;
+    await enqueueAutoHumanEval(imageInput);
+    expect(mockRunContentChecks).not.toHaveBeenCalled();
+  });
+
+  it('does not dispatch for landing pages, even with the flag on (images only for now)', async () => {
+    process.env.CREATIVE_CONTENT_CHECKS_ENABLED = 'true';
+    await enqueueAutoHumanEval({
+      reviewType: 'landing_page',
+      artifactUrl: 'https://acme.example.com',
+      outputSummary: 'LP generated',
+      sourceKey: 'landing-page:p2',
+    });
+    expect(mockRunContentChecks).not.toHaveBeenCalled();
+  });
+
+  it('does not dispatch when no candidate was created', async () => {
+    process.env.CREATIVE_CONTENT_CHECKS_ENABLED = 'true';
+    mockCreateCandidate.mockRejectedValueOnce(new Error('dynamo down'));
+    await enqueueAutoHumanEval({ ...imageInput, sourceKey: 'image:session-5:other.png' });
+    expect(mockRunContentChecks).not.toHaveBeenCalled();
+  });
+
+  it('neither waits on nor fails because of the content-checks runner', async () => {
+    process.env.CREATIVE_CONTENT_CHECKS_ENABLED = 'true';
+    mockRunContentChecks.mockRejectedValueOnce(new Error('runner exploded'));
+
+    const result = await enqueueAutoHumanEval(imageInput);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(result?.candidateId).toBe('candidate-1');
   });
 });
 

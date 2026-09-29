@@ -21,7 +21,9 @@
  */
 import { chromium } from "playwright";
 import { findChromeExecutable, PUPPETEER_LAUNCH_ARGS } from "../utils/browserUtils";
-import { buildSmokeTestEmail, buildSmokeTestPhone, isSmokeTestLead, phoneDigits } from "../utils/smokeTestLead";
+import { buildSmokeTestEmail, buildSmokeTestPhone, buildSmokeTestUtm, isSmokeTestLead, phoneDigits,
+  phoneLeadId,
+} from "../utils/smokeTestLead";
 import { crmDb } from "./db";
 import { sendLandingPageSmokeTestAlert } from "./slackService";
 import { updateLandingPageSmokeTestResult, GeneratedLandingPage } from "./v0Service";
@@ -93,6 +95,11 @@ const SWEEP_MAX_DELETES = 20;
 // predates B's start and carries the marker) and delete it out from under A's poll —
 // turning a passing page into a false FAIL. Leave anything recent alone; a genuinely
 // stranded row is minutes old by the next deploy, never seconds.
+/** Pages of 100 the phone fallback walks before giving up for this attempt — the same
+ *  shape sweepStrandedSmokeLeads uses, and bounded for the same reason: this runs on a
+ *  paying customer's list, up to pollMaxAttempts times. */
+const POLL_SCAN_MAX_PAGES = 3;
+
 const SWEEP_MIN_AGE_MS = 2 * 60 * 1000;
 /**
  * Delete synthetic leads that a PREVIOUS run stranded in this list.
@@ -149,24 +156,140 @@ async function sweepStrandedSmokeLeads(listId: string, beforeIso: string): Promi
   return deleted;
 }
 
+/**
+ * Pick a synthetic phone whose deterministic lead id is FREE in this list, and say whether
+ * we managed to prove it.
+ *
+ * buildSmokeTestPhone draws from 100 values (the NANP reserved fictional block), and
+ * sweepStrandedSmokeLeads deliberately spares rows younger than SWEEP_MIN_AGE_MS — so
+ * roughly 1 run in 100 starts with a stranded row sitting under the exact id it is about to
+ * use. Without this claim the poll cannot distinguish that row from its own: it would report
+ * a PASS over a capture pipeline that filed nothing, and then delete the only evidence the
+ * previous run failed. A false pass is the expensive direction; the whole gate exists to
+ * avoid one.
+ *
+ * `claimed: false` means we did NOT prove the id free — the list was unreadable, the number
+ * produced no id, or every draw was taken. The caller then keeps the stricter freshness rule
+ * rather than trusting the id.
+ */
+async function claimSmokeTestPhone(listId: string): Promise<{ phone: string; claimed: boolean }> {
+  const probed = new Set<string>();
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const candidate = buildSmokeTestPhone();
+    const id = phoneLeadId(candidate);
+    if (!id) return { phone: candidate, claimed: false };
+    probed.add(candidate);
+    try {
+      const occupied = await crmDb.getLeadById(listId, id, { consistentRead: true });
+      if (!occupied) return { phone: candidate, claimed: true };
+    } catch (err: any) {
+      console.warn(
+        `[smokeTest] could not check whether ${id} is free in list ${listId}: ${err?.message || err}`
+      );
+      return { phone: candidate, claimed: false };
+    }
+  }
+  // Eight consecutive draws all landed on occupied ids. Return one we have NOT proven
+  // occupied: re-submitting a known-collided number guarantees webhooks.ts adopts the
+  // existing row without rewriting createdAt, so the freshness rule in the poll can never
+  // match and the run is a CERTAIN false FAIL that strands yet another row.
+  //
+  // This improves the odds, it does not fix them, and the arithmetic is worth stating
+  // because the obvious reading is far too optimistic: 8 hits in a row out of a 100-value
+  // block is strong evidence the block is nearly full (uniform prior → Beta(9,1), so ~90%
+  // occupancy), not that we were unlucky. Expect this run to fail too. The actual remedy is
+  // the sweep catching up — which is what the warning below is for, and why it names the
+  // list. Unclaimed either way, so the poll stays strict.
+  let fallback = buildSmokeTestPhone();
+  for (let attempt = 0; attempt < 8 && probed.has(fallback); attempt++) {
+    fallback = buildSmokeTestPhone();
+  }
+  console.warn(
+    `[smokeTest] every synthetic phone id is already occupied in list ${listId} — the sweep is not keeping up`
+  );
+  return { phone: fallback, claimed: false };
+}
+
 async function pollForLeadByPhone(
   listId: string,
   phone: string,
-  submittedAtIso: string
-): Promise<{ leadId: string } | null> {
+  submittedAtIso: string,
+  /** True only when claimSmokeTestPhone proved this id empty before the form was submitted. */
+  idWasClaimed: boolean
+  // Return type includes LeadAttributionSnapshot's (all-optional) fields purely so this and
+  // pollForLead's result share one type at their common call site below — a phone-matched
+  // lead never actually carries them populated; the UTM check only ever runs on the
+  // email-matched path (see that call site's `emailFilled` guard).
+): Promise<({ leadId: string } & LeadAttributionSnapshot) | null> {
   // Shared with the suppression sites so an E.164 phone can never match in one place and
   // miss in the other.
   const wanted = phoneDigits(phone);
   if (!wanted) return null;
+  // The id webhooks.ts writes a phone-only capture under. Looking it up directly is exact
+  // and O(1); the page scan below is only a fallback for rows that predate ENG-2082.
+  const deterministicId = phoneLeadId(phone);
+
   for (let attempt = 0; attempt < pollMaxAttempts; attempt++) {
     try {
-      // ScanIndexForward:false — newest first, so our row is at the top of page one.
-      const page = await crmDb.getLeadsByListId(listId, 25);
-      const hit = (page?.items || []).find(
-        (lead: any) =>
-          phoneDigits(lead?.phone) === wanted &&
-          String(lead?.createdAt || "") >= submittedAtIso
-      );
+      // Its OWN guard, deliberately. Sharing the outer try means a failing point lookup
+      // silently skips the scan below as well, turning a cheap optimisation into the reason
+      // the row is never found at all.
+      if (deterministicId && typeof (crmDb as any).getLeadById === "function") {
+        try {
+          const direct = await crmDb.getLeadById(listId, deterministicId, { consistentRead: true });
+          // Two ways to know the row is OURS. If we claimed the id before submitting, the
+          // list had nothing there, so anything under it now arrived after the claim —
+          // including the adopted-row case, where webhooks.ts reuses a row without
+          // rewriting createdAt and a freshness test would reject it forever. If we could
+          // NOT claim it, fall back to freshness: accepting any synthetic row there would
+          // turn a stranded row from a previous run into a false pass.
+          //
+          // What the claim does NOT prove, so that nobody re-derives the retracted argument
+          // that "a hash of OUR number can only be ours": it is a read, not a lock. A row
+          // that predates the claim cannot reach here — the claim saw it occupied (strongly
+          // consistent) and redrew — but a CONCURRENT run that drew the same number from the
+          // 100-value block can still land its capture inside our claim→submit→poll window
+          // and be accepted as ours. Adding `createdAt >= claimedAt` does not close that:
+          // the colliding row is newer than the claim too. Closing it needs a second
+          // identifier, and there is none — the deterministic id is used only for captures
+          // that carry NO email (webhooks.ts), so the phone IS the whole identity. Bounded
+          // by a ~1% draw collision inside a ~10s window, and left open knowingly.
+          const isOurs = idWasClaimed
+            ? isSmokeTestLead(direct)
+            : isSmokeTestLead(direct) && String((direct as any).createdAt || "") >= submittedAtIso;
+          if (direct && isOurs) {
+            return { leadId: deterministicId };
+          }
+        } catch (err: any) {
+          // Fall through to the scan, but say so: a throttled or timed-out point lookup is
+          // exactly when the scan matters, and swallowing it silently hides the reason a
+          // run went slow. Same treatment the sweep gives the same class of error.
+          console.warn(
+            `[smokeTest] point lookup for ${deterministicId} failed in list ${listId}: ${err?.message || err}`
+          );
+        }
+      }
+
+      // Fallback for rows the point lookup cannot cover — chiefly a lander that invents its
+      // own placeholder email, so webhooks.ts keys it `lead_<timestamp>_<rand>` instead.
+      //
+      // PAGINATED, not one wide Limit. getLeadsByListId is a Query ordered by leadId (the
+      // RANGE key) and DynamoDB caps a page at 1MB regardless of Limit, so asking for 300
+      // widened the window without making it order-independent — and `lead_<timestamp>_*`
+      // sorts BELOW every `lead_ph_*`, exactly the rows a phone-only list is full of. Walk
+      // the cursor the way sweepStrandedSmokeLeads does instead.
+      let lastKey: any = undefined;
+      let hit: any = undefined;
+      for (let page = 0; page < POLL_SCAN_MAX_PAGES && !hit; page++) {
+        const result = await crmDb.getLeadsByListId(listId, 100, lastKey);
+        hit = ((result?.items || []) as any[]).find(
+          (lead: any) =>
+            phoneDigits(lead?.phone) === wanted &&
+            String(lead?.createdAt || "") >= submittedAtIso
+        );
+        lastKey = result?.lastEvaluatedKey;
+        if (!lastKey) break;
+      }
       if (hit?.leadId) return { leadId: hit.leadId as string };
     } catch {
       // list unreadable — nothing to clean up
@@ -178,10 +301,68 @@ async function pollForLeadByPhone(
   return null;
 }
 
-async function pollForLead(listId: string, email: string): Promise<{ leadId: string } | null> {
+/** The subset of a lead row's attribution fields the ENG-2193 UTM-propagation check reads. */
+export interface LeadAttributionSnapshot {
+  utmSource?: string;
+  utmMedium?: string;
+  firstTouchUtmSource?: string;
+  firstTouchUtmMedium?: string;
+  firstTouchUtmCampaign?: string;
+}
+
+/** Reads only the fields `utmPropagationVerdict` needs off a raw (untyped) Dynamo lead row,
+ *  without asserting the row's overall shape — `AW-Leads` rows come back as `any` from `crmDb`,
+ *  and most fields on them are irrelevant here. */
+function extractLeadAttribution(lead: Record<string, unknown>): LeadAttributionSnapshot {
+  const utmSource = typeof lead.utmSource === "string" ? lead.utmSource : undefined;
+  const utmMedium = typeof lead.utmMedium === "string" ? lead.utmMedium : undefined;
+  const firstTouch = lead.firstTouch;
+  const utm =
+    firstTouch && typeof firstTouch === "object"
+      ? (firstTouch as Record<string, unknown>).utm
+      : undefined;
+  const utmRecord = utm && typeof utm === "object" ? (utm as Record<string, unknown>) : undefined;
+  return {
+    utmSource,
+    utmMedium,
+    firstTouchUtmSource: typeof utmRecord?.source === "string" ? utmRecord.source : undefined,
+    firstTouchUtmMedium: typeof utmRecord?.medium === "string" ? utmRecord.medium : undefined,
+    firstTouchUtmCampaign: typeof utmRecord?.campaign === "string" ? utmRecord.campaign : undefined,
+  };
+}
+
+/**
+ * Did the UTM params injected into the navigation URL make it all the way through the
+ * landing page's own capture middleware and onto the resulting lead? Pure — snapshot in,
+ * verdict out — so it's testable without a real lead row.
+ */
+export function utmPropagationVerdict(
+  expected: { source: string; medium: string; campaign: string },
+  lead: LeadAttributionSnapshot,
+): { propagated: boolean; detail: string } {
+  const sourceOk = lead.utmSource === expected.source || lead.firstTouchUtmSource === expected.source;
+  const mediumOk = lead.utmMedium === expected.medium || lead.firstTouchUtmMedium === expected.medium;
+  const campaignOk = lead.firstTouchUtmCampaign === expected.campaign;
+  if (sourceOk && mediumOk && campaignOk) {
+    return { propagated: true, detail: "lead attribution carries the injected UTM params" };
+  }
+  return {
+    propagated: false,
+    detail:
+      `lead attribution does not match the injected UTM params ` +
+      `(utmSource=${lead.utmSource ?? lead.firstTouchUtmSource ?? "unset"}, ` +
+      `utmMedium=${lead.utmMedium ?? lead.firstTouchUtmMedium ?? "unset"}, ` +
+      `firstTouch.utm.campaign=${lead.firstTouchUtmCampaign ?? "unset"})`,
+  };
+}
+
+async function pollForLead(
+  listId: string,
+  email: string,
+): Promise<({ leadId: string } & LeadAttributionSnapshot) | null> {
   for (let attempt = 0; attempt < pollMaxAttempts; attempt++) {
     const lead = await crmDb.getLeadByEmail(listId, email);
-    if (lead) return lead as { leadId: string };
+    if (lead) return { leadId: (lead as { leadId: string }).leadId, ...extractLeadAttribution(lead) };
     if (attempt < pollMaxAttempts - 1) {
       await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
     }
@@ -1042,6 +1223,10 @@ async function runGenerationSmokeTestNow(
   let authFormOnly = false;
   let iframeCount = 0;
   let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+  // ENG-2193: set only when the check actually ran (an email-keyed lead landed AND the UTM
+  // params were successfully appended to the navigation URL) — absent, not false, otherwise.
+  let utmPropagated: boolean | undefined;
+  let utmPropagationDetail: string | undefined;
 
   try {
     const executablePath = findChromeExecutable();
@@ -1101,7 +1286,27 @@ async function runGenerationSmokeTestNow(
       });
     }
 
-    await browserPage.goto(deployedUrl, { waitUntil: "networkidle", timeout: 30_000 });
+    // ENG-2193: append synthetic UTM params to the navigation URL so the lead this run
+    // captures can be checked, below, for whether the page's own capture middleware
+    // (v0Service.injectLeadCaptureAttribution) actually propagated them. `navigateUrl` falls
+    // back to the bare `deployedUrl` when it cannot be parsed as an absolute URL — navigating
+    // still proceeds, and the UTM check is simply skipped rather than reporting a false
+    // negative caused by our own URL construction, not the page.
+    const smokeTestUtm = buildSmokeTestUtm();
+    let navigateUrl = deployedUrl;
+    let utmInjectedInNavigation = false;
+    try {
+      const withUtm = new URL(deployedUrl);
+      withUtm.searchParams.set("utm_source", smokeTestUtm.source);
+      withUtm.searchParams.set("utm_medium", smokeTestUtm.medium);
+      withUtm.searchParams.set("utm_campaign", smokeTestUtm.campaign);
+      navigateUrl = withUtm.toString();
+      utmInjectedInNavigation = true;
+    } catch {
+      // deployedUrl isn't an absolute URL — see comment above.
+    }
+
+    await browserPage.goto(navigateUrl, { waitUntil: "networkidle", timeout: 30_000 });
 
     // Fill EVERY fillable field, not just email. Modern landers are React-controlled
     // multi-field forms (name/phone/zip + selects) with client-side validation that blocks
@@ -1121,7 +1326,9 @@ async function runGenerationSmokeTestNow(
     // the landers this path was added for), provably unroutable (unlike an arbitrary
     // 555-XXXX line: 555-1212 is live directory assistance), and impossible for a real
     // visitor to hold, which is what makes it safe to key suppression off.
-    const testPhone = buildSmokeTestPhone();
+    // Claimed BEFORE the form is submitted — see claimSmokeTestPhone. The flag is what lets
+    // the poll tell our row from one a previous run stranded under the same id.
+    const { phone: testPhone, claimed: phoneIdClaimed } = await claimSmokeTestPhone(leadListId);
     const email = buildSmokeTestEmail();
     const fillOutcome = await fillAllRequiredFields(browserPage, email, testPhone);
     // ENG-2081: captured HERE, not at the end of the try block. Everything between this
@@ -1316,9 +1523,16 @@ async function runGenerationSmokeTestNow(
     // still found and deleted rather than stranded in the customer's CRM.
     const lead = emailFilled
       ? await pollForLead(leadListId, email)
-      : await pollForLeadByPhone(leadListId, testPhone, submittedAtIso);
+      : await pollForLeadByPhone(leadListId, testPhone, submittedAtIso, phoneIdClaimed);
     if (lead) {
       leadCaptured = true;
+      // Email-keyed only: pollForLeadByPhone doesn't return attribution fields, and a
+      // phone-only lander is a rarer shape not worth widening that path for here.
+      if (emailFilled && utmInjectedInNavigation) {
+        const verdict = utmPropagationVerdict(smokeTestUtm, lead);
+        utmPropagated = verdict.propagated;
+        utmPropagationDetail = verdict.detail;
+      }
       await crmDb.deleteLead(leadListId, lead.leadId);
     } else if (redirectedToHandoff) {
       // The form accepted the submission and handed off (chat/agent redirect with a
@@ -1376,6 +1590,10 @@ async function runGenerationSmokeTestNow(
     ...(noFormOnPage ? { noFormOnPage } : {}),
     ...(authFormOnly ? { authFormOnly } : {}),
     ...(iframeCount ? { iframeCount } : {}),
+    // ENG-2193: advisory only — never folded into `ok` above (see the field's own doc comment
+    // on GeneratedLandingPage).
+    ...(utmPropagated !== undefined ? { utmPropagated } : {}),
+    ...(utmPropagationDetail ? { utmPropagationDetail } : {}),
   };
 
   await updateLandingPageSmokeTestResult(page.id, result);

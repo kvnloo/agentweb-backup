@@ -144,10 +144,12 @@ jobs:
           bash .github/scripts/dependabot-config.test.sh
           bash .github/scripts/merge-evidence.test.sh
           bash .github/scripts/trunk-deploy-state.test.sh
+          bash .github/scripts/deploy-base-sha.test.sh
           bash .github/scripts/deploy-failure-alert.test.sh
           bash .github/scripts/eb-config-conflict.test.sh
           bash .github/scripts/pipefail-hygiene.test.sh
           bash .github/scripts/paths-filter-hygiene.test.sh
+          bash .github/scripts/offline-eval-report.test.sh
 
   # ENG-1377: local-agent-relay and remotion-lambda had no CI of any kind.
   # Under ENG-1463, GitHub Actions proves buildability, not correctness, so

@@ -1,31 +1,33 @@
+import { IMAGE_MODEL_IDS } from './imageModelRegistry';
+import { resolveModelForUser } from './modelRoles';
 import axios from "axios";
 import { getSecret } from "../utils/secretsManager";
 import { uploadFileToS3 } from "../utils/s3Utils";
 import { getOpenAIClient, getGeminiClient } from "../utils/llmClients";
 import { recordUsage, meterUserUsage } from "./usageRecorderService";
 import { imageGenerationCostUsd, LLM_PRICE_BOOK_PROVENANCE } from "../utils/llmPricing";
+import { notCheckedGateResult, runCreativeGates, type CreativeGateResult } from "./creativeGates";
+import { resolveGeminiAspectRatio, type PlacementId } from "./creativePlacementSpecs";
 
 interface ImageGenerationResult {
   success: boolean;
   imageUrl?: string;
   filename?: string;
   error?: string;
+  /**
+   * Advisory deterministic checks on the rendered image (ENG-2139). A provider that returns a
+   * remote URL (Runway) is gated after download, or marked `notChecked` (ENG-2187). Absent only
+   * when the gates themselves threw or the S3 upload failed.
+   */
+  gates?: CreativeGateResult;
 }
 
+/** Bounds for downloading a provider's remote image to gate it (ENG-2187). */
+const REMOTE_GATE_DOWNLOAD_TIMEOUT_MS = 20_000;
+const REMOTE_GATE_MAX_BYTES = 30 * 1024 * 1024;
+
 // Supported image generation models
-const SUPPORTED_MODELS = [
-  "gpt-image-1",
-  "gpt-image-2",
-  "gemini-2.5-flash-image",
-  "gemini-3-pro-image-preview",
-  "gemini-3.1-flash-image",
-  // Legacy preview id — accepted as an alias of gemini-3.1-flash-image so that
-  // persisted settings, in-flight sessions, and scheduled chats created before
-  // the GA migration keep working. Normalized to the GA id before dispatch.
-  "gemini-3.1-flash-image-preview",
-  "gen4_image",
-  "gemini_2.5_flash",
-] as const;
+const SUPPORTED_MODELS = IMAGE_MODEL_IDS;
 
 type SupportedModel = typeof SUPPORTED_MODELS[number];
 
@@ -75,6 +77,12 @@ interface ImageGenerationParams {
   /** Overrides the recorded feature, e.g. `platform:workplan_thumbnail` (ENG-1961). */
   meterFeature?: string;
   imageModel?: string; // Optional model parameter - must be one of the supported models
+  /**
+   * The ad placement the image is for, when the caller knows it (ENG-2187). The creative gates
+   * hold the image against this placement's size and file limits; otherwise they infer one from
+   * `size`.
+   */
+  placement?: PlacementId;
   removeC2PA?: boolean; // Optional parameter to remove C2PA metadata, defaults to true
 }
 
@@ -515,7 +523,7 @@ export class ImageService {
       // Determine which model to use before validation
       // If model not defined, use gemini-3-pro-image-preview as default (supports multiple input images)
       if (!params.imageModel) {
-        params.imageModel = "gemini-3-pro-image-preview";
+        params.imageModel = await resolveModelForUser(params.userId, 'image');
       }
 
       // Normalize legacy/preview ids to their canonical (GA) equivalent so that
@@ -593,8 +601,10 @@ export class ImageService {
             const base64Data = result.imageUrl.split(',')[1];
             imageBuffer = Buffer.from(base64Data, 'base64');
           } else {
-            // It's already a URL, we can't upload it
-            return result;
+            // It's already a URL (Runway), we can't upload it. Gate it from a bounded download
+            // instead, or record that it was not checked (ENG-2187).
+            const gates = await this.runRemoteAdvisoryGates(result.imageUrl, params, modelToUse);
+            return gates ? { ...result, gates } : result;
           }
           
           // Remove C2PA metadata if removeC2PA is true (defaults to true)
@@ -603,6 +613,8 @@ export class ImageService {
             imageBuffer = await this.removeC2PAMetadata(imageBuffer);
           }
           
+          const gates = await this.runAdvisoryGates(imageBuffer, params.size, modelToUse, params.placement);
+
           // Upload to S3
           const uploadResult = await uploadFileToS3(
             imageBuffer,
@@ -617,9 +629,11 @@ export class ImageService {
               success: true,
               imageUrl: uploadResult.url,
               filename: result.filename || params.filename,
+              ...(gates ? { gates } : {}),
             };
           } else {
-            // If S3 upload fails, return the original result
+            // If S3 upload fails, return the original result. Its bytes can differ from the
+            // measured buffer (C2PA removal), so the gate result would describe another artifact.
             console.warn('Failed to upload image to S3, returning original result:', uploadResult.error);
             return result;
           }
@@ -1142,65 +1156,85 @@ export class ImageService {
   }
 
   /**
+   * ENG-2139: advisory creative gates on the final bytes. Only Gemini 3 maps `size` to an
+   * aspect ratio itself, so only there can a substituted ratio be detected up front; the
+   * output aspect check covers every provider. Never throws and never fails the generation.
+   */
+  private async runAdvisoryGates(
+    imageBuffer: Buffer,
+    size: string | undefined,
+    model: string,
+    placement?: PlacementId
+  ): Promise<CreativeGateResult | undefined> {
+    try {
+      const mapsSizeToAspect = model === "gemini-3-pro-image-preview" || model === "gemini-3.1-flash-image";
+      const gates = await runCreativeGates(imageBuffer, {
+        requestedSize: size,
+        ...(placement ? { placement } : {}),
+        ...(mapsSizeToAspect ? { aspectResolution: resolveGeminiAspectRatio(size) } : {}),
+      });
+      if (!gates.passed) {
+        const failed = gates.checks.filter((c) => c.status === "fail").map((c) => `${c.id}: ${c.reason}`);
+        console.warn(`[creative-gates] advisory failures (${model}, size ${size || "default"}):`, failed.join("; "));
+      }
+      return gates;
+    } catch (err) {
+      console.warn("[creative-gates] evaluation failed (ignored):", err instanceof Error ? err.message : err);
+      return undefined;
+    }
+  }
+
+  /**
+   * ENG-2187: gates for a provider that returns a remote URL instead of bytes (Runway). Downloads
+   * the image once, bounded in time and size, and gates the bytes; when the download fails the
+   * result says `notChecked` with the reason rather than the image going ungated silently.
+   * Never throws and never fails the generation.
+   *
+   * `maxRedirects: 0` (CodeRabbit #3137): the URL is whatever the provider's task result names,
+   * not one we control, so a redirect could point this server-side fetch at an internal address
+   * (SSRF). Axios's default `validateStatus` (2xx only) turns any 3xx response into a thrown
+   * error, which the existing catch below already converts to `notChecked` — a refused redirect
+   * fails exactly like any other download failure, never a hard error.
+   */
+  private async runRemoteAdvisoryGates(
+    imageUrl: string,
+    params: ImageGenerationParams,
+    model: string
+  ): Promise<CreativeGateResult | undefined> {
+    let imageBuffer: Buffer;
+    try {
+      const response = await axios.get<ArrayBuffer>(imageUrl, {
+        responseType: "arraybuffer",
+        timeout: REMOTE_GATE_DOWNLOAD_TIMEOUT_MS,
+        maxContentLength: REMOTE_GATE_MAX_BYTES,
+        maxRedirects: 0,
+      });
+      imageBuffer = Buffer.from(response.data);
+    } catch (err) {
+      const reason = `remote image could not be downloaded to check: ${err instanceof Error ? err.message : String(err)}`;
+      console.warn(`[creative-gates] not checked (${model}): ${reason}`);
+      return notCheckedGateResult(
+        { requestedSize: params.size, ...(params.placement ? { placement: params.placement } : {}) },
+        reason
+      );
+    }
+    return this.runAdvisoryGates(imageBuffer, params.size, model, params.placement);
+  }
+
+  /**
    * Convert size parameter to aspect ratio for Gemini 3 Pro
    * Supports: 1:1, 9:16, 16:9, 3:4, 4:3, 3:2, 2:3, 5:4, 4:5, 21:9
+   * The mapping lives in `resolveGeminiAspectRatio`, which also reports when the requested
+   * shape was substituted so the creative gates can flag it (ENG-2139).
    */
   private convertSizeToAspectRatio(size?: string): string {
-    if (!size || size === 'auto') {
-      return '1:1'; // Default aspect ratio
-    }
-
-    // If already in aspect ratio format (e.g., "16:9"), validate and return
-    if (size.includes(':')) {
-      const validRatios = ['1:1', '9:16', '16:9', '3:4', '4:3', '3:2', '2:3', '5:4', '4:5', '21:9'];
-      if (validRatios.includes(size)) {
-        return size;
-      }
-      // If it's a ratio format but not in the valid list, default to 1:1
+    const resolved = resolveGeminiAspectRatio(size);
+    if (resolved.fallback === 'unsupported_ratio') {
       console.warn(`⚠️ Aspect ratio ${size} not supported, defaulting to 1:1`);
-      return '1:1';
+    } else if (resolved.fallback === 'unparseable_size') {
+      console.warn(`⚠️ Could not parse size ${size}, defaulting to 1:1`);
     }
-
-    // Convert common size formats to aspect ratios
-    // Format: "WIDTHxHEIGHT" (e.g., "1024x1024", "1536x1024")
-    if (size.includes('x')) {
-      const [width, height] = size.split('x').map(Number);
-      if (!isNaN(width) && !isNaN(height) && width > 0 && height > 0) {
-        // Calculate the ratio
-        const ratio = width / height;
-        
-        // Map to closest supported aspect ratio
-        const ratioMap: { [key: number]: string } = {
-          1.0: '1:1',        // 1024x1024, 512x512, etc.
-          0.5625: '9:16',    // 576x1024, 1080x1920, etc.
-          1.7778: '16:9',    // 1920x1080, 1024x576, etc.
-          0.75: '3:4',       // 768x1024, etc.
-          1.3333: '4:3',     // 1024x768, etc.
-          1.5: '3:2',        // 1536x1024, etc.
-          0.6667: '2:3',     // 1024x1536, etc.
-          1.25: '5:4',       // 1280x1024, etc.
-          0.8: '4:5',        // 1024x1280, etc.
-          2.3333: '21:9'     // 2560x1080, etc.
-        };
-
-        // Find closest ratio
-        let closestRatio = '1:1';
-        let minDiff = Infinity;
-        for (const [targetRatio, aspectRatio] of Object.entries(ratioMap)) {
-          const diff = Math.abs(ratio - parseFloat(targetRatio));
-          if (diff < minDiff) {
-            minDiff = diff;
-            closestRatio = aspectRatio;
-          }
-        }
-
-        return closestRatio;
-      }
-    }
-
-    // Default to 1:1 if we can't parse the size
-    console.warn(`⚠️ Could not parse size ${size}, defaulting to 1:1`);
-    return '1:1';
+    return resolved.aspectRatio;
   }
 
   /**

@@ -21,6 +21,8 @@ export interface AskCrmLead {
   leadId: string;
   listId: string;
   email?: string | null;
+  /** ENG-2082: phone-only leads are contactable and must be findable and renderable. */
+  phone?: string | null;
   firstName?: string | null;
   lastName?: string | null;
   company?: string | null;
@@ -63,6 +65,7 @@ export interface AskCrmAnswerItem {
   name: string;
   company: string | null;
   email: string | null;
+  phone: string | null;
   status: string | null;
   lifecycle: LifecycleStage;
   heatScore: number;
@@ -117,7 +120,9 @@ export function classifyIntent(question: string): AskCrmIntent {
 
 function fullName(lead: AskCrmLead): string {
   const parts = [lead.firstName, lead.lastName].filter(Boolean);
-  return parts.join(' ').trim() || lead.email || '(unnamed)';
+  // phone before '(unnamed)': a phone-only lead has a real handle, and answering
+  // "(unnamed)" makes a contactable person look like an empty row.
+  return parts.join(' ').trim() || lead.email || lead.phone || '(unnamed)';
 }
 
 function toItem(lead: AskCrmLead, heatScore: number, lifecycle: LifecycleStage): AskCrmAnswerItem {
@@ -127,6 +132,7 @@ function toItem(lead: AskCrmLead, heatScore: number, lifecycle: LifecycleStage):
     name: fullName(lead),
     company: lead.company || null,
     email: lead.email || null,
+    phone: lead.phone || null,
     status: lead.status || null,
     lifecycle,
     heatScore,
@@ -156,6 +162,7 @@ function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: L
   const lifecycle = lead.lifecycle ?? computeLifecycle(
     {
       email: lead.email ?? undefined,
+      phone: lead.phone ?? undefined,
       hasUserRecord: lead.hasUserRecord ?? undefined,
       subscriptionState: lead.subscriptionState ?? undefined,
       lastActivityAt: lead.lastActivityAt ?? undefined,
@@ -227,6 +234,9 @@ export async function askCrm(
       filtered = enriched.filter(e => {
         const hay = [
           e.lead.email,
+          // ENG-2082: without this, asking about a phone-only lead by their number
+          // answered "No contacts matched the question" for a lead that exists.
+          e.lead.phone,
           e.lead.firstName,
           e.lead.lastName,
           e.lead.company,

@@ -5,6 +5,7 @@ import path from "path";
 import { paginatedScan } from "../utils/dynamoPagination";
 import { validateWelcomeMessage } from "../utils/welcomeMessageValidation";
 import { OpeningAction, validateOpeningAction } from "../utils/openingActionValidation";
+import { changedEvalSkillFields, recordSkillChange } from "../loops/eval/evalChangeMarkers";
 
 // Load environment variables
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -151,6 +152,8 @@ export class SkillService {
     try {
       await dynamodb.put(params).promise();
       this.invalidatePublishedSkillsCache();
+      // ENG-2145/2195: report-only "needs eval" marker, recorded here so every caller is covered.
+      void recordSkillChange(skill.skillId, 'create', { ...skill });
       return skill;
     } catch (error) {
       console.error("Error creating skill:", error);
@@ -294,6 +297,14 @@ export class SkillService {
    * conditional write) must apply the returned value itself.
    */
   async updateSkill(skill: Skill, expectedUpdatedAt?: string): Promise<string> {
+    return this.putSkill(skill, expectedUpdatedAt, 'update');
+  }
+
+  /**
+   * The write behind updateSkill and approveSkill. ALL_OLD returns the row it replaced, so the
+   * "needs eval" marker names only the eval-relevant fields this write actually changed.
+   */
+  private async putSkill(skill: Skill, expectedUpdatedAt: string | undefined, action: 'update' | 'approve'): Promise<string> {
     const welcomeMessageError = validateWelcomeMessage(skill.welcomeMessage);
     if (welcomeMessageError) throw new Error(welcomeMessageError);
     const openingActionError = validateOpeningAction(skill.openingAction, skill.toolNames || []);
@@ -311,6 +322,7 @@ export class SkillService {
     const params: any = {
       TableName: this.tableName,
       Item: skillItem,
+      ReturnValues: 'ALL_OLD',
     };
 
     // Explicitly `!== undefined`: a row whose updatedAt is an empty string must
@@ -321,8 +333,11 @@ export class SkillService {
     }
 
     try {
-      await dynamodb.put(params).promise();
+      const result = await dynamodb.put(params).promise();
       this.invalidatePublishedSkillsCache();
+      const before = result?.Attributes ? this.normalizeSkill(result.Attributes) : undefined;
+      const changed = changedEvalSkillFields(before ? { ...before } : undefined, { ...skill });
+      void recordSkillChange(skill.skillId, action, action === 'approve' ? { ...changed, systemPrompt: skill.systemPrompt, isPublished: skill.isPublished } : changed);
       return updatedAt;
     } catch (error) {
       console.error(`Error updating skill ${skill.skillId}:`, error);
@@ -355,10 +370,13 @@ export class SkillService {
         delete skillItem.toolNames;
       }
 
-      await dynamodb.put({
+      const replaced = await dynamodb.put({
         TableName: targetTable,
         Item: skillItem,
+        ReturnValues: 'ALL_OLD',
       }).promise();
+      const before = replaced?.Attributes ? this.normalizeSkill(replaced.Attributes) : undefined;
+      void recordSkillChange(skillId, 'sync', { ...changedEvalSkillFields(before ? { ...before } : undefined, { ...skill }), systemPrompt: skill.systemPrompt });
 
       // ENG-1222: only invalidate when the sync wrote to THIS environment's own
       // table (this.tableName) — getPublishedSkills only ever reads that one, so
@@ -507,7 +525,7 @@ export class SkillService {
 
     skill.visibility = 'public';
     skill.isPublished = true;
-    await this.updateSkill(skill);
+    await this.putSkill(skill, undefined, 'approve');
     return skill;
   }
 
@@ -552,14 +570,17 @@ export class SkillService {
   }
 
   async deleteSkill(skillId: string): Promise<void> {
-    const params = {
+    const params: AWS.DynamoDB.DocumentClient.DeleteItemInput = {
       TableName: this.tableName,
       Key: { skillId },
+      ReturnValues: 'ALL_OLD',
     };
 
     try {
-      await dynamodb.delete(params).promise();
+      const result = await dynamodb.delete(params).promise();
       this.invalidatePublishedSkillsCache();
+      // Only a row that existed changes agent behaviour when it goes.
+      if (result?.Attributes) void recordSkillChange(skillId, 'delete', {});
     } catch (error) {
       console.error(`Error deleting skill ${skillId}:`, error);
       throw error;

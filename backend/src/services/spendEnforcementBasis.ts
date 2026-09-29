@@ -46,6 +46,28 @@ export const SPEND_LEDGER_ENFORCEMENT_ENV = "AW_SPEND_LEDGER_ENFORCEMENT";
 export const SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV = "AW_SPEND_LEDGER_ENFORCEMENT_ACCOUNTS";
 
 /**
+ * Comma-separated subscription tiers to EXCLUDE from ledger enforcement, even
+ * under `=true`. Case-insensitive. Empty/unset excludes nothing.
+ *
+ * This is how the broad flip (`=true`) enforces every PAID tier while leaving
+ * Free on the legacy rail: precise Free-tier enforcement is deferred to ENG-1688
+ * (a $5 cap bites sharply — one image render can be ~40% of it), so we cut the
+ * paid tiers over first. An allowlist can't express "all paid" — ~40 account ids
+ * blow the 4096-char EB env limit — so exclusion by tier is the mechanism.
+ */
+export const SPEND_LEDGER_ENFORCEMENT_EXCLUDE_TIERS_ENV = "AW_SPEND_LEDGER_ENFORCEMENT_EXCLUDE_TIERS";
+
+/** The excluded-tier set (lowercased), or empty. */
+function excludedTiers(): Set<string> {
+  return new Set(
+    (process.env[SPEND_LEDGER_ENFORCEMENT_EXCLUDE_TIERS_ENV] || "")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
+/**
  * Max age of a projection snapshot before enforcement stops trusting it and
  * fails open to legacy. Minutes; unset or <= 0 disables the guard.
  *
@@ -71,20 +93,36 @@ export type EnforcementBasis = "legacy" | "spend_ledger";
 
 /**
  * Whether the ledger (vendor-inclusive) basis is enabled for a given subject.
- * Pure over env + the id, so it is trivially testable and has no I/O.
+ * Pure over env + the id (+ optional tier), so it is trivially testable and has
+ * no I/O.
+ *
+ * `tier` is the subject's subscription tier when the caller has it. An EXCLUDED
+ * tier is never enforced on the ledger rail regardless of mode — so a broad
+ * `=true` flip can enforce all paid tiers while leaving Free on legacy. When the
+ * caller can't supply a tier, exclusion simply can't apply (the mode decides).
  */
-export function isSpendLedgerEnforcementEnabled(billingUserId: string): boolean {
+export function isSpendLedgerEnforcementEnabled(billingUserId: string, tier?: string | null): boolean {
   const mode = (process.env[SPEND_LEDGER_ENFORCEMENT_ENV] || "").trim().toLowerCase();
-  if (mode === "true") return true;
-  if (mode === "allowlist") {
+
+  let enabled: boolean;
+  if (mode === "true") {
+    enabled = true;
+  } else if (mode === "allowlist") {
     const list = (process.env[SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV] || "")
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
-    return list.includes(billingUserId);
+    enabled = list.includes(billingUserId);
+  } else {
+    // "", "legacy", "false", or anything unrecognised → dark (legacy).
+    enabled = false;
   }
-  // "", "legacy", "false", or anything unrecognised → dark (legacy).
-  return false;
+
+  // An excluded tier stays on legacy even when otherwise enabled.
+  if (enabled && tier && excludedTiers().has(tier.trim().toLowerCase())) {
+    return false;
+  }
+  return enabled;
 }
 
 export interface EnforcementCostBasis {
@@ -110,8 +148,10 @@ export async function resolveEnforcementCostBasisMicroUsd(input: {
   billingUserId: string;
   billingMonth: string;
   legacyRawCostUsedMicroUsd: number;
+  /** Subscription tier, when the caller has it — lets an excluded tier (e.g. Free) stay on legacy under a broad flip. */
+  tier?: string | null;
 }): Promise<EnforcementCostBasis> {
-  if (!isSpendLedgerEnforcementEnabled(input.billingUserId)) {
+  if (!isSpendLedgerEnforcementEnabled(input.billingUserId, input.tier)) {
     return { rawCostUsedMicroUsd: input.legacyRawCostUsedMicroUsd, basis: "legacy", projectionMissing: false, stale: false };
   }
 

@@ -355,3 +355,92 @@ describe('GET /lists/:listId/leads — sync status filter + flags', () => {
     expect(body.leads.map((l: any) => l.leadId)).toEqual(['A', 'B', 'C']);
   });
 });
+
+
+// ─── lifecycle validation on PUT ─────────────────────────────────────────────
+
+// `lifecycle` only became writable through this route when updateLead grew an explicit
+// handler for it — before that the key was dropped on the floor, so nothing validated it.
+// askCrmService reads `lead.lifecycle ?? computeLifecycle(...)`, so whatever is stored
+// outranks the live computation for the rest of that lead's life.
+describe('PUT /lists/:listId/leads/:leadId — lifecycle validation', () => {
+  const handler = findHandler(router, '/lists/:listId/leads/:leadId', 'put');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    asMock(crmDb.getLeadListById).mockResolvedValue(HS_UNCONNECTED_LIST);
+    asMock(crmDb.getLeadById).mockResolvedValue({ leadId: 'lead1', email: 'a@x.com' });
+    asMock(crmDb.updateLead).mockResolvedValue({ leadId: 'lead1' });
+  });
+
+  it('rejects an unknown lifecycle with 400, and never reaches the write', async () => {
+    const req = {
+      params: { listId: 'list1', leadId: 'lead1' },
+      body: { lifecycle: 'super_duper_customer' },
+      user: { userId: 'test-user-id' },
+    };
+    const res = makeRes();
+    await handler!(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json.mock.calls[0][0].message).toMatch(/Invalid lifecycle/);
+    // The edge guard exists so this never becomes updateLead's throw surfacing as a 500.
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
+  });
+
+  it('lets a real lifecycle stage through to the write', async () => {
+    const req = {
+      params: { listId: 'list1', leadId: 'lead1' },
+      body: { lifecycle: 'paying' },
+      user: { userId: 'test-user-id' },
+    };
+    const res = makeRes();
+    await handler!(req, res);
+
+    expect(res.status).not.toHaveBeenCalledWith(400);
+    expect(crmDb.updateLead).toHaveBeenCalled();
+    expect(asMock(crmDb.updateLead).mock.calls[0][2].lifecycle).toBe('paying');
+  });
+
+  it('lets an explicit clear through — empty means "go back to computed"', async () => {
+    const req = {
+      params: { listId: 'list1', leadId: 'lead1' },
+      body: { lifecycle: '' },
+      user: { userId: 'test-user-id' },
+    };
+    const res = makeRes();
+    await handler!(req, res);
+
+    expect(res.status).not.toHaveBeenCalledWith(400);
+    expect(crmDb.updateLead).toHaveBeenCalled();
+    expect(asMock(crmDb.updateLead).mock.calls[0][2].lifecycle).toBe('');
+  });
+
+  it('accepts a padded value the layer below would have trimmed and stored', async () => {
+    const req = {
+      params: { listId: 'list1', leadId: 'lead1' },
+      body: { lifecycle: '  paying  ' },
+      user: { userId: 'test-user-id' },
+    };
+    const res = makeRes();
+    await handler!(req, res);
+
+    // updateLead trims before storing, so rejecting the raw string here would 400 on a
+    // value the write path accepts.
+    expect(res.status).not.toHaveBeenCalledWith(400);
+    expect(crmDb.updateLead).toHaveBeenCalled();
+  });
+
+  it('does not disturb an update that carries no lifecycle at all', async () => {
+    const req = {
+      params: { listId: 'list1', leadId: 'lead1' },
+      body: { firstName: 'Ada' },
+      user: { userId: 'test-user-id' },
+    };
+    const res = makeRes();
+    await handler!(req, res);
+
+    expect(res.status).not.toHaveBeenCalledWith(400);
+    expect(crmDb.updateLead).toHaveBeenCalled();
+  });
+});

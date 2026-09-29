@@ -17,6 +17,7 @@ import {
   resolveEnforcementCostBasisMicroUsd,
   SPEND_LEDGER_ENFORCEMENT_ENV,
   SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV,
+  SPEND_LEDGER_ENFORCEMENT_EXCLUDE_TIERS_ENV,
   SPEND_PROJECTION_MAX_STALENESS_MIN_ENV,
 } from "../services/spendEnforcementBasis";
 
@@ -55,6 +56,7 @@ describe("spendEnforcementBasis", () => {
     getProjectionMock.mockReset();
     delete process.env[SPEND_LEDGER_ENFORCEMENT_ENV];
     delete process.env[SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV];
+    delete process.env[SPEND_LEDGER_ENFORCEMENT_EXCLUDE_TIERS_ENV];
     delete process.env[SPEND_PROJECTION_MAX_STALENESS_MIN_ENV];
   });
 
@@ -91,6 +93,56 @@ describe("spendEnforcementBasis", () => {
     it("in 'allowlist' mode with an empty list enables nobody", () => {
       process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "allowlist";
       expect(isSpendLedgerEnforcementEnabled(ACCT)).toBe(false);
+    });
+
+    describe("tier exclusion (broad flip that skips Free)", () => {
+      it("keeps an excluded tier on legacy even under '=true' (case-insensitive)", () => {
+        process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+        process.env[SPEND_LEDGER_ENFORCEMENT_EXCLUDE_TIERS_ENV] = "Free";
+        expect(isSpendLedgerEnforcementEnabled(ACCT, "Free")).toBe(false);
+        expect(isSpendLedgerEnforcementEnabled(ACCT, "free")).toBe(false);
+        expect(isSpendLedgerEnforcementEnabled(ACCT, "  FREE ")).toBe(false);
+      });
+
+      it("still enforces non-excluded (paid) tiers under '=true'", () => {
+        process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+        process.env[SPEND_LEDGER_ENFORCEMENT_EXCLUDE_TIERS_ENV] = "Free";
+        for (const tier of ["Starter", "Pro", "Super Premium"]) {
+          expect(isSpendLedgerEnforcementEnabled(ACCT, tier)).toBe(true);
+        }
+      });
+
+      it("supports a multi-tier exclusion list", () => {
+        process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+        process.env[SPEND_LEDGER_ENFORCEMENT_EXCLUDE_TIERS_ENV] = "Free, Trial";
+        expect(isSpendLedgerEnforcementEnabled(ACCT, "Trial")).toBe(false);
+        expect(isSpendLedgerEnforcementEnabled(ACCT, "Pro")).toBe(true);
+      });
+
+      it("has no effect when the exclusion list is empty/unset", () => {
+        process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+        expect(isSpendLedgerEnforcementEnabled(ACCT, "Free")).toBe(true);
+      });
+
+      it("does not resurrect a disabled mode — an excluded tier under legacy stays false", () => {
+        process.env[SPEND_LEDGER_ENFORCEMENT_EXCLUDE_TIERS_ENV] = "Free";
+        expect(isSpendLedgerEnforcementEnabled(ACCT, "Pro")).toBe(false); // mode dark
+      });
+
+      it("resolveEnforcementCostBasisMicroUsd honors the excluded tier (Free stays on legacy)", async () => {
+        process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+        process.env[SPEND_LEDGER_ENFORCEMENT_EXCLUDE_TIERS_ENV] = "Free";
+        getProjectionMock.mockResolvedValue(projection(999_000_000));
+        const res = await resolveEnforcementCostBasisMicroUsd({
+          billingUserId: ACCT,
+          billingMonth: MONTH,
+          legacyRawCostUsedMicroUsd: 4_420_000,
+          tier: "Free",
+        });
+        expect(res.basis).toBe("legacy");
+        expect(res.rawCostUsedMicroUsd).toBe(4_420_000);
+        expect(getProjectionMock).not.toHaveBeenCalled();
+      });
     });
   });
 

@@ -1,4 +1,5 @@
 import express from 'express';
+import { redactAxiosCredentials } from '../services/hubspotService';
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
@@ -6,11 +7,12 @@ import { getHubSpotConfig } from '../config/integrations';
 import { createAccount } from '../services/connectedAccountsDb';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
+import { storeOAuthFlowSession, consumeOAuthFlowSession, OAUTH_FLOW_SESSION_TTL_MS, LocalOAuthFlowSession } from '../services/oauthFlowSessions';
 
 const router = express.Router();
 
 const STATE_EXPIRATION = '15m';
-const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000;
+const TOKEN_SESSION_TTL_MS = OAUTH_FLOW_SESSION_TTL_MS;
 const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
@@ -37,7 +39,7 @@ const verifyState = (state: string, userId: string): StatePayload | null => {
   }
 };
 
-interface TokenSession {
+interface TokenSession extends LocalOAuthFlowSession {
   tokens: {
     access_token: string;
     refresh_token: string;
@@ -63,29 +65,6 @@ setInterval(() => {
     if (now > session.expires) tokenSessions.delete(id);
   }
 }, SESSION_CLEANUP_INTERVAL_MS).unref();
-
-const storeTokenSession = (
-  userId: string,
-  tokens: TokenSession['tokens'],
-  hubInfo: TokenSession['hubInfo'],
-  accountType: HubSpotAccountType,
-  grantedScopes: string[],
-  missingScopes: string[],
-): string => {
-  const sessionId = crypto.randomBytes(32).toString('hex');
-  tokenSessions.set(sessionId, { tokens, hubInfo, accountType, grantedScopes, missingScopes, userId, expires: Date.now() + TOKEN_SESSION_TTL_MS });
-  return sessionId;
-};
-
-const retrieveTokenSession = (sessionId: string, userId: string): Pick<TokenSession, 'tokens' | 'hubInfo' | 'accountType' | 'grantedScopes' | 'missingScopes'> | null => {
-  const session = tokenSessions.get(sessionId);
-  if (!session || session.userId !== userId || Date.now() > session.expires) {
-    tokenSessions.delete(sessionId);
-    return null;
-  }
-  tokenSessions.delete(sessionId);
-  return { tokens: session.tokens, hubInfo: session.hubInfo, accountType: session.accountType, grantedScopes: session.grantedScopes, missingScopes: session.missingScopes };
-};
 
 // GET /init
 router.get('/init', authenticateToken, async (req: any, res) => {
@@ -189,14 +168,15 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
         : [];
     const missingScopes = requestedScopes.filter(s => !grantedScopes.includes(s));
 
-    const tokenSessionId = storeTokenSession(
+    const tokenSessionId = await storeOAuthFlowSession('hubspot', tokenSessions, {
       userId,
-      { access_token, refresh_token, expires_in },
-      { hub_id, hub_domain, user },
+      tokens: { access_token, refresh_token, expires_in },
+      hubInfo: { hub_id, hub_domain, user },
       accountType,
       grantedScopes,
       missingScopes,
-    );
+      expires: Date.now() + TOKEN_SESSION_TTL_MS,
+    });
 
     res.json({ success: true, tokenSessionId, missingScopes });
   } catch (error: any) {
@@ -211,16 +191,15 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
   const { tokenSessionId } = req.body;
   const userId = req.user.userId;
 
-  if (!tokenSessionId) {
+  if (typeof tokenSessionId !== 'string' || !tokenSessionId.trim()) {
     return res.status(400).json({ error: 'Missing tokenSessionId' });
   }
 
-  const session = retrieveTokenSession(tokenSessionId, userId);
-  if (!session) {
-    return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
-  }
-
   try {
+    const session = await consumeOAuthFlowSession('hubspot', tokenSessions, tokenSessionId, userId);
+    if (!session) {
+      return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
+    }
     const { tokens, hubInfo, accountType, grantedScopes } = session;
 
     const account = await createAccount(userId, 'hubspot', {
@@ -235,12 +214,21 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
         hub_domain: hubInfo.hub_domain,
         hubspot_account_type: accountType,
         granted_scopes: grantedScopes,
+        // A prior grant may have been flagged dead. This IS the reconnect, so clear it
+        // explicitly — mirroring outlookAuth. Leaving it set would make a freshly
+        // authorised account render as "Reconnect required".
+        needs_reconnect: false,
       },
     });
 
     res.json({ success: true, account });
   } catch (error: any) {
-    console.error('[HubSpot OAuth /connect]', error);
+    // Redacted: this handler's own axios.post sends client_secret in the form body, and
+    // axios attaches that body to the error as `config.data`. Logging the raw error wrote
+    // the app's HubSpot client secret to the log on every failed code exchange — which is
+    // an ordinary event (a reused or expired authorization code, a double-submitted
+    // callback), not an exotic one.
+    console.error('[HubSpot OAuth /connect]', redactAxiosCredentials(error));
     const details = IS_PRODUCTION ? undefined : error.message;
     res.status(500).json({ error: 'Failed to connect HubSpot account', ...(details && { details }) });
   }

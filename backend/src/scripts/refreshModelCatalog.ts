@@ -35,6 +35,10 @@ async function main() {
   const plan = await refreshModelCatalog();
   console.log(JSON.stringify(plan, null, 2));
   if (!process.argv.includes('--write')) return;
+  writeCatalogPlan(plan);
+}
+
+export function writeCatalogPlan(plan: Awaited<ReturnType<typeof refreshModelCatalog>>) {
   const registryPath = path.resolve(__dirname, '../services/agentMode/llmModelRegistry.ts');
   const pricePath = path.resolve(__dirname, '../utils/llmPricing.ts');
   const pinPath = path.resolve(__dirname, '../__tests__/llmPricing.test.ts');

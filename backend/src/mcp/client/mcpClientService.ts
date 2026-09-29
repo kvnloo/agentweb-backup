@@ -1,3 +1,4 @@
+import { sanitizeMcpToolSchema } from '../../utils/mcpToolSchemaSanitizer';
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -978,7 +979,7 @@ export class McpClientService {
               function: {
                 name: exposedToolName,
                 description: tool.description,
-                parameters: tool.inputSchema
+                parameters: sanitizeMcpToolSchema(tool.name, tool.inputSchema)
               }
             },
             execute: async (args: any, context: ToolContext) => {
@@ -1623,7 +1624,7 @@ export class McpClientService {
           function: {
             name: exposedToolName, // Use prefixed name in definition
             description: tool.description,
-            parameters: tool.inputSchema
+            parameters: sanitizeMcpToolSchema(tool.name, tool.inputSchema)
           }
         },
         execute: async (args: any, context: ToolContext) => {

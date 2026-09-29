@@ -65,6 +65,8 @@ import UsageCostByUserTab from "../components/admin/UsageCostByUserTab";
 import CostDashboardTab from "../components/admin/CostDashboardTab";
 import ResultEndpointsTab from "../components/admin/ResultEndpointsTab";
 import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
+import EvalV2Tab from "../components/admin/EvalV2Tab";
+import { LegacySatisfactionToggle, SatisfactionBadges, SatisfactionColumnHeader } from "../components/admin/SatisfactionBadges";
 import CrmTab from "../components/admin/CrmTab";
 import V0CreditsCard from "../components/admin/V0CreditsCard";
 import CostBreakdownBody, { OrgUsageRollup } from "../components/admin/CostBreakdownBody";
@@ -832,6 +834,8 @@ export default function AdminDashboard() {
     useState<AdminChatSession | null>(null);
   const [chatDialogOpen, setChatDialogOpen] = useState(false);
   const [scoringSessionIds, setScoringSessionIds] = useState<Set<string>>(new Set());
+  // ENG-2196: the unvalidated Satisfaction column, its auto-scoring and override stay off until an admin opens them.
+  const [showLegacySatisfaction, setShowLegacySatisfaction] = useState(false);
   const [failedScoringIds, setFailedScoringIds] = useState<Set<string>>(new Set());
   const [scoringJudges, setScoringJudges] = useState<Array<{ id: string; name: string; systemPrompt: string }>>([]);
   const [selectedJudgeId, setSelectedJudgeId] = useState<string>("");
@@ -1472,9 +1476,9 @@ export default function AdminDashboard() {
     return () => observer.disconnect();
   }, [tabValue, chatSessionsHasMore, chatSessionsLoading, loadChatSessions]);
 
-  // Trigger satisfaction scoring for sessions that need it
+  // Trigger satisfaction scoring for sessions that need it — only while the legacy column is shown
   useEffect(() => {
-    if (!token || chatSessions.length === 0) return;
+    if (!showLegacySatisfaction || !token || chatSessions.length === 0) return;
 
     const needsScoring = chatSessions.filter((s) => {
       if (scoringSessionIds.has(s.sessionId)) return false;
@@ -1555,7 +1559,7 @@ export default function AdminDashboard() {
 
     scoreBatches();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chatSessions.length, token]);
+  }, [chatSessions.length, token, showLegacySatisfaction]);
 
   const handleScoreOverrideSave = async () => {
     if (!scoreOverrideSession || !token) return;
@@ -6068,6 +6072,8 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                 Clear
               </Button>
             )}
+            <Box sx={{ flexGrow: 1 }} />
+            <LegacySatisfactionToggle checked={showLegacySatisfaction} onChange={setShowLegacySatisfaction} />
           </Box>
           <TableContainer component={Paper}>
             <Table>
@@ -6086,14 +6092,18 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                   <TableCell>Longest Wait</TableCell>
                   <TableCell>Max Heap</TableCell>
                   <TableCell>Feedback</TableCell>
-                  <TableCell>Satisfaction</TableCell>
                   <TableCell>Actions</TableCell>
+                  {showLegacySatisfaction && (
+                    <TableCell>
+                      <SatisfactionColumnHeader />
+                    </TableCell>
+                  )}
                 </TableRow>
               </TableHead>
               <TableBody>
                 {chatSessionsLoading && chatSessions.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={15} align="center">
+                    <TableCell colSpan={showLegacySatisfaction ? 15 : 14} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -6308,121 +6318,6 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                           })()}
                         </TableCell>
                         <TableCell>
-                          {(() => {
-                            const sat = session.satisfactionScore;
-                            if (scoringSessionIds.has(session.sessionId) && !sat) {
-                              return <CircularProgress size={16} />;
-                            }
-                            if (failedScoringIds.has(session.sessionId) && !sat) {
-                              return (
-                                <Tooltip title="Scoring failed. Click to retry.">
-                                  <IconButton
-                                    size="small"
-                                    color="error"
-                                    onClick={async () => {
-                                      setFailedScoringIds((prev) => {
-                                        const next = new Set(prev);
-                                        next.delete(session.sessionId);
-                                        return next;
-                                      });
-                                      setScoringSessionIds((prev) => new Set(prev).add(session.sessionId));
-                                      try {
-                                        const response = await axios.post(
-                                          buildApiUrl("/api/admin/chat-sessions/score"),
-                                          { sessionIds: [session.sessionId] },
-                                          { headers: { Authorization: `Bearer ${token}` }, timeout: 30000 }
-                                        );
-                                        const { scores, failed = [] } = response.data;
-                                        const newScore = scores[session.sessionId];
-                                        if (newScore) {
-                                          setChatSessions((prev) =>
-                                            prev.map((s) =>
-                                              s.sessionId === session.sessionId ? { ...s, satisfactionScore: newScore } : s
-                                            )
-                                          );
-                                        }
-                                        if (failed.includes(session.sessionId)) {
-                                          setFailedScoringIds((prev) => new Set(prev).add(session.sessionId));
-                                        }
-                                      } catch {
-                                        setFailedScoringIds((prev) => new Set(prev).add(session.sessionId));
-                                      } finally {
-                                        setScoringSessionIds((prev) => {
-                                          const next = new Set(prev);
-                                          next.delete(session.sessionId);
-                                          return next;
-                                        });
-                                      }
-                                    }}
-                                  >
-                                    <ReplayIcon sx={{ fontSize: '1rem' }} />
-                                  </IconButton>
-                                </Tooltip>
-                              );
-                            }
-                            if (!sat && (!session.judgeScores || Object.keys(session.judgeScores).length === 0)) {
-                              return <span style={{ color: '#999' }}>-</span>;
-                            }
-                            const chips: React.ReactNode[] = [];
-                            if (sat) {
-                              const color = sat.score <= 2 ? 'error' : sat.score === 3 ? 'warning' : 'success';
-                              const dimSummary = sat.dimensions
-                                ? ` | Goal:${sat.dimensions.goalCompletion} Accuracy:${sat.dimensions.dataAccuracy} Quality:${sat.dimensions.outputQuality}`
-                                : '';
-                              chips.push(
-                                <Tooltip key="default" title={`Default: ${sat.reason}${dimSummary}${sat.adminOverride ? ' (admin override)' : ''}`}>
-                                  <Chip
-                                    label={`Default: ${sat.score}`}
-                                    size="small"
-                                    color={color}
-                                    variant={sat.adminOverride ? 'filled' : 'outlined'}
-                                    icon={sat.adminOverride ? <EditIcon sx={{ fontSize: '0.8rem' }} /> : undefined}
-                                    onClick={(e) => {
-                                      setScoreOverrideAnchor(e.currentTarget);
-                                      setScoreOverrideSession(session);
-                                      setScoreOverrideValue(sat.score);
-                                      setScoreOverrideReason(sat.reason);
-                                    }}
-                                    sx={{ cursor: 'pointer' }}
-                                  />
-                                </Tooltip>
-                              );
-                              if (sat.dimensions) {
-                                const { goalCompletion, dataAccuracy, outputQuality } = sat.dimensions;
-                                const dimColor = (v: number) => v <= 2 ? 'error' : v === 3 ? 'warning' : 'success';
-                                chips.push(
-                                  <Tooltip key="dim-goal" title="Goal completion"><Chip label={`G:${goalCompletion}`} size="small" color={dimColor(goalCompletion) as any} variant="outlined" sx={{ fontSize: '0.65rem', height: 18 }} /></Tooltip>,
-                                  <Tooltip key="dim-acc" title="Data accuracy"><Chip label={`A:${dataAccuracy}`} size="small" color={dimColor(dataAccuracy) as any} variant="outlined" sx={{ fontSize: '0.65rem', height: 18 }} /></Tooltip>,
-                                  <Tooltip key="dim-qual" title="Output quality"><Chip label={`Q:${outputQuality}`} size="small" color={dimColor(outputQuality) as any} variant="outlined" sx={{ fontSize: '0.65rem', height: 18 }} /></Tooltip>,
-                                );
-                              }
-                            }
-                            if (session.judgeScores) {
-                              Object.entries(session.judgeScores).forEach(([jId, jScore]) => {
-                                const jColor = jScore.score <= 2 ? 'error' : jScore.score === 3 ? 'warning' : 'success';
-                                const jDimSummary = jScore.dimensions
-                                  ? ` | Goal:${jScore.dimensions.goalCompletion} Accuracy:${jScore.dimensions.dataAccuracy} Quality:${jScore.dimensions.outputQuality}`
-                                  : '';
-                                chips.push(
-                                  <Tooltip key={jId} title={`${jScore.judgeName}: ${jScore.reason}${jDimSummary}`}>
-                                    <Chip
-                                      label={`${jScore.judgeName}: ${jScore.score}`}
-                                      size="small"
-                                      color={jColor as any}
-                                      variant="outlined"
-                                    />
-                                  </Tooltip>
-                                );
-                              });
-                            }
-                            return (
-                              <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
-                                {chips}
-                              </Box>
-                            );
-                          })()}
-                        </TableCell>
-                        <TableCell>
                           <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
                             <Button
                               variant="outlined"
@@ -6466,11 +6361,83 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                             )}
                           </Box>
                         </TableCell>
+                        {showLegacySatisfaction && (
+                          <TableCell>
+                            {(() => {
+                              const sat = session.satisfactionScore;
+                              if (scoringSessionIds.has(session.sessionId) && !sat) {
+                                return <CircularProgress size={16} />;
+                              }
+                              if (failedScoringIds.has(session.sessionId) && !sat) {
+                                return (
+                                  <Tooltip title="Scoring failed. Click to retry.">
+                                    <IconButton
+                                      size="small"
+                                      color="error"
+                                      onClick={async () => {
+                                        setFailedScoringIds((prev) => {
+                                          const next = new Set(prev);
+                                          next.delete(session.sessionId);
+                                          return next;
+                                        });
+                                        setScoringSessionIds((prev) => new Set(prev).add(session.sessionId));
+                                        try {
+                                          const response = await axios.post(
+                                            buildApiUrl("/api/admin/chat-sessions/score"),
+                                            { sessionIds: [session.sessionId] },
+                                            { headers: { Authorization: `Bearer ${token}` }, timeout: 30000 }
+                                          );
+                                          const { scores, failed = [] } = response.data;
+                                          const newScore = scores[session.sessionId];
+                                          if (newScore) {
+                                            setChatSessions((prev) =>
+                                              prev.map((s) =>
+                                                s.sessionId === session.sessionId ? { ...s, satisfactionScore: newScore } : s
+                                              )
+                                            );
+                                          }
+                                          if (failed.includes(session.sessionId)) {
+                                            setFailedScoringIds((prev) => new Set(prev).add(session.sessionId));
+                                          }
+                                        } catch {
+                                          setFailedScoringIds((prev) => new Set(prev).add(session.sessionId));
+                                        } finally {
+                                          setScoringSessionIds((prev) => {
+                                            const next = new Set(prev);
+                                            next.delete(session.sessionId);
+                                            return next;
+                                          });
+                                        }
+                                      }}
+                                    >
+                                      <ReplayIcon sx={{ fontSize: '1rem' }} />
+                                    </IconButton>
+                                  </Tooltip>
+                                );
+                              }
+                              if (!sat && (!session.judgeScores || Object.keys(session.judgeScores).length === 0)) {
+                                return <span style={{ color: '#999' }}>-</span>;
+                              }
+                              return (
+                                <SatisfactionBadges
+                                  score={sat}
+                                  judgeScores={session.judgeScores}
+                                  onOverride={(anchor, score) => {
+                                    setScoreOverrideAnchor(anchor);
+                                    setScoreOverrideSession(session);
+                                    setScoreOverrideValue(score.score);
+                                    setScoreOverrideReason(score.reason);
+                                  }}
+                                />
+                              );
+                            })()}
+                          </TableCell>
+                        )}
                       </TableRow>
                     ))}
                     {chatSessionsLoading && (
                       <TableRow>
-                        <TableCell colSpan={15} align="center">
+                        <TableCell colSpan={showLegacySatisfaction ? 15 : 14} align="center">
                           <CircularProgress size={24} />
                         </TableCell>
                       </TableRow>
@@ -6775,6 +6742,10 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
 
         <TabPanel value={tabValue} index={25}>
           <UsageCostByUserTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={26}>
+          <EvalV2Tab />
         </TabPanel>
         </Box>
       </Box>

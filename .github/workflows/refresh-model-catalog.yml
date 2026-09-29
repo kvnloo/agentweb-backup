@@ -1,7 +1,7 @@
-name: Refresh model catalog
+name: Frontier monitor and model catalog
 on:
   schedule:
-    - cron: '17 9 * * 1'
+    - cron: '17 9 * * *'
   workflow_dispatch:
 permissions:
   contents: write
@@ -24,11 +24,12 @@ jobs:
           cache-dependency-path: backend/package-lock.json
       - run: npm ci --ignore-scripts
         working-directory: backend
-      - name: Prepare code-only catalog patch
+      - name: Monitor frontier and prepare code-only catalog patch
         working-directory: backend
         env:
           ARTIFICIAL_ANALYSIS_API_KEY: ${{ secrets.ARTIFICIAL_ANALYSIS_API_KEY }}
-        run: npx ts-node --transpile-only src/scripts/refreshModelCatalog.ts --write > /tmp/model-catalog-plan.json
+          SLACK_MODEL_ALERTS_WEBHOOK: ${{ secrets.SLACK_MODEL_ALERTS_WEBHOOK }}
+        run: npx ts-node --transpile-only src/scripts/frontierMonitor.ts --write --notify > /tmp/model-catalog-plan.json
       - name: Refresh capability evidence for added models
         working-directory: backend
         run: |
@@ -37,11 +38,14 @@ jobs:
           fi
       - name: Verify critical catalog and price-book invariants
         working-directory: backend
-        run: npx jest --runInBand --runTestsByPath src/services/agentMode/__tests__/modelCatalogRefresh.test.ts src/__tests__/llmPricing.test.ts
+        run: npx jest --runInBand --runTestsByPath src/services/agentMode/__tests__/modelCatalogRefresh.test.ts src/services/agentMode/__tests__/frontierMonitor.test.ts src/__tests__/llmPricing.test.ts
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: model-catalog-plan
-          path: /tmp/model-catalog-plan.json
+          path: |
+            /tmp/model-catalog-plan.json
+            docs/openrouter-byok-coverage.md
       - uses: peter-evans/create-pull-request@v7
         with:
           branch: automation/model-catalog-refresh
@@ -49,10 +53,12 @@ jobs:
           author: deploy <deploy@agentweb.pro>
           committer: deploy <deploy@agentweb.pro>
           draft: true
-          title: 'Refresh model catalog, pricing and benchmark scores'
+          title: 'Refresh frontier models and OpenRouter BYOK coverage'
           commit-message: 'chore: refresh model catalog from OpenRouter and Artificial Analysis'
           body: |
-            Refresh supported product lines from OpenRouter and benchmark scores from Artificial Analysis.
+            Daily frontier detection using OpenRouter release dates and the Artificial Analysis top 10.
+            Auto-add validated text/tool models in tracked families or top-N models from tracked providers.
+            Include advertised cloud BYOK endpoint coverage; credentials and quota are not verified.
             Missing AA credentials preserve existing scores. Inspect the model-catalog-plan artifact for unmatched scores, proposed prices, and supersession.
 
             New entries are marked auto-added. Review capabilities and customer-facing descriptions before marking ready. Existing Azure BYOK pricing is preserved.
@@ -63,3 +69,6 @@ jobs:
             backend/src/utils/llmPricing.ts
             backend/src/__tests__/llmPricing.test.ts
             backend/src/services/agentMode/__tests__/fixtures/openRouterSupportedParameters.json
+            docs/openrouter-byok-coverage.md
+      - name: Surface incomplete upstream observations
+        run: node -e 'if (require("/tmp/model-catalog-plan.json").degraded) { console.error("Upstream observation incomplete; inspect monitor report"); process.exit(1); }'

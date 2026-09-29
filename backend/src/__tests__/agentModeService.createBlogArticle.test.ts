@@ -98,7 +98,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'medium',
         '',
         '',
-        'default'
+        'default',
+        'user123'
       );
 
       // Verify generateBlogImage was called
@@ -170,7 +171,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'medium',
         '',
         '',
-        'default' // Should default to 'default'
+        'default', // Should default to 'default'
+        'user123'
       );
 
       expect(mockGenerateBlogHtml).toHaveBeenCalledWith(
@@ -228,7 +230,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'medium',
         '',
         '',
-        'substack'
+        'substack',
+        'user123'
       );
 
       // Verify generateBlogHtml was called with substack style
@@ -281,7 +284,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'long',
         'Research context',
         'Requirements',
-        'substack'
+        'substack',
+        'user123'
       );
 
       // Verify style is passed to HTML generation
@@ -332,7 +336,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'short',
         'Research context here',
         'Special requirements',
-        'substack'
+        'substack',
+        'user456'
       );
     });
 
@@ -371,7 +376,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'medium',
         '',
         '',
-        'default'
+        'default',
+        'user123'
       );
     });
   });
@@ -560,7 +566,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'medium',
         '',
         '',
-        'default'
+        'default',
+        'user123'
       );
 
       expect(result.success).toBe(true);
@@ -603,7 +610,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'medium',
         '',
         '',
-        'substack'
+        'substack',
+        'user123'
       );
 
       expect(mockGenerateBlogHtml).toHaveBeenCalledWith(
@@ -693,7 +701,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'medium',
         'Original research context',
         '',
-        'default'
+        'default',
+        'user123'
       );
     });
 
@@ -760,5 +769,39 @@ describe('AgentModeService - create_blog_article function', () => {
       expect(mockRestyleContent).not.toHaveBeenCalled();
     });
   });
-});
 
+  // ENG-2183: #3067 resolves the content_generation model per organization, so
+  // the caller's userId must reach whichever blog call picks the model.
+  describe('Content model user threading (ENG-2183)', () => {
+    const blogData = { title: 'T', description: 'D', content: 'Body', imagePrompt: 'P' };
+    let service: { createBlogArticle(...args: unknown[]): Promise<{ success: boolean }> };
+
+    beforeEach(() => {
+      service = agentModeService as unknown as typeof service;
+      mockGenerateBlogImage.mockResolvedValue({ imageUrl: 'https://example.com/hero.png', filename: 'hero.png' });
+      mockGenerateBlogHtml.mockReturnValue('<html>T</html>');
+      mockUploadFileToS3.mockResolvedValue({ success: true, url: 'https://s3.example.com/blog.html' });
+    });
+
+    it('passes the caller userId to generateBlogContent', async () => {
+      mockGenerateBlogContent.mockResolvedValue(blogData);
+
+      const result = await service.createBlogArticle('Title', 'Draft', 'short', '', '', 'org-member-7', 'session1', 'substack');
+
+      expect(result.success).toBe(true);
+      expect(mockGenerateBlogContent).toHaveBeenCalledTimes(1);
+      expect(mockGenerateBlogContent).toHaveBeenCalledWith('Title', 'Draft', 'short', '', '', 'substack', 'org-member-7');
+    });
+
+    it('passes the caller userId to restyleContent on the deep-research path', async () => {
+      mockDeepResearchService.performDeepResearch.mockResolvedValue({ success: true, markdownContent: '# Research' });
+      mockRestyleContent.mockResolvedValue(blogData);
+
+      const result = await service.createBlogArticle('Title', 'Draft', 'short', '', '', 'org-member-7', 'session1', 'default', true);
+
+      expect(result.success).toBe(true);
+      expect(mockGenerateBlogContent).not.toHaveBeenCalled();
+      expect(mockRestyleContent).toHaveBeenCalledWith('# Research', 'Title', 'professional', 'default', true, 'org-member-7');
+    });
+  });
+});

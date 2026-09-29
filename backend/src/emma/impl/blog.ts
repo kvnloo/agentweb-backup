@@ -127,7 +127,8 @@ export async function createBlogArticle(
         titleDraft,
         'professional',
         style,
-        true // includeInlineImages = true for deep research
+        true, // includeInlineImages = true for deep research
+        userId
       );
 
       if (!blogData.title || !blogData.content) {
@@ -167,7 +168,8 @@ export async function createBlogArticle(
         length,
         researchContext,
         requirements,
-        style
+        style,
+        userId
       );
 
       if (!blogData.title || !blogData.content) {

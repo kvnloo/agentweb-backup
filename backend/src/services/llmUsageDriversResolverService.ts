@@ -103,6 +103,7 @@ function ledgerIsIncomplete(
 }
 import { recordUsageTelemetry, USAGE_TELEMETRY_EVENTS } from "./llmUsageTelemetry";
 import { utcDay, resolveCycle } from "../utils/usageCycle";
+import { taskVerifiedQualityLookup, type TaskVerifiedLookup } from "../loops/eval/taskVerifiedFeed";
 
 /** A different target for the SAME driver — an alternative, never an extra win. */
 export interface UsageRecommendationAlternative {
@@ -142,9 +143,17 @@ export type RecommendationConfidence = "insufficient_data" | "low" | "medium" | 
  * - `unknown` (`source: "none"`) — the true no-data case: AA has not scored
  *   one or both sides of the pair. This is still the ONLY status this file
  *   is entitled to emit for a pair with no AA data, and it stays that way.
- * - `task_verified` (`source: "task_eval"`) — TYPE SLOT RESERVED for a future
- *   Okareo-backed eval harness (open question `OQ:okareo`). Nothing in this
- *   file sets it; see the follow-up issue linked from ENG-1563.
+ * - `task_verified` (`source: "task_eval"`) — set by `taskVerifiedQualityLookup`
+ *   (loops/eval/taskVerifiedFeed.ts, ENG-2190) from the eval-v2 online sampler's
+ *   sampled task-success rate, ONLY for a pair where `evalRegistry.mayGate` is
+ *   true for the grader behind it. As of this writing no grader is validated
+ *   (ENG-2128 principle 2), so this reads as provably inert: no grader mayGates,
+ *   so no eval-v2 data is even read, let alone this status emitted. The full
+ *   Okareo-backed harness and canary/promotion rollout (open question
+ *   `OQ:okareo`) remains ENG-1564, still Backlog pending its own AC1 decision —
+ *   this feed does not attempt that; it reuses AgentWeb's own already-running
+ *   production-outcome sampler instead, behind the same registry gate every
+ *   other eval-v2 metric already respects.
  *
  * HARD INVARIANT: an AA-derived value and a task-eval-derived value are never
  * blended into one number or one status — each tier renders its own explicit
@@ -462,7 +471,7 @@ export async function previewUsageRunway(
 
 export async function resolveUsageDrivers(
   userId: string,
-  options: { today?: string } = {},
+  options: { today?: string; taskVerifiedLookup?: TaskVerifiedLookup } = {},
 ): Promise<ResolvedUsageDrivers> {
   const today = options.today || utcDay(new Date());
   const usage = await getEffectiveLlmUsagePolicy(userId);
@@ -602,8 +611,10 @@ export async function resolveUsageDrivers(
    * either side is missing from `qualityScoreById` — that is the only honest
    * answer when AA has no benchmark for one or both models. Otherwise
    * resolves to `benchmark_comparable` or `benchmark_lower` (AC1/AC2) per
-   * `BENCHMARK_COMPARABLE_MAX_DELTA`, never `task_verified` (AC5 — that
-   * status is reserved for a future task-eval harness, out of scope here).
+   * `BENCHMARK_COMPARABLE_MAX_DELTA`. This function itself never returns
+   * `task_verified` — its caller tries `taskVerifiedQualityLookup` first
+   * (ENG-2190) and only falls back to this AA-benchmark tier when that
+   * returns nothing.
    */
   const qualityFor = (fromModel: string, toModel: string): RecommendationQuality => {
     const fromScore = qualityScoreById.get(fromModel);
@@ -637,6 +648,12 @@ export async function resolveUsageDrivers(
         "Generally rated lower on independent benchmarks — not yet tested on your specific work.",
     };
   };
+
+  // ENG-2190 (ENG-1564's reserved slot): a validated eval-v2 rate wins over the AA-benchmark
+  // guess below when one is available. Injectable for tests; production resolves through
+  // evalRegistry.mayGate, so this reads no eval-v2 data at all while every grader stays
+  // unvalidated — the same "inert by construction" contract as the sampler that feeds it.
+  const taskVerified = options.taskVerifiedLookup ?? taskVerifiedQualityLookup();
 
   const recommendations: UsageRecommendation[] = [];
   for (const driver of attribution.byModel) {
@@ -687,7 +704,9 @@ export async function resolveUsageDrivers(
         completeDaysObserved: baseline.completeDaysElapsed,
         confidence:
           estimatedDaysRecovered === null ? "insufficient_data" : confidenceFor(driver.callCount),
-        quality: qualityFor(driver.key, candidate),
+        // ENG-2190: task_verified (from real sampled outcomes) fully overrides the AA-benchmark
+        // guess for a matching pair, never blends with it (ENG-1564 requirement 4).
+        quality: (await taskVerified(driver.key, candidate)) ?? qualityFor(driver.key, candidate),
         isEstimate: true,
         requiresConfirmation: true,
         basis: est.basis,

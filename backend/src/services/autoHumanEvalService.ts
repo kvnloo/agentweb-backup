@@ -1,6 +1,10 @@
 import { createHash } from 'crypto';
 import { humanEvalService, type HumanEvalAction, type HumanEvalCandidate, type HumanEvalReviewType } from './humanEvalService';
 import { settingsService } from './settingsService';
+import type { CreativeGateResult } from './creativeGates';
+import type { CreativeBrief } from './creativeRubricJudge';
+import { judgeHumanEvalCandidate } from './creativeRubricJudgeRuntime';
+import { runContentChecksForCandidate } from './creativeContentCheckRunner';
 
 export interface AutoHumanEvalInput {
   reviewType: HumanEvalReviewType;
@@ -19,6 +23,15 @@ export interface AutoHumanEvalInput {
    * stored fail-open as 'uncategorized'.
    */
   category?: string;
+  /** Advisory creative gate result from generation (ENG-2139); stored on the candidate. */
+  creativeGates?: CreativeGateResult;
+  /** What the generating flow knows about the creative's brief, for the rubric judge (ENG-2140). */
+  creativeBrief?: Omit<CreativeBrief, 'brand'>;
+  /** Landing pages: the generated page source for the rubric judge, read only if sampled (ENG-2192). */
+  loadLandingPageSource?: () => Promise<string | undefined>;
+  /** Ad copy (headline/body/CTA) supplied alongside the image, if any — spell-checked and
+   *  policy-screened together with the OCR'd text by the ENG-2193 content checks. */
+  adCopyText?: string;
 }
 
 function dedupeSettingKey(sourceKey: string): string {
@@ -115,6 +128,7 @@ export async function enqueueAutoHumanEval(
       originalRequest: input.originalRequest,
       action: input.action,
       category: input.category,
+      creativeGates: input.creativeGates,
     });
 
     // Round-4 review finding: this sourceKey-marker write is housekeeping, not the actual
@@ -133,6 +147,38 @@ export async function enqueueAutoHumanEval(
       );
     } catch (markerErr: any) {
       console.warn('[auto-human-eval] sourceKey dedupe marker write failed after the candidate was already created (non-fatal):', markerErr?.message || markerErr);
+    }
+
+    // ENG-2140 / ENG-2192: advisory rubric judge on sampled generated images and landing pages,
+    // only when enabled. Not awaited, and the hook never throws, so it cannot delay or fail the
+    // enqueue or the generation.
+    if (input.reviewType === 'creative_image' || input.reviewType === 'landing_page') {
+      void judgeHumanEvalCandidate({
+        candidateId: candidate.candidateId,
+        userId: input.userId,
+        reviewType: input.reviewType,
+        category: input.category,
+        artifactUrl: candidate.artifactUrl ?? input.artifactUrl,
+        createdAt: candidate.createdAt,
+        creativeGates: input.creativeGates,
+        ...(input.loadLandingPageSource ? { loadLandingPageSource: input.loadLandingPageSource } : {}),
+        brief: input.creativeBrief,
+      }).catch(() => undefined);
+    }
+
+    // ENG-2193: OCR/spelling/brand-colour/logo/policy-keyword checks, appended onto the
+    // structural `creativeGates` already stored above. Images only for now — see
+    // `creativeContentCheckRunner.ts`'s header for why landing pages aren't wired in here.
+    // Off by default (`CREATIVE_CONTENT_CHECKS_ENABLED`); the runner no-ops when unset, but the
+    // env check is duplicated here too so a disabled flag skips even the download-bound work of
+    // scheduling the call, not just the checks themselves.
+    if (input.reviewType === 'creative_image' && process.env.CREATIVE_CONTENT_CHECKS_ENABLED === 'true') {
+      void runContentChecksForCandidate({
+        candidateId: candidate.candidateId,
+        artifactUrl: candidate.artifactUrl ?? input.artifactUrl,
+        userId: input.userId,
+        adCopyText: input.adCopyText,
+      }).catch(() => undefined);
     }
 
     return candidate;
