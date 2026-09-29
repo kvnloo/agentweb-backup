@@ -246,6 +246,16 @@ export interface AccountHealthSignalState {
   /** Channel of the last emitted signal, so a later needs_review → oncall escalation is not
    * mistaken for an unchanged repeat. */
   lastSignalChannel?: string;
+  /**
+   * ENG-2188 (CodeRabbit #3128): only meaningful when `lastSignalChannel` is `cs_nudge`. The claim
+   * is written `pending` before the batched digest email is even attempted — claiming the episode
+   * first is what stops two cron instances from both queueing it — and finalized to `delivered`
+   * only once the digest actually sends. A `pending` claim older than
+   * `CS_NUDGE_PENDING_TIMEOUT_MS` is not trusted: the next sweep treats it as never delivered and
+   * retries it, recovering a nudge whose process stopped between the claim and the send (crash,
+   * deploy, OOM) instead of losing it silently.
+   */
+  csNudgeDeliveryStatus?: 'pending' | 'delivered';
   /** Optimistic-concurrency counter: every instance runs the cron, and only one may emit. */
   version: number;
 }
@@ -255,8 +265,10 @@ export async function getAccountHealthSignalState(userId: string): Promise<Accou
     .get({ TableName: TABLE_NAME, Key: { userId, capability: ACCOUNT_HEALTH_SIGNAL_CAPABILITY } })
     .promise();
   if (!result.Item) return null;
-  const { state, stateSince, lastEpisodeKey, lastSignalCodes, lastSignalAt, lastSignalChannel, version } = result.Item;
-  return { state, stateSince, lastEpisodeKey, lastSignalCodes, lastSignalAt, lastSignalChannel, version };
+  const {
+    state, stateSince, lastEpisodeKey, lastSignalCodes, lastSignalAt, lastSignalChannel, csNudgeDeliveryStatus, version,
+  } = result.Item;
+  return { state, stateSince, lastEpisodeKey, lastSignalCodes, lastSignalAt, lastSignalChannel, csNudgeDeliveryStatus, version };
 }
 
 /**
