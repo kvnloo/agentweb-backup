@@ -67,7 +67,7 @@ jest.mock('../utils/sseProgress', () => ({
   emitProgress: jest.fn(),
 }));
 
-const mockPostMessage = jest.fn().mockResolvedValue({ ok: true, ts: 'thinking-msg-ts' });
+const mockPostMessage = jest.fn().mockResolvedValue({ ok: true, ts: 'ishare-msg-ts' });
 const mockChatDelete = jest.fn().mockResolvedValue({ ok: true });
 
 jest.mock('../services/slackService', () => {
@@ -75,8 +75,7 @@ jest.mock('../services/slackService', () => {
   return {
     ...actual,
     postThreadResponse: jest.fn().mockResolvedValue(undefined),
-    postThinkingMessage: jest.fn().mockResolvedValue('thinking-msg-ts'),
-    deleteSlackMessage: jest.fn().mockResolvedValue(undefined),
+    setSlackAssistantStatus: jest.fn().mockResolvedValue(undefined),
     getSlackUserDisplayName: jest.fn().mockResolvedValue('John Doe'),
     getSlackUserEmail: jest.fn().mockResolvedValue('customer@example.com'),
     resolveSlackFileUrl: jest.fn(),
@@ -86,6 +85,13 @@ jest.mock('../services/slackService', () => {
 
 jest.mock('../utils/s3Utils', () => ({
   uploadFileToS3: jest.fn(),
+}));
+
+// main gates every app_mention on a resolvable Emma bot identity and drops the event
+// when it is unavailable, so the identity has to be mocked or nothing reaches the pipeline.
+jest.mock('../services/loopSlackApprovalDispatcher', () => ({
+  handleLoopApprovalReaction: jest.fn(),
+  getEmmaBotUserId: jest.fn().mockResolvedValue('UEMMA123'),
 }));
 
 jest.mock('@slack/web-api', () => ({
@@ -104,12 +110,12 @@ const { ensureGtmWorkItemForSlackSession } = require('../services/gtmPlanService
 const { generateSessionResponse } = require('../controllers/agentModeController');
 const {
   postThreadResponse,
-  postThinkingMessage,
-  deleteSlackMessage,
+  setSlackAssistantStatus,
   resolveSlackFileUrl,
   downloadSlackFile,
 } = require('../services/slackService');
 const { uploadFileToS3 } = require('../utils/s3Utils');
+const { getEmmaBotUserId } = require('../services/loopSlackApprovalDispatcher');
 
 const CHANNEL = 'C12345';
 const TS = '1234567890.123456';
@@ -169,7 +175,8 @@ describe('handleSlackSessionResponse — characterization (pre-ENG-272 extractio
       'http://localhost:5174/ishare/session-123?conversable=abc'
     );
     ensureGtmWorkItemForSlackSession.mockResolvedValue(null);
-    postThinkingMessage.mockResolvedValue('thinking-msg-ts');
+    setSlackAssistantStatus.mockResolvedValue(undefined);
+    getEmmaBotUserId.mockResolvedValue('UEMMA123');
     generateSessionResponse.mockResolvedValue({ content: 'Here is your blog article!' });
   });
 
@@ -186,12 +193,13 @@ describe('handleSlackSessionResponse — characterization (pre-ENG-272 extractio
       );
     });
 
-    it('still removes the thinking message when the response is empty', async () => {
+    it('still clears the assistant thread status when the response is empty', async () => {
       generateSessionResponse.mockResolvedValue({ content: '' });
 
       await postMention();
 
-      expect(deleteSlackMessage).toHaveBeenCalledWith(CHANNEL, 'thinking-msg-ts');
+      expect(setSlackAssistantStatus).toHaveBeenCalledWith(CHANNEL, TS, 'is working...');
+      expect(setSlackAssistantStatus).toHaveBeenCalledWith(CHANNEL, TS, '');
     });
   });
 
@@ -269,12 +277,12 @@ describe('handleSlackSessionResponse — characterization (pre-ENG-272 extractio
       expect(chatbotDb.addMessagesToSession).not.toHaveBeenCalled();
     });
 
-    it('removes the thinking message and posts the error text to the thread', async () => {
+    it('clears the assistant thread status and posts the error text to the thread', async () => {
       generateSessionResponse.mockRejectedValue(new Error('generation blew up'));
 
       await postMention();
 
-      expect(deleteSlackMessage).toHaveBeenCalledWith(CHANNEL, 'thinking-msg-ts');
+      expect(setSlackAssistantStatus).toHaveBeenCalledWith(CHANNEL, TS, '');
       expect(postThreadResponse).toHaveBeenCalledWith(
         CHANNEL,
         TS,

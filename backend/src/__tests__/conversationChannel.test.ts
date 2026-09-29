@@ -45,8 +45,6 @@ jest.mock('@slack/web-api', () => ({
 
 jest.mock('../services/slackService', () => ({
   postThreadResponse: jest.fn(),
-  postThinkingMessage: jest.fn(),
-  deleteSlackMessage: jest.fn(),
   resolveSlackFileUrl: jest.fn(),
   downloadSlackFile: jest.fn(),
 }));
@@ -70,8 +68,6 @@ function makeAdapter(overrides: Partial<ConversationChannelAdapter> = {}): Conve
   return {
     transport: 'slack',
     persistThreadBinding: jest.fn(),
-    postThinking: jest.fn().mockResolvedValue({ id: 'think-1' }),
-    deleteMessage: jest.fn(),
     postReply: jest.fn(),
     postContextLinks: jest.fn(),
     fetchAttachments: jest.fn().mockResolvedValue([]),
@@ -97,6 +93,21 @@ describe('handleSessionResponse — FAIL cases', () => {
     jest.clearAllMocks();
     ensureGtmWorkItemForSlackSession.mockResolvedValue(null);
     chatbotDb.createOrReuseInteractiveShare.mockResolvedValue('https://ishare/1');
+  });
+
+  it('reports the failure into the thread when attachment resolution throws', async () => {
+    // main widened this try (ENG-1644-era refactor) so a failure before generation
+    // cannot escape and leak the caller's claimed progress indicator.
+    const adapter = makeAdapter({
+      fetchAttachments: jest.fn().mockRejectedValue(new Error('slack files.info down')),
+    });
+
+    await expect(handleSessionResponse(baseParams(), adapter)).resolves.toBeUndefined();
+
+    expect(adapter.postReply).toHaveBeenCalledWith(
+      REF,
+      'Sorry, I encountered an error while processing your request. Please try again.'
+    );
   });
 
   it('reports the failure into the thread instead of throwing when generation rejects', async () => {
@@ -186,14 +197,6 @@ describe('handleSessionResponse — edges', () => {
     expect(chatbotDb.updateSessionTitle).toHaveBeenCalledWith('s1', 'hello there');
   });
 
-  it('never tries to delete a thinking message the adapter declined to post', async () => {
-    const adapter = makeAdapter({ postThinking: jest.fn().mockResolvedValue(null) });
-
-    await handleSessionResponse(baseParams(), adapter);
-
-    expect(adapter.deleteMessage).not.toHaveBeenCalled();
-  });
-
   it('resolves and persists a default model when the session has none', async () => {
     await handleSessionResponse(baseParams({ session: { sessionId: 's1' } }), makeAdapter());
 
@@ -239,7 +242,6 @@ describe('handleSessionResponse — SUCCESS', () => {
     });
     expect(adapter.gtmTrackerLink).toHaveBeenCalledWith('p', 'ph', true);
     expect(adapter.renderOutbound).toHaveBeenCalledWith({ content: 'done' });
-    expect(adapter.deleteMessage).toHaveBeenCalledWith(REF, { id: 'think-1' });
     expect(adapter.postContextLinks).toHaveBeenCalledWith(REF, {
       ishareLink: 'https://ishare/1',
       gtmTrackerLink: 'https://portal/gtm-plan?planId=p&phaseId=ph',
@@ -340,27 +342,10 @@ describe('slackChannelAdapter', () => {
     });
   });
 
-  describe('postThinking', () => {
-    it('returns a handle when Slack accepts the placeholder', async () => {
-      slackService.postThinkingMessage.mockResolvedValue('ts-1');
-      await expect(slackChannelAdapter.postThinking(REF)).resolves.toEqual({ id: 'ts-1' });
-    });
-
-    it('returns null when Slack posts no placeholder', async () => {
-      slackService.postThinkingMessage.mockResolvedValue(undefined);
-      await expect(slackChannelAdapter.postThinking(REF)).resolves.toBeNull();
-    });
-  });
-
-  describe('postReply / deleteMessage', () => {
+  describe('postReply', () => {
     it('posts into the thread', async () => {
       await slackChannelAdapter.postReply(REF, 'hi');
       expect(slackService.postThreadResponse).toHaveBeenCalledWith('C1', 'T1', 'hi');
-    });
-
-    it('deletes by handle id', async () => {
-      await slackChannelAdapter.deleteMessage(REF, { id: 'ts-1' });
-      expect(slackService.deleteSlackMessage).toHaveBeenCalledWith('C1', 'ts-1');
     });
   });
 
