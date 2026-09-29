@@ -85,5 +85,83 @@ describe('emma/impl/adsApis.ts transitive-import shape', () => {
     expect(typeof adsApis.buildAudienceCampaignConfirmationSummary).toBe('function');
     expect(typeof adsApis.callLinkedInMarketingApi).toBe('function');
     expect(typeof adsApis.callLinkedInAdsInsightsApi).toBe('function');
+    // ENG-2103 (F2 follow-up): resolveOrCreateSeedAudience/getCampaignForAdSetReuseCheck/
+    // hashAudienceRows are new real exports, moved in from AgentModeService.
+    expect(typeof adsApis.resolveOrCreateSeedAudience).toBe('function');
+    expect(typeof adsApis.getCampaignForAdSetReuseCheck).toBe('function');
+    expect(typeof adsApis.hashAudienceRows).toBe('function');
+  });
+});
+
+/**
+ * ENG-2103 (F2 follow-up) — same rationale as htmlUpdate.moduleIsolation.test.ts's
+ * "self-import makes internal calls spy-observable" block. `resolveOrCreateSeedAudience`
+ * and `getCampaignForAdSetReuseCheck` were kept unmoved on `AgentModeService` through
+ * cluster 18 purely because tests jest.spyOn them directly. Moving them into THIS
+ * module means `executeAudienceCampaignLaunch`/`launchAudienceCampaign` (already here)
+ * now call sibling functions in the same module — a bare in-module call to a sibling
+ * `export function` does NOT go through the exports-namespace object (TS/CommonJS
+ * compiles it to a direct local reference), so without the `import * as self from
+ * './adsApis'` indirection, `agentModeService.audienceCampaignWorkflows.test.ts`'s and
+ * `metaLaunchGateWiring.test.ts`'s retargeted `jest.spyOn(adsApisImpl, '<fn>')` calls
+ * would silently stop being exercised. This test proves the indirection actually works,
+ * not just that it compiles — verified directly by temporarily removing the `self.`
+ * prefix and confirming this exact test (and 24 others across the two files above) fail.
+ */
+describe('emma/impl/adsApis.ts self-import makes internal calls spy-observable', () => {
+  beforeEach(() => {
+    jest.resetModules();
+  });
+
+  it('a jest.spyOn on the module namespace intercepts executeAudienceCampaignLaunch\'s own internal resolveOrCreateSeedAudience AND getCampaignForAdSetReuseCheck calls', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const adsApisImpl = require('../adsApis');
+
+    const seedSpy = jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValue({
+      plannedAction: 'create',
+      audience: { id: 'aud-mock-1', name: 'Mock Audience' },
+      created: true,
+      sourceSummary: 'CSV upload (mock)',
+      failures: [],
+    });
+    const campaignSpy = jest.spyOn(adsApisImpl, 'getCampaignForAdSetReuseCheck').mockResolvedValue({});
+
+    const deps = {
+      getMetaCredentials: jest.fn().mockResolvedValue({ accountId: 'act_test', accessToken: 'tok' }),
+      manageMetaCustomAudiences: jest.fn(),
+      resolveHubSpotService: jest.fn(),
+      listMetaAdsAdSets: jest.fn().mockResolvedValue({ success: true, adSets: [] }),
+      createMetaAdsAdSet: jest.fn().mockResolvedValue({ success: true, adSet: { id: 'adset-1', name: 'Ad Set' } }),
+    };
+
+    const result = await adsApisImpl.executeAudienceCampaignLaunch(
+      'user-1',
+      {
+        account_id: 'act_test',
+        campaign_id: 'camp_test',
+        audience_name: 'Mock Audience',
+        // Explicit non-ACTIVE status so isMetaSpendStartingWrite short-circuits the
+        // Meta tracking gate — not what this test is about.
+        ad_set_params: { name: 'Ad Set', status: 'PAUSED', targeting: {} },
+      },
+      'targeted_audience',
+      { type: 'csv', csvUrl: 'https://example.com/a.csv' },
+      deps as any,
+    );
+
+    // If the self-import indirection were missing, executeAudienceCampaignLaunch would
+    // call the REAL resolveOrCreateSeedAudience/getCampaignForAdSetReuseCheck (which
+    // would call the bare jest.fn() deps above and either throw or return undefined)
+    // instead of these mocks — this call would fail rather than return the mocked ledger.
+    expect(seedSpy).toHaveBeenCalledWith(
+      'user-1', 'act_test', 'Mock Audience', { type: 'csv', csvUrl: 'https://example.com/a.csv' }, { dryRun: false },
+      expect.objectContaining({ manageMetaCustomAudiences: deps.manageMetaCustomAudiences, resolveHubSpotService: deps.resolveHubSpotService }),
+    );
+    expect(campaignSpy).toHaveBeenCalledWith(
+      'user-1', 'act_test', 'camp_test',
+      expect.objectContaining({ getMetaCredentials: deps.getMetaCredentials }),
+    );
+    expect(result.success).toBe(true);
+    expect(result.ledger.audience).toEqual({ id: 'aud-mock-1', name: 'Mock Audience', created: true, subtype: 'CUSTOM' });
   });
 });
