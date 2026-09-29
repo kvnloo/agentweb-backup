@@ -24,7 +24,7 @@ import type { DynamoAttributeMap } from '../loops/core/ports';
 import { LOOP_EVENTS_TABLE, eventToItem } from '../loops/core/sensors/eventTableEventSource';
 import { asLoopId, asSubjectId, type LoopId } from '../loops/core/types';
 import { listEvalChangeMarkers, type EvalChangeMarkerRow } from '../loops/eval/evalChangeMarkers';
-import { gateConfigFromEnv, parseBaseline, runOfflineSuite, type OfflineSuiteResult } from '../loops/eval/offlineSuite';
+import { parseBaseline, runOfflineSuite, type OfflineSuiteResult } from '../loops/eval/offlineSuite';
 import { failureReplaySource, replayFixtureSource } from '../loops/eval/offlineSuiteSources';
 
 export const EVAL_MARKER_SUITE_FLAG = 'EVAL_MARKER_SUITE_ENABLED';
@@ -54,14 +54,21 @@ export type EvalMarkerSuiteOutcome =
   | { status: 'no_changes'; since: string }
   | { status: 'ran'; since: string; markerCount: number; verdict: OfflineSuiteResult['verdict'] };
 
-/** The deterministic local run: the committed baseline, replay cases and reply-length fixtures. */
-export function runLocalOfflineSuite(env: NodeJS.ProcessEnv = process.env): Promise<OfflineSuiteResult> {
+/**
+ * The deterministic local run: the committed baseline, replay cases and reply-length fixtures.
+ *
+ * Always report-only, by a literal gate config rather than `gateConfigFromEnv` — this job's own
+ * contract does not depend on whatever `EVAL_GATE_BLOCKING` happens to be set to in this
+ * process's environment. That flag is meaningful for the PR job and the Atem/staging CLI runs
+ * (backend/docs/evals/OFFLINE_EVAL_GATE.md); this cron never blocks (ENG-2195 CodeRabbit).
+ */
+export function runLocalOfflineSuite(): Promise<OfflineSuiteResult> {
   return runOfflineSuite({
     baseline: parseBaseline(localBaseline),
     baselineFile: LOCAL_BASELINE_FILE,
     target: 'local',
     sources: [failureReplaySource(), replayFixtureSource()],
-    gate: gateConfigFromEnv(env),
+    gate: { blockingFlag: false },
   });
 }
 
@@ -127,7 +134,7 @@ export async function runEvalMarkerSuite(deps: EvalMarkerSuiteDeps = {}): Promis
   const markers = (await listEvalChangeMarkers(query, since)).filter((m) => m.ts > since);
   if (markers.length === 0) return { status: 'no_changes', since };
 
-  const result = await (deps.runSuite ?? (() => runLocalOfflineSuite(env)))();
+  const result = await (deps.runSuite ?? runLocalOfflineSuite)();
   await put(buildVerdictItem(result, { since, markers }, now()));
   const line = `[${EVAL_MARKER_SUITE_JOB_NAME}] ${markers.length} change(s) since ${since}: verdict ${result.verdict} (${result.mode})`;
   if (result.verdict === 'pass') console.log(line);
