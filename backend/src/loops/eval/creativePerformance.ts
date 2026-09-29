@@ -82,6 +82,14 @@ export interface CreativeAggregate {
   crmJoinedSpend: number;
   /** The single currency of the settled rows, or null when they span several (or there are none). */
   currency: string | null;
+  /**
+   * The single currency of the settled, CRM-joined rows (the rows `crmLeads`/`crmJoinedSpend` are
+   * built from), or null when those rows span several currencies (or there are none). CPL eligibility
+   * must use this, not `currency`: a settled row with no CRM join contributes to `currency` but not to
+   * `crmJoinedSpend`, so an older unjoined row in a different currency would otherwise make a
+   * perfectly single-currency CRM pairing look mixed and drop a valid CPL point.
+   */
+  crmCurrency: string | null;
   settledRows: number;
   unsettledRows: number;
 }
@@ -145,10 +153,12 @@ export function aggregateCreative(obs: CreativeObservation): CreativeAggregate {
     crmLeads: 0,
     crmJoinedSpend: 0,
     currency: null,
+    crmCurrency: null,
     settledRows: 0,
     unsettledRows: 0,
   };
   const currencies = new Set<string>();
+  const crmCurrencies = new Set<string>();
   for (const ad of obs.ads) {
     const from = firstOwnDate(ad);
     for (const row of ad.rows) {
@@ -170,11 +180,13 @@ export function aggregateCreative(obs: CreativeObservation): CreativeAggregate {
       if (typeof row.crmLeadCount === 'number') {
         agg.crmLeads += row.crmLeadCount;
         agg.crmJoinedSpend += row.spend;
+        crmCurrencies.add(row.currency);
       }
       currencies.add(row.currency);
     }
   }
   agg.currency = currencies.size === 1 ? [...currencies][0] : null;
+  agg.crmCurrency = crmCurrencies.size === 1 ? [...crmCurrencies][0] : null;
   return agg;
 }
 
@@ -227,8 +239,8 @@ export function creativePerformanceReport(
     else excluded.noVideoPlays++;
 
     if (a.crmLeads < minConversions || a.crmLeads <= 0) excluded.noCrmLeads++;
-    else if (a.currency === null) excluded.crmMixedCurrency++;
-    else pushPair(cplPairs, a.currency, { x, y: a.crmJoinedSpend / a.crmLeads });
+    else if (a.crmCurrency === null) excluded.crmMixedCurrency++;
+    else pushPair(cplPairs, a.crmCurrency, { x, y: a.crmJoinedSpend / a.crmLeads });
 
     if (a.leads < minConversions || a.leads <= 0) excluded.noConversions++;
     else if (a.currency === null) excluded.mixedCurrency++;
