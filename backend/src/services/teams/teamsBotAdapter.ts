@@ -20,24 +20,40 @@ import {
   ConfigurationBotFrameworkAuthenticationOptions,
   TurnContext,
 } from 'botbuilder';
+import { createHash } from 'crypto';
 import { getTeamsBotCredentials } from '../../utils/secretsManager';
 
 let cachedAdapter: CloudAdapter | null = null;
-let cachedForAppId: string | null = null;
+let cachedForKey: string | null = null;
+
+/**
+ * Cache key over the whole credential triple, not just appId.
+ *
+ * CodeRabbit, PR #3139: a client-secret rotation keeps the same appId. Keying on appId alone
+ * meant that once the credentials cache expired and returned the NEW password, this still
+ * handed back the adapter built with the OLD one — every outbound reply failing to
+ * authenticate until the process restarted.
+ *
+ * Hashed rather than concatenated so the secret does not sit in a second plaintext copy in a
+ * module-level variable for the life of the process.
+ */
+function credentialKey(appId: string, appPassword: string, tenantId: string): string {
+  return createHash('sha256').update(`${appId}\u0000${tenantId}\u0000${appPassword}`).digest('hex');
+}
 
 /** Test hook: drop the memoized adapter so credentials are re-read. */
 export function __resetTeamsBotAdapter(): void {
   cachedAdapter = null;
-  cachedForAppId = null;
+  cachedForKey = null;
 }
 
 /**
  * Build (or reuse) the CloudAdapter for the configured bot.
  *
- * Memoized on appId rather than unconditionally: the adapter holds the SDK's token cache, so
- * rebuilding it per request would discard a valid Connector token and re-authenticate on every
- * inbound activity. Keying on appId means a credential rotation that changes the bot identity
- * still produces a fresh adapter.
+ * Memoized rather than rebuilt per request: the adapter holds the SDK's token cache, so
+ * rebuilding it every time would discard a valid Connector token and re-authenticate on every
+ * inbound activity. The key covers appId, tenantId AND appPassword, so a rotated secret
+ * produces a fresh adapter instead of one that authenticates with the retired password.
  *
  * Throws when credentials are unavailable. Callers must treat that as fail-closed — an
  * unauthenticated endpoint is strictly worse than an unavailable one.
@@ -45,7 +61,8 @@ export function __resetTeamsBotAdapter(): void {
 export async function getTeamsBotAdapter(): Promise<CloudAdapter> {
   const { appId, appPassword, tenantId } = await getTeamsBotCredentials();
 
-  if (cachedAdapter && cachedForAppId === appId) return cachedAdapter;
+  const key = credentialKey(appId, appPassword, tenantId);
+  if (cachedAdapter && cachedForKey === key) return cachedAdapter;
 
   const authConfig = {
     MicrosoftAppType: 'SingleTenant',
@@ -63,6 +80,6 @@ export async function getTeamsBotAdapter(): Promise<CloudAdapter> {
   };
 
   cachedAdapter = adapter;
-  cachedForAppId = appId;
+  cachedForKey = key;
   return adapter;
 }
