@@ -42787,11 +42787,77 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     throw new Error('No HubSpot account connected. Please connect HubSpot in Settings → External CRM Sync or via OAuth in Connected Accounts.');
   }
 
+  /** Marketing Hub objects served by call_hubspot_api. CONTACT_LIST is CRM, not here. */
+  private static readonly HUBSPOT_MARKETING_ENTITIES = new Set([
+    'CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL',
+  ]);
+
+  /**
+   * Returns an actionable error when the resolved OAuth grant holds no marketing scopes
+   * at all and the caller asked for a marketing object. Returns null to proceed.
+   *
+   * Best-effort by design: any problem resolving the account returns null so the call
+   * goes ahead and HubSpot decides. This guard exists to improve a message, and must
+   * never become a new way for a working call to fail.
+   */
+  private async hubspotMarketingPreflight(
+    userId: string,
+    accountId: string | undefined,
+    entityType: string,
+  ): Promise<{ success: false; error: string } | null> {
+    if (!AgentModeService.HUBSPOT_MARKETING_ENTITIES.has(entityType)) return null;
+    try {
+      const { getAccountsByUserId } = await import('./connectedAccountsDb');
+      const accounts = await getAccountsByUserId(userId);
+      const hs = accounts.filter((a: any) => a.platform === 'hubspot');
+      const acct = accountId ? hs.find((a: any) => a.account_id === accountId) : (hs.length === 1 ? hs[0] : undefined);
+      // No OAuth account resolved (pasted token, or ambiguous multi-account) — not ours to judge.
+      if (!acct) return null;
+      const granted: string[] = ((acct.config as any)?.granted_scopes ?? []) as string[];
+      if (!Array.isArray(granted) || granted.length === 0) return null;
+      const { INTEGRATION_CONFIG } = await import('../config/integrations');
+      const marketingOnly: readonly string[] = (INTEGRATION_CONFIG as any)?.hubspot?.marketingOnlyScopes ?? [];
+      if (marketingOnly.length === 0) return null;
+      if (granted.some((g) => marketingOnly.includes(g))) return null;
+      return {
+        success: false,
+        error:
+          `This HubSpot connection was authorised for CRM access only, so it cannot read or write `
+          + `${entityType} (a Marketing Hub object). Reconnect HubSpot in Settings → Connected Accounts `
+          + `and choose the marketing option to grant marketing access. Reconnecting with CRM access `
+          + `again will not change this.`,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   public async handleHubspotApi(userId: string, args: any): Promise<any> {
     const entityType: string = (args?.entity_type ?? '').toUpperCase();
     const action: string = (args?.action ?? '').toUpperCase();
     try {
       const svc = await this.resolveHubSpotService(userId, args?.account_id);
+
+      // Refuse a call the connection provably cannot serve, BEFORE spending a round trip
+      // on a guaranteed 403 whose message does not name the real problem.
+      //
+      // Every entity below CONTACT_LIST is a Marketing Hub object; CONTACT_LIST is CRM
+      // (crm.lists.*). In production 6 of 10 HubSpot grants hold NONE of
+      // integrations.hubspot.marketingOnlyScopes, so every marketing call they make 403s
+      // and the customer is told to "check your subscription tier and OAuth scopes" —
+      // true but unactionable, and it does not tell them which.
+      //
+      // Deliberately coarse: it fires only when the grant holds ZERO marketing scopes,
+      // where a 403 is certain. A grant holding `content` but not `forms` still reaches
+      // HubSpot and fails there. A precise per-entity scope map is the obvious next step,
+      // but it would be guesswork today — the 403 diagnostic added below is what will
+      // supply the real requirements.
+      //
+      // OAuth only. resolveHubSpotService falls back to a pasted private-app token whose
+      // scopes we cannot see, and blocking on scopes we do not know would break working
+      // setups.
+      const preflight = await this.hubspotMarketingPreflight(userId, args?.account_id, entityType);
+      if (preflight) return preflight;
 
       // ─── CONTACT_LIST ──────────────────────────────────────────────────────
       if (entityType === 'CONTACT_LIST') {
@@ -43208,6 +43274,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         // HubSpot returns 403 both for tier/scope limits and for tokens granted
         // before newer scopes were added to the app — distinguish them.
         const missingScopes = err?.response?.data?.category === 'MISSING_SCOPES';
+
+        // Log what HubSpot actually said. We hold the payload here and, until now, threw
+        // it away: `hubspotError` goes back to the model but the only thing written to
+        // the log is our own paraphrase, so a recurring production 403 (seen 09-23 and
+        // 09-26, same scheduled slot) could not be diagnosed at all.
+        //
+        // The distinction matters because the two causes have OPPOSITE remedies. A
+        // missing scope is fixed by reconnecting. A subscription-tier limit is not —
+        // telling that customer to reconnect sends them through an OAuth round trip that
+        // changes nothing. Right now we cannot tell them apart from the outside.
+        //
+        // `response.data` is HubSpot's error body: category, message, correlationId. It
+        // carries no credentials — unlike the axios error object, whose `config.data`
+        // holds client_secret (see redactAxiosCredentials in hubspotService).
+        const hsBody = err?.response?.data;
+        console.error(
+          `[AgentMode] call_hubspot_api 403 entity=${entityType} action=${action} `
+          + `category=${hsBody?.category ?? 'none'} missingScopes=${missingScopes} `
+          + `message=${JSON.stringify(hsBody?.message ?? null)} `
+          + `correlationId=${hsBody?.correlationId ?? 'none'}`
+        );
         return {
           success: false,
           error: missingScopes
