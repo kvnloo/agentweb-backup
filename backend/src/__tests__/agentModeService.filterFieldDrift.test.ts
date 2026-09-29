@@ -42,7 +42,7 @@ const PREVIOUSLY_BLIND = [
   'companyLinkedin', 'selectedSenderId', 'contactStatus', 'contactStatusReason',
   'contactStatusNote', 'contactStatusUpdatedBy', 'domain', 'accountOwnerUserId',
   'priority', 'expectedClose', 'closedDate', 'heatScore', 'healthScore',
-  'lifecycle', 'role', 'firstTouch', 'lastTouch', 'utmSource', 'utmMedium',
+  'role', 'firstTouch', 'lastTouch', 'utmSource', 'utmMedium',
 ];
 
 /** Lead A has every field populated. */
@@ -101,10 +101,21 @@ describe('CRM filter field drift (ENG-1218)', () => {
       expect((res.sampleLeads ?? []).map((l: any) => l.leadId)).not.toContain('A');
     });
 
-    it('previews rather than deletes — nothing here is destructive', async () => {
-      const res = await destructive('lifecycle', 'is_empty');
-      expect(res.requiresConfirmation).toBe(true);
-      expect(res.deletedCount).toBeUndefined();
+    it('treats lifecycle as semantically non-empty even when the row is unstamped', async () => {
+      const searchEmpty = await search('lifecycle', 'is_empty');
+      expect(searchEmpty.leads).toHaveLength(0);
+
+      const searchPresent = await search('lifecycle', 'is_not_empty');
+      expect(searchPresent.leads.map((l: any) => l.leadId).sort()).toEqual(['A', 'B']);
+
+      const deleteEmpty = await destructive('lifecycle', 'is_empty');
+      expect(deleteEmpty.matchCount).toBe(0);
+      expect(deleteEmpty.requiresConfirmation).toBe(false);
+
+      const deletePresent = await destructive('lifecycle', 'is_not_empty');
+      expect(deletePresent.matchCount).toBe(2);
+      expect(deletePresent.requiresConfirmation).toBe(true);
+      expect((deletePresent.sampleLeads ?? []).map((l: any) => l.leadId).sort()).toEqual(['A', 'B']);
     });
   });
 
@@ -132,13 +143,17 @@ describe('CRM filter field drift (ENG-1218)', () => {
       expect(res.leads.map((l: any) => l.leadId)).toEqual(['C']);
     });
 
-    it('a custom field named like a standard one is never mistaken for it', async () => {
+    it('a custom field named lifecycle never drives lifecycle equality', async () => {
       const decoy = { ...bare, leadId: 'D', customFields: { lifecycle: 'not the real thing' } };
       (mockCrmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
         items: [populated, decoy], lastEvaluatedKey: undefined,
       });
-      const res = await search('lifecycle', 'is_not_empty');
-      expect(res.leads.map((l: any) => l.leadId)).toEqual(['A']);
+      const res = await service.searchLeads(
+        'l1',
+        [{ field: 'lifecycle', operator: 'equals', value: 'not the real thing' }],
+        'u1',
+      ) as any;
+      expect(res.leads.map((l: any) => l.leadId)).toEqual([]);
     });
   });
 });
