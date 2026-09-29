@@ -96,14 +96,53 @@ describe('loadSessionItems — bounded spend read', () => {
     }
   });
 
-  it('falls back to the user as billing subject when resolving it fails', async () => {
+  it('reports truncated, not none, when the billing subject cannot be resolved (ENG-2196 CodeRabbit)', async () => {
+    // A spend row happens to exist under the raw userId itself — if the loader ever fell back to
+    // querying under it, this would misattribute that row as this session's own spend. It must not:
+    // an unresolved billing subject was never checked, so it can only be `truncated` (unknown).
     const reader = fakeReader({ spendByBilling: { member: [spendRow('a', 10)] } });
     const [a] = await loadSessionItems(reader, TABLES, [sessions[0]], {
       ...WINDOW,
       includeSpend: true,
       spendQuery: { indexName: SPEND_INDEX, billingUserOf: async () => { throw new Error('no user'); }, maxEventsPerBillingUser: 5 },
     });
-    expect(a.spendStatus).toBe('attributed');
+    expect(a.spendStatus).toBe('truncated');
+    expect(a.spend).toBeUndefined();
+    // Never queried under the raw userId as a fallback billing subject.
+    expect(reader.calls.some((c) => c.TableName === 'P')).toBe(false);
+  });
+
+  it('reports truncated, not none, for a session with no userId at all', async () => {
+    const reader = fakeReader({ spendByBilling: {} });
+    const billingUserOf = jest.fn(async (userId: string) => userId);
+    const [loaded] = await loadSessionItems(reader, TABLES, [{ sessionId: 'no-user', createdAt: WINDOW.from }], {
+      ...WINDOW,
+      includeSpend: true,
+      spendQuery: { indexName: SPEND_INDEX, billingUserOf, maxEventsPerBillingUser: 5 },
+    });
+    expect(loaded.spendStatus).toBe('truncated');
+    expect(loaded.spend).toBeUndefined();
+    // Nothing to resolve a billing subject from, so the resolver is never even called.
+    expect(billingUserOf).not.toHaveBeenCalled();
+  });
+
+  it('resolves one session normally and leaves another truncated when only its lookup fails', async () => {
+    const reader = fakeReader({ spendByBilling: { solo: [spendRow('b', 4_000_000)] } });
+    const loaded = await loadSessionItems(reader, TABLES, [sessions[0], sessions[1]], {
+      ...WINDOW,
+      includeSpend: true,
+      spendQuery: {
+        indexName: SPEND_INDEX,
+        billingUserOf: async (userId) => {
+          if (userId === 'member') throw new Error('org lookup failed');
+          return userId;
+        },
+        maxEventsPerBillingUser: 5,
+      },
+    });
+    const byId = new Map(loaded.map((l) => [l.session.sessionId, l]));
+    expect(byId.get('a')?.spendStatus).toBe('truncated');
+    expect(byId.get('b')).toMatchObject({ spendStatus: 'attributed', spend: { costMicroUsd: 4_000_000, tokens: 100 } });
   });
 });
 
