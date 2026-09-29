@@ -151,10 +151,14 @@ else
 fi
 
 # ENG-1039: nothing may wait on this job; it must not sit in front of a build or suite.
+# A dependency is a `needs:` naming the job id, inline or as a list item, or a
+# workflow_run trigger on this workflow. (tests.yml running this test file is not one.)
 dependents=""
 for f in "${WORKFLOW_DIR}"/*.yml; do
   [ "${f}" = "${WORKFLOW}" ] && continue
-  if grep -Eq 'needs:.*offline-eval|offline-eval-report' "${f}"; then dependents="${dependents} $(basename "${f}")"; fi
+  if grep -Eq 'needs:.*\boffline-eval\b|^[[:space:]]*-[[:space:]]*offline-eval[[:space:]]*$|Offline eval \(report-only\)' "${f}"; then
+    dependents="${dependents} $(basename "${f}")"
+  fi
 done
 if [ -z "${dependents}" ]; then
   pass "no other workflow depends on the offline eval job"
