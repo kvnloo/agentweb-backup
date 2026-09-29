@@ -261,9 +261,13 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
     source: 'services/creativeRubricJudge.ts; prompts services/creativeRubricJudgePrompt.ts; runtime hook services/creativeRubricJudgeRuntime.ts; offline scripts/scoreCreativeRubric.ts',
     model: 'anthropic.claude-sonnet-5 (CREATIVE_RUBRIC_JUDGE_MODEL; Google/OpenAI models refused)',
     modelFamily: 'claude',
-    consumers: ['AW-HumanEvalQueue.creativeRubric (agent-mode generate_image ads, sampled)', 'scripts/scoreCreativeRubric.ts (offline, read-only)'],
+    consumers: [
+      'AW-HumanEvalQueue.creativeRubric + .creativePairwise (agent-mode generate_image ads; organic/uncategorized images; deployed landing pages)',
+      'AW-Users.adImageResult.variants[].creativeRubric + .creativePairwise, adCopyResult.variants[].creativeRubric (onboarding)',
+      'scripts/scoreCreativeRubric.ts (offline, read-only)',
+    ],
     knownIssues: ['ENG-421'],
-    notes: 'Advisory (ENG-2140): never blocks generation. Off unless CREATIVE_RUBRIC_JUDGE_ENABLED=true with CREATIVE_RUBRIC_JUDGE_SAMPLE_RATE > 0 (unset in prod). Runs only after the deterministic gates pass. Not yet validated against human labels (ENG-2136 harness, per-criterion kappa).',
+    notes: 'Advisory (ENG-2140, ENG-2192): never blocks generation. Off unless CREATIVE_RUBRIC_JUDGE_ENABLED=true with CREATIVE_RUBRIC_JUDGE_SAMPLE_RATE > 0 (unset in prod). Images are judged only after the deterministic gates pass. Surfaces: ad_image (7 criteria), organic_image, ad_copy, landing_page (ENG-421 criteria that apply). Runtime pairwise vs the prior best for ad images. Not yet validated against human labels (ENG-2136 harness, per-criterion kappa).',
   },
   {
     id: 'creative-performance-correlation',
