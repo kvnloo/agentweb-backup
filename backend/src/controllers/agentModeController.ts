@@ -8007,7 +8007,24 @@ export async function runScheduleSelfImprovement(params: {
     'Rules for any improved prompt: keep the same overall goal and any {{variables}} exactly as they are; only refine the wording/instructions to make future runs more reliable. Do not invent new variables. If the current prompt is already good, make no change and simply explain why.',
   ].join('\n');
 
-  await generateSessionResponse(sessionId, reflectionPrompt, userId, llmModel);
+  // ENG-2204: this reflection turn is only ever reached from runScheduledChat
+  // (line ~7068, gated on schedule.selfImprove), unattended, on both real cron
+  // dispatches and manual test runs. It was never on generateSessionResponse's
+  // own documented list of intentionally-unmigrated callers (Slack, chatbot
+  // replies, GTM plan turns, onboarding) — it was simply missed when
+  // isUnattendedRun was introduced. Passing it explicitly as `true` here
+  // matters now that agentModeService.ts's unattended-directive gate checks
+  // `isUnattendedRun === true` rather than sessionType alone: without it, this
+  // genuinely-unattended turn would silently lose both the Slack-send override
+  // and the pre-existing publish-authorization mandate.
+  await generateSessionResponse(
+    sessionId, reflectionPrompt, userId, llmModel,
+    // positions 5-19 (attachments .. approvalDeckCancelledMeta): all optional /
+    // default-safe when undefined — only isUnattendedRun (position 20) matters here.
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    /* isUnattendedRun */ true
+  );
 }
 
 // Helper function to set up SSE connection
