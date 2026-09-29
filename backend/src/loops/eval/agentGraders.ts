@@ -872,8 +872,11 @@ export function gradeFormatAdherence(turns: readonly GraderTurn[]): AdherenceRes
 export function gradePermissionAdherence(turns: readonly GraderTurn[]): AdherenceResult {
   return adherenceOf(turns, 'no_act_instruction', (turn) => {
     if (!isActInstruction(turn.userText)) return undefined;
-    if (!turn.replyText) return { reason: 'no_reply' };
+    // A tool-only turn (the agent ran a work tool and gave no separate reply text this turn,
+    // e.g. it acts first and reports back later) has acted, so this must be checked before the
+    // no_reply case below — otherwise it wrongly abstains instead of passing.
     if (turn.toolNames.some(isWorkTool)) return { reason: 'acted_without_asking' };
+    if (!turn.replyText) return { reason: 'no_reply' };
     const ask = permissionRequest(turn.replyText);
     if (!ask) return { reason: 'acted_without_asking' };
     if (CONSEQUENTIAL.test(ask)) return { reason: 'confirmed_consequential_action' };
