@@ -259,4 +259,48 @@ describe('toTurns (AW-ChatMessages structure)', () => {
     expect(loaded.session.turns).toHaveLength(2);
     expect(gradeAdherence(loaded.session.turns).format).toMatchObject({ verdict: 'pass', reason: 'format_followed' });
   });
+
+  it('resolves a missing tool-message name from the id it answers, via the assistant turn\'s tool_calls (CodeRabbit PR #3136, thread 4129864003)', () => {
+    const withMissingName: ResumeMessage[] = [
+      { role: 'user', content: 'go ahead' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c1', function: { name: 'update_campaign_budget' } }] },
+      // The stored tool message has no `name` of its own — ChatMessage.name is optional.
+      { role: 'tool', tool_call_id: 'c1', content: '{"status":"ok"}' } as ResumeMessage,
+      { role: 'assistant', content: 'Done, budget updated.' },
+    ];
+    expect(toTurns(withMissingName)).toEqual([
+      { userText: 'go ahead', replyText: 'Done, budget updated.', toolNames: ['update_campaign_budget'] },
+    ]);
+  });
+
+  it('also resolves it from metadata.toolCalls, the other shape a stored assistant turn uses', () => {
+    // metadata.toolCalls entries carry `name` directly (see toLedger above), not ResumeMessage's
+    // typed `function.name` — the same mismatch that row() sidesteps elsewhere in this suite.
+    const withMissingName: ResumeMessage[] = [
+      { role: 'user', content: 'go ahead' },
+      { role: 'assistant', content: '', metadata: { toolCalls: [{ id: 'c1', name: 'update_campaign_budget' } as unknown as { id?: string; function?: { name?: string } }] } },
+      { role: 'tool', tool_call_id: 'c1', content: '{"status":"ok"}' } as ResumeMessage,
+      { role: 'assistant', content: 'Done, budget updated.' },
+    ];
+    expect(toTurns(withMissingName)[0].toolNames).toEqual(['update_campaign_budget']);
+  });
+
+  it('keeps a stored tool message name over a same-id assistant tool_call name, when both are present and differ', () => {
+    const messages2: ResumeMessage[] = [
+      { role: 'user', content: 'go ahead' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c1', function: { name: 'wrong_name' } }] },
+      { role: 'tool', tool_call_id: 'c1', name: 'actual_tool', content: '{}' } as ResumeMessage,
+    ];
+    expect(toTurns(messages2)[0].toolNames).toEqual(['actual_tool']);
+  });
+
+  it('credits a work tool run — and so passes an act instruction — even when the tool message itself has no name (downstream of the loader fix, CodeRabbit thread 4129864003)', () => {
+    const withMissingName: ResumeMessage[] = [
+      { role: 'user', content: 'go ahead' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c1', function: { name: 'update_campaign_budget' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: '{"status":"ok"}' } as ResumeMessage,
+      { role: 'assistant', content: 'Should I confirm the new budget with you?' },
+    ];
+    expect(gradePermissionAdherence(toTurns(withMissingName))).toMatchObject({ verdict: 'pass', reason: 'acted_without_asking' });
+  });
 });
