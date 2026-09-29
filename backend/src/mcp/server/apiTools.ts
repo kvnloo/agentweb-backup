@@ -968,6 +968,7 @@ mcpToolRegistry.register({
         run_count: { type: 'number', description: 'Number of runs (-1 for unlimited)' },
         llm_model: { type: 'string', description: 'Override LLM model' },
         backup_model: { type: 'string', description: 'Legacy field, retained for compatibility. Since ENG-1211 the preferred model is not restricted at run time below the hard usage cap, so this is never consulted.' },
+        required_function_calls: { type: 'array', items: { type: 'string' }, description: 'Override the function calls required in each run — replaces the template\'s own list rather than merging with it. Without a tool listed here, its delivery is best-effort — the run can complete "successfully" even if the model skips it, silently. IMPORTANT (ENG-2204): if the template\'s starting message instructs posting, alerting, or notifying via Slack and its own required_function_calls does not already include slack_send_message (older templates predate this guidance), pass the full list here with slack_send_message added — an unattended run has no live approval step for it, and without this it may be silently skipped even when the task asked for it. Omit to use the template\'s stored list as-is.' },
       },
       required: ['template_id']
     }
@@ -983,6 +984,7 @@ mcpToolRegistry.register({
     if (args.run_count !== undefined) body.runCount = args.run_count;
     if (args.llm_model !== undefined) body.llmModel = args.llm_model;
     if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
+    if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
     const data = await mcpFetch({ method: 'POST', path: `/api/agent-mode/schedule-templates/${args.template_id}/use`, context: ctx(context), body });
     return jsonResult(data);
   }
@@ -2523,7 +2525,7 @@ mcpToolRegistry.register({
             properties: {
               title: { type: 'string' },
               description: { type: 'string' },
-              requiredFunctionCalls: { type: 'array', items: { type: 'string' }, description: 'Tool names the step must call before it can complete. Note the camelCase name; the snake_case alias required_function_calls is also accepted.' },
+              requiredFunctionCalls: { type: 'array', items: { type: 'string' }, description: 'Tool names the step must call before it can complete. Note the camelCase name; the snake_case alias required_function_calls is also accepted. Without a tool listed here, its delivery is best-effort — the step can complete even if the model skips it, silently. IMPORTANT (ENG-2204): if this step\'s instructions call for posting, alerting, or notifying via Slack, ALWAYS include slack_send_message here too.' },
               skillIds: { type: 'array', items: { type: 'string' }, description: 'Skill IDs attached to this step (from list_skills / resolve_skill). Alias: skill_ids.' },
               userInstructions: { type: 'string', description: 'Instructions shown to the user for this step. Alias: user_instructions.' },
               stepCount: { type: 'number', description: 'Step order, 1-based. Defaults to the array position. In steps_mode="merge" this is what selects the existing step to amend. Alias: step_count.' },

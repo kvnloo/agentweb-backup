@@ -15683,6 +15683,7 @@ export const agentModeController = {
         frequencyIntervalDays: overrideInterval,
         emailNotifications: overrideEmails,
         variableValues, runCount, llmModel: overrideModel, llmBackupModel: overrideBackupModel,
+        requiredFunctionCalls: overrideRequiredFunctionCalls,
       } = req.body;
 
       const template = await scheduleTemplateDb.getTemplateById(templateId);
@@ -15753,7 +15754,9 @@ export const agentModeController = {
         description: template.description || '',
         startingMessage: template.startingMessage,
         keywords: template.keywords || [],
-        requiredFunctionCalls: template.requiredFunctionCalls || [],
+        requiredFunctionCalls: Array.isArray(overrideRequiredFunctionCalls)
+          ? overrideRequiredFunctionCalls
+          : (template.requiredFunctionCalls || []),
         functionCallMinCalls: template.functionCallMinCalls || {},
         emailNotifications: emails,
         dailyDigest: frequency === 'hourly' ? (template.dailyDigest || false) : false,
