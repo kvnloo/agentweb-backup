@@ -142,7 +142,15 @@ function toItem(lead: AskCrmLead, heatScore: number, lifecycle: LifecycleStage):
   };
 }
 
-/** Compute heat + lifecycle for one lead, preferring stored values when present. */
+/**
+ * Compute heat + lifecycle for one lead.
+ *
+ * ENG-2155: a stored lifecycle is a compatibility fallback, not an override.
+ * When the loader supplied authoritative lifecycle signals, recompute from them so
+ * an old inbox/signed_up snapshot cannot pin a lead after a deal/subscription change.
+ * When those signals are absent, keep the stored value: older callers/rows may not
+ * carry enough information to reconstruct in_deal/trialing/paying safely.
+ */
 function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: LifecycleStage } {
   const heat = typeof lead.heatScore === 'number'
     ? lead.heatScore
@@ -159,7 +167,20 @@ function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: L
         now
       );
 
-  const lifecycle = lead.lifecycle ?? computeLifecycle(
+  // Property presence matters here: undefined means this loader did not supply the
+  // signal, while false / [] / 'none' are authoritative negative answers.
+  const hasAuthoritativeLifecycleSignals =
+    lead.hasUserRecord !== undefined && lead.hasUserRecord !== null ||
+    lead.subscriptionState !== undefined && lead.subscriptionState !== null ||
+    lead.lastActivityAt !== undefined && lead.lastActivityAt !== null ||
+    lead.lastUsageAt !== undefined && lead.lastUsageAt !== null ||
+    lead.openDealStages !== undefined && lead.openDealStages !== null ||
+    (
+      typeof lead.healthScore === 'number' &&
+      (lead.lifecycle === 'paying' || lead.lifecycle === 'at_risk')
+    );
+
+  const computedLifecycle = computeLifecycle(
     {
       email: lead.email ?? undefined,
       phone: lead.phone ?? undefined,
@@ -168,10 +189,15 @@ function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: L
       lastActivityAt: lead.lastActivityAt ?? undefined,
       lastUsageAt: lead.lastUsageAt ?? undefined,
       healthScore: lead.healthScore ?? undefined,
+      currentLifecycle: lead.lifecycle ?? undefined,
       openDealStages: lead.openDealStages ?? undefined,
     } as LifecycleSignals,
     now
   );
+
+  const lifecycle = hasAuthoritativeLifecycleSignals
+    ? computedLifecycle
+    : (lead.lifecycle ?? computedLifecycle);
 
   return { heat, lifecycle };
 }
