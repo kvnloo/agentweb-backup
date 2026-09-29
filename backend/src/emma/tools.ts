@@ -97,6 +97,17 @@ import * as searchResearchImpl from './impl/searchResearch';
 // describeVideo). Both tools.ts call sites repointed to call the module
 // directly.
 import * as videoImpl from './impl/video';
+// ENG-2103 (F2), cluster 22 (last mechanical cluster): skills/admin + file
+// ops + misc tool cluster. getAdminToolNames, readFileContent, and
+// sendEmailFromConfiguredSender are repointed to call the module directly.
+// save_file still calls agentModeService.saveFile directly — saveFile needs
+// AgentModeService's private fileContentCache/cleanupFileCache, which this
+// file has no legal way to reach (see emma/impl/misc.ts's module header).
+// getUnassociatedToolNames and install_skills also keep calling
+// agentModeService.<method> — both were scoped for this cluster but kept
+// entirely on the class instead (deep out-of-scope skills-subsystem
+// coupling), also explained in emma/impl/misc.ts's module header.
+import * as miscImpl from './impl/misc';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -849,8 +860,7 @@ emmaToolRegistry.register({
     // is null and admin tools are skipped (unless delegated-admin context says otherwise).
     const hasAdminAccess = currentUser?.isAdmin === true || context?.isDelegatedAdmin === true;
     if (hasAdminAccess) {
-      const { agentModeService } = await import('../services/agentModeService');
-      const adminToolNamesList = agentModeService.getAdminToolNames();
+      const adminToolNamesList = miscImpl.getAdminToolNames();
       availableSkills.push({
         skillId: '__admin_tools__',
         name: 'Admin Tools',
@@ -4820,7 +4830,7 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     const userId = context?.userId;
     if (!userId) throw new Error('Missing user context');
-    return await agentModeService.sendEmailFromConfiguredSender(userId, {
+    return await miscImpl.sendEmailFromConfiguredSender(userId, {
       to: args.to,
       subject: args.subject,
       html: args.html,
@@ -6388,7 +6398,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    const result = await agentModeService.readFileContent(args.file_url);
+    const result = await miscImpl.readFileContent(args.file_url);
     if (result.success === false) {
       return {
         content: [
@@ -6438,7 +6448,7 @@ emmaToolRegistry.register({
     }
 
     // Default: read raw HTML
-    const result = await agentModeService.readFileContent(args.url);
+    const result = await miscImpl.readFileContent(args.url);
     if (result.success === false) {
       return {
         content: [

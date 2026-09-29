@@ -11,7 +11,6 @@ import {
   buildListResult,
   describeIgnoredCampaignScope,
 } from './agentMode/metaListScope';
-import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
 import { createHash, createHmac, randomUUID } from 'crypto';
@@ -200,7 +199,6 @@ import {
   driveErrorCode as sharedDriveErrorCode,
   driveThrottleRefusal as sharedDriveThrottleRefusal,
 } from '../emma/impl/shared/googleDriveErrors';
-import { pdfPageRender } from '../emma/impl/shared/pdfTextRender';
 import {
   performDirectReplacement as sharedPerformDirectReplacement,
 } from '../emma/impl/shared/contentReplacements';
@@ -251,6 +249,12 @@ import * as searchResearchImpl from '../emma/impl/searchResearch';
 // to call the module directly; describeVideo — kept as a delegating wrapper;
 // waitForGeminiFileActive — deleted, exclusive to describeVideo).
 import * as videoImpl from '../emma/impl/video';
+// ENG-2103 (F2), cluster 22 (last mechanical cluster): skills/admin + file ops
+// + misc tool cluster (getAdminToolNames, saveFile, readFileContent,
+// sendEmailFromConfiguredSender). getUnassociatedToolNames and installSkills
+// were scoped for this cluster but kept entirely on the class instead — see
+// emma/impl/misc.ts's module header for why.
+import * as miscImpl from '../emma/impl/misc';
 // SearchPurpose (but not SearchResultSource — no longer referenced after this
 // cluster's extraction) is still needed: youSearchWeb/googleSearchWeb's own
 // delegating-wrapper signatures on this class keep the same public type as
@@ -462,7 +466,7 @@ import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapsho
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
 import { resolvePinnedPublicAddress, fetchBufferFollowingRedirects, assertPublicHostname, DEFAULT_MAX_IMAGE_BYTES } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
-import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
+import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
 import { computeRunVerdict, type RunTerminalInfo } from '../loops/instances/agent-mode/runRecorder';
@@ -904,19 +908,14 @@ function buildAgentRuntimeRunId(sessionId: string): string {
   return `${sessionId}:run:${Date.now().toString(36)}:${randomSuffix}`;
 }
 
-// Type declaration for pdf-parse module
-interface PDFData {
-  text: string;
-  numpages: number;
-  numrender: number;
-  info: any;
-  metadata: any;
-  version: string;
-}
-
-// ENG-2103 (F2): pdfPageRender moved to emma/impl/shared/pdfTextRender.ts
-// (imported above) — shared with readGoogleDriveFileContent, which now lives
-// in emma/impl/shared/googleDriveAccess.ts.
+// ENG-2103 (F2): pdfPageRender moved to emma/impl/shared/pdfTextRender.ts —
+// shared with readGoogleDriveFileContent (emma/impl/shared/googleDriveAccess.ts)
+// and, as of cluster 22, readFileContent (emma/impl/misc.ts). Neither caller
+// remains in this file, so the top-level import here was removed too.
+//
+// ENG-2103 (F2), cluster 22: the `PDFData` interface that used to live here
+// moved to emma/impl/misc.ts — it was exclusive to readFileContent, which
+// moved in the same cluster.
 
 export type { ModelTier, ModelProvider } from './agentMode/llmModelRegistry';
 
@@ -1118,8 +1117,10 @@ const DIAGNOSIS_TIMEOUT_MS = 10_000;
 // reuse the run's own (often pricier) llmModel — see judgeFinalizeClaims.
 const FINALIZE_GUARD_JUDGE_MODEL = DIAGNOSIS_MODEL;
 
-const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
-const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'ogv', '3gp', 'ts']);
+// ENG-2103 (F2), cluster 22: IMAGE_EXTENSIONS/VIDEO_EXTENSIONS that used to
+// live here moved to emma/impl/misc.ts — their only remaining caller,
+// readFileContent, moved in the same cluster (describeVideo, cluster 21,
+// already carries its own separately-duplicated copy of IMAGE_EXTENSIONS).
 
 // Legacy model ids persisted by sessions/schedules created before a model was
 // renamed or fully retired. Maps the old id to its current registry key so old
@@ -6604,8 +6605,13 @@ export class AgentModeService {
     return AgentModeService.FOUNDATION_TOOLS;
   }
 
+  // ENG-2103 (F2): delegates to emma/impl/misc.ts. Kept as a class method
+  // (not deleted) because services/chatbotService.ts and three call sites in
+  // controllers/agentModeController.ts, plus
+  // agentModeService.skills.test.ts's direct real-instance calls, all call
+  // agentModeService.getAdminToolNames() directly.
   public getAdminToolNames(): string[] {
-    return [...ADMIN_SKILL_TOOL_NAMES];
+    return miscImpl.getAdminToolNames();
   }
 
   /**
@@ -10258,194 +10264,20 @@ export class AgentModeService {
    *
    * Sender resolution: explicit senderId → defaultSenderId → first available.
    */
+  // ENG-2103 (F2): delegates to emma/impl/misc.ts. Kept as a class method
+  // (not deleted) because agentModeService.senderDailyLimit.test.ts calls
+  // (agentModeService as any).sendEmailFromConfiguredSender(...) directly on
+  // the real singleton — emma/tools.ts is its only real production caller and
+  // is repointed to call the module directly.
   public async sendEmailFromConfiguredSender(
     userId: string,
     params: { to: string; subject?: string; html?: string; text?: string; body?: string; senderId?: string }
   ): Promise<any> {
-    try {
-      const to = (params.to || '').trim();
-      if (!to) {
-        return { success: false, message: 'Recipient required', error: 'A recipient email address ("to") is required' };
-      }
-      // Reject clearly malformed recipients up front so the user gets an
-      // actionable "check the address" message instead of a generic provider
-      // failure (Resend) or a silent accept-then-bounce (Gmail). Note: a
-      // well-formed but non-existent mailbox cannot be detected at send time —
-      // that bounce is asynchronous and outside this tool's control.
-      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailRegex.test(to)) {
-        return { success: false, message: 'Invalid recipient', error: `The recipient address "${to}" is not a valid email address. Please check it and try again.` };
-      }
-      if (!params.subject || !params.subject.trim()) {
-        return { success: false, message: 'Subject required', error: 'An email subject is required' };
-      }
-
-      // Normalize the body. Accept `body` as an alias for `text` (the generic
-      // `email` tool and most LLM calls use `body`), and treat empty/whitespace
-      // values as absent so we never send a blank email. html takes precedence.
-      const htmlBody = params.html && params.html.trim() ? params.html : undefined;
-      const textBody = (() => {
-        const t = params.text && params.text.trim() ? params.text : undefined;
-        if (t) return t;
-        return params.body && params.body.trim() ? params.body : undefined;
-      })();
-      if (!htmlBody && !textBody) {
-        return { success: false, message: 'Email body required', error: 'The email body (html or text) is required and cannot be empty' };
-      }
-
-      // Resolve sender from the user's configured CRM senders.
-      const sendersResult = await this.getCrmSenders(userId);
-      if (!sendersResult.success || sendersResult.senders.length === 0) {
-        return { success: false, message: 'No senders configured', error: 'No sender email is configured for your account. To set one up, open CRM, select a lead list, and click "Senders".' };
-      }
-
-      let sender: any = null;
-      if (params.senderId) {
-        // The model can't see internal sender IDs, so accept an id, an email
-        // address, a from-name (case-insensitive), or a provider keyword like
-        // "gmail" / "outlook" — whatever the user named ("send from my outlook sender").
-        const needle = params.senderId.trim().toLowerCase();
-        sender = sendersResult.senders.find((s: any) =>
-          s.id === params.senderId ||
-          (s.email && s.email.toLowerCase() === needle) ||
-          (s.fromName && s.fromName.toLowerCase() === needle)
-        );
-
-        // Fall back to matching by provider (e.g. the single connected-mailbox sender).
-        if (!sender) {
-          const wantedProvider = ['gmail', 'outlook'].find(
-            (p) => needle === p || needle === `${p} sender` || needle === `my ${p}` || needle === `my ${p} sender`,
-          );
-          if (wantedProvider) {
-            const matches = sendersResult.senders.filter(
-              (s: any) => (s.senderProvider || s.senderType) === wantedProvider,
-            );
-            if (matches.length === 1) {
-              sender = matches[0];
-            } else if (matches.length > 1) {
-              const list = matches.map((s: any) => `${s.fromName} <${s.email}>`).join(', ');
-              return {
-                success: false,
-                message: `Multiple ${wantedProvider} senders`,
-                error: `You have more than one ${wantedProvider} sender: ${list}. Tell me which one to use by its email address.`,
-                availableSenders: matches.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: wantedProvider })),
-              };
-            }
-          }
-        }
-
-        if (!sender) {
-          const available = sendersResult.senders.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: s.senderProvider || s.senderType || 'resend' }));
-          const list = available.map((s: any) => `${s.fromName} <${s.email}> [${s.senderType}]`).join(', ');
-          return {
-            success: false,
-            message: 'Sender not found',
-            error: `No configured sender matches "${params.senderId}". Available senders: ${list}. Pass one of their email addresses as sender_id, or omit sender_id to use the default sender.`,
-            availableSenders: available,
-          };
-        }
-      } else {
-        const defaultSenderId = sendersResult.defaultSenderId;
-        sender = defaultSenderId
-          ? sendersResult.senders.find((s: any) => s.id === defaultSenderId)
-          : sendersResult.senders[0];
-        if (!sender) {
-          sender = sendersResult.senders[0];
-        }
-      }
-
-      if (!sender) {
-        return { success: false, message: 'No valid sender', error: 'Could not resolve a valid sender email' };
-      }
-
-      let emailId: string;
-
-      // Accept both shapes: senderProvider is the neutral field, senderType the legacy
-      // persisted key. A sender resolved outside loadSenderConfig may only carry the latter.
-      const senderProvider: string = (sender as any).senderProvider || (sender as any).senderType || 'resend';
-
-      const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
-      if (senderProvider !== 'resend' && !connectedAccountId) {
-        return {
-          success: false,
-          message: `${providerLabel(senderProvider)} sender misconfigured`,
-          error: `The ${providerLabel(senderProvider)} sender is missing its connected account id`,
-        };
-      }
-      const label = providerLabel(senderProvider);
-
-      // ENG-265: route through sendAsSender so this chat-driven ad-hoc send is subject
-      // to the same daily-cap/warmup enforcement as every other send path.
-      const { resolveSenderForSend } = await import('./crmSenderService');
-      const { sendAsSender, SenderDailyLimitExceededError } = await import('./sendAsSender');
-      // Fail closed rather than falling back to a synthesized sender — see the matching
-      // comment in sendEmailToLead for why a null here must not become an uncapped send.
-      const crmSender = await resolveSenderForSend(userId, sender.id, sender.email);
-      if (!crmSender) {
-        return {
-          success: false,
-          message: 'Sender no longer available',
-          error: 'This sender was removed or changed just now. Please pick a sender again and retry.',
-        };
-      }
-
-      try {
-        const sendResult = await sendAsSender(userId, crmSender, {
-          to,
-          subject: params.subject,
-          html: htmlBody,
-          text: textBody,
-        });
-        emailId = sendResult.messageId;
-      } catch (error: any) {
-        if (error instanceof SenderDailyLimitExceededError) {
-          return { success: false, message: 'Daily sending limit reached', error: error.message };
-        }
-        // Translate OAuth failures into an actionable message that names the
-        // affected sender. Raw errors like "unauthorized_client" / "invalid_grant"
-        // are otherwise opaque and get mis-paraphrased by the LLM (e.g. "no account
-        // configured"). Nearly all are resolved by reconnecting in Settings.
-        const raw = error instanceof Error ? error.message : String(error);
-        const needsReconnect = senderProvider !== 'resend' && /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
-        // ENG-1300: Gmail/Outlook throw fully-typed EmailProviderError subclasses
-        // with no HTTP status of their own — mapped by name. undefined for Resend
-        // and any other error shape, which is fine: the fields below are additive.
-        const { emailProviderErrorStatus } = await import('./emailProviderService');
-        const code = emailProviderErrorStatus(error);
-        if (needsReconnect) {
-          return {
-            success: false,
-            message: `${label} sender needs reconnecting`,
-            error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
-            code,
-          };
-        }
-        return {
-          success: false,
-          message: `${label} send failed`,
-          error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
-          code,
-        };
-      }
-
-      return {
-        success: true,
-        message: `Email sent successfully to ${to}`,
-        emailId,
-        to,
-        from: sender.email,
-        subject: params.subject,
-      };
-    } catch (error) {
-      console.error('AgentMode: Error sending email from configured sender:', error);
-      const { emailProviderErrorStatus } = await import('./emailProviderService');
-      return {
-        success: false,
-        message: 'Failed to send email',
-        error: error instanceof Error ? error.message : 'Unknown error',
-        code: emailProviderErrorStatus(error)
-      };
-    }
+    // this.getCrmSenders is passed explicitly (not the module's default) so
+    // agentModeService.crmTools.test.ts's jest.spyOn(service, 'getCrmSenders')
+    // tests keep observing it — see emma/impl/misc.ts's doc comment on this
+    // function for why.
+    return miscImpl.sendEmailFromConfiguredSender(userId, params, this.getCrmSenders.bind(this));
   }
 
   // ENG-2103 (F2): work plans tool cluster (sendForReview half — non-contiguous
@@ -17012,121 +16844,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return formattedContent;
   }
 
-  // Save file to S3 and return URL with content-based deduplication
+  // ENG-2103 (F2): delegates to emma/impl/misc.ts. Kept as a class method
+  // (not deleted) because routes/emmaApi.ts's POST /save-file and
+  // agentModeService.fileCache.test.ts's many direct real-instance calls both
+  // call agentModeService.saveFile(...) directly. fileContentCache/
+  // cleanupFileCache stay on the class unchanged (not promoted to a module
+  // singleton — see emma/impl/misc.ts's module header for why) and are passed
+  // through as parameters instead.
   public async saveFile(fileName: string, fileContent: string, userId: string, sessionId: string): Promise<any> {
-    try {
-      console.log('AgentMode: Saving file:', fileName, 'for user:', userId, 'session:', sessionId);
-
-      // Validate inputs
-      if (!fileName || typeof fileName !== 'string') {
-        throw new Error('file_name is required and must be a non-empty string (e.g. "report.html")');
-      }
-
-      if (fileContent === undefined || fileContent === null) {
-        throw new Error('file_content is required and cannot be undefined or null');
-      }
-
-      if (typeof fileContent !== 'string') {
-        throw new Error(`file_content must be a string, received: ${typeof fileContent}`);
-      }
-
-      if (fileContent.trim().length === 0) {
-        throw new Error('file_content cannot be empty');
-      }
-
-      // Generate content hash for deduplication
-      const contentHash = createHash('sha256').update(fileContent).digest('hex');
-
-      // Cleanup cache before checking/adding entries
-      this.cleanupFileCache();
-
-      // Check if we already have this content cached
-      const cachedFile = this.fileContentCache.get(contentHash);
-      if (cachedFile) {
-        console.log('AgentMode: File content already exists, returning cached URL:', cachedFile.file_url);
-        // Update timestamp to mark as recently used
-        cachedFile.timestamp = Date.now();
-        this.fileContentCache.set(contentHash, cachedFile);
-
-        // Format the save result for LLM consumption
-        const formattedContent = `📁 **File Saved Successfully**\nFile: ${fileName}\nSize: ${fileContent.length} bytes\nURL: ${cachedFile.file_url}\n\nThe file has been uploaded to S3 and is ready for sharing or reference.`;
-
-        return {
-          success: true,
-          message: `File "${fileName}" has been saved successfully.`,
-          file_url: cachedFile.file_url,
-          file_name: fileName,
-          file_size: fileContent.length,
-          formattedContent
-        };
-      }
-
-      const { uploadFileToS3 } = await import('../utils/s3Utils');
-
-      // Determine content type based on file extension
-      const extension = fileName.split('.').pop()?.toLowerCase();
-      const contentTypes: { [key: string]: string } = {
-        'txt': 'text/plain',
-        'md': 'text/markdown',
-        'json': 'application/json',
-        'csv': 'text/csv',
-        'html': 'text/html',
-        'xml': 'application/xml',
-        'pdf': 'application/pdf',
-        'doc': 'application/msword',
-        'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        'xls': 'application/vnd.ms-excel',
-        'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'ppt': 'application/vnd.ms-powerpoint',
-        'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-      };
-      const contentType = contentTypes[extension || ''] || 'application/octet-stream';
-
-      // Upload to S3 using common utility
-      const uploadResult = await uploadFileToS3(
-        fileContent,
-        fileName,
-        userId,
-        contentType
-      );
-
-      if (uploadResult.success) {
-        // Cache the file content hash to URL mapping with timestamp
-        this.fileContentCache.set(contentHash, {
-          file_url: uploadResult.url || '',
-          file_name: fileName || 'unknown',
-          file_size: fileContent.length,
-          timestamp: Date.now()
-        });
-
-        console.log(`AgentMode: File uploaded and cached with hash: ${contentHash} (cache size: ${this.fileContentCache.size})`);
-
-        // Format the save result for LLM consumption
-        const formattedContent = `📁 **File Saved Successfully**\nFile: ${fileName}\nSize: ${fileContent.length} bytes\nURL: ${uploadResult.url}\n\nThe file has been uploaded to S3 and is ready for sharing or reference.`;
-
-        return {
-          success: true,
-          message: `File "${fileName}" has been saved successfully.`,
-          file_url: uploadResult.url,
-          file_name: fileName,
-          file_size: fileContent.length,
-          formattedContent
-        };
-      } else {
-        return {
-          success: false,
-          message: 'Failed to save file to S3. Please try again.',
-          error: uploadResult.error
-        };
-      }
-    } catch (error) {
-      console.error('AgentMode: Error saving file:', error);
-      return {
-        success: false,
-        message: 'Failed to save file. Please try again.',
-        error: error instanceof Error ? error.message : 'Unknown error'
-      };
-    }
+    return miscImpl.saveFile(fileName, fileContent, userId, sessionId, this.fileContentCache, () => this.cleanupFileCache());
   }
 
   // ENG-2103 (F2): delegates to emma/impl/htmlTools.ts. Kept as a class method
@@ -17142,271 +16868,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return htmlToolsImpl.convertToPdf(sourceUrl, outputFilename, userId, options);
   }
 
-  // Read file content from URL with support for various file types
+  // ENG-2103 (F2): delegates to emma/impl/misc.ts. Kept as a class method
+  // (not deleted) because routes/emmaApi.ts's POST /read-file-content and
+  // readFileContent.test.ts/emma.readFileContentTool.test.ts's direct
+  // real-instance calls all call agentModeService.readFileContent(...)
+  // directly.
   public async readFileContent(fileUrl: string): Promise<any> {
-    try {
-      console.log('AgentMode: Reading file content from URL:', fileUrl);
-
-      if (typeof fileUrl !== 'string' || fileUrl.trim().length === 0) {
-        return {
-          success: false,
-          message: 'file_url is required and must be a non-empty HTTP or HTTPS URL.',
-          error: 'Missing file_url'
-        };
-      }
-
-      const normalizedFileUrl = fileUrl.trim();
-
-      // Validate URL format
-      if (!normalizedFileUrl.startsWith('http://') && !normalizedFileUrl.startsWith('https://')) {
-        return {
-          success: false,
-          message: 'Invalid URL format. Must be HTTP or HTTPS.',
-          error: 'Invalid URL format'
-        };
-      }
-
-      // Determine file type from URL
-      const urlPath = new URL(normalizedFileUrl).pathname;
-      const extension = urlPath.split('.').pop()?.toLowerCase() || '';
-
-      if (IMAGE_EXTENSIONS.has(extension)) {
-        return {
-          success: false,
-          message: `This is an image file (.${extension}). Use the describe_image tool to analyze its visual content instead.`,
-          error: 'Image files must be analyzed with describe_image, not read_file_content'
-        };
-      }
-
-      if (VIDEO_EXTENSIONS.has(extension)) {
-        return {
-          success: false,
-          message: `This is a video file (.${extension}). Use the describe_video tool to analyze its content instead.`,
-          error: 'Video files must be analyzed with describe_video, not read_file_content'
-        };
-      }
-
-      // Fetch the file content — S3 objects are private, use SDK directly for our bucket
-      let buffer: Buffer;
-      let contentType: string;
-
-      const s3Key = extractS3KeyFromUrl(normalizedFileUrl);
-      if (s3Key) {
-        // Private bucket object — stream via SDK (same pattern as filesController)
-        const stream = getS3ObjectStream(s3Key);
-        const chunks: Buffer[] = [];
-        for await (const chunk of stream) {
-          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-        }
-        buffer = Buffer.concat(chunks);
-        try {
-          const meta = await getS3ObjectMetadata(s3Key);
-          contentType = meta.ContentType || '';
-        } catch {
-          contentType = '';
-        }
-        console.log(`AgentMode: Fetched S3 file via SDK, size: ${buffer.length} bytes, type: ${contentType}`);
-      } else {
-        // Google Drive / Docs links require the user's OAuth token — unauthenticated
-        // fetches return 401 for Workspace-restricted orgs. Tell the user to upload instead.
-        const urlHost = new URL(normalizedFileUrl).hostname.toLowerCase();
-        if (urlHost === 'drive.google.com' || urlHost === 'docs.google.com') {
-          return {
-            success: false,
-            message: 'Google Drive and Docs links cannot be read directly — your organization may have restricted sharing. Please download the file and upload it using the attachment button in the chat instead.',
-            error: 'Google Drive links require authenticated access'
-          };
-        }
-
-        // External URL — plain fetch. Send no-cache headers so scrapes (e.g.
-        // onboarding brand-build reading the user's live site) reflect the
-        // CURRENT content and never a stale CDN/intermediary copy.
-        const response = await axios.get(normalizedFileUrl, {
-          timeout: 30000,
-          responseType: 'arraybuffer',
-          headers: {
-            'User-Agent': 'AgentWeb-Backend/1.0',
-            'Cache-Control': 'no-cache',
-            Pragma: 'no-cache',
-          },
-        });
-        buffer = Buffer.from(response.data as ArrayBuffer);
-        contentType = response.headers['content-type'] || '';
-        console.log(`AgentMode: Fetched external file, size: ${buffer.length} bytes, type: ${contentType}`);
-      }
-
-      // Process content based on file type
-      let extractedContent = '';
-      let fileType = 'unknown';
-
-      const PDF_PARSE_TIMEOUT_MS = 60000;
-      if (extension === 'pdf' || contentType.includes('application/pdf')) {
-        // Handle PDF files
-        try {
-          const pdfParse = require('pdf-parse');
-          const pdfData: PDFData = await Promise.race([
-            pdfParse(buffer, { pagerender: pdfPageRender }),
-            new Promise<never>((_, reject) =>
-              setTimeout(() => reject(new Error('PDF parse timed out')), PDF_PARSE_TIMEOUT_MS)
-            ),
-          ]);
-          extractedContent = pdfData.text;
-          fileType = 'pdf';
-          console.log(`AgentMode: Successfully parsed PDF, extracted ${extractedContent.length} characters`);
-        } catch (pdfError) {
-          console.error('AgentMode: Error parsing PDF:', pdfError);
-          return {
-            success: false,
-            message: 'Failed to parse PDF file. The file may be corrupted, password-protected, or too complex.',
-            error: pdfError instanceof Error ? pdfError.message : 'PDF parsing failed'
-          };
-        }
-      } else if (['xlsx', 'xls', 'xlsm', 'xlsb'].includes(extension) ||
-        contentType.includes('spreadsheetml') || contentType.includes('ms-excel')) {
-        // Handle Excel/spreadsheet files
-        try {
-          const XLSX = require('xlsx');
-          const workbook = XLSX.read(buffer, { type: 'buffer' });
-          const lines: string[] = [];
-          for (const sheetName of workbook.SheetNames) {
-            const sheet = workbook.Sheets[sheetName];
-            const csv = XLSX.utils.sheet_to_csv(sheet, { blankrows: false });
-            if (csv.trim()) {
-              lines.push(`Sheet: ${sheetName}`);
-              lines.push(csv);
-            }
-          }
-          extractedContent = lines.join('\n\n');
-          fileType = 'spreadsheet';
-          console.log(`AgentMode: Successfully parsed Excel file (${workbook.SheetNames.length} sheet(s)), extracted ${extractedContent.length} characters`);
-        } catch (xlsxError) {
-          console.error('AgentMode: Error parsing Excel file:', xlsxError);
-          return {
-            success: false,
-            message: 'Failed to parse Excel file. The file may be corrupted or in an unsupported format.',
-            error: xlsxError instanceof Error ? xlsxError.message : 'Excel parsing failed'
-          };
-        }
-      } else if (['docx', 'doc'].includes(extension) ||
-        contentType.includes('wordprocessingml') || contentType.includes('msword')) {
-        // Handle Word documents
-        try {
-          const mammoth = require('mammoth');
-          const result = await mammoth.extractRawText({ buffer });
-          extractedContent = result.value;
-          fileType = 'document';
-          console.log(`AgentMode: Successfully parsed Word document, extracted ${extractedContent.length} characters`);
-        } catch (docxError) {
-          console.error('AgentMode: Error parsing Word document:', docxError);
-          return {
-            success: false,
-            message: 'Failed to parse Word document. The file may be corrupted or in an unsupported format.',
-            error: docxError instanceof Error ? docxError.message : 'Word document parsing failed'
-          };
-        }
-      } else if (['txt', 'md', 'csv', 'json', 'xml', 'html', 'htm', 'js', 'css', 'log', 'yml', 'yaml'].includes(extension)) {
-        // Handle text-based files
-        try {
-          extractedContent = buffer.toString('utf-8');
-          fileType = 'text';
-          console.log(`AgentMode: Successfully read text file, extracted ${extractedContent.length} characters`);
-        } catch (textError) {
-          console.error('AgentMode: Error reading text file:', textError);
-          return {
-            success: false,
-            message: 'Failed to read text file. The file may contain invalid characters.',
-            error: textError instanceof Error ? textError.message : 'Text file reading failed'
-          };
-        }
-      } else {
-        // For other file types, try to read as text but with a warning
-        try {
-          extractedContent = buffer.toString('utf-8');
-          fileType = 'text';
-          console.log(`AgentMode: Attempted to read unknown file type as text, extracted ${extractedContent.length} characters`);
-        } catch (textError) {
-          console.error('AgentMode: Error reading file as text:', textError);
-          return {
-            success: false,
-            message: `Unsupported file type (${extension}). Only text files, PDFs, spreadsheets, and common document formats are supported.`,
-            error: 'Unsupported file type'
-          };
-        }
-      }
-
-      // Truncate to avoid overwhelming the LLM context window
-      const MAX_CONTENT_LENGTH = 100_000;
-      let truncated = false;
-      if (extractedContent.length > MAX_CONTENT_LENGTH) {
-        extractedContent = extractedContent.slice(0, MAX_CONTENT_LENGTH);
-        truncated = true;
-        console.log(`AgentMode: Content truncated to ${MAX_CONTENT_LENGTH} characters`);
-      }
-
-      const contentHash = createHash('sha256').update(extractedContent).digest('hex');
-      console.log(`AgentMode: Computed content hash: ${contentHash}`);
-
-      return {
-        success: true,
-        content: extractedContent,
-        content_hash: contentHash,
-        file_type: fileType,
-        file_size: buffer.length,
-        content_length: extractedContent.length,
-        truncated,
-        file_url: normalizedFileUrl,
-        message: `Successfully read ${fileType} file content (${extractedContent.length} characters${truncated ? ' — content was truncated, call again with a byte-range if you need more' : ''})`
-      };
-
-    } catch (error: any) {
-      console.error('AgentMode: Error reading file content:', error);
-
-      let errorMessage = 'Failed to read file content';
-      let statusCode = 500;
-
-      if (error.response) {
-        statusCode = error.response.status;
-        errorMessage = `HTTP ${error.response.status}: ${error.response.statusText}`;
-      } else if (error.code === 'ENOTFOUND') {
-        statusCode = 404;
-        errorMessage = 'File not found or URL is unreachable';
-      } else if (error.code === 'ETIMEDOUT') {
-        statusCode = 408;
-        errorMessage = 'Request timeout while fetching file';
-      }
-
-      // ENG-1162: a 401/403 from this plain external-URL fetch (not S3, not an
-      // AgentWeb-connected account) means the PUBLISHER refused the request —
-      // bot-blocking, a WAF, or a paywall — not an AgentWeb auth/permission
-      // problem. Left as a bare "HTTP 403: Forbidden", classifyToolErrorClass's
-      // embedded-status regex sweeps this into the generic 'auth' class, whose
-      // model-visible guidance says to have the user "reconnect the account" —
-      // nonsensical for an anonymous read, and it gave no signal that a failed
-      // read is NOT evidence the content doesn't exist (the run silently
-      // degraded to search instead of reporting the source as unverified).
-      // Named here so classifyToolErrorClass can match the marker and route to
-      // 'publisher_refused' instead.
-      //
-      // This rewrite is local to THIS call site, not a systemic guard — the
-      // classifier can only recognize the marker text below, not "this was an
-      // anonymous unauthenticated fetch" in the abstract. Any other tool that
-      // anonymously fetches an arbitrary external URL (not S3, not a connected
-      // account) and forwards a bare `HTTP ${status}: ...`-shaped message on a
-      // 401/403 will fall right back into classifyToolErrorClass's generic
-      // embedded-status regex and get the wrong 'auth'/"reconnect the account"
-      // guidance. Apply the same isAxiosError-gated rewrite there too.
-      const isPublisherRefusal = error.isAxiosError && (statusCode === 401 || statusCode === 403);
-      if (isPublisherRefusal) {
-        errorMessage = `The publisher refused this fetch (${errorMessage}) — this is a site-side access block (bot filtering, WAF, or paywall), not an AgentWeb account or permissions problem.`;
-      }
-
-      return {
-        success: false,
-        message: errorMessage,
-        error: isPublisherRefusal ? errorMessage : error.message,
-        file_url: typeof fileUrl === 'string' ? fileUrl : undefined
-      };
-    }
+    return miscImpl.readFileContent(fileUrl);
   }
 
   /**
