@@ -370,7 +370,15 @@ const SPEND_PROJECTION = {
   ExpressionAttributeNames: { '#refs': 'references', '#unit': 'unit' },
 };
 
-/** Spend rows of the sessions' billing subjects in [from, to], and the sessions whose subject overflowed the bound. */
+/**
+ * Spend rows of the sessions' billing subjects in [from, to], and the sessions whose billing
+ * subject is unresolved or overflowed the bound — either way, `spendStatus` must read
+ * `truncated` (spend unknown), never `none` (confirmed no spend). A session with no `userId`, or
+ * whose `billingUserOf` lookup fails, has not been checked at all: querying under the raw
+ * `userId` as a fallback would misattribute an org member's spend to a billing subject nothing
+ * was ever charged to, and silently reporting `none` would read as "we checked and there was no
+ * spend" when the truth is "we never found out" (ENG-2196 CodeRabbit).
+ */
 async function readSpendBounded(
   reader: ReadOnlyDocReader,
   table: string,
@@ -380,20 +388,28 @@ async function readSpendBounded(
 ): Promise<{ rows: DocItem[]; truncated: Set<string> }> {
   const sessionsByBilling = new Map<string, string[]>();
   const billingOf = new Map<string, string>();
+  const unresolved = new Set<string>();
   for (const item of sessionItems) {
     const userId = strOf(item.userId);
-    if (!userId) continue;
+    if (!userId) {
+      unresolved.add(String(item.sessionId));
+      continue;
+    }
     let billing = billingOf.get(userId);
     if (billing === undefined) {
-      billing = await q.billingUserOf(userId).catch(() => userId);
+      billing = await q.billingUserOf(userId).catch(() => '');
       billingOf.set(userId, billing);
+    }
+    if (!billing) {
+      unresolved.add(String(item.sessionId));
+      continue;
     }
     const list = sessionsByBilling.get(billing) ?? [];
     list.push(String(item.sessionId));
     sessionsByBilling.set(billing, list);
   }
   const rows: DocItem[] = [];
-  const truncated = new Set<string>();
+  const truncated = new Set<string>(unresolved);
   for (const [billingUserId, sessionIds] of sessionsByBilling) {
     const got: DocItem[] = [];
     let start: DocItem | undefined;
