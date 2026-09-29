@@ -1138,8 +1138,36 @@ export const getAccountsByAttioWorkspaceId = async (
  * Check if an account token is still valid
  * First checks expiry timestamp, then verifies via API if not expired
  */
+/**
+ * Platforms where `config.needs_reconnect` means THE CREDENTIAL IS DEAD.
+ *
+ * The key is not used consistently, so this cannot be a blanket check:
+ *  - hubspot / twitter  — the refresh token was rejected; nothing works until re-OAuth.
+ *    twitterService.getClient and HubSpotService.create both refuse outright.
+ *  - attio              — set ONLY for a 403 registering the webhook, i.e. a missing
+ *                         `webhook:read-write` scope (attioWebhookSubscription.ts:64).
+ *                         The token is fine and CRM reads/writes still work; treating it
+ *                         as dead would tell Emma a usable account is broken, which is
+ *                         the same class of lie in the other direction.
+ *  - calendarTools      — returns `needs_reconnect` on a TOOL RESULT, never writes it to
+ *                         config, so it is irrelevant here.
+ *
+ * Attio would be better served by its own key (e.g. `webhook_scope_missing`); until then
+ * the exception is explicit rather than implied.
+ */
+const RECONNECT_MEANS_DEAD_CREDENTIAL = new Set(['hubspot', 'twitter']);
+
 export const isTokenValid = async (account: ConnectedAccount): Promise<boolean> => {
   const now = Date.now();
+
+  // A dead credential outranks every check below, including the refresh_token presence
+  // test. Without this, an account that Settings reports as "Reconnect required" was
+  // still handed to Emma as `is_active: true` — the assistant telling a customer their
+  // integration is fine while the UI tells them it is broken. The Meta Ads branch of
+  // routes/connectedAccounts.ts exists for exactly this consistency (ENG-1158).
+  if (RECONNECT_MEANS_DEAD_CREDENTIAL.has(account.platform) && (account.config as any)?.needs_reconnect) {
+    return false;
+  }
 
   // First check: is the token expired based on timestamp?
   if (account.config.token_expires_at <= now) {
