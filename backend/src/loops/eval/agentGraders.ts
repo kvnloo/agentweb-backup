@@ -30,7 +30,9 @@ import { wilsonInterval, type Interval } from './agreement';
  */
 export const AGENT_GRADER_VERSIONS = {
   'agent-task-success': 1,
-  'agent-tool-correctness': 1,
+  // 2 (ENG-2190): write-without-read-back/repeated-mutation coverage extended past ad
+  // platforms to CRM leads, email send, social publish and landing-page publish.
+  'agent-tool-correctness': 2,
   'agent-groundedness-offline': 1,
   'agent-reply-length-adherence': 1,
   'agent-format-adherence': 1,
@@ -243,7 +245,9 @@ export type ToolFindingKind =
   /** Later reads of the same type exist, but none named the object: read-back cannot be confirmed. Does not fail the session. */
   | 'write_read_back_unconfirmed'
   /** The same successful write was sent again: the first "success" did not stick (ENG-286). */
-  | 'repeated_mutation';
+  | 'repeated_mutation'
+  /** ENG-2190: a landing-page deploy reported success but its own post-deploy smoke test (reused from landingPageSmokeTest.ts, surfaced on the ledger as launchReadiness) says the page doesn't actually load or convert. */
+  | 'landing_page_publish_unverified';
 
 export interface ToolFinding {
   kind: ToolFindingKind;
@@ -261,6 +265,7 @@ const FAILING_FINDINGS: ReadonlySet<ToolFindingKind> = new Set<ToolFindingKind>(
   'repeated_failure',
   'write_without_read_back',
   'repeated_mutation',
+  'landing_page_publish_unverified',
 ]);
 
 export interface ToolCorrectnessResult {
@@ -302,7 +307,7 @@ function failureFindings(events: readonly AgentLoopEvent[]): ToolFinding[] {
 
 // --- ad-platform writes and reads ------------------------------------------
 
-type Platform = 'google_ads' | 'meta_ads' | 'linkedin_ads';
+type Platform = 'google_ads' | 'meta_ads' | 'linkedin_ads' | 'crm_lead' | 'email_send' | 'social_post';
 
 /** How a call touches an ad platform: which account, which entity types, which object ids. */
 interface PlatformAccess {
@@ -455,8 +460,64 @@ function verifiedInTool(call: LedgerCall): boolean {
     if (r.readBackVerified === true || r.spend_cap_verified === true || r.verified === true) return true;
     // Google CONVERSION_ACTION CREATE/UPDATE read the action back and report drift.
     if ('drift' in r) return true;
+    // ENG-2190: email and social publish have no separate "read it back" tool — the
+    // provider-issued id THEY return is the only confirmation the send/post ever
+    // happened, so a non-empty one counts as verified in place of a later read.
+    if (typeof r.emailId === 'string' && r.emailId.trim()) return true;
+    if (typeof r.post_id === 'string' && r.post_id.trim()) return true;
+    if (typeof r.post_url === 'string' && r.post_url.trim()) return true;
   }
   return false;
+}
+
+// --- CRM, email and social writes (ENG-2190) --------------------------------
+
+/** CRM lead writes: create (no id returned — see the account-only match below) and update. */
+const CRM_LEAD_WRITE_TOOLS = new Set(['add_leads_to_list', 'update_lead']);
+/** Reads that confirm a CRM write: list-scoped, some with no id filter at all. */
+const CRM_LEAD_READ_TOOLS = new Set(['get_leads', 'search_leads', 'get_lead_details', 'get_leads_needing_followup']);
+/** Sends whose own response carries the provider message id (verifiedInTool above); no read-back tool exists. */
+const EMAIL_SEND_TOOLS = new Set(['send_email_to_lead', 'send_email_from_sender']);
+/** Publishes whose own response carries the post id/URL (verifiedInTool above); no read-back tool exists. */
+const SOCIAL_PUBLISH_TOOLS = new Set(['post_on_connected_account']);
+
+/**
+ * Classify a write or read on a non-ad-platform surface into the same PlatformAccess shape
+ * `platformAccess` uses for ad platforms, so it flows through the same writeFindings /
+ * readBackAfter machinery rather than a second detection pipeline (ENG-2190, ENG-592's scope
+ * beyond ad writes).
+ *
+ * CRM: `add_leads_to_list` never returns the created lead's id in a form the model (or this
+ * grader) can match — its `importedIdentifiers` are human-readable descriptors, not lead ids —
+ * so its only possible confirmation is a later read of the same list. That is exactly what
+ * `readBackAfter` already does for a write whose id is unknown, or a same-type read with no id
+ * filter at all (`get_leads`/`search_leads` with no `lead_id`): both count as confirmed.
+ * `update_lead` additionally matches by the specific lead id it named.
+ *
+ * Email/social have no "read it back" tool at all: verifiedInTool (above) is their entire
+ * confirmation path, from the provider id the write's own response carries. Returning them here
+ * with empty `ids`/`createdIds` means readBackAfter can never confirm them by a later call, so a
+ * write whose own response lacked that id correctly reports write_without_read_back — the same
+ * verdict an ad-platform write nothing ever reads gets.
+ */
+function nonAdPlatformAccess(call: LedgerCall): PlatformAccess | null {
+  const args = call.args;
+  if (CRM_LEAD_WRITE_TOOLS.has(call.toolName) || CRM_LEAD_READ_TOOLS.has(call.toolName)) {
+    const account = str(args.list_id);
+    if (!account) return null;
+    const ids = new Set<string>();
+    const leadId = str(args.lead_id);
+    if (leadId) ids.add(leadId);
+    const kind = CRM_LEAD_WRITE_TOOLS.has(call.toolName) ? 'write' : 'read';
+    return { platform: 'crm_lead', account, kind, entities: ['LEAD'], ids, createdIds: new Set() };
+  }
+  if (EMAIL_SEND_TOOLS.has(call.toolName)) {
+    return { platform: 'email_send', account: 'email', kind: 'write', entities: ['EMAIL_MESSAGE'], ids: new Set(), createdIds: new Set() };
+  }
+  if (SOCIAL_PUBLISH_TOOLS.has(call.toolName)) {
+    return { platform: 'social_post', account: 'social', kind: 'write', entities: ['SOCIAL_POST'], ids: new Set(), createdIds: new Set() };
+  }
+  return null;
 }
 
 /** A write that reported success and actually executed (not a confirmation halt or a block). */
@@ -506,7 +567,7 @@ function stableKey(value: unknown): string {
 
 function writeFindings(ledger: readonly LedgerCall[]): { findings: ToolFinding[]; mutations: number } {
   const findings: ToolFinding[] = [];
-  const accesses = ledger.map((call) => ({ call, access: platformAccess(call) }));
+  const accesses = ledger.map((call) => ({ call, access: platformAccess(call) ?? nonAdPlatformAccess(call) }));
   const seenWrites = new Set<string>();
   let mutations = 0;
   accesses.forEach(({ call, access }, i) => {
@@ -531,19 +592,54 @@ function writeFindings(ledger: readonly LedgerCall[]): { findings: ToolFinding[]
   return { findings, mutations };
 }
 
+/** Deploy tools whose own response carries `launchReadiness` (agentModeService's ENG-1868 minimizer). */
+const LANDING_PAGE_DEPLOY_TOOLS = new Set(['generate_landing_page', 'deploy_landing_page']);
+
+/**
+ * ENG-2190: a landing-page deploy that reported success but whose own post-deploy smoke test
+ * says the page doesn't actually load or convert (a lead form that doesn't capture, or a URL
+ * that doesn't come up at all). Reuses the existing smoke test's verdict — surfaced on the
+ * ledger as `launchReadiness` by agentModeService's minimizer (utils/landingPageLaunchReadiness.ts,
+ * itself backed by services/landingPageSmokeTest.ts) — rather than re-fetching the URL here.
+ * `ready` defaults true until the (fire-and-forget) smoke test has actually run, so this never
+ * flags a page whose smoke test simply hasn't completed yet — only one that ran and failed.
+ */
+function landingPageFindings(ledger: readonly LedgerCall[]): ToolFinding[] {
+  const findings: ToolFinding[] = [];
+  for (const call of ledger) {
+    if (!LANDING_PAGE_DEPLOY_TOOLS.has(call.toolName) || !callSucceeded(call)) continue;
+    for (const payload of [call.output, call.result]) {
+      const readiness = asRecord(asRecord(payload)?.launchReadiness);
+      if (!readiness || readiness.ready !== false) continue;
+      const reasons = Array.isArray(readiness.reasons) ? readiness.reasons.filter((r): r is string => typeof r === 'string') : [];
+      findings.push({
+        kind: 'landing_page_publish_unverified',
+        toolName: call.toolName,
+        ...(call.id ? { callId: call.id } : {}),
+        ...(reasons.length ? { detail: reasons.join('; ') } : {}),
+      });
+      break; // one finding per call even if both output and result carry launchReadiness
+    }
+  }
+  return findings;
+}
+
 /**
  * Tool-call correctness for one session: failure classes from the loop events, plus
  * write-without-read-back and repeated identical writes from the ledger (args live only there).
  *
- * The read-back check is the grader-side half of ENG-592: an external ad-platform write
- * (Google Ads, Meta, LinkedIn) that reported success counts as verified only when the tool
- * itself read the object back (readBackVerified / spend_cap_verified / verified / drift) or a
- * later call in the session confirms it (readBackAfter). A write whose type was read later but
- * never by an id matching it is reported as write_read_back_unconfirmed without failing.
+ * The read-back check is the grader-side half of ENG-592: an external write (Google Ads, Meta,
+ * LinkedIn, CRM leads, email send, social publish) that reported success counts as verified only
+ * when the tool itself read the object back (readBackVerified / spend_cap_verified / verified /
+ * drift / a provider message-or-post id) or a later call in the session confirms it
+ * (readBackAfter). A write whose type was read later but never by an id matching it is reported
+ * as write_read_back_unconfirmed without failing. Landing-page publish is checked separately
+ * (landingPageFindings): it has its own read-back signal (the post-deploy smoke test) rather
+ * than a follow-up tool call to look for.
  */
 export function gradeToolCorrectness(input: { events: readonly AgentLoopEvent[]; ledger: readonly LedgerCall[] }): ToolCorrectnessResult {
   const { findings: writes, mutations } = writeFindings(input.ledger);
-  const findings = [...failureFindings(input.events), ...writes];
+  const findings = [...failureFindings(input.events), ...writes, ...landingPageFindings(input.ledger)];
   const invoked = input.events.filter((e) => e.eventType === EVT_TOOL_INVOKED).length;
   return {
     verdict: findings.some((f) => FAILING_FINDINGS.has(f.kind)) ? 'fail' : 'pass',

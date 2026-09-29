@@ -1286,3 +1286,112 @@ export async function getWhatsAppCredentials(): Promise<WhatsAppCredentials> {
   }
   return whatsappCredsInFlight;
 }
+
+export interface TeamsBotCredentials {
+  /** Microsoft App (client) ID of the bot's Entra app registration. */
+  appId: string;
+  /** Client secret for that app registration. */
+  appPassword: string;
+  /**
+   * Home tenant of the Azure Bot resource.
+   *
+   * Required, not optional: Azure rejected `--app-type MultiTenant` as deprecated, so both
+   * bots are SingleTenant. A single-tenant bot must request its Bot Connector token from
+   * `login.microsoftonline.com/{tenantId}/...` rather than the shared `botframework.com`
+   * endpoint, so without this every outbound reply fails to authenticate.
+   */
+  tenantId: string;
+}
+
+const TEAMS_BOT_ENV_VARS = {
+  appId: 'TEAMS_BOT_APP_ID',
+  appPassword: 'TEAMS_BOT_APP_PASSWORD',
+  tenantId: 'TEAMS_BOT_TENANT_ID',
+} as const satisfies Record<keyof TeamsBotCredentials, string>;
+
+let teamsBotCredsCache: { value: TeamsBotCredentials; expiresAt: number } | null = null;
+let teamsBotCredsInFlight: Promise<TeamsBotCredentials> | null = null;
+const TEAMS_BOT_CREDS_TTL_MS = 5 * 60 * 1000;
+
+/** Test hook: forget any cached or in-flight Secrets-Manager-backed Teams bot credentials. */
+export function __resetTeamsBotCredentialsCache(): void {
+  teamsBotCredsCache = null;
+  teamsBotCredsInFlight = null;
+}
+
+async function fetchTeamsBotCredentialsFromSecretsManager(): Promise<TeamsBotCredentials> {
+  const environment = process.env.NODE_ENV || 'development';
+  const secretName = environment === 'production'
+    ? 'prod/AgentWeb/Microsoft/TeamsBot'
+    : 'dev/AgentWeb/Microsoft/TeamsBot';
+
+  const secretString = await getSecret(secretName);
+
+  if (!secretString || secretString.trim() === '') {
+    throw new Error('Teams bot credentials secret is empty');
+  }
+
+  const credentials = JSON.parse(secretString) as TeamsBotCredentials;
+
+  const missing = (['appId', 'appPassword', 'tenantId'] as const).filter((k) => !credentials[k]);
+  if (missing.length > 0) {
+    throw new Error(`Teams bot credentials missing: ${missing.join(', ')}`);
+  }
+
+  return credentials;
+}
+
+/**
+ * Get Azure Bot Service credentials for the Teams channel (ENG-272).
+ *
+ * Same shape as getWhatsAppCredentials above, for the same reason: these sit on the path of
+ * every inbound Teams activity, so an uncached read would add a Secrets Manager round trip
+ * before the request can even be authenticated.
+ *
+ * The env set is honoured ONLY when complete. A partial set falls through rather than being
+ * merged, so the dev bot's appId can never be paired with the prod bot's secret.
+ *
+ * Note `prod/AgentWeb/Microsoft/TeamsBot` does not exist yet — the provisioning identity
+ * lacked CreateSecret on prod/*, and the prod values are in 1Password. In production this
+ * therefore throws until that secret is created. It deliberately does NOT fall back to the
+ * dev secret: replying to a customer's tenant with the dev bot's identity would fail
+ * authentication in a way that looks like a Teams outage rather than a missing secret.
+ */
+export async function getTeamsBotCredentials(): Promise<TeamsBotCredentials> {
+  const fromEnv = {} as TeamsBotCredentials;
+  const missingEnv: string[] = [];
+  for (const [field, envName] of Object.entries(TEAMS_BOT_ENV_VARS)) {
+    const value = process.env[envName]?.trim();
+    if (value) fromEnv[field as keyof TeamsBotCredentials] = value;
+    else missingEnv.push(envName);
+  }
+  if (missingEnv.length === 0) return fromEnv;
+  if (missingEnv.length < Object.keys(TEAMS_BOT_ENV_VARS).length) {
+    console.warn(
+      `[teams] ignoring partial TEAMS_BOT_* env config (missing: ${missingEnv.join(', ')}); ` +
+        'falling back to Secrets Manager.',
+    );
+  }
+
+  const now = Date.now();
+  if (teamsBotCredsCache && teamsBotCredsCache.expiresAt > now) {
+    return teamsBotCredsCache.value;
+  }
+  if (!teamsBotCredsInFlight) {
+    teamsBotCredsInFlight = fetchTeamsBotCredentialsFromSecretsManager()
+      .then((value) => {
+        teamsBotCredsCache = { value, expiresAt: Date.now() + TEAMS_BOT_CREDS_TTL_MS };
+        return value;
+      })
+      .catch((error) => {
+        console.error('Error fetching Teams bot credentials from Secrets Manager:', error);
+        throw new Error(
+          'Failed to fetch Teams bot credentials. Set all of the TEAMS_BOT_* env vars or store them in Secrets Manager.',
+        );
+      })
+      .finally(() => {
+        teamsBotCredsInFlight = null;
+      });
+  }
+  return teamsBotCredsInFlight;
+}

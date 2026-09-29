@@ -54,9 +54,6 @@ export interface ConversationChannelAdapter {
    */
   persistThreadBinding(ref: ConversationRef, sessionId: string, userId: string): Promise<void>;
 
-  /** Post a placeholder while the response is generated. Null when unsupported/failed. */
-
-
   /** Post the assistant's reply into the thread. */
   postReply(ref: ConversationRef, text: string): Promise<void>;
 

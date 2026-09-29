@@ -242,8 +242,12 @@ describe('notCheckedGateResult (ENG-2187)', () => {
     const result = notCheckedGateResult({ requestedSize: '1:1' }, 'download failed');
 
     expect(result).toMatchObject({ notChecked: 'download failed', placement: 'meta_feed_square', passed: true, bytes: 0 });
+    // ENG-2193: CHECK_IDS grew to include the content checks (OCR/spelling/brand-colour/logo/
+    // policy-keywords) — a `notChecked` result covers every known check id, not just the
+    // structural ones this file computes itself.
     expect(result.checks.map((c) => c.id)).toEqual([
       'decode', 'blank_render', 'aspect_ratio', 'dimensions', 'file_size', 'aspect_fallback',
+      'ocr_text_ratio', 'ocr_legibility', 'spelling', 'brand_colour', 'logo_presence', 'policy_keywords',
     ]);
     expect(result.checks.every((c) => c.status === 'skipped' && c.reason === 'download failed')).toBe(true);
   });

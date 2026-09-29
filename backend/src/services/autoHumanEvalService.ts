@@ -4,6 +4,7 @@ import { settingsService } from './settingsService';
 import type { CreativeGateResult } from './creativeGates';
 import type { CreativeBrief } from './creativeRubricJudge';
 import { judgeHumanEvalCandidate } from './creativeRubricJudgeRuntime';
+import { runContentChecksForCandidate } from './creativeContentCheckRunner';
 
 export interface AutoHumanEvalInput {
   reviewType: HumanEvalReviewType;
@@ -28,6 +29,9 @@ export interface AutoHumanEvalInput {
   creativeBrief?: Omit<CreativeBrief, 'brand'>;
   /** Landing pages: the generated page source for the rubric judge, read only if sampled (ENG-2192). */
   loadLandingPageSource?: () => Promise<string | undefined>;
+  /** Ad copy (headline/body/CTA) supplied alongside the image, if any — spell-checked and
+   *  policy-screened together with the OCR'd text by the ENG-2193 content checks. */
+  adCopyText?: string;
 }
 
 function dedupeSettingKey(sourceKey: string): string {
@@ -159,6 +163,21 @@ export async function enqueueAutoHumanEval(
         creativeGates: input.creativeGates,
         ...(input.loadLandingPageSource ? { loadLandingPageSource: input.loadLandingPageSource } : {}),
         brief: input.creativeBrief,
+      }).catch(() => undefined);
+    }
+
+    // ENG-2193: OCR/spelling/brand-colour/logo/policy-keyword checks, appended onto the
+    // structural `creativeGates` already stored above. Images only for now — see
+    // `creativeContentCheckRunner.ts`'s header for why landing pages aren't wired in here.
+    // Off by default (`CREATIVE_CONTENT_CHECKS_ENABLED`); the runner no-ops when unset, but the
+    // env check is duplicated here too so a disabled flag skips even the download-bound work of
+    // scheduling the call, not just the checks themselves.
+    if (input.reviewType === 'creative_image' && process.env.CREATIVE_CONTENT_CHECKS_ENABLED === 'true') {
+      void runContentChecksForCandidate({
+        candidateId: candidate.candidateId,
+        artifactUrl: candidate.artifactUrl ?? input.artifactUrl,
+        userId: input.userId,
+        adCopyText: input.adCopyText,
       }).catch(() => undefined);
     }
 
