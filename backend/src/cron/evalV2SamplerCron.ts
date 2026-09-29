@@ -274,7 +274,12 @@ export async function runEvalV2Sample(deps: SamplerDeps, opts: SamplerOptions): 
     includeSpend: true,
     spendQuery: {
       indexName: SPEND_EVENTS_OCCURRED_AT_INDEX,
-      billingUserOf: deps.billingUserOf ?? (async (userId) => userId),
+      // No identity fallback: an org member's spend can live under the org's billing root, not
+      // their own userId, so querying under the raw userId can misattribute it. Without a real
+      // resolver wired in, every session's billing subject is unresolved — readSpendBounded's own
+      // `.catch(() => '')` turns that rejection into `truncated` (unknown), never a false `none`
+      // (ENG-2196 CodeRabbit, sibling of the failed-lookup case already fixed).
+      billingUserOf: deps.billingUserOf ?? (() => Promise.reject(new Error('billingUserOf is required for bounded spend queries'))),
       maxEventsPerBillingUser: EVAL_V2_MAX_SPEND_EVENTS_PER_BILLING_USER,
     },
   });
