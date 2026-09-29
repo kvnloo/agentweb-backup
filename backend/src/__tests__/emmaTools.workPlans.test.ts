@@ -14,6 +14,13 @@
  * would fail loudly instead of silently succeeding against the real service
  * — merely being PASSED as a value (never invoked, since
  * workPlansImpl.applyPredefinedWorkPlan is itself mocked below) is fine.
+ *
+ * `modify_work_plan` (ENG-2103 F2 design-decision-list follow-up, Pattern A)
+ * was added to this cluster in a later round than the other 5 — it forwards
+ * `agentModeService.callLLM.bind(agentModeService)` as modifyWorkPlan's 6th
+ * argument, the same "pass the real singleton's bound method, verify by
+ * invoking the mocked/throwing reference" shape `launch_predefined_work_plan`
+ * already established for its own 5th argument.
  */
 
 jest.mock('../emma/impl/workPlans', () => ({
@@ -22,6 +29,7 @@ jest.mock('../emma/impl/workPlans', () => ({
   recommendPredefinedWorkPlan: jest.fn(),
   setWorkPlanStatus: jest.fn(),
   sendForReview: jest.fn(),
+  modifyWorkPlan: jest.fn(),
 }));
 
 // agentModeService.<workPlanMethod> must NOT be called by these tools anymore
@@ -139,5 +147,30 @@ describe('Work plans tool cluster delegates to emma/impl/workPlans.ts (ENG-2103 
     const tool = emmaToolRegistry.getTool('send_for_review')!;
     await expect(tool.execute({ subject: 'X' }, {})).rejects.toThrow('Missing user or session context');
     expect(mockWorkPlans.sendForReview).not.toHaveBeenCalled();
+  });
+
+  it('modify_work_plan forwards steps/removeStepCounts/session/autocomplete/isUnattendedRun plus a callLLM bound to the real agentModeService singleton, and returns the result unchanged', async () => {
+    const expected = { success: true, workPlan: { title: 'T' } };
+    mockWorkPlans.modifyWorkPlan.mockResolvedValue(expected as any);
+
+    const tool = emmaToolRegistry.getTool('modify_work_plan')!;
+    const steps = [{ stepCount: 1, title: 'Step 1' }];
+    const result = await tool.execute(
+      { steps, removeStepCounts: [2], autocomplete: true },
+      { sessionId: 's1', isUnattendedRun: false }
+    );
+
+    const callArgs = mockWorkPlans.modifyWorkPlan.mock.calls[0];
+    expect(callArgs.slice(0, 5)).toEqual([steps, [2], 's1', true, false]);
+    // The 6th argument is `agentModeService.callLLM.bind(agentModeService)` —
+    // the mocked agentModeService above is a throwing Proxy, so invoking the
+    // bound function proves it is really wired to that singleton's callLLM,
+    // the same "invoke the mock to prove the wiring" shape
+    // launch_predefined_work_plan's toBe(agentModeService) check uses for its
+    // own injected 5th argument (a bound function can't be compared by
+    // reference the way a plain object can).
+    expect(typeof callArgs[5]).toBe('function');
+    expect(() => (callArgs[5] as any)()).toThrow('agentModeService.callLLM should not be called by the work-plans tool cluster after ENG-2103 F2');
+    expect(result).toBe(expected);
   });
 });
