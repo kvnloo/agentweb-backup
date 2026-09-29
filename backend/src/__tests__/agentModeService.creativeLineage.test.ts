@@ -152,10 +152,19 @@ describe('agent mode → creative lineage (ENG-2141)', () => {
     jest.mocked(metaService.getAd)
       .mockResolvedValueOnce({ id: 'ad_123', creative: { creative_id: 'old_creative' } })
       .mockResolvedValue({ id: 'ad_123', creative: { creative_id: 'mc-new', object_story_spec: { page_id: 'p', link_data: { link: 'https://x.test' } } } });
-    jest.mocked(metaService.getAdCreative).mockResolvedValue({
-      id: 'old_creative',
-      object_story_spec: { page_id: 'p', link_data: { message: 'm', link: 'https://x.test', name: 'n', image_hash: 'old-hash' } },
-    });
+    jest.mocked(metaService.getAdCreative)
+      // 1st call: read the current (pre-swap) creative to build the new params from.
+      .mockResolvedValueOnce({
+        id: 'old_creative',
+        object_story_spec: { page_id: 'p', link_data: { message: 'm', link: 'https://x.test', name: 'n', image_hash: 'old-hash' } },
+      })
+      // 2nd call (ENG-2169): read the newly-created creative back to verify the swap actually
+      // took. Its picture must be the requested S3_URL and carry no stale image_hash, or the
+      // swap check would (correctly) refuse to attach it.
+      .mockResolvedValue({
+        id: 'mc-new',
+        object_story_spec: { page_id: 'p', link_data: { message: 'm', link: 'https://x.test', name: 'n', picture: S3_URL } },
+      });
     jest.mocked(metaService.createAdCreative).mockResolvedValue({ id: 'mc-new' });
     jest.mocked(metaService.updateAd).mockResolvedValue({ success: true });
 

@@ -100,7 +100,7 @@ describe('AgentMode finalize guard — ON-path characterization (flag pinned bef
     expect(snapshot).toEqual(expected);
   });
 
-  it('SHADOW mode: judge + corrective turn still run (for telemetry), but the delivered message is the ORIGINAL untrue claim, never the correction', async () => {
+  it('SHADOW mode: judge runs (for telemetry) but the corrective turn never does (ENG-2150 fix) — the delivered message is the ORIGINAL untrue claim', async () => {
     delete process.env.AGENT_FINALIZE_GUARD;
     process.env.AGENT_FINALIZE_GUARD_SHADOW = 'true';
 
@@ -109,14 +109,20 @@ describe('AgentMode finalize guard — ON-path characterization (flag pinned bef
       transcript: [
         { content: UNTRUE_CLAIM },     // main loop final turn (no tools ran)
         { content: JUDGE_VERDICT },    // judge call still runs — shadow mode still detects
-        { content: CORRECTED },        // corrective turn still runs — its output is discarded
+        // No CORRECTED turn: detectOnly means the corrective port is never called, so
+        // there is no third transcript entry to consume. A stray unconsumed CORRECTED
+        // entry would be a bug in the harness, not the guard, so it is left out here.
       ],
     });
 
     const expected: BehaviorSnapshot = {
       content: UNTRUE_CLAIM, // NOT corrected — shadow mode never rewrites what the user sees
       toolCallSequence: [],
-      llmTurnsConsumed: 3, // same LLM cost as enforce mode — only the message delivery differs
+      // One fewer LLM turn than enforce mode: shadow reports the mismatch (detected_mismatch)
+      // straight from the judge call, and never pays for a corrective turn whose text would
+      // only be discarded (ENG-2150: the guard shadow was billing a real correction to the
+      // customer's own session and making them wait for it, purely to throw the text away).
+      llmTurnsConsumed: 2,
       responseMessageShape: [{ role: 'assistant' }],
       cancelled: false,
     };
