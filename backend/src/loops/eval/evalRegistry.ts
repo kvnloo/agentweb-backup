@@ -271,7 +271,7 @@ export const EVAL_REGISTRY: readonly GraderEntry[] = [
     graderType: 'code',
     measures: 'Per generated image: decodes, not a blank/near-uniform render, aspect and minimum size vs the requested placement (or the Meta placement assumed from a bare ratio), file size vs platform limit, silent size-to-aspect substitution',
     source: 'services/creativeGates.ts; placement table services/creativePlacementSpecs.ts',
-    version: '2026-09-25.1',
+    version: '2026-09-28.1',
     model: 'none',
     modelFamily: 'none',
     consumers: ['imageGeneration result .gates', 'AW-HumanEvalQueue.creativeGates (agent-mode generate_image)', 'AW-Users.adImageResult.variants[].gates (onboarding; stored since ENG-2187 — rows written before it have none)', 'console.warn on failure'],
