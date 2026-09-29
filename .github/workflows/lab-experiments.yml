@@ -1,0 +1,33 @@
+name: Lab Experiments
+
+on:
+  pull_request:
+    branches: [lab/upstream-20260929]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  backend-experiment:
+    name: Backend experiment
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+      - name: Production build
+        working-directory: backend
+        run: NODE_OPTIONS="--max-old-space-size=4096" npm run build
+      - name: Experiment tests
+        working-directory: backend
+        run: node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit src/__tests__/experiments\.
