@@ -170,8 +170,11 @@ async function main(): Promise<void> {
     tokensIn += result.usage?.inputTokens ?? 0;
     tokensOut += result.usage?.outputTokens ?? 0;
     if (result.status === 'ok') {
-      for (const c of RUBRIC_CRITERIA) perCriterion[c][result.criteria[c].verdict] += 1;
-      const failed = RUBRIC_CRITERIA.filter((c) => result.criteria[c].verdict === 'fail');
+      for (const c of RUBRIC_CRITERIA) {
+        const verdict = result.criteria[c]?.verdict;
+        if (verdict) perCriterion[c][verdict] += 1;
+      }
+      const failed = RUBRIC_CRITERIA.filter((c) => result.criteria[c]?.verdict === 'fail');
       console.log(`${label}: ${result.passedCount}/7 pass${failed.length ? ` — fail: ${failed.join(', ')}` : ''}`);
     } else if (result.status === 'error') {
       console.log(`${label}: ERROR ${result.error.kind}`);

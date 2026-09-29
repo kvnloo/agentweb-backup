@@ -402,6 +402,21 @@ export async function triggerAdCopyForUser(
       return;
     }
     await userDb.updateUser(userId, patch as any);
+    // ENG-2192: advisory rubric verdicts on the stored copy, with each variant's image when it
+    // has one (inert unless CREATIVE_RUBRIC_JUDGE_ENABLED + sample rate). Not awaited; never throws.
+    const { adCopyCompletedAt, adCopyResult } = patch;
+    if (adCopyCompletedAt && adCopyResult) {
+      void import("./creativeRubricOnboarding")
+        .then((m) =>
+          m.judgeOnboardingAdCopy({
+            userId,
+            completedAt: adCopyCompletedAt,
+            copyVariants: adCopyResult.variants,
+            imageVariants,
+          })
+        )
+        .catch(() => undefined);
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const current = await userDb.getUserById(userId);
