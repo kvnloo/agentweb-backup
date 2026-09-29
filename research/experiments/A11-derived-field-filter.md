@@ -1,15 +1,24 @@
-# A11 — Derived-field filter semantics
+# A11 — Lifecycle filter semantics
 
-Hypothesis: lifecycle should behave as a virtual, total CRM field rather than a nullable persisted attribute.
+## Finding A: presence is safe to virtualize now
 
-Key implication: `lifecycle is_empty` should match **zero** leads. Even the sparsest row derives to `unknown`; storage absence is not semantic emptiness.
+Lifecycle is a total semantic stage. `is_empty` should match zero rows and
+`is_not_empty` should match every row, regardless of whether DynamoDB stores the
+attribute. This is the narrow result promoted upstream in #3153.
 
-This experiment is the safety prerequisite for ENG-2155 writer cleanup.
+## Finding B: equality needs live joins
 
-Falsify if a valid lead state exists for which lifecycle cannot be computed, or if existing user intent relies on "attribute missing" rather than "lifecycle unknown".
+A lead row does **not** contain enough information to correctly derive
+`signed_up`, `in_deal`, `trialing`, `paying`, or activity-driven churn/risk.
+The existing backfill obtains those signals from AW-Users, AW-ContactEvents, and
+AW-Deals.
 
-Promotion path:
-1. replay search/delete fixtures with derived lifecycle;
-2. confirm previews do not widen;
-3. move shared filter resolution to a small helper;
-4. only then remove lifecycle stamps from writers.
+The second experiment therefore tests a batched resolver that:
+- deduplicates emails and deal IDs;
+- loads users, events, and deals once per page/batch;
+- reuses the existing backfill computation;
+- produces lifecycle values for all leads without an N+1 query shape.
+
+Promotion gate for equality filtering: production adapters must preserve bounded
+batch/page cost and classifications must agree with the backfill/live scoring path.
+Until then, stored equality filters remain compatibility behavior.
