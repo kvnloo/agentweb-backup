@@ -564,7 +564,10 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
       // The dedup key must be populated or getExistingEnrollment cannot see the row and
       // it is re-created — and the lead re-messaged — on every run.
       const input = dripSequenceDb.bulkEnroll.mock.calls[0][0][0];
-      expect(input.leadEmail).toBe('https://linkedin.com/in/ada');
+      // Canonical, not raw: leadEmail is the partition key of leadEmail-index, so two
+      // spellings of one profile would be two identities and the sequence would be
+      // delivered twice.
+      expect(input.leadEmail).toBe('https://www.linkedin.com/in/ada/');
     });
 
     // A live run reported `skippedNoEmail: 1` for a lead skipped because it had no
@@ -654,7 +657,10 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
       expect(res.status).toBe(200);
       expect(dripSequenceDb.bulkEnroll).toHaveBeenCalled();
       const input = dripSequenceDb.bulkEnroll.mock.calls[0][0][0];
-      expect(input.leadEmail).toBe('https://linkedin.com/in/ada');
+      // Canonical, not raw: leadEmail is the partition key of leadEmail-index, so two
+      // spellings of one profile would be two identities and the sequence would be
+      // delivered twice.
+      expect(input.leadEmail).toBe('https://www.linkedin.com/in/ada/');
       expect(res.body.skippedUnreachable).toBeUndefined();
     });
 
@@ -1059,5 +1065,89 @@ describe('unknown channels fall back to email, matching the worker', () => {
     // Email-only lead, LinkedIn-only sequence -> genuinely unreachable.
     expect(res.body.enrollableLeads).toBe(0);
     expect(res.body.skippedUnreachable).toBe(1);
+  });
+});
+
+/*
+ * The ROUTE must use the shared predicates, not a truthiness check.
+ *
+ * Every existing route test uses leads whose fields are either valid or absent, so both
+ * halves of leadIsReachable reverted to `!!String(x).trim()` with the suite fully green.
+ * The case that matters is a field that is PRESENT but unreachable — `linkedin: 'Acme
+ * Corp'` is exactly what db.ts stores verbatim for anything that is not a /in/ URL, and
+ * enrolling it produces a row that skips every step and completes having sent nothing:
+ * the precise outcome leadIsReachable is documented to prevent.
+ */
+describe('the route uses the shared predicates, not truthiness', () => {
+  const crmDbMock = require('../services/db').crmDb;
+
+  it('refuses a lead whose linkedin is free text, not a profile URL', async () => {
+    dripSequenceDb.getSequence.mockResolvedValue({
+      ...mockSequence,
+      steps: [{ stepId: 's1', stepNumber: 1, name: 'invite', delayDays: 0, channel: 'linkedin', messageText: 'hi' }],
+    });
+    crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+      { leadId: 'junk', listId: 'list-1', linkedin: 'Acme Corp' },
+      { leadId: 'company', listId: 'list-1', linkedin: 'https://www.linkedin.com/company/acme' },
+      { leadId: 'real', listId: 'list-1', linkedin: 'https://www.linkedin.com/in/ada' },
+    ]);
+
+    const res = await request(app).post('/seq_1/enrollments/by-list').send({ listId: 'list-1' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.enrollableLeads).toBe(1);
+    expect(res.body.skippedUnreachable).toBe(2);
+    const ids = dripSequenceDb.bulkEnroll.mock.calls[0][0].map((i: any) => i.leadId);
+    expect(ids).toEqual(['real']);
+  });
+
+  it('refuses a lead whose email is present but malformed', async () => {
+    dripSequenceDb.getSequence.mockResolvedValue(mockSequence);   // email sequence
+    crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+      { leadId: 'bad', listId: 'list-1', email: 'a@x..com' },
+      { leadId: 'brackets', listId: 'list-1', email: '<a@x.com>' },
+      { leadId: 'good', listId: 'list-1', email: 'ada@example.org' },
+    ]);
+
+    const res = await request(app).post('/seq_1/enrollments/by-list').send({ listId: 'list-1' });
+
+    expect(res.body.enrollableLeads).toBe(1);
+    const ids = dripSequenceDb.bulkEnroll.mock.calls[0][0].map((i: any) => i.leadId);
+    expect(ids).toEqual(['good']);
+  });
+
+  it('accepts a LinkedIn URL carrying a query string, and keys it canonically', async () => {
+    dripSequenceDb.getSequence.mockResolvedValue({
+      ...mockSequence,
+      steps: [{ stepId: 's1', stepNumber: 1, name: 'invite', delayDays: 0, channel: 'linkedin', messageText: 'hi' }],
+    });
+    crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+      { leadId: 'uk', listId: 'list-1', linkedin: 'https://linkedin.com/in/ada-lovelace?originalSubdomain=uk' },
+    ]);
+
+    const res = await request(app).post('/seq_1/enrollments/by-list').send({ listId: 'list-1' });
+
+    expect(res.body.enrollableLeads).toBe(1);
+    // The dedup identity must be the CANONICAL url: leadEmail is the partition key of
+    // leadEmail-index, so two spellings of one profile would enrol twice and deliver
+    // the whole sequence twice.
+    const input = dripSequenceDb.bulkEnroll.mock.calls[0][0][0];
+    expect(input.leadEmail).toBe('https://www.linkedin.com/in/ada-lovelace/');
+  });
+
+  it('two spellings of the same profile produce ONE dedup identity', async () => {
+    dripSequenceDb.getSequence.mockResolvedValue({
+      ...mockSequence,
+      steps: [{ stepId: 's1', stepNumber: 1, name: 'invite', delayDays: 0, channel: 'linkedin', messageText: 'hi' }],
+    });
+    crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+      { leadId: 'a', listId: 'list-1', linkedin: 'https://www.linkedin.com/in/ada/' },
+      { leadId: 'b', listId: 'list-1', linkedin: 'https://linkedin.com/in/ada' },
+    ]);
+
+    await request(app).post('/seq_1/enrollments/by-list').send({ listId: 'list-1' });
+
+    const identities = dripSequenceDb.bulkEnroll.mock.calls[0][0].map((i: any) => i.leadEmail);
+    expect(new Set(identities).size).toBe(1);
   });
 });

@@ -21,7 +21,7 @@ import axios from 'axios';
 import { extractVariables, leadHasVariable, isSupportedVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
 import { LEAD_LIFECYCLES, defaultStatusConfigFor } from '../utils/leadSchema';
-import { isReachableEmail, isReachableLinkedIn } from '../utils/leadReachability';
+import { isReachableEmail, isReachableLinkedIn, canonicalLinkedInProfile } from '../utils/leadReachability';
 
 /**
  * ENG-2127: the by-list enrol accepts a `lifecycle` filter and hands it to
@@ -114,7 +114,19 @@ function skipKeyForChannels(channels: Set<string>): string {
  * identity; dripSequenceWorker already treats the field that way at its reply-exit check.
  */
 function enrollmentIdentity(lead: any): string {
-  return String(lead?.email ?? '').trim() || String(lead?.linkedin ?? '').trim();
+  // Use the PREDICATES, not truthiness, and the CANONICAL LinkedIn URL.
+  //
+  // Truthiness keyed an admitted lead on junk: `{email: 'not-an-address', linkedin:
+  // <valid profile>}` in a LinkedIn sequence was admitted on the LinkedIn channel and
+  // then keyed on the unusable address.
+  //
+  // And the raw URL made one person two identities — `.../in/ada/` and
+  // `.../in/ada` differ by a byte. leadEmail is the PARTITION KEY of leadEmail-index,
+  // which getExistingEnrollment queries for an exact match, so those enrol twice and
+  // the whole sequence is delivered twice.
+  const email = String(lead?.email ?? '').trim();
+  if (isReachableEmail(email)) return email;
+  return canonicalLinkedInProfile(lead?.linkedin) ?? '';
 }
 
 // ─── Sequences CRUD ───────────────────────────────────────────────────────────
