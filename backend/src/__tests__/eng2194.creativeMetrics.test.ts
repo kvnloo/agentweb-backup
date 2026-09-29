@@ -13,7 +13,7 @@ import { adsMetricsDb, type AdsMetricsAdRow } from '../services/adsMetricsDb';
 import { userDb, crmDb } from '../services/db';
 import { getMetaAccountCredentials } from '../services/metaAccountCredentials';
 import { aggregateCreative, creativePerformanceReport, type AdDayMetrics, type CreativeObservation } from '../loops/eval/creativePerformance';
-import { formatReport, parseArgs } from '../scripts/creativePerformanceCorrelation';
+import { formatReport, parseArgs, summarizeCreativeAggregate } from '../scripts/creativePerformanceCorrelation';
 import fixture from './fixtures/metaInsightsLevelAd.json';
 
 jest.mock('../services/db', () => ({
@@ -219,6 +219,13 @@ describe('creativePerformanceReport (ENG-2194 metrics)', () => {
     ], { iterations: 200, seed: 3 });
     expect(report.excluded.crmMixedCurrency).toBe(0);
     expect(report.cplByCurrency.USD.n).toBe(5);
+
+    // CodeRabbit (follow-up): the per-creative crmCpl output must carry the same crmCurrency, not
+    // the all-rows currency (which is null here) — otherwise it would report a wrong/missing label
+    // even though cplByCurrency already has the correct point.
+    const joined = report.aggregates.find((a) => a.creativeId === 'crmJoinedOnly')!;
+    expect(joined.currency).toBeNull();
+    expect(summarizeCreativeAggregate(joined).crmCpl).toEqual({ value: 8, currency: 'USD' });
   });
 });
 
