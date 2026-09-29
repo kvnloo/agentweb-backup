@@ -21,6 +21,7 @@ import { CREATIVE_LINEAGE_TABLE_ENV, type MetaAdLink, type MetaAdLinkEnd } from 
 import {
   creativePerformanceReport,
   readRubricScore,
+  type CreativeAggregate,
   type CreativeObservation,
   type CreativePerformanceReport,
   type MetricCorrelation,
@@ -236,6 +237,27 @@ export function formatReport(report: CreativePerformanceReport, truncatedAds: nu
   return lines;
 }
 
+/**
+ * The `--per-creative` JSON row for one creative. Pulled out of `main()` so it's testable directly:
+ * CPA is comparable across every settled row so it uses `a.currency`, but CRM CPL is only comparable
+ * across the CRM-joined rows it's actually built from, so it must use `a.crmCurrency` (CodeRabbit,
+ * same root cause as the eligibility/bucketing fix in creativePerformanceReport).
+ */
+export function summarizeCreativeAggregate(a: CreativeAggregate): Record<string, unknown> {
+  return {
+    creativeId: a.creativeId,
+    rubricScore: a.rubricScore,
+    impressions: a.impressions,
+    ctr: a.impressions > 0 ? a.clicks / a.impressions : null,
+    cvr: a.clicks > 0 ? a.leads / a.clicks : null,
+    hookRate: a.videoImpressions > 0 ? a.videoPlays3s / a.videoImpressions : null,
+    cpa: a.leads > 0 && a.currency ? { value: a.spend / a.leads, currency: a.currency } : null,
+    crmCpl: a.crmLeads > 0 && a.crmCurrency ? { value: a.crmJoinedSpend / a.crmLeads, currency: a.crmCurrency } : null,
+    settledRows: a.settledRows,
+    unsettledRows: a.unsettledRows,
+  };
+}
+
 function documentReader(): ReadOnlyReader {
   const client = new AWS.DynamoDB.DocumentClient();
   return {
@@ -268,20 +290,7 @@ async function main(): Promise<void> {
   }
   for (const line of formatReport(report, truncatedAds, opts)) console.log(line);
   if (opts.perCreative) {
-    for (const a of report.aggregates) {
-      console.log(JSON.stringify({
-        creativeId: a.creativeId,
-        rubricScore: a.rubricScore,
-        impressions: a.impressions,
-        ctr: a.impressions > 0 ? a.clicks / a.impressions : null,
-        cvr: a.clicks > 0 ? a.leads / a.clicks : null,
-        hookRate: a.videoImpressions > 0 ? a.videoPlays3s / a.videoImpressions : null,
-        cpa: a.leads > 0 && a.currency ? { value: a.spend / a.leads, currency: a.currency } : null,
-        crmCpl: a.crmLeads > 0 && a.currency ? { value: a.crmJoinedSpend / a.crmLeads, currency: a.currency } : null,
-        settledRows: a.settledRows,
-        unsettledRows: a.unsettledRows,
-      }));
-    }
+    for (const a of report.aggregates) console.log(JSON.stringify(summarizeCreativeAggregate(a)));
   }
 }
 
