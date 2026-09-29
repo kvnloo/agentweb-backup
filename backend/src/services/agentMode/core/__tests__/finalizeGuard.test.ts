@@ -146,6 +146,40 @@ describe('runFinalizeGuard', () => {
     expect(outcome.claimMismatch).toBe(false);
   });
 
+  it('detectOnly (shadow): mismatch found → detected_mismatch, text unchanged, correction port never called (ENG-2150 fix)', async () => {
+    const { ports, judge, correct } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'email_sent' }]); // initial check
+
+    const outcome = await runFinalizeGuard({
+      finalText: CLAIMING_TEXT,
+      ledger: emptyLedger,
+      ports,
+      detectOnly: true,
+    });
+
+    expect(correct).not.toHaveBeenCalled();
+    expect(outcome.action).toBe('detected_mismatch');
+    expect(outcome.finalText).toBe(CLAIMING_TEXT);
+    expect(outcome.claimMismatch).toBe(true);
+    expect(outcome.mismatchedClaimClasses).toEqual(['email_sent']);
+  });
+
+  it('detectOnly (shadow): a backed claim is still clean, and the judge alone decides — no correction attempted either way', async () => {
+    const { ports, judge, correct } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'email_sent' }]);
+
+    const outcome = await runFinalizeGuard({
+      finalText: CLAIMING_TEXT,
+      ledger: [{ toolName: 'send_email', status: 'success' }],
+      ports,
+      detectOnly: true,
+    });
+
+    expect(correct).not.toHaveBeenCalled();
+    expect(outcome.action).toBe('clean');
+    expect(outcome.claimMismatch).toBe(false);
+  });
+
   it('corrective turn does NOT resolve → visible correction appended + claimMismatch (failure path)', async () => {
     const { ports, judge, correct } = makePorts();
     const stillLying = 'The email was sent earlier today as requested.';
