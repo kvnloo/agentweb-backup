@@ -60,11 +60,22 @@ const mockHubSpotInstance = {
   portalId: '245815183',
   listContactLists: mockListContactLists,
 };
+/*
+ * The two construction paths must be distinguishable, because that distinction IS the
+ * contract the marketing pre-flight depends on: `accountId` is set by create() and left
+ * undefined by fromToken(). A single shared mock instance made the fallback path
+ * invisible — both mutations undoing that fix passed 22/22.
+ */
+const mockTokenInstance = { ...mockHubSpotInstance };            // fromToken: no accountId
+const mockOauthInstance = { ...mockHubSpotInstance, accountId: '245815183' };
 jest.mock('../services/hubspotService', () => ({
   HubSpotService: {
-    create: jest.fn(async () => mockHubSpotInstance),
-    fromToken: jest.fn(() => mockHubSpotInstance),
+    create: jest.fn(async () => mockOauthInstance),
+    fromToken: jest.fn(() => mockTokenInstance),
   },
+}));
+jest.mock('../utils/crypto', () => ({
+  decryptPassword: jest.fn(() => ({ password: 'pat-na1-pasted-key' })),
 }));
 jest.mock('../config/integrations', () => ({
   getHubSpotConfig: jest.fn().mockResolvedValue({ clientId: 'x', clientSecret: 'y', tokenUrl: 'u', redirectUri: 'r', scopes: [], authorizationUrl: 'a', tokenInfoUrl: 't' }),
@@ -138,8 +149,12 @@ jest.mock('../mcp/server/apiTools', () => ({ adminToolNames: [] }));
 
 import { agentModeService } from '../services/agentModeService';
 import { getAccountsByUserId } from '../services/connectedAccountsDb';
+import { HubSpotService } from '../services/hubspotService';
+import { crmDb } from '../services/db';
 
 const mockGetAccounts = getAccountsByUserId as jest.MockedFunction<typeof getAccountsByUserId>;
+const mockCreate = (HubSpotService as any).create as jest.Mock;
+const mockGetLeadLists = (crmDb as any).getLeadListsByUserId as jest.Mock;
 
 const USER = 'user-1';
 const SECRET = 'hubspot-client-secret-DO-NOT-LOG';
@@ -322,10 +337,26 @@ describe('call_hubspot_api marketing pre-flight', () => {
     expect(String(r.error ?? '')).not.toMatch(/CRM access only/i);
   });
 
-  it('does NOT refuse on a multi-account tenant with no account_id — ambiguous, so HubSpot decides', async () => {
-    mockGetAccounts.mockResolvedValue([...oauthAccount(CRM_ONLY), ...oauthAccount(CRM_ONLY)] as any);
-    const r = await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
-    expect(String(r.error ?? '')).not.toMatch(/CRM access only/i);
+  /*
+   * Multi-account with NO account_id is unreachable: resolveHubSpotAccount throws
+   * "Multiple HubSpot accounts found… Specify account_id" and resolveHubSpotService
+   * rethrows it, long before the guard. The reachable multi-account case is an explicit
+   * account_id — and since the guard now reads the account off the service that actually
+   * served the call, it judges THAT one rather than guessing at the list.
+   */
+  it('judges the account that served the call on a multi-account tenant', async () => {
+    mockGetAccounts.mockResolvedValue([
+      ...oauthAccount(CRM_ONLY),
+      { platform: 'hubspot', account_id: 'other-999', account_name: 'other',
+        config: { account_type: 'oauth', granted_scopes: WITH_MARKETING } },
+    ] as any);
+    const r = await agentModeService.handleHubspotApi(USER, {
+      entity_type: 'EMAIL', action: 'LIST', account_id: '245815183',
+    });
+    // 245815183 is the CRM-only one, and it is what create() returned — refuse, and do
+    // not be rescued by the marketing-capable sibling sitting next to it in the list.
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/CRM access only/i);
   });
 
   it('a DB failure resolving the account never blocks the call', async () => {
@@ -362,6 +393,41 @@ describe('the 403 diagnostic does not log a token embedded in HubSpot\'s message
     expect(out).toMatch(/requires any of \[content\]/);
   });
 
+  /*
+   * The whole reason `message` is kept rather than dropped is the scope hint. HubSpot's
+   * observed form uses [brackets], but a parenthesised scope name is token-shaped by
+   * length — and redacting `(marketing.campaigns.revenue.read)` would delete the one
+   * thing the field is retained for. The dot is the discriminator.
+   */
+  it('keeps a parenthesised SCOPE NAME while still redacting a parenthesised token', async () => {
+    mockGetAccounts.mockResolvedValue([] as any);
+    mockListEmails.mockRejectedValue(hs403({
+      category: 'MISSING_SCOPES',
+      message: 'Missing scope (marketing.campaigns.revenue.read) for token (CJSA6doYY4CEQjjrR8YjbCLARi9v4EBIJ)',
+    }));
+    await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
+    const out = logged();
+    expect(out).toContain('marketing.campaigns.revenue.read');   // the hint survives
+    expect(out).not.toContain('CJSA6doYY4CEQjjrR8YjbCLARi9v4EBIJ'); // the token does not
+  });
+
+  /*
+   * The body returned to the CALLER reaches the LLM context and anything that persists
+   * or shares tool results — a wider surface than our own logs, not a narrower one.
+   * Redacting only the log would have the asymmetry backwards.
+   */
+  it('redacts the body handed back to the model, not just the log line', async () => {
+    mockGetAccounts.mockResolvedValue([] as any);
+    mockListEmails.mockRejectedValue(hs403({
+      category: 'MISSING_SCOPES',
+      message: 'This oauth-token (CJSA6doYY4CEQjjrR8YjbCLARi9v4EBIJ) does not have proper permissions!',
+    }));
+    const r: any = await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
+    expect(JSON.stringify(r.hubspotError)).not.toContain('CJSA6doYY4CEQjjrR8YjbCLARi9v4EBIJ');
+    expect(JSON.stringify(r.hubspotError)).toContain('<redacted>');
+    expect(r.hubspotError.category).toBe('MISSING_SCOPES');   // diagnostic value preserved
+  });
+
   it('caps an unbounded message', async () => {
     mockGetAccounts.mockResolvedValue([] as any);
     // Spaced prose: a single 2000-char run is token-shaped and gets redacted wholesale,
@@ -369,5 +435,54 @@ describe('the 403 diagnostic does not log a token embedded in HubSpot\'s message
     mockListEmails.mockRejectedValue(hs403({ category: 'X', message: 'scope missing '.repeat(120) }));
     await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
     expect(logged()).toContain('truncated');
+  });
+});
+
+/*
+ * The pasted private-app-token fallback.
+ *
+ * resolveHubSpotService falls back to a key stored on a lead list whenever create()
+ * throws without an explicit account_id — which includes a rejected refresh, a path this
+ * PR's classifier change makes easier to hit. The guard must stand down there: that
+ * token's scopes are invisible to us, and a dead CRM-only OAuth row must not veto a call
+ * a live, fully-capable pasted key is serving.
+ *
+ * This is the case that made both F3 mutations VACUOUS — create() never rejected, so the
+ * fallback never ran and the recorded value always matched the re-derived one.
+ */
+describe('pre-flight stands down on the pasted-token fallback', () => {
+  beforeEach(() => { jest.clearAllMocks(); });
+
+  it('does NOT refuse a marketing call served by a pasted key, even with a CRM-only OAuth row present', async () => {
+    // A CRM-only OAuth account exists and would fail the guard...
+    mockGetAccounts.mockResolvedValue([{
+      platform: 'hubspot', account_id: '245815183', account_name: 'a',
+      config: { account_type: 'oauth', hubspot_account_type: 'crm',
+                granted_scopes: ['crm.objects.contacts.read'], refresh_token: 'r',
+                token_expires_at: Date.now() - 1000 },
+    }] as any);
+    // ...but create() rejects, so the pasted key on a lead list serves the call instead.
+    mockCreate.mockRejectedValueOnce(new Error('HubSpot access token expired and no refresh token is available.'));
+    mockGetLeadLists.mockResolvedValue([
+      { listId: 'l1', externalCrmSyncConfigs: { hubspot: { apiKeyEncrypted: 'enc' } } },
+    ] as any);
+    mockListEmails.mockResolvedValue({ results: [] });
+
+    const r = await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
+
+    expect(String(r.error ?? '')).not.toMatch(/CRM access only|Marketing Hub/i);
+    expect(mockListEmails).toHaveBeenCalled();
+  });
+
+  it('still refuses when the OAuth path DID serve the call', async () => {
+    mockGetAccounts.mockResolvedValue([{
+      platform: 'hubspot', account_id: '245815183', account_name: 'a',
+      config: { account_type: 'oauth', hubspot_account_type: 'crm',
+                granted_scopes: ['crm.objects.contacts.read'], refresh_token: 'r',
+                token_expires_at: Date.now() + 3600_000 },
+    }] as any);
+    const r = await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/CRM access only/i);
   });
 });

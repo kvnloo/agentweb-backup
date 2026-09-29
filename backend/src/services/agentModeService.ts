@@ -42765,22 +42765,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   // ─── HubSpot Campaigns ──────────────────────────────────────────────────────
 
-  /**
-   * Set by resolveHubSpotService to the OAuth account actually used, or null when the
-   * pasted private-app-token fallback served the call. The marketing pre-flight must not
-   * re-derive this: resolveHubSpotService falls back to a pasted key whenever create()
-   * throws without an explicit account_id — including a missing or rejected refresh
-   * token — so a dead CRM-only OAuth row can coexist with a live, fully-capable pasted
-   * key, and judging the dead row's scopes would refuse a call the token can serve.
-   */
-  private lastResolvedHubSpotAccountId: string | null = null;
-
   private async resolveHubSpotService(userId: string, accountId?: string): Promise<HubSpotService> {
-    this.lastResolvedHubSpotAccountId = null;
     try {
-      const svc = await HubSpotService.create(userId, accountId);
-      this.lastResolvedHubSpotAccountId = accountId ?? (await this.soleHubSpotAccountId(userId));
-      return svc;
+      return await HubSpotService.create(userId, accountId);
     } catch (err: any) {
       // An explicit account_id or a multi-account ambiguity is actionable by the
       // caller — surface it instead of silently falling back to token-paste.
@@ -42814,23 +42801,25 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * kept only for the scope hint it carries — with anything token-shaped removed and a
    * hard length cap, the way describeRefreshFailure caps its body.
    */
+  /** The same redaction applied to a whole HubSpot error body before it leaves us. */
+  private static redactHubSpotBody(body: unknown): unknown {
+    if (!body || typeof body !== 'object') return body ?? null;
+    const b = body as Record<string, unknown>;
+    if (typeof b.message !== 'string') return body;
+    return { ...b, message: AgentModeService.redactHubSpotMessage(b.message) };
+  }
+
   private static redactHubSpotMessage(msg: unknown): string | null {
     if (typeof msg !== 'string') return msg == null ? null : '<non-string>';
     let out = msg
       // HubSpot's own "(oauth-token)" parenthetical, and any bare long token-ish run.
-      .replace(/\(\s*[A-Za-z0-9._-]{20,}\s*\)/g, '(<redacted>)')
+      // No dot inside: `(marketing.campaigns.revenue.read)` is a SCOPE NAME and is the
+      // very hint this field is kept for. Rules 1 and 2 use different character classes
+      // on purpose — do not tidy them into agreement.
+      .replace(/\(\s*[A-Za-z0-9_-]{20,}\s*\)/g, '(<redacted>)')
       .replace(/\b(?:pat-[a-z0-9-]+|na1-[A-Za-z0-9-]{8,}|[A-Za-z0-9_-]{40,})\b/g, '<redacted>');
     if (out.length > 300) out = `${out.slice(0, 300)}…<truncated>`;
     return out;
-  }
-
-  /** The single OAuth HubSpot account id, or null when there is not exactly one. */
-  private async soleHubSpotAccountId(userId: string): Promise<string | null> {
-    try {
-      const { getAccountsByUserId } = await import('./connectedAccountsDb');
-      const hs = (await getAccountsByUserId(userId)).filter((a: any) => a.platform === 'hubspot');
-      return hs.length === 1 ? hs[0].account_id : null;
-    } catch { return null; }
   }
 
   /** Marketing Hub objects served by call_hubspot_api. CONTACT_LIST is CRM, not here. */
@@ -42848,6 +42837,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    */
   private async hubspotMarketingPreflight(
     userId: string,
+    svc: HubSpotService,
     entityType: string,
     action: string,
   ): Promise<{ success: false; error: string } | null> {
@@ -42860,10 +42850,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // request that carries no token.
     if (entityType === 'FORM' && action === 'SUBMIT') return null;
     try {
-      // Only the account that ACTUALLY served this call, recorded by
-      // resolveHubSpotService. Null means the pasted-token fallback ran, whose scopes we
-      // cannot see and must not guess at.
-      const accountId = this.lastResolvedHubSpotAccountId;
+      // The account that ACTUALLY served this call, read off the instance. undefined means
+      // the pasted private-app-token path ran, whose scopes we cannot see and must not
+      // guess at.
+      //
+      // Deliberately not re-derived, and deliberately not carried on `this`. An earlier
+      // version recorded it in a field on this service — which is a process-wide
+      // singleton with a second writer — and the pasted-token fallback does real I/O
+      // (getLeadListsByUserId) between the reset and the read, so a concurrent call
+      // finishing the OAuth path left its id in the slot. A review reproduced that
+      // crossing 300/300.
+      const accountId = svc.accountId;
       if (!accountId) return null;
       const { getAccountsByUserId } = await import('./connectedAccountsDb');
       const accounts = await getAccountsByUserId(userId);
@@ -42923,7 +42920,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // OAuth only. resolveHubSpotService falls back to a pasted private-app token whose
       // scopes we cannot see, and blocking on scopes we do not know would break working
       // setups.
-      const preflight = await this.hubspotMarketingPreflight(userId, entityType, action);
+      const preflight = await this.hubspotMarketingPreflight(userId, svc, entityType, action);
       if (preflight) return preflight;
 
       // ─── CONTACT_LIST ──────────────────────────────────────────────────────
@@ -43367,11 +43364,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           error: missingScopes
             ? 'Your HubSpot connection is missing the required permissions. Please reconnect your HubSpot account in Settings → Connected Accounts to grant them.'
             : 'HubSpot API access denied. Check your HubSpot subscription tier and OAuth scopes (content, automation required for some entity types).',
-          hubspotError: err?.response?.data ?? null,
+          // Redacted on the way OUT as well as into the log: this body reaches the LLM
+          // context and anything that persists or shares tool results, which is a wider
+          // surface than our own logs, not a narrower one.
+          hubspotError: AgentModeService.redactHubSpotBody(err?.response?.data),
           status: 403,
         };
       }
-      return { success: false, error: err?.message ?? 'HubSpot API call failed.', hubspotError: err?.response?.data ?? null, status: err?.response?.status ?? null };
+      return { success: false, error: err?.message ?? 'HubSpot API call failed.', hubspotError: AgentModeService.redactHubSpotBody(err?.response?.data), status: err?.response?.status ?? null };
     }
   }
 

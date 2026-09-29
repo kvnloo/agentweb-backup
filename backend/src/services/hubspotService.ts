@@ -391,6 +391,16 @@ export class HubSpotService {
   }
 
   /** HubSpot portal (hub) ID for this connection. Needed for public form submission. */
+  /**
+   * The OAuth account this instance was built from, or undefined on the fromToken
+   * (pasted private-app key) path. Callers that must know WHICH connection served a call
+   * read this instead of re-deriving it — re-derivation cannot distinguish the two paths
+   * and, when kept on the service as shared state, races with concurrent calls.
+   */
+  get accountId(): string | undefined {
+    return this._accountId;
+  }
+
   get portalId(): string | undefined {
     return this._portalId;
   }
