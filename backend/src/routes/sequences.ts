@@ -328,11 +328,17 @@ router.post(
           // `||` not `??`: a row that exists with `email: ''` must not block an address
           // the caller supplied. `??` only falls through on null/undefined, so an empty
           // string on the row dropped a lead the caller could legitimately enrol.
+          //
+          // `linkedin` comes ONLY from the CRM row. This route's payload contract is
+          // { listId, leadId, leadEmail } — `linkedin` was never part of it, and
+          // honouring it let a caller enrol a genuinely unreachable lead by supplying a
+          // profile URL the lead does not have, under a dedup identity of their
+          // choosing. leadEmail stays honoured because it IS in the contract.
           return {
             input: l,
             lead: {
               email: (row as any)?.email || l.leadEmail || l.email || '',
-              linkedin: (row as any)?.linkedin || l.linkedin || '',
+              linkedin: (row as any)?.linkedin || '',
             },
             readFailed: row === null,
           };
@@ -340,7 +346,16 @@ router.post(
         resolved.push(...batch);
       }
       const enrollable = resolved.filter((r) => leadIsReachable(r.lead, channels));
-      const skippedUnreachable = resolved.length - enrollable.length;
+      // Separate "we could not check" from "we checked and cannot reach".
+      //
+      // readFailed was computed and then never read. A throttled or failing getLeadById
+      // leaves the lead with no CRM data, so for a LinkedIn sequence it falls out as
+      // unreachable and is reported in the same bucket as a lead that genuinely has no
+      // profile — indistinguishable from real data, and silently lost. A deleted lead
+      // takes the same path, which is fine; the point is that the caller can tell.
+      const notEnrollable = resolved.filter((r) => !leadIsReachable(r.lead, channels));
+      const skippedReadFailed = notEnrollable.filter((r) => r.readFailed).length;
+      const skippedUnreachable = notEnrollable.length - skippedReadFailed;
       const inputs = enrollable.map((r) => ({
         sequenceId: req.params.sequenceId,
         userId: authReq.user!.userId,
@@ -352,7 +367,11 @@ router.post(
 
       const result = await dripSequenceDb.bulkEnroll(inputs);
       const skipKey = skipKeyForChannels(channels);
-      res.json(skippedUnreachable > 0 ? { ...result, [skipKey]: skippedUnreachable } : result);
+      res.json({
+        ...result,
+        ...(skippedUnreachable > 0 ? { [skipKey]: skippedUnreachable } : {}),
+        ...(skippedReadFailed > 0 ? { skippedReadFailed } : {}),
+      });
     } catch (err: any) {
       if (err instanceof SequenceNotFoundError) return res.status(404).json({ error: err.message });
       if (err instanceof SequenceAuthError) return res.status(403).json({ error: err.message });
@@ -830,7 +849,15 @@ router.post(
       // channel that was actually missing, the same way the two enrol routes do.
       let verifyChannels = new Set<string>(['email']);
       if (listId) {
-        const leadsResult = await crmDb.getLeadsByListId(listId);
+        // getAllLeadsByListId, not getLeadsByListId.
+        //
+        // getLeadsByListId returns ONE ~1MB DynamoDB page; db.ts says verbatim "Use this
+        // anywhere a complete list is required (enrollment, coverage counts)". The enrol
+        // route paginates, so on any list over a page this screen reported coverage over
+        // a different, smaller population than the one that gets enrolled — while the
+        // comment here claimed they matched. Two screens, same list, contradictory
+        // numbers, and coverage warnings computed from a truncated sample.
+        const leadsResult = await crmDb.getAllLeadsByListId(listId);
         leads = Array.isArray(leadsResult)
           ? leadsResult
           : ((leadsResult as any).items ?? (leadsResult as any).leads ?? []);

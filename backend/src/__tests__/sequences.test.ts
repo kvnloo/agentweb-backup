@@ -422,13 +422,15 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
   // be raised over leads that were never enrolment candidates.
   it('verify-variables counts the same population enrol-by-list will actually enrol', async () => {
     const crmDbMock = require('../services/db').crmDb;
-    crmDbMock.getLeadsByListId = jest.fn().mockResolvedValue({
-      items: [
-        { leadId: 'l1', email: 'a@example.com', firstName: 'Ann' },
-        { leadId: 'l2', firstName: 'Ben' },
-        { leadId: 'l3', email: '', firstName: 'Cal' },
-      ],
-    });
+    // getAllLeadsByListId now, matching the route. The previous version mocked
+    // getLeadsByListId — the single-~1MB-page loader — so the test's own title
+    // ("same population enrol-by-list will actually enrol") was false for any list
+    // over one page: the two screens read different loaders.
+    crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+      { leadId: 'l1', email: 'a@example.com', firstName: 'Ann' },
+      { leadId: 'l2', firstName: 'Ben' },
+      { leadId: 'l3', email: '', firstName: 'Cal' },
+    ]);
 
     const res = await request(app)
       .post('/seq_1/steps/verify-variables')
@@ -1149,5 +1151,88 @@ describe('the route uses the shared predicates, not truthiness', () => {
 
     const identities = dripSequenceDb.bulkEnroll.mock.calls[0][0].map((i: any) => i.leadEmail);
     expect(new Set(identities).size).toBe(1);
+  });
+});
+
+/*
+ * Findings 7, 9 and 12 — each one a place where the route quietly disagreed with
+ * itself about which leads exist.
+ */
+describe('the explicit route reports honestly about what it could not read', () => {
+  const crmDbMock = require('../services/db').crmDb;
+
+  it('distinguishes a FAILED READ from a genuine unreachability', async () => {
+    dripSequenceDb.getSequence.mockResolvedValue({
+      ...mockSequence,
+      steps: [{ stepId: 's1', stepNumber: 1, name: 'invite', delayDays: 0, channel: 'linkedin', messageText: 'hi' }],
+    });
+    // One lead throttles, one genuinely has no profile.
+    (crmDbMock.getLeadById as jest.Mock)
+      .mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException'))
+      .mockResolvedValueOnce({ leadId: 'nolinkedin', email: 'a@example.org' });
+
+    const res = await request(app).post('/seq_1/enrollments').send({
+      leads: [
+        { listId: 'list-1', leadId: 'throttled', leadEmail: '' },
+        { listId: 'list-1', leadId: 'nolinkedin', leadEmail: 'a@example.org' },
+      ],
+    });
+
+    expect(res.status).toBe(200);
+    // Reported in the same bucket, a throttle is indistinguishable from real data and
+    // the lead is silently lost.
+    expect(res.body.skippedReadFailed).toBe(1);
+    expect(res.body.skippedUnreachable).toBe(1);
+  });
+
+  it('does NOT report skippedReadFailed when the payload rescues the lead', async () => {
+    dripSequenceDb.getSequence.mockResolvedValue(mockSequence);   // email sequence
+    (crmDbMock.getLeadById as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB unavailable'));
+
+    const res = await request(app).post('/seq_1/enrollments')
+      .send({ leads: [{ listId: 'list-1', leadId: 'l1', leadEmail: 'a@example.org' }] });
+
+    expect(res.body.skippedReadFailed).toBeUndefined();
+    expect(dripSequenceDb.bulkEnroll).toHaveBeenCalled();
+  });
+
+  /*
+   * `linkedin` is not in this route's payload contract ({listId, leadId, leadEmail}).
+   * Honouring it let a caller enrol a lead that has no profile, under a dedup identity
+   * of their choosing — producing exactly the row that skips every step and completes
+   * having sent nothing.
+   */
+  it('ignores a payload-supplied linkedin when the CRM row has none', async () => {
+    dripSequenceDb.getSequence.mockResolvedValue({
+      ...mockSequence,
+      steps: [{ stepId: 's1', stepNumber: 1, name: 'invite', delayDays: 0, channel: 'linkedin', messageText: 'hi' }],
+    });
+    (crmDbMock.getLeadById as jest.Mock).mockResolvedValueOnce({ leadId: 'l1', email: '', linkedin: '' });
+
+    const res = await request(app).post('/seq_1/enrollments').send({
+      leads: [{ listId: 'list-1', leadId: 'l1', leadEmail: '', linkedin: 'https://linkedin.com/in/not-theirs' }],
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.skippedUnreachable).toBe(1);
+    expect(dripSequenceDb.bulkEnroll).toHaveBeenCalledWith([]);
+  });
+});
+
+describe('verify-variables counts the SAME population enrol does', () => {
+  const crmDbMock = require('../services/db').crmDb;
+
+  it('uses the paginated loader, not a single ~1MB page', async () => {
+    dripSequenceDb.getSequence.mockResolvedValue(mockSequence);
+    (crmDbMock.getAllLeadsByListId as jest.Mock).mockClear();
+    (crmDbMock.getLeadsByListId as jest.Mock).mockClear();
+
+    await request(app).post('/seq_1/steps/verify-variables')
+      .send({ listId: 'list-1', subject: 'Hi {{firstName}}', htmlContent: '' });
+
+    // db.ts: "Use this anywhere a complete list is required (enrollment, coverage
+    // counts) — getLeadsByListId returns only a single ~1MB page."
+    expect(crmDbMock.getAllLeadsByListId).toHaveBeenCalledWith('list-1');
+    expect(crmDbMock.getLeadsByListId).not.toHaveBeenCalled();
   });
 });
