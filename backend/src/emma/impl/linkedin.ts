@@ -20,10 +20,12 @@
  * and its 3 delegating wrappers on the class (`loadConnectedAccountPosts`,
  * `loadConnectedAccountMetrics`, `getPostAnalytics`) are untouched.
  *
- * TWO METHODS DELIBERATELY EXCLUDED FROM THE MOVE, both kept exactly as-is
- * (private, unmoved) on `AgentModeService`, for two different real reasons —
- * neither was in the original extraction brief, both found by reading the
- * actual source rather than trusting a boundary grep:
+ * ONE METHOD DELIBERATELY EXCLUDED FROM THE MOVE, kept exactly as-is
+ * (private, unmoved) on `AgentModeService`, found by reading the actual
+ * source rather than trusting a boundary grep. (A second method,
+ * `linkedinManagePost`, was ALSO excluded in the original cluster-16 pass —
+ * see the "ENG-2103 (F2) FOLLOW-UP" note right after this list for why that
+ * exclusion was later closed instead.):
  *
  * 1. `resolveEmployersForSizeFilter` — a REAL, one-hop-removed
  *    `this.callLLM` coupling, the same shape as the video cluster's
@@ -46,34 +48,37 @@
  *    `AgentModeService.prototype.linkedinOutreach`'s delegating wrapper via
  *    `this.resolveEmployersForSizeFilter.bind(this)`.
  *
- * 2. `linkedinManagePost` — NOT a callLLM issue. Its entire body is a
- *    5-way switch dispatching to sibling methods (`linkedinRepost`,
- *    `commentOnLinkedInPost`, `listLinkedInComments`, `reactToLinkedInPost`,
- *    `getPostAnalytics`), all called as `this.<method>(...)`.
- *    `agentModeService.socialTools.test.ts` has 5 tests
- *    (`describe('linkedinManagePost')`, lines ~1017-1089) that
- *    `jest.spyOn(service, '<eachSibling>')` and assert
- *    `linkedinManagePost` calls the spied CLASS INSTANCE method with the
- *    right args. Moving `linkedinManagePost`'s dispatch into this module
- *    would make it call the module's own plain sibling functions (or, with a
- *    same-module self-import per the cluster-10 lesson, this module's own
- *    exports namespace) — NEITHER of which is the object these tests spy on
- *    (`service`, the class instance), so all 5 tests would silently stop
- *    observing the real dispatch. Retargeting the spies to the module's
- *    exports would be possible for 4 of the 5 (the siblings that DO live
- *    here), but `getPostAnalytics` lives in cluster 15's
- *    `emma/impl/socialAccounts.ts` and requires the `AccountResolver` cluster
- *    15 established for exactly the reason documented there — routing it
- *    through this dispatcher too adds real complexity for a function with no
- *    logic of its own beyond delegation. Kept on the class UNCHANGED (not
- *    even converted to a delegating wrapper — there is nothing to delegate
- *    to): it continues to call `this.linkedinRepost` /
- *    `this.commentOnLinkedInPost` / `this.listLinkedInComments` /
- *    `this.reactToLinkedInPost` (now delegating wrappers to this module) /
- *    `this.getPostAnalytics` (cluster 15's untouched wrapper) exactly as
- *    before. `emma/tools.ts`'s `linkedin_manage_post` tool therefore
- *    deliberately keeps calling `agentModeService.linkedinManagePost`
- *    unchanged — not a repoint oversight.
+ * ENG-2103 (F2) FOLLOW-UP: `linkedinManagePost` was originally kept entirely
+ * on the class (not even a wrapper) for the reason above — its whole body is
+ * a 5-way switch dispatching to sibling methods (`linkedinRepost`,
+ * `commentOnLinkedInPost`, `listLinkedInComments`, `reactToLinkedInPost`,
+ * `getPostAnalytics`), all called as `this.<method>(...)`, and
+ * `agentModeService.socialTools.test.ts` has 5 tests
+ * (`describe('linkedinManagePost')`, lines ~1017-1089) that
+ * `jest.spyOn(service, '<eachSibling>')` and assert `linkedinManagePost`
+ * calls the spied CLASS INSTANCE method with the right args. Calling the
+ * module's own plain sibling functions (or a same-module self-import) would
+ * route around those spies entirely, since neither is the object they spy on.
+ *
+ * This follow-up pass closes that gap the same way clusters 15/16/18/20/22
+ * close an "external capability must stay class-instance-observable" case:
+ * the dispatch body MOVES here as a real export, `linkedinManagePost`, and
+ * the 5 siblings are supplied as injected function parameters
+ * (`LinkedinManagePostDeps`, below) rather than called directly. Only
+ * `AgentModeService.prototype.linkedinManagePost`'s own delegating wrapper —
+ * being inside the class body — can legally supply
+ * `this.<sibling>.bind(this)` for each one, so the 5 test spies (installed
+ * on the class instance BEFORE `linkedinManagePost` runs) are still exactly
+ * what executes: `this.<sibling>.bind(this)` is evaluated fresh on every
+ * call, picking up whatever the prototype method currently is. This needed
+ * zero changes to `agentModeService.socialTools.test.ts` — none of its
+ * assertions reference this module at all, since they spy on the class
+ * instance, which is unchanged. `getPostAnalytics` lives in cluster 15's
+ * `emma/impl/socialAccounts.ts`, not this module; that's irrelevant here
+ * since only a whole callable reference is injected, not its own internal
+ * `AccountResolver` wiring. `emma/tools.ts`'s `linkedin_manage_post` tool
+ * deliberately keeps calling `agentModeService.linkedinManagePost` — not a
+ * repoint oversight, it needs this wrapper's class-bound references.
  *
  * Zero other hidden `this.callLLM`/`this.generateImage`/`this.describeImage`/
  * `this.callVisionLLMWithTimeout` coupling anywhere else in the cluster —
@@ -93,8 +98,9 @@
  *     handler, and many direct real-instance calls in
  *     `agentModeService.socialTools.test.ts`.
  *   - `linkedinRepost`: `AgentModeService.prototype.linkedinManagePost`
- *     (kept on the class, see above — calls `this.linkedinRepost`), plus
- *     direct real-instance test calls in `agentModeService.socialTools.test.ts`.
+ *     (its own delegating wrapper now — see the F2 follow-up note above —
+ *     supplies `this.linkedinRepost.bind(this)` as an injected dependency),
+ *     plus direct real-instance test calls in `agentModeService.socialTools.test.ts`.
  *   - `commentOnLinkedInPost`: `routes/emmaApi.ts`'s `POST /linkedin-comment`
  *     handler, `AgentModeService.prototype.linkedinManagePost`, and direct
  *     real-instance test calls (`agentModeService.duplicateComment.test.ts`,
@@ -177,11 +183,13 @@
  * cluster; `chatbotService.ts`'s one reference (`postOnConnectedAccount`'s
  * H-VOICE capture) was already a lazy dynamic import and stays that way.
  *
- * No stale-mock regressions found beyond the `linkedinManagePost`
- * exclusion documented above (which is a scope decision, not a fix to a
- * broken mock). Every other `jest.spyOn`/direct-call test for the moved
- * methods calls them on the real `AgentModeService` instance, which still
- * works because each keeps its delegating wrapper.
+ * No stale-mock regressions found in the original cluster-16 pass. Every
+ * `jest.spyOn`/direct-call test for the moved methods calls them on the real
+ * `AgentModeService` instance, which still works because each keeps its
+ * delegating wrapper. The F2 follow-up pass that moved `linkedinManagePost`
+ * in (see above) needed zero test-file changes for the same reason — the 5
+ * dispatch tests spy on the class instance's sibling methods, which stayed
+ * exactly where they were.
  */
 import { linkedInOutreachService } from '../../services/linkedInOutreachService';
 import {
@@ -765,6 +773,83 @@ export async function reactToLinkedInPost(userId: string, accountId: string, pos
       message: 'Failed to create reaction',
       error: error instanceof Error ? error.message : 'Unknown error'
     };
+  }
+}
+
+/**
+ * Sibling methods `linkedinManagePost` dispatches to, injected so the class's
+ * own delegating wrapper can supply `this.<sibling>.bind(this)` for each one
+ * — see the "ENG-2103 (F2) FOLLOW-UP" note in this module's header for why
+ * this must stay class-instance-observable rather than calling these
+ * directly (4 live in this module, `getPostAnalytics` lives in cluster 15's
+ * `emma/impl/socialAccounts.ts`).
+ */
+export type LinkedinManagePostDeps = {
+  linkedinRepost: (userId: string, accountId: string, postUrn: string, commentary?: string, toolContext?: any) => Promise<any>;
+  commentOnLinkedInPost: (userId: string, accountId: string, postUrn: string, commentText: string, parentCommentUrn?: string, toolContext?: any) => Promise<any>;
+  listLinkedInComments: (userId: string, accountId: string, postUrn: string) => Promise<any>;
+  reactToLinkedInPost: (userId: string, accountId: string, postUrn: string, reactionType?: string) => Promise<any>;
+  getPostAnalytics: (userId: string, accountId: string, postIds: string[]) => Promise<any>;
+};
+
+/**
+ * Unified LinkedIn post management handler.
+ * Dispatches to the appropriate operation based on `action`.
+ *
+ * ENG-2103 (F2 follow-up): moved verbatim from
+ * `AgentModeService.prototype.linkedinManagePost` — see this module's header
+ * for why it was originally excluded and how the `deps` parameter closes
+ * that gap.
+ */
+export async function linkedinManagePost(
+  userId: string,
+  args: {
+    action: 'repost' | 'comment' | 'list_comments' | 'react' | 'get_analytics';
+    account_id: string;
+    post_urn?: string;
+    commentary?: string;
+    comment_text?: string;
+    parent_comment_urn?: string;
+    reaction_type?: string;
+    post_ids?: string[];
+  },
+  toolContext: any,
+  deps: LinkedinManagePostDeps,
+): Promise<any> {
+  const { action, account_id } = args;
+  console.log('[AgentMode] linkedinManagePost called:', { userId, action, account_id });
+
+  // ENG-827: last-moment publish-consent re-check. A repost or comment is a public
+  // write under the owner's name, so a consent withdrawn after dispatch admitted
+  // this call must still stop it. Self-scoping: the dispatcher attaches the hook
+  // only for a call it classified as publishing, so an analytics or comment-list
+  // read reaches this line with nothing to run.
+  const withdrawn = await publishWithdrawnMidFlight(toolContext);
+  if (withdrawn) return withdrawn;
+
+  const requirePostUrn = (a: string) =>
+    !args.post_urn ? { success: false, message: `post_urn is required for action=${a}` } : null;
+  const requirePostIds = () =>
+    !args.post_ids?.length ? { success: false, message: 'post_ids is required for action=get_analytics' } : null;
+  const requireCommentText = () =>
+    !args.comment_text ? { success: false, message: 'comment_text is required for action=comment' } : null;
+
+  switch (action) {
+    // ENG-827 (Greptile): the check above still leaves an account lookup and a token
+    // refresh in front of the write, so the hook is handed down and re-run
+    // immediately before the irreversible call. Reads below get nothing to run.
+    case 'repost':
+      return requirePostUrn('repost') ?? deps.linkedinRepost(userId, account_id, args.post_urn!, args.commentary, toolContext);
+    case 'comment':
+      return requirePostUrn('comment') ?? requireCommentText() ?? deps.commentOnLinkedInPost(userId, account_id, args.post_urn!, args.comment_text!, args.parent_comment_urn, toolContext);
+    case 'list_comments':
+      return requirePostUrn('list_comments') ?? deps.listLinkedInComments(userId, account_id, args.post_urn!);
+    case 'react':
+      return requirePostUrn('react') ?? deps.reactToLinkedInPost(userId, account_id, args.post_urn!, args.reaction_type || 'LIKE');
+    case 'get_analytics':
+      return requirePostIds() ?? deps.getPostAnalytics(userId, account_id, args.post_ids!);
+    default:
+      return { success: false, message: `Unknown action: ${action}` };
   }
 }
 

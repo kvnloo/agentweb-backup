@@ -36,7 +36,7 @@ import {
   buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
   type CreativeImageReadback, type ImageSwapExpectation, type ImageSwapVerdict,
 } from './agentMode/metaImageSwapCheck';
-import { publishWithdrawnMidFlight, readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
+import { readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import {
   evaluateTurnTimeBudget,
@@ -484,9 +484,8 @@ import { buildSandboxFetchHtml } from './sandboxTrackingPreflight';
 import { HubSpotService } from './hubspotService';
 import { handleAttioApi as handleAttioApiImpl } from './agentMode/attioTools';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
-import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
-import { resolvePinnedPublicAddress, fetchBufferFollowingRedirects, assertPublicHostname, DEFAULT_MAX_IMAGE_BYTES } from '../utils/ssrfGuard';
+import { fetchBufferFollowingRedirects, assertPublicHostname, DEFAULT_MAX_IMAGE_BYTES } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
 import { isTransientLLMError, extractAffordableTokens } from '../utils/agentModeErrors';
@@ -12520,18 +12519,14 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
   }
 
-  /**
-   * Thin wrapper used by executeAudienceCampaignLaunch's ad-set reuse-match
-   * check to determine whether the campaign has Advantage Campaign Budget
-   * (CBO) — needed to normalize the requested budget the same way
-   * createMetaAdsAdSet does (strips it entirely for CBO campaigns) before
-   * comparing against an existing ad set. Kept as its own method (mirroring
-   * listMetaAdsAdSets) so it can be mocked directly in tests.
-   */
-  public async getCampaignForAdSetReuseCheck(userId: string, accountId: string, campaignId: string): Promise<any> {
-    const { accountId: resolvedAccountId, accessToken } = await this.getMetaCredentials(userId, accountId);
-    return metaService.getCampaign(resolvedAccountId, accessToken, campaignId);
-  }
+  // ENG-2103 (F2 follow-up): moved to emma/impl/adsApis.ts as a real export
+  // (`getCampaignForAdSetReuseCheck`) — previously kept unmoved purely
+  // because agentModeService.audienceCampaignWorkflows.test.ts jest.spyOn's
+  // it twice. Deleted here outright (zero production callers remain once
+  // launchTargetedAudienceCampaign/launchRetargetingCampaign/
+  // executeAudienceCampaignLaunch stopped needing
+  // this.getCampaignForAdSetReuseCheck.bind(this)); the two test spies were
+  // retargeted to jest.spyOn(adsApisImpl, 'getCampaignForAdSetReuseCheck').
 
   public async listMetaAdsAdSets(
     userId: string,
@@ -16283,348 +16278,37 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     }
   }
 
-  // ENG-600: fixed EMAIL/PHONE schema for the HubSpot/CSV audience-sourcing
-  // workflows — ticket scope is email/phone seed data, not arbitrary schemas.
-  private static AUDIENCE_SOURCE_SCHEMA = ['EMAIL', 'PHONE'];
-
-  /**
-   * Hashes raw row data per Meta's Custom Audience field-normalization rules
-   * (lowercased email, digits-only phone, etc.), passing through values that
-   * are already a 64-hex-char SHA256 hash unchanged. Shared by UPLOAD_USERS
-   * (manageMetaCustomAudiences) and resolveOrCreateSeedAudience's stale-member
-   * diff, which both need identical hashing so the same contact hashes to the
-   * same row-key regardless of which path produced it.
-   */
+  // ENG-2103 (F2 follow-up): body moved to emma/impl/adsApis.ts
+  // (`hashAudienceRows`, now a real export there — verified genuinely
+  // stateless, zero `this.*` references, so no delegating-wrapper conflict
+  // to worry about). Kept as a one-line delegating wrapper because
+  // manageMetaCustomAudiences (below, out of scope, shared with unrelated
+  // code) calls it 3 times.
   private hashAudienceRows(schema: string[], rows: string[][]): string[][] {
-    return rows.map((row: string[]) => {
-      return row.map((cell: string, index: number) => {
-        const fieldType = (schema && schema[index]) ? schema[index].toUpperCase() : '';
-        let value = cell ? cell.trim() : '';
-
-        if (!value) return '';
-
-        // Pass through if already a SHA256 hash (64 hex chars)
-        if (/^[a-fA-F0-9]{64}$/.test(value)) {
-          return value;
-        }
-
-        // Normalization Rules per Meta requirements:
-        if (['EMAIL'].includes(fieldType)) {
-          value = value.toLowerCase();
-        } else if (['PHONE'].includes(fieldType)) {
-          // Standardize to digits only (strip spaces, dashes, parens)
-          value = value.toLowerCase().replace(/[^a-z0-9]/g, '');
-        } else if (['GEN'].includes(fieldType)) {
-          // Gender: 'f' or 'm'
-          value = value.toLowerCase() === 'female' ? 'f' : (value.toLowerCase() === 'male' ? 'm' : value.toLowerCase());
-        } else if (['DOBY', 'DOBM', 'DOBD'].includes(fieldType)) {
-          // Keep trimmed string
-          value = value.trim();
-        } else if (['COUNTRY'].includes(fieldType)) {
-          // Country codes must be lowercase 2-letter ISO
-          value = value.toLowerCase();
-        } else {
-          // Default: lowercase + trim
-          value = value.toLowerCase();
-        }
-
-        // Compute SHA256
-        return createHash('sha256').update(value).digest('hex');
-      });
-    });
+    return adsApisImpl.hashAudienceRows(schema, rows);
   }
 
-  /** Deterministic row-key for a hashed row, used to diff audience snapshots. */
-  private audienceRowKey(hashedRow: string[]): string {
-    return hashedRow.join('|');
-  }
-
-  /**
-   * Fetches and parses a CSV URL into raw rows for resolveOrCreateSeedAudience's
-   * CSV source path. Fetched exactly once and reused as both the upload
-   * payload and the basis for the stale-member hash diff — fetching twice
-   * (e.g. once to diff, once inside UPLOAD_USERS) would let the two see
-   * different content if the URL's data changed in between, corrupting the
-   * diff against what was actually uploaded.
-   */
-  private async fetchAndParseCsvRows(csvUrl: string): Promise<string[][]> {
-    // Greptile finding: this is a server-side fetch of a caller-supplied URL
-    // with no destination restriction — a classic SSRF vector (cloud metadata
-    // endpoints, RFC1918/internal hosts, loopback). Reuses the repo's existing
-    // guard rather than reinventing IP-range checks.
-    //
-    // Greptile follow-up finding (DNS rebinding): validating the hostname
-    // alone isn't enough if axios then does its own SEPARATE DNS lookup to
-    // actually connect — an attacker-controlled DNS server can answer a
-    // public IP for the validation query and a private IP for the
-    // connection query. Pinning the connection to the exact address that
-    // was validated (via a custom `lookup`) eliminates the second,
-    // unvalidated lookup entirely.
-    const { address, family } = await resolvePinnedPublicAddress(csvUrl);
-    // SSRF defence-in-depth: refuse to follow redirects. Validation only
-    // covers the user-supplied URL itself; if axios followed a redirect to
-    // e.g. http://169.254.169.254/, the guard would be bypassed entirely.
-    // maxRedirects:0 makes axios surface a redirect as an error instead —
-    // same defense already used by routes/crm.ts's load-from-url path.
-    const response = await axios.get(csvUrl, {
-      maxRedirects: 0,
-      lookup: (_hostname: string, options: any, callback: any) => {
-        if (typeof options === 'function') callback = options;
-        callback(null, address, family);
-      },
-    } as any);
-    if (Array.isArray(response.data)) {
-      return response.data;
-    }
-    const str: string = typeof response.data === 'object' ? JSON.stringify(response.data) : String(response.data ?? '');
-    return parseCsv(str, { skip_empty_lines: true, trim: true, relax_column_count: true });
-  }
-
-  /**
-   * Resolves the Meta Custom Audience that a targeted/retargeting campaign
-   * workflow should target: reuse an existing audience whose name matches
-   * (case-insensitive), or create a new one. Either way, the resolved
-   * audience is (re)populated from the caller's HubSpot list or CSV source —
-   * reuse does not skip the upload, so pointing an existing audience at a
-   * fresh source keeps it current rather than silently reusing stale data.
-   *
-   * `dryRun: true` only resolves the reuse-vs-create decision (for building
-   * a pre-execution confirmation preview) without creating/uploading anything.
-   *
-   * Any hard failure (LIST/CREATE/UPLOAD_USERS erroring) is thrown, not
-   * swallowed — the caller (the two new launch* orchestration methods) must
-   * fail the whole campaign-launch rather than attach an empty/broken audience.
-   * Only non-fatal source-side issues (e.g. contacts with no email/phone) are
-   * returned in `failures`.
-   */
-  private async resolveOrCreateSeedAudience(
-    userId: string,
-    accountId: string,
-    audienceName: string,
-    source: { type: 'hubspot_list'; listId: string; hubspotAccountId?: string } | { type: 'csv'; csvUrl: string },
-    opts: { dryRun: boolean }
-  ): Promise<{
-    plannedAction: 'reuse' | 'create';
-    audience?: { id: string; name: string };
-    created: boolean;
-    sourceSummary: string;
-    failures: string[];
-    recordsFound?: number;
-    recordsUsable?: number;
-  }> {
-    const listResult = await this.manageMetaCustomAudiences(userId, 'LIST', accountId, {});
-    if (!listResult.success) {
-      throw new Error(listResult.message || 'Failed to list existing Meta custom audiences.');
-    }
-    const existing = (listResult.audiences || []).find(
-      (a: any) => String(a?.name ?? '').toLowerCase() === audienceName.toLowerCase()
-    );
-    const plannedAction: 'reuse' | 'create' = existing ? 'reuse' : 'create';
-    const sourceSummary = source.type === 'hubspot_list'
-      ? `HubSpot list ${source.listId}`
-      : `CSV upload (${source.csvUrl})`;
-
-    if (opts.dryRun) {
-      return {
-        plannedAction,
-        audience: existing ? { id: existing.id, name: existing.name } : undefined,
-        created: false,
-        sourceSummary,
-        failures: [],
-      };
-    }
-
-    const failures: string[] = [];
-    let schema: string[] = AgentModeService.AUDIENCE_SOURCE_SCHEMA;
-    let payload: string[][];
-    let recordsFound: number | undefined;
-    let recordsUsable: number | undefined;
-
-    if (source.type === 'hubspot_list') {
-      const hubspotSvc = await this.resolveHubSpotService(userId, source.hubspotAccountId);
-      const { contacts, failedChunkContactCount } = await hubspotSvc.getContactsForList(source.listId);
-      const rows: string[][] = [];
-      let skipped = 0;
-      for (const c of contacts) {
-        if (c.email || c.phone) {
-          rows.push([c.email || '', c.phone || '']);
-        } else {
-          skipped++;
-        }
-      }
-      const totalFound = contacts.length + failedChunkContactCount;
-      if (skipped > 0) {
-        failures.push(`${skipped} of ${contacts.length} HubSpot contacts had neither email nor phone, skipped.`);
-      }
-      // Greptile P1 finding: a failed batch/read chunk was previously silently
-      // dropped, then (after an earlier fix) merely reported as a non-fatal
-      // ledger entry while the campaign still launched against a known-
-      // incomplete audience. A HubSpot read failure means we cannot say what
-      // the correct audience actually is, so this now blocks the whole launch
-      // rather than proceeding on a partial/wrong segment — the caller must
-      // retry once HubSpot is reachable again.
-      if (failedChunkContactCount > 0) {
-        throw new Error(`${failedChunkContactCount} of ${totalFound} HubSpot contacts could not be read (batch/read failure) — refusing to launch against a known-incomplete audience. Retry once HubSpot is reachable again.`);
-      }
-      payload = rows;
-      recordsFound = totalFound;
-      recordsUsable = rows.length;
-    } else {
-      // Fetched/parsed once here (not left as a URL for UPLOAD_USERS to fetch
-      // separately) — a second independent fetch would let the stale-member
-      // diff and the actual upload see two different snapshots of the same
-      // URL if its content changed in between, corrupting the diff. One fetch
-      // is also the source of truth for both the hash diff and the upload.
-      payload = await this.fetchAndParseCsvRows(source.csvUrl);
-    }
-
-    let audienceId: string;
-    let audienceLabel: string;
-    if (plannedAction === 'create') {
-      const createResult = await this.manageMetaCustomAudiences(userId, 'CREATE', accountId, {
-        name: audienceName,
-        subtype: 'CUSTOM',
-        customer_file_source: 'USER_PROVIDED_ONLY',
-        confirm: true,
-      });
-      if (!createResult.success) {
-        throw new Error(createResult.message || 'Failed to create Meta custom audience.');
-      }
-      audienceId = createResult.audience.id;
-      audienceLabel = createResult.audience.name;
-    } else {
-      audienceId = existing.id;
-      audienceLabel = existing.name;
-    }
-
-    // Greptile P1 finding: reusing an existing audience for a fresh source
-    // upload never removed members no longer present in the new source — a
-    // contact removed from the HubSpot list (or dropped from a refreshed CSV)
-    // stayed in the Meta audience forever. Diff the current source's hashed
-    // rows against the last-synced snapshot and remove anything stale before
-    // uploading the new set. Only meaningful on reuse — a brand-new audience
-    // has no prior snapshot to diff against.
-    const hashedRows = this.hashAudienceRows(schema, payload);
-    const newRowKeys = hashedRows.map((row) => this.audienceRowKey(row));
-
-    // Greptile P1 finding: a failed DELETE_USERS must not be forgotten. If the
-    // snapshot saved below only reflected the current source (newRowKeys), a
-    // stale member whose removal failed would simply disappear from tracking
-    // — the next sync would see no prior record of it and never retry the
-    // removal, leaving it targetable in Meta permanently. Un-removed keys are
-    // folded back into what gets saved so the next sync sees them as stale
-    // again and retries. Greptile follow-up: a failed removal must not just
-    // be tracked for next time — it means this launch would proceed against
-    // an audience known to still contain removed contacts, so it now blocks
-    // the whole launch (thrown), consistent with every other hard-failure
-    // step here (LIST/CREATE/UPLOAD_USERS/snapshot save).
-    // Greptile finding: reusing an audience with NO prior snapshot (first
-    // sync since stale-member sync shipped, or an audience created outside
-    // this flow) had no baseline to diff against, so add-only uploads could
-    // never remove any pre-existing members not in the current source — they
-    // stayed forever. Tracked here so the write below uses Meta's atomic
-    // usersreplace instead of an add-only upload in exactly this case; once a
-    // snapshot exists, reuse goes back to the normal diff-and-delete-then-add
-    // path (cheaper, and avoids replacing the whole set every sync).
-    let noBaselineReuse = false;
-    if (plannedAction === 'reuse') {
-      // Greptile finding: a snapshot READ failure was previously swallowed
-      // as non-fatal, leaving noBaselineReuse false — which fell through to
-      // an add-only upload against unknown state (we can't tell "no prior
-      // snapshot" from "couldn't read it"), the same "launch against
-      // unreconciled data" problem as the other blocking fixes here. A
-      // genuine infra failure still propagates and blocks below, same as
-      // ever.
-      //
-      // Greptile follow-up finding: a CORRUPTED snapshot (malformed index or
-      // chunk) threw the exact same generic error, permanently blocking
-      // every future launch for that audience — unlike a transient outage,
-      // corruption never resolves itself on retry. Treated the same as "no
-      // baseline exists": falls through to the self-healing REPLACE_USERS
-      // path below (never proceeds with the untrustworthy incomplete
-      // baseline) and a fresh, uncorrupted snapshot gets saved right after,
-      // fixing the corruption for good.
-      let previousRowKeys: string[] | null;
-      try {
-        previousRowKeys = await getAudienceSnapshotRowKeys(userId, audienceId);
-      } catch (e) {
-        if (e instanceof CorruptSnapshotError) {
-          console.error(`AgentMode: Corrupt audience snapshot for ${audienceId}, treating as no baseline:`, e);
-          previousRowKeys = null;
-        } else {
-          throw e;
-        }
-      }
-      if (previousRowKeys) {
-        const currentKeySet = new Set(newRowKeys);
-        const staleRowKeys = previousRowKeys.filter((k) => !currentKeySet.has(k));
-        if (staleRowKeys.length > 0) {
-          const staleRows = staleRowKeys.map((k) => k.split('|'));
-          const deleteResult = await this.manageMetaCustomAudiences(userId, 'DELETE_USERS', accountId, {
-            id: audienceId,
-            schema,
-            payload: staleRows,
-            confirm: true,
-          });
-          if (!deleteResult.success) {
-            throw new Error(`Failed to remove ${staleRowKeys.length} stale member(s) from audience ${audienceId}: ${deleteResult.message}`);
-          }
-        }
-      } else {
-        noBaselineReuse = true;
-      }
-    }
-
-    // Greptile finding: saving the snapshot AFTER the Meta upload meant a
-    // save failure left a successfully-uploaded member with NO record in
-    // any snapshot, ever — future diffs can only flag a member as stale by
-    // comparing against a PRIOR snapshot that recorded it, so an untracked-
-    // from-birth member could never be detected as no-longer-needed and
-    // would stay targetable in Meta forever. Additive UPLOAD_USERS is
-    // idempotent (a future sync just re-sends whatever's in the current
-    // source, self-healing a "snapshot updated, upload not yet retried"
-    // mismatch) but deletes are NOT (they depend entirely on snapshot
-    // history) — so for that path, the snapshot is saved BEFORE uploading.
-    //
-    // Greptile follow-up finding: REPLACE_USERS (the no-baseline reuse path)
-    // is the OPPOSITE case — saving before it has the mirror problem: if
-    // REPLACE_USERS then fails, the snapshot now falsely looks like an
-    // established baseline exists, so a retry switches to additive
-    // UPLOAD_USERS instead of retrying REPLACE_USERS, and pre-existing
-    // members that should have been wiped by the replace are never removed.
-    // REPLACE_USERS doesn't need the save-before reorder at all — it's
-    // fully idempotent regardless of tracking history (always sets Meta's
-    // membership to exactly the payload), so retrying it after ANY failure
-    // — including one where the snapshot save is what actually failed — is
-    // always correct. Save stays AFTER for this path, as originally.
-    if (!noBaselineReuse) {
-      await saveAudienceSnapshotRowKeys(userId, audienceId, newRowKeys);
-    }
-
-    const uploadResult = await this.manageMetaCustomAudiences(userId, noBaselineReuse ? 'REPLACE_USERS' : 'UPLOAD_USERS', accountId, {
-      id: audienceId,
-      schema,
-      payload,
-      confirm: true,
-    });
-    if (!uploadResult.success) {
-      throw new Error(uploadResult.message || (noBaselineReuse ? 'Failed to replace users in Meta custom audience.' : 'Failed to upload users to Meta custom audience.'));
-    }
-
-    if (noBaselineReuse) {
-      await saveAudienceSnapshotRowKeys(userId, audienceId, newRowKeys);
-    }
-
-    return {
-      plannedAction,
-      audience: { id: audienceId, name: audienceLabel },
-      created: plannedAction === 'create',
-      sourceSummary,
-      failures,
-      recordsFound,
-      recordsUsable,
-    };
-  }
+  // ENG-2103 (F2 follow-up): `audienceRowKey`, `fetchAndParseCsvRows`, and
+  // the private static `AUDIENCE_SOURCE_SCHEMA` field were exclusive to
+  // `resolveOrCreateSeedAudience` (confirmed by whole-backend grep) and
+  // moved alongside it into emma/impl/adsApis.ts as plain module functions/
+  // constants — deleted here outright, no delegating wrappers needed since
+  // nothing outside `resolveOrCreateSeedAudience` ever called them.
+  //
+  // `resolveOrCreateSeedAudience` itself also moved to emma/impl/adsApis.ts
+  // as a real export — previously kept unmoved purely because
+  // agentModeService.audienceCampaignWorkflows.test.ts jest.spyOn's it 27
+  // times. Deleted here outright (zero production callers remain once
+  // launchTargetedAudienceCampaign/launchRetargetingCampaign/
+  // executeAudienceCampaignLaunch stopped needing
+  // this.resolveOrCreateSeedAudience.bind(this)); it now takes an explicit
+  // `deps` parameter (`manageMetaCustomAudiences`, `resolveHubSpotService`)
+  // and the 27 test spies were retargeted to
+  // jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience'). See
+  // emma/impl/adsApis.ts's module header for the full explanation, including
+  // the same-module self-import used so the internal calls from
+  // `executeAudienceCampaignLaunch`/`launchAudienceCampaign` stay observable
+  // by that retargeted spy.
 
   /**
    * ENG-2103 (F2): moved to `emma/impl/adsApis.ts` — kept here as a
@@ -16636,24 +16320,22 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * (`resolveAudienceSourceArg`, `computeAudienceCampaignArgsDigest`,
    * `buildAudienceCampaignConfirmationSummary`, `rethrowStepFailure`,
    * `isDeepSubset`, `canonicalJSON`) all moved with it and were deleted here
-   * (zero callers beyond this cluster). `resolveOrCreateSeedAudience` and
-   * `getCampaignForAdSetReuseCheck` stay on the class UNCHANGED — both look
-   * exclusive to this cluster by production caller, but
-   * `agentModeService.audienceCampaignWorkflows.test.ts` independently
-   * `jest.spyOn`s them (27 and 2 times respectively), so moving them would
-   * silently stop those spies from affecting the moved code. `getMetaCredentials`,
-   * `manageMetaCustomAudiences`, `listMetaAdsAdSets`, `createMetaAdsAdSet`
-   * stay on the class too (shared with out-of-scope code). All six are
-   * injected as bound functions.
+   * (zero callers beyond this cluster). `getMetaCredentials`,
+   * `manageMetaCustomAudiences`, `listMetaAdsAdSets`, `createMetaAdsAdSet`,
+   * `resolveHubSpotService` stay on the class (shared with out-of-scope
+   * code, or — for `resolveHubSpotService` — its own cluster-19 cross-spy
+   * reason). All five are injected as bound functions.
+   * `resolveOrCreateSeedAudience`/`getCampaignForAdSetReuseCheck` (F2
+   * follow-up) are no longer part of this deps bag — both are real exports
+   * of `emma/impl/adsApis.ts` now, reached via a same-module self-import.
    */
   public async launchTargetedAudienceCampaign(userId: string, args: any): Promise<any> {
     return adsApisImpl.launchTargetedAudienceCampaign(userId, args, {
       getMetaCredentials: this.getMetaCredentials.bind(this),
-      resolveOrCreateSeedAudience: this.resolveOrCreateSeedAudience.bind(this),
       manageMetaCustomAudiences: this.manageMetaCustomAudiences.bind(this),
+      resolveHubSpotService: this.resolveHubSpotService.bind(this),
       listMetaAdsAdSets: this.listMetaAdsAdSets.bind(this),
       createMetaAdsAdSet: this.createMetaAdsAdSet.bind(this),
-      getCampaignForAdSetReuseCheck: this.getCampaignForAdSetReuseCheck.bind(this),
     });
   }
 
@@ -16665,11 +16347,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   public async launchRetargetingCampaign(userId: string, args: any): Promise<any> {
     return adsApisImpl.launchRetargetingCampaign(userId, args, {
       getMetaCredentials: this.getMetaCredentials.bind(this),
-      resolveOrCreateSeedAudience: this.resolveOrCreateSeedAudience.bind(this),
       manageMetaCustomAudiences: this.manageMetaCustomAudiences.bind(this),
+      resolveHubSpotService: this.resolveHubSpotService.bind(this),
       listMetaAdsAdSets: this.listMetaAdsAdSets.bind(this),
       createMetaAdsAdSet: this.createMetaAdsAdSet.bind(this),
-      getCampaignForAdSetReuseCheck: this.getCampaignForAdSetReuseCheck.bind(this),
     });
   }
 
@@ -16689,11 +16370,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   ): Promise<any> {
     return adsApisImpl.executeAudienceCampaignLaunch(userId, args, workflow, source, {
       getMetaCredentials: this.getMetaCredentials.bind(this),
-      resolveOrCreateSeedAudience: this.resolveOrCreateSeedAudience.bind(this),
       manageMetaCustomAudiences: this.manageMetaCustomAudiences.bind(this),
+      resolveHubSpotService: this.resolveHubSpotService.bind(this),
       listMetaAdsAdSets: this.listMetaAdsAdSets.bind(this),
       createMetaAdsAdSet: this.createMetaAdsAdSet.bind(this),
-      getCampaignForAdSetReuseCheck: this.getCampaignForAdSetReuseCheck.bind(this),
     });
   }
 
@@ -19289,8 +18969,35 @@ Reply with ONLY one word: yes or no.`;
   }
 
   /**
-   * Unified LinkedIn post management handler.
-   * Dispatches to the appropriate operation based on `action`.
+   * ENG-2103 (F2 follow-up): the dispatch body moved to
+   * emma/impl/linkedin.ts's exported `linkedinManagePost` — previously kept
+   * entirely on the class (not even a wrapper) because
+   * `agentModeService.socialTools.test.ts`'s `describe('linkedinManagePost')`
+   * (5 tests, ~1017-1089) `jest.spyOn`s the sibling methods below
+   * (`linkedinRepost`/`commentOnLinkedInPost`/`listLinkedInComments`/
+   * `reactToLinkedInPost`/`getPostAnalytics`) and asserts the dispatcher
+   * calls the spied CLASS INSTANCE method with the right args. Moving the
+   * switch statement's calls to plain module functions (or a same-module
+   * self-import) would route around those spies entirely — none of them are
+   * the object under test.
+   *
+   * Fixed the same way clusters 15/16/18/20/22 close an "external capability
+   * must stay spy-observable" gap: the 5 siblings are injected as bound
+   * function parameters from THIS wrapper, so a `jest.spyOn(service,
+   * '<sibling>')` installed before this method runs is still what actually
+   * executes — `this.<sibling>.bind(this)` is evaluated fresh on every call,
+   * picking up whatever the prototype method currently is. `getPostAnalytics`
+   * lives in cluster 15's `emma/impl/socialAccounts.ts`, not this module;
+   * that's irrelevant here since only a whole callable reference is needed,
+   * not its own internal `AccountResolver` wiring.
+   *
+   * Kept as a delegating wrapper (not deleted): real callers beyond
+   * `emma/tools.ts` are the 5 dispatch tests above plus 2 more direct
+   * real-instance calls in the same file (the mid-flight consent-withdrawal
+   * block, and the "post_urn is required" dispatcher test).
+   * `emma/tools.ts`'s `linkedin_manage_post` tool deliberately keeps calling
+   * `agentModeService.linkedinManagePost` — not a repoint oversight, it needs
+   * this wrapper's class-bound sibling references.
    */
   async linkedinManagePost(userId: string, args: {
     action: 'repost' | 'comment' | 'list_comments' | 'react' | 'get_analytics';
@@ -19302,46 +19009,19 @@ Reply with ONLY one word: yes or no.`;
     reaction_type?: string;
     post_ids?: string[];
   }, toolContext?: any): Promise<any> {
-    const { action, account_id } = args;
-    console.log('[AgentMode] linkedinManagePost called:', { userId, action, account_id });
-
-    // ENG-827: last-moment publish-consent re-check. A repost or comment is a public
-    // write under the owner's name, so a consent withdrawn after dispatch admitted
-    // this call must still stop it. Self-scoping: the dispatcher attaches the hook
-    // only for a call it classified as publishing, so an analytics or comment-list
-    // read reaches this line with nothing to run.
-    const withdrawn = await publishWithdrawnMidFlight(toolContext);
-    if (withdrawn) return withdrawn;
-
-    const requirePostUrn = (a: string) =>
-      !args.post_urn ? { success: false, message: `post_urn is required for action=${a}` } : null;
-    const requirePostIds = () =>
-      !args.post_ids?.length ? { success: false, message: 'post_ids is required for action=get_analytics' } : null;
-    const requireCommentText = () =>
-      !args.comment_text ? { success: false, message: 'comment_text is required for action=comment' } : null;
-
-    switch (action) {
-      // ENG-827 (Greptile): the check above still leaves an account lookup and a token
-      // refresh in front of the write, so the hook is handed down and re-run
-      // immediately before the irreversible call. Reads below get nothing to run.
-      case 'repost':
-        return requirePostUrn('repost') ?? this.linkedinRepost(userId, account_id, args.post_urn!, args.commentary, toolContext);
-      case 'comment':
-        return requirePostUrn('comment') ?? requireCommentText() ?? this.commentOnLinkedInPost(userId, account_id, args.post_urn!, args.comment_text!, args.parent_comment_urn, toolContext);
-      case 'list_comments':
-        return requirePostUrn('list_comments') ?? this.listLinkedInComments(userId, account_id, args.post_urn!);
-      case 'react':
-        return requirePostUrn('react') ?? this.reactToLinkedInPost(userId, account_id, args.post_urn!, args.reaction_type || 'LIKE');
-      case 'get_analytics':
-        return requirePostIds() ?? this.getPostAnalytics(userId, account_id, args.post_ids!);
-      default:
-        return { success: false, message: `Unknown action: ${action}` };
-    }
+    return linkedinImpl.linkedinManagePost(userId, args, toolContext, {
+      linkedinRepost: this.linkedinRepost.bind(this),
+      commentOnLinkedInPost: this.commentOnLinkedInPost.bind(this),
+      listLinkedInComments: this.listLinkedInComments.bind(this),
+      reactToLinkedInPost: this.reactToLinkedInPost.bind(this),
+      getPostAnalytics: this.getPostAnalytics.bind(this),
+    });
   }
 
   // ENG-2103 (F2): body moved verbatim to emma/impl/linkedin.ts. Kept as a
   // delegating wrapper — real callers beyond tools.ts: this class's own
-  // linkedinManagePost (kept on the class below, unmoved — see
+  // linkedinManagePost (F2 follow-up: now also a delegating wrapper, feeding
+  // this method in bound via deps.linkedinRepost — see
   // emma/impl/linkedin.ts's module header for why), and direct real-instance
   // calls in agentModeService.socialTools.test.ts.
   async linkedinRepost(userId: string, accountId: string, postUrn: string, commentary?: string, toolContext?: any): Promise<any> {
@@ -20185,8 +19865,10 @@ Reply with ONLY one word: yes or no.`;
   /**
    * ENG-2103 (F2): body moved verbatim to emma/impl/adsCrmApis.ts. MUST stay a
    * working delegating wrapper (not deleted): `resolveOrCreateSeedAudience`
-   * (emma/impl/adsApis.ts, kept unmoved on this class per cluster 18's own
-   * spy-conflict reason) calls `this.resolveHubSpotService(...)` for its
+   * (emma/impl/adsApis.ts, moved there in the F2 follow-up pass that closed
+   * cluster 18's own spy-conflict) receives this method bound as an injected
+   * `deps.resolveHubSpotService` from `launchTargetedAudienceCampaign`/
+   * `launchRetargetingCampaign`/`executeAudienceCampaignLaunch` for its
    * `hubspot_list` audience-source branch. `agentModeService.
    * audienceCampaignWorkflows.test.ts` also `jest.spyOn`s this method
    * directly (13 times) to stub that branch — both are satisfied by this
