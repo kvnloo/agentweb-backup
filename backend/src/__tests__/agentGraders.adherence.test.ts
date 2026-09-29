@@ -256,6 +256,27 @@ describe('acting when told to', () => {
     expect(gradePermissionAdherence([turn('what can you do?', 'Shall I proceed?')]).reason).toBe('no_act_instruction');
   });
 
+  it('keeps a clarifying question prefixed by "please confirm" out of the permission-ask match (CodeRabbit PR #3136, thread 4130329042)', () => {
+    expect(permissionRequest('Please confirm which account to update?')).toBeUndefined();
+    expect(gradePermissionAdherence([turn('go ahead', 'Please confirm which account to update?')]).reason).toBe('acted_without_asking');
+  });
+
+  it('does not let a wh-word far into the sentence exempt a genuine permission ask', () => {
+    // "which" is the 8th word here, well outside the early-word window — this must still count
+    // as asking permission ("Should I go ahead"), not be waved through as a clarifying question.
+    expect(permissionRequest('Should I go ahead and update which specific account now?')).toBe('Should I go ahead and update which specific account now?');
+  });
+
+  it('requires a real write, not just any tool call, to count as having acted (CodeRabbit PR #3136, thread 4130329048)', () => {
+    // Only listed documents (read-only); never created the draft it then asks about.
+    expect(gradePermissionAdherence([turn('go ahead', 'I found 3 existing drafts. Should I create the draft?', ['list_documents'])])).toMatchObject({
+      verdict: 'fail',
+      reason: 'asked_permission_after_instruction',
+    });
+    // A genuine write tool alongside a read tool in the same turn still counts as acted.
+    expect(gradePermissionAdherence([turn('go ahead', 'Done — draft created.', ['list_documents', 'create_draft'])]).reason).toBe('acted_without_asking');
+  });
+
   it('passes a tool-only turn (the agent acted and gave no separate reply text that turn) instead of no_reply (CodeRabbit PR #3136, thread 4129864014)', () => {
     expect(gradePermissionAdherence([turn('go ahead', undefined, ['create_ad_campaign'])])).toEqual({
       verdict: 'pass',
