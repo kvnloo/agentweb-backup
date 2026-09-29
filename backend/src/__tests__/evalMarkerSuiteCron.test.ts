@@ -86,14 +86,17 @@ describe('runEvalMarkerSuite', () => {
   });
 
   it('runs the suite on new markers and records the verdict as the next cursor', async () => {
+    const covered = marker('2026-09-28T09:00:00.000Z', 'prompt');
+    const newest = marker('2026-09-28T11:30:00.000Z', 'model');
     const table = fakeTable({
-      lastThrough: '2026-09-28T09:00:00.000Z',
-      markers: [marker('2026-09-28T09:00:00.000Z', 'prompt'), marker('2026-09-28T10:00:00.000Z', 'skill'), marker('2026-09-28T11:30:00.000Z', 'model')],
+      // A realistic prior-run cursor is a marker's own full sort key, not its bare timestamp.
+      lastThrough: covered.tsSession,
+      markers: [covered, marker('2026-09-28T10:00:00.000Z', 'skill'), newest],
     });
     const runSuite = jest.fn().mockResolvedValue(suiteResult('pass'));
     const outcome = await runEvalMarkerSuite({ env: ON, now: () => NOW, query: table.query, put: table.put, runSuite });
 
-    expect(outcome).toEqual({ status: 'ran', since: '2026-09-28T09:00:00.000Z', markerCount: 2, verdict: 'pass' });
+    expect(outcome).toEqual({ status: 'ran', since: covered.tsSession, markerCount: 2, verdict: 'pass' });
     expect(runSuite).toHaveBeenCalledTimes(1);
     expect(table.puts).toHaveLength(1);
     const row = table.puts[0];
@@ -104,20 +107,61 @@ describe('runEvalMarkerSuite', () => {
       mode: 'report_only',
       markerCount: 2,
       categories: 'model,skill',
-      markersSince: '2026-09-28T09:00:00.000Z',
-      markersThrough: '2026-09-28T11:30:00.000Z',
+      markersSince: covered.tsSession,
+      // The cursor is the newest marker's full sort key, not just its timestamp (see the
+      // same-millisecond test below for why the distinction matters).
+      markersThrough: newest.tsSession,
     }));
-    // The row holds no skill id or setting name.
-    expect(JSON.stringify(row)).not.toContain('s1');
+    // The cursor fields (markersSince/markersThrough) do carry the covered markers' target
+    // identity as part of their sort key — same boundary evalChangeMarkers.ts already draws for
+    // the marker rows themselves ("never the prompt text/value", not the identifier) — but the
+    // row must never carry the marker's own value/valueSha/fields (the change's content).
+    expect(row.dimensions).not.toHaveProperty('value');
+    expect(row.dimensions).not.toHaveProperty('valueSha');
+    expect(row.dimensions).not.toHaveProperty('fields');
   });
 
   it('writes nothing when no marker is newer than the last run', async () => {
-    const table = fakeTable({ lastThrough: '2026-09-28T11:30:00.000Z', markers: [marker('2026-09-28T11:30:00.000Z', 'skill')] });
+    const covered = marker('2026-09-28T11:30:00.000Z', 'skill');
+    const table = fakeTable({ lastThrough: covered.tsSession, markers: [covered] });
     const runSuite = jest.fn();
     await expect(runEvalMarkerSuite({ env: ON, now: () => NOW, query: table.query, put: table.put, runSuite }))
-      .resolves.toEqual({ status: 'no_changes', since: '2026-09-28T11:30:00.000Z' });
+      .resolves.toEqual({ status: 'no_changes', since: covered.tsSession });
     expect(runSuite).not.toHaveBeenCalled();
     expect(table.put).not.toHaveBeenCalled();
+  });
+
+  it('never drops a same-millisecond sibling of the marker chosen as the cursor (ENG-2195 CodeRabbit)', async () => {
+    // Two markers share a millisecond — buildEvalNeededItem's random per-write suffix is exactly
+    // what keeps them distinct — but markerB is written only AFTER the first tick's query already
+    // ran, so the first run sees and covers only markerA.
+    const sameMs = '2026-09-28T10:00:00.000Z';
+    const markerA = {
+      loopId: EVAL_GATE_LOOP_ID, tsSession: `${sameMs}#skill:sA#eval_needed#aaaaaaaa`, eventType: 'eval_needed',
+      subjectId: 'skill:sA', ts: sameMs, dimensions: { changeKind: 'skill', target: 'sA', category: 'skill', action: 'update' },
+    };
+    const markerB = {
+      loopId: EVAL_GATE_LOOP_ID, tsSession: `${sameMs}#skill:sB#eval_needed#bbbbbbbb`, eventType: 'eval_needed',
+      subjectId: 'skill:sB', ts: sameMs, dimensions: { changeKind: 'skill', target: 'sB', category: 'skill', action: 'update' },
+    };
+    const runSuite = jest.fn().mockResolvedValue(suiteResult('pass'));
+
+    const table1 = fakeTable({ lastThrough: '2026-09-28T09:00:00.000Z', markers: [markerA] });
+    const first = await runEvalMarkerSuite({ env: ON, now: () => NOW, query: table1.query, put: table1.put, runSuite });
+    expect(first).toEqual(expect.objectContaining({ status: 'ran', markerCount: 1 }));
+    const cursor = (table1.puts[0].dimensions as Record<string, unknown> | undefined)?.markersThrough;
+    // The stored cursor is the marker's full sort key, not the bare, collision-prone timestamp —
+    // a bare-timestamp cursor is exactly the shape CodeRabbit's finding traces the bug to.
+    expect(cursor).toBe(markerA.tsSession);
+
+    // Second tick: markerB has now landed at the same millisecond. Both rows persist in the real
+    // table across runs, so both are in the query's result set; a cursor built from `ts` alone
+    // would reject markerB forever (`m.ts > since` is false once both equal the shared
+    // millisecond). The full-sort-key cursor must still pick it up.
+    const table2 = fakeTable({ lastThrough: String(cursor), markers: [markerA, markerB] });
+    const second = await runEvalMarkerSuite({ env: ON, now: () => NOW, query: table2.query, put: table2.put, runSuite });
+    expect(second).toEqual({ status: 'ran', since: String(cursor), markerCount: 1, verdict: 'pass' });
+    expect((table2.puts[0].dimensions as Record<string, unknown> | undefined)?.markersThrough).toBe(markerB.tsSession);
   });
 
   it('looks back 24 hours on its first run', async () => {
