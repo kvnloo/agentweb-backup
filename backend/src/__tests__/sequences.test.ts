@@ -456,14 +456,16 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     expect(crmDbMock.getLeadsByStatus).toHaveBeenCalledWith('list-1', 'at_risk');
   });
 
-  it('rejects an unknown lifecycle value instead of silently returning zero', async () => {
+  it('preserves an unknown legacy value as a custom status filter', async () => {
+    const crmDbMock = require('../services/db').crmDb;
+    crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({ items: [] });
+
     const res = await request(app)
       .post('/seq_1/enrollments/by-list')
-      .send({ listId: 'list-1', lifecycle: 'definitely_not_a_stage' });
+      .send({ listId: 'list-1', lifecycle: 'custom_pipeline_stage' });
 
-    expect(res.status).toBe(400);
-    expect(res.body.error).toBe('invalid_lifecycle_filter');
-    expect(dripSequenceDb.bulkEnroll).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(crmDbMock.getLeadsByStatus).toHaveBeenCalledWith('list-1', 'custom_pipeline_stage');
   });
 
   it('accepts an explicit status filter without overloading lifecycle', async () => {
