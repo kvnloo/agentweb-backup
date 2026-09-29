@@ -428,6 +428,14 @@ describe('the 403 diagnostic does not log a token embedded in HubSpot\'s message
     expect(r.hubspotError.category).toBe('MISSING_SCOPES');   // diagnostic value preserved
   });
 
+  it('leaves a benign body byte-identical — redaction must not mangle ordinary text', async () => {
+    mockGetAccounts.mockResolvedValue([] as any);
+    const body = { category: 'MISSING_SCOPES', message: 'scopes missing', correlationId: 'c-1' };
+    mockListEmails.mockRejectedValue(hs403(body));
+    const r: any = await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
+    expect(r.hubspotError).toEqual(body);
+  });
+
   it('caps an unbounded message', async () => {
     mockGetAccounts.mockResolvedValue([] as any);
     // Spaced prose: a single 2000-char run is token-shaped and gets redacted wholesale,

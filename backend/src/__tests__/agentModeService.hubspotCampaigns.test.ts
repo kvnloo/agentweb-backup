@@ -370,6 +370,11 @@ describe('CAMPAIGN — error handling', () => {
     const result = await hubspot({ action: 'LIST' });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/reconnect your hubspot account/i);
+    // NOTE: hubspotError is now a REDACTED COPY of HubSpot's body, not the raw object —
+    // the message reaches LLM context, so a token embedded in it must not. This passes
+    // unchanged only because 'scopes missing' has nothing token-shaped in it. The
+    // redaction itself is pinned in agentModeService.hubspot403Diagnostic.test.ts; this
+    // assertion exists to prove the pass-through keeps a benign body intact.
     expect(result.hubspotError).toEqual({ category: 'MISSING_SCOPES', message: 'scopes missing' });
     expect(result.status).toBe(403);
   });
