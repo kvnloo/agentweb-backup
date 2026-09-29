@@ -13,7 +13,7 @@ describe('A8 reply candidate admission', () => {
       good('a'),
       { id: 'b', text: 'missing link', suggestedReply: 'x' },
       good('c'),
-    ], [])).map((x) => x.id)).toEqual(['a', 'c']);
+    ], []).map((x) => x.id)).toEqual(['a', 'c']);
   });
 
   it('filters candidates seen in the previous window', () => {
