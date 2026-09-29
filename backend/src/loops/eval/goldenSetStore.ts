@@ -18,6 +18,7 @@ import AWS from 'aws-sdk';
 import {
   parseGoldenCase,
   type GoldenCase,
+  type GoldenCaseDraft,
   type GoldenSplit,
   type LabelUpdate,
 } from './goldenSet';
@@ -85,6 +86,12 @@ export interface GoldenSetStore {
   createCase(goldenCase: GoldenCase): Promise<'created' | 'exists'>;
   /** Replace the case's labels/notes if it is still at `update.expectedVersion`. */
   saveLabels(caseId: string, update: LabelUpdate, labeller: string, now?: Date): Promise<GoldenCase>;
+  /**
+   * Replace the case's AI-drafted suggestion (ENG-2200). Independent of the label optimistic-
+   * concurrency counter — `version` is untouched — so writing a draft can never race or conflict
+   * with a human labeller saving real labels on the same case.
+   */
+  saveDraft(caseId: string, draft: GoldenCaseDraft): Promise<GoldenCase>;
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -202,6 +209,25 @@ export function createGoldenSetStore(opts: { tableName: string | null; db?: Gold
         if (errorCode(error) === 'ConditionalCheckFailedException') {
           throw new GoldenCaseVersionConflictError(caseId, update.expectedVersion);
         }
+        throw error;
+      }
+    },
+
+    async saveDraft(caseId, draft) {
+      const { table, client } = requireTable();
+      try {
+        const out = await client.update({
+          TableName: table,
+          Key: { caseId },
+          UpdateExpression: 'SET #draft = :draft',
+          ConditionExpression: 'attribute_exists(caseId)',
+          ExpressionAttributeNames: { '#draft': 'draft' },
+          ExpressionAttributeValues: { ':draft': draft },
+          ReturnValues: 'ALL_NEW',
+        });
+        return parseGoldenCase(out.Attributes);
+      } catch (error) {
+        if (errorCode(error) === 'ConditionalCheckFailedException') throw new GoldenCaseNotFoundError(caseId);
         throw error;
       }
     },
