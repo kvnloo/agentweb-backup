@@ -75,7 +75,17 @@ function makeLLMResponse(text = 'Done.') {
   };
 }
 
-async function capture(session: any, schedule: any, captureOptions?: (options: any) => void) {
+async function capture(
+  session: any,
+  schedule: any,
+  captureOptions?: (options: any) => void,
+  // ENG-2204: defaults to true because every existing test in this file exercises
+  // ADMITTED_SESSION, which represents a session runScheduledChat actually dispatched
+  // (a genuinely unattended run) — the directive is gated on this, not just sessionType,
+  // so an omitted/undefined value here would silently stop testing the real delivery
+  // path. Callers verifying the ATTENDED-reopen case (ENG-2072) pass false/undefined.
+  isUnattendedRun: boolean | undefined = true
+) {
   const service = new AgentModeService();
   mockDeps(session, schedule);
 
@@ -97,13 +107,9 @@ async function capture(session: any, schedule: any, captureOptions?: (options: a
     'test-user',
     service.default_model,
     'sess-1',
-    // Positional params through isUnattendedRun (ENG-2204): ADMITTED_SESSION represents
-    // a session runScheduledChat actually dispatched, so isUnattendedRun must be true
-    // here to match — the directive is now gated on this, not just sessionType, so an
-    // omitted/undefined value here would silently stop testing the real delivery path.
     false, undefined, undefined, false, undefined, undefined, undefined, false, false,
     undefined, undefined, undefined, false,
-    true
+    isUnattendedRun
   );
 
   return sent;
@@ -238,5 +244,37 @@ describe('ENG-827 — the unattended publish directive is delivered, and deliver
       (value) => { options = value; },
     );
     expect(options.taskClass).toBe('interactive_chat');
+  });
+
+  // ENG-2072 / ENG-2204 — a schedule-created session reopened in the attended chat UI
+  // keeps sessionType 'scheduled' but has a live human present, so isUnattendedRun is
+  // false/undefined. This exercises the ACTUAL call site inside generateMarketingResponse
+  // (not just the pure getUnattendedExecutionDirective/getScheduledSessionOverride
+  // functions in isolation, which stay green even if the call-site wiring regresses —
+  // exactly how the ENG-2204 Slack override first leaked into an attended turn before
+  // being caught in live testing).
+  it('ATTENDED reopen: neither the publish-authorization block nor the ENG-2204 Slack override reach an attended turn', async () => {
+    const messages = await capture(
+      ADMITTED_SESSION,
+      {
+        scheduleId: SCHEDULE_ID,
+        requiredFunctionCalls: ['post_on_connected_account'],
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+      },
+      undefined,
+      false, // isUnattendedRun
+    );
+
+    // NOTE: the base system prompt (always present, attended or not) carries a one-line
+    // cross-reference — "...see SLACK NOTIFICATIONS IN UNATTENDED RUNS below" — pointing
+    // at the override block for readers who ARE in an unattended run. That's harmless
+    // forward-reference text, not the override itself, so assertions here check for the
+    // block's actual substantive content, never its section title alone.
+    const combined = messages.map((m: any) => (typeof m.content === 'string' ? m.content : '')).join('\n');
+    expect(combined).not.toContain('pre-authorized to publish');
+    expect(combined).not.toContain('PUBLISH WITHHELD');
+    expect(combined).not.toContain('There is no one to ask in this unattended run');
+    expect(combined).not.toContain('call slack_send_message directly and actually send it');
   });
 });
