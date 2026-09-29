@@ -27,6 +27,12 @@ jest.mock('../services/metaLaunchGate', () => ({
 import { AgentModeService } from '../services/agentModeService';
 import { metaService } from '../services/metaService';
 import { isMetaSpendStartingWrite, runMetaTrackingGate } from '../services/metaLaunchGate';
+// ENG-2103 (F2 follow-up): resolveOrCreateSeedAudience moved to
+// emma/impl/adsApis.ts as a real export — the spy below was retargeted from
+// `service` (the class instance) to this module, since executeAudienceCampaignLaunch
+// now reaches it via a same-module self-import that still routes through
+// this exports object.
+import * as adsApisImpl from '../emma/impl/adsApis';
 
 const ACCOUNT = '409853340719899';
 const CAMPAIGN = '120200000000000';
@@ -161,8 +167,8 @@ describe('ENG-600 launch flows — ENG-941 gate wiring', () => {
 
   beforeEach(() => {
     seedSpy = jest
-      .spyOn(service as any, 'resolveOrCreateSeedAudience')
-      .mockResolvedValue({ audience: { id: 'aud-1' } });
+      .spyOn(adsApisImpl, 'resolveOrCreateSeedAudience')
+      .mockResolvedValue({ audience: { id: 'aud-1', name: 'aud-1' } } as any);
   });
 
   const run = (adSetParams: any, extra: any = {}) =>
