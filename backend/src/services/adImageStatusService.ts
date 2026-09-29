@@ -18,6 +18,7 @@
 
 import { randomUUID } from "crypto";
 import { parseCreativeGateResult, type CreativeGateResult } from "./creativeGates";
+import type { CreativeRubricResult, StoredCreativePairwise } from "./creativeRubricJudge";
 
 export type AdImageStatus = "idle" | "running" | "ready" | "failed";
 
@@ -55,6 +56,13 @@ export interface AdImageVariant {
    * on placeholders and on rows generated before the gates shipped.
    */
   gates?: CreativeGateResult;
+  /**
+   * Advisory rubric-judge verdict on this image (ENG-2192), and a pairwise verdict against the
+   * previous run's best variant for the same placement. Written after the run is stored, only
+   * when the judge is enabled and this variant was sampled (creativeRubricOnboarding.ts).
+   */
+  creativeRubric?: CreativeRubricResult;
+  creativePairwise?: StoredCreativePairwise;
 }
 
 export interface AdImageResult {
