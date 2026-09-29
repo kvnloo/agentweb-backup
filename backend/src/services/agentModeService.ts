@@ -36463,29 +36463,31 @@ Reply with ONLY one word: yes or no.`;
    * session-wide FACT rather than a per-step produced artifact. `generate_image`
    * (the case ENG-1698 was built for) makes a NEW distinct asset every call, so a
    * later step listing it as required genuinely needs its OWN fresh call — hence
-   * that credit is decremented once the step consuming it resolves. These tools
-   * are the opposite: read_brand_guidelines / read_market_strategy return the SAME
-   * data every time (their own responses say so verbatim: "do not call ... again
-   * in this conversation as it will return the same information"), and
-   * you_search_web/you_search_news verifying a fact for one step's content does
-   * not need to be independently re-verified for a sibling step covering the same
-   * topic in a different format.
+   * that credit is decremented once the step consuming it resolves. These two
+   * tools are the opposite: read_brand_guidelines / read_market_strategy return
+   * the SAME data every time (their own responses say so verbatim: "do not call
+   * ... again in this conversation as it will return the same information").
+   *
+   * you_search_web/you_search_news are deliberately NOT in this set even though
+   * they appeared alongside these two in the reported session: each call hits an
+   * external search API with a caller-supplied query and can legitimately return
+   * different results for a different step, so crediting one step's search
+   * toward a sibling's identical requirement would be wrong. Only a tool whose
+   * own response asserts a session-wide cached-fact contract belongs here.
    *
    * Without this carve-out, a predefined plan whose steps share a common
    * "foundation" requirement (e.g. every content-format step lists
    * read_brand_guidelines so each has brand context) has its very first step
    * consume that credit on completion/skip, then every later sibling step's
    * identical requirement is reported "missing" despite the tool genuinely having
-   * been called earlier in this exact session (prod session 18bc82a6-..., Sondra
-   * Connor: read_brand_guidelines/read_market_strategy called once near the start,
-   * then set_work_plan_status blocked step 5 three times in a row with "Required
+   * been called earlier in this exact session (prod session 18bc82a6-...:
+   * read_brand_guidelines/read_market_strategy called once near the start, then
+   * set_work_plan_status blocked step 5 three times in a row with "Required
    * function calls have not been made yet").
    */
   private static readonly NON_CONSUMABLE_REQUIRED_FUNCTION_CALLS = new Set<string>([
     'read_brand_guidelines',
     'read_market_strategy',
-    'you_search_web',
-    'you_search_news',
   ]);
 
   public async setWorkPlanStatus(
