@@ -9,9 +9,12 @@
  * verdict as one `eval_suite_verdict` row (loopId `eval-gate-runs`). An hour with no new markers
  * writes nothing.
  *
- * The verdict row is also the cursor: `markersThrough` is the newest marker it covered, so the
- * next run starts after it. It carries counts, categories and the per-metric status — never a
- * prompt, a setting value or a skill id.
+ * The verdict row is also the cursor: `markersThrough` is the full sort key of the newest marker
+ * it covered (not just its timestamp — two markers can share a millisecond, so only the full key,
+ * which carries a per-write random suffix, disambiguates them), and the next run starts strictly
+ * after it. That sort key embeds the same target identity the marker itself already carries
+ * (a skill id or an AW-Settings name — evalChangeMarkers.ts's own boundary is "never the prompt
+ * text/value", not the identifier), plus counts, categories and the per-metric status.
  *
  * Report-only. A non-pass verdict is logged as a warning and recorded; nothing is blocked or
  * filed. Off by default: scheduled, and allowed to write, only when
@@ -83,7 +86,10 @@ export async function lastMarkersThrough(query: QueryFn): Promise<string | undef
   });
   const dimensions = page.Items?.[0]?.dimensions as Record<string, unknown> | undefined;
   const through = dimensions?.markersThrough;
-  return typeof through === 'string' && !Number.isNaN(Date.parse(through)) ? through : undefined;
+  // `markersThrough` is a marker's full sort key from the second run onward (see buildVerdictItem
+  // below), not a plain ISO date, so it must not be validated with Date.parse — just require a
+  // non-empty string.
+  return typeof through === 'string' && through.length > 0 ? through : undefined;
 }
 
 export function buildVerdictItem(
@@ -92,7 +98,13 @@ export function buildVerdictItem(
   at: Date,
 ): DynamoAttributeMap {
   const categories = [...new Set(window.markers.map((m) => String(m.dimensions.category ?? 'unknown')))].sort();
-  const markersThrough = window.markers.reduce((latest, m) => (m.ts > latest ? m.ts : latest), window.since);
+  // The cursor for the NEXT run must be the lexicographically greatest full sort key (tsSession)
+  // among this run's markers, never just the greatest timestamp: two markers can share a
+  // millisecond (buildEvalNeededItem appends a random suffix precisely so concurrent writes to
+  // the same target don't collide), and a bare-timestamp cursor would make the next tick's
+  // `m.tsSession > since` filter silently drop whichever of them wasn't chosen as "the" marker at
+  // that millisecond (ENG-2195 CodeRabbit).
+  const markersThrough = window.markers.reduce((latest, m) => (m.tsSession > latest ? m.tsSession : latest), window.since);
   return eventToItem(EVAL_GATE_RUNS_LOOP_ID, {
     subjectId: asSubjectId(`offline-suite:${result.target}`),
     eventType: EVT_EVAL_SUITE_VERDICT,
@@ -130,8 +142,11 @@ export async function runEvalMarkerSuite(deps: EvalMarkerSuiteDeps = {}): Promis
   }
 
   const since = (await lastMarkersThrough(query)) ?? new Date(now().getTime() - FIRST_RUN_LOOKBACK_MS).toISOString();
-  // The key condition is inclusive; a marker at exactly `since` was covered by the previous run.
-  const markers = (await listEvalChangeMarkers(query, since)).filter((m) => m.ts > since);
+  // The query's key condition is inclusive, and `since` is itself either a bare ISO lookback
+  // floor (first run) or a marker's own full sort key (subsequent runs) — filtering on the full
+  // `tsSession` rather than the bare `ts` is what makes `> since` exclude exactly the markers
+  // this run already covered, and nothing sharing their millisecond (see buildVerdictItem).
+  const markers = (await listEvalChangeMarkers(query, since)).filter((m) => m.tsSession > since);
   if (markers.length === 0) return { status: 'no_changes', since };
 
   const result = await (deps.runSuite ?? runLocalOfflineSuite)();

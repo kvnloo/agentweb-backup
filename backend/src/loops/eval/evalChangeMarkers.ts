@@ -195,11 +195,24 @@ export async function recordSkillChange(
 
 export interface EvalChangeMarkerRow {
   ts: string;
+  /**
+   * The row's full sort key (`<ts>#<subjectId>#<eventType>#<random suffix>`). Two markers can
+   * share `ts` down to the millisecond — buildEvalNeededItem appends a random suffix precisely so
+   * concurrent writes never collide — so only `tsSession` identifies and orders a marker
+   * uniquely; a resume cursor built from `ts` alone can silently skip a same-millisecond sibling
+   * of the marker it last covered (ENG-2195 CodeRabbit).
+   */
+  tsSession: string;
   subjectId: string;
   dimensions: Record<string, unknown>;
 }
 
-/** Read-only: `eval_needed` markers recorded since `sinceIso` (oldest first). */
+/**
+ * Read-only: `eval_needed` markers with a sort key >= `since` (oldest first). `since` is usually
+ * a plain ISO date (the CLI's `--changes-since`), but a resume cursor may instead pass a
+ * previously-returned row's full `tsSession` — DynamoDB compares the sort key as a plain string
+ * either way, and a bare ISO date sorts before any marker recorded at or after it.
+ */
 export async function listEvalChangeMarkers(
   query: (params: AWS.DynamoDB.DocumentClient.QueryInput) => Promise<AWS.DynamoDB.DocumentClient.QueryOutput>,
   sinceIso: string,
@@ -215,7 +228,12 @@ export async function listEvalChangeMarkers(
     });
     for (const item of page.Items ?? []) {
       if (item.eventType !== EVT_EVAL_NEEDED) continue;
-      rows.push({ ts: String(item.ts), subjectId: String(item.subjectId), dimensions: (item.dimensions ?? {}) as Record<string, unknown> });
+      rows.push({
+        ts: String(item.ts),
+        tsSession: String(item.tsSession),
+        subjectId: String(item.subjectId),
+        dimensions: (item.dimensions ?? {}) as Record<string, unknown>,
+      });
     }
     startKey = page.LastEvaluatedKey;
   } while (startKey);
