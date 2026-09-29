@@ -556,3 +556,37 @@ describe('the error that escapes carries no credentials', () => {
     expect(JSON.stringify((err as any).response.data)).toContain('corr-123');
   });
 });
+
+/*
+ * The invariant the marketing pre-flight in agentModeService rests on.
+ *
+ * That guard reads `svc.accountId` to know whether an OAuth grant or a pasted
+ * private-app key served a call. `_portalId` sits one line below `_accountId` in the
+ * same class and is the plausible wrong answer — and returning it would be SILENT in
+ * production too, because /connect writes `account_id: String(hubInfo.hub_id)` and
+ * `config.hub_id` from the same value, so the two agree on every row that flow creates.
+ * They diverge only on a migrated or hand-made row: exactly the kind nobody tests with.
+ *
+ * The diagnostic suite cannot pin this — it mocks hubspotService wholesale. This suite
+ * loads the real class, so it is the only place the invariant can be held.
+ */
+describe('accountId distinguishes the OAuth path from the pasted-token path', () => {
+  beforeEach(() => { jest.clearAllMocks(); });
+
+  it('create() sets accountId to the ACCOUNT id, not the portal id', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([{
+      ...expiredAccount(),
+      account_id: 'acct-999',
+      // Deliberately different from account_id so returning _portalId would be caught.
+      config: { ...expiredAccount().config, hub_id: 111222, token_expires_at: Date.now() + 3600_000 },
+    }] as never);
+
+    const svc = await HubSpotService.create('user-1');
+    expect(svc.accountId).toBe('acct-999');
+    expect(svc.accountId).not.toBe(svc.portalId);
+  });
+
+  it('fromToken() leaves accountId undefined — that is how the fallback is recognised', () => {
+    expect(HubSpotService.fromToken('pat-na1-some-key').accountId).toBeUndefined();
+  });
+});

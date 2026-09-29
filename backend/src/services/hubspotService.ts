@@ -213,7 +213,13 @@ function isRevokedRefreshTokenError(err: unknown): boolean {
   //
   // which this regex does not match. (HubSpot validates the refresh token BEFORE the
   // client, so probing with a bogus token returns BAD_REFRESH_TOKEN whatever the
-  // credentials — a real token is required to observe this shape at all.) And a deploy pointed at the wrong
+  // credentials — a real token is required to observe this shape at all.)
+  //
+  // Full order, measured: refresh token -> client -> scopes. That second hop is why an
+  // environment configured with a different HubSpot client secret cannot reach the
+  // BAD_SCOPES case at all — every refresh there stops at BAD_CLIENT_SECRET.
+  //
+  // And a deploy pointed at the wrong
   // client_id would mismatch every grant at once — but those grants genuinely cannot
   // refresh, and since create() no longer short-circuits and the clear still runs, the
   // fleet self-heals within one access-token lifetime once the config is fixed. A false

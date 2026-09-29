@@ -42802,11 +42802,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * hard length cap, the way describeRefreshFailure caps its body.
    */
   /** The same redaction applied to a whole HubSpot error body before it leaves us. */
-  private static redactHubSpotBody(body: unknown): unknown {
+  private static redactHubSpotBody(body: unknown, depth = 0): unknown {
+    // Walk EVERY string, not just a top-level `message`. HubSpot returns at least four
+    // shapes and only one was covered: `{errors:[{message}]}` (which this codebase
+    // already depends on — throwIfBatchPartialFailure reads data.errors[0].message), a
+    // bare string body from a proxy or WAF, `{context:{detail}}`, and a top-level array.
+    // Having accepted that a token can ride in free text, the coverage has to match the
+    // threat model rather than the one sentence that was reported.
+    if (depth > 6) return body;
+    if (typeof body === 'string') return AgentModeService.redactHubSpotMessage(body);
+    if (Array.isArray(body)) return body.map((v) => AgentModeService.redactHubSpotBody(v, depth + 1));
     if (!body || typeof body !== 'object') return body ?? null;
-    const b = body as Record<string, unknown>;
-    if (typeof b.message !== 'string') return body;
-    return { ...b, message: AgentModeService.redactHubSpotMessage(b.message) };
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(body as Record<string, unknown>)) {
+      out[k] = AgentModeService.redactHubSpotBody(v, depth + 1);
+    }
+    return out;
   }
 
   private static redactHubSpotMessage(msg: unknown): string | null {

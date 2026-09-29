@@ -66,7 +66,10 @@ const mockHubSpotInstance = {
  * undefined by fromToken(). A single shared mock instance made the fallback path
  * invisible — both mutations undoing that fix passed 22/22.
  */
-const mockTokenInstance = { ...mockHubSpotInstance };            // fromToken: no accountId
+// fromToken leaves BOTH _accountId and _portalId undefined. Inheriting portalId would
+// make the mock more capable than production — a FORM SUBMIT test on this path would
+// pass here and fail live with "HubSpot portal ID unavailable for this connection".
+const { portalId: _dropPortal, ...mockTokenInstance } = mockHubSpotInstance as any;
 const mockOauthInstance = { ...mockHubSpotInstance, accountId: '245815183' };
 jest.mock('../services/hubspotService', () => ({
   HubSpotService: {
@@ -250,7 +253,14 @@ describe('call_hubspot_api marketing pre-flight', () => {
   const CRM_ONLY = ['crm.objects.contacts.read', 'crm.objects.deals.read', 'crm.lists.read'];
   const WITH_MARKETING = [...CRM_ONLY, 'content', 'automation', 'forms', 'social'];
 
-  beforeEach(() => { jest.clearAllMocks(); });
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // clearMocks clears CALLS, not implementations, so the 403 rejection from the
+    // describe above leaked in and made every "does NOT refuse" case pass on a call
+    // that failed anyway. Resolving it upgrades those assertions from "no refusal" to
+    // "the call actually went through".
+    mockListEmails.mockResolvedValue({ results: [] });
+  });
 
   it.each([['CAMPAIGN'], ['EMAIL'], ['FORM'], ['LANDING_PAGE'], ['BLOG_POST'], ['WORKFLOW'], ['SOCIAL']])(
     'refuses %s on a CRM-only grant, naming the real fix', async (entity) => {
@@ -319,13 +329,15 @@ describe('call_hubspot_api marketing pre-flight', () => {
   it('does NOT refuse a marketing call when the grant holds marketing scopes', async () => {
     mockGetAccounts.mockResolvedValue(oauthAccount(WITH_MARKETING));
     const r = await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
-    expect(String(r.error ?? '')).not.toMatch(/CRM access only/i);
+    expect(mockListEmails).toHaveBeenCalled();
+    expect(r.success).toBe(true);
   });
 
   it('does NOT refuse when no OAuth account resolves — a pasted token has unknowable scopes', async () => {
     mockGetAccounts.mockResolvedValue([] as any);
     const r = await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
-    expect(String(r.error ?? '')).not.toMatch(/CRM access only/i);
+    expect(mockListEmails).toHaveBeenCalled();
+    expect(r.success).toBe(true);
   });
 
   it('does NOT refuse when granted_scopes is absent — absence is not evidence', async () => {
@@ -334,7 +346,8 @@ describe('call_hubspot_api marketing pre-flight', () => {
       config: { account_type: 'oauth', access_token: 't', refresh_token: 'r', token_expires_at: Date.now() + 3600_000 },
     }] as any);
     const r = await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
-    expect(String(r.error ?? '')).not.toMatch(/CRM access only/i);
+    expect(mockListEmails).toHaveBeenCalled();
+    expect(r.success).toBe(true);
   });
 
   /*
@@ -362,7 +375,8 @@ describe('call_hubspot_api marketing pre-flight', () => {
   it('a DB failure resolving the account never blocks the call', async () => {
     mockGetAccounts.mockRejectedValue(new Error('dynamo exploded'));
     const r = await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
-    expect(String(r.error ?? '')).not.toMatch(/CRM access only/i);
+    expect(mockListEmails).toHaveBeenCalled();
+    expect(r.success).toBe(true);
   });
 });
 
@@ -492,5 +506,63 @@ describe('pre-flight stands down on the pasted-token fallback', () => {
     const r = await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
     expect(r.success).toBe(false);
     expect(r.error).toMatch(/CRM access only/i);
+  });
+});
+
+/*
+ * The redaction must match the threat model, not the one sentence that was reported.
+ * `{errors:[{message}]}` is not hypothetical — throwIfBatchPartialFailure in
+ * hubspotService reads data.errors[0].message, so this codebase already depends on it.
+ */
+describe('redaction covers every body shape, and every return path', () => {
+  // A realistic HubSpot OAuth token: 47 chars, the length of the form reported in the
+  // wild. The bare-run rule is deliberately {40,} so a 36-char correlationId stays
+  // legible — see the correlationId case below, which pins that trade. A token shorter
+  // than 40 chars and NOT in parentheses is knowingly let through; no real HubSpot token
+  // is that short.
+  const TOK = 'CJSA6-doYY4CEQjjrR8YjbCLARi9v4EBIJPk8wQo9OYDMhkA';
+  let errSpy2: jest.SpyInstance;
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetAccounts.mockResolvedValue([] as any);
+    errSpy2 = jest.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => { errSpy2.mockRestore(); });
+  const errSpyAll = () => errSpy2.mock.calls.flat()
+    .map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' | ');
+
+  it.each([
+    ['nested errors[]', { category: 'X', errors: [{ message: `token (${TOK}) bad` }] }],
+    ['a bare string body', `This oauth-token (${TOK}) does not have proper permissions!`],
+    ['a nested context object', { category: 'X', context: { detail: `tok ${TOK}` } }],
+    ['a top-level array', [{ message: `tok (${TOK})` }]],
+  ])('redacts a token inside %s', async (_label, body) => {
+    mockListEmails.mockRejectedValue(hs403(body));
+    const r: any = await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
+    expect(JSON.stringify(r.hubspotError)).not.toContain(TOK);
+  });
+
+  it('keeps a 36-char correlationId legible — that is why the bare-run floor is 40', async () => {
+    mockListEmails.mockRejectedValue(hs403({
+      category: 'MISSING_SCOPES', correlationId: '01a0e8c7-03f9-7bae-836e-32f7555b0000',
+      message: 'missing or invalid scopes',
+    }));
+    await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
+    const out = errSpyAll();
+    expect(out).toContain('01a0e8c7-03f9-7bae-836e-32f7555b0000');
+  });
+
+  // The generic return path handles 401/404/429/5xx and non-HTTP errors — wider than the
+  // 403 branch, and every existing test drove a 403.
+  it('redacts on the NON-403 return path too', async () => {
+    const err: any = Object.assign(new Error('Request failed with status code 401'), {
+      isAxiosError: true,
+      response: { status: 401, data: { category: 'INVALID_AUTHENTICATION', message: `bad oauth-token (${TOK})` } },
+    });
+    mockListEmails.mockRejectedValue(err);
+    const r: any = await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
+    expect(r.status).toBe(401);
+    expect(JSON.stringify(r.hubspotError)).not.toContain(TOK);
+    expect(JSON.stringify(r.hubspotError)).toContain('INVALID_AUTHENTICATION');
   });
 });
