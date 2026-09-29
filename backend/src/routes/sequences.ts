@@ -21,23 +21,32 @@ import axios from 'axios';
 import { extractVariables, leadHasVariable, isSupportedVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
 import { defaultStatusConfigFor } from '../utils/leadSchema';
+import { computeLifecycle, LifecycleStage } from '../services/lifecycleService';
 
 /**
- * ENG-2127: the by-list enrol accepts a `lifecycle` filter and hands it to
- * crmDb.getLeadsByStatus, which queries the `status` attribute on listId-status-index and
- * never reads `lifecycle` at all. The two vocabularies are disjoint — measured against
- * production, `status` holds contacted/new/qualified/open/lost/closed/won/… while
- * `lifecycle` holds inbox/signed_up — so a lifecycle-filtered enrol can never match
- * anything. It returns an empty array, which is a legitimate result, so the caller reports
- * "0 leads enrolled" and nothing anywhere says why.
- *
- * Fixing it properly means deciding what the filter should mean (a listId-lifecycle-index,
- * or dropping the control) and is tracked on ENG-2127. Until then this at least refuses to
- * fail silently.
+ * ENG-2127: by-list enrolment historically overloaded `lifecycle` with lead status values.
+ * Preserve that compatibility for values present in the list's status config, but treat
+ * lifecycle-only values as derived state. Lifecycle is intentionally computed on read
+ * rather than indexed/stored so enrolment cannot drift from the canonical CRM model.
  */
-const LIFECYCLE_STAGES = new Set([
+const LIFECYCLE_STAGES = new Set<LifecycleStage>([
   'unknown', 'inbox', 'signed_up', 'in_deal', 'trialing', 'paying', 'at_risk', 'churned',
 ]);
+
+function lifecycleForLead(lead: any): LifecycleStage {
+  return computeLifecycle({
+    email: lead?.email ?? undefined,
+    phone: lead?.phone ?? undefined,
+    domain: lead?.domain ?? undefined,
+    hasUserRecord: lead?.hasUserRecord ?? undefined,
+    subscriptionState: lead?.subscriptionState ?? undefined,
+    lastActivityAt: lead?.lastActivityAt ?? undefined,
+    lastUsageAt: lead?.lastUsageAt ?? undefined,
+    healthScore: lead?.healthScore ?? undefined,
+    currentLifecycle: LIFECYCLE_STAGES.has(lead?.lifecycle) ? lead.lifecycle : undefined,
+    openDealStages: lead?.openDealStages ?? undefined,
+  });
+}
 
 const router = express.Router();
 
@@ -213,7 +222,7 @@ router.post(
   authenticateToken,
   async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
-    const { listId, lifecycle, startAt, confirm } = req.body;
+    const { listId, lifecycle, status, startAt, confirm } = req.body;
     if (!listId) return res.status(400).json({ error: 'listId is required' });
 
     try {
@@ -231,41 +240,39 @@ router.post(
         return res.status(403).json({ error: 'Forbidden' });
       }
 
-      // Load ALL leads. Lifecycle-filtered enroll keeps its existing path; the
-      // default list enroll uses the paginated loader so counts/enrollment are complete.
+      // The old API used the field name `lifecycle` for both lifecycle and status filters.
+      // An explicit `status` now removes that ambiguity. For backwards compatibility, a
+      // legacy `lifecycle` value that exists in this list's status vocabulary still means
+      // status; lifecycle-only values are computed from the complete lead rows.
+      const storedStatusConfig = (list as any)?.statusConfig;
+      const effectiveStatusConfig = Array.isArray(storedStatusConfig) && storedStatusConfig.length > 0
+        ? storedStatusConfig
+        : defaultStatusConfigFor((list as any)?.listType);
+      const listStatuses = new Set(effectiveStatusConfig.map((sc: any) => String(sc?.value)));
+
+      const legacyValue = lifecycle != null ? String(lifecycle) : undefined;
+      const requestedStatus = status != null
+        ? String(status)
+        : (legacyValue && listStatuses.has(legacyValue) ? legacyValue : undefined);
+      const requestedLifecycle = requestedStatus ? undefined : legacyValue;
+
       let leads: any[];
-      if (lifecycle) {
-        const r = await crmDb.getLeadsByStatus(listId, lifecycle);
+      if (requestedStatus) {
+        const r = await crmDb.getLeadsByStatus(listId, requestedStatus);
         leads = Array.isArray(r) ? r : ((r as any).items ?? (r as any).leads ?? []);
-        // `at_risk` and `churned` are BOTH lifecycle stages and default lead statuses, and
-        // a list can define any statusConfig it likes — so the first version of this guard
-        // answered a perfectly valid `status: churned` filter that happened to match
-        // nothing with a 400 telling the caller to filter by a status instead, which is
-        // what they had done. A list with NO stored statusConfig does not have no
-        // statuses: it falls back to the default set, which contains `churned`.
-        const storedStatusConfig = (list as any)?.statusConfig;
-        const effectiveStatusConfig = Array.isArray(storedStatusConfig) && storedStatusConfig.length > 0
-          ? storedStatusConfig
-          : defaultStatusConfigFor((list as any)?.listType);
-        const listStatuses = new Set(
-          effectiveStatusConfig.map((sc: any) => String(sc?.value)),
-        );
-        if (leads.length === 0 && LIFECYCLE_STAGES.has(String(lifecycle)) && !listStatuses.has(String(lifecycle))) {
-          console.error(
-            `[sequences] ENG-2127: lifecycle filter "${lifecycle}" matched 0 leads in list ` +
-            `${listId} because getLeadsByStatus queries the \`status\` attribute, not ` +
-            `\`lifecycle\`. This filter cannot match; enrolling nothing.`,
-          );
+      } else if (requestedLifecycle) {
+        if (!LIFECYCLE_STAGES.has(requestedLifecycle as LifecycleStage)) {
           return res.status(400).json({
-            error: 'lifecycle_filter_unsupported',
-            message:
-              `Filtering by lifecycle stage "${lifecycle}" is not supported yet — leads are ` +
-              `indexed by status, not lifecycle, so this filter matches nothing. Enrol the ` +
-              `whole list, or filter by a lead status instead.`,
-            lifecycle,
+            error: 'invalid_lifecycle_filter',
+            message: `Unknown lifecycle stage "${requestedLifecycle}".`,
+            lifecycle: requestedLifecycle,
             enrolled: false,
           });
         }
+        const allLeads = await crmDb.getAllLeadsByListId(listId);
+        leads = allLeads.filter(
+          (lead: any) => lifecycleForLead(lead) === requestedLifecycle,
+        );
       } else {
         leads = await crmDb.getAllLeadsByListId(listId);
       }
