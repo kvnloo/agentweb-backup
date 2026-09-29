@@ -42,7 +42,8 @@ describe('aggregateCreative', () => {
     };
     expect(aggregateCreative(obs)).toEqual({
       creativeId: 'c', rubricScore: 5, impressions: 3000, clicks: 50, spend: 25, leads: 2,
-      videoPlays3s: 0, videoImpressions: 0, crmLeads: 0, crmJoinedSpend: 0, currency: 'USD', settledRows: 3, unsettledRows: 1,
+      videoPlays3s: 0, videoImpressions: 0, crmLeads: 0, crmJoinedSpend: 0, currency: 'USD', crmCurrency: null,
+      settledRows: 3, unsettledRows: 1,
     });
   });
 

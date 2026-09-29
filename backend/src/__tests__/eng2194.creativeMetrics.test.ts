@@ -157,6 +157,17 @@ describe('aggregateCreative (ENG-2194 fields)', () => {
     ]));
     expect(agg).toMatchObject({ videoPlays3s: 400, videoImpressions: 2000, crmLeads: 2, crmJoinedSpend: 20, spend: 110, impressions: 7000 });
   });
+
+  it('reports the CRM-joined currency separately from the all-rows currency (CodeRabbit #3122)', () => {
+    // An older, unjoined EUR row alongside settled, CRM-joined USD rows: `currency` (all settled
+    // rows) is mixed, but the CRM join itself never left USD, so `crmCurrency` must stay single.
+    const agg = aggregateCreative(creative('c', 5, [
+      settledRow('2026-07-01', { crmLeadCount: 1, spend: 8 }),
+      settledRow('2026-07-02', { currency: 'EUR' }),
+    ]));
+    expect(agg.currency).toBeNull();
+    expect(agg.crmCurrency).toBe('USD');
+  });
 });
 
 describe('creativePerformanceReport (ENG-2194 metrics)', () => {
@@ -192,6 +203,22 @@ describe('creativePerformanceReport (ENG-2194 metrics)', () => {
     expect(report.cvr.n).toBe(5);
     expect(report.hookRate.n).toBe(5);
     expect(report.cplByCurrency.USD.n).toBe(4);
+  });
+
+  it('keeps a valid USD CPL pair when the only other currency never joined the CRM (CodeRabbit #3122)', () => {
+    const report = creativePerformanceReport([
+      ...data,
+      creative('crmJoinedOnly', 5, [
+        // CRM-joined USD row: this is the CPL pair the creative should contribute.
+        settledRow('2026-07-01', { crmLeadCount: 1, spend: 8 }),
+        // Settled EUR row that was never joined to the CRM (no crmLeadCount at all). Determining
+        // CPL eligibility from the all-rows currency would see USD+EUR and wrongly call this
+        // "mixed currency", dropping a perfectly single-currency CRM pairing.
+        settledRow('2026-07-02', { currency: 'EUR' }),
+      ]),
+    ], { iterations: 200, seed: 3 });
+    expect(report.excluded.crmMixedCurrency).toBe(0);
+    expect(report.cplByCurrency.USD.n).toBe(5);
   });
 });
 
