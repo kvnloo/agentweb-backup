@@ -45,6 +45,10 @@ describe('emma/impl/misc.ts loads standalone', () => {
     expect(typeof misc.saveFile).toBe('function');
     expect(typeof misc.readFileContent).toBe('function');
     expect(typeof misc.sendEmailFromConfiguredSender).toBe('function');
+    // ENG-2103 (F2 follow-up): getUnassociatedTools/getUnassociatedToolNames
+    // are new real exports, moved in from AgentModeService.
+    expect(typeof misc.getUnassociatedTools).toBe('function');
+    expect(typeof misc.getUnassociatedToolNames).toBe('function');
   });
 
   it('getAdminToolNames returns a fresh array (not a shared mutable reference)', () => {
@@ -55,5 +59,47 @@ describe('emma/impl/misc.ts loads standalone', () => {
     const second = misc.getAdminToolNames();
     expect(second).not.toContain('mutated');
     expect(second.length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * ENG-2103 (F2 follow-up) — same rationale as adsApis.moduleIsolation.test.ts's
+ * (round 1's) "self-import makes internal calls spy-observable" block.
+ * `getUnassociatedToolNames` calls sibling `getUnassociatedTools`, both now in
+ * this module — a bare in-module call to a sibling `export function` does NOT
+ * go through the exports-namespace object (TS/CommonJS compiles it to a
+ * direct local reference), so without the `import * as self from './misc'`
+ * indirection, an external `jest.spyOn(miscImpl, 'getUnassociatedTools')`
+ * would silently stop being exercised whenever `getUnassociatedToolNames` is
+ * called instead. This test proves the indirection actually works, not just
+ * that it compiles — verified directly by temporarily removing the `self.`
+ * prefix from `getUnassociatedToolNames`'s internal call and confirming this
+ * exact test fails (with the real filter logic running instead of the mock),
+ * then restoring it and confirming the test passes again.
+ */
+describe('emma/impl/misc.ts self-import makes internal calls spy-observable', () => {
+  beforeEach(() => {
+    jest.resetModules();
+  });
+
+  it('a jest.spyOn on the module namespace intercepts getUnassociatedToolNames\'s own internal getUnassociatedTools call', () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const miscImpl = require('../misc');
+
+    const spy = jest.spyOn(miscImpl, 'getUnassociatedTools').mockReturnValue([
+      { name: 'mocked_tool', description: 'mocked description' },
+    ]);
+
+    // Args deliberately shaped so that if the REAL getUnassociatedTools ran
+    // instead of the mock, it would return an empty array (no tools at all
+    // from getAllTools) — making the mocked-vs-real distinction unambiguous.
+    const names = miscImpl.getUnassociatedToolNames(
+      [] /* publishedSkills */,
+      new Set<string>() /* foundationTools */,
+      () => [] /* getAllTools */,
+    );
+
+    expect(spy).toHaveBeenCalledWith([], new Set<string>(), expect.any(Function));
+    expect(names).toEqual(['mocked_tool']);
   });
 });
