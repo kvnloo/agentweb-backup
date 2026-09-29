@@ -7027,7 +7027,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.modifyWorkPlan(args.steps, args.removeStepCounts || [], context?.sessionId, args.autocomplete, context?.isUnattendedRun);
+    return await workPlansImpl.modifyWorkPlan(args.steps, args.removeStepCounts || [], context?.sessionId, args.autocomplete, context?.isUnattendedRun, agentModeService.callLLM.bind(agentModeService));
   }
 });
 
