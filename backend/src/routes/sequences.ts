@@ -251,24 +251,24 @@ router.post(
       const listStatuses = new Set(effectiveStatusConfig.map((sc: any) => String(sc?.value)));
 
       const legacyValue = lifecycle != null ? String(lifecycle) : undefined;
+      // Backward compatibility: this request field historically carried arbitrary lead
+      // statuses. Only reinterpret a legacy value as lifecycle when it is a KNOWN
+      // lifecycle stage that is NOT also a real status for this list. Everything else
+      // stays on the status path, including custom/older status values.
+      const legacyIsLifecycle =
+        Boolean(legacyValue) &&
+        LIFECYCLE_STAGES.has(legacyValue as LifecycleStage) &&
+        !listStatuses.has(legacyValue!);
       const requestedStatus = status != null
         ? String(status)
-        : (legacyValue && listStatuses.has(legacyValue) ? legacyValue : undefined);
-      const requestedLifecycle = requestedStatus ? undefined : legacyValue;
+        : (legacyValue && !legacyIsLifecycle ? legacyValue : undefined);
+      const requestedLifecycle = legacyIsLifecycle ? legacyValue : undefined;
 
       let leads: any[];
       if (requestedStatus) {
         const r = await crmDb.getLeadsByStatus(listId, requestedStatus);
         leads = Array.isArray(r) ? r : ((r as any).items ?? (r as any).leads ?? []);
       } else if (requestedLifecycle) {
-        if (!LIFECYCLE_STAGES.has(requestedLifecycle as LifecycleStage)) {
-          return res.status(400).json({
-            error: 'invalid_lifecycle_filter',
-            message: `Unknown lifecycle stage "${requestedLifecycle}".`,
-            lifecycle: requestedLifecycle,
-            enrolled: false,
-          });
-        }
         const allLeads = await crmDb.getAllLeadsByListId(listId);
         leads = allLeads.filter(
           (lead: any) => lifecycleForLead(lead) === requestedLifecycle,
