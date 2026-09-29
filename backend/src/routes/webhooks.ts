@@ -7,6 +7,7 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { crmDb, userDb, tempEmailDb } from '../services/db';
 import { dripSequenceDb } from '../services/dripSequenceDb';
+import { requiredChannels, leadIsReachable, enrollmentIdentity } from '../utils/leadReachability';
 import { getUserIdByHubSpotPortalId, getAccountsByAttioWorkspaceId } from '../services/connectedAccountsDb';
 import { HubSpotService } from '../services/hubspotService';
 import { AttioService } from '../services/attioService';
@@ -116,18 +117,30 @@ async function autoEnrollLeadInSequences(
   userId: string,
   listId: string,
   leadId: string,
-  leadEmail: string,
+  lead: { email?: string; linkedin?: string } | string,
 ): Promise<void> {
-  if (!leadEmail) return;
+  // Channel-aware, matching the enrol routes and crm.ts's copy of this function.
+  //
+  // The `if (!leadEmail) return` gate meant that once enrolling a LinkedIn-only list
+  // became possible, by-list enrolment switched auto-enroll ON for that list while
+  // every lead arriving by webhook afterwards was silently dropped for having no
+  // address — the capability worked once, for the leads present at the time.
+  const leadObj = typeof lead === 'string' ? { email: lead } : (lead ?? {});
   try {
     const sequences = await dripSequenceDb.getSequencesByAutoEnrollList(userId, listId);
     for (const seq of sequences) {
+      const channels = requiredChannels(seq);
+      if (!leadIsReachable(leadObj, channels)) continue;
+      const identity = enrollmentIdentity(leadObj);
+      // An empty identity is invisible to the leadEmail-index dedup, so the row is
+      // recreated and the lead re-messaged on every run.
+      if (!identity) continue;
       await dripSequenceDb.bulkEnroll([{
         sequenceId: seq.sequenceId,
         userId,
         listId,
         leadId,
-        leadEmail,
+        leadEmail: identity,
       }]);
     }
   } catch (err) {
@@ -1124,7 +1137,12 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
       // Enroll the lead into any list-bound drip sequences (uses the list
       // owner's userId since the public webhook request is unauthenticated).
-      void autoEnrollLeadInSequences(leadList.userId, leadList.listId, lead.leadId, lead.email);
+      // Pass the LEAD, not just its address: a LinkedIn-only lead arriving by webhook
+      // was dropped by the old email-only gate even when the watching sequence is
+      // LinkedIn-only.
+      void autoEnrollLeadInSequences(leadList.userId, leadList.listId, lead.leadId, {
+        email: (lead as any).email ?? '', linkedin: (lead as any).linkedin ?? '',
+      });
 
       void (async () => {
         try {

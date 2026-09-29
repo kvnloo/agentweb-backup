@@ -21,7 +21,10 @@ import axios from 'axios';
 import { extractVariables, leadHasVariable, isSupportedVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
 import { LEAD_LIFECYCLES, defaultStatusConfigFor } from '../utils/leadSchema';
-import { isReachableEmail, isReachableLinkedIn, canonicalLinkedInProfile } from '../utils/leadReachability';
+import {
+  isReachableEmail, isReachableLinkedIn, canonicalLinkedInProfile,
+  requiredChannels, leadIsReachable, skipKeyForChannels, enrollmentIdentity,
+} from '../utils/leadReachability';
 
 /**
  * ENG-2127: the by-list enrol accepts a `lifecycle` filter and hands it to
@@ -40,94 +43,9 @@ const LIFECYCLE_STAGES: ReadonlySet<string> = new Set<string>(LEAD_LIFECYCLES);
 
 const router = express.Router();
 
-/**
- * Which channels a sequence will actually try to use. A step with no `channel` is email
- * (backwards compatibility — see SequenceStep).
- */
-function requiredChannels(sequence: any): Set<string> {
-  const steps = sequence?.steps ?? [];
-  // No sequence in hand (the listId-only verify call) means no channel evidence. Default
-  // to email rather than to the empty set, which would mean "reachable on no channels" —
-  // i.e. filter nothing — and silently widen the population this screen reports on.
-  if (steps.length === 0) return new Set<string>(['email']);
-  // Mirror the WORKER'S dispatch exactly, rather than mapping the stored value.
-  //
-  // dripSequenceWorker does `channel === 'linkedin' ? sendLinkedInStep : sendEmailStep`,
-  // so everything that is not literally 'linkedin' is an EMAIL step as far as delivery
-  // is concerned. Mapping the raw value here instead produced a set the reachability
-  // test could never satisfy: `channel: 'sms'`, a typo like 'linkedln', or an empty
-  // string from an unselected dropdown all yielded {'sms'} / {''} , which matches
-  // neither branch, so the route enrolled NOBODY while the worker would have emailed
-  // them. Note `?? 'email'` does not catch '' — only null/undefined — so an empty
-  // string was the easiest way to hit it.
-  //
-  // Lower-casing alone fixed only the mis-cased case ('Email'); this fixes the general
-  // one. Erring toward email matches what actually gets sent, so the route can no
-  // longer be stricter than the thing it is gating.
-  return new Set<string>(steps.map((st: any) => {
-    const raw = String(st?.channel ?? '').trim().toLowerCase();
-    return raw === 'linkedin' ? 'linkedin' : 'email';
-  }));
-}
 
-/**
- * Can this sequence reach this lead on AT LEAST ONE of the channels it uses?
- *
- * The first version of this guard tested `lead.email` only, which was wrong: sequences are
- * not email-only. `SequenceChannel = 'email' | 'linkedin'`, and dripSequenceWorker's
- * sendLinkedInStep reaches the lead through `lead.linkedin` after loading it by leadId —
- * it never touches the address. So a LinkedIn-only lead in a LinkedIn sequence WAS being
- * messaged, and an email-only test excluded it from enrolment entirely.
- *
- * AT LEAST ONE channel, not every one. Requiring every channel was my first answer and it
- * cost a real send: an email-only lead in a mixed email+LinkedIn sequence stopped being
- * enrolled at all, where before it received the email. The worker now SKIPS a step the
- * lead cannot receive instead of throwing (dripSequenceWorker.processEnrollment), so enrolling
- * such a lead no longer jams it — it gets the steps it can receive and completes.
- *
- * A lead that can receive NO step is still refused: enrolling it would create a row that
- * skips every step and completes having sent nothing.
- */
-function leadIsReachable(lead: any, channels: Set<string>): boolean {
-  // Same predicates the WORKER uses. These used to be "non-empty string" here and
-  // stricter there, so a lead with free text in `linkedin` enrolled and then skipped
-  // every step — contradicting the promise two lines above.
-  if (channels.has('email') && isReachableEmail(lead?.email)) return true;
-  if (channels.has('linkedin') && isReachableLinkedIn(lead?.linkedin)) return true;
-  return false;
-}
 
-/**
- * `skippedNoEmail` is the field existing callers know, and it is the right word only when
- * the sequence is email-only. A LinkedIn step makes "no email" a lie — a live run on env2
- * reported `skippedNoEmail: 1` for a lead skipped because it had no LinkedIn PROFILE.
- */
-function skipKeyForChannels(channels: Set<string>): string {
-  return channels.has('linkedin') ? 'skippedUnreachable' : 'skippedNoEmail';
-}
 
-/**
- * The enrollment's dedup identity. `leadEmail` is the partition key of
- * `leadEmail-index`, which getExistingEnrollment queries — an empty one makes the row
- * invisible to the dedup check, so it is re-created on every run and the lead is
- * messaged again each time. For a lead with no address the LinkedIn URL is the stable
- * identity; dripSequenceWorker already treats the field that way at its reply-exit check.
- */
-function enrollmentIdentity(lead: any): string {
-  // Use the PREDICATES, not truthiness, and the CANONICAL LinkedIn URL.
-  //
-  // Truthiness keyed an admitted lead on junk: `{email: 'not-an-address', linkedin:
-  // <valid profile>}` in a LinkedIn sequence was admitted on the LinkedIn channel and
-  // then keyed on the unusable address.
-  //
-  // And the raw URL made one person two identities — `.../in/ada/` and
-  // `.../in/ada` differ by a byte. leadEmail is the PARTITION KEY of leadEmail-index,
-  // which getExistingEnrollment queries for an exact match, so those enrol twice and
-  // the whole sequence is delivered twice.
-  const email = String(lead?.email ?? '').trim();
-  if (isReachableEmail(email)) return email;
-  return canonicalLinkedInProfile(lead?.linkedin) ?? '';
-}
 
 // ─── Sequences CRUD ───────────────────────────────────────────────────────────
 
