@@ -13,7 +13,7 @@ import { adsMetricsDb, type AdsMetricsAdRow } from '../services/adsMetricsDb';
 import { userDb, crmDb } from '../services/db';
 import { getMetaAccountCredentials } from '../services/metaAccountCredentials';
 import { aggregateCreative, creativePerformanceReport, type AdDayMetrics, type CreativeObservation } from '../loops/eval/creativePerformance';
-import { formatReport, parseArgs, summarizeCreativeAggregate } from '../scripts/creativePerformanceCorrelation';
+import { buildJsonReport, formatReport, parseArgs, summarizeCreativeAggregate } from '../scripts/creativePerformanceCorrelation';
 import fixture from './fixtures/metaInsightsLevelAd.json';
 
 jest.mock('../services/db', () => ({
@@ -226,6 +226,15 @@ describe('creativePerformanceReport (ENG-2194 metrics)', () => {
     const joined = report.aggregates.find((a) => a.creativeId === 'crmJoinedOnly')!;
     expect(joined.currency).toBeNull();
     expect(summarizeCreativeAggregate(joined).crmCpl).toEqual({ value: 8, currency: 'USD' });
+
+    // CodeRabbit (follow-up): `--json --per-creative` must go through the same summarizer as the
+    // plain-text path, not emit raw aggregates (which have no cvr/hookRate/crmCpl fields at all).
+    const jsonOut = buildJsonReport(report, 0, { perCreative: true });
+    const jsonJoined = (jsonOut.aggregates as ReturnType<typeof summarizeCreativeAggregate>[])
+      .find((a) => a.creativeId === 'crmJoinedOnly')!;
+    expect(jsonJoined.crmCpl).toEqual({ value: 8, currency: 'USD' });
+    expect(jsonJoined).toHaveProperty('cvr');
+    expect(jsonJoined).toHaveProperty('hookRate');
   });
 });
 
