@@ -258,6 +258,22 @@ export function summarizeCreativeAggregate(a: CreativeAggregate): Record<string,
   };
 }
 
+/**
+ * The `--json` output shape, with `--per-creative` rows summarized through
+ * summarizeCreativeAggregate the same way the plain-text path already is
+ * (CodeRabbit on #3122: the JSON path was emitting raw aggregates without
+ * cvr/hookRate/crmCpl).
+ */
+export function buildJsonReport(
+  report: CreativePerformanceReport,
+  truncatedAds: number,
+  opts: Pick<CliOptions, 'perCreative'>,
+): Record<string, unknown> {
+  const { aggregates, ...summary } = report;
+  const perCreative = opts.perCreative ? { aggregates: aggregates.map(summarizeCreativeAggregate) } : {};
+  return { ...summary, truncatedAds, ...perCreative };
+}
+
 function documentReader(): ReadOnlyReader {
   const client = new AWS.DynamoDB.DocumentClient();
   return {
@@ -284,8 +300,7 @@ async function main(): Promise<void> {
   });
 
   if (opts.json) {
-    const { aggregates, ...summary } = report;
-    console.log(JSON.stringify({ ...summary, truncatedAds, ...(opts.perCreative ? { aggregates } : {}) }, null, 2));
+    console.log(JSON.stringify(buildJsonReport(report, truncatedAds, opts), null, 2));
     return;
   }
   for (const line of formatReport(report, truncatedAds, opts)) console.log(line);
