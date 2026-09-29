@@ -271,9 +271,13 @@ import * as searchResearchImpl from '../emma/impl/searchResearch';
 import * as videoImpl from '../emma/impl/video';
 // ENG-2103 (F2), cluster 22 (last mechanical cluster): skills/admin + file ops
 // + misc tool cluster (getAdminToolNames, saveFile, readFileContent,
-// sendEmailFromConfiguredSender). getUnassociatedToolNames and installSkills
-// were scoped for this cluster but kept entirely on the class instead — see
-// emma/impl/misc.ts's module header for why.
+// sendEmailFromConfiguredSender). installSkills was scoped for this cluster
+// but kept entirely on the class instead — see emma/impl/misc.ts's module
+// header for why. getUnassociatedTools/getUnassociatedToolNames were
+// initially kept on the class too, then moved here in a design-decision-list
+// follow-up round with FOUNDATION_TOOLS and toolRegistry.getAllTools injected
+// as live parameters — see emma/impl/misc.ts's module header for the full
+// reasoning.
 import * as miscImpl from '../emma/impl/misc';
 // SearchPurpose (but not SearchResultSource — no longer referenced after this
 // cluster's extraction) is still needed: youSearchWeb/googleSearchWeb's own
@@ -6576,45 +6580,37 @@ export class AgentModeService {
     'linkedin_outreach',
   ]);
 
-  /**
-   * Get tools that are not associated with any published skill.
-   * Excludes foundation tools and admin-only tools.
-   */
+  // ENG-2103 (F2 follow-up): delegates to emma/impl/misc.ts. Kept as a private
+  // class method (not deleted) because three still-out-of-scope skills-subsystem
+  // methods on this class (buildAvailableSkillsMessage, getSkillsForDisplay,
+  // buildSkillContext) call this.getUnassociatedTools(...) directly, plus
+  // agentModeService.skills.test.ts's direct real-instance calls via
+  // (agentModeService as any).getUnassociatedTools(...). AgentModeService.
+  // FOUNDATION_TOOLS is read live here (not captured), and getAllTools reads
+  // this.toolRegistry — the private, per-instance ToolRegistry, NOT the
+  // module-level emmaToolRegistry singleton in emma/registry.ts — fresh on
+  // every call so post-construction tool registration is always reflected.
   private getUnassociatedTools(publishedSkills: any[]): { name: string; description: string }[] {
-    // Collect all tool names used by any published skill. Callers (e.g.
-    // loadAuthorizedSkillCatalog) pass a catalog that also mixes in unpublished
-    // private/org-shared skills for install purposes — those must NOT count here,
-    // or a single draft skill nobody published can silently steal a tool out of
-    // the shared __other_skills__ bundle for an entire org (ENG-1237).
-    const associatedToolNames = new Set<string>();
-    publishedSkills.forEach(skill => {
-      if (skill.isPublished !== true) return;
-      skill.toolNames?.forEach((t: string) => associatedToolNames.add(t));
-    });
-
-    // Build exclusion set: foundation tools + admin-only tools + page-context-only tools
-    const excludedTools = new Set<string>(AgentModeService.FOUNDATION_TOOLS);
-    ADMIN_SKILL_TOOL_NAMES.forEach(t => excludedTools.add(t));
-    // get_visual_context is page-embedded Emma only — never expose in Agent Mode or __other_skills__
-    excludedTools.add('get_visual_context');
-
-    // Get all registered tools and find those not in any skill
-    const allTools = this.toolRegistry.getAllTools();
-
-    return allTools
-      .filter(tool => !associatedToolNames.has(tool.name) && !excludedTools.has(tool.name))
-      .map(tool => ({
-        name: tool.name,
-        description: tool.definition?.function?.description || tool.name
-      }));
+    return miscImpl.getUnassociatedTools(
+      publishedSkills,
+      AgentModeService.FOUNDATION_TOOLS,
+      () => this.toolRegistry.getAllTools(),
+    );
   }
 
-  /**
-   * Get tool names not associated with any published skill (excludes infrastructure tools).
-   * Public version of getUnassociatedTools for use by subscriptionService.resolveSkillsToToolNames.
-   */
+  // ENG-2103 (F2 follow-up): delegates to emma/impl/misc.ts. Kept as a class
+  // method (not deleted) because this.toolRegistry is private instance state
+  // that no external caller can legally reach, so emma/tools.ts,
+  // services/subscriptionService.ts's resolveSkillsToToolNames, and
+  // routes/admin.ts's GET /available-skills all keep calling
+  // agentModeService.getUnassociatedToolNames(...) on the singleton, plus
+  // agentModeService.skills.test.ts's direct real-instance calls.
   public getUnassociatedToolNames(publishedSkills: any[]): string[] {
-    return this.getUnassociatedTools(publishedSkills).map(t => t.name);
+    return miscImpl.getUnassociatedToolNames(
+      publishedSkills,
+      AgentModeService.FOUNDATION_TOOLS,
+      () => this.toolRegistry.getAllTools(),
+    );
   }
 
   /**

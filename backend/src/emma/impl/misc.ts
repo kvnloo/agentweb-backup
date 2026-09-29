@@ -36,32 +36,14 @@
  *     `providerLabel` was already a plain, stateless top-level import
  *     (`./crmSenderTypes`) in the original file — imported here unchanged.
  *
- * Two of the six originally-scoped methods are explicitly NOT moved — both
- * judgment calls, reported per the cluster brief rather than forced through:
+ * One of the six originally-scoped methods is explicitly NOT moved — a
+ * judgment call, reported per the cluster brief rather than forced through:
  *
- *   - `getUnassociatedToolNames` — its real logic lives in a PRIVATE sibling,
- *     `getUnassociatedTools` (singular), which is shared with three
- *     out-of-scope skills-subsystem methods (`buildAvailableSkillsMessage`,
- *     `getSkillsForDisplay`, and the tool-name resolution inside
- *     `applyOpeningAction`'s neighborhood — confirmed by grep, not guessed)
- *     and reads `AgentModeService.FOUNDATION_TOOLS`, a `static` field that is
- *     REASSIGNED at runtime by two other out-of-scope methods
- *     (`loadFoundationTools`, `updateFoundationTools`). Extracting
- *     `getUnassociatedToolNames` alone would require either dragging the
- *     out-of-scope skills infrastructure across the module boundary (violating
- *     the brief's explicit "do NOT move, touch, or include any of them") or
- *     duplicating logic that reads live, mutable class state — a real drift
- *     risk, not a cosmetic one, since a `foundation_tools` DB override changes
- *     `FOUNDATION_TOOLS` in place at runtime. Kept entirely on the class
- *     (not even a wrapper — there is nothing to delegate to), exactly the
- *     `linkedinManagePost` (cluster 16) treatment. `emma/tools.ts`'s
- *     `list_available_skills` tool keeps calling
- *     `agentModeService.getUnassociatedToolNames` unchanged.
  *   - `installSkills` — depends on three skills-subsystem methods:
  *     `this.getSkillsForDisplay` (public, itself calls the same
  *     `loadAuthorizedSkillCatalog`/`getUnassociatedTools` infrastructure
- *     above) and two PRIVATE methods, `this.classifySkillRejections` and
- *     `this.describeRejections` — both substantial, actively-tuned
+ *     described below) and two PRIVATE methods, `this.classifySkillRejections`
+ *     and `this.describeRejections` — both substantial, actively-tuned
  *     entitlement/error-classification logic (ENG-1795, ENG-1237, ENG-1945
  *     references throughout), not incidental reads. Extracting `installSkills`
  *     would need three injected function parameters just to keep it working —
@@ -69,22 +51,78 @@
  *     `EmployerSizeFilterResolver` precedent in this series — for a module
  *     function that would still be, in substance, almost entirely calls back
  *     into class-internal skills infrastructure. Not worth forcing. Kept
- *     entirely on the class, same treatment as `getUnassociatedToolNames`
- *     above and `linkedinManagePost` (cluster 16). `emma/tools.ts`'s
- *     `install_skills` tool, `mcp/server/apiTools.ts`,
- *     `controllers/agentModeController.ts`, and `controllers/benchmark.ts`
- *     all keep calling `agentModeService.installSkills` unchanged.
+ *     entirely on the class, same treatment as `linkedinManagePost`
+ *     (cluster 16). `emma/tools.ts`'s `install_skills` tool,
+ *     `mcp/server/apiTools.ts`, `controllers/agentModeController.ts`, and
+ *     `controllers/benchmark.ts` all keep calling `agentModeService.
+ *     installSkills` unchanged.
  *
- * Confirmed via grep: neither `getUnassociatedToolNames` nor `installSkills`
- * (nor anything in this cluster) touches any of the ~10 out-of-scope
- * skills-subsystem methods' own bodies — `getFoundationToolNames`,
- * `loadFoundationTools`, `updateFoundationTools`, `buildAvailableSkillsMessage`,
- * `loadAuthorizedSkillCatalog`, `getAuthorizedSkill`, `applyOpeningAction`,
- * `getSkillsForDisplay`, `classifySkillRejections`, `describeRejections` are
- * all untouched, still on the class, exactly as before this cluster.
- * `convertToPdf` (cluster 5, already a thin delegate to `htmlTools.ts` sitting
- * between `saveFile` and `readFileContent` in the original file) is also
- * untouched.
+ * Confirmed via grep: `installSkills` (nor anything in this cluster) touches
+ * any of the ~9 remaining out-of-scope skills-subsystem methods' own bodies —
+ * `getFoundationToolNames`, `loadFoundationTools`, `updateFoundationTools`,
+ * `buildAvailableSkillsMessage`, `loadAuthorizedSkillCatalog`,
+ * `getAuthorizedSkill`, `applyOpeningAction`, `classifySkillRejections`,
+ * `describeRejections` are all untouched, still on the class, exactly as
+ * before this cluster. `convertToPdf` (cluster 5, already a thin delegate to
+ * `htmlTools.ts` sitting between `saveFile` and `readFileContent` in the
+ * original file) is also untouched.
+ *
+ * ENG-2103 F2 FOLLOW-UP (design-decision list, item 9/12) — `getUnassociatedTools`
+ * (private) and `getUnassociatedToolNames` (public) MOVED here, reversing this
+ * cluster's original "kept entirely on the class" call. The original scoping
+ * (see git history on this file) theorized this was a "promote a mutable
+ * static field to a module singleton" job — that theory was WRONG. The real
+ * shape is the same injected-parameter pattern as `AccountResolver`
+ * (cluster 15) / `EmployerSizeFilterResolver` (cluster 16), with TWO
+ * dependencies:
+ *   1. `AgentModeService.FOUNDATION_TOOLS` — a `public static Set<string>`
+ *      REASSIGNED at runtime by two still-out-of-scope methods
+ *      (`loadFoundationTools`/`updateFoundationTools`, core turn-loop/session-init
+ *      infrastructure, never touched by this cluster). Since the whole `Set`
+ *      object is replaced wholesale (`AgentModeService.FOUNDATION_TOOLS = new
+ *      Set(merged)`), a value captured once at construction/import time would
+ *      go stale the moment a `foundation_tools` DB override loads or an admin
+ *      calls `PUT /foundation-tools`. Injected as `foundationTools:
+ *      ReadonlySet<string>` — the class wrapper reads
+ *      `AgentModeService.FOUNDATION_TOOLS` fresh on every call (not captured
+ *      in a closure), so this module never needs to know the field is
+ *      mutable, only that it receives a current snapshot each invocation.
+ *   2. `this.toolRegistry.getAllTools()` — `toolRegistry` is a PRIVATE,
+ *      per-INSTANCE `ToolRegistry` (`mcp/client/toolRegistry.ts`, constructed
+ *      once in the constructor: `this.toolRegistry = new ToolRegistry()`).
+ *      This is NOT the same object as the module-level `emmaToolRegistry`
+ *      singleton in `emma/registry.ts` (a different class, `McpToolRegistry`,
+ *      used by the external-facing MCP server path) — conflating the two
+ *      would silently return the wrong tool population. `this.toolRegistry`'s
+ *      contents change at runtime (tools are registered/unregistered
+ *      post-construction, e.g. during `initialize()` and per-session MCP tool
+ *      registration), so this is injected as a `getAllTools: () => AgentTool[]`
+ *      function parameter — same shape as `AccountResolver` — rather than a
+ *      pre-resolved array, so a snapshot is never captured before the caller
+ *      is ready to use it.
+ *
+ * Since `toolRegistry` is private instance state, NONE of the three real
+ * external callers of `getUnassociatedToolNames` beyond this cluster
+ * (`emma/tools.ts`'s `list_available_skills` tool; `services/subscriptionService.
+ * ts`'s `resolveSkillsToToolNames`, confirmed via its own pre-existing doc
+ * comment; and `routes/admin.ts`'s `GET /available-skills`, found by a
+ * whole-backend grep the original brief's scoping had missed) have any legal
+ * way to reach `this.toolRegistry` — all three keep calling
+ * `agentModeService.getUnassociatedToolNames(publishedSkills)` on the
+ * singleton unchanged, the same load-bearing "tools.ts cannot repoint" shape
+ * `fileContentCache`/`saveFile` below already established in this cluster.
+ * `getUnassociatedTools` (private) also keeps three real IN-CLASS callers
+ * (`buildAvailableSkillsMessage`, `getSkillsForDisplay`, `buildSkillContext` —
+ * all still-out-of-scope skills-subsystem methods, untouched) reaching it via
+ * `this.getUnassociatedTools(publishedSkills)`, so the class keeps a private
+ * delegating wrapper too, not just the public one.
+ *
+ * `getUnassociatedToolNames` calls sibling `getUnassociatedTools` internally
+ * (same as the original class code) — both now live in this module, so per
+ * the cluster-10 sibling-function-spy lesson, the internal call goes through
+ * a same-module self-import (`import * as self from './misc'`) rather than a
+ * bare local reference, so an external `jest.spyOn(miscImpl,
+ * 'getUnassociatedTools')` still intercepts it.
  *
  * `IMAGE_EXTENSIONS`/`VIDEO_EXTENSIONS` (were module-level consts in
  * `agentModeService.ts`, ~1121-1122) are MOVED here, not duplicated: cluster
@@ -98,13 +136,15 @@
  * `readFileContent` and moved here the same way.
  *
  * `ADMIN_SKILL_TOOL_NAMES` (was a module-level const in `agentModeService.ts`,
- * ~line 307) is DUPLICATED here, not imported back — it is still used by four
- * other, out-of-scope skills-subsystem call sites in the class
- * (`getUnassociatedTools`'s exclusion set, the admin-tools virtual-skill
+ * ~line 307, still exported from there today) is DUPLICATED here, not
+ * imported back — it is used both here (`getUnassociatedTools`'s exclusion
+ * set, moved in the F2 follow-up above) AND by three other, still-out-of-scope
+ * skills-subsystem call sites in the class (the admin-tools virtual-skill
  * catalog entry, `applyOpeningAction`'s neighborhood allowlist, and the admin
- * skill-context prose), so importing it back would either re-export
- * class-adjacent state or force a static import of `agentModeService.ts`
- * itself. Per the F2 design draft §3.2 ("just strings/literals; inline them")
+ * skill-context prose in `buildSkillContext`), so importing it back would
+ * either re-export class-adjacent state or force a static import of
+ * `agentModeService.ts` itself. Per the F2 design draft §3.2 ("just
+ * strings/literals; inline them")
  * and the exact precedent cluster 21's `video.ts` set for `IMAGE_EXTENSIONS`
  * in the same shared-with-out-of-scope situation, this is a plain literal
  * duplicate. Confirmed the source array is a plain `const`, never mutated
@@ -155,12 +195,12 @@
  * directly.
  *
  * Zero `this.callLLM`/`this.generateImage`/`this.describeImage`/
- * `this.callVisionLLMWithTimeout` coupling anywhere in this cluster — all four
+ * `this.callVisionLLMWithTimeout` coupling anywhere in this cluster — all
  * moved methods were read in full and individually grepped for the four
  * names; none matched.
  *
- * All three moved-and-still-externally-called methods kept as delegating
- * wrappers on `AgentModeService.prototype.*` (none deleted):
+ * All moved-and-still-externally-called methods kept as delegating wrappers
+ * on `AgentModeService.prototype.*` (none deleted):
  *   - `getAdminToolNames`: real callers beyond `emma/tools.ts` —
  *     `services/chatbotService.ts` and three call sites in
  *     `controllers/agentModeController.ts`, plus
@@ -179,6 +219,17 @@
  *     alone, same standard cluster 12/13/etc. already applied
  *     ("real callers" includes direct-instance test calls, not just
  *     production code paths).
+ *   - `getUnassociatedToolNames` (F2 follow-up, moved above): real callers
+ *     beyond `emma/tools.ts` — `services/subscriptionService.ts`'s
+ *     `resolveSkillsToToolNames`, `routes/admin.ts`'s `GET /available-skills`,
+ *     plus `agentModeService.skills.test.ts`'s direct real-instance calls —
+ *     all reach the singleton, none can reach `this.toolRegistry` directly.
+ *   - `getUnassociatedTools` (private, F2 follow-up, moved above): kept as a
+ *     private delegating wrapper (not deleted, not public) for its three
+ *     real in-class callers (`buildAvailableSkillsMessage`,
+ *     `getSkillsForDisplay`, `buildSkillContext`), plus
+ *     `agentModeService.skills.test.ts`'s direct real-instance calls via
+ *     `(agentModeService as any).getUnassociatedTools(...)`.
  *
  * Transitive-import notes: `extractS3KeyFromUrl`/`getS3ObjectStream`/
  * `getS3ObjectMetadata` stay STATIC imports from `../../utils/s3Utils`
@@ -196,7 +247,13 @@
  * both source files were read directly and confirmed to import nothing
  * problematic (`crmSenderTypes.ts` has zero imports at all). `pdf-parse`/
  * `xlsx`/`mammoth` stay inline `require()`s inside `readFileContent`, exactly
- * matching the original code — never top-level imports.
+ * matching the original code — never top-level imports. `AgentTool` (used to
+ * type the injected `getAllTools` parameter of `getUnassociatedTools`/
+ * `getUnassociatedToolNames`) is imported with `import type` from
+ * `../../mcp/client/toolRegistry` — type-only, so it is erased at compile
+ * time and carries zero runtime import risk even though `toolRegistry.ts`
+ * itself statically imports `evaluationPolicy.ts`/`anonymousToolAccess.ts`/
+ * `scheduledPublishConsentGuard.ts`.
  *
  * Verified with a module-isolation test (`misc.moduleIsolation.test.ts`) that
  * requiring this module alone does NOT load `agentModeService.ts` or
@@ -207,6 +264,13 @@ import { createHash } from 'crypto';
 import { extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../../utils/s3Utils';
 import { pdfPageRender } from './shared/pdfTextRender';
 import { getCrmSenders } from './shared/crmSenders';
+import type { AgentTool } from '../../mcp/client/toolRegistry';
+// Self-import: `getUnassociatedToolNames` reaches sibling `getUnassociatedTools`
+// (both defined in this same module, below) through `self.<fn>` rather than a
+// local function reference, so an external `jest.spyOn(miscImpl,
+// 'getUnassociatedTools')` actually intercepts the internal call — the
+// cluster-10 lesson.
+import * as self from './misc';
 import { providerLabel } from '../../services/crmSenderTypes';
 
 // Type declaration for pdf-parse module (moved from agentModeService.ts,
@@ -234,6 +298,67 @@ const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_jo
 
 export function getAdminToolNames(): string[] {
   return [...ADMIN_SKILL_TOOL_NAMES];
+}
+
+/**
+ * Get tools that are not associated with any published skill.
+ * Excludes foundation tools and admin-only tools.
+ *
+ * `foundationTools`/`getAllTools` are injected — see this module's header
+ * comment ("ENG-2103 F2 FOLLOW-UP") for why: `foundationTools` must be a LIVE
+ * snapshot of `AgentModeService.FOUNDATION_TOOLS` (reassigned at runtime by
+ * out-of-scope `loadFoundationTools`/`updateFoundationTools`), and
+ * `getAllTools` must read the caller's own per-instance `this.toolRegistry`
+ * (private, NOT the module-level `emmaToolRegistry` singleton) fresh on every
+ * call, since tools are registered into it after construction.
+ */
+export function getUnassociatedTools(
+  publishedSkills: any[],
+  foundationTools: ReadonlySet<string>,
+  getAllTools: () => AgentTool[],
+): { name: string; description: string }[] {
+  // Collect all tool names used by any published skill. Callers (e.g.
+  // loadAuthorizedSkillCatalog) pass a catalog that also mixes in unpublished
+  // private/org-shared skills for install purposes — those must NOT count here,
+  // or a single draft skill nobody published can silently steal a tool out of
+  // the shared __other_skills__ bundle for an entire org (ENG-1237).
+  const associatedToolNames = new Set<string>();
+  publishedSkills.forEach(skill => {
+    if (skill.isPublished !== true) return;
+    skill.toolNames?.forEach((t: string) => associatedToolNames.add(t));
+  });
+
+  // Build exclusion set: foundation tools + admin-only tools + page-context-only tools
+  const excludedTools = new Set<string>(foundationTools);
+  ADMIN_SKILL_TOOL_NAMES.forEach(t => excludedTools.add(t));
+  // get_visual_context is page-embedded Emma only — never expose in Agent Mode or __other_skills__
+  excludedTools.add('get_visual_context');
+
+  // Get all registered tools and find those not in any skill
+  const allTools = getAllTools();
+
+  return allTools
+    .filter(tool => !associatedToolNames.has(tool.name) && !excludedTools.has(tool.name))
+    .map(tool => ({
+      name: tool.name,
+      description: tool.definition?.function?.description || tool.name
+    }));
+}
+
+/**
+ * Get tool names not associated with any published skill (excludes infrastructure tools).
+ * Public version of getUnassociatedTools for use by subscriptionService.resolveSkillsToToolNames.
+ *
+ * Calls sibling `getUnassociatedTools` via the `self` import (not a bare local
+ * reference) so an external `jest.spyOn(miscImpl, 'getUnassociatedTools')`
+ * still intercepts this internal call — see this module's header comment.
+ */
+export function getUnassociatedToolNames(
+  publishedSkills: any[],
+  foundationTools: ReadonlySet<string>,
+  getAllTools: () => AgentTool[],
+): string[] {
+  return self.getUnassociatedTools(publishedSkills, foundationTools, getAllTools).map(t => t.name);
 }
 
 // Save file to S3 and return URL with content-based deduplication.
