@@ -98,13 +98,15 @@ export interface ScheduleSlackSendApprovalInput {
  * Whether an unattended run on this schedule may call slack_send_message directly
  * (without a live approval) when its task asks for it.
  *
- * A pure predicate, mirroring resolvePublishAuthorized's shape exactly: the caller
- * fetches the schedule and passes it in, so both agentModeService.ts's main call site
- * and agentModeController.ts's mid-run publish-revocation-notice call site (a rarer
- * path that also emits this directive's text) resolve the SAME opt-out the SAME way,
- * without duplicating the orchestration (scheduleId extraction, the DB read, the
- * fail-closed error handling) into a shared async helper that would need importing
- * scheduleDb into this otherwise DB-free utility file.
+ * A pure predicate, mirroring resolvePublishAuthorized's shape exactly: designed to be
+ * callable from any orchestrating call site the same way — currently only
+ * agentModeService.ts's main call site actually does. agentModeController.ts's
+ * mid-run publish-revocation-notice call site (a rarer path that also emits this
+ * directive's text) does NOT yet call it — see the "known, accepted gap" comment at
+ * that call site for why — so it still defaults to authorized there regardless of a
+ * schedule's real opt-out. Kept as a pure predicate (the caller fetches the schedule
+ * and passes it in) rather than an async orchestrating helper, so this otherwise
+ * DB-free utility file doesn't need to import scheduleDb just to serve one call site.
  *
  * Same polarity/fail-closed conventions as resolvePublishAuthorized purely for
  * consistency: absent/false = authorized (matches this ticket's fix — no existing

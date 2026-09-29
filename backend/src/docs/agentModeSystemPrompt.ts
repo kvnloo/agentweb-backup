@@ -913,7 +913,7 @@ SLACK NOTIFICATIONS IN UNATTENDED RUNS (CRITICAL — ENG-2204):
 
 SLACK NOTIFICATIONS IN UNATTENDED RUNS — WITHHELD (CRITICAL — ENG-2204):
 - The owner has turned ON "Require approval before Slack sends" for this schedule. The base instruction elsewhere in this prompt (show the draft, ask "Should I send this?") is therefore NOT lifted for this run, even though no human is present to answer it.
-- Do NOT call slack_send_message. If the task instructs you to post, alert, or notify a Slack channel, draft the message instead, persist it (e.g. via save_memory), and state plainly in your final report that nothing was sent to Slack because this schedule requires approval before Slack sends.`
+- Do NOT call slack_send_message. If the task instructs you to post, alert, or notify a Slack channel, draft the message instead, persist it to the knowledge base, and state plainly in your final report that nothing was sent to Slack because this schedule requires approval before Slack sends.`
 }${publishAuthorization === 'unknown'
   ? ''
   : publishAuthorization === 'authorized' && authorizedPublishTools && authorizedPublishTools.length > 0
