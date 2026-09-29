@@ -80,6 +80,21 @@ describe('skillService records eval_needed markers for every caller', () => {
     expect(markers()).toEqual([]);
   });
 
+  it('marks an update that clears an eval-relevant field back to unset (ENG-2195 CodeRabbit)', async () => {
+    // The stored row has a systemPrompt; the write replaces it with a skill object that never
+    // sets the key at all — the same shape a caller genuinely clearing the field would produce,
+    // and skillService.putSkill's full-item put drops the attribute exactly like an explicit clear.
+    mockPut.mockReturnValueOnce(resolved({ Attributes: stored() }));
+    const withoutPrompt: Skill = { ...stored({ name: 'Renamed' }) };
+    delete withoutPrompt.systemPrompt;
+    await skillService.updateSkill(withoutPrompt);
+    await flush();
+    expect(markers()).toEqual([expect.objectContaining({ target: 's1', action: 'update', fields: 'systemPrompt' })]);
+    // Nothing was written for the field, so nothing to hash as its content.
+    expect(markers()[0]).not.toHaveProperty('value');
+    expect(markers()[0]).not.toHaveProperty('valueSha');
+  });
+
   it('marks an approve, which makes the skill public', async () => {
     mockGet.mockReturnValueOnce(resolved({ Item: stored({ visibility: 'pending_review', isPublished: false }) }));
     mockPut.mockReturnValueOnce(resolved({ Attributes: stored({ visibility: 'pending_review', isPublished: false }) }));
