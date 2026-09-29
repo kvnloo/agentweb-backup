@@ -20,6 +20,7 @@ import { meteredV0 } from "./v0Metering";
 // runtime-safe because durableLandingService only imports a TYPE from this module.
 import { STUCK_CEILING_MS } from "./durableLandingService";
 import { enqueueAutoHumanEval } from "./autoHumanEvalService";
+import { landingPageSourceForJudge, type GeneratedFile } from "./landingPageJudgeSource";
 import { getPersistedBrandLogoUrl } from "./agentMode/brandLogo";
 import { getLandingPageLaunchReadiness } from "../utils/landingPageLaunchReadiness";
 // ENG-2087: syntax-only validation of generated modules (see findUnparseableModule).
@@ -2821,7 +2822,7 @@ async function addPageToExistingRepo(
       })
       .promise();
 
-    void enqueueLandingPageHumanEval(deployedSubPage);
+    void enqueueLandingPageHumanEval(deployedSubPage, async () => allFiles);
     // Dynamic import: landingPageSmokeTest.ts imports FROM this module (GeneratedLandingPage,
     // updateLandingPageSmokeTestResult), so a static import here would be circular.
     void import("./landingPageSmokeTest")
@@ -3786,7 +3787,8 @@ export async function deployLandingPage(
       updatedAt: now,
     };
 
-    void enqueueLandingPageHumanEval(deployedRecord);
+    const deployedZip = zipBuffer;
+    void enqueueLandingPageHumanEval(deployedRecord, () => unzipBuffer(deployedZip));
     // Dynamic import: landingPageSmokeTest.ts imports FROM this module (GeneratedLandingPage,
     // updateLandingPageSmokeTestResult), so a static import here would be circular.
     void import("./landingPageSmokeTest")
@@ -3831,7 +3833,14 @@ export async function deployLandingPage(
   }
 }
 
-function enqueueLandingPageHumanEval(page: GeneratedLandingPage): void {
+/**
+ * `generatedFiles` is the v0 output this deploy already holds in memory; the rubric judge
+ * (ENG-2192) reads the page source from it only when the page is sampled.
+ */
+function enqueueLandingPageHumanEval(
+  page: GeneratedLandingPage,
+  generatedFiles?: () => Promise<GeneratedFile[]>,
+): void {
   if (page.status !== "deployed") return;
   const artifactUrl = getLandingPageLiveUrl(page);
   void enqueueAutoHumanEval({
@@ -3847,6 +3856,10 @@ function enqueueLandingPageHumanEval(page: GeneratedLandingPage): void {
       landingPageId: page.id,
       userId: page.userId,
     },
+    ...(page.prompt ? { creativeBrief: { generationRequest: page.prompt } } : {}),
+    ...(generatedFiles
+      ? { loadLandingPageSource: async () => landingPageSourceForJudge(await generatedFiles()) }
+      : {}),
   });
 }
 
