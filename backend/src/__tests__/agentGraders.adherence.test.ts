@@ -196,6 +196,14 @@ describe('acting when told to', () => {
   it('is not applicable without an act instruction', () => {
     expect(gradePermissionAdherence([turn('what can you do?', 'Shall I proceed?')]).reason).toBe('no_act_instruction');
   });
+
+  it('passes a tool-only turn (the agent acted and gave no separate reply text that turn) instead of no_reply (CodeRabbit PR #3136, thread 4129864014)', () => {
+    expect(gradePermissionAdherence([turn('go ahead', undefined, ['create_ad_campaign'])])).toEqual({
+      verdict: 'pass',
+      reason: 'acted_without_asking',
+      applicableTurns: 1,
+    });
+  });
 });
 
 describe('gradeAdherence and rates', () => {
