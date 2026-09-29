@@ -155,6 +155,15 @@ function CreativeThumb({ src, alt, onZoom }: { src: string; alt: string; onZoom:
   return (
     <Box
       onClick={() => onZoom(src)}
+      role="button"
+      tabIndex={0}
+      aria-label={`Zoom in on ${alt}`}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onZoom(src);
+        }
+      }}
       sx={{
         position: 'relative',
         width: '100%',
@@ -164,10 +173,11 @@ function CreativeThumb({ src, alt, onZoom }: { src: string; alt: string; onZoom:
         overflow: 'hidden',
         cursor: 'zoom-in',
         '&:hover .zoom-affordance': { opacity: 1 },
+        '&:focus-visible': { outline: '2px solid', outlineColor: 'primary.main', outlineOffset: 2 },
       }}
     >
       {video ? (
-        <Box component="video" src={src} muted sx={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+        <Box component="video" src={src} muted preload="metadata" sx={{ width: '100%', height: '100%', objectFit: 'contain' }} />
       ) : (
         <Box component="img" src={src} alt={alt} sx={{ width: '100%', height: '100%', objectFit: 'contain' }} />
       )}
@@ -251,7 +261,7 @@ function EvidenceCard({ index, decision }: { index: number; decision: ApprovalDe
             <CloseIcon />
           </IconButton>
           {zoomedSrc && (isVideoUrl(zoomedSrc) ? (
-            <Box component="video" src={zoomedSrc} controls autoPlay sx={{ width: '100%', maxHeight: '85vh', display: 'block' }} />
+            <Box component="video" src={zoomedSrc} controls sx={{ width: '100%', maxHeight: '85vh', display: 'block' }} />
           ) : (
             <Box component="img" src={zoomedSrc} alt="Creative, full size" sx={{ width: '100%', maxHeight: '85vh', objectFit: 'contain', display: 'block' }} />
           ))}
