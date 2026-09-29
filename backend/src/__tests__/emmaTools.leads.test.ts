@@ -4,10 +4,20 @@
  * forward args unchanged. Same pattern as emmaTools.googleDrive.test.ts /
  * emmaTools.htmlTools.test.ts.
  *
- * update_email_draft_for_lead and import_leads_from_search are deliberately
- * NOT covered here — both remain on agentModeService (this.callLLM-coupled,
- * flagged rather than extracted per this round's own decision point) — so
- * the throwing proxy below only guards the 19 names this cluster owns.
+ * update_email_draft_for_lead is deliberately NOT covered here — it remains
+ * on agentModeService (this.callLLM-coupled, flagged rather than extracted).
+ *
+ * ENG-2103 (F2 design-decision-list follow-up, Pattern A):
+ * import_leads_from_search is now ALSO covered — it used to remain on
+ * agentModeService for the identical this.callLLM-shaped reason as
+ * update_email_draft_for_lead, but importLeadsFromSearch itself moved to
+ * emma/impl/leads.ts this round (its real coupling was always to `callLLM`
+ * via module-scope `batchParseCompaniesFromTitlesWithLLM`, not its own
+ * identity), and `callLLM` is `public` on AgentModeService, so this file can
+ * bind it straight off the singleton — same treatment as
+ * create_html_from_template. It's covered in its own describe block below,
+ * separate from the 19-method cluster loop, since it needs a `callLLM`
+ * assertion the other 19 don't.
  */
 
 jest.mock('../emma/impl/leads', () => ({
@@ -30,6 +40,7 @@ jest.mock('../emma/impl/leads', () => ({
   getLeadEngagements: jest.fn(),
   addLeadEngagement: jest.fn(),
   sendEmailToLead: jest.fn(),
+  importLeadsFromSearch: jest.fn(),
 }));
 
 const LEADS_CLUSTER_METHODS = [
@@ -41,15 +52,25 @@ const LEADS_CLUSTER_METHODS = [
 ];
 
 // agentModeService.<leadsClusterMethod> must NOT be called by these 19 tools
-// anymore. update_email_draft_for_lead / import_leads_from_search still
-// legitimately call agentModeService directly (not part of this cluster), so
-// the proxy below only throws for the 19 names this cluster actually owns.
+// anymore, and agentModeService.importLeadsFromSearch must not be called by
+// import_leads_from_search anymore either (it's repointed to leadsImpl this
+// round). update_email_draft_for_lead still legitimately calls
+// agentModeService directly (not part of this cluster) — a bare jest.fn()
+// through the proxy's default branch. `callLLM` is also allowed through the
+// default branch — import_leads_from_search's real execute() binds
+// `agentModeService.callLLM` and forwards it to leadsImpl, so it must
+// resolve to a real function, not throw.
 jest.mock('../services/agentModeService', () => ({
   agentModeService: new Proxy(
-    {},
+    // `callLLM` is a stable target property (not returned fresh per access
+    // like the fallback branch below) so import_leads_from_search's
+    // `agentModeService.callLLM.bind(agentModeService)` and this test's own
+    // `agentModeService.callLLM` assertion resolve to the SAME jest.fn().
+    { callLLM: jest.fn().mockResolvedValue({ success: true }) },
     {
-      get(_target, prop) {
-        if (LEADS_CLUSTER_METHODS.includes(String(prop))) {
+      get(target: any, prop) {
+        if (prop in target) return target[prop];
+        if (LEADS_CLUSTER_METHODS.includes(String(prop)) || prop === 'importLeadsFromSearch') {
           return () => {
             throw new Error(`agentModeService.${String(prop)} should not be called by the leads/CRM cluster after ENG-2103 F2`);
           };
@@ -62,6 +83,7 @@ jest.mock('../services/agentModeService', () => ({
 
 import { emmaToolRegistry } from '../emma/registry';
 import * as leadsImpl from '../emma/impl/leads';
+import { agentModeService } from '../services/agentModeService';
 import '../emma/tools';
 
 const mockLeads = leadsImpl as jest.Mocked<typeof leadsImpl>;
@@ -333,5 +355,56 @@ describe('leads/CRM cluster delegates to emma/impl/leads.ts (ENG-2103 F2)', () =
 
     expect(mockLeads.sendEmailToLead).toHaveBeenCalledWith('L1', 'LD1', 'u1');
     expect(result).toBe(expected);
+  });
+});
+
+// ENG-2103 (F2 design-decision-list follow-up, Pattern A): separate describe
+// block — import_leads_from_search isn't one of the 19 LEADS_CLUSTER_METHODS
+// (it has its own callLLM-binding assertion the others don't need).
+describe('import_leads_from_search calls leadsImpl.importLeadsFromSearch with agentModeService.callLLM bound (ENG-2103 F2)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('forwards agentModeService.callLLM bound, userId, and the mapped args, and returns the result unchanged', async () => {
+    const expected = { success: true, imported: 3 };
+    mockLeads.importLeadsFromSearch.mockResolvedValue(expected);
+
+    const result = await emmaToolRegistry.getTool('import_leads_from_search')!.execute(
+      { list_id: 'L1', title: 'CTO', company_size_max: 200, limit: 10, auto_enrich: true },
+      { userId: 'u1' }
+    );
+
+    expect(mockLeads.importLeadsFromSearch).toHaveBeenCalledTimes(1);
+    const [passedCallLLM, passedUserId, passedArgs] = mockLeads.importLeadsFromSearch.mock.calls[0];
+    expect(typeof passedCallLLM).toBe('function');
+    expect(passedUserId).toBe('u1');
+    expect(passedArgs).toMatchObject({
+      listId: 'L1', title: 'CTO', company_size_max: 200, limit: 10, auto_enrich: true,
+    });
+    expect(result).toBe(expected);
+
+    // The bound callLLM must actually be agentModeService.callLLM, not a
+    // stand-in — prove it by calling it and checking the underlying mock saw it.
+    await passedCallLLM('m', [], {} as any);
+    expect(agentModeService.callLLM).toHaveBeenCalledWith('m', [], {});
+  });
+
+  it('caps limit at 500', async () => {
+    mockLeads.importLeadsFromSearch.mockResolvedValue({ success: true });
+
+    await emmaToolRegistry.getTool('import_leads_from_search')!.execute(
+      { list_id: 'L1', title: 'CTO', limit: 10000 },
+      { userId: 'u1' }
+    );
+
+    expect(mockLeads.importLeadsFromSearch.mock.calls[0][2]).toMatchObject({ limit: 500 });
+  });
+
+  it('throws when userId is missing', async () => {
+    await expect(
+      emmaToolRegistry.getTool('import_leads_from_search')!.execute({ list_id: 'L1', title: 'CTO' }, {})
+    ).rejects.toThrow('Authentication required');
+    expect(mockLeads.importLeadsFromSearch).not.toHaveBeenCalled();
   });
 });
