@@ -108,7 +108,7 @@ import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWor
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
 import { resolveOrgProfileField } from './orgProfileResolver';
-import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
+import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish, resolveSlackSendAuthorized } from '../utils/schedulePublishApproval';
 import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization, describePublishAuthorizationWithholdReason, PublishAuthorizationWithholdReason } from '../utils/schedulePublishAuthorization';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
 import { meteringFeature } from './llmUsageAttributionService';
@@ -3254,6 +3254,43 @@ export class AgentModeService {
     }
   }
 
+  /**
+   * ENG-2204: owner opt-OUT for the unattended Slack-send override, resolved
+   * INDEPENDENTLY of publish authorization above rather than riding along on
+   * `publishAuthorizationOverride`/`resolveScheduledPublishAuthorization`. Those exist
+   * to guarantee the prompt and the required-function checker read the identical
+   * publish decision (ENG-827's whole point) — but nothing analogous checks or
+   * enforces slack_send_message authorization elsewhere, so there is no cross-system
+   * disagreement to prevent, and no reason to entangle this with that machinery
+   * (which would mean threading a new field through generateSessionResponse's
+   * positional signature, the worker IPC boundary, and runScheduledChat's separate
+   * `livePublishAuthorization` construction — the exact class of wiring gap this
+   * ticket's review rounds kept finding elsewhere). A second, independent point-read
+   * of the same schedule row (GetItem, not a scan) on the rare sessionType:'scheduled'
+   * turn is a negligible cost next to that risk.
+   *
+   * Same opt-out polarity/fail-closed conventions as requirePublishApproval, purely
+   * for consistency: absent/false = authorized (matches this ticket's fix — no
+   * existing schedule's behavior changes), explicit true = withheld, and anything
+   * this function cannot verify (no session, no parseable schedule, a read error)
+   * withholds rather than authorizes.
+   */
+  private async resolveScheduledSlackSendAuthorized(currentSession: any): Promise<boolean> {
+    if (currentSession?.sessionType !== 'scheduled') return true;
+    const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
+    if (!scheduleId) return false;
+    try {
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      return resolveSlackSendAuthorized(schedule);
+    } catch (error) {
+      console.error(
+        `AgentMode: failed to read schedule ${scheduleId} for session ${currentSession?.sessionId}; withholding the ENG-2204 unattended Slack-send override rather than authorizing it unverified:`,
+        error
+      );
+      return false;
+    }
+  }
+
   /** Cost per video generation in USD. Veo bills per 8s clip, so longer videos cost proportionally more. */
   private estimateVideoGenerationCost(model: string, durationSeconds?: number): number {
     // Per-clip rates sourced from llmPricing (single source of truth).
@@ -3647,11 +3684,16 @@ export class AgentModeService {
       // so undefined must be excluded, not just false — same strict-true discriminator
       // already used at the Meta-write approval-deck gate below.
       if (currentSession?.sessionType === 'scheduled' && isUnattendedRun === true) {
+        // ENG-2204: owner opt-out for the Slack-send override — resolved independently
+        // of publishAuthorization, see resolveScheduledSlackSendAuthorized's own comment
+        // for why this isn't threaded through publishAuthorizationOverride instead.
+        const slackSendAuthorized = await this.resolveScheduledSlackSendAuthorized(currentSession);
         const publishDirective = getUnattendedExecutionDirective(
           'scheduled',
           isAdmin,
           publishAuthorization.authorized ? 'authorized' : 'withheld',
-          publishAuthorization.tools
+          publishAuthorization.tools,
+          slackSendAuthorized
         );
         if (publishDirective) messages.push({ role: 'system', content: publishDirective });
       }

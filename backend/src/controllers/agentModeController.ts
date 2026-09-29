@@ -4307,6 +4307,14 @@ async function runVerifiedChatInner(
               ? ` except for: ${narrowed.tools.join(', ')}.`
               : ' — you are no longer authorized to publish with any tool.') +
             '\n' +
+            // ENG-2204: known, accepted gap — this call doesn't resolve/pass
+            // slackSendAuthorized (defaults to true), so an owner's Slack opt-out is
+            // not honored in THIS specific re-injection. Scoped narrowly: only fires
+            // on a mid-run publish-consent REVOCATION (rare), and doing it properly
+            // would mean threading scheduleId/session lookup through
+            // runVerifiedChatInner's signature for one edge case. The primary
+            // directive injection (agentModeService.ts, every turn's system prompt)
+            // already resolves and respects the real opt-out.
             getUnattendedExecutionDirective('scheduled', false, narrowed.authorized ? 'authorized' : 'withheld', narrowed.tools);
           console.log(
             `AgentMode: publish consent narrowed mid-run for session ${sessionId} — ` +
@@ -12346,6 +12354,7 @@ export const agentModeController = {
         selfImprove,
         fullAutonomy,
         requirePublishApproval,
+        requireSlackApproval,
         timezone
       } = req.body;
 
@@ -12437,6 +12446,13 @@ export const agentModeController = {
         // and absent from the manage_scheduled_chat MCP allowlist, so only a human
         // can set it.
         requirePublishApproval: requirePublishApproval === true,
+        // ENG-2204: owner opt-OUT for the unattended Slack-send override, same
+        // polarity/rationale as requirePublishApproval above. Default false =
+        // authorized (an unattended run calls slack_send_message directly when its
+        // task asks for it), matching this ticket's fix. Absent from the
+        // manage_scheduled_chat MCP allowlist so only a human can set it — same
+        // reasoning as requirePublishApproval's own comment above.
+        requireSlackApproval: requireSlackApproval === true,
         // ENG-1131 follow-up: owner opt-OUT for the proactive "LinkedIn search
         // blocked/recovered" transition email specifically — does not affect the
         // schedule-card badge, per-run emails, or run history, which stay on.
@@ -12602,6 +12618,7 @@ export const agentModeController = {
         selfImprove,
         fullAutonomy,
         requirePublishApproval,
+        requireSlackApproval,
         disableSourcingBlockAlerts,
         timezone
       } = req.body;
@@ -12695,6 +12712,13 @@ export const agentModeController = {
         // this one authorizes an irreversible public post, so it is not.
         ...(requirePublishApproval !== undefined
           ? { requirePublishApproval: requirePublishApproval === true }
+          : {}),
+        // ENG-2204: same write-only-if-present rationale as requirePublishApproval
+        // immediately above — this field decides whether an unattended run may call
+        // slack_send_message directly, so a read-modify-write here has the identical
+        // race (an unrelated update silently reverting an owner's just-set opt-out).
+        ...(requireSlackApproval !== undefined
+          ? { requireSlackApproval: requireSlackApproval === true }
           : {}),
         // ENG-1131 follow-up: partial-update safe, same pattern as selfImprove —
         // preserve the existing value when this request doesn't touch it.

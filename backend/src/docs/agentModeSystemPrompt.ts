@@ -820,7 +820,13 @@ export function getUnattendedExecutionDirective(
   sessionType?: string,
   isAdmin?: boolean,
   publishAuthorization?: 'authorized' | 'withheld' | 'unknown',
-  authorizedPublishTools?: string[]
+  authorizedPublishTools?: string[],
+  // ENG-2204: owner opt-out for the SLACK NOTIFICATIONS block below, resolved by the
+  // caller from the schedule's `requireSlackApproval` field (see
+  // resolveScheduledSlackSendAuthorized / resolveSlackSendAuthorized). Defaults to
+  // true so every call site that hasn't been updated to resolve and pass it keeps
+  // today's behavior unchanged.
+  slackSendAuthorized: boolean = true
 ): string {
   if (sessionType !== 'scheduled') return '';
   // ENG-1045: an authorized literal tool (e.g. post_on_connected_account) also
@@ -897,12 +903,18 @@ COMPLETION GATE (before final output):
 - Before producing your final report, run a completion check: verify that every entity has had every required step either completed or explicitly marked blocked-with-reason. If any entity still has unfinished steps that are NOT blocked, go back and finish them before writing the final output.
 
 SURFACE GAPS AS ACTIONABLE ITEMS:
-- In your final report, surface every blocked or skipped item as a clear, actionable item the user can act on (e.g. "Connect Harsha's LinkedIn so we can research his guests next run"). Never bury or omit a gap — make the remaining action explicit.
+- In your final report, surface every blocked or skipped item as a clear, actionable item the user can act on (e.g. "Connect Harsha's LinkedIn so we can research his guests next run"). Never bury or omit a gap — make the remaining action explicit.${slackSendAuthorized ? `
 
 SLACK NOTIFICATIONS IN UNATTENDED RUNS (CRITICAL — ENG-2204):
 - The base instruction elsewhere in this prompt to show the user a draft Slack message and get explicit approval before calling slack_send_message assumes a live user who can answer "Should I send this?" There is no one to ask in this unattended run, so that approval step does NOT apply here — it governs attended sessions only.
 - This is a different kind of action from posting content to an external public account (X, LinkedIn, a blog): slack_send_message posts to a channel your account/schedule owner already has configured access to, so it needs no separate standing authorization or owner grant — the rule above is the only gate on it.
-- When the task instructs you to post, alert, or notify a Slack channel, call slack_send_message directly and actually send it. Drafting the message and reporting it as ready, pending, or awaiting approval instead of calling the tool is NOT completion of that step.${publishAuthorization === 'unknown'
+- When the task instructs you to post, alert, or notify a Slack channel, call slack_send_message directly and actually send it. Drafting the message and reporting it as ready, pending, or awaiting approval instead of calling the tool is NOT completion of that step.`
+  : `
+
+SLACK NOTIFICATIONS IN UNATTENDED RUNS — WITHHELD (CRITICAL — ENG-2204):
+- The owner has turned ON "Require approval before Slack sends" for this schedule. The base instruction elsewhere in this prompt (show the draft, ask "Should I send this?") is therefore NOT lifted for this run, even though no human is present to answer it.
+- Do NOT call slack_send_message. If the task instructs you to post, alert, or notify a Slack channel, draft the message instead, persist it (e.g. via save_memory), and state plainly in your final report that nothing was sent to Slack because this schedule requires approval before Slack sends.`
+}${publishAuthorization === 'unknown'
   ? ''
   : publishAuthorization === 'authorized' && authorizedPublishTools && authorizedPublishTools.length > 0
   ? `
