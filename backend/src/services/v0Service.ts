@@ -7094,8 +7094,8 @@ export async function updateLandingPagePageSpeedResult(
         },
       })
       .promise();
-  } catch (error: any) {
-    console.warn(`[V0 SERVICE] Could not persist PageSpeed result for page ${id}: ${error?.message}`);
+  } catch (error) {
+    console.warn(`[V0 SERVICE] Could not persist PageSpeed result for page ${id}: ${error instanceof Error ? error.message : error}`);
   }
 }
 

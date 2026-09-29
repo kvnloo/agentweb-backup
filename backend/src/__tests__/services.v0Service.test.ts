@@ -136,7 +136,7 @@ jest.mock("../services/landingPageSmokeTest", () => ({
 // these tests never make a real PageSpeed Insights / Secrets Manager call.
 const mockRunLandingPagePageSpeedCheck = jest.fn().mockResolvedValue({ ok: false, checkedAt: "2026-01-01T00:00:00.000Z", error: "mocked" });
 jest.mock("../services/landingPagePageSpeedCheck", () => ({
-  runLandingPagePageSpeedCheck: (...args: any[]) => mockRunLandingPagePageSpeedCheck(...args),
+  runLandingPagePageSpeedCheck: (url: string | undefined) => mockRunLandingPagePageSpeedCheck(url),
 }));
 
 // Mock fs for filesystem fallback tests
