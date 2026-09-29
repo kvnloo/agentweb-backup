@@ -103,6 +103,22 @@ describe("CreativeCalibration (ENG-2142)", () => {
     expect(screen.queryByText(/Matt said no|passedCount|2026-09-15/)).not.toBeInTheDocument();
   });
 
+  it("shows a landing-page pair as links to the live pages, not as images (ENG-2192)", async () => {
+    mockedAxios.get.mockImplementation(async (url: string) => {
+      if (url.endsWith("/api/admin/eval/golden-cases/status")) return { data: { provisioned: true } };
+      if (url.endsWith("/api/admin/eval/golden-cases?surface=creative")) return { data: { cases: [pairCase(1)] } };
+      const m = /\/api\/human-eval\/candidates\/(.+)$/.exec(url);
+      if (m) return { data: { candidate: { reviewType: "landing_page", artifactUrl: `https://lp.test/${m[1]}`, originalRequest: `page ${m[1]}` } } };
+      throw new Error(`unexpected GET ${url}`);
+    });
+    renderPage();
+
+    const links = await screen.findAllByRole("link", { name: "Open landing page" });
+    expect(links.map((l) => l.getAttribute("href")).sort()).toEqual(["https://lp.test/new-1", "https://lp.test/old-1"]);
+    expect(links.every((l) => l.getAttribute("target") === "_blank" && l.getAttribute("rel") === "noopener noreferrer")).toBe(true);
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
+
   it("saves with one click as A / B through the golden-case label route and auto-advances to the next pair", async () => {
     const cases = [pairCase(0), pairCase(1), pairCase(2)];
     routeGets(cases);

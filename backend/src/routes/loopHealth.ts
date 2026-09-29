@@ -17,9 +17,9 @@ import express, { Request, Response } from 'express';
 import { getLoopHealthReport } from '../loops/health/loopHealthService';
 import { awsDynamoAdapter } from '../loops/adapters/awsAdapters';
 import { readReliabilityTrend } from '../cron/agentReliabilitySnapshotCron';
-import { EVAL_V2_SAMPLER_FLAG, readEvalV2Trend, samplerEnabled } from '../cron/evalV2SamplerCron';
+import { EVAL_V2_SAMPLER_FLAG, readEvalV2SurfaceTrend, readEvalV2Trend, samplerEnabled } from '../cron/evalV2SamplerCron';
 import { AGENT_GRADER_VERSIONS, type AgentGraderId } from '../loops/eval/agentGraders';
-import { getGrader, mayGate } from '../loops/eval/evalRegistry';
+import { EVAL_REGISTRY, getGrader, mayGate } from '../loops/eval/evalRegistry';
 import {
   evaluateBurnIn,
   BURN_IN_AUTHORITATIVE_WINDOW_LABEL,
@@ -79,12 +79,18 @@ router.get('/reliability-trend', async (req: Request, res: Response) => {
  * `graders` carries each grader's registry validation state. Every grader is unvalidated today
  * (mayGate false), so the dashboard labels them so and none may drive an alert or a headline.
  * `samplerEnabled` distinguishes "never sampled" from "sampled, no sessions".
+ * ENG-2196: `creative` and `accountHealth` carry the other two surfaces' snapshots, and `registry`
+ * lists every grader with its version and validation state.
  */
 router.get('/eval-v2-trend', async (req: Request, res: Response) => {
   try {
     const days = Math.max(1, Math.min(365, Number(req.query.days) || 14));
     const windowLabel = req.query.window === '1d' ? '1d' : '7d';
-    const snapshots = await readEvalV2Trend(awsDynamoAdapter(), { limit: days, windowLabel });
+    const dynamo = awsDynamoAdapter();
+    const [snapshots, surfaces] = await Promise.all([
+      readEvalV2Trend(dynamo, { limit: days, windowLabel }),
+      readEvalV2SurfaceTrend(dynamo, { limit: days, windowLabel }),
+    ]);
     const graders = (Object.keys(AGENT_GRADER_VERSIONS) as AgentGraderId[]).map((id) => ({
       id,
       version: AGENT_GRADER_VERSIONS[id],
@@ -98,6 +104,17 @@ router.get('/eval-v2-trend', async (req: Request, res: Response) => {
       hasData: snapshots.length > 0,
       graders,
       snapshots,
+      creative: surfaces.creative,
+      accountHealth: surfaces.accountHealth,
+      registry: EVAL_REGISTRY.map((g) => ({
+        id: g.id,
+        surface: g.surface,
+        graderType: g.graderType,
+        measures: g.measures,
+        version: g.version,
+        modelFamily: g.modelFamily,
+        mayGate: mayGate(g.id),
+      })),
     });
   } catch (err) {
     console.error('[loopHealth] failed to read eval-v2 trend:', err);

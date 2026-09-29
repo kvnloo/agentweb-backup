@@ -1,5 +1,5 @@
 import React from "react";
-import { Box, Chip, Tooltip } from "@mui/material";
+import { Box, Chip, FormControlLabel, Switch, Tooltip } from "@mui/material";
 import { Edit as EditIcon } from "@mui/icons-material";
 
 interface ScoreDimensions {
@@ -26,6 +26,21 @@ export interface JudgeScore {
 export const SATISFACTION_UNVALIDATED_NOTE =
   "LLM-judge satisfaction scores are not validated against human labels (eval registry: mayGate=false) and cover only " +
   "sessions someone opened, so they are a secondary signal. See the Eval v2 tab for sampled, graded results.";
+
+/**
+ * ENG-2196: the Satisfaction column, its lazy auto-scoring and the admin override are off by
+ * default in Chat History. This switch is the explicit disclosure that turns them on.
+ */
+export function LegacySatisfactionToggle({ checked, onChange }: { checked: boolean; onChange: (checked: boolean) => void }) {
+  return (
+    <Tooltip title={SATISFACTION_UNVALIDATED_NOTE}>
+      <FormControlLabel
+        control={<Switch size="small" checked={checked} onChange={(e) => onChange(e.target.checked)} />}
+        label="Show unvalidated legacy score"
+      />
+    </Tooltip>
+  );
+}
 
 /** Column header for the chat-history satisfaction column: labelled unvalidated. */
 export function SatisfactionColumnHeader() {

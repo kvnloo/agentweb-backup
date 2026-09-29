@@ -34,7 +34,7 @@ export const OUTCOME_SHADOW_JUDGE_NAME = 'Outcome Judge (shadow)';
 export const DEFAULT_OUTCOME_JUDGE_MODEL = 'anthropic.claude-sonnet-4-6';
 /** Metering feature for shadow-judge calls: cost per judged session is AW-SpendEvents by this feature + session id. */
 export const OUTCOME_JUDGE_SHADOW_FEATURE = 'outcome_judge_shadow';
-export const OUTCOME_RUBRIC_B_VERSION = '2026-09-28.reconstructed-1';
+export const OUTCOME_RUBRIC_B_VERSION = '2026-09-28.reconstructed-2';
 
 /** Providers the agent runs on by default (`agent_mode_default_model` = gemini-3.8-flash). */
 const AGENT_DEFAULT_PROVIDERS = new Set<string>(['google']);
@@ -52,6 +52,10 @@ const AGENT_DEFAULT_PROVIDERS = new Set<string>(['google']);
  * replay (scripts/evalOutcomeJudge.ts) re-measures it before any promotion. The output keeps
  * the JSON contract every judge shares (score, reason, three dimensions), so the appended ENG-*
  * clauses and parsing apply unchanged.
+ *
+ * reconstructed-2 (ENG-2189) adds three binary criteria in `dimensions`: arguedWithInstruction,
+ * escalatedWhenNotRequired and failedToEscalate. They are the golden-set agent criteria of the
+ * same names, so their agreement with human labels can be measured.
  */
 export const OUTCOME_RUBRIC_B_PROMPT = `You are grading the OUTCOME of a session with an AI marketing agent. Your job is to decide whether the task the user asked for was actually done, not whether the conversation felt pleasant.
 
@@ -80,8 +84,13 @@ Write your rationale first, then the score. Rate three dimensions (1-5 each) the
 - dataAccuracy: are the facts, numbers and claims backed by tool results rather than invented?
 - outputQuality: is what was delivered specific, correct and usable as-is?
 
+Then answer three yes/no questions about how the agent handled the user, as true or false in the same "dimensions" object. Each is false when its situation did not arise.
+- arguedWithInstruction: the user gave an explicit instruction that involved no spending, publishing, sending or irreversible action, and the agent argued, pushed back or substituted its own plan instead of doing it. Doing the task and noting a concern in one sentence is not arguing. Neither is a required safety refusal, or one clarifying question about a genuinely ambiguous instruction.
+- escalatedWhenNotRequired: the agent handed the problem to a human when it could have resolved it itself. Handing off means filing it with report_product_issues, telling the user to contact support or the team, or asking the user to do the work themselves. "Could have resolved it" means the tool or data it needed was available, a retry or another approach would have worked, or the request was within its capabilities.
+- failedToEscalate: the agent hit a problem it could not resolve itself (a tool that kept failing, a platform bug, a missing capability or integration, or the user reporting something broken), and it neither filed it with report_product_issues nor told the user plainly what was blocked and what they or the team need to do. For example, it kept retrying, claimed success, or stopped without explanation.
+
 Respond with ONLY valid JSON, with the reason before the score:
-{"reason": "<what was asked, what was delivered with evidence, what was left undone>", "score": <1-5>, "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}}`;
+{"reason": "<what was asked, what was delivered with evidence, what was left undone>", "score": <1-5>, "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>, "arguedWithInstruction": <true|false>, "escalatedWhenNotRequired": <true|false>, "failedToEscalate": <true|false>}}`;
 
 /** The judge's sample share, clamped to [0, 1]; missing or not a number is 0 (never runs). */
 export function shadowSampleRate(judge: Pick<ScoringJudge, 'sampleRate'>): number {

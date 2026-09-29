@@ -128,6 +128,7 @@ import {
   setSmokeTestPollConfig,
   setSmokeTestConcurrency,
   syntheticValueFor,
+  utmPropagationVerdict,
 } from "../services/landingPageSmokeTest";
 
 const BASE_PAGE = {
@@ -183,8 +184,10 @@ describe("runGenerationSmokeTest", () => {
     expect(mockLaunch).toHaveBeenCalledWith(
       expect.objectContaining({ executablePath: "/usr/bin/google-chrome" })
     );
+    // ENG-2193: navigates with synthetic UTM params appended (see the "UTM propagation"
+    // describe block below for the dedicated coverage) — still the same page, same options.
     expect(mockPage.goto).toHaveBeenCalledWith(
-      "https://test-page.vercel.app",
+      expect.stringMatching(/^https:\/\/test-page\.vercel\.app\/\?utm_source=/),
       expect.objectContaining({ waitUntil: "networkidle" })
     );
     expect(mockPage.fill).toHaveBeenCalledWith(
@@ -204,6 +207,93 @@ describe("runGenerationSmokeTest", () => {
     expect(result.ok).toBe(true);
     expect(result.leadCaptured).toBe(true);
     expect(result.pixelFired).toBeUndefined();
+  });
+
+  describe("UTM propagation (ENG-2193)", () => {
+    /** Reads the utm_* params the run actually navigated with, off the captured goto() URL. */
+    function navigatedUtm(): { source: string | null; medium: string | null; campaign: string | null } {
+      const navigatedUrl = new URL((mockPage.goto as jest.Mock).mock.calls[0][0]);
+      return {
+        source: navigatedUrl.searchParams.get("utm_source"),
+        medium: navigatedUrl.searchParams.get("utm_medium"),
+        campaign: navigatedUrl.searchParams.get("utm_campaign"),
+      };
+    }
+
+    it("navigates with synthetic utm_source/utm_medium/utm_campaign appended to the deployed URL", async () => {
+      mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+
+      await runGenerationSmokeTest({ ...BASE_PAGE });
+
+      const utm = navigatedUtm();
+      expect(utm.source).toBe("agentweb-smoketest");
+      expect(utm.medium).toBe("paid"); // ENG-239's UTM contract requires utm_medium=paid
+      expect(utm.campaign).toMatch(/^smoketest-\d+$/);
+    });
+
+    it("reports utmPropagated:true when the resulting lead carries the injected UTM params", async () => {
+      // Reads the campaign the run actually generated off the goto() call, rather than
+      // asserting against a fixed value — buildSmokeTestUtm() embeds Date.now().
+      mockGetLeadByEmail.mockImplementationOnce(async () => {
+        const utm = navigatedUtm();
+        return {
+          leadId: "lead-abc",
+          utmSource: utm.source,
+          utmMedium: utm.medium,
+          firstTouch: { utm: { campaign: utm.campaign } },
+        };
+      });
+
+      await runGenerationSmokeTest({ ...BASE_PAGE });
+
+      const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+      expect(result.utmPropagated).toBe(true);
+      expect(result.utmPropagationDetail).toContain("carries the injected UTM params");
+      // Advisory only — never affects the overall verdict.
+      expect(result.ok).toBe(true);
+    });
+
+    it("reports utmPropagated:false when the resulting lead has no matching attribution (ENG-239: capture not wired up)", async () => {
+      // The realistic "capture never ran" case: a lead lands, but with no utm fields at all.
+      mockGetLeadByEmail.mockResolvedValueOnce({ leadId: "lead-abc" });
+
+      await runGenerationSmokeTest({ ...BASE_PAGE });
+
+      const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+      expect(result.utmPropagated).toBe(false);
+      expect(result.utmPropagationDetail).toContain("does not match the injected UTM params");
+      // Still advisory only — a real capture gap must not turn a healthy smoke test red.
+      expect(result.ok).toBe(true);
+    });
+
+    it("leaves utmPropagated unset when there is no email-keyed lead to check (phone/handoff path)", async () => {
+      (mockPage.evaluate as jest.Mock).mockResolvedValueOnce({
+        scope: "",
+        fields: [{ selector: "#phone", hint: "phone", kind: "tel" }],
+        selects: [],
+        checkables: [],
+        submitSelector: null,
+        disclosureTriggers: [],
+        skippedRequired: 0,
+        noFormOnPage: false,
+        authFormOnly: false,
+        iframeCount: 0,
+      });
+      mockPage.click.mockImplementationOnce(async () => {
+        emitResponse({ url: "https://campaign.waterheater.app/api/hero-estimate", status: 200 });
+      });
+      (mockPage.waitForURL as jest.Mock).mockResolvedValueOnce(undefined);
+      (mockPage.url as jest.Mock)
+        .mockReturnValueOnce("https://campaign.waterheater.app/")
+        .mockReturnValueOnce("https://chat.waterheater.app/text?handoff_id=abc123");
+
+      await runGenerationSmokeTest({ ...BASE_PAGE });
+
+      const result = mockUpdateLandingPageSmokeTestResult.mock.calls[0][1];
+      expect(result.leadCaptured).toBe(true); // the handoff path itself still works
+      expect(result.utmPropagated).toBeUndefined();
+      expect(result.utmPropagationDetail).toBeUndefined();
+    });
   });
 
   it("SUCCESS: lead lands + pixel fires (fbq('track','Lead',...) call observed) → ok:true", async () => {
@@ -1345,5 +1435,43 @@ describe("runGenerationSmokeTest", () => {
     await Promise.all([p1, p2]);
 
     expect(events).toEqual(["launch-1", "close-1", "launch-2"]);
+  });
+});
+
+describe("utmPropagationVerdict (pure, ENG-2193)", () => {
+  const expected = { source: "agentweb-smoketest", medium: "paid", campaign: "smoketest-123" };
+
+  it("propagated: matches via the denormalized utmSource/utmMedium fields + firstTouch.utm.campaign", () => {
+    const verdict = utmPropagationVerdict(expected, {
+      utmSource: "agentweb-smoketest",
+      utmMedium: "paid",
+      firstTouchUtmCampaign: "smoketest-123",
+    });
+    expect(verdict).toEqual({ propagated: true, detail: expect.stringContaining("carries the injected UTM params") });
+  });
+
+  it("propagated: also matches via firstTouch.utm.source/medium alone (no denormalized fields)", () => {
+    const verdict = utmPropagationVerdict(expected, {
+      firstTouchUtmSource: "agentweb-smoketest",
+      firstTouchUtmMedium: "paid",
+      firstTouchUtmCampaign: "smoketest-123",
+    });
+    expect(verdict.propagated).toBe(true);
+  });
+
+  it("not propagated: no attribution fields at all", () => {
+    const verdict = utmPropagationVerdict(expected, {});
+    expect(verdict.propagated).toBe(false);
+    expect(verdict.detail).toContain("does not match the injected UTM params");
+    expect(verdict.detail).toContain("unset");
+  });
+
+  it("not propagated: campaign mismatch even when source/medium match", () => {
+    const verdict = utmPropagationVerdict(expected, {
+      utmSource: "agentweb-smoketest",
+      utmMedium: "paid",
+      firstTouchUtmCampaign: "some-other-campaign",
+    });
+    expect(verdict.propagated).toBe(false);
   });
 });

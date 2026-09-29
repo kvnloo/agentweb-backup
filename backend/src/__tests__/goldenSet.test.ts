@@ -24,7 +24,15 @@ describe('golden case schema (ENG-2135)', () => {
   it('builds a new case with the surface criteria, no labels and a deterministic split', () => {
     const c = agentCase();
     expect(c.caseId).toBe('agent#sessionId#session-1');
-    expect(c.criteria).toEqual(['task_success', 'tool_correctness', 'groundedness', 'instruction_compliance']);
+    expect(c.criteria).toEqual([
+      'task_success',
+      'tool_correctness',
+      'groundedness',
+      'instruction_compliance',
+      'argued_with_instruction',
+      'escalated_when_not_required',
+      'failed_to_escalate',
+    ]);
     expect(c.labels).toEqual({});
     expect(c.version).toBe(0);
     expect(c.split).toBe(splitForCaseId(c.caseId));
@@ -55,7 +63,10 @@ describe('golden case schema (ENG-2135)', () => {
   it('reports fully labelled only when every criterion has a label (na counts)', () => {
     const c = agentCase();
     expect(isFullyLabelled(c)).toBe(false);
-    expect(isFullyLabelled({ ...c, labels: { task_success: 'pass', tool_correctness: 'na', groundedness: 'fail', instruction_compliance: 'pass' } })).toBe(true);
+    const core = { task_success: 'pass', tool_correctness: 'na', groundedness: 'fail', instruction_compliance: 'pass' } as const;
+    expect(isFullyLabelled({ ...c, labels: core })).toBe(false);
+    const behaviours = { argued_with_instruction: 'fail', escalated_when_not_required: 'na', failed_to_escalate: 'pass' } as const;
+    expect(isFullyLabelled({ ...c, labels: { ...core, ...behaviours } })).toBe(true);
   });
 
   it('validates a label update against the case surface', () => {

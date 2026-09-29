@@ -17,6 +17,9 @@
  * ENG-1541, the TFAConnect false positive: her onboarding-time "paid ads"
  * intent was stale relative to a plan that doesn't allow it), so neither
  * condition alone may create a renewal-risk alert.
+ * ENG-2188: an account that never connected any ad platform is activation, not
+ * renewal risk — it is never `would_flag`ged (the ENG-2143 classifier cron routes it to a
+ * CS nudge). Only a connection that existed and has expired on every platform can flag.
  * Detection is intentionally cheap and synchronous (timestamp-only expiry
  * checks) — no live third-party API calls — so it can run frequently without
  * external dependency risk. The one async step is the entitlement lookup
@@ -29,7 +32,7 @@
 import { userDb } from '../services/db';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { PlatformType } from '../services/connectedAccountsDb';
-import { isTokenNotExpired } from '../services/connectedAccountsDb';
+import { classifyAdConnections, type AdConnectionSummary } from '../services/clientHealthService';
 import { getAllowedConnectedAccounts } from '../services/subscriptionService';
 import { isEvaluationUser } from '../services/evaluationPolicy';
 import {
@@ -78,6 +81,7 @@ export interface RenewalIntegrationHealthSummary {
 export type RenewalIntegrationHealthDecision =
   | 'skipped_no_paid_ads_intent'
   | 'skipped_healthy_integration'
+  | 'skipped_activation_incomplete'
   | 'skipped_no_ad_entitlement'
   | 'would_flag';
 
@@ -85,6 +89,8 @@ export interface RenewalIntegrationHealthEvaluation {
   decision: RenewalIntegrationHealthDecision;
   hasPaidAdsIntent: boolean;
   hasHealthyAdIntegration: boolean;
+  /** Ad connection across Meta, Google Ads and LinkedIn Ads (ENG-2188). */
+  adConnection: AdConnectionSummary['state'];
   /** null when the entitlement check was short-circuited by an earlier skip. */
   hasAdIntegrationEntitlement: boolean | null;
 }
@@ -94,14 +100,14 @@ function isAdAccount(account: any): boolean {
 }
 
 /**
- * True when the user has at least one connected ad-platform account with a
- * non-expired token. Uses `isTokenNotExpired` (timestamp-only) rather than
- * `isTokenValid` so this check never makes a live third-party API call.
+ * The user's ad connection across every ad platform, by the same timestamp-only rule the Client
+ * Health page and the ENG-2143 classifier use (an expired token that can refresh still counts as
+ * connected), so this check never makes a live third-party API call. ENG-2188: `never_connected`
+ * is activation and must never reach the alert.
  */
-function hasHealthyAdIntegration(user: any): boolean {
+function adConnectionState(user: any): AdConnectionSummary['state'] {
   const raw = user?.connected_accounts;
-  const accounts: any[] = Array.isArray(raw) ? raw : [];
-  return accounts.some((acc) => isAdAccount(acc) && acc.config && isTokenNotExpired(acc));
+  return classifyAdConnections(Array.isArray(raw) ? raw : [], user?.adAccount, Date.now()).state;
 }
 
 /** Which of the three independent paid-ads-intent signals actually matched, if any. */
@@ -203,30 +209,26 @@ function describeLastAdAccountSignal(user: any): string {
  */
 export async function evaluateRenewalIntegrationHealth(user: any): Promise<RenewalIntegrationHealthEvaluation> {
   const paidAdsIntent = hasPaidAdsIntent(user);
-  const healthyIntegration = hasHealthyAdIntegration(user);
+  const adConnection = adConnectionState(user);
+  const healthyIntegration = adConnection === 'connected';
+  const base = { hasPaidAdsIntent: paidAdsIntent, hasHealthyAdIntegration: healthyIntegration, adConnection };
 
   if (!paidAdsIntent) {
-    return {
-      decision: 'skipped_no_paid_ads_intent',
-      hasPaidAdsIntent: paidAdsIntent,
-      hasHealthyAdIntegration: healthyIntegration,
-      hasAdIntegrationEntitlement: null,
-    };
+    return { decision: 'skipped_no_paid_ads_intent', ...base, hasAdIntegrationEntitlement: null };
   }
   if (healthyIntegration) {
-    return {
-      decision: 'skipped_healthy_integration',
-      hasPaidAdsIntent: paidAdsIntent,
-      hasHealthyAdIntegration: healthyIntegration,
-      hasAdIntegrationEntitlement: null,
-    };
+    return { decision: 'skipped_healthy_integration', ...base, hasAdIntegrationEntitlement: null };
+  }
+  // Stale onboarding intent plus an account that never connected is activation, not a broken
+  // integration (ENG-2188, decision D6): the classifier cron nudges CS about it instead.
+  if (adConnection === 'never_connected') {
+    return { decision: 'skipped_activation_incomplete', ...base, hasAdIntegrationEntitlement: null };
   }
 
   const entitled = await hasAdIntegrationEntitlement(user.userId);
   return {
     decision: entitled ? 'would_flag' : 'skipped_no_ad_entitlement',
-    hasPaidAdsIntent: paidAdsIntent,
-    hasHealthyAdIntegration: healthyIntegration,
+    ...base,
     hasAdIntegrationEntitlement: entitled,
   };
 }
@@ -234,8 +236,9 @@ export async function evaluateRenewalIntegrationHealth(user: any): Promise<Renew
 /**
  * Scan users with an active subscription renewing within `RENEWAL_LOOKAHEAD_DAYS`
  * and flag paid-ads customers, whose plan actually permits ad integration,
- * whose ad integration is missing or expired. Resilient: a failure evaluating
- * or alerting for one user is logged and never aborts the rest of the run.
+ * whose every ad integration has expired (never connecting is activation, not
+ * flagged). Resilient: a failure evaluating or alerting for one user is logged
+ * and never aborts the rest of the run.
  */
 export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegrationHealthSummary> {
   const summary: RenewalIntegrationHealthSummary = {
@@ -293,6 +296,8 @@ export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegra
       const capabilityRow = await getAccountCapabilityRequirement(user.userId, 'ad_platform_integration');
       const statusForDecision: Record<RenewalIntegrationHealthDecision, AccountCapabilityStatus> = {
         would_flag: 'unhealthy',
+        // The capability is still not working; only the alert is withheld (activation, not risk).
+        skipped_activation_incomplete: 'unhealthy',
         skipped_healthy_integration: 'healthy',
         skipped_no_ad_entitlement: 'not_entitled',
         skipped_no_paid_ads_intent: 'not_required',
@@ -358,10 +363,11 @@ export async function runRenewalIntegrationHealthCheck(): Promise<RenewalIntegra
         'plan entitlement and current connection state independently verified this run; ' +
         'paid-ads intent is user-declared and not independently re-confirmed';
       await sendAgentModeOncallAlert({
-        subject: `Renewal at risk: ${user.email || user.userId} has no healthy ad integration`,
+        // ENG-2188: an expired connection is reconnect work, not churn evidence — no "at risk" label.
+        subject: `Renewal reconnect needed: ${user.email || user.userId} has no healthy ad integration`,
         message:
-          `${user.email || user.userId} selected paid ads and renews on ${user.current_period_end}, but has no ` +
-          `connected, non-expired ad platform account (Meta/Google Ads/LinkedIn Ads). Check the account ` +
+          `${user.email || user.userId} selected paid ads and renews on ${user.current_period_end}, but every ` +
+          `ad platform account on record (Meta/Google Ads/LinkedIn Ads) has expired. Check the account ` +
           `before the charge fires.\n\n` +
           `Customer outcome: ${customerOutcome}\n` +
           `Capability affected: ad platform integration (Meta / Google Ads / LinkedIn Ads)\n` +

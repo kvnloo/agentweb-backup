@@ -4,7 +4,7 @@
  * For every generated creative that lineage linked to at least one Meta ad, reads its rubric-judge
  * score (AW-HumanEvalQueue.creativeRubric, ENG-2140) and its ads' daily rows (AW-AdsMetricsSnapshots
  * rowType=ad), keeps settled rows only, and prints Spearman's ρ with n and a 95% bootstrap CI for
- * score vs CTR and score vs CPA (per currency).
+ * score vs CTR, CVR and hook rate, and score vs CPA and CRM CPL (per currency).
  *
  * Read-only: it scans the lineage table and reads the other two by key, and writes nothing,
  * anywhere. Output carries ids and numbers only, never prompts, images or customer names.
@@ -12,7 +12,7 @@
  * Usage (default AWS profile; NODE_ENV=development reads the Dev- tables):
  *   CREATIVE_LINEAGE_TABLE=AW-Creatives npx ts-node --transpile-only \
  *     src/scripts/creativePerformanceCorrelation.ts [--table AW-Creatives] \
- *     [--min-impressions 1000] [--min-conversions 1] [--per-creative] [--json]
+ *     [--min-impressions 1000] [--min-conversions 1] [--min-clicks 100] [--per-creative] [--json]
  */
 
 import AWS from 'aws-sdk';
@@ -21,6 +21,7 @@ import { CREATIVE_LINEAGE_TABLE_ENV, type MetaAdLink, type MetaAdLinkEnd } from 
 import {
   creativePerformanceReport,
   readRubricScore,
+  type CreativeAggregate,
   type CreativeObservation,
   type CreativePerformanceReport,
   type MetricCorrelation,
@@ -170,6 +171,7 @@ interface CliOptions {
   table?: string;
   minImpressions: number;
   minConversions: number;
+  minClicks: number;
   perCreative: boolean;
   json: boolean;
 }
@@ -193,6 +195,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     table: value('--table'),
     minImpressions: count('--min-impressions', 1000),
     minConversions: count('--min-conversions', 1),
+    minClicks: count('--min-clicks', 100),
     perCreative: argv.includes('--per-creative'),
     json: argv.includes('--json'),
   };
@@ -212,15 +215,63 @@ export function formatReport(report: CreativePerformanceReport, truncatedAds: nu
       (truncatedAds ? ` (${truncatedAds} left out: an ad series hit the read cap)` : ''),
     `Excluded: no rubric score ${report.excluded.noRubricScore}, no settled rows ${report.excluded.noSettledRows}, ` +
       `< ${opts.minImpressions} impressions (CTR) ${report.excluded.belowMinImpressions}, ` +
-      `< ${opts.minConversions} leads (CPA) ${report.excluded.noConversions}, mixed currency (CPA) ${report.excluded.mixedCurrency}`,
+      `< ${opts.minConversions} leads (CPA) ${report.excluded.noConversions}, mixed currency (CPA) ${report.excluded.mixedCurrency}, ` +
+      `< ${opts.minClicks} clicks (CVR) ${report.excluded.belowMinClicks}, no 3-second plays (hook rate) ${report.excluded.noVideoPlays}, ` +
+      `< ${opts.minConversions} CRM leads (CPL) ${report.excluded.noCrmLeads}, mixed currency (CPL) ${report.excluded.crmMixedCurrency}`,
     `Unsettled ad-day rows excluded (inside Meta's 28-day revision window): ${report.unsettledRowsExcluded}`,
     formatCorrelation('Rubric score vs CTR', report.ctr),
+    formatCorrelation('Rubric score vs CVR', report.cvr),
+    formatCorrelation('Rubric score vs hook rate', report.hookRate),
   ];
-  const currencies = Object.keys(report.cpaByCurrency);
-  if (currencies.length === 0) lines.push('Rubric score vs CPA: no creative with settled conversions');
-  for (const currency of currencies) lines.push(formatCorrelation(`Rubric score vs CPA (${currency})`, report.cpaByCurrency[currency]));
-  lines.push('A useful judge correlates positively with CTR and negatively with CPA. The judge is unvalidated (evalRegistry mayGate=false).');
+  const perCurrency = (label: string, byCurrency: Record<string, MetricCorrelation>, none: string) => {
+    const currencies = Object.keys(byCurrency);
+    if (currencies.length === 0) lines.push(`Rubric score vs ${label}: ${none}`);
+    for (const currency of currencies) lines.push(formatCorrelation(`Rubric score vs ${label} (${currency})`, byCurrency[currency]));
+  };
+  perCurrency('CPA', report.cpaByCurrency, 'no creative with settled conversions');
+  perCurrency('CRM CPL', report.cplByCurrency, 'no creative with settled CRM leads');
+  lines.push(
+    'A useful judge correlates positively with CTR, CVR and hook rate, and negatively with CPA and CPL. ' +
+      'The judge is unvalidated (evalRegistry mayGate=false).'
+  );
   return lines;
+}
+
+/**
+ * The `--per-creative` JSON row for one creative. Pulled out of `main()` so it's testable directly:
+ * CPA is comparable across every settled row so it uses `a.currency`, but CRM CPL is only comparable
+ * across the CRM-joined rows it's actually built from, so it must use `a.crmCurrency` (CodeRabbit,
+ * same root cause as the eligibility/bucketing fix in creativePerformanceReport).
+ */
+export function summarizeCreativeAggregate(a: CreativeAggregate): Record<string, unknown> {
+  return {
+    creativeId: a.creativeId,
+    rubricScore: a.rubricScore,
+    impressions: a.impressions,
+    ctr: a.impressions > 0 ? a.clicks / a.impressions : null,
+    cvr: a.clicks > 0 ? a.leads / a.clicks : null,
+    hookRate: a.videoImpressions > 0 ? a.videoPlays3s / a.videoImpressions : null,
+    cpa: a.leads > 0 && a.currency ? { value: a.spend / a.leads, currency: a.currency } : null,
+    crmCpl: a.crmLeads > 0 && a.crmCurrency ? { value: a.crmJoinedSpend / a.crmLeads, currency: a.crmCurrency } : null,
+    settledRows: a.settledRows,
+    unsettledRows: a.unsettledRows,
+  };
+}
+
+/**
+ * The `--json` output shape, with `--per-creative` rows summarized through
+ * summarizeCreativeAggregate the same way the plain-text path already is
+ * (CodeRabbit on #3122: the JSON path was emitting raw aggregates without
+ * cvr/hookRate/crmCpl).
+ */
+export function buildJsonReport(
+  report: CreativePerformanceReport,
+  truncatedAds: number,
+  opts: Pick<CliOptions, 'perCreative'>,
+): Record<string, unknown> {
+  const { aggregates, ...summary } = report;
+  const perCreative = opts.perCreative ? { aggregates: aggregates.map(summarizeCreativeAggregate) } : {};
+  return { ...summary, truncatedAds, ...perCreative };
 }
 
 function documentReader(): ReadOnlyReader {
@@ -242,26 +293,19 @@ async function main(): Promise<void> {
     humanEval: HUMAN_EVAL_QUEUE_TABLE,
     adsMetrics: ADS_METRICS_TABLE,
   });
-  const report = creativePerformanceReport(observations, { minImpressions: opts.minImpressions, minConversions: opts.minConversions });
+  const report = creativePerformanceReport(observations, {
+    minImpressions: opts.minImpressions,
+    minConversions: opts.minConversions,
+    minClicks: opts.minClicks,
+  });
 
   if (opts.json) {
-    const { aggregates, ...summary } = report;
-    console.log(JSON.stringify({ ...summary, truncatedAds, ...(opts.perCreative ? { aggregates } : {}) }, null, 2));
+    console.log(JSON.stringify(buildJsonReport(report, truncatedAds, opts), null, 2));
     return;
   }
   for (const line of formatReport(report, truncatedAds, opts)) console.log(line);
   if (opts.perCreative) {
-    for (const a of report.aggregates) {
-      console.log(JSON.stringify({
-        creativeId: a.creativeId,
-        rubricScore: a.rubricScore,
-        impressions: a.impressions,
-        ctr: a.impressions > 0 ? a.clicks / a.impressions : null,
-        cpa: a.leads > 0 && a.currency ? { value: a.spend / a.leads, currency: a.currency } : null,
-        settledRows: a.settledRows,
-        unsettledRows: a.unsettledRows,
-      }));
-    }
+    for (const a of report.aggregates) console.log(JSON.stringify(summarizeCreativeAggregate(a)));
   }
 }
 
