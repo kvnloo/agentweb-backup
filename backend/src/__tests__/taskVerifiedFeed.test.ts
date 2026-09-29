@@ -7,6 +7,7 @@
  */
 import {
   TASK_VERIFIED_GRADER_ID,
+  TASK_VERIFIED_RATE_TOLERANCE,
   taskVerifiedQuality,
   taskVerifiedQualityLookup,
 } from '../loops/eval/taskVerifiedFeed';
@@ -42,6 +43,11 @@ function scoresFor(model: string, n: number, passes: number): EvalV2Score[] {
     out.push(score(model, i < passes ? 'success' : 'failure', taskType));
   }
   return out;
+}
+
+/** n sessions for `model` in ONE named task type, `passes` of them successes — for fixtures that need precise control over which (surface, task type) cell a model has data in. */
+function cellScores(model: string, taskType: string, n: number, passes: number): EvalV2Score[] {
+  return Array.from({ length: n }, (_, i) => score(model, i < passes ? 'success' : 'failure', taskType));
 }
 
 function snapshotFor(scores: EvalV2Score[], gate: (id: string) => boolean = () => true) {
@@ -96,6 +102,42 @@ describe('taskVerifiedQuality: wiring once a grader qualifies (injected gate, fi
     // interleaves task types, so this just asserts a realistic split still clears the bar.
     const snapshot = snapshotFor([...scoresFor(FROM, 60, 54), ...scoresFor(TO, 60, 54)]);
     expect(taskVerifiedQuality(FROM, TO, snapshot, { gate })?.status).toBe('task_verified');
+  });
+
+  /**
+   * CodeRabbit on #3142: pooling each model's rate independently across every cell it happens to
+   * have data for is a Simpson's-paradox trap. Here `toModel` is clearly WORSE than `fromModel`
+   * on the one task type they actually share ('ads', 50% vs 90%), but also has a large volume of
+   * ONLY its own data on a second, easy task type ('landing_page', 100%) that `fromModel` never
+   * ran at all. Pooling independently drags toModel's overall rate up near fromModel's, which the
+   * pre-fix code would have read as "not meaningfully worse" and wrongly called task_verified.
+   * Restricting the comparison to the shared cell only must reject this pair.
+   */
+  it("rejects a candidate that is worse on every shared cell, even when an unshared easy cell would make its pooled rate look comparable (Simpson's paradox)", () => {
+    const sharedAds = [...cellScores(FROM, 'ads', 40, 36), ...cellScores(TO, 'ads', 40, 20)]; // fromModel 90%, toModel 50% — the ONLY cell fromModel has data in.
+    const unsharedLandingPage = cellScores(TO, 'landing_page', 200, 200); // toModel only, 100% — fromModel never sampled this cell at all.
+    const snapshot = snapshotFor([...sharedAds, ...unsharedLandingPage]);
+
+    // Control, asserted against the exact pre-fix arithmetic (pooling each side
+    // independently across every cell it has data for) — this documents that the bug
+    // was real even once the fix removes the function that had it: fromModel's pooled
+    // rate is 36/40; toModel's pooled rate, dragged up by the unshared 100% cell, is
+    // (20+200)/(40+200) — NOT meaningfully below fromModel's, so the pre-fix
+    // `combinedRate`-based check would not have rejected this pair.
+    const pooledFromRate = 36 / 40;
+    const pooledToRate = (20 + 200) / (40 + 200);
+    expect(pooledToRate).toBeGreaterThanOrEqual(pooledFromRate - TASK_VERIFIED_RATE_TOLERANCE);
+
+    // The fix: compared only over the shared 'ads' cell, toModel is 50% vs fromModel's
+    // 90% — meaningfully worse — so this must NOT be task_verified.
+    expect(taskVerifiedQuality(FROM, TO, snapshot, { gate })).toBeUndefined();
+  });
+
+  it('is not comparable (undefined) when the two models share no sampled cell at all, however much data each has on its own', () => {
+    const fromOnly = cellScores(FROM, 'ads', 40, 40); // fromModel: 100% on ads, its only cell.
+    const toOnly = cellScores(TO, 'outreach', 40, 40); // toModel: 100% on outreach, its only cell — no overlap with fromModel.
+    const snapshot = snapshotFor([...fromOnly, ...toOnly]);
+    expect(taskVerifiedQuality(FROM, TO, snapshot, { gate })).toBeUndefined();
   });
 });
 
