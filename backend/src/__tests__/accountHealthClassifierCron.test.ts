@@ -7,7 +7,9 @@
 
 jest.mock('../services/db', () => ({ userDb: { scanWithFilter: jest.fn() } }));
 jest.mock('../services/paymentHistoryDb', () => ({ paymentHistoryDb: { getByUserId: jest.fn() } }));
-jest.mock('../services/adsMetricsDb', () => ({ adsMetricsDb: { getAccountDaySnapshots: jest.fn() } }));
+jest.mock('../services/adsMetricsDb', () => ({
+  adsMetricsDb: { getAccountDaySnapshots: jest.fn(), getSnapshotsByUserDateRange: jest.fn() },
+}));
 jest.mock('../utils/agentModeAlerts', () => ({ sendAgentModeOncallAlert: jest.fn() }));
 jest.mock('../services/emailService', () => ({
   emailService: { sendEmail: jest.fn(), escapeHtml: (value: string) => value },
@@ -21,6 +23,8 @@ jest.mock('../services/accountCapabilityRequirementsDb', () => ({
 }));
 jest.mock('../loops/eval/evalRegistry', () => ({ mayGate: jest.fn() }));
 jest.mock('../utils/instanceState', () => ({ isCronEnabled: jest.fn() }));
+jest.mock('../services/chatbotService', () => ({ chatbotDb: { getRecentSessionFeedback: jest.fn() } }));
+jest.mock('../services/metaTrackingMonitor', () => ({ monitorUserTracking: jest.fn() }));
 
 import { userDb } from '../services/db';
 import { paymentHistoryDb, type PaymentHistoryRecord } from '../services/paymentHistoryDb';
@@ -36,10 +40,18 @@ import {
   type AccountCapabilityRequirement,
   type AccountHealthSignalState,
 } from '../services/accountCapabilityRequirementsDb';
-import { decideAccountHealthSignal, runAccountHealthClassifier, type AccountHealthUser } from '../cron/accountHealthClassifierCron';
+import {
+  decideAccountHealthSignal,
+  gatherAccountHealthSignals,
+  runAccountHealthClassifier,
+  type AccountHealthUser,
+} from '../cron/accountHealthClassifierCron';
 import { classifyAccountHealth, type AccountHealthSignals } from '../services/accountHealthClassifier';
 import { mayGate } from '../loops/eval/evalRegistry';
 import { isCronEnabled } from '../utils/instanceState';
+import { chatbotDb } from '../services/chatbotService';
+import { monitorUserTracking, type MonitorSummary } from '../services/metaTrackingMonitor';
+import type { AdsMetricsSnapshotRow } from '../services/adsMetricsDb';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const NOW = Date.parse('2026-09-25T12:00:00.000Z');
@@ -161,6 +173,19 @@ describe('decideAccountHealthSignal', () => {
   });
 });
 
+function monitorSummary(overrides: Partial<MonitorSummary>): MonitorSummary {
+  return {
+    accountsChecked: 0, blackouts: 0, tokenErrors: 0, fetchErrors: 0, unclassifiable: 0, idle: 0, healthy: 0,
+    unrecognizedActionTypes: [], excludedObjectives: [], unknownObjectives: [], optimisationAlerts: 0,
+    optimisationDormant: 0, optimisationUnconfirmed: 0, optimisationStaleDelivery: 0, optimisationUnconfirmable: 0,
+    landingPageAlerts: 0, landingPageUnverifiable: 0, landingPageOk: 0, landingPageDeferred: 0,
+    landingPageUnconfirmed: 0, landingPageFindings: [], destinationAlerts: 0, destinationUnverifiable: 0,
+    destinationOk: 0, destinationUnconfirmed: 0, duplicateAccountsSkipped: 0, eventMixRegressions: 0,
+    eventMixWatched: 0, eventMixStale: 0,
+    ...overrides,
+  };
+}
+
 describe('runAccountHealthClassifier', () => {
   const store = new Map<string, AccountHealthSignalState>();
   const users: AccountHealthUser[] = [];
@@ -201,6 +226,9 @@ describe('runAccountHealthClassifier', () => {
     jest.mocked(emailService.sendEmail).mockResolvedValue('sent');
     jest.mocked(mayGate).mockReturnValue(true);
     jest.mocked(isCronEnabled).mockReturnValue(true);
+    jest.mocked(adsMetricsDb.getSnapshotsByUserDateRange).mockResolvedValue({ rows: [], truncated: false });
+    jest.mocked(chatbotDb.getRecentSessionFeedback).mockResolvedValue([]);
+    jest.mocked(monitorUserTracking).mockResolvedValue(monitorSummary({ accountsChecked: 1 }));
   });
 
   afterAll(() => {
@@ -345,5 +373,58 @@ describe('runAccountHealthClassifier', () => {
     expect(summary.scanned).toBe(1);
     expect(summary.byState.insufficient_evidence).toBe(1);
     expect(sendAgentModeOncallAlert).not.toHaveBeenCalled();
+  });
+});
+
+describe('gatherAccountHealthSignals: behavioural inputs (ENG-2143 audit)', () => {
+  const campaignRow = (date: string, spend: number) => ({ date, spend, rowType: 'campaign' }) as unknown as AdsMetricsSnapshotRow;
+  const accountDayRow = (date: string) => ({ date, spend: 0, totalLeadCount: 0, rowType: 'account_day' }) as unknown as AdsMetricsSnapshotRow;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    jest.mocked(getAccountCapabilityRequirement).mockResolvedValue(null);
+    jest.mocked(paymentHistoryDb.getByUserId).mockResolvedValue([]);
+    jest.mocked(chatbotDb.getRecentSessionFeedback).mockResolvedValue([]);
+    jest.mocked(monitorUserTracking).mockResolvedValue(monitorSummary({ accountsChecked: 1 }));
+  });
+
+  // Account-day rows always store spend 0 (metaMetricsSnapshotCron), so reading spend from them
+  // made "ad spend in the last 30 days" permanently zero.
+  it('reads recent ad spend from campaign rows, so real spend makes the ads requirement current', async () => {
+    jest.mocked(adsMetricsDb.getAccountDaySnapshots).mockResolvedValue({ rows: [accountDayRow('2026-09-20')], truncated: false });
+    jest.mocked(adsMetricsDb.getSnapshotsByUserDateRange).mockResolvedValue({ rows: [campaignRow('2026-09-20', 120)], truncated: false });
+    const { signals } = await gatherAccountHealthSignals({ userId: 'u1', connected_accounts: [expiredMeta] }, NOW);
+    expect(signals.recentAdSpend).toBe(120);
+    expect(signals.adDays).toEqual([{ date: '2026-09-20', spend: 120, leads: 0 }]);
+    expect(classifyAccountHealth(signals)).toMatchObject({ state: 'at_risk', requirement: 'required' });
+  });
+
+  it('a truncated metrics read is unread (null), never a zero', async () => {
+    jest.mocked(adsMetricsDb.getAccountDaySnapshots).mockResolvedValue({ rows: [], truncated: false });
+    jest.mocked(adsMetricsDb.getSnapshotsByUserDateRange).mockResolvedValue({ rows: [], truncated: true });
+    const { signals } = await gatherAccountHealthSignals({ userId: 'u1', connected_accounts: [liveMeta] }, NOW);
+    expect(signals).toMatchObject({ adDays: null, recentAdSpend: null });
+  });
+
+  it('reads ratings from the last 30 days and runs the tracking monitor capture-only for Meta accounts', async () => {
+    jest.mocked(adsMetricsDb.getAccountDaySnapshots).mockResolvedValue({ rows: [], truncated: false });
+    jest.mocked(adsMetricsDb.getSnapshotsByUserDateRange).mockResolvedValue({ rows: [], truncated: false });
+    jest.mocked(monitorUserTracking).mockResolvedValue(monitorSummary({ accountsChecked: 1, destinationAlerts: 2, landingPageAlerts: 1 }));
+    const user = { userId: 'u1', connected_accounts: [liveMeta] };
+    const { signals } = await gatherAccountHealthSignals(user, NOW);
+    expect(chatbotDb.getRecentSessionFeedback).toHaveBeenCalledWith('u1', iso(NOW - 30 * DAY_MS));
+    expect(monitorUserTracking).toHaveBeenCalledWith(user, { dryRun: true });
+    expect(signals.tracking).toEqual({ destinationsWithoutOwnedPixel: 2, landingPagesWithoutOwnedPixel: 1 });
+    expect(classifyAccountHealth(signals).state).toBe('activation_incomplete');
+  });
+
+  it('never runs the tracking monitor without a Meta ad account, and a failed check is unread', async () => {
+    jest.mocked(adsMetricsDb.getAccountDaySnapshots).mockResolvedValue({ rows: [], truncated: false });
+    jest.mocked(adsMetricsDb.getSnapshotsByUserDateRange).mockResolvedValue({ rows: [], truncated: false });
+    expect((await gatherAccountHealthSignals({ userId: 'u1', connected_accounts: [] }, NOW)).signals.tracking).toBeNull();
+    expect(monitorUserTracking).not.toHaveBeenCalled();
+    jest.mocked(monitorUserTracking).mockRejectedValueOnce(new Error('graph down'));
+    expect((await gatherAccountHealthSignals({ userId: 'u1', connected_accounts: [liveMeta] }, NOW)).signals.tracking).toBeNull();
   });
 });

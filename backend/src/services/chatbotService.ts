@@ -2207,6 +2207,32 @@ export class ChatbotDB {
   }
 
   /**
+   * Explicit ratings (`feedbacks`) on sessions updated since `sinceIso`, for the account-health
+   * classifier (ENG-2143). Reads only the `feedbacks` attribute. Returns null when the read would
+   * exceed `maxPages`, so a heavy account reads as "not read" rather than as a partial answer.
+   */
+  async getRecentSessionFeedback(userId: string, sinceIso: string, maxPages = 5): Promise<MessageFeedback[] | null> {
+    const ratings: MessageFeedback[] = [];
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    for (let page = 0; page < maxPages; page++) {
+      const result = await dynamodb.query({
+        TableName: this.tableName,
+        IndexName: "UserIdIndex",
+        KeyConditionExpression: "userId = :userId AND updatedAt >= :since",
+        ExpressionAttributeValues: { ":userId": userId, ":since": sinceIso },
+        ProjectionExpression: "feedbacks",
+        ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+      }).promise();
+      for (const item of result.Items ?? []) {
+        ratings.push(...Object.values((item.feedbacks ?? {}) as Record<string, MessageFeedback>));
+      }
+      lastKey = result.LastEvaluatedKey;
+      if (!lastKey) return ratings;
+    }
+    return null;
+  }
+
+  /**
    * Get sessions metadata only (no messages loaded).
    * Used by getExecutionsWithAssets for fast asset loading via cache.
    */

@@ -8,6 +8,7 @@ import {
   sanitizeAdImageResult,
   MAX_AD_IMAGE_VARIANTS,
 } from "../services/adImageStatusService";
+import { evaluateCreativeGates } from "../services/creativeGates";
 
 const variant = (i: number) => ({
   id: `v${i}`,
@@ -111,6 +112,56 @@ describe("adImageStatusService", () => {
     expect(out.variants[0].id.length).toBeLessThanOrEqual(64);
     expect(out.variants[0].imageUrl.length).toBeLessThanOrEqual(1024);
     expect(out.variants[0].prompt.length).toBeLessThanOrEqual(2000);
+  });
+
+  it("sanitizeAdImageResult keeps gates, archetype, concept and promptVersion (ENG-2187)", () => {
+    const gates = evaluateCreativeGates(
+      { bytes: 2048, decoded: true, width: 1024, height: 1024, format: "png", luminanceStdDev: 40 },
+      { requestedSize: "1:1" },
+      now,
+    );
+    const out = sanitizeAdImageResult({
+      variants: [{ ...variant(1), promptVersion: "v2/t3", archetype: "D", concept: "SOCIAL PROOF (SP)", gates }],
+    });
+    expect(out.variants[0]).toEqual({
+      ...variant(1),
+      promptVersion: "v2/t3",
+      archetype: "D",
+      concept: "SOCIAL PROOF (SP)",
+      gates,
+    });
+  });
+
+  it("sanitizeAdImageResult bounds the optional fields and drops a malformed gate result", () => {
+    const huge = "x".repeat(5000);
+    const gates = evaluateCreativeGates({ bytes: 10, decoded: false }, {}, now);
+    const out = sanitizeAdImageResult({
+      variants: [
+        {
+          ...variant(1),
+          promptVersion: huge,
+          archetype: huge,
+          concept: huge,
+          gates: {
+            ...gates,
+            version: huge,
+            placement: "tiktok_feed",
+            checks: [...gates.checks, { id: "ocr", status: "pass" }, { id: "decode", status: "maybe" }],
+            fitsPlacements: ["meta_feed_square", "nope"],
+          },
+        },
+        { ...variant(2), archetype: 7, concept: null, gates: { graderId: "someone-else", passed: true, checks: [] } },
+      ],
+    });
+    const [first, second] = out.variants;
+    expect(first.promptVersion?.length).toBe(128);
+    expect(first.archetype?.length).toBe(16);
+    expect(first.concept?.length).toBe(200);
+    expect(first.gates?.version.length).toBe(64);
+    expect(first.gates?.placement).toBeUndefined();
+    expect(first.gates?.checks).toEqual(gates.checks);
+    expect(first.gates?.fitsPlacements).toEqual(["meta_feed_square"]);
+    expect(second).toEqual(variant(2));
   });
 
   it("metric log line is grep-able", () => {
