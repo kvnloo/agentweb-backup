@@ -1,5 +1,5 @@
 /**
- * Creative deterministic gates (ENG-2139, ENG-2128 T7).
+ * Creative deterministic gates (ENG-2139, ENG-2128 T7; content checks ENG-2193, ENG-2128 B).
  *
  * Code checks on a generated image: does it decode, is it a blank/near-uniform (broken)
  * render, does its shape and size fit the placement that was asked for, is the file within the
@@ -9,12 +9,15 @@
  * nothing blocks on them until the grader is validated against human labels (ENG-2136, see
  * `mayGate('creative-deterministic-gates')` in loops/eval/evalRegistry.ts).
  *
- * Not included: OCR text-area ratio / spelling. The only open-source option (tesseract.js)
- * downloads language data from a CDN at runtime unless it is vendored; deferred rather than
- * shipping a half-working check.
- *
  * `evaluateCreativeGates` is pure (measurement in, verdict out). `runCreativeGates` measures a
  * buffer with sharp (already a backend dependency, loaded lazily) and never throws.
+ *
+ * The `ocr_text_ratio` / `ocr_legibility` / `spelling` / `brand_colour` / `logo_presence` /
+ * `policy_keywords` checks in `CreativeGateCheckId` below are computed by
+ * `./creativeContentChecks`, not by this file — they are heavier (OCR inference, an optional
+ * logo download) and run out-of-band (see that module's header), then merged into a
+ * `CreativeGateResult.checks` array built here, via `humanEvalService.appendCreativeGateChecks`.
+ * This file only owns the shared type union and the fast structural checks.
  */
 import {
   PLACEMENT_SPECS,
@@ -29,7 +32,7 @@ import {
 } from './creativePlacementSpecs';
 
 export const CREATIVE_GATES_GRADER_ID = 'creative-deterministic-gates';
-export const CREATIVE_GATES_VERSION = '2026-09-28.1';
+export const CREATIVE_GATES_VERSION = '2026-09-29.1';
 
 export type CreativeGateCheckId =
   | 'decode'
@@ -37,7 +40,16 @@ export type CreativeGateCheckId =
   | 'aspect_ratio'
   | 'dimensions'
   | 'file_size'
-  | 'aspect_fallback';
+  | 'aspect_fallback'
+  // ENG-2193: content checks, computed by `./creativeContentChecks` and merged into this same
+  // `checks` array by the caller — the structural checks above stay pure/synchronous, these are
+  // async (OCR, dictionary lookups, optional network fetches) and always advisory.
+  | 'ocr_text_ratio'
+  | 'ocr_legibility'
+  | 'spelling'
+  | 'brand_colour'
+  | 'logo_presence'
+  | 'policy_keywords';
 
 export type CreativeGateStatus = 'pass' | 'fail' | 'skipped';
 
@@ -48,6 +60,12 @@ const CHECK_IDS: readonly CreativeGateCheckId[] = [
   'dimensions',
   'file_size',
   'aspect_fallback',
+  'ocr_text_ratio',
+  'ocr_legibility',
+  'spelling',
+  'brand_colour',
+  'logo_presence',
+  'policy_keywords',
 ];
 const STATUSES: readonly CreativeGateStatus[] = ['pass', 'fail', 'skipped'];
 
