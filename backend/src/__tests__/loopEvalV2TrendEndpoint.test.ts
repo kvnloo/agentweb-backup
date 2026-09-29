@@ -14,6 +14,7 @@ import type { DynamoAttributeMap, DynamoPort } from '../loops/core/ports';
 import { aggregateEvalV2, buildSnapshotItem } from '../loops/eval/evalV2Sampler';
 import { awsDynamoAdapter } from '../loops/adapters/awsAdapters';
 import loopHealthRouter from '../routes/loopHealth';
+import { CREATIVE_GATES_VERSION } from '../services/creativeGates';
 
 jest.mock('../loops/adapters/awsAdapters', () => ({ awsDynamoAdapter: jest.fn() }));
 jest.mock('../loops/health/loopHealthService', () => ({ getLoopHealthReport: jest.fn() }));
@@ -88,6 +89,16 @@ describe('GET /api/admin/loops/eval-v2-trend', () => {
     expect(metric).toMatchObject({ graderId: 'agent-task-success', n: 1, passes: 1, mayGate: false });
     expect(metric.ci.low).toBeGreaterThan(0);
     expect(metric.ci.high).toBe(1);
+  });
+
+  it('serves the creative and account-health snapshots and every registry grader with its version (ENG-2196)', async () => {
+    const res = await get({ userId: 'a', isAdmin: true });
+    expect(res.body.creative).toEqual([]);
+    expect(res.body.accountHealth).toEqual([]);
+    const registry = res.body.registry as Array<{ id: string; surface: string; version: string; mayGate: boolean }>;
+    expect(registry.length).toBeGreaterThan(20);
+    expect(registry.every((g) => typeof g.version === 'string' && g.version.length > 0 && g.mayGate === false)).toBe(true);
+    expect(registry.find((g) => g.id === 'creative-deterministic-gates')).toMatchObject({ surface: 'creative', version: CREATIVE_GATES_VERSION });
   });
 
   it('reads the 1d window on request and reports the sampler flag', async () => {
