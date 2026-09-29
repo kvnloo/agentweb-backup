@@ -89,6 +89,10 @@ import * as adsApisImpl from './impl/adsApis';
 // services/agentMode/attioTools.ts, a pre-existing self-contained
 // extraction) so this file gets one uniform import for the whole cluster.
 import * as adsCrmApisImpl from './impl/adsCrmApis';
+// ENG-2103 (F2), cluster 20: search & research tool cluster (perform_data_analysis,
+// you_search_web, you_search_news, google_search_web, perform_deep_research).
+// All 5 tools.ts call sites repointed to call the module directly.
+import * as searchResearchImpl from './impl/searchResearch';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -2687,7 +2691,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.performDeepResearchTool(
+    return await searchResearchImpl.performDeepResearchTool(
       args.topic,
       args.prompt,
       args.tone || 'professional',
@@ -5922,7 +5926,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.youSearchWeb(args.query, args.max_results || 10, args.freshness, args.include_domains, context?.userId);
+    return await searchResearchImpl.youSearchWeb(args.query, args.max_results || 10, args.freshness, args.include_domains, context?.userId);
   }
 });
 
@@ -5953,7 +5957,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.youSearchNews(args.query, args.max_results || 10, args.freshness, context?.userId);
+    return await searchResearchImpl.youSearchNews(args.query, args.max_results || 10, args.freshness, context?.userId);
   }
 });
 
@@ -5979,7 +5983,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.googleSearchWeb(args.query, args.max_results || 10, context?.userId);
+    return await searchResearchImpl.googleSearchWeb(args.query, args.max_results || 10, context?.userId);
   }
 });
 
@@ -6514,7 +6518,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.performDataAnalysis(args.file_urls, args.analysis_instruction, context?.userId);
+    return await searchResearchImpl.performDataAnalysis(args.file_urls, args.analysis_instruction, context?.userId);
   }
 });
 
