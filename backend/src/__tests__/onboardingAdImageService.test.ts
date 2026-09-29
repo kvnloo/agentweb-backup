@@ -38,6 +38,11 @@ jest.mock("../services/onboardingAdImageChatSessionMirror", () => ({
     .mockResolvedValue("mocked-onboarding-session-id"),
 }));
 
+jest.mock("../services/creativeRubricOnboarding", () => ({
+  judgeOnboardingAdImages: jest.fn(async () => null),
+}));
+
+import { judgeOnboardingAdImages } from "../services/creativeRubricOnboarding";
 import {
   AD_IMAGE_SYSTEM_PROMPT,
   buildSixLayerPromptForVariant,
@@ -654,6 +659,38 @@ describe("onboardingAdImageService", () => {
       for (const p of gen.lastParams) {
         expect(p.logoImage).toBe("https://s3/brand/logo.png");
       }
+    });
+
+    it("hands the stored run, and the run it replaced, to the rubric judge hook (ENG-2192)", async () => {
+      const previousVariants = [{ id: "variant-1", imageUrl: "https://s3/old-1.png", prompt: "old" }];
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { brandName: "Linear", logoUrl: "https://s3/brand/logo.png" } },
+          adImageStartedAt: RUN_AT,
+          adImageCompletedAt: "2026-08-01T00:00:00.000Z",
+          adImageResult: { variants: previousVariants },
+        })
+        .mockResolvedValueOnce({ userId: "u1", adImageStatus: "running", adImageStartedAt: RUN_AT });
+      userDb.updateUser.mockResolvedValue({});
+
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: new FakeImageGen(okResponder) as unknown as AdImageGeneratorDep,
+        verifyLogoUrl: async () => true,
+      });
+      await new Promise((resolve) => setImmediate(resolve)); // the hook is dispatched, not awaited
+
+      const written = userDb.updateUser.mock.calls[0][1];
+      expect(written.adImageStatus).toBe("ready");
+      expect(jest.mocked(judgeOnboardingAdImages)).toHaveBeenCalledWith({
+        userId: "u1",
+        completedAt: written.adImageCompletedAt,
+        variants: written.adImageResult.variants,
+        previous: { completedAt: "2026-08-01T00:00:00.000Z", variants: previousVariants },
+      });
     });
 
     it("fails the run pointing at brand config when no logo is persisted — never generates (AC-3)", async () => {
