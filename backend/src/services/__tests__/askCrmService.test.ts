@@ -129,6 +129,59 @@ describe('askCrm — deals_closing intent', () => {
   });
 });
 
+describe('askCrm — ENG-2155 live lifecycle precedence', () => {
+  it('lets an active subscription advance a stale stored inbox lifecycle', async () => {
+    const result = await askCrm('show paying customers', 'u1', makeDeps([
+      lead({
+        email: 'advanced@x.com',
+        lifecycle: 'inbox',
+        subscriptionState: 'active',
+      }),
+    ]));
+
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0].lifecycle).toBe('paying');
+  });
+
+  it('lets current deal signals outrank a stale stored inbox lifecycle', async () => {
+    const result = await askCrm('which deals are closing', 'u1', makeDeps([
+      lead({
+        email: 'deal@x.com',
+        lifecycle: 'inbox',
+        openDealStages: ['Negotiation'],
+      }),
+    ]));
+
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0].lifecycle).toBe('in_deal');
+  });
+
+  it('uses stored lifecycle only when the loader did not provide authoritative signals', async () => {
+    const result = await askCrm('show paying customers', 'u1', makeDeps([
+      lead({
+        email: 'legacy@x.com',
+        lifecycle: 'paying',
+      }),
+    ]));
+
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0].lifecycle).toBe('paying');
+  });
+
+  it('lets a current health signal move a stored paying customer to at_risk', async () => {
+    const result = await askCrm('who is at risk', 'u1', makeDeps([
+      lead({
+        email: 'risk@x.com',
+        lifecycle: 'paying',
+        healthScore: 20,
+      }),
+    ]));
+
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0].lifecycle).toBe('at_risk');
+  });
+});
+
 describe('askCrm — paying_customers intent', () => {
   it('returns paying + trialing lifecycles', async () => {
     const leads = [
