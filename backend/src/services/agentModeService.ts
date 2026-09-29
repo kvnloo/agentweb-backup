@@ -208,6 +208,7 @@ import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { publishWithResolvedBlogPublisher } from './blogPublishers';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
 import { declaredPlacementField } from './agentMode/generateImagePlacement';
+import { isNonConsumableRequiredFunctionCall } from './agentMode/workPlanRequiredCallsPolicy';
 import { recordGeneratedCreative, stampMetaAdCreated, stampMetaAdCreativeChanged, stampMetaCreativeCreated, stampMetaImageUpload, stampMetaPublish } from './creativeLineage';
 import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
@@ -36660,8 +36661,11 @@ Reply with ONLY one word: yes or no.`;
           continue; // Skip updating this step
         }
 
-        // If validation passed and marking as completed, decrement the function counts
+        // If validation passed and marking as completed, decrement the function counts.
+        // ENG-2206: skip tools whose credit is a session-wide fact, not a per-step
+        // artifact — see workPlanRequiredCallsPolicy.ts's doc comment.
         for (const fn of step.requiredFunctionCalls) {
+          if (isNonConsumableRequiredFunctionCall(fn)) continue;
           calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
           pendingCalledFunctionDecrements[fn] = (pendingCalledFunctionDecrements[fn] || 0) + 1;
           countsModified = true;
@@ -36679,6 +36683,8 @@ Reply with ONLY one word: yes or no.`;
       // step that makes a genuinely fresh call).
       if (update.status === 'skipped' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
         for (const fn of step.requiredFunctionCalls) {
+          // ENG-2206: same carve-out as the completed branch above.
+          if (isNonConsumableRequiredFunctionCall(fn)) continue;
           const current = calledFunctionCounts[fn] || 0;
           if (current > 0) {
             calledFunctionCounts[fn] = current - 1;
