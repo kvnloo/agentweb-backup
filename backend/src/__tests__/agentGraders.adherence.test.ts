@@ -128,6 +128,23 @@ describe('gradeLengthAdherence', () => {
     // user's own text is ever parsed for a bound, never the reply.
     expect(gradeLengthAdherence([turn('Answer in under 100 words', 'I found 3 sentences worth flagging. ' + words(50))]).verdict).toBe('pass');
   });
+
+  it('counts every 3 <p> elements as 3 paragraphs, not 1 (CodeRabbit PR #3136, thread 4130329030)', () => {
+    const threeParagraphs = '<p>Spend rose.</p><p>CTR held steady.</p><p>CPC fell slightly.</p>';
+    expect(gradeLengthAdherence([turn('keep it to one paragraph', threeParagraphs)])).toMatchObject({ verdict: 'fail', reason: 'exceeded_requested_length' });
+    // 2+ consecutive <br> is also a paragraph break, not just a line break.
+    const brParagraphs = 'Spend rose.<br><br>CTR held steady.<br><br>CPC fell slightly.';
+    expect(gradeLengthAdherence([turn('keep it to one paragraph', brParagraphs)])).toMatchObject({ verdict: 'fail', reason: 'exceeded_requested_length' });
+    // A lone <br> is still just a line break within one paragraph.
+    const oneParagraphSoftBreaks = 'Spend rose,<br>CTR held steady,<br>and CPC fell slightly.';
+    expect(gradeLengthAdherence([turn('keep it to one paragraph', oneParagraphSoftBreaks)]).verdict).toBe('pass');
+  });
+
+  // Adversarial pass beyond the CodeRabbit finding:
+  it('combines paragraph and word bounds in one instruction, both satisfied', () => {
+    const html = '<p>Spend rose 12% this week.</p><p>CTR held at 3.1%.</p>';
+    expect(gradeLengthAdherence([turn('in 2 paragraphs and under 30 words', html)]).verdict).toBe('pass');
+  });
 });
 
 describe('format adherence', () => {
