@@ -145,6 +145,16 @@ describe('gradeLengthAdherence', () => {
     const html = '<p>Spend rose 12% this week.</p><p>CTR held at 3.1%.</p>';
     expect(gradeLengthAdherence([turn('in 2 paragraphs and under 30 words', html)]).verdict).toBe('pass');
   });
+
+  it('counts applicable turns after the first failure, not just up to it (CodeRabbit PR #3136, thread 4130329052)', () => {
+    const r = gradeLengthAdherence([
+      turn('Answer in under 10 words', words(50)), // fails first
+      turn('Answer in under 10 words', words(3)), // would pass
+      turn('Answer in under 10 words', words(3)), // would pass
+    ]);
+    expect(r).toMatchObject({ verdict: 'fail', reason: 'exceeded_requested_length', applicableTurns: 3 });
+    expect(r.detail).toBe('turn 1: 50 words vs <= 10 words (fails above 40)');
+  });
 });
 
 describe('format adherence', () => {
@@ -211,6 +221,15 @@ describe('format adherence', () => {
       reason: 'table_missing',
     });
   });
+
+  it('counts applicable turns after the first failure, not just up to it (CodeRabbit PR #3136, thread 4130329052)', () => {
+    const r = gradeFormatAdherence([
+      turn('Show me the results in a table', 'CTR was 2%.'), // fails first (no table)
+      turn('Show me the results in a table', '| A | B |\n| --- | --- |\n| 1 | 2 |'), // would pass
+      turn('give me the numbers as bullet points', '- one\n- two'), // would pass
+    ]);
+    expect(r).toMatchObject({ verdict: 'fail', reason: 'table_missing', applicableTurns: 3, detail: 'turn 1' });
+  });
 });
 
 describe('acting when told to', () => {
@@ -275,6 +294,15 @@ describe('acting when told to', () => {
     });
     // A genuine write tool alongside a read tool in the same turn still counts as acted.
     expect(gradePermissionAdherence([turn('go ahead', 'Done — draft created.', ['list_documents', 'create_draft'])]).reason).toBe('acted_without_asking');
+  });
+
+  it('counts applicable turns after the first failure, not just up to it (CodeRabbit PR #3136, thread 4130329052)', () => {
+    const r = gradePermissionAdherence([
+      turn('go ahead', 'Should I proceed with the keyword research?'), // fails first
+      turn('go ahead', 'Done: keywords researched.', ['create_ad_campaign']), // would pass
+      turn('go ahead', 'Done: budget updated.', ['update_campaign_budget']), // would pass
+    ]);
+    expect(r).toMatchObject({ verdict: 'fail', reason: 'asked_permission_after_instruction', applicableTurns: 3, detail: 'turn 1' });
   });
 
   it('passes a tool-only turn (the agent acted and gave no separate reply text that turn) instead of no_reply (CodeRabbit PR #3136, thread 4129864014)', () => {
