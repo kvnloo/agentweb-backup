@@ -112,6 +112,88 @@
  * parameter; `emma/tools.ts`'s `import_leads_from_search` tool is repointed
  * to call this module directly (`callLLM` is `public` on `AgentModeService`,
  * same treatment as `create_html_from_template`).
+ *
+ * ENG-2103 (F2 design-decision-list follow-up, Pattern A) — `updateEmailDraftForLead`
+ * added: the last leads/CRM-domain item on the design-decision list. Moved
+ * verbatim from `AgentModeService.prototype.updateEmailDraftForLead`
+ * (originally right after `sendEmailToLead` in the pre-extraction source —
+ * placed the same way here). Confirmed by reading the full ~484-line method:
+ * exactly two `this.callLLM` call sites — one drafts the email subject/body
+ * JSON, the other (only when the lead has a LinkedIn URL) drafts a LinkedIn
+ * connection-request note. Both injected via one narrow structural type,
+ * `UpdateEmailDraftForLeadLlmCall` (the two call shapes this method actually
+ * sends — not the full private `LLMCallOptions` interface this module must
+ * not import anyway), same discipline as `emma/impl/htmlCreation.ts`'s
+ * `CreateHtmlFromTemplateLlmCall`.
+ *
+ * `this.getReportGenerationDefaultModel()` picks the model for the email-body
+ * call. It is a bare (no access-modifier keyword, hence `public`) instance
+ * method whose own body reads `this.resolveConfiguredModel`/a private
+ * settings-name field and falls back to `this.getDefaultModel()` — genuine
+ * LLM-gateway/routing infrastructure, the same "never a candidate for
+ * extraction, same category as `callLLM` itself" reasoning `createHtmlFromTemplate`
+ * already applied to `getDefaultModel`/`resolveGenerationModel`. Injected as
+ * `GetReportGenerationDefaultModelFn`, matching its real signature exactly.
+ *
+ * Three more cross-dependencies, each resolved on its own merits rather than
+ * uniformly injected:
+ *  - `this.readBrandGuidelines(userId)` / `this.readMarketStrategy(userId, opts)`
+ *    are ALREADY fully decoupled — both are plain exported functions in
+ *    `emma/impl/brandMarketStrategy.ts` with zero `this` dependency (confirmed
+ *    by reading that module directly) — imported here by name instead of
+ *    injected. `PROMPT_EMBEDDED_COMPETITOR_DETAIL` (the `minCompetitorsInFull`
+ *    argument to `readMarketStrategy` — this prompt embeds the market-strategy
+ *    doc's `formattedContent` wholesale, so it is NOT bounded by the normal
+ *    tool-result page budget) is imported the same way.
+ *  - `this.getSenderForLead(...)`, by contrast, is NOT decoupled — its real
+ *    body still lives directly on `AgentModeService` (confirmed by reading the
+ *    class directly: it is not a delegating wrapper into any module), and it
+ *    reads `this.getCrmSenders(...)`. Its only real caller anywhere in the
+ *    backend besides this method is a test spy — not enough of a second
+ *    caller to justify promoting it to a shared module this round (unlike
+ *    `getCrmSenders` itself, which had three real callers). Injected as
+ *    `GetSenderForLeadFn` instead, matching the class method's real signature
+ *    exactly — the same "moved method needs a still-unextracted sibling's
+ *    capability" pattern as `AccountResolver`/`EmployerSizeFilterResolver`.
+ *
+ * ENG-1388 (card-revenue leak): `stripCardRevenueKeys(lead.customFields)` is
+ * applied UNCONDITIONALLY before `customFields` reach the email-drafting
+ * prompt — moved verbatim, unchanged. This is a real security control: card
+ * revenue is internal-only (Enigma) data and must never inform content meant
+ * for an external lead, regardless of whether the requesting user is
+ * themselves Enigma-allowlisted (that allowlist governs internal visibility,
+ * not what may go into outward-facing content). Re-landed here during the
+ * 2026-09-29 main-sync merge (see this repo's own F2 progress notes) and
+ * independently re-verified present, unconditional, and unchanged after this
+ * move.
+ *
+ * ENG-2082 (phone-only-lead guard): the top-of-function guard
+ * (`!lead.email && !lead.linkedin` → `skipped: true, reason: 'no_contact_channel'`)
+ * and its extensive inline comments — explaining why the guard is
+ * email-OR-linkedin rather than email-alone, why the email draft is
+ * additionally gated on `lead.email` specifically, why the LinkedIn note is
+ * gated on `lead.linkedin` specifically, and the several since-fixed bugs
+ * where those two gates disagreed — are moved verbatim, unchanged.
+ *
+ * `shortenInviteNoteToLimit` (services/inviteNoteShortener.ts) wants the full
+ * `Pick<AgentModeService, 'callLLM'>` shape (it is shared with the inline
+ * LinkedIn-invite send path, outside this method's scope), not this method's
+ * own narrower injected type — the injected `callLLM` is cast to that broader
+ * type at the one call site that needs it. The underlying runtime value is
+ * always the real `agentModeService.callLLM` either way; only the declared
+ * type differs.
+ *
+ * Kept as a delegating wrapper on `AgentModeService` (not deleted): the
+ * forward-lead webhook auto-draft path (`routes/webhooks.ts`, fire-and-forget
+ * after lead capture, confirmed by whole-backend grep) calls
+ * `agentModeService.updateEmailDraftForLead` directly and is the reason for
+ * both the ENG-2082 and ENG-1388 guards in the first place, plus
+ * `agentModeService.updateEmailDraftForLead.test.ts` calls this class method
+ * directly on a real instance. `emma/tools.ts`'s `update_email_draft_for_lead`
+ * tool is repointed to call this module directly (`callLLM` and
+ * `getReportGenerationDefaultModel` are both `public` on `AgentModeService`,
+ * same treatment as `create_html_from_template`/`import_leads_from_search`);
+ * `getSenderForLead` is bound off the singleton the same way.
  */
 import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor } from '../../utils/leadSchema';
 import type { LeadImportRowOutcome } from '../../utils/leadSchema';
@@ -121,7 +203,10 @@ import { recoverLeadFromWrongList } from '../../services/agentMode/leadRecovery'
 import { getCrmSenders } from './shared/crmSenders';
 import { isAnonymizedSearchLead } from '../../utils/anonymizedLinkedInLead';
 import { parseCompanyFromTitle, batchParseCompaniesFromTitlesWithLLM } from './shared/companyTitleParsing';
+import { readBrandGuidelines, readMarketStrategy, PROMPT_EMBEDDED_COMPETITOR_DETAIL } from './brandMarketStrategy';
 import type { AgentModeService } from '../../services/agentModeService';
+import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
+import type { LLMUsageContext } from '../../utils/llmService';
 
 export async function getLeadLists(userId: string): Promise<any> {
     try {
@@ -2222,6 +2307,544 @@ export async function sendEmailToLead(listId: string, leadId: string, userId: st
         // ENG-1300: Gmail/Outlook throw fully-typed EmailProviderError
         // subclasses with no HTTP status of their own — mapped by name.
         code: emailProviderErrorStatus(error)
+      };
+    }
+  }
+
+/**
+ * Narrow structural type for `updateEmailDraftForLead`'s two `this.callLLM`
+ * call sites — covers only the 5 option fields and JSON-shaped response this
+ * method actually sends/reads, not the full private `LLMCallOptions`
+ * interface (which this module must not import from agentModeService.ts
+ * anyway). Same narrowing discipline as `emma/impl/htmlCreation.ts`'s
+ * `CreateHtmlFromTemplateLlmCall`.
+ */
+export type UpdateEmailDraftForLeadLlmCall = (
+  model: string,
+  messages: Array<{ role: 'system' | 'user'; content: string }>,
+  options: {
+    temperature: number;
+    max_completion_tokens: number;
+    response_format?: { type: 'json_object' };
+    usageContext: LLMUsageContext;
+    taskClass: GatewayTaskClass;
+  },
+) => Promise<{
+  choices: Array<{ message: { content?: string | null } }>;
+}>;
+
+/** Matches `AgentModeService.prototype.getReportGenerationDefaultModel`'s real signature exactly. */
+export type GetReportGenerationDefaultModelFn = () => Promise<string>;
+
+/** Matches `AgentModeService.prototype.getSenderForLead`'s real signature exactly. */
+export type GetSenderForLeadFn = (
+  userId: string,
+  leadSelectedSenderId?: string | null,
+  listSenderId?: string | null,
+  listOwnerId?: string | null,
+) => Promise<{ fromName: string; notes?: string } | null>;
+
+/**
+ * ENG-2082/ENG-1388/ENG-945-carrying method: create or refine a lead's email
+ * draft (and, when the lead has a LinkedIn URL, a companion LinkedIn
+ * connection-request note) via two LLM calls. See this module's own header
+ * comment for the ENG-2103 (F2 design-decision-list follow-up, Pattern A)
+ * move notes — moved verbatim from
+ * `AgentModeService.prototype.updateEmailDraftForLead`, with `callLLM`,
+ * `getReportGenerationDefaultModel`, and `getSenderForLead` injected instead
+ * of reading `this`.
+ */
+export async function updateEmailDraftForLead(
+  listId: string,
+  leadId: string,
+  instruction: string,
+  sessionId: string,
+  userId: string,
+  emailFormat: 'text' | 'html' | undefined,
+  callLLM: UpdateEmailDraftForLeadLlmCall,
+  getReportGenerationDefaultModel: GetReportGenerationDefaultModelFn,
+  getSenderForLead: GetSenderForLeadFn,
+): Promise<any> {
+    try {
+      const { crmDb } = await import('../../services/db');
+
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return {
+          success: false,
+          message: 'Lead list not found',
+          error: 'The specified lead list does not exist'
+        };
+      }
+
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('../../services/crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
+      if (!hasAccess) {
+        return {
+          success: false,
+          message: 'Access denied',
+          error: CRM_EDITOR_REQUIRED_MESSAGE
+        };
+      }
+
+      // Get the lead
+      const lead = await crmDb.getLeadById(listId, leadId);
+      if (!lead) {
+        return {
+          success: false,
+          message: 'Lead not found',
+          error: 'The specified lead does not exist'
+        };
+      }
+
+      // No contact channel at all, nothing to draft. ENG-2082 opened lead capture to
+      // phone-only submissions, and this runs fire-and-forget from the forward-lead webhook
+      // whenever the list has autoDraftEnabled — so without a guard every phone-only capture
+      // spends two billed LLM calls writing a polished email to a person who has no address
+      // and a LinkedIn note for a lead with no LinkedIn, then reports success.
+      //
+      // Gated on email AND linkedin, not email alone. This function also produces the
+      // LinkedIn connection-request note below, and linkedInInviteCrmMirror creates leads
+      // that have a linkedin and NO email — refusing those would delete a working feature
+      // to fix a new one.
+      //
+      // `skipped` so the caller can tell "nothing to do" from "this broke": webhooks.ts maps
+      // a plain falsy result to autoDraftStatus='failed' and puts the error in the OWNER
+      // ALERT, which would mean every phone-only capture emails its owner a failure notice.
+      // Its sibling autoSend path already has the right word for this — 'skipped_no_email'.
+      // Trimmed on both sides. The note gate below trims and this did not, so
+      // `linkedin: '   '` passed here, closed there, and fell through to the
+      // nothing-generated arm.
+      if (!String(lead.email ?? '').trim() && !String(lead.linkedin ?? '').trim()) {
+        return {
+          success: false,
+          skipped: true,
+          reason: 'no_contact_channel',
+          // The guard widened to email-or-linkedin; the message did not follow it, so a
+          // LinkedIn-less, email-less lead reported a problem it only half had.
+          message: 'No contact channel',
+          error: 'This lead has neither an email address nor a LinkedIn profile — there is nothing to draft.'
+        };
+      }
+
+      // Check do-not-contact status
+      const { isDoNotContact: isDNC, getDoNotContactReason: getDNCReason } = await import('../../utils/leadContactStatus');
+      if (isDNC(lead)) {
+        const reason = getDNCReason(lead);
+        return {
+          success: false,
+          message: 'Do not contact',
+          error: `Cannot draft email for this lead: ${reason}. Remove the do-not-contact flag first if you want to contact them.`
+        };
+      }
+
+      // Get engagement history
+      const engagementsResult = await crmDb.getLeadEngagements(listId, leadId, userId);
+      const engagements = engagementsResult.engagements || [];
+
+      // Get brand guidelines
+      const brandGuidelines = await readBrandGuidelines(userId);
+
+      // Get market strategy. This prompt embeds formattedContent wholesale, so
+      // it is NOT bounded by the tool-result page budget — before ENG-945 it
+      // received 40 competitors in full and it still must (plus, now, the names
+      // of any beyond that).
+      const marketStrategy = await readMarketStrategy(userId, {
+        minCompetitorsInFull: PROMPT_EMBEDDED_COMPETITOR_DETAIL,
+        pagingHints: false
+      });
+
+      // Get sender information (from lead record, or default sender from CRM configuration)
+      // Pass list.userId so org members use the list owner's sender config
+      const leadSelectedSenderId = (lead as any).selectedSenderId;
+      const senderInfo = await getSenderForLead(userId, leadSelectedSenderId, list?.listSenderId, list?.userId);
+
+      // Get existing draft if it exists
+      const existingDraft = (lead as any).emailDraft;
+
+      // Get email draft format: use provided parameter, or lead's preference, or default to 'text'
+      const emailDraftFormat = emailFormat || (lead as any).emailDraftFormat || 'text';
+
+      // Build the prompt for LLM
+      let emailPrompt = `You are an expert email marketing strategist. Create a personalized email draft for a lead based on the following information:
+
+## Lead Information:
+- Name: ${lead.firstName || ''} ${lead.lastName || ''}`.trim();
+
+      if (lead.company) {
+        emailPrompt += `\n- Company: ${lead.company}`;
+      }
+      if (lead.title) {
+        emailPrompt += `\n- Title: ${lead.title}`;
+      }
+      if (lead.email) {
+        emailPrompt += `\n- Email: ${lead.email}`;
+      }
+      if (lead.notes) {
+        emailPrompt += `\n- Notes: ${lead.notes}`;
+      }
+      // ENG-1388: this draft is meant to be sent to the external lead/prospect,
+      // so card revenue (Enigma, internal-use-only) must never inform it —
+      // unconditionally, regardless of whether the requesting user is
+      // themselves Enigma-allowlisted. That allowlist governs internal
+      // visibility, not what may go into outward-facing content.
+      const { stripCardRevenueKeys } = await import('../../utils/enrichmentMetadataPresentation');
+      const emailPromptCustomFields = stripCardRevenueKeys(lead.customFields);
+      if (emailPromptCustomFields && Object.keys(emailPromptCustomFields).length > 0) {
+        emailPrompt += `\n- Custom Fields: ${JSON.stringify(emailPromptCustomFields, null, 2)}`;
+      }
+
+      // Add engagement history
+      if (engagements.length > 0) {
+        emailPrompt += `\n\n## Engagement History:`;
+        engagements.slice(0, 10).forEach((eng: any, index: number) => {
+          emailPrompt += `\n${index + 1}. ${eng.eventType} - ${eng.createdAt}`;
+          if (eng.eventData?.subject) {
+            emailPrompt += ` (Subject: ${eng.eventData.subject})`;
+          }
+
+          // Include email content if available (first 1k characters)
+          if (eng.emailContent) {
+            let contentPreview = '';
+            // Prefer text content, fall back to HTML
+            if (eng.emailContent.text) {
+              contentPreview = eng.emailContent.text.substring(0, 1000);
+            } else if (eng.emailContent.html) {
+              // Strip HTML tags for preview, then take first 1k characters
+              const textFromHtml = eng.emailContent.html
+                .replace(/<[^>]*>/g, ' ') // Remove HTML tags
+                .replace(/\s+/g, ' ') // Normalize whitespace
+                .trim();
+              contentPreview = textFromHtml.substring(0, 1000);
+            }
+
+            if (contentPreview) {
+              const truncated = contentPreview.length >= 1000 ? contentPreview + '...' : contentPreview;
+              emailPrompt += `\n   Email Content (first 1k characters):\n   ${truncated}`;
+            }
+          }
+        });
+      } else {
+        emailPrompt += `\n\n## Engagement History: No previous engagements`;
+      }
+
+      // Add brand guidelines
+      if (brandGuidelines.exists) {
+        emailPrompt += `\n\n## Brand Guidelines:\n${brandGuidelines.formattedContent || JSON.stringify(brandGuidelines.brandData, null, 2)}`;
+      } else {
+        emailPrompt += `\n\n## Brand Guidelines: Not configured`;
+      }
+
+      // Add market strategy
+      if (marketStrategy.exists) {
+        emailPrompt += `\n\n## Market Strategy:\n${marketStrategy.formattedContent}`;
+      } else {
+        emailPrompt += `\n\n## Market Strategy: Not configured`;
+      }
+
+      // Add sender information
+      if (senderInfo) {
+        emailPrompt += `\n\n## Sender Information:
+- From Name: ${senderInfo.fromName}`;
+        if (senderInfo.notes) {
+          emailPrompt += `\n- Notes: ${senderInfo.notes}`;
+        }
+        emailPrompt += `\n\nIMPORTANT: Use ONLY this sender information for the email signature. The signature MUST match the sender's name above, even if the lead's notes or engagement history mention a different person's name.`;
+        if (senderInfo.notes) {
+          emailPrompt += ` If the notes contain a meeting schedule link or other relevant information, consider including it in the email where appropriate.`;
+        }
+      } else {
+        emailPrompt += `\n\n## Sender Information: Not configured (use a generic professional signature)`;
+      }
+
+      // Add existing draft if it exists
+      if (existingDraft) {
+        const existingContent = emailDraftFormat === 'text'
+          ? (existingDraft.textContent || existingDraft.htmlContent || '')
+          : (existingDraft.htmlContent || existingDraft.textContent || '');
+        emailPrompt += `\n\n## Existing Email Draft (to refine/update):\nSubject: ${existingDraft.subject}\nContent:\n${existingContent}`;
+      }
+
+      // Add instruction
+      emailPrompt += `\n\n## Instruction:\n${instruction}`;
+
+      const contentType = emailDraftFormat === 'text' ? 'plain text' : 'HTML';
+      emailPrompt += `\n\n## Requirements:
+1. Create a professional, personalized email that aligns with the brand guidelines and market strategy
+2. Use the lead's information to personalize the email (use their name, company, etc.)
+3. Consider the engagement history to make the email contextually relevant
+4. The email should be appropriate for the instruction provided
+5. Subject line should be compelling and personalized (50-60 characters ideal)
+6. Email content should be well-formatted, professional, and email-friendly (${contentType} format)
+7. Include a clear call-to-action
+8. Include an appropriate email signature at the end using the sender information provided (if available)
+9. If updating an existing draft, improve it based on the instruction while maintaining the core message
+${emailDraftFormat === 'text' ? '10. Use plain text format only - no HTML tags, no formatting markup. Use line breaks and simple text formatting.' : '10. Use HTML format with proper email-friendly HTML tags and styling.'}
+
+Format the response as JSON with this structure:
+${emailDraftFormat === 'text'
+          ? `{
+  "subject": "Email subject line (personalized, 50-60 characters)",
+  "textContent": "Complete plain text email body (no HTML, use line breaks for paragraphs)"
+}`
+          : `{
+  "subject": "Email subject line (personalized, 50-60 characters)",
+  "htmlContent": "Complete HTML email body (well-formatted, professional, email-friendly HTML)"
+}`}`;
+
+      // The EMAIL draft runs only when there is an address to send to. This function also
+      // produces the LinkedIn connection-request note below, and linkedInInviteCrmMirror
+      // creates leads that have a linkedin and no email — so the guard at the top of this
+      // function cannot refuse them outright. But widening that guard on its own left this
+      // path still running for them: two billed LLM calls producing a polished draft
+      // addressed to nobody, which is the exact harm the guard was added to prevent.
+      let emailDraft: any = null;
+      let emailData: any = null;
+      if (lead.email) {
+        const reportGenerationModel = await getReportGenerationDefaultModel();
+        const completion = await callLLM(
+          reportGenerationModel,
+          [
+            {
+              role: "system",
+              content: emailDraftFormat === 'text'
+                ? "You are an expert email marketing strategist. Create personalized, professional plain text emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and textContent fields. Use plain text only - no HTML tags or formatting markup."
+                : "You are an expert email marketing strategist. Create personalized, professional emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and htmlContent fields.",
+            },
+            { role: "user", content: emailPrompt },
+          ],
+          {
+          temperature: 0.8,
+            max_completion_tokens: 3000,
+            response_format: { type: 'json_object' },
+            usageContext: { userId, sessionId, feature: 'email_draft' },
+            taskClass: 'content_generation',
+          },
+        );
+
+        const responseContent = completion.choices[0].message.content;
+        if (!responseContent) {
+          throw new Error('No content generated from LLM');
+        }
+
+        // Parse the JSON response
+        try {
+          const cleanedContent = responseContent.replace(/```json\s*|\s*```/g, '').trim();
+          emailData = JSON.parse(cleanedContent);
+        } catch (parseError) {
+          console.error('AgentMode: Error parsing email draft JSON:', parseError);
+          throw new Error('Failed to parse email draft response');
+        }
+
+        // Validate required fields based on format
+        if (emailDraftFormat === 'text') {
+          if (!emailData.subject || !emailData.textContent) {
+            throw new Error('LLM response missing required fields (subject, textContent)');
+          }
+        } else {
+          if (!emailData.subject || !emailData.htmlContent) {
+            throw new Error('LLM response missing required fields (subject, htmlContent)');
+          }
+        }
+
+        // Save draft to lead record with sessionId
+        const now = new Date().toISOString();
+        emailDraft = {
+          subject: emailData.subject,
+          createdAt: existingDraft?.createdAt || now,
+          updatedAt: now,
+          sessionId: sessionId
+        };
+
+        if (emailDraftFormat === 'text') {
+          emailDraft.textContent = emailData.textContent;
+        } else {
+          emailDraft.htmlContent = emailData.htmlContent;
+        }
+      }
+
+      // Build activity history section for message prompt (reuse already-fetched engagements)
+      let messageActivityContext = '';
+      if (engagements.length > 0) {
+        messageActivityContext = '\n\n## Activity History (most recent first):';
+        engagements.slice(0, 10).forEach((eng: any, index: number) => {
+          messageActivityContext += `\n${index + 1}. [${eng.eventType}] ${eng.createdAt}`;
+          if (eng.eventData?.subject) messageActivityContext += ` — Subject: ${eng.eventData.subject}`;
+          if (eng.text) messageActivityContext += `\n   "${String(eng.text).slice(0, 300)}"`;
+          else if (eng.emailContent?.text) {
+            messageActivityContext += `\n   "${eng.emailContent.text.substring(0, 300)}"`;
+          }
+        });
+      }
+
+      // Create message draft optimised for LinkedIn connection invites. The char limit
+      // depends on the sending account tier: 300 for Premium, 200 for free. Resolve the
+      // account the same way the send-invite route does (list-assigned → user's own).
+      // The email draft was gated on lead.email; this is the other half, and it was
+      // missing. A commit claimed "the two drafts are independent now — email gated on
+      // lead.email, note on lead.linkedin" and only shipped the first clause, so every
+      // ordinary email-only lead captured into an autoDraft list paid a second billed LLM
+      // call plus two LinkedIn API round trips to write a connection note for a lead with
+      // no LinkedIn URL — and stored it as messageDraft. Exactly the mirror of the harm
+      // the guard was added to stop; the env2 check only exercised the LinkedIn-only
+      // direction, so nothing caught it.
+      const wantsLinkedInNote = !!String((lead as any).linkedin ?? '').trim();
+      const { linkedInOutreachService, LinkedInOutreachService } = await import('../../services/linkedInOutreachService');
+      const inviteAccountId = wantsLinkedInNote
+        ? ((list as any)?.linkedInAccountId
+          || await linkedInOutreachService.resolveUserOwnedAccountId(userId))
+        : null;
+      const inviteCharLimit = inviteAccountId
+        ? await linkedInOutreachService.getInviteCharLimitForAccount(userId, inviteAccountId)
+        : 200;
+      const leadName = [(lead as any).firstName, (lead as any).lastName].filter(Boolean).join(' ');
+      const leadTitle = (lead as any).title || '';
+      const leadCompany = (lead as any).company || '';
+      const leadDesc = [leadName || null, leadTitle, leadCompany ? `at ${leadCompany}` : null].filter(Boolean).join(', ');
+      // `emailData` is null for a LinkedIn-only lead — that is the entire point of
+      // gating the email draft. The line below dereferenced it unconditionally, one line
+      // ABOVE the ternary that correctly handles null, so the LinkedIn-only lead this
+      // block exists to serve threw `Cannot read properties of null (reading
+      // 'textContent')` and produced no note at all. Found on env2, not by the unit
+      // test: that test asserts no email-strategist prompt was sent, which stays true
+      // when the function throws before reaching any prompt.
+      // The `|| ''` also bound to the false branch only, so a text draft with an empty
+      // textContent threw here too.
+      const emailSummary = emailData
+        ? String((emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent) || '').slice(0, 300)
+        : '';
+      const messagePrompt = `You are writing a LinkedIn connection request note. The goal is to get the recipient to accept.
+
+Recipient: ${leadDesc}
+${emailData ? `Context from their email (use to understand the outreach angle): Subject: ${emailData.subject} — ${emailSummary}` : 'No email draft for this lead (no address on file) — write the note from their profile alone.'}
+${messageActivityContext}
+
+Write a note that:
+- Leads with something specific about THEIR work, role, or company — show you looked them up
+- Explains briefly WHY you want to connect, relevant to them
+- Sounds like one human writing to another — warm, direct, no corporate speak
+- Is under ${inviteCharLimit} characters total
+- Opens with their first name naturally (e.g. "John, saw your work on..." or "Sarah —")
+- Does NOT start with Hi or Hello
+- Does NOT have a call to action ("would love to chat", "let's connect")
+- Does NOT use: synergy, opportunity, exciting, leverage, passionate, innovative
+- No emojis
+
+Bad: "Your work in enterprise security is impressive. Would love to connect and explore synergies."
+Good: "Sarah, Island's browser-isolation is one of the smarter takes on shadow IT — solves it without blocking employees."
+
+Reply with ONLY valid JSON: {"content": "the note text"}`;
+
+      const messageCompletion = wantsLinkedInNote
+        ? await callLLM('gemini-3.5-flash', [
+          { role: 'user', content: messagePrompt },
+        ], {
+          temperature: 0.8,
+          max_completion_tokens: 2048,
+          usageContext: { userId, sessionId, feature: 'invite_message' },
+          taskClass: 'content_generation',
+        })
+        : null;
+
+      const messageResponseContent = messageCompletion?.choices?.[0]?.message?.content ?? null;
+      // Only a lead we actually asked for a note about can be missing one.
+      if (wantsLinkedInNote && !messageResponseContent) {
+        throw new Error('No message content generated from LLM');
+      }
+
+      // Parse the JSON response — Gemini may wrap it in markdown or prose
+      let messageData: any = null;
+      if (messageResponseContent) try {
+        const cleanedMsg = messageResponseContent.replace(/```json\s*/g, '').replace(/\s*```/g, '').trim();
+        const bs = cleanedMsg.indexOf('{');
+        const be = cleanedMsg.lastIndexOf('}');
+        if (bs !== -1 && be > bs) {
+          messageData = JSON.parse(cleanedMsg.slice(bs, be + 1));
+        } else {
+          messageData = { content: cleanedMsg };
+        }
+      } catch (parseError) {
+        console.error('AgentMode: Error parsing message draft JSON:', parseError);
+        // Continue with email draft only if message draft fails
+        messageData = null;
+      }
+
+      // Create message draft object if we got valid data — smart-trim to the account's
+      // LinkedIn invite limit (300 Premium / 200 free) on a word boundary (surrogate-safe),
+      // matching what sendInvitation does at send time — never a crude mid-word cut.
+      let messageDraft = null;
+      if (messageData && messageData.content) {
+        const now = new Date().toISOString();
+        let noteText = String(messageData.content);
+        // Layer 2: if the draft exceeds the account limit, ask the model to rewrite it
+        // shorter (capped), then Layer 3 hard-trims on a sentence/word boundary as the
+        // guarantee — same trimInviteMessage() the inline send path uses, kept consistent.
+        if (noteText.length > inviteCharLimit) {
+          const { shortenInviteNoteToLimit } = await import('../../services/inviteNoteShortener');
+          noteText = await shortenInviteNoteToLimit({ callLLM: callLLM as unknown as Pick<AgentModeService, 'callLLM'>['callLLM'] }, noteText, inviteCharLimit, 2, userId, sessionId);
+        }
+        messageDraft = {
+          content: LinkedInOutreachService.trimInviteMessage(noteText, inviteCharLimit),
+          createdAt: now,
+          updatedAt: now,
+          sessionId: sessionId
+        };
+      }
+
+      // Update lead with whichever drafts were actually produced. With both gated off
+      // there is nothing to write, and an empty update is not free: it costs a read plus
+      // an UpdateItem that only bumps updatedAt and re-projects the GSIs.
+      const draftUpdates = {
+        ...(emailDraft && { emailDraft, emailDraftFormat }),
+        ...(messageDraft && { messageDraft: messageDraft })
+      };
+      if (Object.keys(draftUpdates).length > 0) {
+        await crmDb.updateLead(listId, leadId, draftUpdates);
+      }
+
+      return {
+        success: true,
+        // `skipped` when NEITHER draft was produced. webhooks.ts maps `success && !skipped`
+        // to autoDraftStatus='created', so without this the owner alert said "Auto Draft:
+        // Created" over nothing at all — reachable when the note LLM returns parseable but
+        // contentless JSON, or when `linkedin` is whitespace (the entry guard uses raw
+        // truthiness, the note gate trims, so the two disagree on that value).
+        ...(!emailData && !messageDraft ? { skipped: true, reason: 'nothing_generated' } : {}),
+        // Say what actually happened. Each draft is now gated on its own channel, so all
+        // four combinations are reachable and the old two-way message described one.
+        message: emailData && messageDraft
+          ? (existingDraft
+            ? 'Email and message drafts updated successfully'
+            : 'Email and message drafts created successfully')
+          : emailData
+            ? (existingDraft ? 'Email draft updated successfully' : 'Email draft created successfully')
+            : messageDraft
+              ? 'LinkedIn message draft created — no email draft, this lead has no address'
+              : 'No draft created — nothing usable was generated for this lead',
+        data: {
+          // null, not a fabricated shape: webhooks.ts reads data.email to decide whether to
+          // auto-send, and an object with undefined fields would read as a real draft.
+          email: !emailData
+            ? null
+            : emailDraftFormat === 'text'
+              ? {
+                subject: emailData.subject,
+                textContent: emailData.textContent
+              }
+              : {
+                subject: emailData.subject,
+                htmlContent: emailData.htmlContent
+              },
+          message: messageDraft ? { content: messageDraft.content } : null
+        }
+      };
+    } catch (error) {
+      console.error('AgentMode: Error updating email draft for lead:', error);
+      return {
+        success: false,
+        message: 'Failed to create/update email draft',
+        error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
   }

@@ -4,8 +4,11 @@
  * Extracted verbatim from `AgentModeService.prototype.getCrmSenders`. Shared
  * far more widely than any single tool cluster: `emma/impl/leads.ts`'s
  * `sendEmailToLead` (this extraction), `AgentModeService.prototype.getSenderForLead`
- * (used by the deferred, `this.callLLM`-coupled `updateEmailDraftForLead` —
- * see that method's own flag in emma/impl/leads.ts's header comment), and
+ * (used by `emma/impl/leads.ts`'s `updateEmailDraftForLead`, ENG-2103 F2
+ * design-decision-list follow-up — `getSenderForLead` itself stays on the
+ * class, injected into that function as a bound parameter rather than
+ * promoted here, since its only real caller besides a test spy is that one
+ * method; see leads.ts's own header comment for the full reasoning), and
  * `routes/webhooks.ts` (a real production caller found by grepping the whole
  * backend, not just tools.ts or this cluster) all call
  * `agentModeService.getCrmSenders(...)` directly. `AgentModeService`'s own

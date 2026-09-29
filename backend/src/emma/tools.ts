@@ -4172,13 +4172,24 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.updateEmailDraftForLead(
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): calls
+    // emma/impl/leads.ts directly, not agentModeService.updateEmailDraftForLead —
+    // that class method still exists (routes/webhooks.ts's forward-lead
+    // auto-draft path and a dedicated test call it directly), but `callLLM`
+    // and `getReportGenerationDefaultModel` are both `public` on
+    // AgentModeService, so this tool can bind them straight off the
+    // singleton, same treatment as create_html_from_template /
+    // import_leads_from_search.
+    return leadsImpl.updateEmailDraftForLead(
       args.list_id,
       args.lead_id,
       args.instruction,
       context?.sessionId,
       context?.userId,
-      args.email_format
+      args.email_format,
+      agentModeService.callLLM.bind(agentModeService),
+      agentModeService.getReportGenerationDefaultModel.bind(agentModeService),
+      agentModeService.getSenderForLead.bind(agentModeService),
     );
   }
 });
