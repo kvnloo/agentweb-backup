@@ -149,8 +149,9 @@ const refreshLocks = new Map<string, Promise<{ access_token: string; token_expir
 /**
  * Does this refresh failure mean the refresh token is permanently dead?
  *
- * Only a definitive rejection from HubSpot's token endpoint counts: 400 (HubSpot's
- * BAD_REFRESH_TOKEN) or 401. Everything else — 5xx, a timeout, DNS, a proxy hiccup —
+ * Only a definitive rejection from HubSpot's token endpoint counts, and the BODY decides:
+ * any 4xx whose payload names the refresh token. The status alone never decides — an
+ * earlier 400/401 allow-list missed a real production 403 BAD_SCOPES. Everything else — 5xx, a timeout, DNS, a proxy hiccup —
  * is transient and must NOT be flagged, because the flag hard-fails every subsequent
  * call and tells a paying customer their integration is broken. That asymmetry is the
  * same one linkedInOutreachService documents for its 403 case: wrongly persisting

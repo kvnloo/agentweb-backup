@@ -50,7 +50,16 @@ jest.mock('../services/connectedAccountsDb', () => ({
   updateAccountTokens: jest.fn(),
 }));
 const mockListEmails = jest.fn();
-const mockHubSpotInstance = { listEmails: mockListEmails };
+const mockSubmitForm = jest.fn();
+const mockListContactLists = jest.fn();
+const mockHubSpotInstance = {
+  listEmails: mockListEmails,
+  // Needed by the pre-flight's negative cases: asserting only that a string is ABSENT
+  // would pass on a TypeError, so these prove the call actually reached the service.
+  submitForm: mockSubmitForm,
+  portalId: '245815183',
+  listContactLists: mockListContactLists,
+};
 jest.mock('../services/hubspotService', () => ({
   HubSpotService: {
     create: jest.fn(async () => mockHubSpotInstance),
@@ -60,16 +69,10 @@ jest.mock('../services/hubspotService', () => ({
 jest.mock('../config/integrations', () => ({
   getHubSpotConfig: jest.fn().mockResolvedValue({ clientId: 'x', clientSecret: 'y', tokenUrl: 'u', redirectUri: 'r', scopes: [], authorizationUrl: 'a', tokenInfoUrl: 't' }),
   INTEGRATION_CONFIG: {
-    // Real values, not a stub: the marketing pre-flight reads marketingOnlyScopes, and an
-    // empty stub makes the guard silently no-op — a test that passes while proving nothing.
-    hubspot: {
-      scopes: ['crm.objects.contacts.read', 'crm.objects.contacts.write', 'crm.lists.read'],
-      marketingOnlyScopes: [
-        'marketing.campaigns.read', 'marketing.campaigns.revenue.read',
-        'marketing.campaigns.write', 'content', 'automation', 'forms',
-        'communication_preferences.read', 'social',
-      ],
-    },
+    // Read from the real module, not pasted. A hard copy goes stale silently: remove
+    // `social` from INTEGRATION_CONFIG and production stops treating it as a marketing
+    // scope while this suite stays green.
+    hubspot: jest.requireActual('../config/integrations').INTEGRATION_CONFIG.hubspot,
     linkedinAds: { apiVersion: '202603', apiBaseUrl: 'https://api.linkedin.com', scopes: [], redirectUri: '', authorizationUrl: '', tokenUrl: '', profileUrl: '' },
     linkedin: { scopes: [], redirectUri: '', authorizationUrl: '', tokenUrl: '', profileUrl: '' },
     meta: { scopes: [], redirectUri: '', authorizationUrl: '', tokenUrl: '' },
@@ -220,11 +223,12 @@ describe("call_hubspot_api 403 — HubSpot's own category reaches the log", () =
  * so the negative cases below matter more than the positive one.
  */
 describe('call_hubspot_api marketing pre-flight', () => {
-  const oauthAccount = (granted: string[]) => ([{
+  const oauthAccount = (granted: string[], hubspotType: 'crm' | 'marketing' = 'crm') => ([{
     platform: 'hubspot',
     account_id: '245815183',
     account_name: 'argusoft.com',
-    config: { account_type: 'oauth', access_token: 't', refresh_token: 'r',
+    config: { account_type: 'oauth', hubspot_account_type: hubspotType,
+              access_token: 't', refresh_token: 'r',
               token_expires_at: Date.now() + 3600_000, granted_scopes: granted },
   }] as any);
 
@@ -246,8 +250,55 @@ describe('call_hubspot_api marketing pre-flight', () => {
 
   it('does NOT refuse CONTACT_LIST on a CRM-only grant — that is a CRM object', async () => {
     mockGetAccounts.mockResolvedValue(oauthAccount(CRM_ONLY));
+    mockListContactLists.mockResolvedValue({ results: [] });
     const r = await agentModeService.handleHubspotApi(USER, { entity_type: 'CONTACT_LIST', action: 'LIST' });
+    // Asserting only the absence of a string would pass for a guard that blocked with
+    // different wording. Prove the call actually reached HubSpot.
+    expect(mockListContactLists).toHaveBeenCalled();
+    expect(r.success).toBe(true);
+  });
+
+  /*
+   * FORM SUBMIT is the one guarded action that carries no OAuth token at all:
+   * hubspotService.submitForm posts to api.hsforms.com keyed by portalId + formGuid.
+   * Every other method behind these seven entities uses authHeaders() against
+   * api.hubapi.com. A CRM-only grant can submit a form today, so refusing it would break
+   * a working call AND tell the customer to reconnect to fix a request that sends no
+   * credential — the guard's own docstring forbids exactly that.
+   */
+  it('does NOT refuse FORM SUBMIT on a CRM-only grant — that endpoint needs no token', async () => {
+    mockGetAccounts.mockResolvedValue(oauthAccount(CRM_ONLY));
+    mockSubmitForm.mockResolvedValue({ inlineMessage: 'ok' });
+    // The route's real contract: form_id is the GUID, fields is an ARRAY, and portalId
+    // comes off the service instance — not from args.
+    const r = await agentModeService.handleHubspotApi(USER, {
+      entity_type: 'FORM', action: 'SUBMIT', form_id: 'guid-1',
+      fields: [{ name: 'email', value: 'a@b.c' }],
+    });
+    expect(mockSubmitForm).toHaveBeenCalled();
     expect(String(r.error ?? '')).not.toMatch(/CRM access only/i);
+  });
+
+  it('still refuses the OTHER FORM actions on a CRM-only grant', async () => {
+    mockGetAccounts.mockResolvedValue(oauthAccount(CRM_ONLY));
+    const r = await agentModeService.handleHubspotApi(USER, { entity_type: 'FORM', action: 'LIST' });
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/CRM access only/i);
+  });
+
+  /*
+   * When the user DID choose marketing at connect time and HubSpot still granted no
+   * marketing scope, HubSpot declined the optional_scope: the portal has no Marketing
+   * Hub. Telling them to reconnect and pick marketing is the useless remedy this whole
+   * change exists to stop prescribing.
+   */
+  it('tells a marketing-typed grant with no marketing scopes that the PORTAL lacks Marketing Hub', async () => {
+    mockGetAccounts.mockResolvedValue(oauthAccount(CRM_ONLY, 'marketing'));
+    const r = await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
+    expect(r.success).toBe(false);
+    expect(r.error).toMatch(/does not have Marketing Hub/i);
+    expect(r.error).toMatch(/Reconnecting will not change this/i);
+    expect(r.error).not.toMatch(/choose the marketing option/i);
   });
 
   it('does NOT refuse a marketing call when the grant holds marketing scopes', async () => {
@@ -281,5 +332,42 @@ describe('call_hubspot_api marketing pre-flight', () => {
     mockGetAccounts.mockRejectedValue(new Error('dynamo exploded'));
     const r = await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
     expect(String(r.error ?? '')).not.toMatch(/CRM access only/i);
+  });
+});
+
+/*
+ * HubSpot's free-text 403 message is the one unbounded, HubSpot-supplied field in the
+ * diagnostic. Its MISSING_SCOPES form is widely reported as
+ * "This oauth-token (<token>) does not have proper permissions!", which would write a
+ * live access token into the log on exactly the branch this diagnostic serves.
+ */
+describe('the 403 diagnostic does not log a token embedded in HubSpot\'s message', () => {
+  let errSpy: jest.SpyInstance;
+  beforeEach(() => { jest.clearAllMocks(); errSpy = jest.spyOn(console, 'error').mockImplementation(() => {}); });
+  afterEach(() => { errSpy.mockRestore(); });
+  const logged = () => errSpy.mock.calls.flat().map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' | ');
+
+  it('redacts an oauth-token parenthetical', async () => {
+    mockGetAccounts.mockResolvedValue([] as any);
+    mockListEmails.mockRejectedValue(hs403({
+      status: 'error', category: 'MISSING_SCOPES',
+      message: 'This oauth-token (CJSA6-doYY4CEQjjrR8YjbCLARi9v4EBIJPk8wQo9OYDMhkA) does not have proper permissions! (requires any of [content])',
+    }));
+    await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
+    const out = logged();
+    expect(out).not.toContain('CJSA6-doYY4CEQjjrR8YjbCLARi9v4EBIJPk8wQo9OYDMhkA');
+    expect(out).toContain('<redacted>');
+    // the diagnostic value must survive the redaction
+    expect(out).toMatch(/category=MISSING_SCOPES/);
+    expect(out).toMatch(/requires any of \[content\]/);
+  });
+
+  it('caps an unbounded message', async () => {
+    mockGetAccounts.mockResolvedValue([] as any);
+    // Spaced prose: a single 2000-char run is token-shaped and gets redacted wholesale,
+    // which never reaches the length cap. This exercises the cap itself.
+    mockListEmails.mockRejectedValue(hs403({ category: 'X', message: 'scope missing '.repeat(120) }));
+    await agentModeService.handleHubspotApi(USER, { entity_type: 'EMAIL', action: 'LIST' });
+    expect(logged()).toContain('truncated');
   });
 });

@@ -42765,9 +42765,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   // ─── HubSpot Campaigns ──────────────────────────────────────────────────────
 
+  /**
+   * Set by resolveHubSpotService to the OAuth account actually used, or null when the
+   * pasted private-app-token fallback served the call. The marketing pre-flight must not
+   * re-derive this: resolveHubSpotService falls back to a pasted key whenever create()
+   * throws without an explicit account_id — including a missing or rejected refresh
+   * token — so a dead CRM-only OAuth row can coexist with a live, fully-capable pasted
+   * key, and judging the dead row's scopes would refuse a call the token can serve.
+   */
+  private lastResolvedHubSpotAccountId: string | null = null;
+
   private async resolveHubSpotService(userId: string, accountId?: string): Promise<HubSpotService> {
+    this.lastResolvedHubSpotAccountId = null;
     try {
-      return await HubSpotService.create(userId, accountId);
+      const svc = await HubSpotService.create(userId, accountId);
+      this.lastResolvedHubSpotAccountId = accountId ?? (await this.soleHubSpotAccountId(userId));
+      return svc;
     } catch (err: any) {
       // An explicit account_id or a multi-account ambiguity is actionable by the
       // caller — surface it instead of silently falling back to token-paste.
@@ -42787,6 +42800,39 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     throw new Error('No HubSpot account connected. Please connect HubSpot in Settings → External CRM Sync or via OAuth in Connected Accounts.');
   }
 
+  /**
+   * HubSpot's free-text 403 message, made safe to log.
+   *
+   * A review flagged that the previous version wrote `response.data.message` verbatim on
+   * the strength of a comment asserting it "carries no credentials" — asserted, never
+   * measured. HubSpot's MISSING_SCOPES message is widely reported in the form
+   * "This oauth-token (<token>) does not have proper permissions!", which would put a
+   * live access token in the application log on exactly the branch this diagnostic is
+   * for: the same class of leak redactAxiosCredentials exists to prevent.
+   *
+   * `category` and `correlationId` already satisfy the diagnostic goal, so the message is
+   * kept only for the scope hint it carries — with anything token-shaped removed and a
+   * hard length cap, the way describeRefreshFailure caps its body.
+   */
+  private static redactHubSpotMessage(msg: unknown): string | null {
+    if (typeof msg !== 'string') return msg == null ? null : '<non-string>';
+    let out = msg
+      // HubSpot's own "(oauth-token)" parenthetical, and any bare long token-ish run.
+      .replace(/\(\s*[A-Za-z0-9._-]{20,}\s*\)/g, '(<redacted>)')
+      .replace(/\b(?:pat-[a-z0-9-]+|na1-[A-Za-z0-9-]{8,}|[A-Za-z0-9_-]{40,})\b/g, '<redacted>');
+    if (out.length > 300) out = `${out.slice(0, 300)}…<truncated>`;
+    return out;
+  }
+
+  /** The single OAuth HubSpot account id, or null when there is not exactly one. */
+  private async soleHubSpotAccountId(userId: string): Promise<string | null> {
+    try {
+      const { getAccountsByUserId } = await import('./connectedAccountsDb');
+      const hs = (await getAccountsByUserId(userId)).filter((a: any) => a.platform === 'hubspot');
+      return hs.length === 1 ? hs[0].account_id : null;
+    } catch { return null; }
+  }
+
   /** Marketing Hub objects served by call_hubspot_api. CONTACT_LIST is CRM, not here. */
   private static readonly HUBSPOT_MARKETING_ENTITIES = new Set([
     'CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL',
@@ -42802,16 +42848,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    */
   private async hubspotMarketingPreflight(
     userId: string,
-    accountId: string | undefined,
     entityType: string,
+    action: string,
   ): Promise<{ success: false; error: string } | null> {
     if (!AgentModeService.HUBSPOT_MARKETING_ENTITIES.has(entityType)) return null;
+    // FORM SUBMIT is the one guarded action that needs no OAuth scope at all: submitForm
+    // posts to api.hsforms.com keyed by portalId + formGuid and sends NO bearer token
+    // (hubspotService.submitForm). Every other method behind these seven entities goes
+    // through authHeaders() against api.hubapi.com. Refusing it would break a call that
+    // works on a CRM-only grant today — and tell the customer to reconnect to fix a
+    // request that carries no token.
+    if (entityType === 'FORM' && action === 'SUBMIT') return null;
     try {
+      // Only the account that ACTUALLY served this call, recorded by
+      // resolveHubSpotService. Null means the pasted-token fallback ran, whose scopes we
+      // cannot see and must not guess at.
+      const accountId = this.lastResolvedHubSpotAccountId;
+      if (!accountId) return null;
       const { getAccountsByUserId } = await import('./connectedAccountsDb');
       const accounts = await getAccountsByUserId(userId);
       const hs = accounts.filter((a: any) => a.platform === 'hubspot');
-      const acct = accountId ? hs.find((a: any) => a.account_id === accountId) : (hs.length === 1 ? hs[0] : undefined);
-      // No OAuth account resolved (pasted token, or ambiguous multi-account) — not ours to judge.
+      const acct = hs.find((a: any) => a.account_id === accountId);
       if (!acct) return null;
       const granted: string[] = ((acct.config as any)?.granted_scopes ?? []) as string[];
       if (!Array.isArray(granted) || granted.length === 0) return null;
@@ -42819,13 +42876,23 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       const marketingOnly: readonly string[] = (INTEGRATION_CONFIG as any)?.hubspot?.marketingOnlyScopes ?? [];
       if (marketingOnly.length === 0) return null;
       if (granted.some((g) => marketingOnly.includes(g))) return null;
+      // hubspotAuth persists whether the user CHOSE marketing at connect time. If they
+      // did and HubSpot still granted no marketing scope, HubSpot declined the
+      // optional_scope — the portal has no Marketing Hub. Telling them to reconnect and
+      // pick marketing sends them through the exact round trip that changes nothing,
+      // which is the behaviour this whole change exists to stop.
+      const askedForMarketing = (acct.config as any)?.hubspot_account_type === 'marketing';
       return {
         success: false,
-        error:
-          `This HubSpot connection was authorised for CRM access only, so it cannot read or write `
-          + `${entityType} (a Marketing Hub object). Reconnect HubSpot in Settings → Connected Accounts `
-          + `and choose the marketing option to grant marketing access. Reconnecting with CRM access `
-          + `again will not change this.`,
+        error: askedForMarketing
+          ? `This HubSpot portal does not have Marketing Hub, so it cannot read or write `
+            + `${entityType} (a Marketing Hub object). Marketing access was requested when the `
+            + `account was connected and HubSpot did not grant it. Reconnecting will not change `
+            + `this — the portal's HubSpot plan has to include Marketing Hub.`
+          : `This HubSpot connection was authorised for CRM access only, so it cannot read or write `
+            + `${entityType} (a Marketing Hub object). Reconnect HubSpot in Settings → Connected Accounts `
+            + `and choose the marketing option to grant marketing access. Reconnecting with CRM access `
+            + `again will not change this.`,
       };
     } catch {
       return null;
@@ -42856,7 +42923,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // OAuth only. resolveHubSpotService falls back to a pasted private-app token whose
       // scopes we cannot see, and blocking on scopes we do not know would break working
       // setups.
-      const preflight = await this.hubspotMarketingPreflight(userId, args?.account_id, entityType);
+      const preflight = await this.hubspotMarketingPreflight(userId, entityType, action);
       if (preflight) return preflight;
 
       // ─── CONTACT_LIST ──────────────────────────────────────────────────────
@@ -43292,7 +43359,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         console.error(
           `[AgentMode] call_hubspot_api 403 entity=${entityType} action=${action} `
           + `category=${hsBody?.category ?? 'none'} missingScopes=${missingScopes} `
-          + `message=${JSON.stringify(hsBody?.message ?? null)} `
+          + `message=${JSON.stringify(AgentModeService.redactHubSpotMessage(hsBody?.message))} `
           + `correlationId=${hsBody?.correlationId ?? 'none'}`
         );
         return {
