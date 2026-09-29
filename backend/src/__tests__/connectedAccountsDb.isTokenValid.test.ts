@@ -110,3 +110,56 @@ describe('isTokenValid', () => {
     });
   });
 });
+
+/*
+ * A dead credential must read as dead to Emma, not just to the Settings page.
+ *
+ * routes/connectedAccounts.ts reports a flagged hubspot/twitter account as
+ * "Reconnect required", while isTokenValid trusted the mere PRESENCE of a refresh_token —
+ * so list_connected_accounts handed the model `is_active: true` for the same account. The
+ * assistant then tells a customer their integration is fine while the UI says it is
+ * broken. That is the inconsistency the Meta Ads branch of that route exists to prevent
+ * (ENG-1158), reached here through a different door.
+ *
+ * Attio is deliberately exempt: it sets the same key for a 403 registering the webhook
+ * (a missing webhook:read-write scope), where the token is valid and CRM reads/writes
+ * still work. Reporting that account as dead would be the same lie inverted.
+ */
+describe('isTokenValid and a dead credential', () => {
+  const account = (platform: string, config: Record<string, unknown> = {}): any => ({
+    platform,
+    account_id: 'acct-1',
+    account_name: 'Test',
+    config: {
+      access_token: 'tok',
+      refresh_token: 'refresh',
+      // Expired, so the refresh_token-presence path is the one under test.
+      token_expires_at: Date.now() - 60 * 60 * 1000,
+      ...config,
+    },
+  });
+
+  it.each([['hubspot'], ['twitter']])(
+    'reports a flagged %s account as invalid despite a refresh_token',
+    async (platform) => {
+      await expect(isTokenValid(account(platform, { needs_reconnect: true }))).resolves.toBe(false);
+    },
+  );
+
+  it.each([['hubspot'], ['twitter']])(
+    'still reports an UNflagged %s account as valid', async (platform) => {
+      await expect(isTokenValid(account(platform))).resolves.toBe(true);
+      await expect(isTokenValid(account(platform, { needs_reconnect: false }))).resolves.toBe(true);
+    },
+  );
+
+  it('does NOT report a flagged attio account as invalid — its flag means a missing webhook scope, not a dead token', async () => {
+    await expect(isTokenValid(account('attio', { needs_reconnect: true }))).resolves.toBe(true);
+  });
+
+  it('a flagged account with no refresh_token is invalid for the original reason too', async () => {
+    await expect(
+      isTokenValid(account('hubspot', { needs_reconnect: true, refresh_token: undefined })),
+    ).resolves.toBe(false);
+  });
+});
