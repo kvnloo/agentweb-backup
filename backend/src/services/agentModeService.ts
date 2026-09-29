@@ -208,6 +208,7 @@ import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { publishWithResolvedBlogPublisher } from './blogPublishers';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
 import { declaredPlacementField } from './agentMode/generateImagePlacement';
+import { isNonConsumableRequiredFunctionCall } from './agentMode/workPlanRequiredCallsPolicy';
 import { recordGeneratedCreative, stampMetaAdCreated, stampMetaAdCreativeChanged, stampMetaCreativeCreated, stampMetaImageUpload, stampMetaPublish } from './creativeLineage';
 import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
@@ -36458,40 +36459,6 @@ Reply with ONLY one word: yes or no.`;
     }
   }
 
-  /**
-   * ENG-2206: requiredFunctionCalls tools whose successful call is a durable,
-   * session-wide FACT rather than a per-step produced artifact. `generate_image`
-   * (the case ENG-1698 was built for) makes a NEW distinct asset every call, so a
-   * later step listing it as required genuinely needs its OWN fresh call — hence
-   * that credit is decremented once the step consuming it resolves. These two
-   * tools are the opposite: read_brand_guidelines / read_market_strategy return
-   * the SAME data every time (their own responses say so verbatim: "do not call
-   * ... again in this conversation as it will return the same information").
-   *
-   * you_search_web/you_search_news are deliberately NOT in this set even though
-   * they appeared alongside these two in the reported session: each call hits an
-   * external search API with a caller-supplied query and can legitimately return
-   * different results for a different step, so crediting one step's search
-   * toward a sibling's identical requirement would be wrong. Only a tool whose
-   * own response asserts a session-wide cached-fact contract belongs here.
-   *
-   * Without this carve-out, a predefined plan whose steps share a common
-   * "foundation" requirement (e.g. every content-format step lists
-   * read_brand_guidelines so each has brand context) has its very first step
-   * consume that credit on completion/skip, then every later sibling step's
-   * identical requirement is reported "missing" despite the tool genuinely having
-   * been called earlier in this exact session (prod session 18bc82a6-...:
-   * read_brand_guidelines/read_market_strategy called once near the start, then
-   * set_work_plan_status blocked step 5 five times across the session (a mid-run
-   * 600s generation timeout split it into two segments; the issue's own AgentRun
-   * dossier only captured the latter four) with "Required function calls have
-   * not been made yet").
-   */
-  private static readonly NON_CONSUMABLE_REQUIRED_FUNCTION_CALLS = new Set<string>([
-    'read_brand_guidelines',
-    'read_market_strategy',
-  ]);
-
   public async setWorkPlanStatus(
     updates: Array<{ stepCount: number; status: 'pending' | 'completed' | 'skipped'; notes?: string }>,
     sessionId: string
@@ -36696,9 +36663,9 @@ Reply with ONLY one word: yes or no.`;
 
         // If validation passed and marking as completed, decrement the function counts.
         // ENG-2206: skip tools whose credit is a session-wide fact, not a per-step
-        // artifact — see NON_CONSUMABLE_REQUIRED_FUNCTION_CALLS's doc comment.
+        // artifact — see workPlanRequiredCallsPolicy.ts's doc comment.
         for (const fn of step.requiredFunctionCalls) {
-          if (AgentModeService.NON_CONSUMABLE_REQUIRED_FUNCTION_CALLS.has(fn)) continue;
+          if (isNonConsumableRequiredFunctionCall(fn)) continue;
           calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
           pendingCalledFunctionDecrements[fn] = (pendingCalledFunctionDecrements[fn] || 0) + 1;
           countsModified = true;
@@ -36717,7 +36684,7 @@ Reply with ONLY one word: yes or no.`;
       if (update.status === 'skipped' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
         for (const fn of step.requiredFunctionCalls) {
           // ENG-2206: same carve-out as the completed branch above.
-          if (AgentModeService.NON_CONSUMABLE_REQUIRED_FUNCTION_CALLS.has(fn)) continue;
+          if (isNonConsumableRequiredFunctionCall(fn)) continue;
           const current = calledFunctionCounts[fn] || 0;
           if (current > 0) {
             calledFunctionCounts[fn] = current - 1;
