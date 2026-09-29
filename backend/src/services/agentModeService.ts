@@ -208,6 +208,7 @@ import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { publishWithResolvedBlogPublisher } from './blogPublishers';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
 import { declaredPlacementField } from './agentMode/generateImagePlacement';
+import { isNonConsumableRequiredFunctionCall } from './agentMode/workPlanRequiredCallsPolicy';
 import { recordGeneratedCreative, stampMetaAdCreated, stampMetaAdCreativeChanged, stampMetaCreativeCreated, stampMetaImageUpload, stampMetaPublish } from './creativeLineage';
 import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
@@ -36724,8 +36725,11 @@ Reply with ONLY one word: yes or no.`;
           continue; // Skip updating this step
         }
 
-        // If validation passed and marking as completed, decrement the function counts
+        // If validation passed and marking as completed, decrement the function counts.
+        // ENG-2206: skip tools whose credit is a session-wide fact, not a per-step
+        // artifact — see workPlanRequiredCallsPolicy.ts's doc comment.
         for (const fn of step.requiredFunctionCalls) {
+          if (isNonConsumableRequiredFunctionCall(fn)) continue;
           calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
           pendingCalledFunctionDecrements[fn] = (pendingCalledFunctionDecrements[fn] || 0) + 1;
           countsModified = true;
@@ -36743,6 +36747,8 @@ Reply with ONLY one word: yes or no.`;
       // step that makes a genuinely fresh call).
       if (update.status === 'skipped' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
         for (const fn of step.requiredFunctionCalls) {
+          // ENG-2206: same carve-out as the completed branch above.
+          if (isNonConsumableRequiredFunctionCall(fn)) continue;
           const current = calledFunctionCounts[fn] || 0;
           if (current > 0) {
             calledFunctionCounts[fn] = current - 1;
@@ -42855,11 +42861,156 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     throw new Error('No HubSpot account connected. Please connect HubSpot in Settings → External CRM Sync or via OAuth in Connected Accounts.');
   }
 
+  /**
+   * HubSpot's free-text 403 message, made safe to log.
+   *
+   * A review flagged that the previous version wrote `response.data.message` verbatim on
+   * the strength of a comment asserting it "carries no credentials" — asserted, never
+   * measured. HubSpot's MISSING_SCOPES message is widely reported in the form
+   * "This oauth-token (<token>) does not have proper permissions!", which would put a
+   * live access token in the application log on exactly the branch this diagnostic is
+   * for: the same class of leak redactAxiosCredentials exists to prevent.
+   *
+   * `category` and `correlationId` already satisfy the diagnostic goal, so the message is
+   * kept only for the scope hint it carries — with anything token-shaped removed and a
+   * hard length cap, the way describeRefreshFailure caps its body.
+   */
+  /** The same redaction applied to a whole HubSpot error body before it leaves us. */
+  private static redactHubSpotBody(body: unknown, depth = 0): unknown {
+    // Walk EVERY string, not just a top-level `message`. HubSpot returns at least four
+    // shapes and only one was covered: `{errors:[{message}]}` (which this codebase
+    // already depends on — throwIfBatchPartialFailure reads data.errors[0].message), a
+    // bare string body from a proxy or WAF, `{context:{detail}}`, and a top-level array.
+    // Having accepted that a token can ride in free text, the coverage has to match the
+    // threat model rather than the one sentence that was reported.
+    // Fail CLOSED. Returning the raw sub-tree here would hand back tokens intact — a
+    // theoretical leak in a control whose whole premise is that free text can carry a
+    // credential. Losing a deeply nested diagnostic is the cheaper failure. Real HubSpot
+    // bodies are depth <= 3, so this is unreachable either way.
+    if (depth > 6) return '<depth-capped>';
+    if (typeof body === 'string') return AgentModeService.redactHubSpotMessage(body);
+    if (Array.isArray(body)) return body.map((v) => AgentModeService.redactHubSpotBody(v, depth + 1));
+    if (!body || typeof body !== 'object') return body ?? null;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(body as Record<string, unknown>)) {
+      out[k] = AgentModeService.redactHubSpotBody(v, depth + 1);
+    }
+    return out;
+  }
+
+  private static redactHubSpotMessage(msg: unknown): string | null {
+    if (typeof msg !== 'string') return msg == null ? null : '<non-string>';
+    let out = msg
+      // HubSpot's own "(oauth-token)" parenthetical, and any bare long token-ish run.
+      // No dot inside: `(marketing.campaigns.revenue.read)` is a SCOPE NAME and is the
+      // very hint this field is kept for. Rules 1 and 2 use different character classes
+      // on purpose — do not tidy them into agreement.
+      .replace(/\(\s*[A-Za-z0-9_-]{20,}\s*\)/g, '(<redacted>)')
+      .replace(/\b(?:pat-[a-z0-9-]+|na1-[A-Za-z0-9-]{8,}|[A-Za-z0-9_-]{40,})\b/g, '<redacted>');
+    if (out.length > 300) out = `${out.slice(0, 300)}…<truncated>`;
+    return out;
+  }
+
+  /** Marketing Hub objects served by call_hubspot_api. CONTACT_LIST is CRM, not here. */
+  private static readonly HUBSPOT_MARKETING_ENTITIES = new Set([
+    'CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL',
+  ]);
+
+  /**
+   * Returns an actionable error when the resolved OAuth grant holds no marketing scopes
+   * at all and the caller asked for a marketing object. Returns null to proceed.
+   *
+   * Best-effort by design: any problem resolving the account returns null so the call
+   * goes ahead and HubSpot decides. This guard exists to improve a message, and must
+   * never become a new way for a working call to fail.
+   */
+  private async hubspotMarketingPreflight(
+    userId: string,
+    svc: HubSpotService,
+    entityType: string,
+    action: string,
+  ): Promise<{ success: false; error: string } | null> {
+    if (!AgentModeService.HUBSPOT_MARKETING_ENTITIES.has(entityType)) return null;
+    // FORM SUBMIT is the one guarded action that needs no OAuth scope at all: submitForm
+    // posts to api.hsforms.com keyed by portalId + formGuid and sends NO bearer token
+    // (hubspotService.submitForm). Every other method behind these seven entities goes
+    // through authHeaders() against api.hubapi.com. Refusing it would break a call that
+    // works on a CRM-only grant today — and tell the customer to reconnect to fix a
+    // request that carries no token.
+    if (entityType === 'FORM' && action === 'SUBMIT') return null;
+    try {
+      // The account that ACTUALLY served this call, read off the instance. undefined means
+      // the pasted private-app-token path ran, whose scopes we cannot see and must not
+      // guess at.
+      //
+      // Deliberately not re-derived, and deliberately not carried on `this`. An earlier
+      // version recorded it in a field on this service — which is a process-wide
+      // singleton with a second writer — and the pasted-token fallback does real I/O
+      // (getLeadListsByUserId) between the reset and the read, so a concurrent call
+      // finishing the OAuth path left its id in the slot. A review reproduced that
+      // crossing 300/300.
+      const accountId = svc.accountId;
+      if (!accountId) return null;
+      const { getAccountsByUserId } = await import('./connectedAccountsDb');
+      const accounts = await getAccountsByUserId(userId);
+      const hs = accounts.filter((a: any) => a.platform === 'hubspot');
+      const acct = hs.find((a: any) => a.account_id === accountId);
+      if (!acct) return null;
+      const granted: string[] = ((acct.config as any)?.granted_scopes ?? []) as string[];
+      if (!Array.isArray(granted) || granted.length === 0) return null;
+      const { INTEGRATION_CONFIG } = await import('../config/integrations');
+      const marketingOnly: readonly string[] = (INTEGRATION_CONFIG as any)?.hubspot?.marketingOnlyScopes ?? [];
+      if (marketingOnly.length === 0) return null;
+      if (granted.some((g) => marketingOnly.includes(g))) return null;
+      // hubspotAuth persists whether the user CHOSE marketing at connect time. If they
+      // did and HubSpot still granted no marketing scope, HubSpot declined the
+      // optional_scope — the portal has no Marketing Hub. Telling them to reconnect and
+      // pick marketing sends them through the exact round trip that changes nothing,
+      // which is the behaviour this whole change exists to stop.
+      const askedForMarketing = (acct.config as any)?.hubspot_account_type === 'marketing';
+      return {
+        success: false,
+        error: askedForMarketing
+          ? `This HubSpot portal does not have Marketing Hub, so it cannot read or write `
+            + `${entityType} (a Marketing Hub object). Marketing access was requested when the `
+            + `account was connected and HubSpot did not grant it. Reconnecting will not change `
+            + `this — the portal's HubSpot plan has to include Marketing Hub.`
+          : `This HubSpot connection was authorised for CRM access only, so it cannot read or write `
+            + `${entityType} (a Marketing Hub object). Reconnect HubSpot in Settings → Connected Accounts `
+            + `and choose the marketing option to grant marketing access. Reconnecting with CRM access `
+            + `again will not change this.`,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   public async handleHubspotApi(userId: string, args: any): Promise<any> {
     const entityType: string = (args?.entity_type ?? '').toUpperCase();
     const action: string = (args?.action ?? '').toUpperCase();
     try {
       const svc = await this.resolveHubSpotService(userId, args?.account_id);
+
+      // Refuse a call the connection provably cannot serve, BEFORE spending a round trip
+      // on a guaranteed 403 whose message does not name the real problem.
+      //
+      // Every entity below CONTACT_LIST is a Marketing Hub object; CONTACT_LIST is CRM
+      // (crm.lists.*). In production 6 of 10 HubSpot grants hold NONE of
+      // integrations.hubspot.marketingOnlyScopes, so every marketing call they make 403s
+      // and the customer is told to "check your subscription tier and OAuth scopes" —
+      // true but unactionable, and it does not tell them which.
+      //
+      // Deliberately coarse: it fires only when the grant holds ZERO marketing scopes,
+      // where a 403 is certain. A grant holding `content` but not `forms` still reaches
+      // HubSpot and fails there. A precise per-entity scope map is the obvious next step,
+      // but it would be guesswork today — the 403 diagnostic added below is what will
+      // supply the real requirements.
+      //
+      // OAuth only. resolveHubSpotService falls back to a pasted private-app token whose
+      // scopes we cannot see, and blocking on scopes we do not know would break working
+      // setups.
+      const preflight = await this.hubspotMarketingPreflight(userId, svc, entityType, action);
+      if (preflight) return preflight;
 
       // ─── CONTACT_LIST ──────────────────────────────────────────────────────
       if (entityType === 'CONTACT_LIST') {
@@ -43276,16 +43427,40 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         // HubSpot returns 403 both for tier/scope limits and for tokens granted
         // before newer scopes were added to the app — distinguish them.
         const missingScopes = err?.response?.data?.category === 'MISSING_SCOPES';
+
+        // Log what HubSpot actually said. We hold the payload here and, until now, threw
+        // it away: `hubspotError` goes back to the model but the only thing written to
+        // the log is our own paraphrase, so a recurring production 403 (seen 09-23 and
+        // 09-26, same scheduled slot) could not be diagnosed at all.
+        //
+        // The distinction matters because the two causes have OPPOSITE remedies. A
+        // missing scope is fixed by reconnecting. A subscription-tier limit is not —
+        // telling that customer to reconnect sends them through an OAuth round trip that
+        // changes nothing. Right now we cannot tell them apart from the outside.
+        //
+        // `response.data` is HubSpot's error body: category, message, correlationId. It
+        // carries no credentials — unlike the axios error object, whose `config.data`
+        // holds client_secret (see redactAxiosCredentials in hubspotService).
+        const hsBody = err?.response?.data;
+        console.error(
+          `[AgentMode] call_hubspot_api 403 entity=${entityType} action=${action} `
+          + `category=${hsBody?.category ?? 'none'} missingScopes=${missingScopes} `
+          + `message=${JSON.stringify(AgentModeService.redactHubSpotMessage(hsBody?.message))} `
+          + `correlationId=${hsBody?.correlationId ?? 'none'}`
+        );
         return {
           success: false,
           error: missingScopes
             ? 'Your HubSpot connection is missing the required permissions. Please reconnect your HubSpot account in Settings → Connected Accounts to grant them.'
             : 'HubSpot API access denied. Check your HubSpot subscription tier and OAuth scopes (content, automation required for some entity types).',
-          hubspotError: err?.response?.data ?? null,
+          // Redacted on the way OUT as well as into the log: this body reaches the LLM
+          // context and anything that persists or shares tool results, which is a wider
+          // surface than our own logs, not a narrower one.
+          hubspotError: AgentModeService.redactHubSpotBody(err?.response?.data),
           status: 403,
         };
       }
-      return { success: false, error: err?.message ?? 'HubSpot API call failed.', hubspotError: err?.response?.data ?? null, status: err?.response?.status ?? null };
+      return { success: false, error: err?.message ?? 'HubSpot API call failed.', hubspotError: AgentModeService.redactHubSpotBody(err?.response?.data), status: err?.response?.status ?? null };
     }
   }
 

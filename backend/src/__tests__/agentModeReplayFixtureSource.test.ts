@@ -21,6 +21,7 @@ function storeWithLinks(links: Array<[string, { sessionId: string; messageIndex:
     getCase: jest.fn(),
     createCase: jest.fn(),
     saveLabels: jest.fn(),
+    saveDraft: jest.fn(),
   };
 }
 
