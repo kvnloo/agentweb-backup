@@ -296,3 +296,54 @@ describe('dripSequenceWorker — a step the lead cannot receive is skipped, not 
     expect(mockDb.advanceEnrollment).not.toHaveBeenCalled();
   });
 });
+
+/*
+ * Finding 8 — an enrollment that sent NOTHING must be distinguishable, and must not
+ * bar the lead forever.
+ *
+ * completeEnrollment was called with exitReason 'completed' regardless of whether a
+ * single step had been delivered. getEnrollmentStats counts purely by status, so a lead
+ * that skipped every step looked identical to one that received the whole sequence —
+ * and getExistingEnrollment matches regardless of status, so bulkEnroll refused to
+ * re-enrol it even after the user fixed the data. Combined with the channel and
+ * reachability defects, that turned a loud jam into permanent silent loss.
+ */
+describe('an enrollment that delivered nothing', () => {
+  // Derived from the harness fixture, not rebuilt: a hand-rolled object omitted
+  // exitConditions and the worker threw on it, which reads as a code failure.
+  const singleLinkedInStep = {
+    ...mixedSequence,
+    steps: [{ stepId: 's1', stepNumber: 1, name: 'invite', delayDays: 0, channel: 'linkedin', messageText: 'hi' }],
+  };
+
+  it('exits as completed_no_sends when no step ever landed', async () => {
+    mockDb.getSequence.mockResolvedValue(singleLinkedInStep as any);
+    mockDb.getAllDueEnrollments.mockResolvedValue([
+      // No lastEmailSentAt / lastLinkedInSentAt: nothing was ever delivered.
+      enrollmentAt(0, 'https://www.linkedin.com/in/ada/') as any,
+    ]);
+    // Free text, not a profile — db.ts stores it verbatim, so the step is skipped.
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'lead-1', linkedin: 'Acme Corp' } as any);
+
+    await processDueEnrollments();
+
+    expect(mockDb.completeEnrollment).toHaveBeenCalledWith(
+      'e1', 'completed_no_sends', 'completed', 'linkedin', false,
+    );
+  });
+
+  it('still exits as plain completed when an EARLIER step did send', async () => {
+    mockDb.getSequence.mockResolvedValue(singleLinkedInStep as any);
+    mockDb.getAllDueEnrollments.mockResolvedValue([
+      // The send timestamp is the evidence that something already landed.
+      { ...enrollmentAt(0, 'https://www.linkedin.com/in/ada/'), lastEmailSentAt: '2026-01-01T00:00:00Z' } as any,
+    ]);
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'lead-1', linkedin: 'Acme Corp' } as any);
+
+    await processDueEnrollments();
+
+    expect(mockDb.completeEnrollment).toHaveBeenCalledWith(
+      'e1', 'completed', 'completed', 'linkedin', false,
+    );
+  });
+});

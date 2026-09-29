@@ -76,6 +76,13 @@ export type EnrollmentStatus =
 
 export type ExitReason =
   | 'completed'
+  /**
+   * Ran to the end without a single step being delivered — every step was skipped
+   * because the lead could not be reached on that channel. Distinct from 'completed'
+   * on purpose: those two rows are otherwise identical in the dashboard, and one means
+   * the lead received the entire sequence while the other means it received nothing.
+   */
+  | 'completed_no_sends'
   | 'converted'
   | 'engagement'
   | 'unsubscribed'
@@ -431,7 +438,15 @@ async function getExistingEnrollment(
   }).promise();
 
   const items = (result.Items ?? []) as SequenceEnrollment[];
-  return items[0] ?? null;
+  // An enrollment that completed WITHOUT sending anything must not block a re-enrol.
+  //
+  // This query deliberately matches regardless of status, so a lead already enrolled is
+  // never enrolled twice. But a row that skipped every step and exited
+  // 'completed_no_sends' delivered nothing — and it permanently barred that lead from
+  // the sequence even after the user fixed the data that made it unreachable. Ignoring
+  // those rows cannot cause a double send, because by definition nothing was sent.
+  const blocking = items.filter((e) => (e as any).exitReason !== 'completed_no_sends');
+  return blocking[0] ?? null;
 }
 
 async function getActiveEnrollment(

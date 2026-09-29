@@ -177,7 +177,21 @@ async function processEnrollment(
   // Advance or complete either way — a skipped step is done with, not pending.
   const nextStepIndex = enrollment.currentStep + 1;
   if (nextStepIndex >= sequence.steps.length) {
-    await dripSequenceDb.completeEnrollment(enrollment.enrollmentId, 'completed', 'completed', channel, delivered);
+    // Did this enrollment EVER send anything? The send timestamps are stamped only on
+    // delivery, so their absence — plus this final step also being skipped — means the
+    // lead received nothing at all. Recording that as plain 'completed' made it
+    // identical in the dashboard to a lead that got the whole sequence, and barred it
+    // from ever being re-enrolled (getExistingEnrollment matches regardless of status).
+    const everDelivered = delivered
+      || !!(enrollment as any).lastEmailSentAt
+      || !!(enrollment as any).lastLinkedInSentAt;
+    await dripSequenceDb.completeEnrollment(
+      enrollment.enrollmentId,
+      everDelivered ? 'completed' : 'completed_no_sends',
+      'completed',
+      channel,
+      delivered,
+    );
   } else {
     const nextStep = sequence.steps[nextStepIndex];
     const nextSendAt = addDays(new Date(), nextStep.delayDays).toISOString();
