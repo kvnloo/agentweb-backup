@@ -693,18 +693,39 @@ function unitOf(raw: string): LengthUnit {
  */
 const DIRECT_INSTRUCTION_MAX_CHARS = 1000;
 
-/** The explicit upper bound on reply length a user message states, or undefined. */
-export function parseLengthRequest(userText: string): LengthRequest | undefined {
-  if (userText.length > DIRECT_INSTRUCTION_MAX_CHARS) return undefined;
-  for (const re of [LENGTH_LIMIT, LENGTH_COMPOUND]) {
-    const m = re.exec(userText);
-    if (!m) continue;
+function lengthRequestsFrom(re: RegExp, userText: string): LengthRequest[] {
+  const global = new RegExp(re.source, re.flags.includes('g') ? re.flags : `${re.flags}g`);
+  const out: LengthRequest[] = [];
+  for (let m = global.exec(userText); m; m = global.exec(userText)) {
     const max = countOf(m[1]);
     const unit = unitOf(m[2]);
-    if (!max || PER_ITEM.test(sentenceOf(userText, m.index))) continue;
-    return { max, unit };
+    if (max && !PER_ITEM.test(sentenceOf(userText, m.index))) out.push({ max, unit });
   }
-  return undefined;
+  return out;
+}
+
+/**
+ * Every explicit length bound the user message states — there can be more than one, e.g.
+ * "in 3 sentences and under 50 words" gives both a sentence bound and a word bound, and a reply
+ * must satisfy each independently. Each matched span is unambiguously a size limit of a known
+ * unit, so combining them is safe (unlike guessing which of several unrelated instructions a
+ * single check should apply to) — no need to abstain just because there is more than one.
+ */
+export function parseLengthRequests(userText: string): LengthRequest[] {
+  if (userText.length > DIRECT_INSTRUCTION_MAX_CHARS) return [];
+  const found = [...lengthRequestsFrom(LENGTH_LIMIT, userText), ...lengthRequestsFrom(LENGTH_COMPOUND, userText)];
+  const seen = new Map<string, LengthRequest>();
+  for (const req of found) {
+    const key = `${req.unit}:${req.max}`;
+    if (!seen.has(key)) seen.set(key, req);
+  }
+  return [...seen.values()];
+}
+
+/** The single explicit length bound a user message states, when there is exactly one. */
+export function parseLengthRequest(userText: string): LengthRequest | undefined {
+  const all = parseLengthRequests(userText);
+  return all.length === 1 ? all[0] : undefined;
 }
 
 /** Chat replies may be HTML or markdown: tags become line breaks, markup is not words. */
@@ -842,14 +863,25 @@ function adherenceOf(
   return { verdict: 'not_applicable', reason: lastNa ?? notApplicable, applicableTurns: 0 };
 }
 
-/** Reply length vs an explicit length the user asked for (words, sentences, paragraphs, pages). */
+function lengthDetail(req: LengthRequest, m: ReturnType<typeof exceedsLength>): string {
+  return `${m.measured} ${m.unit} vs <= ${req.max} ${req.unit}${req.max === 1 ? '' : 's'} (fails above ${m.allowed})`;
+}
+
+/**
+ * Reply length vs every explicit length bound the user asked for (words, sentences, paragraphs,
+ * pages) — checked independently, so "in 3 sentences and under 50 words" fails if the reply
+ * breaks either bound, not just whichever one this function happened to look at first.
+ */
 export function gradeLengthAdherence(turns: readonly GraderTurn[]): AdherenceResult {
   return adherenceOf(turns, 'no_length_request', (turn) => {
-    const req = parseLengthRequest(turn.userText);
-    if (!req) return undefined;
+    const reqs = parseLengthRequests(turn.userText);
+    if (reqs.length === 0) return undefined;
     if (!turn.replyText) return { reason: 'no_reply' };
-    const m = exceedsLength(turn.replyText, req);
-    return { reason: m.over ? 'exceeded_requested_length' : 'within_requested_length', detail: `${m.measured} ${m.unit} vs <= ${req.max} ${req.unit}${req.max === 1 ? '' : 's'} (fails above ${m.allowed})` };
+    const replyText = turn.replyText;
+    const measured = reqs.map((req) => ({ req, m: exceedsLength(replyText, req) }));
+    const violated = measured.find(({ m }) => m.over);
+    if (violated) return { reason: 'exceeded_requested_length', detail: lengthDetail(violated.req, violated.m) };
+    return { reason: 'within_requested_length', detail: measured.map(({ req, m }) => lengthDetail(req, m)).join('; ') };
   }, new Set(['exceeded_requested_length']));
 }
 
