@@ -18,6 +18,11 @@ jest.mock("../services/db", () => ({
   },
 }));
 
+jest.mock("../services/creativeRubricOnboarding", () => ({
+  judgeOnboardingAdCopy: jest.fn(async () => null),
+}));
+
+import { judgeOnboardingAdCopy } from "../services/creativeRubricOnboarding";
 import {
   AD_COPY_SYSTEM_PROMPT,
   BRICK_10_VARIETIES,
@@ -537,6 +542,31 @@ describe("onboardingAdCopyService", () => {
       errSpy.mockRestore();
 
       expect(userDb.updateUser.mock.calls[0][1].adCopyStatus).toBe("failed");
+    });
+
+    it("hands the stored copy run and its images to the rubric judge hook (ENG-2192)", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          adImageStatus: "ready",
+          adImageResult: { variants: threeImages },
+          icpResult: [onePersona],
+          creativeDirResult: creativeDir,
+        })
+        .mockResolvedValueOnce({ userId: "user-1", adCopyStatus: "running" });
+      userDb.updateUser.mockResolvedValue({});
+
+      type CopyDeps = NonNullable<Parameters<typeof triggerAdCopyForUser>[1]>;
+      await triggerAdCopyForUser("user-1", { llm: new FakeLlm(buildVariantResponse) as unknown as CopyDeps["llm"] });
+      await new Promise((resolve) => setImmediate(resolve)); // the hook is dispatched, not awaited
+
+      const written = userDb.updateUser.mock.calls[0][1];
+      expect(jest.mocked(judgeOnboardingAdCopy)).toHaveBeenCalledWith({
+        userId: "user-1",
+        completedAt: written.adCopyCompletedAt,
+        copyVariants: written.adCopyResult.variants,
+        imageVariants: threeImages,
+      });
     });
 
     it("patches User with adCopyReadyPatch when LLM succeeds and images are ready", async () => {

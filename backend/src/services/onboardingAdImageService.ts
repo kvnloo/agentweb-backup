@@ -1205,6 +1205,20 @@ export async function triggerAdImageGenerationForUser(
     await userDb.updateUser(userId, finalPatch, {
       condition: axisOwnershipCondition(readAxisIdentity(current)),
     });
+    // ENG-2192: advisory rubric verdicts on the stored variants (inert unless
+    // CREATIVE_RUBRIC_JUDGE_ENABLED + sample rate). Not awaited; never throws.
+    const { adImageCompletedAt, adImageResult } = patch;
+    if (adImageCompletedAt && adImageResult) {
+      const previous = {
+        completedAt: typeof u.adImageCompletedAt === "string" ? u.adImageCompletedAt : undefined,
+        variants: Array.isArray(u.adImageResult?.variants) ? (u.adImageResult.variants as AdImageVariant[]) : [],
+      };
+      void import("./creativeRubricOnboarding")
+        .then((m) =>
+          m.judgeOnboardingAdImages({ userId, completedAt: adImageCompletedAt, variants: adImageResult.variants, previous })
+        )
+        .catch(() => undefined);
+    }
   } catch (err) {
     if (!isConditionalCheckFailure(err)) throw err;
     // eslint-disable-next-line no-console

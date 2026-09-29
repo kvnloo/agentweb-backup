@@ -31,7 +31,7 @@ harness (ENG-2136) produces those runs; record the result on the entry, with evi
 | image-prompt-like-rate | creative | human (likes) | — | no |
 | landing-page-smoke-test | creative | code | — | deterministic |
 | creative-deterministic-gates | creative | code, advisory | — | no |
-| creative-rubric-judge | creative | LLM judge, 7 binary criteria + pairwise, advisory, off by default | anthropic.claude-sonnet-5 (Claude) | no |
+| creative-rubric-judge | creative | LLM judge, binary ENG-421 criteria per surface (ad image, organic image, ad copy, landing page) + runtime pairwise vs prior best, advisory, off by default | anthropic.claude-sonnet-5 (Claude) | no |
 | creative-performance-correlation | creative | outcome: Spearman ρ of rubric score vs settled ad CTR/CPA, read-only report, no data until OPS-3 (ENG-2148) | — | no |
 | client-health-assessment | account health | code | — | no |
 | renewal-integration-health | account health | code, off in prod | — | no |
@@ -67,7 +67,11 @@ Sources, consumers and known issues for each entry are in `evalRegistry.ts`.
    customer portal's offline `scripts/eval-onboarding-quality.ts`: a Claude Sonnet pairwise judge
    that compares two onboarding pipeline versions layer by layer (including creative direction,
    ad images and ad copy) on fixture pairs. ENG-2140 adds `creative-rubric-judge` (ENG-421's
-   7 criteria as binary checks), which stays off until its flag is turned on. ENG-2141 links each
+   7 criteria as binary checks), which stays off until its flag is turned on. ENG-2192 extends it,
+   under the same flag and sample rate, to organic images, onboarding images and ad copy (stored on
+   the AW-Users variants) and deployed landing pages (judged from their generated source), with a
+   runtime pairwise verdict against the account's prior best ad; video keyframes are not scored
+   yet. ENG-2141 links each
    generated creative to the Meta ad it became and records ad-level daily rows, so
    `creative-performance-correlation` can compare the judge's score with settled CTR/CPA; both
    stay inert until OPS-3 (ENG-2148).

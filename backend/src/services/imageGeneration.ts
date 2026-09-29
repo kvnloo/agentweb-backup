@@ -1189,6 +1189,12 @@ export class ImageService {
    * the image once, bounded in time and size, and gates the bytes; when the download fails the
    * result says `notChecked` with the reason rather than the image going ungated silently.
    * Never throws and never fails the generation.
+   *
+   * `maxRedirects: 0` (CodeRabbit #3137): the URL is whatever the provider's task result names,
+   * not one we control, so a redirect could point this server-side fetch at an internal address
+   * (SSRF). Axios's default `validateStatus` (2xx only) turns any 3xx response into a thrown
+   * error, which the existing catch below already converts to `notChecked` — a refused redirect
+   * fails exactly like any other download failure, never a hard error.
    */
   private async runRemoteAdvisoryGates(
     imageUrl: string,
@@ -1201,6 +1207,7 @@ export class ImageService {
         responseType: "arraybuffer",
         timeout: REMOTE_GATE_DOWNLOAD_TIMEOUT_MS,
         maxContentLength: REMOTE_GATE_MAX_BYTES,
+        maxRedirects: 0,
       });
       imageBuffer = Buffer.from(response.data);
     } catch (err) {

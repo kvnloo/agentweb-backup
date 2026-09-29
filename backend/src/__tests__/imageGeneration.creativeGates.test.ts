@@ -178,9 +178,36 @@ describe('ImageService.generateImage creative gates (ENG-2139)', () => {
       });
 
       expect(get).toHaveBeenCalledWith(remoteUrl, expect.objectContaining({ responseType: 'arraybuffer' }));
+      // CodeRabbit #3137 (SSRF): the URL is provider-named, not ours — redirects must never be
+      // followed to an address axios itself would otherwise silently fetch.
+      expect(get).toHaveBeenCalledWith(remoteUrl, expect.objectContaining({ maxRedirects: 0 }));
       expect(result).toMatchObject({ success: true, imageUrl: remoteUrl });
       expect(result.gates).toMatchObject({ passed: true, placement: 'meta_feed_portrait', width: 600, height: 750 });
       expect(uploadFileToS3).not.toHaveBeenCalled();
+    });
+
+    it('refuses a redirect from the remote URL — recorded as not checked, never a hard error (ENG-2187, CodeRabbit #3137)', async () => {
+      stubRunway();
+      jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      // With maxRedirects: 0, axios's default validateStatus (2xx only) turns a 3xx response
+      // into a thrown error — this is what a real redirect attempt looks like from the caller's
+      // side; no request to the redirect target's Location is ever made.
+      const redirectError = Object.assign(new Error('Request failed with status code 302'), {
+        response: { status: 302, headers: { location: 'http://169.254.169.254/latest/meta-data/' } },
+      });
+      jest.spyOn(axios, 'get').mockRejectedValue(redirectError);
+
+      const result = await new ImageService().generateImage({
+        prompt: 'ad',
+        filename: 'ad.png',
+        userId: 'user-1',
+        size: '1080x1350',
+        imageModel: 'gen4_image',
+      });
+
+      expect(result).toMatchObject({ success: true, imageUrl: remoteUrl });
+      expect(result.gates?.notChecked).toContain('302');
+      expect(result.gates?.checks.every((c) => c.status === 'skipped')).toBe(true);
     });
 
     it('records the image as not checked when the download fails (ENG-2187)', async () => {
