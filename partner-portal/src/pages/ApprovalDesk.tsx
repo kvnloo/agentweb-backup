@@ -67,6 +67,10 @@ function apiMessage(error: unknown, fallback: string): string {
 
 const RESOLVED_STATUSES = new Set(['approved', 'rejected', 'edited', 'dispatching', 'executed', 'execution_failed']);
 
+function statusColor(decision: ApprovalDecisionView, answered: boolean): 'error' | 'success' | 'default' {
+  return decision.status === 'execution_failed' ? 'error' : answered ? 'success' : 'default';
+}
+
 function ManifestQueue() {
   const { token, user } = useAuth();
   const [manifests, setManifests] = useState<ManifestSummary[]>([]);
@@ -146,15 +150,7 @@ function EvidenceCard({ index, decision }: { index: number; decision: ApprovalDe
         <Stack spacing={1}>
           <Stack direction="row" justifyContent="space-between" alignItems="flex-start">
             <Typography variant="subtitle1">{index}. {decision.subjectLabel}</Typography>
-            <Chip
-              size="small"
-              label={decision.status.replace(/_/g, ' ')}
-              color={
-                decision.status === 'execution_failed' ? 'error'
-                  : answered ? 'success'
-                  : 'default'
-              }
-            />
+            <Chip size="small" label={decision.status.replace(/_/g, ' ')} color={statusColor(decision, answered)} />
           </Stack>
           <Typography variant="body2">{decision.businessImpact}</Typography>
           {decision.evidencePacket?.researchSummary && (
@@ -243,11 +239,7 @@ function DecisionRailItem({
           <Typography variant="body2" sx={{ fontWeight: 600 }}>
             {index}. {decision.subjectLabel}
           </Typography>
-          <Chip
-            size="small"
-            label={decision.status.replace(/_/g, ' ')}
-            color={decision.status === 'execution_failed' ? 'error' : answered ? 'success' : 'default'}
-          />
+          <Chip size="small" label={decision.status.replace(/_/g, ' ')} color={statusColor(decision, answered)} />
         </Stack>
 
         {answered ? (
@@ -275,16 +267,24 @@ function DecisionRailItem({
               >
                 {acting === 'reject' ? 'Saving…' : rejectLabel}
               </Button>
-              {decision.gateType !== 'meta_write' && !showNote && (
+              {!showNote && (
                 <Button size="small" disabled={disabled || acting !== null} onClick={() => setShowNote(true)}>
-                  + correction
+                  + note
                 </Button>
               )}
             </Stack>
-            {showNote && decision.gateType !== 'meta_write' && (
+            {showNote && (
               <Stack spacing={0.5}>
+                {/* A note attaches to Approve/Reject above regardless of gate
+                    type — claimDecision persists freeText and it's surfaced
+                    back to the agent session either way (ENG-1853 review
+                    fix: an earlier version of this hid the note entirely for
+                    meta_write, silently dropping a reviewer's "wrong
+                    account, use $50 not $100" context on a real ad-spend
+                    reject). Only the dedicated edit-verdict submit below
+                    stays non-meta_write — meta_write has no 'edited' state. */}
                 <TextField
-                  label="What exactly should change?"
+                  label={decision.gateType === 'meta_write' ? 'Note (optional, attaches to Approve/Reject above)' : 'What exactly should change?'}
                   size="small"
                   multiline
                   minRows={1}
@@ -294,14 +294,16 @@ function DecisionRailItem({
                   inputProps={{ maxLength: 2000 }}
                   autoFocus
                 />
-                <Button
-                  size="small"
-                  variant="outlined"
-                  disabled={disabled || acting !== null || !freeText}
-                  onClick={() => void act('edit')}
-                >
-                  {acting === 'edit' ? 'Saving…' : 'Send back with this correction'}
-                </Button>
+                {decision.gateType !== 'meta_write' && (
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    disabled={disabled || acting !== null || !freeText}
+                    onClick={() => void act('edit')}
+                  >
+                    {acting === 'edit' ? 'Saving…' : 'Send back with this correction'}
+                  </Button>
+                )}
               </Stack>
             )}
           </Stack>
@@ -351,8 +353,8 @@ function ManifestDetail({ manifestId }: { manifestId: string }) {
     }
   };
 
-  const allAnswered = decisions.length > 0 && decisions.every((d) => RESOLVED_STATUSES.has(d.status));
   const answeredCount = decisions.filter((d) => RESOLVED_STATUSES.has(d.status)).length;
+  const allAnswered = decisions.length > 0 && answeredCount === decisions.length;
   const hasMetaWrite = decisions.some((d) => d.gateType === 'meta_write');
 
   const approveAll = async () => {
