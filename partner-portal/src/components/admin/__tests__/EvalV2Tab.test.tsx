@@ -378,6 +378,19 @@ describe("EvalV2Tab — dashboard UX (ENG-2221)", () => {
     }
   });
 
+  it("omits nav links for sections that have no anchor to jump to", async () => {
+    // No snapshots (so Main table/Trend never render their anchor Box) and no registry —
+    // only Creative and Account health always render theirs, even empty.
+    mockedAxios.get.mockResolvedValue({ data: { ...RESPONSE, hasData: false, count: 0, snapshots: [] } });
+    render(<EvalV2Tab />);
+    const nav = await screen.findByTestId("eval-v2-section-nav");
+    expect(within(nav).queryByText("Main table")).not.toBeInTheDocument();
+    expect(within(nav).queryByText("Trend")).not.toBeInTheDocument();
+    expect(within(nav).queryByText("Grader registry")).not.toBeInTheDocument();
+    expect(within(nav).getByText("Creative")).toBeInTheDocument();
+    expect(within(nav).getByText("Account health")).toBeInTheDocument();
+  });
+
   it("makes the first (surface) column of the breakdown table sticky", async () => {
     mockedAxios.get.mockResolvedValue({ data: RESPONSE });
     render(<EvalV2Tab />);

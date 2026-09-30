@@ -430,17 +430,31 @@ function RegistryTable({ registry }: { registry: RegistryGrader[] }) {
   );
 }
 
-/** Jump targets for {@link SectionNav} (ENG-2221): every section stays fully visible, none collapsed. */
+/**
+ * Jump targets for {@link SectionNav} (ENG-2221): every section stays fully visible, none collapsed.
+ * Creative and Account health always render their anchor Box (a "no data" message inside it when
+ * empty), so they're always valid targets. Main table/Trend and Grader registry only render their
+ * anchor at all when there's data — {@link SectionNav} must be told when to skip those.
+ */
 const SECTION_NAV_ITEMS = [
-  { id: "eval-v2-section-main-table", label: "Main table" },
-  { id: "eval-v2-section-trend", label: "Trend" },
-  { id: "eval-v2-section-creative", label: "Creative" },
-  { id: "eval-v2-section-account-health", label: "Account health" },
-  { id: "eval-v2-section-registry", label: "Grader registry" },
+  { id: "eval-v2-section-main-table", label: "Main table", key: "mainTable" as const },
+  { id: "eval-v2-section-trend", label: "Trend", key: "mainTable" as const },
+  { id: "eval-v2-section-creative", label: "Creative", key: "always" as const },
+  { id: "eval-v2-section-account-health", label: "Account health", key: "always" as const },
+  { id: "eval-v2-section-registry", label: "Grader registry", key: "registry" as const },
 ] as const;
 
+interface SectionNavProps {
+  /** Whether `eval-v2-section-main-table` and `eval-v2-section-trend` actually exist. */
+  hasMainTable: boolean;
+  /** Whether `eval-v2-section-registry` actually exists. */
+  hasRegistry: boolean;
+}
+
 /** Sticky in-page nav (ENG-2221): a ~3500px page with no anchors was awkward for a 30-second daily glance. */
-function SectionNav() {
+function SectionNav({ hasMainTable, hasRegistry }: SectionNavProps) {
+  const available = { always: true, mainTable: hasMainTable, registry: hasRegistry };
+  const items = SECTION_NAV_ITEMS.filter((item) => available[item.key]);
   return (
     <Box
       component="nav"
@@ -459,7 +473,7 @@ function SectionNav() {
         py: 1,
       }}
     >
-      {SECTION_NAV_ITEMS.map((item) => (
+      {items.map((item) => (
         <Box
           key={item.id}
           component="a"
@@ -552,7 +566,7 @@ export default function EvalV2Tab() {
 
       {data && !loading && (
         <>
-          <SectionNav />
+          <SectionNav hasMainTable={data.hasData && !!latest} hasRegistry={!!data.registry && data.registry.length > 0} />
           {unvalidated.length > 0 && (
             <Alert severity="warning" data-testid="eval-v2-unvalidated-banner">
               {unvalidated.length === graders.length ? "All graders are" : `${unvalidated.length} graders are`} unvalidated:
