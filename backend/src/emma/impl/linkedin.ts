@@ -257,6 +257,17 @@ import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGu
 import { withTimeoutOrReject } from './shared/withTimeoutOrReject';
 import { parseCompanyFromTitle, batchParseCompaniesFromTitlesWithLLM } from './shared/companyTitleParsing';
 import type { AgentModeService } from '../../services/agentModeService';
+// F2 fresh-eyes review round 1: `resolveAccessibleAccount` is called from two
+// sibling functions in this same module (`listLinkedInComments`,
+// `reactToLinkedInPost`). Per the cluster-10 lesson, a direct call to a
+// sibling export doesn't route through the exports-namespace object, so an
+// external `jest.spyOn(linkedinImpl, 'resolveAccessibleAccount')` would
+// silently fail to intercept those two call sites. No test does this today,
+// but every other module in this series (`misc.ts`/`adsApis.ts`/
+// `mediaVideo.ts`/`htmlUpdate.ts`) uses this same-module self-import for
+// exactly this reason — matching that convention here pre-empts the same
+// stale-mock regression class this series has hit at least 5 times.
+import * as self from './linkedin';
 
 // Mirrors LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS /
 // COMPANY_SIZE_LOOKUP_CONCURRENCY (kept as separate local constants rather
@@ -768,7 +779,7 @@ export async function listLinkedInComments(userId: string, accountId: string, po
   try {
     const { socialPlatformService } = await import('../../services/socialPlatformService');
 
-    const resolved = await resolveAccessibleAccount(userId, accountId, 'linkedin');
+    const resolved = await self.resolveAccessibleAccount(userId, accountId, 'linkedin');
     if (!resolved) {
       return { success: false, message: 'Account not found or access denied' };
     }
@@ -825,7 +836,7 @@ export async function reactToLinkedInPost(userId: string, accountId: string, pos
 
     try {
       console.log('[AgentMode] Looking up account:', accountId);
-      const resolved = await resolveAccessibleAccount(userId, accountId, 'linkedin');
+      const resolved = await self.resolveAccessibleAccount(userId, accountId, 'linkedin');
       console.log('[AgentMode] Account lookup result:', resolved ? {
         found: true,
         platform: resolved.account.platform,
