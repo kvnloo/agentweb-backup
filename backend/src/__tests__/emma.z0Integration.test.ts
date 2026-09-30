@@ -38,6 +38,15 @@ describe('z0 AgentWeb adapter', () => {
     expect(tool?.internalOnly).toBe(true);
   });
 
+  it('refuses the tool to an external MCP caller even when the caller knows its name', async () => {
+    await expect(
+      emmaToolRegistry.execute('z0_route', request, {
+        externalMcp: true,
+        sessionId: 'external-session',
+      }),
+    ).rejects.toThrow(/not available to external clients/i);
+  });
+
   it('off mode makes no transport call', async () => {
     const fetchImpl = jest.fn() as unknown as Z0FetchLike;
     const result = await runZ0Route(request, {
