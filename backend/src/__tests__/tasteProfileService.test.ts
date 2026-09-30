@@ -189,6 +189,77 @@ describe('TasteProfileService', () => {
   });
 
 
+
+  it('projects one profile through surface-specific Taste Skill rules', async () => {
+    const { store } = memoryHarness();
+    const service = new TasteProfileService({ getBookmarks: jest.fn() }, store);
+
+    await service.importCollection(
+      'user-a',
+      [
+        { title: 'minimal minimal editorial editorial motion motion', url: 'https://example.com/a' },
+        { title: 'minimal editorial motion', url: 'https://example.com/b' },
+      ],
+      'design-board'
+    );
+
+    const landing = await service.getApplication('user-a', 'landing_page');
+    expect(landing.active).toBe(true);
+    expect(landing.intensity).toBe('strong');
+    expect(landing.dials.designVariance).toBeGreaterThanOrEqual(1);
+    expect(landing.dials.designVariance).toBeLessThanOrEqual(10);
+    expect(landing.promptContext).toContain('Apply the Taste Skill process');
+    expect(landing.promptContext).toContain('DESIGN_VARIANCE=');
+    expect(landing.promptContext).toContain('Existing brand assets');
+
+    const research = await service.getApplication('user-a', 'research');
+    expect(research.active).toBe(true);
+    expect(research.intensity).toBe('subtle');
+    expect(research.promptContext).toContain('must never change factual findings');
+
+    const email = await service.getApplication('user-a', 'email');
+    expect(email.active).toBe(false);
+    expect(email.intensity).toBe('off');
+    expect(email.promptContext).toBe('');
+  });
+
+  it('applies Taste to a prompt without exposing raw source content', async () => {
+    const { store } = memoryHarness();
+    const service = new TasteProfileService({ getBookmarks: jest.fn() }, store);
+
+    await service.importCollection(
+      'user-a',
+      [
+        { title: 'premium premium motion motion secret-once-only' },
+        { title: 'premium motion' },
+      ],
+      'refs'
+    );
+
+    const applied = await service.applyToPrompt(
+      'user-a',
+      'image',
+      'Create a product hero image',
+      'strong'
+    );
+
+    expect(applied.prompt).toContain('Create a product hero image');
+    expect(applied.prompt).toContain('TASTE CONTEXT');
+    expect(applied.prompt).toContain('intensity=strong');
+    expect(applied.prompt).not.toContain('secret-once-only');
+  });
+
+  it('leaves prompts unchanged when the surface defaults Taste off', async () => {
+    const { store } = memoryHarness();
+    const service = new TasteProfileService({ getBookmarks: jest.fn() }, store);
+    await service.importCollection('user-a', [{ title: 'minimal minimal' }], 'refs');
+
+    const applied = await service.applyToPrompt('user-a', 'crm', 'Find overdue leads');
+
+    expect(applied.application.active).toBe(false);
+    expect(applied.prompt).toBe('Find overdue leads');
+  });
+
   it('caps durable source fan-out while still allowing an existing source to be replaced', async () => {
     const seed = Array.from({ length: MAX_TASTE_SOURCES }, (_, index) => ({
       memoryId: `taste-${index}`,
