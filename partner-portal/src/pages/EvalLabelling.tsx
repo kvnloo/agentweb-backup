@@ -20,9 +20,14 @@ import {
   Card,
   CardContent,
   Chip,
+  FormControl,
   Grid,
+  InputLabel,
   LinearProgress,
   Link,
+  MenuItem,
+  Select,
+  type SelectChangeEvent,
   Skeleton,
   Stack,
   Tab,
@@ -414,6 +419,9 @@ export default function EvalLabelling() {
   const [surface, setSurface] = useState<Surface>('agent');
   const [cases, setCases] = useState<GoldenCaseView[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Filters the case list only — the open case in the detail pane stays open even if a filter
+  // change hides it from the list, so switching filters mid-edit never loses unsaved work.
+  const [splitFilter, setSplitFilter] = useState<'all' | 'dev' | 'test'>('all');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -463,6 +471,8 @@ export default function EvalLabelling() {
 
   const selected = cases.find((c) => c.caseId === selectedId) ?? null;
   const fullyLabelled = cases.filter((c) => labelledCount(c) === c.criteria.length).length;
+  const filteredCases = splitFilter === 'all' ? cases : cases.filter((c) => c.split === splitFilter);
+  const filteredFullyLabelled = filteredCases.filter((c) => labelledCount(c) === c.criteria.length).length;
 
   return (
     <Box sx={{ p: 3 }}>
@@ -493,9 +503,29 @@ export default function EvalLabelling() {
           <Grid item xs={12} md={4}>
             <Card variant="outlined">
               <CardContent>
-                <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                  {loading ? 'Loading cases…' : `${cases.length} cases · ${fullyLabelled} fully labelled`}
-                </Typography>
+                <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1} sx={{ mb: 1 }}>
+                  <Typography variant="subtitle2">
+                    {loading
+                      ? 'Loading cases…'
+                      : splitFilter === 'all'
+                        ? `${cases.length} cases · ${fullyLabelled} fully labelled`
+                        : `${filteredCases.length} of ${cases.length} cases · ${filteredFullyLabelled} fully labelled`}
+                  </Typography>
+                  <FormControl size="small" sx={{ minWidth: 110 }} disabled={loading}>
+                    <InputLabel id="eval-labelling-split-filter-label">Split</InputLabel>
+                    <Select
+                      labelId="eval-labelling-split-filter-label"
+                      label="Split"
+                      value={splitFilter}
+                      onChange={(e: SelectChangeEvent) => setSplitFilter(e.target.value as 'all' | 'dev' | 'test')}
+                      data-testid="eval-labelling-split-filter"
+                    >
+                      <MenuItem value="all">All</MenuItem>
+                      <MenuItem value="test">test</MenuItem>
+                      <MenuItem value="dev">dev</MenuItem>
+                    </Select>
+                  </FormControl>
+                </Stack>
                 <Table size="small">
                   <TableHead>
                     <TableRow>
@@ -516,7 +546,15 @@ export default function EvalLabelling() {
                             <TableCell align="right"><Skeleton variant="text" width={30} sx={{ ml: 'auto' }} /></TableCell>
                           </TableRow>
                         ))
-                      : cases.map((c) => (
+                      : filteredCases.length === 0
+                        ? (
+                          <TableRow>
+                            <TableCell colSpan={3}>
+                              <Typography variant="body2" color="text.secondary">No {splitFilter} cases.</Typography>
+                            </TableCell>
+                          </TableRow>
+                        )
+                        : filteredCases.map((c) => (
                           <TableRow
                             key={c.caseId}
                             hover
