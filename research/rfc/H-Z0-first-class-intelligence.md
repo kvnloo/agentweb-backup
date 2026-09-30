@@ -18,7 +18,7 @@ The default is `off`. There is no automatic shadow-to-active promotion.
 
 ## Identity and retry contract
 
-AgentWeb hashes its session id before crossing the boundary. Raw AgentWeb user ids are never sent. A caller supplies a stable `operation_id`; the adapter deterministically derives the z0 trace id from pseudonymous session + operation + function.
+AgentWeb hashes its session id before crossing the boundary. Raw AgentWeb user ids are never sent. A caller supplies a stable `operation_id`; the adapter deterministically derives the z0 trace id from pseudonymous session + operation. Function/task/context changes under that operation therefore collide with the same authority identity and are rejected by z0's request fingerprint.
 
 Active transport ambiguity is not retry permission. The same operation and same request must be reconciled with the same trace. A changed request under the same identity is expected to fail z0's fingerprint check.
 
