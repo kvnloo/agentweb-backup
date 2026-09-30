@@ -29,10 +29,16 @@
 
 const mockProbeAdsAccountAccess = jest.fn();
 const mockClassifyAdsRefusalTier = jest.fn().mockResolvedValue('unknown');
+// Rejects by default, matching the pre-ENG-2232 behaviour of an unmocked
+// getPages — no write from the Page-access block unless a test opts in, so
+// existing ads-scope tests (and their `mock.calls[0]` assumptions) are
+// unaffected.
+const mockGetPages = jest.fn().mockRejectedValue(new Error('getPages not stubbed for this test'));
 jest.mock('../services/metaService', () => ({
   metaService: {
     probeAdsAccountAccess: (...args: any[]) => mockProbeAdsAccountAccess(...args),
     classifyAdsRefusalTier: (...args: any[]) => mockClassifyAdsRefusalTier(...args),
+    getPages: (...args: any[]) => mockGetPages(...args),
   },
 }));
 
@@ -610,6 +616,73 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
 
       expect(result.outcome).toBe('skipped');
       expect(mockProbeAdsAccountAccess).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * ENG-2232: before this, Page access was only ever probed once, at
+   * connect/reconnect time (metaAuth.ts) — nothing revisited it, so an
+   * already-connected account whose Page access was never granted (or was
+   * revoked later) stayed reported as ads_capable:true indefinitely unless the
+   * user redid a full OAuth reconnect. This is the twice-daily sweep's half of
+   * that fix: it must persist has_meta_pages itself, independent of the
+   * ads-scope outcome above, since Page access is a second, separate Meta
+   * grant.
+   */
+  describe('Page access reconciliation (ENG-2232)', () => {
+    beforeEach(() => {
+      // Undetermined on purpose: isolates the Page-probe write from the
+      // ads-scope write assertions covered elsewhere in this file.
+      mockProbeAdsAccountAccess.mockResolvedValue('unknown');
+    });
+
+    it('persists has_meta_pages:true the first time Pages are found for an unprobed account', async () => {
+      mockGetPages.mockResolvedValueOnce([{ id: '1010991085424542', name: 'My Health Surveys' }]);
+      const account = metaAccount({ granted_scopes: ['ads_read'] });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      expect(mockGetPages).toHaveBeenCalledWith('EAA-token');
+      const [userId, platform, accountId, updates] = mockUpdateAccountConfig.mock.calls[0];
+      expect(userId).toBe('user1');
+      expect(platform).toBe('meta');
+      expect(accountId).toBe(AD_ACCOUNT_ID);
+      expect(updates).toEqual({ has_meta_pages: true });
+      expect(account.config.has_meta_pages).toBe(true);
+    });
+
+    it('persists has_meta_pages:false when PAGE LIST comes back empty for an already-connected account', async () => {
+      // The exact production case (ENG-2232): ad account 1209971551106961
+      // stayed ads_capable:true indefinitely because nothing but a manual
+      // OAuth reconnect ever probed Page access. The twice-daily sweep now
+      // catches it without the customer having to reconnect.
+      mockGetPages.mockResolvedValueOnce([]);
+      const account = metaAccount({ granted_scopes: ['ads_read'] });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      const [, , , updates] = mockUpdateAccountConfig.mock.calls[0];
+      expect(updates).toEqual({ has_meta_pages: false });
+      expect(account.config.has_meta_pages).toBe(false);
+    });
+
+    it('does not write when the newly-probed answer matches what is already recorded', async () => {
+      mockGetPages.mockResolvedValueOnce([{ id: '1010991085424542', name: 'My Health Surveys' }]);
+      const account = metaAccount({ granted_scopes: ['ads_read'], has_meta_pages: true });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+    });
+
+    it('leaves the recorded value untouched when the Page probe itself fails', async () => {
+      mockGetPages.mockRejectedValueOnce(new Error('rate limited'));
+      const account = metaAccount({ granted_scopes: ['ads_read'], has_meta_pages: true });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+      expect(account.config.has_meta_pages).toBe(true);
     });
   });
 });

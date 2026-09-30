@@ -595,6 +595,7 @@ describe('Meta Auth Routes', () => {
 
             const { finalizeRes, connectRes } = await connectWithPages('error');
 
+            expect(metaService.getPages).toHaveBeenCalledWith('valid_access_token');
             expect(finalizeRes.body.hasMetaPages).toBeUndefined();
             expect(connectRes.status).toBe(200);
             const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
