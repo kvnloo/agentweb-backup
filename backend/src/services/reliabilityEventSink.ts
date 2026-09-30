@@ -5,9 +5,12 @@
 import {
   buildReliabilityEvent,
   validateReliabilityEvent,
+  classifyToolResultOutcome,
+  summarizeToolError,
   type ReliabilityEvent,
   type ReliabilityOutcome,
 } from './reliabilityEvent';
+import { exportReliabilityEventToZ0Safe } from './z0ReliabilityExporter';
 
 export interface RecordReliabilityEventInput {
   tool: string;
@@ -84,9 +87,31 @@ export function setReliabilityEventSinkForTests(sink: ReliabilityEventSink | nul
 
 export function recordReliabilityEventSafe(input: RecordReliabilityEventInput): ReliabilityEvent | null {
   try {
-    return getReliabilityEventSink().record(input);
+    const event = getReliabilityEventSink().record(input);
+    if (event) void exportReliabilityEventToZ0Safe(event);
+    return event;
   } catch (err) {
     console.warn('[H-LEARN] reliability sink failed (non-fatal):', err);
     return null;
   }
+}
+
+export function recordToolReliabilitySafe(input: {
+  tool: string;
+  startedAtMs: number;
+  sessionId?: string;
+  userId?: string;
+  platform: string;
+  result?: unknown;
+  error?: unknown;
+}): ReliabilityEvent | null {
+  return recordReliabilityEventSafe({
+    tool: input.tool,
+    outcome: classifyToolResultOutcome(input.result, input.error),
+    latencyMs: Math.max(0, Date.now() - input.startedAtMs),
+    sessionId: input.sessionId,
+    userId: input.userId,
+    errorSummary: summarizeToolError(input.result, input.error),
+    platform: input.platform,
+  });
 }
