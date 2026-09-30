@@ -838,6 +838,38 @@ createTestAccount().then(async () => {
         console.error('[MetaMetricsSnapshotCron] Failed to initialize:', error);
       }
 
+      // ENG-2215: Google Ads Metrics Snapshot — runs daily at 09:15 UTC (after
+      // MetaMetricsSnapshotCron at 09:00), re-pulling the last 92 dates each run so the final
+      // refresh occurs after reporting-day end plus Google's up-to-90-day conversion attribution
+      // window has elapsed. Inert unless GOOGLE_ADS_METRICS_SNAPSHOT_ENABLED=true — the cron
+      // itself refuses to enumerate accounts or call the Google Ads API without it (see
+      // runGoogleAdsMetricsSnapshot's own flag check).
+      try {
+        const GOOGLE_ADS_METRICS_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        const { runGoogleAdsMetricsSnapshot } = await import('./cron/googleAdsMetricsSnapshotCron');
+
+        const nowForGoogleAdsMetricsCron = new Date();
+        const nextGoogleAdsMetricsRunUTC = new Date(nowForGoogleAdsMetricsCron);
+        nextGoogleAdsMetricsRunUTC.setUTCHours(9, 15, 0, 0);
+        if (nextGoogleAdsMetricsRunUTC <= nowForGoogleAdsMetricsCron) {
+          nextGoogleAdsMetricsRunUTC.setUTCDate(nextGoogleAdsMetricsRunUTC.getUTCDate() + 1);
+        }
+        const msUntilNextGoogleAdsMetricsRun = nextGoogleAdsMetricsRunUTC.getTime() - nowForGoogleAdsMetricsCron.getTime();
+
+        console.log(`[GoogleAdsMetricsSnapshotCron] Initialized — first run at 09:15 UTC (in ${Math.round(msUntilNextGoogleAdsMetricsRun / 60000)} min)`);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('GoogleAdsMetricsSnapshotCron', runGoogleAdsMetricsSnapshot())
+            .catch(e => console.error('[GoogleAdsMetricsSnapshotCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('GoogleAdsMetricsSnapshotCron', runGoogleAdsMetricsSnapshot())
+              .catch(e => console.error('[GoogleAdsMetricsSnapshotCron] Error:', e));
+          }, GOOGLE_ADS_METRICS_SNAPSHOT_INTERVAL_MS);
+        }, msUntilNextGoogleAdsMetricsRun);
+      } catch (error) {
+        console.error('[GoogleAdsMetricsSnapshotCron] Failed to initialize:', error);
+      }
 
       // Drip Sequence Worker — runs every 5 minutes
       try {
