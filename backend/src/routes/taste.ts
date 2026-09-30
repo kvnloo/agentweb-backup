@@ -3,6 +3,7 @@ import rateLimit from 'express-rate-limit';
 import { authenticateToken } from '../middleware/auth';
 import {
   MAX_TASTE_ITEMS,
+  TASTE_SURFACES,
   TasteProviderError,
   TasteSourceAccessError,
   TasteValidationError,
@@ -90,6 +91,42 @@ router.post('/import/collection', importLimiter, async (req, res) => {
       req.body.collectionId
     );
     return res.status(201).json({ profile });
+  } catch (error) {
+    return sendTasteError(res, error);
+  }
+});
+
+
+router.get('/surfaces', (_req, res) => {
+  return res.json({
+    surfaces: TASTE_SURFACES,
+    intensities: ['off', 'subtle', 'strong'],
+  });
+});
+
+router.get('/application', async (req, res) => {
+  try {
+    const application = await tasteProfileService.getApplication(
+      userId(req),
+      req.query.surface,
+      req.query.intensity
+    );
+    return res.json({ application });
+  } catch (error) {
+    return sendTasteError(res, error);
+  }
+});
+
+router.post('/apply', importLimiter, async (req, res) => {
+  try {
+    assertExactKeys(req.body, ['surface', 'intensity', 'prompt']);
+    const result = await tasteProfileService.applyToPrompt(
+      userId(req),
+      req.body.surface,
+      req.body.prompt,
+      req.body.intensity
+    );
+    return res.json(result);
   } catch (error) {
     return sendTasteError(res, error);
   }
