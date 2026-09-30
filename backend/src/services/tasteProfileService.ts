@@ -401,10 +401,12 @@ function aggregateSnapshots(snapshots: TasteSourceSnapshot[]): TasteProfile {
     .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
     .slice(0, MAX_PROFILE_SIGNALS);
 
-  const updatedAt = snapshots
+  const sortedTimestamps = snapshots
     .map((snapshot) => snapshot.generatedAt)
-    .sort()
-    .at(-1) || null;
+    .sort();
+  const updatedAt = sortedTimestamps.length > 0
+    ? sortedTimestamps[sortedTimestamps.length - 1]
+    : null;
 
   const sourceCounts = new Map<TasteSourceSnapshot['source'], number>();
   for (const snapshot of snapshots) {
