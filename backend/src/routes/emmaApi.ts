@@ -189,8 +189,23 @@ router.post('/generate-image', async (req: Request, res: Response) => {
 router.post('/generate-video', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const { prompt, filename, session_id, video_model, start_frame, end_frame } = req.body;
-    const result = await svc.generateVideo(prompt, filename, userId(req), session_id, video_model, start_frame, end_frame);
+    const { prompt, filename, session_id, video_model, start_frame, end_frame, taste_intensity } = req.body;
+    const result = await svc.generateVideo(
+      prompt,
+      filename,
+      userId(req),
+      session_id,
+      video_model,
+      start_frame,
+      end_frame,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      taste_intensity
+    );
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
