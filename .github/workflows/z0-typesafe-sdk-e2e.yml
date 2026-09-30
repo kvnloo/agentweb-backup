@@ -1,0 +1,176 @@
+name: AgentWeb z0 TypeSafe SDK E2E
+
+on:
+  pull_request:
+    branches: [lab/z0-agentweb-emma-v0]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  protocol-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout AgentWeb exact head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Checkout stacked z0intelligence SDK branch
+        uses: actions/checkout@v4
+        with:
+          repository: kvnloo/z0intelligence
+          ref: lab/agentweb-emma-typesafe-sdk-v1
+          path: deps/z0intelligence
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Record exact heads
+        run: |
+          python - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          roots = {
+              "agentweb": ".",
+              "z0intelligence": "deps/z0intelligence",
+          }
+          out = {
+              name: subprocess.check_output(
+                  ["git", "-C", path, "rev-parse", "HEAD"], text=True
+              ).strip()
+              for name, path in roots.items()
+          }
+          Path("/tmp/typesafe-sdk-heads.json").write_text(
+              json.dumps(out, indent=2) + "\n", encoding="utf-8"
+          )
+          print(json.dumps(out, indent=2))
+          PY
+
+      - name: Install narrow dependencies
+        run: |
+          python -m pip install typesafe-sdk==0.7.2
+          cd backend && npm ci
+
+      - name: Start local System One fixture
+        working-directory: backend
+        env:
+          TYPESAFE_MOCK_COUNTER: /tmp/typesafe-mock-counts.json
+        run: |
+          python scripts/typesafe-system-one-mock.py > /tmp/typesafe-mock.log 2>&1 &
+          echo $! > /tmp/typesafe-mock.pid
+
+      - name: Start stacked z0intelligence authority
+        env:
+          PYTHONPATH: ${{ github.workspace }}/deps/z0intelligence/src
+          Z0INT_HOME: /tmp/z0int-sdk-home
+          Z0INT_EXPERIMENTAL_JEV_SHADOW: "1"
+          TYPESAFE_API_KEY: test-key
+          TYPESAFE_BASE_URL: http://127.0.0.1:11888
+        run: |
+          mkdir -p "$Z0INT_HOME"
+          python -m z0int.intelligence_service --port 11501 > /tmp/z0int-sdk.log 2>&1 &
+          echo $! > /tmp/z0int-sdk.pid
+          python - <<'PY'
+          import time, urllib.request
+          for url in (
+              "http://127.0.0.1:11888/v1/systemone",
+              "http://127.0.0.1:11501/healthz",
+          ):
+              if url.endswith("/systemone"):
+                  continue
+              last = None
+              for _ in range(40):
+                  try:
+                      with urllib.request.urlopen(url, timeout=1) as response:
+                          if response.status == 200:
+                              break
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(.25)
+              else:
+                  raise SystemExit(f"service did not become ready: {url}: {last}")
+          PY
+
+      - name: Run AgentWeb -> z0 -> official SDK protocol E2E
+        working-directory: backend
+        env:
+          Z0INT_SERVICE_URL: http://127.0.0.1:11501
+          Z0INT_AGENTWEB_MODE: shadow
+        run: npm run study:z0-typesafe-protocol -- /tmp/z0-typesafe-protocol.json
+
+      - name: Verify physical calls and durable receipts
+        run: |
+          cat /tmp/typesafe-mock-counts.json
+          cat /tmp/z0-typesafe-protocol.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          counts = json.load(open("/tmp/typesafe-mock-counts.json"))
+          assert counts == {"choice": 1, "noul": 1, "total": 2}, counts
+
+          result = json.load(open("/tmp/z0-typesafe-protocol.json"))
+          assert result["choice"]["first"]["ok"] is True
+          assert result["choice"]["replay"]["replayed"] is True
+          assert result["choice"]["mutation"]["ok"] is False
+          assert result["noul"]["first"]["ok"] is True
+          assert result["noul"]["replay"]["replayed"] is True
+
+          rows = [
+              json.loads(line)
+              for line in Path("/tmp/z0int-sdk-home/receipts/decisions.jsonl").read_text().splitlines()
+              if line.strip()
+          ]
+          completed = [
+              row for row in rows
+              if row.get("capability_id") in {
+                  "experiment.report_type_v1",
+                  "experiment.stop_request_v1",
+              }
+              and (row.get("extra") or {}).get("status") == "completed"
+          ]
+          assert len(completed) == 2, completed
+          for row in completed:
+              assert row["execution"] == "shadow"
+              assert row["model"] == "jev-1.13.0"
+              assert row["input_tokens"] == 12
+              assert row["output_tokens"] == 3
+              assert row["extra"]["applied"] is False
+              assert row["extra"]["quality_authoritative"] is False
+              assert row["extra"]["physical_call_attempted"] is True
+          PY
+
+      - name: Stop fixture services
+        if: always()
+        run: |
+          for pidfile in /tmp/z0int-sdk.pid /tmp/typesafe-mock.pid; do
+            if test -f "$pidfile"; then kill "$(cat "$pidfile")" || true; fi
+          done
+          cat /tmp/typesafe-mock.log || true
+          cat /tmp/z0int-sdk.log || true
+
+      - name: Upload protocol evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentweb-z0-typesafe-sdk-e2e
+          path: |
+            /tmp/typesafe-sdk-heads.json
+            /tmp/typesafe-mock-counts.json
+            /tmp/z0-typesafe-protocol.json
+            /tmp/z0int-sdk-home/receipts/decisions.jsonl
+            /tmp/typesafe-mock.log
+            /tmp/z0int-sdk.log
