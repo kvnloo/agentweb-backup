@@ -20,6 +20,7 @@ import LightbulbIcon from '@mui/icons-material/Lightbulb';
 import ChevronRightIcon from '@mui/icons-material/ChevronRight';
 import FormatQuoteIcon from '@mui/icons-material/FormatQuote';
 import BrushIcon from '@mui/icons-material/Brush';
+import AutoAwesomeIcon from '@mui/icons-material/AutoAwesome';
 
 const testimonials = [
   {
@@ -253,6 +254,46 @@ const Home: React.FC = () => {
             </Card>
           </Grid>
         </Grid>
+
+
+        <Card
+          variant="outlined"
+          sx={{
+            mb: 6,
+            boxShadow: 'none',
+          }}
+        >
+          <CardContent sx={{ p: { xs: 3, md: 4 } }}>
+            <Stack
+              direction={{ xs: 'column', md: 'row' }}
+              spacing={3}
+              alignItems={{ md: 'center' }}
+              justifyContent="space-between"
+            >
+              <Stack direction="row" spacing={2} alignItems="flex-start">
+                <Avatar sx={{ bgcolor: 'primary.light' }}>
+                  <AutoAwesomeIcon />
+                </Avatar>
+                <Box>
+                  <Typography variant="h5" fontWeight="bold">
+                    Taste
+                  </Typography>
+                  <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5, maxWidth: 640 }}>
+                    Teach Emma what you like from X bookmarks and reference collections, then choose where Taste should be strong, subtle, or off.
+                  </Typography>
+                </Box>
+              </Stack>
+              <Button
+                component={Link}
+                to="/marketing/taste"
+                variant="outlined"
+                endIcon={<ChevronRightIcon />}
+              >
+                Tune Emma
+              </Button>
+            </Stack>
+          </CardContent>
+        </Card>
 
         <Box sx={{ mt: 12, mb: 8 }}>
           <Box sx={{ textAlign: 'center', mb: 6 }}>
