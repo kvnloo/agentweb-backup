@@ -888,5 +888,27 @@ describe("Admin chat sessions endpoint", () => {
 
       expect(res.body.failed).toEqual([{ sessionId: "s1", reason: "weird non-error rejection" }]);
     });
+
+    // CodeRabbit (CWE-532): a judge-score failure reason can echo back judge/
+    // provider response content (e.g. the missing-score guard's
+    // JSON.stringify(parsed.score)), which may itself derive from a real
+    // session transcript, so it must not reach logs or the API response
+    // unbounded.
+    it("truncates a very long rejection reason instead of logging/returning it verbatim", async () => {
+      const session = makeSession("s1");
+      mockChatbotDb.getChatSession.mockResolvedValue(session);
+      const longReason = "x".repeat(1000);
+      mockScoreSessionWithJudgeIfNeeded.mockRejectedValue(new Error(longReason));
+
+      const res = await request(app)
+        .post("/api/admin/chat-sessions/judge-score")
+        .send({ sessionIds: ["s1"], judgeId: "judge-1" })
+        .expect(200);
+
+      expect(res.body.failed).toHaveLength(1);
+      expect(res.body.failed[0].sessionId).toBe("s1");
+      expect(res.body.failed[0].reason.length).toBeLessThan(longReason.length);
+      expect(res.body.failed[0].reason.endsWith("…")).toBe(true);
+    });
   });
 });
