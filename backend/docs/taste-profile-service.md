@@ -46,7 +46,6 @@ Deletes all durable Taste Profile memories for the authenticated user.
 Raw source items are ephemeral. The durable representation contains only:
 
 - source type and item count
-- a truncated content digest
 - aggregate domains
 - aggregate terms that occur at least twice
 - bounded style signals
