@@ -28,7 +28,11 @@ jest.mock('aws-sdk', () => ({
 }));
 
 jest.mock('axios', () => ({ get: jest.fn() }));
-jest.mock('crypto', () => ({ createHash: jest.fn() }));
+// ENG-2103 F2 full-suite checkpoint: spread the REAL crypto module rather than
+// a bare { createHash } stub — see readFileContent.test.ts's comment on this
+// same pattern for why (agentModeController.ts's uuid.v4() call needs
+// crypto.randomFillSync at module load).
+jest.mock('crypto', () => ({ ...jest.requireActual('crypto'), createHash: jest.fn() }));
 jest.mock('../utils/s3Utils', () => ({
   uploadFileToS3WithPath: jest.fn().mockResolvedValue({
     success: true,
