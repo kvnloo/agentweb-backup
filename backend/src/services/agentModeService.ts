@@ -31,6 +31,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, ChatSession, searchPlatformKnowledgeBase } from './chatbotService';
+import { observeZ0ContextPacketShadow } from './z0ContextPacket';
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
@@ -26335,20 +26336,29 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   }
 
   public async searchKnowledgeBase(query: string, maxResults: number = 5, userId?: string): Promise<any> {
+    const finish = (result: any) => {
+      observeZ0ContextPacketShadow(
+        query,
+        result,
+        userId || 'agentweb-public-kb',
+      );
+      return result;
+    };
+
     try {
       console.log('AgentMode: Searching knowledge base for query:', query, 'maxResults:', maxResults);
 
       // Guard: an empty/whitespace query matches everything in Vertex (returned the whole
       // KB). Skip the search entirely and return nothing.
       if (!query || !query.trim()) {
-        return {
+        return finish({
           success: true,
           message: 'No search query provided.',
           query: query || '',
           results: [],
           returnedResults: 0,
           hasMore: false,
-        };
+        });
       }
 
       // Limit max results to 10
@@ -26519,7 +26529,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       }
 
       if (results.length === 0) {
-        return {
+        return finish({
           success: true,
           message: driveScanIncomplete
             ? `No knowledge base results found for "${query}" — note: some Google Drive folders could not be fully scanned, so this is not confirmed exhaustive.`
@@ -26529,7 +26539,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           returnedResults: 0,
           hasMore: false,
           ...(driveScanIncomplete && { scanIncomplete: true })
-        };
+        });
       }
 
       // Bound the merged results to what the caller asked for. Each source (Vertex, Drive,
@@ -26555,7 +26565,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const scanIncompleteNote = driveScanIncomplete
         ? ' Some Google Drive folders could not be fully scanned, so this is not confirmed exhaustive.'
         : '';
-      return {
+      return finish({
         success: true,
         message: (hasMore
           ? `Showing the first ${boundedResults.length} knowledge base results for "${query}" — raise max_results to see more.`
@@ -26571,14 +26581,14 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         hasMore,
         ...(driveScanIncomplete && { scanIncomplete: true }),
         results: boundedResults,
-      };
+      });
     } catch (error) {
       console.error('AgentMode: Error searching knowledge base:', error);
-      return {
+      return finish({
         success: false,
         message: 'Failed to search the knowledge base. Please try again.',
         error: error instanceof Error ? error.message : 'Unknown error'
-      };
+      });
     }
   }
 
