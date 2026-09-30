@@ -54,6 +54,7 @@ import { resolvePublishAuthorized, extractScheduleId, resolveSlackSendAuthorized
 import { meteringFeature } from '../services/llmUsageAttributionService';
 import type { LLMUsageContext } from '../utils/llmService';
 import { runStopRequestZ0Shadow, logStopRequestZ0Shadow } from '../services/z0StopRequestShadow';
+import { runStopRequestIncumbentJudge } from '../services/stopRequestJudgeService';
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
 import { countCallsSatisfyingRequirement, RequiredCallLedgerEntry } from '../utils/requiredCallSatisfaction';
 import { canonicalizeVisibility, resolveVisibilityUpdate } from '../utils/scheduleTemplateVisibility';
@@ -1523,85 +1524,41 @@ async function scheduleAutoMediaContinuation(
 // setImmediate. A stale read here would, worst case, cost one harmless extra continuation
 // round before self-correcting on the next round's fresh check — not a silent, permanent
 // failure to ever honor the stop.
-const STOP_REQUEST_JUDGE_MODEL = 'gemini-3.1-flash-lite';
-const STOP_REQUEST_JUDGE_TIMEOUT_MS = 8000;
-const STOP_REQUEST_JUDGE_SYSTEM = `You classify one message from a user talking to an AI assistant that is running a multi-step work plan on their behalf.
-
-Decide whether the user's message explicitly asks the assistant to STOP or to NOT do any more work right now — as opposed to a normal instruction, question, or request to continue/proceed.
-
-Answer "yes" when the message clearly asks to halt, pause, wait, not continue, or do no further work without being asked again — even if phrased casually ("that's enough for now", "hold off", "don't keep going").
-
-Answer "no" for everything else, including ordinary requests, questions, corrections, or instructions that do not ask the assistant to stop.
-
-Reply with ONLY one word: yes or no.`;
-
 async function userExplicitlyRequestedStop(sessionId: string, usageContext?: LLMUsageContext): Promise<boolean> {
-  let z0ShadowPromise: Promise<any> | null = null;
-  try {
-    const recent = await chatbotDb.getMostRecentRealUserMessage(sessionId);
-    if (!recent?.content) return false;
-    const judgeText = recent.content.slice(0, 2500);
+  const recent = await chatbotDb.getMostRecentRealUserMessage(sessionId);
+  if (!recent?.content) return false;
+  const judgeText = recent.content.slice(0, 2500);
 
-    // Downstream-only z0 experiment: begins concurrently so it adds no latency to
-    // the authoritative Gemini judge. Its probability is observational only.
-    z0ShadowPromise = runStopRequestZ0Shadow(sessionId, judgeText);
+  // Downstream-only z0 experiment: starts concurrently and can never alter the
+  // incumbent result. It exists solely to collect probability/receipt evidence.
+  const z0ShadowPromise = runStopRequestZ0Shadow(sessionId, judgeText);
 
-    const llmPromise = agentModeService.callLLM(
-      STOP_REQUEST_JUDGE_MODEL,
-      [
-        { role: 'system', content: STOP_REQUEST_JUDGE_SYSTEM },
-        { role: 'user', content: judgeText },
-      ],
-      // ENG-1819 live-testing found gemini-3.1-flash-lite is a reasoning model (confirmed
-      // in this file's own llmModels registry) that can spend its whole completion budget on
-      // an internal reasoning trace before ever emitting "yes"/"no" -- a tight budget (the
-      // scheduledTurnDefersToUser precedent's max_completion_tokens: 3) came back
-      // finish_reason:"length" with content:null every time, which this function's own
-      // empty-string parse then (correctly, but unintentionally) treated as "no". 500 leaves
-      // headroom for a reasoning trace ahead of the one-word answer; cost scales with tokens
-      // actually generated, not this ceiling.
-      {
-        temperature: 0,
-        max_completion_tokens: 500,
-        taskClass: 'scheduled_background',
-        // ENG-1858: judging the user's own continuation — attribute it to them.
-        usageContext: usageContext ?? { feature: 'stop_request_judge' },
-      }
+  const incumbent = await runStopRequestIncumbentJudge(judgeText, usageContext);
+  if (incumbent.truncated) {
+    console.warn(
+      `AgentMode: work-plan auto-continuation stop-request judge for session ${sessionId} was ` +
+      `truncated (finish_reason: length) before producing an answer -- treating as "no", but ` +
+      `this may be silently missing a real stop request.`
     );
-    const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('stop-request judge timed out')), STOP_REQUEST_JUDGE_TIMEOUT_MS)
-    );
-    const res: any = await Promise.race([llmPromise, timeoutPromise]);
-    // ENG-1819: this is exactly the failure mode live-testing found at
-    // max_completion_tokens: 3 -- a truncated reasoning trace silently reads as "no". 500
-    // makes truncation unlikely, but isn't a guarantee; log loudly instead of letting a
-    // recurrence go unnoticed again.
-    if (res?.choices?.[0]?.finish_reason === 'length') {
-      console.warn(
-        `AgentMode: work-plan auto-continuation stop-request judge for session ${sessionId} was ` +
-        `truncated (finish_reason: length) before producing an answer -- treating as "no", but ` +
-        `this may be silently missing a real stop request.`
-      );
-    }
-    const raw = (res?.choices?.[0]?.message?.content ?? '').trim().toLowerCase();
-    const incumbentStop = raw.startsWith('yes');
-    if (z0ShadowPromise) {
-      void z0ShadowPromise.then(
-        result => logStopRequestZ0Shadow(result, incumbentStop),
-        () => logStopRequestZ0Shadow({ ok: false, reason: 'shadow_exception' }, incumbentStop),
-      );
-    }
-    return incumbentStop;
-  } catch (err) {
-    if (z0ShadowPromise) {
-      void z0ShadowPromise.then(
-        result => logStopRequestZ0Shadow(result, null, true),
-        () => logStopRequestZ0Shadow({ ok: false, reason: 'shadow_exception' }, null, true),
-      );
-    }
-    console.error(`AgentMode: work-plan auto-continuation stop-request judge failed for session ${sessionId}:`, err);
-    return false; // fail-safe: never suppress a continuation on judge failure
   }
+  if (incumbent.failed) {
+    console.error(
+      `AgentMode: work-plan auto-continuation stop-request judge failed for session ${sessionId}; ` +
+      `treating as "no" to preserve existing fail-safe behavior.`
+    );
+  }
+
+  if (z0ShadowPromise) {
+    void z0ShadowPromise.then(
+      result => logStopRequestZ0Shadow(result, incumbent.stop, incumbent.failed),
+      () => logStopRequestZ0Shadow(
+        { ok: false, reason: 'shadow_exception' },
+        incumbent.stop,
+        incumbent.failed,
+      ),
+    );
+  }
+  return incumbent.stop;
 }
 /**
  * ENG-1684: the autocomplete-work-plan analogue of scheduleAutoMediaContinuation above —
