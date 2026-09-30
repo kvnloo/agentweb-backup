@@ -50,10 +50,14 @@ describe('AgentModeService - OpenRouter client initialization (ENG-9)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     process.env.OPENROUTER_API_KEY = 'test-openrouter-key';
+    delete process.env.Z0_MODEL_STUDY_PROVIDER_EMULATION;
+    delete process.env.Z0_MODEL_STUDY_OPENROUTER_BASE_URL;
   });
 
   afterEach(() => {
     delete process.env.OPENROUTER_API_KEY;
+    delete process.env.Z0_MODEL_STUDY_PROVIDER_EMULATION;
+    delete process.env.Z0_MODEL_STUDY_OPENROUTER_BASE_URL;
   });
 
   function openRouterConfig(): any {
@@ -66,6 +70,25 @@ describe('AgentModeService - OpenRouter client initialization (ENG-9)', () => {
     expect(MockOpenAI.mock.calls.find((call: any[]) =>
       call[0]?.baseURL?.includes('openrouter.ai')
     )?.[0]?.baseURL).toBe('https://openrouter.ai/api/v1');
+  });
+
+  it('ignores the study base URL unless emulation is explicitly enabled', async () => {
+    process.env.Z0_MODEL_STUDY_OPENROUTER_BASE_URL = 'http://127.0.0.1:18080/v1';
+    const service = new AgentModeService();
+    await service.getOpenRouterClient();
+    expect(MockOpenAI.mock.calls.find((call: any[]) =>
+      call[0]?.apiKey === 'test-openrouter-key'
+    )?.[0]?.baseURL).toBe('https://openrouter.ai/api/v1');
+  });
+
+  it('uses the local study base only behind the explicit emulation gate', async () => {
+    process.env.Z0_MODEL_STUDY_PROVIDER_EMULATION = '1';
+    process.env.Z0_MODEL_STUDY_OPENROUTER_BASE_URL = 'http://127.0.0.1:18080/v1/';
+    const service = new AgentModeService();
+    await service.getOpenRouterClient();
+    expect(MockOpenAI.mock.calls.find((call: any[]) =>
+      call[0]?.apiKey === 'test-openrouter-key'
+    )?.[0]?.baseURL).toBe('http://127.0.0.1:18080/v1');
   });
 
   it('passes OPENROUTER_API_KEY to the client', async () => {
