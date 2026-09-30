@@ -215,6 +215,7 @@ export const portalRouteCatalog: readonly PortalRouteCatalogEntry[] = [
   route('marketing-creative-generation', 'Creative generation', '/marketing/creative-generation', 'Generate marketing creative', 'customer', 'Return to marketing', 'Not implemented; renders Not Found', {
     availability: 'placeholder',
   }),
+  route('marketing-taste', 'Taste', '/marketing/taste', 'Teach Emma preferences and control where they apply', 'customer', 'Tune Taste', 'Empty profile explains how to add sources'),
   route('marketing-research', 'Market research', '/marketing/research', 'Run market research', 'customer', 'Create or open research', 'Empty research collection is handled by the page'),
   route('marketing-research-detail', 'Research detail', '/marketing/research/:taskId', 'Review market research', 'customer', 'Open research result', 'Missing research task is handled by the page'),
   route('marketing-research-legacy', 'Legacy market research', '/marketing/market-research', 'Reach market research from the legacy URL', 'customer', 'Redirect to research', 'Redirects to /marketing/research', {
