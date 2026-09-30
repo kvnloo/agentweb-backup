@@ -341,7 +341,9 @@ function snapshotFor(
     source,
     sourceKey,
     itemCount: items.length,
-    // Like terms, retain a domain only after repeated evidence so a one-off private\n    // source does not become durable preference context.\n    topDomains: countTop(domains, MAX_PROFILE_DOMAINS, MIN_AGGREGATE_TERM_FREQUENCY).map((entry) => entry.value),
+    // Like terms, retain a domain only after repeated evidence so a one-off private
+    // source does not become durable preference context.
+    topDomains: countTop(domains, MAX_PROFILE_DOMAINS, MIN_AGGREGATE_TERM_FREQUENCY).map((entry) => entry.value),
     // A term must occur at least twice before it is retained. This avoids turning a
     // one-off private bookmark phrase into durable memory.
     topTerms: countTop(tokens, MAX_PROFILE_TERMS, MIN_AGGREGATE_TERM_FREQUENCY).map((entry) => entry.value),
