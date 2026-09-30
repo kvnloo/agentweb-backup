@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
+      NODE_OPTIONS: --max-old-space-size=4096
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
       Z0INT_EXPERIMENTAL_JEV_SHADOW: "1"
