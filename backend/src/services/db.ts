@@ -11940,6 +11940,8 @@ export const oauthSessionDb = {
     scopes: string[];
     /** Scopes actually GRANTED, when the provider could tell us (ENG-629). */
     granted_scopes?: string[];
+    /** Whether at least one Facebook Page is accessible, when probed (ENG-2232). */
+    has_meta_pages?: boolean;
     flow: string;
   } | PendingOAuthSession): Promise<void> {
     const TEN_MINUTES_SECONDS = 10 * 60;
@@ -11979,6 +11981,7 @@ export const oauthSessionDb = {
     expires_in?: number;
     scopes: string[];
     granted_scopes?: string[];
+    has_meta_pages?: boolean;
     flow: string;
   } | null> {
     try {

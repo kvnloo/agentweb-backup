@@ -19215,9 +19215,19 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const pages = await metaService.getPages(accessToken);
       const totalCount = Array.isArray(pages) ? pages.length : 0;
 
+      // ENG-2232: a bare "Found 0" here is silent — nothing told the model this
+      // is fatal for every AD_CREATIVE until it hit the permission error after
+      // building out a full campaign. Say the consequence and the fix up front.
+      const message = totalCount === 0
+        ? 'Found 0 Facebook Page(s). No ads can be created without a Page — ask the user to select a Page under ' +
+          'Meta\'s "Choose Pages" step when connecting, or to get "Create ads" (Advertiser) access on the ' +
+          'intended Page, then reconnect and retry. Do not proceed to build campaigns/ad sets/creatives for this ' +
+          'account until PAGE LIST returns at least one Page.'
+        : `Found ${totalCount} Facebook Page(s)`;
+
       return {
         success: true,
-        message: `Found ${totalCount} Facebook Page(s)`,
+        message,
         pages: pages,
         totalCount: totalCount
       };

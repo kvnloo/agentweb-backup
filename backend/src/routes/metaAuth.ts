@@ -45,7 +45,7 @@ function buildOAuthUrl(params: { authorizationUrl: string; clientId: string; red
     return `${params.authorizationUrl}?${searchParams.toString()}`;
 }
 
-async function storeTokenSession(userId: string, tokens: { access_token: string; expires_in?: number; scopes: string[]; granted_scopes?: string[]; flow: MetaFlowType }): Promise<string> {
+async function storeTokenSession(userId: string, tokens: { access_token: string; expires_in?: number; scopes: string[]; granted_scopes?: string[]; has_meta_pages?: boolean; flow: MetaFlowType }): Promise<string> {
     const sessionId = crypto.randomBytes(32).toString('hex');
     await oauthSessionDb.save({ sessionId, userId, ...tokens });
     return sessionId;
@@ -265,11 +265,29 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
             console.warn(`[Meta Finalize] Could not determine granted scopes: ${err?.message ?? err}`);
         }
 
+        // ENG-2232: Page access is a second, independent Meta grant that
+        // granted_scopes says nothing about — a token can hold ads_read with
+        // zero accessible Pages, and every AD_CREATIVE needs a page_id. Probed
+        // once here, at connect/reconnect time, same pattern as granted_scopes
+        // above: best-effort, and `undefined` (never `false`) on failure so
+        // "we could not ask" is never read as "confirmed zero Pages".
+        let has_meta_pages: boolean | undefined;
+        if (flow === 'marketing') {
+            try {
+                const pages = await metaService.getPages(access_token);
+                has_meta_pages = pages.length > 0;
+                console.log(`[Meta Finalize] has_meta_pages: ${has_meta_pages} (${pages.length} Page(s))`);
+            } catch (err: any) {
+                console.warn(`[Meta Finalize] Could not determine Page access: ${err?.message ?? err}`);
+            }
+        }
+
         const tokenSessionId = await storeTokenSession(userId, {
             access_token,
             expires_in,
             scopes: flowCfg.scopes,
             ...(granted_scopes ? { granted_scopes } : {}),
+            ...(has_meta_pages !== undefined ? { has_meta_pages } : {}),
             flow
         });
 
@@ -298,6 +316,10 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
                 flow,
                 adAccounts: adAccounts.length > 0 ? adAccounts : undefined,
                 adAccountsError: adAccountsError || undefined,
+                // ENG-2232: lets the frontend show a blocking warning on the
+                // "Choose Pages" step before the user finishes connecting,
+                // instead of only discovering this later at ad-creative time.
+                hasMetaPages: has_meta_pages,
                 tokenSessionId
             });
         }
@@ -366,6 +388,9 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
                     // Omitted (not []) when undetermined, so "we could not ask" never
                     // masquerades as "nothing was granted" (ENG-629).
                     ...(session.granted_scopes ? { granted_scopes: session.granted_scopes } : {}),
+                    // Authoritative Page-access signal, read back by getMetaPagesAccessState.
+                    // Omitted when undetermined, for the same reason (ENG-2232).
+                    ...(session.has_meta_pages !== undefined ? { has_meta_pages: session.has_meta_pages } : {}),
                 }
             });
             connectedAccounts.push(account);

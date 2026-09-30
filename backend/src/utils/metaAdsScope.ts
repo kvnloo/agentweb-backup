@@ -106,6 +106,23 @@ export interface MetaAdsScopeConfigLike {
    * which write reaches the database first.
    */
   ads_capability_probed_at?: unknown;
+  /**
+   * Whether this connection has at least one accessible Facebook Page, probed
+   * once via PAGE LIST at connect/reconnect time (ENG-2232).
+   *
+   * Independent of `granted_scopes`: the OAuth `ads_read`/`ads_management`
+   * scope and Page access are two separate Meta grants, and a token can hold
+   * the former with zero of the latter. Production case (ENG-2232): ad account
+   * 1209971551106961 reported `ads_capable: true` (ads_read granted) while
+   * PAGE LIST returned 0 Pages both before and after the customer reconnected
+   * — every AD_CREATIVE CREATE needs a page_id, so the build failed only after
+   * 4 campaigns and 4 ad sets had already been approved through the deck.
+   *
+   * Tri-state for the same reason as the scope fields above: `undefined` means
+   * "never probed" (legacy record, or the probe itself failed) and must not be
+   * read as either answer.
+   */
+  has_meta_pages?: unknown;
 }
 
 /**
@@ -135,6 +152,20 @@ export const META_ADS_ASSET_ACCESS_MESSAGE =
   'so no campaign or insights data could be read. Reconnecting will not fix this. Ask whoever manages this ad ' +
   'account in Meta Business Settings to add this person with Ads permissions, then run this again. ' +
   'No metrics were retrieved.';
+
+/**
+ * ENG-2232: no Facebook Page is accessible with this connection, so ad
+ * creation cannot succeed however healthy the ad-account grant looks.
+ *
+ * Distinct from the two messages above: this fires even when ads_read/
+ * ads_management IS granted, because Page access is a second, independent
+ * Meta grant that OAuth scopes say nothing about.
+ */
+export const META_ADS_NO_PAGES_MESSAGE =
+  'Meta Ads access is incomplete for this connection: no Facebook Pages are accessible, and every ad creative ' +
+  'must reference a Page, so ad creation will fail. Reconnect Meta under Settings -> Connected accounts and ' +
+  'select the Page on the "Choose Pages" step, and/or ask whoever manages that Page in Meta Business Settings ' +
+  'to add this person with "Create ads" (Advertiser) access, then run this again. No ads were created.';
 
 const isAdsScope = (value: unknown): boolean =>
   typeof value === 'string' &&
@@ -174,6 +205,21 @@ export const hasMetaAdsReadScope = (
   config: MetaAdsScopeConfigLike | null | undefined
 ): boolean => getMetaAdsScopeState(config) === 'granted';
 
+/**
+ * What do we know about this connection having at least one accessible
+ * Facebook Page? (ENG-2232) Mirrors `getMetaAdsScopeState`'s tri-state shape:
+ * a probe that never ran (legacy record) must read as 'unknown', never as a
+ * confident answer either way.
+ */
+export const getMetaPagesAccessState = (
+  config: MetaAdsScopeConfigLike | null | undefined
+): MetaAdsScopeState => {
+  const hasPages = config?.has_meta_pages;
+  if (hasPages === true) return 'granted';
+  if (hasPages === false) return 'missing';
+  return 'unknown';
+};
+
 /** Minimal structural shape of a connected-account record. */
 export interface MetaAdsAccountLike {
   platform?: unknown;
@@ -212,7 +258,6 @@ export const describeMetaAdsCapability = (
   if (!isMetaAdAccountRecord(account)) return {};
 
   const state = getMetaAdsScopeState(account?.config);
-  if (state === 'granted') return { ads_capable: true };
   if (state === 'missing') {
     const message =
       account?.config?.ads_scope_tier === 'asset'
@@ -220,6 +265,16 @@ export const describeMetaAdsCapability = (
         : META_ADS_RECONSENT_MESSAGE;
     return { ads_capable: false, capability_warning: message };
   }
+
+  // A confirmed absence of any accessible Page is its own, independently fatal
+  // blocker — checked even when the OAuth ads scope is granted (or unproven),
+  // because Page access is a second Meta grant that scopes say nothing about.
+  // This is the exact gap ENG-2232 reported: ads_capable:true with 0 Pages.
+  if (getMetaPagesAccessState(account?.config) === 'missing') {
+    return { ads_capable: false, capability_warning: META_ADS_NO_PAGES_MESSAGE };
+  }
+
+  if (state === 'granted') return { ads_capable: true };
   return {};
 };
 
