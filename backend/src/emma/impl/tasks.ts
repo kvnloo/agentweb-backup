@@ -23,19 +23,21 @@
  *     createTaskFromPrompt). Was already `private` on the class — DELETED,
  *     same reasoning.
  *
- * CROSS-DEPENDENCY with the excluded createImageTaskFromPrompt: unlike the
- * two helpers above, `getPreviousTaskResults` is called by THREE methods —
+ * CROSS-DEPENDENCY with createImageTaskFromPrompt, AS IT STOOD AT THE ORIGINAL
+ * CLUSTER-14 PASS (superseded by the follow-up below — kept here for the
+ * historical reasoning, not as a statement of current fact): unlike the
+ * two helpers above, `getPreviousTaskResults` was called by THREE methods —
  * createTaskFromTemplate and createTaskFromPrompt (both moving here) AND
- * createImageTaskFromPrompt (excluded, stays on the class) — confirmed by
- * whole-backend grep, exactly 3 call sites, no others. It is a pure function
- * (only reads `chatbotDb`/`taskDb`, no other instance state), so this is
- * handled with a plain one-line delegating wrapper kept on the class
- * (`AgentModeService.prototype.getPreviousTaskResults`) rather than a
- * structural-interface parameter (cluster 13's WorkPlanModelRegistry shape
- * was needed there because of real instance state; no such state exists
- * here). The two moved methods in this module call the exported
- * `getPreviousTaskResults` function directly; createImageTaskFromPrompt
- * keeps calling `this.getPreviousTaskResults(...)`, unaffected.
+ * createImageTaskFromPrompt (excluded at the time, still on the class) —
+ * confirmed by whole-backend grep, exactly 3 call sites, no others. It is a
+ * pure function (only reads `chatbotDb`/`taskDb`, no other instance state),
+ * so this was handled with a plain one-line delegating wrapper kept on the
+ * class rather than a structural-interface parameter (cluster 13's
+ * WorkPlanModelRegistry shape was needed there because of real instance
+ * state; no such state exists here). All three callers now call the exported
+ * `getPreviousTaskResults` function directly, in this same module — see the
+ * follow-up note immediately below for why createImageTaskFromPrompt's
+ * `this.` call didn't stay "unaffected" after all.
  *
  * `createImageTaskFromPrompt` (ADDED IN A FOLLOW-UP PASS, same session): the
  * original cluster 14 brief excluded it on the theory that it makes a direct
@@ -210,12 +212,14 @@ function convertUrlsToAttachments(fileUrls: string[]): any[] {
 }
 
 /**
- * Used by createTaskFromTemplate and createTaskFromPrompt (both moved here)
- * AND by createImageTaskFromPrompt (excluded, stays on
- * `AgentModeService`) — see module header's cross-dependency writeup.
- * `AgentModeService.prototype.getPreviousTaskResults` keeps a one-line
- * delegating wrapper to this function so createImageTaskFromPrompt's
- * existing `this.getPreviousTaskResults(...)` call keeps working unchanged.
+ * Used by createTaskFromTemplate, createTaskFromPrompt, and
+ * createImageTaskFromPrompt — all three now live in this module (see the
+ * "ADDED IN A FOLLOW-UP PASS" section of the module header for
+ * createImageTaskFromPrompt's history; it's no longer excluded, it calls
+ * this function directly, not via `this.`). `AgentModeService.prototype
+ * .getPreviousTaskResults` keeps a one-line delegating wrapper to this
+ * function anyway, for `routes/emmaApi.ts` and direct-instance test callers
+ * — see the module header's real-callers list below.
  */
 export async function getPreviousTaskResults(userId: string, sessionId: string): Promise<string> {
   const { chatbotDb } = require('../../services/chatbotService') as typeof import('../../services/chatbotService');
