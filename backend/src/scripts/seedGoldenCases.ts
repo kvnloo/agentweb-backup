@@ -2,7 +2,8 @@
  * Build the ENG-2135 golden-set seed (case ids only) and optionally write it to the store.
  *
  * Usage:
- *   npx ts-node --transpile-only src/scripts/seedGoldenCases.ts [--fp-catalogue <file>] [--write]
+ *   npx ts-node --transpile-only src/scripts/seedGoldenCases.ts [--fp-catalogue <file>]
+ *     [--target-agent N] [--target-creative N] [--target-account-health N] [--write]
  *
  * Reads (read-only, projected scans — ids and flags only):
  *   AW-ChatSessions   sessionId, satisfactionScore.adminOverride
@@ -14,9 +15,16 @@
  * ids they name, plus the session turn behind each ENG-1312 replay fixture (goldenSetSeed.ts
  * FpCatalogue). It stays out of git because it holds production session ids.
  *
+ * `--target-<surface>` overrides that surface's target case count (default 50/50/30, see
+ * DEFAULT_SEED_TARGETS). Splits are a deterministic hash of the case id (~60% test / 40% dev,
+ * `splitForCaseId`), not reassignable per case — the only way to grow a surface's *test* split
+ * past the ENG-2136 validation minimum (MIN_VALIDATION_N = 30) is to raise its total target so
+ * more cases get selected, some of which land in test.
+ *
  * Prints counts only. Writes nothing unless `--write` is given, and then only to the table in
  * EVAL_GOLDEN_CASES_TABLE; with that unset it refuses and exits 1. Existing cases (and their
- * labels) are never overwritten.
+ * labels) are never overwritten — `store.createCase` only creates, so raising a target and
+ * re-running is safe and idempotent: already-selected cases keep their id, split and any labels.
  */
 
 import AWS from 'aws-sdk';
@@ -30,21 +38,36 @@ import {
   type SeedSessionRow,
   type SeedUserRow,
 } from '../loops/eval/goldenSetSeed';
+import type { EvalSurface } from '../loops/eval/evalRegistry';
 import { goldenSetStoreFromEnv, GOLDEN_CASES_TABLE_ENV } from '../loops/eval/goldenSetStore';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 
-interface Args {
+const TARGET_FLAGS: Record<string, EvalSurface> = {
+  '--target-agent': 'agent',
+  '--target-creative': 'creative',
+  '--target-account-health': 'account_health',
+};
+
+export interface Args {
   fpCatalogue?: string;
   write: boolean;
+  targets: Partial<Record<EvalSurface, number>>;
 }
 
-function parseArgs(argv: string[]): Args {
-  const args: Args = { write: false };
+export function parseArgs(argv: string[]): Args {
+  const args: Args = { write: false, targets: {} };
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--write') args.write = true;
-    else if (argv[i] === '--fp-catalogue') args.fpCatalogue = argv[++i];
-    else throw new Error(`unknown argument ${argv[i]}`);
+    const flag = argv[i];
+    const surface = TARGET_FLAGS[flag];
+    if (flag === '--write') args.write = true;
+    else if (flag === '--fp-catalogue') args.fpCatalogue = argv[++i];
+    else if (surface) {
+      const raw = argv[++i];
+      const n = Number(raw);
+      if (!Number.isInteger(n) || n < 1) throw new Error(`${flag} needs a positive integer, got ${JSON.stringify(raw)}`);
+      args.targets[surface] = n;
+    } else throw new Error(`unknown argument ${flag}`);
   }
   return args;
 }
@@ -110,7 +133,12 @@ async function main(): Promise<void> {
     ? parseFpCatalogue(JSON.parse(readFileSync(args.fpCatalogue, 'utf8')))
     : undefined;
   const inputs = await loadInputs(new AWS.DynamoDB.DocumentClient());
-  const result = buildSeedCases({ ...inputs, ...(fpCatalogue ? { fpCatalogue } : {}), now: new Date() });
+  const result = buildSeedCases({
+    ...inputs,
+    ...(fpCatalogue ? { fpCatalogue } : {}),
+    ...(Object.keys(args.targets).length ? { targets: args.targets } : {}),
+    now: new Date(),
+  });
 
   console.log(`Source rows: ${inputs.sessions.length} sessions, ${inputs.candidates.length} human-eval candidates, ${inputs.users.length} users`);
   for (const [surface, r] of Object.entries(result.report)) {

@@ -1575,13 +1575,13 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
         (crmDb.createLead as jest.Mock).mockResolvedValue({
           leadId: 'lead_enroll',
           listId: 'list_123',
-          email: 'enroll@example.com',
+          email: 'enroll@acme.io',
         });
         (dripSequenceDb.getSequencesByAutoEnrollList as jest.Mock).mockResolvedValue([mockSequence]);
 
         const response = await request(app)
           .post('/api/webhooks/forward-lead')
-          .send({ listId: 'list_123', email: 'enroll@example.com' });
+          .send({ listId: 'list_123', email: 'enroll@acme.io' });
 
         expect(response.status).toBe(201);
 
@@ -1595,7 +1595,7 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
             userId: 'owner_123',
             listId: 'list_123',
             leadId: 'lead_enroll',
-            leadEmail: 'enroll@example.com',
+            leadEmail: 'enroll@acme.io',
           }),
         ]);
       });
@@ -1604,14 +1604,14 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
         (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
           leadId: 'lead_existing',
           listId: 'list_123',
-          email: 'existing@example.com',
+          email: 'existing@acme.io',
           firstName: '',
         });
         (dripSequenceDb.getSequencesByAutoEnrollList as jest.Mock).mockResolvedValue([mockSequence]);
 
         const response = await request(app)
           .post('/api/webhooks/forward-lead')
-          .send({ listId: 'list_123', email: 'existing@example.com', firstName: 'Updated' });
+          .send({ listId: 'list_123', email: 'existing@acme.io', firstName: 'Updated' });
 
         expect(response.status).toBe(200);
 
@@ -1622,7 +1622,7 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
           expect.objectContaining({
             sequenceId: 'seq_123',
             leadId: 'lead_existing',
-            leadEmail: 'existing@example.com',
+            leadEmail: 'existing@acme.io',
           }),
         ]);
       });

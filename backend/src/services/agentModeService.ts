@@ -16154,6 +16154,19 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // markdownToDocsRequests is kept below (delegating), because
   // __tests__/agentModeService.googleDrive.test.ts calls
   // `AgentModeService.markdownToDocsRequests.bind(AgentModeService)` directly.
+  //
+  // ENG-2103 (F2) main-sync note: origin/main's version of this region also
+  // carried the FULL unmodified bodies of inlineToHtml/markdownToHtml/
+  // parseInlineRuns/lexMarkdown/buildDocBlocks (unchanged bystander content,
+  // caught in this conflict only because HEAD deleted the contiguous block
+  // they used to sit in) plus one genuinely new method, `collectTemplateValueMarkup`
+  // (ENG-1960) — that one's real caller is createHtmlFromTemplate, whose real
+  // body now lives in emma/impl/htmlCreation.ts, so it's ported there as a
+  // plain function instead of re-added here.
+  /**
+   * Convert markdown to Google Docs API batchUpdate requests.
+   * Returns [] when content is blank (caller can skip batchUpdate).
+   */
   static markdownToDocsRequests(markdown: string, insertIndex = 1): any[] {
     return sharedMarkdownToDocsRequests(markdown, insertIndex);
   }
@@ -16905,6 +16918,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     userId: string,
     sessionId: string
   ): Promise<any> {
+    // ENG-2103 (F2): real body moved to emma/impl/htmlCreation.ts, including the
+    // ENG-1960 markup-detection call main added to it during the sync below —
+    // see that module for the current logic, not this comment block.
     return htmlCreationImpl.createHtmlFromTemplate(
       llmModel,
       templateId,

@@ -20,9 +20,15 @@ import {
   Card,
   CardContent,
   Chip,
+  FormControl,
   Grid,
+  InputLabel,
   LinearProgress,
   Link,
+  MenuItem,
+  Select,
+  type SelectChangeEvent,
+  Skeleton,
   Stack,
   Tab,
   Table,
@@ -413,6 +419,9 @@ export default function EvalLabelling() {
   const [surface, setSurface] = useState<Surface>('agent');
   const [cases, setCases] = useState<GoldenCaseView[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Filters the case list only — the open case in the detail pane stays open even if a filter
+  // change hides it from the list, so switching filters mid-edit never loses unsaved work.
+  const [splitFilter, setSplitFilter] = useState<'all' | 'dev' | 'test'>('all');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -462,6 +471,8 @@ export default function EvalLabelling() {
 
   const selected = cases.find((c) => c.caseId === selectedId) ?? null;
   const fullyLabelled = cases.filter((c) => labelledCount(c) === c.criteria.length).length;
+  const filteredCases = splitFilter === 'all' ? cases : cases.filter((c) => c.split === splitFilter);
+  const filteredFullyLabelled = filteredCases.filter((c) => labelledCount(c) === c.criteria.length).length;
 
   return (
     <Box sx={{ p: 3 }}>
@@ -492,9 +503,29 @@ export default function EvalLabelling() {
           <Grid item xs={12} md={4}>
             <Card variant="outlined">
               <CardContent>
-                <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                  {cases.length} cases · {fullyLabelled} fully labelled
-                </Typography>
+                <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1} sx={{ mb: 1 }}>
+                  <Typography variant="subtitle2">
+                    {loading
+                      ? 'Loading cases…'
+                      : splitFilter === 'all'
+                        ? `${cases.length} cases · ${fullyLabelled} fully labelled`
+                        : `${filteredCases.length} of ${cases.length} cases · ${filteredFullyLabelled} fully labelled`}
+                  </Typography>
+                  <FormControl size="small" sx={{ minWidth: 110 }} disabled={loading}>
+                    <InputLabel id="eval-labelling-split-filter-label">Split</InputLabel>
+                    <Select
+                      labelId="eval-labelling-split-filter-label"
+                      label="Split"
+                      value={splitFilter}
+                      onChange={(e: SelectChangeEvent) => setSplitFilter(e.target.value as 'all' | 'dev' | 'test')}
+                      data-testid="eval-labelling-split-filter"
+                    >
+                      <MenuItem value="all">All</MenuItem>
+                      <MenuItem value="test">test</MenuItem>
+                      <MenuItem value="dev">dev</MenuItem>
+                    </Select>
+                  </FormControl>
+                </Stack>
                 <Table size="small">
                   <TableHead>
                     <TableRow>
@@ -504,30 +535,49 @@ export default function EvalLabelling() {
                     </TableRow>
                   </TableHead>
                   <TableBody>
-                    {cases.map((c) => (
-                      <TableRow
-                        key={c.caseId}
-                        hover
-                        selected={c.caseId === selectedId}
-                        aria-selected={c.caseId === selectedId}
-                        tabIndex={0}
-                        onClick={() => setSelectedId(c.caseId)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter' || e.key === ' ') {
-                            e.preventDefault();
-                            setSelectedId(c.caseId);
-                          }
-                        }}
-                        sx={{ cursor: 'pointer' }}
-                      >
-                        <TableCell>
-                          <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>{c.sourceRef.id.slice(0, 12)}</Typography>
-                          <Typography variant="caption" color="text.secondary">{c.taskType}</Typography>
-                        </TableCell>
-                        <TableCell>{c.split}</TableCell>
-                        <TableCell align="right">{labelledCount(c)}/{c.criteria.length}</TableCell>
-                      </TableRow>
-                    ))}
+                    {loading
+                      ? Array.from({ length: 6 }).map((_, i) => (
+                          <TableRow key={`skeleton-${i}`}>
+                            <TableCell>
+                              <Skeleton variant="text" width="70%" />
+                              <Skeleton variant="text" width="40%" />
+                            </TableCell>
+                            <TableCell><Skeleton variant="text" width={40} /></TableCell>
+                            <TableCell align="right"><Skeleton variant="text" width={30} sx={{ ml: 'auto' }} /></TableCell>
+                          </TableRow>
+                        ))
+                      : filteredCases.length === 0
+                        ? (
+                          <TableRow>
+                            <TableCell colSpan={3}>
+                              <Typography variant="body2" color="text.secondary">No {splitFilter} cases.</Typography>
+                            </TableCell>
+                          </TableRow>
+                        )
+                        : filteredCases.map((c) => (
+                          <TableRow
+                            key={c.caseId}
+                            hover
+                            selected={c.caseId === selectedId}
+                            aria-selected={c.caseId === selectedId}
+                            tabIndex={0}
+                            onClick={() => setSelectedId(c.caseId)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' || e.key === ' ') {
+                                e.preventDefault();
+                                setSelectedId(c.caseId);
+                              }
+                            }}
+                            sx={{ cursor: 'pointer' }}
+                          >
+                            <TableCell>
+                              <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>{c.sourceRef.id.slice(0, 12)}</Typography>
+                              <Typography variant="caption" color="text.secondary">{c.taskType}</Typography>
+                            </TableCell>
+                            <TableCell>{c.split}</TableCell>
+                            <TableCell align="right">{labelledCount(c)}/{c.criteria.length}</TableCell>
+                          </TableRow>
+                        ))}
                   </TableBody>
                 </Table>
               </CardContent>
@@ -536,6 +586,13 @@ export default function EvalLabelling() {
           <Grid item xs={12} md={8}>
             {selected ? (
               <Stack spacing={2}>
+                {/* Source renders first: a reviewer must read it before judging the criteria below. */}
+                <Card variant="outlined">
+                  <CardContent>
+                    <Typography variant="subtitle2" sx={{ mb: 1 }}>Source</Typography>
+                    <SourceContext goldenCase={selected} token={token} />
+                  </CardContent>
+                </Card>
                 <Card variant="outlined">
                   <CardContent>
                     <Typography variant="subtitle2" sx={{ mb: 1 }}>Labels</Typography>
@@ -546,12 +603,6 @@ export default function EvalLabelling() {
                       token={token}
                       onSaved={(saved) => setCases((prev) => prev.map((c) => (c.caseId === saved.caseId ? saved : c)).sort(byLeastLabelled))}
                     />
-                  </CardContent>
-                </Card>
-                <Card variant="outlined">
-                  <CardContent>
-                    <Typography variant="subtitle2" sx={{ mb: 1 }}>Source</Typography>
-                    <SourceContext goldenCase={selected} token={token} />
                   </CardContent>
                 </Card>
               </Stack>
