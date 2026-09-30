@@ -1,6 +1,7 @@
 import { enforceEvaluationTool } from '../../services/evaluationPolicy';
 import { isAnonymousUserId, buildAnonymousToolRefusal } from '../anonymousToolAccess';
 import { refuseUnauthorizedScheduledPublish, attachPublishRevalidation } from '../../utils/scheduledPublishConsentGuard';
+import { recordToolReliabilitySafe } from '../../services/reliabilityEventSink';
 
 export interface ToolContext {
   userId: string;
@@ -55,34 +56,56 @@ export class ToolRegistry {
   }
 
   async execute(toolName: string, args: any, context: ToolContext): Promise<any> {
-    await enforceEvaluationTool(context?.userId, toolName);
-    const tool = this.getTool(toolName);
-    if (!tool) {
-      throw new Error(`Unknown tool: ${toolName}`);
-    }
+    const reliabilityStartedAt = Date.now();
+    const record = (result?: unknown, error?: unknown) =>
+      recordToolReliabilitySafe({
+        tool: toolName,
+        startedAtMs: reliabilityStartedAt,
+        sessionId: context?.sessionId,
+        userId: context?.userId,
+        platform: 'emma_live',
+        result,
+        error,
+      });
 
-    // ENG-822: this is the live Emma dispatch path. Refuse account-scoped tools
-    // for anonymous sessions before the handler runs, so the visitor gets an
-    // actionable sign-in message rather than a raw `User not found`.
-    if (tool.requiresUserAccount && isAnonymousUserId(context?.userId)) {
-      return buildAnonymousToolRefusal(toolName);
-    }
+    try {
+      await enforceEvaluationTool(context?.userId, toolName);
+      const tool = this.getTool(toolName);
+      if (!tool) {
+        throw new Error(`Unknown tool: ${toolName}`);
+      }
 
-    // ENG-827: an unattended scheduled run may only publish while its owner's
-    // consent is live. This registry — not the declaring one — is what a live Emma
-    // session dispatches through, and `registerTools()` copies handlers here as
-    // `{name, definition, execute}`, so a check placed only in McpToolRegistry
-    // never runs for a real run. Same trap as ENG-822 above; same remedy.
-    const publishRefusal = await refuseUnauthorizedScheduledPublish(toolName, context, undefined, args);
-    if (publishRefusal) {
-      console.warn(`ENG-827: refused ${toolName} in session ${context?.sessionId} — publish consent not live.`);
-      return publishRefusal;
-    }
+      // ENG-822: this is the live Emma dispatch path. Refuse account-scoped tools
+      // for anonymous sessions before the handler runs, so the visitor gets an
+      // actionable sign-in message rather than a raw `User not found`.
+      if (tool.requiresUserAccount && isAnonymousUserId(context?.userId)) {
+        const result = buildAnonymousToolRefusal(toolName);
+        record(result);
+        return result;
+      }
 
-    // Admission is not enough on its own: a publishing handler can spend minutes
-    // downloading media or uploading video before it commits. Hand it the
-    // re-validation to run at its last moment.
-    return await tool.execute(args, attachPublishRevalidation(toolName, context, args));
+      // ENG-827: an unattended scheduled run may only publish while its owner's
+      // consent is live. This registry — not the declaring one — is what a live Emma
+      // session dispatches through, and `registerTools()` copies handlers here as
+      // `{name, definition, execute}`, so a check placed only in McpToolRegistry
+      // never runs for a real run. Same trap as ENG-822 above; same remedy.
+      const publishRefusal = await refuseUnauthorizedScheduledPublish(toolName, context, undefined, args);
+      if (publishRefusal) {
+        console.warn(`ENG-827: refused ${toolName} in session ${context?.sessionId} — publish consent not live.`);
+        record(publishRefusal);
+        return publishRefusal;
+      }
+
+      // Admission is not enough on its own: a publishing handler can spend minutes
+      // downloading media or uploading video before it commits. Hand it the
+      // re-validation to run at its last moment.
+      const result = await tool.execute(args, attachPublishRevalidation(toolName, context, args));
+      record(result);
+      return result;
+    } catch (error) {
+      record(undefined, error);
+      throw error;
+    }
   }
 
   getAllTools(): AgentTool[] {
