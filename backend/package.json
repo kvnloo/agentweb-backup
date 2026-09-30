@@ -26,7 +26,8 @@
     "study:z0-report-type": "ts-node src/scripts/run-z0-report-type-study.ts",
     "study:z0-stop-request": "ts-node src/scripts/run-z0-stop-request-study.ts",
     "study:z0-context-packet": "ts-node src/scripts/run-z0-context-packet-study.ts",
-    "study:z0-reliability": "ts-node src/scripts/run-z0-reliability-study.ts"
+    "study:z0-reliability": "ts-node src/scripts/run-z0-reliability-study.ts",
+    "study:z0-typesafe-protocol": "ts-node src/scripts/run-z0-typesafe-protocol-study.ts"
   },
   "keywords": [],
   "author": "",
