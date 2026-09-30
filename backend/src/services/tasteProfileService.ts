@@ -88,12 +88,12 @@ export type TasteMemoryStore = {
     category: string,
     content: string,
     sourceSessionId?: string
-  ): Promise<MemoryRecord>;
+  ): Promise<Record<string, any>>;
   updateMemory(
     userId: string,
     memoryId: string,
     updates: { content?: string; category?: string }
-  ): Promise<MemoryRecord | undefined>;
+  ): Promise<Record<string, any> | undefined>;
   deleteMemory(userId: string, memoryId: string): Promise<void>;
 };
 
@@ -431,7 +431,7 @@ function hashKey(value: string): string {
 export class TasteProfileService {
   constructor(
     private readonly xReader: TasteXBookmarkReader = twitterService,
-    private readonly memoryStore: TasteMemoryStore = accountMemoryDb as TasteMemoryStore
+    private readonly memoryStore: TasteMemoryStore = accountMemoryDb
   ) {}
 
   async importXBookmarks(userId: string, accountId: unknown): Promise<TasteProfile> {
