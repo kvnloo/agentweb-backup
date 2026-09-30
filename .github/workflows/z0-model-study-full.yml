@@ -1,0 +1,217 @@
+name: AgentWeb z0 Full Authored Model Campaign
+
+on:
+  pull_request:
+    branches: [lab/z0-agentweb-emma-v0]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  authored-campaign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+      Z0INT_EXPERIMENTAL_JEV_SHADOW: "1"
+      Z0INT_HOME: /tmp/z0int-authored-campaign
+      Z0INT_AGENTWEB_MODE: shadow
+      Z0INT_REPORT_CLASSIFY_ALLOW_REMOTE: "1"
+      Z0INT_STOP_REQUEST_ALLOW_REMOTE: "1"
+      Z0INT_SERVICE_URL: http://127.0.0.1:11501
+    steps:
+      - name: Checkout exact AgentWeb PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Checkout official-SDK z0intelligence branch
+        uses: actions/checkout@v4
+        with:
+          repository: kvnloo/z0intelligence
+          ref: lab/agentweb-emma-typesafe-sdk-v1
+          path: deps/z0intelligence
+          persist-credentials: false
+
+      - name: Checkout z0eval study branch
+        uses: actions/checkout@v4
+        with:
+          repository: kvnloo/z0evals
+          ref: study/agentweb-emma-z0-v0
+          path: deps/z0evals
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Campaign preflight
+        id: gate
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          trigger = Path("research/experiments/z0-model-campaign.trigger").read_text()
+          enabled = "RUN_FULL_AUTHORED_MODEL_CAMPAIGN=1" in trigger.splitlines()
+          missing = [
+              name for name in ("OPENROUTER_API_KEY", "TYPESAFE_API_KEY")
+              if not os.environ.get(name, "").strip()
+          ]
+          runnable = enabled and not missing
+          status = {
+              "schema": "z0eval.agentweb_authored_campaign_status.v1",
+              "trigger_enabled": enabled,
+              "credentials_available": not missing,
+              "missing": missing,
+              "executed": False,
+          }
+          Path("/tmp/authored-campaign-status.json").write_text(
+              json.dumps(status, indent=2) + "\n"
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("runnable=" + ("true" if runnable else "false") + "\n")
+          print("full authored campaign runnable:", runnable)
+          if missing:
+              print("missing credential names:", ",".join(missing))
+          PY
+
+      - name: Install AgentWeb dependencies
+        if: steps.gate.outputs.runnable == 'true'
+        working-directory: backend
+        run: npm ci
+
+      - name: Install TypeSafe SDK
+        if: steps.gate.outputs.runnable == 'true'
+        run: python -m pip install typesafe-sdk==0.7.2
+
+      - name: Record exact source heads
+        if: steps.gate.outputs.runnable == 'true'
+        run: |
+          python - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          roots = {
+              "agentweb": ".",
+              "z0intelligence": "deps/z0intelligence",
+              "z0evals": "deps/z0evals",
+          }
+          heads = {
+              name: subprocess.check_output(
+                  ["git", "-C", path, "rev-parse", "HEAD"], text=True
+              ).strip()
+              for name, path in roots.items()
+          }
+          Path("/tmp/authored-campaign-heads.json").write_text(
+              json.dumps(heads, indent=2) + "\n"
+          )
+          print(json.dumps(heads, indent=2))
+          PY
+
+      - name: Start z0intelligence shadow authority
+        if: steps.gate.outputs.runnable == 'true'
+        env:
+          PYTHONPATH: ${{ github.workspace }}/deps/z0intelligence/src
+        run: |
+          mkdir -p "$Z0INT_HOME"
+          python -m z0int.intelligence_service --port 11501 > /tmp/z0int-authored-campaign.log 2>&1 &
+          echo $! > /tmp/z0int-authored-campaign.pid
+          python - <<'PY'
+          import time, urllib.request
+          for _ in range(40):
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:11501/healthz", timeout=1) as r:
+                      if r.status == 200:
+                          raise SystemExit(0)
+              except Exception:
+                  time.sleep(.25)
+          raise SystemExit("z0intelligence did not become ready")
+          PY
+
+      - name: Run 30 report pairs
+        if: steps.gate.outputs.runnable == 'true'
+        working-directory: backend
+        run: |
+          npm run study:z0-report-type --             ../deps/z0evals/studies/agentweb-emma-z0-v0/report-type-fixtures.jsonl             /tmp/report-results.jsonl
+
+      - name: Run 40 stop pairs
+        if: steps.gate.outputs.runnable == 'true'
+        working-directory: backend
+        run: |
+          npm run study:z0-stop-request --             ../deps/z0evals/studies/agentweb-emma-z0-v0/stop-request-fixtures.jsonl             /tmp/stop-results.jsonl
+
+      - name: Score authored campaigns
+        if: steps.gate.outputs.runnable == 'true'
+        run: |
+          python deps/z0evals/scripts/score_agentweb_report_type.py             /tmp/report-results.jsonl --output /tmp/report-summary.json
+          python deps/z0evals/scripts/score_agentweb_stop_request.py             /tmp/stop-results.jsonl --output /tmp/stop-summary.json
+          cat /tmp/report-summary.json
+          cat /tmp/stop-summary.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.load(open("/tmp/report-summary.json"))
+          stop = json.load(open("/tmp/stop-summary.json"))
+          assert report["n_rows"] == 30 and report["n_paired"] == 30, report
+          assert stop["n_rows"] == 40 and stop["n_paired"] == 40, stop
+          assert not report["applied_violations"], report
+          assert not stop["applied_violations"], stop
+          assert not report["missing_receipts"], report
+          assert not stop["missing_receipts"], stop
+          # Authored corpora cannot self-promote.
+          assert report["gates"]["minimum_live_sample"] is False
+          assert stop["gates"]["minimum_live_sample"] is False
+          assert report["eligible_for_review"] is False
+          assert stop["eligible_for_review"] is False
+
+          status = {
+              "schema": "z0eval.agentweb_authored_campaign_status.v1",
+              "trigger_enabled": True,
+              "credentials_available": True,
+              "executed": True,
+              "report_summary": report,
+              "stop_summary": stop,
+          }
+          Path("/tmp/authored-campaign-status.json").write_text(
+              json.dumps(status, indent=2) + "\n"
+          )
+          PY
+
+      - name: Stop z0intelligence
+        if: always() && steps.gate.outputs.runnable == 'true'
+        run: |
+          if test -f /tmp/z0int-authored-campaign.pid; then
+            kill "$(cat /tmp/z0int-authored-campaign.pid)" || true
+          fi
+          cat /tmp/z0int-authored-campaign.log || true
+
+      - name: Bind campaign to exact AgentWeb head
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+          git rev-parse HEAD
+
+      - name: Upload campaign evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentweb-z0-authored-model-campaign
+          path: |
+            /tmp/authored-campaign-status.json
+            /tmp/authored-campaign-heads.json
+            /tmp/report-results.jsonl
+            /tmp/report-summary.json
+            /tmp/stop-results.jsonl
+            /tmp/stop-summary.json
+            /tmp/z0int-authored-campaign/receipts/decisions.jsonl
+            /tmp/z0int-authored-campaign.log
+          if-no-files-found: warn
