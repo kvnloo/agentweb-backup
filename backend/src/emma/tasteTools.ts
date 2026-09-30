@@ -64,6 +64,60 @@ emmaToolRegistry.register({
   requiresUserAccount: true,
 });
 
+
+emmaToolRegistry.register({
+  name: 'get_taste_settings',
+  definition: {
+    name: 'get_taste_settings',
+    description:
+      'Read the authenticated user\'s persistent per-surface Taste defaults. ' +
+      'These are defaults only; a task-local off/subtle/strong override does not mutate them.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: [],
+    },
+  },
+  execute: async (_args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Taste settings require an authenticated user');
+    return await tasteProfileService.getSettings(userId);
+  },
+  readOnly: true,
+  requiresUserAccount: true,
+});
+
+emmaToolRegistry.register({
+  name: 'update_taste_settings',
+  definition: {
+    name: 'update_taste_settings',
+    description:
+      'Persist one or more per-surface Taste defaults for the authenticated user. ' +
+      'ONLY call when the user explicitly asks to change their ongoing Taste behavior (for example, "always use strong Taste for social" or "never use Taste for email"). ' +
+      'Do not call this for a one-off request; use preview_taste_application with a task-local intensity instead.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        surfaces: {
+          type: 'object',
+          description: 'Map of Emma surface to off, subtle, or strong.',
+          additionalProperties: {
+            type: 'string',
+            enum: ['off', 'subtle', 'strong'],
+          },
+        },
+      },
+      required: ['surfaces'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Taste settings require an authenticated user');
+    return await tasteProfileService.updateSettings(userId, args.surfaces);
+  },
+  requiresUserAccount: true,
+});
+
 emmaToolRegistry.register({
   name: 'refresh_taste_from_x',
   definition: {
