@@ -203,3 +203,67 @@ describe('enrollmentIdentityCandidates', () => {
     }
   });
 });
+
+describe('canonicalLinkedInProfile collapses every host spelling of one profile', () => {
+  /*
+   * Review round 3, finding 13. normalizeLinkedInUrl strips scheme/query/fragment but
+   * not the host, so a regional subdomain (uk./de./m.), a protocol-relative URL, a bare
+   * host with no scheme, and the /mwlite/ mobile path all survived as DISTINCT
+   * identities for one person — each an extra LinkedIn DM. The consumer
+   * (linkedInOutreachService.getLinkedInProfile) only reads the slug after `/in/` and
+   * discards the host entirely, so the host was never part of what gets sent — only of
+   * what got hashed into the dedup key. New in this PR (canonicalLinkedInProfile has
+   * exactly three callers, all in this diff), so collapsing the host carries no
+   * migration risk: nothing in production is keyed on the old form.
+   */
+  const CANONICAL = 'https://www.linkedin.com/in/ada/';
+
+  it.each([
+    ['https', 'https://www.linkedin.com/in/ada'],
+    ['http, no www', 'http://linkedin.com/in/ada'],
+    ['UK regional host', 'https://uk.linkedin.com/in/ada'],
+    ['DE regional host', 'https://de.linkedin.com/in/ada'],
+    ['mobile host', 'https://m.linkedin.com/in/ada'],
+    ['mobile-lite path', 'https://www.linkedin.com/mwlite/in/ada'],
+    ['protocol-relative', '//www.linkedin.com/in/ada'],
+    ['bare, no protocol', 'linkedin.com/in/ada'],
+    ['bare with www', 'www.linkedin.com/in/ada'],
+  ])('%s collapses to the one canonical identity', (_label, input) => {
+    expect(canonicalLinkedInProfile(input)).toBe(CANONICAL);
+  });
+
+  it('the send-path identifier is unaffected by the host rebuild', () => {
+    // The consumer's own parse: split('/in/'), take the tail.
+    const canon = canonicalLinkedInProfile('https://uk.linkedin.com/in/ada?originalSubdomain=uk')!;
+    expect(canon.split('/in/')[1].replace(/\/$/, '')).toBe('ada');
+  });
+});
+
+describe('canonicalLinkedInProfile refuses a slug the consumer cannot resolve', () => {
+  /*
+   * Review round 3, finding 16. The gate validated shape (no nested path) but not slug
+   * plausibility. A trailing comma, space or parenthesis from a CSV paste survived an
+   * otherwise well-formed URL, reached Unipile as part of the identifier, 404'd, and
+   * retried every five minutes forever — the last remaining route to the exact jam this
+   * function exists to close.
+   */
+  it.each([
+    ['a trailing comma', 'https://www.linkedin.com/in/ada,'],
+    ['a stray parenthesis', 'https://www.linkedin.com/in/ada)'],
+    ['embedded whitespace', 'https://www.linkedin.com/in/ada smith'],
+  ])('refuses %s rather than sending an unresolvable identifier', (_label, input) => {
+    expect(canonicalLinkedInProfile(input)).toBeNull();
+  });
+
+  it('still accepts a hyphenated slug, an underscore, and a percent-encoded name', () => {
+    expect(canonicalLinkedInProfile('https://www.linkedin.com/in/ada-lovelace')).toBe(
+      'https://www.linkedin.com/in/ada-lovelace/',
+    );
+    expect(canonicalLinkedInProfile('https://www.linkedin.com/in/ada_lovelace')).toBe(
+      'https://www.linkedin.com/in/ada_lovelace/',
+    );
+    expect(canonicalLinkedInProfile('https://www.linkedin.com/in/jos%c3%a9-p%c3%a9rez')).toBe(
+      'https://www.linkedin.com/in/jos%c3%a9-p%c3%a9rez/',
+    );
+  });
+});

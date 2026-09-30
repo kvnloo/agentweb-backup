@@ -35,7 +35,7 @@ import { normalizeLinkedInUrl } from './linkedInUrl';
  * one such lead burns ~288 sends a day and starves the user's real mail.
  *
  * `isEligibleGroupEmailRecipient` is the same `=== null` test every other consumer of
- * this validator uses (crm.ts:6707/6713/6776/6892); this file was the lone outlier.
+ * this validator uses (crm.ts:6709/6715/6778/6894); this file was the lone outlier.
  */
 export function isReachableEmail(value: unknown): boolean {
   const email = String(value ?? '').trim();
@@ -87,7 +87,29 @@ export function canonicalLinkedInProfile(value: unknown): string | null {
   // A slug, and nothing after it: company/school pages and nested paths are not
   // personal profiles and make sendMessage throw, which is retried forever.
   if (!slug || slug.includes('/')) return null;
-  return url;
+  // And nothing the consumer's parser would choke on. A slug is everything after the
+  // LAST `/in/` up to the next `/`, `?` or `#` — all three already stripped above — but a
+  // stray character from a CSV paste (a trailing comma, a space, a parenthesis) survives
+  // an otherwise well-formed URL and reaches Unipile as part of the identifier, which
+  // 404s. That throw is retried every five minutes forever, same as every other shape
+  // this function exists to keep out. LinkedIn slugs are ASCII alphanumerics, hyphen and
+  // underscore, or a URL-encoded (%XX) or literal non-ASCII segment for a name in another
+  // script — never punctuation from surrounding text.
+  if (!/^[a-z0-9\-_%¡-￿]+$/i.test(slug)) return null;
+  // Rebuild on www.linkedin.com rather than returning `url` as-is. normalizeLinkedInUrl
+  // strips scheme/query/fragment but NOT the host, so uk.linkedin.com, m.linkedin.com,
+  // a protocol-relative `//www...`, a bare `linkedin.com/...` and the `/mwlite/` mobile
+  // path all survived as distinct hosts while producing the identical SLUG — one person,
+  // split into up to eight enrollment identities, each getting the sequence once. The
+  // consumer only ever reads the tail after `/in/` (confirmed: getLinkedInProfile does
+  // `split('/in/')` and discards everything before it), so the host is never part of
+  // what actually gets sent — only of what got hashed into the dedup key. This function
+  // is new in this PR — 5 use sites across 3 files (isReachableLinkedIn and
+  // enrollmentIdentity[Candidates] here, plus dripSequenceWorker's send and reply-exit
+  // paths), all in this diff — so there is no production row anywhere keyed on the
+  // host-preserving form to migrate away from. Every one of those 5 wants a boolean, an
+  // identity, or a URL whose only meaningful content is the slug; none needs the host.
+  return `https://www.linkedin.com/in/${slug}/`;
 }
 
 /**

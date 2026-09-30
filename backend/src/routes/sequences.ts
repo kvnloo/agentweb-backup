@@ -22,7 +22,6 @@ import { extractVariables, leadHasVariable, isSupportedVariable, injectUnsubscri
 import { LLMService } from '../utils/llmService';
 import { LEAD_LIFECYCLES, defaultStatusConfigFor } from '../utils/leadSchema';
 import {
-  isReachableEmail, isReachableLinkedIn, canonicalLinkedInProfile,
   requiredChannels, leadIsReachable, skipKeyForChannels, enrollmentIdentity,
   enrollmentIdentityCandidates,
 } from '../utils/leadReachability';
