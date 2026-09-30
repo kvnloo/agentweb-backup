@@ -192,13 +192,25 @@ router.get('/scoring-judges', authenticateToken, requireAdmin, async (req, res) 
 // Create a scoring judge
 router.post('/scoring-judges', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { name, systemPrompt, llmModel } = req.body;
+    const { name, systemPrompt, llmModel, id } = req.body;
     if (!name || !systemPrompt) {
       return res.status(400).json({ error: 'name and systemPrompt are required' });
     }
 
     const setting = await settingsService.getSetting('scoring-judges');
     const judges = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
+
+    // ENG-2218: this route only ever builds name/systemPrompt/llmModel and always mints a new
+    // id, so calling it against an id that already exists (e.g. the shadow judge) doesn't
+    // "update" that row — it silently drops any fields this route doesn't know about (shadow,
+    // sampleRate, ...) and leaves the original row untouched under a duplicate id. Reject that
+    // rather than let it happen quietly; PUT /scoring-judges/:judgeId merges onto the existing
+    // row and is the correct call for updating a judge that already exists.
+    if (id && judges.some((j: { id?: string }) => j.id === id)) {
+      return res.status(409).json({
+        error: `Judge "${id}" already exists. Use PUT /scoring-judges/${id} to update it instead of POST.`,
+      });
+    }
 
     const now = new Date().toISOString();
     const newJudge: any = {
@@ -235,6 +247,10 @@ router.put('/scoring-judges/:judgeId', authenticateToken, requireAdmin, async (r
     if (index === -1) {
       return res.status(404).json({ error: 'Judge not found' });
     }
+    // ENG-2218: mutate the stored row in place field-by-field (never replace it wholesale) so
+    // fields this route's request body doesn't carry — shadow, sampleRate, or anything future —
+    // survive an update untouched. This is what lets the Scoring Judges admin UI edit the shadow
+    // judge's name/model/prompt without stripping its shadow/sampling status.
     if (name) judges[index].name = name.trim();
     if (systemPrompt) judges[index].systemPrompt = systemPrompt.trim();
     if (llmModel !== undefined) {
