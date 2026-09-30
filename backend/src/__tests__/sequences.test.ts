@@ -560,7 +560,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
       .send({ listId: 'list-1', lifecycle: 'churned' });
 
     expect(res.status).toBe(200);
-    expect(crmDbMock.getLeadsByStatus).toHaveBeenCalledWith('list-1', 'churned');
+    expect(crmDbMock.getLeadsByStatus).toHaveBeenCalledWith('list-1', 'churned', 200, undefined);
   });
 
   it('uses default status vocabulary when statusConfig is absent', async () => {
@@ -577,7 +577,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
       .send({ listId: 'list-1', lifecycle: 'churned' });
 
     expect(res.status).toBe(200);
-    expect(crmDbMock.getLeadsByStatus).toHaveBeenCalledWith('list-1', 'churned');
+    expect(crmDbMock.getLeadsByStatus).toHaveBeenCalledWith('list-1', 'churned', 200, undefined);
   });
 
   it('derives a lifecycle-only stage when it is not a status for this list type', async () => {
@@ -618,7 +618,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
       .send({ listId: 'list-1', lifecycle: 'at_risk' });
 
     expect(customers.status).toBe(200);
-    expect(crmDbMock.getLeadsByStatus).toHaveBeenCalledWith('list-1', 'at_risk');
+    expect(crmDbMock.getLeadsByStatus).toHaveBeenCalledWith('list-1', 'at_risk', 200, undefined);
   });
 
   it('does not demote a stored paying customer to in_deal from an open deal alone', async () => {
@@ -656,6 +656,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
       statusConfig: [{ value: 'active', label: 'Active', color: 'green', type: 'active' }],
     });
     crmDbMock.canOrgMemberAccessList = jest.fn().mockResolvedValue(true);
+    crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({ items: [] });
     crmDbMock.getAllLeadsByListId = jest.fn()
       .mockResolvedValueOnce([
         {
@@ -678,6 +679,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
       .post('/seq_1/enrollments/by-list')
       .send({ listId: 'list-1', lifecycle: 'churned' });
     expect(churned.status).toBe(200);
+    expect(crmDbMock.getLeadsByStatus).not.toHaveBeenCalled();
     expect(dripSequenceDb.bulkEnroll).toHaveBeenLastCalledWith([
       expect.objectContaining({ leadId: 'stale-activity' }),
     ]);
@@ -701,7 +703,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
 
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('invalid_lifecycle');
-    expect(crmDbMock.getLeadsByStatus).toHaveBeenCalledWith('list-1', 'inbxo');
+    expect(crmDbMock.getLeadsByStatus).toHaveBeenCalledWith('list-1', 'inbxo', 200, undefined);
   });
 
   it('preserves a removed legacy status when real lead rows still carry it', async () => {
@@ -714,18 +716,40 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
       ],
     });
     crmDbMock.canOrgMemberAccessList = jest.fn().mockResolvedValue(true);
-    crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({
-      items: [{ leadId: 'legacy-1', email: 'legacy@example.com', status: 'retired_stage' }],
-    });
+    const legacyLastKey = { listId: 'list-1', status: 'retired_stage', leadId: 'legacy-1' };
+    crmDbMock.getLeadsByStatus = jest.fn()
+      .mockResolvedValueOnce({
+        items: [{ leadId: 'legacy-1', email: 'legacy@example.com', status: 'retired_stage' }],
+        lastEvaluatedKey: legacyLastKey,
+      })
+      .mockResolvedValueOnce({
+        items: [{ leadId: 'legacy-2', email: 'legacy2@example.com', status: 'retired_stage' }],
+        lastEvaluatedKey: null,
+      });
 
     const res = await request(app)
       .post('/seq_1/enrollments/by-list')
       .send({ listId: 'list-1', lifecycle: 'retired_stage' });
 
     expect(res.status).toBe(200);
-    expect(crmDbMock.getLeadsByStatus).toHaveBeenCalledTimes(1);
+    expect(crmDbMock.getLeadsByStatus).toHaveBeenCalledTimes(2);
+    expect(crmDbMock.getLeadsByStatus).toHaveBeenNthCalledWith(
+      1,
+      'list-1',
+      'retired_stage',
+      200,
+      undefined,
+    );
+    expect(crmDbMock.getLeadsByStatus).toHaveBeenNthCalledWith(
+      2,
+      'list-1',
+      'retired_stage',
+      200,
+      legacyLastKey,
+    );
     expect(dripSequenceDb.bulkEnroll).toHaveBeenCalledWith([
       expect.objectContaining({ leadId: 'legacy-1' }),
+      expect.objectContaining({ leadId: 'legacy-2' }),
     ]);
   });
 
@@ -956,17 +980,18 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     });
   });
 
-  it('still enrols normally when a lifecycle filter does return leads', async () => {
+  it('still enrols normally when a derived lifecycle filter returns leads', async () => {
     const crmDbMock = require('../services/db').crmDb;
-    crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({
-      items: [{ leadId: 'l1', email: 'a@acme.io' }],
-    });
+    crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+      { leadId: 'l1', email: 'a@acme.io' },
+    ]);
 
     const res = await request(app)
       .post('/seq_1/enrollments/by-list')
       .send({ listId: 'list-1', lifecycle: 'inbox' });
 
     expect(res.status).toBe(200);
+    expect(crmDbMock.getLeadsByStatus).not.toHaveBeenCalled();
     expect(dripSequenceDb.bulkEnroll).toHaveBeenCalled();
   });
 
