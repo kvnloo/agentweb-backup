@@ -13,6 +13,8 @@ const mockTasteProfileService = {
   importCollection: jest.fn(),
   getProfile: jest.fn(),
   getApplication: jest.fn(),
+  getSettings: jest.fn(),
+  updateSettings: jest.fn(),
   applyToPrompt: jest.fn(),
   deleteProfile: jest.fn(),
 };
@@ -113,6 +115,31 @@ describe('Taste profile routes', () => {
     expect(response.body.error).toBe('Unable to read bookmarks from the connected X account');
   });
 
+
+
+  it('reads and persists per-surface defaults for the authenticated user', async () => {
+    mockTasteProfileService.getSettings.mockResolvedValue({
+      schema: 'taste.settings.v1',
+      surfaces: { landing_page: 'strong', social: 'subtle', crm: 'off' },
+      updatedAt: null,
+    });
+    mockTasteProfileService.updateSettings.mockResolvedValue({
+      schema: 'taste.settings.v1',
+      surfaces: { landing_page: 'strong', social: 'strong', crm: 'off' },
+      updatedAt: '2026-09-30T12:00:00.000Z',
+    });
+
+    const getResponse = await request(app()).get('/api/taste/settings');
+    expect(getResponse.status).toBe(200);
+    expect(mockTasteProfileService.getSettings).toHaveBeenCalledWith('taste-test-user');
+
+    const putResponse = await request(app())
+      .put('/api/taste/settings')
+      .send({ surfaces: { social: 'strong' } });
+    expect(putResponse.status).toBe(200);
+    expect(mockTasteProfileService.updateSettings)
+      .toHaveBeenCalledWith('taste-test-user', { social: 'strong' });
+  });
 
   it('lists supported Taste surfaces and intensities', async () => {
     const response = await request(app()).get('/api/taste/surfaces');
