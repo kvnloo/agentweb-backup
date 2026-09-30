@@ -73,6 +73,131 @@ export type TasteProfile = {
   updatedAt: string | null;
 };
 
+export type TasteSurface =
+  | 'brand'
+  | 'landing_page'
+  | 'image'
+  | 'video'
+  | 'social'
+  | 'ad_creative'
+  | 'editorial'
+  | 'research'
+  | 'reply_curation'
+  | 'email'
+  | 'crm'
+  | 'analytics';
+
+export type TasteIntensity = 'off' | 'subtle' | 'strong';
+
+export type TasteDials = {
+  designVariance: number;
+  motionIntensity: number;
+  visualDensity: number;
+};
+
+export type TasteApplication = {
+  schema: 'taste.application.v1';
+  surface: TasteSurface;
+  active: boolean;
+  intensity: TasteIntensity;
+  confidence: number;
+  profile: TasteProfile;
+  dials: TasteDials;
+  signals: string[];
+  guardrails: string[];
+  promptContext: string;
+};
+
+export const TASTE_SURFACES: readonly TasteSurface[] = [
+  'brand',
+  'landing_page',
+  'image',
+  'video',
+  'social',
+  'ad_creative',
+  'editorial',
+  'research',
+  'reply_curation',
+  'email',
+  'crm',
+  'analytics',
+] as const;
+
+const DEFAULT_SURFACE_INTENSITY: Record<TasteSurface, TasteIntensity> = {
+  brand: 'subtle',
+  landing_page: 'strong',
+  image: 'strong',
+  video: 'strong',
+  social: 'subtle',
+  ad_creative: 'subtle',
+  editorial: 'subtle',
+  research: 'subtle',
+  reply_curation: 'subtle',
+  email: 'off',
+  crm: 'off',
+  analytics: 'off',
+};
+
+const STYLE_DIAL_TARGETS: Record<string, TasteDials> = {
+  minimal: { designVariance: 5, motionIntensity: 3, visualDensity: 3 },
+  motion: { designVariance: 7, motionIntensity: 8, visualDensity: 4 },
+  editorial: { designVariance: 6, motionIntensity: 4, visualDensity: 3 },
+  brutalist: { designVariance: 8, motionIntensity: 5, visualDensity: 5 },
+  playful: { designVariance: 9, motionIntensity: 8, visualDensity: 4 },
+  dense: { designVariance: 6, motionIntensity: 5, visualDensity: 8 },
+  premium: { designVariance: 7, motionIntensity: 6, visualDensity: 3 },
+  experimental: { designVariance: 9, motionIntensity: 8, visualDensity: 4 },
+};
+
+const SURFACE_GUARDRAILS: Record<TasteSurface, string[]> = {
+  brand: [
+    'Treat Taste as inspiration for a brand proposal, never as permission to overwrite existing brand guidelines silently.',
+    'Existing brand assets, audience, category, accessibility and explicit user direction outrank Taste.',
+  ],
+  landing_page: [
+    'Run brief inference first: page kind, audience, existing design system, brand constraints, and accessibility outrank Taste.',
+    'Use Taste to choose among valid layout, typography, material and motion options; avoid generic AI-default composition.',
+    'Preserve an existing design system during redesigns unless the user explicitly asks for an overhaul.',
+  ],
+  image: [
+    'Use Taste for art direction, composition, materiality and visual rhythm, not for inventing facts, logos or product claims.',
+    'Explicit source images, persisted brand assets and the user prompt outrank Taste.',
+  ],
+  video: [
+    'Use Taste for pacing, framing, typography, transitions and visual world.',
+    'Story requirements, source media continuity, accessibility and brand assets outrank Taste.',
+  ],
+  social: [
+    'Use Taste for angle, rhythm, specificity and presentation; platform-native formatting and brand voice outrank Taste.',
+    'Do not turn aesthetic preference into fabricated claims or engagement predictions.',
+  ],
+  ad_creative: [
+    'Performance evidence, offer clarity, platform policy, compliance and brand constraints outrank Taste.',
+    'Use Taste only as a creative prior for visual/copy variants; keep performance learning separate from aesthetic preference.',
+  ],
+  editorial: [
+    'Use Taste for structure, pacing, examples and visual/editorial character while preserving factual accuracy and citations.',
+    'Explicit voice/brand guidance outranks Taste.',
+  ],
+  research: [
+    'Taste may rank examples, references and presentation style only; it must never change factual findings, source quality or uncertainty.',
+    'Do not filter out disconfirming evidence because it conflicts with preference.',
+  ],
+  reply_curation: [
+    'Taste may help rank which posts feel relevant or worth responding to, but freshness, completeness and user intent outrank it.',
+    'Never fabricate a candidate to satisfy Taste.',
+  ],
+  email: [
+    'Taste is off by default for email. Use explicit voice/brand guidance instead unless the user opts in for this task.',
+  ],
+  crm: [
+    'Taste is off by default for CRM facts, lifecycle, enrichment, scoring and mutations.',
+  ],
+  analytics: [
+    'Taste is off by default for measurements, attribution, reporting and diagnosis.',
+  ],
+};
+
 type MemoryRecord = {
   memoryId: string;
   category?: string;
@@ -423,6 +548,135 @@ function aggregateSnapshots(snapshots: TasteSourceSnapshot[]): TasteProfile {
   };
 }
 
+
+function clampDial(value: number): number {
+  return Math.max(1, Math.min(10, Math.round(value * 10) / 10));
+}
+
+function deriveTasteDials(profile: TasteProfile): TasteDials {
+  if (profile.styleSignals.length === 0) {
+    // Taste Skill's mainstream marketing baseline, kept intentionally moderate
+    // until the user profile contains repeated evidence.
+    return { designVariance: 7, motionIntensity: 5, visualDensity: 4 };
+  }
+
+  let weight = 0;
+  let designVariance = 0;
+  let motionIntensity = 0;
+  let visualDensity = 0;
+
+  for (const signal of profile.styleSignals) {
+    const target = STYLE_DIAL_TARGETS[signal.name];
+    if (!target || !Number.isFinite(signal.score) || signal.score <= 0) continue;
+    weight += signal.score;
+    designVariance += target.designVariance * signal.score;
+    motionIntensity += target.motionIntensity * signal.score;
+    visualDensity += target.visualDensity * signal.score;
+  }
+
+  if (weight <= 0) {
+    return { designVariance: 7, motionIntensity: 5, visualDensity: 4 };
+  }
+
+  return {
+    designVariance: clampDial(designVariance / weight),
+    motionIntensity: clampDial(motionIntensity / weight),
+    visualDensity: clampDial(visualDensity / weight),
+  };
+}
+
+function validateTasteSurface(surface: unknown): TasteSurface {
+  if (typeof surface !== 'string' || !TASTE_SURFACES.includes(surface as TasteSurface)) {
+    throw new TasteValidationError(
+      `surface must be one of: ${TASTE_SURFACES.join(', ')}`
+    );
+  }
+  return surface as TasteSurface;
+}
+
+function validateTasteIntensity(intensity: unknown): TasteIntensity | undefined {
+  if (intensity === undefined || intensity === null || intensity === '') return undefined;
+  if (intensity !== 'off' && intensity !== 'subtle' && intensity !== 'strong') {
+    throw new TasteValidationError('intensity must be one of: off, subtle, strong');
+  }
+  return intensity;
+}
+
+function buildTasteApplication(
+  profile: TasteProfile,
+  rawSurface: unknown,
+  rawIntensity?: unknown
+): TasteApplication {
+  const surface = validateTasteSurface(rawSurface);
+  const requestedIntensity = validateTasteIntensity(rawIntensity);
+  const intensity = requestedIntensity || DEFAULT_SURFACE_INTENSITY[surface];
+  const dials = deriveTasteDials(profile);
+  const guardrails = SURFACE_GUARDRAILS[surface];
+  const active = intensity !== 'off' && profile.sourceCount > 0 && profile.itemCount > 0;
+  const confidence = active
+    ? Math.round(Math.min(1, profile.itemCount / 20) * 1000) / 1000
+    : 0;
+  const signals = profile.styleSignals
+    .slice(0, MAX_PROFILE_SIGNALS)
+    .map((signal) => `${signal.name}:${signal.score}`);
+
+  if (!active) {
+    return {
+      schema: 'taste.application.v1',
+      surface,
+      active: false,
+      intensity,
+      confidence,
+      profile,
+      dials,
+      signals,
+      guardrails,
+      promptContext: '',
+    };
+  }
+
+  const strength = intensity === 'strong'
+    ? 'Use these preferences as a strong creative prior when several choices satisfy the brief.'
+    : 'Use these preferences as a light tie-breaker between choices that already satisfy the brief.';
+
+  const designRules =
+    surface === 'landing_page' || surface === 'image' || surface === 'video' || surface === 'brand'
+      ? [
+          'Apply the Taste Skill process: infer the brief before styling, then use the three dials below.',
+          'Actively avoid generic AI-default composition; choose an intentional design system/aesthetic family that fits the brief.',
+          'Do a final anti-slop/pre-flight check for hierarchy, layout, motion, accessibility and implementation clarity.',
+        ]
+      : [];
+
+  const contextLines = [
+    'TASTE CONTEXT — preference, not requirement; raw source content is intentionally unavailable.',
+    `surface=${surface}; intensity=${intensity}; confidence=${confidence}`,
+    `dials: DESIGN_VARIANCE=${dials.designVariance}/10; MOTION_INTENSITY=${dials.motionIntensity}/10; VISUAL_DENSITY=${dials.visualDensity}/10`,
+    profile.styleSignals.length
+      ? `style signals: ${profile.styleSignals.map((signal) => signal.name).join(', ')}`
+      : '',
+    profile.topTerms.length ? `recurring preference terms: ${profile.topTerms.join(', ')}` : '',
+    profile.topDomains.length ? `recurring reference domains: ${profile.topDomains.join(', ')}` : '',
+    strength,
+    ...designRules,
+    ...guardrails,
+    'Never mention or reconstruct private source items from these aggregates.',
+  ].filter(Boolean);
+
+  return {
+    schema: 'taste.application.v1',
+    surface,
+    active: true,
+    intensity,
+    confidence,
+    profile,
+    dials,
+    signals,
+    guardrails,
+    promptContext: contextLines.join('\n'),
+  };
+}
+
 function sourceMemoryId(sourceKey: string): string {
   return `${TASTE_MEMORY_PREFIX}${sourceKey}`;
 }
@@ -482,6 +736,34 @@ export class TasteProfileService {
     return aggregateSnapshots(snapshots);
   }
 
+  async getApplication(
+    userId: string,
+    surface: unknown,
+    intensity?: unknown
+  ): Promise<TasteApplication> {
+    const profile = await this.getProfile(userId);
+    return buildTasteApplication(profile, surface, intensity);
+  }
+
+  async applyToPrompt(
+    userId: string,
+    surface: unknown,
+    prompt: string,
+    intensity?: unknown
+  ): Promise<{ prompt: string; application: TasteApplication }> {
+    if (typeof prompt !== 'string' || !prompt.trim()) {
+      throw new TasteValidationError('prompt is required');
+    }
+    const application = await this.getApplication(userId, surface, intensity);
+    if (!application.active || !application.promptContext) {
+      return { prompt, application };
+    }
+    return {
+      prompt: `${prompt.trim()}\n\n${application.promptContext}`,
+      application,
+    };
+  }
+
   async deleteProfile(userId: string): Promise<number> {
     const memories = await this.memoryStore.getUserMemories(userId, 'preference');
     const tasteMemories = memories.filter((memory) =>
@@ -529,4 +811,6 @@ export const _tasteInternalsForTests = {
   decodeSnapshot,
   aggregateSnapshots,
   assertNoSensitiveKeys,
+  deriveTasteDials,
+  buildTasteApplication,
 };
