@@ -7,7 +7,7 @@ import { getMetaCredentials, getInstagramCredentials } from '../utils/secretsMan
 import { getMetaFlowConfig, INTEGRATION_CONFIG, MetaFlowType } from '../config/integrations';
 import { metaService } from '../services/metaService';
 import { instagramService } from '../services/instagramService';
-import { createAccount } from '../services/connectedAccountsDb';
+import { createAccount, getAccountById } from '../services/connectedAccountsDb';
 import { oauthSessionDb } from '../services/db';
 import { MetaAdAccount, MetaInstagramAccount } from '../types/meta';
 import { getJwtSecret } from '../config/jwt';
@@ -373,6 +373,17 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
 
         const connectedAccounts = [];
         for (const adAccount of adAccounts) {
+            // ENG-2232: createAccount replaces `config` wholesale on reconnect
+            // (unlike top-level fields such as sharedWithOrg, which survive via
+            // spread). A transient Page-probe failure on this reconnect would
+            // otherwise silently erase a previously confirmed has_meta_pages:false
+            // back to 'unknown'. Fall back to the existing account's recorded
+            // value whenever this session's probe came back undetermined.
+            const existingAccount = await getAccountById(adAccount.account_id, userId, 'meta');
+            const has_meta_pages = session.has_meta_pages !== undefined
+                ? session.has_meta_pages
+                : (existingAccount?.config as Record<string, any> | undefined)?.has_meta_pages;
+
             const account = await createAccount(userId, 'meta', {
                 account_id: adAccount.account_id,
                 account_name: adAccount.name,
@@ -389,8 +400,10 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
                     // masquerades as "nothing was granted" (ENG-629).
                     ...(session.granted_scopes ? { granted_scopes: session.granted_scopes } : {}),
                     // Authoritative Page-access signal, read back by getMetaPagesAccessState.
-                    // Omitted when undetermined, for the same reason (ENG-2232).
-                    ...(session.has_meta_pages !== undefined ? { has_meta_pages: session.has_meta_pages } : {}),
+                    // Falls back to the previously recorded value on an undetermined
+                    // probe so a transient failure can't revert a confirmed value
+                    // back to unknown (ENG-2232).
+                    ...(has_meta_pages !== undefined ? { has_meta_pages } : {}),
                 }
             });
             connectedAccounts.push(account);
