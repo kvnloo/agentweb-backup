@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { runZ0NoulExperiment } from '../emma/z0Adapter';
+import { runStopRequestIncumbentJudge } from './stopRequestJudgeService';
 
 export const STOP_REQUEST_Z0_DECISION_ID = 'stop_request_v1';
 export const STOP_REQUEST_Z0_PROPOSITION =
@@ -90,4 +91,60 @@ export function logStopRequestZ0Shadow(
     providerLatencyMs: result.output.latency_ms ?? null,
     usage: result.output.usage ?? null,
   }));
+}
+
+
+export async function runStopRequestStudyCase(
+  content: string,
+  options: {
+    scopeId?: string;
+    env?: NodeJS.ProcessEnv;
+  } = {},
+) {
+  const env = options.env ?? process.env;
+  const scopeId = options.scopeId ?? STOP_REQUEST_Z0_DECISION_ID;
+  const built = buildStopRequestZ0Experiment(scopeId, content, env);
+
+  const incumbentPromise = runStopRequestIncumbentJudge(content);
+  const z0StartedAt = Date.now();
+  const z0Promise = runZ0NoulExperiment(
+    built.request,
+    built.options,
+  ).then((result: any) => ({
+    result,
+    wall_latency_ms: Date.now() - z0StartedAt,
+  }));
+
+  const [incumbent, z0] = await Promise.all([incumbentPromise, z0Promise]);
+  const output = z0.result?.output ?? {};
+  return {
+    decision_id: STOP_REQUEST_Z0_DECISION_ID,
+    operation_id: built.request.operation_id,
+    incumbent_stop: incumbent.stop,
+    incumbent_failed: incumbent.failed,
+    incumbent_truncated: incumbent.truncated,
+    incumbent_latency_ms: incumbent.latency_ms,
+    z0_ok: z0.result?.ok === true,
+    p_stop: typeof output.probability === 'number' ? output.probability : null,
+    z0_latency_ms: z0.wall_latency_ms,
+    z0_provider_latency_ms:
+      typeof output.latency_ms === 'number' ? output.latency_ms : null,
+    z0_input_tokens:
+      typeof output.usage?.input_tokens === 'number'
+        ? output.usage.input_tokens
+        : null,
+    z0_output_tokens:
+      typeof output.usage?.output_tokens === 'number'
+        ? output.usage.output_tokens
+        : null,
+    band:
+      typeof output.probability === 'number'
+        ? stopRequestZ0Band(output.probability)
+        : null,
+    applied: z0.result?.applied === true,
+    replayed: z0.result?.replayed === true,
+    dispatch_receipt_id: z0.result?.dispatch_receipt_id ?? null,
+    z0_trace_id: z0.result?.trace_id ?? null,
+    z0_reason: z0.result?.reason ?? null,
+  };
 }
