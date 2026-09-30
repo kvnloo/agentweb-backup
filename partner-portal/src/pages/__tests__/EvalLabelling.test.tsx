@@ -301,6 +301,39 @@ describe("EvalLabelling (ENG-2135)", () => {
     expect(screen.queryByRole("button", { name: "Use suggestion" })).not.toBeInTheDocument();
   });
 
+  it("renders the source panel before the labels panel so reviewers read before judging (ENG-2219)", async () => {
+    routeGets(true);
+    renderPage();
+    await screen.findByText("Synthetic session");
+
+    const sourceHeading = screen.getByRole("heading", { name: "Source" });
+    const labelsHeading = screen.getByRole("heading", { name: "Labels" });
+    expect(sourceHeading.compareDocumentPosition(labelsHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("shows a loading state instead of a false-empty list while a surface's cases are still in flight (ENG-2219)", async () => {
+    let resolveCreative: (value: { data: { cases: GoldenCaseView[] } }) => void = () => undefined;
+    mockedAxios.get.mockImplementation((url: string) => {
+      if (url.endsWith("/status")) return Promise.resolve({ data: { provisioned: true } });
+      if (url.includes("surface=agent")) return Promise.resolve({ data: { cases: [CASE] } });
+      if (url.includes("surface=creative")) return new Promise((resolve) => { resolveCreative = resolve; });
+      if (url.includes("/api/admin/chat-sessions")) return Promise.resolve({ data: { sessions: [{ title: "Synthetic session", messages: [] }] } });
+      return Promise.reject(new Error(`unexpected GET ${url}`));
+    });
+    renderPage();
+    await screen.findByText("Synthetic session");
+
+    fireEvent.click(screen.getByRole("tab", { name: "Creatives" }));
+
+    // While the creative surface's cases are still in flight, the list shows a loading state,
+    // never the "0 cases" false-empty state that a naive reset-then-fetch would flash.
+    expect(await screen.findByText("Loading cases…")).toBeInTheDocument();
+    expect(screen.queryByText(/cases · .* fully labelled/)).not.toBeInTheDocument();
+
+    resolveCreative({ data: { cases: [] } });
+    await waitFor(() => expect(screen.getByText("0 cases · 0 fully labelled")).toBeInTheDocument());
+  });
+
   it("leaves pairwise calibration cases to their own page and links to it (ENG-2142)", async () => {
     const single: GoldenCaseView = { ...CASE, caseId: "creative#candidateId#cand-1", surface: "creative", taskType: "creative_image", sourceRef: { kind: "candidateId", id: "cand-1" }, criteria: ["hook"] };
     const pair: GoldenCaseView = {
