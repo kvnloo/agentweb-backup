@@ -5576,6 +5576,10 @@ router.delete("/result-endpoints/:name", async (req, res) => {
   }
 });
 
+// ENG-2222: caps how much of a per-session score failure reason reaches
+// logs/the API response — see the truncation comment at its one call site below.
+const MAX_SCORE_FAILURE_REASON_LENGTH = 300;
+
 // Score chat sessions for satisfaction
 router.post("/chat-sessions/score", async (req, res) => {
   try {
@@ -5602,12 +5606,24 @@ router.post("/chat-sessions/score", async (req, res) => {
     );
 
     const scores: Record<string, any> = {};
-    const failed: string[] = [];
+    const failed: Array<{ sessionId: string; reason: string }> = [];
     results.forEach((result, i) => {
       if (result.status === "fulfilled") {
         scores[result.value.sessionId] = result.value.score;
       } else {
-        failed.push(sessionIds[i]);
+        const sessionId = sessionIds[i];
+        // Bounded, not the raw reason verbatim: a scoring failure message can
+        // echo back provider response content, which may itself derive from a
+        // real session transcript. Capping what reaches logs and the API
+        // response keeps this diagnostic without risking an unbounded dump of
+        // that content (CWE-532).
+        const rawReason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        const reason =
+          rawReason.length > MAX_SCORE_FAILURE_REASON_LENGTH
+            ? rawReason.slice(0, MAX_SCORE_FAILURE_REASON_LENGTH) + "…"
+            : rawReason;
+        console.error(`Score failed for session ${sessionId}: ${reason}`);
+        failed.push({ sessionId, reason });
       }
     });
 

@@ -1,7 +1,7 @@
 import request from "supertest";
 import express from "express";
 import adminRoutes from "../routes/admin";
-import { chatbotDb } from "../services/chatbotService";
+import { chatbotDb, ChatSession } from "../services/chatbotService";
 import * as sessionScoringService from "../services/sessionScoringService";
 
 jest.mock("../services/chatbotService", () => ({
@@ -207,6 +207,95 @@ describe("POST /api/admin/chat-sessions/score", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.scores.s5).toBeNull();
+  });
+
+  // ENG-2222: mirrors the ENG-2216 fix on the sibling judge-score route — a
+  // per-session rejection used to be discarded entirely, no log, and `failed`
+  // carried only a bare session id with no indication of why. It must now be
+  // logged and the reason must be returned in the response.
+  const makeScoringSession = (id: string): ChatSession => ({
+    sessionId: id,
+    userId: "u1",
+    createdAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-01T00:00:00Z",
+    messages: [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+    ],
+  });
+
+  it("logs the rejection reason and reports it in `failed` instead of swallowing it", async () => {
+    const consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+    mockChatbotDb.getChatSession.mockResolvedValue(makeScoringSession("s1"));
+    mockScoring.scoreSessionIfNeeded.mockRejectedValue(new Error("LLM provider timed out"));
+
+    const res = await request(app)
+      .post("/api/admin/chat-sessions/score")
+      .send({ sessionIds: ["s1"] })
+      .expect(200);
+
+    expect(res.body.scores).toEqual({});
+    expect(res.body.failed).toEqual([{ sessionId: "s1", reason: "LLM provider timed out" }]);
+    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("s1"));
+    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("LLM provider timed out"));
+
+    consoleErrorSpy.mockRestore();
+  });
+
+  it("returns scores for sessions that succeed and failed entries for sessions that reject, in the same request", async () => {
+    const sessionOk = makeScoringSession("ok");
+    const sessionBad = makeScoringSession("bad");
+    mockChatbotDb.getChatSession.mockImplementation(async (id: string) =>
+      id === "ok" ? sessionOk : sessionBad
+    );
+    const goodScore = {
+      score: 4,
+      reason: "good",
+      evaluatedAt: "2026-01-01T00:00:00Z",
+      evaluatedMessageIndex: 2,
+    };
+    mockScoring.scoreSessionIfNeeded.mockImplementation(async (session) =>
+      session.sessionId === "ok" ? goodScore : Promise.reject(new Error("LLM timeout"))
+    );
+
+    const res = await request(app)
+      .post("/api/admin/chat-sessions/score")
+      .send({ sessionIds: ["ok", "bad"] })
+      .expect(200);
+
+    expect(res.body.scores).toEqual({ ok: goodScore });
+    expect(res.body.failed).toEqual([{ sessionId: "bad", reason: "LLM timeout" }]);
+  });
+
+  it("stringifies a non-Error rejection reason rather than dropping it", async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(makeScoringSession("s1"));
+    mockScoring.scoreSessionIfNeeded.mockRejectedValue("weird non-error rejection");
+
+    const res = await request(app)
+      .post("/api/admin/chat-sessions/score")
+      .send({ sessionIds: ["s1"] })
+      .expect(200);
+
+    expect(res.body.failed).toEqual([{ sessionId: "s1", reason: "weird non-error rejection" }]);
+  });
+
+  // CodeRabbit (CWE-532) on ENG-2216: a scoring failure reason can echo back
+  // provider response content, which may itself derive from a real session
+  // transcript, so it must not reach logs or the API response unbounded.
+  it("truncates a very long rejection reason instead of logging/returning it verbatim", async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(makeScoringSession("s1"));
+    const longReason = "x".repeat(1000);
+    mockScoring.scoreSessionIfNeeded.mockRejectedValue(new Error(longReason));
+
+    const res = await request(app)
+      .post("/api/admin/chat-sessions/score")
+      .send({ sessionIds: ["s1"] })
+      .expect(200);
+
+    expect(res.body.failed).toHaveLength(1);
+    expect(res.body.failed[0].sessionId).toBe("s1");
+    expect(res.body.failed[0].reason.length).toBeLessThan(longReason.length);
+    expect(res.body.failed[0].reason.endsWith("…")).toBe(true);
   });
 });
 
