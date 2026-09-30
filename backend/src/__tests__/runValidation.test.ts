@@ -4,9 +4,15 @@ import { newCreativePairCase, newGoldenCase, type GoldenCase, type LabelValue } 
 import type { GoldenSetStore } from '../loops/eval/goldenSetStore';
 import type { ReadOnlyDocReader, ReadRequest } from '../loops/eval/agentGraderLoader';
 import type { SessionForGrading } from '../loops/eval/agentGraders';
+import type { CreativeGateResult } from '../services/creativeGates';
+import type { AccountHealthState } from '../services/accountHealthClassifier';
 import {
+  accountHealthGrader,
+  accountHealthPrediction,
   agentGraderPrediction,
   computeCriterionAgreement,
+  creativeGatesGrader,
+  creativeGatesPrediction,
   liveAgentGraders,
   loadSessionForGrading,
   runValidation,
@@ -278,5 +284,79 @@ describe('agent grader adapters (ENG-2137 graders on golden cases)', () => {
   it('returns undefined for a session that does not exist', async () => {
     const reader: ReadOnlyDocReader = { scan: jest.fn(), query: jest.fn(async () => ({ Items: [] })) };
     await expect(loadSessionForGrading(reader, { sessions: 'S', messages: 'M', loopEvents: 'E' }, 'gone')).resolves.toBeUndefined();
+  });
+});
+
+describe('creative deterministic gates adapter (ENG-2139, ENG-2226)', () => {
+  const gateResult = (passed: boolean): CreativeGateResult => ({
+    graderId: 'creative-deterministic-gates',
+    version: '2026-09-29.1',
+    advisory: true,
+    passed,
+    checks: [{ id: 'decode', status: 'pass' }],
+    bytes: 12345,
+    fitsPlacements: [],
+    evaluatedAt: '2026-09-29T00:00:00.000Z',
+  });
+
+  const creativeCase = (candidateId: string): GoldenCase => ({
+    ...newGoldenCase({ surface: 'creative', taskType: 'creative_image', sourceId: candidateId, seedSource: 's', now: NOW }),
+    split: 'test',
+  });
+
+  it('maps passed/failed onto format_readiness and abstains when the candidate has no stored gate result', () => {
+    expect(creativeGatesPrediction(gateResult(true))).toEqual({ format_readiness: 'pass' });
+    expect(creativeGatesPrediction(gateResult(false))).toEqual({ format_readiness: 'fail' });
+    expect(creativeGatesPrediction(undefined)).toEqual({});
+  });
+
+  it('grades a case by its candidate id, read-only', async () => {
+    const read = jest.fn(async (id: string) => (id === 'cand-1' ? gateResult(true) : undefined));
+    const grader = creativeGatesGrader(read);
+    expect(grader).toMatchObject({
+      graderId: 'creative-deterministic-gates',
+      surface: 'creative',
+      criteria: ['format_readiness'],
+      primaryCriterion: 'format_readiness',
+    });
+
+    expect(await grader.grade(creativeCase('cand-1'))).toEqual({ format_readiness: 'pass' });
+    expect(read).toHaveBeenCalledWith('cand-1');
+
+    // Abstention: no stored gate result for this candidate (e.g. gated before ENG-2139).
+    expect(await grader.grade(creativeCase('cand-2'))).toEqual({});
+  });
+});
+
+describe('account-health classifier adapter (ENG-2143, ENG-2226)', () => {
+  const accountCase = (userId: string): GoldenCase => ({
+    ...newGoldenCase({ surface: 'account_health', taskType: 'paying_account', sourceId: userId, seedSource: 's', now: NOW }),
+    split: 'test',
+  });
+
+  it('maps the classified state onto the three golden criteria, and abstains on insufficient evidence or no classification', () => {
+    expect(accountHealthPrediction('at_risk')).toEqual({ activation_incomplete: 'fail', at_risk: 'pass', healthy: 'fail' });
+    expect(accountHealthPrediction('activation_incomplete')).toEqual({ activation_incomplete: 'pass', at_risk: 'fail', healthy: 'fail' });
+    expect(accountHealthPrediction('healthy')).toEqual({ activation_incomplete: 'fail', at_risk: 'fail', healthy: 'pass' });
+    // Abstention cases: the classifier itself could not decide, or never ran at all.
+    expect(accountHealthPrediction('insufficient_evidence')).toEqual({});
+    expect(accountHealthPrediction(undefined)).toEqual({});
+  });
+
+  it('grades a case by its user id, read-only, with at_risk as the primary (gating) criterion', async () => {
+    const classify = jest.fn(async (id: string): Promise<AccountHealthState | undefined> => (id === 'user-1' ? 'at_risk' : undefined));
+    const grader = accountHealthGrader(classify);
+    expect(grader).toMatchObject({
+      graderId: 'account-health-classifier',
+      surface: 'account_health',
+      criteria: ['activation_incomplete', 'at_risk', 'healthy'],
+      primaryCriterion: 'at_risk',
+    });
+
+    expect(await grader.grade(accountCase('user-1'))).toEqual({ activation_incomplete: 'fail', at_risk: 'pass', healthy: 'fail' });
+    expect(classify).toHaveBeenCalledWith('user-1');
+
+    // Abstention: the classify function found nothing for this user (e.g. deleted since the case was seeded).
+    expect(await grader.grade(accountCase('user-2'))).toEqual({});
   });
 });
