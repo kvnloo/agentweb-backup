@@ -119,6 +119,8 @@ jobs:
               "zero_model_calls",
               "source_diversity_or_explicit_budget_degradation",
               "gap_semantics_match",
+              "fixture_expected_excerpts_truncated",
+              "fixture_large_context_sample_present",
               "fixture_large_context_compression_under_80pct",
           ]
           failed = [name for name in hard if s["gates"].get(name) is not True]
