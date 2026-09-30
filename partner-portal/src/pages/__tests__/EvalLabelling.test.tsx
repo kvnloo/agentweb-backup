@@ -32,6 +32,14 @@ const CASE: GoldenCaseView = {
   version: 3,
 };
 
+const DEV_CASE: GoldenCaseView = {
+  ...CASE,
+  caseId: "agent#sessionId#session-2",
+  sourceRef: { kind: "sessionId", id: "session-2" },
+  split: "dev",
+  version: 1,
+};
+
 function renderPage() {
   return render(
     <MemoryRouter>
@@ -45,6 +53,17 @@ function routeGets(provisioned: boolean) {
     if (url.endsWith("/api/admin/eval/golden-cases/status")) return { data: { provisioned } };
     if (url.includes("/api/admin/eval/golden-cases?surface=agent")) return { data: { cases: [CASE] } };
     if (url.includes("/api/admin/chat-sessions?sessionId=session-1")) {
+      return { data: { sessions: [{ title: "Synthetic session", messages: [{ role: "user", content: "Is it on?" }, { role: "assistant", content: "Yes." }] }] } };
+    }
+    throw new Error(`unexpected GET ${url}`);
+  });
+}
+
+function routeGetsTestAndDev() {
+  mockedAxios.get.mockImplementation(async (url: string) => {
+    if (url.endsWith("/api/admin/eval/golden-cases/status")) return { data: { provisioned: true } };
+    if (url.includes("/api/admin/eval/golden-cases?surface=agent")) return { data: { cases: [CASE, DEV_CASE] } };
+    if (url.includes("/api/admin/chat-sessions?sessionId=session-1") || url.includes("/api/admin/chat-sessions?sessionId=session-2")) {
       return { data: { sessions: [{ title: "Synthetic session", messages: [{ role: "user", content: "Is it on?" }, { role: "assistant", content: "Yes." }] }] } };
     }
     throw new Error(`unexpected GET ${url}`);
@@ -358,5 +377,66 @@ describe("EvalLabelling (ENG-2135)", () => {
     expect(screen.getByText("cand-1")).toBeInTheDocument();
     expect(screen.queryByText("cand-2")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "pairwise_preference pass" })).not.toBeInTheDocument();
+  });
+
+  describe("split filter", () => {
+    const selectSplit = async (label: "All" | "test" | "dev") => {
+      const combobox = screen.getByLabelText("Split");
+      fireEvent.mouseDown(combobox);
+      const option = await screen.findByRole("option", { name: label });
+      fireEvent.click(option);
+    };
+
+    it("defaults to All and shows every case", async () => {
+      routeGetsTestAndDev();
+      renderPage();
+      expect(await screen.findByText("2 cases · 0 fully labelled")).toBeInTheDocument();
+      expect(screen.getByText("session-1")).toBeInTheDocument();
+      expect(screen.getByText("session-2")).toBeInTheDocument();
+    });
+
+    it("filters the list to only the selected split, without refetching", async () => {
+      routeGetsTestAndDev();
+      renderPage();
+      await screen.findByText("2 cases · 0 fully labelled");
+      const getCallCount = mockedAxios.get.mock.calls.length;
+
+      await selectSplit("test");
+
+      expect(screen.getByText("1 of 2 cases · 0 fully labelled")).toBeInTheDocument();
+      expect(screen.getByText("session-1")).toBeInTheDocument();
+      expect(screen.queryByText("session-2")).not.toBeInTheDocument();
+      // Purely a client-side filter over the already-loaded cases — no new request.
+      expect(mockedAxios.get.mock.calls.length).toBe(getCallCount);
+    });
+
+    it("shows a no-cases message when a split has no matches", async () => {
+      mockedAxios.get.mockImplementation(async (url: string) => {
+        if (url.endsWith("/status")) return { data: { provisioned: true } };
+        if (url.includes("surface=agent")) return { data: { cases: [CASE] } };
+        throw new Error(`unexpected GET ${url}`);
+      });
+      renderPage();
+      await screen.findByText("1 cases · 0 fully labelled");
+
+      await selectSplit("dev");
+
+      expect(screen.getByText("No dev cases.")).toBeInTheDocument();
+      expect(screen.getByText("0 of 1 cases · 0 fully labelled")).toBeInTheDocument();
+    });
+
+    it("keeps the open case in the detail pane even when a filter change hides it from the list", async () => {
+      routeGetsTestAndDev();
+      renderPage();
+      // session-1 (split "test") loads first and is auto-selected.
+      expect(await screen.findByText("Synthetic session")).toBeInTheDocument();
+
+      await selectSplit("dev");
+
+      // The list no longer shows session-1's row, but its detail pane stays open —
+      // filtering must never silently discard unsaved work in an open case.
+      expect(screen.queryByText("session-1")).not.toBeInTheDocument();
+      expect(screen.getByText("Synthetic session")).toBeInTheDocument();
+    });
   });
 });
