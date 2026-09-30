@@ -27,6 +27,14 @@ architecture:
       paths:
         - backend/src/services/z0ReliabilityProjection.ts
         - backend/src/services/reliabilityEvent.ts
+    - id: z0-context-packet-shadow
+      name: Bounded KB context packet shadow
+      kind: context-integration
+      paths:
+        - backend/src/services/z0ContextPacket.ts
+        - backend/src/services/agentModeService.ts
+      depends_on:
+        - z0-intelligence-adapter
     - id: z0-reliability-exporter
       name: Bounded z0 reliability exporter
       kind: evidence-transport
