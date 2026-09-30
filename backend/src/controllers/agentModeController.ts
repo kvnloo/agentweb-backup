@@ -53,6 +53,7 @@ import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterReq
 import { resolvePublishAuthorized, extractScheduleId, resolveSlackSendAuthorized, filterSlackSendFromRequiredIfWithheld } from '../utils/schedulePublishApproval';
 import { meteringFeature } from '../services/llmUsageAttributionService';
 import type { LLMUsageContext } from '../utils/llmService';
+import { runStopRequestZ0Shadow, logStopRequestZ0Shadow } from '../services/z0StopRequestShadow';
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
 import { countCallsSatisfyingRequirement, RequiredCallLedgerEntry } from '../utils/requiredCallSatisfaction';
 import { canonicalizeVisibility, resolveVisibilityUpdate } from '../utils/scheduleTemplateVisibility';
@@ -1535,14 +1536,21 @@ Answer "no" for everything else, including ordinary requests, questions, correct
 Reply with ONLY one word: yes or no.`;
 
 async function userExplicitlyRequestedStop(sessionId: string, usageContext?: LLMUsageContext): Promise<boolean> {
+  let z0ShadowPromise: Promise<any> | null = null;
   try {
     const recent = await chatbotDb.getMostRecentRealUserMessage(sessionId);
     if (!recent?.content) return false;
+    const judgeText = recent.content.slice(0, 2500);
+
+    // Downstream-only z0 experiment: begins concurrently so it adds no latency to
+    // the authoritative Gemini judge. Its probability is observational only.
+    z0ShadowPromise = runStopRequestZ0Shadow(sessionId, judgeText);
+
     const llmPromise = agentModeService.callLLM(
       STOP_REQUEST_JUDGE_MODEL,
       [
         { role: 'system', content: STOP_REQUEST_JUDGE_SYSTEM },
-        { role: 'user', content: recent.content.slice(0, 2500) },
+        { role: 'user', content: judgeText },
       ],
       // ENG-1819 live-testing found gemini-3.1-flash-lite is a reasoning model (confirmed
       // in this file's own llmModels registry) that can spend its whole completion budget on
@@ -1576,13 +1584,25 @@ async function userExplicitlyRequestedStop(sessionId: string, usageContext?: LLM
       );
     }
     const raw = (res?.choices?.[0]?.message?.content ?? '').trim().toLowerCase();
-    return raw.startsWith('yes');
+    const incumbentStop = raw.startsWith('yes');
+    if (z0ShadowPromise) {
+      void z0ShadowPromise.then(
+        result => logStopRequestZ0Shadow(result, incumbentStop),
+        () => logStopRequestZ0Shadow({ ok: false, reason: 'shadow_exception' }, incumbentStop),
+      );
+    }
+    return incumbentStop;
   } catch (err) {
+    if (z0ShadowPromise) {
+      void z0ShadowPromise.then(
+        result => logStopRequestZ0Shadow(result, null, true),
+        () => logStopRequestZ0Shadow({ ok: false, reason: 'shadow_exception' }, null, true),
+      );
+    }
     console.error(`AgentMode: work-plan auto-continuation stop-request judge failed for session ${sessionId}:`, err);
     return false; // fail-safe: never suppress a continuation on judge failure
   }
 }
-
 /**
  * ENG-1684: the autocomplete-work-plan analogue of scheduleAutoMediaContinuation above —
  * same shape (usage-gated, lock-claimed so it never fights a real concurrent user turn,
