@@ -5695,12 +5695,15 @@ router.post("/chat-sessions/judge-score", async (req, res) => {
     );
 
     const scores: Record<string, any> = {};
-    const failed: string[] = [];
+    const failed: Array<{ sessionId: string; reason: string }> = [];
     results.forEach((result, i) => {
       if (result.status === "fulfilled") {
         scores[result.value.sessionId] = result.value.score;
       } else {
-        failed.push(sessionIds[i]);
+        const sessionId = sessionIds[i];
+        const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        console.error(`Judge-score failed for session ${sessionId} (judge ${judgeId}): ${reason}`);
+        failed.push({ sessionId, reason });
       }
     });
 

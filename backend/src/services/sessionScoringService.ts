@@ -1539,6 +1539,26 @@ function finiteNumber(v: any): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+/**
+ * ENG-2216: Bedrock-routed models don't always strictly honor
+ * `response_format: json_object` — a text preamble (e.g. "Here is my
+ * evaluation:") before the JSON object makes a bare `JSON.parse(raw)` throw,
+ * and that throw was previously swallowed silently by the judge-score route's
+ * `Promise.allSettled`. If `raw` isn't already a bare JSON object, slice from
+ * its first `{` to its last `}`, same as the "everything from the first `{`"
+ * convention already used elsewhere in this codebase for non-strict LLM
+ * output. Falls back to the original `raw` when no `{` is present, so
+ * `JSON.parse` still throws with a meaningful message.
+ */
+function extractJsonObject(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith("{")) return trimmed;
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start === -1 || end === -1 || end < start) return raw;
+  return raw.slice(start, end + 1);
+}
+
 function parseDimensions(raw: any): ScoringResult["dimensions"] | undefined {
   const d = raw?.dimensions;
   if (!d || typeof d !== "object") return undefined;
@@ -1648,7 +1668,8 @@ export async function scoreSession(
   const res = await raceWithScoringTimeout(llmPromise, conversationText);
 
   const raw = res.choices?.[0]?.message?.content ?? "{}";
-  const parsed = JSON.parse(raw);
+  // ENG-2216: Bedrock doesn't always honor response_format: json_object strictly.
+  const parsed = JSON.parse(extractJsonObject(raw));
   // ENG-1669: a missing/non-numeric "score" field used to flow straight through
   // Math.round/Math.max/Math.min as NaN — no code path checked for it — and the
   // resulting NaN only surfaced when DynamoDB's SDK rejected it at the point of
@@ -1795,7 +1816,8 @@ export async function scoreSessionWithJudge(
   const res = await raceWithScoringTimeout(llmPromise, conversationText);
 
   const raw = res.choices?.[0]?.message?.content ?? "{}";
-  const parsed = JSON.parse(raw);
+  // ENG-2216: Bedrock doesn't always honor response_format: json_object strictly.
+  const parsed = JSON.parse(extractJsonObject(raw));
   // ENG-1669: see scoreSession's identical guard — a missing/non-numeric
   // "score" here previously reached chatbotDb.updateSessionJudgeScore as NaN
   // and failed opaquely inside the DynamoDB SDK instead of at the source.
