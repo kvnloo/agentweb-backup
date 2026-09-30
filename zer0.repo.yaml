@@ -1,0 +1,44 @@
+version: 1
+repo: kvnloo/agentweb
+id: agentweb-runtime
+kind: runtime
+summary: >
+  AgentWeb/Emma runtime with a downstream-only z0intelligence experiment boundary.
+  This manifest describes this exact ref; it does not promote the experiment to canonical Zer0 truth.
+architecture:
+  subsystems:
+    - id: emma-tool-registry
+      name: Emma tool registry and safety boundary
+      kind: runtime-registry
+      paths:
+        - backend/src/emma/registry.ts
+        - backend/src/mcp/server/registry.ts
+    - id: z0-intelligence-adapter
+      name: z0intelligence adapter
+      kind: integration
+      paths:
+        - backend/src/emma/z0Adapter.ts
+        - backend/src/emma/jevTools.ts
+      depends_on:
+        - emma-tool-registry
+    - id: z0-reliability-projection
+      name: Privacy-safe reliability projection
+      kind: evidence-projection
+      paths:
+        - backend/src/services/z0ReliabilityProjection.ts
+        - backend/src/services/reliabilityEvent.ts
+  boundaries:
+    owns:
+      - AgentWeb user/session boundary and confirmation policy.
+      - Emma tool exposure, evaluation-workspace, scheduling, funding, and publish guards.
+      - Default-off shadow/active integration mode selection.
+    not_here:
+      - Canonical z0 routing and dispatch authority.
+      - Canonical z0 decision receipt persistence.
+      - Quality verification inferred from transport or tool success.
+  evidence:
+    docs:
+      - research/rfc/H-Z0-first-class-intelligence.md
+    tests:
+      - backend/src/__tests__/experiments.z0Integration.test.ts
+      - backend/src/__tests__/experiments.z0ReliabilityProjection.test.ts
