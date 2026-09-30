@@ -48,4 +48,12 @@ describe('Agent Mode system prompt — lead attribution vs lead quality discipli
       'never let a total silently shrink or grow without explanation'
     );
   });
+
+  it('requires pagination to be checked before a CRM total is stated as final, and partial totals to be flagged', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      'Check for pagination/incompleteness before stating a CRM total as final'
+    );
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('next_cursor');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('load_limit');
+  });
 });
