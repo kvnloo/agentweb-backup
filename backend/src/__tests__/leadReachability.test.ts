@@ -159,12 +159,23 @@ describe('enrollmentIdentityCandidates', () => {
     expect(enrollmentIdentityCandidates({ email: 'ada@acme.io' })).toEqual(['ada@acme.io']);
   });
 
-  it('never offers a malformed address as an identity', () => {
-    expect(enrollmentIdentityCandidates({ email: 'a@x..com', linkedin: profile })).toEqual([profile]);
+  /*
+   * Review round 3, finding 14. Candidates are LOOKUP-ONLY — never written, never
+   * passed to enrollmentIdentity's own reachability rules — so an address that fails
+   * isReachableEmail still belongs here. Pre-PR enrollments were written under the raw
+   * `l.email` with no reachability gate at all, and after this PR shipped,
+   * isReachableEmail started rejecting reserved test domains it used to accept. Gating
+   * this list on the same predicate made it impossible to find those old rows: the
+   * dedup check would look under the profile URL, miss, and re-deliver the sequence.
+   */
+  it('still offers a malformed/reserved-domain address as a LOOKUP candidate', () => {
+    expect(enrollmentIdentityCandidates({ email: 'a@x..com', linkedin: profile }))
+      .toEqual(expect.arrayContaining([profile, 'a@x..com']));
   });
 
-  it('returns nothing for a lead reachable on no channel', () => {
-    expect(enrollmentIdentityCandidates({ email: 'a@x..com', linkedin: 'Acme Corp' })).toEqual([]);
+  it('offers the raw address even for a lead reachable on no channel today', () => {
+    expect(enrollmentIdentityCandidates({ email: 'a@x..com', linkedin: 'Acme Corp' }))
+      .toEqual(['a@x..com']);
     expect(enrollmentIdentityCandidates({})).toEqual([]);
   });
 

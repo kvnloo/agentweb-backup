@@ -371,6 +371,27 @@ describe('POST /:sequenceId/enrollments - bulk enroll', () => {
       .send({ leads: [{ listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@acme.io' }] });
     expect(res.status).toBe(403);
   });
+
+  /*
+   * Review round 3, finding 15. The candidate mechanism (bulkEnroll's lookup loop) was
+   * mutation-tested; this call site's WIRING was not — deleting `identityCandidates:`
+   * here left every test green. Assert the value reaching bulkEnroll directly.
+   */
+  it('passes identityCandidates through to bulkEnroll', async () => {
+    const crmDbMock = require('../services/db').crmDb;
+    crmDbMock.getLeadById = jest.fn().mockResolvedValue({
+      leadId: 'lead-1', email: 'a@acme.io', linkedin: 'https://linkedin.com/in/ada',
+    });
+
+    await request(app)
+      .post('/seq_1/enrollments')
+      .send({ leads: [{ listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@acme.io' }] });
+
+    const input = dripSequenceDb.bulkEnroll.mock.calls.at(-1)![0][0];
+    expect(input.identityCandidates).toEqual(
+      expect.arrayContaining(['a@acme.io', 'https://www.linkedin.com/in/ada/']),
+    );
+  });
 });
 
 // ─── GET /:sequenceId/enrollments ─────────────────────────────────────────────
@@ -1252,6 +1273,30 @@ describe('the route uses the shared predicates, not truthiness', () => {
 
     const identities = dripSequenceDb.bulkEnroll.mock.calls[0][0].map((i: any) => i.leadEmail);
     expect(new Set(identities).size).toBe(1);
+  });
+
+  /*
+   * Review round 3, finding 15. Same gap as the explicit route: deleting
+   * `identityCandidates:` at this call site left every test green.
+   */
+  it('by-list also passes identityCandidates through to bulkEnroll', async () => {
+    dripSequenceDb.getSequence.mockResolvedValue({
+      ...mockSequence,
+      steps: [
+        { stepId: 's1', stepNumber: 1, name: 'm', delayDays: 0, subject: 'Hi', bodyHtml: 'x' },
+        { stepId: 's2', stepNumber: 2, name: 'dm', delayDays: 1, channel: 'linkedin', messageText: 'z' },
+      ],
+    });
+    crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
+      { leadId: 'a', listId: 'list-1', email: 'ada@acme.io', linkedin: 'https://linkedin.com/in/ada' },
+    ]);
+
+    await request(app).post('/seq_1/enrollments/by-list').send({ listId: 'list-1' });
+
+    const input = dripSequenceDb.bulkEnroll.mock.calls[0][0][0];
+    expect(input.identityCandidates).toEqual(
+      expect.arrayContaining(['ada@acme.io', 'https://www.linkedin.com/in/ada/']),
+    );
   });
 });
 

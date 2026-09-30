@@ -201,7 +201,15 @@ export function enrollmentIdentityCandidates(lead: any): string[] {
   if (primary) out.push(primary);
   const profile = canonicalLinkedInProfile(lead?.linkedin);
   if (profile && !out.includes(profile)) out.push(profile);
+  // RAW, not gated on isReachableEmail. When the email IS reachable it's already
+  // `primary` and this is a no-op — but F5 made isReachableEmail(x) false for reserved
+  // test domains, and pre-PR enrollments were written under the raw `l.email` with no
+  // such gate. Gating this on the same predicate that just excluded the email made the
+  // branch dead: it can never add anything primary didn't already add. The result was a
+  // row stored under a reserved-domain address that no candidate could ever find again,
+  // so the first enrol run after the F5 deploy would look under the profile URL, miss,
+  // and re-deliver the whole sequence to someone already enrolled.
   const email = String(lead?.email ?? '').trim();
-  if (isReachableEmail(email) && !out.includes(email)) out.push(email);
+  if (email && !out.includes(email)) out.push(email);
   return out;
 }

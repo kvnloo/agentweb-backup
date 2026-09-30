@@ -181,6 +181,20 @@ describe('crm auto-enroll is channel-aware', () => {
     ]);
   });
 
+  /*
+   * Review round 3, finding 15. `identityCandidates:` at this call site was unpinned —
+   * deleting it left every test in this file green.
+   */
+  it('passes identityCandidates through to bulkEnroll', async () => {
+    await autoEnrollLeadInSequences('user-1', 'list-1', 'lead-1',
+      { email: 'a@x..com', linkedin: 'https://linkedin.com/in/ada' });
+
+    const input = (mockSeqDb.bulkEnroll as jest.Mock).mock.calls[0][0][0];
+    expect(input.identityCandidates).toEqual(
+      expect.arrayContaining(['https://www.linkedin.com/in/ada/', 'a@x..com']),
+    );
+  });
+
   it('refuses an email-only lead for a LinkedIn-only sequence', async () => {
     await autoEnrollLeadInSequences('user-1', 'list-1', 'lead-1',
       { email: 'ada@acme.io', linkedin: '' });
@@ -218,5 +232,23 @@ describe('crm auto-enroll is channel-aware', () => {
     const inputs = (mockSeqDb.bulkEnroll as jest.Mock).mock.calls[0][0];
     expect(inputs.map((i: any) => i.leadId)).toEqual(['li']);
     expect(inputs[0].leadEmail).toBe('https://www.linkedin.com/in/ada/');
+  });
+
+  /*
+   * Review round 3, finding 15. This is the highest-traffic of the four unpinned call
+   * sites: autoEnrollListIntoSequences re-runs over the ENTIRE list on every import,
+   * which is exactly the path a stale identity has to survive.
+   */
+  it('list import also passes identityCandidates through to bulkEnroll', async () => {
+    (mockCrm.getAllLeadsByListId as jest.Mock) = jest.fn().mockResolvedValue([
+      { leadId: 'both', email: 'a@x..com', linkedin: 'https://linkedin.com/in/ada' },
+    ]);
+
+    await autoEnrollListIntoSequences('user-1', 'list-1');
+
+    const input = (mockSeqDb.bulkEnroll as jest.Mock).mock.calls[0][0][0];
+    expect(input.identityCandidates).toEqual(
+      expect.arrayContaining(['https://www.linkedin.com/in/ada/', 'a@x..com']),
+    );
   });
 });
