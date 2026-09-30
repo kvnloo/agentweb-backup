@@ -106,6 +106,9 @@ async function main() {
       retained_source_count: Array.isArray(packet.evidence)
         ? packet.evidence.length
         : 0,
+      source_diversity_target: measurements.source_diversity_target ?? null,
+      source_diversity_degraded_for_budget:
+        measurements.source_diversity_degraded_for_budget === true,
       unresolved_gap_count: Array.isArray(packet.unresolved_gaps)
         ? packet.unresolved_gaps.length
         : 0,
