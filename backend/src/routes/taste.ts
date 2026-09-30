@@ -18,6 +18,9 @@ const importLimiter = rateLimit({
   limit: 10,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  // authenticateToken runs first, so imports are throttled per account rather than
+  // per shared office/VPN IP.
+  keyGenerator: (req: any) => String(req.user.userId),
   message: { error: 'Too many taste imports. Try again shortly.' },
 });
 
