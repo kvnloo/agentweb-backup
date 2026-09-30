@@ -108,6 +108,23 @@ describe('z0 AgentWeb adapter', () => {
     expect(first.trace_id).toBe(
       agentWebTraceId(pseudonymousAgentWebParent('raw-session-secret'), request),
     );
+
+    const changedFunction = await runZ0Route(
+      { ...request, function: 'research' },
+      {
+        sessionId: 'raw-session-secret',
+        config: config('active'),
+        fetchImpl,
+      },
+    );
+    expect(changedFunction.trace_id).toBe(first.trace_id);
+  });
+
+  it('changed function under the same operation preserves the authority trace for conflict detection', () => {
+    const parent = pseudonymousAgentWebParent('raw-session-secret');
+    expect(agentWebTraceId(parent, request)).toBe(
+      agentWebTraceId(parent, { ...request, function: 'research' }),
+    );
   });
 
   it('the registered tool supplies Emma session identity to the adapter boundary', async () => {
