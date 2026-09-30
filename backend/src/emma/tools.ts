@@ -29,6 +29,9 @@ import { CLIENT_ID_SCHEMA_PROPERTY } from '../mcp/server/toolHelpers';
 // Register browser cookie persistence tools
 import './browserCookieTools';
 
+// First-class user Taste tools (read/preview + explicit X refresh).
+import './tasteTools';
+
 // Register email lookup / find tool (provider-agnostic)
 import './emailLookupTool';
 
