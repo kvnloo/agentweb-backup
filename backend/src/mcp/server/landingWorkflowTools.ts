@@ -52,6 +52,11 @@ mcpToolRegistry.register({
           type: 'string',
           description: 'Optional lead-list id for the contact form. Omit to use the default list.',
         },
+        taste_intensity: {
+          type: 'string',
+          enum: ['off', 'subtle', 'strong'],
+          description: 'Optional task-local Taste override. Omit to use the user\'s landing-page default.',
+        },
       },
       required: ['description', 'name'],
     },
@@ -65,6 +70,7 @@ mcpToolRegistry.register({
         prompt: args?.description,
         name: args?.name,
         ...(args?.lead_list_id ? { lead_list_id: args.lead_list_id } : {}),
+        ...(args?.taste_intensity ? { taste_intensity: args.taste_intensity } : {}),
       },
     });
     const pageId = generated?.id;
