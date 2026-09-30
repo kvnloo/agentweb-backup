@@ -12,6 +12,8 @@ const mockTasteProfileService = {
   importXBookmarks: jest.fn(),
   importCollection: jest.fn(),
   getProfile: jest.fn(),
+  getApplication: jest.fn(),
+  applyToPrompt: jest.fn(),
   deleteProfile: jest.fn(),
 };
 
@@ -109,6 +111,55 @@ describe('Taste profile routes', () => {
       .send({ accountId: 'account-1' });
     expect(response.status).toBe(502);
     expect(response.body.error).toBe('Unable to read bookmarks from the connected X account');
+  });
+
+
+  it('lists supported Taste surfaces and intensities', async () => {
+    const response = await request(app()).get('/api/taste/surfaces');
+
+    expect(response.status).toBe(200);
+    expect(response.body.surfaces).toEqual(expect.arrayContaining([
+      'landing_page',
+      'image',
+      'video',
+      'social',
+      'ad_creative',
+      'research',
+      'crm',
+    ]));
+    expect(response.body.intensities).toEqual(['off', 'subtle', 'strong']);
+  });
+
+  it('previews one surface without mutating the profile', async () => {
+    mockTasteProfileService.getApplication.mockResolvedValue({
+      schema: 'taste.application.v1',
+      surface: 'landing_page',
+      active: true,
+      intensity: 'strong',
+    });
+
+    const response = await request(app())
+      .get('/api/taste/application')
+      .query({ surface: 'landing_page', intensity: 'strong' });
+
+    expect(response.status).toBe(200);
+    expect(mockTasteProfileService.getApplication)
+      .toHaveBeenCalledWith('taste-test-user', 'landing_page', 'strong');
+  });
+
+  it('applies Taste to a prompt with a task-local intensity override', async () => {
+    mockTasteProfileService.applyToPrompt.mockResolvedValue({
+      prompt: 'Create a hero\n\nTASTE CONTEXT',
+      application: { active: true, surface: 'image', intensity: 'subtle' },
+    });
+
+    const response = await request(app())
+      .post('/api/taste/apply')
+      .send({ surface: 'image', intensity: 'subtle', prompt: 'Create a hero' });
+
+    expect(response.status).toBe(200);
+    expect(mockTasteProfileService.applyToPrompt)
+      .toHaveBeenCalledWith('taste-test-user', 'image', 'Create a hero', 'subtle');
   });
 
   it('returns and deletes the authenticated user profile', async () => {
