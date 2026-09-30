@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import axios from "axios";
 import {
   Alert,
@@ -19,6 +19,7 @@ import {
 } from "@mui/material";
 import { useAuth } from "../../contexts/AuthContext";
 import { buildApiUrl } from "../../config";
+import { hasMoreToScrollRight } from "./evalV2ScrollUtils";
 
 /** Mirrors backend/src/loops/eval/evalV2Sampler.ts (ENG-2144). */
 interface Interval {
@@ -156,6 +157,27 @@ const pct = (x: number) => `${Math.round(x * 100)}%`;
 const usd = (x: number) => `$${x.toFixed(2)}`;
 const duration = (ms: number) => (ms >= 60_000 ? `${(ms / 60_000).toFixed(1)} min` : `${(ms / 1000).toFixed(1)} s`);
 
+/**
+ * Below this sample size a rate can swing sharply with the next session graded (ENG-2221):
+ * a row's n is flagged with a badge rather than by dimming its text, which would fight WCAG
+ * contrast exactly where accuracy matters most.
+ */
+const LOW_SAMPLE_THRESHOLD = 10;
+
+function LowSampleBadge() {
+  return (
+    <Tooltip title={`Fewer than ${LOW_SAMPLE_THRESHOLD} sampled sessions: this rate can swing sharply with the next session graded.`}>
+      <Chip
+        label="low n"
+        size="small"
+        variant="outlined"
+        data-testid="eval-v2-low-n-badge"
+        sx={{ height: 18, fontSize: "0.65rem", "& .MuiChip-label": { px: 0.75 } }}
+      />
+    </Tooltip>
+  );
+}
+
 function MetricCell({ metric }: { metric: (RateWithCI & { notApplicable?: number }) | undefined }) {
   if (!metric || metric.rate === null || !metric.ci) {
     return <Typography variant="body2" color="text.secondary">– (n=0)</Typography>;
@@ -163,13 +185,14 @@ function MetricCell({ metric }: { metric: (RateWithCI & { notApplicable?: number
   const notApplicable = metric.notApplicable === undefined ? "" : `; ${metric.notApplicable} not applicable`;
   return (
     <Tooltip title={`${metric.passes} of ${metric.n} passed${notApplicable}. 95% Wilson interval.`}>
-      <Box component="span">
+      <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.5 }}>
         <Typography variant="body2" component="span" sx={{ fontWeight: 500 }}>
           {pct(metric.rate)}
         </Typography>{" "}
         <Typography variant="caption" component="span" color="text.secondary">
           [{pct(metric.ci.low)}–{pct(metric.ci.high)}] n={metric.n}
         </Typography>
+        {metric.n < LOW_SAMPLE_THRESHOLD && <LowSampleBadge />}
       </Box>
     </Tooltip>
   );
@@ -229,6 +252,63 @@ function LatencyCell({ efficiency }: { efficiency: EvalV2Efficiency | undefined 
 const windowText = (s: { windowStartDate: string; windowEndDate: string }) =>
   s.windowStartDate === s.windowEndDate ? s.windowEndDate : `${s.windowStartDate} – ${s.windowEndDate}`;
 
+/** Sticks the first (identifying) column of a wide table to the left while it scrolls horizontally (ENG-2221). */
+const stickyColumnSx = {
+  position: "sticky" as const,
+  left: 0,
+  zIndex: 2,
+  backgroundColor: "background.paper",
+  borderRight: 1,
+  borderColor: "divider",
+};
+
+/**
+ * Wraps a wide table so its first column stays visible (via `stickyColumnSx` on that column's
+ * cells) and shows a fading shadow on the right edge only while there is more to scroll to
+ * (ENG-2221) — the native scrollbar alone was too thin a hint that the newest criteria columns
+ * existed.
+ */
+function ScrollableWideTable({ testId, children }: { testId: string; children: React.ReactNode }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [showShadow, setShowShadow] = useState(false);
+
+  const updateShadow = useCallback(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    setShowShadow(hasMoreToScrollRight({ scrollWidth: el.scrollWidth, clientWidth: el.clientWidth, scrollLeft: el.scrollLeft }));
+  }, []);
+
+  useEffect(() => {
+    updateShadow();
+    window.addEventListener("resize", updateShadow);
+    return () => window.removeEventListener("resize", updateShadow);
+  }, [updateShadow]);
+
+  return (
+    <Box sx={{ position: "relative" }}>
+      <TableContainer component={Paper} ref={containerRef} onScroll={updateShadow} data-testid={testId}>
+        {children}
+      </TableContainer>
+      {showShadow && (
+        <Box
+          data-testid={`${testId}-shadow`}
+          aria-hidden
+          sx={{
+            position: "absolute",
+            top: 0,
+            right: 0,
+            bottom: 0,
+            width: 24,
+            pointerEvents: "none",
+            background: (theme) =>
+              `linear-gradient(to right, transparent, ${theme.palette.mode === "dark" ? "rgba(0,0,0,0.6)" : "rgba(0,0,0,0.2)"})`,
+          }}
+        />
+      )}
+    </Box>
+  );
+}
+
 function SurfaceStatus({ status, reason }: { status: SurfaceReadStatus; reason?: string }) {
   if (status === "ok") return null;
   return (
@@ -243,7 +323,7 @@ function SurfaceStatus({ status, reason }: { status: SurfaceReadStatus; reason?:
 function CreativeSection({ snapshots }: { snapshots: CreativeSnapshot[] }) {
   const latest = snapshots[snapshots.length - 1];
   return (
-    <Box data-testid="eval-v2-creative" sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+    <Box id="eval-v2-section-creative" data-testid="eval-v2-creative" sx={{ ...sectionAnchorSx, display: "flex", flexDirection: "column", gap: 1 }}>
       <Typography variant="subtitle1">Creatives</Typography>
       {!latest ? (
         <Typography color="text.secondary">No creative snapshots yet.</Typography>
@@ -293,7 +373,7 @@ function CreativeSection({ snapshots }: { snapshots: CreativeSnapshot[] }) {
 function AccountHealthSection({ snapshots }: { snapshots: AccountHealthSnapshot[] }) {
   const latest = snapshots[snapshots.length - 1];
   return (
-    <Box data-testid="eval-v2-account-health" sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+    <Box id="eval-v2-section-account-health" data-testid="eval-v2-account-health" sx={{ ...sectionAnchorSx, display: "flex", flexDirection: "column", gap: 1 }}>
       <Typography variant="subtitle1">Account health</Typography>
       {!latest ? (
         <Typography color="text.secondary">No account-health snapshots yet.</Typography>
@@ -349,6 +429,57 @@ function RegistryTable({ registry }: { registry: RegistryGrader[] }) {
     </TableContainer>
   );
 }
+
+/** Jump targets for {@link SectionNav} (ENG-2221): every section stays fully visible, none collapsed. */
+const SECTION_NAV_ITEMS = [
+  { id: "eval-v2-section-main-table", label: "Main table" },
+  { id: "eval-v2-section-trend", label: "Trend" },
+  { id: "eval-v2-section-creative", label: "Creative" },
+  { id: "eval-v2-section-account-health", label: "Account health" },
+  { id: "eval-v2-section-registry", label: "Grader registry" },
+] as const;
+
+/** Sticky in-page nav (ENG-2221): a ~3500px page with no anchors was awkward for a 30-second daily glance. */
+function SectionNav() {
+  return (
+    <Box
+      component="nav"
+      aria-label="Eval v2 sections"
+      data-testid="eval-v2-section-nav"
+      sx={{
+        position: "sticky",
+        top: 0,
+        zIndex: (theme) => theme.zIndex.appBar,
+        bgcolor: "background.paper",
+        borderBottom: 1,
+        borderColor: "divider",
+        display: "flex",
+        flexWrap: "wrap",
+        gap: 2,
+        py: 1,
+      }}
+    >
+      {SECTION_NAV_ITEMS.map((item) => (
+        <Box
+          key={item.id}
+          component="a"
+          href={`#${item.id}`}
+          sx={{
+            typography: "body2",
+            color: "text.primary",
+            textDecoration: "none",
+            "&:hover": { textDecoration: "underline" },
+          }}
+        >
+          {item.label}
+        </Box>
+      ))}
+    </Box>
+  );
+}
+
+/** Lands an anchor jump below the sticky {@link SectionNav} instead of under it. */
+const sectionAnchorSx = { scrollMarginTop: 48 };
 
 /**
  * Online eval sampler results (ENG-2144): a uniform random daily sample of completed sessions,
@@ -421,6 +552,7 @@ export default function EvalV2Tab() {
 
       {data && !loading && (
         <>
+          <SectionNav />
           {unvalidated.length > 0 && (
             <Alert severity="warning" data-testid="eval-v2-unvalidated-banner">
               {unvalidated.length === graders.length ? "All graders are" : `${unvalidated.length} graders are`} unvalidated:
@@ -455,107 +587,111 @@ export default function EvalV2Tab() {
             <Typography color="text.secondary">No eval-v2 snapshots yet.</Typography>
           ) : (
             <>
-              <Typography variant="subtitle2">
-                {latest.windowStartDate === latest.windowEndDate
-                  ? latest.windowEndDate
-                  : `${latest.windowStartDate} – ${latest.windowEndDate}`}
-                : {latest.sessions} sampled sessions
-                {latest.coverage.length > 0 &&
-                  ` (${latest.coverage.map((c) => `${c.date}: ${c.scored} of ${c.frameSize}`).join(", ")})`}
-              </Typography>
-              {latest.spendAttribution && (
-                <Typography variant="body2" color="text.secondary" data-testid="eval-v2-spend-attribution">
-                  Spend tied to the session for {latest.spendAttribution.attributed} of {latest.spendAttribution.sessions} sampled
-                  sessions ({latest.spendAttribution.none} with no spend row carrying their id,{" "}
-                  {latest.spendAttribution.truncated + latest.spendAttribution.notRead} not read). Cost per success covers only
-                  sessions with spend.
+              <Box id="eval-v2-section-main-table" sx={sectionAnchorSx}>
+                <Typography variant="subtitle2">
+                  {latest.windowStartDate === latest.windowEndDate
+                    ? latest.windowEndDate
+                    : `${latest.windowStartDate} – ${latest.windowEndDate}`}
+                  : {latest.sessions} sampled sessions
+                  {latest.coverage.length > 0 &&
+                    ` (${latest.coverage.map((c) => `${c.date}: ${c.scored} of ${c.frameSize}`).join(", ")})`}
                 </Typography>
-              )}
+                {latest.spendAttribution && (
+                  <Typography variant="body2" color="text.secondary" data-testid="eval-v2-spend-attribution">
+                    Spend tied to the session for {latest.spendAttribution.attributed} of {latest.spendAttribution.sessions} sampled
+                    sessions ({latest.spendAttribution.none} with no spend row carrying their id,{" "}
+                    {latest.spendAttribution.truncated + latest.spendAttribution.notRead} not read). Cost per success covers only
+                    sessions with spend.
+                  </Typography>
+                )}
 
-              <TableContainer component={Paper}>
-                <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Surface</TableCell>
-                      <TableCell>Task type</TableCell>
-                      <TableCell>Model</TableCell>
-                      <TableCell align="right">Sessions</TableCell>
-                      {graders.map((g) => (
-                        <TableCell key={g.id}>
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
-                            {GRADER_LABELS[g.id] ?? g.id}
-                            <ValidationChip grader={g} />
-                          </Box>
-                        </TableCell>
-                      ))}
-                      <TableCell>Cost / success</TableCell>
-                      <TableCell>Run time / success</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {latest.groups.map((group, i) => (
-                      <TableRow key={`${group.surface}|${group.taskType}|${group.model}`} data-testid={`eval-v2-row-${i}`}>
-                        <TableCell>{group.surface}</TableCell>
-                        <TableCell>{group.taskType}</TableCell>
-                        <TableCell>{group.model}</TableCell>
-                        <TableCell align="right">{group.sessions}</TableCell>
+                <ScrollableWideTable testId="eval-v2-breakdown-table">
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell sx={stickyColumnSx}>Surface</TableCell>
+                        <TableCell>Task type</TableCell>
+                        <TableCell>Model</TableCell>
+                        <TableCell align="right">Sessions</TableCell>
                         {graders.map((g) => (
                           <TableCell key={g.id}>
-                            <MetricCell metric={metricOf(group, g.id)} />
+                            <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                              {GRADER_LABELS[g.id] ?? g.id}
+                              <ValidationChip grader={g} />
+                            </Box>
                           </TableCell>
                         ))}
-                        <TableCell>
-                          <CostCell efficiency={group.efficiency} />
-                        </TableCell>
-                        <TableCell>
-                          <LatencyCell efficiency={group.efficiency} />
-                        </TableCell>
+                        <TableCell>Cost / success</TableCell>
+                        <TableCell>Run time / success</TableCell>
                       </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </TableContainer>
-
-              <Typography variant="subtitle2">Trend (all sessions, {data.windowLabel} window)</Typography>
-              <TableContainer component={Paper}>
-                <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Date</TableCell>
-                      <TableCell align="right">Sessions</TableCell>
-                      {graders.map((g) => (
-                        <TableCell key={g.id}>{GRADER_LABELS[g.id] ?? g.id}</TableCell>
-                      ))}
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {[...data.snapshots].reverse().map((snap) => {
-                      const all = snap.groups[0];
-                      return (
-                        <TableRow key={snap.date} data-testid={`eval-v2-trend-${snap.date}`}>
-                          <TableCell>{snap.date}</TableCell>
-                          <TableCell align="right">{snap.sessions}</TableCell>
+                    </TableHead>
+                    <TableBody>
+                      {latest.groups.map((group, i) => (
+                        <TableRow key={`${group.surface}|${group.taskType}|${group.model}`} data-testid={`eval-v2-row-${i}`}>
+                          <TableCell sx={stickyColumnSx}>{group.surface}</TableCell>
+                          <TableCell>{group.taskType}</TableCell>
+                          <TableCell>{group.model}</TableCell>
+                          <TableCell align="right">{group.sessions}</TableCell>
                           {graders.map((g) => (
                             <TableCell key={g.id}>
-                              <MetricCell metric={all ? metricOf(all, g.id) : undefined} />
+                              <MetricCell metric={metricOf(group, g.id)} />
                             </TableCell>
                           ))}
+                          <TableCell>
+                            <CostCell efficiency={group.efficiency} />
+                          </TableCell>
+                          <TableCell>
+                            <LatencyCell efficiency={group.efficiency} />
+                          </TableCell>
                         </TableRow>
-                      );
-                    })}
-                  </TableBody>
-                </Table>
-              </TableContainer>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </ScrollableWideTable>
+              </Box>
+
+              <Box id="eval-v2-section-trend" sx={sectionAnchorSx}>
+                <Typography variant="subtitle2">Trend (all sessions, {data.windowLabel} window)</Typography>
+                <TableContainer component={Paper}>
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Date</TableCell>
+                        <TableCell align="right">Sessions</TableCell>
+                        {graders.map((g) => (
+                          <TableCell key={g.id}>{GRADER_LABELS[g.id] ?? g.id}</TableCell>
+                        ))}
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {[...data.snapshots].reverse().map((snap) => {
+                        const all = snap.groups[0];
+                        return (
+                          <TableRow key={snap.date} data-testid={`eval-v2-trend-${snap.date}`}>
+                            <TableCell>{snap.date}</TableCell>
+                            <TableCell align="right">{snap.sessions}</TableCell>
+                            {graders.map((g) => (
+                              <TableCell key={g.id}>
+                                <MetricCell metric={all ? metricOf(all, g.id) : undefined} />
+                              </TableCell>
+                            ))}
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              </Box>
             </>
           )}
 
           <CreativeSection snapshots={data.creative ?? []} />
           <AccountHealthSection snapshots={data.accountHealth ?? []} />
           {data.registry && data.registry.length > 0 && (
-            <>
+            <Box id="eval-v2-section-registry" sx={sectionAnchorSx}>
               <Typography variant="subtitle1">Grader registry</Typography>
               <RegistryTable registry={data.registry} />
-            </>
+            </Box>
           )}
         </>
       )}
