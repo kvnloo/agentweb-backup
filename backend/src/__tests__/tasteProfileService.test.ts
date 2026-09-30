@@ -190,6 +190,65 @@ describe('TasteProfileService', () => {
 
 
 
+
+  it('persists per-surface defaults separately from imported profile sources', async () => {
+    const { store, rows } = memoryHarness();
+    const service = new TasteProfileService({ getBookmarks: jest.fn() }, store);
+
+    const initial = await service.getSettings('user-a');
+    expect(initial.surfaces.landing_page).toBe('strong');
+    expect(initial.surfaces.social).toBe('subtle');
+    expect(initial.surfaces.crm).toBe('off');
+
+    const updated = await service.updateSettings('user-a', {
+      social: 'strong',
+      image: 'off',
+    });
+    expect(updated.surfaces.social).toBe('strong');
+    expect(updated.surfaces.image).toBe('off');
+
+    const settingsRow = rows.find((row) => row.sourceSessionId === 'taste-settings:v1');
+    expect(settingsRow).toBeDefined();
+    expect(rows.filter((row) => String(row.sourceSessionId || '').startsWith(TASTE_MEMORY_PREFIX)))
+      .toHaveLength(0);
+  });
+
+  it('uses persisted surface defaults unless the current task explicitly overrides them', async () => {
+    const { store } = memoryHarness();
+    const service = new TasteProfileService({ getBookmarks: jest.fn() }, store);
+
+    await service.importCollection(
+      'user-a',
+      [
+        { title: 'minimal minimal motion motion' },
+        { title: 'minimal motion' },
+      ],
+      'refs'
+    );
+    await service.updateSettings('user-a', { social: 'strong' });
+
+    const persisted = await service.getApplication('user-a', 'social');
+    expect(persisted.intensity).toBe('strong');
+    expect(persisted.active).toBe(true);
+
+    const localOverride = await service.getApplication('user-a', 'social', 'off');
+    expect(localOverride.intensity).toBe('off');
+    expect(localOverride.active).toBe(false);
+
+    const after = await service.getSettings('user-a');
+    expect(after.surfaces.social).toBe('strong');
+  });
+
+  it('rejects unknown surfaces and invalid persistent intensities', async () => {
+    const { store } = memoryHarness();
+    const service = new TasteProfileService({ getBookmarks: jest.fn() }, store);
+
+    await expect(service.updateSettings('user-a', { imaginary_surface: 'strong' } as any))
+      .rejects.toBeInstanceOf(TasteValidationError);
+    await expect(service.updateSettings('user-a', { social: 'maximum' } as any))
+      .rejects.toBeInstanceOf(TasteValidationError);
+  });
+
   it('projects one profile through surface-specific Taste Skill rules', async () => {
     const { store } = memoryHarness();
     const service = new TasteProfileService({ getBookmarks: jest.fn() }, store);
