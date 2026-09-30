@@ -1515,8 +1515,9 @@ export default function AdminDashboard() {
           );
           const { scores, failed = [] } = response.data as {
             scores: Record<string, AdminChatSession["satisfactionScore"] | null>;
-            failed?: string[];
+            failed?: Array<{ sessionId: string; reason: string }>;
           };
+          const failedIds = failed.map((f) => f.sessionId);
           setChatSessions((prev) =>
             prev.map((s) => {
               const newScore = scores[s.sessionId];
@@ -1531,8 +1532,8 @@ export default function AdminDashboard() {
             return next;
           });
           // Mark sessions that didn't get a score as failed (retryable)
-          const noResult = batch.filter((id) => !scores[id] && !failed.includes(id));
-          const allFailed = [...failed, ...noResult];
+          const noResult = batch.filter((id) => !scores[id] && !failedIds.includes(id));
+          const allFailed = [...failedIds, ...noResult];
           if (allFailed.length > 0) {
             setFailedScoringIds((prev) => {
               const next = new Set(prev);
@@ -6387,7 +6388,10 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                             { sessionIds: [session.sessionId] },
                                             { headers: { Authorization: `Bearer ${token}` }, timeout: 30000 }
                                           );
-                                          const { scores, failed = [] } = response.data;
+                                          const { scores, failed = [] } = response.data as {
+                                            scores: Record<string, AdminChatSession["satisfactionScore"] | null>;
+                                            failed?: Array<{ sessionId: string; reason: string }>;
+                                          };
                                           const newScore = scores[session.sessionId];
                                           if (newScore) {
                                             setChatSessions((prev) =>
@@ -6396,7 +6400,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                               )
                                             );
                                           }
-                                          if (failed.includes(session.sessionId)) {
+                                          if (failed.some((f) => f.sessionId === session.sessionId)) {
                                             setFailedScoringIds((prev) => new Set(prev).add(session.sessionId));
                                           }
                                         } catch {
