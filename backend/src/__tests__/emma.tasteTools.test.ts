@@ -5,6 +5,8 @@ jest.mock('../services/tasteProfileService', () => {
     tasteProfileService: {
       getProfile: jest.fn(),
       getApplication: jest.fn(),
+      getSettings: jest.fn(),
+      updateSettings: jest.fn(),
       importXBookmarks: jest.fn(),
     },
   };
@@ -22,6 +24,8 @@ describe('Emma Taste tools', () => {
   it('registers read, preview, and explicit refresh tools with the right capability flags', () => {
     const profile = emmaToolRegistry.getTool('get_taste_profile');
     const preview = emmaToolRegistry.getTool('preview_taste_application');
+    const settings = emmaToolRegistry.getTool('get_taste_settings');
+    const updateSettings = emmaToolRegistry.getTool('update_taste_settings');
     const refresh = emmaToolRegistry.getTool('refresh_taste_from_x');
 
     expect(profile).toBeDefined();
@@ -31,6 +35,11 @@ describe('Emma Taste tools', () => {
     expect(preview).toBeDefined();
     expect(preview?.readOnly).toBe(true);
     expect(preview?.requiresUserAccount).toBe(true);
+
+    expect(settings?.readOnly).toBe(true);
+    expect(settings?.requiresUserAccount).toBe(true);
+    expect(updateSettings?.readOnly).not.toBe(true);
+    expect(updateSettings?.requiresUserAccount).toBe(true);
 
     expect(refresh).toBeDefined();
     expect(refresh?.readOnly).not.toBe(true);
@@ -67,6 +76,29 @@ describe('Emma Taste tools', () => {
 
     expect(tasteProfileService.getApplication)
       .toHaveBeenCalledWith('user-123', 'landing_page', 'strong');
+  });
+
+
+  it('separates durable defaults from task-local preview overrides', async () => {
+    (tasteProfileService.getSettings as jest.Mock).mockResolvedValue({
+      schema: 'taste.settings.v1',
+      surfaces: { social: 'subtle' },
+    });
+    (tasteProfileService.updateSettings as jest.Mock).mockResolvedValue({
+      schema: 'taste.settings.v1',
+      surfaces: { social: 'strong' },
+    });
+
+    const readTool = emmaToolRegistry.getTool('get_taste_settings');
+    const updateTool = emmaToolRegistry.getTool('update_taste_settings');
+    if (!readTool || !updateTool) throw new Error('Taste settings tools not registered');
+
+    await readTool.execute({}, { userId: 'user-123' });
+    await updateTool.execute({ surfaces: { social: 'strong' } }, { userId: 'user-123' });
+
+    expect(tasteProfileService.getSettings).toHaveBeenCalledWith('user-123');
+    expect(tasteProfileService.updateSettings)
+      .toHaveBeenCalledWith('user-123', { social: 'strong' });
   });
 
   it('refreshes X Taste only through an existing connected-account id', async () => {
