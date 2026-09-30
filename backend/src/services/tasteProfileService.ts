@@ -4,6 +4,8 @@ import { twitterService } from './twitterService';
 
 export const TASTE_MEMORY_PREFIX = 'taste-profile:v1:';
 export const TASTE_PROFILE_SCHEMA = 'taste.profile.v1';
+export const TASTE_SETTINGS_SOURCE = 'taste-settings:v1';
+export const TASTE_SETTINGS_SCHEMA = 'taste.settings.v1';
 export const MAX_TASTE_ITEMS = 250;
 export const MAX_TASTE_TEXT_CHARS = 2000;
 export const MAX_TASTE_TITLE_CHARS = 300;
@@ -88,6 +90,12 @@ export type TasteSurface =
   | 'analytics';
 
 export type TasteIntensity = 'off' | 'subtle' | 'strong';
+
+export type TasteSettings = {
+  schema: typeof TASTE_SETTINGS_SCHEMA;
+  surfaces: Record<TasteSurface, TasteIntensity>;
+  updatedAt: string | null;
+};
 
 export type TasteDials = {
   designVariance: number;
@@ -677,6 +685,59 @@ function buildTasteApplication(
   };
 }
 
+
+function defaultTasteSettings(): TasteSettings {
+  return {
+    schema: TASTE_SETTINGS_SCHEMA,
+    surfaces: { ...DEFAULT_SURFACE_INTENSITY },
+    updatedAt: null,
+  };
+}
+
+function decodeTasteSettings(memory: MemoryRecord | undefined): TasteSettings | null {
+  if (!memory || memory.sourceSessionId !== TASTE_SETTINGS_SOURCE || typeof memory.content !== 'string') {
+    return null;
+  }
+  const marker = memory.content.indexOf('{');
+  if (marker < 0) return null;
+  try {
+    const parsed = JSON.parse(memory.content.slice(marker));
+    if (parsed?.schema !== TASTE_SETTINGS_SCHEMA || !parsed?.surfaces || typeof parsed.surfaces !== 'object') {
+      return null;
+    }
+    const surfaces = { ...DEFAULT_SURFACE_INTENSITY };
+    for (const surface of TASTE_SURFACES) {
+      const value = parsed.surfaces[surface];
+      if (value === 'off' || value === 'subtle' || value === 'strong') surfaces[surface] = value;
+    }
+    return {
+      schema: TASTE_SETTINGS_SCHEMA,
+      surfaces,
+      updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : (memory.updatedAt || null),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeTasteSettingsPatch(raw: unknown): Partial<Record<TasteSurface, TasteIntensity>> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new TasteValidationError('surfaces must be an object');
+  }
+  const patch: Partial<Record<TasteSurface, TasteIntensity>> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    const surface = validateTasteSurface(key);
+    const intensity = validateTasteIntensity(value);
+    if (!intensity) throw new TasteValidationError(`intensity is required for ${surface}`);
+    patch[surface] = intensity;
+  }
+  return patch;
+}
+
+function encodeTasteSettings(settings: TasteSettings): string {
+  return `Taste Settings: ${JSON.stringify(settings)}`;
+}
+
 function sourceMemoryId(sourceKey: string): string {
   return `${TASTE_MEMORY_PREFIX}${sourceKey}`;
 }
@@ -736,13 +797,60 @@ export class TasteProfileService {
     return aggregateSnapshots(snapshots);
   }
 
+  async getSettings(userId: string): Promise<TasteSettings> {
+    const memories = await this.memoryStore.getUserMemories(userId, 'preference');
+    const stored = decodeTasteSettings(
+      memories.find((memory) => memory.sourceSessionId === TASTE_SETTINGS_SOURCE)
+    );
+    return stored || defaultTasteSettings();
+  }
+
+  async updateSettings(
+    userId: string,
+    rawSurfaces: unknown
+  ): Promise<TasteSettings> {
+    const patch = normalizeTasteSettingsPatch(rawSurfaces);
+    const memories = await this.memoryStore.getUserMemories(userId, 'preference');
+    const existing = memories.find((memory) => memory.sourceSessionId === TASTE_SETTINGS_SOURCE);
+    const current = decodeTasteSettings(existing) || defaultTasteSettings();
+    const settings: TasteSettings = {
+      schema: TASTE_SETTINGS_SCHEMA,
+      surfaces: { ...current.surfaces, ...patch },
+      updatedAt: new Date().toISOString(),
+    };
+    const content = encodeTasteSettings(settings);
+    if (charLength(content) > 2000) {
+      throw new TasteValidationError('Taste settings exceeded the durable memory size limit');
+    }
+    if (existing) {
+      await this.memoryStore.updateMemory(userId, existing.memoryId, {
+        category: 'preference',
+        content,
+      });
+    } else {
+      await this.memoryStore.addMemory(
+        userId,
+        'preference',
+        content,
+        TASTE_SETTINGS_SOURCE
+      );
+    }
+    return settings;
+  }
+
   async getApplication(
     userId: string,
     surface: unknown,
     intensity?: unknown
   ): Promise<TasteApplication> {
-    const profile = await this.getProfile(userId);
-    return buildTasteApplication(profile, surface, intensity);
+    const validatedSurface = validateTasteSurface(surface);
+    const explicitIntensity = validateTasteIntensity(intensity);
+    const [profile, settings] = await Promise.all([
+      this.getProfile(userId),
+      explicitIntensity ? Promise.resolve(defaultTasteSettings()) : this.getSettings(userId),
+    ]);
+    const resolvedIntensity = explicitIntensity || settings.surfaces[validatedSurface];
+    return buildTasteApplication(profile, validatedSurface, resolvedIntensity);
   }
 
   async applyToPrompt(
@@ -813,4 +921,7 @@ export const _tasteInternalsForTests = {
   assertNoSensitiveKeys,
   deriveTasteDials,
   buildTasteApplication,
+  defaultTasteSettings,
+  decodeTasteSettings,
+  normalizeTasteSettingsPatch,
 };
