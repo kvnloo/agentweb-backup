@@ -76,7 +76,8 @@ Future adapters can cover LinkedIn saved items, uploaded archives, Figma boards,
 7. No source adapter performs a social write.
 8. Re-importing the same source replaces its aggregate snapshot instead of multiplying durable memories.
 9. Delete removes only Taste-prefixed memories.
-10. Imports are rate-limited.
+10. Imports are rate-limited per authenticated user.
+11. Durable Taste sources are capped at 16 per user; re-importing the same source replaces it.
 
 ## Acceptance tests
 
