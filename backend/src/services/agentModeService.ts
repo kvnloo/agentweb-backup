@@ -6221,9 +6221,12 @@ export class AgentModeService {
     // Taste read/preview must survive a stale prod foundation_tools override.
     'get_taste_profile',
     'preview_taste_application',
+    'get_taste_settings',
+    'update_taste_settings',
     // Explicit refresh is also force-merged so "learn from my X bookmarks" works
     // without asking the user to install an unrelated catch-all skill.
-    'refresh_taste_from_x',       // Self account status (plan, usage, api-key count) — wraps /api/auth/me, no args
+    'refresh_taste_from_x',
+    // Self account status (plan, usage, api-key count) — wraps /api/auth/me, no args
 
     // Account Memory (cross-session knowledge)
     'save_memory',
