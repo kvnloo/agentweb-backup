@@ -1,0 +1,36 @@
+name: AgentWeb z0 Model Study Contract
+
+on:
+  pull_request:
+    branches: [lab/z0-agentweb-emma-v0]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+      - name: Typecheck model-study branch
+        working-directory: backend
+        run: npm run typecheck
+      - name: Pin OpenRouter emulation gate contract
+        working-directory: backend
+        run: |
+          node --max-old-space-size=4096 node_modules/.bin/jest             --runInBand --forceExit             src/__tests__/agentModeService.openRouterClient.test.ts
+      - name: Bind contract to exact head
+        run: test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
