@@ -27,6 +27,16 @@ architecture:
       paths:
         - backend/src/services/z0ReliabilityProjection.ts
         - backend/src/services/reliabilityEvent.ts
+    - id: z0-reliability-exporter
+      name: Bounded z0 reliability exporter
+      kind: evidence-transport
+      paths:
+        - backend/src/services/z0ReliabilityExporter.ts
+        - backend/src/services/reliabilityEventSink.ts
+        - backend/src/mcp/client/toolRegistry.ts
+        - backend/src/mcp/server/registry.ts
+      depends_on:
+        - z0-reliability-projection
   boundaries:
     owns:
       - AgentWeb user/session boundary and confirmation policy.
