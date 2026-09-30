@@ -23,6 +23,7 @@ import {
   Grid,
   LinearProgress,
   Link,
+  Skeleton,
   Stack,
   Tab,
   Table,
@@ -493,7 +494,7 @@ export default function EvalLabelling() {
             <Card variant="outlined">
               <CardContent>
                 <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                  {cases.length} cases · {fullyLabelled} fully labelled
+                  {loading ? 'Loading cases…' : `${cases.length} cases · ${fullyLabelled} fully labelled`}
                 </Typography>
                 <Table size="small">
                   <TableHead>
@@ -504,30 +505,41 @@ export default function EvalLabelling() {
                     </TableRow>
                   </TableHead>
                   <TableBody>
-                    {cases.map((c) => (
-                      <TableRow
-                        key={c.caseId}
-                        hover
-                        selected={c.caseId === selectedId}
-                        aria-selected={c.caseId === selectedId}
-                        tabIndex={0}
-                        onClick={() => setSelectedId(c.caseId)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter' || e.key === ' ') {
-                            e.preventDefault();
-                            setSelectedId(c.caseId);
-                          }
-                        }}
-                        sx={{ cursor: 'pointer' }}
-                      >
-                        <TableCell>
-                          <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>{c.sourceRef.id.slice(0, 12)}</Typography>
-                          <Typography variant="caption" color="text.secondary">{c.taskType}</Typography>
-                        </TableCell>
-                        <TableCell>{c.split}</TableCell>
-                        <TableCell align="right">{labelledCount(c)}/{c.criteria.length}</TableCell>
-                      </TableRow>
-                    ))}
+                    {loading
+                      ? Array.from({ length: 6 }).map((_, i) => (
+                          <TableRow key={`skeleton-${i}`}>
+                            <TableCell>
+                              <Skeleton variant="text" width="70%" />
+                              <Skeleton variant="text" width="40%" />
+                            </TableCell>
+                            <TableCell><Skeleton variant="text" width={40} /></TableCell>
+                            <TableCell align="right"><Skeleton variant="text" width={30} sx={{ ml: 'auto' }} /></TableCell>
+                          </TableRow>
+                        ))
+                      : cases.map((c) => (
+                          <TableRow
+                            key={c.caseId}
+                            hover
+                            selected={c.caseId === selectedId}
+                            aria-selected={c.caseId === selectedId}
+                            tabIndex={0}
+                            onClick={() => setSelectedId(c.caseId)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' || e.key === ' ') {
+                                e.preventDefault();
+                                setSelectedId(c.caseId);
+                              }
+                            }}
+                            sx={{ cursor: 'pointer' }}
+                          >
+                            <TableCell>
+                              <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>{c.sourceRef.id.slice(0, 12)}</Typography>
+                              <Typography variant="caption" color="text.secondary">{c.taskType}</Typography>
+                            </TableCell>
+                            <TableCell>{c.split}</TableCell>
+                            <TableCell align="right">{labelledCount(c)}/{c.criteria.length}</TableCell>
+                          </TableRow>
+                        ))}
                   </TableBody>
                 </Table>
               </CardContent>
@@ -536,6 +548,13 @@ export default function EvalLabelling() {
           <Grid item xs={12} md={8}>
             {selected ? (
               <Stack spacing={2}>
+                {/* Source renders first: a reviewer must read it before judging the criteria below. */}
+                <Card variant="outlined">
+                  <CardContent>
+                    <Typography variant="subtitle2" sx={{ mb: 1 }}>Source</Typography>
+                    <SourceContext goldenCase={selected} token={token} />
+                  </CardContent>
+                </Card>
                 <Card variant="outlined">
                   <CardContent>
                     <Typography variant="subtitle2" sx={{ mb: 1 }}>Labels</Typography>
@@ -546,12 +565,6 @@ export default function EvalLabelling() {
                       token={token}
                       onSaved={(saved) => setCases((prev) => prev.map((c) => (c.caseId === saved.caseId ? saved : c)).sort(byLeastLabelled))}
                     />
-                  </CardContent>
-                </Card>
-                <Card variant="outlined">
-                  <CardContent>
-                    <Typography variant="subtitle2" sx={{ mb: 1 }}>Source</Typography>
-                    <SourceContext goldenCase={selected} token={token} />
                   </CardContent>
                 </Card>
               </Stack>
