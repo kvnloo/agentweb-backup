@@ -3585,7 +3585,17 @@ export class AgentModeService {
 
         if (memoryUser?.memoryEnabled !== false) {
           const allMemories = await accountMemoryDb.getUserMemories(userId);
-          const relevantMemories = await selectRelevantMemories(allMemories, (memoryId, emb) => {
+          // Taste is surface-scoped creative context, not generic account memory.
+          // Excluding it here prevents a CRM/analytics/research-truth turn from
+          // receiving aesthetic preferences simply because they exist. Creative
+          // surfaces resolve Taste explicitly through preview_taste_application
+          // or the service-boundary integrations (landing/image/video).
+          const nonTasteMemories = allMemories.filter((memory: any) => {
+            const source = String(memory?.sourceSessionId || '');
+            return !source.startsWith('taste-profile:v1:')
+              && source !== 'taste-settings:v1';
+          });
+          const relevantMemories = await selectRelevantMemories(nonTasteMemories, (memoryId, emb) => {
             accountMemoryDb.setMemoryEmbedding(userId, memoryId, emb).catch((e) =>
               console.error('Failed to backfill account memory embedding:', e)
             );
