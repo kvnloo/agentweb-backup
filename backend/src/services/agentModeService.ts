@@ -29551,7 +29551,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     durationSeconds?: number,
     useKeyframes?: boolean,
     aspectRatio?: string,
-    resolution?: string
+    resolution?: string,
+    tasteIntensity?: 'off' | 'subtle' | 'strong'
   ): Promise<any> {
     try {
       console.log('AgentMode: Generating video with prompt:', prompt, 'filename:', filename, 'videoModel:', videoModel, 'startFrame:', startFrame ? 'provided' : 'none', 'endFrame:', endFrame ? 'provided' : 'none', 'compose:', compose ?? false, 'durationSeconds:', durationSeconds, 'useKeyframes:', useKeyframes ?? false, 'aspectRatio:', aspectRatio, 'resolution:', resolution, 'userId:', userId, 'sessionId:', sessionId);
@@ -29569,9 +29570,28 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         };
       }
 
+      let effectivePrompt = prompt;
+      let tasteApplication: any = null;
+      try {
+        const { tasteProfileService } = await import('./tasteProfileService');
+        const applied = await tasteProfileService.applyToPrompt(
+          userId,
+          'video',
+          prompt,
+          tasteIntensity
+        );
+        effectivePrompt = applied.prompt;
+        tasteApplication = applied.application;
+      } catch (tasteError) {
+        console.warn(
+          'AgentMode: Taste video context unavailable; continuing without it:',
+          tasteError instanceof Error ? tasteError.message : tasteError
+        );
+      }
+
       // Generate the video
       const result = await videoService.generateVideo({
-        prompt,
+        prompt: effectivePrompt,
         filename,
         userId,
         videoModel,
@@ -29628,6 +29648,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           prompt: prompt,
           model: videoModel || 'veo-3.1-generate-preview',
           composed: isComposed,
+          ...(tasteApplication ? {
+            taste: {
+              active: tasteApplication.active,
+              intensity: tasteApplication.intensity,
+              confidence: tasteApplication.confidence,
+              dials: tasteApplication.dials,
+              signals: tasteApplication.signals,
+            }
+          } : {}),
         };
       } else {
         return {
