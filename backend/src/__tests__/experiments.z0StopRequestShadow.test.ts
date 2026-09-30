@@ -7,6 +7,7 @@ import {
   buildStopRequestZ0Experiment,
   readStopRequestZ0ShadowMode,
   runStopRequestZ0Shadow,
+  runStopRequestStudyCase,
   stopRequestZ0Band,
 } from '../services/z0StopRequestShadow';
 
@@ -72,6 +73,54 @@ describe('z0 stop-request shadow', () => {
       decision_id: 'stop_request_v1',
       allow_remote: true,
     });
+  });
+
+  it('returns one paired study row with incumbent and z0 receipt evidence', async () => {
+    const { runStopRequestIncumbentJudge } = require('../services/stopRequestJudgeService');
+    jest.spyOn(
+      require('../services/stopRequestJudgeService'),
+      'runStopRequestIncumbentJudge',
+    ).mockResolvedValueOnce({
+      stop: true,
+      failed: false,
+      truncated: false,
+      latency_ms: 18,
+    });
+    run.mockResolvedValueOnce({
+      ok: true,
+      executed: true,
+      applied: false,
+      replayed: false,
+      trace_id: 'trace-stop',
+      dispatch_receipt_id: 'dispatch-stop',
+      output: {
+        probability: 0.97,
+        latency_ms: 11,
+        usage: { input_tokens: 22, output_tokens: 1 },
+      },
+    });
+
+    const row = await runStopRequestStudyCase('please stop', {
+      scopeId: 'study-scope',
+      env: {
+        Z0INT_STOP_REQUEST_ALLOW_REMOTE: '1',
+      } as NodeJS.ProcessEnv,
+    });
+
+    expect(row).toMatchObject({
+      decision_id: 'stop_request_v1',
+      incumbent_stop: true,
+      incumbent_failed: false,
+      p_stop: 0.97,
+      band: 'stop',
+      applied: false,
+      replayed: false,
+      dispatch_receipt_id: 'dispatch-stop',
+      z0_trace_id: 'trace-stop',
+      z0_input_tokens: 22,
+      z0_output_tokens: 1,
+    });
+    expect(row.operation_id).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it('does not authorize remote message content from the shadow flag alone', async () => {
