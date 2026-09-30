@@ -25,9 +25,9 @@ jobs:
       - name: Install dependencies
         working-directory: backend
         run: npm ci
-      - name: Typecheck model-study branch
+      - name: Production build
         working-directory: backend
-        run: npm run typecheck
+        run: npm run build
       - name: Pin OpenRouter emulation gate contract
         working-directory: backend
         run: |
