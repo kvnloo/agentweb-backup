@@ -29180,7 +29180,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     logoImage?: string,
     confirm?: boolean,
     category?: string,
-    metricsVerified?: boolean
+    metricsVerified?: boolean,
+    tasteIntensity?: 'off' | 'subtle' | 'strong'
   ): Promise<any> {
     // ENG-343: the producing flow must self-declare the eval use case — Matt's
     // review feedback differs entirely between ads and organic posts, and a
@@ -29285,8 +29286,32 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         : await this.getImageApiDefaultModel();
 
       const inputImagesForRequest = inputImages || [];
+
+      // Taste is an aggregate creative prior, never a replacement for the explicit
+      // prompt, source images, brand assets, accessibility, or factual constraints.
+      // Applying it here gives every image path (chat, REST, MCP, work plans) the
+      // same behavior instead of relying on the model to remember to restate Taste.
+      let effectivePrompt = prompt;
+      let tasteApplication: any = null;
+      try {
+        const { tasteProfileService } = await import('./tasteProfileService');
+        const applied = await tasteProfileService.applyToPrompt(
+          userId,
+          category === 'ad' ? 'ad_creative' : 'image',
+          prompt,
+          tasteIntensity
+        );
+        effectivePrompt = applied.prompt;
+        tasteApplication = applied.application;
+      } catch (tasteError) {
+        console.warn(
+          'AgentMode: Taste image context unavailable; continuing without it:',
+          tasteError instanceof Error ? tasteError.message : tasteError
+        );
+      }
+
       const primaryRequest = {
-        prompt,
+        prompt: effectivePrompt,
         filename,
         size,
         quality,
@@ -29472,6 +29497,15 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           size: size,
           quality: quality,
           imageModel: imageModelUsed,
+          ...(tasteApplication ? {
+            taste: {
+              active: tasteApplication.active,
+              intensity: tasteApplication.intensity,
+              confidence: tasteApplication.confidence,
+              dials: tasteApplication.dials,
+              signals: tasteApplication.signals,
+            }
+          } : {}),
           ...(dataReliabilityWarning ? { dataReliabilityWarning } : {}),
           ...(fallbackUsed ? { fallbackUsed: true, primaryError } : {})
         };
