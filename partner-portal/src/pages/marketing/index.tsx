@@ -8,6 +8,7 @@ import Home from './Home';
 import NotFound from './NotFound';
 import MarketResearch from './MarketResearch';
 import MarketResearchDetail from './MarketResearchDetail';
+import TasteCenter from './TasteCenter';
 
 // Placeholders for components we haven't implemented yet
 const ReportDetail = () => <div>Report Detail</div>;
@@ -28,6 +29,7 @@ const Marketing: React.FC = () => {
         <Route path="/social-listening" element={<NotFound />} />
         <Route path="/creative-generation" element={<NotFound />} />
         <Route path="/research" element={<MarketResearch />} />
+        <Route path="/taste" element={<TasteCenter />} />
         <Route path="/research/:taskId" element={<MarketResearchDetail />} />
         <Route path="/market-research" element={<Navigate to="/marketing/research" replace />} />
         <Route path="/report/:id" element={<ReportDetail />} />
