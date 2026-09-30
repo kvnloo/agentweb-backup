@@ -5650,6 +5650,10 @@ router.put("/chat-sessions/:sessionId/score", async (req, res) => {
   }
 });
 
+// ENG-2216: caps how much of a per-session judge-score failure reason reaches
+// logs/the API response — see the truncation comment at its one call site below.
+const MAX_JUDGE_SCORE_FAILURE_REASON_LENGTH = 300;
+
 // Score sessions with a custom judge
 router.post("/chat-sessions/judge-score", async (req, res) => {
   try {
@@ -5695,12 +5699,25 @@ router.post("/chat-sessions/judge-score", async (req, res) => {
     );
 
     const scores: Record<string, any> = {};
-    const failed: string[] = [];
+    const failed: Array<{ sessionId: string; reason: string }> = [];
     results.forEach((result, i) => {
       if (result.status === "fulfilled") {
         scores[result.value.sessionId] = result.value.score;
       } else {
-        failed.push(sessionIds[i]);
+        const sessionId = sessionIds[i];
+        // Bounded, not the raw reason verbatim: a judge-score failure message can
+        // echo back judge/provider response content (e.g. the "missing score"
+        // guard's JSON.stringify(parsed.score)), which may itself derive from a
+        // real session transcript. Capping what reaches logs and the API
+        // response keeps this diagnostic without risking an unbounded dump of
+        // that content (CWE-532).
+        const rawReason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        const reason =
+          rawReason.length > MAX_JUDGE_SCORE_FAILURE_REASON_LENGTH
+            ? rawReason.slice(0, MAX_JUDGE_SCORE_FAILURE_REASON_LENGTH) + "…"
+            : rawReason;
+        console.error(`Judge-score failed for session ${sessionId} (judge ${judgeId}): ${reason}`);
+        failed.push({ sessionId, reason });
       }
     });
 
