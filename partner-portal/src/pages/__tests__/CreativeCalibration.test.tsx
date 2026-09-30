@@ -149,8 +149,11 @@ describe("CreativeCalibration (ENG-2142)", () => {
     expect(Array.from(frames).map((f) => f.getAttribute("src")).sort()).toEqual(["https://lp.test/new-1", "https://lp.test/old-1"]);
     frames.forEach((frame) => {
       // No allow-forms/allow-popups/allow-top-navigation: a reviewer must not be able to
-      // submit the page's real lead form or navigate away from inside the preview.
-      expect(frame.getAttribute("sandbox")).toBe("allow-scripts allow-same-origin");
+      // submit the page's real lead form or navigate away from inside the preview. No
+      // allow-same-origin either: these are uncurated AI-generated pages inside an
+      // authenticated admin surface, and allow-scripts + allow-same-origin together would
+      // let the framed page act with its own origin's full cookie/storage/XHR access.
+      expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
       expect(frame).toHaveStyle({ opacity: 0 });
     });
 

@@ -125,13 +125,17 @@ function CreativePanel({ candidateId, side, token }: { candidateId: string; side
               // frame-ancestors CSP, so framing them directly is not blocked. No allow-forms /
               // allow-top-navigation / allow-popups: a reviewer scrolling the preview must not
               // be able to submit the page's real lead-capture form or navigate away.
+              // No allow-same-origin: these are uncurated AI-generated pages loaded inside an
+              // authenticated admin surface — allow-scripts alone still renders and runs
+              // client-side JS for the preview, it just can't use its own origin's cookies,
+              // storage or same-origin XHR, which a visual preview never needs.
               <Box sx={{ position: 'relative', width: '100%', height: PREVIEW_HEIGHT, bgcolor: 'action.hover', borderRadius: 1 }}>
                 {!assetLoaded && <Skeleton variant="rectangular" width="100%" height={PREVIEW_HEIGHT} sx={{ position: 'absolute', inset: 0, borderRadius: 1 }} />}
                 <Box
                   component="iframe"
                   src={candidate.artifactUrl}
                   title={`${side} landing page preview`}
-                  sandbox="allow-scripts allow-same-origin"
+                  sandbox="allow-scripts"
                   onLoad={() => setAssetLoaded(true)}
                   onError={() => setAssetLoaded(true)}
                   sx={{ width: '100%', height: '100%', border: 0, borderRadius: 1, opacity: assetLoaded ? 1 : 0, transition: 'opacity 0.15s' }}
