@@ -28,6 +28,20 @@ export interface TasteProfile {
   updatedAt: string | null;
 }
 
+export interface TasteApplication {
+  schema: 'taste.application.v1';
+  surface: TasteSurface;
+  active: boolean;
+  intensity: TasteIntensity;
+  confidence: number;
+  dials: {
+    designVariance: number;
+    motionIntensity: number;
+    visualDensity: number;
+  };
+  signals: string[];
+}
+
 export interface TasteSettings {
   schema: 'taste.settings.v1';
   surfaces: Record<TasteSurface, TasteIntensity>;
@@ -50,6 +64,21 @@ function auth(token: string) {
 export async function getTasteProfile(token: string): Promise<TasteProfile> {
   const response = await axios.get(buildApiUrl('/api/taste/profile'), auth(token));
   return response.data.profile;
+}
+
+
+export async function getTasteApplication(
+  token: string,
+  surface: TasteSurface,
+  intensity?: TasteIntensity,
+): Promise<TasteApplication> {
+  const params = new URLSearchParams({ surface });
+  if (intensity) params.set('intensity', intensity);
+  const response = await axios.get(
+    buildApiUrl(`/api/taste/application?${params.toString()}`),
+    auth(token),
+  );
+  return response.data.application;
 }
 
 export async function getTasteSettings(token: string): Promise<TasteSettings> {
