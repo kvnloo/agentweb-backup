@@ -2459,7 +2459,11 @@ export class AgentModeService {
 
         this.openrouter_client = new OpenAI({
           apiKey: openRouterApiKey.trim(),
-          baseURL: 'https://openrouter.ai/api/v1',
+          baseURL:
+            process.env.Z0_MODEL_STUDY_PROVIDER_EMULATION === '1'
+            && process.env.Z0_MODEL_STUDY_OPENROUTER_BASE_URL?.trim()
+              ? process.env.Z0_MODEL_STUDY_OPENROUTER_BASE_URL.trim().replace(/\\/+$/, '')
+              : 'https://openrouter.ai/api/v1',
           // OpenRouter owns provider retry/fallback. SDK retries here would
           // multiply with the gateway's own routing attempts.
           maxRetries: 0,
