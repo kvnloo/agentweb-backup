@@ -104,6 +104,22 @@ function lifecycleForLead(lead: any): LifecycleStage {
     : currentLifecycle;
 }
 
+async function getAllLeadsByStatus(
+  listId: string,
+  status: string,
+  pageSize = 200,
+): Promise<any[]> {
+  const items: any[] = [];
+  let lastKey: any = undefined;
+  do {
+    const page = await crmDb.getLeadsByStatus(listId, status, pageSize, lastKey);
+    if (Array.isArray(page)) return page;
+    items.push(...((page as any).items ?? (page as any).leads ?? []));
+    lastKey = (page as any).lastEvaluatedKey;
+  } while (lastKey);
+  return items;
+}
+
 const router = express.Router();
 
 // ─── Sequences CRUD ───────────────────────────────────────────────────────────
@@ -405,10 +421,7 @@ router.post(
         !legacyIsLifecycle &&
         !listStatuses.has(legacyValue)
       ) {
-        const legacyProbe = await crmDb.getLeadsByStatus(listId, legacyValue);
-        legacyStatusProbeLeads = Array.isArray(legacyProbe)
-          ? legacyProbe
-          : ((legacyProbe as any).items ?? (legacyProbe as any).leads ?? []);
+        legacyStatusProbeLeads = await getAllLeadsByStatus(listId, legacyValue);
         if (legacyStatusProbeLeads.length === 0) {
           return res.status(400).json({
             error: 'invalid_lifecycle',
@@ -427,10 +440,7 @@ router.post(
         if (legacyStatusProbeLeads !== undefined) {
           leads = legacyStatusProbeLeads;
         } else {
-          const result = await crmDb.getLeadsByStatus(listId, requestedStatus);
-          leads = Array.isArray(result)
-            ? result
-            : ((result as any).items ?? (result as any).leads ?? []);
+          leads = await getAllLeadsByStatus(listId, requestedStatus);
         }
       } else if (requestedLifecycle) {
         const allLeads = await crmDb.getAllLeadsByListId(listId);
