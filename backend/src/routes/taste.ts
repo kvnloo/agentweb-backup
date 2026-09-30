@@ -97,6 +97,26 @@ router.post('/import/collection', importLimiter, async (req, res) => {
 });
 
 
+
+router.get('/settings', async (req, res) => {
+  try {
+    const settings = await tasteProfileService.getSettings(userId(req));
+    return res.json({ settings });
+  } catch (error) {
+    return sendTasteError(res, error);
+  }
+});
+
+router.put('/settings', async (req, res) => {
+  try {
+    assertExactKeys(req.body, ['surfaces']);
+    const settings = await tasteProfileService.updateSettings(userId(req), req.body.surfaces);
+    return res.json({ settings });
+  } catch (error) {
+    return sendTasteError(res, error);
+  }
+});
+
 router.get('/surfaces', (_req, res) => {
   return res.json({
     surfaces: TASTE_SURFACES,
