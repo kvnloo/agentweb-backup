@@ -25,9 +25,9 @@ jobs:
       - name: Install dependencies
         working-directory: backend
         run: npm ci --no-audit --no-fund
-      - name: Typecheck live hook
+      - name: Production build
         working-directory: backend
-        run: npm run typecheck
+        run: npm run build
       - name: Route-shadow contracts
         working-directory: backend
         run: |
