@@ -6153,6 +6153,8 @@ export class AgentModeService {
     // tool description and is not auto-called.
     'get_taste_profile',
     'preview_taste_application',
+    'get_taste_settings',
+    'update_taste_settings',
     'refresh_taste_from_x',
     'update_market_strategy',
     'read_market_strategy',
