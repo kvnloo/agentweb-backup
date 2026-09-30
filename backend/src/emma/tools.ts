@@ -5196,6 +5196,11 @@ emmaToolRegistry.register({
           type: 'boolean',
           description: 'Optional: When true, post-process the generated clip with Remotion to add branded overlays (brand name headline, tagline, logo, and optional CTA card). Requires composeParams. Use this when the user wants a polished, branded video rather than the raw AI-generated clip.'
         },
+        taste_intensity: {
+          type: 'string',
+          enum: ['off', 'subtle', 'strong'],
+          description: "Optional per-video Taste override. Omit to use the video default. Use 'strong' when the user explicitly wants the result to feel like their taste; use 'off' for neutral/reference-only output."
+        },
         composeParams: {
           type: 'object',
           description: 'Optional: Brand overlay configuration for Remotion post-processing. Required when compose is true.',
@@ -5263,7 +5268,8 @@ emmaToolRegistry.register({
       args.durationSeconds,
       args.useKeyframes,
       args.aspectRatio,
-      args.resolution
+      args.resolution,
+      args.taste_intensity
     );
   }
 });
