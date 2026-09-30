@@ -2,6 +2,7 @@ import { enforceEvaluationTool } from '../../services/evaluationPolicy';
 import { currentRunFunding, resolveRunFunding, withRunFunding } from '../../services/funding/runFunding';
 import { isAnonymousUserId, buildAnonymousToolRefusal } from '../anonymousToolAccess';
 import { refuseUnauthorizedScheduledPublish, attachPublishRevalidation } from '../../utils/scheduledPublishConsentGuard';
+import { recordToolReliabilitySafe } from '../../services/reliabilityEventSink';
 
 export interface McpToolHandler {
   name: string;
@@ -106,78 +107,59 @@ export class McpToolRegistry {
   }
 
   async execute(name: string, args: any, context?: any) {
-    await enforceEvaluationTool(context?.userId, name);
-    const handler = this.tools.get(name);
-    if (!handler) {
-      throw new Error(`Tool ${name} not found`);
-    }
+    const reliabilityStartedAt = Date.now();
+    const platform = context?.externalMcp === true ? 'external_mcp' : 'emma_registry';
+    const record = (result?: unknown, error?: unknown) =>
+      recordToolReliabilitySafe({
+        tool: name,
+        startedAtMs: reliabilityStartedAt,
+        sessionId: context?.sessionId,
+        userId: context?.userId,
+        platform,
+        result,
+        error,
+      });
 
-    // ENG-974: refuse outbound-action tools for external MCP callers.
-    //
-    // Keyed on `context.externalMcp`, NOT on `isInternal`. Emma's own dispatch
-    // (agentModeService.ts, `this.toolRegistry.execute(...)`) passes a context of
-    // `{ userId, sessionId, llmModel, service }` with neither flag set, so a
-    // check of `isInternal !== true` would refuse Emma her own `send_email` and
-    // `install_skills`. `externalMcp` is set to true by mcpServerCore for exactly
-    // one caller — an external API-key or OAuth client — and in-process callers
-    // never set it. security.mcpServer.test.ts pins that invariant so this cannot
-    // quietly fail open if the dispatcher changes.
-    if (handler.internalOnly && context?.externalMcp === true) {
-      throw new Error(
-        `Tool ${name} is not available to external clients. It is used by Emma internally.`
-      );
-    }
+    try {
+      await enforceEvaluationTool(context?.userId, name);
+      const handler = this.tools.get(name);
+      if (!handler) {
+        throw new Error(`Tool ${name} not found`);
+      }
 
-    // ENG-822: refuse account-scoped tools in an anonymous session BEFORE the
-    // handler runs. Catching the downstream lookup failure would still burn the
-    // round trip and still surface as an error; this turns a broken-looking
-    // failure into an instruction the visitor can act on.
-    //
-    // One check here rather than a per-handler list, because the gate that has
-    // to be remembered for each new tool is the gate that silently rots.
-    if (handler.requiresUserAccount && isAnonymousUserId(context?.userId)) {
-      return buildAnonymousToolRefusal(name);
-    }
+      if (handler.internalOnly && context?.externalMcp === true) {
+        throw new Error(
+          `Tool ${name} is not available to external clients. It is used by Emma internally.`
+        );
+      }
 
-    // ENG-827: an unattended scheduled run may only publish while its owner's
-    // consent is live. The runner re-checks between verification attempts, but a
-    // single turn is one worker invocation that can run for minutes over many
-    // internal tool calls — so a revocation arriving mid-turn would not be seen
-    // until after the publish. Checked here, immediately before execution, there
-    // is no window left. Same placement rationale as the two refusals above.
-    const publishRefusal = await refuseUnauthorizedScheduledPublish(name, context, undefined, args);
-    if (publishRefusal) {
-      console.warn(`ENG-827: refused ${name} in session ${context?.sessionId} — publish consent not live.`);
-      return publishRefusal;
-    }
+      if (handler.requiresUserAccount && isAnonymousUserId(context?.userId)) {
+        const result = buildAnonymousToolRefusal(name);
+        record(result);
+        return result;
+      }
 
-    // A publishing handler may do minutes of work (media download, video upload)
-    // between being admitted here and actually committing the post, so admission
-    // alone is not enough — hand it a re-validation to run at its last moment.
-    const publishContext = attachPublishRevalidation(name, context, args);
+      const publishRefusal = await refuseUnauthorizedScheduledPublish(name, context, undefined, args);
+      if (publishRefusal) {
+        console.warn(`ENG-827: refused ${name} in session ${context?.sessionId} — publish consent not live.`);
+        record(publishRefusal);
+        return publishRefusal;
+      }
 
-    // ENG-1816 F1: resolve funding ONLY when no ambient RunFunding is already active.
-    // This method is the single dispatch point for BOTH Emma's own in-process tool
-    // calls (agentModeService.ts, already inside the worker's withRunFunding scope)
-    // AND genuinely external entry points that never go through the worker at all —
-    // e.g. an internal MCP_ACCESS_TOKEN caller hitting POST /mcp directly, which
-    // reaches create_blog_article -> agentModeService.createBlogArticle ->
-    // generateBlogContent/restyleContent with no scope ever entered, so their
-    // currentRunFunding()-based attribution fix silently read undefined. Found by
-    // an independent review of this same PR's earlier leak fixes.
-    //
-    // Checking currentRunFunding() first, and only resolving when it's absent, is
-    // load-bearing, not a micro-optimization: a run's funding must be resolved ONCE,
-    // at that run's true entry point. Unconditionally re-resolving here would
-    // overwrite an outer, already-correct funding decision for the duration of every
-    // nested tool call inside an agent-mode turn — harmless today (F1 always
-    // resolves 'agentweb'), but wrong the moment a real customer route exists,
-    // since a fresh resolve could return something different mid-run.
-    if (currentRunFunding() || !context?.userId) {
-      return await handler.execute(args, publishContext);
+      const publishContext = attachPublishRevalidation(name, context, args);
+      let result: unknown;
+      if (currentRunFunding() || !context?.userId) {
+        result = await handler.execute(args, publishContext);
+      } else {
+        const runFunding = await resolveRunFunding({ userId: context.userId });
+        result = await withRunFunding(runFunding, () => handler.execute(args, publishContext));
+      }
+      record(result);
+      return result;
+    } catch (error) {
+      record(undefined, error);
+      throw error;
     }
-    const runFunding = await resolveRunFunding({ userId: context.userId });
-    return await withRunFunding(runFunding, () => handler.execute(args, publishContext));
   }
 }
 
