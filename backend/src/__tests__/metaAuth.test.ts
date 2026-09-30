@@ -520,4 +520,87 @@ describe('Meta Auth Routes', () => {
             expect(config.scopes).toEqual(['ads_management', 'pages_show_list']);
         });
     });
+
+    /**
+     * ENG-2232 — Page access is a second, independent Meta grant from the ads
+     * scope: production account 1209971551106961 had ads_read granted and 0
+     * accessible Pages both before AND after the customer reconnected, and
+     * nothing probed or recorded that until the first AD_CREATIVE failed —
+     * after 4 campaigns and 4 ad sets were already built and approved.
+     */
+    describe('POST /finalize + /connect-ad-accounts — Page access capture (ENG-2232)', () => {
+        const connectWithPages = async (pages: any[] | 'error') => {
+            (axios.get as jest.Mock).mockResolvedValue({
+                data: { access_token: 'valid_access_token', expires_in: 3600 }
+            });
+            (metaService.getAdAccounts as jest.Mock).mockResolvedValue([
+                { account_id: 'act_123', name: 'Test Ad Account', currency: 'USD', account_status: 1 }
+            ]);
+            (metaService.getGrantedScopes as jest.Mock).mockResolvedValue(['ads_read']);
+            if (pages === 'error') {
+                (metaService.getPages as jest.Mock).mockRejectedValue(new Error('Graph API down'));
+            } else {
+                (metaService.getPages as jest.Mock).mockResolvedValue(pages);
+            }
+            (connectedAccountsDb.createAccount as jest.Mock).mockResolvedValue({
+                platform: 'meta',
+                account_id: 'act_123'
+            });
+            jest.spyOn(jwt, 'verify').mockReturnValue({ userId: 'test_user_id', flow: 'marketing' } as any);
+
+            const finalizeRes = await request(app)
+                .post('/auth/meta/finalize')
+                .send({ code: 'valid_code', state: 'valid_state' });
+
+            const connectRes = await request(app)
+                .post('/auth/meta/connect-ad-accounts')
+                .send({
+                    tokenSessionId: finalizeRes.body.tokenSessionId,
+                    adAccounts: [{ account_id: 'act_123', name: 'Test Ad Account', currency: 'USD', account_status: 1 }]
+                });
+
+            return { finalizeRes, connectRes };
+        };
+
+        it('probes PAGE LIST during finalize and reports hasMetaPages: false for zero Pages', async () => {
+            const { finalizeRes } = await connectWithPages([]);
+
+            expect(metaService.getPages).toHaveBeenCalledWith('valid_access_token');
+            expect(finalizeRes.body.hasMetaPages).toBe(false);
+        });
+
+        it('reports hasMetaPages: true when at least one Page is accessible', async () => {
+            const { finalizeRes } = await connectWithPages([{ id: 'page_1', name: 'My Health Surveys' }]);
+
+            expect(finalizeRes.body.hasMetaPages).toBe(true);
+        });
+
+        it('persists has_meta_pages: false on the connected ad account config', async () => {
+            const { connectRes } = await connectWithPages([]);
+
+            expect(connectRes.status).toBe(200);
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.has_meta_pages).toBe(false);
+        });
+
+        it('persists has_meta_pages: true when Pages are accessible', async () => {
+            await connectWithPages([{ id: 'page_1', name: 'My Health Surveys' }]);
+
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.has_meta_pages).toBe(true);
+        });
+
+        it('omits has_meta_pages (never writes false) when the Page probe itself fails', async () => {
+            const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+            const { finalizeRes, connectRes } = await connectWithPages('error');
+
+            expect(finalizeRes.body.hasMetaPages).toBeUndefined();
+            expect(connectRes.status).toBe(200);
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.has_meta_pages).toBeUndefined();
+
+            consoleWarnSpy.mockRestore();
+        });
+    });
 });

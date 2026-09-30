@@ -18,7 +18,9 @@ import {
   META_ADS_READ_SCOPES,
   META_ADS_RECONSENT_MESSAGE,
   META_ADS_ASSET_ACCESS_MESSAGE,
+  META_ADS_NO_PAGES_MESSAGE,
   getMetaAdsScopeState,
+  getMetaPagesAccessState,
   hasMetaAdsReadScope,
   isMetaAdsScopeRefusal,
   buildMetaAdsScopeError,
@@ -471,6 +473,75 @@ describe('describeMetaAdsCapability', () => {
   it('tolerates a null/undefined account without throwing', () => {
     expect(describeMetaAdsCapability(null)).toEqual({});
     expect(describeMetaAdsCapability(undefined)).toEqual({});
+  });
+});
+
+/**
+ * ENG-2232 — Page access is a second, independent Meta grant. A connection can
+ * have ads_read granted and still have zero accessible Facebook Pages, which
+ * is fatal for every AD_CREATIVE (each one needs a page_id). Production case:
+ * ad account 1209971551106961 reported `ads_capable: true` with PAGE LIST
+ * returning 0 Pages both before and after the customer reconnected, so
+ * `list_connected_accounts` never warned before 4 campaigns + 4 ad sets were
+ * already built and approved.
+ */
+describe('getMetaPagesAccessState', () => {
+  it("returns 'granted' when has_meta_pages is true", () => {
+    expect(getMetaPagesAccessState({ has_meta_pages: true })).toBe<MetaAdsScopeState>('granted');
+  });
+
+  it("returns 'missing' when has_meta_pages is false", () => {
+    expect(getMetaPagesAccessState({ has_meta_pages: false })).toBe<MetaAdsScopeState>('missing');
+  });
+
+  it("returns 'unknown' when has_meta_pages was never probed", () => {
+    expect(getMetaPagesAccessState({})).toBe<MetaAdsScopeState>('unknown');
+    expect(getMetaPagesAccessState(undefined)).toBe<MetaAdsScopeState>('unknown');
+    expect(getMetaPagesAccessState(null)).toBe<MetaAdsScopeState>('unknown');
+  });
+});
+
+describe('describeMetaAdsCapability — Page access (ENG-2232)', () => {
+  const adAccount = (config: Record<string, unknown>) => ({
+    platform: 'meta',
+    account_id: '1209971551106961',
+    config: { account_type: 'ad_account', ...config },
+  });
+
+  it('is incapable with the Page-specific warning when ads_read is granted but 0 Pages are accessible', () => {
+    // The exact production shape: ads_read granted, has_meta_pages confirmed false.
+    expect(
+      describeMetaAdsCapability(adAccount({ granted_scopes: ['ads_read'], has_meta_pages: false }))
+    ).toEqual({ ads_capable: false, capability_warning: META_ADS_NO_PAGES_MESSAGE });
+  });
+
+  it('is incapable with the Page-specific warning even when the ads scope state is unknown', () => {
+    // No granted_scopes on record at all, but the Page probe still ran and found none.
+    expect(
+      describeMetaAdsCapability(adAccount({ has_meta_pages: false }))
+    ).toEqual({ ads_capable: false, capability_warning: META_ADS_NO_PAGES_MESSAGE });
+  });
+
+  it('stays capable when ads_read is granted and Pages are confirmed accessible', () => {
+    expect(
+      describeMetaAdsCapability(adAccount({ granted_scopes: ['ads_read'], has_meta_pages: true }))
+    ).toEqual({ ads_capable: true });
+  });
+
+  it('stays capable (no page warning) when the Page probe never ran — never crying wolf on a legacy record', () => {
+    expect(
+      describeMetaAdsCapability(adAccount({ granted_scopes: ['ads_read'] }))
+    ).toEqual({ ads_capable: true });
+  });
+
+  it('prefers the OAuth re-consent message when BOTH the ads scope and Page access are missing', () => {
+    // Reconnecting fixes the OAuth grant and lets the user pick Pages in the same flow —
+    // one actionable message beats two competing ones.
+    expect(
+      describeMetaAdsCapability(
+        adAccount({ granted_scopes: ['pages_show_list'], has_meta_pages: false })
+      )
+    ).toEqual({ ads_capable: false, capability_warning: META_ADS_RECONSENT_MESSAGE });
   });
 });
 
