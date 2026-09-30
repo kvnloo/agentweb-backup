@@ -55,7 +55,6 @@ export type TasteSourceSnapshot = {
   source: 'x_bookmarks' | 'collection';
   sourceKey: string;
   itemCount: number;
-  digest: string;
   topDomains: string[];
   topTerms: string[];
   styleSignals: Array<{ name: string; score: number }>;
@@ -336,17 +335,11 @@ function snapshotFor(
   }));
 
   const domains = items.map((item) => domainOf(item.url)).filter((value): value is string => Boolean(value));
-  const digest = createHash('sha256')
-    .update(items.map(stableItemKey).sort().join('\n'))
-    .digest('hex')
-    .slice(0, 24);
-
   return {
     schema: TASTE_PROFILE_SCHEMA,
     source,
     sourceKey,
     itemCount: items.length,
-    digest,
     topDomains: countTop(domains, MAX_PROFILE_DOMAINS).map((entry) => entry.value),
     // A term must occur at least twice before it is retained. This avoids turning a
     // one-off private bookmark phrase into durable memory.
@@ -477,7 +470,7 @@ export class TasteProfileService {
   }
 
   async getProfile(userId: string): Promise<TasteProfile> {
-    const memories = await this.memoryStore.getUserMemories(userId, 'preference', 100);
+    const memories = await this.memoryStore.getUserMemories(userId, 'preference');
     const snapshots = memories
       .filter((memory) => memory.sourceSessionId?.startsWith(TASTE_MEMORY_PREFIX))
       .map(decodeSnapshot)
@@ -487,7 +480,7 @@ export class TasteProfileService {
   }
 
   async deleteProfile(userId: string): Promise<number> {
-    const memories = await this.memoryStore.getUserMemories(userId, 'preference', 100);
+    const memories = await this.memoryStore.getUserMemories(userId, 'preference');
     const tasteMemories = memories.filter((memory) =>
       memory.sourceSessionId?.startsWith(TASTE_MEMORY_PREFIX)
     );
@@ -502,7 +495,7 @@ export class TasteProfileService {
       throw new TasteValidationError('Taste profile exceeded the durable memory size limit');
     }
 
-    const memories = await this.memoryStore.getUserMemories(userId, 'preference', 100);
+    const memories = await this.memoryStore.getUserMemories(userId, 'preference');
     const existing = memories.find((memory) => memory.sourceSessionId === sourceSessionId);
     if (existing) {
       await this.memoryStore.updateMemory(userId, existing.memoryId, {
