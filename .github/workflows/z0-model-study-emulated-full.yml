@@ -1,0 +1,215 @@
+name: AgentWeb z0 Emulated Full Campaign
+
+on:
+  pull_request:
+    branches: [lab/z0-agentweb-emma-v0]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  emulated-full-campaign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      OPENROUTER_API_KEY: local-emulation-key
+      TYPESAFE_API_KEY: local-emulation-key
+      TYPESAFE_BASE_URL: http://127.0.0.1:18081
+      Z0_MODEL_STUDY_PROVIDER_EMULATION: "1"
+      Z0_MODEL_STUDY_OPENROUTER_BASE_URL: http://127.0.0.1:18080/v1
+      Z0INT_EXPERIMENTAL_JEV_SHADOW: "1"
+      Z0INT_HOME: /tmp/z0int-emulated-campaign
+      Z0INT_AGENTWEB_MODE: shadow
+      Z0INT_REPORT_CLASSIFY_ALLOW_REMOTE: "1"
+      Z0INT_STOP_REQUEST_ALLOW_REMOTE: "1"
+      Z0INT_SERVICE_URL: http://127.0.0.1:11501
+    steps:
+      - name: Checkout exact AgentWeb PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Checkout official-SDK z0intelligence branch
+        uses: actions/checkout@v4
+        with:
+          repository: kvnloo/z0intelligence
+          ref: lab/agentweb-emma-typesafe-sdk-v1
+          path: deps/z0intelligence
+          persist-credentials: false
+
+      - name: Checkout z0eval study branch
+        uses: actions/checkout@v4
+        with:
+          repository: kvnloo/z0evals
+          ref: study/agentweb-emma-z0-v0
+          path: deps/z0evals
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install AgentWeb dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Install TypeSafe SDK
+        run: python -m pip install typesafe-sdk==0.7.2
+
+      - name: Record exact source heads
+        run: |
+          python - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          roots = {
+              "agentweb": ".",
+              "z0intelligence": "deps/z0intelligence",
+              "z0evals": "deps/z0evals",
+          }
+          heads = {
+              name: subprocess.check_output(
+                  ["git", "-C", path, "rev-parse", "HEAD"], text=True
+              ).strip()
+              for name, path in roots.items()
+          }
+          Path("/tmp/emulated-campaign-heads.json").write_text(
+              json.dumps(heads, indent=2) + "\n"
+          )
+          print(json.dumps(heads, indent=2))
+          PY
+
+      - name: Start local provider emulators
+        run: |
+          python research/experiments/z0-model-provider-emulation.py             > /tmp/provider-emulation.log 2>&1 &
+          echo $! > /tmp/provider-emulation.pid
+          python - <<'PY'
+          import time, urllib.request
+          for port in (18080, 18081):
+              for _ in range(40):
+                  try:
+                      with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=1) as r:
+                          if r.status == 200:
+                              break
+                  except Exception:
+                      time.sleep(.1)
+              else:
+                  raise SystemExit(f"provider emulator {port} not ready")
+          PY
+
+      - name: Start z0intelligence shadow authority
+        env:
+          PYTHONPATH: ${{ github.workspace }}/deps/z0intelligence/src
+        run: |
+          mkdir -p "$Z0INT_HOME"
+          python -m z0int.intelligence_service --port 11501 > /tmp/z0int-emulated.log 2>&1 &
+          echo $! > /tmp/z0int-emulated.pid
+          python - <<'PY'
+          import time, urllib.request
+          for _ in range(40):
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:11501/healthz", timeout=1) as r:
+                      if r.status == 200:
+                          raise SystemExit(0)
+              except Exception:
+                  time.sleep(.1)
+          raise SystemExit("z0intelligence did not become ready")
+          PY
+
+      - name: Run all 30 report pairs
+        working-directory: backend
+        run: |
+          npm run study:z0-report-type --             ../deps/z0evals/studies/agentweb-emma-z0-v0/report-type-fixtures.jsonl             /tmp/emulated-report-results.jsonl
+
+      - name: Run all 40 stop pairs
+        working-directory: backend
+        run: |
+          npm run study:z0-stop-request --             ../deps/z0evals/studies/agentweb-emma-z0-v0/stop-request-fixtures.jsonl             /tmp/emulated-stop-results.jsonl
+
+      - name: Score orchestration and transport only
+        run: |
+          python deps/z0evals/scripts/score_agentweb_report_type.py             /tmp/emulated-report-results.jsonl             --output /tmp/emulated-report-summary.json
+          python deps/z0evals/scripts/score_agentweb_stop_request.py             /tmp/emulated-stop-results.jsonl             --output /tmp/emulated-stop-summary.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.load(open("/tmp/emulated-report-summary.json"))
+          stop = json.load(open("/tmp/emulated-stop-summary.json"))
+          assert report["n_rows"] == 30 and report["n_paired"] == 30, report
+          assert stop["n_rows"] == 40 and stop["n_paired"] == 40, stop
+          assert not report["applied_violations"], report
+          assert not stop["applied_violations"], stop
+          assert not report["missing_receipts"], report
+          assert not stop["missing_receipts"], stop
+          assert report["eligible_for_review"] is False
+          assert stop["eligible_for_review"] is False
+
+          events = [
+              json.loads(line)
+              for line in Path("/tmp/z0-model-provider-emulation-events.jsonl").read_text().splitlines()
+              if line.strip()
+          ]
+          openrouter = [e for e in events if e["provider"] == "openrouter"]
+          typesafe = [e for e in events if e["provider"] == "typesafe"]
+          assert len(openrouter) == 70, len(openrouter)
+          assert len(typesafe) == 70, len(typesafe)
+          assert all(e["path"] == "/v1/chat/completions" for e in openrouter)
+          assert all(e["path"] == "/v1/systemone" for e in typesafe)
+
+          status = {
+              "schema": "z0eval.agentweb_emulated_model_campaign.v1",
+              "evidence_class": "deterministic_e2e",
+              "quality_authoritative": False,
+              "report_pairs": report["n_paired"],
+              "stop_pairs": stop["n_paired"],
+              "openrouter_http_requests": len(openrouter),
+              "typesafe_http_requests": len(typesafe),
+              "total_provider_http_requests": len(events),
+              "applied_violations": [],
+              "missing_receipts": [],
+              "quality_metrics_are_synthetic": True,
+          }
+          Path("/tmp/emulated-campaign-status.json").write_text(
+              json.dumps(status, indent=2) + "\n"
+          )
+          print(json.dumps(status, indent=2))
+          PY
+
+      - name: Stop local services
+        if: always()
+        run: |
+          test ! -f /tmp/z0int-emulated.pid || kill "$(cat /tmp/z0int-emulated.pid)" || true
+          test ! -f /tmp/provider-emulation.pid || kill "$(cat /tmp/provider-emulation.pid)" || true
+          cat /tmp/provider-emulation.log || true
+          cat /tmp/z0int-emulated.log || true
+
+      - name: Bind campaign to exact AgentWeb head
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+          git rev-parse HEAD
+
+      - name: Upload emulated campaign evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentweb-z0-emulated-full-campaign
+          path: |
+            /tmp/emulated-campaign-heads.json
+            /tmp/emulated-campaign-status.json
+            /tmp/emulated-report-results.jsonl
+            /tmp/emulated-report-summary.json
+            /tmp/emulated-stop-results.jsonl
+            /tmp/emulated-stop-summary.json
+            /tmp/z0-model-provider-emulation-events.jsonl
+            /tmp/z0int-emulated-campaign/receipts/decisions.jsonl
+            /tmp/provider-emulation.log
+            /tmp/z0int-emulated.log
+          if-no-files-found: warn
