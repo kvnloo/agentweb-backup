@@ -66,3 +66,29 @@ ReliabilityEvent projection drops `userId` and free-form `errorSummary`. It is o
 ## Promotion gate
 
 Freeze exact AgentWeb, z0intelligence and z0evals SHAs. Require safety invariants to pass, JEV parity on the eligible slice, and at least one representative workload with measurable latency/token benefit and no quality regression before proposing anything upstream.
+
+
+## Paired report_type_v1 replay
+
+The first measured domain seam is report classification. Gemini remains authoritative;
+the z0 lane performs one shadow Jev Choice call behind z0 dispatch authority and emits
+a canonical receipt with `applied=false`.
+
+Run against the frozen z0evals corpus:
+
+```bash
+cd backend
+Z0INT_AGENTWEB_MODE=shadow \
+Z0INT_REPORT_CLASSIFY_ALLOW_REMOTE=1 \
+npm run study:z0-report-type -- \
+  /path/to/z0evals/studies/agentweb-emma-z0-v0/report-type-fixtures.jsonl \
+  /tmp/agentweb-report-type-results.jsonl
+```
+
+The z0 service separately requires `Z0INT_EXPERIMENTAL_JEV_SHADOW=1`; that flag is
+kept on the authority side so AgentWeb cannot unilaterally authorize the paid shadow
+lane. Score results with `z0evals/scripts/score_agentweb_report_type.py`.
+
+A 30-case authored corpus is only a design/regression set. The scorer refuses
+promotion review until at least 1,000 paired live decisions exist and all quality,
+coverage, receipt, non-application, and latency gates pass.
