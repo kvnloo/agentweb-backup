@@ -10,6 +10,14 @@ const CLASSIFICATION_MODEL = 'gemini-3.1-flash-lite';
 const CLASSIFICATION_TIMEOUT_MS = 10000;
 const MAX_CONTENT_CHARS = 500;
 
+export const REPORT_TYPE_DECISION_ID = 'report_type_v1';
+export const REPORT_TYPE_INSTRUCTIONS = 'Classify the HTML report into exactly one category.';
+export const REPORT_TYPE_OPTIONS: Record<ReportType, string> = {
+  creative: 'Blog articles, social media posts, ad copy, content calendars, email campaigns, marketing copy.',
+  performance: 'Paid ads reports, ROAS, CPM, CPC, CTR, ad spend, campaign metrics, conversion rates, media buying analytics.',
+  research: 'Market intelligence, competitor analysis, SEO reports, lead lists, general business reports, summaries, audits, GTM plans.',
+};
+
 // JEV report_type_v1 shadow: bounded Choice over the same three labels.
 // Mode is per-decision via env: unset/off = no Jev call (today's behavior);
 // 'shadow' = call Jev concurrently, log comparison, always return incumbent.
@@ -36,12 +44,8 @@ async function shadowJevReportClassify(
       questions: {
         report_type: {
           type: 'choice',
-          instructions: 'Classify the HTML report into exactly one category.',
-          criteria: {
-            creative: 'Blog articles, social media posts, ad copy, content calendars, email campaigns, marketing copy.',
-            performance: 'Paid ads reports, ROAS, CPM, CPC, CTR, ad spend, campaign metrics, conversion rates, media buying analytics.',
-            research: 'Market intelligence, competitor analysis, SEO reports, lead lists, general business reports, summaries, audits, GTM plans.',
-          },
+          instructions: REPORT_TYPE_INSTRUCTIONS,
+          criteria: REPORT_TYPE_OPTIONS,
         },
       },
     });
@@ -76,32 +80,33 @@ async function shadowJevReportClassify(
   }
 }
 
+export function buildZ0ReportTypeExperiment(filename: string, truncated: string) {
+  const state = { filename, excerpt: truncated };
+  const operation_id = createHash('sha256')
+    .update(JSON.stringify(state))
+    .digest('hex');
+  return {
+    operation_id,
+    decision_id: REPORT_TYPE_DECISION_ID,
+    state,
+    instructions: REPORT_TYPE_INSTRUCTIONS,
+    options: REPORT_TYPE_OPTIONS,
+    allow_remote: process.env.Z0INT_REPORT_CLASSIFY_ALLOW_REMOTE === '1',
+  };
+}
+
 async function shadowZ0ReportClassify(
   filename: string,
   truncated: string,
   incumbent: ReportType,
   incumbentLatencyMs: number,
 ): Promise<void> {
-  const state = { filename, excerpt: truncated };
-  const operationId = createHash('sha256')
-    .update(JSON.stringify(state))
-    .digest('hex');
+  const request = buildZ0ReportTypeExperiment(filename, truncated);
   const startedAt = Date.now();
   try {
     const result: any = await runZ0ChoiceExperiment(
-      {
-        operation_id: operationId,
-        decision_id: 'report_type_v1',
-        state,
-        instructions: 'Classify the HTML report into exactly one category.',
-        options: {
-          creative: 'Blog articles, social media posts, ad copy, content calendars, email campaigns, marketing copy.',
-          performance: 'Paid ads reports, ROAS, CPM, CPC, CTR, ad spend, campaign metrics, conversion rates, media buying analytics.',
-          research: 'Market intelligence, competitor analysis, SEO reports, lead lists, general business reports, summaries, audits, GTM plans.',
-        },
-        allow_remote: process.env.Z0INT_REPORT_CLASSIFY_ALLOW_REMOTE === '1',
-      },
-      { scopeId: 'report_type_v1' },
+      request,
+      { scopeId: REPORT_TYPE_DECISION_ID },
     );
     const latencyMs = Date.now() - startedAt;
     if (!result.ok || !result.output) {
@@ -121,7 +126,7 @@ async function shadowZ0ReportClassify(
     const margin = sorted.length >= 2 ? sorted[0][1] - sorted[1][1] : null;
     console.log(JSON.stringify({
       event: 'z0_report_classify_shadow', ok: true,
-      decisionId: 'report_type_v1', traceId: result.trace_id ?? null,
+      decisionId: REPORT_TYPE_DECISION_ID, traceId: result.trace_id ?? null,
       dispatchReceiptId: result.dispatch_receipt_id ?? null,
       replayed: result.replayed === true, applied: result.applied === true,
       model: output.model ?? null, z0Label: label,
@@ -148,6 +153,51 @@ Categories:
 - research: market intelligence, competitor analysis, SEO reports, lead lists, general business reports, summaries, audits, GTM plans
 
 Reply with ONLY one word: creative, performance, or research.`;
+
+export async function runReportTypeStudyCase(
+  filename: string,
+  contentExcerpt: string,
+  usageContext?: LLMUsageContext,
+) {
+  const truncated = contentExcerpt.slice(0, MAX_CONTENT_CHARS);
+  const userMessage = `Filename: ${filename}\nContent: ${truncated}`;
+  const request = buildZ0ReportTypeExperiment(filename, truncated);
+
+  const incumbentStartedAt = Date.now();
+  const incumbentPromise = runIncumbentClassifier(userMessage, usageContext)
+    .then(label => ({ label, latency_ms: Date.now() - incumbentStartedAt }));
+
+  const z0StartedAt = Date.now();
+  const z0Promise = runZ0ChoiceExperiment(
+    request,
+    { scopeId: REPORT_TYPE_DECISION_ID },
+  ).then((result: any) => ({
+    result,
+    wall_latency_ms: Date.now() - z0StartedAt,
+  }));
+
+  const [incumbent, z0] = await Promise.all([incumbentPromise, z0Promise]);
+  const output = z0.result?.output ?? {};
+  return {
+    decision_id: REPORT_TYPE_DECISION_ID,
+    operation_id: request.operation_id,
+    incumbent_label: incumbent.label,
+    incumbent_latency_ms: incumbent.latency_ms,
+    z0_ok: z0.result?.ok === true,
+    z0_label: typeof output.label === 'string' ? output.label : null,
+    z0_confidence: typeof output.confidence === 'number' ? output.confidence : null,
+    z0_probabilities: output.probabilities ?? null,
+    z0_latency_ms: z0.wall_latency_ms,
+    z0_provider_latency_ms: typeof output.latency_ms === 'number' ? output.latency_ms : null,
+    z0_input_tokens: typeof output.usage?.input_tokens === 'number' ? output.usage.input_tokens : null,
+    z0_output_tokens: typeof output.usage?.output_tokens === 'number' ? output.usage.output_tokens : null,
+    applied: z0.result?.applied === true,
+    replayed: z0.result?.replayed === true,
+    dispatch_receipt_id: z0.result?.dispatch_receipt_id ?? null,
+    z0_trace_id: z0.result?.trace_id ?? null,
+    z0_reason: z0.result?.reason ?? null,
+  };
+}
 
 export async function classifyReport(filename: string, contentExcerpt: string, usageContext?: LLMUsageContext): Promise<ReportType> {
   const truncated = contentExcerpt.slice(0, MAX_CONTENT_CHARS);
