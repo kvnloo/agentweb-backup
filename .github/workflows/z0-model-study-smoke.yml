@@ -1,0 +1,218 @@
+name: AgentWeb z0 Model Study Smoke
+
+on:
+  pull_request:
+    branches: [lab/z0-agentweb-emma-v0]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  paired-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+      Z0INT_EXPERIMENTAL_JEV_SHADOW: "1"
+      Z0INT_HOME: /tmp/z0int-model-smoke
+      Z0INT_AGENTWEB_MODE: shadow
+      Z0INT_REPORT_CLASSIFY_ALLOW_REMOTE: "1"
+      Z0INT_STOP_REQUEST_ALLOW_REMOTE: "1"
+      Z0INT_SERVICE_URL: http://127.0.0.1:11501
+    steps:
+      - name: Checkout exact AgentWeb PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Checkout official-SDK z0intelligence branch
+        uses: actions/checkout@v4
+        with:
+          repository: kvnloo/z0intelligence
+          ref: lab/agentweb-emma-typesafe-sdk-v1
+          path: deps/z0intelligence
+          persist-credentials: false
+
+      - name: Checkout z0eval study branch
+        uses: actions/checkout@v4
+        with:
+          repository: kvnloo/z0evals
+          ref: study/agentweb-emma-z0-v0
+          path: deps/z0evals
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Credential preflight
+        id: creds
+        run: |
+          python - <<'PY'
+          import json, os
+          missing = [
+              name for name in ("OPENROUTER_API_KEY", "TYPESAFE_API_KEY")
+              if not os.environ.get(name, "").strip()
+          ]
+          available = not missing
+          with open("/tmp/model-smoke-status.json", "w") as f:
+              json.dump({
+                  "schema": "z0eval.agentweb_model_smoke_status.v1",
+                  "credentials_available": available,
+                  "missing": missing,
+                  "executed": False,
+              }, f, indent=2)
+              f.write("\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("available=" + ("true" if available else "false") + "\n")
+          print("model-backed credentials available:", available)
+          if missing:
+              print("missing credential names:", ",".join(missing))
+          PY
+
+      - name: Install AgentWeb dependencies
+        if: steps.creds.outputs.available == 'true'
+        working-directory: backend
+        run: npm ci
+
+      - name: Install TypeSafe SDK
+        if: steps.creds.outputs.available == 'true'
+        run: python -m pip install typesafe-sdk==0.7.2
+
+      - name: Record exact source heads
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          python - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          roots = {
+              "agentweb": ".",
+              "z0intelligence": "deps/z0intelligence",
+              "z0evals": "deps/z0evals",
+          }
+          heads = {
+              name: subprocess.check_output(
+                  ["git", "-C", path, "rev-parse", "HEAD"], text=True
+              ).strip()
+              for name, path in roots.items()
+          }
+          Path("/tmp/model-smoke-heads.json").write_text(
+              json.dumps(heads, indent=2) + "\n"
+          )
+          print(json.dumps(heads, indent=2))
+          PY
+
+      - name: Start z0intelligence shadow authority
+        if: steps.creds.outputs.available == 'true'
+        env:
+          PYTHONPATH: ${{ github.workspace }}/deps/z0intelligence/src
+        run: |
+          mkdir -p "$Z0INT_HOME"
+          python -m z0int.intelligence_service --port 11501 > /tmp/z0int-model-smoke.log 2>&1 &
+          echo $! > /tmp/z0int-model-smoke.pid
+          python - <<'PY'
+          import time, urllib.request
+          for _ in range(40):
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:11501/healthz", timeout=1) as r:
+                      if r.status == 200:
+                          raise SystemExit(0)
+              except Exception:
+                  time.sleep(.25)
+          raise SystemExit("z0intelligence did not become ready")
+          PY
+
+      - name: Select one report and one stop fixture
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          head -n 1 deps/z0evals/studies/agentweb-emma-z0-v0/report-type-fixtures.jsonl > /tmp/report-smoke.jsonl
+          head -n 1 deps/z0evals/studies/agentweb-emma-z0-v0/stop-request-fixtures.jsonl > /tmp/stop-smoke.jsonl
+
+      - name: Run real paired report smoke
+        if: steps.creds.outputs.available == 'true'
+        working-directory: backend
+        run: |
+          npm run study:z0-report-type -- /tmp/report-smoke.jsonl /tmp/report-smoke-results.jsonl
+
+      - name: Run real paired stop smoke
+        if: steps.creds.outputs.available == 'true'
+        working-directory: backend
+        run: |
+          npm run study:z0-stop-request -- /tmp/stop-smoke.jsonl /tmp/stop-smoke-results.jsonl
+
+      - name: Verify smoke evidence is observational
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path("/tmp/report-smoke-results.jsonl").read_text().strip())
+          stop = json.loads(Path("/tmp/stop-smoke-results.jsonl").read_text().strip())
+          assert report["applied"] is False, report
+          assert stop["applied"] is False, stop
+          assert report["dispatch_receipt_id"], report
+          assert stop["dispatch_receipt_id"], stop
+          assert report["z0_label"] in {"creative", "performance", "research"}, report
+          assert isinstance(stop["p_stop"], (int, float)) and 0 <= stop["p_stop"] <= 1, stop
+
+          status = {
+              "schema": "z0eval.agentweb_model_smoke_status.v1",
+              "credentials_available": True,
+              "executed": True,
+              "report": {
+                  "expected": report["expected"],
+                  "incumbent": report["incumbent_label"],
+                  "z0": report["z0_label"],
+                  "applied": report["applied"],
+                  "receipt": report["dispatch_receipt_id"],
+              },
+              "stop": {
+                  "expected_stop": stop["expected_stop"],
+                  "incumbent_stop": stop["incumbent_stop"],
+                  "p_stop": stop["p_stop"],
+                  "applied": stop["applied"],
+                  "receipt": stop["dispatch_receipt_id"],
+              },
+          }
+          Path("/tmp/model-smoke-status.json").write_text(
+              json.dumps(status, indent=2) + "\n"
+          )
+          print(json.dumps(status, indent=2))
+          PY
+
+      - name: Stop z0intelligence
+        if: always() && steps.creds.outputs.available == 'true'
+        run: |
+          if test -f /tmp/z0int-model-smoke.pid; then
+            kill "$(cat /tmp/z0int-model-smoke.pid)" || true
+          fi
+          cat /tmp/z0int-model-smoke.log || true
+
+      - name: Bind smoke to exact AgentWeb head
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+          git rev-parse HEAD
+
+      - name: Upload smoke status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentweb-z0-model-smoke
+          path: |
+            /tmp/model-smoke-status.json
+            /tmp/model-smoke-heads.json
+            /tmp/report-smoke-results.jsonl
+            /tmp/stop-smoke-results.jsonl
+            /tmp/z0int-model-smoke/receipts/decisions.jsonl
+            /tmp/z0int-model-smoke.log
+          if-no-files-found: warn
