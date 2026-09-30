@@ -1541,18 +1541,18 @@ function finiteNumber(v: any): number | undefined {
 
 /**
  * ENG-2216: Bedrock-routed models don't always strictly honor
- * `response_format: json_object` — a text preamble (e.g. "Here is my
- * evaluation:") before the JSON object makes a bare `JSON.parse(raw)` throw,
- * and that throw was previously swallowed silently by the judge-score route's
- * `Promise.allSettled`. If `raw` isn't already a bare JSON object, slice from
- * its first `{` to its last `}`, same as the "everything from the first `{`"
- * convention already used elsewhere in this codebase for non-strict LLM
- * output. Falls back to the original `raw` when no `{` is present, so
- * `JSON.parse` still throws with a meaningful message.
+ * `response_format: json_object` — leading text (e.g. "Here is my
+ * evaluation:") or trailing text (e.g. "Hope that helps!") around the JSON
+ * object makes a bare `JSON.parse(raw)` throw, and that throw was previously
+ * swallowed silently by the judge-score route's `Promise.allSettled`. Always
+ * slice from the first `{` to the last `}`, same as the "everything from the
+ * first `{`" convention already used elsewhere in this codebase for
+ * non-strict LLM output — this covers a bare JSON object (slicing is a
+ * no-op), a leading preamble, trailing text, or both. Falls back to the
+ * original `raw` when no `{` is present, so `JSON.parse` still throws with a
+ * meaningful message.
  */
 function extractJsonObject(raw: string): string {
-  const trimmed = raw.trim();
-  if (trimmed.startsWith("{")) return trimmed;
   const start = raw.indexOf("{");
   const end = raw.lastIndexOf("}");
   if (start === -1 || end === -1 || end < start) return raw;

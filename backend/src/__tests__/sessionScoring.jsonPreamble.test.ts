@@ -109,6 +109,17 @@ describe('ENG-2216 — a text preamble before the JSON object no longer breaks p
     ).rejects.toThrow(/missing or non-numeric "score"/);
   });
 
+  it('scoreSession: parses a real score out of a response with only trailing text, no leading preamble', async () => {
+    mockCallLLM.mockResolvedValue(
+      llmWith('{"score": 4, "reason": "did the thing well"}\nHope that helps!')
+    );
+
+    const result = await scoreSession(messages, messages.length);
+
+    expect(result.score).toBe(4);
+    expect(result.reason).toBe('did the thing well');
+  });
+
   it('scoreSession: genuinely non-JSON content (no "{" anywhere) still throws a parse error, not silently', async () => {
     mockCallLLM.mockResolvedValue(llmWith('I refuse to evaluate this conversation.'));
 
