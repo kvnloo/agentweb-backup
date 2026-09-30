@@ -5110,6 +5110,11 @@ emmaToolRegistry.register({
         metrics_verified: {
           type: 'boolean',
           description: "Set true ONLY when your prompt describes a dashboard/table/metrics-shaped layout AND every number/percentage/dollar figure in it came directly from a real tool result earlier in this conversation (e.g. get_meta_ads_metrics, call_meta_marketing_api). Leave false or omit for any illustrative, placeholder, or self-written figure — including a plausible-looking value you wrote yourself with no real source (e.g. a progress-bar percentage). Omitting this on a data-shaped prompt triggers an automatic post-generation reliability check; setting it true when the values are genuinely real skips that check instead of risking a false 'unverified' caution on accurate data."
+        },
+        taste_intensity: {
+          type: 'string',
+          enum: ['off', 'subtle', 'strong'],
+          description: "Optional per-image Taste override. Omit to use the surface default. Use 'strong' when the user explicitly asks for something that feels like their taste; use 'off' when they explicitly want a neutral or reference-only result."
         }
       },
       required: ['prompt', 'filename', 'category']
@@ -5134,7 +5139,8 @@ emmaToolRegistry.register({
       args.logo_image,
       args.confirm,
       args.category,
-      args.metrics_verified
+      args.metrics_verified,
+      args.taste_intensity
     );
   }
 });
