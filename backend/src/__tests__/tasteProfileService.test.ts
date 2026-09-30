@@ -1,5 +1,6 @@
 import {
   MAX_TASTE_ITEMS,
+  MAX_TASTE_SOURCES,
   TASTE_MEMORY_PREFIX,
   TasteMemoryStore,
   TasteProfileService,
@@ -185,6 +186,22 @@ describe('TasteProfileService', () => {
       { source: 'collection', itemCount: 2 },
       { source: 'x_bookmarks', itemCount: 1 },
     ]);
+  });
+
+
+  it('caps durable source fan-out while still allowing an existing source to be replaced', async () => {
+    const seed = Array.from({ length: MAX_TASTE_SOURCES }, (_, index) => ({
+      memoryId: `taste-${index}`,
+      category: 'preference',
+      content: `Taste Profile aggregate (raw source content intentionally not retained): {"schema":"taste.profile.v1","source":"collection","sourceKey":"seed-${index}","itemCount":1,"topDomains":[],"topTerms":[],"styleSignals":[],"generatedAt":"2026-09-30T00:00:00.000Z"}`,
+      sourceSessionId: `${TASTE_MEMORY_PREFIX}seed-${index}`,
+    }));
+    const { store } = memoryHarness(seed);
+    const service = new TasteProfileService({ getBookmarks: jest.fn() }, store);
+
+    await expect(service.importCollection('user-a', [{ title: 'new reference' }], 'new-source'))
+      .rejects.toThrow(`Taste supports at most ${MAX_TASTE_SOURCES} durable sources`);
+    expect(store.addMemory).not.toHaveBeenCalled();
   });
 
   it('deletes only Taste memories for the authenticated user', async () => {
