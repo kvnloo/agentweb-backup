@@ -120,6 +120,32 @@ export function resolveSlackSendAuthorized(schedule?: ScheduleSlackSendApprovalI
 }
 
 /**
+ * ENG-2204 follow-up (prod incident, 2026-09-29): narrow a schedule's required-function
+ * list so the deterministic completion checker never nudges for `slack_send_message` on
+ * a withheld run.
+ *
+ * Without this, a schedule with BOTH `slack_send_message` in `requiredFunctionCalls` AND
+ * `requireSlackApproval: true` produced a live contradiction: turn 1 correctly withheld
+ * the send and drafted to the knowledge base, exactly as instructed — then the checker's
+ * own retry press, blind to the withhold state, nudged "Please try again. Make sure to
+ * slack_send_message (1 more time needed)". The model complied with the press over the
+ * withhold instruction on turn 2 and the message actually posted, defeating the opt-out
+ * entirely. This mirrors `filterRequiredFunctionsToAuthorizedScope` above for publish —
+ * same fix shape, applied to the one tool name that axis governs. Deliberately no mid-run
+ * re-narrowing counterpart (unlike publish's admission-stamp/revocation machinery): a
+ * schedule's `requireSlackApproval` has no live "revoke while a run is executing" action,
+ * so a single filter at admission is the whole fix.
+ */
+export function filterSlackSendFromRequiredIfWithheld(
+  requiredFunctionCalls: string[] | undefined,
+  slackSendAuthorized: boolean
+): string[] {
+  const required = Array.isArray(requiredFunctionCalls) ? requiredFunctionCalls : [];
+  if (slackSendAuthorized) return required;
+  return required.filter(name => name !== 'slack_send_message');
+}
+
+/**
  * Whether an unattended run on this schedule may publish externally.
  *
  * TWO DIFFERENT ABSENCES, TWO DIFFERENT ANSWERS — this distinction is the whole
