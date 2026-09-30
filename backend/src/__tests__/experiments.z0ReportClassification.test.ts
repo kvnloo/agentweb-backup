@@ -19,7 +19,7 @@ jest.mock('../emma/z0Adapter', () => {
 import { agentModeService } from '../services/agentModeService';
 import { runJevDecide } from '../emma/jevAdapter';
 import { runZ0ChoiceExperiment } from '../emma/z0Adapter';
-import { classifyReport, readReportShadowBackend } from '../services/reportClassificationService';
+import { classifyReport, readReportShadowBackend, runReportTypeStudyCase } from '../services/reportClassificationService';
 
 const llm = agentModeService.callLLM as jest.Mock;
 const z0 = runZ0ChoiceExperiment as jest.Mock;
@@ -100,6 +100,46 @@ describe('report classification z0 shadow', () => {
     expect(z0).toHaveBeenCalledTimes(1);
     expect(z0.mock.calls[0][0].allow_remote).toBe(false);
     expect(jev).not.toHaveBeenCalled();
+  });
+
+  it('returns one paired study row with z0 receipt identity and no application', async () => {
+    process.env.Z0INT_REPORT_CLASSIFY_ALLOW_REMOTE = '1';
+    z0.mockResolvedValue({
+      ok: true,
+      executed: true,
+      applied: false,
+      replayed: false,
+      trace_id: 'trace-fixture',
+      dispatch_receipt_id: 'dispatch-fixture',
+      output: {
+        model: 'jev-1.13.0',
+        label: 'performance',
+        probabilities: { creative: 0.01, performance: 0.98, research: 0.01 },
+        confidence: 0.98,
+        latency_ms: 12,
+        usage: { input_tokens: 40, output_tokens: 3 },
+      },
+    });
+
+    const row = await runReportTypeStudyCase(
+      'paid-media.html',
+      'ROAS CTR CPC campaign spend',
+    );
+
+    expect(row).toMatchObject({
+      decision_id: 'report_type_v1',
+      incumbent_label: 'performance',
+      z0_ok: true,
+      z0_label: 'performance',
+      z0_confidence: 0.98,
+      z0_input_tokens: 40,
+      z0_output_tokens: 3,
+      applied: false,
+      replayed: false,
+      dispatch_receipt_id: 'dispatch-fixture',
+      z0_trace_id: 'trace-fixture',
+    });
+    expect(row.operation_id).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it('preserves the legacy direct-JEV shadow when z0 shadow is off', async () => {
