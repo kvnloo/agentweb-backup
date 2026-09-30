@@ -6148,6 +6148,12 @@ export class AgentModeService {
     // GTM Context (Read/Write)
     'update_brand_guidelines',
     'read_brand_guidelines',
+    // Taste is ambient creative context, not an optional capability. Read/preview
+    // are always available; the mutating X refresh remains explicit in its own
+    // tool description and is not auto-called.
+    'get_taste_profile',
+    'preview_taste_application',
+    'refresh_taste_from_x',
     'update_market_strategy',
     'read_market_strategy',
 
@@ -6209,7 +6215,13 @@ export class AgentModeService {
     'connect_account',        // Read-only UI handoff when a required account is absent
 
     'get_user_profile',         // Account info teaser
-    'get_account_status',       // Self account status (plan, usage, api-key count) — wraps /api/auth/me, no args
+    'get_account_status',
+    // Taste read/preview must survive a stale prod foundation_tools override.
+    'get_taste_profile',
+    'preview_taste_application',
+    // Explicit refresh is also force-merged so "learn from my X bookmarks" works
+    // without asking the user to install an unrelated catch-all skill.
+    'refresh_taste_from_x',       // Self account status (plan, usage, api-key count) — wraps /api/auth/me, no args
 
     // Account Memory (cross-session knowledge)
     'save_memory',
