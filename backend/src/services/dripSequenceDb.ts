@@ -76,6 +76,13 @@ export type EnrollmentStatus =
 
 export type ExitReason =
   | 'completed'
+  /**
+   * Ran to the end without a single step being delivered — every step was skipped
+   * because the lead could not be reached on that channel. Distinct from 'completed'
+   * on purpose: those two rows are otherwise identical in the dashboard, and one means
+   * the lead received the entire sequence while the other means it received nothing.
+   */
+  | 'completed_no_sends'
   | 'converted'
   | 'engagement'
   | 'unsubscribed'
@@ -200,6 +207,14 @@ export interface CreateEnrollmentInput {
   leadId: string;
   leadEmail: string;
   startAt?: string;            // override first send time; defaults to now
+  /**
+   * Other identities this lead may already be stored under, for the dedup check only —
+   * never written. `leadEmail` is derived from mutable lead data (email wins over the
+   * LinkedIn URL), so an address-less lead enrolled under its profile URL gets a
+   * DIFFERENT identity the day it gains an email, and re-enrols. See
+   * `enrollmentIdentityCandidates`.
+   */
+  identityCandidates?: string[];
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -397,7 +412,16 @@ async function bulkEnroll(
   let skipped = 0;
 
   for (const input of inputs) {
-    const existing = await getExistingEnrollment(input.sequenceId, input.leadEmail);
+    // Check every identity the lead could already be stored under, not just the one we
+    // would write today — the identity moves when the lead's data changes, and a miss
+    // here re-delivers the whole sequence. Deduped, and `leadEmail` is always included.
+    const candidates = Array.from(new Set([input.leadEmail, ...(input.identityCandidates ?? [])]))
+      .filter(Boolean);
+    let existing: SequenceEnrollment | null = null;
+    for (const identity of candidates) {
+      existing = await getExistingEnrollment(input.sequenceId, identity);
+      if (existing) break;
+    }
     if (existing) {
       skipped++;
       continue;
@@ -431,7 +455,15 @@ async function getExistingEnrollment(
   }).promise();
 
   const items = (result.Items ?? []) as SequenceEnrollment[];
-  return items[0] ?? null;
+  // An enrollment that completed WITHOUT sending anything must not block a re-enrol.
+  //
+  // This query deliberately matches regardless of status, so a lead already enrolled is
+  // never enrolled twice. But a row that skipped every step and exited
+  // 'completed_no_sends' delivered nothing — and it permanently barred that lead from
+  // the sequence even after the user fixed the data that made it unreachable. Ignoring
+  // those rows cannot cause a double send, because by definition nothing was sent.
+  const blocking = items.filter((e) => (e as any).exitReason !== 'completed_no_sends');
+  return blocking[0] ?? null;
 }
 
 async function getActiveEnrollment(
@@ -532,16 +564,24 @@ async function advanceEnrollment(
   nextStep: number,
   nextSendAt: string,
   channel: SequenceChannel = 'email',
+  /**
+   * False when the step was SKIPPED because the lead could not receive it. Stamping a
+   * sent-timestamp for a message that was never sent is a false record — the worker
+   * advances past undeliverable steps now, so this is reachable.
+   */
+  delivered: boolean = true,
 ): Promise<void> {
   const sentField = channel === 'linkedin' ? 'lastLinkedInSentAt' : 'lastEmailSentAt';
   await dynamodb.update({
     TableName: ENROLLMENTS_TABLE,
     Key: { enrollmentId },
-    UpdateExpression: `SET currentStep = :step, nextSendAt = :next, ${sentField} = :sent REMOVE claimedAt`,
+    UpdateExpression: delivered
+      ? `SET currentStep = :step, nextSendAt = :next, ${sentField} = :sent REMOVE claimedAt`
+      : 'SET currentStep = :step, nextSendAt = :next REMOVE claimedAt',
     ExpressionAttributeValues: {
       ':step': nextStep,
       ':next': nextSendAt,
-      ':sent': now(),
+      ...(delivered ? { ':sent': now() } : {}),
     },
   }).promise();
 }
@@ -551,18 +591,22 @@ async function completeEnrollment(
   exitReason: ExitReason,
   finalStatus: EnrollmentStatus = 'completed',
   channel: SequenceChannel = 'email',
+  /** See advanceEnrollment: false when the final step was skipped, not sent. */
+  delivered: boolean = true,
 ): Promise<void> {
   const sentField = channel === 'linkedin' ? 'lastLinkedInSentAt' : 'lastEmailSentAt';
   await dynamodb.update({
     TableName: ENROLLMENTS_TABLE,
     Key: { enrollmentId },
-    UpdateExpression: `SET #s = :status, exitReason = :reason, completedAt = :ts, ${sentField} = :sent REMOVE claimedAt`,
+    UpdateExpression: delivered
+      ? `SET #s = :status, exitReason = :reason, completedAt = :ts, ${sentField} = :sent REMOVE claimedAt`
+      : 'SET #s = :status, exitReason = :reason, completedAt = :ts REMOVE claimedAt',
     ExpressionAttributeNames: { '#s': 'status' },
     ExpressionAttributeValues: {
       ':status': finalStatus,
       ':reason': exitReason,
       ':ts': now(),
-      ':sent': now(),
+      ...(delivered ? { ':sent': now() } : {}),
     },
   }).promise();
 }
@@ -617,7 +661,11 @@ async function exitEnrollment(
   exitReason: ExitReason,
 ): Promise<void> {
   const finalStatus: EnrollmentStatus = exitReason === 'unsubscribed' ? 'unsubscribed' : 'exited';
-  await completeEnrollment(enrollmentId, exitReason, finalStatus);
+  // delivered=false. An exit sends NOTHING — unsubscribe, conversion, engagement exit,
+  // archived sequence, condition-not-met — so stamping a sent-timestamp records a message
+  // that never existed. This is the highest-volume caller of completeEnrollment and the
+  // `delivered` flag was added without reaching it.
+  await completeEnrollment(enrollmentId, exitReason, finalStatus, 'email', false);
 }
 
 async function getEnrollmentStats(sequenceId: string): Promise<{
