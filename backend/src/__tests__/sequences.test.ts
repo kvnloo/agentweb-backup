@@ -14,7 +14,7 @@ import { settingsService } from '../services/settingsService';
 
 jest.mock('../middleware/auth', () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
-    req.user = { userId: 'user-123', email: 'test@example.com' };
+    req.user = { userId: 'user-123', email: 'test@acme.io' };
     next();
   },
 }));
@@ -37,33 +37,33 @@ jest.mock('../services/emailProviderService', () => ({
 jest.mock('../services/db', () => ({
   crmDb: {
     getLeads: jest.fn().mockResolvedValue([
-      { leadId: 'lead-1', email: 'a@example.com' },
-      { leadId: 'lead-2', email: 'b@example.com' },
+      { leadId: 'lead-1', email: 'a@acme.io' },
+      { leadId: 'lead-2', email: 'b@acme.io' },
     ]),
-    getLead: jest.fn().mockResolvedValue({ leadId: 'lead-1', email: 'a@example.com', lifecycle: 'inbox' }),
+    getLead: jest.fn().mockResolvedValue({ leadId: 'lead-1', email: 'a@acme.io', lifecycle: 'inbox' }),
     // The explicit enroll route decides reachability from the CRM ROW, not the request
     // body — its payload has no `linkedin` field, so reading the body made it enrol
     // nobody for a LinkedIn sequence. Resolve per leadId, because "this lead has no
     // address" is now a fact about the CRM, not about the payload.
     getLeadById: jest.fn().mockImplementation(async (_listId: string, leadId: string) => (
       leadId === 'lead-1'
-        ? { leadId: 'lead-1', email: 'a@example.com' }
+        ? { leadId: 'lead-1', email: 'a@acme.io' }
         : { leadId, email: '' }
     )),
     getLeadsByListId: jest.fn().mockResolvedValue([
-      { leadId: 'lead-1', email: 'a@example.com' },
-      { leadId: 'lead-2', email: 'b@example.com' },
+      { leadId: 'lead-1', email: 'a@acme.io' },
+      { leadId: 'lead-2', email: 'b@acme.io' },
     ]),
     getAllLeadsByListId: jest.fn().mockResolvedValue([
-      { leadId: 'lead-1', email: 'a@example.com' },
-      { leadId: 'lead-2', email: 'b@example.com' },
+      { leadId: 'lead-1', email: 'a@acme.io' },
+      { leadId: 'lead-2', email: 'b@acme.io' },
     ]),
     getLeadsByStatus: jest.fn().mockResolvedValue([]),
     getLeadListById: jest.fn().mockResolvedValue({ listId: 'list-1', userId: 'user-123' }),
     canOrgMemberAccessList: jest.fn().mockResolvedValue(true),
   },
   userDb: {
-    getUserById: jest.fn().mockResolvedValue({ userId: 'user-123', email: 'test@example.com' }),
+    getUserById: jest.fn().mockResolvedValue({ userId: 'user-123', email: 'test@acme.io' }),
   },
 }));
 
@@ -129,6 +129,55 @@ const mockSequence = {
 const app = express();
 app.use(express.json());
 app.use('/', sequenceRoutes);
+
+// Restore every crmDb/userDb fixture before each test.
+//
+// Tests here set fixtures by BARE REASSIGNMENT (`crmDbMock.getAllLeadsByListId =
+// jest.fn()...`), which replaces the property outright — `clearAllMocks`/`resetAllMocks`
+// cannot restore it, so whatever the previous test assigned leaks into the next one.
+// That is not theoretical: one test mocked `getLeadsByListId` while the route calls
+// `getAllLeadsByListId`, and it passed purely on the fixture left behind by its
+// neighbour — a test asserting nothing about its own subject. Under `--randomize` this
+// file failed 13-14 of 73. Re-seeding the defaults here makes each test independent of
+// order, so a leak shows up as a failure in the test that actually has the bug.
+beforeEach(() => {
+  const { crmDb, userDb } = require('../services/db');
+  crmDb.getLeads = jest.fn().mockResolvedValue([
+    { leadId: 'lead-1', email: 'a@acme.io' },
+    { leadId: 'lead-2', email: 'b@acme.io' },
+  ]);
+  crmDb.getLead = jest.fn().mockResolvedValue({ leadId: 'lead-1', email: 'a@acme.io', lifecycle: 'inbox' });
+  crmDb.getLeadById = jest.fn().mockImplementation(async (_listId: string, leadId: string) => (
+    leadId === 'lead-1'
+      ? { leadId: 'lead-1', email: 'a@acme.io' }
+      : { leadId, email: '' }
+  ));
+  crmDb.getLeadsByListId = jest.fn().mockResolvedValue([
+    { leadId: 'lead-1', email: 'a@acme.io' },
+    { leadId: 'lead-2', email: 'b@acme.io' },
+  ]);
+  crmDb.getAllLeadsByListId = jest.fn().mockResolvedValue([
+    { leadId: 'lead-1', email: 'a@acme.io' },
+    { leadId: 'lead-2', email: 'b@acme.io' },
+  ]);
+  crmDb.getLeadsByStatus = jest.fn().mockResolvedValue([]);
+  crmDb.getLeadListById = jest.fn().mockResolvedValue({ listId: 'list-1', userId: 'user-123' });
+  crmDb.canOrgMemberAccessList = jest.fn().mockResolvedValue(true);
+  userDb.getUserById = jest.fn().mockResolvedValue({ userId: 'user-123', email: 'test@acme.io' });
+
+  // dripSequenceDb too: `getSequence.mockResolvedValue(...)` (not ...Once) persists for
+  // the rest of the file, so a test that swaps in a LinkedIn sequence silently changed
+  // the channel every later test ran under.
+  dripSequenceDb.listSequences.mockReset().mockResolvedValue([mockSequence]);
+  dripSequenceDb.createSequence.mockReset().mockResolvedValue(mockSequence);
+  dripSequenceDb.getSequence.mockReset().mockResolvedValue(mockSequence);
+  dripSequenceDb.updateSequence.mockReset().mockResolvedValue({ ...mockSequence, name: 'Updated' });
+  dripSequenceDb.deleteSequence.mockReset().mockResolvedValue(undefined);
+  dripSequenceDb.listEnrollmentsForSequence.mockReset().mockResolvedValue([]);
+  dripSequenceDb.getEnrollmentStats.mockReset().mockResolvedValue({ active: 0, completed: 0, exited: 0, unsubscribed: 0, bounced: 0, total: 0 });
+  dripSequenceDb.bulkEnroll.mockReset().mockResolvedValue({ enrolled: 2, skipped: 0 });
+  dripSequenceDb.exitEnrollment.mockReset().mockResolvedValue(undefined);
+});
 
 // ─── GET / — list sequences ───────────────────────────────────────────────────
 
@@ -256,8 +305,8 @@ describe('POST /:sequenceId/enrollments - bulk enroll', () => {
       .post('/seq_1/enrollments')
       .send({
         leads: [
-          { listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@example.com' },
-          { listId: 'list-1', leadId: 'lead-2', leadEmail: 'b@example.com' },
+          { listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@acme.io' },
+          { listId: 'list-1', leadId: 'lead-2', leadEmail: 'b@acme.io' },
         ],
       });
     expect(res.status).toBe(200);
@@ -276,7 +325,7 @@ describe('POST /:sequenceId/enrollments - bulk enroll', () => {
       .post('/seq_1/enrollments')
       .send({
         leads: [
-          { listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@example.com' },
+          { listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@acme.io' },
           { listId: 'list-1', leadId: 'lead-2' },
           { listId: 'list-1', leadId: 'lead-3', leadEmail: '' },
         ],
@@ -291,7 +340,7 @@ describe('POST /:sequenceId/enrollments - bulk enroll', () => {
   it('omits skippedNoEmail when every lead has an address', async () => {
     const res = await request(app)
       .post('/seq_1/enrollments')
-      .send({ leads: [{ listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@example.com' }] });
+      .send({ leads: [{ listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@acme.io' }] });
     expect(res.status).toBe(200);
     expect(res.body).not.toHaveProperty('skippedNoEmail');
   });
@@ -310,7 +359,7 @@ describe('POST /:sequenceId/enrollments - bulk enroll', () => {
     dripSequenceDb.getSequence.mockResolvedValueOnce({ ...mockSequence, steps: [] });
     const res = await request(app)
       .post('/seq_1/enrollments')
-      .send({ leads: [{ listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@example.com' }] });
+      .send({ leads: [{ listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@acme.io' }] });
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/no steps/i);
   });
@@ -319,7 +368,7 @@ describe('POST /:sequenceId/enrollments - bulk enroll', () => {
     dripSequenceDb.getSequence.mockResolvedValueOnce({ ...mockSequence, userId: 'other-user' });
     const res = await request(app)
       .post('/seq_1/enrollments')
-      .send({ leads: [{ listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@example.com' }] });
+      .send({ leads: [{ listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@acme.io' }] });
     expect(res.status).toBe(403);
   });
 });
@@ -356,7 +405,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
 
     const crmDbMock = require('../services/db').crmDb;
     crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
-      { leadId: 'lead-1', email: 'a@example.com' },
+      { leadId: 'lead-1', email: 'a@acme.io' },
     ]);
 
     const res = await request(app)
@@ -383,10 +432,10 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
   it('reports the full population AND the enrollable subset', async () => {
     const crmDbMock = require('../services/db').crmDb;
     crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
-      { leadId: 'lead-1', email: 'a@example.com' },
+      { leadId: 'lead-1', email: 'a@acme.io' },
       { leadId: 'lead-2' },
       { leadId: 'lead-3', email: '' },
-      { leadId: 'lead-4', email: 'd@example.com' },
+      { leadId: 'lead-4', email: 'd@acme.io' },
     ]);
 
     const res = await request(app)
@@ -405,7 +454,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
   it('omits skippedNoEmail when every lead is addressable', async () => {
     const crmDbMock = require('../services/db').crmDb;
     crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
-      { leadId: 'lead-1', email: 'a@example.com' },
+      { leadId: 'lead-1', email: 'a@acme.io' },
     ]);
 
     const res = await request(app)
@@ -427,7 +476,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     // ("same population enrol-by-list will actually enrol") was false for any list
     // over one page: the two screens read different loaders.
     crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
-      { leadId: 'l1', email: 'a@example.com', firstName: 'Ann' },
+      { leadId: 'l1', email: 'a@acme.io', firstName: 'Ann' },
       { leadId: 'l2', firstName: 'Ben' },
       { leadId: 'l3', email: '', firstName: 'Cal' },
     ]);
@@ -673,11 +722,11 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
 
       const res = await request(app)
         .post('/seq_1/enrollments')
-        .send({ leads: [{ listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@example.com' }] });
+        .send({ leads: [{ listId: 'list-1', leadId: 'lead-1', leadEmail: 'a@acme.io' }] });
 
       expect(res.status).toBe(200);
       expect(dripSequenceDb.bulkEnroll).toHaveBeenCalled();
-      expect(dripSequenceDb.bulkEnroll.mock.calls[0][0][0].leadEmail).toBe('a@example.com');
+      expect(dripSequenceDb.bulkEnroll.mock.calls[0][0][0].leadEmail).toBe('a@acme.io');
     });
 
     // Review 5, finding 9. Nothing validates `step.channel` on create/update, so a
@@ -690,7 +739,11 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     it('verify-variables names the skip reason after the channel too', async () => {
       dripSequenceDb.getSequence.mockResolvedValue(linkedInSequence);
       const crmDbMock = require('../services/db').crmDb;
-      crmDbMock.getLeadsByListId = jest.fn().mockResolvedValue([
+      // getAllLeadsByListId, NOT getLeadsByListId — the route paginates. Mocking the
+      // single-page loader left this test reading whatever fixture the PREVIOUS test
+      // had assigned, so it passed in file order and failed under -t and --randomize.
+      // Same defect as two tests above; only that instance was repaired.
+      crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
         { leadId: 'l1', listId: 'list-1', email: 'a@x.com' },
         { leadId: 'l2', listId: 'list-1', linkedin: 'https://linkedin.com/in/b' },
       ]);
@@ -746,7 +799,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
   it('still enrols normally when a lifecycle filter does return leads', async () => {
     const crmDbMock = require('../services/db').crmDb;
     crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({
-      items: [{ leadId: 'l1', email: 'a@example.com' }],
+      items: [{ leadId: 'l1', email: 'a@acme.io' }],
     });
 
     const res = await request(app)
@@ -835,7 +888,7 @@ describe('POST /:sequenceId/steps/test-email', () => {
     senderName: 'Me',
     subject: 'Hi',
     htmlContent: '<p>hi</p>',
-    recipients: ['a@example.com'],
+    recipients: ['a@acme.io'],
   };
 
   describe('FAIL cases', () => {
@@ -868,7 +921,7 @@ describe('POST /:sequenceId/steps/test-email', () => {
       expect(resendService.sendEmail).toHaveBeenCalledWith(
         expect.objectContaining({
           from: 'Me <me@test.com>',
-          to: 'a@example.com',
+          to: 'a@acme.io',
           subject: '[TEST] Hi',
         }),
       );
@@ -891,7 +944,7 @@ describe('POST /:sequenceId/steps/test-email', () => {
         senderName: 'Hunter',
         subject: 'Hi',
         htmlContent: '<p>hi</p>',
-        recipients: ['a@example.com'],
+        recipients: ['a@acme.io'],
       });
 
       expect(resendService.sendEmail).not.toHaveBeenCalled();
@@ -1004,6 +1057,54 @@ describe('cross-tenant authorization', () => {
       expect(crmDbMock.getLeadsByListId).not.toHaveBeenCalled();
     });
 
+    /*
+     * Review round 2, finding 7. Every cross-tenant test above passes a `listId`, so
+     * only the LIST branch was exercised — scoping the sequence check to
+     * `hasSequence && listId` left the ELSE branch (the sequence's own enrollments, and
+     * a getLeadById per enrolled lead) completely unauthorised and 80/80 still passed.
+     * That branch is the worst leak the route had: it returns another tenant's lead
+     * rows, not just counts.
+     */
+    it('403s the enrollments branch (no listId) for someone else\'s sequence', async () => {
+      dripSequenceDb.getSequence.mockResolvedValue({ ...mockSequence, userId: 'someone-else' });
+      dripSequenceDb.listEnrollmentsForSequence.mockClear();
+      (crmDbMock.getLeadById as jest.Mock).mockClear();
+
+      const res = await request(app)
+        .post('/seq_1/steps/verify-variables')
+        .send({ subject: 'Hi {{firstName}}', htmlContent: '' });
+
+      expect(res.status).toBe(403);
+      expect(dripSequenceDb.listEnrollmentsForSequence).not.toHaveBeenCalled();
+      expect(crmDbMock.getLeadById).not.toHaveBeenCalled();
+    });
+
+    it('404s the enrollments branch (no listId) for a sequence that does not exist', async () => {
+      dripSequenceDb.getSequence.mockResolvedValue(null);
+      dripSequenceDb.listEnrollmentsForSequence.mockClear();
+
+      const res = await request(app)
+        .post('/seq_1/steps/verify-variables')
+        .send({ subject: 'Hi', htmlContent: '' });
+
+      expect(res.status).toBe(404);
+      expect(dripSequenceDb.listEnrollmentsForSequence).not.toHaveBeenCalled();
+    });
+
+    it('reads the enrollments branch for the OWNER', async () => {
+      dripSequenceDb.getSequence.mockResolvedValue(mockSequence);
+      dripSequenceDb.listEnrollmentsForSequence.mockResolvedValue([
+        { listId: 'list-1', leadId: 'lead-1' },
+      ]);
+
+      const res = await request(app)
+        .post('/seq_1/steps/verify-variables')
+        .send({ subject: 'Hi {{firstName}}', htmlContent: '' });
+
+      expect(res.status).toBe(200);
+      expect(dripSequenceDb.listEnrollmentsForSequence).toHaveBeenCalledWith('seq_1');
+    });
+
     it('still works for the owner', async () => {
       dripSequenceDb.getSequence.mockResolvedValue(mockSequence);
       const res = await request(app)
@@ -1028,8 +1129,8 @@ describe('unknown channels fall back to email, matching the worker', () => {
 
   beforeEach(() => {
     crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
-      { leadId: 'l1', listId: 'list-1', email: 'a@example.com' },
-      { leadId: 'l2', listId: 'list-1', email: 'b@example.com' },
+      { leadId: 'l1', listId: 'list-1', email: 'a@acme.io' },
+      { leadId: 'l2', listId: 'list-1', email: 'b@acme.io' },
     ]);
   });
 
@@ -1059,7 +1160,7 @@ describe('unknown channels fall back to email, matching the worker', () => {
       steps: [{ stepId: 's1', stepNumber: 1, name: 'x', delayDays: 0, channel: 'LinkedIn', messageText: 'hi' }],
     });
     crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
-      { leadId: 'l1', listId: 'list-1', email: 'a@example.com' },
+      { leadId: 'l1', listId: 'list-1', email: 'a@acme.io' },
     ]);
 
     const res = await request(app).post('/seq_1/enrollments/by-list').send({ listId: 'list-1' });
@@ -1108,7 +1209,7 @@ describe('the route uses the shared predicates, not truthiness', () => {
     crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
       { leadId: 'bad', listId: 'list-1', email: 'a@x..com' },
       { leadId: 'brackets', listId: 'list-1', email: '<a@x.com>' },
-      { leadId: 'good', listId: 'list-1', email: 'ada@example.org' },
+      { leadId: 'good', listId: 'list-1', email: 'ada@acme.io' },
     ]);
 
     const res = await request(app).post('/seq_1/enrollments/by-list').send({ listId: 'list-1' });
@@ -1169,12 +1270,12 @@ describe('the explicit route reports honestly about what it could not read', () 
     // One lead throttles, one genuinely has no profile.
     (crmDbMock.getLeadById as jest.Mock)
       .mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException'))
-      .mockResolvedValueOnce({ leadId: 'nolinkedin', email: 'a@example.org' });
+      .mockResolvedValueOnce({ leadId: 'nolinkedin', email: 'a@acme.io' });
 
     const res = await request(app).post('/seq_1/enrollments').send({
       leads: [
         { listId: 'list-1', leadId: 'throttled', leadEmail: '' },
-        { listId: 'list-1', leadId: 'nolinkedin', leadEmail: 'a@example.org' },
+        { listId: 'list-1', leadId: 'nolinkedin', leadEmail: 'a@acme.io' },
       ],
     });
 
@@ -1190,7 +1291,7 @@ describe('the explicit route reports honestly about what it could not read', () 
     (crmDbMock.getLeadById as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB unavailable'));
 
     const res = await request(app).post('/seq_1/enrollments')
-      .send({ leads: [{ listId: 'list-1', leadId: 'l1', leadEmail: 'a@example.org' }] });
+      .send({ leads: [{ listId: 'list-1', leadId: 'l1', leadEmail: 'a@acme.io' }] });
 
     expect(res.body.skippedReadFailed).toBeUndefined();
     expect(dripSequenceDb.bulkEnroll).toHaveBeenCalled();

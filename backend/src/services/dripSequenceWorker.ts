@@ -12,7 +12,7 @@
  */
 
 import { dripSequenceDb, DripSequence, SequenceEnrollment, StepCondition, SequenceChannel } from './dripSequenceDb';
-import { isReachableEmail, isReachableLinkedIn } from '../utils/leadReachability';
+import { isReachableEmail, canonicalLinkedInProfile } from '../utils/leadReachability';
 import { sendAsSender, SenderDailyLimitExceededError } from './sendAsSender';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { crmDb, userDb } from './db';
@@ -123,7 +123,20 @@ async function processEnrollment(
   if (!step) {
     // No more steps — sequence complete. delivered=false: this branch sends nothing, it
     // just notices there is nothing left to send.
-    await dripSequenceDb.completeEnrollment(enrollment.enrollmentId, 'completed', 'completed', 'email', false);
+    //
+    // Same everDelivered test as the completion branch below. Writing a flat 'completed'
+    // here contradicted it: an enrollment that reached this branch having sent nothing
+    // (its sequence was shortened under it, say) was recorded as fully delivered AND
+    // permanently barred from re-enrolment, which is the pair of defects
+    // 'completed_no_sends' exists to separate.
+    const everDelivered = !!(enrollment as any).lastEmailSentAt || !!(enrollment as any).lastLinkedInSentAt;
+    await dripSequenceDb.completeEnrollment(
+      enrollment.enrollmentId,
+      everDelivered ? 'completed' : 'completed_no_sends',
+      'completed',
+      'email',
+      false,
+    );
     stats.exited++;
     return;
   }
@@ -179,9 +192,14 @@ async function processEnrollment(
   if (nextStepIndex >= sequence.steps.length) {
     // Did this enrollment EVER send anything? The send timestamps are stamped only on
     // delivery, so their absence — plus this final step also being skipped — means the
-    // lead received nothing at all. Recording that as plain 'completed' made it
-    // identical in the dashboard to a lead that got the whole sequence, and barred it
-    // from ever being re-enrolled (getExistingEnrollment matches regardless of status).
+    // lead received nothing at all. Recording that as plain 'completed' barred it from
+    // ever being re-enrolled (getExistingEnrollment matches regardless of status), which
+    // is what this distinction is for.
+    //
+    // It does NOT yet change any dashboard: getEnrollmentStats buckets on `status`, and
+    // these rows keep `status: 'completed'`. Nothing outside dripSequenceDb reads
+    // `exitReason` today. Surfacing "enrolled but never reachable" in the UI is a
+    // separate change; this one only unblocks re-enrolment.
     const everDelivered = delivered
       || !!(enrollment as any).lastEmailSentAt
       || !!(enrollment as any).lastLinkedInSentAt;
@@ -279,22 +297,31 @@ async function sendLinkedInStep(
   lead: any,
   msgVars: Record<string, any>,
 ): Promise<boolean> {
-  const linkedInUrl = lead?.linkedin?.trim();
+  // SEND THE CANONICAL URL, NOT THE RAW FIELD.
+  //
   // Must be a PERSONAL profile. db.ts stores `lead.linkedin` verbatim for anything that
   // is not a /in/ URL — company and school pages, handles, free text from a CSV — and
   // sendMessage throws on those. That throw is not a lead-data skip, so it retried
   // forever: the exact failure this whole change set out to kill, surviving in the one
   // case the emptiness check does not catch.
-  // Shared predicate: it mirrors linkedInOutreachService's own `split('/in/')` parse, so
-  // a value this accepts is one the service can resolve. A case-insensitive test accepted
-  // `/IN/`, which the service then threw on — and a throw here is retried forever.
-  const isPersonalProfile = isReachableLinkedIn(linkedInUrl);
-  if (!isPersonalProfile) {
+  //
+  // The predicate normalises before judging (it strips query/fragment and lower-cases),
+  // so it accepts `?originalSubdomain=uk`, `#about` and `/IN/Ada`. Gating on the
+  // normalised value and then sending the RAW one reopened that same retry-forever jam
+  // on every URL the widening newly admitted: linkedInOutreachService.getLinkedInProfile
+  // does a plain case-sensitive `split('/in/')` and passes the tail to Unipile verbatim,
+  // so the raw value arrives as `ada?originalSubdomain=uk` (404) or, for `/IN/Ada`,
+  // fails `parts.length < 2` and throws outright. leadLinkedinCanonicalizer exists
+  // because pre-ENG-787 rows hold exactly these shapes, so the population is real.
+  //
+  // Take the value the predicate actually validated.
+  const linkedInUrl = canonicalLinkedInProfile(lead?.linkedin);
+  if (!linkedInUrl) {
     // A LEAD-DATA gap, not a failure. Throwing here rethrew out of processEnrollment, so the
     // enrollment retried this step forever and never reached the steps it COULD receive.
     // The configuration throws below are deliberately left as throws: retrying those is
     // correct, because they start working the moment the user fixes the config.
-    console.log(`[dripWorker] LinkedIn step ${step.stepNumber} skipped for enrollment ${enrollment.enrollmentId}: lead has no personal LinkedIn profile URL (${linkedInUrl || 'empty'})`);
+    console.log(`[dripWorker] LinkedIn step ${step.stepNumber} skipped for enrollment ${enrollment.enrollmentId}: lead has no personal LinkedIn profile URL (${String(lead?.linkedin ?? '').trim() || 'empty'})`);
     return false;
   }
 
@@ -444,8 +471,20 @@ async function checkExitConditions(
 
   // Check LinkedIn reply exit — fetch messages and look for inbound after enrollment
   if (exitConditions.onLinkedInReply) {
-    const linkedInUrl = lead?.linkedin?.trim() || enrollment.leadEmail;
-    if (linkedInUrl?.includes('linkedin.com')) {
+    // Same canonical URL the send path uses, not a third predicate.
+    //
+    // This was `includes('linkedin.com')` over the RAW field, and it handed that raw
+    // value to resolveProviderId. For a profile carrying `?originalSubdomain=uk` the
+    // resolve is `.catch(() => null)`-wrapped, so it failed silently and the reply-exit
+    // never fired at all — a sequence set to stop on a LinkedIn reply kept DMing someone
+    // who had already replied. The `linkedInProviderId` cache does not save it: the send
+    // that would populate the cache is the one that was throwing.
+    //
+    // `enrollment.leadEmail` is still the fallback because for an address-less lead that
+    // field holds the canonical profile URL — it IS the dedup identity.
+    const linkedInUrl = canonicalLinkedInProfile(lead?.linkedin)
+      ?? canonicalLinkedInProfile(enrollment.leadEmail);
+    if (linkedInUrl) {
       try {
         const accountId = await linkedInOutreachService.resolveAccountId(enrollment.userId);
         if (accountId) {

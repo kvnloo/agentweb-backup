@@ -1,4 +1,4 @@
-import { getGroupEmailRecipientIssue } from './groupEmailRecipientValidation';
+import { isEligibleGroupEmailRecipient } from './groupEmailRecipientValidation';
 import { normalizeLinkedInUrl } from './linkedInUrl';
 
 /**
@@ -23,15 +23,24 @@ import { normalizeLinkedInUrl } from './linkedInUrl';
  * against itself. groupEmailRecipientValidation is the single validator the group-send
  * preview and send routes already share (ENG-1194).
  *
- * Only `malformed` counts as unreachable. `test-domain` is a group-send POLICY — a
- * sequence addressed to example.com is a deliberate choice by the user, and the address
- * is perfectly deliverable in the sense this predicate is asking about. Conflating the
- * two would silently refuse every lead in the repo's own fixtures.
+ * `test-domain` counts as unreachable too, for the same reason `malformed` does.
+ *
+ * An earlier version admitted it, reasoning that example.com is a deliberate user
+ * choice and a send POLICY rather than a reachability fact. That was a test-suite
+ * constraint driving a production decision, and it kept the exact jam this predicate
+ * exists to close: the docstring above records that Resend answers these with a 422,
+ * sendEmailStep RETHROWS, and processDueEnrollments releases the claim and retries in
+ * five minutes — forever. Worse than the loop itself, sendAsSender reserves the
+ * sender's daily slot BEFORE dispatch and deliberately never releases it on failure, so
+ * one such lead burns ~288 sends a day and starves the user's real mail.
+ *
+ * `isEligibleGroupEmailRecipient` is the same `=== null` test every other consumer of
+ * this validator uses (crm.ts:6707/6713/6776/6892); this file was the lone outlier.
  */
 export function isReachableEmail(value: unknown): boolean {
   const email = String(value ?? '').trim();
   if (!email) return false;
-  return getGroupEmailRecipientIssue(email) !== 'malformed';
+  return isEligibleGroupEmailRecipient(email);
 }
 
 /**
@@ -39,9 +48,12 @@ export function isReachableEmail(value: unknown): boolean {
  * so company pages, school pages, `/pub/` legacy URLs and bare handles all throw there —
  * and a throw is retried forever rather than skipped.
  *
- * Case-sensitive on `/in/` deliberately: the service's own parser is
- * (`getLinkedInProfile` does a plain `split('/in/')`), so accepting `/IN/` here would
- * hand it a value it cannot parse. Matching the consumer beats being lenient.
+ * Case-INSENSITIVE, because it normalises first: `canonicalLinkedInProfile` lower-cases
+ * via normalizeLinkedInUrl, so `/IN/Ada` is accepted and canonicalised to `/in/ada`.
+ * That is only safe as long as the caller then SENDS the canonical value — the service's
+ * own `split('/in/')` is case-sensitive and throws on the raw form. Use
+ * `canonicalLinkedInProfile` directly wherever the URL is going to be used, not just
+ * tested; this boolean is for counting and filtering.
  */
 export function isReachableLinkedIn(value: unknown): boolean {
   return canonicalLinkedInProfile(value) !== null;
@@ -162,4 +174,34 @@ export function enrollmentIdentity(lead: any): string {
   const email = String(lead?.email ?? '').trim();
   if (isReachableEmail(email)) return email;
   return canonicalLinkedInProfile(lead?.linkedin) ?? '';
+}
+
+/**
+ * EVERY identity this lead could be stored under — the one `enrollmentIdentity` picks
+ * today, plus the one it would have picked before the lead's data changed.
+ *
+ * The identity is derived from MUTABLE lead data with email taking precedence, so it
+ * moves under an enrolled lead. Enrol an address-less lead and the row is keyed on its
+ * canonical LinkedIn URL; the day that lead gains an email, `enrollmentIdentity` returns
+ * the address instead, `getExistingEnrollment` looks only under the new key, finds
+ * nothing, and the entire sequence is delivered a second time.
+ *
+ * That is not hypothetical — three automatic paths write an email onto an existing lead
+ * and then re-run enrolment over the whole list: webhooks.ts auto-enrolls on `isUpdated`
+ * (so the very submission that adds the address re-enrols), crm.ts re-evaluates every
+ * lead on each import — including the LinkedIn-connections import that CREATES
+ * address-less leads — and applyApolloMatchToLead writes `updates.email` directly.
+ *
+ * Dedup therefore has to look under all of them. Order matters only for which row is
+ * reported; any hit means "already enrolled".
+ */
+export function enrollmentIdentityCandidates(lead: any): string[] {
+  const out: string[] = [];
+  const primary = enrollmentIdentity(lead);
+  if (primary) out.push(primary);
+  const profile = canonicalLinkedInProfile(lead?.linkedin);
+  if (profile && !out.includes(profile)) out.push(profile);
+  const email = String(lead?.email ?? '').trim();
+  if (isReachableEmail(email) && !out.includes(email)) out.push(email);
+  return out;
 }

@@ -433,3 +433,44 @@ describe('worker behaviours that had no coverage', () => {
       .toHaveBeenCalledWith('x.com', 'live@example.org');
   });
 });
+
+/*
+ * Review round 2, finding 9. There are TWO completion sites, and only one used
+ * everDelivered. The `!step` branch — reached when currentStep is already past the end,
+ * e.g. the sequence was shortened under a live enrollment — wrote a flat 'completed'
+ * even when nothing had ever been sent. That is the same pair of defects the exit
+ * reason exists to separate: it reads as fully delivered, and it bars the lead from
+ * ever being re-enrolled. The existing test used expect.any(String) here, so the
+ * inconsistency was knowingly unpinned.
+ */
+describe('the no-steps-left branch agrees with the completion branch', () => {
+  const emptySequence = { ...mixedSequence, steps: [] };
+
+  it('records completed_no_sends when the enrollment never delivered anything', async () => {
+    mockDb.getSequence.mockResolvedValue(emptySequence as any);
+    mockDb.getAllDueEnrollments.mockResolvedValue([
+      enrollmentAt(0, 'https://www.linkedin.com/in/ada/') as any,
+    ]);
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'lead-1', linkedin: 'https://www.linkedin.com/in/ada' } as any);
+
+    await processDueEnrollments();
+
+    expect(mockDb.completeEnrollment).toHaveBeenCalledWith(
+      'e1', 'completed_no_sends', 'completed', 'email', false,
+    );
+  });
+
+  it('records plain completed when an earlier step DID deliver', async () => {
+    mockDb.getSequence.mockResolvedValue(emptySequence as any);
+    mockDb.getAllDueEnrollments.mockResolvedValue([
+      { ...enrollmentAt(0, 'https://www.linkedin.com/in/ada/'), lastLinkedInSentAt: '2026-01-01T00:00:00Z' } as any,
+    ]);
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'lead-1', linkedin: 'https://www.linkedin.com/in/ada' } as any);
+
+    await processDueEnrollments();
+
+    expect(mockDb.completeEnrollment).toHaveBeenCalledWith(
+      'e1', 'completed', 'completed', 'email', false,
+    );
+  });
+});

@@ -6,7 +6,10 @@
  * the fix for it. Refusing a reachable lead is not the safe direction: it costs a real
  * send, silently, and the count looks like clean data.
  */
-import { isReachableEmail, isReachableLinkedIn, canonicalLinkedInProfile } from '../utils/leadReachability';
+import {
+  isReachableEmail, isReachableLinkedIn, canonicalLinkedInProfile,
+  requiredChannels, enrollmentIdentity, enrollmentIdentityCandidates,
+} from '../utils/leadReachability';
 
 describe('isReachableEmail', () => {
   /*
@@ -31,7 +34,7 @@ describe('isReachableEmail', () => {
   });
 
   it.each([
-    ['an ordinary address', 'ada@example.org'],
+    ['an ordinary address', 'ada@acme.io'],
     ['a plus tag', 'ada+seq@agentweb.pro'],
     ['a subdomain', 'ada@mail.agentweb.pro'],
     ['surrounding whitespace', '  ada@agentweb.pro  '],
@@ -40,12 +43,22 @@ describe('isReachableEmail', () => {
   });
 
   /*
-   * test-domain is a GROUP-SEND POLICY, not a statement about deliverability. A sequence
-   * addressed to example.com is a deliberate choice, and treating it as unreachable would
-   * silently refuse every lead in this repo's own fixtures.
+   * A reserved test domain is UNREACHABLE, for the same reason a malformed address is.
+   *
+   * This previously asserted the opposite, on the grounds that example.com is a send
+   * POLICY rather than a deliverability fact. It isn't: Resend answers these with a 422,
+   * sendEmailStep rethrows, and processDueEnrollments retries every five minutes
+   * forever — while sendAsSender has already reserved (and deliberately never releases)
+   * a daily send slot, so one such lead burns ~288 of the user's sends a day. Admitting
+   * it kept alive the exact jam this predicate was added to close.
    */
-  it('accepts a reserved test domain — that is a send policy, not unreachability', () => {
-    expect(isReachableEmail('lead@example.com')).toBe(true);
+  it.each([
+    ['example.com', 'lead@example.com'],
+    ['example.org', 'lead@example.org'],
+    ['an RFC 2606 .test TLD', 'lead@acme.test'],
+    ['an RFC 2606 .invalid TLD', 'lead@acme.invalid'],
+  ])('refuses a reserved test domain (%s) — the provider 422s it', (_label, value) => {
+    expect(isReachableEmail(value)).toBe(false);
   });
 });
 
@@ -98,5 +111,84 @@ describe('isReachableLinkedIn / canonicalLinkedInProfile', () => {
 
   it('returns null rather than a half-formed URL for a non-profile', () => {
     expect(canonicalLinkedInProfile('Acme Corp')).toBeNull();
+  });
+});
+
+describe('requiredChannels defaults', () => {
+  /*
+   * Review round 2, finding 11. The empty-steps default is a live branch, not a
+   * defensive one: verify-variables' 'test' sentinel calls this with no sequence at all.
+   * Returning an empty set there means "reachable on no channel", which filters out
+   * every lead and reports leadCount 0 — a blank coverage screen with no error.
+   */
+  it('defaults to email when there is no sequence to read', () => {
+    expect(Array.from(requiredChannels(null))).toEqual(['email']);
+    expect(Array.from(requiredChannels(undefined))).toEqual(['email']);
+    expect(Array.from(requiredChannels({}))).toEqual(['email']);
+    expect(Array.from(requiredChannels({ steps: [] }))).toEqual(['email']);
+  });
+
+  it('never returns an empty set — that would filter out every lead', () => {
+    for (const seq of [null, undefined, {}, { steps: [] }, { steps: [{}] }]) {
+      expect(requiredChannels(seq).size).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('enrollmentIdentityCandidates', () => {
+  /*
+   * Review round 2, finding 2. The identity is derived from mutable lead data, so the
+   * dedup check must look under the identity the lead HAD as well as the one it has now.
+   */
+  const profile = 'https://www.linkedin.com/in/ada/';
+
+  it('offers both identities for a lead that has an email and a profile', () => {
+    const got = enrollmentIdentityCandidates({ email: 'ada@acme.io', linkedin: profile });
+    expect(got).toContain('ada@acme.io');
+    expect(got).toContain(profile);
+    // The identity actually written comes first.
+    expect(got[0]).toBe('ada@acme.io');
+  });
+
+  it('canonicalises the profile candidate, so both URL spellings find the same row', () => {
+    expect(enrollmentIdentityCandidates({ linkedin: 'https://www.LinkedIn.com/IN/Ada?trk=x' }))
+      .toEqual([profile]);
+  });
+
+  it('offers just the address when there is no profile', () => {
+    expect(enrollmentIdentityCandidates({ email: 'ada@acme.io' })).toEqual(['ada@acme.io']);
+  });
+
+  it('never offers a malformed address as an identity', () => {
+    expect(enrollmentIdentityCandidates({ email: 'a@x..com', linkedin: profile })).toEqual([profile]);
+  });
+
+  it('returns nothing for a lead reachable on no channel', () => {
+    expect(enrollmentIdentityCandidates({ email: 'a@x..com', linkedin: 'Acme Corp' })).toEqual([]);
+    expect(enrollmentIdentityCandidates({})).toEqual([]);
+  });
+
+  it('never contains a duplicate or an empty string', () => {
+    for (const lead of [
+      { email: 'ada@acme.io', linkedin: profile },
+      { linkedin: profile },
+      { email: 'ada@acme.io' },
+      {},
+    ]) {
+      const got = enrollmentIdentityCandidates(lead);
+      expect(got).toEqual(Array.from(new Set(got)));
+      expect(got.every((x) => x.length > 0)).toBe(true);
+    }
+  });
+
+  it('always includes the identity enrollmentIdentity would write', () => {
+    for (const lead of [
+      { email: 'ada@acme.io', linkedin: profile },
+      { linkedin: profile },
+      { email: 'ada@acme.io' },
+      { email: 'a@x..com', linkedin: profile },
+    ]) {
+      expect(enrollmentIdentityCandidates(lead)).toContain(enrollmentIdentity(lead));
+    }
   });
 });

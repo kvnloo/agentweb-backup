@@ -24,7 +24,7 @@ import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { isValidLeadLifecycle, LEAD_LIFECYCLES } from '../utils/leadSchema';
-import { requiredChannels, leadIsReachable, enrollmentIdentity } from '../utils/leadReachability';
+import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValidation';
 import { syncContact, SyncInput } from '../services/contactSyncService';
 import { isCardRevenueField } from '../services/enrichmentGroups';
@@ -123,6 +123,7 @@ export async function autoEnrollLeadInSequences(
         listId,
         leadId,
         leadEmail: identity,
+        identityCandidates: enrollmentIdentityCandidates(leadObj),
       }]);
     }
   } catch (err) {
@@ -159,6 +160,7 @@ export async function autoEnrollListIntoSequences(userId: string, listId: string
           listId,
           leadId: l.leadId,
           leadEmail: enrollmentIdentity(l),
+          identityCandidates: enrollmentIdentityCandidates(l),
         }));
       if (inputs.length > 0) {
         await dripSequenceDb.bulkEnroll(inputs);

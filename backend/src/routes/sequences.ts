@@ -24,6 +24,7 @@ import { LEAD_LIFECYCLES, defaultStatusConfigFor } from '../utils/leadSchema';
 import {
   isReachableEmail, isReachableLinkedIn, canonicalLinkedInProfile,
   requiredChannels, leadIsReachable, skipKeyForChannels, enrollmentIdentity,
+  enrollmentIdentityCandidates,
 } from '../utils/leadReachability';
 
 /**
@@ -42,10 +43,6 @@ import {
 const LIFECYCLE_STAGES: ReadonlySet<string> = new Set<string>(LEAD_LIFECYCLES);
 
 const router = express.Router();
-
-
-
-
 
 // ─── Sequences CRUD ───────────────────────────────────────────────────────────
 
@@ -280,6 +277,7 @@ router.post(
         listId: r.input.listId,
         leadId: r.input.leadId,
         leadEmail: enrollmentIdentity(r.lead),
+        identityCandidates: enrollmentIdentityCandidates(r.lead),
         startAt: startAt ?? undefined,
       }));
 
@@ -435,6 +433,7 @@ router.post(
           listId,
           leadId: l.leadId,
           leadEmail: enrollmentIdentity(l),
+          identityCandidates: enrollmentIdentityCandidates(l),
           startAt: startAt ?? undefined,
         }));
 

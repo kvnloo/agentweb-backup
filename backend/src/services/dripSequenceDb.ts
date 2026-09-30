@@ -207,6 +207,14 @@ export interface CreateEnrollmentInput {
   leadId: string;
   leadEmail: string;
   startAt?: string;            // override first send time; defaults to now
+  /**
+   * Other identities this lead may already be stored under, for the dedup check only —
+   * never written. `leadEmail` is derived from mutable lead data (email wins over the
+   * LinkedIn URL), so an address-less lead enrolled under its profile URL gets a
+   * DIFFERENT identity the day it gains an email, and re-enrols. See
+   * `enrollmentIdentityCandidates`.
+   */
+  identityCandidates?: string[];
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -404,7 +412,16 @@ async function bulkEnroll(
   let skipped = 0;
 
   for (const input of inputs) {
-    const existing = await getExistingEnrollment(input.sequenceId, input.leadEmail);
+    // Check every identity the lead could already be stored under, not just the one we
+    // would write today — the identity moves when the lead's data changes, and a miss
+    // here re-delivers the whole sequence. Deduped, and `leadEmail` is always included.
+    const candidates = Array.from(new Set([input.leadEmail, ...(input.identityCandidates ?? [])]))
+      .filter(Boolean);
+    let existing: SequenceEnrollment | null = null;
+    for (const identity of candidates) {
+      existing = await getExistingEnrollment(input.sequenceId, identity);
+      if (existing) break;
+    }
     if (existing) {
       skipped++;
       continue;

@@ -15,6 +15,7 @@
 import AWS from 'aws-sdk';
 import dotenv from 'dotenv';
 import path from 'path';
+import { normalizeLinkedInUrl } from '../utils/linkedInUrl';
 
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 
@@ -181,7 +182,6 @@ export async function getLatestConnectedAt(accountId: string): Promise<number | 
   return item?.connectedAt ?? null;
 }
 
-import { normalizeLinkedInUrl } from '../utils/linkedInUrl';
 // Re-exported so existing importers of this module keep working; the function
 // itself moved to utils/ because it is pure and leadReachability needs it without
 // dragging in this module's AWS initialisation.

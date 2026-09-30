@@ -34,11 +34,11 @@ describe('auto-enroll decides the same way the enrol routes do', () => {
   });
 
   it('enrols an email-only lead into a mixed sequence', () => {
-    expect(decide(mixedSeq, { email: 'ada@example.org' })).toBe('ada@example.org');
+    expect(decide(mixedSeq, { email: 'ada@acme.io' })).toBe('ada@acme.io');
   });
 
   it('refuses an email-only lead for a LinkedIn-only sequence', () => {
-    expect(decide(linkedInSeq, { email: 'ada@example.org' })).toBeNull();
+    expect(decide(linkedInSeq, { email: 'ada@acme.io' })).toBeNull();
   });
 
   it('refuses a lead reachable on no channel at all', () => {

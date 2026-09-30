@@ -1,11 +1,14 @@
-jest.mock('../services/db', () => ({
-  ...jest.requireActual('../services/db'),
-  crmDb: { getAllLeadsByListId: jest.fn(), getLeadsByListId: jest.fn() },
-}));
 /**
- * ENG-1388 AC7: the per-field "Refresh" endpoint runs the legacy web/LinkedIn
- * LLM path with forceOverwrite. Card revenue is measured by Enigma, so a refresh
- * of one must be refused before that path can overwrite it with a guess.
+ * routes/crm.ts's copy of autoEnrollLeadInSequences is channel-aware.
+ *
+ * Two copies of this function exist — this one and routes/webhooks.ts's — and testing
+ * the shared predicates alone left both call sites unpinned, so each needs its own
+ * guard. See webhooks.autoEnrollChannelAware.test.ts for the twin.
+ *
+ * (A dead duplicate `jest.mock('../services/db', ...)` stood here, overridden by the
+ * one below, which is why every test hand-assigns its own crmDb fixtures. Removing it
+ * changes nothing at runtime; it was only ever misleading. The docstring it carried
+ * described an unrelated ENG-1388 enrichment endpoint.)
  */
 
 const mockExecute = jest.fn();
@@ -102,7 +105,7 @@ jest.mock('../services/dripSequenceDb', () => ({
 
 const mockUser: { userId: string; email: string; isAdmin: boolean } = {
   userId: 'user-A',
-  email: 'a@example.com',
+  email: 'a@acme.io',
   isAdmin: false,
 };
 
@@ -127,7 +130,7 @@ app.use('/api/crm', router);
 beforeEach(() => {
   jest.clearAllMocks();
   mockUser.userId = 'user-A';
-  mockUser.email = 'a@example.com';
+  mockUser.email = 'a@acme.io';
   mockUser.isAdmin = false;
   dynamoScan.mockReset();
 });
@@ -180,7 +183,7 @@ describe('crm auto-enroll is channel-aware', () => {
 
   it('refuses an email-only lead for a LinkedIn-only sequence', async () => {
     await autoEnrollLeadInSequences('user-1', 'list-1', 'lead-1',
-      { email: 'ada@example.org', linkedin: '' });
+      { email: 'ada@acme.io', linkedin: '' });
 
     expect(mockSeqDb.bulkEnroll).not.toHaveBeenCalled();
   });
@@ -190,17 +193,17 @@ describe('crm auto-enroll is channel-aware', () => {
       { sequenceId: 'seq-2', userId: 'user-1', steps: [{ subject: 'Hi', bodyHtml: 'y' }] } as any,
     ]);
 
-    await autoEnrollLeadInSequences('user-1', 'list-1', 'lead-1', 'ada@example.org');
+    await autoEnrollLeadInSequences('user-1', 'list-1', 'lead-1', 'ada@acme.io');
 
     expect(mockSeqDb.bulkEnroll).toHaveBeenCalledWith([
-      expect.objectContaining({ leadEmail: 'ada@example.org' }),
+      expect.objectContaining({ leadEmail: 'ada@acme.io' }),
     ]);
   });
 
   it('list import: filters by reachability and reads the COMPLETE list', async () => {
     (mockCrm.getAllLeadsByListId as jest.Mock) = jest.fn().mockResolvedValue([
       { leadId: 'li', linkedin: 'https://linkedin.com/in/ada' },
-      { leadId: 'mail', email: 'ada@example.org' },
+      { leadId: 'mail', email: 'ada@acme.io' },
       { leadId: 'junk', linkedin: 'Acme Corp' },
     ]);
     (mockCrm.getLeadsByListId as jest.Mock) = jest.fn();

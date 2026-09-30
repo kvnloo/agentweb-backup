@@ -13,7 +13,7 @@ import sequenceRoutes from '../routes/sequences';
 
 jest.mock('../middleware/auth', () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
-    req.user = { userId: 'user-123', email: 'test@example.com' };
+    req.user = { userId: 'user-123', email: 'test@acme.io' };
     next();
   },
 }));
@@ -26,7 +26,7 @@ jest.mock('../services/db', () => ({
     getLeadsByStatus: jest.fn().mockResolvedValue([]),
   },
   userDb: {
-    getUserById: jest.fn().mockResolvedValue({ userId: 'user-123', email: 'test@example.com' }),
+    getUserById: jest.fn().mockResolvedValue({ userId: 'user-123', email: 'test@acme.io' }),
   },
 }));
 
@@ -71,9 +71,9 @@ const emailStepWithGaps = {
 };
 
 const threeLeads = [
-  { leadId: 'l1', email: 'a@example.com', firstName: 'A', customFields: { region: 'X' } },
-  { leadId: 'l2', email: 'b@example.com', firstName: 'B', customFields: { region: 'Y' } },
-  { leadId: 'l3', email: 'c@example.com', firstName: 'C' },
+  { leadId: 'l1', email: 'a@acme.io', firstName: 'A', customFields: { region: 'X' } },
+  { leadId: 'l2', email: 'b@acme.io', firstName: 'B', customFields: { region: 'Y' } },
+  { leadId: 'l3', email: 'c@acme.io', firstName: 'C' },
 ];
 
 // The same three leads, reachable on LinkedIn. Enrollability is derived from the
@@ -131,7 +131,7 @@ describe('POST /:sequenceId/enrollments/by-list — variable-warning gating', ()
         subject: 'Hi {{firstName}} from {{senderName}} {{senderEmail}}', bodyHtml: '<p>x</p>' },
     ]));
     crmDb.getAllLeadsByListId.mockResolvedValue([
-      { leadId: 'l1', email: 'a@example.com', firstName: 'A' },
+      { leadId: 'l1', email: 'a@acme.io', firstName: 'A' },
     ]);
 
     const res = await request(app).post('/seq_1/enrollments/by-list').send({ listId: 'list-1' });
@@ -151,8 +151,8 @@ describe('POST /:sequenceId/enrollments/by-list — variable-warning gating', ()
         subject: 'Hi {{firstName}}', bodyHtml: 'Hello' },
     ]));
     crmDb.getAllLeadsByListId.mockResolvedValue([
-      { leadId: 'l1', email: 'a@example.com', firstName: 'A' },
-      { leadId: 'l2', email: 'b@example.com', firstName: 'B' },
+      { leadId: 'l1', email: 'a@acme.io', firstName: 'A' },
+      { leadId: 'l2', email: 'b@acme.io', firstName: 'B' },
       // No email AND no firstName — it must not be counted, and must not be the reason
       // the confirmation gate fires.
       { leadId: 'l3', phone: '4155550142' },
@@ -182,7 +182,7 @@ describe('POST /:sequenceId/enrollments/by-list — variable-warning gating', ()
         subject: 'Hi', bodyHtml: 'Hello' },
     ]));
     crmDb.getAllLeadsByListId.mockResolvedValue([
-      { leadId: 'l1', email: 'a@example.com', firstName: 'A' },
+      { leadId: 'l1', email: 'a@acme.io', firstName: 'A' },
       { leadId: 'l2', phone: '4155550142', firstName: 'PhoneOnly' },
       { leadId: 'l3', email: '', firstName: 'Empty' },
     ]);

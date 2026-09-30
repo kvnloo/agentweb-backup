@@ -7,7 +7,7 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { crmDb, userDb, tempEmailDb } from '../services/db';
 import { dripSequenceDb } from '../services/dripSequenceDb';
-import { requiredChannels, leadIsReachable, enrollmentIdentity } from '../utils/leadReachability';
+import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { getUserIdByHubSpotPortalId, getAccountsByAttioWorkspaceId } from '../services/connectedAccountsDb';
 import { HubSpotService } from '../services/hubspotService';
 import { AttioService } from '../services/attioService';
@@ -112,8 +112,12 @@ function validatedEventTimeSeconds(capturedAtMs: unknown): number | undefined {
  * autoEnrollListIds containing this list. Mirrors the authenticated CRM path
  * (routes/crm.ts) so leads captured via the public forward-lead webhook also
  * land in list-bound drip sequences. Errors are logged but never surfaced.
+ *
+ * Exported for tests only. The crm.ts twin was exported for exactly this reason and
+ * then guarded; this copy was left private, so reinstating its `if (!lead.email) return`
+ * gate passed 219/219 webhooks tests — half the fix had no regression guard at all.
  */
-async function autoEnrollLeadInSequences(
+export async function autoEnrollLeadInSequences(
   userId: string,
   listId: string,
   leadId: string,
@@ -141,6 +145,7 @@ async function autoEnrollLeadInSequences(
         listId,
         leadId,
         leadEmail: identity,
+        identityCandidates: enrollmentIdentityCandidates(leadObj),
       }]);
     }
   } catch (err) {
