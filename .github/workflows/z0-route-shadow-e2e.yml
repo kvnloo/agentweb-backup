@@ -1,0 +1,103 @@
+name: AgentWeb z0 Route Shadow E2E
+
+on:
+  pull_request:
+    branches: [lab/z0-agentweb-emma-v0]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  route-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      Z0INT_SERVICE_URL: http://127.0.0.1:11501
+      Z0INT_HOME: /tmp/z0int-route-shadow
+      Z0_ROUTE_SHADOW: shadow
+      Z0INT_ROUTE_SHADOW_ALLOW: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: kvnloo/z0intelligence
+          ref: lab/agentweb-emma-v0
+          path: deps/z0intelligence
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: kvnloo/z0evals
+          ref: study/agentweb-emma-z0-v0
+          path: deps/z0evals
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install AgentWeb dependencies
+        working-directory: backend
+        run: npm ci --no-audit --no-fund
+
+      - name: Start z0 plan service
+        env:
+          PYTHONPATH: ${{ github.workspace }}/deps/z0intelligence/src
+        run: |
+          python -m z0int.intelligence_service --port 11501 > /tmp/z0-route-service.log 2>&1 &
+          echo $! > /tmp/z0-route-service.pid
+          python - <<'PY'
+          import time, urllib.request
+          for _ in range(40):
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:11501/healthz", timeout=1) as r:
+                      if r.status == 200:
+                          raise SystemExit(0)
+              except Exception:
+                  time.sleep(.1)
+          raise SystemExit("z0 service did not become ready")
+          PY
+
+      - name: Run 12 native-turn route observations
+        working-directory: backend
+        run: |
+          npm run study:z0-route-shadow --             ../deps/z0evals/studies/agentweb-emma-z0-v0/route-shadow-fixtures.jsonl             /tmp/route-shadow-results.jsonl
+
+      - name: Score abstention baseline
+        run: |
+          python deps/z0evals/scripts/score_agentweb_route_shadow.py             /tmp/route-shadow-results.jsonl             --output /tmp/route-shadow-summary.json
+          cat /tmp/route-shadow-summary.json
+          python - <<'PY'
+          import json
+          s = json.load(open("/tmp/route-shadow-summary.json"))
+          assert s["n"] == 12
+          assert s["passed"] is True, s
+          PY
+
+      - name: Stop service
+        if: always()
+        run: |
+          test ! -f /tmp/z0-route-service.pid || kill "$(cat /tmp/z0-route-service.pid)" || true
+          cat /tmp/z0-route-service.log || true
+
+      - name: Upload route-shadow evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentweb-z0-route-shadow-e2e
+          path: |
+            /tmp/route-shadow-results.jsonl
+            /tmp/route-shadow-summary.json
+            /tmp/z0-route-service.log
+          if-no-files-found: warn
