@@ -66,10 +66,9 @@ export function pseudonymousAgentWebParent(sessionId: string): string {
   return `agentweb:${sha256(sessionId).slice(0, 24)}`;
 }
 
-export function agentWebTraceId(parentAgent: string, args: Pick<Z0RouteArgs, 'operation_id' | 'function'>): string {
+export function agentWebTraceId(parentAgent: string, args: Pick<Z0RouteArgs, 'operation_id'>): string {
   if (!args.operation_id?.trim()) throw new Error('operation_id is required');
-  if (!args.function?.trim()) throw new Error('function is required');
-  return sha256(`${parentAgent}\0${args.operation_id}\0${args.function}`);
+  return sha256(`${parentAgent}\0${args.operation_id}`);
 }
 
 function validateArgs(args: Z0RouteArgs): string | null {
