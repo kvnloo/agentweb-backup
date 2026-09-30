@@ -126,7 +126,9 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.health.status_reasons.join(' ')).toMatch(/activation/i);
   });
 
-  it('reports at-risk with the expiry date when the only Meta ad account token has expired', async () => {
+  // ENG-2188: an expired connection is reconnect work, not churn evidence. This test previously
+  // asserted 'at-risk'.
+  it('reports needs-attention (not at-risk) with the expiry date when the only Meta ad account token has expired', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
     (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
       userId: 'client-user',
@@ -146,8 +148,43 @@ describe('Client Health - assessClientHealth', () => {
 
     expect(result.success).toBe(true);
     expect(result.health.ads_layer.connection).toBe('expired');
-    expect(result.health.status).toBe('at-risk');
+    expect(result.health.ads_layer.connection_all_platforms).toBe('expired');
+    expect(result.health.status).toBe('needs-attention');
     expect(result.health.status_reasons.join(' ')).toContain('2026-09-15T20:52:34.993Z');
+    expect(result.health.status_reasons.join(' ')).toMatch(/reconnect needed/);
+  });
+
+  it('ENG-2188: an expired Meta token is not a whole-account expiry while Google Ads is still connected', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user', email: 'client@example.com', adAccount: '', productDomain: 'client.example', emailDomain: 'client.example',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      { platform: 'meta', config: { account_type: 'ad_account', ad_account_id: 'act_1', access_token: 'tok', token_expires_at: 1 } },
+      { platform: 'google_ads', config: { account_type: 'google_ads', refresh_token: 'r', token_expires_at: 1 } },
+    ]);
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.health.ads_layer.connection).toBe('expired');
+    expect(result.health.ads_layer.connection_all_platforms).toBe('connected');
+    expect(['at-risk', 'needs-attention']).not.toContain(result.health.status);
+    expect(result.health.status_reasons.join(' ')).toMatch(/Meta ad account connection expired .* still connected on another platform/);
+  });
+
+  it('ENG-2188: an expired Google Ads-only connection needs attention (every platform is checked, not just Meta)', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({ userId: 'client-user', email: 'client@example.com', adAccount: '' });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      { platform: 'google_ads', config: { account_type: 'google_ads', token_expires_at: Date.parse('2026-09-01T00:00:00.000Z') } },
+    ]);
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.health.ads_layer.connection).toBe('other_platform');
+    expect(result.health.ads_layer.connection_all_platforms).toBe('expired');
+    expect(result.health.ads_layer.all_platforms_expired_at).toBe('2026-09-01T00:00:00.000Z');
+    expect(result.health.status).toBe('needs-attention');
   });
 
   it('does not call a Google/LinkedIn Ads client onboarding or blocked when Meta is absent', async () => {
@@ -539,6 +576,29 @@ describe('Client Health - assessClientHealth', () => {
     d.setUTCDate(d.getUTCDate() - 13 - 1 - 13);
     return d.toISOString().slice(0, 10);
   }
+
+  // ENG-2188: setup gaps (no lander, no CRM) plus creative fatigue are more than two reasons, which
+  // used to read as 'at-risk'. None of them is churn evidence.
+  it('ENG-2188: more than two setup gaps need attention, never at-risk', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user', email: 'client@example.com', displayName: 'Client User', adAccount: '123456',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+    mockedMetaFetch
+      .mockResolvedValueOnce({ data: [{ id: 'camp1', name: 'Campaign 1', status: 'ACTIVE', objective: 'OUTCOME_LEADS' }] })
+      .mockResolvedValueOnce({
+        data: [{
+          id: 'ad1', name: 'Fatigued Ad', creative: { id: 'cr1' }, status: 'ACTIVE',
+          insights: { data: [{ spend: '50', frequency: '4.2', ctr: '1.0', cpm: '10', date_start: currentWindowDateStart() }] },
+        }],
+      });
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.health.status_reasons.length).toBeGreaterThan(2);
+    expect(result.health.status).toBe('needs-attention');
+  });
 
   it('flags a creative fatigued by frequency alone (no prior-period data)', async () => {
     const adminUserId = 'admin-user';
@@ -1589,6 +1649,11 @@ describe('Client Health - listAllClients ad_connection', () => {
     expect(byId['u-expired'].ad_connection).toBe('expired');
     expect(byId['u-legacy'].ad_connection).toBe('connected');
     expect(byId['u-google'].ad_connection).toBe('other_platform');
+    // ENG-2188: the all-platform state the portal's status reads.
+    expect(byId['u-never'].ad_connection_all_platforms).toBe('never_connected');
+    expect(byId['u-expired'].ad_connection_all_platforms).toBe('expired');
+    expect(byId['u-legacy'].ad_connection_all_platforms).toBe('connected');
+    expect(byId['u-google'].ad_connection_all_platforms).toBe('connected');
     // has_ads keeps its historical meaning (an ad account is on record) for existing consumers.
     expect(byId['u-expired'].has_ads).toBe(true);
     (getAccountsByUserId as jest.Mock).mockReset();

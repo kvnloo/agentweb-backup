@@ -1,6 +1,6 @@
 import type AWS from 'aws-sdk';
 import { isQualifyingValidation } from '../loops/eval/evalRegistry';
-import { newGoldenCase, type GoldenCase, type LabelValue } from '../loops/eval/goldenSet';
+import { newCreativePairCase, newGoldenCase, type GoldenCase, type LabelValue } from '../loops/eval/goldenSet';
 import type { GoldenSetStore } from '../loops/eval/goldenSetStore';
 import type { ReadOnlyDocReader, ReadRequest } from '../loops/eval/agentGraderLoader';
 import type { SessionForGrading } from '../loops/eval/agentGraders';
@@ -116,6 +116,34 @@ describe('validation runner math (ENG-2135)', () => {
     warn.mockRestore();
   });
 
+  it('leaves pairwise calibration cases out of a creative grader run (ENG-2142)', async () => {
+    const single = { ...newGoldenCase({ surface: 'creative', taskType: 'creative_image', sourceId: 'c1', seedSource: 's', now: NOW }), split: 'test' as const, labels: { hook: 'pass' as const } };
+    const pair: GoldenCase = {
+      ...newCreativePairCase({
+        candidateIdA: 'c2',
+        pair: { candidateIdB: 'c1', batch: '2026-W39', position: 0, batchSize: 1, category: 'ad', placement: 'unknown', signal: 'unscored' },
+        now: NOW,
+      }),
+      split: 'test',
+      labels: { pairwise_preference: 'A' },
+    };
+    const graded: string[] = [];
+    const grader: GoldenCaseGrader = {
+      graderId: 'creative-rubric-judge',
+      surface: 'creative',
+      criteria: ['hook'],
+      primaryCriterion: 'hook',
+      grade: async (c) => {
+        graded.push(c.caseId);
+        return { hook: 'pass' };
+      },
+    };
+    const run = await runValidation({ graderId: 'creative-rubric-judge', store: storeOf([single, pair]), graders: [grader], bootstrap: { iterations: 10 } });
+    expect(graded).toEqual([single.caseId]);
+    expect(run.cases).toBe(1);
+    expect(run.criteria[0]).toMatchObject({ unlabelled: 0 });
+  });
+
   it('rejects an unknown grader, a grader with no adapter, and a surface mismatch', async () => {
     const store = storeOf([]);
     await expect(runValidation({ graderId: 'nope', store, graders: [] })).rejects.toThrow(/Unknown eval-registry grader/);
@@ -127,8 +155,8 @@ describe('validation runner math (ENG-2135)', () => {
 
 describe('stored session-judge adapters', () => {
   it('maps 1-5 dimensions to pass at >= 4 and abstains on a missing dimension', () => {
-    expect(sessionJudgePrediction({ goalCompletion: 4, dataAccuracy: 3 })).toEqual({ task_success: 'pass', groundedness: 'fail', instruction_compliance: 'na' });
-    expect(sessionJudgePrediction(undefined)).toEqual({ task_success: 'na', groundedness: 'na', instruction_compliance: 'na' });
+    expect(sessionJudgePrediction({ goalCompletion: 4, dataAccuracy: 3 })).toEqual({ task_success: 'pass', groundedness: 'fail', instruction_compliance: 'na', argued_with_instruction: 'na', escalated_when_not_required: 'na', failed_to_escalate: 'na' });
+    expect(sessionJudgePrediction(undefined)).toEqual({ task_success: 'na', groundedness: 'na', instruction_compliance: 'na', argued_with_instruction: 'na', escalated_when_not_required: 'na', failed_to_escalate: 'na' });
   });
 
   it('grades a case by its session id', async () => {
@@ -138,22 +166,44 @@ describe('stored session-judge adapters', () => {
     expect(read).toHaveBeenCalledWith('sess-9');
   });
 
-  it('exposes the general, Fangfang and Matt judges, reading only the stored scores', async () => {
+  it('exposes the general, Fangfang, Matt and shadow outcome judges, reading only the stored scores', async () => {
     const get = jest.fn(() => ({
       promise: async () => ({
         Item: {
           satisfactionScore: { dimensions: { goalCompletion: 5 } },
-          judgeScores: { judge_1779822633705_027n0uoio: { dimensions: { goalCompletion: 1 } } },
+          judgeScores: {
+            judge_1779822633705_027n0uoio: { dimensions: { goalCompletion: 1 } },
+            'outcome-judge-b-shadow': { dimensions: { goalCompletion: 4 } },
+          },
         },
       }),
     }));
     const graders = storedSessionJudgeGraders({ get } as unknown as AWS.DynamoDB.DocumentClient);
-    expect(graders.map((g) => g.graderId)).toEqual(['session-judge-general', 'session-judge-fangfang', 'session-judge-matt']);
+    expect(graders.map((g) => g.graderId)).toEqual(['session-judge-general', 'session-judge-fangfang', 'session-judge-matt', 'session-judge-outcome-b-shadow']);
     const c = labelled('sess-1', 'pass');
     expect((await graders[0].grade(c)).task_success).toBe('pass');
     expect((await graders[1].grade(c)).task_success).toBe('na');
     expect((await graders[2].grade(c)).task_success).toBe('fail');
+    expect((await graders[3].grade(c)).task_success).toBe('pass');
     expect(get).toHaveBeenCalledWith(expect.objectContaining({ Key: { sessionId: 'sess-1' }, ProjectionExpression: 'satisfactionScore, judgeScores' }));
+  });
+});
+
+describe('outcome rubric behaviour criteria (ENG-2189)', () => {
+  it('maps the shadow judge\'s booleans onto the golden criteria, true = pass (it happened)', () => {
+    expect(sessionJudgePrediction({ arguedWithInstruction: true, escalatedWhenNotRequired: false })).toMatchObject({
+      argued_with_instruction: 'pass',
+      escalated_when_not_required: 'fail',
+      failed_to_escalate: 'na',
+    });
+  });
+
+  it('scores the behaviour criteria for the shadow judge only; the Gemini judges never ask for them', () => {
+    const read = async () => undefined;
+    expect(sessionJudgeGrader('session-judge-outcome-b-shadow', read).criteria).toEqual([
+      'task_success', 'groundedness', 'instruction_compliance', 'argued_with_instruction', 'escalated_when_not_required', 'failed_to_escalate',
+    ]);
+    expect(sessionJudgeGrader('session-judge-general', read).criteria).toEqual(['task_success', 'groundedness', 'instruction_compliance']);
   });
 });
 
@@ -175,6 +225,12 @@ describe('agent grader adapters (ENG-2137 graders on golden cases)', () => {
     expect(agentGraderPrediction('agent-tool-correctness', completed)).toEqual({ tool_correctness: 'pass' });
     expect(agentGraderPrediction('agent-groundedness-offline', completed)).toEqual({ groundedness: 'na' });
     expect(agentGraderPrediction('agent-task-success', undefined)).toEqual({});
+    // ENG-2189: the adherence checks label instruction_compliance, abstaining when no instruction applies.
+    expect(agentGraderPrediction('agent-format-adherence', completed)).toEqual({ instruction_compliance: 'na' });
+    const asked = { ...completed, turns: [{ userText: 'go ahead', replyText: 'Shall I proceed with the research?', toolNames: [] }] };
+    expect(agentGraderPrediction('agent-act-without-asking', asked)).toEqual({ instruction_compliance: 'fail' });
+    const short = { ...completed, turns: [{ userText: 'in under 100 words', replyText: 'Short answer.', toolNames: [] }] };
+    expect(agentGraderPrediction('agent-reply-length-adherence', short)).toEqual({ instruction_compliance: 'pass' });
     expect(() => agentGraderPrediction('session-judge-general', completed)).toThrow(/not an agent grader/);
   });
 
@@ -185,6 +241,9 @@ describe('agent grader adapters (ENG-2137 graders on golden cases)', () => {
       ['agent-task-success', ['task_success'], 'task_success'],
       ['agent-tool-correctness', ['tool_correctness'], 'tool_correctness'],
       ['agent-groundedness-offline', ['groundedness'], 'groundedness'],
+      ['agent-reply-length-adherence', ['instruction_compliance'], 'instruction_compliance'],
+      ['agent-format-adherence', ['instruction_compliance'], 'instruction_compliance'],
+      ['agent-act-without-asking', ['instruction_compliance'], 'instruction_compliance'],
     ]);
     expect(await graders[0].grade(labelled('sess-1', 'pass'))).toEqual({ task_success: 'pass' });
     expect(load).toHaveBeenCalledWith('sess-1');

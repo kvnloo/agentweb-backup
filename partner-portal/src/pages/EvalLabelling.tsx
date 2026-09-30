@@ -12,6 +12,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import axios from 'axios';
+import { Link as RouterLink } from 'react-router-dom';
 import {
   Alert,
   Box,
@@ -22,6 +23,7 @@ import {
   Grid,
   LinearProgress,
   Link,
+  Skeleton,
   Stack,
   Tab,
   Table,
@@ -54,6 +56,22 @@ export interface GoldenCaseView {
   labelledAt?: string;
   split: 'dev' | 'test';
   version: number;
+  /** Pairwise calibration cases only (ENG-2142); labelled on the calibration page, not here. */
+  pair?: {
+    candidateIdB: string;
+    batch: string;
+    position: number;
+    batchSize: number;
+    category: string;
+    placement: string;
+    signal: string;
+  };
+  /** AI-drafted suggestions (ENG-2200), advisory only. Never the ground truth; see `labels`. */
+  draft?: {
+    labels: Partial<Record<string, { label: LabelValue; rationale: string }>>;
+    model: string;
+    generatedAt: string;
+  };
 }
 
 const SURFACES: ReadonlyArray<{ value: Surface; label: string }> = [
@@ -67,6 +85,9 @@ const CRITERION_HELP: Record<string, string> = {
   tool_correctness: 'Tools were called correctly and their results were checked',
   groundedness: 'Every claim in the reply is backed by a tool result',
   instruction_compliance: 'Explicit user instructions were followed on the first attempt',
+  argued_with_instruction: 'Pass = the agent argued or pushed back instead of doing a safe, explicit instruction',
+  escalated_when_not_required: 'Pass = the agent handed off to a human or the user when it could have resolved it',
+  failed_to_escalate: 'Pass = the agent hit a blocker it could not fix and neither reported it nor told the user',
   hook: 'Stops the scroll in the first second',
   offer: 'A clear, specific offer',
   proof_integrity: 'Proof points are real, not invented',
@@ -258,6 +279,26 @@ function LabelForm({ goldenCase, token, onSaved }: { goldenCase: GoldenCaseView;
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
 
+  const draft = goldenCase.draft;
+
+  const applySuggestion = (criterion: string, value: LabelValue) => {
+    setSaved(false);
+    setLabels((prev) => ({ ...prev, [criterion]: value }));
+  };
+
+  const applyAllSuggestions = () => {
+    if (!draft) return;
+    setSaved(false);
+    setLabels((prev) => {
+      const next = { ...prev };
+      for (const criterion of goldenCase.criteria) {
+        const suggestion = draft.labels[criterion];
+        if (suggestion && next[criterion] === undefined) next[criterion] = suggestion.label;
+      }
+      return next;
+    });
+  };
+
   const save = async () => {
     setSaving(true);
     setError(null);
@@ -283,37 +324,62 @@ function LabelForm({ goldenCase, token, onSaved }: { goldenCase: GoldenCaseView;
 
   return (
     <Stack spacing={1.5}>
-      {goldenCase.criteria.map((criterion) => (
-        <Box key={criterion}>
-          <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
-            <Box>
-              <Typography variant="body2" fontWeight={600}>{criterion.replace(/_/g, ' ')}</Typography>
-              <Typography variant="caption" color="text.secondary">{CRITERION_HELP[criterion] ?? ''}</Typography>
-            </Box>
-            <ToggleButtonGroup
-              size="small"
-              exclusive
-              value={labels[criterion] ?? null}
-              disabled={saving}
-              onChange={(_e, value: LabelValue | null) => {
-                // Any edit makes the last "saved" confirmation stale.
-                setSaved(false);
-                setLabels((prev) => {
-                  const next = { ...prev };
-                  if (value) next[criterion] = value;
-                  else delete next[criterion];
-                  return next;
-                });
-              }}
-              aria-label={`${criterion} label`}
-            >
-              {LABEL_OPTIONS.map((o) => (
-                <ToggleButton key={o.value} value={o.value} aria-label={`${criterion} ${o.value}`}>{o.label}</ToggleButton>
-              ))}
-            </ToggleButtonGroup>
-          </Stack>
-        </Box>
-      ))}
+      {draft && (
+        <Alert
+          severity="info"
+          action={<Button color="inherit" size="small" onClick={applyAllSuggestions}>Apply all suggestions</Button>}
+        >
+          AI-drafted suggestions available (model: {draft.model}, generated {new Date(draft.generatedAt).toLocaleString()}) — review each one; nothing is applied until you save.
+        </Alert>
+      )}
+      {goldenCase.criteria.map((criterion) => {
+        const suggestion = draft?.labels[criterion];
+        const suggestionOption = suggestion ? LABEL_OPTIONS.find((o) => o.value === suggestion.label) : undefined;
+        return (
+          <Box key={criterion}>
+            <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
+              <Box>
+                <Typography variant="body2" fontWeight={600}>{criterion.replace(/_/g, ' ')}</Typography>
+                <Typography variant="caption" color="text.secondary">{CRITERION_HELP[criterion] ?? ''}</Typography>
+              </Box>
+              <ToggleButtonGroup
+                size="small"
+                exclusive
+                value={labels[criterion] ?? null}
+                disabled={saving}
+                onChange={(_e, value: LabelValue | null) => {
+                  // Any edit makes the last "saved" confirmation stale.
+                  setSaved(false);
+                  setLabels((prev) => {
+                    const next = { ...prev };
+                    if (value) next[criterion] = value;
+                    else delete next[criterion];
+                    return next;
+                  });
+                }}
+                aria-label={`${criterion} label`}
+              >
+                {LABEL_OPTIONS.map((o) => (
+                  <ToggleButton key={o.value} value={o.value} aria-label={`${criterion} ${o.value}`}>{o.label}</ToggleButton>
+                ))}
+              </ToggleButtonGroup>
+            </Stack>
+            {suggestion && suggestionOption && (
+              <Stack direction="row" alignItems="center" spacing={1} sx={{ mt: 0.5 }}>
+                <Chip size="small" variant="outlined" label={`AI suggests: ${suggestionOption.label}`} />
+                <Button size="small" variant="text" disabled={saving} onClick={() => applySuggestion(criterion, suggestion.label)}>
+                  Use suggestion
+                </Button>
+              </Stack>
+            )}
+            {suggestion && (
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                {suggestion.rationale}
+              </Typography>
+            )}
+          </Box>
+        );
+      })}
       <TextField
         label="Note"
         multiline
@@ -369,7 +435,8 @@ export default function EvalLabelling() {
       if (!status.data.provisioned) return;
       const res = await axios.get<{ cases: GoldenCaseView[] }>(buildApiUrl(`/api/admin/eval/golden-cases?surface=${which}`), { headers });
       if (!isCurrent()) return;
-      const next = [...res.data.cases].sort(byLeastLabelled);
+      // Pairwise calibration cases take an A/B/tie choice on their own page, not binary criteria.
+      const next = res.data.cases.filter((c) => c.pair === undefined).sort(byLeastLabelled);
       setCases(next);
       setSelectedId((current) => (current && next.some((c) => c.caseId === current) ? current : next[0]?.caseId ?? null));
     } catch (err) {
@@ -405,6 +472,8 @@ export default function EvalLabelling() {
       </Stack>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
         Binary human labels for the golden sets that validate AgentWeb&apos;s graders. Case content is loaded from its source when opened and is never copied into the golden set.
+        {' '}Pairwise creative comparisons are on the <Link component={RouterLink} to="/eval-labelling/calibration">weekly creative calibration</Link> page.
+        {' '}Some cases may show AI-drafted label suggestions for you to review and explicitly accept or reject — they are never saved on their own.
       </Typography>
 
       {provisioned === false && (
@@ -425,7 +494,7 @@ export default function EvalLabelling() {
             <Card variant="outlined">
               <CardContent>
                 <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                  {cases.length} cases · {fullyLabelled} fully labelled
+                  {loading ? 'Loading cases…' : `${cases.length} cases · ${fullyLabelled} fully labelled`}
                 </Typography>
                 <Table size="small">
                   <TableHead>
@@ -436,30 +505,41 @@ export default function EvalLabelling() {
                     </TableRow>
                   </TableHead>
                   <TableBody>
-                    {cases.map((c) => (
-                      <TableRow
-                        key={c.caseId}
-                        hover
-                        selected={c.caseId === selectedId}
-                        aria-selected={c.caseId === selectedId}
-                        tabIndex={0}
-                        onClick={() => setSelectedId(c.caseId)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter' || e.key === ' ') {
-                            e.preventDefault();
-                            setSelectedId(c.caseId);
-                          }
-                        }}
-                        sx={{ cursor: 'pointer' }}
-                      >
-                        <TableCell>
-                          <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>{c.sourceRef.id.slice(0, 12)}</Typography>
-                          <Typography variant="caption" color="text.secondary">{c.taskType}</Typography>
-                        </TableCell>
-                        <TableCell>{c.split}</TableCell>
-                        <TableCell align="right">{labelledCount(c)}/{c.criteria.length}</TableCell>
-                      </TableRow>
-                    ))}
+                    {loading
+                      ? Array.from({ length: 6 }).map((_, i) => (
+                          <TableRow key={`skeleton-${i}`}>
+                            <TableCell>
+                              <Skeleton variant="text" width="70%" />
+                              <Skeleton variant="text" width="40%" />
+                            </TableCell>
+                            <TableCell><Skeleton variant="text" width={40} /></TableCell>
+                            <TableCell align="right"><Skeleton variant="text" width={30} sx={{ ml: 'auto' }} /></TableCell>
+                          </TableRow>
+                        ))
+                      : cases.map((c) => (
+                          <TableRow
+                            key={c.caseId}
+                            hover
+                            selected={c.caseId === selectedId}
+                            aria-selected={c.caseId === selectedId}
+                            tabIndex={0}
+                            onClick={() => setSelectedId(c.caseId)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' || e.key === ' ') {
+                                e.preventDefault();
+                                setSelectedId(c.caseId);
+                              }
+                            }}
+                            sx={{ cursor: 'pointer' }}
+                          >
+                            <TableCell>
+                              <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>{c.sourceRef.id.slice(0, 12)}</Typography>
+                              <Typography variant="caption" color="text.secondary">{c.taskType}</Typography>
+                            </TableCell>
+                            <TableCell>{c.split}</TableCell>
+                            <TableCell align="right">{labelledCount(c)}/{c.criteria.length}</TableCell>
+                          </TableRow>
+                        ))}
                   </TableBody>
                 </Table>
               </CardContent>
@@ -468,6 +548,13 @@ export default function EvalLabelling() {
           <Grid item xs={12} md={8}>
             {selected ? (
               <Stack spacing={2}>
+                {/* Source renders first: a reviewer must read it before judging the criteria below. */}
+                <Card variant="outlined">
+                  <CardContent>
+                    <Typography variant="subtitle2" sx={{ mb: 1 }}>Source</Typography>
+                    <SourceContext goldenCase={selected} token={token} />
+                  </CardContent>
+                </Card>
                 <Card variant="outlined">
                   <CardContent>
                     <Typography variant="subtitle2" sx={{ mb: 1 }}>Labels</Typography>
@@ -478,12 +565,6 @@ export default function EvalLabelling() {
                       token={token}
                       onSaved={(saved) => setCases((prev) => prev.map((c) => (c.caseId === saved.caseId ? saved : c)).sort(byLeastLabelled))}
                     />
-                  </CardContent>
-                </Card>
-                <Card variant="outlined">
-                  <CardContent>
-                    <Typography variant="subtitle2" sx={{ mb: 1 }}>Source</Typography>
-                    <SourceContext goldenCase={selected} token={token} />
                   </CardContent>
                 </Card>
               </Stack>

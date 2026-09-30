@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "baselineId": "local-deterministic-v2",
+  "suiteVersion": 1,
+  "createdAt": "2026-09-30T05:36:17.777Z",
+  "target": "local",
+  "source": "runOfflineEvalSuite local; review and commit via PR",
+  "metrics": [
+    {
+      "metricId": "failure-replay:agent-tool-correctness",
+      "graderId": "agent-tool-correctness",
+      "graderVersion": "2",
+      "kind": "deterministic",
+      "category": "quality",
+      "n": 2,
+      "passes": 2,
+      "threshold": 0,
+      "minN": 2,
+      "placeholder": false
+    },
+    {
+      "metricId": "replay-fixture-length",
+      "graderId": "agent-reply-length-fixtures",
+      "graderVersion": "1",
+      "kind": "deterministic",
+      "category": "quality",
+      "n": 3,
+      "passes": 3,
+      "threshold": 0,
+      "minN": 3,
+      "placeholder": true
+    }
+  ]
+}

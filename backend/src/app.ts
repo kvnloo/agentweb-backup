@@ -26,6 +26,8 @@ import stripeConnectRoutes from "./routes/stripeConnect";
 import brandRoutes from "./routes/brand";
 import marketStrategyRoutes from "./routes/marketStrategy";
 import slackRoutes from "./routes/slack";
+import teamsRoutes from "./routes/teamsMessages";
+import approvalDeskRoutes from "./routes/approvalDesk";
 import metaRoutes from "./routes/meta";
 import metaV2Routes from "./routes/metaV2";
 import blogRoutes from "./routes/blog";
@@ -398,6 +400,11 @@ app.use("/api/html-templates", authenticateToken, htmlTemplatesRoutes);
 app.use("/api/domains", domainRoutes);
 app.use("/api/market-strategy", marketStrategyRoutes);
 app.use("/api/slack", slackRoutes);
+// ENG-272: Teams' Bot Framework endpoint authenticates with a bearer JWT, not an HMAC over the
+// raw bytes, and CloudAdapter reads the parsed body — so this belongs here, after
+// express.json(), and NOT in the raw-body block above with Slack and WhatsApp.
+app.use("/api/teams", teamsRoutes);
+app.use("/api/approval-desk", approvalDeskRoutes);
 app.use("/api/meta", metaRoutes);
 app.use("/api/meta/v2", metaV2Routes);
 app.use("/api/blog", blogRoutes);

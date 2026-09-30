@@ -4,12 +4,14 @@ import { isMetaAdAccount } from "../services/metaTokenRefresh";
 import { ConnectedAccount } from "../services/connectedAccountsDb";
 import {
   adsMetricsDb,
+  buildAdEntityKey,
   buildEntityKey,
   ACCOUNT_DAY_SENTINEL,
   AdsPlatform,
 } from "../services/adsMetricsDb";
+import { leadTotals, type MetaAction } from "../utils/metaActionFamilies";
 import { META_GRAPH_TIMEOUT_MS } from "../utils/metaApiFetch";
-import { promoteAttributionFromCustomFields } from "../types/attribution";
+import { promoteAttributionFromCustomFields, type AttributionTouch } from "../types/attribution";
 import { isEvaluationUser } from "../services/evaluationPolicy";
 
 /**
@@ -238,6 +240,52 @@ export async function fetchMetaAccountContext(
   };
 }
 
+/** One page of a Meta insights response. */
+interface MetaInsightsPage<Row> {
+  data?: Row[];
+  paging?: { next?: string };
+  error?: { message?: string };
+}
+
+/** A level=campaign insights row. Meta returns every metric as a decimal string. */
+interface CampaignInsightsRow {
+  campaign_id: string;
+  campaign_name?: string;
+  spend: string;
+  impressions: string;
+  clicks: string;
+  ctr: string;
+  cpm: string;
+  frequency: string;
+}
+
+/**
+ * Follows Meta's cursor pagination (`paging.next`) until exhausted. A single-page read silently
+ * truncated campaigns past the first page, leaving them with no snapshot row and their CRM leads
+ * counted as unattributed (ENG-916 Greptile P1 #1).
+ */
+async function fetchAllInsightsPages<Row>(insightsUrl: string, dateStr: string): Promise<Row[]> {
+  const rows: Row[] = [];
+  let nextUrl: string | undefined = insightsUrl;
+  while (nextUrl) {
+    // Bounded deliberately: Node's fetch applies NO default deadline, and these reads run
+    // sequentially inside the settling-window loop — so one connection that accepts a request
+    // and never completes stalls every remaining day and surfaces as "the cron did not run"
+    // rather than as a network fault. AbortSignal.timeout is preferred over a manual controller
+    // so no timer can outlive the process.
+    const res = await fetch(nextUrl, { signal: AbortSignal.timeout(META_GRAPH_TIMEOUT_MS) });
+    const body = (await res.json()) as MetaInsightsPage<Row> | null;
+    if (!res.ok || body?.error) {
+      throw new Error(
+        `[ENG-916] Meta Insights API failed for ${dateStr}: ${body?.error?.message || res.status}`
+      );
+    }
+    rows.push(...(body?.data || []));
+    nextUrl = body?.paging?.next;
+  }
+  return rows;
+}
+
 export async function snapshotMetaMetricsForDate(
   userId: string,
   dateStr: string,
@@ -295,27 +343,7 @@ export async function snapshotMetaMetricsForDate(
     `&time_range={'since':'${dateStr}','until':'${dateStr}'}` +
     `&level=campaign&access_token=${accessToken}`;
 
-  // Follow Meta's cursor pagination (`paging.next`) until exhausted. A single-page read
-  // silently truncated campaigns past the first page, leaving them with no snapshot row and
-  // their CRM leads counted as unattributed (ENG-916 Greptile P1 #1).
-  const campaignRows: any[] = [];
-  let nextUrl: string | undefined = insightsUrl;
-  while (nextUrl) {
-    // Bounded deliberately: Node's fetch applies NO default deadline, and these reads run
-    // sequentially inside the settling-window loop — so one connection that accepts a request
-    // and never completes stalls every remaining day and surfaces as "the cron did not run"
-    // rather than as a network fault. AbortSignal.timeout is preferred over a manual controller
-    // so no timer can outlive the process.
-    const res = await fetch(nextUrl, { signal: AbortSignal.timeout(META_GRAPH_TIMEOUT_MS) });
-    const body: any = await res.json();
-    if (!res.ok || body?.error) {
-      throw new Error(
-        `[ENG-916] Meta Insights API failed for ${dateStr}: ${body?.error?.message || res.status}`
-      );
-    }
-    campaignRows.push(...(body?.data || []));
-    nextUrl = body?.paging?.next;
-  }
+  const campaignRows = await fetchAllInsightsPages<CampaignInsightsRow>(insightsUrl, dateStr);
 
   // This user's leads for the date, across all their lists — reused for every campaign's join
   // below rather than re-querying per campaign. runMetaMetricsSnapshot prefetches the whole
@@ -519,6 +547,166 @@ export async function snapshotMetaMetricsForDate(
   };
 }
 
+/**
+ * ENG-2141: ad-level rows are written only when this is exactly "true". Unset in production until
+ * OPS-3 (ENG-2148) enables it; the campaign and account_day rows are unaffected either way.
+ */
+export const AD_LEVEL_SNAPSHOTS_ENV = "META_AD_LEVEL_SNAPSHOTS_ENABLED";
+
+export function isAdLevelSnapshotEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  return env[AD_LEVEL_SNAPSHOTS_ENV] === "true";
+}
+
+/** Video fields Meta returns only for video ads; recorded when present, never defaulted to 0. */
+const VIDEO_METRIC_FIELDS: ReadonlyArray<["video_p25_watched_actions" | "video_thruplay_watched_actions", string]> = [
+  ["video_p25_watched_actions", "videoP25Watched"],
+  ["video_thruplay_watched_actions", "videoThruplayWatched"],
+];
+
+/** A level=ad insights row. Metrics arrive as decimal strings; action lists only when non-empty. */
+interface AdInsightsRow {
+  ad_id?: string;
+  ad_name?: string;
+  adset_id?: string;
+  campaign_id?: string;
+  spend?: string;
+  impressions?: string;
+  clicks?: string;
+  ctr?: string;
+  cpm?: string;
+  frequency?: string;
+  actions?: MetaAction[];
+  video_p25_watched_actions?: MetaAction[];
+  video_thruplay_watched_actions?: MetaAction[];
+}
+
+/** Sum of a Meta video action list (`[{action_type: "video_view", value}]`), or null when absent. */
+function sumActionValues(actions: MetaAction[] | undefined): number | null {
+  if (!Array.isArray(actions) || actions.length === 0) return null;
+  let total = 0;
+  for (const a of actions) {
+    const n = typeof a?.value === "number" ? a.value : parseFloat(String(a?.value ?? ""));
+    if (Number.isFinite(n)) total += n;
+  }
+  return total;
+}
+
+/**
+ * ENG-2194: 3-second video plays. Meta reports them as the `video_view` entry of `actions` (Ads
+ * Manager's "3-second video plays"); `video_play_actions` counts every play start, however short,
+ * so it would overstate a hook rate. Null when the ad reported none (image ads).
+ */
+function threeSecondVideoPlays(actions: MetaAction[] | undefined): number | null {
+  return sumActionValues(actions?.filter((a) => a?.action_type === "video_view"));
+}
+
+/** The parts of an AW-Leads item the ad-level CRM join reads. */
+export interface CrmLeadAttributionFields {
+  customFields?: unknown;
+  firstTouch?: AttributionTouch;
+}
+
+/**
+ * ENG-2194: CRM leads per ad, joined on `utm_content`, which our ads carry as Meta's `{{ad.id}}`
+ * macro (utils/adUtm.ts). Resolved through promoteAttributionFromCustomFields exactly like the
+ * campaign join, and bounded the same way: only ads Meta reported for this date can match, so a
+ * lead whose utm_content is anything else (a campaign id, free text) is simply not counted here.
+ */
+export function countCrmLeadsByAd(
+  leads: ReadonlyArray<CrmLeadAttributionFields>,
+  reportedAdIds: ReadonlySet<string>
+): Map<string, number> {
+  const byAd = new Map<string, number>();
+  for (const lead of leads) {
+    const content = promoteAttributionFromCustomFields(lead.customFields, lead.firstTouch)?.utm?.content;
+    const adId = typeof content === "string" ? content.trim() : "";
+    if (adId && reportedAdIds.has(adId)) byAd.set(adId, (byAd.get(adId) ?? 0) + 1);
+  }
+  return byAd;
+}
+
+export interface AdSnapshotResult {
+  adRowsWritten: number;
+}
+
+/**
+ * ENG-2141: one row per ad Meta reported activity for on `dateStr` (level=ad insights), so a
+ * generated creative linked to its ad (services/creativeLineage.ts) can be compared with that ad's
+ * delivery and conversions. Same account context, pagination and overwrite-within-the-refresh-window
+ * behaviour as the campaign rows, so each date is rewritten until Meta has settled it; readers
+ * decide settledness per row with isMetaRowSettled.
+ *
+ * `platformLeadCount` is Meta-reported (the `actions` lead family, counted once). When the day's
+ * CRM leads are passed, `crmLeadCount` is the ad-level CRM join (countCrmLeadsByAd, ENG-2194); it is
+ * omitted when they are not, so "not joined" never reads as "zero CRM leads".
+ */
+export async function snapshotMetaAdMetricsForDate(
+  userId: string,
+  dateStr: string,
+  resolvedCredentials: ResolvedMetaCredentials,
+  accountContext: MetaAccountContext,
+  /** Same meaning and position rule as snapshotMetaMetricsForDate's `snapshotSource`. */
+  snapshotSource: "daily" | "backfill" = "daily",
+  /** This date's CRM leads (getLeadsByDateForUser bucket); omit to skip the CRM join. */
+  crmLeadsForDate?: ReadonlyArray<CrmLeadAttributionFields>
+): Promise<AdSnapshotResult> {
+  const { accountId, accessToken } = resolvedCredentials;
+  const insightsUrl =
+    `https://graph.facebook.com/${META_API_VERSION}/act_${accountId}/insights` +
+    `?fields=ad_id,ad_name,adset_id,campaign_id,spend,impressions,clicks,ctr,cpm,frequency,actions,` +
+    VIDEO_METRIC_FIELDS.map(([field]) => field).join(",") +
+    `&time_range={'since':'${dateStr}','until':'${dateStr}'}` +
+    `&level=ad&access_token=${accessToken}`;
+  const adRows = await fetchAllInsightsPages<AdInsightsRow>(insightsUrl, dateStr);
+  const crmLeadsByAd = crmLeadsForDate
+    ? countCrmLeadsByAd(crmLeadsForDate, new Set(adRows.filter((r) => r?.ad_id).map((r) => String(r.ad_id))))
+    : null;
+
+  const capturedAt = new Date().toISOString();
+  let written = 0;
+  for (const r of adRows) {
+    if (!r?.ad_id) continue;
+    const adId = String(r.ad_id);
+    const platformMetrics: Record<string, number> = {
+      ctr: parseFloat(r.ctr ?? "") || 0,
+      cpm: parseFloat(r.cpm ?? "") || 0,
+      frequency: parseFloat(r.frequency ?? "") || 0,
+    };
+    for (const [field, key] of VIDEO_METRIC_FIELDS) {
+      const value = sumActionValues(r[field]);
+      if (value !== null) platformMetrics[key] = value;
+    }
+    const plays3s = threeSecondVideoPlays(r.actions);
+    if (plays3s !== null) platformMetrics.videoPlays3s = plays3s;
+    await adsMetricsDb.putAdSnapshot({
+      entityKey: buildAdEntityKey(PLATFORM, accountId, adId),
+      date: dateStr,
+      rowType: "ad",
+      platform: PLATFORM,
+      accountId,
+      parentAccountId: null,
+      ownerUserId: userId,
+      currency: accountContext.currency,
+      reportingTimezone: accountContext.reportingTimezone,
+      dataQuality: "exact",
+      adId,
+      adName: r.ad_name || "",
+      adsetId: r.adset_id ? String(r.adset_id) : null,
+      campaignId: r.campaign_id ? String(r.campaign_id) : null,
+      spend: parseFloat(r.spend ?? "") || 0,
+      impressions: parseInt(r.impressions ?? "", 10) || 0,
+      clicks: parseInt(r.clicks ?? "", 10) || 0,
+      platformLeadCount: leadTotals(r.actions).total,
+      ...(crmLeadsByAd ? { crmLeadCount: crmLeadsByAd.get(adId) ?? 0 } : {}),
+      platformMetrics,
+      snapshotSource,
+      capturedAt,
+    });
+    written++;
+  }
+  return { adRowsWritten: written };
+}
+
 /** One distinct Meta ad account, resolved down to the single user record it will be
  * snapshotted under. */
 export interface DistinctMetaAdAccount {
@@ -604,6 +792,7 @@ export async function runMetaMetricsSnapshot(): Promise<void> {
     return;
   }
   console.log(`[MetaMetricsSnapshotCron] ${accounts.length} distinct Meta ad account(s) to snapshot.`);
+  const adLevel = isAdLevelSnapshotEnabled();
 
   for (const { accountId, canonicalUserId, canonicalUser } of accounts) {
     // Resolve credentials once per ACCOUNT (not per day, and not once for the whole run —
@@ -653,6 +842,19 @@ export async function runMetaMetricsSnapshot(): Promise<void> {
         // A missed day is recoverable later (Meta retains historical insights data) —
         // but only if the miss is visible. Never fail silently.
         console.error(`[MetaMetricsSnapshotCron] CRITICAL ERROR for account ${accountId} ${dateStr}:`, error);
+      }
+
+      // ENG-2141: isolated from the campaign pass above — a failed ad read never costs the day's
+      // campaign rows, and a failed campaign read does not skip the ad rows.
+      if (adLevel) {
+        try {
+          const { adRowsWritten } = await snapshotMetaAdMetricsForDate(
+            canonicalUserId, dateStr, credentials, accountContext, "daily", leadsByDate.get(dateStr) ?? []
+          );
+          console.log(`[MetaMetricsSnapshotCron] account ${accountId} ${dateStr}: wrote ${adRowsWritten} ad rows`);
+        } catch (error) {
+          console.error(`[MetaMetricsSnapshotCron] CRITICAL ERROR (ad level) for account ${accountId} ${dateStr}:`, error);
+        }
       }
     }
   }

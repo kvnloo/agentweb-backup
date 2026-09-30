@@ -76,8 +76,8 @@ export async function priorBestFor(
   return selectPriorBest(candidate, await service.listCandidatesForUser(candidate.userId, 'creative_image'));
 }
 
-/** OpenRouter without the usage ledger: this script must write nothing. */
-const unmeteredOpenRouterLlm: RubricJudgeLlm = {
+/** OpenRouter without the usage ledger: this script (and creativeCalibrationReport.ts) must write nothing. */
+export const unmeteredOpenRouterLlm: RubricJudgeLlm = {
   async complete(request) {
     const { agentModeService } = await import('../services/agentModeService');
     const { resolveOpenRouterUpstreamModelId } = await import('../utils/openRouterGatewayContract');
@@ -97,7 +97,8 @@ const unmeteredOpenRouterLlm: RubricJudgeLlm = {
   },
 };
 
-async function briefFor(candidate: HumanEvalCandidate): Promise<CreativeBrief> {
+/** The judge brief for a stored candidate: generation request, placement and brand profile. */
+export async function briefFor(candidate: HumanEvalCandidate): Promise<CreativeBrief> {
   const { resolveBrandGuidelinesForUser } = await import('../services/agentMode/brandLogo');
   const brandData = candidate.userId ? (await resolveBrandGuidelinesForUser(candidate.userId))?.brandData : undefined;
   const brand = brandProfileFromBrandData(brandData);
@@ -169,8 +170,11 @@ async function main(): Promise<void> {
     tokensIn += result.usage?.inputTokens ?? 0;
     tokensOut += result.usage?.outputTokens ?? 0;
     if (result.status === 'ok') {
-      for (const c of RUBRIC_CRITERIA) perCriterion[c][result.criteria[c].verdict] += 1;
-      const failed = RUBRIC_CRITERIA.filter((c) => result.criteria[c].verdict === 'fail');
+      for (const c of RUBRIC_CRITERIA) {
+        const verdict = result.criteria[c]?.verdict;
+        if (verdict) perCriterion[c][verdict] += 1;
+      }
+      const failed = RUBRIC_CRITERIA.filter((c) => result.criteria[c]?.verdict === 'fail');
       console.log(`${label}: ${result.passedCount}/7 pass${failed.length ? ` — fail: ${failed.join(', ')}` : ''}`);
     } else if (result.status === 'error') {
       console.log(`${label}: ERROR ${result.error.kind}`);

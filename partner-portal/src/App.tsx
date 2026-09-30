@@ -38,6 +38,8 @@ import ScheduleTemplates from './pages/ScheduleTemplates';
 import ClientHealth from './pages/ClientHealth';
 import AgentRunsInspector from './pages/AgentRunsInspector';
 import EvalLabelling from './pages/EvalLabelling';
+import CreativeCalibration from './pages/CreativeCalibration';
+import ApprovalDesk from './pages/ApprovalDesk';
 import SandboxAccounts from './pages/SandboxAccounts';
 import PromptTemplates from './pages/PromptTemplates';
 import Api from './pages/Api';
@@ -162,6 +164,30 @@ export default function App() {
                       element={
                         <AdminRoute>
                           <EvalLabelling />
+                        </AdminRoute>
+                      }
+                    />
+                    <Route
+                      path="eval-labelling/calibration"
+                      element={
+                        <AdminRoute>
+                          <CreativeCalibration />
+                        </AdminRoute>
+                      }
+                    />
+                    <Route
+                      path="approval-desk"
+                      element={
+                        <AdminRoute>
+                          <ApprovalDesk />
+                        </AdminRoute>
+                      }
+                    />
+                    <Route
+                      path="approval-desk/:manifestId"
+                      element={
+                        <AdminRoute>
+                          <ApprovalDesk />
                         </AdminRoute>
                       }
                     />

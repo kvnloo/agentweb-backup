@@ -136,7 +136,7 @@ Default to short. Depth is opt-in, not the default shape of a reply.
 - NEVER ask: "Should I proceed?" after installation
 - **Explicit confirmation is required ONLY for three things: spend changes (budgets, campaign launches/pauses, ad-account writes), publish/send actions (posting, sending, emailing, or otherwise delivering content to a real destination on the user's behalf), and irreversible data actions (deletions, overwrites you cannot undo).** For everything else — running a test, reading data, producing a draft, research, analysis — proceed without asking permission first; do not ask "should I run this?" or "should I proceed?" for a reversible, non-spending, non-publishing step. This is a FLOOR, not a ceiling: if a currently-installed skill's own rules require confirmation for additional actions specific to that skill (e.g. a calendar write, a meeting-derived send), follow that stricter skill-specific rule for that skill's tools — this rule never lowers another skill's explicit confirmation requirement.
 - **Exception — a matching work plan beats an ad-hoc draft.** "Producing a draft" above does not cover the case where the Work Plan Capabilities check finds one predefined plan that clearly matches the user's stated goal. When that happens, propose the plan via **recommend_predefined_work_plan** INSTEAD of drafting the content yourself — do not draft the content AND also show the recommendation in the same turn. This is not the "should I proceed?" pause banned above: it's a one-time proposal that itself IS the response to the request, not a question blocking it.
-- **ALWAYS** show the user the draft Slack message and ask for explicit approval BEFORE calling \`slack_send_message\` — no exceptions, even if the user asked you to send a message. Show the full message text and ask "Should I send this?" before proceeding.
+- **ALWAYS** show the user the draft Slack message and ask for explicit approval BEFORE calling \`slack_send_message\` — no exceptions, even if the user asked you to send a message. Show the full message text and ask "Should I send this?" before proceeding. (This assumes a live user to ask; an unattended scheduled run overrides this — see SLACK NOTIFICATIONS IN UNATTENDED RUNS below.)
 - **Slack channel access:** Non-admin accounts can only access their configured Slack channel(s). If the user asks to search or read messages across multiple or all Slack channels, let them know that only an admin account can search across all channels, and suggest they ask an admin to run the search instead.
 - **Slack not configured:** If a Slack tool returns an error indicating no channel is configured (e.g. "No Slack channel is configured"), tell the user that Slack channels are set up by an admin — NOT through their own Settings or Connected Accounts. Direct them to contact their admin to configure Slack access. Do NOT suggest they go to Settings → Connected Accounts to connect Slack.
 
@@ -820,7 +820,13 @@ export function getUnattendedExecutionDirective(
   sessionType?: string,
   isAdmin?: boolean,
   publishAuthorization?: 'authorized' | 'withheld' | 'unknown',
-  authorizedPublishTools?: string[]
+  authorizedPublishTools?: string[],
+  // ENG-2204: owner opt-out for the SLACK NOTIFICATIONS block below, resolved by the
+  // caller from the schedule's `requireSlackApproval` field (see
+  // resolveScheduledSlackSendAuthorized / resolveSlackSendAuthorized). Defaults to
+  // true so every call site that hasn't been updated to resolve and pass it keeps
+  // today's behavior unchanged.
+  slackSendAuthorized: boolean = true
 ): string {
   if (sessionType !== 'scheduled') return '';
   // ENG-1045: an authorized literal tool (e.g. post_on_connected_account) also
@@ -897,7 +903,18 @@ COMPLETION GATE (before final output):
 - Before producing your final report, run a completion check: verify that every entity has had every required step either completed or explicitly marked blocked-with-reason. If any entity still has unfinished steps that are NOT blocked, go back and finish them before writing the final output.
 
 SURFACE GAPS AS ACTIONABLE ITEMS:
-- In your final report, surface every blocked or skipped item as a clear, actionable item the user can act on (e.g. "Connect Harsha's LinkedIn so we can research his guests next run"). Never bury or omit a gap — make the remaining action explicit.${publishAuthorization === 'unknown'
+- In your final report, surface every blocked or skipped item as a clear, actionable item the user can act on (e.g. "Connect Harsha's LinkedIn so we can research his guests next run"). Never bury or omit a gap — make the remaining action explicit.${slackSendAuthorized ? `
+
+SLACK NOTIFICATIONS IN UNATTENDED RUNS (CRITICAL — ENG-2204):
+- The base instruction elsewhere in this prompt to show the user a draft Slack message and get explicit approval before calling slack_send_message assumes a live user who can answer "Should I send this?" There is no one to ask in this unattended run, so that approval step does NOT apply here — it governs attended sessions only.
+- This is a different kind of action from posting content to an external public account (X, LinkedIn, a blog): slack_send_message posts to a channel your account/schedule owner already has configured access to, so it needs no separate standing authorization or owner grant — the rule above is the only gate on it.
+- When the task instructs you to post, alert, or notify a Slack channel, call slack_send_message directly and actually send it. Drafting the message and reporting it as ready, pending, or awaiting approval instead of calling the tool is NOT completion of that step.`
+  : `
+
+SLACK NOTIFICATIONS IN UNATTENDED RUNS — WITHHELD (CRITICAL — ENG-2204):
+- The owner has turned ON "Require approval before Slack sends" for this schedule. The base instruction elsewhere in this prompt (show the draft, ask "Should I send this?") is therefore NOT lifted for this run, even though no human is present to answer it.
+- Do NOT call slack_send_message. If the task instructs you to post, alert, or notify a Slack channel, draft the message instead, persist it to the knowledge base, and state plainly in your final report that nothing was sent to Slack because this schedule requires approval before Slack sends.`
+}${publishAuthorization === 'unknown'
   ? ''
   : publishAuthorization === 'authorized' && authorizedPublishTools && authorizedPublishTools.length > 0
   ? `

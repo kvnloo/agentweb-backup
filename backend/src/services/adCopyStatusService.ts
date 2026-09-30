@@ -14,6 +14,8 @@
  * `variety` tag describing the angle/style each variant tests.
  */
 
+import type { CreativeRubricResult } from "./creativeRubricJudge";
+
 export type AdCopyStatus = "idle" | "running" | "ready" | "failed";
 
 export interface AdCopyVariant {
@@ -22,6 +24,12 @@ export interface AdCopyVariant {
   primaryText: string;
   cta: string;
   variety: string;
+  /**
+   * Advisory rubric-judge verdict on this copy (ENG-2192): the full ad with its image when that
+   * image passed its gates, else the copy alone. Written after the run is stored, only when the
+   * judge is enabled and this variant was sampled (creativeRubricOnboarding.ts).
+   */
+  creativeRubric?: CreativeRubricResult;
 }
 
 export interface AdCopyResult {

@@ -40,6 +40,10 @@ jest.mock('../services/agentModeService', () => ({
 
 const mockSettingsService = settingsService as jest.Mocked<typeof settingsService>;
 
+// A minimal, properly-typed stand-in for setSetting's resolved value — the ENG-2218 tests below
+// only care that the promise resolves, not its contents.
+const stubSetting = () => ({ settingName: 'scoring-judges', settingValue: '[]', updatedAt: 't', updatedBy: 'a' });
+
 const app = express();
 app.use(express.json());
 app.use('/api/settings', settingsRoutes);
@@ -106,6 +110,53 @@ describe('POST /api/settings/scoring-judges', () => {
     expect(res.status).toBe(400);
     expect(mockSettingsService.setSetting).not.toHaveBeenCalled();
   });
+
+  it('creating a genuinely new judge (no id collision) still works as before', async () => {
+    mockSettingsService.getSetting.mockResolvedValue({
+      settingName: 'scoring-judges',
+      settingValue: JSON.stringify([{ id: 'j1', name: 'A', systemPrompt: 'p', createdAt: 't', updatedAt: 't' }]),
+      description: '', updatedBy: 'a', updatedAt: 't',
+    });
+    mockSettingsService.setSetting.mockResolvedValue(stubSetting());
+
+    const res = await request(app)
+      .post('/api/settings/scoring-judges')
+      .send({ name: 'Brand New', systemPrompt: 'Rate it' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.judge.name).toBe('Brand New');
+    expect(res.body.judge.shadow).toBeUndefined();
+    expect(res.body.judge.sampleRate).toBeUndefined();
+    const stored = JSON.parse(mockSettingsService.setSetting.mock.calls[0][1]);
+    expect(stored).toHaveLength(2);
+  });
+
+  it('rejects POST with an id that already exists instead of silently dropping fields (ENG-2218)', async () => {
+    mockSettingsService.getSetting.mockResolvedValue({
+      settingName: 'scoring-judges',
+      settingValue: JSON.stringify([
+        {
+          id: 'outcome-judge-b-shadow',
+          name: 'Outcome Judge (shadow)',
+          systemPrompt: 'rubric b',
+          llmModel: 'anthropic.claude-sonnet-4-6',
+          shadow: true,
+          sampleRate: 0.33,
+          createdAt: 't',
+          updatedAt: 't',
+        },
+      ]),
+      description: '', updatedBy: 'a', updatedAt: 't',
+    });
+    mockSettingsService.setSetting.mockResolvedValue(stubSetting());
+
+    const res = await request(app)
+      .post('/api/settings/scoring-judges')
+      .send({ id: 'outcome-judge-b-shadow', name: 'Outcome Judge (shadow)', systemPrompt: 'rubric b' });
+
+    expect(res.status).toBe(409);
+    expect(mockSettingsService.setSetting).not.toHaveBeenCalled();
+  });
 });
 
 describe('PUT /api/settings/scoring-judges/:judgeId', () => {
@@ -153,6 +204,43 @@ describe('PUT /api/settings/scoring-judges/:judgeId', () => {
       .put('/api/settings/scoring-judges/does-not-exist')
       .send({ llmModel: 'gemini-3.5-flash' });
     expect(res.status).toBe(404);
+  });
+
+  it('ENG-2218: updating an existing shadow judge preserves shadow/sampleRate unchanged', async () => {
+    const shadowJudge = {
+      id: 'outcome-judge-b-shadow',
+      name: 'Outcome Judge (shadow)',
+      systemPrompt: 'old rubric b prompt',
+      llmModel: 'anthropic.claude-sonnet-4-6',
+      shadow: true,
+      sampleRate: 0.33,
+      createdAt: 't0',
+      updatedAt: 't0',
+    };
+    mockSettingsService.getSetting.mockResolvedValue({
+      settingName: 'scoring-judges',
+      settingValue: JSON.stringify([shadowJudge]),
+      description: '', updatedBy: 'a', updatedAt: 't0',
+    });
+    mockSettingsService.setSetting.mockResolvedValue(stubSetting());
+
+    const res = await request(app)
+      .put('/api/settings/scoring-judges/outcome-judge-b-shadow')
+      .send({ name: 'Outcome Judge (shadow) renamed', systemPrompt: 'updated rubric b prompt' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.judge.name).toBe('Outcome Judge (shadow) renamed');
+    expect(res.body.judge.systemPrompt).toBe('updated rubric b prompt');
+    // The fields this form never sends must survive untouched.
+    expect(res.body.judge.shadow).toBe(true);
+    expect(res.body.judge.sampleRate).toBe(0.33);
+    expect(res.body.judge.id).toBe('outcome-judge-b-shadow');
+
+    // Also assert what was actually persisted, not just the response.
+    const stored = JSON.parse(mockSettingsService.setSetting.mock.calls[0][1]);
+    expect(stored).toHaveLength(1);
+    expect(stored[0].shadow).toBe(true);
+    expect(stored[0].sampleRate).toBe(0.33);
   });
 });
 
