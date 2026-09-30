@@ -90,6 +90,34 @@ export const syncMetaAdsCapability = async (
   }
 
   try {
+    // ENG-2232: Page access is a second, independent Meta grant that the
+    // ads-scope probe below says nothing about — a token can hold ads_read
+    // with zero accessible Pages, and every AD_CREATIVE needs a page_id.
+    // Previously this was only probed once, at connect/reconnect time, so an
+    // already-connected account whose Page access was never granted (or was
+    // later revoked) stayed reported as ads_capable:true indefinitely unless
+    // the user redid a full OAuth reconnect. Probed here too, on the same
+    // twice-daily sweep, best-effort and independent of the ads-scope outcome
+    // below: a failure here must not affect that outcome.
+    try {
+      const pages = await metaService.getPages(config.access_token);
+      const newHasPages = pages.length > 0;
+      if (config.has_meta_pages !== newHasPages) {
+        const { updateAccountConfig: persistPageAccess } = await import('./connectedAccountsDb');
+        await persistPageAccess(userId, platform as any, account.account_id, {
+          has_meta_pages: newHasPages,
+        });
+        config.has_meta_pages = newHasPages;
+        console.log(
+          `[MetaAdsCapabilitySync] Page access ${newHasPages ? 'confirmed' : 'missing'} for user ${userId} account ${account.account_id} (${pages.length} Page(s))`
+        );
+      }
+    } catch (pageError: any) {
+      console.warn(
+        `[MetaAdsCapabilitySync] Could not reconcile Page access for user ${userId} account ${account.account_id}: ${pageError?.message || pageError}`
+      );
+    }
+
     const access = await metaService.probeAdsAccountAccess(
       config.access_token,
       config.ad_account_id || account.account_id
