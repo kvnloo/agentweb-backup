@@ -32,6 +32,7 @@ import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, ChatSession, searchPlatformKnowledgeBase } from './chatbotService';
 import { observeZ0ContextPacketShadow } from './z0ContextPacket';
+import { observeZ0RouteShadow } from './z0RouteShadow';
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
@@ -3378,6 +3379,13 @@ export class AgentModeService {
       sessionId,
       sessionType: isInteractiveShare ? 'interactive_share' : 'regular',
     });
+    // Downstream-only route observation. Default off, forced /v1/plan,
+    // fail-open and never consulted by the AgentWeb execution path.
+    observeZ0RouteShadow(
+      sessionId,
+      messageContent,
+      sessionHistory.length,
+    );
     try {
       // Resolve the model up front: map legacy/renamed ids forward (e.g. old
       // sessions persisted the pre-rename "claude-opus-4-8") AND validate against
