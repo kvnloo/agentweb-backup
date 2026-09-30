@@ -11,6 +11,7 @@ export const MAX_TASTE_URL_CHARS = 2048;
 export const MAX_TASTE_TAGS = 20;
 export const MAX_TASTE_TAG_CHARS = 64;
 export const MAX_TASTE_COLLECTION_ID_CHARS = 64;
+export const MAX_TASTE_SOURCES = 16;
 
 const MAX_PROFILE_TERMS = 12;
 const MAX_PROFILE_DOMAINS = 8;
@@ -496,13 +497,22 @@ export class TasteProfileService {
     }
 
     const memories = await this.memoryStore.getUserMemories(userId, 'preference');
-    const existing = memories.find((memory) => memory.sourceSessionId === sourceSessionId);
+    const tasteMemories = memories.filter((memory) =>
+      memory.sourceSessionId?.startsWith(TASTE_MEMORY_PREFIX)
+    );
+    const existing = tasteMemories.find((memory) => memory.sourceSessionId === sourceSessionId);
     if (existing) {
       await this.memoryStore.updateMemory(userId, existing.memoryId, {
         category: 'preference',
         content,
       });
       return;
+    }
+
+    if (tasteMemories.length >= MAX_TASTE_SOURCES) {
+      throw new TasteValidationError(
+        `Taste supports at most ${MAX_TASTE_SOURCES} durable sources; replace or delete an existing source first`
+      );
     }
 
     await this.memoryStore.addMemory(userId, 'preference', content, sourceSessionId);
