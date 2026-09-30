@@ -1,15 +1,15 @@
 {
   "schemaVersion": 1,
-  "baselineId": "local-deterministic-v1",
+  "baselineId": "local-deterministic-v2",
   "suiteVersion": 1,
-  "createdAt": "2026-09-25T19:17:50.257Z",
+  "createdAt": "2026-09-30T05:36:17.777Z",
   "target": "local",
-  "source": "runOfflineEvalSuite --target local on origin/main 9801c1cb3 + ENG-2145 (no credentials, no network)",
+  "source": "runOfflineEvalSuite local; review and commit via PR",
   "metrics": [
     {
       "metricId": "failure-replay:agent-tool-correctness",
       "graderId": "agent-tool-correctness",
-      "graderVersion": "1",
+      "graderVersion": "2",
       "kind": "deterministic",
       "category": "quality",
       "n": 2,

@@ -250,6 +250,7 @@ import { shouldForceScheduledAutocomplete } from '../../services/agentMode/core/
 import { extractProducedAssetCount } from '../../services/agentMode/core/synthesisResidue';
 import { extractGeneratedImageFilenames } from './shared/generatedAssets';
 import { currentRunFunding } from '../../services/funding/runFunding';
+import { isNonConsumableRequiredFunctionCall } from '../../services/agentMode/workPlanRequiredCallsPolicy';
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
 
@@ -1012,8 +1013,11 @@ async function setWorkPlanStatusAttempt(
         continue; // Skip updating this step
       }
 
-      // If validation passed and marking as completed, decrement the function counts
+      // If validation passed and marking as completed, decrement the function counts.
+      // ENG-2206: skip tools whose credit is a session-wide fact, not a per-step
+      // artifact — see workPlanRequiredCallsPolicy.ts's doc comment.
       for (const fn of step.requiredFunctionCalls) {
+        if (isNonConsumableRequiredFunctionCall(fn)) continue;
         calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
         pendingCalledFunctionDecrements[fn] = (pendingCalledFunctionDecrements[fn] || 0) + 1;
         countsModified = true;
@@ -1031,6 +1035,8 @@ async function setWorkPlanStatusAttempt(
     // step that makes a genuinely fresh call).
     if (update.status === 'skipped' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
       for (const fn of step.requiredFunctionCalls) {
+        // ENG-2206: same carve-out as the completed branch above.
+        if (isNonConsumableRequiredFunctionCall(fn)) continue;
         const current = calledFunctionCounts[fn] || 0;
         if (current > 0) {
           calledFunctionCounts[fn] = current - 1;

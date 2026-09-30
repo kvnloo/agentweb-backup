@@ -94,6 +94,26 @@ export interface CreativePairRef {
   signal: PairSignal;
 }
 
+/** One criterion's AI-suggested label, with the reasoning the labeller reviews it against. */
+export interface DraftCriterionLabel {
+  label: LabelValue;
+  rationale: string;
+}
+
+/**
+ * An AI-drafted suggestion for a case's labels (ENG-2200): never the ground truth itself, never
+ * written to `labels`, and never counted toward `isFullyLabelled`. A human reviews and explicitly
+ * applies each suggestion (or ignores it) before saving through the normal label route. Advisory
+ * only — a case with a stale or malformed draft still labels normally, so a bad draft never
+ * blocks a real labeller.
+ */
+export interface GoldenCaseDraft {
+  labels: Partial<Record<GoldenCriterion, DraftCriterionLabel>>;
+  /** The model that generated this draft, e.g. `claude-opus-5-5`. */
+  model: string;
+  generatedAt: string;
+}
+
 export interface GoldenCase {
   caseId: string;
   surface: EvalSurface;
@@ -107,7 +127,7 @@ export interface GoldenCase {
   labeller?: string;
   labelledAt?: string;
   split: GoldenSplit;
-  /** Revision of this case; incremented by every label save (optimistic concurrency). */
+  /** Revision of this case; incremented by every label save (optimistic concurrency). Untouched by a draft write. */
   version: number;
   schemaVersion: number;
   /** Where the seed builder found the case, e.g. `fp_catalogue:ENG-972`. No content. */
@@ -116,6 +136,8 @@ export interface GoldenCase {
   replay?: ReplayLink;
   /** Present on pairwise creative cases only; their criteria are exactly [PAIRWISE_CRITERION]. */
   pair?: CreativePairRef;
+  /** An AI-drafted suggestion for this case, pending human review. Absent until generated. */
+  draft?: GoldenCaseDraft;
 }
 
 /** Share of cases in the test split. 0.6 so a 50-case surface can reach the registry's
@@ -216,6 +238,51 @@ function parsePairRef(value: unknown): CreativePairRef {
   };
 }
 
+/**
+ * Parses a stored `draft`. Strict — every failure throws GoldenCaseValidationError naming the
+ * bad field — because the one caller that must not silently swallow a bad shape is the writer
+ * (generateGoldenDraftLabels.ts): a bug there should fail loudly, not save a malformed suggestion.
+ */
+export function parseDraft(surface: EvalSurface, criteria: readonly GoldenCriterion[], value: unknown): GoldenCaseDraft {
+  if (!isRecord(value)) throw new GoldenCaseValidationError('draft must be an object');
+  if (!isRecord(value.labels)) throw new GoldenCaseValidationError('draft.labels must be an object');
+  const labels: Partial<Record<GoldenCriterion, DraftCriterionLabel>> = {};
+  for (const [criterion, entry] of Object.entries(value.labels)) {
+    if (!criteria.includes(criterion as GoldenCriterion)) {
+      throw new GoldenCaseValidationError(`draft.labels.${criterion} is not one of this case's criteria (${criteria.join(', ')})`);
+    }
+    if (!isRecord(entry)) throw new GoldenCaseValidationError(`draft.labels.${criterion} must be an object`);
+    const pairwise = criteria.length === 1 && criteria[0] === PAIRWISE_CRITERION;
+    if (pairwise ? !isPairwiseLabel(entry.label) : !isLabelValue(entry.label)) {
+      throw new GoldenCaseValidationError(`draft.labels.${criterion}.label must be ${pairwise ? 'A, B or tie' : 'pass, fail or na'}`);
+    }
+    labels[criterion as GoldenCriterion] = {
+      label: entry.label as LabelValue,
+      rationale: nonEmptyString(entry.rationale, `draft.labels.${criterion}.rationale`),
+    };
+  }
+  return {
+    labels,
+    model: nonEmptyString(value.model, 'draft.model'),
+    generatedAt: nonEmptyString(value.generatedAt, 'draft.generatedAt'),
+  };
+}
+
+/**
+ * Parses a stored `draft` for display, tolerant of a stale/malformed shape (e.g. a criterion
+ * removed from GOLDEN_CRITERIA since the draft was written): logs and drops it rather than
+ * failing the whole case, since a bad draft must never block real labelling.
+ */
+function parseDraftOrDrop(surface: EvalSurface, criteria: readonly GoldenCriterion[], caseId: string, value: unknown): GoldenCaseDraft | undefined {
+  if (value === undefined) return undefined;
+  try {
+    return parseDraft(surface, criteria, value);
+  } catch (error) {
+    console.warn(`[goldenSet] dropping invalid draft on case ${caseId}: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+}
+
 /** Validates a stored or seeded case. Throws GoldenCaseValidationError naming the first bad field. */
 export function parseGoldenCase(value: unknown): GoldenCase {
   if (!isRecord(value)) throw new GoldenCaseValidationError('case must be an object');
@@ -272,6 +339,7 @@ export function parseGoldenCase(value: unknown): GoldenCase {
   const notes = optionalString(value.notes, 'notes');
   const labeller = optionalString(value.labeller, 'labeller');
   const labelledAt = optionalString(value.labelledAt, 'labelledAt');
+  const draft = parseDraftOrDrop(surface, criteria, caseId, value.draft);
   return {
     caseId,
     surface,
@@ -289,6 +357,7 @@ export function parseGoldenCase(value: unknown): GoldenCase {
     createdAt: nonEmptyString(value.createdAt, 'createdAt'),
     ...(replay ? { replay } : {}),
     ...(pair ? { pair } : {}),
+    ...(draft ? { draft } : {}),
   };
 }
 

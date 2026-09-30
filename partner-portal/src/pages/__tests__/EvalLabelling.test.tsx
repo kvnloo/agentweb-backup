@@ -228,6 +228,79 @@ describe("EvalLabelling (ENG-2135)", () => {
     expect(firstColumn()[0]).toContain("session-2");
   });
 
+  it("renders a draft's suggestion chip and rationale, and applies it only on explicit click without saving (ENG-2200)", async () => {
+    const draftCase: GoldenCaseView = {
+      ...CASE,
+      draft: {
+        labels: { task_success: { label: "pass", rationale: "The tool result confirms the task completed." } },
+        model: "claude-opus-5-5",
+        generatedAt: "2026-09-20T12:00:00.000Z",
+      },
+    };
+    mockedAxios.get.mockImplementation(async (url: string) => {
+      if (url.endsWith("/status")) return { data: { provisioned: true } };
+      if (url.includes("surface=agent")) return { data: { cases: [draftCase] } };
+      if (url.includes("sessionId=session-1")) return { data: { sessions: [{ title: "Synthetic session", messages: [] }] } };
+      throw new Error(`unexpected GET ${url}`);
+    });
+    renderPage();
+    await screen.findByText("Synthetic session");
+
+    expect(screen.getByText("AI suggests: Pass")).toBeInTheDocument();
+    expect(screen.getByText("The tool result confirms the task completed.")).toBeInTheDocument();
+    expect(screen.getByText(/AI-drafted suggestions available \(model: claude-opus-5-5/)).toBeInTheDocument();
+
+    // Not pre-set: the toggle starts unselected even though a draft exists for this criterion.
+    expect(screen.getByRole("button", { name: "task_success pass" })).not.toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Use suggestion" }));
+    expect(screen.getByRole("button", { name: "task_success pass" })).toHaveAttribute("aria-pressed", "true");
+    expect(mockedAxios.put).not.toHaveBeenCalled();
+  });
+
+  it("fills every unlabelled criterion with its draft suggestion on 'Apply all suggestions', without saving", async () => {
+    const draftCase: GoldenCaseView = {
+      ...CASE,
+      labels: { tool_correctness: "fail" },
+      draft: {
+        labels: {
+          task_success: { label: "pass", rationale: "Looks right." },
+          tool_correctness: { label: "pass", rationale: "Should not override the existing human label." },
+          groundedness: { label: "na", rationale: "No claims made." },
+        },
+        model: "claude-opus-5-5",
+        generatedAt: "2026-09-20T12:00:00.000Z",
+      },
+    };
+    mockedAxios.get.mockImplementation(async (url: string) => {
+      if (url.endsWith("/status")) return { data: { provisioned: true } };
+      if (url.includes("surface=agent")) return { data: { cases: [draftCase] } };
+      if (url.includes("sessionId=session-1")) return { data: { sessions: [{ title: "Synthetic session", messages: [] }] } };
+      throw new Error(`unexpected GET ${url}`);
+    });
+    renderPage();
+    await screen.findByText("Synthetic session");
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply all suggestions" }));
+
+    expect(screen.getByRole("button", { name: "task_success pass" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "groundedness na" })).toHaveAttribute("aria-pressed", "true");
+    // Already human-labelled criterion keeps its existing label, not the draft's.
+    expect(screen.getByRole("button", { name: "tool_correctness fail" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "tool_correctness pass" })).toHaveAttribute("aria-pressed", "false");
+    expect(mockedAxios.put).not.toHaveBeenCalled();
+  });
+
+  it("renders no draft UI for a case without a draft (no regression)", async () => {
+    routeGets(true);
+    renderPage();
+    await screen.findByText("Synthetic session");
+    expect(screen.queryByText(/AI suggests:/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/AI-drafted suggestions available/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Apply all suggestions" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Use suggestion" })).not.toBeInTheDocument();
+  });
+
   it("leaves pairwise calibration cases to their own page and links to it (ENG-2142)", async () => {
     const single: GoldenCaseView = { ...CASE, caseId: "creative#candidateId#cand-1", surface: "creative", taskType: "creative_image", sourceRef: { kind: "candidateId", id: "cand-1" }, criteria: ["hook"] };
     const pair: GoldenCaseView = {
