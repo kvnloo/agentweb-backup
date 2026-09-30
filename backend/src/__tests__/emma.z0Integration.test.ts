@@ -122,8 +122,9 @@ describe('z0 AgentWeb adapter', () => {
 
   it('changed function under the same operation preserves the authority trace for conflict detection', () => {
     const parent = pseudonymousAgentWebParent('raw-session-secret');
+    const changed: Z0RouteArgs = { ...request, function: 'research' };
     expect(agentWebTraceId(parent, request)).toBe(
-      agentWebTraceId(parent, { ...request, function: 'research' }),
+      agentWebTraceId(parent, changed),
     );
   });
 
