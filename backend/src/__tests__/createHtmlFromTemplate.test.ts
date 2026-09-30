@@ -252,6 +252,19 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
     it('ENG-1960: logs markup-like variable paths without mutating the values', async () => {
       const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
       try {
+        // This test exercises an array_variable_values entry ('items'), so the
+        // template mock must declare it in arrayVariables — otherwise the
+        // pre-existing "Extra array variables provided" validation rejects the
+        // call before it ever reaches the ENG-1960 detection code below.
+        const templateWithItems = {
+          ...mockTemplate,
+          arrayVariables: ['items'],
+          html_content: '<html><body><h1>{{title}}</h1><p>{{content}}</p><ul>{{#items}}<li>{{item}}</li>{{/items}}</ul></body></html>',
+        };
+        (settingsService.getSetting as jest.Mock).mockResolvedValue({
+          settingValue: JSON.stringify([templateWithItems]),
+        });
+
         await (agentModeService as any).createHtmlFromTemplate(
           agentModeService.default_model,
           'test-template-id',
