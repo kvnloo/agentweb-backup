@@ -75,7 +75,7 @@ const emailEnrollment = {
   sequenceId: 'seq-1',
   leadId: 'lead-1',
   listId: 'list-1',
-  leadEmail: 'prospect@example.com',
+  leadEmail: 'prospect@acme.io',
   userId: 'user-1',
   currentStep: 0,
   status: 'active',
@@ -96,7 +96,7 @@ const emailSequence = {
   ],
 };
 
-const activeLead = { leadId: 'lead-1', email: 'prospect@example.com', firstName: 'John', contactStatus: 'active' };
+const activeLead = { leadId: 'lead-1', email: 'prospect@acme.io', firstName: 'John', contactStatus: 'active' };
 
 const senderConfigSetting = {
   settingValue: JSON.stringify({
@@ -107,7 +107,7 @@ const senderConfigSetting = {
 
 beforeEach(() => {
   jest.clearAllMocks();
-  mockUserDb.getUserById.mockResolvedValue({ userId: 'user-1', email: 'sender@example.com' } as any);
+  mockUserDb.getUserById.mockResolvedValue({ userId: 'user-1', email: 'sender@acme.io' } as any);
   mockEmailEventsDb.getEventsByEmailDomainAndLeadEmail.mockResolvedValue([]);
   (settingsService.getSetting as jest.Mock).mockResolvedValue(senderConfigSetting);
   mockDb.snoozeEnrollment.mockResolvedValue(undefined as any);

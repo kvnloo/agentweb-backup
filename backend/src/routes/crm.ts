@@ -24,6 +24,7 @@ import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { isValidLeadLifecycle, LEAD_LIFECYCLES } from '../utils/leadSchema';
+import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValidation';
 import { syncContact, SyncInput } from '../services/contactSyncService';
 import { isCardRevenueField } from '../services/enrichmentGroups';
@@ -87,22 +88,42 @@ const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
  * Fire-and-forget: enroll a single newly created lead into any sequences that
  * have autoEnrollListIds containing this list. Errors are logged but never surfaced.
  */
-async function autoEnrollLeadInSequences(
+// Exported for tests: these decide WHICH leads get auto-enrolled, and the decision
+// was previously unpinned — a mutation restoring the email-only gate passed the
+// whole suite. Testing the shared predicates is not enough; this pins that crm.ts
+// actually calls them.
+export async function autoEnrollLeadInSequences(
   userId: string,
   listId: string,
   leadId: string,
-  leadEmail: string,
+  lead: { email?: string; linkedin?: string } | string,
 ): Promise<void> {
-  if (!leadEmail) return;
+  // Channel-aware, like the two enrol ROUTES.
+  //
+  // This gated on `if (!leadEmail) return` — so once enrolling a LinkedIn-only list
+  // into a LinkedIn sequence became possible, by-list enrolment switched auto-enroll
+  // ON for that list (sequences.ts adds it to autoEnrollListIds) while every lead
+  // arriving afterwards was silently dropped here for having no address. The feature
+  // worked exactly once, for the leads present at the time.
+  //
+  // Accepts a bare string for the legacy email-only call shape.
+  const leadObj = typeof lead === 'string' ? { email: lead } : (lead ?? {});
   try {
     const sequences = await dripSequenceDb.getSequencesByAutoEnrollList(userId, listId);
     for (const seq of sequences) {
+      const channels = requiredChannels(seq);
+      if (!leadIsReachable(leadObj, channels)) continue;
+      const identity = enrollmentIdentity(leadObj);
+      // leadEmail is the partition key of leadEmail-index; an empty one makes the row
+      // invisible to dedup, so it is recreated and the lead re-messaged every run.
+      if (!identity) continue;
       await dripSequenceDb.bulkEnroll([{
         sequenceId: seq.sequenceId,
         userId,
         listId,
         leadId,
-        leadEmail,
+        leadEmail: identity,
+        identityCandidates: enrollmentIdentityCandidates(leadObj),
       }]);
     }
   } catch (err) {
@@ -115,25 +136,31 @@ async function autoEnrollLeadInSequences(
  * in the list against any sequences watching it. The bulkEnroll dedup ensures
  * already-enrolled leads are skipped; only genuinely new leads get added.
  */
-async function autoEnrollListIntoSequences(userId: string, listId: string): Promise<void> {
+export async function autoEnrollListIntoSequences(userId: string, listId: string): Promise<void> {
   try {
     const sequences = await dripSequenceDb.getSequencesByAutoEnrollList(userId, listId);
     if (sequences.length === 0) return;
 
-    const leadsResult = await crmDb.getLeadsByListId(listId);
+    // getAllLeadsByListId: getLeadsByListId returns ONE ~1MB page, so a bulk import
+    // into a large list auto-enrolled only the first page and silently skipped the rest.
+    const leadsResult = await crmDb.getAllLeadsByListId(listId);
     const leads = Array.isArray(leadsResult)
       ? leadsResult
       : ((leadsResult as any).items ?? (leadsResult as any).leads ?? []);
 
     for (const seq of sequences) {
+      const channels = requiredChannels(seq);
       const inputs = leads
-        .filter((l: any) => l.email)
+        // Channel-aware and predicate-based, matching the enrol routes. `l.email`
+        // truthiness admitted junk addresses and excluded LinkedIn-only leads.
+        .filter((l: any) => leadIsReachable(l, channels) && !!enrollmentIdentity(l))
         .map((l: any) => ({
           sequenceId: seq.sequenceId,
           userId,
           listId,
           leadId: l.leadId,
-          leadEmail: l.email,
+          leadEmail: enrollmentIdentity(l),
+          identityCandidates: enrollmentIdentityCandidates(l),
         }));
       if (inputs.length > 0) {
         await dripSequenceDb.bulkEnroll(inputs);
@@ -2091,7 +2118,9 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     void Promise.allSettled([
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'hubspot', 'created'),
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'attio', 'created'),
-      autoEnrollLeadInSequences(userId, listId, (lead as any).leadId, leadData.email ?? ''),
+      autoEnrollLeadInSequences(userId, listId, (lead as any).leadId, {
+        email: leadData.email ?? '', linkedin: (leadData as any).linkedin ?? '',
+      }),
       // Single-lead create always validates the email in background (locked design).
       // Failures are swallowed so a transient enrich.so outage doesn't block creation.
       validateLeadEmailInBackground(listId, (lead as any).leadId, leadData.email ?? '', userId),

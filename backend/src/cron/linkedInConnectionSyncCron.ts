@@ -18,6 +18,7 @@ import {
 } from '../services/linkedInConnectionHealth';
 import { settingsService } from '../services/settingsService';
 import { dripSequenceDb } from '../services/dripSequenceDb';
+import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { crmDb } from '../services/db';
 import { leadListAlertService } from '../services/leadListAlertService';
 import {
@@ -329,12 +330,31 @@ export async function enrollNewConnections(newConnections: UnipileConnection[]):
             lastKey = (page as any).lastEvaluatedKey ?? null;
 
             for (const lead of items) {
-              if (!lead.linkedin || !lead.email) continue;
+              // `!lead.email` was here, on the one enrolment path whose trigger is
+              // literally "a LinkedIn connection was accepted". A LinkedIn-only lead —
+              // precisely the lead this cron exists to serve — was skipped for having no
+              // email address it was never going to be sent to. Same defect as the
+              // auto-enroll paths, on the fifth and last enrolment site.
+              if (!lead.linkedin) continue;
               const normalized = normalizeLinkedInUrl(lead.linkedin);
               if (normalized !== conn.publicProfileUrl) continue;
+              const channels = requiredChannels(seq);
+              if (!leadIsReachable(lead, channels)) continue;
+
+              // The shared identity, not the raw address. Keying on `lead.email` here
+              // while every other path keys on `enrollmentIdentity` split one person
+              // into two enrollments: a lead with a malformed address and a good profile
+              // is stored under the profile URL by the routes and under the junk address
+              // by this cron, so neither dedup check saw the other's row.
+              const identity = enrollmentIdentity(lead);
+              if (!identity) continue;
 
               // Found a matching lead — enroll if not already enrolled
-              const existing = await dripSequenceDb.getExistingEnrollment(seq.sequenceId, lead.email);
+              let existing = null as Awaited<ReturnType<typeof dripSequenceDb.getExistingEnrollment>>;
+              for (const candidate of enrollmentIdentityCandidates(lead)) {
+                existing = await dripSequenceDb.getExistingEnrollment(seq.sequenceId, candidate);
+                if (existing) break;
+              }
               if (existing) continue;
 
               await dripSequenceDb.enrollLead({
@@ -342,10 +362,10 @@ export async function enrollNewConnections(newConnections: UnipileConnection[]):
                 userId: seq.userId,
                 listId: list.listId,
                 leadId: lead.leadId,
-                leadEmail: lead.email,
+                leadEmail: identity,
               });
               enrolled++;
-              console.log(`${TAG} Enrolled lead ${lead.email} into sequence ${seq.sequenceId} (LinkedIn connected)`);
+              console.log(`${TAG} Enrolled lead ${identity} into sequence ${seq.sequenceId} (LinkedIn connected)`);
             }
           } while (lastKey);
         }

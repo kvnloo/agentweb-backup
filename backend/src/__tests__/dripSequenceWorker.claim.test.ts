@@ -68,7 +68,7 @@ const enrollment = {
   sequenceId: 'seq-1',
   leadId: 'lead-1',
   listId: 'list-1',
-  leadEmail: 'prospect@example.com',
+  leadEmail: 'prospect@acme.io',
   userId: 'user-1',
   currentStep: 0,
   status: 'active',
@@ -101,11 +101,11 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockUserDb.getUserById.mockResolvedValue({
     userId: 'user-1',
-    email: 'sender@example.com',
+    email: 'sender@acme.io',
     emailDomain: 'example.com',
     defaultSenderUsername: 'sender',
   } as any);
-  mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'lead-1', email: 'prospect@example.com' } as any);
+  mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'lead-1', email: 'prospect@acme.io' } as any);
   mockEmailEventsDb.getEventsByEmailDomainAndLeadEmail.mockResolvedValue([]);
   (require('../services/settingsService').settingsService.getSetting as jest.Mock).mockResolvedValue(null);
   mockDb.getAllDueEnrollments.mockResolvedValue([enrollment as any]);
