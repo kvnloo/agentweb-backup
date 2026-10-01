@@ -932,9 +932,22 @@ export class MetaService {
       );
       const { items, truncated } = await this.drainCursor(cursor, META_LIST_MAX_PAGES);
       if (truncated) {
-        this.log(`getPages: Page list truncated at the ${META_LIST_MAX_PAGES}-page bound`, {
-          itemsSoFar: items.length,
-        });
+        // ENG-2232 code review follow-up: draining pagination closed the
+        // "page 1 only" gap, but `drainCursor` can ALSO report truncated:true
+        // for a transient page-N fetch failure mid-walk (by design — see its
+        // own "a page-N failure must not throw away pages 1..N-1" comment) or
+        // for hitting the META_LIST_MAX_PAGES bound. Either way, this result
+        // backs exact-membership, absence-sensitive checks (the AD_CREATIVE
+        // CREATE page_id gate, the wrong-Page cross-check) where an
+        // incomplete list read as complete reproduces the exact bug class
+        // this fix exists for, just one layer deeper. Throwing — rather than
+        // returning the partial list — means every real caller's EXISTING
+        // best-effort try/catch (all five already treat a getPages() failure
+        // as "could not determine", never as a confirmed negative) handles
+        // this correctly for free, with no caller-side changes needed.
+        const message = `Page list pagination stopped early after ${items.length} item(s); treating as undetermined rather than risking an incomplete list being read as complete`;
+        this.log(`getPages: ${message}`, { itemsSoFar: items.length });
+        throw new Error(message);
       }
 
       const pages = items.map((page: any) => ({
