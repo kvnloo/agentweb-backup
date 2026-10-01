@@ -216,9 +216,30 @@ describe('imageForJudge', () => {
     mockExtractKey.mockReturnValue('users/u1/image.png');
     mockGetObject.mockResolvedValue({ buffer: await png(3000, 3000), contentType: 'image/png' });
     const uri = await imageForJudge({ url: 'https://agentweb-user-files.s3.amazonaws.com/users/u1/image.png' });
-    expect(mockGetObject).toHaveBeenCalledWith('users/u1/image.png', undefined, 15 * 1024 * 1024);
+    expect(mockGetObject).toHaveBeenCalledWith('users/u1/image.png', undefined, 30 * 1024 * 1024);
     const meta = await sharp(Buffer.from(uri.split(',')[1], 'base64')).metadata();
     expect(Math.max(meta.width ?? 0, meta.height ?? 0)).toBe(1568);
+  });
+
+  it('lets a download between the old 15MB and current 30MB limit past the size check (ENG-2214)', async () => {
+    // Not a real image: a filler buffer this size only needs to prove the download-size check no
+    // longer rejects it. It should fail later, at decode, rather than at the byte-size gate.
+    mockExtractKey.mockReturnValue('users/u1/big.png');
+    const big = Buffer.alloc(20 * 1024 * 1024, 1);
+    mockGetObject.mockResolvedValue({ buffer: big, contentType: 'image/png' });
+    await expect(imageForJudge({ url: 'https://agentweb-user-files.s3.amazonaws.com/users/u1/big.png' })).rejects.toThrow(
+      'could not be decoded',
+    );
+    expect(mockGetObject).toHaveBeenCalledWith('users/u1/big.png', undefined, 30 * 1024 * 1024);
+  });
+
+  it('still rejects a download above the current 30MB limit', async () => {
+    mockExtractKey.mockReturnValue('users/u1/huge.png');
+    const huge = Buffer.alloc(31 * 1024 * 1024, 1);
+    mockGetObject.mockResolvedValue({ buffer: huge, contentType: 'image/png' });
+    await expect(imageForJudge({ url: 'https://agentweb-user-files.s3.amazonaws.com/users/u1/huge.png' })).rejects.toThrow(
+      /above the \d+-byte limit/,
+    );
   });
 
   it('passes any other https URL through for the provider to fetch, and refuses plain http', async () => {
