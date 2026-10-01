@@ -67,6 +67,7 @@ export interface Z0BridgeResponseV1 {
   operation_id: string;
   trace_id: string;
   mode: Z0BridgeMode;
+  kind: Z0BridgeKind;
   status: Z0BridgeStatus;
   applied: boolean;
   replayed: boolean;
@@ -206,25 +207,27 @@ export function assertZ0BridgeRequestV1(value: unknown): asserts value is Z0Brid
 export function bridgeFailureDisposition(
   mode: Z0BridgeMode,
   failure: Z0BridgeFailureClass,
+  kind: Z0BridgeKind = mode === 'shadow' ? 'plan' : 'dispatch',
 ): Z0BridgeFailureDisposition {
-  if (mode === 'shadow') {
-    return {
-      status: 'not_executed',
-      reconcile_required: false,
-      retry: 'caller_may_fallback',
-    };
-  }
-
-  if (
+  const knownRejection =
     failure === 'validation' ||
     failure === 'policy' ||
     failure === 'trace_conflict' ||
-    failure === 'http_4xx'
-  ) {
+    failure === 'http_4xx';
+
+  if (knownRejection) {
     return {
       status: 'rejected',
       reconcile_required: false,
       retry: 'none',
+    };
+  }
+
+  if (mode === 'shadow' && kind !== 'decide') {
+    return {
+      status: 'not_executed',
+      reconcile_required: false,
+      retry: 'caller_may_fallback',
     };
   }
 
@@ -251,6 +254,9 @@ export function validateZ0BridgeResponseV1(value: unknown): string[] {
   if (!MODES.has(value.mode as Z0BridgeMode)) {
     errors.push('mode must be shadow or active');
   }
+  if (!KINDS.has(value.kind as Z0BridgeKind)) {
+    errors.push('kind must be plan, decide, dispatch, or observe');
+  }
   if (!new Set<Z0BridgeStatus>(['completed', 'not_executed', 'rejected', 'failed', 'unknown'])
     .has(value.status as Z0BridgeStatus)) {
     errors.push('status is invalid');
@@ -263,10 +269,24 @@ export function validateZ0BridgeResponseV1(value: unknown): string[] {
     errors.push('retry is invalid');
   }
 
-  if (value.mode === 'shadow') {
-    if (value.applied === true) errors.push('shadow response cannot be applied');
-    if (value.status === 'unknown') errors.push('shadow response cannot have unknown execution status');
-    if (value.reconcile_required === true) errors.push('shadow response cannot require reconciliation');
+  if (value.mode === 'shadow' && value.applied === true) {
+    errors.push('shadow response cannot be applied');
+  }
+
+  if (
+    value.mode === 'shadow' &&
+    value.kind !== 'decide' &&
+    value.status === 'unknown'
+  ) {
+    errors.push('side-effect-free shadow response cannot have unknown execution status');
+  }
+
+  if (
+    value.mode === 'shadow' &&
+    value.kind !== 'decide' &&
+    value.reconcile_required === true
+  ) {
+    errors.push('side-effect-free shadow response cannot require reconciliation');
   }
 
   if (value.status === 'unknown') {
