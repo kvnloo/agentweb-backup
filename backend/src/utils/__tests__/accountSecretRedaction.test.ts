@@ -92,6 +92,10 @@ describe('redactAccountsSecrets', () => {
     expect(redactAccountsSecrets(undefined)).toEqual([]);
     expect(redactAccountsSecrets(null)).toEqual([]);
   });
+
+  it('fails closed (empty array) on a malformed non-array value, matching org.ts\'s own guard', () => {
+    expect(redactAccountsSecrets({ not: 'an array' } as any)).toEqual([]);
+  });
 });
 
 describe('sanitizeUserForResponse', () => {
