@@ -899,8 +899,20 @@ router.get('/leads/:leadId/enrichment', async (req: Request, res: Response) => {
               (statusPriority[a.status] ?? 99) - (statusPriority[b.status] ?? 99)
           );
           const sub: any = sorted[0];
-          const priceId = sub.items?.data?.[0]?.price?.id;
-          const price = sub.items?.data?.[0]?.price;
+          // Uses `findBasePlanItem` rather than `items.data[0]` — a
+          // subscription can carry a seat-billing extra-seat line item
+          // (ENG-2243..2246) alongside the plan item, and `items.data`
+          // order is not guaranteed. `items.data[0]` could price this
+          // lead's MRR enrichment off the seat item instead of the plan
+          // (ENG-2257). See `findBasePlanItem`'s doc comment in
+          // stripeService.ts. Imported dynamically (like routes/stripe.ts)
+          // so this route doesn't eagerly pull in stripeService's heavier
+          // transitive import graph (e.g. waitlistDb's AWS.config.update at
+          // module load) for requests that never hit this branch.
+          const { findBasePlanItem } = await import('../services/stripeService');
+          const basePlanItem = sub?.items?.data ? findBasePlanItem(sub) : undefined;
+          const priceId = basePlanItem?.price?.id;
+          const price = basePlanItem?.price;
           const mrrCents = price?.unit_amount
             ? (price.recurring?.interval === 'year'
                 ? Math.round(price.unit_amount / 12)

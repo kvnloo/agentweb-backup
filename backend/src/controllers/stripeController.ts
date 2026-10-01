@@ -15,6 +15,7 @@ import {
   handleChargeDisputeClosed,
   handleSubscriptionScheduleEnded,
   reconcileAllStripeUsers,
+  findBasePlanItem,
 } from '../services/stripeService';
 
 const CUSTOMER_FRONTEND_URL =
@@ -232,6 +233,17 @@ async function recordSubscriptionEvent(
     const user = await findUserByStripeCustomerId(customerId);
     if (!user) return;
 
+    // `data` is the subscription object for customer.subscription.* events
+    // (which has `.items`) or a checkout session for checkout.session.completed
+    // (which doesn't — falls through to `line_items`). For the subscription
+    // case, use `findBasePlanItem` rather than `items.data[0]` — a
+    // subscription can carry a seat-billing extra-seat line item
+    // (ENG-2243..2246) alongside the plan item, and `items.data` order is
+    // not guaranteed. `items.data[0]` could record the seat's price instead
+    // of the plan's in this payment-history audit trail (ENG-2257). See
+    // `findBasePlanItem`'s doc comment in stripeService.ts.
+    const basePlanItem = data.items?.data?.length ? findBasePlanItem(data) : undefined;
+
     const { paymentHistoryDb } = await import('../services/paymentHistoryDb');
     await paymentHistoryDb.record({
       userId: user.userId,
@@ -242,7 +254,7 @@ async function recordSubscriptionEvent(
       status: data.status || eventType,
       stripeInvoiceId: data.invoice || undefined,
       stripeSubscriptionId: (typeof data.subscription === 'string' ? data.subscription : data.subscription?.id) || data.id || undefined,
-      priceId: data.items?.data?.[0]?.price?.id || data.line_items?.data?.[0]?.price?.id || undefined,
+      priceId: basePlanItem?.price?.id || data.line_items?.data?.[0]?.price?.id || undefined,
       planName: undefined,
     });
   } catch (err: any) {

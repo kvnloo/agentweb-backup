@@ -363,6 +363,241 @@ describe('Stripe subscription upgrade', () => {
     });
   });
 
+  // --- SEAT-BILLING INTERACTION TESTS (ENG-2243..2246) ---
+  //
+  // Seat billing (PR #3175) put a second item — the extra-seat line item —
+  // on the same subscription as the plan item. upgradeSubscription /
+  // changeSubscriptionPrice were written back when a subscription could
+  // only ever have one item and picked it via `items.data[0]`. These tests
+  // pin that a plan change on a subscription that ALSO carries a seat item
+  // still targets the correct (plan) item, and that a scheduled downgrade
+  // does not drop the seat item from the next phase.
+  describe('POST /api/stripe/upgrade (subscription also has a seat-billing extra-seat item)', () => {
+    const SEAT_ITEM = {
+      id: 'si_seat',
+      quantity: 3,
+      price: { id: 'price_seat_dynamic_1', product: 'prod_extra_seat', unit_amount: 5000 },
+    };
+
+    beforeEach(() => {
+      process.env.STRIPE_EXTRA_SEAT_PRODUCT_ID = 'prod_extra_seat';
+    });
+
+    afterEach(() => {
+      delete process.env.STRIPE_EXTRA_SEAT_PRODUCT_ID;
+    });
+
+    it('upgrades the PLAN item (not the seat item) when the seat item sorts first in items.data', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'user-123',
+        stripe_customer_id: 'cus_abc123',
+      });
+      mockStripe.subscriptions.list.mockResolvedValue({
+        data: [{
+          id: 'sub_existing',
+          status: 'active',
+          // Plan item is NOT first here — regression guard for an
+          // items.data[0] assumption that no longer holds once a seat item
+          // can exist on the same subscription.
+          items: { data: [SEAT_ITEM, { id: 'si_item1', price: { id: 'price_starter_123' } }] },
+        }],
+      });
+      mockStripe.subscriptions.retrieve.mockResolvedValue({
+        id: 'sub_existing',
+        current_period_end: 1700000000,
+        items: {
+          data: [
+            SEAT_ITEM,
+            {
+              id: 'si_item1',
+              price: { id: 'price_starter_123', unit_amount: 2900 },
+              current_period_end: 1700000000,
+            },
+          ],
+        },
+      });
+      mockStripe.prices.retrieve.mockResolvedValue({ id: 'price_complete_456', unit_amount: 9900 });
+      mockStripe.subscriptions.update.mockResolvedValue({
+        id: 'sub_existing',
+        status: 'active',
+        current_period_end: 1700000000,
+        items: { data: [{ id: 'si_item1', price: { id: 'price_complete_456' }, current_period_end: 1700000000 }] },
+      });
+      mockUpdateUser.mockResolvedValue({});
+
+      const app = createApp();
+      const res = await request(app)
+        .post('/api/stripe/upgrade')
+        .set('Authorization', 'Bearer valid-token')
+        .send({ plan: 'pro' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.kind).toBe('upgrade_immediate');
+      // Must reprice the PLAN item (si_item1), never the seat item (si_seat).
+      expect(mockStripe.subscriptions.update).toHaveBeenCalledWith('sub_existing', {
+        items: [{ id: 'si_item1', price: 'price_complete_456' }],
+        proration_behavior: 'create_prorations',
+      });
+    });
+
+    it('carries the seat item forward into the next phase on a scheduled downgrade', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'user-123',
+        stripe_customer_id: 'cus_abc123',
+      });
+      mockStripe.subscriptions.list.mockResolvedValue({
+        data: [{
+          id: 'sub_existing',
+          status: 'active',
+          items: { data: [{ id: 'si_item1', price: { id: 'price_complete_456' } }, SEAT_ITEM] },
+        }],
+      });
+      mockStripe.subscriptions.retrieve.mockResolvedValue({
+        id: 'sub_existing',
+        status: 'active',
+        current_period_end: 1700000000,
+        items: {
+          data: [
+            {
+              id: 'si_item1',
+              price: { id: 'price_complete_456', unit_amount: 9900 },
+              current_period_end: 1700000000,
+            },
+            SEAT_ITEM,
+          ],
+        },
+      });
+      mockStripe.prices.retrieve.mockResolvedValue({ id: 'price_starter_123', unit_amount: 2900 });
+      mockStripe.subscriptionSchedules.create.mockResolvedValue({
+        id: 'sub_sched_xyz',
+        phases: [{
+          start_date: 1_697_400_000,
+          end_date: 1700000000,
+          items: [
+            { price: 'price_complete_456', quantity: 1 },
+            { price: 'price_seat_dynamic_1', quantity: 3 },
+          ],
+        }],
+      });
+      mockStripe.subscriptionSchedules.update.mockResolvedValue({
+        id: 'sub_sched_xyz',
+        phases: [
+          {
+            items: [
+              { price: 'price_complete_456', quantity: 1 },
+              { price: 'price_seat_dynamic_1', quantity: 3 },
+            ],
+          },
+          { items: [{ price: 'price_starter_123', quantity: 1 }, { price: 'price_seat_dynamic_1', quantity: 3 }] },
+        ],
+      });
+
+      const app = createApp();
+      const res = await request(app)
+        .post('/api/stripe/upgrade')
+        .set('Authorization', 'Bearer valid-token')
+        .send({ plan: 'starter' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.kind).toBe('downgrade_scheduled');
+      expect(mockStripe.subscriptionSchedules.update).toHaveBeenCalledTimes(1);
+      const [, scheduleUpdateArgs] = mockStripe.subscriptionSchedules.update.mock.calls[0];
+      // Phase 2 (the phase that takes effect at period end) must include the
+      // new plan price AND the seat item, carried forward unchanged — not
+      // just the new plan price alone (which would silently cancel seat
+      // billing the moment the schedule transitions).
+      expect(scheduleUpdateArgs.phases[1].items).toEqual(
+        expect.arrayContaining([
+          { price: 'price_starter_123', quantity: 1 },
+          { price: 'price_seat_dynamic_1', quantity: 3 },
+        ])
+      );
+      expect(scheduleUpdateArgs.phases[1].items).toHaveLength(2);
+    });
+
+    // ENG-2257: the "already on this plan" check (`currentPriceId =
+    // currentSub.items.data[0]?.price?.id`) had the identical items.data[0]
+    // hazard as upgradeSubscription/changeSubscriptionPrice above. Pin both
+    // orderings so a seat item sorting first can never be mistaken for (or
+    // mask) the user's actual plan price.
+    it('correctly detects "already on this plan" when the seat item sorts FIRST in items.data', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'user-123',
+        stripe_customer_id: 'cus_abc123',
+      });
+      mockStripe.subscriptions.list.mockResolvedValue({
+        data: [{
+          id: 'sub_existing',
+          status: 'active',
+          items: { data: [SEAT_ITEM, { id: 'si_item1', price: { id: 'price_complete_456' } }] },
+        }],
+      });
+
+      const app = createApp();
+      const res = await request(app)
+        .post('/api/stripe/upgrade')
+        .set('Authorization', 'Bearer valid-token')
+        .send({ plan: 'pro' });
+
+      // Before the fix, items.data[0] would read the seat price
+      // (price_seat_dynamic_1), never match resolvedPriceId, and this
+      // request would fall through to attempt a real price change.
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/already on this plan/i);
+    });
+
+    it('correctly allows a real plan change when the seat item sorts FIRST in items.data', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'user-123',
+        stripe_customer_id: 'cus_abc123',
+      });
+      mockStripe.subscriptions.list.mockResolvedValue({
+        data: [{
+          id: 'sub_existing',
+          status: 'active',
+          items: { data: [SEAT_ITEM, { id: 'si_item1', price: { id: 'price_starter_123' } }] },
+        }],
+      });
+      mockStripe.subscriptions.retrieve.mockResolvedValue({
+        id: 'sub_existing',
+        current_period_end: 1700000000,
+        items: {
+          data: [
+            SEAT_ITEM,
+            {
+              id: 'si_item1',
+              price: { id: 'price_starter_123', unit_amount: 2900 },
+              current_period_end: 1700000000,
+            },
+          ],
+        },
+      });
+      mockStripe.prices.retrieve.mockResolvedValue({ id: 'price_complete_456', unit_amount: 9900 });
+      mockStripe.subscriptions.update.mockResolvedValue({
+        id: 'sub_existing',
+        status: 'active',
+        current_period_end: 1700000000,
+        items: { data: [{ id: 'si_item1', price: { id: 'price_complete_456' }, current_period_end: 1700000000 }] },
+      });
+      mockUpdateUser.mockResolvedValue({});
+
+      const app = createApp();
+      const res = await request(app)
+        .post('/api/stripe/upgrade')
+        .set('Authorization', 'Bearer valid-token')
+        .send({ plan: 'pro' });
+
+      // Before the fix, items.data[0] (the seat item, price_seat_dynamic_1)
+      // would never equal resolvedPriceId, so this would incorrectly be
+      // treated as "not already on this plan" regardless of target —
+      // masking the inverse bug where a genuine same-plan request on a
+      // plan-first subscription still has to pass through correctly too
+      // (covered by the non-seat "already on this plan" test above).
+      expect(res.status).toBe(200);
+      expect(res.body.kind).toBe('upgrade_immediate');
+    });
+  });
+
   // --- NO FREE TRIAL TESTS ---
   // Free trials were removed (product decision, 2026-04). New users pay on
   // first checkout. These tests assert checkout never emits trial_period_days
