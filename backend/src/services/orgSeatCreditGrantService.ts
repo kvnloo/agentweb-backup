@@ -30,23 +30,10 @@
  * retry loop (llmUsageCreditService.ts). This module's only job is to decide,
  * once per org per sweep, what to call that function with.
  *
- * DECIDED SCOPE LIMIT, not an oversight (2026-10-01 review): the grant id is
- * `seat-credit:{orgId}:{month}` — scoped to org+month, not to the seat count
- * at grant time. If an org raises `purchasedExtraSeats` mid-month (buys more
- * seats after this month's grant already landed), the additional credit is
- * NOT back-filled for the remainder of the current month — it first shows up
- * once this sweep runs again under next month's grant id, at the new total.
- * This was considered and deliberately NOT "fixed" with an immediate
- * mid-cycle top-up: doing that correctly needs either a delta-tracking ledger
- * (real risk of a worse double-credit bug if rushed) or folding seat credit
- * into the live policy-threshold resolution in llmUsagePolicyResolverService.ts
- * instead of a ledgered grant (a larger change touching every usage check in
- * the system, not just seat billing). Both are real options for a follow-up
- * iteration; shipping the simpler, well-tested monthly-grant model now with
- * this limitation disclosed beats rushing either under deadline pressure.
- * `grantMonthlySeatCreditForOrg` logs when it skips an org this way so the
- * gap stays visible in logs rather than silently indistinguishable from a
- * routine idempotent replay.
+ * DECIDED SCOPE LIMIT, not an oversight (2026-10-01 review): mid-month seat
+ * increases are not back-filled. See the doc comment on
+ * `grantMonthlySeatCreditForOrg` below for why, and for how that limit is kept
+ * visible in logs.
  */
 
 import { orgDb, type Organization } from './db';
@@ -87,14 +74,14 @@ export function seatCreditGrantId(orgId: string, usageMonth: string): string {
  * zero, negative, or fractional like 0.5) all collapse to 0 — "no seats
  * purchased" — rather than throwing, since this reads untyped DynamoDB data.
  *
- * Used both by the sweep's own eligibility pre-check and by
- * `grantMonthlySeatCreditForOrg`'s skip check, so the two can never disagree:
- * previously the sweep counted an org as "eligible" using the raw (unfloored)
- * value while the per-org function skipped it using the floored value, so an
- * org with e.g. `purchasedExtraSeats: 0.5` was tallied as eligible but ended
- * up neither granted, idempotent, nor failed — a silent gap in the summary,
- * and a wasted call into the credit-grant path for an org that was always
- * going to no-op.
+ * `grantMonthlySeatCreditForOrg` is the only caller, so eligibility is
+ * decided in exactly one place. An earlier version had the sweep re-derive
+ * eligibility from the raw (unfloored) value before also calling into this
+ * per-org function, which floored it independently — an org with e.g.
+ * `purchasedExtraSeats: 0.5` was tallied as eligible by the sweep but then
+ * came back neither granted, idempotent, nor failed, a silent gap in the
+ * summary. `grantMonthlySeatCreditsForAllOrgs` now reads eligibility off this
+ * function's own `attempted` result instead of recomputing it.
  */
 export function normalizePurchasedSeats(rawSeats: unknown): number {
   const seats = typeof rawSeats === 'number' && Number.isFinite(rawSeats) ? Math.floor(rawSeats) : 0;
@@ -106,6 +93,24 @@ export function normalizePurchasedSeats(rawSeats: unknown): number {
  * Skips orgs with no purchased extra seats without calling the credit
  * function at all — a zero/absent seat count must never produce a call,
  * wasted or otherwise.
+ *
+ * DECIDED SCOPE LIMIT, not an oversight (2026-10-01 review): the grant id is
+ * `seat-credit:{orgId}:{month}` — scoped to org+month, not to the seat count
+ * at grant time. If an org raises `purchasedExtraSeats` mid-month (buys more
+ * seats after this month's grant already landed), the additional credit is
+ * NOT back-filled for the remainder of the current month — it first shows up
+ * once this sweep runs again under next month's grant id, at the new total.
+ * This was considered and deliberately NOT "fixed" with an immediate
+ * mid-cycle top-up: doing that correctly needs either a delta-tracking ledger
+ * (real risk of a worse double-credit bug if rushed) or folding seat credit
+ * into the live policy-threshold resolution in llmUsagePolicyResolverService.ts
+ * instead of a ledgered grant (a larger change touching every usage check in
+ * the system, not just seat billing). Both are real options for a follow-up
+ * iteration; shipping the simpler, well-tested monthly-grant model now with
+ * this limitation disclosed beats rushing either under deadline pressure.
+ * This function logs when it skips an org this way (below) so the gap stays
+ * visible in logs rather than silently indistinguishable from a routine
+ * idempotent replay.
  */
 export async function grantMonthlySeatCreditForOrg(
   org: Pick<Organization, 'orgId' | 'ownerUserId' | 'purchasedExtraSeats'>,
@@ -139,7 +144,7 @@ export async function grantMonthlySeatCreditForOrg(
     // against AW-Users' llmUsageCredits ledger for this billingUserId/grantId
     // if a customer ever reports a shortfall.
     console.log(
-      `[orgSeatCreditGrantService] ${grantId} already granted this month; current seat count (${seats}) would compute ${amountMicroUsd} microUSD — if this differs from the original grant, seats increased mid-month and the difference lands next cycle (decided scope limit, see file header).`
+      `[orgSeatCreditGrantService] ${grantId} already granted this month; current seat count (${seats}) would compute ${amountMicroUsd} microUSD — if this differs from the original grant, seats increased mid-month and the difference lands next cycle (decided scope limit, see this function's doc comment).`
     );
   }
 
@@ -168,17 +173,21 @@ export async function grantMonthlySeatCreditsForAllOrgs(
   const orgs = await orgDb.listAll();
   for (const org of orgs) {
     summary.scanned++;
-    if (normalizePurchasedSeats(org.purchasedExtraSeats) <= 0) continue;
-    summary.eligible++;
     try {
       const result = await grantMonthlySeatCreditForOrg(org, now);
+      if (!result.attempted) continue;
+      summary.eligible++;
       if (result.granted) {
         summary.granted++;
         summary.totalGrantedMicroUsd += result.amountMicroUsd;
-      } else if (result.attempted) {
+      } else {
         summary.idempotent++;
       }
     } catch (error: any) {
+      // grantMonthlySeatCreditForOrg only throws past its own eligibility
+      // check (see normalizePurchasedSeats), so a thrown error here always
+      // means this org was eligible — count it as such alongside the failure.
+      summary.eligible++;
       summary.failed++;
       summary.errors.push({ orgId: org.orgId, error: error?.message || String(error) });
       console.error(`[orgSeatCreditGrantService] Failed to grant seat credit for org ${org.orgId}:`, error);
