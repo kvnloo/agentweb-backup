@@ -64,6 +64,26 @@ export function seatCreditGrantId(orgId: string, usageMonth: string): string {
 }
 
 /**
+ * Normalize a raw `purchasedExtraSeats` value to a non-negative integer seat
+ * count. Non-numeric/non-finite values and values that floor to <= 0 (absent,
+ * zero, negative, or fractional like 0.5) all collapse to 0 — "no seats
+ * purchased" — rather than throwing, since this reads untyped DynamoDB data.
+ *
+ * Used both by the sweep's own eligibility pre-check and by
+ * `grantMonthlySeatCreditForOrg`'s skip check, so the two can never disagree:
+ * previously the sweep counted an org as "eligible" using the raw (unfloored)
+ * value while the per-org function skipped it using the floored value, so an
+ * org with e.g. `purchasedExtraSeats: 0.5` was tallied as eligible but ended
+ * up neither granted, idempotent, nor failed — a silent gap in the summary,
+ * and a wasted call into the credit-grant path for an org that was always
+ * going to no-op.
+ */
+export function normalizePurchasedSeats(rawSeats: unknown): number {
+  const seats = typeof rawSeats === 'number' && Number.isFinite(rawSeats) ? Math.floor(rawSeats) : 0;
+  return seats > 0 ? seats : 0;
+}
+
+/**
  * Grant (or no-op replay) this month's seat credit for a single org.
  * Skips orgs with no purchased extra seats without calling the credit
  * function at all — a zero/absent seat count must never produce a call,
@@ -73,8 +93,7 @@ export async function grantMonthlySeatCreditForOrg(
   org: Pick<Organization, 'orgId' | 'ownerUserId' | 'purchasedExtraSeats'>,
   now: Date = new Date(),
 ): Promise<OrgSeatCreditGrantResult> {
-  const rawSeats = org.purchasedExtraSeats;
-  const seats = typeof rawSeats === 'number' && Number.isFinite(rawSeats) ? Math.floor(rawSeats) : 0;
+  const seats = normalizePurchasedSeats(org.purchasedExtraSeats);
   if (seats <= 0) {
     return { orgId: org.orgId, attempted: false, granted: false, amountMicroUsd: 0 };
   }
@@ -117,8 +136,7 @@ export async function grantMonthlySeatCreditsForAllOrgs(
   const orgs = await orgDb.listAll();
   for (const org of orgs) {
     summary.scanned++;
-    const seats = org.purchasedExtraSeats;
-    if (!(typeof seats === 'number' && Number.isFinite(seats) && seats > 0)) continue;
+    if (normalizePurchasedSeats(org.purchasedExtraSeats) <= 0) continue;
     summary.eligible++;
     try {
       const result = await grantMonthlySeatCreditForOrg(org, now);
