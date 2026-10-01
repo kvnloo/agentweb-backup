@@ -1,0 +1,158 @@
+name: AgentWeb z0 Evidence Provenance E2E
+
+on:
+  pull_request:
+    branches: [lab/z0-verified-event-fanout-v1]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evidence-provenance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout AgentWeb exact head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Checkout z0intelligence provenance branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kvnloo/z0intelligence
+          ref: lab/agentweb-evidence-provenance-v1
+          path: deps/z0intelligence
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Record exact heads
+        run: |
+          python - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          roots = {
+              "agentweb": ".",
+              "z0intelligence": "deps/z0intelligence",
+          }
+          heads = {
+              name: subprocess.check_output(
+                  ["git", "-C", path, "rev-parse", "HEAD"], text=True
+              ).strip()
+              for name, path in roots.items()
+          }
+          Path("/tmp/z0-evidence-provenance-heads.json").write_text(
+              json.dumps(heads, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(heads, indent=2))
+          PY
+
+      - name: Install narrow dependencies
+        run: |
+          cd backend && npm ci
+          cd ..
+          python -m pip install pytest==8.4.2 typesafe-sdk==0.7.2
+
+      - name: Run provenance unit suites
+        run: |
+          cd backend
+          node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit \
+            src/__tests__/experiments.z0EvidenceProvenance.test.ts
+          cd ..
+          PYTHONPATH="$GITHUB_WORKSPACE/deps/z0intelligence/src" python -m pytest -q \
+            deps/z0intelligence/tests/test_agentweb_context_packet.py
+
+      - name: Start z0intelligence
+        env:
+          PYTHONPATH: ${{ github.workspace }}/deps/z0intelligence/src
+          Z0INT_HOME: /tmp/z0int-evidence-provenance-home
+        run: |
+          mkdir -p "$Z0INT_HOME"
+          python -m z0int.intelligence_service --port 11501 > /tmp/z0int-evidence-provenance.log 2>&1 &
+          echo $! > /tmp/z0int-evidence-provenance.pid
+          python - <<'PY'
+          import time, urllib.request
+          url = "http://127.0.0.1:11501/healthz"
+          last = None
+          for _ in range(40):
+              try:
+                  with urllib.request.urlopen(url, timeout=1) as response:
+                      if response.status == 200:
+                          raise SystemExit(0)
+              except Exception as exc:
+                  last = exc
+                  time.sleep(.25)
+          raise SystemExit(f"z0intelligence did not become ready: {last}")
+          PY
+
+      - name: Run live provenance study
+        working-directory: backend
+        env:
+          Z0INT_SERVICE_URL: http://127.0.0.1:11501
+        run: |
+          npx ts-node src/scripts/run-z0-evidence-provenance-study.ts \
+            /tmp/z0-evidence-provenance-study.json
+          cat /tmp/z0-evidence-provenance-study.json
+
+      - name: Verify credential-free structural provenance
+        run: |
+          python - <<'PY'
+          import json
+
+          result = json.load(open("/tmp/z0-evidence-provenance-study.json"))
+          projected = result["projected"]
+          packet = result["packet"]
+
+          assert projected["source_id"].startswith("agentweb-kb:")
+          assert projected["locator"].startswith("agentweb-kb://")
+          assert projected["source_version"] == "sha256:" + projected["content_sha256"]
+          assert packet["observed_at"] == projected["retrieved_at"]
+          assert packet["source_version"] == projected["source_version"]
+          assert "content_sha256=" + projected["content_sha256"] in packet["note"]
+          assert packet["aodl_excerpt_present"] is False
+          assert packet["provenance_verified_count"] == 1
+          assert packet["network_model_calls"] == 0
+          assert packet["private_text_persisted"] is False
+          assert result["changed_source_version"] != projected["source_version"]
+          assert result["tampered_status"] == 400
+
+          encoded = json.dumps(result)
+          for forbidden in (
+              "drive-file-123",
+              "drive.google.com",
+              "RAW-SECRET-TOKEN",
+              "access_token",
+          ):
+              assert forbidden not in encoded, forbidden
+          PY
+
+      - name: Stop z0intelligence
+        if: always()
+        run: |
+          if test -f /tmp/z0int-evidence-provenance.pid; then
+            kill "$(cat /tmp/z0int-evidence-provenance.pid)" || true
+          fi
+          cat /tmp/z0int-evidence-provenance.log || true
+
+      - name: Upload provenance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentweb-z0-evidence-provenance-e2e
+          path: |
+            /tmp/z0-evidence-provenance-heads.json
+            /tmp/z0-evidence-provenance-study.json
+            /tmp/z0int-evidence-provenance.log
