@@ -121,6 +121,37 @@ describe('automatic z0 bridge-v1 route shadow observer', () => {
     expect(JSON.stringify(body)).not.toContain('workspace-secret');
   });
 
+  it('fails closed on a mismatched trace response', async () => {
+    const fetchImpl = jest.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        protocol_version: Z0_BRIDGE_PROTOCOL_VERSION,
+        mode: 'shadow',
+        trace_id: '0'.repeat(64),
+        executed: false,
+        reconcile_required: false,
+      }),
+    })) as unknown as Z0BridgeFetchLike;
+
+    const result = await runZ0RouteShadow({
+      sessionId: 's',
+      task: 't',
+      turnOrdinal: 1,
+      nowUnixMs: 1_000,
+      env: {
+        Z0_ROUTE_SHADOW: 'shadow',
+        Z0INT_ROUTE_SHADOW_ALLOW: '1',
+        Z0INT_AGENTWEB_INSTANCE: 'instance',
+      } as NodeJS.ProcessEnv,
+      fetchImpl,
+    });
+    expect(result).toMatchObject({
+      reason: 'invalid_bridge_response',
+      executed: false,
+    });
+  });
+
   it('fails closed if a shadow response claims physical execution', async () => {
     const fetchImpl = jest.fn(async (_url: string, init?: any) => {
       const body = JSON.parse(init.body);
