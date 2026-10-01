@@ -718,6 +718,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
           confidence: tasteApplication.confidence,
           dials: tasteApplication.dials,
           signals: tasteApplication.signals,
+          receipt: tasteApplication.receipt,
         }
       : undefined;
     const payload = taste ? { ...result, taste } : result;
