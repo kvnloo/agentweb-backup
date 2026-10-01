@@ -114,6 +114,7 @@ export type TasteApplicationReceipt = {
   surface: TasteSurface;
   active: boolean;
   intensity: TasteIntensity;
+  confidence: number;
   resolutionSource: TasteResolutionSource;
   profileRevision: string;
   settingsRevision: string | null;
@@ -683,6 +684,7 @@ function buildTasteApplication(
     surface,
     active,
     intensity,
+    confidence,
     resolutionSource,
     profileRevision: tasteProfileRevision(profile),
     settingsRevision: receiptSettings ? tasteSettingsRevision(receiptSettings) : null,
@@ -693,7 +695,7 @@ function buildTasteApplication(
 
   if (!active) {
     return {
-      schema: 'taste.application.v1',
+      schema: TASTE_APPLICATION_SCHEMA,
       surface,
       active: false,
       intensity,
@@ -912,7 +914,7 @@ export class TasteProfileService {
     const explicitIntensity = validateTasteIntensity(intensity);
     const profile = await this.getProfile(userId);
     const settings = explicitIntensity ? null : await this.getSettings(userId);
-    const resolvedIntensity = explicitIntensity || settings!.surfaces[validatedSurface];
+    const resolvedIntensity = explicitIntensity ?? settings!.surfaces[validatedSurface];
     return buildTasteApplication(profile, validatedSurface, resolvedIntensity, {
       resolutionSource: explicitIntensity ? 'task_override' : 'surface_default',
       settings,
