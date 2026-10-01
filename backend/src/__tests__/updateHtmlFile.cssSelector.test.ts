@@ -23,7 +23,7 @@ jest.mock('aws-sdk', () => ({
 }));
 
 jest.mock('axios', () => ({ get: jest.fn() }));
-jest.mock('crypto', () => ({ createHash: jest.fn() }));
+jest.mock('crypto', () => ({ ...jest.requireActual('crypto'), createHash: jest.fn() }));
 jest.mock('../utils/s3Utils', () => ({
   uploadFileToS3WithPath: jest.fn().mockResolvedValue({
     success: true,

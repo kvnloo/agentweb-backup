@@ -2157,6 +2157,10 @@ describe('AgentModeService - Work Plan', () => {
       });
 
       it('should succeed when required functions have been called', async () => {
+        // 'create_blog_article' produces a distinct per-step artifact, same as
+        // generate_image, so it exercises the decrement path this test asserts
+        // (read_brand_guidelines/read_market_strategy's non-consumable carve-out
+        // is exercised by its own dedicated ENG-2206 test below).
         const workPlan = {
           title: 'Project Plan',
           steps: [
@@ -2164,7 +2168,7 @@ describe('AgentModeService - Work Plan', () => {
               stepCount: 1,
               title: 'Research',
               status: 'pending' as const,
-              requiredFunctionCalls: ['you_search_web'],
+              requiredFunctionCalls: ['create_blog_article'],
             },
           ],
           createdAt: '2025-01-15T09:00:00.000Z',
@@ -2176,7 +2180,7 @@ describe('AgentModeService - Work Plan', () => {
           userId: mockUserId,
           messages: [],
           workPlan: JSON.parse(JSON.stringify(workPlan)),
-          calledFunctions: { you_search_web: 1 },
+          calledFunctions: { create_blog_article: 1 },
         };
 
         (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
@@ -2194,7 +2198,7 @@ describe('AgentModeService - Work Plan', () => {
         // value computed from this call's local snapshot.
         expect(chatbotDb.decrementCalledFunctionsClamped).toHaveBeenCalledWith(
           mockSessionId,
-          { you_search_web: 1 }
+          { create_blog_article: 1 }
         );
       });
 
@@ -2433,6 +2437,128 @@ describe('AgentModeService - Work Plan', () => {
         // Clamped at 0 -- must not persist a negative count for a later step to inherit.
         expect(chatbotDb.updateCalledFunctions).not.toHaveBeenCalled();
         expect(chatbotDb.decrementCalledFunctionsClamped).not.toHaveBeenCalled();
+      });
+
+      // ENG-2206: read_brand_guidelines/read_market_strategy return the SAME
+      // session-wide fact on every call (their own responses say "do not call
+      // again in this conversation"), unlike generate_image's per-call distinct
+      // asset. A predefined plan whose steps share one of these as a common
+      // "foundation" requirement must not have the first step's completion consume
+      // that credit and block every later sibling step's identical requirement --
+      // reproduces prod session 18bc82a6-..., where step 5 stayed blocked on
+      // "Required function calls have not been made yet" for
+      // read_brand_guidelines/read_market_strategy despite both having genuinely
+      // been called earlier in the same session.
+      it('ENG-2206: completing a step does not consume read_brand_guidelines/read_market_strategy credit for a later step', async () => {
+        const workPlan = {
+          title: 'Content Transformation',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Load brand context',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['read_brand_guidelines', 'read_market_strategy'],
+            },
+            {
+              stepCount: 2,
+              title: 'LinkedIn post',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['read_brand_guidelines', 'read_market_strategy', 'save_file'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: {
+            read_brand_guidelines: 1,
+            read_market_strategy: 1,
+            save_file: 1,
+          },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const step1Result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed', notes: 'Loaded brand guidelines and market strategy' }],
+          mockSessionId
+        );
+        expect(step1Result.success).toBe(true);
+
+        // Step 1's completion must NOT decrement the non-consumable tools' credit.
+        expect(chatbotDb.decrementCalledFunctionsClamped).not.toHaveBeenCalled();
+
+        // Step 2 lists the same two tools -- both were already called this
+        // session, so it must complete without the model re-calling either of
+        // them, even though step 1 "used" that requirement first.
+        const step2Result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 2, status: 'completed', notes: 'Posted LinkedIn content' }],
+          mockSessionId
+        );
+        expect(step2Result.success).toBe(true);
+        expect(step2Result.missingFunctionCalls).toBeUndefined();
+      });
+
+      it('ENG-2206: skipping a step does not consume read_brand_guidelines/read_market_strategy credit for a sibling step', async () => {
+        // Mirrors the ENG-1698 skip test above, but with a NON_CONSUMABLE tool:
+        // step 1 called read_brand_guidelines once, then got skipped. Without the
+        // carve-out in the skip branch, that credit would be decremented and step
+        // 2's identical requirement would be reported "missing" despite the tool
+        // genuinely having been called earlier in the session.
+        const workPlan = {
+          title: 'Content Transformation',
+          steps: [
+            {
+              stepCount: 1,
+              title: 'Load brand context',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['read_brand_guidelines'],
+            },
+            {
+              stepCount: 2,
+              title: 'LinkedIn post',
+              status: 'pending' as const,
+              requiredFunctionCalls: ['read_brand_guidelines'],
+            },
+          ],
+          createdAt: '2025-01-15T09:00:00.000Z',
+          updatedAt: '2025-01-15T10:00:00.000Z',
+        };
+
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [],
+          workPlan: JSON.parse(JSON.stringify(workPlan)),
+          calledFunctions: { read_brand_guidelines: 1 },
+        };
+
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const step1Result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'skipped', notes: 'Not needed' }],
+          mockSessionId
+        );
+        expect(step1Result.success).toBe(true);
+
+        // Step 1's skip must NOT decrement the non-consumable tool's credit.
+        expect(chatbotDb.decrementCalledFunctionsClamped).not.toHaveBeenCalled();
+
+        // Step 2 lists the same tool -- it was already called this session, so it
+        // must complete without the model calling it again.
+        const step2Result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 2, status: 'completed', notes: 'Posted LinkedIn content' }],
+          mockSessionId
+        );
+        expect(step2Result.success).toBe(true);
+        expect(step2Result.missingFunctionCalls).toBeUndefined();
       });
 
       // ENG-1793: pins the "or failing" half of the ticket title -- a required

@@ -45,7 +45,9 @@ jest.mock('../services/connectedAccountsDb', () => ({
 jest.mock('../config/integrations', () => ({
   getHubSpotConfig: jest.fn().mockResolvedValue({ clientId: 'x', clientSecret: 'y', tokenUrl: 'u', redirectUri: 'r', scopes: [], authorizationUrl: 'a', tokenInfoUrl: 't' }),
   INTEGRATION_CONFIG: {
-    hubspot: { scopes: [] },
+    // Real config: an empty stub makes the marketing pre-flight silently no-op, so this
+    // suite — which owns every marketing action — could not see the guard at all.
+    hubspot: jest.requireActual('../config/integrations').INTEGRATION_CONFIG.hubspot,
     linkedinAds: { apiVersion: '202603', apiBaseUrl: 'https://api.linkedin.com', scopes: [], redirectUri: '', authorizationUrl: '', tokenUrl: '', profileUrl: '' },
     linkedin: { scopes: [], redirectUri: '', authorizationUrl: '', tokenUrl: '', profileUrl: '' },
     meta: { scopes: [], redirectUri: '', authorizationUrl: '', tokenUrl: '' },
@@ -368,6 +370,11 @@ describe('CAMPAIGN — error handling', () => {
     const result = await hubspot({ action: 'LIST' });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/reconnect your hubspot account/i);
+    // NOTE: hubspotError is now a REDACTED COPY of HubSpot's body, not the raw object —
+    // the message reaches LLM context, so a token embedded in it must not. This passes
+    // unchanged only because 'scopes missing' has nothing token-shaped in it. The
+    // redaction itself is pinned in agentModeService.hubspot403Diagnostic.test.ts; this
+    // assertion exists to prove the pass-through keeps a benign body intact.
     expect(result.hubspotError).toEqual({ category: 'MISSING_SCOPES', message: 'scopes missing' });
     expect(result.status).toBe(403);
   });

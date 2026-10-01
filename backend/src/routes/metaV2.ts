@@ -6,6 +6,7 @@ import { metaService } from '../services/metaService';
 import { getCachedPixels, setCachedPixels } from '../services/metaPixelsCache';
 import { sandboxManagementUrl } from '../services/sandboxManagementUrl';
 import { isEvaluationUser } from '../services/evaluationPolicy';
+import { stampMetaImageUpload, stampMetaPublish } from '../services/creativeLineage';
 import {
   getConnectedMetaAccountsList,
   getMetaAccountCredentials,
@@ -251,6 +252,8 @@ router.post('/create-image-ad', async (req, res) => {
 
     // 1. Upload image
     const imageHash = await uploadImageGetHash(accountId, accessToken, image_url, 'ad-image.jpg');
+    // ENG-2194: a generated image uploaded by its S3 URL gains this hash (inert unless enabled).
+    void stampMetaImageUpload({ userId, imageUrl: image_url, imageHash });
 
     // 2. Create ad creative
     const creative = await metaService.createAdCreative(accountId, accessToken, {
@@ -270,6 +273,12 @@ router.post('/create-image-ad', async (req, res) => {
       creative_id: creative.id,
       status: 'PAUSED',
     });
+    // ENG-2194: link the generated image to this creative and ad, as agent mode does.
+    if (creative?.id && ad?.id) {
+      void stampMetaPublish({
+        userId, accountId, metaCreativeId: String(creative.id), adId: String(ad.id), params: { image_hash: imageHash }, via: 'create_ad',
+      });
+    }
 
     // A sandbox account's ad account is fictional, so it gets a portal-internal link
     // instead of a dead Meta URL (ENG-1909).
@@ -342,6 +351,8 @@ router.post('/create-carousel-ad', async (req, res) => {
         const imageHash = await uploadImageGetHash(
           accountId, accessToken, img.url, `carousel-slide-${idx + 1}.jpg`
         );
+        // ENG-2194: a generated slide image gains this hash (inert unless enabled).
+        void stampMetaImageUpload({ userId, imageUrl: img.url, imageHash });
         return {
           image_hash: imageHash,
           title: img.title || undefined,
@@ -368,6 +379,12 @@ router.post('/create-carousel-ad', async (req, res) => {
       creative_id: creative.id,
       status: 'PAUSED',
     });
+    // ENG-2194: link every generated slide image to this creative and ad (inert unless enabled).
+    if (creative?.id && ad?.id) {
+      void stampMetaPublish({
+        userId, accountId, metaCreativeId: String(creative.id), adId: String(ad.id), params: { carousel_cards }, via: 'create_ad',
+      });
+    }
 
     // A sandbox account's ad account is fictional, so it gets a portal-internal link
     // instead of a dead Meta URL (ENG-1909).
@@ -424,6 +441,9 @@ router.post('/create-video-ad', async (req, res) => {
 
     // 2. Upload thumbnail
     const imageHash = await uploadImageGetHash(accountId, accessToken, thumbnail_url, 'thumbnail.jpg');
+
+    // No lineage stamp here (ENG-2194): lineage records generated images only, and the thumbnail
+    // is not what this ad serves, so linking it would credit an image with a video's performance.
 
     // 3. Create video creative (thumbnail required by Meta)
     const creative = await metaService.createAdCreative(accountId, accessToken, {

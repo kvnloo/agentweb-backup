@@ -32,6 +32,14 @@ const CASE: GoldenCaseView = {
   version: 3,
 };
 
+const DEV_CASE: GoldenCaseView = {
+  ...CASE,
+  caseId: "agent#sessionId#session-2",
+  sourceRef: { kind: "sessionId", id: "session-2" },
+  split: "dev",
+  version: 1,
+};
+
 function renderPage() {
   return render(
     <MemoryRouter>
@@ -45,6 +53,17 @@ function routeGets(provisioned: boolean) {
     if (url.endsWith("/api/admin/eval/golden-cases/status")) return { data: { provisioned } };
     if (url.includes("/api/admin/eval/golden-cases?surface=agent")) return { data: { cases: [CASE] } };
     if (url.includes("/api/admin/chat-sessions?sessionId=session-1")) {
+      return { data: { sessions: [{ title: "Synthetic session", messages: [{ role: "user", content: "Is it on?" }, { role: "assistant", content: "Yes." }] }] } };
+    }
+    throw new Error(`unexpected GET ${url}`);
+  });
+}
+
+function routeGetsTestAndDev() {
+  mockedAxios.get.mockImplementation(async (url: string) => {
+    if (url.endsWith("/api/admin/eval/golden-cases/status")) return { data: { provisioned: true } };
+    if (url.includes("/api/admin/eval/golden-cases?surface=agent")) return { data: { cases: [CASE, DEV_CASE] } };
+    if (url.includes("/api/admin/chat-sessions?sessionId=session-1") || url.includes("/api/admin/chat-sessions?sessionId=session-2")) {
       return { data: { sessions: [{ title: "Synthetic session", messages: [{ role: "user", content: "Is it on?" }, { role: "assistant", content: "Yes." }] }] } };
     }
     throw new Error(`unexpected GET ${url}`);
@@ -88,6 +107,32 @@ describe("EvalLabelling (ENG-2135)", () => {
     });
     expect(await screen.findByText("Labels saved.")).toBeInTheDocument();
     expect(screen.getByText("1/4")).toBeInTheDocument();
+  });
+
+  it("renders the ENG-2189 behaviour criteria with their help text and saves their labels", async () => {
+    const behaviourCase = { ...CASE, criteria: [...CASE.criteria, "argued_with_instruction", "escalated_when_not_required", "failed_to_escalate"] };
+    mockedAxios.get.mockImplementation(async (url: string) => {
+      if (url.endsWith("/api/admin/eval/golden-cases/status")) return { data: { provisioned: true } };
+      if (url.includes("/api/admin/eval/golden-cases?surface=agent")) return { data: { cases: [behaviourCase] } };
+      if (url.includes("/api/admin/chat-sessions?sessionId=session-1")) return { data: { sessions: [{ title: "Synthetic session", messages: [] }] } };
+      throw new Error(`unexpected GET ${url}`);
+    });
+    mockedAxios.put.mockResolvedValue({ data: { case: { ...behaviourCase, labels: { argued_with_instruction: "pass" }, version: 4 } } });
+    renderPage();
+
+    await screen.findByText("Synthetic session");
+    expect(screen.getByText(/Pass = the agent argued or pushed back/)).toBeInTheDocument();
+    expect(screen.getByText(/Pass = the agent handed off to a human/)).toBeInTheDocument();
+    expect(screen.getByText(/Pass = the agent hit a blocker/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "argued_with_instruction pass" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save labels" }));
+    await waitFor(() => {
+      expect(mockedAxios.put).toHaveBeenCalledWith(
+        "https://api.test/api/admin/eval/golden-cases/agent%23sessionId%23session-1/labels",
+        { labels: { argued_with_instruction: "pass" }, notes: "", expectedVersion: 3 },
+        AUTH,
+      );
+    });
   });
 
   it("drops the saved confirmation as soon as a label or the note changes (#3079 review)", async () => {
@@ -202,6 +247,112 @@ describe("EvalLabelling (ENG-2135)", () => {
     expect(firstColumn()[0]).toContain("session-2");
   });
 
+  it("renders a draft's suggestion chip and rationale, and applies it only on explicit click without saving (ENG-2200)", async () => {
+    const draftCase: GoldenCaseView = {
+      ...CASE,
+      draft: {
+        labels: { task_success: { label: "pass", rationale: "The tool result confirms the task completed." } },
+        model: "claude-opus-5-5",
+        generatedAt: "2026-09-20T12:00:00.000Z",
+      },
+    };
+    mockedAxios.get.mockImplementation(async (url: string) => {
+      if (url.endsWith("/status")) return { data: { provisioned: true } };
+      if (url.includes("surface=agent")) return { data: { cases: [draftCase] } };
+      if (url.includes("sessionId=session-1")) return { data: { sessions: [{ title: "Synthetic session", messages: [] }] } };
+      throw new Error(`unexpected GET ${url}`);
+    });
+    renderPage();
+    await screen.findByText("Synthetic session");
+
+    expect(screen.getByText("AI suggests: Pass")).toBeInTheDocument();
+    expect(screen.getByText("The tool result confirms the task completed.")).toBeInTheDocument();
+    expect(screen.getByText(/AI-drafted suggestions available \(model: claude-opus-5-5/)).toBeInTheDocument();
+
+    // Not pre-set: the toggle starts unselected even though a draft exists for this criterion.
+    expect(screen.getByRole("button", { name: "task_success pass" })).not.toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Use suggestion" }));
+    expect(screen.getByRole("button", { name: "task_success pass" })).toHaveAttribute("aria-pressed", "true");
+    expect(mockedAxios.put).not.toHaveBeenCalled();
+  });
+
+  it("fills every unlabelled criterion with its draft suggestion on 'Apply all suggestions', without saving", async () => {
+    const draftCase: GoldenCaseView = {
+      ...CASE,
+      labels: { tool_correctness: "fail" },
+      draft: {
+        labels: {
+          task_success: { label: "pass", rationale: "Looks right." },
+          tool_correctness: { label: "pass", rationale: "Should not override the existing human label." },
+          groundedness: { label: "na", rationale: "No claims made." },
+        },
+        model: "claude-opus-5-5",
+        generatedAt: "2026-09-20T12:00:00.000Z",
+      },
+    };
+    mockedAxios.get.mockImplementation(async (url: string) => {
+      if (url.endsWith("/status")) return { data: { provisioned: true } };
+      if (url.includes("surface=agent")) return { data: { cases: [draftCase] } };
+      if (url.includes("sessionId=session-1")) return { data: { sessions: [{ title: "Synthetic session", messages: [] }] } };
+      throw new Error(`unexpected GET ${url}`);
+    });
+    renderPage();
+    await screen.findByText("Synthetic session");
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply all suggestions" }));
+
+    expect(screen.getByRole("button", { name: "task_success pass" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "groundedness na" })).toHaveAttribute("aria-pressed", "true");
+    // Already human-labelled criterion keeps its existing label, not the draft's.
+    expect(screen.getByRole("button", { name: "tool_correctness fail" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "tool_correctness pass" })).toHaveAttribute("aria-pressed", "false");
+    expect(mockedAxios.put).not.toHaveBeenCalled();
+  });
+
+  it("renders no draft UI for a case without a draft (no regression)", async () => {
+    routeGets(true);
+    renderPage();
+    await screen.findByText("Synthetic session");
+    expect(screen.queryByText(/AI suggests:/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/AI-drafted suggestions available/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Apply all suggestions" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Use suggestion" })).not.toBeInTheDocument();
+  });
+
+  it("renders the source panel before the labels panel so reviewers read before judging (ENG-2219)", async () => {
+    routeGets(true);
+    renderPage();
+    await screen.findByText("Synthetic session");
+
+    const sourceHeading = screen.getByRole("heading", { name: "Source" });
+    const labelsHeading = screen.getByRole("heading", { name: "Labels" });
+    expect(sourceHeading.compareDocumentPosition(labelsHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("shows a loading state instead of a false-empty list while a surface's cases are still in flight (ENG-2219)", async () => {
+    let resolveCreative: (value: { data: { cases: GoldenCaseView[] } }) => void = () => undefined;
+    mockedAxios.get.mockImplementation((url: string) => {
+      if (url.endsWith("/status")) return Promise.resolve({ data: { provisioned: true } });
+      if (url.includes("surface=agent")) return Promise.resolve({ data: { cases: [CASE] } });
+      if (url.includes("surface=creative")) return new Promise((resolve) => { resolveCreative = resolve; });
+      if (url.includes("/api/admin/chat-sessions")) return Promise.resolve({ data: { sessions: [{ title: "Synthetic session", messages: [] }] } });
+      return Promise.reject(new Error(`unexpected GET ${url}`));
+    });
+    renderPage();
+    await screen.findByText("Synthetic session");
+
+    fireEvent.click(screen.getByRole("tab", { name: "Creatives" }));
+
+    // While the creative surface's cases are still in flight, the list shows a loading state,
+    // never the "0 cases" false-empty state that a naive reset-then-fetch would flash.
+    expect(await screen.findByText("Loading cases…")).toBeInTheDocument();
+    expect(screen.queryByText(/cases · .* fully labelled/)).not.toBeInTheDocument();
+
+    resolveCreative({ data: { cases: [] } });
+    await waitFor(() => expect(screen.getByText("0 cases · 0 fully labelled")).toBeInTheDocument());
+  });
+
   it("leaves pairwise calibration cases to their own page and links to it (ENG-2142)", async () => {
     const single: GoldenCaseView = { ...CASE, caseId: "creative#candidateId#cand-1", surface: "creative", taskType: "creative_image", sourceRef: { kind: "candidateId", id: "cand-1" }, criteria: ["hook"] };
     const pair: GoldenCaseView = {
@@ -226,5 +377,66 @@ describe("EvalLabelling (ENG-2135)", () => {
     expect(screen.getByText("cand-1")).toBeInTheDocument();
     expect(screen.queryByText("cand-2")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "pairwise_preference pass" })).not.toBeInTheDocument();
+  });
+
+  describe("split filter", () => {
+    const selectSplit = async (label: "All" | "test" | "dev") => {
+      const combobox = screen.getByLabelText("Split");
+      fireEvent.mouseDown(combobox);
+      const option = await screen.findByRole("option", { name: label });
+      fireEvent.click(option);
+    };
+
+    it("defaults to All and shows every case", async () => {
+      routeGetsTestAndDev();
+      renderPage();
+      expect(await screen.findByText("2 cases · 0 fully labelled")).toBeInTheDocument();
+      expect(screen.getByText("session-1")).toBeInTheDocument();
+      expect(screen.getByText("session-2")).toBeInTheDocument();
+    });
+
+    it("filters the list to only the selected split, without refetching", async () => {
+      routeGetsTestAndDev();
+      renderPage();
+      await screen.findByText("2 cases · 0 fully labelled");
+      const getCallCount = mockedAxios.get.mock.calls.length;
+
+      await selectSplit("test");
+
+      expect(screen.getByText("1 of 2 cases · 0 fully labelled")).toBeInTheDocument();
+      expect(screen.getByText("session-1")).toBeInTheDocument();
+      expect(screen.queryByText("session-2")).not.toBeInTheDocument();
+      // Purely a client-side filter over the already-loaded cases — no new request.
+      expect(mockedAxios.get.mock.calls.length).toBe(getCallCount);
+    });
+
+    it("shows a no-cases message when a split has no matches", async () => {
+      mockedAxios.get.mockImplementation(async (url: string) => {
+        if (url.endsWith("/status")) return { data: { provisioned: true } };
+        if (url.includes("surface=agent")) return { data: { cases: [CASE] } };
+        throw new Error(`unexpected GET ${url}`);
+      });
+      renderPage();
+      await screen.findByText("1 cases · 0 fully labelled");
+
+      await selectSplit("dev");
+
+      expect(screen.getByText("No dev cases.")).toBeInTheDocument();
+      expect(screen.getByText("0 of 1 cases · 0 fully labelled")).toBeInTheDocument();
+    });
+
+    it("keeps the open case in the detail pane even when a filter change hides it from the list", async () => {
+      routeGetsTestAndDev();
+      renderPage();
+      // session-1 (split "test") loads first and is auto-selected.
+      expect(await screen.findByText("Synthetic session")).toBeInTheDocument();
+
+      await selectSplit("dev");
+
+      // The list no longer shows session-1's row, but its detail pane stays open —
+      // filtering must never silently discard unsaved work in an open case.
+      expect(screen.queryByText("session-1")).not.toBeInTheDocument();
+      expect(screen.getByText("Synthetic session")).toBeInTheDocument();
+    });
   });
 });

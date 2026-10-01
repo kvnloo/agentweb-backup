@@ -17,7 +17,7 @@ The image preview alias is excluded from new selections.
 | Role | Default source, then validated fallback |
 | --- | --- |
 | chat | `agent_mode_default_model`, then `gemini-3.8-flash` |
-| enrichment | `gemini-3.1-flash-lite` |
+| enrichment | `gpt-5.5`, what enrichment ran before model roles (`gpt-5-chat-2`, aliased). ENG-2184: the flash-lite default silently moved prod enrichment to a model at 1/20 the price and quality index 16 vs 38; move cheaper only on ENG-2137 grader evidence |
 | image | `agent_mode_image_api_default_model`, then older `default_image_model` when absent, then `gemini-3-pro-image-preview` |
 | embedding | `openai/text-embedding-3-large` via the shared OpenRouter embeddings helper; 1536 output dimensions |
 | scoring_judge | `default-scoring-model`, then `gemini-3.1-flash-lite` |
@@ -63,8 +63,9 @@ Models section with eight pickers in the customer-portal follow-up, using this A
 ## Migrated runtime sites
 
 - Enrichment V3: non-web extraction, identity candidate disambiguation, LinkedIn
-  candidate selection and smart-field evaluation. Smart-field attribution records
-  the resolved model. Specialized web-search/critic models remain explicit.
+  candidate selection, smart-field evaluation, the web-search tier and the critic
+  (ENG-2184), so one run uses one model. Smart-field attribution records the
+  resolved model. The `CRM_ENRICH_V3_*` env overrides still take precedence.
 - Image: both agent-mode's upstream default and the shared image generator.
   Explicit request models and existing retry/fallback semantics are preserved.
 - Embedding: shared `embedText` (memory/relevance and its callers), via user tenant.
@@ -78,7 +79,7 @@ Models section with eight pickers in the customer-portal follow-up, using this A
 - Customer-portal Models UI (separate repository).
 - Chat/session/scheduled-chat defaults, with explicit session/user choices first.
 - Specialized research/Sonar, live voice transport and voice artifact extraction.
-- Enrichment web-search/critic adapters and other older extraction/mapping paths.
+- Older enrichment extraction/mapping paths.
 - Knowledge-base embeddings inside `chatbotService.findRelevantChunks` (currently
   no tenant context), plus other direct SDK/vector ingestion paths. Propagate
   tenant/index identity before migration; no alternate embedding space enabled.

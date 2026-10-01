@@ -98,9 +98,70 @@ describe("CreativeCalibration (ENG-2142)", () => {
     await waitFor(() => expect(mockedAxios.get).toHaveBeenCalledWith("https://api.test/api/human-eval/candidates/new-1", AUTH));
     expect(mockedAxios.get).toHaveBeenCalledWith("https://api.test/api/human-eval/candidates/old-1", AUTH);
     expect(await screen.findAllByRole("img")).toHaveLength(2);
-    expect(screen.getByText("request for new-1")).toBeInTheDocument();
+    // The generation prompt is implementation detail, not shown by default (ENG-2220).
+    expect(screen.queryByText(/request for/)).not.toBeInTheDocument();
+    const toggles = screen.getAllByRole("button", { name: "Show generation prompt" });
+    expect(toggles).toHaveLength(2);
+    fireEvent.click(toggles[0]);
+    expect(await screen.findByText(/request for (new|old)-1/)).toBeInTheDocument();
     // No reviewer feedback, judge result or date that would say which creative is newer.
     expect(screen.queryByText(/Matt said no|passedCount|2026-09-15/)).not.toBeInTheDocument();
+  });
+
+  it("shows a loading skeleton while a creative image fetches, then reveals the image (ENG-2220)", async () => {
+    routeGets([pairCase(0), pairCase(1)]);
+    const { container } = renderPage();
+    expect(await screen.findByText("Pair 1")).toBeInTheDocument();
+    const images = await screen.findAllByRole("img");
+    expect(images).toHaveLength(2);
+    // Skeleton placeholders are up and the images are not yet visually revealed.
+    expect(container.querySelectorAll(".MuiSkeleton-root").length).toBe(2);
+    images.forEach((img) => expect(img).toHaveStyle({ opacity: 0 }));
+
+    fireEvent.load(images[0]);
+    expect(container.querySelectorAll(".MuiSkeleton-root").length).toBe(1);
+    expect(images[0]).toHaveStyle({ opacity: 1 });
+    expect(images[1]).toHaveStyle({ opacity: 0 });
+
+    fireEvent.load(images[1]);
+    expect(container.querySelectorAll(".MuiSkeleton-root").length).toBe(0);
+  });
+
+  it("shows a landing-page pair as an inline preview, not as images (ENG-2192, ENG-2220)", async () => {
+    mockedAxios.get.mockImplementation(async (url: string) => {
+      if (url.endsWith("/api/admin/eval/golden-cases/status")) return { data: { provisioned: true } };
+      if (url.endsWith("/api/admin/eval/golden-cases?surface=creative")) return { data: { cases: [pairCase(1)] } };
+      const m = /\/api\/human-eval\/candidates\/(.+)$/.exec(url);
+      if (m) return { data: { candidate: { reviewType: "landing_page", artifactUrl: `https://lp.test/${m[1]}`, originalRequest: `page ${m[1]}` } } };
+      throw new Error(`unexpected GET ${url}`);
+    });
+    const { container } = renderPage();
+
+    const links = await screen.findAllByRole("link", { name: "Open landing page in new tab" });
+    expect(links.map((l) => l.getAttribute("href")).sort()).toEqual(["https://lp.test/new-1", "https://lp.test/old-1"]);
+    expect(links.every((l) => l.getAttribute("target") === "_blank" && l.getAttribute("rel") === "noopener noreferrer")).toBe(true);
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+
+    // Both landing pages render inline as sandboxed iframes so a reviewer can compare them
+    // without leaving the page — the whole point of this surface.
+    const frames = container.querySelectorAll("iframe");
+    expect(frames).toHaveLength(2);
+    expect(Array.from(frames).map((f) => f.getAttribute("src")).sort()).toEqual(["https://lp.test/new-1", "https://lp.test/old-1"]);
+    frames.forEach((frame) => {
+      // No allow-forms/allow-popups/allow-top-navigation: a reviewer must not be able to
+      // submit the page's real lead form or navigate away from inside the preview. No
+      // allow-same-origin either: these are uncurated AI-generated pages inside an
+      // authenticated admin surface, and allow-scripts + allow-same-origin together would
+      // let the framed page act with its own origin's full cookie/storage/XHR access.
+      expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
+      expect(frame).toHaveStyle({ opacity: 0 });
+    });
+
+    fireEvent.load(frames[0]);
+    expect(frames[0]).toHaveStyle({ opacity: 1 });
+
+    // The generation brief is collapsed by default here too.
+    expect(screen.queryByText(/^page /)).not.toBeInTheDocument();
   });
 
   it("saves with one click as A / B through the golden-case label route and auto-advances to the next pair", async () => {

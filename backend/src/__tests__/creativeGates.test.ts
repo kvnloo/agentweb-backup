@@ -12,12 +12,15 @@ import {
   CREATIVE_GATES_GRADER_ID,
   evaluateCreativeGates,
   measureImage,
+  notCheckedGateResult,
+  parseCreativeGateResult,
   runCreativeGates,
   type CreativeGateCheckId,
   type CreativeGateResult,
 } from '../services/creativeGates';
 import {
   PLACEMENT_SPECS,
+  metaPlacementForAspect,
   placementForSize,
   resolveGeminiAspectRatio,
 } from '../services/creativePlacementSpecs';
@@ -56,6 +59,18 @@ describe('placement spec table', () => {
     expect(placementForSize('1200x628')?.id).toBe('google_marketing_image');
     expect(placementForSize('1024x1024')).toBeUndefined();
     expect(placementForSize('4:5')).toBeUndefined();
+  });
+});
+
+describe('metaPlacementForAspect (ENG-2187)', () => {
+  it('maps the Meta ratios to their placement and nothing else', () => {
+    expect(metaPlacementForAspect(1)?.id).toBe('meta_feed_square');
+    expect(metaPlacementForAspect(4 / 5)?.id).toBe('meta_feed_portrait');
+    expect(metaPlacementForAspect(9 / 16)?.id).toBe('meta_story_reel');
+    expect(metaPlacementForAspect(1200 / 628)).toBeUndefined();
+    expect(metaPlacementForAspect(3 / 4)).toBeUndefined();
+    expect(metaPlacementForAspect(16 / 9)).toBeUndefined();
+    expect(metaPlacementForAspect(null)).toBeUndefined();
   });
 });
 
@@ -130,12 +145,36 @@ describe('runCreativeGates', () => {
     expect(result.fitsPlacements).toEqual(['meta_feed_square', 'google_square_marketing_image']);
   });
 
-  it('checks the aspect against a bare ratio request, without a placement to size against', async () => {
+  it('holds a bare ratio request against the matching Meta placement (ENG-2187)', async () => {
     const result = await runCreativeGates(await texturedPng(1200, 900), { requestedSize: '9:16' });
 
-    expect(result.placement).toBeUndefined();
+    expect(result).toMatchObject({ placement: 'meta_story_reel', placementSource: 'ratio' });
     expect(status(result, 'aspect_ratio')).toBe('fail');
-    expect(status(result, 'dimensions')).toBe('skipped');
+    expect(status(result, 'dimensions')).toBe('pass');
+    expect(status(result, 'file_size')).toBe('pass');
+  });
+
+  it('reports dimensions and file_size for the 1:1 agent-mode request, not skipped (ENG-2187)', async () => {
+    const ok = await runCreativeGates(await texturedPng(1024, 1024), { requestedSize: '1:1' });
+    const small = await runCreativeGates(await texturedPng(512, 512), { requestedSize: '1024x1024' });
+
+    expect(ok).toMatchObject({ placement: 'meta_feed_square', placementSource: 'ratio', passed: true });
+    expect(status(ok, 'dimensions')).toBe('pass');
+    expect(status(ok, 'file_size')).toBe('pass');
+    expect(small.placement).toBe('meta_feed_square');
+    expect(status(small, 'dimensions')).toBe('fail');
+    expect(small.checks.find((c) => c.id === 'dimensions')?.reason).toContain('600x600');
+  });
+
+  it('still skips the size checks, with the ratio as the reason, when no Meta placement uses it', async () => {
+    const result = await runCreativeGates(await texturedPng(1600, 900), { requestedSize: '16:9' });
+
+    expect(result.placement).toBeUndefined();
+    expect(status(result, 'aspect_ratio')).toBe('pass');
+    expect(result.checks.find((c) => c.id === 'dimensions')).toMatchObject({
+      status: 'skipped',
+      reason: 'no Meta placement uses the requested ratio "16:9"',
+    });
     expect(status(result, 'file_size')).toBe('skipped');
   });
 
@@ -182,6 +221,49 @@ describe('runCreativeGates', () => {
 
     expect(status(result, 'aspect_ratio')).toBe('pass');
     expect(status(result, 'dimensions')).toBe('fail');
+  });
+});
+
+describe('placement resolution order (ENG-2187)', () => {
+  const measured = { bytes: 1000, decoded: true, width: 1200, height: 1200, format: 'png', luminanceStdDev: 50 };
+
+  it('prefers the named placement, then an exact placement size, then the ratio', () => {
+    expect(evaluateCreativeGates(measured, { requestedSize: '1:1', placement: 'google_square_marketing_image' }))
+      .toMatchObject({ placement: 'google_square_marketing_image', placementSource: 'requested' });
+    expect(evaluateCreativeGates(measured, { requestedSize: '1200x1200' }))
+      .toMatchObject({ placement: 'google_square_marketing_image', placementSource: 'size' });
+    expect(evaluateCreativeGates(measured, { requestedSize: '1:1' }))
+      .toMatchObject({ placement: 'meta_feed_square', placementSource: 'ratio' });
+  });
+});
+
+describe('notCheckedGateResult (ENG-2187)', () => {
+  it('records every check as skipped with the reason instead of omitting the result', () => {
+    const result = notCheckedGateResult({ requestedSize: '1:1' }, 'download failed');
+
+    expect(result).toMatchObject({ notChecked: 'download failed', placement: 'meta_feed_square', passed: true, bytes: 0 });
+    // ENG-2193: CHECK_IDS grew to include the content checks (OCR/spelling/brand-colour/logo/
+    // policy-keywords) — a `notChecked` result covers every known check id, not just the
+    // structural ones this file computes itself.
+    expect(result.checks.map((c) => c.id)).toEqual([
+      'decode', 'blank_render', 'aspect_ratio', 'dimensions', 'file_size', 'aspect_fallback',
+      'ocr_text_ratio', 'ocr_legibility', 'spelling', 'brand_colour', 'logo_presence', 'policy_keywords',
+    ]);
+    expect(result.checks.every((c) => c.status === 'skipped' && c.reason === 'download failed')).toBe(true);
+  });
+});
+
+describe('parseCreativeGateResult (ENG-2187)', () => {
+  it('round-trips a real result and rejects anything from another grader', () => {
+    const real = evaluateCreativeGates(
+      { bytes: 1000, decoded: true, width: 1080, height: 1350, format: 'png', luminanceStdDev: 50 },
+      { requestedSize: '4:5' },
+    );
+
+    expect(parseCreativeGateResult(JSON.parse(JSON.stringify(real)))).toEqual(real);
+    expect(parseCreativeGateResult({ ...real, graderId: 'other' })).toBeUndefined();
+    expect(parseCreativeGateResult({ ...real, passed: 'yes' })).toBeUndefined();
+    expect(parseCreativeGateResult('gates')).toBeUndefined();
   });
 });
 

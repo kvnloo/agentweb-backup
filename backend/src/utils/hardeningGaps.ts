@@ -45,6 +45,11 @@ export const SEND_TOOLS = new Set<string>([
   // Enrichment / import (volume + spend)
   "enrich_leads_execute",
   "import_leads_from_search",
+  // ENG-2204: Slack sends are external, typically fail persistently (bad
+  // webhook/token, channel access) rather than transiently, so they get the
+  // send-class "attempted-though-failed counts as met" + 2-attempt press cap
+  // (sendPressCircuitBreaker) instead of the publish-class success requirement.
+  "slack_send_message",
 ]);
 
 // Internal tools that superficially match a send prefix but are NOT external sends.

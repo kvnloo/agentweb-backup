@@ -18,7 +18,7 @@ import type { LlmTransport, LlmTransportRetryOptions } from "./llmTransport";
 
 export class OpenRouterPlatformTransport implements LlmTransport {
   async send(client: OpenAI, model: string, params: any, options: LlmTransportRetryOptions): Promise<any> {
-    const { timeoutMs, maxAttempts, isRetryableError, computeBackoff, sleep } = options;
+    const { timeoutMs, maxAttempts, isRetryableError, computeBackoff, sleep, adjustParamsForRetry } = options;
 
     let lastError: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -31,6 +31,13 @@ export class OpenRouterPlatformTransport implements LlmTransport {
         return res;
       } catch (error) {
         lastError = error;
+        // ENG-2185: a deterministic correction (e.g. capping max_tokens to what
+        // the provider says the account can afford), not a "hope it clears"
+        // retry — checked ahead of isRetryableError/backoff and unconditional on
+        // attempt count, since it's still bounded by the same maxAttempts loop.
+        if (adjustParamsForRetry?.(error, params)) {
+          continue;
+        }
         if (attempt < maxAttempts && isRetryableError(error)) {
           const { ms: backoffMs, honoredRetryAfter } = computeBackoff(error, attempt);
           console.warn(

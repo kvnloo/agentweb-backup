@@ -23,11 +23,14 @@ import {
   PAIRWISE_SYSTEM_PROMPT,
   RUBRIC_CRITERIA,
   RUBRIC_PROMPT_VERSION,
-  RUBRIC_SYSTEM_PROMPT,
+  SURFACE_CRITERIA,
+  promptVersionFor,
+  rubricSystemPromptFor,
   type RubricCriterionId,
+  type RubricSurface,
 } from './creativeRubricJudgePrompt';
 
-export { RUBRIC_CRITERIA, type RubricCriterionId } from './creativeRubricJudgePrompt';
+export { RUBRIC_CRITERIA, SURFACE_CRITERIA, type RubricCriterionId, type RubricSurface } from './creativeRubricJudgePrompt';
 
 export const CREATIVE_RUBRIC_GRADER_ID = 'creative-rubric-judge';
 export const CREATIVE_RUBRIC_VERSION = '2026-09-25.1';
@@ -42,8 +45,17 @@ const JUDGE_TIMEOUT_MS = 90_000;
 const JUDGE_MAX_OUTPUT_TOKENS = 4_000;
 /** Longest image edge sent to the judge; larger images cost more tokens without changing a verdict. */
 const JUDGE_IMAGE_MAX_EDGE = 1568;
-const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
+/**
+ * Raw download ceiling, checked before decode/resize. Matches `CONTENT_CHECK_MAX_BYTES` in
+ * creativeContentCheckRunner.ts, this codebase's established ceiling for downloading a generated
+ * creative asset. The prior 15MB rejected real max-resolution creatives (e.g. a 4096x4096 generated
+ * ad image, a placement size ENG-2139/2187 already approve) before they ever reached the
+ * downscale-to-JUDGE_IMAGE_MAX_EDGE step above, which would have made them cheap to judge.
+ */
+const MAX_IMAGE_BYTES = 30 * 1024 * 1024;
 const MAX_BRIEF_FIELD_CHARS = 2_000;
+/** Landing-page source sent to the judge; beyond this it is cut (and the cut is said in the prompt). */
+export const MAX_LANDING_PAGE_SOURCE_CHARS = 60_000;
 
 // ── inputs ───────────────────────────────────────────────────────────────────
 
@@ -94,6 +106,17 @@ export interface CreativeUnderReview {
   gates?: CreativeGateResult;
 }
 
+/** The image surfaces `judgeCreative` scores (ENG-2192); copy and pages have their own entry points. */
+export type ImageRubricSurface = Extract<RubricSurface, 'ad_image' | 'organic_image'>;
+
+/** A generated landing page as the judge reads it: its source, already in memory at deploy time. */
+export interface LandingPageUnderReview {
+  /** The page's generated source (the route file and its section components). */
+  source: string;
+  /** The live URL, shown for context only; the judge never fetches it. */
+  url?: string;
+}
+
 // ── results ──────────────────────────────────────────────────────────────────
 
 export type RubricVerdict = 'pass' | 'fail';
@@ -111,6 +134,8 @@ export interface PairwiseCriterionResult {
 export type RubricJudgeErrorKind =
   | 'model_not_allowed'
   | 'image_unavailable'
+  /** No copy / page source to judge (ENG-2192); no model call is made. */
+  | 'input_unavailable'
   | 'llm_error'
   | 'malformed_output'
   | 'missing_criteria'
@@ -132,6 +157,8 @@ interface RubricResultBase {
   graderId: typeof CREATIVE_RUBRIC_GRADER_ID;
   version: string;
   promptVersion: string;
+  /** What was judged (ENG-2192). Absent on results stored before surfaces existed: those are `ad_image`. */
+  surface?: RubricSurface;
   /** Always true until the grader is validated; consumers must not block on a verdict. */
   advisory: true;
   model: string;
@@ -143,9 +170,12 @@ export type CreativeRubricResult =
   | (RubricResultBase & {
       mode: 'single';
       status: 'ok';
-      criteria: Record<RubricCriterionId, RubricCriterionResult>;
+      /** The surface's criteria (SURFACE_CRITERIA): all 7 for `ad_image`, a subset otherwise. */
+      criteria: Partial<Record<RubricCriterionId, RubricCriterionResult>>;
       passedCount: number;
-      /** All 7 criteria pass (ENG-421: the floor is met only when every criterion passes). */
+      /** How many criteria the surface has; absent on older `ad_image` results (7). */
+      criteriaCount?: number;
+      /** Every criterion of the surface passes (ENG-421: the floor is met only when every criterion passes). */
       passed: boolean;
     })
   | (RubricResultBase & { mode: 'single'; status: 'error'; error: RubricJudgeError })
@@ -166,6 +196,14 @@ export type CreativePairwiseResult =
       presentedOrder: 'AB' | 'BA';
     })
   | (RubricResultBase & { mode: 'pairwise'; status: 'error'; error: RubricJudgeError });
+
+/**
+ * A runtime pairwise result as stored next to the single result (ENG-2192): A is the stored
+ * creative, B the prior best it was compared with. `priorId` is B's human-eval candidate id, or
+ * `previous-run:<variant id>` for an onboarding variant that a later run has since replaced, so
+ * B's image URL is kept too.
+ */
+export type StoredCreativePairwise = CreativePairwiseResult & { priorId: string; priorArtifactUrl?: string };
 
 // ── LLM client ───────────────────────────────────────────────────────────────
 
@@ -430,12 +468,15 @@ function assertAllPresent(parsed: Record<string, unknown>, keys: readonly string
   if (missing.length > 0) throw new JudgeFailure('missing_criteria', `judge output is missing: ${missing.join(', ')}`);
 }
 
-/** Strict parse of a single-creative verdict: all 7 criteria, each with a rationale and pass|fail. */
-export function parseRubricOutput(raw: string): Record<RubricCriterionId, RubricCriterionResult> {
+/** Strict parse of a single verdict: every criterion asked (default all 7), each with a rationale and pass|fail. */
+export function parseRubricOutput<C extends RubricCriterionId = RubricCriterionId>(
+  raw: string,
+  criteria: readonly C[] = RUBRIC_CRITERIA as readonly RubricCriterionId[] as readonly C[],
+): Record<C, RubricCriterionResult> {
   const parsed = parseJudgeJson(raw);
-  assertAllPresent(parsed, RUBRIC_CRITERIA);
-  const out = {} as Record<RubricCriterionId, RubricCriterionResult>;
-  for (const id of RUBRIC_CRITERIA) {
+  assertAllPresent(parsed, criteria);
+  const out = {} as Record<C, RubricCriterionResult>;
+  for (const id of criteria) {
     const entry = entryFor(parsed, id) as Record<string, unknown>;
     const verdict = entry.verdict;
     if (verdict !== 'pass' && verdict !== 'fail') {
@@ -484,11 +525,12 @@ export interface RubricJudgeOptions {
   random?: () => number;
 }
 
-function base(model: string, now: () => Date, usage?: RubricJudgeUsage): RubricResultBase {
+function base(model: string, now: () => Date, usage?: RubricJudgeUsage, surface?: RubricSurface): RubricResultBase {
   return {
     graderId: CREATIVE_RUBRIC_GRADER_ID,
     version: CREATIVE_RUBRIC_VERSION,
-    promptVersion: RUBRIC_PROMPT_VERSION,
+    promptVersion: surface ? promptVersionFor(surface) : RUBRIC_PROMPT_VERSION,
+    ...(surface ? { surface } : {}),
     advisory: true,
     model,
     evaluatedAt: now().toISOString(),
@@ -499,48 +541,133 @@ function base(model: string, now: () => Date, usage?: RubricJudgeUsage): RubricR
 // ── public API ───────────────────────────────────────────────────────────────
 
 /** A result recording that the judge deliberately did not run (no model call was made). */
-export function skippedRubricResult(model: string, reason: string, now: Date = new Date()): CreativeRubricResult {
-  return { ...base(model, () => now), mode: 'single', status: 'skipped', reason };
+export function skippedRubricResult(
+  model: string,
+  reason: string,
+  now: Date = new Date(),
+  surface?: RubricSurface,
+): CreativeRubricResult {
+  return { ...base(model, () => now, undefined, surface), mode: 'single', status: 'skipped', reason };
 }
 
-/** Judges one creative against the 7 criteria. Never throws. */
-export async function judgeCreative(
-  creative: CreativeUnderReview,
-  brief: CreativeBrief,
-  options: RubricJudgeOptions = {},
+/**
+ * One single-mode judge call for `surface`: builds the content, asks for the surface's criteria,
+ * parses strictly. `ad_image` results stay exactly as before (no `surface` field, same prompt).
+ */
+async function judgeSingle(
+  surface: RubricSurface,
+  content: () => Promise<RubricJudgeContentPart[]>,
+  options: RubricJudgeOptions,
 ): Promise<CreativeRubricResult> {
   const model = options.model ?? DEFAULT_RUBRIC_JUDGE_MODEL;
   const now = options.now ?? (() => new Date());
   const llm = options.llm ?? gatewayRubricJudgeLlm;
+  const tagged = surface === 'ad_image' ? undefined : surface;
+  const criteriaIds = SURFACE_CRITERIA[surface];
   let usage: RubricJudgeUsage | undefined;
   try {
     assertJudgeModelAllowed(model);
-    const imageUrl = await imageForJudge(creative.image);
     const response = await llm.complete({
       model,
-      system: RUBRIC_SYSTEM_PROMPT,
-      content: [
-        { type: 'text', text: `Brief:\n${fencedJson(briefForPrompt(brief))}` },
-        ...creativeParts('Creative under review', creative, imageUrl),
-        { type: 'text', text: 'Return your verdict JSON now.' },
-      ],
+      system: rubricSystemPromptFor(surface),
+      content: await content(),
       maxTokens: JUDGE_MAX_OUTPUT_TOKENS,
       timeoutMs: JUDGE_TIMEOUT_MS,
     });
     usage = response.usage;
-    const criteria = parseRubricOutput(response.text);
-    const passedCount = RUBRIC_CRITERIA.filter((id) => criteria[id].verdict === 'pass').length;
+    const criteria = parseRubricOutput(response.text, criteriaIds);
+    const passedCount = criteriaIds.filter((id) => criteria[id].verdict === 'pass').length;
     return {
-      ...base(model, now, usage),
+      ...base(model, now, usage, tagged),
       mode: 'single',
       status: 'ok',
       criteria,
       passedCount,
-      passed: passedCount === RUBRIC_CRITERIA.length,
+      ...(tagged ? { criteriaCount: criteriaIds.length } : {}),
+      passed: passedCount === criteriaIds.length,
     };
   } catch (err) {
-    return { ...base(model, now, usage), mode: 'single', status: 'error', error: toJudgeError(err) };
+    return { ...base(model, now, usage, tagged), mode: 'single', status: 'error', error: toJudgeError(err) };
   }
+}
+
+/**
+ * Judges one image creative: an ad against the 7 criteria (default), or an organic post image
+ * against the criteria that apply to it (ENG-2192). The ad copy, when known, is shown with the
+ * image. Never throws.
+ */
+export async function judgeCreative(
+  creative: CreativeUnderReview,
+  brief: CreativeBrief,
+  options: RubricJudgeOptions & { surface?: ImageRubricSurface } = {},
+): Promise<CreativeRubricResult> {
+  return judgeSingle(
+    options.surface ?? 'ad_image',
+    async () => [
+      { type: 'text', text: `Brief:\n${fencedJson(briefForPrompt(brief))}` },
+      ...creativeParts('Creative under review', creative, await imageForJudge(creative.image)),
+      { type: 'text', text: 'Return your verdict JSON now.' },
+    ],
+    options,
+  );
+}
+
+/** Judges ad copy on its own (no image) against the criteria that apply to copy (ENG-2192). Never throws. */
+export async function judgeAdCopy(
+  copy: CreativeCopy,
+  brief: CreativeBrief,
+  options: RubricJudgeOptions = {},
+): Promise<CreativeRubricResult> {
+  return judgeSingle(
+    'ad_copy',
+    async () => {
+      const shown = copyForPrompt(copy);
+      if (!shown) throw new JudgeFailure('input_unavailable', 'no ad copy to judge (headline, primary text, description and CTA are all empty)');
+      return [
+        { type: 'text', text: `Brief:\n${fencedJson(briefForPrompt(brief))}` },
+        { type: 'text', text: `Ad copy under review:\n${fencedJson(shown)}` },
+        { type: 'text', text: 'Return your verdict JSON now.' },
+      ];
+    },
+    options,
+  );
+}
+
+/**
+ * Judges a generated landing page from its source (ENG-2192): no render and no fetch, so it needs
+ * the source the deploy already has in memory. Source past MAX_LANDING_PAGE_SOURCE_CHARS is cut,
+ * and the prompt says so. Never throws.
+ */
+export async function judgeLandingPage(
+  page: LandingPageUnderReview,
+  brief: CreativeBrief,
+  options: RubricJudgeOptions = {},
+): Promise<CreativeRubricResult> {
+  return judgeSingle(
+    'landing_page',
+    async () => {
+      const source = page.source.trim();
+      if (!source) throw new JudgeFailure('input_unavailable', 'no landing-page source to judge');
+      const cut = source.length > MAX_LANDING_PAGE_SOURCE_CHARS;
+      return [
+        { type: 'text', text: `Brief:\n${fencedJson(briefForPrompt(brief))}` },
+        {
+          type: 'text',
+          text: [
+            `Landing page under review${page.url ? ` (live at ${page.url}; you are shown its source, not a render)` : ''}:`,
+            cut ? `(source cut to its first ${MAX_LANDING_PAGE_SOURCE_CHARS} characters)` : '',
+            '```tsx',
+            source.slice(0, MAX_LANDING_PAGE_SOURCE_CHARS),
+            '```',
+          ]
+            .filter(Boolean)
+            .join('\n'),
+        },
+        { type: 'text', text: 'Return your verdict JSON now.' },
+      ];
+    },
+    options,
+  );
 }
 
 /**

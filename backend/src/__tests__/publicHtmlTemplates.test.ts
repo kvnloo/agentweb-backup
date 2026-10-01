@@ -33,6 +33,7 @@ jest.mock('axios', () => ({
 
 // Mock crypto
 jest.mock('crypto', () => ({
+  ...jest.requireActual('crypto'),
   createHash: jest.fn(() => ({
     update: jest.fn().mockReturnThis(),
     digest: jest.fn().mockReturnValue('mock-hash')
