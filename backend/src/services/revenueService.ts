@@ -9,6 +9,7 @@ import { createStripeClient } from './stripeClientFactory';
 import dotenv from 'dotenv';
 import { userDb } from './db';
 import { paymentHistoryDb, PaymentHistoryRecord } from './paymentHistoryDb';
+import { findBasePlanItem } from './stripeService';
 
 dotenv.config();
 
@@ -112,9 +113,16 @@ async function fetchAllSubscriptions(): Promise<Stripe.Subscription[]> {
  * Exported for mrrCollectionGapService, which needs the same post-discount
  * "actually billed" figure to compare against a subscription's configured
  * contracted price.
+ *
+ * Uses `findBasePlanItem` rather than `items.data[0]` — a subscription can
+ * now carry a seat-billing extra-seat line item (ENG-2243..2246) alongside
+ * the plan item, and `items.data` is not documented as stably ordered. If a
+ * seat item ever sorted first, reading `items.data[0]` would price every
+ * MRR/ARR/churn/cohort figure in this file off the seat item instead of the
+ * plan (ENG-2257). See `findBasePlanItem`'s doc comment in stripeService.ts.
  */
 export function getMonthlyAmount(sub: Stripe.Subscription): number {
-  const item = sub.items.data[0];
+  const item = findBasePlanItem(sub);
   if (!item?.price) return 0;
 
   let amount = item.price.unit_amount || 0;

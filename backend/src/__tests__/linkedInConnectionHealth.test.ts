@@ -13,6 +13,8 @@ import {
   getUnipileHealth,
   DISCONNECT_REMINDER_MS,
   VERIFY_STAMP_INTERVAL_MS,
+  SITE_WIDE_UNKNOWN_ALERT_THRESHOLD_MS,
+  __resetSiteWideUnknownTrackingForTests,
 } from '../services/linkedInConnectionHealth';
 import { PROMPT_REVISIONS_BUDGET_BYTES, estimateDynamoItemBytes } from '../utils/dynamoItemBudget';
 
@@ -73,6 +75,7 @@ beforeEach(() => {
   updateAccountConfig.mockResolvedValue(undefined);
   userDb.getUserById.mockResolvedValue({ email: 'jennifer.sun@tfaconnect.com' });
   scheduleDb.getSchedulesByUserId.mockResolvedValue([]);
+  __resetSiteWideUnknownTrackingForTests();
 });
 
 afterEach(() => {
@@ -170,6 +173,116 @@ describe('recordUnipileAccountHealth — signals that must not flag an account',
       }),
     ).resolves.toBe('no-op');
     expect(emailService.sendLinkedInAccountDisconnectedEmail).not.toHaveBeenCalled();
+  });
+});
+
+describe('recordUnipileAccountHealth — sustained-unknown alert for ownerless accounts (ENG-2182)', () => {
+  const SITE_WIDE_ID = 'mLJm4hlsQ2eVsqqA6mlTVA';
+
+  it('does not page oncall the moment an ownerless account first goes unknown', async () => {
+    await recordUnipileAccountHealth({
+      accountId: SITE_WIDE_ID,
+      ownerUserId: undefined,
+      state: 'unknown',
+      now: NOW,
+    });
+
+    expect(sendAgentModeOncallAlert).not.toHaveBeenCalled();
+  });
+
+  it('still does not page oncall just before the sustained-unknown threshold elapses', async () => {
+    await recordUnipileAccountHealth({
+      accountId: SITE_WIDE_ID, ownerUserId: undefined, state: 'unknown', now: NOW,
+    });
+    await recordUnipileAccountHealth({
+      accountId: SITE_WIDE_ID,
+      ownerUserId: undefined,
+      state: 'unknown',
+      now: NOW + SITE_WIDE_UNKNOWN_ALERT_THRESHOLD_MS - 1,
+    });
+
+    expect(sendAgentModeOncallAlert).not.toHaveBeenCalled();
+  });
+
+  it('pages oncall once an ownerless account has stayed unknown past the threshold (reproduces ENG-2182: 3+ days silent)', async () => {
+    await recordUnipileAccountHealth({
+      accountId: SITE_WIDE_ID, ownerUserId: undefined, state: 'unknown', now: NOW,
+    });
+    await recordUnipileAccountHealth({
+      accountId: SITE_WIDE_ID,
+      ownerUserId: undefined,
+      state: 'unknown',
+      now: NOW + SITE_WIDE_UNKNOWN_ALERT_THRESHOLD_MS,
+    });
+
+    expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
+    expect(sendAgentModeOncallAlert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        dedupeKey: `linkedin-sitewide-unknown:${SITE_WIDE_ID}`,
+        context: expect.objectContaining({ accountId: SITE_WIDE_ID, state: 'unknown' }),
+      }),
+    );
+  });
+
+  it('measures sustained-unknown from the FIRST unknown reading, not the most recent one', async () => {
+    // Three cron cycles into the outage, still under threshold...
+    await recordUnipileAccountHealth({
+      accountId: SITE_WIDE_ID, ownerUserId: undefined, state: 'unknown', now: NOW,
+    });
+    await recordUnipileAccountHealth({
+      accountId: SITE_WIDE_ID, ownerUserId: undefined, state: 'unknown', now: NOW + 10 * 60 * 1000,
+    });
+    expect(sendAgentModeOncallAlert).not.toHaveBeenCalled();
+
+    // ...then crosses the threshold measured from the very first observation, not this call's `now`.
+    await recordUnipileAccountHealth({
+      accountId: SITE_WIDE_ID,
+      ownerUserId: undefined,
+      state: 'unknown',
+      now: NOW + SITE_WIDE_UNKNOWN_ALERT_THRESHOLD_MS + 1,
+    });
+    expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
+  });
+
+  it('resets the clock once the account is confirmed connected again', async () => {
+    await recordUnipileAccountHealth({
+      accountId: SITE_WIDE_ID, ownerUserId: undefined, state: 'unknown', now: NOW,
+    });
+    await recordUnipileAccountHealth({
+      accountId: SITE_WIDE_ID,
+      ownerUserId: undefined,
+      state: 'connected',
+      now: NOW + SITE_WIDE_UNKNOWN_ALERT_THRESHOLD_MS - 1000,
+    });
+    // Unknown again right after recovery — must not inherit the pre-recovery clock.
+    await recordUnipileAccountHealth({
+      accountId: SITE_WIDE_ID,
+      ownerUserId: undefined,
+      state: 'unknown',
+      now: NOW + SITE_WIDE_UNKNOWN_ALERT_THRESHOLD_MS + 1000,
+    });
+
+    expect(sendAgentModeOncallAlert).not.toHaveBeenCalled();
+  });
+
+  it('does not let a proven disconnect and a later unknown reading share one clock', async () => {
+    // A proven disconnect fires its own immediate alert and must not seed the
+    // separate sustained-unknown timer.
+    await recordUnipileAccountHealth({
+      accountId: SITE_WIDE_ID, ownerUserId: undefined, state: 'disconnected', now: NOW,
+    });
+    expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
+    (sendAgentModeOncallAlert as jest.Mock).mockClear();
+
+    await recordUnipileAccountHealth({
+      accountId: SITE_WIDE_ID,
+      ownerUserId: undefined,
+      state: 'unknown',
+      now: NOW + SITE_WIDE_UNKNOWN_ALERT_THRESHOLD_MS,
+    });
+
+    // Freshly starts its own clock from this first 'unknown' observation — not yet due.
+    expect(sendAgentModeOncallAlert).not.toHaveBeenCalled();
   });
 });
 

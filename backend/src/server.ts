@@ -838,6 +838,38 @@ createTestAccount().then(async () => {
         console.error('[MetaMetricsSnapshotCron] Failed to initialize:', error);
       }
 
+      // ENG-2215: Google Ads Metrics Snapshot — runs daily at 09:15 UTC (after
+      // MetaMetricsSnapshotCron at 09:00), re-pulling the last 92 dates each run so the final
+      // refresh occurs after reporting-day end plus Google's up-to-90-day conversion attribution
+      // window has elapsed. Inert unless GOOGLE_ADS_METRICS_SNAPSHOT_ENABLED=true — the cron
+      // itself refuses to enumerate accounts or call the Google Ads API without it (see
+      // runGoogleAdsMetricsSnapshot's own flag check).
+      try {
+        const GOOGLE_ADS_METRICS_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        const { runGoogleAdsMetricsSnapshot } = await import('./cron/googleAdsMetricsSnapshotCron');
+
+        const nowForGoogleAdsMetricsCron = new Date();
+        const nextGoogleAdsMetricsRunUTC = new Date(nowForGoogleAdsMetricsCron);
+        nextGoogleAdsMetricsRunUTC.setUTCHours(9, 15, 0, 0);
+        if (nextGoogleAdsMetricsRunUTC <= nowForGoogleAdsMetricsCron) {
+          nextGoogleAdsMetricsRunUTC.setUTCDate(nextGoogleAdsMetricsRunUTC.getUTCDate() + 1);
+        }
+        const msUntilNextGoogleAdsMetricsRun = nextGoogleAdsMetricsRunUTC.getTime() - nowForGoogleAdsMetricsCron.getTime();
+
+        console.log(`[GoogleAdsMetricsSnapshotCron] Initialized — first run at 09:15 UTC (in ${Math.round(msUntilNextGoogleAdsMetricsRun / 60000)} min)`);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('GoogleAdsMetricsSnapshotCron', runGoogleAdsMetricsSnapshot())
+            .catch(e => console.error('[GoogleAdsMetricsSnapshotCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('GoogleAdsMetricsSnapshotCron', runGoogleAdsMetricsSnapshot())
+              .catch(e => console.error('[GoogleAdsMetricsSnapshotCron] Error:', e));
+          }, GOOGLE_ADS_METRICS_SNAPSHOT_INTERVAL_MS);
+        }, msUntilNextGoogleAdsMetricsRun);
+      } catch (error) {
+        console.error('[GoogleAdsMetricsSnapshotCron] Failed to initialize:', error);
+      }
 
       // Drip Sequence Worker — runs every 5 minutes
       try {
@@ -1003,6 +1035,36 @@ createTestAccount().then(async () => {
         );
       } catch (error) {
         console.error('[metaTrackingMonitorCron] Failed to initialize:', error);
+      }
+
+      // Seat-based billing (ENG-2247) — daily sweep that grants each org's
+      // monthly LLM usage credit for its purchased extra seats. Anchored to a
+      // fixed UTC hour (same reasoning as metaTrackingMonitorCron above: a
+      // naive 24h setInterval never elapses in an environment that redeploys
+      // every 1-2 hours) — grantId idempotency in grantMonthlyLlmUsageCredit
+      // makes any extra fire within the same usage month a safe no-op.
+      try {
+        const { runOrgSeatCreditGrant } = await import('./cron/orgSeatCreditGrantCron');
+        const { msUntilNextUtcHour } = await import('./utils/dailySchedule');
+        const SEAT_CREDIT_GRANT_HOUR_UTC = 10;
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const msUntilFirstSeatCreditRun = msUntilNextUtcHour(SEAT_CREDIT_GRANT_HOUR_UTC);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('orgSeatCreditGrantCron', runOrgSeatCreditGrant())
+            .catch(e => console.error('[orgSeatCreditGrantCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('orgSeatCreditGrantCron', runOrgSeatCreditGrant())
+              .catch(e => console.error('[orgSeatCreditGrantCron] Error:', e));
+          }, DAY_MS);
+        }, msUntilFirstSeatCreditRun);
+        console.log(
+          `[orgSeatCreditGrantCron] Initialized — first run at ${SEAT_CREDIT_GRANT_HOUR_UTC}:00 UTC ` +
+          `(in ${Math.round(msUntilFirstSeatCreditRun / 60000)} min)`,
+        );
+      } catch (error) {
+        console.error('[orgSeatCreditGrantCron] Failed to initialize:', error);
       }
 
       // Pre-Renewal Ad-Integration Health Check (ENG-1270) — runs daily.
