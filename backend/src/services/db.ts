@@ -887,6 +887,14 @@ export interface Organization {
   shareAnalyticsWithOrg?: boolean;
   secrets?: Record<string, string>; // Encrypted per-org secrets (key → encrypted value)
   orgMemoryEnabled?: boolean; // Whether org-wide Emma memory is enabled (default: true)
+  /**
+   * Seat-based billing (ENG-TBD). Number of paid extra seats beyond the
+   * owner's tier's free base (see orgSeatService.baseSeatsForTier). This is a
+   * mirror of the Stripe subscription's seat line-item quantity, kept in sync
+   * by the billing webhook — never incremented/decremented directly on
+   * member join/leave. Absent/0 = no extra seats purchased.
+   */
+  purchasedExtraSeats?: number;
 }
 
 export interface OrgShareSettings {

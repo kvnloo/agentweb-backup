@@ -45,7 +45,14 @@ const JUDGE_TIMEOUT_MS = 90_000;
 const JUDGE_MAX_OUTPUT_TOKENS = 4_000;
 /** Longest image edge sent to the judge; larger images cost more tokens without changing a verdict. */
 const JUDGE_IMAGE_MAX_EDGE = 1568;
-const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
+/**
+ * Raw download ceiling, checked before decode/resize. Matches `CONTENT_CHECK_MAX_BYTES` in
+ * creativeContentCheckRunner.ts, this codebase's established ceiling for downloading a generated
+ * creative asset. The prior 15MB rejected real max-resolution creatives (e.g. a 4096x4096 generated
+ * ad image, a placement size ENG-2139/2187 already approve) before they ever reached the
+ * downscale-to-JUDGE_IMAGE_MAX_EDGE step above, which would have made them cheap to judge.
+ */
+const MAX_IMAGE_BYTES = 30 * 1024 * 1024;
 const MAX_BRIEF_FIELD_CHARS = 2_000;
 /** Landing-page source sent to the judge; beyond this it is cut (and the cut is said in the prompt). */
 export const MAX_LANDING_PAGE_SOURCE_CHARS = 60_000;
