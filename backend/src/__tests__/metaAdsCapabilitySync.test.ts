@@ -34,11 +34,16 @@ const mockClassifyAdsRefusalTier = jest.fn().mockResolvedValue('unknown');
 // existing ads-scope tests (and their `mock.calls[0]` assumptions) are
 // unaffected.
 const mockGetPages = jest.fn().mockRejectedValue(new Error('getPages not stubbed for this test'));
+// ENG-2232: defaults to [] (never throws), matching the real method's own
+// best-effort contract — the wrong-Page cross-check is a no-op unless a test
+// explicitly opts in, so pre-existing getPages-only assertions are unaffected.
+const mockGetExistingAdPageIds = jest.fn().mockResolvedValue([]);
 jest.mock('../services/metaService', () => ({
   metaService: {
     probeAdsAccountAccess: (...args: any[]) => mockProbeAdsAccountAccess(...args),
     classifyAdsRefusalTier: (...args: any[]) => mockClassifyAdsRefusalTier(...args),
     getPages: (...args: any[]) => mockGetPages(...args),
+    getExistingAdPageIds: (...args: any[]) => mockGetExistingAdPageIds(...args),
   },
 }));
 
@@ -683,6 +688,69 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
 
       expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
       expect(account.config.has_meta_pages).toBe(true);
+    });
+  });
+
+  /**
+   * ENG-2232 — the subtler sibling of the block above: "has at least one
+   * Page" isn't the same as "has the Page this account's own ads actually
+   * run under". Lets the sweep catch an account that holds access to some
+   * unrelated Page while its real ads keep failing.
+   */
+  describe('wrong-Page cross-check (ENG-2232)', () => {
+    beforeEach(() => {
+      mockProbeAdsAccountAccess.mockResolvedValue('unknown');
+    });
+
+    it('downgrades has_meta_pages to false and names the Page when existing ads use a Page outside the accessible set', async () => {
+      mockGetPages.mockResolvedValueOnce([{ id: 'page_unrelated', name: 'Some Other Page' }]);
+      mockGetExistingAdPageIds.mockResolvedValueOnce(['1010991085424542']);
+      const account = metaAccount({ granted_scopes: ['ads_read'] });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      expect(mockGetExistingAdPageIds).toHaveBeenCalledWith(AD_ACCOUNT_ID, 'EAA-token');
+      const [, , , updates] = mockUpdateAccountConfig.mock.calls[0];
+      expect(updates).toEqual({ has_meta_pages: false, existing_ads_page_id: '1010991085424542' });
+      expect(account.config.has_meta_pages).toBe(false);
+      expect(account.config.existing_ads_page_id).toBe('1010991085424542');
+    });
+
+    it('keeps has_meta_pages true (no write) when the accessible Pages already match the one existing ads use', async () => {
+      mockGetPages.mockResolvedValueOnce([{ id: '1010991085424542', name: 'My Health Surveys' }]);
+      mockGetExistingAdPageIds.mockResolvedValueOnce(['1010991085424542']);
+      const account = metaAccount({ granted_scopes: ['ads_read'], has_meta_pages: true });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+      expect(account.config.has_meta_pages).toBe(true);
+    });
+
+    it('does not run the cross-check when PAGE LIST itself is already empty (nothing to tighten)', async () => {
+      mockGetPages.mockResolvedValueOnce([]);
+      const account = metaAccount({ granted_scopes: ['ads_read'] });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      expect(mockGetExistingAdPageIds).not.toHaveBeenCalled();
+    });
+
+    it('clears a stale existing_ads_page_id once the mismatch is fixed', async () => {
+      mockGetPages.mockResolvedValueOnce([{ id: '1010991085424542', name: 'My Health Surveys' }]);
+      mockGetExistingAdPageIds.mockResolvedValueOnce(['1010991085424542']);
+      const account = metaAccount({
+        granted_scopes: ['ads_read'],
+        has_meta_pages: false,
+        existing_ads_page_id: '1010991085424542',
+      });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      const [, , , updates] = mockUpdateAccountConfig.mock.calls[0];
+      expect(updates).toEqual({ has_meta_pages: true, existing_ads_page_id: null });
+      expect(account.config.has_meta_pages).toBe(true);
+      expect(account.config.existing_ads_page_id).toBeUndefined();
     });
   });
 });

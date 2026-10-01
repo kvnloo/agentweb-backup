@@ -21,6 +21,8 @@ import {
   META_ADS_NO_PAGES_MESSAGE,
   getMetaAdsScopeState,
   getMetaPagesAccessState,
+  getMetaAdsNoPagesMessage,
+  buildMetaAdsWrongPageMessage,
   hasMetaAdsReadScope,
   isMetaAdsScopeRefusal,
   buildMetaAdsScopeError,
@@ -542,6 +544,46 @@ describe('describeMetaAdsCapability — Page access (ENG-2232)', () => {
         adAccount({ granted_scopes: ['pages_show_list'], has_meta_pages: false })
       )
     ).toEqual({ ads_capable: false, capability_warning: META_ADS_RECONSENT_MESSAGE });
+  });
+
+  it('names the specific Page when has_meta_pages is false because of a wrong-Page mismatch, not zero Pages', () => {
+    // This account DOES have Page access — just not to the Page its own ads use.
+    // "no Facebook Pages are accessible" would be false here.
+    const warning = describeMetaAdsCapability(
+      adAccount({
+        granted_scopes: ['ads_read'],
+        has_meta_pages: false,
+        existing_ads_page_id: '1010991085424542',
+      })
+    ).capability_warning;
+    expect(warning).toContain('1010991085424542');
+    expect(warning).not.toEqual(META_ADS_NO_PAGES_MESSAGE);
+  });
+
+  it('falls back to the generic zero-Pages message when existing_ads_page_id is absent', () => {
+    expect(
+      describeMetaAdsCapability(
+        adAccount({ granted_scopes: ['ads_read'], has_meta_pages: false, existing_ads_page_id: undefined })
+      )
+    ).toEqual({ ads_capable: false, capability_warning: META_ADS_NO_PAGES_MESSAGE });
+  });
+});
+
+describe('getMetaAdsNoPagesMessage', () => {
+  it('returns the generic message when no existing_ads_page_id is recorded', () => {
+    expect(getMetaAdsNoPagesMessage({})).toBe(META_ADS_NO_PAGES_MESSAGE);
+    expect(getMetaAdsNoPagesMessage(null)).toBe(META_ADS_NO_PAGES_MESSAGE);
+    expect(getMetaAdsNoPagesMessage({ existing_ads_page_id: null })).toBe(META_ADS_NO_PAGES_MESSAGE);
+  });
+
+  it('returns the Page-specific message, naming the Page, when existing_ads_page_id is a string', () => {
+    const message = getMetaAdsNoPagesMessage({ existing_ads_page_id: '1010991085424542' });
+    expect(message).toBe(buildMetaAdsWrongPageMessage('1010991085424542'));
+    expect(message).toContain('1010991085424542');
+  });
+
+  it('ignores a non-string existing_ads_page_id (defensive, shouldn\'t happen)', () => {
+    expect(getMetaAdsNoPagesMessage({ existing_ads_page_id: 12345 })).toBe(META_ADS_NO_PAGES_MESSAGE);
   });
 });
 
