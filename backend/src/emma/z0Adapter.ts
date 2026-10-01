@@ -7,6 +7,15 @@
  */
 import { createHash } from 'crypto';
 import {
+  acquireZ0BridgeAdmission,
+  noteZ0BridgeTransportFailure,
+  observeZ0BridgeResponse,
+  readZ0BridgeBackpressureMode,
+  releaseZ0BridgeAdmission,
+  type Z0BridgeAdmissionToken,
+  type Z0BridgeBackpressureMode,
+} from './z0BridgeBackpressure';
+import {
   Z0_BRIDGE_SCHEMA_V1,
   bridgeFailureDisposition,
   validateZ0BridgeRequestV1,
@@ -23,6 +32,7 @@ export interface Z0AgentWebConfig {
   mode: Z0AgentWebMode;
   baseUrl: string;
   timeoutMs: number;
+  backpressureMode?: Z0BridgeBackpressureMode;
 }
 
 export interface Z0RouteArgs {
@@ -64,6 +74,7 @@ export function readZ0AgentWebConfig(env: NodeJS.ProcessEnv = process.env): Z0Ag
       Number.isFinite(timeoutRaw) && timeoutRaw > 0 && timeoutRaw <= 120000
         ? timeoutRaw
         : DEFAULT_TIMEOUT_MS,
+    backpressureMode: readZ0BridgeBackpressureMode(env),
   };
 }
 
@@ -195,13 +206,61 @@ function unwrapBridgeResponse(
 function bridgeFailureExtra(
   mode: Z0BridgeMode,
   kind: Z0BridgeKind,
-  failure: 'http_4xx' | 'http_5xx' | 'timeout' | 'transport' | 'invalid_response',
+  failure:
+    | 'http_4xx'
+    | 'http_5xx'
+    | 'overload_pre_execution'
+    | 'timeout'
+    | 'transport'
+    | 'invalid_response',
 ) {
   const disposition = bridgeFailureDisposition(mode, failure, kind);
   return {
     execution_status: disposition.status,
     reconcile_required: disposition.reconcile_required,
     bridge_retry: disposition.retry,
+  };
+}
+
+async function maybeAcquireBridgeAdmission(params: {
+  config: Z0AgentWebConfig;
+  fetchImpl: Z0FetchLike;
+  bridgeMode: Z0BridgeMode;
+  bridgeKind: Z0BridgeKind;
+  capability: string;
+  freeOnly: boolean;
+  serializedBody: string;
+}): Promise<
+  | { admitted: true; token: Z0BridgeAdmissionToken | null }
+  | {
+      admitted: false;
+      reason: string;
+      retryAfterMs: number;
+      message: string;
+    }
+> {
+  if ((params.config.backpressureMode ?? 'off') !== 'enforce') {
+    return { admitted: true, token: null };
+  }
+
+  return acquireZ0BridgeAdmission({
+    baseUrl: params.config.baseUrl,
+    mode: params.bridgeMode,
+    kind: params.bridgeKind,
+    capability: params.capability,
+    freeOnly: params.freeOnly,
+    requestBytes: Buffer.byteLength(params.serializedBody, 'utf8'),
+    fetchImpl: params.fetchImpl,
+    timeoutMs: params.config.timeoutMs,
+  });
+}
+
+function backpressureDeniedExtra(retryAfterMs: number) {
+  return {
+    execution_status: 'not_executed',
+    reconcile_required: false,
+    bridge_retry: 'caller_may_fallback',
+    retry_after_ms: retryAfterMs,
   };
 }
 
@@ -263,6 +322,24 @@ export async function runZ0Route(args: Z0RouteArgs, options: Z0RouteOptions) {
 
   const endpoint = bridgeMode === 'shadow' ? '/v1/plan' : '/v1/intelligence';
   const fetchImpl = options.fetchImpl ?? fetch;
+  const serializedBody = JSON.stringify(body);
+  const admission = await maybeAcquireBridgeAdmission({
+    config,
+    fetchImpl,
+    bridgeMode,
+    bridgeKind,
+    capability: args.function,
+    freeOnly: true,
+    serializedBody,
+  });
+  if (!admission.admitted) {
+    return skipped(config.mode, admission.reason, admission.message, {
+      trace_id: traceId,
+      parent_agent: parentAgent,
+      ...backpressureDeniedExtra(admission.retryAfterMs),
+    });
+  }
+  const admissionToken = admission.token;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
 
@@ -270,9 +347,26 @@ export async function runZ0Route(args: Z0RouteArgs, options: Z0RouteOptions) {
     const response = await fetchImpl(`${config.baseUrl}${endpoint}`, {
       method: 'POST',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: serializedBody,
       signal: controller.signal,
     });
+
+    const observed = admissionToken
+      ? observeZ0BridgeResponse(admissionToken, response)
+      : null;
+    if (observed?.kind === 'pre_execution_overload') {
+      return skipped(
+        config.mode,
+        'overloaded_pre_execution',
+        'z0intelligence rejected the request before execution because host capacity is full',
+        {
+          trace_id: traceId,
+          parent_agent: parentAgent,
+          ...bridgeFailureExtra(bridgeMode, bridgeKind, 'overload_pre_execution'),
+          retry_after_ms: observed.retryAfterMs,
+        },
+      );
+    }
 
     if (!response.ok) {
       const failure = response.status >= 500 ? 'http_5xx' : 'http_4xx';
@@ -311,6 +405,7 @@ export async function runZ0Route(args: Z0RouteArgs, options: Z0RouteOptions) {
       bridge_retry: unwrapped.bridge.retry,
     };
   } catch (error) {
+    if (admissionToken) noteZ0BridgeTransportFailure(admissionToken);
     const isTimeout = error instanceof Error && error.name === 'AbortError';
     return skipped(config.mode, isTimeout ? 'timeout' : 'transport_error', isTimeout
       ? `z0intelligence timed out after ${config.timeoutMs}ms`
@@ -325,6 +420,7 @@ export async function runZ0Route(args: Z0RouteArgs, options: Z0RouteOptions) {
     });
   } finally {
     clearTimeout(timer);
+    releaseZ0BridgeAdmission(admissionToken);
   }
 }
 
@@ -441,6 +537,25 @@ export async function runZ0ChoiceExperiment(
     };
   }
   const fetchImpl = options.fetchImpl ?? fetch;
+  const serializedBody = JSON.stringify(body);
+  const admission = await maybeAcquireBridgeAdmission({
+    config,
+    fetchImpl,
+    bridgeMode,
+    bridgeKind,
+    capability: `experiment.${args.decision_id}`,
+    freeOnly: false,
+    serializedBody,
+  });
+  if (!admission.admitted) {
+    return {
+      ok: false, skipped: true, executed: false, applied: false,
+      mode: 'shadow', reason: admission.reason, message: admission.message,
+      trace_id: traceId, parent_agent: parentAgent,
+      ...backpressureDeniedExtra(admission.retryAfterMs),
+    };
+  }
+  const admissionToken = admission.token;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
 
@@ -448,9 +563,22 @@ export async function runZ0ChoiceExperiment(
     const response = await fetchImpl(`${config.baseUrl}/v1/experimental/choice`, {
       method: 'POST',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: serializedBody,
       signal: controller.signal,
     });
+    const observed = admissionToken
+      ? observeZ0BridgeResponse(admissionToken, response)
+      : null;
+    if (observed?.kind === 'pre_execution_overload') {
+      return {
+        ok: false, skipped: true, executed: false, applied: false,
+        mode: 'shadow', reason: 'overloaded_pre_execution',
+        message: 'z0intelligence rejected the decision before execution because host capacity is full',
+        trace_id: traceId, parent_agent: parentAgent,
+        ...bridgeFailureExtra(bridgeMode, bridgeKind, 'overload_pre_execution'),
+        retry_after_ms: observed.retryAfterMs,
+      };
+    }
     if (!response.ok) {
       const failure = response.status >= 500 ? 'http_5xx' : 'http_4xx';
       return {
@@ -489,6 +617,7 @@ export async function runZ0ChoiceExperiment(
       bridge_retry: unwrapped.bridge.retry,
     };
   } catch (error) {
+    if (admissionToken) noteZ0BridgeTransportFailure(admissionToken);
     const isTimeout = error instanceof Error && error.name === 'AbortError';
     return {
       ok: false, skipped: true, executed: false, applied: false,
@@ -504,6 +633,7 @@ export async function runZ0ChoiceExperiment(
     };
   } finally {
     clearTimeout(timer);
+    releaseZ0BridgeAdmission(admissionToken);
   }
 }
 
@@ -605,6 +735,25 @@ export async function runZ0NoulExperiment(
     };
   }
   const fetchImpl = options.fetchImpl ?? fetch;
+  const serializedBody = JSON.stringify(body);
+  const admission = await maybeAcquireBridgeAdmission({
+    config,
+    fetchImpl,
+    bridgeMode,
+    bridgeKind,
+    capability: `experiment.${args.decision_id}`,
+    freeOnly: false,
+    serializedBody,
+  });
+  if (!admission.admitted) {
+    return {
+      ok: false, skipped: true, executed: false, applied: false,
+      mode: 'shadow', reason: admission.reason, message: admission.message,
+      trace_id: traceId, parent_agent: parentAgent,
+      ...backpressureDeniedExtra(admission.retryAfterMs),
+    };
+  }
+  const admissionToken = admission.token;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
 
@@ -612,9 +761,22 @@ export async function runZ0NoulExperiment(
     const response = await fetchImpl(`${config.baseUrl}/v1/experimental/noul`, {
       method: 'POST',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: serializedBody,
       signal: controller.signal,
     });
+    const observed = admissionToken
+      ? observeZ0BridgeResponse(admissionToken, response)
+      : null;
+    if (observed?.kind === 'pre_execution_overload') {
+      return {
+        ok: false, skipped: true, executed: false, applied: false,
+        mode: 'shadow', reason: 'overloaded_pre_execution',
+        message: 'z0intelligence rejected the decision before execution because host capacity is full',
+        trace_id: traceId, parent_agent: parentAgent,
+        ...bridgeFailureExtra(bridgeMode, bridgeKind, 'overload_pre_execution'),
+        retry_after_ms: observed.retryAfterMs,
+      };
+    }
     if (!response.ok) {
       const failure = response.status >= 500 ? 'http_5xx' : 'http_4xx';
       return {
@@ -653,6 +815,7 @@ export async function runZ0NoulExperiment(
       bridge_retry: unwrapped.bridge.retry,
     };
   } catch (error) {
+    if (admissionToken) noteZ0BridgeTransportFailure(admissionToken);
     const isTimeout = error instanceof Error && error.name === 'AbortError';
     return {
       ok: false, skipped: true, executed: false, applied: false,
@@ -668,5 +831,6 @@ export async function runZ0NoulExperiment(
     };
   } finally {
     clearTimeout(timer);
+    releaseZ0BridgeAdmission(admissionToken);
   }
 }
