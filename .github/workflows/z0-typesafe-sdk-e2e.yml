@@ -1,8 +1,8 @@
-name: AgentWeb z0 TypeSafe SDK E2E
+name: AgentWeb z0 Bridge v1 TypeSafe E2E
 
 on:
   pull_request:
-    branches: [lab/z0-agentweb-emma-v0]
+    branches: [lab/z0-agentweb-emma-typesafe-sdk-v1]
     types: [opened, synchronize, reopened]
   workflow_dispatch:
 
@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: kvnloo/z0intelligence
-          ref: lab/agentweb-emma-typesafe-sdk-v1
+          ref: lab/agentweb-bridge-wire-v1
           path: deps/z0intelligence
           persist-credentials: false
 
@@ -61,8 +61,20 @@ jobs:
 
       - name: Install narrow dependencies
         run: |
-          python -m pip install typesafe-sdk==0.7.2
+          python -m pip install typesafe-sdk==0.7.2 pytest==8.4.2
           cd backend && npm ci
+
+      - name: Run bridge contract unit slices
+        run: |
+          cd backend
+          node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit \
+            src/__tests__/experiments.z0BridgeProtocol.test.ts \
+            src/__tests__/experiments.z0Integration.test.ts \
+            src/__tests__/experiments.z0ChoiceExperiment.test.ts
+          cd ..
+          PYTHONPATH="$GITHUB_WORKSPACE/deps/z0intelligence/src" python -m pytest -q \
+            deps/z0intelligence/tests/test_agentweb_bridge_protocol.py \
+            deps/z0intelligence/tests/test_agentweb_bridge_wire.py
 
       - name: Start local System One fixture
         working-directory: backend
@@ -124,9 +136,14 @@ jobs:
 
           result = json.load(open("/tmp/z0-typesafe-protocol.json"))
           assert result["choice"]["first"]["ok"] is True
+          assert result["choice"]["first"]["bridge_schema"] == "agentweb.z0.bridge.v1"
+          assert result["choice"]["first"]["bridge_status"] == "completed"
           assert result["choice"]["replay"]["replayed"] is True
           assert result["choice"]["mutation"]["ok"] is False
+          assert result["choice"]["mutation"]["reason"] == "http_error"
           assert result["noul"]["first"]["ok"] is True
+          assert result["noul"]["first"]["bridge_schema"] == "agentweb.z0.bridge.v1"
+          assert result["noul"]["first"]["bridge_status"] == "completed"
           assert result["noul"]["replay"]["replayed"] is True
 
           rows = [
