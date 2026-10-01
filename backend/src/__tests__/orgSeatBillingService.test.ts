@@ -258,6 +258,34 @@ describe('purchaseExtraSeat', () => {
       expect.objectContaining({ quantity: 1 })
     );
   });
+
+  // ENG-2256: observability for the money-relevant seat purchase path.
+  it('logs the purchase with orgId, new total seats, and price charged', async () => {
+    const infoSpy = jest.spyOn(console, 'info').mockImplementation(() => {});
+    mockStripe.subscriptions.retrieve.mockResolvedValue(makeSubscription([makeSeatItem({ quantity: 2 })]));
+
+    await purchaseExtraSeat(ORG_ID);
+
+    expect(infoSpy).toHaveBeenCalledWith(
+      '[orgSeatBillingService] seat purchased',
+      { orgId: ORG_ID, newTotalSeats: 3, priceCentsCharged: SEAT_PRICING.priceCents }
+    );
+  });
+
+  it('logs a warn (not error) and never calls Stripe when the owner has no subscription', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockUserDb.getUserById.mockResolvedValue(makeOwner({ stripe_subscription_id: undefined }));
+
+    await expect(purchaseExtraSeat(ORG_ID)).rejects.toThrow(/no Stripe subscription/);
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[orgSeatBillingService] seat operation refused: owner has no Stripe subscription',
+      { orgId: ORG_ID, ownerUserId: OWNER_ID }
+    );
+    expect(errorSpy).not.toHaveBeenCalled();
+    expect(mockStripe.subscriptions.retrieve).not.toHaveBeenCalled();
+  });
 });
 
 describe('removeExtraSeat', () => {
@@ -319,5 +347,51 @@ describe('removeExtraSeat', () => {
     const result = await removeExtraSeat(ORG_ID);
 
     expect(result).toEqual({ newTotalSeats: 0 });
+  });
+
+  // ENG-2256: observability for the money-relevant seat removal path.
+  it('logs the removal with orgId and new total seats (no price — nothing was charged)', async () => {
+    const infoSpy = jest.spyOn(console, 'info').mockImplementation(() => {});
+    mockStripe.subscriptions.retrieve.mockResolvedValue(makeSubscription([makeSeatItem({ quantity: 3 })]));
+    mockOrgDb.getOrgMemberCount.mockResolvedValue(2);
+
+    await removeExtraSeat(ORG_ID);
+
+    expect(infoSpy).toHaveBeenCalledWith('[orgSeatBillingService] seat removed', {
+      orgId: ORG_ID,
+      newTotalSeats: 2,
+    });
+  });
+
+  it('logs the removal when it drops the seat line item entirely to 0', async () => {
+    const infoSpy = jest.spyOn(console, 'info').mockImplementation(() => {});
+    mockStripe.subscriptions.retrieve.mockResolvedValue(makeSubscription([makeSeatItem({ quantity: 1 })]));
+    mockOrgDb.getOrgMemberCount.mockResolvedValue(0);
+
+    await removeExtraSeat(ORG_ID);
+
+    expect(infoSpy).toHaveBeenCalledWith('[orgSeatBillingService] seat removed', {
+      orgId: ORG_ID,
+      newTotalSeats: 0,
+    });
+  });
+
+  it('logs a warn (not error) when refusing removal because seats are occupied', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockStripe.subscriptions.retrieve.mockResolvedValue(makeSubscription([makeSeatItem({ quantity: 1 })]));
+    mockOrgDb.getOrgMemberCount.mockResolvedValue(5);
+
+    await expect(removeExtraSeat(ORG_ID)).rejects.toThrow(/Cannot remove extra seat/);
+
+    expect(warnSpy).toHaveBeenCalledWith('[orgSeatBillingService] seat removal refused: seat occupied', {
+      orgId: ORG_ID,
+      currentTotal: 1,
+      currentMemberCount: 5,
+      baseSeats: 2,
+      currentlyNeeded: 3,
+      ownerTier: 'Starter',
+    });
+    expect(errorSpy).not.toHaveBeenCalled();
   });
 });
