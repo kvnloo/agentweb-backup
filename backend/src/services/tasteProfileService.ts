@@ -292,6 +292,13 @@ export class TasteProviderError extends Error {
   }
 }
 
+export class TasteFeedbackNotFoundError extends Error {
+  constructor(message = 'Taste feedback not found') {
+    super(message);
+    this.name = 'TasteFeedbackNotFoundError';
+  }
+}
+
 function charLength(value: string): number {
   return Array.from(value).length;
 }
@@ -921,10 +928,15 @@ function applyTasteFeedback(profile: TasteProfile, events: TasteFeedbackEvent[])
   const feedbackTimestamps = events
     .flatMap((event) => [event.createdAt, event.reversedAt].filter((value): value is string => Boolean(value)))
     .sort();
-  const updatedAt = [profile.updatedAt, feedbackTimestamps.at(-1)]
+  const latestFeedbackAt = feedbackTimestamps.length > 0
+    ? feedbackTimestamps[feedbackTimestamps.length - 1]
+    : null;
+  const allTimestamps = [profile.updatedAt, latestFeedbackAt]
     .filter((value): value is string => Boolean(value))
-    .sort()
-    .at(-1) || null;
+    .sort();
+  const updatedAt = allTimestamps.length > 0
+    ? allTimestamps[allTimestamps.length - 1]
+    : null;
 
   return { ...profile, styleSignals, updatedAt };
 }
@@ -971,20 +983,13 @@ export class TasteProfileService {
   }
 
   async getProfile(userId: string): Promise<TasteProfile> {
-    const [memories, feedbackMemories] = await Promise.all([
-      this.memoryStore.getUserMemories(userId, 'preference'),
-      this.memoryStore.getUserMemories(userId, 'history'),
-    ]);
+    const memories = await this.memoryStore.getUserMemories(userId, 'preference');
     const snapshots = memories
       .filter((memory) => memory.sourceSessionId?.startsWith(TASTE_MEMORY_PREFIX))
       .map(decodeSnapshot)
       .filter((snapshot): snapshot is TasteSourceSnapshot => Boolean(snapshot));
-    const feedback = feedbackMemories
-      .filter((memory) => memory.sourceSessionId?.startsWith(TASTE_FEEDBACK_MEMORY_PREFIX))
-      .map(decodeTasteFeedback)
-      .filter((event): event is TasteFeedbackEvent => Boolean(event));
 
-    return applyTasteFeedback(aggregateSnapshots(snapshots), feedback);
+    return aggregateSnapshots(snapshots);
   }
 
   async getSettings(userId: string): Promise<TasteSettings> {
@@ -1035,7 +1040,16 @@ export class TasteProfileService {
   ): Promise<TasteApplication> {
     const validatedSurface = validateTasteSurface(surface);
     const explicitIntensity = validateTasteIntensity(intensity);
-    const profile = await this.getProfile(userId);
+    const [baseProfile, feedback] = await Promise.all([
+      this.getProfile(userId),
+      this.listFeedback(userId),
+    ]);
+    // Feedback is surface-scoped: liking a landing-page treatment must not silently
+    // steer research, email, or another creative surface.
+    const profile = applyTasteFeedback(
+      baseProfile,
+      feedback.filter((event) => event.receipt.surface === validatedSurface)
+    );
     const settings = explicitIntensity ? null : await this.getSettings(userId);
     const resolvedIntensity = explicitIntensity ?? settings!.surfaces[validatedSurface];
     return buildTasteApplication(profile, validatedSurface, resolvedIntensity, {
@@ -1129,7 +1143,7 @@ export class TasteProfileService {
         candidate.sourceSessionId?.startsWith(TASTE_FEEDBACK_MEMORY_PREFIX)
     );
     const event = memory ? decodeTasteFeedback(memory) : null;
-    if (!memory || !event) throw new TasteSourceAccessError('Taste feedback not found');
+    if (!memory || !event) throw new TasteFeedbackNotFoundError();
     if (event.reversedAt) return event;
 
     const updated: Omit<TasteFeedbackEvent, 'eventId'> = {
