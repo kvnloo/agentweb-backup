@@ -914,11 +914,30 @@ export class MetaService {
       this.initApi(accessToken);
       const user = new User('me');
       const fields = ['id', 'name', 'access_token', 'category', 'tasks'];
+      const params: Record<string, any> = { limit: META_LIST_PAGE_SIZE };
 
-      // Fetch pages (accounts edge on User)
-      const pagesPath = await user.getAccounts(fields);
+      // Fetch pages (accounts edge on User). Drains pagination (ENG-2232 code
+      // review follow-up) — this result no longer only feeds an informational
+      // count, it backs the AD_CREATIVE CREATE page_id gate and the wrong-Page
+      // cross-check (ENG-2232), both exact-membership checks against the
+      // returned set. Before those existed, only taking the first batch was
+      // harmless — has_meta_pages is a presence check, unaffected by
+      // truncation. Now, an account with more accessible Pages than fit in one
+      // batch would have a REAL Page silently missing from this list, and the
+      // gate would wrongly block a legitimate creative, or the cross-check
+      // would wrongly flag a healthy account as broken.
+      const cursor = await MetaService.withReadDeadline(
+        () => user.getAccounts(fields, params),
+        'page list',
+      );
+      const { items, truncated } = await this.drainCursor(cursor, META_LIST_MAX_PAGES);
+      if (truncated) {
+        this.log(`getPages: Page list truncated at the ${META_LIST_MAX_PAGES}-page bound`, {
+          itemsSoFar: items.length,
+        });
+      }
 
-      const pages = pagesPath.map((page: any) => ({
+      const pages = items.map((page: any) => ({
         id: page.id || page._data?.id,
         name: page.name || page._data?.name,
         access_token: page.access_token || page._data?.access_token,
