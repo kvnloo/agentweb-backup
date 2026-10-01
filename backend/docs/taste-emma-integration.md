@@ -440,12 +440,13 @@ Implemented:
 - automatic backend application for landing pages, images, and video
 - versioned Taste application receipts with semantic profile/settings revisions, threaded into landing/image/video results
 - durable write-once Taste receipts on generated landing-page artifact records, across v0 and coding-agent paths
-- REST surface/application/apply/settings APIs
+- append-only, reversible More / Less / Ignore feedback keyed to persisted landing-page receipts and scoped to that surface
+- REST surface/application/apply/settings/feedback APIs
 - customer Taste Center at `/marketing/taste`
 
 Not yet implemented:
 - screenshot/Figma/design-dump visual ingestion
-- "more like this / less like this" artifact feedback
+- "Add as reference" artifact feedback and customer-facing artifact feedback controls
 - campaign/project overlays
 - durable receipt storage for non-landing artifacts and scheduled-run replay/pinning
 - landing-page edit/coding-agent automatic receipt injection
