@@ -46,16 +46,24 @@ export async function createBenchmarkTest(req: AuthenticatedRequest, res: Respon
     // Process messages to include attachments in user messages (same as generateResponse)
     messages = messages.map((message: any) => {
       if (message.role === 'user') {
+        let content = message.content;
         // Check for attachments in both message.attachments and message.metadata.attachments
         const attachments = message.attachments || message.metadata?.attachments || [];
         if (attachments.length > 0) {
           const attachmentUrls = attachments.map((attachment: any) => {
             return `[${attachment.filename || 'Attachment'}](${attachment.url})`;
           }).join('\n');
-          return {
-            ...message,
-            content: `${message.content}\n\n**Attached Files:**\n${attachmentUrls}`
-          };
+          content = `${content}\n\n**Attached Files:**\n${attachmentUrls}`;
+        }
+        // ENG-2227: this independently duplicates agentModeService's buildMarketingContext
+        // attachment-folding pattern, so it independently needs the same anonymous-sender
+        // marker — otherwise an admin replaying a session containing an ishare message
+        // through this benchmark tool loses the provenance signal the live path now carries.
+        if (message.metadata?.ishareSender?.isAnonymous) {
+          content = `${content}\n\n[Sent by an anonymous viewer via a shared link — not a verified account owner]`;
+        }
+        if (content !== message.content) {
+          return { ...message, content };
         }
       }
       return message;
