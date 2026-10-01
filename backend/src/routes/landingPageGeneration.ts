@@ -709,16 +709,21 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       bridgeOutUrl: typeof bridge_out_url === "string" ? bridge_out_url : undefined,
       metaPixelOverride,
       googleAds,
+      tasteReceipt: tasteApplication?.receipt,
     });
     void emitLanderLifecycle("created", { pageId: (result as any)?.id || "unknown", userId, channel: landerChannelFromRequest(req), mode: "cold_start", outcome: (result as any)?.status === "failed" ? "failed" : "ok" });
-    const taste = tasteApplication
+    // Always describe the artifact with the receipt persisted on that artifact.
+    // A duplicate-route request can reuse an older page; reporting today's Taste
+    // settings for an artifact that was not regenerated would rewrite history.
+    const persistedTasteReceipt = (result as any)?.tasteReceipt;
+    const taste = persistedTasteReceipt
       ? {
-          active: tasteApplication.active,
-          intensity: tasteApplication.intensity,
-          confidence: tasteApplication.confidence,
-          dials: tasteApplication.dials,
-          signals: tasteApplication.signals,
-          receipt: tasteApplication.receipt,
+          active: persistedTasteReceipt.active,
+          intensity: persistedTasteReceipt.intensity,
+          confidence: persistedTasteReceipt.confidence,
+          dials: persistedTasteReceipt.dials,
+          signals: persistedTasteReceipt.signals,
+          receipt: persistedTasteReceipt,
         }
       : undefined;
     const payload = taste ? { ...result, taste } : result;
