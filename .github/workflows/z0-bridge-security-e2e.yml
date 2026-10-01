@@ -1,0 +1,162 @@
+name: AgentWeb z0 Bridge Security E2E
+
+on:
+  pull_request:
+    branches: [lab/z0-bridge-capabilities-v1]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bridge-security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout AgentWeb exact head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Checkout z0intelligence security branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kvnloo/z0intelligence
+          ref: lab/agentweb-bridge-nontransitive-secrets-v1
+          path: deps/z0intelligence
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install narrow dependencies
+        run: |
+          cd backend && npm ci
+          cd ..
+          python -m pip install pytest==8.4.2 typesafe-sdk==0.7.2
+
+      - name: Run non-transitivity unit suites
+        run: |
+          cd backend
+          node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit \
+            src/__tests__/experiments.z0BridgeNonTransitiveSecrets.test.ts
+          cd ..
+          PYTHONPATH="$GITHUB_WORKSPACE/deps/z0intelligence/src" python -m pytest -q \
+            deps/z0intelligence/tests/test_agentweb_bridge_nontransitive_secrets.py \
+            deps/z0intelligence/tests/test_agentweb_bridge_protocol.py \
+            deps/z0intelligence/tests/test_agentweb_bridge_wire.py
+
+      - name: Start z0intelligence
+        env:
+          PYTHONPATH: ${{ github.workspace }}/deps/z0intelligence/src
+          Z0INT_HOME: /tmp/z0int-security-home
+        run: |
+          mkdir -p "$Z0INT_HOME"
+          python -m z0int.intelligence_service --port 11501 > /tmp/z0int-security.log 2>&1 &
+          echo $! > /tmp/z0int-security.pid
+          python - <<'PY'
+          import time, urllib.request
+          url = "http://127.0.0.1:11501/healthz"
+          last = None
+          for _ in range(40):
+              try:
+                  with urllib.request.urlopen(url, timeout=1) as response:
+                      if response.status == 200:
+                          raise SystemExit(0)
+              except Exception as exc:
+                  last = exc
+                  time.sleep(.25)
+          raise SystemExit(f"z0intelligence did not become ready: {last}")
+          PY
+
+      - name: Prove live ingress rejects nested credentials but allows prose
+        run: |
+          python - <<'PY'
+          import json
+          import urllib.error
+          import urllib.request
+
+          URL = "http://127.0.0.1:11501/v1/plan"
+
+          def request(operation, trace, state):
+              return {
+                  "schema": "agentweb.z0.bridge.v1",
+                  "operation_id": operation,
+                  "trace_id": trace,
+                  "parent_agent": "agentweb:" + "b" * 24,
+                  "mode": "shadow",
+                  "kind": "plan",
+                  "capability": "summarization",
+                  "policy": {
+                      "allow_remote": False,
+                      "free_only": True,
+                      "experimental": False,
+                      "risk_class": "read",
+                      "approval_state": "not_required",
+                  },
+                  "payload": {
+                      "function": "summarization",
+                      "task": "summarize fixture",
+                      "state": state,
+                  },
+              }
+
+          def post(value):
+              data = json.dumps(value).encode()
+              req = urllib.request.Request(
+                  URL,
+                  data=data,
+                  headers={"content-type": "application/json"},
+                  method="POST",
+              )
+              return urllib.request.urlopen(req, timeout=5)
+
+          secret = request(
+              "security-secret",
+              "a" * 64,
+              {"headers": {"Authorization": "Bearer secret"}},
+          )
+          try:
+              post(secret)
+          except urllib.error.HTTPError as exc:
+              assert exc.code == 400, exc.code
+              body = json.loads(exc.read())
+              assert body["error"] == "invalid_request_or_trace_conflict"
+          else:
+              raise AssertionError("nested credential reached authority code")
+
+          safe = request(
+              "security-prose",
+              "c" * 64,
+              {
+                  "excerpt": (
+                      "Documentation says an Authorization header may contain an API key. "
+                      "This is prose, not a credential field."
+                  )
+              },
+          )
+          with post(safe) as response:
+              assert response.status == 200
+              body = json.loads(response.read())
+          assert body["schema"] == "agentweb.z0.bridge.v1"
+          assert body["kind"] == "plan"
+          assert body["status"] == "completed"
+          assert body["applied"] is False
+          PY
+
+      - name: Stop z0intelligence
+        if: always()
+        run: |
+          if test -f /tmp/z0int-security.pid; then
+            kill "$(cat /tmp/z0int-security.pid)" || true
+          fi
+          cat /tmp/z0int-security.log || true
