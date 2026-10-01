@@ -558,7 +558,14 @@ export async function syncSubscriptionFromStripe(
       activeOffer: extractActiveOffer(sub),
     };
 
-    // Derive tier from price if available
+    // Derive tier from price if available.
+    //
+    // NOTE: still `items.data[0]`, not `findBasePlanItem` — left alone by the
+    // seat-billing (ENG-2243..2246) correctness review as low-risk, since a
+    // wrong read here just skips an additive-only tier backfill rather than
+    // corrupting billing state. Don't copy this pattern elsewhere: see
+    // findBasePlanItem's doc comment for why position-based lookup breaks
+    // once a seat item can coexist on the same subscription.
     const priceId = sub.items?.data?.[0]?.price?.id;
     if (priceId) {
       const derivedType = deriveSubscriptionTypeFromPriceId(priceId);
@@ -1008,7 +1015,15 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
             stripe_subscription_id: activeSub.id,
           };
 
-          // Derive tier from the remaining subscription's price
+          // Derive tier from the remaining subscription's price.
+          //
+          // NOTE: still `items.data[0]`, not `findBasePlanItem` — left alone
+          // by the seat-billing (ENG-2243..2246) correctness review as
+          // low-risk: this only sets subscriptionType/allowedPages, and a
+          // seat item sorting first here would just skip that sync rather
+          // than corrupt billing state. See findBasePlanItem's doc comment
+          // for why position-based lookup is otherwise unsafe once a seat
+          // item can coexist on the same subscription.
           const priceId = activeSub.items?.data?.[0]?.price?.id;
           if (priceId) {
             const newType = deriveSubscriptionTypeFromPriceId(priceId);
@@ -1467,6 +1482,14 @@ function deriveSubscriptionType(session: any, subscription?: any): string | null
   // fetches explicitly) and fall back to session.line_items only when a
   // caller happens to have expanded them (e.g. an admin-invoked flow that
   // retrieves the session with { expand: ['line_items'] }).
+  //
+  // NOTE: still `items.data[0]`, not `findBasePlanItem` — left alone by the
+  // seat-billing (ENG-2243..2246) correctness review as low-risk: a
+  // freshly-completed checkout session's subscription is brand new and
+  // can't yet carry a seat line item (that's only added later, via
+  // purchaseExtraSeat), so there's nothing for items.data[0] to collide
+  // with here. Don't copy this pattern elsewhere a subscription's items can
+  // have grown since creation — see findBasePlanItem's doc comment.
   const priceId = subscription?.items?.data?.[0]?.price?.id
     || session.line_items?.data?.[0]?.price?.id
     || session.display_items?.[0]?.price?.id;
@@ -1577,7 +1600,15 @@ export async function reconcileStripeUser(
     hasPaymentMethod = methods.data.length > 0;
   }
 
-  // Derive tier
+  // Derive tier.
+  //
+  // NOTE: still `items.data[0]`, not `findBasePlanItem`. Same hazard class as
+  // syncSubscriptionFromStripe above (not one of the sites the seat-billing
+  // ENG-2243..2246 correctness review named, but identical in kind): a seat
+  // item sorting first here would just leave this admin-triggered
+  // reconciliation skipping a tier overwrite rather than corrupting billing
+  // state. See findBasePlanItem's doc comment before reusing this pattern
+  // anywhere a subscription's items can include a seat line item.
   const priceId = sub.items?.data?.[0]?.price?.id;
   const derivedType = priceId ? deriveSubscriptionTypeFromPriceId(priceId) : null;
 
