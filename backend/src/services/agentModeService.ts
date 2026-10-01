@@ -6465,7 +6465,7 @@ export class AgentModeService {
     return text;
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>, declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>, openResearchRequests?: any[]): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>, declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>, openResearchRequests?: any[], isCurrentTurnAnonymousIshare: boolean = false): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -6483,10 +6483,20 @@ export class AgentModeService {
 
     // Merge consecutive user messages into one — keeps the 10-message window from dropping
     // the original task when many retry messages ("Please try again...") pile up behind it.
+    // ENG-2227: merging mutates only `.content`, never `.metadata` — if an anonymous ishare
+    // message landed adjacent to a real owner message (the exact retry-pileup shape this merge
+    // exists for), only the FIRST message's metadata survived the merge, silently dropping the
+    // anonymous tag (when it merged INTO an owner message) or mislabeling the owner's own words
+    // as anonymous (when an owner message merged into one). This merge was only ever meant to
+    // collapse retries from the SAME actor, so only merge when both sides share the same
+    // anonymity status — a genuine identity change between two adjacent messages now keeps them
+    // as separate entries, each correctly tagged by the per-message loop below.
     const mergedHistory: ChatMessage[] = [];
     for (const msg of filteredHistory) {
       const last = mergedHistory[mergedHistory.length - 1];
-      if (last && last.role === 'user' && msg.role === 'user') {
+      const sameAnonymity = Boolean((last as any)?.metadata?.ishareSender?.isAnonymous)
+        === Boolean((msg as any)?.metadata?.ishareSender?.isAnonymous);
+      if (last && last.role === 'user' && msg.role === 'user' && sameAnonymity) {
         last.content = `${last.content}\n\n${msg.content}`;
       } else {
         mergedHistory.push({ ...msg });
@@ -6668,16 +6678,25 @@ export class AgentModeService {
     messages.push(...AgentModeService.buildOpenResearchRequestReminder(openResearchRequests));
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
+    // ENG-2227: this turn's own message is deliberately filtered OUT of sessionHistory above
+    // (the dedupe filter at the top of this function) and reconstructed here as a bare string,
+    // bypassing the per-message loop above entirely — including its anonymous-sender marker.
+    // That left the single highest-stakes turn (the live reaction to a fresh anonymous claim,
+    // before it's even "history") with zero provenance signal. Apply the same marker here when
+    // this turn itself came through the public ishare endpoint.
+    const currentMessageContent = isCurrentTurnAnonymousIshare
+      ? `${messageContent}\n\n[Sent by an anonymous viewer via a shared link — not a verified account owner]`
+      : messageContent;
     if (screenshotUrl) {
       messages.push({
         role: 'user',
         content: [
-          { type: 'text', text: `${messageContent}\n\n[Page screenshot captured. URL: ${screenshotUrl}]` },
+          { type: 'text', text: `${currentMessageContent}\n\n[Page screenshot captured. URL: ${screenshotUrl}]` },
           { type: 'image_url', image_url: { url: screenshotUrl, detail: 'low' } }
         ]
       });
     } else {
-      messages.push({ role: 'user', content: messageContent });
+      messages.push({ role: 'user', content: currentMessageContent });
     }
 
     return messages;
