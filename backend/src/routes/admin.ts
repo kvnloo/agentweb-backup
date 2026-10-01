@@ -4932,6 +4932,7 @@ router.get("/subscription-types", async (req, res) => {
         ...(type.monthlyCostAllowance != null ? { monthlyCostAllowance: type.monthlyCostAllowance } : {}),
         ...(type.llmUsagePolicy ? { llmUsagePolicy: type.llmUsagePolicy } : {}),
         ...(type.llmUsageTopUp ? { llmUsageTopUp: type.llmUsageTopUp } : {}),
+        ...(type.seatPricing ? { seatPricing: type.seatPricing } : {}),
       };
     }));
 
@@ -5083,6 +5084,31 @@ router.post("/subscription-types", async (req, res) => {
         }
       }
 
+      // Seat-based billing (ENG-2243..2246): admin-configured pricing for extra
+      // org seats. priceCents is the full monthly per-seat charge; baseSeats
+      // mirrors orgSeatService.baseSeatsForTier for display/config purposes.
+      let normalizedSeatPricing: any = undefined;
+      if (type.seatPricing != null) {
+        normalizedSeatPricing = {
+          priceCents: Number(type.seatPricing.priceCents),
+          usageCreditMicroUsd: Number(type.seatPricing.usageCreditMicroUsd),
+          baseSeats: Number(type.seatPricing.baseSeats),
+        };
+        const seatPricingErrors: string[] = [];
+        if (!Number.isInteger(normalizedSeatPricing.priceCents) || normalizedSeatPricing.priceCents <= 0) {
+          seatPricingErrors.push('priceCents must be a positive integer');
+        }
+        if (!Number.isInteger(normalizedSeatPricing.usageCreditMicroUsd) || normalizedSeatPricing.usageCreditMicroUsd <= 0) {
+          seatPricingErrors.push('usageCreditMicroUsd must be a positive integer');
+        }
+        if (!Number.isInteger(normalizedSeatPricing.baseSeats) || normalizedSeatPricing.baseSeats < 0) {
+          seatPricingErrors.push('baseSeats must be a non-negative integer');
+        }
+        if (seatPricingErrors.length > 0) {
+          throw new Error(`${type.name} seat pricing: ${seatPricingErrors.join('; ')}`);
+        }
+      }
+
       // Pass through hiddenPages as-is; validate it's an array of strings
       const hiddenPages: string[] = Array.isArray(type.hiddenPages)
         ? type.hiddenPages.filter((p: any) => typeof p === 'string')
@@ -5099,6 +5125,7 @@ router.post("/subscription-types", async (req, res) => {
         ...(parsedCostAllowance != null && !isNaN(parsedCostAllowance) ? { monthlyCostAllowance: parsedCostAllowance } : {}),
         ...(normalizedLlmUsagePolicy ? { llmUsagePolicy: normalizedLlmUsagePolicy } : {}),
         ...(normalizedLlmUsageTopUp ? { llmUsageTopUp: normalizedLlmUsageTopUp } : {}),
+        ...(normalizedSeatPricing ? { seatPricing: normalizedSeatPricing } : {}),
       };
     }));
 
