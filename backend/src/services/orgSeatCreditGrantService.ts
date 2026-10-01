@@ -29,6 +29,24 @@
  * `grantMonthlyLlmUsageCredit`'s own grantId ledger + ConditionalCheckFailedException
  * retry loop (llmUsageCreditService.ts). This module's only job is to decide,
  * once per org per sweep, what to call that function with.
+ *
+ * DECIDED SCOPE LIMIT, not an oversight (2026-10-01 review): the grant id is
+ * `seat-credit:{orgId}:{month}` — scoped to org+month, not to the seat count
+ * at grant time. If an org raises `purchasedExtraSeats` mid-month (buys more
+ * seats after this month's grant already landed), the additional credit is
+ * NOT back-filled for the remainder of the current month — it first shows up
+ * once this sweep runs again under next month's grant id, at the new total.
+ * This was considered and deliberately NOT "fixed" with an immediate
+ * mid-cycle top-up: doing that correctly needs either a delta-tracking ledger
+ * (real risk of a worse double-credit bug if rushed) or folding seat credit
+ * into the live policy-threshold resolution in llmUsagePolicyResolverService.ts
+ * instead of a ledgered grant (a larger change touching every usage check in
+ * the system, not just seat billing). Both are real options for a follow-up
+ * iteration; shipping the simpler, well-tested monthly-grant model now with
+ * this limitation disclosed beats rushing either under deadline pressure.
+ * `grantMonthlySeatCreditForOrg` logs when it skips an org this way so the
+ * gap stays visible in logs rather than silently indistinguishable from a
+ * routine idempotent replay.
  */
 
 import { orgDb, type Organization } from './db';
@@ -110,6 +128,20 @@ export async function grantMonthlySeatCreditForOrg(
     now,
     reason: `Seat-based billing: ${seats} purchased extra seat(s) for ${usageMonth}`,
   });
+
+  if (!result.granted) {
+    // Idempotent replay — normal on every subsequent daily sweep run this
+    // month. Logged at this (not error) level purely so the "mid-month
+    // seat increase isn't back-filled" scope limit documented above stays
+    // traceable: if `seats`/`amountMicroUsd` here is higher than whatever
+    // was actually granted under this exact grantId earlier this month,
+    // that gap is this decided limitation, not a failure — cross-reference
+    // against AW-Users' llmUsageCredits ledger for this billingUserId/grantId
+    // if a customer ever reports a shortfall.
+    console.log(
+      `[orgSeatCreditGrantService] ${grantId} already granted this month; current seat count (${seats}) would compute ${amountMicroUsd} microUSD — if this differs from the original grant, seats increased mid-month and the difference lands next cycle (decided scope limit, see file header).`
+    );
+  }
 
   return { orgId: org.orgId, attempted: true, granted: result.granted, amountMicroUsd };
 }

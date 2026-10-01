@@ -249,6 +249,43 @@ describe('orgSeatCreditGrantService', () => {
     });
   });
 
+  describe('documented scope limit: mid-month seat increases are not back-filled', () => {
+    it('does not top up an org that already received this month\'s grant, even after purchasedExtraSeats rises — the increase is credited next month, not retroactively this month', async () => {
+      const org: any = { orgId: 'org-midmonth', ownerUserId: 'owner-midmonth', purchasedExtraSeats: 3 };
+      seedOwner(org.ownerUserId);
+
+      const first = await grantMonthlySeatCreditForOrg(org, NOW);
+      expect(first).toEqual({ orgId: 'org-midmonth', attempted: true, granted: true, amountMicroUsd: 90_000_000 });
+
+      // Org buys 2 more seats mid-month — now 5 total.
+      org.purchasedExtraSeats = 5;
+
+      const second = await grantMonthlySeatCreditForOrg(org, NOW);
+      // Still idempotent: this is the decided v1 scope limit (file header),
+      // not a bug. If this ever starts asserting `granted: true` or a second
+      // ledger entry, someone has changed the grant-id scheme to be seat-count-
+      // specific without updating this test to match the new, presumably
+      // intentional, immediate-top-up behavior.
+      expect(second.attempted).toBe(true);
+      expect(second.granted).toBe(false);
+
+      // The ledger must still show only the original $90 for 3 seats — not
+      // $150 for the new total of 5, and not $90+$150 double-counted.
+      expect(users['owner-midmonth'].llmUsageCredits.totalPurchasedMicroUsd).toBe(90_000_000);
+      expect(users['owner-midmonth'].llmUsageCredits.grantIds).toEqual([
+        seatCreditGrantId('org-midmonth', USAGE_MONTH),
+      ]);
+
+      // Next month, the sweep grants fresh against the (by then current) seat
+      // count. The ledger is a per-month total (MonthlyLlmUsageCredits), not a
+      // lifetime cumulative one, so November's total is just November's grant.
+      const nextMonth = new Date('2026-11-01T00:00:00.000Z');
+      const third = await grantMonthlySeatCreditForOrg(org, nextMonth);
+      expect(third).toEqual({ orgId: 'org-midmonth', attempted: true, granted: true, amountMicroUsd: 150_000_000 });
+      expect(users['owner-midmonth'].llmUsageCredits.totalPurchasedMicroUsd).toBe(150_000_000);
+    });
+  });
+
   describe('fractional purchasedExtraSeats', () => {
     it('treats a seat count that floors to zero as fully ineligible — no call, no phantom eligible count', async () => {
       const org = { orgId: 'org-fractional', ownerUserId: 'owner-fractional', purchasedExtraSeats: 0.5 } as any;
