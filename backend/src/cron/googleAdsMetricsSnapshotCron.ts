@@ -1,6 +1,7 @@
 import { userDb } from "../services/db";
 import { googleAdsService } from "../services/googleAdsService";
 import { ConnectedAccount, GoogleAdsConfig } from "../services/connectedAccountsDb";
+import { isEvaluationUser } from "../services/evaluationPolicy";
 import {
   adsMetricsDb,
   buildEntityKey,
@@ -293,11 +294,23 @@ export interface DistinctGoogleAdsAccount {
  * page/Instagram-style split to filter out — see GoogleAdsConfig in connectedAccountsDb.ts), so
  * this needs no isMetaAdAccount-equivalent predicate: `platform === 'google_ads'` is sufficient.
  *
- * `userDb.getAllUsers()` already excludes soft-deleted (`deleted_`-prefixed) and sandbox/
- * evaluation userIds — see its own filter — so no extra filtering is needed here either.
+ * Reads via `userDb.scanWithFilter`, not `userDb.getAllUsers()`: the latter additionally fans
+ * out three full secondary-index scans (tasks/workflows/chat sessions) per user for
+ * admin-dashboard display, irrelevant here and multiplying the cost of every cron run — see
+ * connectedAccountsDb.ts's getAccountsByAttioWorkspaceId for the same tradeoff reasoning.
+ * `scanWithFilter` already excludes soft-deleted (`deleted_`-prefixed) users via its own
+ * built-in filter, but NOT sandbox/evaluation userIds (that exclusion is `getAllUsers()`-only),
+ * so eval users are filtered out explicitly below.
  */
 export async function enumerateDistinctGoogleAdsAccounts(): Promise<DistinctGoogleAdsAccount[]> {
-  const users = await userDb.getAllUsers();
+  // scanWithFilter, not getAllUsers(): getAllUsers() additionally fans out three full
+  // secondary-index scans (tasks/workflows/chat sessions) per user for admin-dashboard
+  // display, irrelevant here and multiplying the cost of every cron run — the same
+  // reasoning connectedAccountsDb.ts's getAccountsByAttioWorkspaceId documents for the
+  // same tradeoff. Eval/sandbox users are excluded to match getAllUsers()'s default
+  // (includeSandbox: false).
+  const rawUsers = await userDb.scanWithFilter("attribute_exists(connected_accounts)", {});
+  const users = rawUsers.filter((user: { userId: unknown }) => !isEvaluationUser(user.userId));
   const byCustomerId = new Map<string, Array<{ userId: string; createdAt: string }>>();
 
   for (const user of users) {
