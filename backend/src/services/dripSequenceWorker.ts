@@ -12,6 +12,7 @@
  */
 
 import { dripSequenceDb, DripSequence, SequenceEnrollment, StepCondition, SequenceChannel } from './dripSequenceDb';
+import { isReachableEmail, canonicalLinkedInProfile } from '../utils/leadReachability';
 import { sendAsSender, SenderDailyLimitExceededError } from './sendAsSender';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { crmDb, userDb } from './db';
@@ -30,10 +31,12 @@ const INSTANCE_ID = uuidv4();
 export async function processDueEnrollments(): Promise<{
   processed: number;
   sent: number;
+  /** Steps the LEAD could not receive. Distinct from `errors`: nothing is wrong. */
+  skipped: number;
   exited: number;
   errors: number;
 }> {
-  const stats = { processed: 0, sent: 0, exited: 0, errors: 0 };
+  const stats = { processed: 0, sent: 0, skipped: 0, exited: 0, errors: 0 };
 
   let due: SequenceEnrollment[];
   try {
@@ -96,7 +99,7 @@ export async function processDueEnrollments(): Promise<{
 
 async function processEnrollment(
   enrollment: SequenceEnrollment,
-  stats: { sent: number; exited: number },
+  stats: { sent: number; skipped: number; exited: number },
 ): Promise<void> {
   const sequence = await dripSequenceDb.getSequence(enrollment.sequenceId);
   if (!sequence || sequence.status === 'archived') {
@@ -118,13 +121,32 @@ async function processEnrollment(
 
   const step = sequence.steps[enrollment.currentStep];
   if (!step) {
-    // No more steps — sequence complete
-    await dripSequenceDb.completeEnrollment(enrollment.enrollmentId, 'completed');
+    // No more steps — sequence complete. delivered=false: this branch sends nothing, it
+    // just notices there is nothing left to send.
+    //
+    // Same everDelivered test as the completion branch below. Writing a flat 'completed'
+    // here contradicted it: an enrollment that reached this branch having sent nothing
+    // (its sequence was shortened under it, say) was recorded as fully delivered AND
+    // permanently barred from re-enrolment, which is the pair of defects
+    // 'completed_no_sends' exists to separate.
+    const everDelivered = !!(enrollment as any).lastEmailSentAt || !!(enrollment as any).lastLinkedInSentAt;
+    await dripSequenceDb.completeEnrollment(
+      enrollment.enrollmentId,
+      everDelivered ? 'completed' : 'completed_no_sends',
+      'completed',
+      'email',
+      false,
+    );
     stats.exited++;
     return;
   }
 
-  const channel: SequenceChannel = step.channel ?? 'email';
+  // Normalised the same way requiredChannels does in the route. Lower-casing only there
+  // turned a dead misconfiguration into a live one: a step authored as 'LinkedIn' passed
+  // the route's reachability test, then failed `channel === 'linkedin'` here and was sent
+  // down the EMAIL branch — a blank email, counted as sent, stamped into lastEmailSentAt.
+  const channel: SequenceChannel =
+    (String(step.channel ?? 'email').trim().toLowerCase() as SequenceChannel);
 
   // Build variable context for substitution (shared by both channels)
   const lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
@@ -144,7 +166,10 @@ async function processEnrollment(
   const msgVars: Record<string, any> = {
     firstName: lead?.firstName ?? '',
     lastName: lead?.lastName ?? '',
-    email: enrollment.leadEmail,
+    // NOT enrollment.leadEmail — that is the dedup IDENTITY, and for a lead with no
+    // address it holds the LinkedIn URL. msgVars is shared by both channels, so a
+    // {{email}} token in a LinkedIn DM rendered the recipient their own profile URL.
+    email: lead?.email ?? '',
     company: lead?.company ?? '',
     title: lead?.title ?? '',
     senderName: user?.displayName ?? user?.name ?? '',
@@ -152,23 +177,47 @@ async function processEnrollment(
     customFields: lead?.customFields ?? {},
   };
 
-  if (channel === 'linkedin') {
-    await sendLinkedInStep(enrollment, step, lead, msgVars);
-  } else {
-    await sendEmailStep(enrollment, step, user, msgVars);
-  }
+  // A step the LEAD cannot receive is skipped, not failed. It used to throw, and the
+  // throw propagated out of here, so the enrollment retried the same undeliverable step
+  // forever and never reached the steps it COULD receive: an email-only lead in a
+  // mixed sequence got its email and then jammed. Configuration problems (no sender, no
+  // LinkedIn account, empty message text) still throw, because those are worth retrying
+  // once the user fixes them.
+  const delivered = channel === 'linkedin'
+    ? await sendLinkedInStep(enrollment, step, lead, msgVars)
+    : await sendEmailStep(enrollment, step, user, msgVars, lead);
 
-  // Advance or complete only after confirmed send
+  // Advance or complete either way — a skipped step is done with, not pending.
   const nextStepIndex = enrollment.currentStep + 1;
   if (nextStepIndex >= sequence.steps.length) {
-    await dripSequenceDb.completeEnrollment(enrollment.enrollmentId, 'completed', 'completed', channel);
+    // Did this enrollment EVER send anything? The send timestamps are stamped only on
+    // delivery, so their absence — plus this final step also being skipped — means the
+    // lead received nothing at all. Recording that as plain 'completed' barred it from
+    // ever being re-enrolled (getExistingEnrollment matches regardless of status), which
+    // is what this distinction is for.
+    //
+    // It does NOT yet change any dashboard: getEnrollmentStats buckets on `status`, and
+    // these rows keep `status: 'completed'`. Nothing outside dripSequenceDb reads
+    // `exitReason` today. Surfacing "enrolled but never reachable" in the UI is a
+    // separate change; this one only unblocks re-enrolment.
+    const everDelivered = delivered
+      || !!(enrollment as any).lastEmailSentAt
+      || !!(enrollment as any).lastLinkedInSentAt;
+    await dripSequenceDb.completeEnrollment(
+      enrollment.enrollmentId,
+      everDelivered ? 'completed' : 'completed_no_sends',
+      'completed',
+      channel,
+      delivered,
+    );
   } else {
     const nextStep = sequence.steps[nextStepIndex];
     const nextSendAt = addDays(new Date(), nextStep.delayDays).toISOString();
-    await dripSequenceDb.advanceEnrollment(enrollment.enrollmentId, nextStepIndex, nextSendAt, channel);
+    await dripSequenceDb.advanceEnrollment(enrollment.enrollmentId, nextStepIndex, nextSendAt, channel, delivered);
   }
 
-  stats.sent++;
+  if (delivered) stats.sent++;
+  else stats.skipped++;
 }
 
 async function sendEmailStep(
@@ -176,7 +225,27 @@ async function sendEmailStep(
   step: any,
   user: any,
   msgVars: Record<string, any>,
-): Promise<void> {
+  lead: any,
+): Promise<boolean> {
+  // The enrollment's `leadEmail` is its dedup IDENTITY, not necessarily an address: a
+  // lead with no email carries its LinkedIn URL there (see sequences.ts
+  // enrollmentIdentity). Sending to that would hand a profile URL to the mail provider.
+  //
+  // Prefer the LIVE row. The identity is frozen at enrolment, so a lead that has GAINED
+  // an address since would otherwise have its email step skipped forever and consumed —
+  // a silent lost send, which is exactly what this whole change set out to stop. The
+  // LinkedIn step already reads the live lead; this makes the two consistent.
+  //
+  // And the check is a SHAPE, not `includes('@')`: db.ts stores `lead.linkedin`
+  // verbatim for anything that is not a personal /in/ profile, so a handle like
+  // `@ada-lovelace` passed the old test and reached the mail provider. Shared with the
+  // enrol routes so the two cannot disagree about who is reachable.
+  const recipient = String(lead?.email ?? enrollment.leadEmail ?? '').trim();
+  if (!isReachableEmail(recipient)) {
+    console.log(`[dripWorker] Email step ${step.stepNumber} skipped for enrollment ${enrollment.enrollmentId}: lead has no email address`);
+    return false;
+  }
+
   // Load configured senders for this user
   const senderConfig = await loadSenderConfig(enrollment.userId);
 
@@ -188,7 +257,12 @@ async function sendEmailStep(
   bodyHtml = normalizeYoutubeUrls(bodyHtml);
 
   const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
-  const unsubscribeUrl = `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe?listId=${encodeURIComponent(enrollment.listId)}&leadId=${encodeURIComponent(enrollment.leadId)}&email=${encodeURIComponent(enrollment.leadEmail)}`;
+  // `recipient`, NOT enrollment.leadEmail. The identity is the LinkedIn URL for a lead
+  // that had no address at enrolment, and crmPublic's unsubscribe handler compares the
+  // `email` param against lead.email — so the link in a cold email 403'd and the
+  // recipient could not unsubscribe. This became reachable the moment the email step
+  // started sending to the live address instead of skipping.
+  const unsubscribeUrl = `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe?listId=${encodeURIComponent(enrollment.listId)}&leadId=${encodeURIComponent(enrollment.leadId)}&email=${encodeURIComponent(recipient)}`;
   bodyHtml = injectUnsubscribeUrl(bodyHtml, unsubscribeUrl);
 
   const selectedSender = senderConfig.senders.find(
@@ -204,16 +278,17 @@ async function sendEmailStep(
   let sendResult;
   try {
     sendResult = await sendAsSender(enrollment.userId, sender, {
-      to: enrollment.leadEmail,
+      to: recipient,
       subject,
       html: bodyHtml,
     });
   } catch (error) {
-    console.error(`[dripWorker] Send failed for step ${step.stepNumber} to ${enrollment.leadEmail}:`, error);
+    console.error(`[dripWorker] Send failed for step ${step.stepNumber} to ${recipient}:`, error);
     throw error;
   }
 
-  console.log(`[dripWorker] Sent email step ${step.stepNumber} to ${enrollment.leadEmail} via ${sendResult.provider} (id: ${sendResult.messageId})`);
+  console.log(`[dripWorker] Sent email step ${step.stepNumber} to ${recipient} via ${sendResult.provider} (id: ${sendResult.messageId})`);
+  return true;
 }
 
 async function sendLinkedInStep(
@@ -221,11 +296,33 @@ async function sendLinkedInStep(
   step: any,
   lead: any,
   msgVars: Record<string, any>,
-): Promise<void> {
-  const linkedInUrl = lead?.linkedin?.trim();
+): Promise<boolean> {
+  // SEND THE CANONICAL URL, NOT THE RAW FIELD.
+  //
+  // Must be a PERSONAL profile. db.ts stores `lead.linkedin` verbatim for anything that
+  // is not a /in/ URL — company and school pages, handles, free text from a CSV — and
+  // sendMessage throws on those. That throw is not a lead-data skip, so it retried
+  // forever: the exact failure this whole change set out to kill, surviving in the one
+  // case the emptiness check does not catch.
+  //
+  // The predicate normalises before judging (it strips query/fragment and lower-cases),
+  // so it accepts `?originalSubdomain=uk`, `#about` and `/IN/Ada`. Gating on the
+  // normalised value and then sending the RAW one reopened that same retry-forever jam
+  // on every URL the widening newly admitted: linkedInOutreachService.getLinkedInProfile
+  // does a plain case-sensitive `split('/in/')` and passes the tail to Unipile verbatim,
+  // so the raw value arrives as `ada?originalSubdomain=uk` (404) or, for `/IN/Ada`,
+  // fails `parts.length < 2` and throws outright. leadLinkedinCanonicalizer exists
+  // because pre-ENG-787 rows hold exactly these shapes, so the population is real.
+  //
+  // Take the value the predicate actually validated.
+  const linkedInUrl = canonicalLinkedInProfile(lead?.linkedin);
   if (!linkedInUrl) {
-    console.error(`[dripWorker] LinkedIn step skipped for enrollment ${enrollment.enrollmentId}: lead has no LinkedIn URL`);
-    throw new Error(`Lead ${enrollment.leadEmail} has no LinkedIn URL for LinkedIn step`);
+    // A LEAD-DATA gap, not a failure. Throwing here rethrew out of processEnrollment, so the
+    // enrollment retried this step forever and never reached the steps it COULD receive.
+    // The configuration throws below are deliberately left as throws: retrying those is
+    // correct, because they start working the moment the user fixes the config.
+    console.log(`[dripWorker] LinkedIn step ${step.stepNumber} skipped for enrollment ${enrollment.enrollmentId}: lead has no personal LinkedIn profile URL (${String(lead?.linkedin ?? '').trim() || 'empty'})`);
+    return false;
   }
 
   // Resolve which LinkedIn account to send from
@@ -252,6 +349,7 @@ async function sendLinkedInStep(
       if (providerId) await dripSequenceDb.setEnrollmentLinkedInProviderId(enrollment.enrollmentId, providerId);
     } catch { /* non-critical */ }
   }
+  return true;
 }
 
 async function checkExitConditions(
@@ -260,9 +358,17 @@ async function checkExitConditions(
 ): Promise<'converted' | 'engagement' | 'unsubscribed' | null> {
   const { exitConditions } = sequence;
 
-  // Fetch lead once — needed for lifecycle and unsubscribe checks
+  // Fetch lead once — needed for lifecycle, unsubscribe AND the engagement key.
+  // onEmailEngagement was NOT in this condition, so for a sequence configured with only
+  // that exit the lead was null and the engagement lookup fell back to the enrollment
+  // identity — which for an address-less lead is its LinkedIn URL, and matches no Resend
+  // event. The exit could never fire.
   let lead: any = null;
-  if (exitConditions.onLifecycleChange?.length || exitConditions.onUnsubscribe) {
+  if (
+    exitConditions.onLifecycleChange?.length
+    || exitConditions.onUnsubscribe
+    || exitConditions.onEmailEngagement?.length
+  ) {
     lead = await crmDb.getLeadById(enrollment.listId, enrollment.leadId).catch(() => null);
   }
 
@@ -298,8 +404,13 @@ async function checkExitConditions(
         `user ${enrollment.userId} has no emailDomain, so no email events exist`,
       );
     } else {
+      // Keyed on the address Resend actually saw, not on the enrollment identity. For a
+      // lead enrolled without an address the identity is its LinkedIn URL, so this query
+      // matched nothing and a sequence set to stop on 'replied' kept sending to someone
+      // who had already replied. `lead` is loaded above for the unsubscribe check.
+      const engagementKey = String((lead as any)?.email ?? '').trim() || enrollment.leadEmail;
       const events = await emailEventsDb
-        .getEventsByEmailDomainAndLeadEmail(emailDomain, enrollment.leadEmail)
+        .getEventsByEmailDomainAndLeadEmail(emailDomain, engagementKey)
         .catch(() => []);
 
       // Scope to engagement that happened AFTER this enrollment started.
@@ -360,8 +471,20 @@ async function checkExitConditions(
 
   // Check LinkedIn reply exit — fetch messages and look for inbound after enrollment
   if (exitConditions.onLinkedInReply) {
-    const linkedInUrl = lead?.linkedin?.trim() || enrollment.leadEmail;
-    if (linkedInUrl?.includes('linkedin.com')) {
+    // Same canonical URL the send path uses, not a third predicate.
+    //
+    // This was `includes('linkedin.com')` over the RAW field, and it handed that raw
+    // value to resolveProviderId. For a profile carrying `?originalSubdomain=uk` the
+    // resolve is `.catch(() => null)`-wrapped, so it failed silently and the reply-exit
+    // never fired at all — a sequence set to stop on a LinkedIn reply kept DMing someone
+    // who had already replied. The `linkedInProviderId` cache does not save it: the send
+    // that would populate the cache is the one that was throwing.
+    //
+    // `enrollment.leadEmail` is still the fallback because for an address-less lead that
+    // field holds the canonical profile URL — it IS the dedup identity.
+    const linkedInUrl = canonicalLinkedInProfile(lead?.linkedin)
+      ?? canonicalLinkedInProfile(enrollment.leadEmail);
+    if (linkedInUrl) {
       try {
         const accountId = await linkedInOutreachService.resolveAccountId(enrollment.userId);
         if (accountId) {

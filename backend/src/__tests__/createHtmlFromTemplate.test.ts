@@ -33,6 +33,7 @@ jest.mock('axios', () => ({
 
 // Mock crypto
 jest.mock('crypto', () => ({
+  ...jest.requireActual('crypto'),
   createHash: jest.fn(() => ({
     update: jest.fn().mockReturnThis(),
     digest: jest.fn().mockReturnValue('mock-hash')
@@ -247,6 +248,141 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(promptContent).toContain('&amp;');
       expect(promptContent).toContain('&quot;Sale&quot;');
       expect(promptContent).toContain('&lt;b&gt;Bold&lt;/b&gt;');
+    });
+
+    it('ENG-1960: logs markup-like variable paths without mutating the values', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        // This test exercises an array_variable_values entry ('items'), so the
+        // template mock must declare it in arrayVariables — otherwise the
+        // pre-existing "Extra array variables provided" validation rejects the
+        // call before it ever reaches the ENG-1960 detection code below.
+        const templateWithItems = {
+          ...mockTemplate,
+          arrayVariables: ['items'],
+          html_content: '<html><body><h1>{{title}}</h1><p>{{content}}</p><ul>{{#items}}<li>{{item}}</li>{{/items}}</ul></body></html>',
+        };
+        (settingsService.getSetting as jest.Mock).mockResolvedValue({
+          settingValue: JSON.stringify([templateWithItems]),
+        });
+
+        await (agentModeService as any).createHtmlFromTemplate(
+          agentModeService.default_model,
+          'test-template-id',
+          {
+            title: 'Quarterly report',
+            content: '<ul><li><strong>Revenue</strong></li></ul>',
+          },
+          {
+            items: [{ item: '- first point\n- second point' }],
+          },
+          'user123',
+          'session123'
+        );
+
+        const markupWarning = warnSpy.mock.calls.find(
+          ([message]) => message === '[ENG-1960] create_html_from_template received markup-like variable values'
+        );
+        expect(markupWarning).toBeDefined();
+        expect(markupWarning?.[1]).toEqual({
+          count: 2,
+          paths: ['variable_values.content', 'array_variable_values.items[0].<field>'],
+          paths_truncated: false,
+        });
+
+        // Detection is observability only. Existing escaping/substitution owns behavior.
+        const [, messages] = (agentModeService.callLLM as jest.Mock).mock.calls[0];
+        expect(messages[0].content).toContain('&lt;ul&gt;&lt;li&gt;&lt;strong&gt;Revenue&lt;/strong&gt;&lt;/li&gt;&lt;/ul&gt;');
+        expect(messages[0].content).toContain('- first point\\n- second point');
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it('ENG-1960: detects common Markdown forms, redacts nested keys, and caps logged paths', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const templateWithItems = {
+          ...mockTemplate,
+          arrayVariables: ['items'],
+          html_content: '<html><body><ul>{{#items}}<li>{{item}}</li>{{/items}}</ul></body></html>',
+        };
+        (settingsService.getSetting as jest.Mock).mockResolvedValue({
+          settingValue: JSON.stringify([templateWithItems]),
+        });
+        const items = Array.from({ length: 25 }, (_, index) => ({
+          [`customer_secret_${index}`]:
+            index % 3 === 0 ? '*emphasis*' : index % 3 === 1 ? '`inline code`' : '> quoted text',
+        }));
+
+        await (agentModeService as any).createHtmlFromTemplate(
+          agentModeService.default_model,
+          'test-template-id',
+          { title: 'Quarterly report', content: 'Plain text' },
+          { items },
+          'user123',
+          'session123'
+        );
+
+        const markupWarning = warnSpy.mock.calls.find(
+          ([message]) => message === '[ENG-1960] create_html_from_template received markup-like variable values'
+        );
+        expect(markupWarning).toBeDefined();
+        expect(markupWarning?.[1].count).toBe(25);
+        expect(markupWarning?.[1].paths).toHaveLength(20);
+        expect(markupWarning?.[1].paths_truncated).toBe(true);
+        expect(markupWarning?.[1].paths.every((p: string) => p.includes('.<field>'))).toBe(true);
+        expect(JSON.stringify(markupWarning?.[1])).not.toContain('customer_secret_');
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it('ENG-1960: detects quoted underscore emphasis without treating identifiers as Markdown', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        await (agentModeService as any).createHtmlFromTemplate(
+          agentModeService.default_model,
+          'test-template-id',
+          { title: '"_urgent_"', content: 'north_america_east' },
+          {},
+          'user123',
+          'session123'
+        );
+
+        const markupWarning = warnSpy.mock.calls.find(
+          ([message]) => message === '[ENG-1960] create_html_from_template received markup-like variable values'
+        );
+        expect(markupWarning?.[1]).toMatchObject({
+          count: 1,
+          paths: ['variable_values.title'],
+          paths_truncated: false,
+        });
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it('ENG-1960: does not flag ordinary punctuation such as a lone asterisk in a name', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        await (agentModeService as any).createHtmlFromTemplate(
+          agentModeService.default_model,
+          'test-template-id',
+          { title: 'A* Star', content: "Vince's ad — north_america_east" },
+          {},
+          'user123',
+          'session123'
+        );
+
+        expect(
+          warnSpy.mock.calls.some(
+            ([message]) => message === '[ENG-1960] create_html_from_template received markup-like variable values'
+          )
+        ).toBe(false);
+      } finally {
+        warnSpy.mockRestore();
+      }
     });
 
     // A single-quoted HTML attribute (e.g. <img src='{{url}}'>) is valid HTML the template
