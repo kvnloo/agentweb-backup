@@ -1037,6 +1037,36 @@ createTestAccount().then(async () => {
         console.error('[metaTrackingMonitorCron] Failed to initialize:', error);
       }
 
+      // Seat-based billing (ENG-2247) — daily sweep that grants each org's
+      // monthly LLM usage credit for its purchased extra seats. Anchored to a
+      // fixed UTC hour (same reasoning as metaTrackingMonitorCron above: a
+      // naive 24h setInterval never elapses in an environment that redeploys
+      // every 1-2 hours) — grantId idempotency in grantMonthlyLlmUsageCredit
+      // makes any extra fire within the same usage month a safe no-op.
+      try {
+        const { runOrgSeatCreditGrant } = await import('./cron/orgSeatCreditGrantCron');
+        const { msUntilNextUtcHour } = await import('./utils/dailySchedule');
+        const SEAT_CREDIT_GRANT_HOUR_UTC = 10;
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const msUntilFirstSeatCreditRun = msUntilNextUtcHour(SEAT_CREDIT_GRANT_HOUR_UTC);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('orgSeatCreditGrantCron', runOrgSeatCreditGrant())
+            .catch(e => console.error('[orgSeatCreditGrantCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('orgSeatCreditGrantCron', runOrgSeatCreditGrant())
+              .catch(e => console.error('[orgSeatCreditGrantCron] Error:', e));
+          }, DAY_MS);
+        }, msUntilFirstSeatCreditRun);
+        console.log(
+          `[orgSeatCreditGrantCron] Initialized — first run at ${SEAT_CREDIT_GRANT_HOUR_UTC}:00 UTC ` +
+          `(in ${Math.round(msUntilFirstSeatCreditRun / 60000)} min)`,
+        );
+      } catch (error) {
+        console.error('[orgSeatCreditGrantCron] Failed to initialize:', error);
+      }
+
       // Pre-Renewal Ad-Integration Health Check (ENG-1270) — runs daily.
       // Charging a customer while their ad platform connection is silently dead
       // is a trust break (ThinkingAI, TransAmerica — Aug 2026 audit, both caught
