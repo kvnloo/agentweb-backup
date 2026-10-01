@@ -6,7 +6,7 @@ import { callerCan, can, roleOf, isBillingRoot } from "../services/orgAuthz";
 import { v4 as uuidv4 } from "uuid";
 import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
-import { getUserSubscriptionResolution, getUserSubscriptionType } from "../services/subscriptionService";
+import { getUserSubscriptionResolution, getUserSubscriptionType, getTierConfig } from "../services/subscriptionService";
 import { purchaseExtraSeat, removeExtraSeat } from "../services/orgSeatBillingService";
 import {
   assertSeatAvailable,
@@ -511,15 +511,37 @@ router.get("/me", async (req: Request, res: Response) => {
           purchasedExtraSeats: number;
           effectiveCap: number | null;
           currentMemberCount: number;
+          // Forwarded as-is to the already-built (but, until this field existed,
+          // permanently inert — confirmed live, 2026-10-01: the real paywall
+          // modal rendered its hardcoded "$50/mo" fallback and no usage-boost
+          // line) frontend paywall/usage-boost copy — see SeatPaywallModal's
+          // `seatPricing` prop and getSeatUsageBoostCopy. Omitted (not sent
+          // with zeros) when the tier has no seatPricing configured yet, same
+          // "absent means nothing to show" contract as `seatInfo` itself.
+          seatPricing?: {
+            priceCents: number;
+            usageCreditMicroUsd: number;
+            hardCostThresholdMicroUsd?: number;
+          };
         }
       | undefined;
     if (baseSeats != null) {
       const currentMemberCount = await orgDb.getOrgMemberCount(org.orgId);
+      const ownerTierConfig = await getTierConfig(ownerTier);
       seatInfo = {
         baseSeats,
         purchasedExtraSeats: org.purchasedExtraSeats || 0,
         effectiveCap: effectiveSeatCap(baseSeats, org.purchasedExtraSeats),
         currentMemberCount,
+        ...(ownerTierConfig?.seatPricing
+          ? {
+              seatPricing: {
+                priceCents: ownerTierConfig.seatPricing.priceCents,
+                usageCreditMicroUsd: ownerTierConfig.seatPricing.usageCreditMicroUsd,
+                hardCostThresholdMicroUsd: ownerTierConfig.llmUsagePolicy?.hardCostThresholdMicroUsd,
+              },
+            }
+          : {}),
       };
     }
 

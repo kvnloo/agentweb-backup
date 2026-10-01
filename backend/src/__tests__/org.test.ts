@@ -14,6 +14,10 @@ let mockUsers: Record<string, any> = {};
 let mockOrgs: Record<string, any> = {};
 let mockSubscriptionType = 'Starter';
 let mockSubscriptionResolution: { subscriptionType: string; resolved: boolean } | undefined;
+// `null` by default: most tests never configured a tier's `seatPricing`
+// (matches production reality for every tier until an admin sets it), so
+// `/me`'s seatInfo.seatPricing should be absent unless a test opts in.
+let mockTierConfig: { seatPricing?: any; llmUsagePolicy?: any } | null = null;
 
 // Mock auth middleware
 jest.mock('../middleware/auth', () => ({
@@ -110,6 +114,13 @@ jest.mock('../services/subscriptionService', () => ({
   getUserSubscriptionResolution: jest.fn(() => Promise.resolve(
     mockSubscriptionResolution ?? { subscriptionType: mockSubscriptionType, resolved: true },
   )),
+  // Controllable per-test via `mockTierConfig` below — exercises the real
+  // `/me` code path that reads `seatPricing`/`llmUsagePolicy` off the tier
+  // config, rather than assuming the mock would never diverge from it (the
+  // previous version of this mock omitted `getTierConfig` entirely, which
+  // would have thrown "not a function" the moment `/me` started calling it —
+  // caught here, not in production).
+  getTierConfig: jest.fn(() => Promise.resolve(mockTierConfig)),
 }));
 const orgRoutes = require('../routes/org').default;
 
@@ -145,6 +156,7 @@ describe('Organization routes', () => {
     // each test's `attemptedFetches` assertions independent of run order.
     installNoNetworkGuard();
     mockSendEmail.mockResolvedValue(undefined);
+    mockTierConfig = null;
     mockOrgs = {};
     mockUsers = {
       'user-1': {
@@ -355,6 +367,60 @@ describe('Organization routes', () => {
 
         expect(res.status).toBe(200);
         expect(Object.prototype.hasOwnProperty.call(res.body.data, 'seatInfo')).toBe(false);
+      });
+
+      // Found via live production verification (2026-10-01): the frontend's
+      // SeatPaywallModal/getSeatUsageBoostCopy have been reading
+      // `org.seatInfo.seatPricing` since they shipped, but nothing ever sent
+      // it — confirmed live by triggering the real paywall modal in a browser
+      // and seeing the hardcoded "$50/mo" fallback and no usage-boost line,
+      // not the real configured numbers. This is the fix: forward the tier's
+      // admin-configured seatPricing (and the hard cost cap the boost
+      // percentage is computed against) once it exists, omit it when it
+      // doesn't — same "absent means nothing to show" contract as seatInfo
+      // itself, so an unconfigured tier doesn't regress to showing zeros.
+      it('forwards seatPricing (+ the tier hard cap) once an admin has configured it, so the already-built paywall copy stops being permanently inert', async () => {
+        mockSubscriptionType = 'Starter';
+        mockTierConfig = {
+          seatPricing: { priceCents: 5000, usageCreditMicroUsd: 30_000_000, baseSeats: 2 },
+          llmUsagePolicy: { hardCostThresholdMicroUsd: 80_000_000 },
+        };
+
+        const res = await request(app).get('/api/org/me');
+
+        expect(res.status).toBe(200);
+        expect(res.body.data.seatInfo.seatPricing).toEqual({
+          priceCents: 5000,
+          usageCreditMicroUsd: 30_000_000,
+          hardCostThresholdMicroUsd: 80_000_000,
+        });
+      });
+
+      it('omits seatPricing (not zeros) when the tier has no seatPricing configured yet — the live production state for every tier until this session configured it', async () => {
+        mockSubscriptionType = 'Starter';
+        mockTierConfig = { llmUsagePolicy: { hardCostThresholdMicroUsd: 80_000_000 } }; // no seatPricing
+
+        const res = await request(app).get('/api/org/me');
+
+        expect(res.status).toBe(200);
+        expect(Object.prototype.hasOwnProperty.call(res.body.data.seatInfo, 'seatPricing')).toBe(false);
+      });
+
+      it('omits hardCostThresholdMicroUsd (not null) when seatPricing is configured but the tier has no llmUsagePolicy', async () => {
+        mockSubscriptionType = 'Starter';
+        mockTierConfig = {
+          seatPricing: { priceCents: 5000, usageCreditMicroUsd: 30_000_000, baseSeats: 2 },
+          // llmUsagePolicy deliberately absent
+        };
+
+        const res = await request(app).get('/api/org/me');
+
+        expect(res.status).toBe(200);
+        expect(res.body.data.seatInfo.seatPricing).toEqual({
+          priceCents: 5000,
+          usageCreditMicroUsd: 30_000_000,
+          hardCostThresholdMicroUsd: undefined,
+        });
       });
     });
   });
