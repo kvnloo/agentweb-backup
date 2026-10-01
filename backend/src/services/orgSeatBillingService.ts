@@ -90,6 +90,16 @@ async function getOwnerWithLiveSubscription(orgId: string): Promise<OwnerSubscri
     throw new Error(`Owner ${org.ownerUserId} of organization ${orgId} not found`);
   }
   if (!owner.stripe_subscription_id) {
+    // Expected, handled refusal (e.g. an org whose owner hasn't completed
+    // Stripe checkout yet attempting to buy/remove a seat) — not a system
+    // failure, so this is a warn, not an error. Shared by both
+    // purchaseExtraSeat and removeExtraSeat (both resolve to this function),
+    // so logging once here covers either refusal without duplicating it at
+    // each call site.
+    console.warn('[orgSeatBillingService] seat operation refused: owner has no Stripe subscription', {
+      orgId,
+      ownerUserId: org.ownerUserId,
+    });
     throw new Error(
       `Organization ${orgId}'s owner (${org.ownerUserId}) has no Stripe subscription; cannot manage extra seats`
     );
@@ -137,10 +147,17 @@ export async function setOrgSeatQuantity(orgId: string, totalExtraSeats: number)
   const stripe = getStripeOrThrow();
   const subscription = await stripe.subscriptions.retrieve(stripeSubscriptionId);
   const seatItem = findSeatLineItem(subscription, productId);
+  // Captured before the mutation so the logging below (purchase vs removal)
+  // can be derived from the direction of the change, without purchaseExtraSeat
+  // / removeExtraSeat each needing to know Stripe/pricing details themselves —
+  // this remains "the ONLY place that talks to Stripe about an org's extra
+  // seats" (see module doc).
+  const previousTotalSeats = seatItem?.quantity ?? 0;
 
   if (totalExtraSeats === 0) {
     if (seatItem) {
       await stripe.subscriptionItems.del(seatItem.id);
+      console.info('[orgSeatBillingService] seat removed', { orgId, newTotalSeats: 0 });
     }
     return;
   }
@@ -175,6 +192,16 @@ export async function setOrgSeatQuantity(orgId: string, totalExtraSeats: number)
       price_data: priceData,
       quantity: totalExtraSeats,
     });
+  }
+
+  if (totalExtraSeats > previousTotalSeats) {
+    console.info('[orgSeatBillingService] seat purchased', {
+      orgId,
+      newTotalSeats: totalExtraSeats,
+      priceCentsCharged: seatPricing.priceCents,
+    });
+  } else if (totalExtraSeats < previousTotalSeats) {
+    console.info('[orgSeatBillingService] seat removed', { orgId, newTotalSeats: totalExtraSeats });
   }
 }
 
@@ -217,6 +244,17 @@ export async function removeExtraSeat(orgId: string): Promise<{ newTotalSeats: n
   const currentlyNeeded = baseSeats == null ? 0 : Math.max(0, currentMemberCount - baseSeats);
 
   if (newTotalSeats < currentlyNeeded) {
+    // Expected, handled refusal — the org's members currently occupy every
+    // seat it has, so removal is blocked. Useful signal for how often
+    // customers hit this wall, not a system failure, hence warn not error.
+    console.warn('[orgSeatBillingService] seat removal refused: seat occupied', {
+      orgId,
+      currentTotal,
+      currentMemberCount,
+      baseSeats,
+      currentlyNeeded,
+      ownerTier,
+    });
     throw new Error(
       `Cannot remove extra seat for organization ${orgId}: it has ${currentMemberCount} member(s) ` +
         `and only ${baseSeats} free seat(s) on the ${ownerTier} tier, so it needs at least ` +
