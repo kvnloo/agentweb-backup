@@ -6563,6 +6563,24 @@ export class AgentModeService {
         content = `${contentStr}\n\n**Attached Files:**\n${attachmentUrls}`;
       }
 
+      // ENG-2227: a message submitted via an anonymous ishare link carries no verified
+      // identity — metadata.ishareSender is stored on the message (agentModeController.ts)
+      // but was never surfaced into what the model actually reads, so a claim from an
+      // anonymous viewer looked identical to one from the verified account owner. Fold the
+      // marker into content on every reconstruction (not just the turn it arrived in), the
+      // same way attachments are folded in above, so it survives into later turns.
+      if (msg.role === 'user' && (msg as any).metadata?.ishareSender?.isAnonymous) {
+        let contentStr = '';
+        if (Array.isArray(content)) {
+          contentStr = content.map((item: any) => item?.text || '').filter(Boolean).join('\n');
+        } else if (typeof content === 'object' && content !== null) {
+          contentStr = (content as any).text || JSON.stringify(content);
+        } else {
+          contentStr = String(content);
+        }
+        content = `${contentStr}\n\n[Sent by an anonymous viewer via a shared link — not a verified account owner]`;
+      }
+
       const messageObj: any = { role: msg.role, content: content };
 
       // Add optional properties based on message type
