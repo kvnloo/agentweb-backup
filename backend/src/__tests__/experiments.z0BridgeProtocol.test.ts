@@ -71,6 +71,19 @@ describe('agentweb.z0.bridge.v1', () => {
     });
   });
 
+  it('treats proven host overload as pre-execution in every mode', () => {
+    expect(bridgeFailureDisposition('active', 'overload_pre_execution', 'dispatch')).toEqual({
+      status: 'not_executed',
+      reconcile_required: false,
+      retry: 'caller_may_fallback',
+    });
+    expect(bridgeFailureDisposition('shadow', 'overload_pre_execution', 'decide')).toEqual({
+      status: 'not_executed',
+      reconcile_required: false,
+      retry: 'caller_may_fallback',
+    });
+  });
+
   it('preserves ambiguity for active timeout/transport failures', () => {
     expect(bridgeFailureDisposition('active', 'timeout')).toEqual({
       status: 'unknown',
