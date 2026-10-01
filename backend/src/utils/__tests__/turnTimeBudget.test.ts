@@ -71,6 +71,34 @@ describe('evaluateTurnTimeBudget', () => {
     expect(state.phase).toBe('normal');
   });
 
+  // ENG-2231: reserveMs is handed straight through to the OpenAI SDK's `timeout`
+  // option a few calls downstream (agentModeService's llmCallTimeoutMs), which
+  // throws "timeout must be an integer" on a fractional value. Both totalMs/2 (odd
+  // totalMs) and slowestCallReserve's *1.25 multiplier (odd longestLlmCallMs) can
+  // independently produce a fraction — pin that reserveMs is always an integer
+  // regardless of which branch of the min/max produces it.
+  it('floors a fractional reserve from an odd total budget (totalMs/2)', () => {
+    const state = evaluateTurnTimeBudget({
+      startedAtMs: START,
+      hardCapMs: START + 600_001, // odd totalMs -> totalMs/2 = 300_000.5
+      nowMs: START + 10_000,
+      longestLlmCallMs: 590_000, // forces the totalMs/2 branch to win the min()
+    });
+    expect(state.reserveMs).toBe(300_000);
+    expect(Number.isInteger(state.reserveMs)).toBe(true);
+  });
+
+  it('floors a fractional reserve from the slowest-call multiplier (longestLlmCallMs * 1.25)', () => {
+    const state = evaluateTurnTimeBudget({
+      startedAtMs: START,
+      hardCapMs: CAP,
+      nowMs: START + 400_000,
+      longestLlmCallMs: 161_001, // *1.25 = 201_251.25
+    });
+    expect(state.reserveMs).toBe(201_251);
+    expect(Number.isInteger(state.reserveMs)).toBe(true);
+  });
+
   it('reports final_synthesis when the cap has already passed', () => {
     const state = evaluateTurnTimeBudget({ startedAtMs: START, hardCapMs: CAP, nowMs: START + 700_000 });
     expect(state.phase).toBe('final_synthesis');
