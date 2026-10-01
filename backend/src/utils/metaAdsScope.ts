@@ -141,6 +141,16 @@ export interface MetaAdsScopeConfigLike {
    * "never probed", same tri-state discipline as every other field here.
    */
   accessible_page_ids?: unknown;
+  /**
+   * The moment the twice-daily reconciliation sweep's Page probe (`has_meta_pages`
+   * / `existing_ads_page_id` / `accessible_page_ids`) was learned (ENG-2232) —
+   * the Page-access sibling of `ads_capability_probed_at` above, same CAS-retry
+   * race it guards against: a sweep's write, retried after a conflict, must
+   * defer to a concurrent writer's (another sweep's, or a reconnect's) NEWER
+   * Page probe rather than overwrite it with this one's now-stale answer.
+   * Internal to `metaAdsCapabilitySync.ts`'s own write — no gate reads it.
+   */
+  page_access_probed_at?: unknown;
 }
 
 /**

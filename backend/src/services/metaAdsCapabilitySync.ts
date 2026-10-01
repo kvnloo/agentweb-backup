@@ -101,6 +101,11 @@ export const syncMetaAdsCapability = async (
     // below: a failure here must not affect that outcome.
     try {
       const pages = await metaService.getPages(config.access_token);
+      // The moment THIS probe's answer was learned — same reason as the
+      // ads-scope probe's own `probedAt` below (Greptile P1 follow-up): every
+      // retry of the write guards against a concurrent writer's NEWER Page
+      // probe, not against itself.
+      const pageProbedAt = new Date().toISOString();
       let newHasPages = pages.length > 0;
       let newExistingAdsPageId: string | undefined;
       if (newHasPages) {
@@ -124,36 +129,80 @@ export const syncMetaAdsCapability = async (
           newExistingAdsPageId = existingPageIds[0];
         }
       }
+      const newAccessiblePageIds: string[] = pages.map((p: any) => p.id);
+
+      // Order-independent — Graph API doesn't guarantee stable ordering across calls.
+      const pageIdSetChanged = (a: string[], b: string[]) =>
+        a.length !== b.length || new Set(a).size !== new Set([...a, ...b]).size;
+
       const currentExistingAdsPageId =
         typeof config.existing_ads_page_id === 'string' ? config.existing_ads_page_id : undefined;
-      const existingAdsPageIdChanged = currentExistingAdsPageId !== newExistingAdsPageId;
-      const newAccessiblePageIds: string[] = pages.map((p: any) => p.id);
       const currentAccessiblePageIds: string[] = Array.isArray(config.accessible_page_ids)
         ? config.accessible_page_ids
         : [];
-      // Order-independent — Graph API doesn't guarantee stable ordering across calls.
-      const accessiblePageIdsChanged =
-        newAccessiblePageIds.length !== currentAccessiblePageIds.length ||
-        new Set(newAccessiblePageIds).size !== new Set([...newAccessiblePageIds, ...currentAccessiblePageIds]).size;
-      if (config.has_meta_pages !== newHasPages || existingAdsPageIdChanged || accessiblePageIdsChanged) {
+      // Cheap pre-check against the config already in hand, purely to skip the
+      // write attempt (and its DB read) entirely when nothing looks changed —
+      // mirrors the 'unchanged' early-return the ads-scope branches below take
+      // before ever calling updateAccountConfig. The actual write decision is
+      // made fresh inside the function form below, never from this snapshot.
+      const likelyChanged =
+        config.has_meta_pages !== newHasPages ||
+        currentExistingAdsPageId !== newExistingAdsPageId ||
+        pageIdSetChanged(newAccessiblePageIds, currentAccessiblePageIds);
+
+      if (likelyChanged) {
         const { updateAccountConfig: persistPageAccess } = await import('./connectedAccountsDb');
-        await persistPageAccess(userId, platform as any, account.account_id, {
-          has_meta_pages: newHasPages,
-          // Only written when it's actually changing — explicit null (not
-          // omitted) so a stale Page id from a PRIOR wrong-page verdict is
-          // cleared once that's no longer the reason (e.g. access dropped to
-          // zero Pages entirely, or was fixed). Omitted entirely when nothing
-          // about it changed, so an unrelated has_meta_pages flip doesn't
-          // rewrite a field that was never set to begin with.
-          ...(existingAdsPageIdChanged ? { existing_ads_page_id: newExistingAdsPageId ?? null } : {}),
-          // The actual accessible Page ids, read back by getAccessiblePageIds
-          // for the AD_CREATIVE CREATE page_id gate (ENG-2232). Same
-          // only-when-changed discipline as the fields above.
-          ...(accessiblePageIdsChanged ? { accessible_page_ids: newAccessiblePageIds } : {}),
+        // Function form (same reason as the ads-scope writes below): a CAS
+        // retry must decide what to write from THIS attempt's fresh read, not
+        // reapply a plain object computed from the config read at the top of
+        // this function — a stale pre-computed write reapplied on retry could
+        // silently clobber a concurrent writer's newer state (e.g. a user's
+        // own reconnect landing between this sweep's probe and its write
+        // finally committing).
+        await persistPageAccess(userId, platform as any, account.account_id, freshConfig => {
+          // A fresher Page probe already landed (another sweep run, or a
+          // connect/reconnect) — that answer is newer than this one; defer to
+          // it instead of overwriting with stale data.
+          const storedProbedAt = freshConfig.page_access_probed_at;
+          if (typeof storedProbedAt === 'string' && storedProbedAt > pageProbedAt) {
+            return { updates: {}, skip: true };
+          }
+
+          const freshExistingAdsPageId =
+            typeof freshConfig.existing_ads_page_id === 'string' ? freshConfig.existing_ads_page_id : undefined;
+          const freshAccessiblePageIds: string[] = Array.isArray(freshConfig.accessible_page_ids)
+            ? freshConfig.accessible_page_ids
+            : [];
+          const existingAdsPageIdChanged = freshExistingAdsPageId !== newExistingAdsPageId;
+          const accessiblePageIdsChanged = pageIdSetChanged(newAccessiblePageIds, freshAccessiblePageIds);
+
+          if (freshConfig.has_meta_pages === newHasPages && !existingAdsPageIdChanged && !accessiblePageIdsChanged) {
+            return { updates: {}, skip: true };
+          }
+
+          return {
+            updates: {
+              has_meta_pages: newHasPages,
+              page_access_probed_at: pageProbedAt,
+              // Only written when it's actually changing — explicit null (not
+              // omitted) so a stale Page id from a PRIOR wrong-page verdict is
+              // cleared once that's no longer the reason (e.g. access dropped
+              // to zero Pages entirely, or was fixed). Omitted entirely when
+              // nothing about it changed, so an unrelated has_meta_pages flip
+              // doesn't rewrite a field that was never set to begin with.
+              ...(existingAdsPageIdChanged ? { existing_ads_page_id: newExistingAdsPageId ?? null } : {}),
+              // The actual accessible Page ids, read back by
+              // getAccessiblePageIds for the AD_CREATIVE CREATE page_id gate
+              // (ENG-2232). Same only-when-changed discipline as the fields
+              // above.
+              ...(accessiblePageIdsChanged ? { accessible_page_ids: newAccessiblePageIds } : {}),
+            },
+          };
         });
         config.has_meta_pages = newHasPages;
         config.existing_ads_page_id = newExistingAdsPageId;
         config.accessible_page_ids = newAccessiblePageIds;
+        config.page_access_probed_at = pageProbedAt;
         console.log(
           `[MetaAdsCapabilitySync] Page access ${newHasPages ? 'confirmed' : 'missing'} for user ${userId} account ${account.account_id} ` +
           `(${pages.length} Page(s)${newExistingAdsPageId ? `, existing ads use Page ${newExistingAdsPageId}` : ''})`
