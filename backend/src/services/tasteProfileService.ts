@@ -253,6 +253,12 @@ type MemoryRecord = {
 
 export type TasteMemoryStore = {
   getUserMemories(userId: string, category?: string, limit?: number): Promise<MemoryRecord[]>;
+  /**
+   * Optional bounded full-drain read for durable state machines. Production
+   * Account Memory implements this; in-memory/unit adapters can omit it when
+   * getUserMemories already returns their complete dataset.
+   */
+  getUserMemoriesComplete?(userId: string, category?: string): Promise<MemoryRecord[]>;
   addMemory(
     userId: string,
     category: string,
@@ -953,6 +959,12 @@ export class TasteProfileService {
     private readonly memoryStore: TasteMemoryStore = accountMemoryDb
   ) {}
 
+  private getCompleteMemories(userId: string, category: string): Promise<MemoryRecord[]> {
+    return this.memoryStore.getUserMemoriesComplete
+      ? this.memoryStore.getUserMemoriesComplete(userId, category)
+      : this.memoryStore.getUserMemories(userId, category);
+  }
+
   async importXBookmarks(userId: string, accountId: unknown): Promise<TasteProfile> {
     const cleanAccountId = boundedString(accountId, 'accountId', 256);
     if (!cleanAccountId) throw new TasteValidationError('accountId is required');
@@ -989,7 +1001,7 @@ export class TasteProfileService {
   }
 
   async getProfile(userId: string): Promise<TasteProfile> {
-    const memories = await this.memoryStore.getUserMemories(userId, 'preference');
+    const memories = await this.getCompleteMemories(userId, 'preference');
     const snapshots = memories
       .filter((memory) => memory.sourceSessionId?.startsWith(TASTE_MEMORY_PREFIX))
       .map(decodeSnapshot)
@@ -999,7 +1011,7 @@ export class TasteProfileService {
   }
 
   async getSettings(userId: string): Promise<TasteSettings> {
-    const memories = await this.memoryStore.getUserMemories(userId, 'preference');
+    const memories = await this.getCompleteMemories(userId, 'preference');
     const stored = decodeTasteSettings(
       memories.find((memory) => memory.sourceSessionId === TASTE_SETTINGS_SOURCE)
     );
@@ -1011,7 +1023,7 @@ export class TasteProfileService {
     rawSurfaces: unknown
   ): Promise<TasteSettings> {
     const patch = normalizeTasteSettingsPatch(rawSurfaces);
-    const memories = await this.memoryStore.getUserMemories(userId, 'preference');
+    const memories = await this.getCompleteMemories(userId, 'preference');
     const existing = memories.find((memory) => memory.sourceSessionId === TASTE_SETTINGS_SOURCE);
     const current = decodeTasteSettings(existing) || defaultTasteSettings();
     const settings: TasteSettings = {
@@ -1130,7 +1142,10 @@ export class TasteProfileService {
     const cleanArtifactId = artifactId === undefined
       ? undefined
       : boundedString(artifactId, 'artifactId', 256);
-    const memories = await this.memoryStore.getUserMemories(userId, 'history');
+    if (artifactId !== undefined && !cleanArtifactId) {
+      throw new TasteValidationError('artifactId is required');
+    }
+    const memories = await this.getCompleteMemories(userId, 'history');
     return memories
       .filter((memory) => memory.sourceSessionId?.startsWith(TASTE_FEEDBACK_MEMORY_PREFIX))
       .map(decodeTasteFeedback)
@@ -1142,7 +1157,7 @@ export class TasteProfileService {
   async reverseFeedback(userId: string, eventId: unknown): Promise<TasteFeedbackEvent> {
     const cleanEventId = boundedString(eventId, 'eventId', 128);
     if (!cleanEventId) throw new TasteValidationError('eventId is required');
-    const memories = await this.memoryStore.getUserMemories(userId, 'history');
+    const memories = await this.getCompleteMemories(userId, 'history');
     const memory = memories.find(
       (candidate) =>
         candidate.memoryId === cleanEventId &&
@@ -1170,7 +1185,7 @@ export class TasteProfileService {
   }
 
   async deleteProfile(userId: string): Promise<number> {
-    const memories = await this.memoryStore.getUserMemories(userId, 'preference');
+    const memories = await this.getCompleteMemories(userId, 'preference');
     const tasteMemories = memories.filter((memory) =>
       memory.sourceSessionId?.startsWith(TASTE_MEMORY_PREFIX)
     );
@@ -1185,7 +1200,7 @@ export class TasteProfileService {
       throw new TasteValidationError('Taste profile exceeded the durable memory size limit');
     }
 
-    const memories = await this.memoryStore.getUserMemories(userId, 'preference');
+    const memories = await this.getCompleteMemories(userId, 'preference');
     const tasteMemories = memories.filter((memory) =>
       memory.sourceSessionId?.startsWith(TASTE_MEMORY_PREFIX)
     );
