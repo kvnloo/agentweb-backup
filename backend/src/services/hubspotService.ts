@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { getHubSpotConfig } from '../config/integrations';
-import { getAccountsByUserId, getAccountById, updateAccountTokens } from './connectedAccountsDb';
+import { getAccountsByUserId, getAccountById, updateAccountTokens, updateAccountConfig } from './connectedAccountsDb';
 
 // Module-level axios instance with a 15-second timeout for all HubSpot API calls.
 // Falls back to the base axios object when axios.create returns falsy (e.g., in jest auto-mock).
@@ -146,6 +146,206 @@ const TOKEN_REFRESH_BUFFER_MS = 60 * 1000; // refresh 60s before expiry
 // Value is { access_token, token_expires_at } so waiting callers get both.
 const refreshLocks = new Map<string, Promise<{ access_token: string; token_expires_at: number }>>();
 
+/**
+ * Does this refresh failure mean the refresh token is permanently dead?
+ *
+ * Only a definitive rejection from HubSpot's token endpoint counts, and the BODY decides:
+ * any 4xx whose payload names the refresh token. The status alone never decides — an
+ * earlier 400/401 allow-list missed a real production 403 BAD_SCOPES. Everything else — 5xx, a timeout, DNS, a proxy hiccup —
+ * is transient and must NOT be flagged, because the flag hard-fails every subsequent
+ * call and tells a paying customer their integration is broken. That asymmetry is the
+ * same one linkedInOutreachService documents for its 403 case: wrongly persisting
+ * "disconnected" is far worse than retrying a live connection.
+ */
+function isRevokedRefreshTokenError(err: unknown): boolean {
+  // Any 4xx. NOT an allow-list of 400/401.
+  //
+  // The body is the discriminator — once it must name the refresh token, restricting the
+  // STATUS adds no false-positive protection and only creates places for a real
+  // revocation to hide. A review said exactly that, with a mutation proving the widening
+  // was free, and I kept the allow-list anyway. Production answered within minutes: see
+  // the BAD_SCOPES note below.
+  //
+  // 5xx stays excluded — that is HubSpot failing, not the grant.
+  const status = Number((err as any)?.response?.status);
+  if (!(status >= 400 && status < 500)) return false;
+
+  // The STATUS never decides this on its own — the BODY has to name the refresh token.
+  //
+  // Measured against live HubSpot from env2 on 2026-09-28, posting a bogus refresh_token
+  // to cfg.tokenUrl with valid client credentials:
+  //
+  //   HTTP 400
+  //   {"status":"BAD_REFRESH_TOKEN","message":"missing or invalid refresh token",
+  //    "correlationId":"01a0e82e-...","error":"invalid_request",
+  //    "error_description":"missing or invalid refresh token"}
+  //
+  // So a revoked grant is a 400 naming BAD_REFRESH_TOKEN. Note `error` is
+  // "invalid_request", NOT "invalid_grant" — the BAD_REFRESH_TOKEN alternative below is
+  // load-bearing, not belt-and-braces.
+  //
+  // That is not the only shape, and an earlier version of this comment wrongly called it
+  // "one measured sample". MISMATCH_REFRESH_TOKEN_CLIENT — "refresh token was not issued
+  // to this client" — has been recorded in this repo since b97814ea4 (2026-06-26):
+  // externalCrmSyncService.ts:571 and externalCrmSync.service.test.ts:1104-1120. It is
+  // also a 400, it also means the grant can never be refreshed, and that commit states
+  // outright that "the user-facing fix for the underlying account is to reconnect
+  // HubSpot" — i.e. precisely what needs_reconnect exists to surface. Matching only
+  // BAD_REFRESH_TOKEN let it render "Active · Connected" forever, which is the original
+  // bug wearing a green test suite. The message text is matched too, because that commit
+  // shows the error reaching callers as a bare message with the body already lost.
+  //
+  // Widening here does NOT reopen the fleet-wide risk. Measured live against HubSpot on
+  // 2026-09-28 with a REAL refresh token and a wrong client_secret:
+  //
+  //   HTTP 400 {"status":"BAD_CLIENT_SECRET", ... "error":"invalid_client"}
+  //
+  // BAD_SCOPES, measured in PRODUCTION on 2026-09-28 against portal 245815183:
+  //
+  //   HTTP 403 {"status":"BAD_SCOPES","message":"missing or invalid scopes", ...}
+  //
+  // Note the 403. That grant holds 19 legacy scopes (content, social, automation, forms,
+  // crm.lists.read …) while the app now requests crm.objects.contacts/deals. Scopes are
+  // fixed at grant time, so this can NEVER succeed — only re-authorisation clears it,
+  // which makes it a revocation for our purposes. It is also the actual reason that
+  // portal reported "Active · Connected" for 97 days, which means the 400/401 version of
+  // this function would not have caught the very incident it was written for.
+  //
+  // which this regex does not match. (HubSpot validates the refresh token BEFORE the
+  // client, so probing with a bogus token returns BAD_REFRESH_TOKEN whatever the
+  // credentials — a real token is required to observe this shape at all.)
+  //
+  // Full order, measured: refresh token -> client -> scopes. That second hop is why an
+  // environment configured with a different HubSpot client secret cannot reach the
+  // BAD_SCOPES case at all — every refresh there stops at BAD_CLIENT_SECRET.
+  //
+  // And a deploy pointed at the wrong
+  // client_id would mismatch every grant at once — but those grants genuinely cannot
+  // refresh, and since create() no longer short-circuits and the clear still runs, the
+  // fleet self-heals within one access-token lifetime once the config is fixed. A false
+  // negative never self-heals.
+  //
+  // Why 401 is gated the same way rather than trusted: the refresh POST carries
+  // client_id/client_secret, and RFC 6749 §5.2 assigns 401 to `invalid_client` — a
+  // statement about the SHARED credential from getHubSpotConfig(), not about one
+  // customer's grant. This repo's own OAuth server implements exactly that split
+  // (mcp/oauth/oauthRoutes.ts: 400 invalid_grant for a dead refresh token, 401
+  // invalid_client for client-auth failure). An ungated 401 therefore reopens the whole
+  // failure this function exists to prevent: one rotated clientSecret, or a bodiless 401
+  // from an ALB/WAF/corporate proxy, flags EVERY HubSpot account in the fleet dead in a
+  // single sweep — externalCrmSyncService stops syncing them and every customer is told
+  // to reconnect an integration that works.
+  const data = (err as any)?.response?.data;
+  let marker: string;
+  try {
+    // Guarded for the same reason describeRefreshFailure is: a throw here escapes the
+    // catch block it runs inside, replacing the refresh error and skipping BOTH the flag
+    // and the diagnostic warn. Unreachable with axios defaults; one line to keep it so.
+    marker = typeof data === 'string' ? data : JSON.stringify(data ?? '');
+  } catch {
+    marker = '';
+  }
+  return /BAD_REFRESH_TOKEN|MISMATCH_REFRESH_TOKEN_CLIENT|BAD_SCOPES|invalid_grant|not issued to this client/i.test(marker);
+}
+
+/**
+ * Flag the stored connection as needing a fresh OAuth grant.
+ *
+ * Without this the connection is indistinguishable from a healthy one: the row keeps a
+ * `refresh_token`, and GET /api/oauth/connected-accounts reports any account holding one
+ * as `active` / "Connected" (deliberately — auto-renewing accounts should not surface a
+ * 30-minute access-token expiry). A revoked refresh token therefore renders as Connected
+ * indefinitely. That is how this account sat dead from 2026-06-16 to 2026-09-28 — 97 days —
+ * while the UI said Connected and every sync 401'd. Same failure class the Meta Ads branch
+ * of that handler calls out for ENG-1158.
+ *
+ * Best-effort: a failure to write the flag must not mask the auth error being reported.
+ */
+async function markHubSpotNeedsReconnect(userId: string, accountId: string): Promise<void> {
+  try {
+    await updateAccountConfig(userId, 'hubspot', accountId, { needs_reconnect: true });
+  } catch (e) {
+    console.error(`[HubSpotService] Failed to mark account ${accountId} needs_reconnect:`, e);
+  }
+}
+
+/**
+ * Strip credentials off an axios error IN PLACE, before it is thrown or logged.
+ *
+ * Axios hangs the outgoing request off the error as `config` — `config.data` is the form
+ * body, which for every OAuth call here is
+ *   grant_type=…&refresh_token=<customer token>&client_id=…&client_secret=<app secret>
+ * and `config.headers` can carry a bearer token. So ANY `console.error(msg, err)` on a
+ * failed OAuth call writes those to the log.
+ *
+ * Redacting only at the log sites inside this file was not enough — a review found the
+ * same error still reaching `console.error` raw at routes/hubspotAuth.ts (a failed code
+ * exchange, which happens whenever a user double-submits or reuses an authorization code)
+ * and routes/crmSync.ts (`err.response?.data || err` falls through to the raw error when
+ * a network failure means there is no response). Sanitising at the SOURCE makes every
+ * present and future logger safe instead of requiring each to remember.
+ *
+ * Mutates rather than clones: the error is about to be thrown, callers inspect `.response`
+ * and `.message`, and a clone would drop the prototype that `instanceof` checks rely on.
+ */
+export function redactAxiosCredentials<T>(err: T): T {
+  const cfg = (err as any)?.config;
+  if (cfg && typeof cfg === 'object') {
+    if (cfg.data !== undefined) cfg.data = '[redacted: request body carries client_secret]';
+    if (cfg.headers !== undefined) cfg.headers = '[redacted]';
+    if (cfg.auth !== undefined) cfg.auth = '[redacted]';
+    // tokenInfoUrl puts a live access token in the PATH, not the body.
+    if (typeof cfg.url === 'string') cfg.url = cfg.url.replace(/\/[A-Za-z0-9._~-]{20,}$/, '/[redacted]');
+  }
+  return err;
+}
+
+/**
+ * A refresh failure reduced to the two fields worth logging.
+ *
+ * NEVER log the axios error itself. Axios attaches the outgoing request to the error as
+ * `config.data`, and for this endpoint that body is
+ * `grant_type=refresh_token&refresh_token=...&client_id=...&client_secret=...`
+ * — so `console.error(msg, err)` writes the app's HubSpot CLIENT SECRET and the
+ * customer's refresh token into the application log, where they persist and fan out to
+ * whatever ships logs. Observed doing exactly that during live testing on env2.
+ *
+ * `response.data` is the RESPONSE body and carries no credentials; it is capped anyway so
+ * an HTML error page from a proxy cannot flood the log.
+ *
+ * Deliberately NOT the same threat model as agentModeService.redactHubSpotMessage. That
+ * one guards resource-endpoint bodies, which can echo an ACCESS token, so it strips
+ * token-shaped runs. This is the token endpoint, whose error bodies do not echo the
+ * credential — and a refresh token can be a 36-char UUID, which would slip a bare-run
+ * rule anyway. Do not unify the two on the assumption they do the same job.
+ */
+function describeRefreshFailure(err: unknown): string {
+  const status = (err as any)?.response?.status;
+  const data = (err as any)?.response?.data;
+  let body: string;
+  try {
+    body = typeof data === 'string' ? data : JSON.stringify(data ?? null);
+  } catch {
+    body = '<unserialisable>';
+  }
+  if (body && body.length > 500) body = `${body.slice(0, 500)}…<truncated>`;
+  return `status=${status ?? 'none'} body=${body}`;
+}
+
+/** Best-effort inverse of markHubSpotNeedsReconnect — see the call site for why it exists. */
+async function clearHubSpotNeedsReconnect(userId: string, accountId: string): Promise<void> {
+  try {
+    await updateAccountConfig(userId, 'hubspot', accountId, { needs_reconnect: false });
+  } catch (e) {
+    console.error(`[HubSpotService] Failed to clear account ${accountId} needs_reconnect:`, e);
+  }
+}
+
+/** Message shown wherever a dead HubSpot grant surfaces. One wording, one place. */
+const RECONNECT_MESSAGE =
+  'Your HubSpot account needs to be reconnected. Go to Settings \u2192 Connected Accounts and reconnect HubSpot.';
+
+
 // ─── Module-level account resolver ───────────────────────────────────────────
 // Used by both the static factory and the mid-operation refresh path.
 
@@ -203,6 +403,16 @@ export class HubSpotService {
   }
 
   /** HubSpot portal (hub) ID for this connection. Needed for public form submission. */
+  /**
+   * The OAuth account this instance was built from, or undefined on the fromToken
+   * (pasted private-app key) path. Callers that must know WHICH connection served a call
+   * read this instead of re-deriving it — re-derivation cannot distinguish the two paths
+   * and, when kept on the service as shared state, races with concurrent calls.
+   */
+  get accountId(): string | undefined {
+    return this._accountId;
+  }
+
   get portalId(): string | undefined {
     return this._portalId;
   }
@@ -219,6 +429,16 @@ export class HubSpotService {
     const expiresAt: number = config.token_expires_at || 0;
     const portalId: string | undefined = config.hub_id !== undefined ? String(config.hub_id) : account.account_id;
 
+    // NOTE: a `needs_reconnect` account is deliberately NOT short-circuited here.
+    //
+    // An earlier version fast-failed to save a round-trip. That made the flag a one-way
+    // door: create() returned before any refresh could run, so the only way out was a
+    // manual re-OAuth — and a single false positive (see isRevokedRefreshTokenError)
+    // bricked a working integration permanently. twitterService's forceRefresh clears its
+    // flag on a successful refresh for the same reason. Letting the refresh attempt
+    // proceed costs one API call on a genuinely dead grant and lets a recovered one heal
+    // itself on the next use.
+
     if (expiresAt - Date.now() > TOKEN_REFRESH_BUFFER_MS) {
       return new HubSpotService(config.access_token, userId, account.account_id, expiresAt, portalId);
     }
@@ -229,7 +449,7 @@ export class HubSpotService {
 
     // Token is expiring — create provisional instance, refresh, then return it.
     const instance = new HubSpotService(config.access_token, userId, account.account_id, expiresAt, portalId);
-    await instance.doRefresh(userId, account.account_id, config.refresh_token);
+    await instance.doRefresh(userId, account.account_id, config.refresh_token, !!config.needs_reconnect);
     return instance;
   }
 
@@ -263,11 +483,17 @@ export class HubSpotService {
     if (!config.refresh_token) {
       throw new Error('HubSpot access token expired and no refresh token is available. Please reconnect your HubSpot account.');
     }
-    await this.doRefresh(this._userId, this._accountId, config.refresh_token);
+    await this.doRefresh(this._userId, this._accountId, config.refresh_token, !!(config as any).needs_reconnect);
     return this._token;
   }
 
-  private async doRefresh(userId: string, accountId: string, refreshToken: string): Promise<void> {
+  /**
+   * `wasFlagged` is REQUIRED, deliberately. With a default it silently took the
+   * non-healing value, so a new call site that forgot it would stop clearing
+   * needs_reconnect and no test would notice — a review found exactly that gap on the
+   * mid-operation path. Making it required turns that mistake into a compile error.
+   */
+  private async doRefresh(userId: string, accountId: string, refreshToken: string, wasFlagged: boolean): Promise<void> {
     const hubspotConfig = await getHubSpotConfig();
     const lockKey = `${userId}:${accountId}`;
 
@@ -279,16 +505,43 @@ export class HubSpotService {
     }
 
     const refreshPromise = (async () => {
-      const response = await axiosInstance.post(
-        hubspotConfig.tokenUrl,
-        new URLSearchParams({
-          grant_type: 'refresh_token',
-          refresh_token: refreshToken,
-          client_id: hubspotConfig.clientId,
-          client_secret: hubspotConfig.clientSecret,
-        }).toString(),
-        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-      );
+      let response;
+      try {
+        response = await axiosInstance.post(
+          hubspotConfig.tokenUrl,
+          new URLSearchParams({
+            grant_type: 'refresh_token',
+            refresh_token: refreshToken,
+            client_id: hubspotConfig.clientId,
+            client_secret: hubspotConfig.clientSecret,
+          }).toString(),
+          { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+        );
+      } catch (refreshErr) {
+        // Only a definitive rejection is persisted; transient failures rethrow untouched
+        // so the next call retries against a connection that may well be healthy.
+        if (isRevokedRefreshTokenError(refreshErr)) {
+          console.error(
+            `[HubSpotService] Refresh token rejected for account ${accountId} \u2014 marking `
+            + `needs_reconnect. ${describeRefreshFailure(refreshErr)}`
+          );
+          redactAxiosCredentials(refreshErr);
+          await markHubSpotNeedsReconnect(userId, accountId);
+          throw new Error(RECONNECT_MESSAGE);
+        }
+        // Logged deliberately. The branch above is the only place that learns HubSpot's
+        // revocation shape, and it is pinned to one measured sample. If HubSpot ever
+        // answers a revoked grant differently, THIS is the line that will show it —
+        // otherwise the classifier silently returns false forever and the account goes on
+        // reporting "Connected", which is the original bug wearing a green test suite.
+        console.warn(
+          `[HubSpotService] Refresh failed for account ${accountId} and was NOT treated as a `
+          + `revocation. ${describeRefreshFailure(refreshErr)}`
+        );
+        // Redacted before it escapes: this rethrow hands the raw AxiosError to callers,
+        // and at least two of them log it whole.
+        throw redactAxiosCredentials(refreshErr);
+      }
 
       const { access_token, refresh_token, expires_in } = response.data as {
         access_token: string;
@@ -303,6 +556,21 @@ export class HubSpotService {
         refresh_token: refresh_token ?? refreshToken,
         token_expires_at,
       }, accountId);
+
+      // The grant works — clear a stale `needs_reconnect` so the account stops reporting
+      // "Reconnect required" the moment it recovers, whether it was flagged by a genuine
+      // revocation since re-authorised or by a false positive.
+      //
+      // Guarded, exactly as twitterService.forceRefresh guards its own clear. An
+      // unconditional write here would fire on EVERY refresh — every 30 minutes per
+      // HubSpot customer, since that is the access-token lifetime — and
+      // updateAccountConfig is a consistent read plus a CAS write of the entire
+      // connected_accounts attribute. Doubling the write rate on that attribute also
+      // raises the odds that a concurrent updateAccountTokens loses its CAS twice and
+      // fails closed with ConnectedAccountChanged.
+      if (wasFlagged) {
+        await clearHubSpotNeedsReconnect(userId, accountId);
+      }
 
       return { access_token, token_expires_at };
     })().finally(() => refreshLocks.delete(lockKey));

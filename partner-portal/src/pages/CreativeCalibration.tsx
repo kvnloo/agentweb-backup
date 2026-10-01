@@ -22,10 +22,12 @@ import {
   Card,
   CardContent,
   Chip,
+  Collapse,
   Grid,
   LinearProgress,
   Link,
   MenuItem,
+  Skeleton,
   Stack,
   TextField,
   Typography,
@@ -64,16 +66,30 @@ function byPosition(a: GoldenCaseView, b: GoldenCaseView): number {
   return (a.pair?.position ?? 0) - (b.pair?.position ?? 0);
 }
 
+/** Height the image / iframe preview area renders at, and what the loading skeleton matches. */
+const PREVIEW_HEIGHT = 520;
+
 function CreativePanel({ candidateId, side, token }: { candidateId: string; side: string; token: string | null }) {
   const [candidate, setCandidate] = useState<CandidateView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  // Whether the actual image/iframe payload has finished loading, separate from `loading`
+  // (which only covers the metadata fetch above) — without this the card goes straight from
+  // a progress bar to a blank/broken-looking box for the ~3s the image or landing page itself
+  // takes to fetch.
+  const [assetLoaded, setAssetLoaded] = useState(false);
+  // The generation prompt is implementation detail (hex codes, layout/font specs for ad images;
+  // a long generation brief for landing pages) that a reviewer doesn't need to pick a winner, so
+  // it stays collapsed unless someone asks for it.
+  const [showRequest, setShowRequest] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
     setCandidate(null);
+    setAssetLoaded(false);
+    setShowRequest(false);
     axios
       .get<{ candidate: CandidateView }>(buildApiUrl(`/api/human-eval/candidates/${encodeURIComponent(candidateId)}`), {
         headers: { Authorization: `Bearer ${token}` },
@@ -93,6 +109,7 @@ function CreativePanel({ candidateId, side, token }: { candidateId: string; side
   }, [candidateId, token]);
 
   const request = candidate?.originalRequest ?? '';
+  const isLandingPage = candidate?.reviewType === 'landing_page';
   return (
     <Card variant="outlined" sx={{ height: '100%' }}>
       <CardContent>
@@ -101,15 +118,60 @@ function CreativePanel({ candidateId, side, token }: { candidateId: string; side
         {error && <Alert severity="error">{error}</Alert>}
         {candidate && (
           <Stack spacing={1}>
-            {candidate.artifactUrl ? (
-              <Box component="img" src={candidate.artifactUrl} alt={`${side} creative`} sx={{ width: '100%', maxHeight: 520, objectFit: 'contain', bgcolor: 'action.hover', borderRadius: 1 }} />
+            {candidate.artifactUrl && isLandingPage ? (
+              // ENG-2220: an inline preview so a reviewer can compare landing pages without
+              // leaving the page. Confirmed live (curl -I) that generated pages on
+              // *.agentwebforms.com / *.vercel.app send neither X-Frame-Options nor a
+              // frame-ancestors CSP, so framing them directly is not blocked. No allow-forms /
+              // allow-top-navigation / allow-popups: a reviewer scrolling the preview must not
+              // be able to submit the page's real lead-capture form or navigate away.
+              // No allow-same-origin: these are uncurated AI-generated pages loaded inside an
+              // authenticated admin surface — allow-scripts alone still renders and runs
+              // client-side JS for the preview, it just can't use its own origin's cookies,
+              // storage or same-origin XHR, which a visual preview never needs.
+              <Box sx={{ position: 'relative', width: '100%', height: PREVIEW_HEIGHT, bgcolor: 'action.hover', borderRadius: 1 }}>
+                {!assetLoaded && <Skeleton variant="rectangular" width="100%" height={PREVIEW_HEIGHT} sx={{ position: 'absolute', inset: 0, borderRadius: 1 }} />}
+                <Box
+                  component="iframe"
+                  src={candidate.artifactUrl}
+                  title={`${side} landing page preview`}
+                  sandbox="allow-scripts"
+                  onLoad={() => setAssetLoaded(true)}
+                  onError={() => setAssetLoaded(true)}
+                  sx={{ width: '100%', height: '100%', border: 0, borderRadius: 1, opacity: assetLoaded ? 1 : 0, transition: 'opacity 0.15s' }}
+                />
+              </Box>
+            ) : candidate.artifactUrl ? (
+              <Box sx={{ position: 'relative', width: '100%' }}>
+                {!assetLoaded && <Skeleton variant="rectangular" width="100%" height={PREVIEW_HEIGHT} sx={{ position: 'absolute', inset: 0, borderRadius: 1 }} />}
+                <Box
+                  component="img"
+                  src={candidate.artifactUrl}
+                  alt={`${side} creative`}
+                  onLoad={() => setAssetLoaded(true)}
+                  onError={() => setAssetLoaded(true)}
+                  sx={{ width: '100%', maxHeight: PREVIEW_HEIGHT, objectFit: 'contain', bgcolor: 'action.hover', borderRadius: 1, opacity: assetLoaded ? 1 : 0, transition: 'opacity 0.15s' }}
+                />
+              </Box>
             ) : (
               <Alert severity="warning">This creative has no image.</Alert>
             )}
+            {candidate.artifactUrl && isLandingPage && (
+              <Button variant="outlined" size="small" href={candidate.artifactUrl} target="_blank" rel="noopener noreferrer">
+                Open landing page in new tab
+              </Button>
+            )}
             {request && (
-              <Typography variant="body2" color="text.secondary" sx={{ whiteSpace: 'pre-wrap' }}>
-                <strong>Request:</strong> {request.length > MAX_REQUEST_CHARS ? `${request.slice(0, MAX_REQUEST_CHARS)}…` : request}
-              </Typography>
+              <Box>
+                <Button size="small" onClick={() => setShowRequest((v) => !v)} sx={{ textTransform: 'none', pl: 0 }}>
+                  {showRequest ? 'Hide generation prompt' : 'Show generation prompt'}
+                </Button>
+                <Collapse in={showRequest} unmountOnExit>
+                  <Typography variant="body2" color="text.secondary" sx={{ whiteSpace: 'pre-wrap' }}>
+                    <strong>Request:</strong> {request.length > MAX_REQUEST_CHARS ? `${request.slice(0, MAX_REQUEST_CHARS)}…` : request}
+                  </Typography>
+                </Collapse>
+              </Box>
             )}
           </Stack>
         )}

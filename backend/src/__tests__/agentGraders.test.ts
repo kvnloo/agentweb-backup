@@ -312,6 +312,74 @@ describe('gradeToolCorrectness: write without read-back (ENG-592 grader side)', 
   });
 });
 
+describe('gradeToolCorrectness: read-back beyond ad platforms (ENG-2190)', () => {
+  const LIST = 'list_1';
+  const LEAD = 'lead_1';
+
+  it('flags a CRM lead import that nothing ever reads back, and accepts an unfiltered read of the list', () => {
+    const create = call('add_leads_to_list', { list_id: LIST, leads: [{ email: 'a@b.com' }] }, { output: { success: true, attempted: 1, importedIdentifiers: ['a@b.com'] } });
+    expect(kinds(gradeToolCorrectness({ ledger: [create], events: [] }))).toEqual(['write_without_read_back']);
+
+    const readAll = call('get_leads', { list_id: LIST });
+    expect(gradeToolCorrectness({ ledger: [create, readAll], events: [] }).verdict).toBe('pass');
+  });
+
+  it('flags a CRM lead update nothing reads back, accepts a read of the same lead id, and reports (without failing) a read of a different lead', () => {
+    const update = call('update_lead', { list_id: LIST, lead_id: LEAD, updates: { status: 'qualified' } }, { output: { success: true } });
+    expect(kinds(gradeToolCorrectness({ ledger: [update], events: [] }))).toEqual(['write_without_read_back']);
+
+    const getSame = call('get_lead_details', { list_id: LIST, lead_id: LEAD });
+    expect(gradeToolCorrectness({ ledger: [update, getSame], events: [] }).verdict).toBe('pass');
+
+    const getOther = call('get_lead_details', { list_id: LIST, lead_id: 'lead_2' });
+    expect(gradeToolCorrectness({ ledger: [update, getOther], events: [] })).toMatchObject({ verdict: 'pass', findings: [{ kind: 'write_read_back_unconfirmed' }] });
+  });
+
+  it('flags an email send whose own response carries no provider message id, and trusts one that does', () => {
+    const noId = call('send_email_to_lead', { list_id: LIST, lead_id: LEAD }, { output: { success: true, message: 'Email sent successfully' } });
+    expect(kinds(gradeToolCorrectness({ ledger: [noId], events: [] }))).toEqual(['write_without_read_back']);
+
+    const withId = call('send_email_to_lead', { list_id: LIST, lead_id: LEAD }, { output: { success: true, emailId: 'em_abc123', to: 'a@b.com' } });
+    expect(gradeToolCorrectness({ ledger: [withId], events: [] })).toMatchObject({ verdict: 'pass', mutations: 1 });
+
+    const fromSender = call('send_email_from_sender', { to: 'a@b.com', subject: 'hi' }, { output: { success: true, emailId: 'em_xyz' } });
+    expect(gradeToolCorrectness({ ledger: [fromSender], events: [] }).verdict).toBe('pass');
+  });
+
+  it('flags a social publish whose own response carries no post id/URL, and trusts one that does', () => {
+    const noId = call('post_on_connected_account', { platform: 'linkedin', content: 'hello' }, { output: { success: true, message: 'Posted' } });
+    expect(kinds(gradeToolCorrectness({ ledger: [noId], events: [] }))).toEqual(['write_without_read_back']);
+
+    const withId = call('post_on_connected_account', { platform: 'linkedin', content: 'hello' }, { output: { success: true, post_id: 'urn:li:share:1', post_url: 'https://linkedin.com/feed/update/1' } });
+    expect(gradeToolCorrectness({ ledger: [withId], events: [] })).toMatchObject({ verdict: 'pass', mutations: 1 });
+  });
+
+  it('flags a landing-page deploy whose own post-deploy smoke test failed, and passes one that succeeded or has not run yet', () => {
+    const failed = call('deploy_landing_page', { id: 'lp_1' }, {
+      output: { success: true, status: 'deployed', deployedUrl: 'https://x.example.com', launchReadiness: { ready: false, reasons: ['Post-deploy smoke test failed: form did not capture a lead'] } },
+    });
+    expect(gradeToolCorrectness({ ledger: [failed], events: [] })).toMatchObject({
+      verdict: 'fail',
+      findings: [{ kind: 'landing_page_publish_unverified', toolName: 'deploy_landing_page', detail: 'Post-deploy smoke test failed: form did not capture a lead' }],
+    });
+
+    const passed = call('deploy_landing_page', { id: 'lp_1' }, {
+      output: { success: true, status: 'deployed', deployedUrl: 'https://x.example.com', launchReadiness: { ready: true, reasons: [] } },
+    });
+    expect(gradeToolCorrectness({ ledger: [passed], events: [] }).verdict).toBe('pass');
+
+    // Smoke test is fire-and-forget after deploy: mid-generation, launchReadiness is
+    // simply absent yet, which must not read as a failure.
+    const notRunYet = call('generate_landing_page', { name: 'lp' }, { output: { success: true, status: 'building' } });
+    expect(gradeToolCorrectness({ ledger: [notRunYet], events: [] }).verdict).toBe('pass');
+  });
+
+  it('still does not treat a CRM write with no list_id, or an unrecognized surface, as a write', () => {
+    const r = gradeToolCorrectness({ ledger: [call('update_lead_status', { lead_id: '123456' }), call('some_unrelated_tool', {})], events: [] });
+    expect(r).toMatchObject({ verdict: 'pass', mutations: 0 });
+  });
+});
+
 describe('gradeGroundedness (finalize-guard claim classes, offline)', () => {
   it('reports no claims when the lexicon finds none', () => {
     expect(gradeGroundedness('Here are three options for next week.', []).verdict).toBe('no_claims');

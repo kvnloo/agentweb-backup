@@ -610,6 +610,47 @@ describe('Schedule Templates', () => {
       expect(scheduleTemplateDb.incrementUsageCount).toHaveBeenCalledWith('t1', mockUser.userId);
     });
 
+    // ENG-2204 review round 5: the tool schema encourages Emma to pass
+    // required_function_calls when instantiating an older template that predates
+    // the slack_send_message guidance, but nothing enforced the controller could
+    // actually apply that override — it always used the template's own stored list.
+    it('overrides requiredFunctionCalls from the request instead of the template default', async () => {
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue({
+        ...baseTemplate, requiredFunctionCalls: ['you_search_web'],
+      });
+      (scheduleDb.createSchedule as jest.Mock).mockResolvedValue({});
+      (scheduleTemplateDb.incrementUsageCount as jest.Mock).mockResolvedValue({});
+
+      const req = mockReq({
+        params: { templateId: 't1' },
+        body: {
+          variableValues: { website: 'example.com' },
+          requiredFunctionCalls: ['you_search_web', 'slack_send_message'],
+        },
+      });
+      await agentModeController.createScheduleFromTemplate(req as any, mockRes());
+
+      const created = (scheduleDb.createSchedule as jest.Mock).mock.calls[0][0];
+      expect(created.requiredFunctionCalls).toEqual(['you_search_web', 'slack_send_message']);
+    });
+
+    it('falls back to the template default when no override is provided', async () => {
+      (scheduleTemplateDb.getTemplateById as jest.Mock).mockResolvedValue({
+        ...baseTemplate, requiredFunctionCalls: ['you_search_web'],
+      });
+      (scheduleDb.createSchedule as jest.Mock).mockResolvedValue({});
+      (scheduleTemplateDb.incrementUsageCount as jest.Mock).mockResolvedValue({});
+
+      const req = mockReq({
+        params: { templateId: 't1' },
+        body: { variableValues: { website: 'example.com' } },
+      });
+      await agentModeController.createScheduleFromTemplate(req as any, mockRes());
+
+      const created = (scheduleDb.createSchedule as jest.Mock).mock.calls[0][0];
+      expect(created.requiredFunctionCalls).toEqual(['you_search_web']);
+    });
+
     // ENG-1722 (ENG-1609 AC #2): variables alone must be sufficient — no freehand
     // conversation. Run against the REAL seeded template, not a fixture, so a
     // change to the shipped prompt or variable list is caught here.

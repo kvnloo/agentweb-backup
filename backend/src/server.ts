@@ -838,6 +838,38 @@ createTestAccount().then(async () => {
         console.error('[MetaMetricsSnapshotCron] Failed to initialize:', error);
       }
 
+      // ENG-2215: Google Ads Metrics Snapshot — runs daily at 09:15 UTC (after
+      // MetaMetricsSnapshotCron at 09:00), re-pulling the last 92 dates each run so the final
+      // refresh occurs after reporting-day end plus Google's up-to-90-day conversion attribution
+      // window has elapsed. Inert unless GOOGLE_ADS_METRICS_SNAPSHOT_ENABLED=true — the cron
+      // itself refuses to enumerate accounts or call the Google Ads API without it (see
+      // runGoogleAdsMetricsSnapshot's own flag check).
+      try {
+        const GOOGLE_ADS_METRICS_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        const { runGoogleAdsMetricsSnapshot } = await import('./cron/googleAdsMetricsSnapshotCron');
+
+        const nowForGoogleAdsMetricsCron = new Date();
+        const nextGoogleAdsMetricsRunUTC = new Date(nowForGoogleAdsMetricsCron);
+        nextGoogleAdsMetricsRunUTC.setUTCHours(9, 15, 0, 0);
+        if (nextGoogleAdsMetricsRunUTC <= nowForGoogleAdsMetricsCron) {
+          nextGoogleAdsMetricsRunUTC.setUTCDate(nextGoogleAdsMetricsRunUTC.getUTCDate() + 1);
+        }
+        const msUntilNextGoogleAdsMetricsRun = nextGoogleAdsMetricsRunUTC.getTime() - nowForGoogleAdsMetricsCron.getTime();
+
+        console.log(`[GoogleAdsMetricsSnapshotCron] Initialized — first run at 09:15 UTC (in ${Math.round(msUntilNextGoogleAdsMetricsRun / 60000)} min)`);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('GoogleAdsMetricsSnapshotCron', runGoogleAdsMetricsSnapshot())
+            .catch(e => console.error('[GoogleAdsMetricsSnapshotCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('GoogleAdsMetricsSnapshotCron', runGoogleAdsMetricsSnapshot())
+              .catch(e => console.error('[GoogleAdsMetricsSnapshotCron] Error:', e));
+          }, GOOGLE_ADS_METRICS_SNAPSHOT_INTERVAL_MS);
+        }, msUntilNextGoogleAdsMetricsRun);
+      } catch (error) {
+        console.error('[GoogleAdsMetricsSnapshotCron] Failed to initialize:', error);
+      }
 
       // Drip Sequence Worker — runs every 5 minutes
       try {
@@ -1028,7 +1060,7 @@ createTestAccount().then(async () => {
       }
 
       // Account-health classifier sweep (ENG-2143), the replacement for the renewal cron above:
-      // at-risk → deduped oncall, activation incomplete → CS nudge log. Off unless
+      // at-risk → deduped oncall, activation incomplete → CS nudge digest email. Off unless
       // ACCOUNT_HEALTH_ALERTS_ENABLED=true (enabling it in prod is an OPS step).
       if (process.env.ACCOUNT_HEALTH_ALERTS_ENABLED === 'true') try {
         const { runAccountHealthClassifier } = await import('./cron/accountHealthClassifierCron');
@@ -1445,6 +1477,19 @@ createTestAccount().then(async () => {
         });
       } catch (error) {
         console.error('[FailureReplayNightly] Failed to initialize:', error);
+      }
+
+      // Offline eval suite on "needs eval" markers (ENG-2195) — hourly: when prompt/model/skill
+      // markers appeared since the last run, run the deterministic suite and record the verdict in
+      // Dev-AW-LoopEvents. Off unless EVAL_MARKER_SUITE_ENABLED=true.
+      try {
+        const { scheduleEvalMarkerSuite } = await import('./cron/evalMarkerSuiteCron');
+        scheduleEvalMarkerSuite({
+          isCronEnabled,
+          track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
+        });
+      } catch (error) {
+        console.error('[EvalMarkerSuite] Failed to initialize:', error);
       }
 
       // Weekly Engineering Scoreboard — read-only backend replacement for the

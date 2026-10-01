@@ -11,9 +11,10 @@
  * or missing (counted as `humanNa` / `unlabelled`), or when the grader gives no pass/fail for it
  * (`graderAbstained`), so abstentions never count as agreement.
  *
- * Adapters on this branch: the session judges' stored verdicts (general, Fangfang, Matt) and the
- * ENG-2137 agent graders run live on the case's session. Account-health and creative graders
- * register theirs as they land (ENG-2143, ENG-2138). All adapters read only.
+ * Adapters on this branch: the session judges' stored verdicts (general, Fangfang, Matt), the
+ * ENG-2137 agent graders run live on the case's session, the ENG-2139 creative deterministic
+ * gates (stored gate result on the human-eval candidate) and the ENG-2143 account-health
+ * classifier (classified live from the account's current signals). All adapters read only.
  */
 
 import AWS from 'aws-sdk';
@@ -21,10 +22,22 @@ import { agreementReport, toGraderValidation, type AgreementReport, type LabelPa
 import { getGrader, type EvalSurface } from './evalRegistry';
 import type { GoldenCase, GoldenCriterion, GoldenSplit, LabelValue } from './goldenSet';
 import type { GoldenSetStore } from './goldenSetStore';
-import { gradeGroundedness, gradeTaskSuccess, gradeToolCorrectness, type SessionForGrading } from './agentGraders';
+import {
+  gradeFormatAdherence,
+  gradeGroundedness,
+  gradeLengthAdherence,
+  gradePermissionAdherence,
+  gradeTaskSuccess,
+  gradeToolCorrectness,
+  type AdherenceResult,
+  type SessionForGrading,
+} from './agentGraders';
 import { buildLoadedSession, groupEventsBySession, type DocItem, type ReadOnlyDocReader, type ReadRequest } from './agentGraderLoader';
 import { LOOP_EVENTS_TABLE } from '../core/sensors/eventTableEventSource';
 import { OUTCOME_SHADOW_JUDGE_ID } from '../../services/outcomeJudge';
+import { CREATIVE_GATES_GRADER_ID, type CreativeGateResult } from '../../services/creativeGates';
+import type { AccountHealthState } from '../../services/accountHealthClassifier';
+import type { AccountHealthUser } from '../../cron/accountHealthClassifierCron';
 
 export type GraderPrediction = Partial<Record<GoldenCriterion, LabelValue>>;
 
@@ -157,6 +170,10 @@ export interface StoredJudgeDimensions {
   goalCompletion?: number;
   dataAccuracy?: number;
   instructionCompliance?: number;
+  /** ENG-2189: the outcome rubric's binary criteria (true = it happened). */
+  arguedWithInstruction?: boolean;
+  escalatedWhenNotRequired?: boolean;
+  failedToEscalate?: boolean;
 }
 
 /** Reads a session judge's stored dimensions; undefined when that judge never scored the session. */
@@ -167,20 +184,32 @@ function dimensionLabel(value: number | undefined): LabelValue {
   return value >= JUDGE_PASS_THRESHOLD ? 'pass' : 'fail';
 }
 
-/** Maps a session judge's stored 1-5 dimensions onto agent criteria. It has no tool-correctness dimension. */
+/** A behaviour criterion's label: `pass` = it happened (golden-set convention for these criteria). */
+function flagLabel(value: boolean | undefined): LabelValue {
+  return typeof value === 'boolean' ? (value ? 'pass' : 'fail') : 'na';
+}
+
+/** Maps a session judge's stored dimensions onto agent criteria. It has no tool-correctness dimension. */
 export function sessionJudgePrediction(dims: StoredJudgeDimensions | undefined): GraderPrediction {
   return {
     task_success: dimensionLabel(dims?.goalCompletion),
     groundedness: dimensionLabel(dims?.dataAccuracy),
     instruction_compliance: dimensionLabel(dims?.instructionCompliance),
+    argued_with_instruction: flagLabel(dims?.arguedWithInstruction),
+    escalated_when_not_required: flagLabel(dims?.escalatedWhenNotRequired),
+    failed_to_escalate: flagLabel(dims?.failedToEscalate),
   };
 }
+
+const SESSION_JUDGE_CRITERIA: GoldenCriterion[] = ['task_success', 'groundedness', 'instruction_compliance'];
+/** Only the outcome rubric asks for these (ENG-2189); the other judges would abstain on every case. */
+const OUTCOME_RUBRIC_CRITERIA: GoldenCriterion[] = ['argued_with_instruction', 'escalated_when_not_required', 'failed_to_escalate'];
 
 export function sessionJudgeGrader(graderId: string, read: StoredJudgeReader): GoldenCaseGrader {
   return {
     graderId,
     surface: 'agent',
-    criteria: ['task_success', 'groundedness', 'instruction_compliance'],
+    criteria: graderId === 'session-judge-outcome-b-shadow' ? [...SESSION_JUDGE_CRITERIA, ...OUTCOME_RUBRIC_CRITERIA] : SESSION_JUDGE_CRITERIA,
     primaryCriterion: 'task_success',
     grade: async (c) => sessionJudgePrediction(await read(c.sourceRef.id)),
   };
@@ -266,9 +295,12 @@ export async function loadSessionForGrading(reader: ReadOnlyDocReader, tables: A
   return buildLoadedSession(item, messageRows, groupEventsBySession(eventRows).get(sessionId) ?? [], undefined).session;
 }
 
-/** Maps each agent grader's verdict onto its criterion; `excluded` / `no_claims` abstain. */
+const adherenceLabel = ({ verdict }: AdherenceResult): LabelValue => (verdict === 'not_applicable' ? 'na' : verdict);
+
+/** Maps each agent grader's verdict onto its criterion; `excluded` / `no_claims` / not applicable abstain. */
 export function agentGraderPrediction(graderId: string, session: SessionForGrading | undefined): GraderPrediction {
   if (!session) return {};
+  const turns = session.turns ?? [];
   switch (graderId) {
     case 'agent-task-success': {
       const { verdict } = gradeTaskSuccess(session);
@@ -280,6 +312,12 @@ export function agentGraderPrediction(graderId: string, session: SessionForGradi
       const { verdict } = gradeGroundedness(session.finalReply, session.ledger);
       return { groundedness: verdict === 'grounded' ? 'pass' : verdict === 'ungrounded' ? 'fail' : 'na' };
     }
+    case 'agent-reply-length-adherence':
+      return { instruction_compliance: adherenceLabel(gradeLengthAdherence(turns)) };
+    case 'agent-format-adherence':
+      return { instruction_compliance: adherenceLabel(gradeFormatAdherence(turns)) };
+    case 'agent-act-without-asking':
+      return { instruction_compliance: adherenceLabel(gradePermissionAdherence(turns)) };
     default:
       throw new Error(`not an agent grader: ${graderId}`);
   }
@@ -289,6 +327,10 @@ const AGENT_GRADER_CRITERIA: Record<string, GoldenCriterion> = {
   'agent-task-success': 'task_success',
   'agent-tool-correctness': 'tool_correctness',
   'agent-groundedness-offline': 'groundedness',
+  // ENG-2189: each is one explicit-instruction check, compared with the human instruction_compliance label.
+  'agent-reply-length-adherence': 'instruction_compliance',
+  'agent-format-adherence': 'instruction_compliance',
+  'agent-act-without-asking': 'instruction_compliance',
 };
 
 export function liveAgentGraders(load: (sessionId: string) => Promise<SessionForGrading | undefined>): GoldenCaseGrader[] {
@@ -301,6 +343,104 @@ export function liveAgentGraders(load: (sessionId: string) => Promise<SessionFor
   }));
 }
 
+// Creative deterministic gates (ENG-2139/2187), read from the candidate's stored gate result ---
+
+/**
+ * The one golden criterion the gates decide: `format_readiness` (ENG-421's launch-ready floor
+ * for decode/blank-render/aspect/size/file-size — the same things `evaluateCreativeGates` checks;
+ * hook, offer, proof, brand, policy and buyer-usefulness are the rubric judge's, not this grader's).
+ */
+export const CREATIVE_GATES_CRITERION: GoldenCriterion = 'format_readiness';
+
+/**
+ * Maps the stored gate result onto `format_readiness`: pass when no check failed. Abstains (no
+ * verdict) when this candidate has no stored gate result at all — an older candidate, a non-image
+ * one, or one whose gates never ran.
+ */
+export function creativeGatesPrediction(gates: CreativeGateResult | undefined): GraderPrediction {
+  if (!gates) return {};
+  return { [CREATIVE_GATES_CRITERION]: gates.passed ? 'pass' : 'fail' };
+}
+
+export type CreativeGateReader = (candidateId: string) => Promise<CreativeGateResult | undefined>;
+
+export function creativeGatesGrader(read: CreativeGateReader): GoldenCaseGrader {
+  return {
+    graderId: CREATIVE_GATES_GRADER_ID,
+    surface: 'creative',
+    criteria: [CREATIVE_GATES_CRITERION],
+    primaryCriterion: CREATIVE_GATES_CRITERION,
+    grade: async (c) => creativeGatesPrediction(await read(c.sourceRef.id)),
+  };
+}
+
+/**
+ * Read-only: the gate result `humanEvalService` stored on the candidate at generation time
+ * (`createCandidate`'s `creativeGates` input, extended by `appendCreativeGateChecks`). Dynamic
+ * import keeps humanEvalService's own dependencies (Slack, S3, chatbot, learning) out of this
+ * module's static graph, as the other offline creative scripts already do (scoreCreativeRubric.ts,
+ * creativeCalibrationReport.ts).
+ */
+async function readStoredCreativeGates(candidateId: string): Promise<CreativeGateResult | undefined> {
+  const { humanEvalService } = await import('../../services/humanEvalService');
+  const candidate = await humanEvalService.getCandidate(candidateId);
+  return candidate?.creativeGates;
+}
+
+// Account-health classifier (ENG-2143), classified live from the account's current signals -----
+
+/** Matches evalRegistry.ts's `account-health-classifier` entry id and the cron's ACCOUNT_HEALTH_GRADER_ID. */
+export const ACCOUNT_HEALTH_GRADER_ID = 'account-health-classifier';
+
+const ACCOUNT_HEALTH_CRITERIA: GoldenCriterion[] = ['activation_incomplete', 'at_risk', 'healthy'];
+
+/**
+ * Maps the classifier's one mutually-exclusive state onto the three golden criteria: the
+ * matching state's criterion is `pass`, the other two are `fail`. `insufficient_evidence` (a
+ * signal the classifier needed could not be read) and no classification at all abstain on every
+ * criterion instead of guessing, same as the classifier's own ENG-2016 AC2 rule.
+ */
+export function accountHealthPrediction(state: AccountHealthState | undefined): GraderPrediction {
+  if (state === undefined || state === 'insufficient_evidence') return {};
+  const prediction: GraderPrediction = {};
+  for (const criterion of ACCOUNT_HEALTH_CRITERIA) prediction[criterion] = criterion === state ? 'pass' : 'fail';
+  return prediction;
+}
+
+export type AccountHealthClassifyFn = (userId: string) => Promise<AccountHealthState | undefined>;
+
+export function accountHealthGrader(classify: AccountHealthClassifyFn): GoldenCaseGrader {
+  return {
+    graderId: ACCOUNT_HEALTH_GRADER_ID,
+    surface: 'account_health',
+    criteria: ACCOUNT_HEALTH_CRITERIA,
+    // at_risk is the criterion mayGate(ACCOUNT_HEALTH_GRADER_ID) actually unlocks: it is what
+    // moves the cron's at-risk path from a needs-review log line to an oncall page.
+    primaryCriterion: 'at_risk',
+    grade: async (c) => accountHealthPrediction(await classify(c.sourceRef.id)),
+  };
+}
+
+/**
+ * Read-only: rebuilds the account's current signals the way the live sweep does
+ * (`gatherAccountHealthSignals` in accountHealthClassifierCron.ts — payments, ad days, feedback,
+ * tracking; campaigns stays null there too, since no per-campaign delivery source exists yet) and
+ * classifies it. Dynamic import for the same reason as readStoredCreativeGates: the cron module's
+ * own dependencies (email, Slack, oncall alerting) never need to load for a validation run that
+ * only calls its read helper. Undefined when the user no longer exists.
+ */
+async function classifyAccountHealthForUser(userId: string): Promise<AccountHealthState | undefined> {
+  const [{ userDb }, { gatherAccountHealthSignals }, { classifyAccountHealth }] = await Promise.all([
+    import('../../services/db'),
+    import('../../cron/accountHealthClassifierCron'),
+    import('../../services/accountHealthClassifier'),
+  ]);
+  const user = (await userDb.getUserById(userId)) as AccountHealthUser | undefined;
+  if (!user?.userId) return undefined;
+  const { signals } = await gatherAccountHealthSignals(user, Date.now());
+  return classifyAccountHealth(signals).state;
+}
+
 /** Every golden-case adapter available on this branch, reading production (or `Dev-`) tables read-only. */
 export function defaultGoldenCaseGraders(): GoldenCaseGrader[] {
   const doc = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || 'us-west-2' });
@@ -310,5 +450,10 @@ export function defaultGoldenCaseGraders(): GoldenCaseGrader[] {
     scan: (request) => doc.scan(request as AWS.DynamoDB.DocumentClient.ScanInput).promise(),
   };
   const tables: AgentGraderTables = { sessions: `${prefix}AW-ChatSessions`, messages: `${prefix}AW-ChatMessages`, loopEvents: LOOP_EVENTS_TABLE };
-  return [...storedSessionJudgeGraders(doc), ...liveAgentGraders((sessionId) => loadSessionForGrading(reader, tables, sessionId))];
+  return [
+    ...storedSessionJudgeGraders(doc),
+    ...liveAgentGraders((sessionId) => loadSessionForGrading(reader, tables, sessionId)),
+    creativeGatesGrader(readStoredCreativeGates),
+    accountHealthGrader(classifyAccountHealthForUser),
+  ];
 }
