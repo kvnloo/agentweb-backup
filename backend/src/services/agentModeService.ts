@@ -19215,9 +19215,19 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const pages = await metaService.getPages(accessToken);
       const totalCount = Array.isArray(pages) ? pages.length : 0;
 
+      // ENG-2232: a bare "Found 0" here is silent — nothing told the model this
+      // is fatal for every AD_CREATIVE until it hit the permission error after
+      // building out a full campaign. Say the consequence and the fix up front.
+      const message = totalCount === 0
+        ? 'Found 0 Facebook Page(s). No ads can be created without a Page — ask the user to select a Page under ' +
+          'Meta\'s "Choose Pages" step when connecting, or to get "Create ads" (Advertiser) access on the ' +
+          'intended Page, then reconnect and retry. Do not proceed to build campaigns/ad sets/creatives for this ' +
+          'account until PAGE LIST returns at least one Page.'
+        : `Found ${totalCount} Facebook Page(s)`;
+
       return {
         success: true,
-        message: `Found ${totalCount} Facebook Page(s)`,
+        message,
         pages: pages,
         totalCount: totalCount
       };
@@ -22395,6 +22405,34 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // re-derived from params after this point, so nothing downstream can
       // silently drift it (the idx=202→205 LEADS→TRAFFIC flip in the incident).
       params = { ...params, objective: gate.objective };
+
+      // ENG-2232: deterministic Page-access preflight. Page access is a second,
+      // independent Meta grant that the objective gate above says nothing
+      // about, and the PAGE LIST tool's own warning text is only advisory — a
+      // model can still choose to build anyway. This is what the reported
+      // production incident actually needed: the account had 0 accessible
+      // Pages, PAGE LIST said so, and the agent built 4 campaigns + 4 ad sets
+      // before the failure finally surfaced at AD_CREATIVE CREATE. Blocking
+      // here stops the whole build at step 1 instead of after the waste.
+      //
+      // Reuses the credential-resolution call the tracking gate below already
+      // makes for its own account lookup (same `getMetaCredentials(userId,
+      // account_id)` shape, deliberately no clientScope per ENG-1801) — a
+      // second call is the established pattern for a preflight gate here, not
+      // a new one. 'unknown' (never probed, or credentials came from the
+      // legacy adAccount fallback which predates this field) is NOT treated as
+      // 'missing' — only a confirmed-empty PAGE LIST blocks.
+      const { connection: pageGateConnection } = await this.getMetaCredentials(userId, account_id);
+      const { getMetaPagesAccessState, getMetaAdsNoPagesMessage } = await import('../utils/metaAdsScope');
+      if (getMetaPagesAccessState(pageGateConnection?.config) === 'missing') {
+        const pageMessage = getMetaAdsNoPagesMessage(pageGateConnection?.config);
+        return {
+          success: false,
+          message: pageMessage,
+          error: `META_PAGE_ACCESS_MISSING: ${pageMessage}`,
+          hint: 'Reconnect Meta and select the Page on the "Choose Pages" step, or get "Create ads" (Advertiser) access on the Page, then retry.'
+        } as any;
+      }
     }
 
     // Pre-validate params before any API round-trip
@@ -22408,6 +22446,33 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         error: `PARAM_VALIDATION_ERROR: ${validationError.message}`,
         hint: 'Fix the listed parameters and retry.'
       } as any;
+    }
+
+    // ENG-2232: deterministic Page-access preflight for AD_CREATIVE CREATE
+    // specifically — the CAMPAIGN CREATE gate above only catches a build that
+    // starts with a NEW campaign; adding a creative to an EXISTING campaign
+    // never goes through that gate at all. validateMetaActionParams above
+    // already guarantees params.page_id is present (Meta requires it for
+    // every creative), so this checks the ACTUAL target Page directly —
+    // more precise than the CAMPAIGN CREATE gate's historical-existing-ads
+    // heuristic, since a Meta CAMPAIGN object carries no page_id to compare
+    // against in the first place.
+    if (entity_type === 'AD_CREATIVE' && action === 'CREATE') {
+      const { connection: creativeGateConnection } = await this.getMetaCredentials(userId, account_id);
+      const { getAccessiblePageIds, buildMetaAdsPageNotAccessibleMessage } = await import('../utils/metaAdsScope');
+      const accessiblePageIds = getAccessiblePageIds(creativeGateConnection?.config);
+      const requestedPageId = typeof params.page_id === 'string' ? params.page_id : undefined;
+      // Only a verdict when we've actually probed (accessiblePageIds defined) —
+      // a legacy/never-probed connection must not be blocked on an unknown.
+      if (accessiblePageIds !== undefined && requestedPageId && !accessiblePageIds.includes(requestedPageId)) {
+        const pageMessage = buildMetaAdsPageNotAccessibleMessage(requestedPageId);
+        return {
+          success: false,
+          message: pageMessage,
+          error: `META_PAGE_ACCESS_MISSING: ${pageMessage}`,
+          hint: 'Reconnect Meta and select that Page on the "Choose Pages" step, or get "Create ads" (Advertiser) access on it, then retry.'
+        } as any;
+      }
     }
 
     // Target-confirmation guardrail for mutating actions (publish/change/delete).

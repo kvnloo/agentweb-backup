@@ -106,6 +106,51 @@ export interface MetaAdsScopeConfigLike {
    * which write reaches the database first.
    */
   ads_capability_probed_at?: unknown;
+  /**
+   * Whether this connection has at least one accessible Facebook Page, probed
+   * once via PAGE LIST at connect/reconnect time (ENG-2232).
+   *
+   * Independent of `granted_scopes`: the OAuth `ads_read`/`ads_management`
+   * scope and Page access are two separate Meta grants, and a token can hold
+   * the former with zero of the latter. Production case (ENG-2232): ad account
+   * 1209971551106961 reported `ads_capable: true` (ads_read granted) while
+   * PAGE LIST returned 0 Pages both before and after the customer reconnected
+   * — every AD_CREATIVE CREATE needs a page_id, so the build failed only after
+   * 4 campaigns and 4 ad sets had already been approved through the deck.
+   *
+   * Tri-state for the same reason as the scope fields above: `undefined` means
+   * "never probed" (legacy record, or the probe itself failed) and must not be
+   * read as either answer.
+   */
+  has_meta_pages?: unknown;
+  /**
+   * Set only when `has_meta_pages` is `false` *because* this account's own
+   * existing ad creatives were found to run under a specific Facebook Page
+   * that isn't among the ones this connection can access (ENG-2232) — as
+   * opposed to the connection having zero accessible Pages at all. Lets
+   * `describeMetaAdsCapability` name the actual Page in the warning instead
+   * of a generic "no Pages are accessible" that would be factually wrong
+   * when some OTHER Page is reachable.
+   */
+  existing_ads_page_id?: unknown;
+  /**
+   * The actual accessible Facebook Page ids, probed alongside `has_meta_pages`
+   * (ENG-2232) — lets a gate check a SPECIFIC page_id (e.g. the one an
+   * AD_CREATIVE CREATE call is about to use) against the real set, rather
+   * than only the aggregate "has at least one" boolean. `undefined` means
+   * "never probed", same tri-state discipline as every other field here.
+   */
+  accessible_page_ids?: unknown;
+  /**
+   * The moment the twice-daily reconciliation sweep's Page probe (`has_meta_pages`
+   * / `existing_ads_page_id` / `accessible_page_ids`) was learned (ENG-2232) —
+   * the Page-access sibling of `ads_capability_probed_at` above, same CAS-retry
+   * race it guards against: a sweep's write, retried after a conflict, must
+   * defer to a concurrent writer's (another sweep's, or a reconnect's) NEWER
+   * Page probe rather than overwrite it with this one's now-stale answer.
+   * Internal to `metaAdsCapabilitySync.ts`'s own write — no gate reads it.
+   */
+  page_access_probed_at?: unknown;
 }
 
 /**
@@ -135,6 +180,69 @@ export const META_ADS_ASSET_ACCESS_MESSAGE =
   'so no campaign or insights data could be read. Reconnecting will not fix this. Ask whoever manages this ad ' +
   'account in Meta Business Settings to add this person with Ads permissions, then run this again. ' +
   'No metrics were retrieved.';
+
+/**
+ * ENG-2232: no Facebook Page is accessible with this connection, so ad
+ * creation cannot succeed however healthy the ad-account grant looks.
+ *
+ * Distinct from the two messages above: this fires even when ads_read/
+ * ads_management IS granted, because Page access is a second, independent
+ * Meta grant that OAuth scopes say nothing about.
+ */
+export const META_ADS_NO_PAGES_MESSAGE =
+  'Meta Ads access is incomplete for this connection: no Facebook Pages are accessible, and every ad creative ' +
+  'must reference a Page, so ad creation will fail. Reconnect Meta under Settings -> Connected accounts and ' +
+  'select the Page on the "Choose Pages" step, and/or ask whoever manages that Page in Meta Business Settings ' +
+  'to add this person with "Create ads" (Advertiser) access, then run this again. No ads were created.';
+
+/**
+ * ENG-2232: the subtler sibling of `META_ADS_NO_PAGES_MESSAGE` — this
+ * connection DOES have access to some Page, just not the one this account's
+ * own existing ads already run under. Naming the specific Page (inferred
+ * from existing ad creatives, per the issue's own suggestion) is the whole
+ * point: "no Pages are accessible" would be false here and send the owner
+ * chasing the wrong fix.
+ */
+export const buildMetaAdsWrongPageMessage = (existingAdsPageId: string): string =>
+  `Meta Ads access is incomplete for this connection: this account's existing ads run under Facebook Page ` +
+  `${existingAdsPageId}, which isn't one of the Pages this connection can currently access, so ad creation will ` +
+  `fail. Reconnect Meta under Settings -> Connected accounts and select that Page on the "Choose Pages" step, ` +
+  `and/or ask whoever manages it in Meta Business Settings to add this person with "Create ads" (Advertiser) ` +
+  `access, then run this again. No ads were created.`;
+
+/**
+ * ENG-2232: the precise sibling of both messages above, for AD_CREATIVE
+ * CREATE specifically — that call always carries a concrete `page_id`
+ * (Meta requires it), so this names exactly the Page it tried to use instead
+ * of a historical inference.
+ */
+export const buildMetaAdsPageNotAccessibleMessage = (requestedPageId: string): string =>
+  `Meta Ads access does not include Facebook Page ${requestedPageId} — this ad creative can't be created under ` +
+  `that Page. Reconnect Meta under Settings -> Connected accounts and select that Page on the "Choose Pages" ` +
+  `step, and/or ask whoever manages it in Meta Business Settings to add this person with "Create ads" ` +
+  `(Advertiser) access, then run this again. No ads were created.`;
+
+/**
+ * The accessible Facebook Page ids themselves, when probed. `undefined`
+ * (not `[]`) when never probed, so a gate can tell "we don't know" apart
+ * from "we checked and it's empty" (ENG-2232).
+ */
+export const getAccessiblePageIds = (
+  config: MetaAdsScopeConfigLike | null | undefined
+): string[] | undefined => {
+  const ids = config?.accessible_page_ids;
+  if (!Array.isArray(ids)) return undefined;
+  return ids.filter((id): id is string => typeof id === 'string');
+};
+
+/** The right message for a confirmed-missing Page state — generic or Page-specific. */
+export const getMetaAdsNoPagesMessage = (config: MetaAdsScopeConfigLike | null | undefined): string => {
+  const existingAdsPageId = config?.existing_ads_page_id;
+  if (typeof existingAdsPageId === 'string' && existingAdsPageId) {
+    return buildMetaAdsWrongPageMessage(existingAdsPageId);
+  }
+  return META_ADS_NO_PAGES_MESSAGE;
+};
 
 const isAdsScope = (value: unknown): boolean =>
   typeof value === 'string' &&
@@ -174,6 +282,21 @@ export const hasMetaAdsReadScope = (
   config: MetaAdsScopeConfigLike | null | undefined
 ): boolean => getMetaAdsScopeState(config) === 'granted';
 
+/**
+ * What do we know about this connection having at least one accessible
+ * Facebook Page? (ENG-2232) Mirrors `getMetaAdsScopeState`'s tri-state shape:
+ * a probe that never ran (legacy record) must read as 'unknown', never as a
+ * confident answer either way.
+ */
+export const getMetaPagesAccessState = (
+  config: MetaAdsScopeConfigLike | null | undefined
+): MetaAdsScopeState => {
+  const hasPages = config?.has_meta_pages;
+  if (hasPages === true) return 'granted';
+  if (hasPages === false) return 'missing';
+  return 'unknown';
+};
+
 /** Minimal structural shape of a connected-account record. */
 export interface MetaAdsAccountLike {
   platform?: unknown;
@@ -212,7 +335,6 @@ export const describeMetaAdsCapability = (
   if (!isMetaAdAccountRecord(account)) return {};
 
   const state = getMetaAdsScopeState(account?.config);
-  if (state === 'granted') return { ads_capable: true };
   if (state === 'missing') {
     const message =
       account?.config?.ads_scope_tier === 'asset'
@@ -220,6 +342,16 @@ export const describeMetaAdsCapability = (
         : META_ADS_RECONSENT_MESSAGE;
     return { ads_capable: false, capability_warning: message };
   }
+
+  // A confirmed absence of any accessible Page is its own, independently fatal
+  // blocker — checked even when the OAuth ads scope is granted (or unproven),
+  // because Page access is a second Meta grant that scopes say nothing about.
+  // This is the exact gap ENG-2232 reported: ads_capable:true with 0 Pages.
+  if (getMetaPagesAccessState(account?.config) === 'missing') {
+    return { ads_capable: false, capability_warning: getMetaAdsNoPagesMessage(account?.config) };
+  }
+
+  if (state === 'granted') return { ads_capable: true };
   return {};
 };
 

@@ -914,11 +914,43 @@ export class MetaService {
       this.initApi(accessToken);
       const user = new User('me');
       const fields = ['id', 'name', 'access_token', 'category', 'tasks'];
+      const params: Record<string, any> = { limit: META_LIST_PAGE_SIZE };
 
-      // Fetch pages (accounts edge on User)
-      const pagesPath = await user.getAccounts(fields);
+      // Fetch pages (accounts edge on User). Drains pagination (ENG-2232 code
+      // review follow-up) — this result no longer only feeds an informational
+      // count, it backs the AD_CREATIVE CREATE page_id gate and the wrong-Page
+      // cross-check (ENG-2232), both exact-membership checks against the
+      // returned set. Before those existed, only taking the first batch was
+      // harmless — has_meta_pages is a presence check, unaffected by
+      // truncation. Now, an account with more accessible Pages than fit in one
+      // batch would have a REAL Page silently missing from this list, and the
+      // gate would wrongly block a legitimate creative, or the cross-check
+      // would wrongly flag a healthy account as broken.
+      const cursor = await MetaService.withReadDeadline(
+        () => user.getAccounts(fields, params),
+        'page list',
+      );
+      const { items, truncated } = await this.drainCursor(cursor, META_LIST_MAX_PAGES);
+      if (truncated) {
+        // ENG-2232 code review follow-up: draining pagination closed the
+        // "page 1 only" gap, but `drainCursor` can ALSO report truncated:true
+        // for a transient page-N fetch failure mid-walk (by design — see its
+        // own "a page-N failure must not throw away pages 1..N-1" comment) or
+        // for hitting the META_LIST_MAX_PAGES bound. Either way, this result
+        // backs exact-membership, absence-sensitive checks (the AD_CREATIVE
+        // CREATE page_id gate, the wrong-Page cross-check) where an
+        // incomplete list read as complete reproduces the exact bug class
+        // this fix exists for, just one layer deeper. Throwing — rather than
+        // returning the partial list — means every real caller's EXISTING
+        // best-effort try/catch (all five already treat a getPages() failure
+        // as "could not determine", never as a confirmed negative) handles
+        // this correctly for free, with no caller-side changes needed.
+        const message = `Page list pagination stopped early after ${items.length} item(s); treating as undetermined rather than risking an incomplete list being read as complete`;
+        this.log(`getPages: ${message}`, { itemsSoFar: items.length });
+        throw new Error(message);
+      }
 
-      const pages = pagesPath.map((page: any) => ({
+      const pages = items.map((page: any) => ({
         id: page.id || page._data?.id,
         name: page.name || page._data?.name,
         access_token: page.access_token || page._data?.access_token,
@@ -1712,6 +1744,33 @@ export class MetaService {
     } catch (error) {
       // handleError always throws — see listAds.
       return this.handleError(error, 'listAdCreatives') as never;
+    }
+  }
+
+  /**
+   * Facebook Page IDs this account's existing ad creatives were built against,
+   * sampled from the most recent page of creatives. Best-effort: returns []
+   * on any failure rather than throwing, same discipline as `getPages`'
+   * granular-scopes fallback — a failed sample must read as "couldn't tell",
+   * never as "no existing ads".
+   *
+   * Lets a caller distinguish "this connection has zero accessible Pages"
+   * from the subtler "it has Pages, but not the one this account's ads
+   * actually run under" (ENG-2232) — a token can hold access to an unrelated
+   * Page while the account's real ads keep failing.
+   */
+  public async getExistingAdPageIds(adAccountId: string, accessToken: string): Promise<string[]> {
+    try {
+      const { creatives } = await this.listAdCreatives(adAccountId, accessToken, { maxPages: 1 });
+      const pageIds = new Set<string>();
+      for (const creative of creatives) {
+        const pageId = creative?.object_story_spec?.page_id;
+        if (typeof pageId === 'string' && pageId) pageIds.add(pageId);
+      }
+      return [...pageIds];
+    } catch (error: any) {
+      console.warn(`[MetaService] getExistingAdPageIds failed for account ${adAccountId}: ${error?.message || error}`);
+      return [];
     }
   }
 
