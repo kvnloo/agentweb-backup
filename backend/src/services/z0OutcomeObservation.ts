@@ -50,6 +50,11 @@ const DEFAULT_TIMEOUT_MS = 1000;
 const MAX_IN_FLIGHT = 16;
 const METRIC_ID = /^[A-Za-z0-9._:-]{1,120}$/;
 const TRACE_ID = /^[a-f0-9]{64}$/;
+const WINDOW_MS: Record<Z0OutcomeWindow, number> = {
+  '1h': 60 * 60 * 1000,
+  '24h': 24 * 60 * 60 * 1000,
+  '7d': 7 * 24 * 60 * 60 * 1000,
+};
 let inFlight = 0;
 
 function sha256(value: string): string {
@@ -124,6 +129,9 @@ export function projectOutcomeObservationToZ0(
   }
   if (executionMs !== undefined && observationMs < executionMs) {
     throw new Error('observationTime cannot predate executionTime');
+  }
+  if (observationMs - decisionMs < WINDOW_MS[input.window]) {
+    throw new Error('observationTime is earlier than the declared measurement window');
   }
 
   const subjectRef = input.subjectId
