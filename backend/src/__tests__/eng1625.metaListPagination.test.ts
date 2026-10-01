@@ -361,4 +361,30 @@ describe('ENG-2232 getPages — pagination', () => {
 
     expect(result.map((p: any) => p.id)).toEqual(['page_1', 'page_2_on_page_2']);
   });
+
+  /**
+   * ENG-2232 code review follow-up (round 2): `drainCursor` reports
+   * truncated:true not only at the META_LIST_MAX_PAGES bound but also when a
+   * page-N fetch fails mid-walk (by design — see drainCursor's own "a page-N
+   * failure must not throw away pages 1..N-1" comment) or at the bound — see
+   * `truncated: true` in both of `drainCursor`'s early-return branches. The
+   * first version of this fix drained pagination but then discarded that
+   * signal, so a transient Graph API hiccup on (say) page 3 of a real Page
+   * list would silently return an incomplete list as if it were complete —
+   * reproducing the exact bug class this fix exists for, one layer deeper.
+   * `getPages()` must throw instead, so every real caller's EXISTING
+   * best-effort try/catch (all five already treat a getPages() failure as
+   * "could not determine", never as a confirmed negative) handles it
+   * correctly with no caller-side changes needed.
+   */
+  it('throws instead of silently returning a partial list when a page fetch fails mid-walk', async () => {
+    const cursor: any = [{ _data: { id: 'page_1', name: 'Page One', access_token: 'p1_token', category: 'Brand' } }];
+    cursor.hasNext = () => true;
+    cursor.next = async () => { throw new Error('transient Graph API hiccup'); };
+    (User as unknown as jest.Mock).mockImplementation(() => ({
+      getAccounts: jest.fn().mockResolvedValue(cursor),
+    }));
+
+    await expect(service.getPages(token)).rejects.toThrow(/stopped early/);
+  });
 });
