@@ -23,6 +23,9 @@ export interface Z0BridgeCapabilitiesV1 {
     socket_backlog: number;
     overload_status: number;
     retry_after_seconds: number;
+    queue_policy: 'reject_excess';
+    overload_execution: 'not_started';
+    overload_execution_header: 'X-Z0-Execution';
   };
   active_dispatch_supported: boolean;
   receipt_schemas: string[];
@@ -76,6 +79,15 @@ export function validateZ0BridgeCapabilitiesV1(value: unknown): string[] {
       if (!Number.isInteger(v) || (v as number) < 0) {
         errors.push(`transport.${field} must be a non-negative integer`);
       }
+    }
+    if (value.transport.queue_policy !== 'reject_excess') {
+      errors.push('transport.queue_policy must be reject_excess');
+    }
+    if (value.transport.overload_execution !== 'not_started') {
+      errors.push('transport.overload_execution must be not_started');
+    }
+    if (value.transport.overload_execution_header !== 'X-Z0-Execution') {
+      errors.push('transport.overload_execution_header must be X-Z0-Execution');
     }
     if (
       Number.isInteger(value.transport.max_request_bytes) &&
