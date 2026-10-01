@@ -1,0 +1,167 @@
+name: AgentWeb z0 Backpressure Circuit E2E
+
+on:
+  pull_request:
+    branches: [lab/z0-evidence-provenance-v1]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backpressure-circuit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout AgentWeb exact head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Checkout z0intelligence backpressure branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kvnloo/z0intelligence
+          ref: lab/agentweb-backpressure-circuit-v1
+          path: deps/z0intelligence
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Record exact heads
+        run: |
+          python - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          roots = {
+              "agentweb": ".",
+              "z0intelligence": "deps/z0intelligence",
+          }
+          heads = {
+              name: subprocess.check_output(
+                  ["git", "-C", path, "rev-parse", "HEAD"], text=True
+              ).strip()
+              for name, path in roots.items()
+          }
+          Path("/tmp/z0-backpressure-heads.json").write_text(
+              json.dumps(heads, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(heads, indent=2))
+          PY
+
+      - name: Install narrow dependencies
+        run: |
+          cd backend && npm ci
+          cd ..
+          python -m pip install pytest==8.4.2 typesafe-sdk==0.7.2
+
+      - name: Run backpressure unit suites
+        run: |
+          cd backend
+          node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit \
+            src/__tests__/experiments.z0BridgeBackpressure.test.ts \
+            src/__tests__/experiments.z0BridgeCapabilities.test.ts \
+            src/__tests__/experiments.z0BridgeProtocol.test.ts \
+            src/__tests__/experiments.z0Integration.test.ts \
+            src/__tests__/experiments.z0ChoiceExperiment.test.ts
+          cd ..
+          PYTHONPATH="$GITHUB_WORKSPACE/deps/z0intelligence/src" python -m pytest -q \
+            deps/z0intelligence/tests/test_agentweb_bridge_overload.py \
+            deps/z0intelligence/tests/test_agentweb_bridge_capabilities.py \
+            deps/z0intelligence/tests/test_agentweb_bridge_protocol.py
+
+      - name: Start z0intelligence
+        env:
+          PYTHONPATH: ${{ github.workspace }}/deps/z0intelligence/src
+          Z0INT_HOME: /tmp/z0int-backpressure-home
+        run: |
+          mkdir -p "$Z0INT_HOME"
+          python -m z0int.intelligence_service --port 11501 > /tmp/z0int-backpressure.log 2>&1 &
+          echo $! > /tmp/z0int-backpressure.pid
+          python - <<'PY'
+          import time, urllib.request
+          url = "http://127.0.0.1:11501/healthz"
+          last = None
+          for _ in range(40):
+              try:
+                  with urllib.request.urlopen(url, timeout=1) as response:
+                      if response.status == 200:
+                          raise SystemExit(0)
+              except Exception as exc:
+                  last = exc
+                  time.sleep(.25)
+          raise SystemExit(f"z0intelligence did not become ready: {last}")
+          PY
+
+      - name: Run exact-head backpressure study
+        working-directory: backend
+        env:
+          Z0INT_SERVICE_URL: http://127.0.0.1:11501
+        run: |
+          npx ts-node src/scripts/run-z0-backpressure-study.ts \
+            /tmp/z0-backpressure-study.json
+          cat /tmp/z0-backpressure-study.json
+
+      - name: Verify no queue, no retry storm, and overload proof
+        run: |
+          python - <<'PY'
+          import json
+
+          result = json.load(open("/tmp/z0-backpressure-study.json"))
+          caps = result["capabilities"]
+          assert caps["max_active"] == 4
+          assert caps["queue_policy"] == "reject_excess"
+          assert caps["overload_execution"] == "not_started"
+          assert caps["overload_execution_header"] == "X-Z0-Execution"
+
+          local = result["local"]
+          assert local["post_count"] == 4
+          assert local["completed_count"] == 4
+          assert local["fifth"]["reason"] == "local_backpressure"
+          assert local["fifth"]["execution_status"] == "not_executed"
+          assert local["fifth"]["reconcile_required"] is False
+
+          overload = result["overload"]
+          assert overload["post_count"] == 2
+          assert overload["first"]["reason"] == "overloaded_pre_execution"
+          assert overload["first"]["execution_status"] == "not_executed"
+          assert overload["first"]["reconcile_required"] is False
+          assert overload["second"]["reason"] == "circuit_open"
+          assert overload["recovered"]["ok"] is True
+
+          unproven = result["unproven"]
+          assert unproven["post_count"] == 1
+          assert unproven["result"]["reason"] == "http_error"
+          assert unproven["result"]["execution_status"] == "unknown"
+          assert unproven["result"]["reconcile_required"] is True
+          assert unproven["result"]["bridge_retry"] == "same_identity_only"
+          PY
+
+      - name: Stop z0intelligence
+        if: always()
+        run: |
+          if test -f /tmp/z0int-backpressure.pid; then
+            kill "$(cat /tmp/z0int-backpressure.pid)" || true
+          fi
+          cat /tmp/z0int-backpressure.log || true
+
+      - name: Upload backpressure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentweb-z0-backpressure-circuit-e2e
+          path: |
+            /tmp/z0-backpressure-heads.json
+            /tmp/z0-backpressure-study.json
+            /tmp/z0int-backpressure.log
