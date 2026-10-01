@@ -83,6 +83,7 @@ export type Z0BridgeFailureClass =
   | 'policy'
   | 'trace_conflict'
   | 'http_4xx'
+  | 'overload_pre_execution'
   | 'timeout'
   | 'transport'
   | 'http_5xx'
@@ -289,6 +290,14 @@ export function bridgeFailureDisposition(
   failure: Z0BridgeFailureClass,
   kind: Z0BridgeKind = mode === 'shadow' ? 'plan' : 'dispatch',
 ): Z0BridgeFailureDisposition {
+  if (failure === 'overload_pre_execution') {
+    return {
+      status: 'not_executed',
+      reconcile_required: false,
+      retry: 'caller_may_fallback',
+    };
+  }
+
   const knownRejection =
     failure === 'validation' ||
     failure === 'policy' ||
