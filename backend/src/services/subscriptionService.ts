@@ -5,6 +5,7 @@ import { skillService } from "./skillService";
 import { hasOwnLiveSubscription } from "./orgAuthz";
 import type { LlmUsagePolicy } from "./llmUsagePolicyService";
 import type { LlmUsageTopUpConfig } from './llmUsageTopUpService';
+import type { SeatPricingConfig } from './orgSeatService';
 
 export interface SubscriptionType {
   name: string;
@@ -34,7 +35,7 @@ export interface SubscriptionType {
    * lookup — `orgSeatService.baseSeatsForTier` remains the source of truth
    * used for enforcement today; this field is not yet wired to replace it.
    */
-  seatPricing?: { priceCents: number; usageCreditMicroUsd: number; baseSeats: number };
+  seatPricing?: SeatPricingConfig;
 }
 
 // Default pages that are always available regardless of subscription type

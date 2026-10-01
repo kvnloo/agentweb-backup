@@ -5089,21 +5089,13 @@ router.post("/subscription-types", async (req, res) => {
       // mirrors orgSeatService.baseSeatsForTier for display/config purposes.
       let normalizedSeatPricing: any = undefined;
       if (type.seatPricing != null) {
+        const { validateSeatPricingConfig } = await import('../services/orgSeatService');
         normalizedSeatPricing = {
           priceCents: Number(type.seatPricing.priceCents),
           usageCreditMicroUsd: Number(type.seatPricing.usageCreditMicroUsd),
           baseSeats: Number(type.seatPricing.baseSeats),
         };
-        const seatPricingErrors: string[] = [];
-        if (!Number.isInteger(normalizedSeatPricing.priceCents) || normalizedSeatPricing.priceCents <= 0) {
-          seatPricingErrors.push('priceCents must be a positive integer');
-        }
-        if (!Number.isInteger(normalizedSeatPricing.usageCreditMicroUsd) || normalizedSeatPricing.usageCreditMicroUsd <= 0) {
-          seatPricingErrors.push('usageCreditMicroUsd must be a positive integer');
-        }
-        if (!Number.isInteger(normalizedSeatPricing.baseSeats) || normalizedSeatPricing.baseSeats < 0) {
-          seatPricingErrors.push('baseSeats must be a non-negative integer');
-        }
+        const seatPricingErrors = validateSeatPricingConfig(normalizedSeatPricing);
         if (seatPricingErrors.length > 0) {
           throw new Error(`${type.name} seat pricing: ${seatPricingErrors.join('; ')}`);
         }
