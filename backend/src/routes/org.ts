@@ -474,6 +474,35 @@ router.get("/me", async (req: Request, res: Response) => {
       return res.json({ success: true, data: null });
     }
 
+    // Seat-based billing (ENG-2250): surface seat usage so the frontend's
+    // already-built paywall/usage UI (`org.seatInfo`) has something to read.
+    // `baseSeatsForTier` returns null for a tier with no seat cap concept
+    // (Managed, etc.) — that is "unlimited," not "zero," so `seatInfo` must be
+    // omitted entirely rather than sent as a capped-at-zero object. The
+    // frontend already treats an absent `seatInfo` as "nothing to show," so
+    // uncapped orgs need no frontend change. The extra `getOrgMemberCount`
+    // read only happens for a capped tier — every other org on every `/me`
+    // call pays nothing for this.
+    const ownerTier = await getUserSubscriptionType(org.ownerUserId);
+    const baseSeats = baseSeatsForTier(ownerTier);
+    let seatInfo:
+      | {
+          baseSeats: number;
+          purchasedExtraSeats: number;
+          effectiveCap: number | null;
+          currentMemberCount: number;
+        }
+      | undefined;
+    if (baseSeats != null) {
+      const currentMemberCount = await orgDb.getOrgMemberCount(org.orgId);
+      seatInfo = {
+        baseSeats,
+        purchasedExtraSeats: org.purchasedExtraSeats || 0,
+        effectiveCap: effectiveSeatCap(baseSeats, org.purchasedExtraSeats),
+        currentMemberCount,
+      };
+    }
+
     // Get members (without sensitive data)
     const members = await orgDb.getOrgMembers(user.orgId);
     // EFFECTIVE role, not the stored column. `roleOf` unions `ownerUserId`, so
@@ -511,6 +540,9 @@ router.get("/me", async (req: Request, res: Response) => {
       success: true,
       data: {
         ...projectOrgForMemberResponse(org, canManageMembers),
+        // Absent (not null) for an uncapped tier — see the comment above
+        // where `seatInfo` is computed.
+        seatInfo,
         members: safeMembers,
         // Server-computed capabilities. Clients must gate on these rather than
         // comparing orgRole themselves — that comparison is exactly what has to
