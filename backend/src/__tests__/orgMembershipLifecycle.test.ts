@@ -80,6 +80,24 @@ jest.mock('../services/db', () => ({
 
 jest.mock('../services/emailService', () => ({ sendEmail: jest.fn(() => Promise.resolve()) }), { virtual: true });
 
+// ENG-2250: xCures (the owner, u-filipe) carries no `subscriptionType` field
+// anywhere in this file's mock data, so without this mock the REAL
+// subscriptionService resolves it to "Free" — which has no seat-cap concept
+// at all (see orgSeatService.SEAT_BASE_BY_TIER) and so never triggers
+// `assertSeatAvailable`'s 409. That made this file's invite/accept tests pass
+// by an accident of the default, not because they were deliberately exercising
+// an uncapped tier — explicit and controllable here instead, defaulting to
+// Managed (also uncapped) so this suite's existing lifecycle scenarios (which
+// add far more than 2-5 members and are not about seat billing) keep passing
+// for a documented reason. Starter/Pro cap enforcement itself is covered in
+// org.test.ts and orgSeatEnforcement.test.ts.
+let mockSubscriptionType = 'Managed';
+jest.mock('../services/subscriptionService', () => ({
+  getUserSubscriptionType: jest.fn(() => Promise.resolve(mockSubscriptionType)),
+  getUserSubscriptionResolution: jest.fn(() =>
+    Promise.resolve({ subscriptionType: mockSubscriptionType, resolved: true })),
+}));
+
 const ORG = 'org-xcures';
 let app: express.Express;
 
@@ -113,6 +131,7 @@ const setRole = (target: string, role: string) =>
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockSubscriptionType = 'Managed';
   seed();
   app = express();
   app.use(express.json());
@@ -386,12 +405,27 @@ describe('adding people', () => {
     expect(mockOrgs[ORG].pendingInvites).toHaveLength(0);
   });
 
-  it('org size is not capped — invites keep succeeding past the old limit of 5', async () => {
+  // ENG-2250 superseded the old blanket "org size is not capped" invariant
+  // this test used to assert: Starter/Pro orgs now have a real seat cap (see
+  // org.test.ts and orgSeatEnforcement.test.ts). An uncapped tier like Managed
+  // (xCures' tier here — see the subscriptionService mock above) still admits
+  // members without limit, which is what this test actually pins now.
+  it('an uncapped-tier org (e.g. Managed) keeps admitting members past the old limit of 5 — seat caps only apply to Starter/Pro', async () => {
     for (let i = 0; i < 10; i++) {
       mockUsers[`u-fill-${i}`] = { userId: `u-fill-${i}`, email: `fill${i}@xcures.com`, orgId: ORG, orgRole: 'member' };
     }
     const res = await request(app).post(`/api/org/${ORG}/invite`).send({ email: 'fifteenth@xcures.com' });
     expect(res.status).toBe(200);
+  });
+
+  it('a Starter-tier org (capped) is blocked from inviting past its seat cap, unlike the uncapped case above', async () => {
+    mockSubscriptionType = 'Starter'; // base 2 seats
+    for (let i = 0; i < 10; i++) {
+      mockUsers[`u-fill-${i}`] = { userId: `u-fill-${i}`, email: `fill${i}@xcures.com`, orgId: ORG, orgRole: 'member' };
+    }
+    const res = await request(app).post(`/api/org/${ORG}/invite`).send({ email: 'fifteenth@xcures.com' });
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe('SEAT_LIMIT_REACHED');
   });
 });
 

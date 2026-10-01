@@ -21,13 +21,18 @@
  * reads org headcount live, on demand, from the existing GSI-backed source
  * of truth (`orgDb.getOrgMemberCount`) — there is no new counter to drift.
  *
- * IMPORTANT: `assertSeatAvailable` is intentionally NOT wired into any route
- * yet. Invite-time enforcement must not ship before the existing-org
- * rollout backfill (computing and persisting `purchasedExtraSeats` for orgs
- * already over their new base, plus the in-product notification) is live —
- * otherwise every such org would start failing invites with zero warning
- * the moment this function is called from a route. Wiring it in is a later,
- * separate change.
+ * ENG-2250: `assertSeatAvailable` IS wired in now, at every path that creates
+ * a new membership (`routes/org.ts`'s invite-send, accept-invite, and
+ * domain-join approval). There is no data migration and no automatic
+ * Stripe/billing change for any existing org — nothing is backfilled or
+ * charged. An org that is already over its effective cap today (there was
+ * never a cap before this feature) keeps every existing member untouched; it
+ * simply cannot admit a new one until the owner purchases enough extra seats
+ * to cover current headcount, or removes someone. This is deliberate, not a
+ * gap to close later — an earlier draft of this comment described a planned
+ * "rollout backfill" gating this wiring, which the product decision behind
+ * ENG-2250 superseded: there is nothing to backfill, so there was nothing to
+ * wait for.
  */
 
 import { orgDb, type Organization } from './db';

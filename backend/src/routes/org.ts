@@ -8,7 +8,13 @@ import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
 import { getUserSubscriptionResolution, getUserSubscriptionType } from "../services/subscriptionService";
 import { purchaseExtraSeat, removeExtraSeat } from "../services/orgSeatBillingService";
-import { baseSeatsForTier, effectiveSeatCap } from "../services/orgSeatService";
+import {
+  assertSeatAvailable,
+  baseSeatsForTier,
+  effectiveSeatCap,
+  SeatLimitReachedError,
+  SEAT_LIMIT_REACHED,
+} from "../services/orgSeatService";
 
 const router = Router();
 
@@ -267,6 +273,20 @@ function deriveDomainFromEmail(email: string): string | undefined {
   return email.split("@")[1]?.toLowerCase() || undefined;
 }
 
+/**
+ * Seat-based billing (ENG-2250): shared `SeatLimitReachedError` → 409 mapping
+ * for every membership-creation path (invite-send, accept-invite, and
+ * domain-join approval). Returns the 409 response when `error` is the seat
+ * limit, or `null` for any other error so the caller's existing catch block
+ * handles it exactly as before (unrelated failures must not change shape).
+ */
+function respondIfSeatLimitReached(error: unknown, res: Response): Response | null {
+  if (error instanceof SeatLimitReachedError) {
+    return res.status(409).json({ error: error.message, code: SEAT_LIMIT_REACHED });
+  }
+  return null;
+}
+
 function sanitizeConnectedAccountForOrgResponse(account: any): any {
   const safeConfig: Record<string, any> = {};
   // Daily outreach limits are account-activity data, not org-shared connection
@@ -474,6 +494,35 @@ router.get("/me", async (req: Request, res: Response) => {
       return res.json({ success: true, data: null });
     }
 
+    // Seat-based billing (ENG-2250): surface seat usage so the frontend's
+    // already-built paywall/usage UI (`org.seatInfo`) has something to read.
+    // `baseSeatsForTier` returns null for a tier with no seat cap concept
+    // (Managed, etc.) — that is "unlimited," not "zero," so `seatInfo` must be
+    // omitted entirely rather than sent as a capped-at-zero object. The
+    // frontend already treats an absent `seatInfo` as "nothing to show," so
+    // uncapped orgs need no frontend change. The extra `getOrgMemberCount`
+    // read only happens for a capped tier — every other org on every `/me`
+    // call pays nothing for this.
+    const ownerTier = await getUserSubscriptionType(org.ownerUserId);
+    const baseSeats = baseSeatsForTier(ownerTier);
+    let seatInfo:
+      | {
+          baseSeats: number;
+          purchasedExtraSeats: number;
+          effectiveCap: number | null;
+          currentMemberCount: number;
+        }
+      | undefined;
+    if (baseSeats != null) {
+      const currentMemberCount = await orgDb.getOrgMemberCount(org.orgId);
+      seatInfo = {
+        baseSeats,
+        purchasedExtraSeats: org.purchasedExtraSeats || 0,
+        effectiveCap: effectiveSeatCap(baseSeats, org.purchasedExtraSeats),
+        currentMemberCount,
+      };
+    }
+
     // Get members (without sensitive data)
     const members = await orgDb.getOrgMembers(user.orgId);
     // EFFECTIVE role, not the stored column. `roleOf` unions `ownerUserId`, so
@@ -511,6 +560,9 @@ router.get("/me", async (req: Request, res: Response) => {
       success: true,
       data: {
         ...projectOrgForMemberResponse(org, canManageMembers),
+        // Absent (not null) for an uncapped tier — see the comment above
+        // where `seatInfo` is computed.
+        seatInfo,
         members: safeMembers,
         // Server-computed capabilities. Clients must gate on these rather than
         // comparing orgRole themselves — that comparison is exactly what has to
@@ -625,6 +677,17 @@ router.post("/:orgId/invite", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "An invite is already pending for this email" });
     }
 
+    // Seat-based billing (ENG-2250): checked here at invite-send time, and
+    // again in accept-invite at accept time. A pending invite doesn't occupy
+    // a seat, so this isn't the only enforcement point — time can pass
+    // between a send and an accept, during which the org can fill up some
+    // other way (another invite accepted, a domain-join approved), so the
+    // accept-time check is the one that actually prevents overfill. This one
+    // exists so an owner gets the paywall immediately, at the point where
+    // they're deciding whether to invite, rather than only discovering it
+    // when the invitee tries to accept.
+    await assertSeatAvailable(orgId);
+
     // Generate invite token
     const inviteToken = crypto.randomBytes(32).toString("hex");
 
@@ -681,6 +744,8 @@ router.post("/:orgId/invite", async (req: Request, res: Response) => {
 
     return res.json({ success: true, message: "Invitation sent" });
   } catch (error) {
+    const seatLimitResponse = respondIfSeatLimitReached(error, res);
+    if (seatLimitResponse) return seatLimitResponse;
     console.error("Error inviting member:", error);
     return res.status(500).json({ error: "Internal server error" });
   }
@@ -718,6 +783,13 @@ router.post("/accept-invite", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Invalid or expired invitation" });
     }
 
+    // Seat-based billing (ENG-2250): re-checked here at accept time, not just
+    // at invite-send time. A pending invite doesn't occupy a seat, so time
+    // between send and accept can let the org fill up some other way (e.g.
+    // another invite accepted, or a domain-join auto-approved) — this is the
+    // check that actually prevents the org from exceeding its cap.
+    await assertSeatAvailable(orgId);
+
     // Add user to org first — the conditional write in joinOrg rejects a user
     // who already belongs to an org, so two concurrent accepts/approvals for the
     // same person resolve to exactly one membership. We
@@ -741,6 +813,8 @@ router.post("/accept-invite", async (req: Request, res: Response) => {
 
     return res.json({ success: true, message: "Successfully joined the organization" });
   } catch (error) {
+    const seatLimitResponse = respondIfSeatLimitReached(error, res);
+    if (seatLimitResponse) return seatLimitResponse;
     console.error("Error accepting invite:", error);
     return res.status(500).json({ error: "Internal server error" });
   }
@@ -780,6 +854,12 @@ router.post("/:orgId/domain-requests/:requestToken/approve", async (req: Request
       return res.status(400).json({ error: "This user is already in an organization" });
     }
 
+    // Seat-based billing (ENG-2250): a domain-join request can sit pending
+    // for a while (it waits on owner approval), during which the org can
+    // fill up — so this is checked here, right before the join, not when the
+    // request was first created.
+    await assertSeatAvailable(orgId);
+
     // Only remove the request from this org's pending list once the join
     // actually succeeds — removing it first would silently drop the request
     // if the atomic join loses the race, with no way to retry.
@@ -796,6 +876,8 @@ router.post("/:orgId/domain-requests/:requestToken/approve", async (req: Request
 
     return res.json({ success: true, message: "Domain-join request approved" });
   } catch (error) {
+    const seatLimitResponse = respondIfSeatLimitReached(error, res);
+    if (seatLimitResponse) return seatLimitResponse;
     console.error("Error approving domain-join request:", error);
     return res.status(500).json({ error: "Internal server error" });
   }
