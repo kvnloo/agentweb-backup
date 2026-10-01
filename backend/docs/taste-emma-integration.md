@@ -441,6 +441,7 @@ Implemented:
 - versioned Taste application receipts with semantic profile/settings revisions, threaded into landing/image/video results
 - durable write-once Taste receipts on generated landing-page artifact records, across v0 and coding-agent paths
 - append-only, reversible More / Less / Ignore feedback keyed to persisted landing-page receipts and scoped to that surface
+- provenance-safe four-arm Taste experiment harness with a fixed suite and deterministic blind pairwise packets
 - REST surface/application/apply/settings/feedback APIs
 - customer Taste Center at `/marketing/taste`
 
@@ -449,6 +450,7 @@ Not yet implemented:
 - "Add as reference" artifact feedback and customer-facing artifact feedback controls
 - campaign/project overlays
 - durable receipt storage for non-landing artifacts and scheduled-run replay/pinning
+- automated experiment execution, human-review queue wiring, and eval dashboard
 - landing-page edit/coding-agent automatic receipt injection
 - social/research candidate re-rankers
 - eval dashboard comparing Brand-only vs Brand+Taste
