@@ -1,11 +1,12 @@
 import Stripe from 'stripe';
 import { createStripeClient } from './stripeClientFactory';
 import dotenv from 'dotenv';
-import { userDb, User } from './db';
+import { userDb, orgDb, User } from './db';
 import { getTierConfig, DEFAULT_PAGES } from './subscriptionService';
 import { paymentHistoryDb } from './paymentHistoryDb';
 import { syncUserUpdateToLeadList } from './crmAutoSyncService';
 import { waitlistDb, WaitlistEntry } from './waitlistDb';
+import { findSeatLineItem } from './orgSeatBillingService';
 
 dotenv.config();
 
@@ -812,6 +813,32 @@ export async function handleSubscriptionUpdated(
     subscriptionType: updateData.subscriptionType,
     subscription_status: updateData.subscription_status,
   });
+
+  // Seat-based billing (ENG-2243..2246): mirror the extra-seat line item's
+  // quantity onto Organization.purchasedExtraSeats when this user is an
+  // org's billing owner. This webhook is the ONLY writer of that field —
+  // orgSeatBillingService reads Stripe live and never writes the mirror.
+  // Idempotent (same quantity in = no-op write) and tolerant of an absent
+  // line item (treated as 0 extra seats) or an unconfigured product id
+  // (skipped entirely rather than guessing).
+  if (user.orgId) {
+    try {
+      const org = await orgDb.getOrgById(user.orgId, ['orgId', 'ownerUserId', 'purchasedExtraSeats']);
+      const productId = process.env.STRIPE_EXTRA_SEAT_PRODUCT_ID;
+      if (org && org.ownerUserId === user.userId && productId) {
+        const seatItem = findSeatLineItem(subscription, productId);
+        const newExtraSeats = seatItem?.quantity ?? 0;
+        if (org.purchasedExtraSeats !== newExtraSeats) {
+          await orgDb.updateOrg(org.orgId, { purchasedExtraSeats: newExtraSeats });
+        }
+      }
+    } catch (seatSyncError: any) {
+      console.error(
+        `[STRIPE] Failed to sync extra-seat quantity for user ${user.userId}'s org:`,
+        seatSyncError.message
+      );
+    }
+  }
 
   console.log(
     `Subscription updated: user ${user.userId} → status=${subscription.status}, has_pm=${hasPaymentMethod}, periodEnd=${updateData.current_period_end || 'unchanged'}, offer=${updateData.activeOffer?.couponId ?? 'none'}`
