@@ -23,6 +23,7 @@ export interface Z0RouteShadowOptions {
   sessionId: string;
   task: string;
   turnOrdinal: number;
+  observationId?: string;
   env?: NodeJS.ProcessEnv;
   fetchImpl?: Z0BridgeFetchLike;
   nowUnixMs?: number;
@@ -91,6 +92,9 @@ function buildShadowRequest(
       risk_class: 'read',
       approval_state: 'not_required',
     },
+    correlation: options.observationId
+      ? { observation_id: options.observationId }
+      : undefined,
   });
 }
 
@@ -155,7 +159,10 @@ export async function runZ0RouteShadow(
         executed: false,
       };
     }
-    return result;
+    return {
+      ...result,
+      observation_id: request.correlation?.observation_id ?? null,
+    };
   } catch (error: any) {
     return {
       ok: false,
@@ -175,6 +182,7 @@ export function logZ0RouteShadow(result: any): void {
     reason: result?.reason ?? null,
     traceId: result?.trace_id ?? null,
     requestSha256: result?.request_sha256 ?? null,
+    observationId: result?.observation_id ?? null,
     routeKind: route?.kind ?? null,
     routeReason: route?.reason ?? null,
     executed: result?.executed === true || route?.executed === true,
@@ -186,9 +194,10 @@ export function observeZ0RouteShadow(
   sessionId: string,
   task: string,
   turnOrdinal: number,
+  observationId?: string,
 ): void {
   if (readZ0RouteShadowMode() === 'off') return;
-  void runZ0RouteShadow({ sessionId, task, turnOrdinal }).then(
+  void runZ0RouteShadow({ sessionId, task, turnOrdinal, observationId }).then(
     logZ0RouteShadow,
     () => logZ0RouteShadow({ ok: false, reason: 'shadow_exception' }),
   );
