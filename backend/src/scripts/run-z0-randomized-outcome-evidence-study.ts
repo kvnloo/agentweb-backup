@@ -196,6 +196,13 @@ async function main() {
   if (oneHour.candidate_n !== 2 || oneHour.reference_n !== 2) {
     throw new Error('arm counts are wrong');
   }
+  if (
+    oneHour.candidate_mean === null ||
+    oneHour.reference_mean === null ||
+    oneHour.difference_in_means === null
+  ) {
+    throw new Error('effect summary unexpectedly incomplete');
+  }
   if (Math.abs(oneHour.candidate_mean - 0.22) > 1e-12) {
     throw new Error('candidate mean mismatch');
   }
