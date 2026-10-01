@@ -92,11 +92,46 @@ describe('POST /api/org/:orgId/seats', () => {
     expect(purchaseExtraSeat).not.toHaveBeenCalled();
   });
 
-  it('propagates a thrown service error as 500', async () => {
-    (purchaseExtraSeat as jest.Mock).mockRejectedValue(new Error('Stripe is down'));
+  it('maps an unexpected service error to a generic 500 without leaking its message', async () => {
+    // A raw Stripe SDK error (or any other unexpected failure) must never
+    // reach the client verbatim — it can carry internal identifiers or
+    // implementation detail that has no business in an API response. Only
+    // the specific, expected, client-correctable error shapes (asserted in
+    // the other tests here) get their message echoed back.
+    (purchaseExtraSeat as jest.Mock).mockRejectedValue(
+      new Error('Stripe API error: no such price prod_internal_abc123')
+    );
     const res = await request(app).post(`/api/org/${ORG}/seats`);
     expect(res.status).toBe(500);
-    expect(res.body.error).toBe('Stripe is down');
+    expect(res.body.error).toBe('Internal server error');
+    expect(res.body.error).not.toMatch(/prod_internal_abc123/);
+  });
+
+  it("maps the service's 'no Stripe subscription' refusal to 400 with its message", async () => {
+    (purchaseExtraSeat as jest.Mock).mockRejectedValue(
+      new Error(`Organization ${ORG}'s owner (u-owner) has no Stripe subscription; cannot manage extra seats`)
+    );
+    const res = await request(app).post(`/api/org/${ORG}/seats`);
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/no Stripe subscription/);
+  });
+
+  it("maps the service's 'no seatPricing configured' refusal to 400 with its message", async () => {
+    (purchaseExtraSeat as jest.Mock).mockRejectedValue(
+      new Error(`Subscription tier 'Managed' has no seatPricing configured; cannot bill extra seats for organization ${ORG}`)
+    );
+    const res = await request(app).post(`/api/org/${ORG}/seats`);
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/no seatPricing configured/);
+  });
+
+  it("maps a service 'not found' error to a generic 404 without leaking internal ids", async () => {
+    (purchaseExtraSeat as jest.Mock).mockRejectedValue(
+      new Error(`Owner u-owner of organization ${ORG} not found`)
+    );
+    const res = await request(app).post(`/api/org/${ORG}/seats`);
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe('Organization not found');
   });
 });
 
@@ -125,9 +160,13 @@ describe('DELETE /api/org/:orgId/seats', () => {
     expect(res.body.error).toMatch(/Cannot remove extra seat/);
   });
 
-  it('returns 500 for an unrelated thrown error', async () => {
-    (removeExtraSeat as jest.Mock).mockRejectedValue(new Error('Stripe is down'));
+  it('maps an unrelated unexpected error to a generic 500 without leaking its message', async () => {
+    (removeExtraSeat as jest.Mock).mockRejectedValue(
+      new Error('Stripe API error: no such price prod_internal_abc123')
+    );
     const res = await request(app).delete(`/api/org/${ORG}/seats`);
     expect(res.status).toBe(500);
+    expect(res.body.error).toBe('Internal server error');
+    expect(res.body.error).not.toMatch(/prod_internal_abc123/);
   });
 });
