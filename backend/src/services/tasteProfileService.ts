@@ -103,8 +103,27 @@ export type TasteDials = {
   visualDensity: number;
 };
 
+export const TASTE_APPLICATION_SCHEMA = 'taste.application.v1';
+export const TASTE_RECEIPT_SCHEMA = 'taste.application-receipt.v1';
+
+export type TasteResolutionSource = 'surface_default' | 'task_override';
+
+export type TasteApplicationReceipt = {
+  schema: typeof TASTE_RECEIPT_SCHEMA;
+  applicationSchema: typeof TASTE_APPLICATION_SCHEMA;
+  surface: TasteSurface;
+  active: boolean;
+  intensity: TasteIntensity;
+  resolutionSource: TasteResolutionSource;
+  profileRevision: string;
+  settingsRevision: string | null;
+  dials: TasteDials;
+  signals: string[];
+  generatedAt: string;
+};
+
 export type TasteApplication = {
-  schema: 'taste.application.v1';
+  schema: typeof TASTE_APPLICATION_SCHEMA;
   surface: TasteSurface;
   active: boolean;
   intensity: TasteIntensity;
@@ -114,6 +133,7 @@ export type TasteApplication = {
   signals: string[];
   guardrails: string[];
   promptContext: string;
+  receipt: TasteApplicationReceipt;
 };
 
 export const TASTE_SURFACES: readonly TasteSurface[] = [
@@ -610,10 +630,35 @@ function validateTasteIntensity(intensity: unknown): TasteIntensity | undefined 
   return intensity;
 }
 
+function stableTasteRevision(prefix: 'profile' | 'settings', value: unknown): string {
+  const digest = createHash('sha256')
+    .update(JSON.stringify(value))
+    .digest('hex')
+    .slice(0, 16);
+  return `${prefix}:v1:${digest}`;
+}
+
+function tasteProfileRevision(profile: TasteProfile): string {
+  const { updatedAt: _updatedAt, ...stableProfile } = profile;
+  return stableTasteRevision('profile', stableProfile);
+}
+
+function tasteSettingsRevision(settings: TasteSettings): string {
+  return stableTasteRevision('settings', {
+    schema: settings.schema,
+    surfaces: TASTE_SURFACES.map((surface) => [surface, settings.surfaces[surface]]),
+  });
+}
+
 function buildTasteApplication(
   profile: TasteProfile,
   rawSurface: unknown,
-  rawIntensity?: unknown
+  rawIntensity?: unknown,
+  receiptContext: {
+    resolutionSource?: TasteResolutionSource;
+    settings?: TasteSettings | null;
+    generatedAt?: string;
+  } = {}
 ): TasteApplication {
   const surface = validateTasteSurface(rawSurface);
   const requestedIntensity = validateTasteIntensity(rawIntensity);
@@ -627,6 +672,24 @@ function buildTasteApplication(
   const signals = profile.styleSignals
     .slice(0, MAX_PROFILE_SIGNALS)
     .map((signal) => `${signal.name}:${signal.score}`);
+  const resolutionSource = receiptContext.resolutionSource
+    || (requestedIntensity ? 'task_override' : 'surface_default');
+  const receiptSettings = resolutionSource === 'surface_default'
+    ? (receiptContext.settings || defaultTasteSettings())
+    : null;
+  const receipt: TasteApplicationReceipt = {
+    schema: TASTE_RECEIPT_SCHEMA,
+    applicationSchema: TASTE_APPLICATION_SCHEMA,
+    surface,
+    active,
+    intensity,
+    resolutionSource,
+    profileRevision: tasteProfileRevision(profile),
+    settingsRevision: receiptSettings ? tasteSettingsRevision(receiptSettings) : null,
+    dials: { ...dials },
+    signals: [...signals],
+    generatedAt: receiptContext.generatedAt || new Date().toISOString(),
+  };
 
   if (!active) {
     return {
@@ -640,6 +703,7 @@ function buildTasteApplication(
       signals,
       guardrails,
       promptContext: '',
+      receipt,
     };
   }
 
@@ -672,7 +736,7 @@ function buildTasteApplication(
   ].filter(Boolean);
 
   return {
-    schema: 'taste.application.v1',
+    schema: TASTE_APPLICATION_SCHEMA,
     surface,
     active: true,
     intensity,
@@ -682,6 +746,7 @@ function buildTasteApplication(
     signals,
     guardrails,
     promptContext: contextLines.join('\n'),
+    receipt,
   };
 }
 
@@ -845,12 +910,13 @@ export class TasteProfileService {
   ): Promise<TasteApplication> {
     const validatedSurface = validateTasteSurface(surface);
     const explicitIntensity = validateTasteIntensity(intensity);
-    const [profile, settings] = await Promise.all([
-      this.getProfile(userId),
-      explicitIntensity ? Promise.resolve(defaultTasteSettings()) : this.getSettings(userId),
-    ]);
-    const resolvedIntensity = explicitIntensity || settings.surfaces[validatedSurface];
-    return buildTasteApplication(profile, validatedSurface, resolvedIntensity);
+    const profile = await this.getProfile(userId);
+    const settings = explicitIntensity ? null : await this.getSettings(userId);
+    const resolvedIntensity = explicitIntensity || settings!.surfaces[validatedSurface];
+    return buildTasteApplication(profile, validatedSurface, resolvedIntensity, {
+      resolutionSource: explicitIntensity ? 'task_override' : 'surface_default',
+      settings,
+    });
   }
 
   async applyToPrompt(
@@ -924,4 +990,6 @@ export const _tasteInternalsForTests = {
   defaultTasteSettings,
   decodeTasteSettings,
   normalizeTasteSettingsPatch,
+  tasteProfileRevision,
+  tasteSettingsRevision,
 };
