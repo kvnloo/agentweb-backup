@@ -628,6 +628,63 @@ describe('Meta Auth Routes', () => {
 
             consoleWarnSpy.mockRestore();
         });
+
+        /**
+         * ENG-2232 code review follow-up: the "fall back to the existing
+         * account's recorded value" branch above (fix commit 75528ce01) had no
+         * test exercising it with a REAL existing value — every prior test left
+         * `getAccountById` at its automock default of `undefined`, so this
+         * branch always took the "nothing to fall back to" path regardless of
+         * whether the fallback logic itself was correct.
+         */
+        it('falls back to the existing account\'s recorded has_meta_pages when a reconnect\'s probe fails', async () => {
+            const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+            (connectedAccountsDb.getAccountById as jest.Mock).mockResolvedValue({
+                platform: 'meta',
+                account_id: 'act_123',
+                config: { has_meta_pages: false, accessible_page_ids: [] },
+            });
+
+            const { connectRes } = await connectWithPages('error');
+
+            expect(connectRes.status).toBe(200);
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.has_meta_pages).toBe(false);
+            expect(config.accessible_page_ids).toEqual([]);
+
+            consoleWarnSpy.mockRestore();
+        });
+
+        /**
+         * ENG-2232 code review follow-up: getAccountById elsewhere in this
+         * codebase (getMetaCredentials) treats the legacy 'facebook' platform
+         * value as the same account as 'meta' for backward compatibility with
+         * connections made before the platform name was standardized. A lookup
+         * scoped to 'meta' alone would silently miss the recorded value on any
+         * account still stored under the old name.
+         */
+        it('finds the existing value even when it is recorded under the legacy \'facebook\' platform value', async () => {
+            const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+            (connectedAccountsDb.getAccountById as jest.Mock).mockImplementation(
+                async (accountId: string, userId: string, platform?: string | string[]) => {
+                    const platforms = Array.isArray(platform) ? platform : [platform];
+                    if (!platforms.includes('facebook')) return null;
+                    return {
+                        platform: 'facebook',
+                        account_id: accountId,
+                        config: { has_meta_pages: false, accessible_page_ids: [] },
+                    };
+                }
+            );
+
+            const { connectRes } = await connectWithPages('error');
+
+            expect(connectRes.status).toBe(200);
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.has_meta_pages).toBe(false);
+
+            consoleWarnSpy.mockRestore();
+        });
     });
 
     /**
