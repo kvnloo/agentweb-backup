@@ -1,5 +1,5 @@
 import { MetaService } from '../services/metaService';
-import { AdAccount, Campaign, AdSet } from 'facebook-nodejs-business-sdk';
+import { AdAccount, Campaign, AdSet, User } from 'facebook-nodejs-business-sdk';
 
 jest.mock('facebook-nodejs-business-sdk', () => ({
   FacebookAdsApi: { init: jest.fn() },
@@ -325,5 +325,40 @@ describe('ENG-1625 listPixels — now goes through the SDK Cursor, not a bespoke
 
     expect(result.pixels).toHaveLength(2);
     expect(result.truncated).toBe(true);
+  });
+});
+
+/**
+ * ENG-2232 code review follow-up — the same truncation defect this file otherwise covers,
+ * found live on `getPages` (the Facebook Page list, not an ads-entity list, which is why it
+ * lives here rather than alongside the AdAccount-scoped methods above). Only taking the first
+ * batch was harmless while `getPages`'s result fed nothing but a presence check
+ * (`has_meta_pages = pages.length > 0`, unaffected by truncation) and an informational count.
+ * ENG-2232 then wired the same result into two exact-membership checks — the AD_CREATIVE
+ * CREATE page_id gate and the wrong-Page cross-check — where a real, accessible Page silently
+ * missing past the first batch would wrongly block a legitimate creative or flag a healthy
+ * account as broken.
+ */
+describe('ENG-2232 getPages — pagination', () => {
+  let service: MetaService;
+  const token = 'tok';
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = MetaService.getInstance();
+  });
+
+  it('walks every page and finds a Page that only exists on page 2', async () => {
+    const pages = [
+      [{ _data: { id: 'page_1', name: 'Page One', access_token: 'p1_token', category: 'Brand' } }],
+      [{ _data: { id: 'page_2_on_page_2', name: 'Page Two', access_token: 'p2_token', category: 'Brand' } }],
+    ];
+    (User as unknown as jest.Mock).mockImplementation(() => ({
+      getAccounts: jest.fn().mockResolvedValue(makeCursor(pages)),
+    }));
+
+    const result = await service.getPages(token);
+
+    expect(result.map((p: any) => p.id)).toEqual(['page_1', 'page_2_on_page_2']);
   });
 });
