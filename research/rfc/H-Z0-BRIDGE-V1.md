@@ -15,7 +15,7 @@ That makes important invariants implicit:
 
 - which system owns user authorization;
 - how one logical operation gets one stable authority identity;
-- what a timeout means after active dispatch may have started;
+- what a timeout means after execution may already have started;
 - whether a response may be treated as applied;
 - which policy assertions cross the boundary;
 - how evidence/receipt identity is represented;
@@ -42,7 +42,7 @@ This RFC extracts those invariants into a small protocol without changing produc
 - specialist/provider eligibility;
 - dispatch claims;
 - durable decision receipts;
-- reconciliation of ambiguous active executions.
+- reconciliation of ambiguous physical execution.
 
 Neither side may infer authority owned by the other from prompt text.
 
@@ -90,23 +90,36 @@ at the AgentWeb-owned boundary.
 
 ## Failure semantics
 
-### Shadow
+### Shadow plan / observe
 
-Any transport/HTTP ambiguity is `not_executed`.
+These lanes are side-effect-free with respect to z0 physical execution. Transport ambiguity is
+`not_executed`.
 
 - no reconciliation;
 - no applied result;
 - AgentWeb may continue using its incumbent behavior.
 
-### Active, known pre-execution rejection
+### Shadow decide
+
+A shadow decision never applies its answer to AgentWeb, but it **may already have issued a model/provider
+call and durable receipt**. Therefore timeout, transport loss, 5xx, or malformed response is
+`unknown` for physical execution even though `applied=false`.
+
+- `reconcile_required=true`;
+- retry semantics are `same_identity_only`;
+- a fresh trace MUST NOT be minted;
+- AgentWeb still keeps its incumbent decision authoritative.
+
+This distinction is required by the existing #50/#51 Choice/Noul study semantics.
+
+### Known pre-execution rejection
 
 Validation, policy rejection, trace conflict, and bounded 4xx failures are `rejected`.
 
 - no fresh identity;
-- no automatic z0 retry;
-- the caller may decide whether its native path is still appropriate.
+- no automatic z0 retry.
 
-### Active, execution ambiguity
+### Active execution ambiguity
 
 Timeout, transport loss, 5xx, or malformed success response are `unknown`.
 
@@ -114,12 +127,11 @@ Timeout, transport loss, 5xx, or malformed success response are `unknown`.
 - retry semantics are `same_identity_only`;
 - a new trace MUST NOT be minted.
 
-This is the bridge-level form of the invariant already exercised by #48/#50.
-
 ## Response
 
 A v1 response repeats operation + trace identity and reports:
 
+- `mode` and `kind`;
 - `status = completed | not_executed | rejected | failed | unknown`;
 - `applied`;
 - `replayed`;
@@ -128,7 +140,8 @@ A v1 response repeats operation + trace identity and reports:
 - optional evidence/receipt identity;
 - bounded structured error/output.
 
-Shadow responses can never be `applied`, `unknown`, or reconciliation-required.
+All shadow responses must have `applied=false`. Only `kind=decide` may be both shadow and
+`status=unknown`, because observational model execution can be ambiguous without influencing AgentWeb.
 
 ## Mapping current experiments
 
@@ -140,8 +153,7 @@ Shadow responses can never be `applied`, `unknown`, or reconciliation-required.
 | `/v1/experimental/noul` | shadow / decide |
 | `/v1/observe/reliability` | shadow / observe |
 
-`/v1/context/pack` remains endpoint-specific in this first slice. Do not enlarge v1 merely to make
-every existing endpoint fit.
+`/v1/context/pack` remains endpoint-specific in this first slice.
 
 ## Capability negotiation
 
@@ -163,11 +175,12 @@ Before active promotion:
 1. AgentWeb and z0 validate the same deterministic fixture corpus.
 2. Identical replay produces no duplicate physical execution.
 3. Changed request under the same authority identity conflicts.
-4. Shadow failure cannot change AgentWeb behavior.
-5. Active ambiguity cannot create a second trace.
-6. No raw AgentWeb identity or credentials cross the boundary.
-7. Existing #49/#51 E2E behavior maps to v1 without weakening safety.
-8. Exact cross-repo heads are frozen in CI.
+4. Shadow plan failure cannot change AgentWeb behavior or require reconciliation.
+5. Shadow decision ambiguity preserves same-identity reconciliation.
+6. Active ambiguity cannot create a second trace.
+7. No raw AgentWeb identity or credentials cross the boundary.
+8. Existing #49/#51 E2E behavior maps to v1 without weakening safety.
+9. Exact cross-repo heads are frozen in CI.
 
 ## First implementation slice
 
@@ -175,7 +188,7 @@ This branch adds only:
 
 - protocol types;
 - runtime request/response validation;
-- conservative failure disposition;
+- kind-aware failure disposition;
 - deterministic unit fixtures.
 
 It intentionally does **not** wire production traffic to the envelope yet.
