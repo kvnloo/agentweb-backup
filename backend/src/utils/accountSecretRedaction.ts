@@ -35,7 +35,7 @@ export const redactAccountSecrets = <T extends AccountLike>(account: T): T => {
 
 export const redactAccountsSecrets = <T extends AccountLike>(
   accounts: T[] | undefined | null
-): T[] => (accounts ?? []).map(redactAccountSecrets);
+): T[] => (Array.isArray(accounts) ? accounts.map(redactAccountSecrets) : []);
 
 /**
  * Strips password hash, encrypted per-user secrets, the password-reset token,

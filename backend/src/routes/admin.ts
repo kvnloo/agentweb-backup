@@ -1007,10 +1007,10 @@ router.get("/users/:userId", async (req, res) => {
     }
 
     // Strip encrypted secret values, expose only key names
-    const { secrets, ...rest } = user as any;
+    const secretNames = (user as any).secrets ? Object.keys((user as any).secrets) : [];
     res.json({
-      ...rest,
-      secretNames: secrets ? Object.keys(secrets) : [],
+      ...sanitizeUserForResponse(user),
+      secretNames,
     });
   } catch (error) {
     console.error("Error getting user:", error);
