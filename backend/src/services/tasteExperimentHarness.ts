@@ -1,7 +1,8 @@
 import { createHash } from 'crypto';
-import type {
-  TasteApplicationReceipt,
-  TasteSurface,
+import {
+  TASTE_SURFACES,
+  type TasteApplicationReceipt,
+  type TasteSurface,
 } from './tasteProfileService';
 
 export const TASTE_EXPERIMENT_SCHEMA = 'taste.experiment.v1';
@@ -96,7 +97,10 @@ export type TasteExperimentEvaluation = {
 
 export type TasteBlindCandidate = {
   presentationId: 'A' | 'B';
-  artifactId: string;
+  /**
+   * Supply an opaque/staged URL when possible. Raw artifact IDs stay only in
+   * the hidden mapping so they cannot encode the experiment arm for reviewers.
+   */
   artifactUrl?: string;
 };
 
@@ -201,6 +205,9 @@ export function createTasteExperimentReceipt(input: {
   const experimentId = cleanString(input.experimentId, 'experimentId', 100);
   const caseId = cleanString(input.caseId, 'caseId', 100);
   const brandRevision = cleanString(input.brandRevision, 'brandRevision', 200);
+  if (!(TASTE_SURFACES as readonly string[]).includes(input.surface)) {
+    throw new Error('unsupported Taste experiment surface');
+  }
   if (!isExperimentArm(input.arm)) throw new Error('unsupported Taste experiment arm');
   const arm = input.arm;
   const usesTaste = armUsesTaste(arm);
@@ -296,12 +303,13 @@ export function createTasteExperimentEvaluation(input: {
   if (input.objectivePerformance && input.objectivePerformance.kind !== 'measured') {
     throw new Error('objective performance must be measured evidence');
   }
+  const objectivePerformance = input.objectivePerformance
+    ? createMeasuredPerformance(input.objectivePerformance)
+    : undefined;
   return {
     candidateId,
     rubric: { ...input.rubric },
-    ...(input.objectivePerformance
-      ? { objectivePerformance: { ...input.objectivePerformance } }
-      : {}),
+    ...(objectivePerformance ? { objectivePerformance } : {}),
   };
 }
 
@@ -362,12 +370,10 @@ export function buildBlindTastePairwise(
       candidates: [
         {
           presentationId: 'A',
-          artifactId: A.artifactId,
           ...(A.artifactUrl ? { artifactUrl: A.artifactUrl } : {}),
         },
         {
           presentationId: 'B',
-          artifactId: B.artifactId,
           ...(B.artifactUrl ? { artifactUrl: B.artifactUrl } : {}),
         },
       ],
