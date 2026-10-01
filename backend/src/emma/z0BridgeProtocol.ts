@@ -126,6 +126,83 @@ const FORBIDDEN_TOP_LEVEL_FIELDS = new Set([
   'password',
 ]);
 
+const FORBIDDEN_PAYLOAD_KEYS = new Set([
+  'userid',
+  'accountid',
+  'sessionid',
+  'apikey',
+  'oauthtoken',
+  'authtoken',
+  'accesstoken',
+  'refreshtoken',
+  'bearertoken',
+  'authorization',
+  'cookie',
+  'password',
+  'clientsecret',
+  'privatekey',
+  'secretkey',
+  'credential',
+  'credentials',
+]);
+
+const MAX_PAYLOAD_DEPTH = 12;
+const MAX_PAYLOAD_NODES = 4096;
+
+function normalizePayloadKey(key: string): string {
+  return key.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+export function validateZ0BridgePayloadIsolationV1(payload: unknown): string[] {
+  const errors: string[] = [];
+  const seen = new WeakSet<object>();
+  let nodes = 0;
+  let stopped = false;
+
+  const visit = (value: unknown, path: string, depth: number): void => {
+    if (stopped) return;
+
+    nodes += 1;
+    if (nodes > MAX_PAYLOAD_NODES) {
+      errors.push(`payload structure exceeds max node count ${MAX_PAYLOAD_NODES}`);
+      stopped = true;
+      return;
+    }
+
+    if (depth > MAX_PAYLOAD_DEPTH) {
+      errors.push(`payload structure exceeds max depth ${MAX_PAYLOAD_DEPTH}`);
+      stopped = true;
+      return;
+    }
+
+    if (!value || typeof value !== 'object') return;
+
+    const objectValue = value as object;
+    if (seen.has(objectValue)) {
+      errors.push('payload must be acyclic');
+      stopped = true;
+      return;
+    }
+    seen.add(objectValue);
+
+    if (Array.isArray(value)) {
+      value.forEach((entry, index) => visit(entry, `${path}[${index}]`, depth + 1));
+      return;
+    }
+
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      if (FORBIDDEN_PAYLOAD_KEYS.has(normalizePayloadKey(key))) {
+        errors.push(`forbidden payload field at ${path}.${key}: ${key}`);
+      }
+      visit(entry, `${path}.${key}`, depth + 1);
+      if (stopped) return;
+    }
+  };
+
+  visit(payload, 'payload', 0);
+  return errors;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -168,6 +245,9 @@ export function validateZ0BridgeRequestV1(value: unknown): string[] {
   }
   if (!Object.prototype.hasOwnProperty.call(value, 'payload')) {
     errors.push('payload is required');
+  }
+  else {
+    errors.push(...validateZ0BridgePayloadIsolationV1(value.payload));
   }
 
   if (!isRecord(value.policy)) {
