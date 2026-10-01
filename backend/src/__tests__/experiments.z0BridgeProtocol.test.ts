@@ -55,11 +55,19 @@ describe('agentweb.z0.bridge.v1', () => {
       .toContain('active external_side_effect dispatch requires confirmed AgentWeb approval');
   });
 
-  it('fails open without reconciliation for shadow transport failures', () => {
-    expect(bridgeFailureDisposition('shadow', 'timeout')).toEqual({
+  it('fails open for side-effect-free shadow planning failures', () => {
+    expect(bridgeFailureDisposition('shadow', 'timeout', 'plan')).toEqual({
       status: 'not_executed',
       reconcile_required: false,
       retry: 'caller_may_fallback',
+    });
+  });
+
+  it('preserves ambiguity for shadow decisions that may already have called a model', () => {
+    expect(bridgeFailureDisposition('shadow', 'timeout', 'decide')).toEqual({
+      status: 'unknown',
+      reconcile_required: true,
+      retry: 'same_identity_only',
     });
   });
 
@@ -84,12 +92,13 @@ describe('agentweb.z0.bridge.v1', () => {
     });
   });
 
-  it('rejects impossible shadow response semantics', () => {
+  it('rejects impossible side-effect-free shadow response semantics', () => {
     const errors = validateZ0BridgeResponseV1({
       schema: Z0_BRIDGE_SCHEMA_V1,
       operation_id: 'op-1',
       trace_id: 'c'.repeat(64),
       mode: 'shadow',
+      kind: 'plan',
       status: 'unknown',
       applied: true,
       replayed: false,
@@ -99,8 +108,23 @@ describe('agentweb.z0.bridge.v1', () => {
 
     expect(errors).toEqual(expect.arrayContaining([
       'shadow response cannot be applied',
-      'shadow response cannot have unknown execution status',
-      'shadow response cannot require reconciliation',
+      'side-effect-free shadow response cannot have unknown execution status',
+      'side-effect-free shadow response cannot require reconciliation',
     ]));
+  });
+
+  it('allows shadow decision ambiguity while keeping the result unapplied', () => {
+    expect(validateZ0BridgeResponseV1({
+      schema: Z0_BRIDGE_SCHEMA_V1,
+      operation_id: 'op-2',
+      trace_id: 'd'.repeat(64),
+      mode: 'shadow',
+      kind: 'decide',
+      status: 'unknown',
+      applied: false,
+      replayed: false,
+      reconcile_required: true,
+      retry: 'same_identity_only',
+    })).toEqual([]);
   });
 });
