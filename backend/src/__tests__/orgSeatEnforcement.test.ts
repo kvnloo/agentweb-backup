@@ -216,4 +216,45 @@ describe('POST /api/org/:orgId/domain-requests/:requestToken/approve — seat ca
     const res = await request(app).post(`/api/org/${ORG}/domain-requests/valid-domain-token/approve`);
     expect(res.status).toBe(200);
   });
+
+  // Domain auto-join has no "send" step to gate at — unlike an invite, several
+  // of these can pile up waiting on one owner click each. The cap must be
+  // re-read live on every individual approval, not decided once for the whole
+  // batch, so approving them one at a time correctly admits members up to the
+  // cap and then 409s on the rest — never all-regardless-of-cap, and never
+  // wrongly blocking the first one just because others are also pending.
+  it('with several domain-join requests pending at once, approving one at a time fills the org exactly to its cap and then blocks the rest', async () => {
+    // Starter cap is 2. u-owner already holds 1 seat, so exactly one more
+    // approval should succeed; a second and third must both be blocked.
+    mockUsers['u-second'] = { userId: 'u-second', email: 'second@acme.com' };
+    mockUsers['u-third'] = { userId: 'u-third', email: 'third@acme.com' };
+    mockOrgs[ORG].pendingDomainJoinRequests = [
+      { userId: 'u-joiner', email: 'joiner@acme.com', requestedAt: '2026-01-01T00:00:00Z', requestToken: 'tok-1' },
+      { userId: 'u-second', email: 'second@acme.com', requestedAt: '2026-01-01T00:00:01Z', requestToken: 'tok-2' },
+      { userId: 'u-third', email: 'third@acme.com', requestedAt: '2026-01-01T00:00:02Z', requestToken: 'tok-3' },
+    ];
+
+    const first = await request(app).post(`/api/org/${ORG}/domain-requests/tok-1/approve`);
+    expect(first.status).toBe(200);
+    expect(mockUsers['u-joiner'].orgId).toBe(ORG);
+
+    // The org is now at its cap of 2 (owner + joiner). The second request
+    // must be blocked, not silently admitted because it was already pending
+    // before the cap filled up.
+    const second = await request(app).post(`/api/org/${ORG}/domain-requests/tok-2/approve`);
+    expect(second.status).toBe(409);
+    expect(second.body.code).toBe('SEAT_LIMIT_REACHED');
+    expect(mockUsers['u-second'].orgId).toBeUndefined();
+
+    // The third is blocked for the same reason, independently of the second.
+    const third = await request(app).post(`/api/org/${ORG}/domain-requests/tok-3/approve`);
+    expect(third.status).toBe(409);
+    expect(third.body.code).toBe('SEAT_LIMIT_REACHED');
+    expect(mockUsers['u-third'].orgId).toBeUndefined();
+
+    // Both blocked requests are still pending — a 409 never silently drops
+    // the request, so the owner can approve either one later if a seat opens.
+    const remainingTokens = mockOrgs[ORG].pendingDomainJoinRequests.map((r: any) => r.requestToken);
+    expect(remainingTokens).toEqual(['tok-2', 'tok-3']);
+  });
 });
