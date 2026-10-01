@@ -10210,8 +10210,12 @@ export const browserCookieDb = {
 
 /** Keep structured ads lessons out of generic relevance injection, without consuming its
  * requested limit. Scope-aware readers use adsLearningDb; malformed pages fail closed. */
-async function queryOrdinaryAccountMemories(params: AWS.DynamoDB.DocumentClient.QueryInput): Promise<any[]> {
+async function queryOrdinaryAccountMemories(
+  params: AWS.DynamoDB.DocumentClient.QueryInput,
+  options: { drainAll?: boolean } = {}
+): Promise<any[]> {
   const rows: any[] = [];
+  const drainAll = options.drainAll === true;
   let query = { ...params };
   let cursor: AWS.DynamoDB.DocumentClient.Key | undefined;
   for (let page = 0; page < 10; page++) {
@@ -10236,7 +10240,12 @@ async function queryOrdinaryAccountMemories(params: AWS.DynamoDB.DocumentClient.
       if (params.Limit && rows.length >= params.Limit) return rows.slice(0, params.Limit);
       continue;
     }
-    if (!cursor || (params.Limit ? rows.length >= params.Limit : rows.length > 0)) return params.Limit ? rows.slice(0, params.Limit) : rows;
+    if (
+      !cursor ||
+      (params.Limit ? rows.length >= params.Limit : (!drainAll && rows.length > 0))
+    ) {
+      return params.Limit ? rows.slice(0, params.Limit) : rows;
+    }
   }
   throw new Error('Account memory retrieval exceeded its bounded page budget; incomplete results withheld');
 }
@@ -10315,6 +10324,33 @@ export const accountMemoryDb = {
       return await queryOrdinaryAccountMemories(params);
     } catch (error) {
       handleDynamoDbError(error, 'getUserMemories');
+      throw error;
+    }
+  },
+
+  /**
+   * Bounded complete read for state machines that must never silently recompute
+   * from only the first DynamoDB page. Ordinary UI/context reads keep their
+   * existing first-useful-page semantics via getUserMemories().
+   */
+  async getUserMemoriesComplete(userId: string, category?: string) {
+    try {
+      const params: AWS.DynamoDB.DocumentClient.QueryInput = category
+        ? {
+          TableName: ACCOUNT_MEMORY_TABLE,
+          IndexName: 'UserIdCategoryIndex',
+          KeyConditionExpression: 'userId = :userId AND category = :category',
+          ExpressionAttributeValues: { ':userId': userId, ':category': category },
+        }
+        : {
+          TableName: ACCOUNT_MEMORY_TABLE,
+          KeyConditionExpression: 'userId = :userId',
+          ExpressionAttributeValues: { ':userId': userId },
+        };
+
+      return await queryOrdinaryAccountMemories(params, { drainAll: true });
+    } catch (error) {
+      handleDynamoDbError(error, 'getUserMemoriesComplete');
       throw error;
     }
   },
