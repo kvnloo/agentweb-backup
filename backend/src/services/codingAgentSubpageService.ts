@@ -40,6 +40,7 @@ const SUBPAGE_MODEL = process.env.CODING_AGENT_SUBPAGE_MODEL || "anthropic.claud
 export interface AddPageViaCodingAgentOptions {
   leadListId?: string;
   originatingSessionId?: string;
+  tasteReceipt?: import("./tasteProfileService").TasteApplicationReceipt;
 }
 
 /**
@@ -94,6 +95,7 @@ export async function addPageViaCodingAgent(
     siteId: site.siteId ?? site.id,
     ...(opts.originatingSessionId ? { originatingSessionId: opts.originatingSessionId } : {}),
     ...(opts.leadListId ? { leadListId: opts.leadListId } : {}),
+    ...(opts.tasteReceipt ? { tasteReceipt: opts.tasteReceipt } : {}),
     // A conversion is site-wide by construction (shared root layout), so this page
     // inherits the site's pair rather than resolving its own — the same rule addSubPage
     // follows. Carried onto the record so RULE 7.5 and the offline import (ENG-1325) can
