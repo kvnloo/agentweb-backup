@@ -3380,7 +3380,12 @@ export class AgentModeService {
     });
     // Observation-only: bridge v1 shadow routing is never consulted by the
     // AgentWeb execution path and fails open on any bridge error.
-    observeZ0RouteShadow(sessionId, messageContent, sessionHistory.length);
+    observeZ0RouteShadow(
+      sessionId,
+      messageContent,
+      sessionHistory.length,
+      agentRuntimeRunId,
+    );
     try {
       // Resolve the model up front: map legacy/renamed ids forward (e.g. old
       // sessions persisted the pre-rename "claude-opus-4-8") AND validate against
