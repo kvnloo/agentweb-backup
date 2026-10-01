@@ -439,6 +439,7 @@ Implemented:
 - Agent Mode policy for when Taste should/shouldn't apply
 - automatic backend application for landing pages, images, and video
 - versioned Taste application receipts with semantic profile/settings revisions, threaded into landing/image/video results
+- durable write-once Taste receipts on generated landing-page artifact records, across v0 and coding-agent paths
 - REST surface/application/apply/settings APIs
 - customer Taste Center at `/marketing/taste`
 
@@ -446,7 +447,7 @@ Not yet implemented:
 - screenshot/Figma/design-dump visual ingestion
 - "more like this / less like this" artifact feedback
 - campaign/project overlays
-- durable storage/retrieval of Taste receipts on persisted artifacts and scheduled runs
+- durable receipt storage for non-landing artifacts and scheduled-run replay/pinning
 - landing-page edit/coding-agent automatic receipt injection
 - social/research candidate re-rankers
 - eval dashboard comparing Brand-only vs Brand+Taste
