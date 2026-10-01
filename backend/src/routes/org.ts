@@ -7,6 +7,7 @@ import { v4 as uuidv4 } from "uuid";
 import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
 import { getUserSubscriptionResolution, getUserSubscriptionType, getTierConfig } from "../services/subscriptionService";
+import { redactAccountSecrets } from "../utils/accountSecretRedaction";
 import { purchaseExtraSeat, removeExtraSeat } from "../services/orgSeatBillingService";
 import {
   assertSeatAvailable,
@@ -288,28 +289,27 @@ function respondIfSeatLimitReached(error: unknown, res: Response): Response | nu
 }
 
 function sanitizeConnectedAccountForOrgResponse(account: any): any {
-  const safeConfig: Record<string, any> = {};
+  // Credential stripping (access/refresh tokens, API keys, webhook signing
+  // keys) delegates to the shared helper (ENG-2258) — this function's own
+  // pattern-based denylist missed `webhook_signing_key` (doesn't end in
+  // "token" or contain "secret"), which the shared, explicit field list does
+  // not.
+  const { config: safeConfig, ...safeAccount } = redactAccountSecrets(account);
+
   // Daily outreach limits are account-activity data, not org-shared connection
   // metadata. The owner-facing account endpoint has its own explicit contract;
   // this member-visible projection must not expose the cap, count, or window.
   const privateOperationalKeys = new Set(['daily_invite_cap', 'daily_volume']);
-  for (const [key, value] of Object.entries(account.config || {})) {
-    const normalizedKey = key.toLowerCase();
-    const looksCredentialLike =
-      normalizedKey === "token" ||
-      normalizedKey.endsWith("_token") ||
-      normalizedKey.endsWith("token") ||
-      normalizedKey.includes("secret") ||
-      normalizedKey === "api_key" ||
-      normalizedKey === "apikey";
-    if (!looksCredentialLike && !privateOperationalKeys.has(normalizedKey)) {
-      safeConfig[key] = value;
+  const projectedConfig: Record<string, any> = {};
+  for (const [key, value] of Object.entries(safeConfig || {})) {
+    if (!privateOperationalKeys.has(key)) {
+      projectedConfig[key] = value;
     }
   }
 
   return {
-    ...account,
-    config: safeConfig,
+    ...safeAccount,
+    config: projectedConfig,
   };
 }
 
