@@ -1,5 +1,6 @@
 import '../emma/jevTools';
 import { emmaToolRegistry } from '../emma/registry';
+import { clearZ0BridgeBackpressureStateForTests } from '../emma/z0BridgeBackpressure';
 import {
   agentWebTraceId,
   pseudonymousAgentWebParent,
@@ -20,6 +21,48 @@ const request: Z0RouteArgs = {
 function config(mode: 'off' | 'shadow' | 'active'): Z0AgentWebConfig {
   return { mode, baseUrl: 'http://z0.test', timeoutMs: 1000 };
 }
+
+function backpressureConfig(mode: 'shadow' | 'active'): Z0AgentWebConfig {
+  return {
+    ...config(mode),
+    backpressureMode: 'enforce',
+  };
+}
+
+const capabilities = {
+  schema: 'agentweb.z0.bridge.capabilities.v1',
+  bridge_protocol_versions: ['agentweb.z0.bridge.v1'],
+  transport: {
+    max_request_bytes: 40000,
+    max_active: 4,
+    socket_backlog: 8,
+    overload_status: 503,
+    retry_after_seconds: 1,
+    queue_policy: 'reject_excess',
+    overload_execution: 'not_started',
+    overload_execution_header: 'X-Z0-Execution',
+  },
+  active_dispatch_supported: true,
+  receipt_schemas: ['z0int.decision_receipt.v1'],
+  endpoints: [
+    {
+      path: '/v1/plan',
+      kind: 'plan',
+      modes: ['shadow'],
+      capability_source: 'payload.function',
+      physical_execution: false,
+      free_only: 'caller_explicit',
+    },
+    {
+      path: '/v1/intelligence',
+      kind: 'dispatch',
+      modes: ['active'],
+      capability_source: 'payload.function',
+      physical_execution: true,
+      free_only: 'caller_explicit',
+    },
+  ],
+};
 
 function bridgeResponse(legacy: Record<string, any>, status = 200): Z0FetchLike {
   return jest.fn(async (_url: unknown, init?: RequestInit) => {
@@ -48,6 +91,7 @@ function bridgeResponse(legacy: Record<string, any>, status = 200): Z0FetchLike 
 }
 
 describe('z0 AgentWeb adapter', () => {
+  beforeEach(() => clearZ0BridgeBackpressureStateForTests());
   it('defaults to an internal-only read-only Emma tool', () => {
     const tool = emmaToolRegistry.getTool('z0_route');
     expect(tool).toBeDefined();
@@ -122,6 +166,93 @@ describe('z0 AgentWeb adapter', () => {
     });
     expect(JSON.stringify(body)).not.toContain('raw-session-secret');
     expect(body.parent_agent).toMatch(/^agentweb:[a-f0-9]{24}$/);
+  });
+
+  it('treats a proven overload 503 as pre-execution and opens the circuit', async () => {
+    const fetchImpl = jest.fn(async (_url: unknown, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'GET') {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => capabilities,
+        };
+      }
+      return {
+        ok: false,
+        status: 503,
+        headers: new Headers({
+          'Retry-After': '1',
+          'X-Z0-Execution': 'not_started',
+        }),
+        json: async () => ({}),
+      };
+    }) as unknown as Z0FetchLike;
+
+    const first = await runZ0Route(request, {
+      sessionId: 'raw-session-secret',
+      config: backpressureConfig('active'),
+      fetchImpl,
+    });
+    expect(first).toMatchObject({
+      ok: false,
+      reason: 'overloaded_pre_execution',
+      execution_status: 'not_executed',
+      reconcile_required: false,
+      bridge_retry: 'caller_may_fallback',
+      retry_after_ms: 1000,
+    });
+
+    const second = await runZ0Route(
+      { ...request, operation_id: 'op-43' },
+      {
+        sessionId: 'raw-session-secret',
+        config: backpressureConfig('active'),
+        fetchImpl,
+      },
+    );
+    expect(second).toMatchObject({
+      ok: false,
+      reason: 'circuit_open',
+      execution_status: 'not_executed',
+      reconcile_required: false,
+      bridge_retry: 'caller_may_fallback',
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps an unproven active 503 ambiguous and never retries automatically', async () => {
+    const fetchImpl = jest.fn(async (_url: unknown, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'GET') {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => capabilities,
+        };
+      }
+      return {
+        ok: false,
+        status: 503,
+        headers: new Headers({ 'Retry-After': '1' }),
+        json: async () => ({}),
+      };
+    }) as unknown as Z0FetchLike;
+
+    const result = await runZ0Route(request, {
+      sessionId: 'raw-session-secret',
+      config: backpressureConfig('active'),
+      fetchImpl,
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason: 'http_error',
+      execution_status: 'unknown',
+      reconcile_required: true,
+      bridge_retry: 'same_identity_only',
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
   it('active ambiguity requires reconciliation with the same deterministic trace', async () => {
