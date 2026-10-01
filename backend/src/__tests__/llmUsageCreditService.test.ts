@@ -1,5 +1,6 @@
 import {
   applyLlmUsageCredits,
+  getCurrentUsageMonth,
   getLlmUsageCreditAdjustment,
   grantMonthlyLlmUsageCredit,
   planRolloutMigrationCredit,
@@ -18,6 +19,29 @@ const ledger: MonthlyLlmUsageCredits = {
 };
 
 describe('LLM usage credits', () => {
+  // usageCycle.ts's header comment documents the billing cycle as "reckoned
+  // per CALENDAR month in UTC." getCurrentUsageMonth had no direct test and
+  // silently used local-time getters instead, which only read as correct
+  // because every CI/prod machine for this project happens to already run in
+  // UTC — found via a real timezone-dependent test failure (orgSeatCreditGrantService
+  // tests passed on UTC machines, failed on Pacific). Pinning explicit UTC dates
+  // here (process.env.TZ-independent, unlike `new Date(2026, 9, 1)` which is
+  // local-time) is what actually exercises the UTC contract regardless of the
+  // machine running the suite.
+  describe('getCurrentUsageMonth', () => {
+    it('reckons the month in UTC, not the host process\'s local timezone', () => {
+      // 2026-10-01T00:00:00Z is still 2026-09-30 in every timezone behind UTC
+      // (the whole Western hemisphere) — exactly the boundary a local-time
+      // implementation gets wrong.
+      expect(getCurrentUsageMonth(new Date('2026-10-01T00:00:00Z'))).toBe('2026-10');
+      expect(getCurrentUsageMonth(new Date('2026-09-30T23:59:59Z'))).toBe('2026-09');
+    });
+
+    it('pads single-digit months', () => {
+      expect(getCurrentUsageMonth(new Date('2026-01-15T12:00:00Z'))).toBe('2026-01');
+    });
+  });
+
   it('migration credit starts an affected user from zero without erasing raw spend', () => {
     const adjustment = getLlmUsageCreditAdjustment(ledger, '2026-08');
     expect(applyLlmUsageCredits({
