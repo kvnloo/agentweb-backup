@@ -299,6 +299,64 @@ describe('Organization routes', () => {
       // Members should not include sensitive data
       expect(res.body.data.members[0]).not.toHaveProperty('password');
     });
+
+    // ENG-2250: the frontend's paywall/usage UI reads org.seatInfo. It was
+    // never sent before this, so that UI has been silently inert.
+    describe('seatInfo', () => {
+      beforeEach(() => {
+        mockOrgs['org-1'] = {
+          orgId: 'org-1',
+          name: 'Test Org',
+          ownerUserId: 'user-1',
+        };
+        mockUsers['user-1'].orgId = 'org-1';
+        mockUsers['user-1'].orgRole = 'owner';
+      });
+
+      it('returns seatInfo for a capped-tier org, computed from the owner tier and live member count', async () => {
+        mockSubscriptionType = 'Starter'; // base 2
+        mockUsers['user-2'].orgId = 'org-1';
+        mockUsers['user-2'].orgRole = 'member';
+        (mockOrgs['org-1'] as any).purchasedExtraSeats = 3;
+
+        const res = await request(app).get('/api/org/me');
+
+        expect(res.status).toBe(200);
+        expect(res.body.data.seatInfo).toEqual({
+          baseSeats: 2,
+          purchasedExtraSeats: 3,
+          effectiveCap: 5,
+          currentMemberCount: 2,
+        });
+      });
+
+      it('reports a true pre-existing overage rather than special-casing it — currentMemberCount can exceed effectiveCap', async () => {
+        mockSubscriptionType = 'Starter'; // base 2, no purchased extra seats
+        for (let i = 0; i < 4; i++) {
+          mockUsers[`filler-${i}`] = { userId: `filler-${i}`, email: `filler-${i}@example.com`, orgId: 'org-1', orgRole: 'member' };
+        }
+        // 5 members total (owner + 4 fillers) against an effective cap of 2.
+
+        const res = await request(app).get('/api/org/me');
+
+        expect(res.status).toBe(200);
+        expect(res.body.data.seatInfo).toEqual({
+          baseSeats: 2,
+          purchasedExtraSeats: 0,
+          effectiveCap: 2,
+          currentMemberCount: 5,
+        });
+      });
+
+      it('omits seatInfo entirely (not null) for an uncapped-tier org', async () => {
+        mockSubscriptionType = 'Managed';
+
+        const res = await request(app).get('/api/org/me');
+
+        expect(res.status).toBe(200);
+        expect(Object.prototype.hasOwnProperty.call(res.body.data, 'seatInfo')).toBe(false);
+      });
+    });
   });
 
   describe('PUT /api/org/:orgId - update org', () => {
@@ -596,15 +654,36 @@ describe('Organization routes', () => {
       expect(mockOrgs['org-1'].pendingInvites).toHaveLength(1);
     });
 
-    // Replaces the removed maxMembers/memberCount capacity tests. Org size is no
-    // longer capped: tiers are usage-based, not seat-based, so there is nothing
-    // for a seat limit to enforce. Orgs that predate this still carry a stored
-    // maxMembers attribute; nothing reads it, so it is inert.
-    it('does not cap org size — an invite succeeds well past the old limit of 5', async () => {
-      for (let i = 0; i < 12; i++) {
+    // ENG-2250 superseded this invariant. This test used to prove org size was
+    // never capped (tiers were usage-based, not seat-based, so there was
+    // nothing for a seat limit to enforce). Seat-based billing reinstates a
+    // real cap for capped tiers (Starter/Pro) going forward — this is the
+    // confirmed, intended behavior, not a regression: an org already over its
+    // new cap (this one has 5 Starter-tier members against a base of 2, no
+    // purchased extra seats — exactly the "already over-cap before this
+    // feature" case) cannot add a new member until the owner buys seats or
+    // removes someone. No existing member is touched by this — see
+    // orgSeatService.test.ts / the dedicated non-removal test below for that.
+    it('blocks an invite for an org already over its seat cap before this feature shipped (no retroactive punishment, just no further growth)', async () => {
+      for (let i = 0; i < 4; i++) {
         mockUsers[`filler-${i}`] = { userId: `filler-${i}`, email: `filler-${i}@example.com`, orgId: 'org-1', orgRole: 'member' };
       }
-      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'thirteenth@example.com' });
+      // 5 members total (owner + 4 fillers) against a Starter base of 2 —
+      // already over cap, with zero purchased extra seats.
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'sixth@example.com' });
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('SEAT_LIMIT_REACHED');
+      // No existing member is removed, demoted, or otherwise touched.
+      for (let i = 0; i < 4; i++) {
+        expect(mockUsers[`filler-${i}`].orgId).toBe('org-1');
+      }
+      expect(mockOrgs['org-1'].pendingInvites).toHaveLength(0);
+    });
+
+    it('succeeds for a Starter org below its seat cap', async () => {
+      // Only the owner is in the org at this point (base beforeEach) — 1 of 2
+      // Starter seats used, so there's room for exactly one more.
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'second@example.com' });
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
     });
