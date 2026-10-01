@@ -4,11 +4,13 @@ import { authenticateToken } from '../middleware/auth';
 import {
   MAX_TASTE_ITEMS,
   TASTE_SURFACES,
+  TasteFeedbackNotFoundError,
   TasteProviderError,
   TasteSourceAccessError,
   TasteValidationError,
   tasteProfileService,
 } from '../services/tasteProfileService';
+import { getLandingPage } from '../services/v0Service';
 
 const router = express.Router();
 
@@ -23,6 +25,15 @@ const importLimiter = rateLimit({
   // per shared office/VPN IP.
   keyGenerator: (req: any) => String(req.user.userId),
   message: { error: 'Too many taste imports. Try again shortly.' },
+});
+
+const feedbackLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 30,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  keyGenerator: (req: any) => String(req.user.userId),
+  message: { error: 'Too many Taste feedback actions. Try again shortly.' },
 });
 
 function userId(req: any): string {
@@ -51,6 +62,9 @@ function sendTasteError(res: express.Response, error: unknown) {
   }
   if (error instanceof TasteSourceAccessError) {
     return res.status(404).json({ error: 'Connected source not found' });
+  }
+  if (error instanceof TasteFeedbackNotFoundError) {
+    return res.status(404).json({ error: error.message });
   }
   if (error instanceof TasteProviderError) {
     return res.status(502).json({ error: error.message });
@@ -147,6 +161,66 @@ router.post('/apply', importLimiter, async (req, res) => {
       req.body.intensity
     );
     return res.json(result);
+  } catch (error) {
+    return sendTasteError(res, error);
+  }
+});
+
+router.post('/feedback', feedbackLimiter, async (req, res) => {
+  try {
+    // Receipt/provenance is NEVER caller-supplied. Resolve the artifact through its
+    // owner-scoped store and copy the receipt that was persisted at generation time.
+    assertExactKeys(req.body, ['artifactType', 'artifactId', 'direction']);
+    if (req.body.artifactType !== 'landing_page') {
+      throw new TasteValidationError('artifactType must be landing_page');
+    }
+    if (typeof req.body.artifactId !== 'string' || !req.body.artifactId.trim()) {
+      throw new TasteValidationError('artifactId is required');
+    }
+    if (!['more', 'less', 'ignore'].includes(req.body.direction)) {
+      throw new TasteValidationError('direction must be more, less, or ignore');
+    }
+
+    const artifact = await getLandingPage(req.body.artifactId.trim(), userId(req));
+    if (!artifact) {
+      return res.status(404).json({ error: 'Artifact not found' });
+    }
+    if (!artifact.tasteReceipt) {
+      return res.status(409).json({ error: 'Artifact does not have Taste provenance' });
+    }
+
+    const feedback = await tasteProfileService.recordFeedback(
+      userId(req),
+      'landing_page',
+      artifact.id,
+      req.body.direction,
+      artifact.tasteReceipt
+    );
+    return res.status(201).json({ feedback });
+  } catch (error) {
+    return sendTasteError(res, error);
+  }
+});
+
+router.get('/feedback', async (req, res) => {
+  try {
+    const feedback = await tasteProfileService.listFeedback(
+      userId(req),
+      req.query.artifactId
+    );
+    return res.json({ feedback });
+  } catch (error) {
+    return sendTasteError(res, error);
+  }
+});
+
+router.post('/feedback/:eventId/reverse', feedbackLimiter, async (req, res) => {
+  try {
+    const feedback = await tasteProfileService.reverseFeedback(
+      userId(req),
+      req.params.eventId
+    );
+    return res.json({ feedback });
   } catch (error) {
     return sendTasteError(res, error);
   }
