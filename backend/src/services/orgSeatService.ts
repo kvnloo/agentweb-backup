@@ -21,13 +21,18 @@
  * reads org headcount live, on demand, from the existing GSI-backed source
  * of truth (`orgDb.getOrgMemberCount`) — there is no new counter to drift.
  *
- * IMPORTANT: `assertSeatAvailable` is intentionally NOT wired into any route
- * yet. Invite-time enforcement must not ship before the existing-org
- * rollout backfill (computing and persisting `purchasedExtraSeats` for orgs
- * already over their new base, plus the in-product notification) is live —
- * otherwise every such org would start failing invites with zero warning
- * the moment this function is called from a route. Wiring it in is a later,
- * separate change.
+ * ENG-2250: `assertSeatAvailable` IS wired in now, at every path that creates
+ * a new membership (`routes/org.ts`'s invite-send, accept-invite, and
+ * domain-join approval). There is no data migration and no automatic
+ * Stripe/billing change for any existing org — nothing is backfilled or
+ * charged. An org that is already over its effective cap today (there was
+ * never a cap before this feature) keeps every existing member untouched; it
+ * simply cannot admit a new one until the owner purchases enough extra seats
+ * to cover current headcount, or removes someone. This is deliberate, not a
+ * gap to close later — an earlier draft of this comment described a planned
+ * "rollout backfill" gating this wiring, which the product decision behind
+ * ENG-2250 superseded: there is nothing to backfill, so there was nothing to
+ * wait for.
  */
 
 import { orgDb, type Organization } from './db';
@@ -51,6 +56,40 @@ export function baseSeatsForTier(tierName: string): number | null {
   return Object.prototype.hasOwnProperty.call(SEAT_BASE_BY_TIER, tierName)
     ? SEAT_BASE_BY_TIER[tierName]
     : null;
+}
+
+/**
+ * Admin-configured pricing for extra org seats on a given tier (Phase 2,
+ * ENG-2243..2246). `priceCents` is the full monthly charge per extra seat;
+ * `usageCreditMicroUsd` is the portion of that charge a separate ticket
+ * grants back as shared LLM usage credit. `baseSeats` mirrors
+ * `baseSeatsForTier` above for display/config purposes only — it is not yet
+ * wired to replace that hardcoded lookup.
+ */
+export interface SeatPricingConfig {
+  priceCents: number;
+  usageCreditMicroUsd: number;
+  baseSeats: number;
+}
+
+/**
+ * Validates an already-normalized (numbers coerced) `SeatPricingConfig`,
+ * mirroring the `validateLlmUsagePolicy`/`validateLlmUsageTopUpConfig`
+ * pattern: collect every violation and let the caller decide what to do
+ * with them (admin.ts throws, joining them into one message).
+ */
+export function validateSeatPricingConfig(config: SeatPricingConfig): string[] {
+  const errors: string[] = [];
+  if (!Number.isInteger(config.priceCents) || config.priceCents <= 0) {
+    errors.push('priceCents must be a positive integer');
+  }
+  if (!Number.isInteger(config.usageCreditMicroUsd) || config.usageCreditMicroUsd <= 0) {
+    errors.push('usageCreditMicroUsd must be a positive integer');
+  }
+  if (!Number.isInteger(config.baseSeats) || config.baseSeats < 0) {
+    errors.push('baseSeats must be a non-negative integer');
+  }
+  return errors;
 }
 
 /**

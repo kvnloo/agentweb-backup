@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getLinkedInConfig, getLinkedInScopesForType, LinkedInAccountType } from '../config/integrations';
 import { createAccount } from '../services/connectedAccountsDb';
+import { redactAccountsSecrets } from '../utils/accountSecretRedaction';
 import { linkedInService } from '../services/linkedInService';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
@@ -420,7 +421,7 @@ router.post('/connect-accounts', authenticateToken, async (req: any, res) => {
       }
     }
 
-    res.json({ success: true, accounts: connectedAccounts });
+    res.json({ success: true, accounts: redactAccountsSecrets(connectedAccounts) });
 
   } catch (error: any) {
     console.error('[LinkedIn Connect Accounts] Error:', error);

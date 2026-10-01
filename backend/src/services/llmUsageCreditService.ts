@@ -81,7 +81,16 @@ export interface LlmUsageCreditAdjustment {
 }
 
 export function getCurrentUsageMonth(now = new Date()): string {
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  // UTC, not local time — see usageCycle.ts's header comment: the billing cycle is
+  // documented as "reckoned per CALENDAR month in UTC". Using local-time getters
+  // here silently broke that contract: in any timezone behind UTC (the whole
+  // Western hemisphere), the month flips a few hours late relative to the ledger's
+  // actual UTC-keyed semantics. Harmless on a server whose local time already is
+  // UTC (true today — no `TZ` env var or platform override anywhere in this
+  // deploy), but it would silently mislabel credit grants the moment that ever
+  // changed, and it made this function's behavior depend on the ambient timezone
+  // of whatever process calls it (prod server vs. a developer's laptop vs. CI).
+  return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
 export function getLlmUsageCreditAdjustment(

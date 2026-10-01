@@ -98,6 +98,52 @@ describe('GET /api/admin/users/:userId/notes', () => {
   });
 });
 
+describe('GET /api/admin/users/:userId (ENG-2258)', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('does not leak connected-account tokens or other secret fields', async () => {
+    mockUserDb.getUserById.mockResolvedValue({
+      ...existingUser,
+      password: 'hashed-password',
+      secrets: { foo: 'encrypted-value' },
+      resetPasswordToken: 'reset-token-value',
+      stripeConnectAccessToken: 'encrypted-stripe-access',
+      connected_accounts: [
+        {
+          platform: 'hubspot',
+          account_id: 'h-1',
+          account_name: 'HubSpot',
+          config: { access_token: 'secret-access', refresh_token: 'secret-refresh', hub_id: 1 },
+        },
+      ],
+    } as any);
+
+    const res = await request(app).get('/api/admin/users/user-1');
+
+    expect(res.status).toBe(200);
+    expect(res.body).not.toHaveProperty('password');
+    expect(res.body).not.toHaveProperty('secrets');
+    expect(res.body).not.toHaveProperty('resetPasswordToken');
+    expect(res.body).not.toHaveProperty('stripeConnectAccessToken');
+    expect(res.body.secretNames).toEqual(['foo']);
+    expect(res.body.connected_accounts[0].config).not.toHaveProperty('access_token');
+    expect(res.body.connected_accounts[0].config).not.toHaveProperty('refresh_token');
+    expect(res.body.connected_accounts[0].config.hub_id).toBe(1);
+  });
+
+  it('tolerates a legacy/corrupted record whose connected_accounts is not an array', async () => {
+    mockUserDb.getUserById.mockResolvedValue({
+      ...existingUser,
+      connected_accounts: { not: 'an array' },
+    } as any);
+
+    const res = await request(app).get('/api/admin/users/user-1');
+
+    expect(res.status).toBe(200);
+    expect(res.body.connected_accounts).toEqual([]);
+  });
+});
+
 describe('POST /api/admin/users/:userId/notes', () => {
   beforeEach(() => jest.clearAllMocks());
 

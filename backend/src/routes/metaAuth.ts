@@ -8,6 +8,7 @@ import { getMetaFlowConfig, INTEGRATION_CONFIG, MetaFlowType } from '../config/i
 import { metaService } from '../services/metaService';
 import { instagramService } from '../services/instagramService';
 import { createAccount, getAccountById } from '../services/connectedAccountsDb';
+import { redactAccountSecrets, redactAccountsSecrets } from '../utils/accountSecretRedaction';
 import { oauthSessionDb } from '../services/db';
 import { MetaAdAccount, MetaInstagramAccount } from '../types/meta';
 import { getJwtSecret } from '../config/jwt';
@@ -462,13 +463,15 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
         // with a plain "Connected!" toast that reads as "you're all set" — Page
         // access is a second, independent Meta grant that won't be revisited until
         // the twice-daily reconciler or a future chat session's PAGE LIST call.
+        // Computed from the unredacted list (only reads has_meta_pages/account_name,
+        // nothing secret) before ENG-2258's redaction is applied to the response.
         const accountsMissingPages = connectedAccounts
             .filter(acc => (acc.config as Record<string, any> | undefined)?.has_meta_pages === false)
             .map(acc => acc.account_name);
 
         res.json({
             success: true,
-            connectedAccounts,
+            connectedAccounts: redactAccountsSecrets(connectedAccounts),
             ...(accountsMissingPages.length > 0 ? { accountsMissingPages } : {}),
         });
 
@@ -517,7 +520,7 @@ router.post('/connect-instagram', authenticateToken, async (req: any, res) => {
         // reconnect system, same treatment as /connect-ad-accounts above.
         await safeAutoResolve('Meta Connect Instagram', userId, 'instagram', instagramAccount.id);
 
-        res.json({ success: true, connectedAccount: account });
+        res.json({ success: true, connectedAccount: redactAccountSecrets(account) });
 
     } catch (error: any) {
         console.error('[Meta Connect Instagram] Error:', error);

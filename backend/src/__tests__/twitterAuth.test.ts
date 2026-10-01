@@ -224,7 +224,10 @@ describe('POST /finalize — 500 error paths', () => {
     await request(app).get('/api/oauth/twitter/init');
     const res = await request(app).post('/api/oauth/twitter/finalize').send({ code: 'C1', state: 'ST8' });
     expect(res.status).toBe(200);
-    expect(res.body.account).not.toHaveProperty('config');
+    // ENG-2258: redactAccountSecrets keeps safe config fields (scopes,
+    // token_expires_at, username, ...) but must strip every credential.
+    expect(res.body.account.config).not.toHaveProperty('access_token');
+    expect(res.body.account.config).not.toHaveProperty('refresh_token');
     expect(res.body.account).toHaveProperty('platform', 'twitter');
   });
 });

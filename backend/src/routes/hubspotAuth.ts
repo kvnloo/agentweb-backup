@@ -5,6 +5,7 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getHubSpotConfig } from '../config/integrations';
 import { createAccount } from '../services/connectedAccountsDb';
+import { redactAccountSecrets } from '../utils/accountSecretRedaction';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
 import { storeOAuthFlowSession, consumeOAuthFlowSession, OAUTH_FLOW_SESSION_TTL_MS, LocalOAuthFlowSession } from '../services/oauthFlowSessions';
@@ -221,7 +222,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
       },
     });
 
-    res.json({ success: true, account });
+    res.json({ success: true, account: redactAccountSecrets(account) });
   } catch (error: any) {
     // Redacted: this handler's own axios.post sends client_secret in the form body, and
     // axios attaches that body to the error as `config.data`. Logging the raw error wrote
