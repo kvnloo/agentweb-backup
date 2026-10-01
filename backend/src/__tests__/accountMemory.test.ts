@@ -154,6 +154,31 @@ describe('Account Memory Database Service', () => {
     });
   });
 
+  describe('getUserMemoriesComplete', () => {
+    it('drains later DynamoDB pages even when the first page already has ordinary rows', async () => {
+      mockDocumentClientMethods.query.mockReset();
+      mockDocumentClientMethods.query
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({
+            Items: [{ memoryId: 'mem1', content: 'first page' }],
+            LastEvaluatedKey: { userId: 'user1', category: 'history', memoryId: 'mem1' },
+          }),
+        })
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({
+            Items: [{ memoryId: 'mem2', content: 'second page' }],
+          }),
+        });
+
+      const result = await accountMemoryDb.getUserMemoriesComplete('user1', 'history');
+
+      expect(result.map((item: any) => item.memoryId)).toEqual(['mem1', 'mem2']);
+      expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(2);
+      expect(mockDocumentClientMethods.query.mock.calls[1][0].ExclusiveStartKey)
+        .toEqual({ userId: 'user1', category: 'history', memoryId: 'mem1' });
+    });
+  });
+
   describe('getRecentMemories', () => {
     it('should return memories sorted by most recent', async () => {
       const mockItems = [
