@@ -357,4 +357,93 @@ describe('TasteProfileService', () => {
     expect(store.deleteMemory).toHaveBeenCalledWith('user-a', 'taste-1');
     expect(rows.map((row) => row.memoryId)).toEqual(['normal-1']);
   });
+
+  it('emits a versioned receipt for persisted surface defaults', async () => {
+    const { store } = memoryHarness();
+    const service = new TasteProfileService({ getBookmarks: jest.fn() }, store);
+
+    await service.importCollection(
+      'user-a',
+      [
+        { title: 'minimal minimal editorial editorial' },
+        { title: 'minimal editorial' },
+      ],
+      'receipt-refs'
+    );
+    await service.updateSettings('user-a', { social: 'strong' });
+
+    const application = await service.getApplication('user-a', 'social');
+
+    expect(application.receipt).toEqual(expect.objectContaining({
+      schema: 'taste.application-receipt.v1',
+      applicationSchema: 'taste.application.v1',
+      surface: 'social',
+      active: true,
+      intensity: 'strong',
+      resolutionSource: 'surface_default',
+    }));
+    expect(application.receipt.profileRevision).toMatch(/^profile:v1:[0-9a-f]{16}$/);
+    expect(application.receipt.settingsRevision).toMatch(/^settings:v1:[0-9a-f]{16}$/);
+    expect(application.receipt.generatedAt).toEqual(expect.any(String));
+    expect(application.receipt.dials).toEqual(application.dials);
+    expect(application.receipt.signals).toEqual(application.signals);
+  });
+
+  it('marks task-local overrides without pretending they changed persistent settings', async () => {
+    const { store } = memoryHarness();
+    const service = new TasteProfileService({ getBookmarks: jest.fn() }, store);
+
+    await service.importCollection('user-a', [{ title: 'motion motion minimal minimal' }], 'refs');
+    await service.updateSettings('user-a', { social: 'subtle' });
+
+    const overridden = await service.getApplication('user-a', 'social', 'strong');
+
+    expect(overridden.receipt.resolutionSource).toBe('task_override');
+    expect(overridden.receipt.settingsRevision).toBeNull();
+
+    const settings = await service.getSettings('user-a');
+    expect(settings.surfaces.social).toBe('subtle');
+  });
+
+  it('keeps the profile revision stable when a re-import changes only source timestamps', async () => {
+    const { store } = memoryHarness();
+    const service = new TasteProfileService({ getBookmarks: jest.fn() }, store);
+    const items = [
+      { title: 'premium premium editorial editorial' },
+      { title: 'premium editorial' },
+    ];
+
+    await service.importCollection('user-a', items, 'stable-refs');
+    const before = await service.getApplication('user-a', 'landing_page');
+
+    await service.importCollection('user-a', items, 'stable-refs');
+    const after = await service.getApplication('user-a', 'landing_page');
+
+    expect(after.receipt.profileRevision).toBe(before.receipt.profileRevision);
+  });
+
+  it('changes receipt revisions when the effective Taste profile or defaults change', async () => {
+    const { store } = memoryHarness();
+    const service = new TasteProfileService({ getBookmarks: jest.fn() }, store);
+
+    await service.importCollection(
+      'user-a',
+      [{ title: 'minimal minimal editorial editorial' }],
+      'changing-refs'
+    );
+    const first = await service.getApplication('user-a', 'social');
+
+    await service.importCollection(
+      'user-a',
+      [{ title: 'playful playful motion motion' }],
+      'changing-refs'
+    );
+    const profileChanged = await service.getApplication('user-a', 'social');
+    expect(profileChanged.receipt.profileRevision).not.toBe(first.receipt.profileRevision);
+
+    await service.updateSettings('user-a', { social: 'strong' });
+    const settingsChanged = await service.getApplication('user-a', 'social');
+    expect(settingsChanged.receipt.settingsRevision).not.toBe(profileChanged.receipt.settingsRevision);
+  });
+
 });
