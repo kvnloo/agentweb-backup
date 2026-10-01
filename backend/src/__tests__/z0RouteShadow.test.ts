@@ -82,6 +82,7 @@ describe('automatic z0 bridge-v1 route shadow observer', () => {
       sessionId: 'raw-session-secret',
       task: 'summarize this bounded turn',
       turnOrdinal: 7,
+      observationId: 'agent-run-123',
       nowUnixMs: 1_000,
       env: {
         Z0_ROUTE_SHADOW: 'shadow',
@@ -117,6 +118,8 @@ describe('automatic z0 bridge-v1 route shadow observer', () => {
       },
     });
     expect(body.deadline_unix_ms).toBe(2_000);
+    expect(body.correlation).toEqual({ observation_id: 'agent-run-123' });
+    expect(result.observation_id).toBe('agent-run-123');
     expect(JSON.stringify(body)).not.toContain('raw-session-secret');
     expect(JSON.stringify(body)).not.toContain('workspace-secret');
   });
