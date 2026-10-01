@@ -128,6 +128,10 @@ describe('Taste experiment harness', () => {
     expect(publicJson).not.toContain('brand_taste');
     expect(publicJson).not.toContain('profile:v1');
     expect(publicJson).not.toContain('settings:v1');
+    expect(publicJson).not.toContain('candidate-brand');
+    expect(publicJson).not.toContain('candidate-taste');
+    expect(publicJson).not.toContain('artifact-brand');
+    expect(publicJson).not.toContain('artifact-taste');
     expect(first.mapping.A.receipt.arm).not.toBe(first.mapping.B.receipt.arm);
   });
 
@@ -201,6 +205,25 @@ describe('Taste experiment harness', () => {
         tasteAlignment: 4,
       },
     })).toThrow('briefCompliance');
+
+    expect(() => createTasteExperimentEvaluation({
+      candidateId: 'candidate-1',
+      rubric: {
+        briefCompliance: 5,
+        brandCompliance: 4,
+        accessibilityPolicy: 5,
+        tasteAlignment: 4,
+      },
+      objectivePerformance: {
+        kind: 'measured',
+        metric: 'conversion_rate',
+        value: 0.12,
+        evidenceRevision: 'perf:v1',
+        source: '',
+        windowStart: '2026-09-01T00:00:00.000Z',
+        windowEnd: '2026-09-30T23:59:59.000Z',
+      },
+    } as any)).toThrow('source is required');
   });
 
   it('scores blinded preference without making a significance claim', () => {
