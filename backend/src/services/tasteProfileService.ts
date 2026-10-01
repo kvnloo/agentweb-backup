@@ -105,8 +105,12 @@ export type TasteDials = {
 
 export const TASTE_APPLICATION_SCHEMA = 'taste.application.v1';
 export const TASTE_RECEIPT_SCHEMA = 'taste.application-receipt.v1';
+export const TASTE_FEEDBACK_SCHEMA = 'taste.feedback.v1';
+export const TASTE_FEEDBACK_MEMORY_PREFIX = 'taste-feedback:v1:';
 
 export type TasteResolutionSource = 'surface_default' | 'task_override';
+export type TasteFeedbackDirection = 'more' | 'less' | 'ignore';
+export type TasteFeedbackArtifactType = 'landing_page';
 
 export type TasteApplicationReceipt = {
   schema: typeof TASTE_RECEIPT_SCHEMA;
@@ -135,6 +139,17 @@ export type TasteApplication = {
   guardrails: string[];
   promptContext: string;
   receipt: TasteApplicationReceipt;
+};
+
+export type TasteFeedbackEvent = {
+  schema: typeof TASTE_FEEDBACK_SCHEMA;
+  eventId: string;
+  artifactType: TasteFeedbackArtifactType;
+  artifactId: string;
+  direction: TasteFeedbackDirection;
+  receipt: TasteApplicationReceipt;
+  createdAt: string;
+  reversedAt?: string;
 };
 
 export const TASTE_SURFACES: readonly TasteSurface[] = [
@@ -813,6 +828,107 @@ function hashKey(value: string): string {
   return createHash('sha256').update(value).digest('hex').slice(0, 16);
 }
 
+function validateFeedbackDirection(value: unknown): TasteFeedbackDirection {
+  if (value === 'more' || value === 'less' || value === 'ignore') return value;
+  throw new TasteValidationError('direction must be more, less, or ignore');
+}
+
+function validateFeedbackArtifactType(value: unknown): TasteFeedbackArtifactType {
+  if (value === 'landing_page') return value;
+  throw new TasteValidationError('artifactType must be landing_page');
+}
+
+function feedbackSourceMemoryId(artifactType: TasteFeedbackArtifactType, artifactId: string): string {
+  return `${TASTE_FEEDBACK_MEMORY_PREFIX}${hashKey(`${artifactType}:${artifactId}`)}`;
+}
+
+function encodeTasteFeedback(event: Omit<TasteFeedbackEvent, 'eventId'>): string {
+  return `Taste Feedback (explicit user action; not performance data): ${JSON.stringify(event)}`;
+}
+
+function decodeTasteFeedback(memory: MemoryRecord): TasteFeedbackEvent | null {
+  if (!memory.sourceSessionId?.startsWith(TASTE_FEEDBACK_MEMORY_PREFIX) || typeof memory.content !== 'string') {
+    return null;
+  }
+  const marker = memory.content.indexOf('{');
+  if (marker < 0) return null;
+  try {
+    const parsed = JSON.parse(memory.content.slice(marker));
+    if (
+      parsed?.schema !== TASTE_FEEDBACK_SCHEMA ||
+      parsed?.artifactType !== 'landing_page' ||
+      typeof parsed?.artifactId !== 'string' ||
+      !['more', 'less', 'ignore'].includes(parsed?.direction) ||
+      parsed?.receipt?.schema !== TASTE_RECEIPT_SCHEMA ||
+      parsed?.receipt?.applicationSchema !== TASTE_APPLICATION_SCHEMA ||
+      typeof parsed?.createdAt !== 'string'
+    ) {
+      return null;
+    }
+    return {
+      ...parsed,
+      eventId: memory.memoryId,
+    } as TasteFeedbackEvent;
+  } catch {
+    return null;
+  }
+}
+
+function parseReceiptSignal(signal: string): { name: string; score: number } | null {
+  const splitAt = signal.lastIndexOf(':');
+  if (splitAt <= 0) return null;
+  const name = signal.slice(0, splitAt);
+  const score = Number(signal.slice(splitAt + 1));
+  if (!STYLE_DIAL_TARGETS[name] || !Number.isFinite(score) || score <= 0) return null;
+  return { name, score };
+}
+
+/**
+ * Explicit feedback is a bounded preference correction, never performance data.
+ * Accumulate deltas before clamping so opposite events cancel independent of
+ * DynamoDB return order. Reversed and Ignore events remain auditable but inert.
+ */
+function applyTasteFeedback(profile: TasteProfile, events: TasteFeedbackEvent[]): TasteProfile {
+  const deltas = new Map<string, number>();
+  const FEEDBACK_STEP = 0.25;
+
+  for (const event of events) {
+    if (event.reversedAt || event.direction === 'ignore') continue;
+    const sign = event.direction === 'more' ? 1 : -1;
+    for (const rawSignal of event.receipt.signals || []) {
+      const signal = parseReceiptSignal(rawSignal);
+      if (!signal) continue;
+      deltas.set(signal.name, (deltas.get(signal.name) || 0) + sign * FEEDBACK_STEP * signal.score);
+    }
+  }
+
+  if (deltas.size === 0) return profile;
+
+  const weights = new Map(profile.styleSignals.map((signal) => [signal.name, signal.score]));
+  for (const [name, delta] of deltas) {
+    weights.set(name, Math.max(0, (weights.get(name) || 0) + delta));
+  }
+
+  const total = Array.from(weights.values()).reduce((sum, value) => sum + value, 0);
+  const styleSignals = total > 0
+    ? Array.from(weights.entries())
+        .filter(([, value]) => value > 0)
+        .map(([name, value]) => ({ name, score: Math.round((value / total) * 1000) / 1000 }))
+        .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
+        .slice(0, MAX_PROFILE_SIGNALS)
+    : [];
+
+  const feedbackTimestamps = events
+    .flatMap((event) => [event.createdAt, event.reversedAt].filter((value): value is string => Boolean(value)))
+    .sort();
+  const updatedAt = [profile.updatedAt, feedbackTimestamps.at(-1)]
+    .filter((value): value is string => Boolean(value))
+    .sort()
+    .at(-1) || null;
+
+  return { ...profile, styleSignals, updatedAt };
+}
+
 export class TasteProfileService {
   constructor(
     private readonly xReader: TasteXBookmarkReader = twitterService,
@@ -855,13 +971,20 @@ export class TasteProfileService {
   }
 
   async getProfile(userId: string): Promise<TasteProfile> {
-    const memories = await this.memoryStore.getUserMemories(userId, 'preference');
+    const [memories, feedbackMemories] = await Promise.all([
+      this.memoryStore.getUserMemories(userId, 'preference'),
+      this.memoryStore.getUserMemories(userId, 'history'),
+    ]);
     const snapshots = memories
       .filter((memory) => memory.sourceSessionId?.startsWith(TASTE_MEMORY_PREFIX))
       .map(decodeSnapshot)
       .filter((snapshot): snapshot is TasteSourceSnapshot => Boolean(snapshot));
+    const feedback = feedbackMemories
+      .filter((memory) => memory.sourceSessionId?.startsWith(TASTE_FEEDBACK_MEMORY_PREFIX))
+      .map(decodeTasteFeedback)
+      .filter((event): event is TasteFeedbackEvent => Boolean(event));
 
-    return aggregateSnapshots(snapshots);
+    return applyTasteFeedback(aggregateSnapshots(snapshots), feedback);
   }
 
   async getSettings(userId: string): Promise<TasteSettings> {
@@ -940,6 +1063,92 @@ export class TasteProfileService {
     };
   }
 
+  async recordFeedback(
+    userId: string,
+    artifactType: unknown,
+    artifactId: unknown,
+    direction: unknown,
+    receipt: TasteApplicationReceipt
+  ): Promise<TasteFeedbackEvent> {
+    const cleanArtifactType = validateFeedbackArtifactType(artifactType);
+    const cleanArtifactId = boundedString(artifactId, 'artifactId', 256);
+    if (!cleanArtifactId) throw new TasteValidationError('artifactId is required');
+    const cleanDirection = validateFeedbackDirection(direction);
+    if (
+      !receipt ||
+      receipt.schema !== TASTE_RECEIPT_SCHEMA ||
+      receipt.applicationSchema !== TASTE_APPLICATION_SCHEMA ||
+      receipt.surface !== 'landing_page'
+    ) {
+      throw new TasteValidationError('artifact receipt is not valid landing-page Taste provenance');
+    }
+
+    const event: Omit<TasteFeedbackEvent, 'eventId'> = {
+      schema: TASTE_FEEDBACK_SCHEMA,
+      artifactType: cleanArtifactType,
+      artifactId: cleanArtifactId,
+      direction: cleanDirection,
+      // Defensive copy keeps the stored event immutable even if a caller reuses/mutates
+      // its in-memory application object after this method returns.
+      receipt: JSON.parse(JSON.stringify(receipt)),
+      createdAt: new Date().toISOString(),
+    };
+    const content = encodeTasteFeedback(event);
+    if (charLength(content) > 2000) {
+      throw new TasteValidationError('Taste feedback exceeded the durable memory size limit');
+    }
+    const memory = await this.memoryStore.addMemory(
+      userId,
+      'history',
+      content,
+      feedbackSourceMemoryId(cleanArtifactType, cleanArtifactId)
+    );
+    return { ...event, eventId: String(memory.memoryId) };
+  }
+
+  async listFeedback(userId: string, artifactId?: unknown): Promise<TasteFeedbackEvent[]> {
+    const cleanArtifactId = artifactId === undefined
+      ? undefined
+      : boundedString(artifactId, 'artifactId', 256);
+    const memories = await this.memoryStore.getUserMemories(userId, 'history');
+    return memories
+      .filter((memory) => memory.sourceSessionId?.startsWith(TASTE_FEEDBACK_MEMORY_PREFIX))
+      .map(decodeTasteFeedback)
+      .filter((event): event is TasteFeedbackEvent => Boolean(event))
+      .filter((event) => !cleanArtifactId || event.artifactId === cleanArtifactId)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.eventId.localeCompare(a.eventId));
+  }
+
+  async reverseFeedback(userId: string, eventId: unknown): Promise<TasteFeedbackEvent> {
+    const cleanEventId = boundedString(eventId, 'eventId', 128);
+    if (!cleanEventId) throw new TasteValidationError('eventId is required');
+    const memories = await this.memoryStore.getUserMemories(userId, 'history');
+    const memory = memories.find(
+      (candidate) =>
+        candidate.memoryId === cleanEventId &&
+        candidate.sourceSessionId?.startsWith(TASTE_FEEDBACK_MEMORY_PREFIX)
+    );
+    const event = memory ? decodeTasteFeedback(memory) : null;
+    if (!memory || !event) throw new TasteSourceAccessError('Taste feedback not found');
+    if (event.reversedAt) return event;
+
+    const updated: Omit<TasteFeedbackEvent, 'eventId'> = {
+      schema: event.schema,
+      artifactType: event.artifactType,
+      artifactId: event.artifactId,
+      direction: event.direction,
+      receipt: event.receipt,
+      createdAt: event.createdAt,
+      reversedAt: new Date().toISOString(),
+    };
+    const content = encodeTasteFeedback(updated);
+    await this.memoryStore.updateMemory(userId, memory.memoryId, {
+      category: 'history',
+      content,
+    });
+    return { ...updated, eventId: memory.memoryId };
+  }
+
   async deleteProfile(userId: string): Promise<number> {
     const memories = await this.memoryStore.getUserMemories(userId, 'preference');
     const tasteMemories = memories.filter((memory) =>
@@ -994,4 +1203,6 @@ export const _tasteInternalsForTests = {
   normalizeTasteSettingsPatch,
   tasteProfileRevision,
   tasteSettingsRevision,
+  decodeTasteFeedback,
+  applyTasteFeedback,
 };
