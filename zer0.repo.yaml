@@ -1,0 +1,84 @@
+version: 1
+repo: kvnloo/agentweb
+id: agentweb
+kind: suite
+summary: Downstream AgentWeb/Emma automation surface combining user-facing task management, isolated web-agent execution, knowledge/tool integrations, and experimental Zer0 decision/context bridges.
+
+architecture:
+  subsystems:
+    - id: web-agent-engine
+      name: Web agent engine
+      kind: execution
+      summary: Executes browser and tool tasks in the Python agent engine with action control, task monitoring, usage reporting, and integration helpers.
+      paths:
+        - agent-engine/
+      depends_on: []
+
+    - id: application-backend
+      name: Application backend
+      kind: runtime
+      summary: Owns task/session APIs, account and integration state, deployment/runtime services, and long-running Agent Mode coordination.
+      paths:
+        - backend/
+      depends_on: [web-agent-engine]
+
+    - id: knowledge-integrations
+      name: Knowledge and external integrations
+      kind: context
+      summary: Provides bounded access to knowledge-base files, external APIs, cloud storage, social tools, and other user-configured context surfaces.
+      paths:
+        - agent-engine/knowledge_base_utils.py
+        - agent-engine/openrouter_gateway.py
+        - backend/
+        - docs/
+      depends_on: [application-backend]
+
+    - id: isolated-execution
+      name: Isolated task execution
+      kind: security
+      summary: Separates browser sessions and credentials per task while keeping execution state observable to the application.
+      paths:
+        - agent-engine/strict_action_controller.py
+        - agent-engine/task_monitor.py
+        - agent-engine/secrets_manager.py
+        - backend/
+      depends_on: [web-agent-engine]
+
+    - id: z0-integration-lab
+      name: Zer0 integration lab
+      kind: integration
+      summary: Hosts downstream experiments connecting Emma/AgentWeb to typed decisions, personal context, and Zer0 orchestration without making the fork canonical architecture authority.
+      paths:
+        - research/
+        - tasks/
+        - docs/
+        - .mcp.json
+      depends_on: [application-backend, knowledge-integrations]
+
+  provides_interfaces: []
+  consumes_interfaces: []
+  produces_representations: []
+  consumes_representations: []
+
+  boundaries:
+    owns:
+      - AgentWeb application and web-agent execution
+      - Agent Mode workflows
+      - user-facing knowledge and API integrations
+      - task isolation and application security controls
+    not_here:
+      - canonical z0intelligence policy
+      - canonical AODL ontology
+      - global memory authority
+      - canonical Zer0 repository map
+
+  evidence:
+    docs:
+      - README.md
+      - design.md
+      - dev.md
+    tests:
+      - agent-engine/tests/
+      - backend/
+      - test-env/
+    schemas: []
