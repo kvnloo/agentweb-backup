@@ -16,6 +16,9 @@ const mockTasteProfileService = {
   getSettings: jest.fn(),
   updateSettings: jest.fn(),
   applyToPrompt: jest.fn(),
+  recordFeedback: jest.fn(),
+  listFeedback: jest.fn(),
+  reverseFeedback: jest.fn(),
   deleteProfile: jest.fn(),
 };
 
@@ -27,9 +30,15 @@ jest.mock('../services/tasteProfileService', () => {
   };
 });
 
+const mockGetLandingPage = jest.fn();
+jest.mock('../services/v0Service', () => ({
+  getLandingPage: (...args: any[]) => mockGetLandingPage(...args),
+}));
+
 import tasteRoutes from '../routes/taste';
 import {
   MAX_TASTE_ITEMS,
+  TasteFeedbackNotFoundError,
   TasteProviderError,
   TasteSourceAccessError,
   TasteValidationError,
@@ -187,6 +196,115 @@ describe('Taste profile routes', () => {
     expect(response.status).toBe(200);
     expect(mockTasteProfileService.applyToPrompt)
       .toHaveBeenCalledWith('taste-test-user', 'image', 'Create a hero', 'subtle');
+  });
+
+  it('records feedback from the artifact persisted receipt, never caller-supplied provenance', async () => {
+    const receipt = {
+      schema: 'taste.application-receipt.v1',
+      applicationSchema: 'taste.application.v1',
+      surface: 'landing_page',
+      active: true,
+      intensity: 'strong',
+      confidence: 0.8,
+      resolutionSource: 'surface_default',
+      profileRevision: 'profile:v1:0123456789abcdef',
+      settingsRevision: 'settings:v1:fedcba9876543210',
+      dials: { designVariance: 8, motionIntensity: 4, visualDensity: 5 },
+      signals: ['minimal:0.6', 'editorial:0.4'],
+      generatedAt: '2026-10-01T06:00:00.000Z',
+    };
+    mockGetLandingPage.mockResolvedValue({ id: 'page-1', userId: 'taste-test-user', tasteReceipt: receipt });
+    mockTasteProfileService.recordFeedback.mockResolvedValue({
+      schema: 'taste.feedback.v1',
+      eventId: 'event-1',
+      artifactType: 'landing_page',
+      artifactId: 'page-1',
+      direction: 'more',
+      receipt,
+      createdAt: '2026-10-01T06:01:00.000Z',
+    });
+
+    const response = await request(app())
+      .post('/api/taste/feedback')
+      .send({ artifactType: 'landing_page', artifactId: 'page-1', direction: 'more' });
+
+    expect(response.status).toBe(201);
+    expect(mockGetLandingPage).toHaveBeenCalledWith('page-1', 'taste-test-user');
+    expect(mockTasteProfileService.recordFeedback).toHaveBeenCalledWith(
+      'taste-test-user',
+      'landing_page',
+      'page-1',
+      'more',
+      receipt
+    );
+  });
+
+  it('rejects caller-supplied receipts so provenance cannot be spoofed', async () => {
+    const response = await request(app())
+      .post('/api/taste/feedback')
+      .send({
+        artifactType: 'landing_page',
+        artifactId: 'page-1',
+        direction: 'more',
+        receipt: { profileRevision: 'forged' },
+      });
+
+    expect(response.status).toBe(400);
+    expect(mockGetLandingPage).not.toHaveBeenCalled();
+    expect(mockTasteProfileService.recordFeedback).not.toHaveBeenCalled();
+  });
+
+  it('does not disclose another user artifact and refuses legacy artifacts without Taste provenance', async () => {
+    mockGetLandingPage.mockResolvedValueOnce(null);
+    let response = await request(app())
+      .post('/api/taste/feedback')
+      .send({ artifactType: 'landing_page', artifactId: 'other-user-page', direction: 'less' });
+    expect(response.status).toBe(404);
+    expect(response.body).toEqual({ error: 'Artifact not found' });
+    expect(mockTasteProfileService.recordFeedback).not.toHaveBeenCalled();
+
+    mockGetLandingPage.mockResolvedValueOnce({ id: 'legacy-page', userId: 'taste-test-user' });
+    response = await request(app())
+      .post('/api/taste/feedback')
+      .send({ artifactType: 'landing_page', artifactId: 'legacy-page', direction: 'ignore' });
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({ error: 'Artifact does not have Taste provenance' });
+    expect(mockTasteProfileService.recordFeedback).not.toHaveBeenCalled();
+  });
+
+  it('lists feedback for only the authenticated user and reverses by event id', async () => {
+    mockTasteProfileService.listFeedback.mockResolvedValue([{ eventId: 'event-1' }]);
+    mockTasteProfileService.reverseFeedback.mockResolvedValue({
+      eventId: 'event-1',
+      reversedAt: '2026-10-01T06:02:00.000Z',
+    });
+
+    const listResponse = await request(app())
+      .get('/api/taste/feedback')
+      .query({ artifactId: 'page-1' });
+    expect(listResponse.status).toBe(200);
+    expect(mockTasteProfileService.listFeedback)
+      .toHaveBeenCalledWith('taste-test-user', 'page-1');
+
+    const reverseResponse = await request(app())
+      .post('/api/taste/feedback/event-1/reverse')
+      .send({});
+    expect(reverseResponse.status).toBe(200);
+    expect(mockTasteProfileService.reverseFeedback)
+      .toHaveBeenCalledWith('taste-test-user', 'event-1');
+  });
+
+  it('maps missing feedback to a tenant-safe 404', async () => {
+    mockTasteProfileService.reverseFeedback.mockRejectedValue(
+      new TasteFeedbackNotFoundError()
+    );
+
+    const response = await request(app())
+      .post('/api/taste/feedback/missing/reverse')
+      .send({});
+
+    expect(response.status).toBe(404);
+    expect(response.body).toEqual({ error: 'Taste feedback not found' });
   });
 
   it('returns and deletes the authenticated user profile', async () => {
