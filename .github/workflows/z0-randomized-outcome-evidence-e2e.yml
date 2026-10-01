@@ -1,0 +1,195 @@
+name: AgentWeb z0 Randomized Outcome Evidence E2E
+
+on:
+  pull_request:
+    branches: [lab/z0-outcome-coverage-gate-v1]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  randomized-evidence-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout AgentWeb exact head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Checkout z0intelligence randomized-evidence branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kvnloo/z0intelligence
+          ref: lab/agentweb-outcome-randomized-evidence-v1
+          path: deps/z0intelligence
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Record exact heads
+        run: |
+          python - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          roots = {
+              "agentweb": ".",
+              "z0intelligence": "deps/z0intelligence",
+          }
+          heads = {
+              name: subprocess.check_output(
+                  ["git", "-C", path, "rev-parse", "HEAD"], text=True
+              ).strip()
+              for name, path in roots.items()
+          }
+          Path("/tmp/z0-randomized-evidence-heads.json").write_text(
+              json.dumps(heads, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(heads, indent=2))
+          PY
+
+      - name: Install narrow dependencies
+        run: |
+          cd backend && npm ci
+          cd ..
+          python -m pip install pytest==8.4.2 typesafe-sdk==0.7.2
+
+      - name: Run randomized evidence unit suites
+        run: |
+          cd backend
+          node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit \
+            src/__tests__/experiments.z0OutcomeRandomizedEvidence.test.ts \
+            src/__tests__/experiments.z0OutcomeCoverage.test.ts \
+            src/__tests__/experiments.z0OutcomeObservation.test.ts
+          cd ..
+          PYTHONPATH="$GITHUB_WORKSPACE/deps/z0intelligence/src" python -m pytest -q \
+            deps/z0intelligence/tests/test_outcome_randomized_evidence.py \
+            deps/z0intelligence/tests/test_outcome_coverage.py \
+            deps/z0intelligence/tests/test_outcome_observation.py
+
+      - name: Start z0intelligence with compact live-review thresholds
+        env:
+          PYTHONPATH: ${{ github.workspace }}/deps/z0intelligence/src
+          Z0INT_HOME: /tmp/z0int-randomized-home
+          Z0INT_AGENTWEB_OUTCOME_MIN_ELIGIBLE_PER_WINDOW: "4"
+          Z0INT_AGENTWEB_OUTCOME_MIN_COVERAGE: "1.0"
+          Z0INT_AGENTWEB_OUTCOME_MIN_COMPLETE_COVERAGE: "1.0"
+          Z0INT_AGENTWEB_RANDOMIZED_MIN_TOTAL: "4"
+          Z0INT_AGENTWEB_RANDOMIZED_MIN_PER_ARM: "2"
+        run: |
+          mkdir -p "$Z0INT_HOME"
+          python -m z0int.intelligence_service --port 11501 > /tmp/z0int-randomized.log 2>&1 &
+          echo $! > /tmp/z0int-randomized.pid
+          python - <<'PY'
+          import time, urllib.request
+          url = "http://127.0.0.1:11501/healthz"
+          last = None
+          for _ in range(40):
+              try:
+                  with urllib.request.urlopen(url, timeout=1) as response:
+                      if response.status == 200:
+                          raise SystemExit(0)
+              except Exception as exc:
+                  last = exc
+                  time.sleep(.25)
+          raise SystemExit(f"z0intelligence did not become ready: {last}")
+          PY
+
+      - name: Run randomized evidence study
+        working-directory: backend
+        env:
+          Z0INT_SERVICE_URL: http://127.0.0.1:11501
+        run: |
+          npx ts-node src/scripts/run-z0-randomized-outcome-evidence-study.ts \
+            /tmp/z0-randomized-evidence-study.json
+          cat /tmp/z0-randomized-evidence-study.json
+
+      - name: Verify human-review-only causal barrier
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          result = json.load(open("/tmp/z0-randomized-evidence-study.json"))
+          before = result["beforeAssignments"]
+          after = result["afterAssignments"]
+          experiment = after["experiments"]["agentweb-live-outcome-v1"]
+
+          assert before["coverage"]["promotion_gate"]["eligible"] is True
+          assert before["review_ready_any"] is False
+
+          assert result["reviewReady"] is True
+          assert experiment["review_ready"] is True
+          assert experiment["human_review_required"] is True
+          assert experiment["auto_promotion_allowed"] is False
+          assert experiment["causal_quality_proven"] is False
+          assert after["human_review_required"] is True
+          assert after["auto_promotion_allowed"] is False
+          assert after["causal_quality_proven"] is False
+
+          effect = experiment["metric_windows"]["agentweb.analytics:conversion_rate"]["1h"]
+          assert effect["candidate_n"] == 2
+          assert effect["reference_n"] == 2
+          assert abs(effect["difference_in_means"] - 0.11) < 1e-12
+          assert len(effect["ci95"]) == 2
+
+          root = Path("/tmp/z0int-randomized-home/receipts")
+          assignments = [
+              json.loads(line)
+              for line in (root / "agentweb_outcome_assignments.jsonl").read_text().splitlines()
+              if line.strip()
+          ]
+          expectations = [
+              json.loads(line)
+              for line in (root / "agentweb_outcome_expectations.jsonl").read_text().splitlines()
+              if line.strip()
+          ]
+          observations = [
+              json.loads(line)
+              for line in (root / "agentweb_outcome_observations.jsonl").read_text().splitlines()
+              if line.strip()
+          ]
+
+          assert len(assignments) == 4
+          assert len(expectations) == 4
+          assert len(observations) == 12
+          assert all(row["assignment_method"] == "randomized" for row in assignments)
+          assert all(row["selection_policy"] == "production" for row in assignments)
+          assert all(row["quality_authoritative"] is False for row in assignments)
+          assert all("raw-randomized-unit-" not in json.dumps(row) for row in assignments)
+          assert all("raw-randomized-unit-" not in json.dumps(row) for row in expectations)
+          assert all("raw-randomized-unit-" not in json.dumps(row) for row in observations)
+          PY
+
+      - name: Stop z0intelligence
+        if: always()
+        run: |
+          if test -f /tmp/z0int-randomized.pid; then
+            kill "$(cat /tmp/z0int-randomized.pid)" || true
+          fi
+          cat /tmp/z0int-randomized.log || true
+
+      - name: Upload randomized evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentweb-z0-randomized-outcome-evidence-e2e
+          path: |
+            /tmp/z0-randomized-evidence-heads.json
+            /tmp/z0-randomized-evidence-study.json
+            /tmp/z0int-randomized-home/receipts/agentweb_outcome_assignments.jsonl
+            /tmp/z0int-randomized-home/receipts/agentweb_outcome_expectations.jsonl
+            /tmp/z0int-randomized-home/receipts/agentweb_outcome_observations.jsonl
+            /tmp/z0int-randomized.log
