@@ -43,6 +43,43 @@ export function getSubscriptionPeriodEndIso(sub: any): string | undefined {
 }
 
 /**
+ * Identify "the" base-plan subscription item, robust to the presence of the
+ * seat-billing extra-seat line item (ENG-2243..2246) that can now coexist on
+ * the same subscription alongside the plan item.
+ *
+ * Every plan-mutating call site in this file (`upgradeSubscription`,
+ * `changeSubscriptionPrice`) was written when a subscription could only ever
+ * have one item, and picked it with `items.data[0]`. Seat billing breaks that
+ * assumption — a subscription can now carry two items — and Stripe does not
+ * document `items.data` as being stably ordered with the originally-
+ * subscribed item first. If a seat item ever sorted ahead of the plan item,
+ * `items.data[0]` would silently become the SEAT item, and a plan
+ * upgrade/downgrade would overwrite the seat item's price with the new
+ * plan's price — corrupting the seat line item while leaving the real plan
+ * item (and its old price) untouched. Explicitly excluding the known seat
+ * product id removes the dependency on ordering entirely.
+ *
+ * Behavior-preserving: returns `items[0]` whenever there's at most one item
+ * or the seat product id isn't configured, which is every subscription that
+ * predates seat billing.
+ */
+export function findBasePlanItem(
+  subscription: Pick<Stripe.Subscription, 'items'>
+): Stripe.SubscriptionItem | undefined {
+  const items = subscription.items.data;
+  if (items.length <= 1) return items[0];
+
+  const seatProductId = process.env.STRIPE_EXTRA_SEAT_PRODUCT_ID;
+  if (!seatProductId) return items[0];
+
+  const seatItem = findSeatLineItem(subscription, seatProductId);
+  if (!seatItem) return items[0];
+
+  const nonSeatItems = items.filter((item) => item.id !== seatItem.id);
+  return nonSeatItems[0] ?? items[0];
+}
+
+/**
  * Extract the two custom checkout fields ("companyname" and
  * "howdoyouplantousethisproduct") from a Stripe Checkout Session's
  * `custom_fields` array. Shared by the authenticated webhook handler
@@ -237,7 +274,7 @@ export const stripeService = {
 
     const s = getStripeOrThrow();
     const subscription = await s.subscriptions.retrieve(stripeSubscriptionId);
-    const existingItemId = subscription.items.data[0]?.id;
+    const existingItemId = findBasePlanItem(subscription)?.id;
 
     if (!existingItemId) {
       throw new Error('No subscription item found on the existing subscription.');
@@ -373,7 +410,7 @@ export async function changeSubscriptionPrice(
 
   const stripe = getStripeOrThrow();
   const current = await stripe.subscriptions.retrieve(subscriptionId);
-  const currentItem = current.items.data[0];
+  const currentItem = findBasePlanItem(current);
   if (!currentItem) throw new Error(`Subscription ${subscriptionId} has no items`);
 
   if (newPriceId === currentItem.price.id) {
@@ -792,9 +829,15 @@ export async function handleSubscriptionUpdated(
     updateData.current_period_end = updatedPeriodEndIso;
   }
 
-  // Sync plan tier on upgrades/downgrades
-  if (subscription.items?.data?.[0]?.price?.id) {
-    const newType = deriveSubscriptionTypeFromPriceId(subscription.items.data[0].price.id);
+  // Sync plan tier on upgrades/downgrades. Use findBasePlanItem rather than
+  // items.data[0] — a subscription can now also carry a seat-billing extra-
+  // seat item (ENG-2243..2246), and Stripe doesn't guarantee the originally-
+  // subscribed item stays first in `items.data` once a second item exists.
+  const basePlanPriceId = subscription.items?.data?.length
+    ? findBasePlanItem(subscription)?.price?.id
+    : undefined;
+  if (basePlanPriceId) {
+    const newType = deriveSubscriptionTypeFromPriceId(basePlanPriceId);
     if (newType) {
       updateData.subscriptionType = newType;
       const tierConfig = await getTierConfig(newType);

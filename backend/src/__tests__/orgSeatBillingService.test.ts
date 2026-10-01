@@ -98,6 +98,17 @@ describe('findSeatLineItem', () => {
   it('returns undefined for an empty item list', () => {
     expect(findSeatLineItem(makeSubscription([]) as any, PRODUCT_ID)).toBeUndefined();
   });
+
+  it('picks the seat item out of a realistic multi-item subscription, regardless of position', () => {
+    const planItem = { id: 'si_plan', quantity: 1, price: { id: 'price_complete_456', product: 'prod_pro_plan' } };
+    const seatItem = makeSeatItem({ id: 'si_seat', quantity: 4 });
+
+    // Seat item second (plan item created first, as in the common case).
+    expect(findSeatLineItem(makeSubscription([planItem, seatItem]) as any, PRODUCT_ID)?.id).toBe('si_seat');
+    // Seat item first — must not accidentally match (or be shadowed by) the
+    // base plan's own item just because of array position.
+    expect(findSeatLineItem(makeSubscription([seatItem, planItem]) as any, PRODUCT_ID)?.id).toBe('si_seat');
+  });
 });
 
 describe('setOrgSeatQuantity', () => {
