@@ -82,6 +82,25 @@ describe('z0 outcome observation ETL', () => {
     })).toThrow(/predate decisionTime/);
   });
 
+  it('rejects an observation before its declared window matures', async () => {
+    const fetchImpl = jest.fn() as unknown as Z0OutcomeFetchLike;
+    const result = await exportOutcomeObservationToZ0Safe({
+      ...base,
+      window: '24h',
+      observationTime: '2026-10-01T13:00:00Z',
+    }, {
+      env: {
+        Z0INT_AGENTWEB_OUTCOME_OBSERVE: 'shadow',
+      } as NodeJS.ProcessEnv,
+      fetchImpl,
+    });
+
+    expect(result.exported).toBe(false);
+    expect(result.reason).toMatch(/^validation_error:/);
+    expect(result.reason).toMatch(/earlier than the declared measurement window/);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('is default-off and makes no network call', async () => {
     const fetchImpl = jest.fn() as unknown as Z0OutcomeFetchLike;
     const result = await exportOutcomeObservationToZ0Safe(base, {
