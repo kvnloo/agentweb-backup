@@ -51,9 +51,40 @@ function post(body: any, headers: Record<string, string> = {}) {
   return req.send(body);
 }
 
+// Mirrors app.ts's REAL global body-parser stack (express.json() matching only
+// "application/json", falling back to express.urlencoded()) rather than the
+// hand-picked express.json() the `app` above mounts for every request regardless
+// of content-type. That mismatch is exactly why ENG-2180's bug shipped unnoticed:
+// every test here used a parser more forgiving than production's.
+const prodLikeAppWithoutFix = express();
+prodLikeAppWithoutFix.use(express.json({ limit: '50mb' }));
+prodLikeAppWithoutFix.use(express.urlencoded({ limit: '50mb', extended: true }));
+prodLikeAppWithoutFix.use('/api/webhooks/unipile', unipileWebhookRouter);
+
+// app.ts's actual fix: a path-scoped express.json({ type: () => true }) mounted
+// before the global parsers, so this route parses JSON regardless of the
+// declared content-type.
+const prodLikeAppWithFix = express();
+prodLikeAppWithFix.use('/api/webhooks/unipile', express.json({ type: () => true, limit: '1mb' }));
+prodLikeAppWithFix.use(express.json({ limit: '50mb' }));
+prodLikeAppWithFix.use(express.urlencoded({ limit: '50mb', extended: true }));
+prodLikeAppWithFix.use('/api/webhooks/unipile', unipileWebhookRouter);
+
 const payload = (message: string, accountId = 'acc_1', accountType: string | undefined = 'LINKEDIN') => ({
   AccountStatus: { account_id: accountId, account_type: accountType, message },
 });
+
+function postTo(
+  targetApp: express.Express,
+  body: ReturnType<typeof payload>,
+  headers: Record<string, string> = {},
+  contentType?: string,
+) {
+  let req = request(targetApp).post(PATH);
+  for (const [k, v] of Object.entries(headers)) req = req.set(k, v);
+  if (contentType) req = req.type(contentType);
+  return req.send(JSON.stringify(body));
+}
 
 describe('mapAccountStatusMessage', () => {
   it.each([
@@ -199,5 +230,74 @@ describe('POST /api/webhooks/unipile/account-status', () => {
       const res = await post(payload('CREDENTIALS', 'acc_1'), headers);
       expect(res.status).toBe(500);
     });
+  });
+});
+
+describe('body parsing against the real production middleware chain (ENG-2180)', () => {
+  const headers = { 'unipile-auth': SECRET };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    process.env.UNIPILE_WEBHOOK_SECRET = SECRET;
+    mockGetAllUnipileAccountIds.mockResolvedValue({
+      ids: ['acc_1'],
+      ownerByAccountId: new Map([['acc_1', 'user_1']]),
+    });
+    mockRecordUnipileAccountHealth.mockResolvedValue('marked-disconnected');
+    mockSendAgentModeOncallAlert.mockResolvedValue(true);
+  });
+
+  // Confirmed in prod (2026-09-28): every Unipile account_status delivery in the
+  // last 5 days — 127 events across 10+ distinct accounts, 0 successful parses —
+  // logged "[Unipile Webhook] Malformed payload" with the entire raw JSON body
+  // turned into a single object key with an empty string value. That shape is the
+  // unmistakable signature of express.urlencoded() parsing a JSON string it was
+  // never meant to see: Unipile's delivery does not carry a Content-Type of
+  // exactly "application/json", so app.ts's global express.json() (type-matched)
+  // silently skips it and express.urlencoded() parses the raw text as a single
+  // key. Every delivery was silently dropped and returned 400 — Unipile retries
+  // up to 5x/30s then gives up, so the account_status fast-path (ENG-1197) has
+  // never actually delivered a single event to recordUnipileAccountHealth.
+  it('without the fix: a real-shaped delivery with a non-application/json content-type is silently dropped', async () => {
+    const res = await postTo(prodLikeAppWithoutFix, payload('CREDENTIALS', 'acc_1'), headers, 'text/plain');
+    expect(res.status).toBe(400);
+    expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
+  });
+
+  it('with the fix: the same delivery is parsed and reaches recordUnipileAccountHealth', async () => {
+    const res = await postTo(prodLikeAppWithFix, payload('CREDENTIALS', 'acc_1'), headers, 'text/plain');
+    expect(res.status).toBe(200);
+    expect(mockRecordUnipileAccountHealth).toHaveBeenCalledWith({
+      accountId: 'acc_1',
+      ownerUserId: 'user_1',
+      state: 'disconnected',
+    });
+  });
+
+  it('with the fix: a delivery whose content-type defaults to application/x-www-form-urlencoded is still parsed as JSON', async () => {
+    // Clearing the Content-Type override doesn't make superagent send no header —
+    // empirically verified it falls back to superagent's own default of
+    // "application/x-www-form-urlencoded" for a raw string body. That default is
+    // worth its own case: it's the exact content-type express.urlencoded() would
+    // otherwise claim, i.e. precisely the pre-fix failure mode, reached here via a
+    // client that never sets Content-Type at all rather than one that explicitly
+    // (and wrongly) declares text/plain.
+    const res = await request(prodLikeAppWithFix)
+      .post(PATH)
+      .set('unipile-auth', SECRET)
+      .set('Content-Type', '')
+      .send(JSON.stringify(payload('OK', 'acc_1')));
+    expect(res.status).toBe(200);
+    expect(mockRecordUnipileAccountHealth).toHaveBeenCalledWith({
+      accountId: 'acc_1',
+      ownerUserId: 'user_1',
+      state: 'connected',
+    });
+  });
+
+  it('with the fix: auth is still enforced before the body is ever trusted', async () => {
+    const res = await postTo(prodLikeAppWithFix, payload('CREDENTIALS', 'acc_1'), { 'unipile-auth': 'wrong' }, 'text/plain');
+    expect(res.status).toBe(401);
+    expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
   });
 });
