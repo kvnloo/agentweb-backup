@@ -23,7 +23,7 @@ export interface Z0OutcomeExpectationInput {
   decisionTraceId: string;
   decisionTime: string;
   executionTime?: string;
-  requiredWindows: Z0OutcomeWindow[];
+  requiredWindows: readonly Z0OutcomeWindow[];
   subjectId?: string;
   metric: Z0OutcomeExpectationMetric;
 }
@@ -126,7 +126,7 @@ function validateMetric(metric: Z0OutcomeExpectationMetric): void {
   }
 }
 
-function canonicalWindows(windows: Z0OutcomeWindow[]): Z0OutcomeWindow[] {
+function canonicalWindows(windows: readonly Z0OutcomeWindow[]): Z0OutcomeWindow[] {
   if (!Array.isArray(windows) || windows.length === 0) {
     throw new Error('requiredWindows must be non-empty');
   }
@@ -390,6 +390,8 @@ export function outcomeDataPromotionEligible(
   summary: Z0OutcomeCoverageSummaryV1,
 ): boolean {
   return (
+    summary.required_windows.length > 0 &&
+    summary.required_windows.every(window => summary.by_window[window]?.passes === true) &&
     summary.promotion_gate.eligible === true &&
     summary.promotion_gate.necessary_not_sufficient === true &&
     summary.promotion_gate.causal_quality_proven === false
