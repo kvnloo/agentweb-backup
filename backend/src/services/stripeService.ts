@@ -447,6 +447,21 @@ export async function changeSubscriptionPrice(
   });
   const currentPhase = schedule.phases[0];
 
+  // Carry forward every item that ISN'T the plan item being downgraded — in
+  // particular the seat-billing extra-seat item (ENG-2243..2246), which can
+  // now coexist on the same subscription. Without this, phase 2 would only
+  // ever list `newPriceId`, and Stripe would silently drop every other item
+  // (including a paid seat item, at whatever quantity it was) the moment the
+  // scheduled downgrade takes effect — canceling seat billing entirely
+  // without going through removeExtraSeat's occupied-seat safety check.
+  const planPriceId = currentItem.price.id;
+  const carryForwardItems = currentPhase.items
+    .map((i: any) => ({
+      price: typeof i.price === 'string' ? i.price : i.price?.id,
+      quantity: i.quantity ?? 1,
+    }))
+    .filter((i: { price: string }) => i.price !== planPriceId);
+
   const updated = await stripe.subscriptionSchedules.update(schedule.id, {
     phases: [
       {
@@ -458,7 +473,7 @@ export async function changeSubscriptionPrice(
         end_date: currentPhase.end_date ?? periodEnd,
       },
       {
-        items: [{ price: newPriceId, quantity: 1 }],
+        items: [{ price: newPriceId, quantity: 1 }, ...carryForwardItems],
       },
     ],
     end_behavior: 'release', // After phase 2, drop back to a plain subscription

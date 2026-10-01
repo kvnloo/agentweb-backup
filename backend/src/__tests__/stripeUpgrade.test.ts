@@ -440,6 +440,80 @@ describe('Stripe subscription upgrade', () => {
       });
     });
 
+    it('carries the seat item forward into the next phase on a scheduled downgrade', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'user-123',
+        stripe_customer_id: 'cus_abc123',
+      });
+      mockStripe.subscriptions.list.mockResolvedValue({
+        data: [{
+          id: 'sub_existing',
+          status: 'active',
+          items: { data: [{ id: 'si_item1', price: { id: 'price_complete_456' } }, SEAT_ITEM] },
+        }],
+      });
+      mockStripe.subscriptions.retrieve.mockResolvedValue({
+        id: 'sub_existing',
+        status: 'active',
+        current_period_end: 1700000000,
+        items: {
+          data: [
+            {
+              id: 'si_item1',
+              price: { id: 'price_complete_456', unit_amount: 9900 },
+              current_period_end: 1700000000,
+            },
+            SEAT_ITEM,
+          ],
+        },
+      });
+      mockStripe.prices.retrieve.mockResolvedValue({ id: 'price_starter_123', unit_amount: 2900 });
+      mockStripe.subscriptionSchedules.create.mockResolvedValue({
+        id: 'sub_sched_xyz',
+        phases: [{
+          start_date: 1_697_400_000,
+          end_date: 1700000000,
+          items: [
+            { price: 'price_complete_456', quantity: 1 },
+            { price: 'price_seat_dynamic_1', quantity: 3 },
+          ],
+        }],
+      });
+      mockStripe.subscriptionSchedules.update.mockResolvedValue({
+        id: 'sub_sched_xyz',
+        phases: [
+          {
+            items: [
+              { price: 'price_complete_456', quantity: 1 },
+              { price: 'price_seat_dynamic_1', quantity: 3 },
+            ],
+          },
+          { items: [{ price: 'price_starter_123', quantity: 1 }, { price: 'price_seat_dynamic_1', quantity: 3 }] },
+        ],
+      });
+
+      const app = createApp();
+      const res = await request(app)
+        .post('/api/stripe/upgrade')
+        .set('Authorization', 'Bearer valid-token')
+        .send({ plan: 'starter' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.kind).toBe('downgrade_scheduled');
+      expect(mockStripe.subscriptionSchedules.update).toHaveBeenCalledTimes(1);
+      const [, scheduleUpdateArgs] = mockStripe.subscriptionSchedules.update.mock.calls[0];
+      // Phase 2 (the phase that takes effect at period end) must include the
+      // new plan price AND the seat item, carried forward unchanged — not
+      // just the new plan price alone (which would silently cancel seat
+      // billing the moment the schedule transitions).
+      expect(scheduleUpdateArgs.phases[1].items).toEqual(
+        expect.arrayContaining([
+          { price: 'price_starter_123', quantity: 1 },
+          { price: 'price_seat_dynamic_1', quantity: 3 },
+        ])
+      );
+      expect(scheduleUpdateArgs.phases[1].items).toHaveLength(2);
+    });
   });
 
   // --- NO FREE TRIAL TESTS ---
