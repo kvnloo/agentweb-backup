@@ -16,6 +16,30 @@
  */
 const SECRET_CONFIG_KEYS = ['access_token', 'refresh_token', 'api_key', 'webhook_signing_key'] as const;
 
+// Compile-time tripwire: `SECRET_CONFIG_KEYS` above is a hand-maintained
+// literal list with nothing forcing it to stay in sync with
+// `PlatformConfig` as platforms are added. `import type` is erased
+// entirely by the compiler — zero runtime import, so this does NOT
+// reintroduce the jest.mock problem the module comment above describes.
+// `KeysOf` distributes over the union to get every field name that
+// appears on ANY platform's config (not just fields common to all of
+// them); `CredentialShapedKey` keeps the ones that look like a secret by
+// the same naming heuristic org.ts used before this fix existed. If a
+// future platform adds e.g. `bearer_token` or `signing_secret` and
+// forgets to add it to `SECRET_CONFIG_KEYS`, this line fails to compile.
+import type { PlatformConfig } from '../services/connectedAccountsDb';
+type KeysOf<U> = U extends infer T ? keyof T : never;
+type CredentialShapedKey = Extract<
+  KeysOf<PlatformConfig>,
+  `${string}token` | `${string}_key` | `${string}secret${string}`
+>;
+type MissingFromSecretConfigKeys = Exclude<CredentialShapedKey, (typeof SECRET_CONFIG_KEYS)[number]>;
+// If this errors, a credential-shaped field exists that SECRET_CONFIG_KEYS doesn't cover.
+const _assertNoSecretConfigKeyMissing: MissingFromSecretConfigKeys extends never ? true : [
+  'add to SECRET_CONFIG_KEYS:', MissingFromSecretConfigKeys
+] = true;
+void _assertNoSecretConfigKeyMissing;
+
 type AccountLike = Record<string, any> & { config?: Record<string, any> };
 
 /**
