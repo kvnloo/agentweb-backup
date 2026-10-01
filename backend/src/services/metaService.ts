@@ -1716,6 +1716,33 @@ export class MetaService {
   }
 
   /**
+   * Facebook Page IDs this account's existing ad creatives were built against,
+   * sampled from the most recent page of creatives. Best-effort: returns []
+   * on any failure rather than throwing, same discipline as `getPages`'
+   * granular-scopes fallback — a failed sample must read as "couldn't tell",
+   * never as "no existing ads".
+   *
+   * Lets a caller distinguish "this connection has zero accessible Pages"
+   * from the subtler "it has Pages, but not the one this account's ads
+   * actually run under" (ENG-2232) — a token can hold access to an unrelated
+   * Page while the account's real ads keep failing.
+   */
+  public async getExistingAdPageIds(adAccountId: string, accessToken: string): Promise<string[]> {
+    try {
+      const { creatives } = await this.listAdCreatives(adAccountId, accessToken, { maxPages: 1 });
+      const pageIds = new Set<string>();
+      for (const creative of creatives) {
+        const pageId = creative?.object_story_spec?.page_id;
+        if (typeof pageId === 'string' && pageId) pageIds.add(pageId);
+      }
+      return [...pageIds];
+    } catch (error: any) {
+      console.warn(`[MetaService] getExistingAdPageIds failed for account ${adAccountId}: ${error?.message || error}`);
+      return [];
+    }
+  }
+
+  /**
    * Return caller-resolved creative `url_tags` verbatim.
    *
    * Customer defaults and per-lander overrides are resolved in AgentMode, where

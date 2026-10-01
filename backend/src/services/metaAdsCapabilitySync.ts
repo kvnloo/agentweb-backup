@@ -101,15 +101,49 @@ export const syncMetaAdsCapability = async (
     // below: a failure here must not affect that outcome.
     try {
       const pages = await metaService.getPages(config.access_token);
-      const newHasPages = pages.length > 0;
-      if (config.has_meta_pages !== newHasPages) {
+      let newHasPages = pages.length > 0;
+      let newExistingAdsPageId: string | undefined;
+      if (newHasPages) {
+        // ENG-2232: "has at least one Page" isn't the same as "has the Page
+        // this account's own ads actually run under" — an account can hold
+        // access to some unrelated Page while its real ads keep failing.
+        // `getExistingAdPageIds` is itself best-effort (never throws, returns
+        // [] on failure), so this only ever tightens newHasPages, never
+        // loosens it.
+        const existingPageIds = await metaService.getExistingAdPageIds(
+          config.ad_account_id || account.account_id,
+          config.access_token
+        );
+        const accessiblePageIds = new Set(pages.map((p: any) => p.id));
+        const uncovered = existingPageIds.filter(id => !accessiblePageIds.has(id));
+        // Only a verdict when EVERY Page this account's existing ads use is
+        // uncovered — a multi-Page account with partial coverage still has a
+        // valid Page to build new campaigns under.
+        if (existingPageIds.length > 0 && uncovered.length === existingPageIds.length) {
+          newHasPages = false;
+          newExistingAdsPageId = existingPageIds[0];
+        }
+      }
+      const currentExistingAdsPageId =
+        typeof config.existing_ads_page_id === 'string' ? config.existing_ads_page_id : undefined;
+      const existingAdsPageIdChanged = currentExistingAdsPageId !== newExistingAdsPageId;
+      if (config.has_meta_pages !== newHasPages || existingAdsPageIdChanged) {
         const { updateAccountConfig: persistPageAccess } = await import('./connectedAccountsDb');
         await persistPageAccess(userId, platform as any, account.account_id, {
           has_meta_pages: newHasPages,
+          // Only written when it's actually changing — explicit null (not
+          // omitted) so a stale Page id from a PRIOR wrong-page verdict is
+          // cleared once that's no longer the reason (e.g. access dropped to
+          // zero Pages entirely, or was fixed). Omitted entirely when nothing
+          // about it changed, so an unrelated has_meta_pages flip doesn't
+          // rewrite a field that was never set to begin with.
+          ...(existingAdsPageIdChanged ? { existing_ads_page_id: newExistingAdsPageId ?? null } : {}),
         });
         config.has_meta_pages = newHasPages;
+        config.existing_ads_page_id = newExistingAdsPageId;
         console.log(
-          `[MetaAdsCapabilitySync] Page access ${newHasPages ? 'confirmed' : 'missing'} for user ${userId} account ${account.account_id} (${pages.length} Page(s))`
+          `[MetaAdsCapabilitySync] Page access ${newHasPages ? 'confirmed' : 'missing'} for user ${userId} account ${account.account_id} ` +
+          `(${pages.length} Page(s)${newExistingAdsPageId ? `, existing ads use Page ${newExistingAdsPageId}` : ''})`
         );
       }
     } catch (pageError: any) {

@@ -123,6 +123,16 @@ export interface MetaAdsScopeConfigLike {
    * read as either answer.
    */
   has_meta_pages?: unknown;
+  /**
+   * Set only when `has_meta_pages` is `false` *because* this account's own
+   * existing ad creatives were found to run under a specific Facebook Page
+   * that isn't among the ones this connection can access (ENG-2232) — as
+   * opposed to the connection having zero accessible Pages at all. Lets
+   * `describeMetaAdsCapability` name the actual Page in the warning instead
+   * of a generic "no Pages are accessible" that would be factually wrong
+   * when some OTHER Page is reachable.
+   */
+  existing_ads_page_id?: unknown;
 }
 
 /**
@@ -166,6 +176,30 @@ export const META_ADS_NO_PAGES_MESSAGE =
   'must reference a Page, so ad creation will fail. Reconnect Meta under Settings -> Connected accounts and ' +
   'select the Page on the "Choose Pages" step, and/or ask whoever manages that Page in Meta Business Settings ' +
   'to add this person with "Create ads" (Advertiser) access, then run this again. No ads were created.';
+
+/**
+ * ENG-2232: the subtler sibling of `META_ADS_NO_PAGES_MESSAGE` — this
+ * connection DOES have access to some Page, just not the one this account's
+ * own existing ads already run under. Naming the specific Page (inferred
+ * from existing ad creatives, per the issue's own suggestion) is the whole
+ * point: "no Pages are accessible" would be false here and send the owner
+ * chasing the wrong fix.
+ */
+export const buildMetaAdsWrongPageMessage = (existingAdsPageId: string): string =>
+  `Meta Ads access is incomplete for this connection: this account's existing ads run under Facebook Page ` +
+  `${existingAdsPageId}, which isn't one of the Pages this connection can currently access, so ad creation will ` +
+  `fail. Reconnect Meta under Settings -> Connected accounts and select that Page on the "Choose Pages" step, ` +
+  `and/or ask whoever manages it in Meta Business Settings to add this person with "Create ads" (Advertiser) ` +
+  `access, then run this again. No ads were created.`;
+
+/** The right message for a confirmed-missing Page state — generic or Page-specific. */
+export const getMetaAdsNoPagesMessage = (config: MetaAdsScopeConfigLike | null | undefined): string => {
+  const existingAdsPageId = config?.existing_ads_page_id;
+  if (typeof existingAdsPageId === 'string' && existingAdsPageId) {
+    return buildMetaAdsWrongPageMessage(existingAdsPageId);
+  }
+  return META_ADS_NO_PAGES_MESSAGE;
+};
 
 const isAdsScope = (value: unknown): boolean =>
   typeof value === 'string' &&
@@ -271,7 +305,7 @@ export const describeMetaAdsCapability = (
   // because Page access is a second Meta grant that scopes say nothing about.
   // This is the exact gap ENG-2232 reported: ads_capable:true with 0 Pages.
   if (getMetaPagesAccessState(account?.config) === 'missing') {
-    return { ads_capable: false, capability_warning: META_ADS_NO_PAGES_MESSAGE };
+    return { ads_capable: false, capability_warning: getMetaAdsNoPagesMessage(account?.config) };
   }
 
   if (state === 'granted') return { ads_capable: true };

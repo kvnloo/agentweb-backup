@@ -22405,6 +22405,34 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // re-derived from params after this point, so nothing downstream can
       // silently drift it (the idx=202→205 LEADS→TRAFFIC flip in the incident).
       params = { ...params, objective: gate.objective };
+
+      // ENG-2232: deterministic Page-access preflight. Page access is a second,
+      // independent Meta grant that the objective gate above says nothing
+      // about, and the PAGE LIST tool's own warning text is only advisory — a
+      // model can still choose to build anyway. This is what the reported
+      // production incident actually needed: the account had 0 accessible
+      // Pages, PAGE LIST said so, and the agent built 4 campaigns + 4 ad sets
+      // before the failure finally surfaced at AD_CREATIVE CREATE. Blocking
+      // here stops the whole build at step 1 instead of after the waste.
+      //
+      // Reuses the credential-resolution call the tracking gate below already
+      // makes for its own account lookup (same `getMetaCredentials(userId,
+      // account_id)` shape, deliberately no clientScope per ENG-1801) — a
+      // second call is the established pattern for a preflight gate here, not
+      // a new one. 'unknown' (never probed, or credentials came from the
+      // legacy adAccount fallback which predates this field) is NOT treated as
+      // 'missing' — only a confirmed-empty PAGE LIST blocks.
+      const { connection: pageGateConnection } = await this.getMetaCredentials(userId, account_id);
+      const { getMetaPagesAccessState, getMetaAdsNoPagesMessage } = await import('../utils/metaAdsScope');
+      if (getMetaPagesAccessState(pageGateConnection?.config) === 'missing') {
+        const pageMessage = getMetaAdsNoPagesMessage(pageGateConnection?.config);
+        return {
+          success: false,
+          message: pageMessage,
+          error: `META_PAGE_ACCESS_MISSING: ${pageMessage}`,
+          hint: 'Reconnect Meta and select the Page on the "Choose Pages" step, or get "Create ads" (Advertiser) access on the Page, then retry.'
+        } as any;
+      }
     }
 
     // Pre-validate params before any API round-trip

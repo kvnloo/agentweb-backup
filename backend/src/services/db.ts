@@ -11950,6 +11950,13 @@ export const oauthSessionDb = {
     granted_scopes?: string[];
     /** Whether at least one Facebook Page is accessible, when probed (ENG-2232). */
     has_meta_pages?: boolean;
+    /**
+     * The accessible Facebook Page ids themselves, when probed (ENG-2232).
+     * Lets /connect-ad-accounts cross-check each selected ad account's
+     * existing ads against the actual set, instead of just the boolean —
+     * without re-fetching Pages once per ad account in that loop.
+     */
+    meta_page_ids?: string[];
     flow: string;
   } | PendingOAuthSession): Promise<void> {
     const TEN_MINUTES_SECONDS = 10 * 60;
@@ -11990,6 +11997,7 @@ export const oauthSessionDb = {
     scopes: string[];
     granted_scopes?: string[];
     has_meta_pages?: boolean;
+    meta_page_ids?: string[];
     flow: string;
   } | null> {
     try {
