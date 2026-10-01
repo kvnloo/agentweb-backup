@@ -21,12 +21,30 @@ function config(mode: 'off' | 'shadow' | 'active'): Z0AgentWebConfig {
   return { mode, baseUrl: 'http://z0.test', timeoutMs: 1000 };
 }
 
-function response(payload: unknown, status = 200): Z0FetchLike {
-  return jest.fn(async () => ({
-    ok: status >= 200 && status < 300,
-    status,
-    json: async () => payload,
-  })) as unknown as Z0FetchLike;
+function bridgeResponse(legacy: Record<string, any>, status = 200): Z0FetchLike {
+  return jest.fn(async (_url: unknown, init?: RequestInit) => {
+    const requestBody = JSON.parse(String(init?.body ?? '{}'));
+    const payload = status >= 200 && status < 300
+      ? {
+          schema: 'agentweb.z0.bridge.v1',
+          operation_id: requestBody.operation_id,
+          trace_id: requestBody.trace_id,
+          mode: requestBody.mode,
+          kind: requestBody.kind,
+          status: legacy.ok === true ? 'completed' : 'failed',
+          applied: Boolean(legacy.applied),
+          replayed: Boolean(legacy.replayed),
+          reconcile_required: false,
+          retry: 'none',
+          output: legacy,
+        }
+      : legacy;
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => payload,
+    };
+  }) as unknown as Z0FetchLike;
 }
 
 describe('z0 AgentWeb adapter', () => {
@@ -58,23 +76,49 @@ describe('z0 AgentWeb adapter', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it('shadow mode uses /v1/plan, forces free-only, and exports no raw session id', async () => {
-    const fetchImpl = response({ ok: true, mode: 'shadow', executed: false, route: { kind: 'PARENT_ONLY' } });
+  it('shadow mode carries v1 policy, forces free-only, and exports no raw session id', async () => {
+    const fetchImpl = bridgeResponse({
+      ok: true,
+      mode: 'shadow',
+      executed: false,
+      route: { kind: 'PARENT_ONLY' },
+    });
     const result = await runZ0Route(request, {
       sessionId: 'raw-session-secret',
       config: config('shadow'),
       fetchImpl,
     });
 
-    expect(result).toMatchObject({ ok: true, mode: 'shadow', executed: false, reconcile_required: false });
+    expect(result).toMatchObject({
+      ok: true,
+      mode: 'shadow',
+      executed: false,
+      reconcile_required: false,
+      bridge_schema: 'agentweb.z0.bridge.v1',
+      bridge_status: 'completed',
+    });
     const [url, init] = (fetchImpl as unknown as jest.Mock).mock.calls[0];
     expect(url).toBe('http://z0.test/v1/plan');
     const body = JSON.parse(init.body);
     expect(body).toMatchObject({
-      harness: 'agentweb',
-      function: 'summarization',
-      free_only: true,
-      allow_remote: false,
+      schema: 'agentweb.z0.bridge.v1',
+      operation_id: 'op-42',
+      mode: 'shadow',
+      kind: 'plan',
+      capability: 'summarization',
+      policy: {
+        allow_remote: false,
+        free_only: true,
+        experimental: false,
+        risk_class: 'generate',
+        approval_state: 'not_required',
+      },
+      payload: {
+        function: 'summarization',
+        task: 'summarize this bounded fixture',
+        expected_parent_tokens: 9000,
+        expected_parent_ms: 40000,
+      },
     });
     expect(JSON.stringify(body)).not.toContain('raw-session-secret');
     expect(body.parent_agent).toMatch(/^agentweb:[a-f0-9]{24}$/);
@@ -103,6 +147,7 @@ describe('z0 AgentWeb adapter', () => {
       reason: 'timeout',
       execution_status: 'unknown',
       reconcile_required: true,
+      bridge_retry: 'same_identity_only',
     });
     expect(first.trace_id).toBe(second.trace_id);
     expect(first.trace_id).toBe(
