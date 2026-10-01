@@ -10,6 +10,17 @@
  *
  * The reconciliation test is the single most important assertion in this
  * file: a silent double-grant or missed grant here is a real money bug.
+ *
+ * The `updateUser` fake below deliberately evaluates `options.condition`
+ * against the live `users` table at write time and throws a
+ * `ConditionalCheckFailedException`-shaped error on mismatch, the same way
+ * real DynamoDB does. An earlier version of this fake applied `updates`
+ * unconditionally, which made every "idempotency" test here pass even though
+ * it never actually exercised `grantMonthlyLlmUsageCredit`'s optimistic-
+ * concurrency retry loop — the one piece of code that is actually
+ * responsible for collapsing two concurrent grant attempts (e.g. two cron
+ * instances, or a deploy restarting mid-sweep) into a single grant. The
+ * concurrency test below depends on this fidelity.
  */
 import { orgDb, userDb } from '../services/db';
 import {
@@ -21,6 +32,32 @@ import {
 
 type FakeUser = { userId: string; email: string; llmUsageCredits?: any };
 
+/** Mirrors the handful of ConditionExpression shapes `grantMonthlyLlmUsageCredit`
+ * actually issues against the (non-admin) `userDb.updateUser` path, evaluated
+ * against the live fake table — not the caller's stale read — exactly like
+ * DynamoDB evaluates a real ConditionExpression at write time. */
+function conditionHolds(
+  condition: { expression: string; names?: Record<string, string>; values?: Record<string, any> } | undefined,
+  stored: FakeUser | undefined,
+): boolean {
+  if (!condition) return true;
+  const ledger = stored?.llmUsageCredits;
+  if (condition.expression === 'attribute_not_exists(#creditLedger)') {
+    return !ledger;
+  }
+  if (condition.expression === '#creditLedger.#version = :expectedVersion') {
+    return ledger?.version === condition.values?.[':expectedVersion'];
+  }
+  if (condition.expression.includes('attribute_not_exists(#creditLedger.#version)')) {
+    return (
+      ledger?.version == null &&
+      ledger?.month === condition.values?.[':expectedMonth'] &&
+      JSON.stringify(ledger?.grantIds || []) === JSON.stringify(condition.values?.[':expectedGrantIds'] || [])
+    );
+  }
+  throw new Error(`orgSeatCreditGrantService.test.ts fake does not model condition: ${condition.expression}`);
+}
+
 describe('orgSeatCreditGrantService', () => {
   let users: Record<string, FakeUser>;
   let getUserByIdSpy: jest.SpyInstance;
@@ -30,7 +67,17 @@ describe('orgSeatCreditGrantService', () => {
   beforeEach(() => {
     users = {};
     getUserByIdSpy = jest.spyOn(userDb, 'getUserById').mockImplementation(async (userId: string) => users[userId]);
-    updateUserSpy = jest.spyOn(userDb, 'updateUser').mockImplementation(async (userId: string, updates: any) => {
+    updateUserSpy = jest.spyOn(userDb, 'updateUser').mockImplementation(async (userId: string, updates: any, options?: any) => {
+      // A microtask tick between the condition check and the write, modeling
+      // the real read-then-write gap `grantMonthlyLlmUsageCredit` has between
+      // its `userDb.getUserById` read and this `updateUser` call — enough for
+      // two concurrent callers to genuinely interleave in the tests below.
+      await Promise.resolve();
+      if (!conditionHolds(options?.condition, users[userId])) {
+        const err: any = new Error('The conditional request failed');
+        err.code = 'ConditionalCheckFailedException';
+        throw err;
+      }
       users[userId] = { ...users[userId], ...updates } as FakeUser;
       return users[userId] as any;
     });
@@ -144,6 +191,80 @@ describe('orgSeatCreditGrantService', () => {
 
       expect(users['owner-direct'].llmUsageCredits.totalPurchasedMicroUsd).toBe(60_000_000);
       expect(updateUserSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not double-grant when two sweeps race concurrently for the same org/month (simulates two cron-bearing instances firing at once, or a deploy restarting mid-sweep)', async () => {
+      const org = { orgId: 'org-race', ownerUserId: 'owner-race', purchasedExtraSeats: 3 } as any;
+      seedOwner(org.ownerUserId);
+      listAllSpy.mockResolvedValue([org]);
+
+      const [summaryA, summaryB] = await Promise.all([
+        grantMonthlySeatCreditsForAllOrgs(NOW),
+        grantMonthlySeatCreditsForAllOrgs(NOW),
+      ]);
+
+      // Exactly one of the two concurrent sweeps may have actually granted;
+      // the loser must observe the DynamoDB-level ConditionalCheckFailedException,
+      // retry, see the grantId already present, and report idempotent instead.
+      expect(summaryA.granted + summaryB.granted).toBe(1);
+      expect(summaryA.idempotent + summaryB.idempotent).toBe(1);
+      expect(summaryA.failed).toBe(0);
+      expect(summaryB.failed).toBe(0);
+      expect(summaryA.totalGrantedMicroUsd + summaryB.totalGrantedMicroUsd).toBe(90_000_000);
+
+      // The ledger itself must reflect exactly one grant, not two.
+      expect(users['owner-race'].llmUsageCredits.totalPurchasedMicroUsd).toBe(90_000_000);
+      expect(users['owner-race'].llmUsageCredits.grantIds).toEqual([
+        seatCreditGrantId('org-race', USAGE_MONTH),
+      ]);
+    });
+  });
+
+  describe('failure isolation', () => {
+    it('continues past an org whose owner user record is missing and still grants the other orgs', async () => {
+      const orgs = [
+        { orgId: 'org-ghost', ownerUserId: 'owner-deleted-long-ago', purchasedExtraSeats: 5 },
+        { orgId: 'org-fine', ownerUserId: 'owner-fine', purchasedExtraSeats: 2 },
+      ] as any[];
+      // Deliberately do NOT seed 'owner-deleted-long-ago' — models a missing/deleted
+      // owner record so userDb.getUserById returns undefined and
+      // grantMonthlyLlmUsageCredit throws "User not found".
+      seedOwner('owner-fine');
+      listAllSpy.mockResolvedValue(orgs);
+
+      const summary = await grantMonthlySeatCreditsForAllOrgs(NOW);
+
+      expect(summary.scanned).toBe(2);
+      expect(summary.eligible).toBe(2);
+      expect(summary.failed).toBe(1);
+      expect(summary.errors).toEqual([
+        expect.objectContaining({ orgId: 'org-ghost', error: expect.stringContaining('User not found') }),
+      ]);
+
+      // The batch must not have aborted — the org after the failing one still
+      // got its grant.
+      expect(summary.granted).toBe(1);
+      expect(summary.totalGrantedMicroUsd).toBe(60_000_000);
+      expect(users['owner-fine'].llmUsageCredits.totalPurchasedMicroUsd).toBe(60_000_000);
+    });
+  });
+
+  describe('fractional purchasedExtraSeats', () => {
+    it('treats a seat count that floors to zero as fully ineligible — no call, no phantom eligible count', async () => {
+      const org = { orgId: 'org-fractional', ownerUserId: 'owner-fractional', purchasedExtraSeats: 0.5 } as any;
+      seedOwner(org.ownerUserId);
+      listAllSpy.mockResolvedValue([org]);
+
+      const summary = await grantMonthlySeatCreditsForAllOrgs(NOW);
+
+      // Must not be counted eligible if it can never be granted/idempotent/failed —
+      // eligible must always equal granted + idempotent + failed.
+      expect(summary.eligible).toBe(0);
+      expect(summary.granted).toBe(0);
+      expect(summary.idempotent).toBe(0);
+      expect(summary.failed).toBe(0);
+      expect(updateUserSpy).not.toHaveBeenCalled();
+      expect(users['owner-fractional'].llmUsageCredits).toBeUndefined();
     });
   });
 });
