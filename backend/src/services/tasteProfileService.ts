@@ -905,7 +905,13 @@ function applyTasteFeedback(profile: TasteProfile, events: TasteFeedbackEvent[])
     for (const rawSignal of event.receipt.signals || []) {
       const signal = parseReceiptSignal(rawSignal);
       if (!signal) continue;
-      deltas.set(signal.name, (deltas.get(signal.name) || 0) + sign * FEEDBACK_STEP * signal.score);
+      // Reinforce/attenuate the artifact's strongest effective signals more than
+      // weak incidental ones. Squaring preserves ordering and lets + / - events
+      // cancel exactly before normalization.
+      deltas.set(
+        signal.name,
+        (deltas.get(signal.name) || 0) + sign * FEEDBACK_STEP * signal.score * signal.score
+      );
     }
   }
 
