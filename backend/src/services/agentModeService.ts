@@ -29519,6 +29519,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
               confidence: tasteApplication.confidence,
               dials: tasteApplication.dials,
               signals: tasteApplication.signals,
+              receipt: tasteApplication.receipt,
             }
           } : {}),
           ...(dataReliabilityWarning ? { dataReliabilityWarning } : {}),
@@ -29670,6 +29671,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
               confidence: tasteApplication.confidence,
               dials: tasteApplication.dials,
               signals: tasteApplication.signals,
+              receipt: tasteApplication.receipt,
             }
           } : {}),
         };
