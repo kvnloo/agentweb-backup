@@ -186,6 +186,37 @@ describe("addPageViaCodingAgent", () => {
     expect(res.status).toBe("deployed"); // metering failure did not surface
   });
 
+  it("persists the exact Taste receipt on the artifact record", async () => {
+    mockRunCodingAgent.mockResolvedValue({ success: false, message: "stop after persist", iterations: 0 });
+    const tasteReceipt = {
+      schema: "taste.application-receipt.v1",
+      applicationSchema: "taste.application.v1",
+      surface: "landing_page",
+      active: true,
+      intensity: "strong",
+      confidence: 0.8,
+      resolutionSource: "surface_default",
+      profileRevision: "profile:v1:0123456789abcdef",
+      settingsRevision: "settings:v1:fedcba9876543210",
+      dials: { designVariance: 8, motionIntensity: 4, visualDensity: 5 },
+      signals: ["minimal:0.6", "editorial:0.4"],
+      generatedAt: "2026-10-01T06:00:00.000Z",
+    } as const;
+
+    await addPageViaCodingAgent(
+      site,
+      "u1",
+      "p",
+      "Taste page",
+      {} as any,
+      { tasteReceipt: tasteReceipt as any }
+    );
+
+    const put = mockPut.mock.calls[0][0].Item;
+    expect(put.tasteReceipt).toEqual(tasteReceipt);
+    expect(put.tasteReceipt).toBe(tasteReceipt);
+  });
+
   it("rejects a site with no deployed repo before creating anything", async () => {
     await expect(
       addPageViaCodingAgent({ id: "x", userId: "u1" } as any, "u1", "p", "N", {} as any)
