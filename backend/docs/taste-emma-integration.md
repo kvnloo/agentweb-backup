@@ -438,6 +438,7 @@ Implemented:
 - first-class Emma read/preview/settings/explicit-refresh tools
 - Agent Mode policy for when Taste should/shouldn't apply
 - automatic backend application for landing pages, images, and video
+- versioned Taste application receipts with semantic profile/settings revisions, threaded into landing/image/video results
 - REST surface/application/apply/settings APIs
 - customer Taste Center at `/marketing/taste`
 
@@ -445,7 +446,7 @@ Not yet implemented:
 - screenshot/Figma/design-dump visual ingestion
 - "more like this / less like this" artifact feedback
 - campaign/project overlays
-- artifact-level immutable Taste receipts
+- durable storage/retrieval of Taste receipts on persisted artifacts and scheduled runs
 - landing-page edit/coding-agent automatic receipt injection
 - social/research candidate re-rankers
 - eval dashboard comparing Brand-only vs Brand+Taste
