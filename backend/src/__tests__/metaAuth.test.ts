@@ -594,6 +594,27 @@ describe('Meta Auth Routes', () => {
             expect(config.has_meta_pages).toBe(true);
         });
 
+        it('persists accessible_page_ids alongside has_meta_pages (ENG-2232)', async () => {
+            await connectWithPages([
+                { id: 'page_1', name: 'My Health Surveys' },
+                { id: 'page_2', name: 'Other Page' },
+            ]);
+
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.accessible_page_ids).toEqual(['page_1', 'page_2']);
+        });
+
+        it('omits accessible_page_ids (never writes []) when the Page probe itself fails', async () => {
+            const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+            await connectWithPages('error');
+
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.accessible_page_ids).toBeUndefined();
+
+            consoleWarnSpy.mockRestore();
+        });
+
         it('omits has_meta_pages (never writes false) when the Page probe itself fails', async () => {
             const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
 

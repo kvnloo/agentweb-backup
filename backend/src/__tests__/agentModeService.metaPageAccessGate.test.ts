@@ -14,6 +14,13 @@
  * file covers the hard stop: CAMPAIGN CREATE must refuse to even start a
  * build when Page access is confirmed missing, the same way the ENG-400
  * objective gate (tested separately) refuses an unconfirmed objective.
+ *
+ * Also covers the narrower AD_CREATIVE CREATE gate: the CAMPAIGN CREATE gate
+ * above only catches a build that starts with a brand-new campaign — adding
+ * a creative to an EXISTING campaign never goes through it. AD_CREATIVE
+ * CREATE always carries a concrete page_id (Meta requires it), so that gate
+ * checks the literal requested Page against the accessible set directly,
+ * rather than the CAMPAIGN gate's historical-existing-ads heuristic.
  */
 
 jest.mock('../mcp/client/mcpClientService', () => ({
@@ -26,6 +33,7 @@ jest.mock('../services/metaService', () => {
     ...actual,
     metaService: {
       createCampaign: jest.fn(),
+      createAdCreative: jest.fn(),
     },
   };
 });
@@ -60,7 +68,7 @@ import { AgentModeService } from '../services/agentModeService';
 import { metaService } from '../services/metaService';
 import { userDb } from '../services/db';
 import { chatbotDb } from '../services/chatbotService';
-import { META_ADS_NO_PAGES_MESSAGE, buildMetaAdsWrongPageMessage } from '../utils/metaAdsScope';
+import { META_ADS_NO_PAGES_MESSAGE, buildMetaAdsWrongPageMessage, buildMetaAdsPageNotAccessibleMessage } from '../utils/metaAdsScope';
 
 const AD_ACCOUNT_ID = '1209971551106961';
 const SESSION_ID = 'session-1';
@@ -185,5 +193,104 @@ describe('AgentModeService — Meta Page-access CAMPAIGN CREATE gate (ENG-2232)'
     // An UPDATE isn't gated by this preflight — it must reach dispatch (and fail
     // or succeed) for reasons unrelated to Page access, never this gate's message.
     expect(result.error).not.toContain('META_PAGE_ACCESS_MISSING');
+  });
+});
+
+describe('AgentModeService — Meta AD_CREATIVE CREATE page_id gate (ENG-2232)', () => {
+  let service: AgentModeService;
+
+  const validCreativeParams = (extra: any = {}) => ({
+    name: 'Test Creative',
+    page_id: '1010991085424542',
+    body: 'Body copy',
+    title: 'Title',
+    link_url: 'https://example.com',
+    image_hash: 'abc123',
+    confirm: true,
+    ...extra,
+  });
+
+  const callCreativeApi = (params: any = {}) =>
+    (service as any).callMetaMarketingApi(
+      'user1', 'AD_CREATIVE', 'CREATE', AD_ACCOUNT_ID, undefined, undefined, undefined,
+      validCreativeParams(params),
+      SESSION_ID,
+    );
+
+  beforeEach(() => {
+    service = new AgentModeService();
+    jest.clearAllMocks();
+    mockIsTokenValid.mockResolvedValue(true);
+    (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_1' });
+  });
+
+  it('blocks AD_CREATIVE CREATE when the requested page_id is not in the accessible set', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      id: 'user1',
+      connected_accounts: [metaAccount({ accessible_page_ids: ['some_other_page'] })],
+    });
+
+    const result = await callCreativeApi({ page_id: '1010991085424542' });
+
+    expect(result.success).toBe(false);
+    expect(result.message).toBe(buildMetaAdsPageNotAccessibleMessage('1010991085424542'));
+    expect(result.error).toContain('META_PAGE_ACCESS_MISSING');
+    expect(metaService.createAdCreative).not.toHaveBeenCalled();
+  });
+
+  it('blocks AD_CREATIVE CREATE when the accessible set is confirmed empty', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      id: 'user1',
+      connected_accounts: [metaAccount({ accessible_page_ids: [] })],
+    });
+
+    const result = await callCreativeApi({ page_id: '1010991085424542' });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('META_PAGE_ACCESS_MISSING');
+    expect(metaService.createAdCreative).not.toHaveBeenCalled();
+  });
+
+  it('allows AD_CREATIVE CREATE through when the requested page_id IS in the accessible set', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      id: 'user1',
+      connected_accounts: [metaAccount({ accessible_page_ids: ['1010991085424542', 'other_page'] })],
+    });
+
+    const result = await callCreativeApi({ page_id: '1010991085424542' });
+
+    // Downstream of the gate (getCustomerUtmDefault etc.) isn't mocked here — the
+    // only thing this test asserts is that the gate itself did not block.
+    expect(result.error ?? '').not.toContain('META_PAGE_ACCESS_MISSING');
+  });
+
+  it('allows AD_CREATIVE CREATE through when accessible_page_ids was never probed (unknown, not missing)', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      id: 'user1',
+      connected_accounts: [metaAccount({})], // no accessible_page_ids field at all
+    });
+
+    const result = await callCreativeApi({ page_id: '1010991085424542' });
+
+    expect(result.error ?? '').not.toContain('META_PAGE_ACCESS_MISSING');
+  });
+
+  it('is independent of the historical existing_ads_page_id signal — checks the literal requested page_id', async () => {
+    // existing ads use a DIFFERENT page than the one this call requests, but the
+    // requested page IS in the accessible set — must not be blocked on history.
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      id: 'user1',
+      connected_accounts: [
+        metaAccount({
+          has_meta_pages: false,
+          existing_ads_page_id: 'some_legacy_page',
+          accessible_page_ids: ['1010991085424542'],
+        }),
+      ],
+    });
+
+    const result = await callCreativeApi({ page_id: '1010991085424542' });
+
+    expect(result.error ?? '').not.toContain('META_PAGE_ACCESS_MISSING');
   });
 });

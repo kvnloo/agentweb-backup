@@ -23,6 +23,8 @@ import {
   getMetaPagesAccessState,
   getMetaAdsNoPagesMessage,
   buildMetaAdsWrongPageMessage,
+  getAccessiblePageIds,
+  buildMetaAdsPageNotAccessibleMessage,
   hasMetaAdsReadScope,
   isMetaAdsScopeRefusal,
   buildMetaAdsScopeError,
@@ -584,6 +586,42 @@ describe('getMetaAdsNoPagesMessage', () => {
 
   it('ignores a non-string existing_ads_page_id (defensive, shouldn\'t happen)', () => {
     expect(getMetaAdsNoPagesMessage({ existing_ads_page_id: 12345 })).toBe(META_ADS_NO_PAGES_MESSAGE);
+  });
+});
+
+describe('getAccessiblePageIds', () => {
+  it('returns undefined when never probed — must not be read as an empty, confirmed list', () => {
+    expect(getAccessiblePageIds({})).toBeUndefined();
+    expect(getAccessiblePageIds(null)).toBeUndefined();
+    expect(getAccessiblePageIds(undefined)).toBeUndefined();
+  });
+
+  it('returns the probed ids', () => {
+    expect(getAccessiblePageIds({ accessible_page_ids: ['1010991085424542', 'page_2'] })).toEqual([
+      '1010991085424542',
+      'page_2',
+    ]);
+  });
+
+  it('returns [] (not undefined) when probed and confirmed empty', () => {
+    expect(getAccessiblePageIds({ accessible_page_ids: [] })).toEqual([]);
+  });
+
+  it('filters out non-string entries defensively', () => {
+    expect(getAccessiblePageIds({ accessible_page_ids: ['page_1', 42, null] })).toEqual(['page_1']);
+  });
+
+  it('treats a non-array value as never-probed', () => {
+    expect(getAccessiblePageIds({ accessible_page_ids: 'page_1' })).toBeUndefined();
+  });
+});
+
+describe('buildMetaAdsPageNotAccessibleMessage', () => {
+  it('names the specific requested Page', () => {
+    const message = buildMetaAdsPageNotAccessibleMessage('1010991085424542');
+    expect(message).toContain('1010991085424542');
+    expect(message).toContain('Choose Pages');
+    expect(message).toContain('Advertiser');
   });
 });
 

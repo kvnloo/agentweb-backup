@@ -652,7 +652,7 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       expect(userId).toBe('user1');
       expect(platform).toBe('meta');
       expect(accountId).toBe(AD_ACCOUNT_ID);
-      expect(updates).toEqual({ has_meta_pages: true });
+      expect(updates).toEqual({ has_meta_pages: true, accessible_page_ids: ['1010991085424542'] });
       expect(account.config.has_meta_pages).toBe(true);
     });
 
@@ -673,7 +673,11 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
 
     it('does not write when the newly-probed answer matches what is already recorded', async () => {
       mockGetPages.mockResolvedValueOnce([{ id: '1010991085424542', name: 'My Health Surveys' }]);
-      const account = metaAccount({ granted_scopes: ['ads_read'], has_meta_pages: true });
+      const account = metaAccount({
+        granted_scopes: ['ads_read'],
+        has_meta_pages: true,
+        accessible_page_ids: ['1010991085424542'],
+      });
 
       await syncMetaAdsCapability(account, 'user1');
 
@@ -711,7 +715,11 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
 
       expect(mockGetExistingAdPageIds).toHaveBeenCalledWith(AD_ACCOUNT_ID, 'EAA-token');
       const [, , , updates] = mockUpdateAccountConfig.mock.calls[0];
-      expect(updates).toEqual({ has_meta_pages: false, existing_ads_page_id: '1010991085424542' });
+      expect(updates).toEqual({
+        has_meta_pages: false,
+        existing_ads_page_id: '1010991085424542',
+        accessible_page_ids: ['page_unrelated'],
+      });
       expect(account.config.has_meta_pages).toBe(false);
       expect(account.config.existing_ads_page_id).toBe('1010991085424542');
     });
@@ -719,7 +727,11 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
     it('keeps has_meta_pages true (no write) when the accessible Pages already match the one existing ads use', async () => {
       mockGetPages.mockResolvedValueOnce([{ id: '1010991085424542', name: 'My Health Surveys' }]);
       mockGetExistingAdPageIds.mockResolvedValueOnce(['1010991085424542']);
-      const account = metaAccount({ granted_scopes: ['ads_read'], has_meta_pages: true });
+      const account = metaAccount({
+        granted_scopes: ['ads_read'],
+        has_meta_pages: true,
+        accessible_page_ids: ['1010991085424542'],
+      });
 
       await syncMetaAdsCapability(account, 'user1');
 
@@ -748,7 +760,11 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       await syncMetaAdsCapability(account, 'user1');
 
       const [, , , updates] = mockUpdateAccountConfig.mock.calls[0];
-      expect(updates).toEqual({ has_meta_pages: true, existing_ads_page_id: null });
+      expect(updates).toEqual({
+        has_meta_pages: true,
+        existing_ads_page_id: null,
+        accessible_page_ids: ['1010991085424542'],
+      });
       expect(account.config.has_meta_pages).toBe(true);
       expect(account.config.existing_ads_page_id).toBeUndefined();
     });
