@@ -12,7 +12,7 @@ import { googleAdsService } from '../services/googleAdsService';
 
 jest.mock('../services/db', () => ({
   userDb: {
-    getAllUsers: jest.fn(),
+    scanWithFilter: jest.fn(),
   },
 }));
 
@@ -40,10 +40,10 @@ const writtenRows = (): WrittenRow[] => mockAdsDb.putSnapshot.mock.calls.map((ca
 const campaignRows = (): WrittenRow[] => writtenRows().filter((r) => r.rowType === 'campaign');
 const accountDayRows = (): WrittenRow[] => writtenRows().filter((r) => r.rowType === 'account_day');
 
-/** `userDb.getAllUsers()`'s real return type is a large, mostly-irrelevant-here User shape; this
- * mocks only the fields enumerateDistinctGoogleAdsAccounts actually reads, funnelled through
- * `unknown` at exactly one point rather than sprinkling `any` through every test. */
-type UsersList = Awaited<ReturnType<typeof userDb.getAllUsers>>;
+/** `userDb.scanWithFilter()`'s real return type is `any[]`; this mocks only the fields
+ * enumerateDistinctGoogleAdsAccounts actually reads, funnelled through `unknown` at exactly one
+ * point rather than sprinkling `any` through every test. */
+type UsersList = Awaited<ReturnType<typeof userDb.scanWithFilter>>;
 interface TestConnectedAccount {
   platform: string;
   account_id: string;
@@ -55,7 +55,7 @@ interface TestUser {
   connected_accounts?: TestConnectedAccount[];
 }
 function mockUsers(users: readonly TestUser[]): void {
-  mockUserDb.getAllUsers.mockResolvedValue(users as unknown as UsersList);
+  mockUserDb.scanWithFilter.mockResolvedValue(users as unknown as UsersList);
 }
 
 const TEST_DATE = '2026-08-09';
@@ -263,6 +263,35 @@ describe('ENG-2215 enumerateDistinctGoogleAdsAccounts', () => {
     ]);
     expect(await enumerateDistinctGoogleAdsAccounts()).toEqual([]);
   });
+
+  it('excludes eval/sandbox users, matching getAllUsers()\'s default includeSandbox: false', async () => {
+    mockUsers([
+      {
+        userId: 'eval_abc123',
+        connected_accounts: [
+          { platform: 'google_ads', account_id: '2883029950', config: { customer_id: '2883029950' } },
+        ],
+      },
+      {
+        userId: 'real-user',
+        connected_accounts: [
+          { platform: 'google_ads', account_id: '9999999999', config: { customer_id: '9999999999' } },
+        ],
+      },
+    ]);
+
+    const accounts = await enumerateDistinctGoogleAdsAccounts();
+    expect(accounts).toEqual([{ customerId: '9999999999', canonicalUserId: 'real-user' }]);
+  });
+
+  it('scans via scanWithFilter, not getAllUsers(): avoids the per-user task/workflow/chat count fan-out', async () => {
+    mockUsers([]);
+
+    await enumerateDistinctGoogleAdsAccounts();
+
+    expect(mockUserDb.scanWithFilter).toHaveBeenCalledTimes(1);
+    expect(mockUserDb.scanWithFilter).toHaveBeenCalledWith('attribute_exists(connected_accounts)', {});
+  });
 });
 
 describe('ENG-2215 runGoogleAdsMetricsSnapshot — flag gating', () => {
@@ -282,7 +311,7 @@ describe('ENG-2215 runGoogleAdsMetricsSnapshot — flag gating', () => {
     const result = await runGoogleAdsMetricsSnapshot({ enabled: false, dryRun: false });
 
     expect(result).toEqual({ status: 'refused', reason: 'flag_off' });
-    expect(mockUserDb.getAllUsers).not.toHaveBeenCalled();
+    expect(mockUserDb.scanWithFilter).not.toHaveBeenCalled();
     expect(mockGetCreds).not.toHaveBeenCalled();
     expect(mockSearch).not.toHaveBeenCalled();
     expect(mockAdsDb.putSnapshot).not.toHaveBeenCalled();
