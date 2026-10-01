@@ -1,0 +1,91 @@
+name: AgentWeb z0 Bridge v1 E2E
+
+on:
+  pull_request:
+    branches: [lab/z0-agentweb-emma-v0]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bridge-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout AgentWeb exact head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Checkout z0intelligence bridge branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kvnloo/z0intelligence
+          ref: lab/agentweb-bridge-protocol-v1
+          path: deps/z0intelligence
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Record exact heads
+        run: |
+          python - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+
+          roots = {
+              "agentweb": ".",
+              "z0intelligence": "deps/z0intelligence",
+          }
+          heads = {
+              name: subprocess.check_output(
+                  ["git", "-C", path, "rev-parse", "HEAD"], text=True
+              ).strip()
+              for name, path in roots.items()
+          }
+          Path("/tmp/agentweb-z0-bridge-v1-heads.json").write_text(
+              json.dumps(heads, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(heads, indent=2))
+          PY
+
+      - name: Verify fixture corpus is byte-identical
+        run: |
+          cmp             research/fixtures/z0-bridge-v1.json             deps/z0intelligence/tests/fixtures/agentweb-z0-bridge-v1.json
+          sha256sum             research/fixtures/z0-bridge-v1.json             deps/z0intelligence/tests/fixtures/agentweb-z0-bridge-v1.json
+
+      - name: Install AgentWeb dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Run AgentWeb bridge contract tests
+        working-directory: backend
+        run: |
+          node --max-old-space-size=4096 node_modules/.bin/jest             --runInBand --forceExit             src/__tests__/experiments.z0BridgeProtocol.test.ts
+
+      - name: Install narrow z0 test dependency
+        run: python -m pip install pytest==8.4.2
+
+      - name: Run z0 bridge contract tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/deps/z0intelligence/src
+        run: |
+          python -m pytest -q             deps/z0intelligence/tests/test_agentweb_bridge_protocol.py
+
+      - name: Upload exact-head evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentweb-z0-bridge-v1-e2e
+          path: /tmp/agentweb-z0-bridge-v1-heads.json
