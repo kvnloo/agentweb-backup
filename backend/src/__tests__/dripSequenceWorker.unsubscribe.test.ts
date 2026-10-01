@@ -67,7 +67,7 @@ const baseEnrollment = {
   sequenceId: 'seq-1',
   leadId: 'lead-1',
   listId: 'list-1',
-  leadEmail: 'test@example.com',
+  leadEmail: 'test@acme.io',
   userId: 'user-1',
   currentStep: 0,
   status: 'active',
@@ -99,7 +99,7 @@ const baseSequence = {
 
 const baseUser = {
   userId: 'user-1',
-  email: 'sender@example.com',
+  email: 'sender@acme.io',
   displayName: 'Sender',
   emailDomain: 'example.com',
   defaultSenderUsername: 'sender',
@@ -120,7 +120,7 @@ describe('dripSequenceWorker - unsubscribe handling', () => {
     mockDripSequenceDb.getSequence.mockResolvedValue(baseSequence as any);
     mockCrmDb.getLeadById.mockResolvedValue({
       leadId: 'lead-1',
-      email: 'test@example.com',
+      email: 'test@acme.io',
       contactStatus: 'unsubscribed',
     } as any);
     mockDripSequenceDb.exitEnrollment.mockResolvedValue(undefined as any);
@@ -138,7 +138,7 @@ describe('dripSequenceWorker - unsubscribe handling', () => {
     mockDripSequenceDb.getSequence.mockResolvedValue(baseSequence as any);
     mockCrmDb.getLeadById.mockResolvedValue({
       leadId: 'lead-1',
-      email: 'test@example.com',
+      email: 'test@acme.io',
       contactStatus: 'do-not-contact',
     } as any);
     mockDripSequenceDb.exitEnrollment.mockResolvedValue(undefined as any);
@@ -155,7 +155,7 @@ describe('dripSequenceWorker - unsubscribe handling', () => {
     mockDripSequenceDb.getSequence.mockResolvedValue(baseSequence as any);
     mockCrmDb.getLeadById.mockResolvedValue({
       leadId: 'lead-1',
-      email: 'test@example.com',
+      email: 'test@acme.io',
       unsubscribedFromGroupEmail: true,
     } as any);
     mockDripSequenceDb.exitEnrollment.mockResolvedValue(undefined as any);
@@ -172,7 +172,7 @@ describe('dripSequenceWorker - unsubscribe handling', () => {
     mockDripSequenceDb.getSequence.mockResolvedValue(baseSequence as any);
     mockCrmDb.getLeadById.mockResolvedValue({
       leadId: 'lead-1',
-      email: 'test@example.com',
+      email: 'test@acme.io',
       contactStatus: 'active',
     } as any);
     mockResendService.sendEmail.mockResolvedValue({ id: 'email-id-1' } as any);
@@ -191,7 +191,7 @@ describe('dripSequenceWorker - unsubscribe handling', () => {
     mockDripSequenceDb.getSequence.mockResolvedValue(baseSequence as any);
     mockCrmDb.getLeadById.mockResolvedValue({
       leadId: 'lead-1',
-      email: 'test@example.com',
+      email: 'test@acme.io',
     } as any);
     mockResendService.sendEmail.mockResolvedValue({ id: 'email-id-2' } as any);
     mockDripSequenceDb.completeEnrollment.mockResolvedValue(undefined as any);

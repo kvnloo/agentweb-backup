@@ -14,13 +14,26 @@ jest.mock('../services/metaService', () => {
     metaService: {
       getCampaign: jest.fn(),
       createAdSet: jest.fn(),
-      getAdSet: jest.fn()
+      getAdSet: jest.fn(),
+      // createMetaAdsAdSet's pre-flight token-freshness check
+      // (ensureFreshMetaAdAccountToken) calls this before every ad-set
+      // operation; without a mock it throws "not a function" on any
+      // fixture whose token looks like it needs a refresh.
+      extendAccessToken: jest.fn().mockResolvedValue({
+        access_token: 'mock-refreshed-token',
+        expires_in: 5184000
+      })
     }
   };
 });
 
 jest.mock('../services/db', () => ({
-  userDb: { getUserById: jest.fn() }
+  // getUserByIdConsistent: same token-refresh pre-flight
+  // (ensureFreshMetaAdAccountToken) that needs metaService.extendAccessToken
+  // mocked above also reads the user consistently to persist a refreshed
+  // token; without it the refresh warns and no-ops rather than throwing, but
+  // an unmocked call still logs a misleading "Failed to refresh token" line.
+  userDb: { getUserById: jest.fn(), getUserByIdConsistent: jest.fn(), updateUser: jest.fn() }
 }));
 
 jest.mock('../utils/secretsManager', () => ({
@@ -87,13 +100,18 @@ describe('ENG-838/ENG-842 — ad set bid strategy and dayparting must not silent
   };
 
   // Dayparting requires a lifetime budget (no daily_budget) plus end_time.
+  // end_time must stay >24h ahead of whatever "now" is when the test runs
+  // (createMetaAdsAdSet defaults start_time to `new Date()` when unset, and
+  // enforces a 24h minimum lifetime-budget duration) — a fixed calendar date
+  // eventually stops being far enough in the future and the test starts
+  // failing for a reason that has nothing to do with the behavior under test.
   const daypartingAdSetParams = {
     name: 'Ad Set',
     campaign_id: 'camp_123',
     billing_event: 'IMPRESSIONS',
     optimization_goal: 'LINK_CLICKS',
     lifetime_budget: 500,
-    end_time: '2026-10-01T00:00:00+0000',
+    end_time: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
     targeting: { geo_locations: { countries: ['US'] } }
   };
 
@@ -101,6 +119,7 @@ describe('ENG-838/ENG-842 — ad set bid strategy and dayparting must not silent
     service = new AgentModeService();
     jest.clearAllMocks();
     (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+    (userDb.getUserByIdConsistent as jest.Mock).mockResolvedValue(mockUser);
     (metaService.getCampaign as jest.Mock).mockResolvedValue({
       id: 'camp_123',
       objective: 'OUTCOME_TRAFFIC'

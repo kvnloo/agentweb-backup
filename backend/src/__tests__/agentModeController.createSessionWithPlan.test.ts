@@ -58,6 +58,7 @@ jest.mock('uuid', () => ({
 }));
 
 jest.mock('crypto', () => ({
+  ...jest.requireActual('crypto'),
   randomBytes: jest.fn(() => ({
     toString: jest.fn(() => 'mock-conversable-token-123')
   }))
