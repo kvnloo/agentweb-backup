@@ -107,7 +107,7 @@ async function localAdmissionStudy() {
 
   await waitFor(() => postCount === 4);
 
-  const fifth = await runZ0Route(
+  const fifth: any = await runZ0Route(
     { ...baseRequest, operation_id: 'backpressure-op-5' },
     {
       sessionId: 'backpressure-session-5',
@@ -129,7 +129,7 @@ async function localAdmissionStudy() {
   }
 
   releasePosts();
-  const completed = await Promise.all(firstFour);
+  const completed: any[] = await Promise.all(firstFour);
   if (completed.some(row => row.ok !== true)) {
     throw new Error(`admitted calls did not complete: ${JSON.stringify(completed)}`);
   }
@@ -172,7 +172,7 @@ async function provenOverloadStudy() {
     return jsonResponse(bridgeSuccess(body));
   }) as Z0FetchLike;
 
-  const first = await runZ0Route(
+  const first: any = await runZ0Route(
     { ...baseRequest, operation_id: 'overload-op-1' },
     { sessionId: 'overload-session-1', config, fetchImpl },
   );
@@ -186,7 +186,7 @@ async function provenOverloadStudy() {
     throw new Error(`proven overload semantics failed: ${JSON.stringify(first)}`);
   }
 
-  const second = await runZ0Route(
+  const second: any = await runZ0Route(
     { ...baseRequest, operation_id: 'overload-op-2' },
     { sessionId: 'overload-session-2', config, fetchImpl },
   );
@@ -196,7 +196,7 @@ async function provenOverloadStudy() {
 
   await sleep(1100);
 
-  const recovered = await runZ0Route(
+  const recovered: any = await runZ0Route(
     { ...baseRequest, operation_id: 'overload-op-3' },
     { sessionId: 'overload-session-3', config, fetchImpl },
   );
@@ -223,7 +223,7 @@ async function unproven503Study() {
     });
   }) as Z0FetchLike;
 
-  const result = await runZ0Route(
+  const result: any = await runZ0Route(
     { ...baseRequest, operation_id: 'unproven-503-op' },
     { sessionId: 'unproven-503-session', config, fetchImpl },
   );
