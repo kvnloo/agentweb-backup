@@ -26,12 +26,30 @@ const config: Z0AgentWebConfig = {
   timeoutMs: 1000,
 };
 
-function response(payload: unknown, status = 200): Z0FetchLike {
-  return jest.fn(async () => ({
-    ok: status >= 200 && status < 300,
-    status,
-    json: async () => payload,
-  })) as unknown as Z0FetchLike;
+function bridgeResponse(legacy: Record<string, any>, status = 200): Z0FetchLike {
+  return jest.fn(async (_url: unknown, init?: RequestInit) => {
+    const requestBody = JSON.parse(String(init?.body ?? '{}'));
+    const payload = status >= 200 && status < 300
+      ? {
+          schema: 'agentweb.z0.bridge.v1',
+          operation_id: requestBody.operation_id,
+          trace_id: requestBody.trace_id,
+          mode: requestBody.mode,
+          kind: requestBody.kind,
+          status: legacy.ok === true ? 'completed' : 'failed',
+          applied: Boolean(legacy.applied),
+          replayed: Boolean(legacy.replayed),
+          reconcile_required: false,
+          retry: 'none',
+          output: legacy,
+        }
+      : legacy;
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => payload,
+    };
+  }) as unknown as Z0FetchLike;
 }
 
 describe('z0 choice experiment adapter', () => {
@@ -50,8 +68,8 @@ describe('z0 choice experiment adapter', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it('calls only the bounded z0 experiment endpoint and preserves shadow semantics', async () => {
-    const fetchImpl = response({
+  it('carries a paid observational decision in the v1 envelope and preserves shadow semantics', async () => {
+    const fetchImpl = bridgeResponse({
       ok: true,
       executed: true,
       applied: false,
@@ -76,19 +94,34 @@ describe('z0 choice experiment adapter', () => {
       applied: false,
       z0: true,
       reconcile_required: false,
+      bridge_schema: 'agentweb.z0.bridge.v1',
+      bridge_status: 'completed',
     });
     const [url, init] = (fetchImpl as unknown as jest.Mock).mock.calls[0];
     expect(url).toBe('http://z0.test/v1/experimental/choice');
     const body = JSON.parse(init.body);
     expect(body).toMatchObject({
-      harness: 'agentweb',
-      function: 'experimental_choice',
-      decision_id: 'report_type_v1',
-      allow_remote: true,
-      experimental: true,
+      schema: 'agentweb.z0.bridge.v1',
+      operation_id: 'fixture-op-1',
+      mode: 'shadow',
+      kind: 'decide',
+      capability: 'experiment.report_type_v1',
+      policy: {
+        allow_remote: true,
+        free_only: false,
+        experimental: true,
+        risk_class: 'read',
+        approval_state: 'not_required',
+      },
+      payload: {
+        function: 'experimental_choice',
+        decision_id: 'report_type_v1',
+        state: args.state,
+        instructions: args.instructions,
+        options: args.options,
+      },
     });
     expect(body.parent_agent).toMatch(/^agentweb:[a-f0-9]{24}$/);
-    expect(body.state).toEqual(args.state);
   });
 
   it('keeps the same authority trace when state mutates under one logical operation', () => {
@@ -108,7 +141,7 @@ describe('z0 choice experiment adapter', () => {
     );
   });
 
-  it('marks ambiguous transport failure for same-trace reconciliation', async () => {
+  it('preserves ambiguous shadow-model execution for same-trace reconciliation', async () => {
     const error = new Error('timeout');
     error.name = 'AbortError';
     const fetchImpl = jest.fn(async () => { throw error; }) as unknown as Z0FetchLike;
@@ -120,8 +153,20 @@ describe('z0 choice experiment adapter', () => {
       reason: 'timeout',
       execution_status: 'unknown',
       reconcile_required: true,
+      bridge_retry: 'same_identity_only',
       applied: false,
     });
     expect(first.trace_id).toBe(second.trace_id);
+  });
+
+  it('treats a 4xx authority conflict as a known rejection, not ambiguous execution', async () => {
+    const fetchImpl = bridgeResponse({ error: 'conflict' }, 400);
+    const result = await runZ0ChoiceExperiment(args, { scopeId: 'report_type_v1', config, fetchImpl });
+    expect(result).toMatchObject({
+      reason: 'http_error',
+      execution_status: 'rejected',
+      reconcile_required: false,
+      bridge_retry: 'none',
+    });
   });
 });
