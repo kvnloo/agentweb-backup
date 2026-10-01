@@ -414,6 +414,182 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
   });
 
   describe('Error cases', () => {
+    // ENG-2082: lead capture now accepts phone-only submissions, and this runs
+    // fire-and-forget from the forward-lead webhook when the list has autoDraftEnabled.
+    // Unguarded it spends two billed LLM calls writing a polished email to someone with no
+    // address — and a LinkedIn note for a lead with no LinkedIn — then persists both and
+    // reports success. send_email_to_lead already refuses on this exact condition.
+    // This function ALSO writes the LinkedIn connection-request note, and
+    // linkedInInviteCrmMirror creates leads with a linkedin and no email. Gating on email
+    // alone deleted a working feature to fix a new one.
+    // Widening the guard to `!email && !linkedin` let the LinkedIn note through — but left
+    // the EMAIL path running for those leads too: two billed LLM calls producing a polished
+    // draft addressed to nobody, the exact harm the guard was added to prevent.
+    it('a LinkedIn-only lead gets NO email draft, and no email is written to the lead', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead1', listId: 'list1', linkedin: 'https://linkedin.com/in/ada',
+        firstName: 'Ada', lastName: 'Lovelace',
+      });
+
+      await (agentModeService as any).updateEmailDraftForLead(
+        'list1', 'lead1', 'Create email', 'session1', 'user1'
+      );
+
+      // Assert on the LLM CALLS, not on the result. Both the gated and ungated versions
+      // return a similar-looking object once the mocked LLM yields nothing usable, so a
+      // result-shaped assertion cannot tell them apart — it passes either way. The billed
+      // call is the harm, so that is what to measure.
+      const systemPrompts = (agentModeService.callLLM as jest.Mock).mock.calls
+        .flatMap((c: any[]) => (c[1] ?? []))
+        .filter((m: any) => m?.role === 'system')
+        .map((m: any) => String(m.content));
+      expect(systemPrompts.some((p) => p.includes('email marketing strategist'))).toBe(false);
+
+      // The name says "and no email is written to the lead" — assert it, rather than
+      // leaving half the name unverified.
+      const written = (crmDb.updateLead as jest.Mock).mock.calls.map((c: any[]) => c[2] ?? {});
+      expect(written.some((w: any) => 'emailDraft' in w || 'emailDraftFormat' in w)).toBe(false);
+    });
+
+    it('still drafts for a LinkedIn-only lead (no email)', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead1', listId: 'list1', linkedin: 'https://linkedin.com/in/ada',
+        firstName: 'Ada', lastName: 'Lovelace',
+      });
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        'list1', 'lead1', 'Create email', 'session1', 'user1'
+      );
+
+      expect(result?.message).not.toBe('No email address');
+      expect(crmDb.getLeadEngagements).toHaveBeenCalled();
+    });
+
+    // Found on env2, NOT here. The two assertions above both pass while the function
+    // throws: one measures a prompt that was never sent, the other a call made before the
+    // throw. The gating change set `emailData` to null for a LinkedIn-only lead, and the
+    // note builder dereferenced `emailData.textContent` one line ABOVE the ternary that
+    // handles null — so the lead this whole branch exists to serve got a TypeError and no
+    // note at all. Assert the outcome, not the absence of a side effect.
+    it('a LinkedIn-only lead REACHES the note builder without throwing on the null email draft', async () => {
+      // Mocked HERE, not inherited. jest.config sets clearMocks, which clears calls but not
+      // implementations, so this test previously survived on a mockResolvedValue leaked
+      // from a test ~100 lines above and threw when run with -t in isolation.
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue([]);
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead1', listId: 'list1', linkedin: 'https://linkedin.com/in/ada',
+        firstName: 'Ada', lastName: 'Lovelace', title: 'CTO', company: 'Analytical Engines',
+      });
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        'list1', 'lead1', 'Create email', 'session1', 'user1'
+      );
+
+      // The TypeError surfaced as a failure result with that exact text.
+      expect(String(result?.error ?? '')).not.toMatch(/Cannot read properties of null/);
+      expect(String(result?.error ?? '')).not.toMatch(/textContent/);
+
+      // And the note prompt must actually have been built and sent — the note is the only
+      // thing a LinkedIn-only lead can get, so "no email prompt" alone is not success.
+      const systemPrompts = (agentModeService.callLLM as jest.Mock).mock.calls
+        .flatMap((c: any[]) => (c[1] ?? []))
+        .map((m: any) => String(m?.content ?? ''));
+      const userPrompts = (agentModeService.callLLM as jest.Mock).mock.calls
+        .flatMap((c: any[]) => (c[1] ?? []))
+        .filter((m: any) => m?.role === 'user')
+        .map((m: any) => String(m.content));
+      const all = [...systemPrompts, ...userPrompts].join('\n');
+      expect(all).toMatch(/LinkedIn connection request note/i);
+      // With no draft to quote it must fall back to the profile-only wording, not to
+      // "Subject: undefined".
+      expect(all).toMatch(/no address on file/i);
+      expect(all).not.toMatch(/Subject: undefined/);
+    });
+
+    // The other half of "the two drafts are independent". A commit claimed the note was
+    // gated on lead.linkedin; only the email gate existed, so every ordinary email-only
+    // lead paid a second billed LLM call to write a LinkedIn note for a lead with no
+    // LinkedIn URL — the mirror image of the harm the guard was added to stop.
+    it('an EMAIL-ONLY lead does not pay for a LinkedIn note it can never send', async () => {
+      // A real email draft, so the run reaches persistence and `success` means something.
+      (agentModeService.callLLM as jest.Mock).mockResolvedValue({
+        choices: [{ message: { content: JSON.stringify({
+          subject: 'Hello Ada', textContent: 'Hi Ada, quick note.',
+        }) } }],
+      });
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue([]);
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead1', listId: 'list1', email: 'ada@example.com',
+        firstName: 'Ada', lastName: 'Lovelace',
+      });
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        'list1', 'lead1', 'Create email', 'session1', 'user1'
+      );
+
+      // FIRST: the run has to have SUCCEEDED. Without this the test cannot tell "the note
+      // was gated off" from "the note path threw before building its prompt" — the
+      // absence-only version passed under a mutation that forced the gate open, because
+      // resolving the LinkedIn account then failed and the prompt was never reached.
+      expect(result?.success).toBe(true);
+      const written = (crmDb.updateLead as jest.Mock).mock.calls.map((c: any[]) => c[2] ?? {});
+      expect(written.some((w: any) => 'emailDraft' in w)).toBe(true);
+
+      const prompts = (agentModeService.callLLM as jest.Mock).mock.calls
+        .flatMap((c: any[]) => (c[1] ?? []))
+        .map((m: any) => String(m?.content ?? ''));
+      const all = prompts.join('\n');
+      // The email draft is the whole job for this lead...
+      expect(all).toMatch(/email marketing strategist/i);
+      // ...and the note prompt must never be built.
+      expect(all).not.toMatch(/LinkedIn connection request note/i);
+      // Measure the billed calls directly, not just the prompt text.
+      const features = (agentModeService.callLLM as jest.Mock).mock.calls
+        .map((c: any[]) => c[2]?.usageContext?.feature).filter(Boolean);
+      expect(features).not.toContain('invite_message');
+      // And nothing is persisted as a message draft for a lead with no LinkedIn.
+      expect(written.some((w: any) => 'messageDraft' in w)).toBe(false);
+      expect(result?.data?.message ?? null).toBeNull();
+    });
+
+    it('marks a lead with no contact channel as SKIPPED, not failed', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead1', listId: 'list1', phone: '2125559876', firstName: '', lastName: '',
+      });
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        'list1', 'lead1', 'Create email', 'session1', 'user1'
+      );
+
+      // `skipped` is what stops webhooks.ts reporting autoDraftStatus='failed' and putting
+      // the reason into the owner alert on every phone-only capture.
+      expect(result.success).toBe(false);
+      expect(result.skipped).toBe(true);
+      expect(result.reason).toBe('no_contact_channel');
+      expect(crmDb.getLeadEngagements).not.toHaveBeenCalled();
+    });
+
+    it('refuses to draft for a lead with no email address, before any LLM call', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+        leadId: 'lead1', listId: 'list1', phone: '2125559876', firstName: '', lastName: '',
+      });
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        'list1', 'lead1', 'Create email', 'session1', 'user1'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('No contact channel');
+      // nothing drafted, nothing billed
+      expect(crmDb.getLeadEngagements).not.toHaveBeenCalled();
+    });
+
     it('should return error if list not found', async () => {
       const listId = 'nonexistent';
       const leadId = 'lead1';
@@ -1047,6 +1223,11 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       lastName: 'Smith',
       company: 'Tech Corp',
       title: 'CTO',
+      // Required now that the note is gated on it. These three tests are ABOUT the
+      // LinkedIn connection-request note, and a note for a lead with no profile URL
+      // cannot be sent — sendInvitation needs one — so the fixture was describing a
+      // lead the feature does not apply to.
+      linkedin: 'https://linkedin.com/in/jane-smith',
     };
     const mockList = { listId, userId, name: 'Test List' };
     const mockBrandGuidelines = { exists: false };
@@ -1125,6 +1306,53 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       expect(mockCreate).toHaveBeenCalledTimes(3);
       const updateCall = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
       expect(updateCall.messageDraft.content).toBe(reworked);
+    });
+  });
+
+  // ENG-1388: this draft is generated FOR the external lead/prospect — a
+  // customFields JSON dump was being embedded straight into the LLM prompt,
+  // which could put Enigma card revenue (internal-use-only) into content sent
+  // outside the company. Unlike the other ENG-1388 fixes, this strip is
+  // unconditional: it doesn't matter whether the requesting user is
+  // Enigma-allowlisted, because the allowlist governs internal visibility,
+  // not what may inform outward-facing copy.
+  describe('card revenue exclusion from the email prompt (ENG-1388)', () => {
+    it('never includes card-revenue fields in the LLM prompt, even for an allowlisted requester', async () => {
+      const listId = 'list1';
+      const leadId = 'lead1';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Follow up email';
+
+      const mockList = { listId, name: 'Test List', userId };
+      const mockLead = {
+        leadId,
+        listId,
+        email: 'lead@example.com',
+        firstName: 'John',
+        customFields: { card_revenue_12m: '41999657', card_revenue_period_end: '2026-06-30', industry: 'Software' },
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({ engagements: [] });
+      mockReadBrandGuidelines.mockResolvedValue({ exists: false });
+      mockReadMarketStrategy.mockResolvedValue({ exists: false });
+      mockGetSenderForLead.mockResolvedValue({ fromName: 'Sender' });
+      mockCreate.mockResolvedValue({
+        choices: [{ message: { content: JSON.stringify({ subject: 'Follow Up', htmlContent: '<p>Content</p>' }) } }],
+      });
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(mockLead);
+
+      await (agentModeService as any).updateEmailDraftForLead(listId, leadId, instruction, sessionId, userId, 'html');
+
+      expect(mockCreate).toHaveBeenCalled();
+      const prompt = mockCreate.mock.calls[0][0].messages[1].content;
+      expect(prompt).not.toContain('card_revenue_12m');
+      expect(prompt).not.toContain('41999657');
+      expect(prompt).not.toContain('card_revenue_period_end');
+      expect(prompt).toContain('industry');
+      expect(prompt).toContain('Software');
     });
   });
 });

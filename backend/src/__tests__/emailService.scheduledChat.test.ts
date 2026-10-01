@@ -1,6 +1,7 @@
 import { emailService } from '../services/emailService';
 import { chatbotDb } from '../services/chatbotService';
-import { userDb } from '../services/db';
+import { scheduleDb, userDb } from '../services/db';
+import { __resetAgentModeAlertDedupeForTests } from '../utils/agentModeAlerts';
 
 // Mock chatbotService used inside sendScheduledChatResultEmail to avoid side effects.
 // getChatSession is read by the recipient-authorization guard (ENG-500); default it
@@ -21,7 +22,12 @@ jest.mock('../services/chatbotService', () => ({
 // The guard resolves per-recipient admin status + the owner via userDb.
 jest.mock('../services/db', () => ({
   userDb: { getUserByEmail: jest.fn(), getUserById: jest.fn() },
+  scheduleDb: { getScheduleById: jest.fn(), appendDeliveryLogEntry: jest.fn().mockResolvedValue(undefined) },
 }));
+
+// The withheld-report oncall alert is deduped per schedule for 24h (ENG-1552), and
+// several tests below reuse 'schedule-123' — start every test with a clean window.
+beforeEach(() => __resetAgentModeAlertDedupeForTests());
 
 // Shared result fixture for the guard tests (module scope so it is visible
 // regardless of which describe block the guard tests live in).
@@ -258,6 +264,35 @@ describe('emailService.sendScheduledChatTokenLimitEmail', () => {
     expect(htmlContent).not.toContain('1,050,000');
     expect(htmlContent).not.toContain('spent this month');
     expect(htmlContent).not.toContain('tokens used');
+    expect(htmlContent).not.toContain('$');
+  });
+
+  it('names the reset DATE, not "the start of each billing period" (ENG-1344)', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatTokenLimitEmail(
+      'user@example.com',
+      'My Schedule',
+      'schedule-123',
+      {
+        used: 5000000,
+        allowance: null,
+        effectiveAllowance: null,
+        percentUsed: 0,
+        costUsed: 42.5,
+        costAllowance: 40,
+        costPercentUsed: 106,
+        month: '2026-09',
+      }
+    );
+
+    const [, , textContent, htmlContent] = spy.mock.calls[0];
+    for (const body of [textContent, htmlContent]) {
+      expect(body).toContain('resets on October 1, 2026');
+      // The vague sentence the escalating customer could not decode.
+      expect(body).not.toContain('resets at the start of each billing period');
+    }
+    // ENG-1566 still holds: a date is not a dollar figure.
     expect(htmlContent).not.toContain('$');
   });
 
@@ -586,3 +621,103 @@ describe('emailService.sendScheduledRunFailedEmail (ENG-826 #1)', () => {
     ).resolves.toBeUndefined();
   });
 });
+
+// ── ENG-1552: zero-content runs (the xCures / ENG-1504 class) ────────────────
+describe('emailService.sendScheduledChatResultEmail — empty report (ENG-1552)', () => {
+  // ENG-1552 behavior is customer-visible only with enforcement on (shadow mode otherwise).
+  beforeAll(() => { process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT = 'true'; });
+  afterAll(() => { delete process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT; });
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it.each([['empty', ''], ['whitespace-only', '  \n\t ']])(
+    'never sends a %s report — to recipients or anyone else; records withheld/empty_content',
+    async (_label, body) => {
+      const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+      await emailService.sendScheduledChatResultEmail(
+        ['a@example.com', 'b@example.com'],
+        'xCures monthly',
+        { ...GUARD_BASE_RESULT, passed: false, actualResponse: body, runId: 'run-9' },
+        'schedule-123'
+      );
+
+      // Nothing goes to the customer during the review period (2026-09-18) — not the
+      // empty report, and not a new "not delivered" notice either.
+      expect(spy).not.toHaveBeenCalled();
+      expect(scheduleDb.appendDeliveryLogEntry).toHaveBeenCalledWith(
+        'schedule-123',
+        expect.objectContaining({ runId: 'run-9', state: 'withheld', reason: 'empty_content', withheldRecipients: ['a@example.com', 'b@example.com'] }),
+        undefined,
+      );
+      // No share link is minted for a report that does not exist.
+      expect(chatbotDb.createOrReuseInteractiveShare).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([
+    ['sent', [['delivered', undefined]]],
+    ['suppressed', [['delivery_attempted', 'suppressed_nonprod']]],
+    ['failed', [['delivery_attempted', 'provider_error']]],
+  ])('a %s send records exactly the delivery states it earned', async (outcome, expected) => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: 'session-abc', userId: 'owner-id', calledFunctions: {} });
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
+    jest.spyOn(emailService, 'sendEmail').mockResolvedValue(outcome as any);
+
+    await emailService.sendScheduledChatResultEmail(['a@example.com'], 'Weekly', { ...GUARD_BASE_RESULT, runId: 'run-5' }, 'schedule-123');
+
+    const states = (scheduleDb.appendDeliveryLogEntry as jest.Mock).mock.calls.map((c) => [c[1].state, c[1].reason]);
+    expect(states).toEqual(expected);
+    expect((scheduleDb.appendDeliveryLogEntry as jest.Mock).mock.calls.every((c) => c[1].runId === 'run-5')).toBe(true);
+  });
+
+  it('records withheld/no_authorized_recipients when the send-time guard leaves nobody', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: 'session-abc', userId: 'owner-id', calledFunctions: { list_all_clients: 1 } });
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com', isAdmin: false });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ isAdmin: false });
+    jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+    jest.spyOn(emailService, 'sendOncallAlert').mockResolvedValue(undefined);
+
+    await emailService.sendScheduledChatResultEmail(['nonadmin@example.com'], 'Report', { ...GUARD_BASE_RESULT, runId: 'run-7' }, 'schedule-123');
+
+    expect(scheduleDb.appendDeliveryLogEntry).toHaveBeenCalledWith(
+      'schedule-123',
+      expect.objectContaining({ runId: 'run-7', state: 'withheld', reason: 'no_authorized_recipients', missingPermission: 'isAdmin' }),
+      undefined,
+    );
+  });
+});
+
+describe('ENG-1552 shadow mode — empty report is sent exactly as before (enforcement unset)', () => {
+  beforeEach(() => { jest.clearAllMocks(); delete process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT; });
+
+  it('still emails the recipients, and records the send internally', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: 'session-abc', userId: 'owner-id', calledFunctions: {} });
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue('sent' as any);
+
+    await emailService.sendScheduledChatResultEmail(['a@example.com'], 'xCures monthly', { ...GUARD_BASE_RESULT, actualResponse: '', runId: 'run-e' }, 'schedule-123');
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0][0]).toEqual(['a@example.com']);
+    const states = (scheduleDb.appendDeliveryLogEntry as jest.Mock).mock.calls.map((c) => c[1].state);
+    expect(states).toEqual(['delivered']);
+  });
+});
+
+describe('ENG-1552 manual resend is never recorded as a delivery', () => {
+  beforeEach(() => { jest.clearAllMocks(); process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT = 'true'; });
+  afterEach(() => { delete process.env.SCHEDULED_REPORT_DELIVERY_ENFORCEMENT; });
+
+  it.each([['a report with content', 'Report body'], ['an empty report', '']])('%s: records nothing', async (_l, body) => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ sessionId: 'session-abc', userId: 'owner-id', calledFunctions: {} });
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
+    jest.spyOn(emailService, 'sendEmail').mockResolvedValue('sent' as any);
+
+    await emailService.sendScheduledChatResultEmail(['me@example.com'], 'Weekly', { ...GUARD_BASE_RESULT, actualResponse: body, runId: 'run-5' }, 'schedule-123', undefined, { recordDelivery: false });
+
+    expect(scheduleDb.appendDeliveryLogEntry).not.toHaveBeenCalled();
+  });
+});
+

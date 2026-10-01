@@ -18,7 +18,7 @@ import {
   ModelChangeForbiddenError,
   ModelNotAvailableError,
 } from '../services/llmModelChangeService';
-import { resolveBillingUserId } from '../services/tokenUsageService';
+import { resolveBillingUserId, toCustomerTokenUsage } from '../services/tokenUsageService';
 import { readBilledLedgerRows } from '../services/llmUsageLedgerReader';
 import { listLlmChargeEvents } from '../services/llmChargeAuditDb';
 import { reconcileItemizedUsage } from '../services/usageItemization';
@@ -26,7 +26,14 @@ import { resolveUsageCostReconciliation } from '../services/usageCostReconciliat
 
 const router = express.Router();
 
-// Get current user's token usage and allowance
+/**
+ * Get current user's token usage and allowance.
+ *
+ * `toCustomerTokenUsage` carries the same obligation as `toCustomerRunway` one
+ * route below (ENG-1212 AC4): internal USD never reaches a customer API. This
+ * route used to return `checkTokenUsage` verbatim, so `costUsed` and
+ * `costAllowance` went out in plain dollars to every authenticated user.
+ */
 router.get('/usage', authenticateToken, async (req, res) => {
   try {
     const userId = (req as any).user?.userId;
@@ -34,7 +41,7 @@ router.get('/usage', authenticateToken, async (req, res) => {
       return res.status(401).json({ error: 'Not authenticated' });
     }
     const usage = await checkTokenUsage(userId);
-    res.json(usage);
+    res.json(toCustomerTokenUsage(usage));
   } catch (error) {
     console.error('Error getting token usage:', error);
     res.status(500).json({ error: 'Failed to get token usage' });

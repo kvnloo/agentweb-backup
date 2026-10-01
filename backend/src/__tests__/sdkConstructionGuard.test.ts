@@ -38,6 +38,35 @@ const DIRECT_TEXT_PROVIDER_SDKS = [
   '@langchain/anthropic',
 ] as const;
 
+/**
+ * True when a declaration can only ever bring TYPES from a provider SDK
+ * (ENG-1937).
+ *
+ * TypeScript erases these at compile time, so they cannot construct a client
+ * or call the SDK at runtime — the thing this guard exists to stop. Flagging
+ * them made a module that merely names `OpenAI` in an interface
+ * (agentMode/llmModelRegistry.ts) fail the build as if it constructed one.
+ *
+ * Deliberately narrow: a declaration is type-only only when NOTHING in it is a
+ * value. `import { type A, B }` still imports `B` and is still flagged, as is a
+ * bare side-effect `import 'openai'`.
+ */
+function isTypeOnlyDeclaration(node: ts.ImportDeclaration | ts.ExportDeclaration): boolean {
+  if (ts.isImportDeclaration(node)) {
+    const clause = node.importClause;
+    if (!clause) return false; // side-effect import: runs the module
+    if (clause.isTypeOnly) return true; // import type X / import type { X }
+    if (clause.name) return false; // a default import is a value
+    const bindings = clause.namedBindings;
+    if (!bindings || ts.isNamespaceImport(bindings)) return false; // import * as X
+    return bindings.elements.length > 0 && bindings.elements.every((el) => el.isTypeOnly);
+  }
+  if (node.isTypeOnly) return true; // export type { X } from '…'
+  const clause = node.exportClause;
+  if (!clause || !ts.isNamedExports(clause)) return false; // export * from '…'
+  return clause.elements.length > 0 && clause.elements.every((el) => el.isTypeOnly);
+}
+
 function findDirectProviderSdkImports(content: string, fileName = 'source.ts'): string[] {
   const sourceFile = ts.createSourceFile(
     fileName,
@@ -55,7 +84,7 @@ function findDirectProviderSdkImports(content: string, fileName = 'source.ts'): 
   };
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
-      recordModule(node.moduleSpecifier);
+      if (!isTypeOnlyDeclaration(node)) recordModule(node.moduleSpecifier);
     } else if (ts.isCallExpression(node) && node.arguments.length === 1) {
       const isRequire = ts.isIdentifier(node.expression) && node.expression.text === 'require';
       const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
@@ -125,8 +154,44 @@ const PYTHON_IMPORT_AST_SCRIPT = [
   'print(json.dumps(modules))',
 ].join('\n');
 
+// The repo's production f-strings (e.g. agent-engine/app/services/mcp_client.py)
+// use syntax Python 3.10 cannot parse (ENG-1433: a backslash inside an f-string
+// expression, valid since 3.12). CI runs a modern interpreter, but a headless
+// post-merge-verifier host's `python3` can resolve to whatever the OS shipped
+// (3.10.12 on Ubuntu 22.04) regardless of what's actually installed alongside it.
+// Probe for a compatible interpreter instead of trusting bare `python3` on PATH.
+let cachedPython3: string | null = null;
+function resolvePython3(): string {
+  if (cachedPython3) return cachedPython3;
+  const candidates = [
+    'python3.13',
+    'python3.12',
+    'python3.11',
+    // uv-managed installs (common on dev/agent boxes) aren't always on PATH.
+    `${process.env.HOME || ''}/.local/bin/python3.12`,
+    `${process.env.HOME || ''}/.local/bin/python3.11`,
+    '/usr/bin/python3.12',
+    '/usr/bin/python3.11',
+    'python3',
+  ];
+  for (const candidate of candidates) {
+    const probe = spawnSync(candidate, ['-c', 'import sys; assert sys.version_info >= (3, 11)'], {
+      encoding: 'utf8',
+    });
+    if (probe.status === 0) {
+      cachedPython3 = candidate;
+      return candidate;
+    }
+  }
+  // Nothing satisfies >=3.11 — fall back to plain python3 so the original
+  // error (a real parse failure, now correctly attributable to the source
+  // file rather than the host) still surfaces instead of silently no-op'ing.
+  cachedPython3 = 'python3';
+  return 'python3';
+}
+
 function findDirectPythonProviderImports(content: string): string[] {
-  const parsed = spawnSync('python3', ['-c', PYTHON_IMPORT_AST_SCRIPT], {
+  const parsed = spawnSync(resolvePython3(), ['-c', PYTHON_IMPORT_AST_SCRIPT], {
     input: content,
     encoding: 'utf8',
   });
@@ -207,6 +272,32 @@ describe('SDK construction guard', () => {
       }
     }
     expect(stale).toEqual([]);
+  });
+});
+
+describe('SDK construction guard ignores type-only imports (ENG-1937)', () => {
+  it.each([
+    ["import type OpenAI from 'openai';\nlet c: OpenAI | null = null;"],
+    ["import type { ChatCompletion } from 'openai/resources';\nimport type { OpenAI } from 'openai';"],
+    ["import { type OpenAI, type ClientOptions } from 'openai';"],
+    ["export type { OpenAI } from 'openai';"],
+    ["export { type OpenAI } from '@azure/openai';"],
+  ])('allows a declaration that can only bring types: %s', (source) => {
+    expect(() => assertNoForbiddenProviderImports('services/newConsumer.ts', source)).not.toThrow();
+  });
+
+  it.each([
+    // One value binding is enough to reach the SDK at runtime.
+    ["import { type ClientOptions, OpenAI } from 'openai';"],
+    // A default import beside type-only named imports is a value.
+    ["import OpenAI, { type ClientOptions } from 'openai';"],
+    // A side-effect import runs the module.
+    ["import 'openai';"],
+    // Re-exporting everything includes values.
+    ["export * from 'openai';"],
+    ["import * as sdk from 'openai';"],
+  ])('still rejects a declaration with any runtime value: %s', (source) => {
+    expect(() => assertNoForbiddenProviderImports('services/newConsumer.ts', source)).toThrow(/Direct provider SDK import/);
   });
 });
 

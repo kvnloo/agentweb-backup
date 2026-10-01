@@ -31,6 +31,15 @@ export interface DeployedLandingUrl {
   url: string;
   /** Page display name, when the tool result carried one. */
   name?: string;
+  /**
+   * ENG-1868: "deployed" (this URL check) is a BUILD claim, not a launch-ready claim — a
+   * page can build fine and still fail its post-deploy smoke test or ship with no
+   * conversion tracking. Carried through from the tool result's own `launchReadiness`
+   * (computed by extractMinimalToolResult / getDeploymentStatus) when present. Absent, not
+   * `{ready: true}`, when the tool result predates this field or never carried it — absence
+   * must not be read as a positive readiness claim.
+   */
+  launchReadiness?: { ready: boolean; reasons: string[] };
 }
 
 /**
@@ -65,11 +74,16 @@ function successfulUrlFromEntry(entry: LandingLedgerEntry | null | undefined): D
   // Record-shaped tools (generate/deploy/duplicate) return the page record: only a
   // status of "deployed" means it actually went live ("failed" / "generating" /
   // "deploying" do not).
+  const launchReadiness =
+    r.launchReadiness && typeof r.launchReadiness.ready === 'boolean'
+      ? { ready: r.launchReadiness.ready, reasons: Array.isArray(r.launchReadiness.reasons) ? r.launchReadiness.reasons : [] }
+      : undefined;
+
   if (name === 'generate_landing_page' || name === 'deploy_landing_page' || name === 'duplicate_landing_page') {
     if (r.status !== 'deployed') return null;
     const url = firstHttpUrl(r.customDomainUrl, r.deployedUrl);
     if (!url) return null;
-    return { url, name: typeof r.name === 'string' ? r.name : undefined };
+    return { url, name: typeof r.name === 'string' ? r.name : undefined, launchReadiness };
   }
 
   // Status/preview tools gate on buildStatus === "success" (other values: error,
@@ -78,29 +92,58 @@ function successfulUrlFromEntry(entry: LandingLedgerEntry | null | undefined): D
     if (r.buildStatus !== 'success') return null;
     const url = firstHttpUrl(r.customDomainUrl, r.deployedUrl);
     if (!url) return null;
-    return { url, name: typeof r.name === 'string' ? r.name : undefined };
+    return { url, name: typeof r.name === 'string' ? r.name : undefined, launchReadiness };
   }
   if (name === 'get_landing_page_preview_url') {
     if (r.buildStatus !== 'success') return null;
     const url = firstHttpUrl(r.previewUrl);
     if (!url) return null;
-    return { url, name: undefined };
+    return { url, name: undefined, launchReadiness };
   }
   return null;
+}
+
+/**
+ * ENG-1868 review: merge two launchReadiness verdicts for the SAME url, never first-wins.
+ * `smokeTestResult` is fire-and-forget AFTER deploy — a `generate_landing_page` ledger
+ * entry earlier in the same run genuinely cannot know it yet, so it reports `ready: true`
+ * by default; a LATER `get_deployment_status` call for the same URL can then see the real
+ * (possibly failed) result. First-occurrence-wins dedup would keep the stale optimistic
+ * verdict and silently drop the real failure — reproducing the exact bug this module
+ * exists to fix. A `ready: false` from EITHER side always wins, regardless of order.
+ */
+function mergeLaunchReadiness(
+  a: DeployedLandingUrl['launchReadiness'],
+  b: DeployedLandingUrl['launchReadiness'],
+): DeployedLandingUrl['launchReadiness'] {
+  if (!a) return b;
+  if (!b) return a;
+  if (a.ready && b.ready) return b; // both ready — prefer the later (fresher) observation
+  const reasons = new Set<string>([...(a.ready ? [] : a.reasons), ...(b.ready ? [] : b.reasons)]);
+  return { ready: false, reasons: Array.from(reasons) };
 }
 
 /** URLs of landing pages that genuinely deployed live this run, de-duplicated by URL. */
 export function collectSuccessfulLandingUrls(toolCalls: LandingLedgerEntry[] | null | undefined): DeployedLandingUrl[] {
   if (!Array.isArray(toolCalls)) return [];
   const out: DeployedLandingUrl[] = [];
-  const seen = new Set<string>();
+  const indexByKey = new Map<string, number>();
   for (const entry of toolCalls) {
     const hit = successfulUrlFromEntry(entry);
     if (!hit) continue;
     const key = hit.url.toLowerCase().replace(/\/+$/, '');
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(hit);
+    const existingIdx = indexByKey.get(key);
+    if (existingIdx === undefined) {
+      indexByKey.set(key, out.length);
+      out.push(hit);
+      continue;
+    }
+    const existing = out[existingIdx];
+    out[existingIdx] = {
+      url: existing.url,
+      name: hit.name ?? existing.name,
+      launchReadiness: mergeLaunchReadiness(existing.launchReadiness, hit.launchReadiness),
+    };
   }
   return out;
 }
@@ -130,10 +173,18 @@ export function reconcileLandingDeploymentReport(
   const missing = deployed.filter((d) => !contentMentionsUrl(content, d.url));
   if (missing.length === 0) return content;
 
-  const lines = missing.map((d) =>
-    d.name
+  // ENG-1868: "deployed successfully" is a true BUILD claim — never rewritten or removed,
+  // per this module's append-only contract. A readiness caveat is a SEPARATE, additional
+  // truth appended after it, not a correction of it: the build really did succeed even when
+  // the page is not yet launch-ready (failed smoke test / no tracking).
+  const lines = missing.map((d) => {
+    const base = d.name
       ? `🔗 Your landing page **${d.name}** was deployed successfully — preview it here: ${d.url}`
-      : `🔗 Your landing page was deployed successfully — preview it here: ${d.url}`,
-  );
+      : `🔗 Your landing page was deployed successfully — preview it here: ${d.url}`;
+    if (d.launchReadiness && !d.launchReadiness.ready && d.launchReadiness.reasons.length > 0) {
+      return `${base}\n⚠️ Not launch-ready yet: ${d.launchReadiness.reasons.join('; ')}.`;
+    }
+    return base;
+  });
   return `${content.replace(/\s+$/, '')}\n\n${lines.join('\n')}`;
 }

@@ -1,3 +1,96 @@
+## ENG-1907: sandbox mode phase 1 — the `eval_` principal becomes a real portal account (2026-09-12)
+
+ENG-1870 shipped a separate mini-product for evaluations (server-rendered `/evaluation` page, a
+single-shot Gemini with no tools, a toy simulator, an HTTP allowlist that 403'd every real route).
+Harsha rejected it on sight: the candidate never touched the product. Phase 1 of ENG-1906 keeps the
+lifecycle that was good — `eval_<uuid>` identity, the `AW-Evaluations` policy row, atomic
+provision/revoke/audit, reviewer assignment, the `scope:'evaluation'` delegate token — and
+inverts the boundary: a **denylist** (connector OAuth, MCP OAuth/servers/API keys, Stripe, org,
+Featurebase identity, public share links, session transfer, Clarity replay registration,
+`/api/admin`), socket admission on the same policy check, and **class-based** tool denial
+(`SANDBOX_TOOL_CLASSES` in `evaluationPolicy.ts`) enforced in all three dispatchers. Everything
+unclassified — Meta tools included — reaches its normal handler. No Meta simulation exists yet
+(phase 2/3), so a phase-1 sandbox account simply has no Meta connection.
+
+Assumptions worth knowing when this bites later:
+
+- **`getAllUsers` now excludes `eval_` principals by default** (`{ includeSandbox: true }` opts
+  in). That single filter is what keeps a take-home account out of the activation CRM sync,
+  onboarding nudges, Meta crons, renewal alerts, LLM unit economics and revenue listings. The one
+  caller that opts in is the partner-portal roster (`GET /api/admin/users`) because Access Portal
+  lives there. If a sweep ever bypasses `getAllUsers` (the renewal cron's `scanWithFilter` did),
+  it needs its own `isEvaluationUser` skip — one test per enumerator pins the current set.
+- **Oncall suppression is keyed on identity, never a caller flag.** `sendAgentModeOncallAlert`
+  resolves the session owner when no `userId` is passed, so the 30 call sites are untouched. It
+  fails open: a lookup error still pages for a real customer.
+- **Reliability telemetry skips sandbox runs entirely** (run ids remembered at
+  `recordAgentModeRunStarted`, cleared on the terminal event) because
+  `agentReliabilitySnapshotCron` has no per-user filter and feeds the closure gate's
+  `failedRunRate`/`degradedRunRate`.
+- **`install_skills` is deliberately outside the `connectors` class** even though it matches the
+  `install_` prefix — denying it would strip every non-foundation tool from Emma.
+- **A policy row without `deniedToolClasses` denies every class** (fail closed; this is also what
+  the pre-phase-1 row for the Ryan take-home looks like). The store's `get()` normalizes legacy
+  fields (`materials`, `artifacts`, `simulation`, `remaining`) away instead of throwing.
+- **Provision refuses without the `Sandbox` tier row** (`scripts/ensure-sandbox-tier.ts`,
+  compare-and-set append) because an unknown tier name fails *open* to every page, connector and
+  skill in `subscriptionService`. The AW-Users item is written with `subscriptionType: 'Sandbox'`,
+  seeded `brandGuidelines` (else the portal forces onboarding, which runs real brand extraction),
+  and never `adAccount` — `routes/meta.ts` and Emma's Meta credential resolver would otherwise
+  fall back to AgentWeb's shared production Meta token.
+- Local TDD ran under Node 20 (`/usr/local/bin/node`); the default Node 26 on the Mac cannot load
+  `jsonwebtoken`. Merge evidence is the Atem run.
+
+## ENG-1624: the "stopped caching the private key" claim describes a bug that never reached `main` (2026-08-31)
+
+A second correction to this same PR's history (see the entry directly below for the
+first). Commit `22bd000c6`'s message also says: "Also stop caching the parsed
+service-account secret (private key included) on `driveServiceAccountCredentials` —
+only `client_email` is needed... so keep just that." Read on its own, that describes
+fixing a security exposure that existed in the codebase.
+
+It didn't. `git log -p -- backend/src/services/agentModeService.ts` shows
+`driveServiceAccountCredentials` (the field that cached the full parsed secret) was
+introduced AND removed within this same unmerged PR branch — added by an earlier
+stage of the pipeline run that produced this PR, then replaced with the narrower
+`driveServiceAccountEmail` by the commit whose message makes the claim.
+`origin/main` never had a `driveServiceAccountCredentials` field at any point;
+`getGoogleDriveClient()` there never cached anything beyond what this PR adds. So
+nothing was "removed" in the sense of undoing a production exposure — the vulnerable
+code was draft-only and never shipped. What this PR actually does is *add* a narrow
+`driveServiceAccountEmail` cache (just the email, needed to name the account in a
+share-access error) and document why the rest of the secret isn't retained. That's
+good hygiene, but it's not the removal of a private-key leak, and describing it that
+way overstates what happened. Left uncorrected in the commit itself (same reasoning
+as the entry below — rewriting a pushed, already-in-PR commit isn't worth a
+force-push for a wording fix); noting the correction here instead.
+
+## ENG-1624: sub-folder KB traversal fix is correct; one commit's stated motivation isn't (2026-08-31)
+
+Independent re-verification against the live prod session (`822c1ed4-133e-4081-b8c9-ee43547fd463`,
+pulled from `AW-ChatSessions` + `AW-ChatMessages`, since the session record's own `messages` list is
+empty and the real transcript lives in the separate messages table) confirms the fix. The two actual
+failures — matching the session's own `failedFunctions` counter — were both
+`materialize_knowledge_base_asset`, at `2026-08-27T15:49:26Z` (file-not-found against the registered
+root) and `15:49:36Z` ("Not authorized" against the sub-folder itself). That's ~1.5h before the
+issue's stated "~17:19–17:24Z" window, which is actually when the deferred-ads deployment ran and
+step 9 completed with 0 ads — close to when the customer's Slack complaint landed (10:31 PDT =
+17:31Z), not when the tool itself failed. All four Drive KB call sites
+(`materializeKnowledgeBaseAsset`, `readGoogleDriveSharedFile`, `listKnowledgeBaseFiles`,
+`searchKnowledgeBase`) now route through `getGoogleDriveFolderTreeIds`; `tsc` and the 195 targeted
+tests pass post-merge with `main`.
+
+One inaccuracy survives in the commit log: `22bd000c6`'s message claims "search_knowledge_base was
+the call actually exercised by the failing Phoenix session." The transcript shows otherwise —
+`search_knowledge_base` was called exactly once in that session, at `18:55:59Z`, *after* Harsha's
+manual sub-folder registration had already unblocked `materialize` (`18:50–18:52Z`), for an
+unrelated query ("Do Not Say marketing guardrails") that Emma herself determined belonged to a
+different client's KB entry, not Phoenix's. The fix to `searchKnowledgeBase`'s Drive branch is still
+correct and worth keeping — same class of bug, independently confirmed by reading the code — the
+commit message's specific attribution to this session is just wrong. Left uncorrected in the commit
+itself (rewriting a pushed, already-in-PR commit isn't worth a force-push for a prose-only fix);
+noting the correction here instead.
+
 ## ENG-1484: two correct instructions can still lose to each other (2026-08-23)
 
 ENG-1478 (same day) fixed the Work Plan Capabilities section to tell Emma to check
@@ -7524,3 +7617,18 @@ All three positive cases: Emma checked the plan catalog and proposed a matching 
 proceeding with the row's primary tool, in the same shape already verified in production for the
 LinkedIn row. Negative control: no spurious recommendation, no spurious tool calls, answered
 directly. Full transcripts in the ENG-1490 follow-up PR.
+
+## ENG-1643 — typed consent resolves only when deterministic (2026-08-29)
+
+An awaiting `ask_user_question` card used to clear whenever the owner typed text, even when that
+text was an unambiguous answer. The correction is a pure, controller-side resolver: one exact
+option id/label match is persisted as a normal `answeredBy: 'user'` answer; a bare affirmative is
+accepted only for a card with exactly one affirmative option (for example Approve/Reject). Bare
+affirmatives on multi-choice cards, ambiguous text, and unrelated text retain the prior
+clear-and-re-ask behavior.
+
+This is an intentional consent-correctness change, not a model-routing or prompt change. It keeps
+the existing optimistic `requireStillAwaiting` write condition, immutable-question gate,
+delegation invariant, and no-model-answerer invariant. Typed provenance uses the existing optional
+answer rationale field; it adds no table, schema, or new persistence path. Focused controller and
+primitive tests cover the three affirmative paths plus multi-choice/ambiguity controls.

@@ -1,3 +1,6 @@
+import { registerLeadNotificationProcessor } from './services/orgLeadNotificationService';
+import { evaluationAdminRoutes } from './routes/evaluation';
+import { evaluationHttpBoundary } from './middleware/evaluation';
 import express from "express";
 import nodePath from "path";
 import cors from "cors";
@@ -23,6 +26,8 @@ import stripeConnectRoutes from "./routes/stripeConnect";
 import brandRoutes from "./routes/brand";
 import marketStrategyRoutes from "./routes/marketStrategy";
 import slackRoutes from "./routes/slack";
+import teamsRoutes from "./routes/teamsMessages";
+import approvalDeskRoutes from "./routes/approvalDesk";
 import metaRoutes from "./routes/meta";
 import metaV2Routes from "./routes/metaV2";
 import blogRoutes from "./routes/blog";
@@ -30,7 +35,6 @@ import agentModeRoutes from "./routes/agentMode";
 import settingsRoutes from "./routes/settings";
 import imageModelsRoutes from "./routes/image-models";
 import webhookRoutes from "./routes/webhooks";
-import devEnvRoutes from "./routes/devEnv";
 import benchmarkRoutes from "./routes/benchmark";
 import seoRoutes from "./routes/seo";
 import funnelRoutes from "./routes/funnel";
@@ -57,7 +61,10 @@ import youtubeAuthRoutes from "./routes/youtubeAuth";
 import googleAdsAuthRoutes from "./routes/googleAdsAuth";
 import fathomAuthRoutes from "./routes/fathomAuth";
 import fathomWebhookRoutes from "./routes/fathomWebhook";
+import whatsappWebhookRoutes from "./routes/whatsappWebhook";
+import messagingChannelsRoutes from "./routes/messagingChannels";
 import calendlyWebhookRoutes from "./routes/calendlyWebhook";
+import unipileWebhookRoutes from "./routes/unipileWebhook";
 // ENG-926 §C: registers the CRM -> Meta conversion relay's queue processor at boot. The
 // poller leaves a job claimed-but-unprocessed when no processor is registered for its
 // source, so this cannot be deferred to the first status transition of a process's life —
@@ -67,6 +74,8 @@ import fathomOnboardingAdminRoutes from "./routes/fathomOnboardingAdmin";
 import hubspotAuthRoutes from "./routes/hubspotAuth";
 import attioAuthRoutes from "./routes/attioAuth";
 import crmSyncRoutes from "./routes/crmSync";
+import adsThresholdsRoutes from "./routes/adsThresholds";
+import outcomeLedgerRoutes from "./routes/outcomeLedger";
 import crmWebhookRoutes from "./routes/crmWebhook";
 import mcpServersRoutes, { mcpOAuthPublicRouter } from "./routes/mcpServers";
 import skillRoutes from "./routes/skillRoutes";
@@ -76,8 +85,10 @@ import adminWorkPlanRoutes from "./routes/adminWorkPlanRoutes";
 import adminLandingPagesRoutes from "./routes/adminLandingPages";
 import adminOrgDiagnosticsRoutes from "./routes/adminOrgDiagnostics";
 import adminTrackingMonitorRoutes from "./routes/adminTrackingMonitor";
+import adminRenewalIntegrationHealthRoutes from "./routes/adminRenewalIntegrationHealth";
 import adminPromptTemplatesRoutes from "./routes/adminPromptTemplates";
 import adminScheduleTemplateRoutes from "./routes/adminScheduleTemplateRoutes";
+import adminGoldenSetRoutes from "./routes/adminGoldenSet";
 import supportRoutes from "./routes/support";
 import integrationsRoutes from "./routes/integrations";
 import featurebaseRoutes from "./routes/featurebase";
@@ -97,9 +108,12 @@ import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
 import batchReviewRoutes, { batchReviewPublicRouter } from "./routes/batchReview";
 import imageReportsRoutes from "./routes/imageReports";
 import clientHealthRoutes from "./routes/clientHealth";
+import leadVolumeMonitorRoutes from "./routes/leadVolumeMonitor";
+import l2DiagnoseRoutes from "./routes/l2Diagnose";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import orgRoutes from "./routes/org";
 import orgMemoryRoutes from "./routes/orgMemory";
+import orgModelRolesRoutes from './routes/orgModelRoles';
 import orgShareSettingsRoutes from "./routes/orgShareSettings";
 import orgMemberRemovalRoutes from "./routes/orgMemberRemoval";
 import testAccountsRoutes from "./routes/testAccounts";
@@ -112,6 +126,7 @@ import { registerAiReadinessFunnel } from "./loops/instances/ai-readiness-funnel
 import { checkFinalizeGuardMisconfiguration, registerAgentModeLoop } from "./loops/instances/agent-mode";
 import loopHealthRoutes from "./routes/loopHealth";
 import brandBuildRoutes from "./routes/brandBuild";
+import designSystemBuildRoutes from "./routes/designSystemBuild";
 import adGenRoutes from "./routes/adGen";
 import onboardingStepsRoutes from "./routes/onboardingSteps";
 import outreachOnboardingRoutes from "./routes/outreachOnboarding";
@@ -120,6 +135,7 @@ import charactersRoutes from "./routes/characters";
 import contractorRoutes from "./routes/contractor";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
+import { authenticateAgentRunsSecretOrAdmin } from "./middleware/agentRunsAuth";
 
 
 import { setupMcpServer } from "./mcp/server/mcpServer";
@@ -133,8 +149,41 @@ import {
   exportHtmlToPdf,
 } from "./controllers/filesController";
 import { serveAsset, getAssetStats } from "./controllers/assetController";
+import { healthPayload } from "./utils/buildInfo";
 
 const app = express();
+
+// ENG-493: trust the first 2 hops in front of this process so `req.ip` (and everything
+// keyed off it, e.g. express-rate-limit's default per-IP keying in routes/auth.ts)
+// resolves to the real client instead of collapsing to one value for every caller.
+//
+// Prod topology is ALB -> nginx -> Node, all on the same EB instance, with nginx
+// proxying to Node over loopback. The EB-platform-managed nginx config for the general
+// proxy location isn't in this repo (only .platform/nginx/conf.d/elasticbeanstalk/
+// websocket.conf's /socket.io/ location is, as an analogous example of the same directive
+// — it does not itself govern the routes below), so this is confirmed against live prod
+// rather than static config: nginx sets `X-Forwarded-For: $proxy_add_x_forwarded_for`,
+// which APPENDS nginx's own
+// connecting address (the ALB's private IP) to whatever X-Forwarded-For it received —
+// and the ALB itself already sets X-Forwarded-For to the real client IP before that.
+// So by the time Express sees the request: the socket is loopback (hop 1, nginx) and
+// X-Forwarded-For is "<real client>, <ALB private IP>" (hop 2 is the ALB). Trusting 2
+// hops skips both and leaves the real client as `req.ip` — confirmed by spoofing
+// X-Forwarded-For against live prod and reading the raw header chain Node received:
+// exactly 2 trailing hops, no CDN/WAF in front. nginx's own $remote_addr is always one
+// of a small set of internal ALB addresses, but that set churns across AZs, so this is
+// keyed on a numeric hop count, never an IP allowlist.
+//
+// This is load-bearing on the ALB's own X-Forwarded-For handling, not just nginx's:
+//   - routing.http.xff_header_processing.mode must stay "append" (the default). If it's
+//     ever changed to "preserve", the ALB stops appending the real client IP and the
+//     chain collapses to "<attacker-supplied XFF>, <ALB private IP>" — hop count 2 would
+//     then resolve `req.ip` straight to an attacker-controlled value instead of skipping
+//     past it, the exact spoofing class this fix (and its rework test) exists to prevent.
+//   - routing.http.xff_client_port.enabled must stay disabled — enabling it appends
+//     "ip:port" entries that `proxy-addr` doesn't parse as a plain address.
+// Both are ALB load balancer attributes, not app code — nothing here enforces them.
+app.set('trust proxy', 2);
 
 // Security hardening (TAC Security report — Low findings):
 //   1. Remove the default "X-Powered-By: Express" header so the framework is not
@@ -184,10 +233,26 @@ const corsOptions = {
       "https://agentweb-user-files.s3.us-west-2.amazonaws.com", // S3 bucket for user files
       process.env.FRONTEND_URL || "http://localhost:5173", // Partner Portal (Deployed or Local)
       process.env.CUSTOMER_FRONTEND_URL || "http://localhost:5174", // Customer Portal (Deployed or Local)
-      process.env.GROWTH_GENIUS_CHAT_URL || "http://localhost:8080", // Growth Genius Chat (Deployed or Local)
-      /^https:\/\/[a-zA-Z0-9\-]+\.ngrok-free\.app$/, // Allow any ngrok-free.app subdomain
-      /^https:\/\/[a-zA-Z0-9\-]+\.ngrok\.io$/, // Allow any ngrok.io subdomain
     ];
+
+    // ngrok tunnels are a local-dev convenience (exposing a laptop's backend to a
+    // webhook sender, a mobile device, etc.) and must never be a credentialed
+    // origin in production — any ngrok tenant on the internet would otherwise be
+    // allowed (ENG-1751). Fail closed on NODE_ENV: neither tracked EB config nor
+    // package.json sets NODE_ENV=production explicitly, so `!== "production"`
+    // was fail-open (unset/mistyped/staging all fell through as "allow"), the
+    // exact class of bug already fixed in webhooks.ts's Attio isDev check. Only
+    // an explicit NODE_ENV=development, or the CORS_ALLOW_NGROK=1 opt-in, allows
+    // ngrok origins.
+    if (
+      process.env.NODE_ENV === "development" ||
+      process.env.CORS_ALLOW_NGROK === "1"
+    ) {
+      allowedOrigins.push(
+        /^https:\/\/[a-zA-Z0-9\-]+\.ngrok-free\.app$/, // Allow any ngrok-free.app subdomain
+        /^https:\/\/[a-zA-Z0-9\-]+\.ngrok\.io$/ // Allow any ngrok.io subdomain
+      );
+    }
 
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
@@ -260,19 +325,26 @@ app.use((req, res, next) => {
 });
 // Stripe webhook needs the raw body (Buffer) for signature verification.
 // This MUST come before express.json() which parses the body.
+app.use("/api/slack/events", express.raw({ type: "application/json", limit: "1mb" }));
 app.use("/api/stripe/webhook", express.raw({ type: "application/json" }));
 // Stripe Connect webhook needs its own raw-body handler — also before express.json().
 app.use("/api/stripe/connect/webhook", express.raw({ type: "application/json" }));
 // HubSpot webhook needs raw body for HMAC-SHA256 signature verification.
 app.use("/api/webhooks/hubspot", express.raw({ type: "application/json" }));
 app.use("/api/webhooks/calendly", express.raw({ type: "application/json" })); // raw body needed for HMAC signature verification
+app.use("/api/webhooks/attio", express.raw({ type: "application/json" })); // raw body needed for Attio-Signature HMAC verification
 // Linear webhook (bug-resolve bridge) needs raw body for HMAC signature verification — before express.json().
 app.use("/api/integrations/linear/webhook", express.raw({ type: "application/json" }));
 // Featurebase webhook (Slack ship-notify) signs the raw body too — before express.json().
 app.use("/api/integrations/featurebase/webhook", express.raw({ type: "application/json" }));
+// WhatsApp Cloud API webhook: Meta signs the exact payload bytes as X-Hub-Signature-256,
+// so the HMAC must be computed over the raw Buffer, not a re-serialized parse (ENG-273).
+app.use("/api/webhooks/whatsapp", express.raw({ type: "application/json" }));
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());
+app.use(evaluationHttpBoundary);
+app.use("/api/admin/evaluations", evaluationAdminRoutes);
 
 // MCP OAuth 2.1 routes. Registered AFTER the CORS middleware and body parsers
 // so the consent page (served from the customer portal origin) can POST to
@@ -295,6 +367,17 @@ app.use("/api/users", usersRoutes);
 app.use("/api/tasks", taskRoutes);
 app.use("/api/waitlist", waitlistRoutes);
 app.use("/api/schedules", scheduleRoutes);
+// D78: mounted AHEAD of the catch-all `/api/admin` router below (which applies a blanket
+// authenticateToken/isAdmin via router.use with no path filter, matching this path too) —
+// registration order matters in Express, so a later, more specific mount here would never
+// be reached; a request without a valid admin session would 401 out of the catch-all before
+// this gate's own secret-header check ever ran. Mounting first means this route's own gate
+// decides: a correct AW_AGENT_RUNS_SECRET header authenticates directly (narrowed to one
+// sessionId, limit<=3, never falling through to the catch-all below); no header falls
+// through to this gate's own authenticateToken/isAdmin call, identical to the old behavior,
+// and never reaches the catch-all a second time since this mount already terminates the
+// response either way. See middleware/agentRunsAuth.ts.
+app.use("/api/admin/agent-runs", authenticateAgentRunsSecretOrAdmin(agentRunsRoutes));
 app.use("/api/admin", adminRoutes);
 app.use("/api/admin", adminUsageRoutes);
 app.use("/api/admin", mcpUsageAdminRoutes);
@@ -317,6 +400,11 @@ app.use("/api/html-templates", authenticateToken, htmlTemplatesRoutes);
 app.use("/api/domains", domainRoutes);
 app.use("/api/market-strategy", marketStrategyRoutes);
 app.use("/api/slack", slackRoutes);
+// ENG-272: Teams' Bot Framework endpoint authenticates with a bearer JWT, not an HMAC over the
+// raw bytes, and CloudAdapter reads the parsed body — so this belongs here, after
+// express.json(), and NOT in the raw-body block above with Slack and WhatsApp.
+app.use("/api/teams", teamsRoutes);
+app.use("/api/approval-desk", approvalDeskRoutes);
 app.use("/api/meta", metaRoutes);
 app.use("/api/meta/v2", metaV2Routes);
 app.use("/api/blog", blogRoutes);
@@ -325,9 +413,12 @@ app.use("/api/settings", settingsRoutes);
 app.use("/api/image-models", imageModelsRoutes);
 app.use("/api/webhooks", webhookRoutes);
 app.use("/api/webhooks/fathom", fathomWebhookRoutes);
+app.use("/api/webhooks/whatsapp", whatsappWebhookRoutes);
+app.use("/api/messaging-channels", messagingChannelsRoutes);
 app.use("/api/webhooks/calendly", calendlyWebhookRoutes);
+app.use("/api/webhooks/unipile", unipileWebhookRoutes);
 registerConversionRelayProcessor();
-app.use("/api", devEnvRoutes);
+registerLeadNotificationProcessor();
 app.use("/api/benchmark", benchmarkRoutes);
 app.use("/api/seo", seoRoutes);
 app.use("/api/funnels", funnelRoutes);
@@ -342,6 +433,13 @@ app.use("/api/crm/webhooks/apollo", apolloWebhookRoutes);
 app.use("/api/crm/sequences", sequenceRoutes);
 app.use("/api/crm/companies", crmCompaniesRoutes);
 app.use("/api/crm", crmRoutes);
+// ENG-918 — per-account ads-detection thresholds. Every route authenticates and re-derives
+// ad-account ownership from the caller's own connected accounts; see the route file's header.
+app.use("/api/ads-thresholds", adsThresholdsRoutes);
+// ENG-1550 — outcome ledger. Read is owner-scoped like ads-thresholds; record/score are
+// admin-only — a recommendation is the agent's own prediction, not a customer-set value. See the
+// route file's header.
+app.use("/api/outcome-ledger", outcomeLedgerRoutes);
 app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/books", booksRoutes);
 app.use("/api/oauth/linkedin", linkedinAuthRoutes);
@@ -371,8 +469,11 @@ app.use("/api/admin/lead-magnets", authenticateToken, isAdmin, leadMagnetAdminRo
 app.use("/api/admin/fathom-onboarding", authenticateToken, isAdmin, fathomOnboardingAdminRoutes);
 app.use("/api/admin/onboarding-loop", authenticateToken, isAdmin, onboardingLoopAdminRoutes);
 app.use("/api/admin/loops", authenticateToken, isAdmin, loopHealthRoutes);
-app.use("/api/admin/agent-runs", authenticateToken, isAdmin, agentRunsRoutes);
 app.use("/api/client-health", authenticateToken, isAdmin, clientHealthRoutes);
+// ENG-1551 — lead volume drought monitor. Same double-gate as client-health: middleware +
+// service-layer admin check.
+app.use("/api/lead-volume-monitor", authenticateToken, isAdmin, leadVolumeMonitorRoutes);
+app.use("/api/l2-diagnose", authenticateToken, isAdmin, l2DiagnoseRoutes);
 app.use("/api/skills", authenticateToken, isAdmin, skillRoutes);
 app.use("/api/user-skills", authenticateToken, userSkillRoutes);
 app.use("/api/user-work-plans", authenticateToken, userWorkPlanRoutes);
@@ -380,8 +481,11 @@ app.use("/api/admin/work-plans", authenticateToken, isAdmin, adminWorkPlanRoutes
 app.use("/api/admin/landing-pages", authenticateToken, isAdmin, adminLandingPagesRoutes);
 app.use("/api/admin/org-diagnostics", authenticateToken, isAdmin, adminOrgDiagnosticsRoutes);
 app.use("/api/admin/tracking-monitor", authenticateToken, isAdmin, adminTrackingMonitorRoutes);
+app.use("/api/admin/renewal-integration-health", authenticateToken, isAdmin, adminRenewalIntegrationHealthRoutes);
 app.use("/api/admin/prompt-templates", authenticateToken, isAdmin, adminPromptTemplatesRoutes);
 app.use("/api/admin/schedule-templates", authenticateToken, isAdmin, adminScheduleTemplateRoutes);
+// ENG-2135: golden-set labelling (inert until EVAL_GOLDEN_CASES_TABLE is set by OPS-2).
+app.use("/api/admin/eval/golden-cases", authenticateToken, isAdmin, adminGoldenSetRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/integrations", integrationsRoutes);
 app.use("/api/featurebase", featurebaseRoutes);
@@ -424,6 +528,7 @@ try {
   console.warn("[loops] registerAgentModeLoop skipped:", String(err));
 }
 app.use("/api/onboarding", brandBuildRoutes);
+app.use("/api/onboarding", designSystemBuildRoutes);
 app.use("/api/onboarding", adGenRoutes);
 app.use("/api/onboarding", onboardingStepsRoutes);
 app.use("/api/onboarding", outreachOnboardingRoutes);
@@ -438,6 +543,7 @@ app.use("/api/image-reports", imageReportsRoutes);
 app.use("/api/lead-magnet", leadMagnetRoutes);
 app.use("/api/org", orgRoutes);
 app.use("/api/org", orgMemoryRoutes);
+app.use("/api/orgs/me/model-roles", authenticateToken, orgModelRolesRoutes);
 app.use("/api/orgs/me/share-settings", authenticateToken, orgShareSettingsRoutes);
 app.use("/api/orgs/me/members", authenticateToken, orgMemberRemovalRoutes);
 app.use("/api/characters", charactersRoutes);
@@ -476,7 +582,7 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "healthy" });
+  res.status(200).json(healthPayload());
 });
 
 // Global error handler — catches unhandled errors from all routes and reports them to Notion

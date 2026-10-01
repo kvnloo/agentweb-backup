@@ -65,8 +65,12 @@ describe('the action matrix documents the entity for the model', () => {
   it('states that REMOVE is supported behind a confirmation', () => {
     // Was "NO REMOVE … use status=PAUSED". Both halves are now known wrong: REMOVE is the
     // only working retire path, and PAUSED is not a conversion-action status at all.
-    expect(matrix()).toMatch(/REMOVE \(conversion_action_resource_name, confirm_conversion_action_removal\)/);
-    expect(matrix()).toMatch(/Ask the user before setting the flag/);
+    expect(matrix()).toMatch(/REMOVE \(conversion_action_resource_name, confirm_conversion_action_removal, conversion_action_removal_token\)/);
+    // The old text asked the model to "ask the user before setting the flag", which is
+    // advice, not a control — the model sets its own arguments. The matrix now states the
+    // enforced fact: the flag alone does nothing without a token from the disclosure halt.
+    expect(matrix()).toMatch(/The flag alone does nothing/);
+    expect(matrix()).toMatch(/You cannot approve this yourself by setting the flag/);
   });
 
   it('warns that counting_type is never inferred', () => {
@@ -90,7 +94,7 @@ describe('the tool stops recommending an impossible action (ENG-1329 e2e)', () =
   });
 
   it('lists REMOVE as a supported CONVERSION_ACTION operation', () => {
-    expect(text).toMatch(/REMOVE \(conversion_action_resource_name, confirm_conversion_action_removal\)/);
+    expect(text).toMatch(/REMOVE \(conversion_action_resource_name, confirm_conversion_action_removal, conversion_action_removal_token\)/);
   });
 
   it('tells the model not to suggest HIDDEN', () => {

@@ -17,6 +17,9 @@ jest.mock('../services/db', () => ({
 jest.mock('../services/autoHumanEvalService', () => ({
   enqueueAutoHumanEval: jest.fn().mockResolvedValue(null),
 }));
+jest.mock('../services/enigmaCardRevenueEnrichment', () => ({
+  isEnigmaEnrichmentEnabledForUser: jest.fn().mockReturnValue(false),
+}));
 
 import '../emma/tools';
 import { emmaToolRegistry } from '../emma/registry';
@@ -26,6 +29,7 @@ import {
   resolveExecuteLeadIds,
 } from '../emma/enrichmentToolRunner';
 import { crmDb } from '../services/db';
+import { isEnigmaEnrichmentEnabledForUser } from '../services/enigmaCardRevenueEnrichment';
 const { enqueueAutoHumanEval } = jest.requireMock('../services/autoHumanEvalService');
 
 const SUMMARY = {
@@ -122,8 +126,13 @@ describe('enrich_leads_execute', () => {
     }));
   });
 
-  it('sends completed list enrichment runs to Fangfang for human eval', async () => {
+  // ENG-1854: routine, zero-failure completions are no longer sent for review at all — they
+  // were the dominant source of #eval-queue noise and were never a real judgment call. This
+  // replaces the old "always sends" test with the actual current behavior: only a run with a
+  // genuine failure counts as review-worthy.
+  it('sends list enrichment runs with genuine failures to Fangfang for human eval', async () => {
     (resolveExecuteLeadIds as jest.Mock).mockResolvedValue({ leadIds: undefined, count: 5 });
+    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, processedCount: 4, failedCount: 1 });
     const tool = emmaToolRegistry.getTool('enrich_leads_execute')!;
     await tool.execute(
       { list_id: 'list-abc', output_fields: [{ name: 'industry', instruction: 'classify' }] },
@@ -135,7 +144,7 @@ describe('enrich_leads_execute', () => {
       userId: 'user1',
       sessionId: 'session-1',
       originalRequest: 'enrich_leads_execute list=list-abc fields=industry',
-      outputSummary: expect.stringContaining('processed 5 lead'),
+      outputSummary: expect.stringContaining('processed 4 lead'),
       sourceKey: 'lead-enrichment:run-1',
       action: expect.objectContaining({
         type: 'lead_enrichment_rerun',
@@ -145,6 +154,18 @@ describe('enrich_leads_execute', () => {
         toolName: 'enrich_leads_execute',
       }),
     }));
+  });
+
+  it('does NOT send a routine, zero-failure list enrichment run for human eval', async () => {
+    (resolveExecuteLeadIds as jest.Mock).mockResolvedValue({ leadIds: undefined, count: 5 });
+    // SUMMARY's default failedCount is 0 — the routine, no-issue case.
+    const tool = emmaToolRegistry.getTool('enrich_leads_execute')!;
+    await tool.execute(
+      { list_id: 'list-abc', output_fields: [{ name: 'industry', instruction: 'classify' }] },
+      { userId: 'user1', sessionId: 'session-1' },
+    );
+
+    expect(enqueueAutoHumanEval).not.toHaveBeenCalled();
   });
 
   it('passes an explicit lead_ids subset through', async () => {
@@ -225,8 +246,8 @@ describe('enrich_lead_custom', () => {
     expect(result.enrichedValues).toEqual({ company_size: '200', title: 'CTO' });
   });
 
-  it('sends completed single-lead enrichment runs to Fangfang for human eval', async () => {
-    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, runId: 'run-single', processedCount: 1 });
+  it('sends a single-lead enrichment run with a genuine failure to Fangfang for human eval', async () => {
+    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, runId: 'run-single', processedCount: 1, failedCount: 1 });
     const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
     await tool.execute(
       {
@@ -253,6 +274,21 @@ describe('enrich_lead_custom', () => {
         toolName: 'enrich_lead_custom',
       }),
     }));
+  });
+
+  it('does NOT send a routine, zero-failure single-lead enrichment run for human eval', async () => {
+    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, runId: 'run-single', processedCount: 1 });
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    await tool.execute(
+      {
+        list_id: 'list-abc',
+        lead_id: 'lead-7',
+        output_fields: [{ name: 'company_size', instruction: 'find headcount' }],
+      },
+      { userId: 'user1', sessionId: 'session-1' },
+    );
+
+    expect(enqueueAutoHumanEval).not.toHaveBeenCalled();
   });
 
   it('returns sanitized per-field enrichmentMetadata so the agent can cite source/confidence', async () => {
@@ -316,6 +352,60 @@ describe('enrich_lead_custom', () => {
     expect(meta.siblingLeadId).toBeUndefined();
     expect(meta.siblingListId).toBeUndefined();
     expect(meta.siblingUserId).toBeUndefined();
+  });
+
+  // ENG-1388: the enigma card-revenue TRIGGER is allowlist-gated inside
+  // runEmmaEnrichment, but this readback re-reads whatever's now stored for
+  // the requested output fields — which could be a card-revenue value a
+  // DIFFERENT (allowlisted) org member filled in earlier on a shared list.
+  // Never hand that back to a caller who isn't allowlisted themselves.
+  it('strips card-revenue fields from enrichedValues and enrichmentMetadata for a non-allowlisted caller', async () => {
+    (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(false);
+    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, processedCount: 1 });
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+      leadId: 'lead-7',
+      customFields: { card_revenue_12m: '41999657', industry: 'Software' },
+      enrichmentMetadata: {
+        card_revenue_12m: { source: 'api', provider: 'enigma', confidence: 'medium', enrichedAt: '2026-06-22T00:00:00.000Z' },
+        industry: { source: 'api', provider: 'apollo', confidence: 'high', enrichedAt: '2026-06-22T00:00:00.000Z' },
+      },
+    });
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    const result = await tool.execute(
+      {
+        list_id: 'list-abc',
+        lead_id: 'lead-7',
+        output_fields: [
+          { name: 'card_revenue_12m', instruction: 'find card revenue' },
+          { name: 'industry', instruction: 'find industry' },
+        ],
+      },
+      { userId: 'org-mate-not-allowlisted' },
+    );
+    expect(result.enrichedValues).not.toHaveProperty('card_revenue_12m');
+    expect(result.enrichedValues.industry).toBe('Software');
+    expect(result.enrichmentMetadata).not.toHaveProperty('card_revenue_12m');
+    expect(result.enrichmentMetadata.industry).toBeDefined();
+  });
+
+  it('keeps card-revenue fields in enrichedValues and enrichmentMetadata for an allowlisted caller', async () => {
+    (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(true);
+    (runEmmaEnrichment as jest.Mock).mockResolvedValue({ ...SUMMARY, processedCount: 1 });
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+      leadId: 'lead-7',
+      customFields: { card_revenue_12m: '41999657' },
+      enrichmentMetadata: {
+        card_revenue_12m: { source: 'api', provider: 'enigma', confidence: 'medium', enrichedAt: '2026-06-22T00:00:00.000Z' },
+      },
+    });
+    const tool = emmaToolRegistry.getTool('enrich_lead_custom')!;
+    const result = await tool.execute(
+      { list_id: 'list-abc', lead_id: 'lead-7', output_fields: [{ name: 'card_revenue_12m', instruction: 'find card revenue' }] },
+      { userId: 'allowlisted-admin' },
+    );
+    expect(result.enrichedValues.card_revenue_12m).toBe('41999657');
+    expect(result.enrichmentMetadata.card_revenue_12m).toBeDefined();
+    (isEnigmaEnrichmentEnabledForUser as jest.Mock).mockReturnValue(false);
   });
 
   it('omits enrichmentMetadata when the enriched lead has none', async () => {

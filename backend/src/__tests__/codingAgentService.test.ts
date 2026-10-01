@@ -1,4 +1,5 @@
-import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, LANDING_PAGE_PREVIEW_BRANCH, _isMissingGithubRefError, _describeGithubError, _previewBranchCommitsAheadOfMain, _setOpenRouterClientForTest, _setDeploymentSleepForTest, _rollbackEditedFiles } from '../services/codingAgentService';
+import { OPENROUTER_PROVIDER_PREFERENCES } from '../services/agentMode/openRouterRequestParams';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, LANDING_PAGE_PREVIEW_BRANCH, _isMissingGithubRefError, _describeGithubError, _previewBranchCommitsAheadOfMain, _previewBranchDivergence, _setOpenRouterClientForTest, _setDeploymentSleepForTest, _rollbackEditedFiles } from '../services/codingAgentService';
 import { agentModeService } from '../services/agentModeService';
 import Anthropic from '@anthropic-ai/sdk';
 import { getSecret } from '../utils/secretsManager';
@@ -221,12 +222,13 @@ describe('runCodingAgent', () => {
     // edit_file step 2: write (PUT /github-edit) — throws 403
     mockedMcpFetch.mockRejectedValueOnce(new Error('API error (403): Not authorized to edit this landing page'));
 
+    mockCreate.mockResolvedValueOnce({ stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'flush', name: 'check_deployment', input: {} }] });
     const result = await runCodingAgent('Change the heading', mockContext);
 
     expect(result.success).toBe(false);
     expect(result.message).toMatch(/not authorized|403|permission/i);
     // Should fail-fast: no second LLM call after the 403
-    expect(mockCreate).toHaveBeenCalledTimes(1);
+    expect(mockCreate).toHaveBeenCalledTimes(2);
   });
 
   test('403 on pre-flight list_files returns authorization error without LLM call', async () => {
@@ -363,6 +365,7 @@ describe('runCodingAgent', () => {
   });
 
   test('max iterations failure includes files edited and preview URL', async () => {
+    mockedMcpFetch.mockResolvedValueOnce({ files: [] });
     // Iteration 1: read_file
     mockCreate.mockResolvedValueOnce({
       content: [
@@ -370,7 +373,7 @@ describe('runCodingAgent', () => {
       ],
       stop_reason: 'tool_use'
     });
-    mockedMcpFetch.mockResolvedValueOnce({ content: '<h1>Old</h1>\n<p>Text</p>' });
+    mockedMcpFetch.mockResolvedValueOnce({ content: '<><h1>Old</h1>\n<p>Text</p></>' });
 
     // Iteration 2: edit_file
     mockCreate.mockResolvedValueOnce({
@@ -384,8 +387,8 @@ describe('runCodingAgent', () => {
     });
     // edit_file reads content, then writes
     mockedMcpFetch
-      .mockResolvedValueOnce({ content: '<h1>Old</h1>\n<p>Text</p>' })
-      .mockResolvedValueOnce({ success: true, commit_url: 'https://github.com/test/commit/abc' });
+      .mockResolvedValueOnce({ content: '<><h1>Old</h1>\n<p>Text</p></>' })
+      .mockResolvedValueOnce({ success: true, commit_url: 'https://github.com/test/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' });
 
     // Iteration 3: check_deployment (last iteration)
     mockCreate.mockResolvedValueOnce({
@@ -395,7 +398,7 @@ describe('runCodingAgent', () => {
       stop_reason: 'tool_use'
     });
     mockedMcpFetch.mockResolvedValueOnce({
-      status: 'READY',
+      buildStatus: 'success',
       url: 'https://test-abc.vercel.app',
       preview_url: 'https://test-abc.vercel.app'
     });
@@ -624,6 +627,7 @@ describe('runCodingAgent', () => {
   });
 
   test('multi-iteration: read_file then edit_file then report_to_user', async () => {
+    mockedMcpFetch.mockResolvedValueOnce({ files: [] });
     // Iteration 1: LLM calls read_file
     mockCreate.mockResolvedValueOnce({
       content: [
@@ -635,7 +639,7 @@ describe('runCodingAgent', () => {
     // read_file mcpFetch returns file content
     mockedMcpFetch.mockResolvedValueOnce({
       path: 'app/page.tsx',
-      content: '<h1>Old Title</h1>\n<p>Some text</p>',
+      content: '<><h1>Old Title</h1>\n<p>Some text</p></>',
       sha: 'abc123'
     });
 
@@ -654,12 +658,12 @@ describe('runCodingAgent', () => {
     mockedMcpFetch
       .mockResolvedValueOnce({ // GET file content for edit
         path: 'app/page.tsx',
-        content: '<h1>Old Title</h1>\n<p>Some text</p>',
+        content: '<><h1>Old Title</h1>\n<p>Some text</p></>',
         sha: 'abc123'
       })
       .mockResolvedValueOnce({ // PUT github-edit
         success: true,
-        commit_url: 'https://github.com/test/repo/commit/def456',
+        commit_url: 'https://github.com/test/repo/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
         file_path: 'app/page.tsx',
         deployed_url: 'https://test.vercel.app'
       });
@@ -672,12 +676,17 @@ describe('runCodingAgent', () => {
       stop_reason: 'tool_use'
     });
 
+    mockCreate.mockResolvedValueOnce({ stop_reason: 'tool_use', content: [
+      { type: 'tool_use', id: 'verified', name: 'report_to_user', input: { status: 'success', message: 'New Title verified.' } }
+    ] });
+    mockedMcpFetch.mockResolvedValue({ buildStatus: 'success' });
+
     const result = await runCodingAgent('Change the heading to New Title', mockContext);
 
     expect(result.success).toBe(true);
     expect(result.message).toContain('New Title');
-    expect(result.iterations).toBe(3);
-    expect(mockCreate).toHaveBeenCalledTimes(3);
+    expect(result.iterations).toBe(4);
+    expect(mockCreate).toHaveBeenCalledTimes(4);
   });
 
   // --- edit_files (ENG-497): atomic multi-file commit ---
@@ -701,7 +710,7 @@ describe('runCodingAgent', () => {
       .mockResolvedValueOnce({ path: 'public/book-a-demo.html', content: '<h1>Old</h1>' })
       .mockResolvedValueOnce({
         success: true,
-        commit_url: 'https://github.com/test/repo/commit/abc123',
+        commit_url: 'https://github.com/test/repo/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
         deployed_url: 'https://test.vercel.app',
       });
 
@@ -712,10 +721,15 @@ describe('runCodingAgent', () => {
       stop_reason: 'tool_use'
     });
 
+    mockCreate.mockResolvedValueOnce({ stop_reason: 'tool_use', content: [
+      { type: 'tool_use', id: 'verified', name: 'report_to_user', input: { status: 'success', message: 'Verified.' } }
+    ] });
+    mockedMcpFetch.mockResolvedValue({ buildStatus: 'success' });
+
     const result = await runCodingAgent('Fix the demo page and remove the old route', mockContext);
 
     expect(result.success).toBe(true);
-    expect(mockedMcpFetch).toHaveBeenCalledTimes(3); // preflight + one read + ONE atomic write, not two writes
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(4); // preflight + one read + ONE atomic write, not two writes
     const putCall = mockedMcpFetch.mock.calls[2][0] as any;
     expect(putCall.method).toBe('PUT');
     expect(putCall.path).toBe(`/api/landing-pages/v0/generated/${mockContext.pageId}/update-files`);
@@ -723,7 +737,7 @@ describe('runCodingAgent', () => {
       { file_path: 'public/book-a-demo.html', content: '<h1>New</h1>' },
       { file_path: 'app/api/old-route/route.ts', deleted: true },
     ]);
-    expect(putCall.body.commit_message).toBe('Fix email capture + remove stale route');
+    expect(putCall.body.commit_message).toBe('Coding agent: update 2 file(s)');
     // Greptile: batch commits must be tracked for rollback the same way edit_file's are.
     expect(result.editedFiles).toEqual(
       expect.arrayContaining(['public/book-a-demo.html', 'app/api/old-route/route.ts'])
@@ -1081,9 +1095,14 @@ describe('runCodingAgent', () => {
     // Second tool call: PUT github-edit
     mockedMcpFetch.mockResolvedValueOnce({
       success: true,
-      commit_url: 'https://github.com/test/repo/commit/newsha',
+      commit_url: 'https://github.com/test/repo/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       deployed_url: 'https://test.vercel.app'
     });
+
+    mockCreate.mockResolvedValueOnce({ stop_reason: 'tool_use', content: [
+      { type: 'tool_use', id: 'verified', name: 'report_to_user', input: { status: 'success', message: 'Verified.' } }
+    ] });
+    mockedMcpFetch.mockResolvedValue({ buildStatus: 'success' });
 
     const result = await runCodingAgent('revert the file', mockContext);
 
@@ -1097,11 +1116,9 @@ describe('runCodingAgent', () => {
     // Verify github-edit was called with old content
     expect(mockedMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
       method: 'PUT',
-      path: expect.stringContaining('/github-edit'),
+      path: expect.stringContaining('/update-files'),
       body: expect.objectContaining({
-        file_path: 'app/page.tsx',
-        content: '<h1>Original Content</h1>',
-        commit_message: 'Revert to pre-edit state'
+        files: [{ file_path: 'app/page.tsx', content: '<h1>Original Content</h1>' }]
       })
     }));
   });
@@ -1308,7 +1325,7 @@ describe('runCodingAgent', () => {
         content: [
           { type: 'tool_use', id: 'tu_1', name: 'edit_file', input: {
             file_path: 'app/page.tsx',
-            line_edits: [{ start_line: 2, end_line: 3, new_content: '  return "universe";\n' }],
+            line_edits: [{ start_line: 2, end_line: 2, new_content: '  return "universe";\n' }],
             commit_message: 'Update return value'
           }}
         ],
@@ -1330,8 +1347,13 @@ describe('runCodingAgent', () => {
     // PUT github-edit
     mockedMcpFetch.mockResolvedValueOnce({
       success: true,
-      commit_url: 'https://github.com/test/repo/commit/abc',
+      commit_url: 'https://github.com/test/repo/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     });
+
+    mockCreate.mockResolvedValueOnce({ stop_reason: 'tool_use', content: [
+      { type: 'tool_use', id: 'verified', name: 'report_to_user', input: { status: 'success', message: 'Verified.' } }
+    ] });
+    mockedMcpFetch.mockResolvedValue({ buildStatus: 'success' });
 
     const result = await runCodingAgent('edit with line numbers', mockContext);
     expect(result.success).toBe(true);
@@ -1339,8 +1361,8 @@ describe('runCodingAgent', () => {
     // Verify the PUT was called with the line-edited content
     const putCall = mockedMcpFetch.mock.calls.find(call => call[0]?.method === 'PUT');
     expect(putCall).toBeDefined();
-    expect((putCall![0] as any).body.content).toContain('universe');
-    expect((putCall![0] as any).body.content).not.toContain('"world"');
+    expect((putCall![0] as any).body.files[0].content).toContain('universe');
+    expect((putCall![0] as any).body.files[0].content).not.toContain('"world"');
   });
 
   test('edit_file with search/replace still works (backward compat)', async () => {
@@ -1363,7 +1385,7 @@ describe('runCodingAgent', () => {
       });
 
     mockedMcpFetch.mockResolvedValueOnce({ content: '<h1>Old</h1>\n<p>Text</p>' });
-    mockedMcpFetch.mockResolvedValueOnce({ success: true, commit_url: 'https://github.com/test/repo/commit/xyz' });
+    mockedMcpFetch.mockResolvedValueOnce({ success: true, commit_url: 'https://github.com/test/repo/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' });
 
     const result = await runCodingAgent('edit with search/replace', mockContext);
     expect(result.success).toBe(true);
@@ -1685,7 +1707,7 @@ describe('ENG-1451 — coding-agent OpenRouter gateway contract', () => {
     await runCodingAgent('change the heading', context);
 
     expect(gatewayCreate.mock.calls[0][0]).toEqual(expect.objectContaining({
-      provider: { allow_fallbacks: true, require_parameters: true },
+      provider: { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true },
       plugins: [{ id: 'context-compression' }],
       fallbacks: [{ model: 'deepseek/deepseek-v4-flash' }],
       session_id: context.sessionId,
@@ -1981,8 +2003,8 @@ describe('runCodingAgent — scope enforcement', () => {
     });
     // edit_file: GET current content, then PUT
     mockedMcpFetch
-      .mockResolvedValueOnce({ content: '<button>' })
-      .mockResolvedValueOnce({ success: true, is_staging: true, commit_url: 'https://github.com/x/commit/abc' });
+      .mockResolvedValueOnce({ content: '<button>Submit</button>' })
+      .mockResolvedValueOnce({ success: true, is_staging: true, commit_url: 'https://github.com/x/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' });
     mockCreate.mockResolvedValueOnce({
       content: [
         { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Aligned the submit button.', status: 'success' } }
@@ -1990,12 +2012,17 @@ describe('runCodingAgent — scope enforcement', () => {
       stop_reason: 'tool_use'
     });
 
+    mockCreate.mockResolvedValueOnce({ stop_reason: 'tool_use', content: [
+      { type: 'tool_use', id: 'verified', name: 'report_to_user', input: { status: 'success', message: 'Verified.' } }
+    ] });
+    mockedMcpFetch.mockResolvedValue({ buildStatus: 'success' });
+
     const result = await runCodingAgent('align the series A submit button', scopedContext);
 
     expect(result.success).toBe(true);
     const putCalls = mockedMcpFetch.mock.calls.filter(c => c[0]?.method === 'PUT');
     expect(putCalls).toHaveLength(1);
-    expect((putCalls[0][0] as any).body.file_path).toBe('app/other-page/_components/lead-capture-form.tsx');
+    expect((putCalls[0][0] as any).body.files[0].file_path).toBe('app/other-page/_components/lead-capture-form.tsx');
   });
 
   test('allows an edit inside the page\'s own directory', async () => {
@@ -2014,7 +2041,7 @@ describe('runCodingAgent — scope enforcement', () => {
     // edit_file: GET current content, then PUT
     mockedMcpFetch
       .mockResolvedValueOnce({ content: '<img src="placeholder" />' })
-      .mockResolvedValueOnce({ success: true, is_staging: true, commit_url: 'https://github.com/x/commit/abc' });
+      .mockResolvedValueOnce({ success: true, is_staging: true, commit_url: 'https://github.com/x/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' });
     mockCreate.mockResolvedValueOnce({
       content: [
         { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Logo updated.', status: 'success' } }
@@ -2022,12 +2049,17 @@ describe('runCodingAgent — scope enforcement', () => {
       stop_reason: 'tool_use'
     });
 
+    mockCreate.mockResolvedValueOnce({ stop_reason: 'tool_use', content: [
+      { type: 'tool_use', id: 'verified', name: 'report_to_user', input: { status: 'success', message: 'Verified.' } }
+    ] });
+    mockedMcpFetch.mockResolvedValue({ buildStatus: 'success' });
+
     const result = await runCodingAgent('replace the placeholder logo', scopedContext);
 
     expect(result.success).toBe(true);
     const putCalls = mockedMcpFetch.mock.calls.filter(c => c[0]?.method === 'PUT');
     expect(putCalls).toHaveLength(1);
-    expect((putCalls[0][0] as any).body.file_path).toBe('app/my-page/_components/landing/TrustBar.tsx');
+    expect((putCalls[0][0] as any).body.files[0].file_path).toBe('app/my-page/_components/landing/TrustBar.tsx');
   });
 
   test('blocks a write that escapes the repo via parent traversal', async () => {
@@ -2111,11 +2143,16 @@ describe('runCodingAgent — scope enforcement', () => {
     });
     mockedMcpFetch
       .mockResolvedValueOnce({ content: 'a' })
-      .mockResolvedValueOnce({ success: true, is_staging: true });
+      .mockResolvedValueOnce({ success: true, is_staging: true, commit_url: 'https://github.com/o/r/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' });
     mockCreate.mockResolvedValueOnce({
       content: [{ type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'done', status: 'success' } }],
       stop_reason: 'tool_use'
     });
+
+    mockCreate.mockResolvedValueOnce({ stop_reason: 'tool_use', content: [
+      { type: 'tool_use', id: 'verified', name: 'report_to_user', input: { status: 'success', message: 'Verified.' } }
+    ] });
+    mockedMcpFetch.mockResolvedValue({ buildStatus: 'success' });
 
     const result = await runCodingAgent('edit anything', scopedContext);
 
@@ -2512,7 +2549,7 @@ describe('_rollbackEditedFiles (Greptile: new files must be deleted, not "revert
   test('succeeds normally when the file existed at the base commit (real content to revert to)', async () => {
     mockedMcpFetch
       .mockResolvedValueOnce({ content: '<h1>Old</h1>' }) // file-at-commit: existed
-      .mockResolvedValueOnce({ success: true, commit_url: 'https://github.com/test/repo/commit/abc' }); // github-edit write
+      .mockResolvedValueOnce({ success: true, commit_url: 'https://github.com/test/repo/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }); // github-edit write
 
     const result = await _rollbackEditedFiles({
       context: rollbackContext,
@@ -2590,7 +2627,7 @@ describe('_rollbackEditedFiles (Greptile: new files must be deleted, not "revert
   test('Greptile: a file that legitimately existed with EMPTY content at the base commit is restored, NOT deleted', async () => {
     mockedMcpFetch
       .mockResolvedValueOnce({ path: 'app/empty.css', content: '', sha: 'sha1' }) // file-at-commit: real, just empty
-      .mockResolvedValueOnce({ success: true, commit_url: 'https://github.com/test/repo/commit/def' }); // github-edit restore
+      .mockResolvedValueOnce({ success: true, commit_url: 'https://github.com/test/repo/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }); // github-edit restore
 
     const result = await _rollbackEditedFiles({
       context: rollbackContext,
@@ -2601,7 +2638,20 @@ describe('_rollbackEditedFiles (Greptile: new files must be deleted, not "revert
     expect(result.status).toBe('succeeded');
     // Second call must be the normal restore-content write, NOT a delete.
     const secondCall = mockedMcpFetch.mock.calls[1][0] as any;
-    expect(secondCall.path).toBe('/api/landing-pages/v0/generated/test-page-123/github-edit');
-    expect(secondCall.body.content).toBe('');
+    expect(secondCall.path).toBe('/api/landing-pages/v0/generated/test-page-123/update-files');
+    expect(secondCall.body.files).toEqual([{ file_path: 'app/empty.css', content: '' }]);
+  });
+});
+
+describe('_previewBranchDivergence', () => {
+  const repoBase = 'https://api.github.com/repos/AgentWebPro/lp-example';
+  beforeEach(() => { mockedAxios.get.mockReset(); });
+  test('reports behind_by so a stale draft is detected', async () => {
+    mockedAxios.get.mockResolvedValueOnce({ data: { ahead_by: 20, behind_by: 11 } } as any);
+    await expect(_previewBranchDivergence(repoBase, {})).resolves.toEqual({ aheadBy: 20, behindBy: 11 });
+  });
+  test('returns null on error', async () => {
+    mockedAxios.get.mockRejectedValueOnce(new Error('boom'));
+    await expect(_previewBranchDivergence(repoBase, {})).resolves.toBeNull();
   });
 });

@@ -1,3 +1,6 @@
+import { requireActiveEvaluation } from './services/evaluationPolicy';
+import { evaluationSocketDecision } from './utils/socketEvaluationAuth';
+import { installSandboxMetaInterceptorAtBoot } from './services/sandbox/bootstrap';
 import app from './app';
 import { isCronEnabled, disableCron, shouldBootstrapBackgroundJobs } from './utils/instanceState';
 import { cronJobRegistry } from './utils/cronJobRegistry';
@@ -6,6 +9,7 @@ import { agentModeService } from './services/agentModeService';
 import { generateMarketingResponseWorkerService } from './services/generateMarketingResponseWorkerService';
 import dotenv from 'dotenv';
 import { getJwtSecret, assertJwtSecretAtBoot } from './config/jwt';
+import { logServiceSecretResolutionAtBoot } from './middleware/serviceAuth';
 import bcrypt from 'bcryptjs';
 import http from 'http';
 import { Server, Socket } from 'socket.io';
@@ -20,6 +24,7 @@ import {
   sendTextTurn,
   closeLiveSession,
   hasLiveSession,
+  drainLiveVoiceToolExecutions,
 } from './services/liveVoiceService';
 import {
   getEffectiveLiveUserId,
@@ -44,6 +49,11 @@ registerFathomLinearPort(createFathomLinearPort());
 // letting tokens be signed/verified with a fallback secret or erroring on first request.
 assertJwtSecretAtBoot();
 
+// Best-effort visibility only (ENG-1754 AC3) — never blocks/delays binding the port.
+logServiceSecretResolutionAtBoot().catch((err) =>
+  console.error('[serviceAuth] boot-time secret resolution check failed:', err)
+);
+
 const port = process.env.PORT || 3001;
 const server = http.createServer(app);
 
@@ -58,9 +68,23 @@ const io = new Server(server, {
         'http://localhost:5174',
         process.env.FRONTEND_URL || 'http://localhost:5173',
         process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174',
-        /^https:\/\/[a-zA-Z0-9\-]+\.ngrok-free\.app$/, // Allow any ngrok-free.app subdomain
-        /^https:\/\/[a-zA-Z0-9\-]+\.ngrok\.io$/, // Allow any ngrok.io subdomain
       ];
+
+      // Same fail-closed production gate as the HTTP CORS config in app.ts
+      // (ENG-1751): ngrok tunnels are a local-dev convenience and must not be
+      // a credentialed origin in production. `NODE_ENV !== 'production'` was
+      // fail-open (no tracked EB config sets NODE_ENV=production explicitly);
+      // require an explicit NODE_ENV=development or the CORS_ALLOW_NGROK=1
+      // opt-in instead.
+      if (
+        process.env.NODE_ENV === 'development' ||
+        process.env.CORS_ALLOW_NGROK === '1'
+      ) {
+        allowedOrigins.push(
+          /^https:\/\/[a-zA-Z0-9\-]+\.ngrok-free\.app$/, // Allow any ngrok-free.app subdomain
+          /^https:\/\/[a-zA-Z0-9\-]+\.ngrok\.io$/ // Allow any ngrok.io subdomain
+        );
+      }
 
       if (!origin) return callback(null, true);
 
@@ -100,10 +124,24 @@ io.use(async (socket, next) => {
     try {
       const decoded = jwt.verify(token, getJwtSecret()) as {
         userId?: string;
+        email?: string;
         sv?: number;
+        dte?: number;
         delegateAccess?: unknown;
         _svc?: boolean;
+        isAdmin?: boolean;
       };
+
+      // Sandbox principals stream Emma over this socket like any customer, on the
+      // same policy check as the HTTP layer; the primary record is read by email
+      // because a just-provisioned account may not be in the userId GSI yet.
+      const evaluationDecision = await evaluationSocketDecision(decoded, requireActiveEvaluation,
+        async claims => (typeof claims.email === 'string' ? userDb.getUserByEmailConsistent(claims.email) : null));
+      if (evaluationDecision === 'deny') return next(new Error('Authentication error'));
+      if (evaluationDecision === 'allow') {
+        socket.data.user = decoded;
+        return next();
+      }
 
       // Enforce session versioning for normal user tokens so a password change
       // disconnects other devices' sockets too. Delegate/service tokens are
@@ -260,13 +298,21 @@ io.on('connection', (socket: Socket) => {
   });
 
   // Handle chat messages
+  //
+  // ENG-1189: this Emma-chatbot turn runs in-process (no fork) and can
+  // dispatch MCP tools (including manage_scheduled_chat) via
+  // agentModeService.executeTool, but — unlike the Agent Mode /generate
+  // family — it was never tracked as in-flight work, so runDrain()'s wait
+  // below wouldn't hold the listener open for it. cronJobRegistry.track() is
+  // a drop-in wrap (untouched resolution/rejection), so this is a pure
+  // addition, not a behavior change.
   socket.on('message', (data: {
     sessionId: string;
     message: string;
     currentUrl?: string;
     pageContent?: string;
     portal?: 'customer' | 'partner';
-  }) => handleSocketChatMessage(socket, data));
+  }) => cronJobRegistry.track('chatbotTurn', handleSocketChatMessage(socket, data)));
 
   // Implement automatic reconnection
   socket.on('reconnect_attempt', () => {
@@ -362,7 +408,49 @@ const runDrain = async (reason: string): Promise<void> => {
     // ignore — scheduler may not have started
   }
 
-  // 3. Stop accepting new HTTP connections
+  // 3. Drain the LLM worker (scheduled chats / EMMA runs), every other
+  //    in-flight cron job (LinkedIn sync, drip worker, meta token refresh,
+  //    etc. — see cronJobRegistry), in-flight interactive Agent Mode turns,
+  //    AND in-flight Gemini Live Voice tool calls, concurrently, up to the
+  //    same ceiling, so the total wait is the max of the four rather than
+  //    their sum.
+  //
+  //    This MUST run BEFORE the HTTP listener closes below (ENG-1189): every
+  //    one of these self-calls back into THIS process via mcpFetch's
+  //    http://localhost:${PORT} — the marketing-response worker is a forked
+  //    child process that inherits the same PORT, and an interactive turn's
+  //    (or a live-voice tool call's) tool calls run right here. Closing the
+  //    listener first (as this used to do) meant any of that in-flight
+  //    work's self-calls failed with an unrecoverable "fetch failed" for the
+  //    rest of the process's life — not a transient blip, since
+  //    server.close() refuses every new loopback connection a retry would
+  //    need, no matter how long the retry waits.
+  const { drainActiveSessionGenerations } = await import('./controllers/agentModeController');
+  const [, cronDrain, sessionDrain, liveVoiceDrain] = await Promise.all([
+    generateMarketingResponseWorkerService.shutdown(),
+    cronJobRegistry.drain(),
+    drainActiveSessionGenerations(),
+    drainLiveVoiceToolExecutions(),
+  ]);
+  if (!cronDrain.drained) {
+    console.warn(
+      `[gracefulShutdown] Cron drain ceiling reached — ${cronDrain.stuckCount} job(s) still in-flight:`,
+      cronDrain.stuckJobs
+    );
+  }
+  if (!sessionDrain.drained) {
+    console.warn(
+      `[gracefulShutdown] Interactive session drain ceiling reached — ${sessionDrain.stuckCount} turn(s) still in-flight`
+    );
+  }
+  if (!liveVoiceDrain.drained) {
+    console.warn(
+      `[gracefulShutdown] Live voice tool-call drain ceiling reached — ${liveVoiceDrain.stuckCount} call(s) still in-flight`
+    );
+  }
+
+  // 4. Stop accepting new HTTP connections — safe now that in-flight
+  //    self-calls above have had their chance to complete.
   server.close((err) => {
     if (err) {
       console.error('Error closing HTTP server:', err);
@@ -371,7 +459,7 @@ const runDrain = async (reason: string): Promise<void> => {
     }
   });
 
-  // 4. Disconnect all Socket.IO clients (they auto-reconnect to the new instance)
+  // 5. Disconnect all Socket.IO clients (they auto-reconnect to the new instance)
   io.close((err) => {
     if (err) {
       console.error('Error closing Socket.IO:', err);
@@ -379,21 +467,6 @@ const runDrain = async (reason: string): Promise<void> => {
       console.log('Socket.IO connections closed');
     }
   });
-
-  // 5. Drain the LLM worker (scheduled chats / EMMA runs) and every other
-  //    in-flight cron job (LinkedIn sync, drip worker, meta token refresh,
-  //    etc. — see cronJobRegistry) concurrently, up to the same ceiling, so
-  //    the total wait is the max of the two rather than their sum.
-  const [, cronDrain] = await Promise.all([
-    generateMarketingResponseWorkerService.shutdown(),
-    cronJobRegistry.drain(),
-  ]);
-  if (!cronDrain.drained) {
-    console.warn(
-      `[gracefulShutdown] Cron drain ceiling reached — ${cronDrain.stuckCount} job(s) still in-flight:`,
-      cronDrain.stuckJobs
-    );
-  }
 
   // 6. Close parent MCP clients after the drain (child has its own MCP instance)
   await agentModeService.shutdown();
@@ -446,6 +519,31 @@ createTestAccount().then(async () => {
     console.log('Apollo service initialized');
   } catch (err) {
     console.warn('Apollo service not initialized — Apollo specialists will be inert:', (err as Error).message);
+  }
+
+  // Load the Okareo trace-exporter key from Secrets Manager (ENG-2070). It was an
+  // 856-char EB env var that pushed the env past CloudFormation's 4096-char
+  // limit. An explicit OKAREO_API_KEY env still wins; a missing secret leaves
+  // the Okareo exporter off, exactly as before (config gating, not a crash).
+  if (!process.env.OKAREO_API_KEY) {
+    try {
+      const { getOkareoApiKey } = await import('./utils/secretsManager');
+      process.env.OKAREO_API_KEY = await getOkareoApiKey();
+      console.log('Okareo API key loaded from Secrets Manager');
+    } catch (err) {
+      console.warn('Okareo API key not loaded — Okareo trace export disabled:', (err as Error).message);
+    }
+  }
+
+  // Initialize Enigma card-revenue lookups (ENG-1388). Defensive like Apollo —
+  // without the Secrets Manager key getEnigmaService() stays null and nothing
+  // calls Enigma.
+  try {
+    const { initEnigmaServiceFromEnv } = await import('./services/enigmaServiceFactory');
+    await initEnigmaServiceFromEnv();
+    console.log('Enigma service initialized');
+  } catch (err) {
+    console.warn('Enigma service not initialized — card-revenue lookups disabled:', (err as Error).message);
   }
 
   // Initialize Unipile LinkedIn-profile cache wrapper (cache-first reads of
@@ -506,6 +604,19 @@ createTestAccount().then(async () => {
       return;
     }
 
+    // ENG-1908: install the sandbox Meta interceptor once, here, in every real runtime
+    // (dev/staging/prod) but never under the Jest test-boot path above — same reasoning as
+    // the ENG-1286 guard: metaInterceptor.test.ts manages its own install/uninstall lifecycle
+    // against the same module-level singleton, and this call is synchronous with no timer or
+    // dynamic import, so it carries none of the risk that guard exists for; it just needs to
+    // stay on this side of the same line so it doesn't fire during an incidental test boot.
+    try {
+      installSandboxMetaInterceptorAtBoot();
+      console.log('[server] Sandbox Meta interceptor installed');
+    } catch (error) {
+      console.error('[server] Failed to install sandbox Meta interceptor:', (error as Error).message);
+    }
+
     // ENG-764: an EB deploy terminates this instance without waiting for the
     // drain, killing any in-flight scheduled run. Watch for the ASG's termination
     // signal, drain first, then release the instance. Self-disables off-ASG (local
@@ -534,7 +645,18 @@ createTestAccount().then(async () => {
     console.log('Initializing Agent Mode Tools (non-blocking)...');
     agentModeService.initialize()
       .then(() => {
-        console.log('Agent Mode Tools initialized successfully');
+        // initialize() resolves even when a step failed — every step swallows its own
+        // errors — so this must report the actual outcome. Logging unconditional success
+        // directly beneath the latch's own failure line is how a degraded boot reads as a
+        // healthy one, which cost real debugging time on ENG-1852.
+        if (agentModeService.isInitialized) {
+          console.log('Agent Mode Tools initialized successfully');
+        } else {
+          console.error(
+            'Agent Mode Tools initialization DEGRADED — a later request will retry. ' +
+            'See the AgentMode latch error above for which step failed.',
+          );
+        }
         // Pre-start the worker process so MCP servers are ready before the first chat message
         console.log('Pre-starting worker process...');
         generateMarketingResponseWorkerService.ensureWorkerReady()
@@ -610,11 +732,85 @@ createTestAccount().then(async () => {
         console.error('[ActivationCron] Failed to initialize:', error);
       }
 
+      // ENG-1839: Domain reachability sweep — records whether managed domains actually serve.
+      // Three landing pages sat unreachable while every record read healthy, one of them
+      // unreported for months, because nothing ever asked whether the site loads.
+      try {
+        const { runDomainReachabilitySweep, REACHABILITY_INTERVAL_MS } =
+          await import('./cron/domainReachabilityCron');
+
+        /*
+         * DAILY at a fixed UTC time, not hourly-from-boot.
+         *
+         * Hourly meant we made an unsolicited HTTPS request to every customer's domain 24
+         * times a day. That is traffic they did not ask for, against their origin, and a WAF
+         * or bot-protection layer is entitled to start refusing it — at which point we would
+         * confidently report a working site as unreachable. Daily is enough: these are static
+         * landing pages, and the failure this watches for (a certificate that can never be
+         * issued) does not come and go.
+         *
+         * Fixed clock time rather than boot+offset, matching every other cron here. Under
+         * boot-relative scheduling the schedule reshuffles on every deploy, so "hourly" really
+         * meant "whenever this instance happened to start, then every hour after that" — which
+         * is neither predictable nor reproducible when reading the timestamps back.
+         */
+        const nowForReach = new Date();
+        const nextReachRun = new Date(nowForReach);
+        nextReachRun.setUTCHours(6, 15, 0, 0);
+        if (nextReachRun <= nowForReach) {
+          nextReachRun.setUTCDate(nextReachRun.getUTCDate() + 1);
+        }
+        const msUntilReach = nextReachRun.getTime() - nowForReach.getTime();
+
+        console.log(
+          `[DomainReachability] Initialized — first sweep at 06:15 UTC (in ${Math.round(msUntilReach / 60000)} min), then daily`,
+        );
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('DomainReachabilitySweep', runDomainReachabilitySweep())
+            .catch(e => console.error('[DomainReachability] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('DomainReachabilitySweep', runDomainReachabilitySweep())
+              .catch(e => console.error('[DomainReachability] Error:', e));
+          }, REACHABILITY_INTERVAL_MS);
+        }, msUntilReach);
+      } catch (error) {
+        console.error('[DomainReachability] Failed to initialize:', error);
+      }
+
+
+      // ENG-1967: one bounded due-record page per tick. Registry drains in-flight work at shutdown.
+      const { runAdsLearningEvaluation } = await import('./cron/adsLearningCron');
+      setInterval(() => {
+        if (!isCronEnabled()) return;
+        cronJobRegistry.track('AdsLearningEvaluation', runAdsLearningEvaluation())
+          .catch(e => console.error('[AdsLearning] due evaluation failed:', e));
+      }, 15 * 60 * 1000).unref();
+      console.info('[AdsLearning] evaluation scheduled every 15 minutes');
+
+      // ENG-1644 gap-closing: sweep AW-ApprovalDecisions for decisions past
+      // expiresAt that nobody ever answered — flip to 'expired', notify the
+      // origin session. Hourly — decisions expire on a 1-30 day horizon
+      // (review fix: was "1-7 day", stale relative to emma/tools.ts's own
+      // MAX_EXPIRES_IN_DAYS=30 clamp added earlier in this same PR).
+      // Own try/catch (review fix) — an import failure here must not abort
+      // registration of every cron block after it in this boot sequence.
+      try {
+        const { runApprovalExpirySweep } = await import('./cron/approvalExpirySweepCron');
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('ApprovalExpirySweep', runApprovalExpirySweep())
+            .catch(e => console.error('[ApprovalExpirySweep] sweep failed:', e));
+        }, 60 * 60 * 1000).unref();
+        console.info('[ApprovalExpirySweep] sweep scheduled hourly');
+      } catch (error) {
+        console.error('[ApprovalExpirySweep] Failed to initialize:', error);
+      }
 
       // ENG-916: Meta Ads Metrics Snapshot — runs daily at 09:00 UTC (after
-      // ActivationCron at 08:00), re-pulling the last SETTLING_WINDOW_DAYS days each run
-      // (28, sized against Meta's documented insights-mutability window) so a stored row
-      // doesn't freeze while Meta is still revising it.
+      // ActivationCron at 08:00), re-pulling the last 30 dates each run so the
+      // final refresh occurs after reporting-day end plus 28 elapsed days.
       try {
         const METRICS_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
         const { runMetaMetricsSnapshot } = await import('./cron/metaMetricsSnapshotCron');
@@ -814,7 +1010,9 @@ createTestAccount().then(async () => {
       // is a trust break (ThinkingAI, TransAmerica — Aug 2026 audit, both caught
       // manually). Flags active-subscription users renewing within the lookahead
       // window whose ad integration is missing/expired via a deduped oncall alert.
-      try {
+      // Disabled by default: per-customer "Renewal at risk" oncall emails were flooding the team inbox.
+      // Opt back in with RENEWAL_HEALTH_ALERTS_ENABLED=true. The read-only admin evaluation route is unaffected.
+      if (process.env.RENEWAL_HEALTH_ALERTS_ENABLED === 'true') try {
         const { runRenewalIntegrationHealthCheck } = await import('./cron/renewalIntegrationHealthCron');
         const RENEWAL_HEALTH_INTERVAL_MS = 24 * 60 * 60 * 1000;
         cronJobRegistry.track('renewalIntegrationHealthCron', runRenewalIntegrationHealthCheck())
@@ -827,6 +1025,42 @@ createTestAccount().then(async () => {
         console.log('[renewalIntegrationHealthCron] Initialized — running daily');
       } catch (error) {
         console.error('[renewalIntegrationHealthCron] Failed to initialize:', error);
+      }
+
+      // Account-health classifier sweep (ENG-2143), the replacement for the renewal cron above:
+      // at-risk → deduped oncall, activation incomplete → CS nudge digest email. Off unless
+      // ACCOUNT_HEALTH_ALERTS_ENABLED=true (enabling it in prod is an OPS step).
+      if (process.env.ACCOUNT_HEALTH_ALERTS_ENABLED === 'true') try {
+        const { runAccountHealthClassifier } = await import('./cron/accountHealthClassifierCron');
+        const ACCOUNT_HEALTH_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        cronJobRegistry.track('accountHealthClassifierCron', runAccountHealthClassifier())
+          .catch(e => console.error('[accountHealthClassifierCron] Error on first run:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('accountHealthClassifierCron', runAccountHealthClassifier())
+            .catch(e => console.error('[accountHealthClassifierCron] Error:', e));
+        }, ACCOUNT_HEALTH_INTERVAL_MS);
+        console.log('[accountHealthClassifierCron] Initialized — running daily');
+      } catch (error) {
+        console.error('[accountHealthClassifierCron] Failed to initialize:', error);
+      }
+
+      // Weekly creative calibration batch (ENG-2142): ~20 creative pairs as pairwise golden cases
+      // and one Slack link. Checked daily; each ISO week's batch is written once across instances.
+      // Off unless CREATIVE_CALIBRATION_ENABLED=true (enabling it in prod is an OPS step).
+      if (process.env.CREATIVE_CALIBRATION_ENABLED === 'true') try {
+        const { runCreativeCalibration } = await import('./cron/creativeCalibrationCron');
+        const CREATIVE_CALIBRATION_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        cronJobRegistry.track('creativeCalibrationCron', runCreativeCalibration())
+          .catch(e => console.error('[creativeCalibrationCron] Error on first run:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('creativeCalibrationCron', runCreativeCalibration())
+            .catch(e => console.error('[creativeCalibrationCron] Error:', e));
+        }, CREATIVE_CALIBRATION_INTERVAL_MS);
+        console.log('[creativeCalibrationCron] Initialized — checking daily for the weekly batch');
+      } catch (error) {
+        console.error('[creativeCalibrationCron] Failed to initialize:', error);
       }
 
       // CRM Auto-Enrichment (ENG-88) — runs every 15 minutes.
@@ -1164,6 +1398,66 @@ createTestAccount().then(async () => {
         }
       } else {
         console.log('[AgentReliabilitySnapshot] Disabled (AGENT_RELIABILITY_SNAPSHOT_ENABLED=false)');
+      }
+
+      // Online eval sampler (ENG-2144) — daily at 17:15 UTC: a seeded uniform random sample of the
+      // previous day's completed sessions, graded by the deterministic ENG-2137 graders into
+      // Dev-AW-LoopEvents (loopId eval-v2), plus the eval-v2-daily snapshots. Off unless
+      // EVAL_V2_SAMPLER_ENABLED=true (enabling it in prod is OPS-7, ENG-2152); the run itself
+      // refuses to write without the flag. No grader is validated, so it raises no alert.
+      if (process.env.EVAL_V2_SAMPLER_ENABLED === 'true') {
+        try {
+          const EVAL_V2_INTERVAL_MS = 24 * 60 * 60 * 1000;
+          const { runEvalV2SamplerCron } = await import('./cron/evalV2SamplerCron');
+          const nowForEvalV2 = new Date();
+          const nextEvalV2Run = new Date(nowForEvalV2);
+          nextEvalV2Run.setUTCHours(17, 15, 0, 0);
+          if (nextEvalV2Run <= nowForEvalV2) {
+            nextEvalV2Run.setUTCDate(nextEvalV2Run.getUTCDate() + 1);
+          }
+          const msUntilEvalV2 = nextEvalV2Run.getTime() - nowForEvalV2.getTime();
+          console.log(
+            `[EvalV2Sampler] Initialized — first run at 17:15 UTC (in ${Math.round(msUntilEvalV2 / 60000)} min)`,
+          );
+          setTimeout(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('EvalV2Sampler', runEvalV2SamplerCron())
+              .catch(e => console.error('[EvalV2Sampler] Error:', e));
+            setInterval(() => {
+              if (!isCronEnabled()) return;
+              cronJobRegistry.track('EvalV2Sampler', runEvalV2SamplerCron())
+                .catch(e => console.error('[EvalV2Sampler] Error:', e));
+            }, EVAL_V2_INTERVAL_MS);
+          }, msUntilEvalV2);
+        } catch (error) {
+          console.error('[EvalV2Sampler] Failed to initialize:', error);
+        }
+      }
+
+      // Nightly failure replay (ENG-591 AC2, ENG-2145) — 04:30 UTC: the registered replay cases
+      // against current code; a regression is filed once through the ENG-240 intake. Off unless
+      // FAILURE_REPLAY_NIGHTLY_ENABLED=true.
+      try {
+        const { scheduleFailureReplayNightly } = await import('./cron/failureReplayNightlyCron');
+        scheduleFailureReplayNightly({
+          isCronEnabled,
+          track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
+        });
+      } catch (error) {
+        console.error('[FailureReplayNightly] Failed to initialize:', error);
+      }
+
+      // Offline eval suite on "needs eval" markers (ENG-2195) — hourly: when prompt/model/skill
+      // markers appeared since the last run, run the deterministic suite and record the verdict in
+      // Dev-AW-LoopEvents. Off unless EVAL_MARKER_SUITE_ENABLED=true.
+      try {
+        const { scheduleEvalMarkerSuite } = await import('./cron/evalMarkerSuiteCron');
+        scheduleEvalMarkerSuite({
+          isCronEnabled,
+          track: (jobName, promise) => cronJobRegistry.track(jobName, promise),
+        });
+      } catch (error) {
+        console.error('[EvalMarkerSuite] Failed to initialize:', error);
       }
 
       // Weekly Engineering Scoreboard — read-only backend replacement for the

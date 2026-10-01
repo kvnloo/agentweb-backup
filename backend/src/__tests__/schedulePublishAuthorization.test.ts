@@ -497,6 +497,144 @@ describe('isPublishCallWithinAuthorizedScope (ENG-1045)', () => {
 });
 
 /**
+ * ENG-1599 — the reverse of ENG-1045's gap. Session 90ad8838 (2026-08-26,
+ * "Harsha Daily X Post (Autonomous)", schedule 1d001fba-0fb7-4bcd-80f6-6041b244a442):
+ * the schedule's only authorized/required publish tool was `twitter_manage_post`,
+ * but the task was a single standalone tweet — the ONE outcome `twitter_manage_post`
+ * structurally cannot express (post_thread hard-refuses under 2 tweets; see
+ * agentModeService.ts's 'post-thread' handler). The model correctly reached for
+ * post_on_connected_account instead and was refused: "The owner authorized only:
+ * twitter_manage_post." A grant that already permits autonomous threads, replies,
+ * quote-tweets and retweets under the owner's identity necessarily covers the
+ * strictly narrower act of posting one new tweet, so the equivalence route needs
+ * to run in this direction too.
+ */
+describe('isPublishCallWithinAuthorizedScope (ENG-1599)', () => {
+  it('authorizes a standalone tweet via post_on_connected_account when only twitter_manage_post was granted', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope('post_on_connected_account', { platform: 'twitter' }, ['twitter_manage_post'])
+    ).toBe(true);
+  });
+
+  it('does NOT widen the grant to other platforms post_on_connected_account also supports', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope('post_on_connected_account', { platform: 'linkedin' }, ['twitter_manage_post'])
+    ).toBe(false);
+  });
+
+  // Not `tools: []` — an empty grant short-circuits `tools.some(...)` trivially,
+  // before EQUIVALENT_PUBLISH_ROUTES is ever consulted, so it passes regardless of
+  // whether the route logic below is correct. A non-empty grant naming a tool with
+  // no route to post_on_connected_account actually exercises that logic.
+  it('does NOT authorize post_on_connected_account for a grant naming an unrelated tool with no route to it', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope('post_on_connected_account', { platform: 'twitter' }, ['publish_blog_article'])
+    ).toBe(false);
+  });
+});
+
+/**
+ * ENG-1599 review (security) — `postOnConnectedAccount` (agentModeService.ts) resolves
+ * the account to post to by `account_id` FIRST and ignores `platform` entirely whenever
+ * `account_id` is present. Trusting `args.platform` here regardless would let a call that
+ * names a mismatched (e.g. non-twitter) `account_id` alongside `platform: 'twitter'` pass
+ * a twitter-only grant and actually publish to that account_id's real, unauthorized
+ * platform.
+ */
+describe('isPublishCallWithinAuthorizedScope — fails closed when account_id is present (ENG-1599 review)', () => {
+  it('does NOT authorize a call naming account_id even with a matching platform claim', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope(
+        'post_on_connected_account',
+        { platform: 'twitter', account_id: 'some-account-id' },
+        ['twitter_manage_post']
+      )
+    ).toBe(false);
+  });
+
+  it('still authorizes on platform alone when no account_id is given', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope('post_on_connected_account', { platform: 'twitter' }, ['twitter_manage_post'])
+    ).toBe(true);
+  });
+});
+
+/**
+ * ENG-1616 — `list_connected_accounts` pairs every account_id with its platform and
+ * the model is meant to use account_id once it knows it, so a call like
+ * `post_on_connected_account(account_id: '1340767380')` is a plausible shape for the
+ * ENG-1599 reverse route — but prior to this change, the route's platform check was
+ * hard-wired to fail whenever account_id was present, regardless of correctness. The
+ * caller can now pass the account_id's independently-verified platform (read from
+ * storage, not attacker-controlled) to unlock the same route safely.
+ *
+ * This is a proactive close of a logic gap, not a reproduction of an observed
+ * production failure — no account_id-shaped call has been seen hitting this refusal
+ * in production. (Session 672b3af7 on schedule 1d001fba-0fb7-4bcd-80f6-6041b244a442,
+ * 2026-08-27, is the incident ENG-1616 was filed from, but its actual blocked call
+ * passed `platform`, not `account_id`, and ran hours BEFORE ENG-1599 merged that same
+ * day — so it never exercised this route at all, in either its pre- or post-fix form.
+ * ENG-1599's own platform-only route already covers that call once ENG-1599 is live.)
+ */
+describe('isPublishCallWithinAuthorizedScope — resolved account platform (ENG-1616)', () => {
+  it('authorizes a standalone tweet by account_id once the caller has verified it is the connected Twitter account', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope(
+        'post_on_connected_account',
+        { account_id: '1340767380' },
+        ['twitter_manage_post'],
+        'twitter'
+      )
+    ).toBe(true);
+  });
+
+  it('still REFUSES when the verified platform is not one the grant\'s route covers', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope(
+        'post_on_connected_account',
+        { account_id: 'li-account' },
+        ['twitter_manage_post'],
+        'linkedin'
+      )
+    ).toBe(false);
+  });
+
+  it('ignores a caller-claimed platform that contradicts the verified one', () => {
+    // The handler ignores args.platform whenever account_id is present, so a claim
+    // here must not override the verified truth in either direction.
+    expect(
+      isPublishCallWithinAuthorizedScope(
+        'post_on_connected_account',
+        { account_id: 'li-account', platform: 'twitter' },
+        ['twitter_manage_post'],
+        'linkedin'
+      )
+    ).toBe(false);
+  });
+
+  it('still fails CLOSED when account_id is present but no verified platform was supplied', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope(
+        'post_on_connected_account',
+        { account_id: '1340767380', platform: 'twitter' },
+        ['twitter_manage_post']
+      )
+    ).toBe(false);
+  });
+
+  it('still fails CLOSED when the lookup came back empty (account not found)', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope(
+        'post_on_connected_account',
+        { account_id: 'unknown' },
+        ['twitter_manage_post'],
+        null
+      )
+    ).toBe(false);
+  });
+});
+
+/**
  * ENG-1245 — session 0e5af215 (2026-08-15) and every daily run since, through
  * today, told the owner "you turned ON Require approval before publishing,
  * turn it OFF to unblock." Verified against the live schedule record

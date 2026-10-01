@@ -22,7 +22,11 @@ jest.mock('../services/chatbotService', () => ({
 }));
 
 const mockCheckTokenUsage = jest.fn();
+// Spread the real module: replacing it wholesale dropped `toCustomerTokenUsage`,
+// so the projection silently returned undefined the moment this path started
+// using it. Only `checkTokenUsage` needs to be a stub.
 jest.mock('../services/tokenUsageService', () => ({
+  ...jest.requireActual('../services/tokenUsageService'),
   checkTokenUsage: (...args: any[]) => mockCheckTokenUsage(...args),
 }));
 
@@ -31,7 +35,15 @@ jest.mock('../services/db', () => ({
   userDb: { getUserById: (...args: any[]) => mockGetUserById(...args) },
 }));
 
+jest.mock('../services/funding/runFunding', () => {
+  const actual = jest.requireActual('../services/funding/runFunding');
+  return { ...actual, resolveRunFunding: jest.fn() };
+});
+
 import { handleSocketChatMessage } from '../services/chatSocketHandler';
+import { currentRunFunding, resolveRunFunding, type RunFunding } from '../services/funding/runFunding';
+
+const mockResolveRunFunding = resolveRunFunding as jest.MockedFunction<typeof resolveRunFunding>;
 
 function makeSocket() {
   return {
@@ -109,5 +121,60 @@ describe('handleSocketChatMessage — session ownership (ENG-1222)', () => {
       'hi',
       expect.objectContaining({ userId: 'customer-user', isDelegatedAdmin: true }),
     );
+  });
+});
+
+/**
+ * ENG-1816 F1 — without this wrapping, chatbotService's attribution fixes
+ * (embeddings metering, etc.) are silent no-ops on this entry point:
+ * currentRunFunding() would read undefined for every real sidebar turn that
+ * goes through the socket. Found unwrapped by a round-1 PR review; the fix
+ * has since been re-traced by code review 3 more times (rounds 2, 5) but
+ * never actually executed by anything until this test.
+ */
+describe('ENG-1816 F1 — handleSocketChatMessage resolves and enters a RunFunding scope', () => {
+  function makeFunding(ownerUserId: string): RunFunding {
+    return {
+      route: 'agentweb',
+      fallback: 'agentweb',
+      ownerUserId,
+      billingUserId: ownerUserId,
+      resolvedAt: new Date().toISOString(),
+    };
+  }
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockCheckTokenUsage.mockResolvedValue({ allowed: true });
+    mockJwtVerify.mockReturnValue({ userId: 'owner-user' });
+    mockGetChatSessionRecord.mockResolvedValue({ sessionId: 'sess-1', userId: 'owner-user' });
+  });
+
+  it('resolves RunFunding for the real caller and generateChatResponse executes inside that scope', async () => {
+    const funding = makeFunding('owner-user');
+    mockResolveRunFunding.mockResolvedValue(funding);
+    const seen: (RunFunding | undefined)[] = [];
+    mockGenerateChatResponse.mockImplementation(async () => {
+      seen.push(currentRunFunding());
+      return 'a real response';
+    });
+    const socket = makeSocket();
+
+    await handleSocketChatMessage(socket, { sessionId: 'sess-1', message: 'hi' });
+
+    expect(mockResolveRunFunding).toHaveBeenCalledWith({ userId: 'owner-user' });
+    expect(seen).toEqual([funding]);
+    // No leakage past the handler.
+    expect(currentRunFunding()).toBeUndefined();
+  });
+
+  it('never invokes generateChatResponse outside any RunFunding scope, even when unauthorized', async () => {
+    mockGetChatSessionRecord.mockResolvedValue({ sessionId: 'sess-1', userId: 'someone-else' });
+    const socket = makeSocket();
+
+    await handleSocketChatMessage(socket, { sessionId: 'sess-1', message: 'hi' });
+
+    expect(mockResolveRunFunding).not.toHaveBeenCalled();
+    expect(mockGenerateChatResponse).not.toHaveBeenCalled();
   });
 });

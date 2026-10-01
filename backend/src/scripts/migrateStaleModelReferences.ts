@@ -231,7 +231,7 @@ export async function collectCandidates(
 
 // ── Apply (never invoked in the ENG-9 dry-run session — see PR body) ───────
 
-async function applyCandidate(doc: DynamoDB.DocumentClient, tablePrefix: string, c: Candidate): Promise<'updated' | 'raced' | 'skipped'> {
+export async function applyCandidate(doc: DynamoDB.DocumentClient, tablePrefix: string, c: Candidate): Promise<'updated' | 'raced' | 'skipped'> {
   if (c.plan.action !== 'migrate') return 'skipped'; // orphans are never written
   const newModel = c.plan.newModel;
 
@@ -264,14 +264,20 @@ async function applyCandidate(doc: DynamoDB.DocumentClient, tablePrefix: string,
       return 'updated';
     }
     // Scanned tables: conditional UPDATE keyed by the table's own key field.
+    // ENG-1333: this used to also bump `updatedAt`, which corrupted every
+    // consumer that treats updatedAt as "last real activity" (e.g.
+    // get_chat_history's time-range scoping) — a stale-model-id rewrite is a
+    // data-hygiene fix, not user/agent activity, so it must never touch that
+    // field. `modelMigratedAt` records the same audit fact without the
+    // collateral damage.
     const spec = SCANNED_TABLES.find((s) => s.table === c.table)!;
     await doc.update({
       TableName: `${tablePrefix}${c.table}`,
       Key: { [spec.keyField]: c.recordId },
       ConditionExpression: '#field = :old',
-      UpdateExpression: 'SET #field = :new, updatedAt = :now',
+      UpdateExpression: 'SET #field = :new, modelMigratedAt = :migratedAt',
       ExpressionAttributeNames: { '#field': c.field },
-      ExpressionAttributeValues: { ':old': c.oldModel, ':new': newModel, ':now': new Date().toISOString() },
+      ExpressionAttributeValues: { ':old': c.oldModel, ':new': newModel, ':migratedAt': new Date().toISOString() },
     }).promise();
     return 'updated';
   } catch (error: any) {

@@ -1,12 +1,24 @@
 import { isDeepStrictEqual } from 'node:util';
 import { userDb, User } from './db';
 import { invalidateCachedPixels } from './metaPixelsCache';
+import type { DailyVolumeState } from './linkedInWritePacer';
 
 // ============================================
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly' | 'slack';
+
+/**
+ * ENG-1616 — the subset of `PlatformType` that `postOnConnectedAccount` treats as
+ * social-posting-capable. Single source of truth for that allowlist: it used to be
+ * duplicated between `agentModeService.postOnConnectedAccount` and the scheduled
+ * publish consent guard's `resolveAccountPlatform`, both narrowing an account_id
+ * lookup to these platforms before matching — a drift between the two copies would
+ * silently break account resolution for the missing platform on one side, with no
+ * test or runtime signal to catch it.
+ */
+export const SOCIAL_POSTING_PLATFORMS: readonly PlatformType[] = ['twitter', 'linkedin', 'instagram', 'youtube'];
 
 /**
  * Base OAuth configuration shared across all platforms
@@ -64,6 +76,23 @@ export interface LinkedInOutreachConfig {
   // Premium LinkedIn accounts allow 300-char invitation notes (free accounts: 200).
   // User-set in Settings → Connected accounts. Absent/false = free tier.
   is_premium?: boolean;
+  /**
+   * Self-reported daily LinkedIn connection-request ceiling (linkedInWritePacer.ts).
+   * Set directly by the user in Settings, or by Emma via the linkedin_outreach
+   * `set-daily-invite-cap` action after asking whether the account has LinkedIn
+   * Premium. Deliberately NOT auto-detected — see the pacer's module doc comment.
+   * Unset defaults to the conservative free-tier number; the pacer clamps any
+   * value to its own absolute system-wide ceiling regardless of what's stored here.
+   */
+  daily_invite_cap?: number;
+  /**
+   * Durable daily-volume counters (linkedInWritePacer.ts). Persisted here —
+   * not in process memory — specifically so a backend restart (which happens
+   * on every merge to `main`) can't reset an account's daily send count to
+   * zero mid-day. Written by the pacer's caller, never read/written directly
+   * anywhere else.
+   */
+  daily_volume?: DailyVolumeState;
   /**
    * Persisted session health (ENG-1197).
    *
@@ -272,6 +301,17 @@ export interface AttioConfig extends BaseOAuthConfig {
   account_type: 'oauth';
   workspace_id: string;
   workspace_name: string;
+  // Set after a real-time webhook subscription is registered against this
+  // workspace (POST /v2/webhooks — Attio's model is per-workspace, unlike
+  // HubSpot's single app-wide subscription list). `webhook_signing_key` is
+  // the secret Attio returns at creation time — it's shown only once and
+  // must be persisted immediately for HMAC verification of inbound events.
+  webhook_id?: string;
+  webhook_signing_key?: string;
+  // Set when webhook registration fails with 403 (missing webhook:read-write
+  // scope on this token — e.g. connected before the scope was added to the
+  // app). Cleared on reconnect, same pattern as TwitterXConfig/CalendlyConfig.
+  needs_reconnect?: boolean;
 }
 
 export interface GoogleAdsConfig extends BaseOAuthConfig {
@@ -360,7 +400,13 @@ export interface CalendlyConfig extends BaseOAuthConfig {
   attributionDisabled?: boolean;
 }
 
-export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig;
+/** Org-owned Emma Slack bot installation; account_id must equal team_id. */
+export interface SlackConfig extends BaseOAuthConfig {
+  account_type: 'bot';
+  team_id: string;
+}
+
+export type PlatformConfig = SlackConfig | LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig;
 
 /**
  * Per-connection engagement memory: a persona profile generated from LinkedIn data
@@ -711,7 +757,30 @@ export type AccountConfigMutation =
   | ((freshConfig: Record<string, any>) => {
       updates: Record<string, any>;
       unset?: string[];
+      /** Return without writing when the fresh state declines the mutation. */
+      skip?: boolean;
     });
+
+/**
+ * How many times `updateAccountConfig` retries a write that collided with an
+ * in-flight DynamoDB transaction on the same user item, and how long it waits.
+ *
+ * ENG-1873. `TransactionConflictException` means another request holds a
+ * transaction on this item right now — on the users table that is, in practice,
+ * `applyMonthlyChargeAtomic`, which `tokenUsageService` runs for each LLM
+ * completion. A tool call executes the moment its completion returns, often
+ * while that completion's charge transaction is still committing, so the tool's
+ * config write lost the race and was treated as fatal. AWS documents the error
+ * as transient; `paymentHistoryDb` and `usageRecordDb` already classify it so.
+ *
+ * Kept separate from the CAS attempt budget below so it cannot change when a
+ * genuine concurrent overwrite gives up with `ConnectedAccountChanged`.
+ */
+export const TRANSACTION_CONFLICT_RETRIES = 4;
+export const transactionConflictBackoffMs = (retry: number): number =>
+  25 * 2 ** retry + Math.floor(Math.random() * 25);
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 export const updateAccountConfig = async (
   userId: string,
@@ -731,7 +800,9 @@ export const updateAccountConfig = async (
   // so a fresh read followed by the same merge is exactly the right answer —
   // provided the merge itself is recomputed from that fresh read when it needs
   // to be (see AccountConfigMutation above).
-  for (let attempt = 0; attempt < 3; attempt++) {
+  let casAttempts = 0;
+  let transactionConflictRetries = 0;
+  for (;;) {
     const user = await userDb.getUserByIdConsistent(userId);
     if (!user) {
       throw new Error('User not found');
@@ -750,9 +821,11 @@ export const updateAccountConfig = async (
     const existingAccount = accounts[accountIndex];
 
     const isDerived = typeof configUpdates === 'function';
-    const { updates, unset } = isDerived
+    const mutation = isDerived
       ? configUpdates(existingAccount.config || {})
       : { updates: configUpdates, unset: options?.unset };
+    if (mutation.skip) return;
+    const { updates, unset } = mutation;
 
     const mergedConfig: Record<string, any> = {
       ...existingAccount.config,
@@ -783,8 +856,21 @@ export const updateAccountConfig = async (
       });
       return;
     } catch (error: any) {
+      // ENG-1873: an in-flight transaction on this item (see
+      // TRANSACTION_CONFLICT_RETRIES). Back off briefly, then re-read and
+      // re-apply exactly as the CAS path does — the merge is recomputed from the
+      // fresh read, so a retry can never write a stale snapshot.
+      if (
+        error?.code === 'TransactionConflictException'
+        && transactionConflictRetries < TRANSACTION_CONFLICT_RETRIES
+      ) {
+        transactionConflictRetries++;
+        await sleep(transactionConflictBackoffMs(transactionConflictRetries));
+        continue;
+      }
       if (error?.code !== 'ConditionalCheckFailedException') throw error;
-      if (attempt === 2) {
+      casAttempts++;
+      if (casAttempts >= 3) {
         throw Object.assign(
           new Error(`Connected account "${accountId}" changed while updating its config; retry`),
           { code: 'ConnectedAccountChanged' },
@@ -1005,11 +1091,83 @@ export const getAccountsByCalendlyUserUri = async (
 };
 
 /**
+ * Find the user (and the specific connected account) that owns a given Attio
+ * workspace_id. Used by the incoming Attio webhook to resolve which tenant(s)
+ * a delivery belongs to.
+ *
+ * Returns every match, not a single best-guess userId, following the same
+ * ENG-994 lesson `getAccountsByCalendlyUserUri` already documents above:
+ * two tenants could in principle connect the same underlying Attio workspace
+ * independently, each with their own webhook subscription and signing key —
+ * a single-match resolver would silently drop one tenant's deliveries on a
+ * collision. The caller verifies each candidate's own webhook_signing_key
+ * against the delivery's signature rather than committing to a guess.
+ */
+export const getAccountsByAttioWorkspaceId = async (
+  workspaceId: string
+): Promise<Array<{ userId: string; account: ConnectedAccountConfig }>> => {
+  try {
+    const { userDb } = await import('./db');
+    // Deliberately scanWithFilter, not getAllUsers(): this runs on every
+    // incoming Attio webhook, unauthenticated until a candidate's signing key
+    // verifies below — getAllUsers() additionally starts three count queries
+    // (tasks/workflows/chat sessions) per user for admin-dashboard display,
+    // irrelevant here and multiplying the cost of every delivery. A full
+    // table scan is still unavoidable without a dedicated workspace-to-account
+    // index (a schema change, gated separately), but skipping the per-user
+    // fan-out removes the dominant, easily-avoidable cost.
+    const users = await userDb.scanWithFilter('attribute_exists(connected_accounts)', {});
+    const matches: Array<{ userId: string; account: ConnectedAccountConfig }> = [];
+
+    for (const user of users) {
+      const accounts = normalizeAccounts((user as User).connected_accounts);
+      for (const account of accounts) {
+        if (account.platform === 'attio' && (account.config as AttioConfig).workspace_id === workspaceId) {
+          matches.push({ userId: user.userId, account });
+        }
+      }
+    }
+    return matches;
+  } catch (error) {
+    console.error('Error resolving Attio workspace_id to accounts:', error);
+    return [];
+  }
+};
+
+/**
  * Check if an account token is still valid
  * First checks expiry timestamp, then verifies via API if not expired
  */
+/**
+ * Platforms where `config.needs_reconnect` means THE CREDENTIAL IS DEAD.
+ *
+ * The key is not used consistently, so this cannot be a blanket check:
+ *  - hubspot / twitter  — the refresh token was rejected; nothing works until re-OAuth.
+ *    twitterService.getClient and HubSpotService.create both refuse outright.
+ *  - attio              — set ONLY for a 403 registering the webhook, i.e. a missing
+ *                         `webhook:read-write` scope (attioWebhookSubscription.ts:64).
+ *                         The token is fine and CRM reads/writes still work; treating it
+ *                         as dead would tell Emma a usable account is broken, which is
+ *                         the same class of lie in the other direction.
+ *  - calendarTools      — returns `needs_reconnect` on a TOOL RESULT, never writes it to
+ *                         config, so it is irrelevant here.
+ *
+ * Attio would be better served by its own key (e.g. `webhook_scope_missing`); until then
+ * the exception is explicit rather than implied.
+ */
+const RECONNECT_MEANS_DEAD_CREDENTIAL = new Set(['hubspot', 'twitter']);
+
 export const isTokenValid = async (account: ConnectedAccount): Promise<boolean> => {
   const now = Date.now();
+
+  // A dead credential outranks every check below, including the refresh_token presence
+  // test. Without this, an account that Settings reports as "Reconnect required" was
+  // still handed to Emma as `is_active: true` — the assistant telling a customer their
+  // integration is fine while the UI tells them it is broken. The Meta Ads branch of
+  // routes/connectedAccounts.ts exists for exactly this consistency (ENG-1158).
+  if (RECONNECT_MEANS_DEAD_CREDENTIAL.has(account.platform) && (account.config as any)?.needs_reconnect) {
+    return false;
+  }
 
   // First check: is the token expired based on timestamp?
   if (account.config.token_expires_at <= now) {

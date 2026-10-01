@@ -205,6 +205,69 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     expect(executedTools).toHaveLength(finalSynthesisPerCall.filter((f) => !f).length);
   });
 
+  it('applies a set_work_plan_status call discarded by the forced synthesis instead of dropping it (ENG-1682 follow-up)', async () => {
+    // Prod session f771b626-…: create_html_file succeeded, but the turn ran out of time
+    // one call before the model could mark the step completed. Discarding that late
+    // set_work_plan_status call like every other one left the step stuck "pending"
+    // forever even though the deliverable was already done. Applying it directly (a
+    // single bounded DB write, not another LLM round trip) closes the gap.
+    const workPlanSession = {
+      sessionId: 'test-session',
+      messages: [],
+      associatedSkills: null,
+      workPlan: {
+        title: 'Test Plan',
+        steps: [
+          { stepCount: 1, title: 'Step 1', status: 'completed' },
+          { stepCount: 2, title: 'Step 2', status: 'pending' },
+        ],
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+    };
+    installStandardMockDeps(workPlanSession);
+    const mockChatbotService = require('../../../services/chatbotService');
+    mockChatbotService.chatbotDb.updateSessionWorkPlan = jest.fn().mockResolvedValue(workPlanSession);
+    mockChatbotService.chatbotDb.updateSessionWorkPlanInputRequest = jest.fn().mockResolvedValue(workPlanSession);
+    mockChatbotService.chatbotDb.updateCalledFunctions = jest.fn().mockResolvedValue(undefined);
+    mockChatbotService.chatbotDb.addAssociatedSkills = jest.fn().mockResolvedValue(undefined);
+
+    const { result, executedTools } = await runRealLoop(
+      (call, isFinalSynthesis) =>
+        isFinalSynthesis
+          ? {
+              content: 'Report generated — here is what I finished before the time limit.',
+              tool_calls: [
+                {
+                  id: 'late-status',
+                  name: 'set_work_plan_status',
+                  arguments: JSON.stringify({
+                    updates: [{ stepCount: 2, status: 'completed', notes: 'Report generated' }],
+                  }),
+                },
+              ],
+            }
+          : {
+              content: `Scanned batch ${call + 1}.`,
+              tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
+            },
+    );
+
+    expect(result.truncatedByTimeBudget).toBe(true);
+    // The late call never ran through the normal tool-execution path...
+    expect(executedTools).not.toContain('set_work_plan_status');
+    // ...but its state effect still applied: the step is completed in the DB despite the
+    // turn running out of time before the model's call could go through normally.
+    expect(mockChatbotService.chatbotDb.updateSessionWorkPlan).toHaveBeenCalledWith(
+      'test-session',
+      expect.objectContaining({
+        steps: expect.arrayContaining([
+          expect.objectContaining({ stepCount: 2, status: 'completed', notes: 'Report generated' }),
+        ]),
+      }),
+    );
+  });
+
   it('warns the model to wrap up before it stops honouring tool calls', async () => {
     let sawWrapUpNudge = false;
     let sawFinalNudge = false;
@@ -244,6 +307,36 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     // inside the reserve held back for this one call, so a retry would spend it and
     // could let the controller's cap fire mid-call — discarding the whole turn, which
     // is the ENG-907 failure itself. One synthesis attempt, then deliver.
+    expect(finalSynthesisPerCall.filter(Boolean)).toHaveLength(1);
+    expect(elapsedMs).toBeLessThanOrEqual(CAP_MS);
+  });
+
+  it('still prefers the ledger recap over the time-limit message when the forced synthesis returns residue (ENG-1576 correction)', async () => {
+    // A forced-final-synthesis turn (truncatedByTimeBudget) can ALSO produce
+    // residue-shaped output ("}]") — isUnusableSynthesis runs unconditionally, so
+    // the two flags are not mutually exclusive (CodeRabbit question, PR #2639). An
+    // earlier revision of this fix made that combination defer to the generic
+    // time-limit message instead of the ledger recap — but that's wrong:
+    // synthesisResidueDropped also covers ENG-1188's echoed-nudge detection
+    // (including the wall-clock nudge specifically — see nudgeEchoRecovery.test.ts's
+    // "recovers with the executed-action ledger when the forced synthesis turn
+    // echoes the time-budget nudge"), and ENG-1188's entire point is that an echoed
+    // nudge must never reach the user, EVEN under time-budget truncation. Since
+    // isUnusableSynthesis gives the caller no way to distinguish plain residue from
+    // a nudge echo, the ledger recap has to win for both — reverted to match.
+    const { result, elapsedMs, finalSynthesisPerCall } = await runRealLoop((call, isFinalSynthesis) =>
+      isFinalSynthesis
+        ? { content: '}]' }
+        : {
+            content: '',
+            tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
+          },
+    );
+
+    expect(result.truncatedByTimeBudget).toBe(true);
+    expect(result.content).toMatch(/built directly from the actions I actually ran/);
+    expect(result.content).toContain('twitter_outreach');
+    expect(result.content).not.toMatch(/time limit/i);
     expect(finalSynthesisPerCall.filter(Boolean)).toHaveLength(1);
     expect(elapsedMs).toBeLessThanOrEqual(CAP_MS);
   });
@@ -578,5 +671,296 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     // The loop never entered synthesis mode — no nudge was ever injected.
     expect(finalSynthesisPerCall.some(Boolean)).toBe(false);
     expect(result.content).toMatch(/10 best posts/);
+  });
+
+  it('grows the synthesis reserve using slow TOOL-dispatch time, not just slow LLM calls (ENG-2121)', async () => {
+    // Prod bug: a Meta ad-creative work-plan step spent its turn on heavy
+    // knowledge-base reads (design tokens / media assets) and was cut off by the
+    // whole-turn hard cap before it ever got to issue a generate_image call — the
+    // user saw the bare "Partial results — I hit the time limit" fallback instead
+    // of a graceful, nudge-driven partial answer. Every individual LLM call in
+    // that turn was fast; it was the TOOL call (a heavy read_knowledge_base_files)
+    // that was slow, and the reserve calc only ever widened for slow LLM calls —
+    // so the budget kept reading as "normal" long after most of the clock was gone,
+    // and a second slow read ran the turn straight past the hard cap.
+    const SLOW_TOOL_MS = 380_000; // ~6.3 min, in line with a heavy multi-file KB read
+    let call = 0;
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const messages = args[1] || [];
+      const isFinalSynthesis = messages.some(
+        (m: any) =>
+          m?.role === 'user' &&
+          typeof m.content === 'string' &&
+          /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
+      );
+      nowMs += 5_000; // every LLM call itself is fast
+      return buildLLMResponse(
+        isFinalSynthesis
+          ? { content: 'Partial results — here is what I gathered before the time limit.' }
+          : {
+              content: `Reading knowledge base batch ${++call}.`,
+              tool_calls: [
+                { id: `c${call}`, name: 'read_knowledge_base_files', arguments: '{"files":["design-tokens.json"]}' },
+              ],
+            },
+      );
+    });
+    jest.spyOn(service as any, 'executeTool').mockImplementation(async (...args: any[]) => {
+      const toolName: string = args[1];
+      if (toolName === 'read_knowledge_base_files') {
+        nowMs += SLOW_TOOL_MS;
+      }
+      return JSON.stringify({ success: true, data: `mock:${toolName}` });
+    });
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    const startedAt = nowMs;
+    const result = (await service.generateMarketingResponse(
+      'Generate the first wave of ad creatives using the brand design tokens.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+      false, undefined, undefined, false, undefined, undefined, undefined, false, false,
+      nowMs,
+    )) as any;
+
+    // The loop's own bookkeeping must never let elapsed time cross the controller's
+    // hard cap — if it does, `withGenerationTimeout`'s real-clock race has already
+    // fired and this graceful partial answer never reaches the user (ENG-2121).
+    expect(nowMs - startedAt).toBeLessThanOrEqual(CAP_MS);
+    expect(result.truncatedByTimeBudget).toBe(true);
+    expect(result.content).toMatch(/Partial results/);
+  });
+
+  it('bounds every LLM call, including iteration 1, to the remaining turn budget (ENG-2121)', async () => {
+    // Prod session d874874f's "Continue building all the creative" turn: iteration 1's
+    // own LLM call ran the ENTIRE ~600s hard cap uninterrupted, with nothing dispatched
+    // yet, so the between-iteration reserve check (which only runs BEFORE a call starts,
+    // off PRIOR calls' durations) never got a chance to matter. Every call must carry an
+    // explicit timeoutMs bound derived from the remaining budget so a pathological call
+    // fails fast via a catchable error instead of silently eating the whole turn.
+    const seenTimeoutMs: any[] = [];
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const options = args[2] || {};
+      seenTimeoutMs.push(options.timeoutMs);
+      return buildLLMResponse({ content: 'Here is the answer.' });
+    });
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    await service.generateMarketingResponse(
+      'Generate the first wave of ad creatives using the brand design tokens.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+      false, undefined, undefined, false, undefined, undefined, undefined, false, false,
+      nowMs,
+    );
+
+    expect(seenTimeoutMs).toHaveLength(1);
+    expect(typeof seenTimeoutMs[0]).toBe('number');
+    // Bounded well under the hard cap (leaving room for the synthesis reserve), and
+    // never below the floor a call needs to have any real chance of succeeding.
+    expect(seenTimeoutMs[0]).toBeLessThan(CAP_MS);
+    expect(seenTimeoutMs[0]).toBeGreaterThanOrEqual(30_000);
+  });
+
+  it('never bounds a call to LONGER than the wall-clock actually left before the hard cap (CodeRabbit, PR #3050)', async () => {
+    // The MIN_LLM_CALL_TIMEOUT_MS floor above exists so a call gets a real chance to
+    // succeed — but applied blindly, it can hand out a bound bigger than the time
+    // actually left (e.g. remainingMs=5000 flooring to 30000), letting this call run
+    // PAST the controller's own hard cap and get killed by that uncontrolled race
+    // instead of this one — recreating the exact failure mode this whole fix exists to
+    // prevent. Model that by stamping the caller's deadline far enough in the past that
+    // under 30s of real budget is left by the time the loop's first call fires.
+    const seenTimeoutMs: any[] = [];
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const options = args[2] || {};
+      seenTimeoutMs.push(options.timeoutMs);
+      return buildLLMResponse({ content: 'Here is the answer.' });
+    });
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    // Mirrors the existing "measures against the CALLER's deadline" test's pattern:
+    // capture the deadline stamp BEFORE the clock advances, then advance `nowMs` (the
+    // mocked Date.now()) to model setup latency the caller already burned before the
+    // loop got control — turnStartMs stays the earlier, real anchor.
+    const callerTurnStartMs = nowMs;
+    const SETUP_LATENCY_MS = CAP_MS - 5_000; // only 5s of real budget left when the loop starts
+    nowMs += SETUP_LATENCY_MS;
+
+    await service.generateMarketingResponse(
+      'Generate the first wave of ad creatives using the brand design tokens.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+      false, undefined, undefined, false, undefined, undefined, undefined, false, false,
+      callerTurnStartMs,
+    );
+
+    expect(seenTimeoutMs).toHaveLength(1);
+    // Capped at (approximately) the ~5s actually left, never floored up to 30s.
+    expect(seenTimeoutMs[0]).toBeLessThanOrEqual(5_000);
+    expect(seenTimeoutMs[0]).toBeGreaterThan(0);
+  });
+
+  it('retries with a forced synthesis instead of failing loudly when the VERY FIRST call times out (ENG-2121)', async () => {
+    // Prod session d874874f's SECOND turn ("Continue building all the creative"):
+    // iteration 1's own LLM call ran the entire ~601s cap with nothing yet dispatched.
+    // ENG-907's original design exempted iteration 1 from forced synthesis because
+    // nothing had failed yet at that point — a reasonable reason to not PROACTIVELY
+    // give up before trying. But this catch runs REACTIVELY, after the call already
+    // failed, so that rationale does not apply: retrying costs nothing beyond the
+    // reserve that would otherwise be thrown away, and even with zero tool work done,
+    // the model itself can give the user an honest answer built from the REAL request
+    // context — a materially better outcome than the generic diagnosis agent's guess,
+    // which is what produced this exact session's hallucinated "I have successfully
+    // completed the brand intelligence, market research..." fallback.
+    let call = 0;
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const messages = args[1] || [];
+      const isFinalSynthesis = messages.some(
+        (m: any) =>
+          m?.role === 'user' &&
+          typeof m.content === 'string' &&
+          /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
+      );
+      call++;
+      if (isFinalSynthesis) {
+        nowMs += 5_000;
+        return buildLLMResponse({
+          content: 'Partial results — I ran into a delay before I could start; nothing verified yet. Reply "continue" and I\'ll pick this up.',
+        });
+      }
+      nowMs += 570_000;
+      const err: any = new Error('Request timed out.');
+      throw err;
+    });
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    const startedAt = nowMs;
+    const result = (await service.generateMarketingResponse(
+      'Generate the first wave of ad creatives using the brand design tokens.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+      false, undefined, undefined, false, undefined, undefined, undefined, false, false,
+      nowMs,
+    )) as any;
+
+    // Resolved gracefully — never thrown up to the controller.
+    expect(nowMs - startedAt).toBeLessThanOrEqual(CAP_MS);
+    expect(result.truncatedByTimeBudget).toBe(true);
+    expect(result.content).toMatch(/Partial results/);
+    // Exactly one retry after the timed-out first call.
+    expect(call).toBe(2);
+  });
+
+  it('still fails loudly, tagged, when iteration 1\'s OWN retry also times out (no infinite loop, no false partial)', async () => {
+    // The regression guard for the fix above: retrying is a bounded, one-shot
+    // affordance, not a way to paper over a request that genuinely cannot complete in
+    // time (e.g. the context itself is too large to process within the reserve). When
+    // even the retry times out, this must still fail loudly and tagged — never loop
+    // again, never fabricate a partial from nothing — so the controller's own salvage
+    // backstop (which checks for images/tool work actually persisted so far) gets a
+    // fair, honest chance instead of this loop looping forever or lying.
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async () => {
+      nowMs += 570_000;
+      const err: any = new Error('Request timed out.');
+      throw err;
+    });
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    const rejection = await service
+      .generateMarketingResponse(
+        'Generate the first wave of ad creatives using the brand design tokens.',
+        [] as any,
+        'test-user',
+        service.default_model,
+        'test-session',
+        false, undefined, undefined, false, undefined, undefined, undefined, false, false,
+        nowMs,
+      )
+      .then(
+        (value: any) => ({ resolved: value }),
+        (error: any) => ({ error }),
+      );
+
+    expect((rejection as any).resolved).toBeUndefined();
+    // The service wraps the raw error into a user-friendly one (agentModeService's own
+    // outer catch) — the raw message survives on `.originalMessage`, and the tag this
+    // fix adds must survive that same wrap (it did not, before this fix: the wrap only
+    // forwarded status/code/originalMessage, silently dropping isGenerationTimeout).
+    expect((rejection as any).error.originalMessage).toMatch(/timed out/i);
+    expect((rejection as any).error.isGenerationTimeout).toBe(true);
+  });
+
+  it('retries with a forced synthesis instead of throwing when a LATER iteration times out (regression guard, ENG-2121)', async () => {
+    // Prod session d874874f's FIRST turn ("Go"): 2 fast tool calls completed
+    // (iterations 1-2), then iteration 3's LLM call alone ran ~578s and blew the cap.
+    // That turn was only saved by the controller's OWN opportunistic salvage of the 2
+    // completed tool results — this loop's synthesis mechanism never got involved. A
+    // naive "just bound and throw" fix would make this WORSE: throwing an untagged
+    // error here would skip the controller's salvage path entirely (it only fires on
+    // its own isGenerationTimeout race) and fall straight to the generic diagnosis-agent
+    // fallback. The loop must instead catch its OWN bounded timeout here and retry with
+    // forced synthesis — the same graceful path the between-iteration check already
+    // uses — so the turn still ends with the real work delivered.
+    let call = 0;
+    const modelCallCount = { value: 0 };
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const messages = args[1] || [];
+      const isFinalSynthesis = messages.some(
+        (m: any) =>
+          m?.role === 'user' &&
+          typeof m.content === 'string' &&
+          /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
+      );
+      modelCallCount.value++;
+      if (modelCallCount.value === 1) {
+        nowMs += 8_000; // iteration 1: fast, e.g. list_knowledge_base_files
+        return buildLLMResponse({
+          content: 'Checking the design system knowledge base.',
+          tool_calls: [{ id: `c${++call}`, name: 'read_knowledge_base_files', arguments: '{"files":["design.md"]}' }],
+        });
+      }
+      if (isFinalSynthesis) {
+        nowMs += 5_000;
+        return buildLLMResponse({
+          content: 'Partial results — read the design tokens; still need to generate the creatives.',
+        });
+      }
+      // iteration 2: the pathological call that eats almost the whole remaining budget
+      // and hits its own bound instead of returning.
+      nowMs += 560_000;
+      const err: any = new Error('Request timed out.');
+      throw err;
+    });
+    jest.spyOn(service as any, 'executeTool').mockResolvedValue(
+      JSON.stringify({ success: true, data: 'mock' }),
+    );
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    const startedAt = nowMs;
+    const result = (await service.generateMarketingResponse(
+      'Generate the first wave of ad creatives using the brand design tokens.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+      false, undefined, undefined, false, undefined, undefined, undefined, false, false,
+      nowMs,
+    )) as any;
+
+    // Resolved gracefully — never thrown up to the controller.
+    expect(nowMs - startedAt).toBeLessThanOrEqual(CAP_MS);
+    expect(result.truncatedByTimeBudget).toBe(true);
+    expect(result.content).toMatch(/Partial results/);
+    // Exactly one retry after the timed-out call: iteration 1 + the failed iteration 2 +
+    // one forced-synthesis retry.
+    expect(modelCallCount.value).toBe(3);
   });
 });

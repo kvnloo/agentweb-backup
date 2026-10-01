@@ -13,6 +13,7 @@ import {
   detectFalseCompletionClaim,
   buildFalseClaimCorrectionFooter,
   extractProducedAssetCount,
+  assetProducingToolsInPlay,
 } from '../synthesisResidue';
 import { SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE } from '../termination';
 import { buildTurnTimeBudgetNudge, type TurnTimeBudgetState } from '../../../../utils/turnTimeBudget';
@@ -72,6 +73,50 @@ describe('isUnusableSynthesis', () => {
 
   it('flags a reply that opens with the degraded tool-call marker', () => {
     expect(isUnusableSynthesis('[Previously called call_meta_marketing_api({"action":"UPDATE"})]')).toBe(true);
+  });
+
+  // ENG-1224 Variant B / production session d5898ffd: the model echoed the
+  // loop's own wall-clock budget nudge ("Do not call any more tools. Write
+  // your final answer NOW...") back as its answer instead of following it —
+  // the persisted final message was the literal string below.
+  describe('leaked internal directive (ENG-1224)', () => {
+    it('flags the exact production leak "Do not call any more tools."', () => {
+      expect(isUnusableSynthesis(' Do not call any more tools.')).toBe(true);
+    });
+
+    it('flags other phrasings of the same injected directive', () => {
+      for (const leak of [
+        'Do not call any more tools.',
+        "don't call any more tools",
+        'DO NOT CALL ANY MORE TOOLS.',
+        'Stop all searching/pagination immediately.',
+        '[SYSTEM WARNING] Do not call any more tools. Write your final answer now.',
+      ]) {
+        expect(isUnusableSynthesis(leak)).toBe(true);
+      }
+    });
+
+    it('does NOT flag genuine prose that merely discusses tool-calling policy', () => {
+      for (const real of [
+        'I have finished the task and will not call any more tools unless you ask me to continue.',
+        'As requested, here is a summary of what I found — no further tools were needed.',
+      ]) {
+        expect(isUnusableSynthesis(real)).toBe(false);
+      }
+    });
+
+    // "Stop calling tools" and "No more tool calls" were removed from the guard: no
+    // code path ever injects either phrase, and being anchored + under the residue
+    // length cap they could discard a genuine short answer that happens to open
+    // with similar wording.
+    it('does NOT flag a genuine answer that opens with similar-but-uninjected wording', () => {
+      for (const real of [
+        'Stop calling tools that are not needed — the report below is already complete.',
+        'No more tool calls were necessary; here are the results you asked for.',
+      ]) {
+        expect(isUnusableSynthesis(real)).toBe(false);
+      }
+    });
   });
 
   // Observed live: driving the synthesis retry into a failure state made the model
@@ -549,6 +594,34 @@ describe('detectFalseCompletionClaim', () => {
       [{ name: 'playwright_browser_take_screenshot', result: { success: true } }],
     );
     expect(claim).toEqual({ claimed: 12, actual: 1 });
+  });
+});
+
+describe('assetProducingToolsInPlay', () => {
+  it('is true when the ledger contains an asset-producing tool call', () => {
+    expect(assetProducingToolsInPlay([{ name: 'generate_image', result: { success: true } }])).toBe(true);
+  });
+
+  it('is false for an empty ledger', () => {
+    expect(assetProducingToolsInPlay([])).toBe(false);
+  });
+
+  // ENG-2076 live repro: a Meta Ads turn's ledger has real tool calls, just none of
+  // them in ASSET_PRODUCING_TOOL_NAMES (which has no Meta Ads vocabulary and never
+  // will). Distinguishes "no asset-producing call" from "no call at all" — the
+  // guard's domain gate must treat both the same way (skip), but this is the shape
+  // that actually broke production.
+  it('is false when the ledger has calls, but none in ASSET_PRODUCING_TOOL_NAMES', () => {
+    expect(
+      assetProducingToolsInPlay([
+        { name: 'call_meta_marketing_api', result: { success: true } },
+        { name: 'list_meta_ads_campaigns', result: { success: true } },
+      ]),
+    ).toBe(false);
+  });
+
+  it('ignores a ledger entry with no name', () => {
+    expect(assetProducingToolsInPlay([{ result: { success: true } }])).toBe(false);
   });
 });
 

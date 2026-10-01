@@ -5,6 +5,7 @@ import {
 } from '../utils/linkedInAnonymizedProfile';
 import {
   FIELD_GROUPS,
+  isCardRevenueField,
   buildCompanyCanonicalKey,
   buildPersonCanonicalKey,
   toCanonicalId,
@@ -41,6 +42,10 @@ export function splitFieldsByGroup(
   for (const field of fields) {
     // Resolve to canonical: alias > self
     const canonical = aliases[field] ?? field;
+    // ENG-1388: card revenue comes only from Enigma via the V3 waterfall. This
+    // legacy web path would web-search and LLM-fill it, so drop it entirely
+    // (neither grouped nor ungrouped).
+    if (isCardRevenueField(canonical)) continue;
     let found = false;
     for (const [groupName, config] of Object.entries(FIELD_GROUPS)) {
       if (config.fields.includes(canonical)) {

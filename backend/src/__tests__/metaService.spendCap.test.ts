@@ -63,7 +63,11 @@ describe('MetaService campaign spend_cap (ENG-1018)', () => {
     const result = await service.listCampaigns(accountId, token);
 
     expect(getCampaigns.mock.calls[0][0] as string[]).toEqual(expect.arrayContaining(['spend_cap']));
-    expect(result).toEqual([{ id: 'c1', spend_cap: '300000' }]);
+    expect(result).toEqual({
+      campaigns: [{ id: 'c1', spend_cap: '300000' }],
+      truncated: false,
+      pagesFetched: 1,
+    });
   });
 
   it('CAMPAIGN LIST accepts an explicit spend_cap fields selection instead of rejecting it', async () => {
@@ -72,11 +76,16 @@ describe('MetaService campaign spend_cap (ENG-1018)', () => {
 
     await service.listCampaigns(accountId, token, { fields: 'id,name,spend_cap' });
 
-    expect(getCampaigns).toHaveBeenCalledWith(['id', 'name', 'spend_cap']);
+    // ENG-1625: LIST now paginates, so every account-edge call also carries a page-size limit.
+    expect(getCampaigns).toHaveBeenCalledWith(['id', 'name', 'spend_cap'], { limit: 100 });
   });
 
   it('getCampaign reads spend_cap back so a write can be verified', async () => {
-    const get = jest.fn().mockResolvedValue({ _data: { id: 'camp_9', spend_cap: '300000' } });
+    // getCampaign now verifies ownership from the same response, so Graph answers `account_id`
+    // alongside the requested fields; it is stripped before the caller sees the payload.
+    const get = jest.fn().mockResolvedValue({
+      _data: { id: 'camp_9', spend_cap: '300000', account_id: accountId },
+    });
     (Campaign as unknown as jest.Mock).mockImplementation(() => ({ get }));
 
     const result = await service.getCampaign(accountId, token, 'camp_9');

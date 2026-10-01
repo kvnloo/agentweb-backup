@@ -284,12 +284,14 @@ describe('POST /api/agent-mode/run-scheduled-chats service auth (ENG-347)', () =
     });
   });
 
-  it('rollout: env secret unset → request passes through (pre-ENG-347 behavior preserved)', async () => {
+  it('fail-closed (ENG-1754): env secret unset + SM unresolved → 503, nothing executes', async () => {
     delete process.env[SCHEDULED_CHATS_SERVICE_SECRET_ENV];
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
     const res = await request(app).post(ROUTE);
 
-    expect(res.status).toBe(200);
-    expect(mockScheduleDb.getSchedulesReadyToRun).toHaveBeenCalledTimes(1);
+    expect(res.status).toBe(503);
+    expect(mockScheduleDb.getSchedulesReadyToRun).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
   });
 });

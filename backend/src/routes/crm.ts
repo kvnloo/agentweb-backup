@@ -23,7 +23,12 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { isValidLeadLifecycle, LEAD_LIFECYCLES } from '../utils/leadSchema';
+import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
+import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValidation';
 import { syncContact, SyncInput } from '../services/contactSyncService';
+import { isCardRevenueField } from '../services/enrichmentGroups';
+import { stripImplicitCardRevenueRouting } from '../services/enrichmentConfigService';
 import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
 import { dedupContactsForUser } from '../services/contactDedupService';
 import {
@@ -67,8 +72,8 @@ import {
 import { buildConfigServiceDeps } from '../services/enrichmentConfigDeps';
 import { runEnrichment as svcRunEnrichmentV3 } from '../services/crmEnrichmentServiceV3';
 import { buildOrchestratorDeps as buildV3OrchestratorDeps } from '../services/enrichmentV3RealDeps';
-import { sanitizeLeadForResponse } from '../utils/enrichmentMetadataPresentation';
-import { getHubspotConnection, getMappedAgentwebFields, mappedFieldChanged, resolveSyncStatus } from '../utils/leadSyncStatus';
+import { sanitizeLeadForResponse, shouldHideCardRevenueForViewer } from '../utils/enrichmentMetadataPresentation';
+import { getExternalCrmConnection, getMappedAgentwebFields, mappedFieldChanged, resolveSyncStatus } from '../utils/leadSyncStatus';
 
 const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 
@@ -83,22 +88,42 @@ const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
  * Fire-and-forget: enroll a single newly created lead into any sequences that
  * have autoEnrollListIds containing this list. Errors are logged but never surfaced.
  */
-async function autoEnrollLeadInSequences(
+// Exported for tests: these decide WHICH leads get auto-enrolled, and the decision
+// was previously unpinned — a mutation restoring the email-only gate passed the
+// whole suite. Testing the shared predicates is not enough; this pins that crm.ts
+// actually calls them.
+export async function autoEnrollLeadInSequences(
   userId: string,
   listId: string,
   leadId: string,
-  leadEmail: string,
+  lead: { email?: string; linkedin?: string } | string,
 ): Promise<void> {
-  if (!leadEmail) return;
+  // Channel-aware, like the two enrol ROUTES.
+  //
+  // This gated on `if (!leadEmail) return` — so once enrolling a LinkedIn-only list
+  // into a LinkedIn sequence became possible, by-list enrolment switched auto-enroll
+  // ON for that list (sequences.ts adds it to autoEnrollListIds) while every lead
+  // arriving afterwards was silently dropped here for having no address. The feature
+  // worked exactly once, for the leads present at the time.
+  //
+  // Accepts a bare string for the legacy email-only call shape.
+  const leadObj = typeof lead === 'string' ? { email: lead } : (lead ?? {});
   try {
     const sequences = await dripSequenceDb.getSequencesByAutoEnrollList(userId, listId);
     for (const seq of sequences) {
+      const channels = requiredChannels(seq);
+      if (!leadIsReachable(leadObj, channels)) continue;
+      const identity = enrollmentIdentity(leadObj);
+      // leadEmail is the partition key of leadEmail-index; an empty one makes the row
+      // invisible to dedup, so it is recreated and the lead re-messaged every run.
+      if (!identity) continue;
       await dripSequenceDb.bulkEnroll([{
         sequenceId: seq.sequenceId,
         userId,
         listId,
         leadId,
-        leadEmail,
+        leadEmail: identity,
+        identityCandidates: enrollmentIdentityCandidates(leadObj),
       }]);
     }
   } catch (err) {
@@ -111,25 +136,31 @@ async function autoEnrollLeadInSequences(
  * in the list against any sequences watching it. The bulkEnroll dedup ensures
  * already-enrolled leads are skipped; only genuinely new leads get added.
  */
-async function autoEnrollListIntoSequences(userId: string, listId: string): Promise<void> {
+export async function autoEnrollListIntoSequences(userId: string, listId: string): Promise<void> {
   try {
     const sequences = await dripSequenceDb.getSequencesByAutoEnrollList(userId, listId);
     if (sequences.length === 0) return;
 
-    const leadsResult = await crmDb.getLeadsByListId(listId);
+    // getAllLeadsByListId: getLeadsByListId returns ONE ~1MB page, so a bulk import
+    // into a large list auto-enrolled only the first page and silently skipped the rest.
+    const leadsResult = await crmDb.getAllLeadsByListId(listId);
     const leads = Array.isArray(leadsResult)
       ? leadsResult
       : ((leadsResult as any).items ?? (leadsResult as any).leads ?? []);
 
     for (const seq of sequences) {
+      const channels = requiredChannels(seq);
       const inputs = leads
-        .filter((l: any) => l.email)
+        // Channel-aware and predicate-based, matching the enrol routes. `l.email`
+        // truthiness admitted junk addresses and excluded LinkedIn-only leads.
+        .filter((l: any) => leadIsReachable(l, channels) && !!enrollmentIdentity(l))
         .map((l: any) => ({
           sequenceId: seq.sequenceId,
           userId,
           listId,
           leadId: l.leadId,
-          leadEmail: l.email,
+          leadEmail: enrollmentIdentity(l),
+          identityCandidates: enrollmentIdentityCandidates(l),
         }));
       if (inputs.length > 0) {
         await dripSequenceDb.bulkEnroll(inputs);
@@ -143,6 +174,17 @@ async function autoEnrollListIntoSequences(userId: string, listId: string): Prom
 // In-memory cache for CRM data files uploaded to S3
 // Key: `${userId}:${listId}`, Value: { leadsUrl, eventsUrl, expiresAt }
 const crmDataFileCache = new Map<string, { leadsUrl: string; eventsUrl: string; expiresAt: number }>();
+
+/**
+ * Columns the /analyze leads CSV ALWAYS carries, in this order, whether or not any lead in
+ * the list happens to have them. The header used to be a union of the keys present across
+ * the list, so a list where every lead is phone-only (ENG-2082) shipped a CSV with no
+ * `email` column while the prompt promised one — and the generated pandas hit a KeyError.
+ * Shared with the prompt below so the two can never drift again.
+ */
+const CRM_ANALYZE_CORE_LEAD_FIELDS = [
+  'leadId', 'email', 'phone', 'firstName', 'lastName', 'company', 'title', 'status', 'stage',
+];
 const CRM_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 /**
@@ -221,7 +263,11 @@ import {
   normalizeSender,
 } from '../services/crmSenderService';
 import { MAILBOX_PROVIDERS, CrmSender, isMailboxSender } from '../services/crmSenderTypes';
-import { sendAsSender } from '../services/sendAsSender';
+import { sendAsSender, SenderDailyLimitExceededError } from '../services/sendAsSender';
+import { claimEmailDomain, releaseEmailDomainClaim, confirmEmailDomainClaim, EmailDomainAlreadyClaimedError } from '../services/emailDomainClaimService';
+import { getPendingBatch, upsertPendingBatch, deletePendingBatch, PendingBatchConflictError } from '../services/groupEmailPendingBatchService';
+import { effectiveDailyLimit } from '../services/senderUsageTracker';
+import { senderUsageTracker } from '../services/senderUsageTrackerFactory';
 router.use(apolloSubRouter);
 
 const normalizeAlertEvents = (alertEvents: any) => {
@@ -1037,12 +1083,16 @@ router.get('/contacts', async (req: Request, res: Response) => {
     // Merge deduped contacts across users, re-dedup by email
     const contactMap = new Map<string, any>();
     let rawCount = 0;
+    let noEmailCount = 0;
     let listsCount = 0;
     for (const r of perUserResults) {
       rawCount += r.rawCount;
+      noEmailCount += r.noEmailCount ?? 0;
       listsCount += r.listsCount;
       for (const c of r.contacts) {
-        const key = c.email?.toLowerCase() ?? '';
+        // dedupKey, never email: an email-less contact carries `email: ''`, so keying on
+        // the address here would merge every phone-only contact across every user into one.
+        const key = c.dedupKey || c.email?.toLowerCase() || '';
         if (!contactMap.has(key)) contactMap.set(key, c);
       }
     }
@@ -1057,7 +1107,10 @@ router.get('/contacts', async (req: Request, res: Response) => {
     const total = contacts.length;
     if (parsedLimit !== undefined) contacts = contacts.slice(0, parsedLimit);
 
-    const result = { contacts, total, rawCount, listsCount };
+    // noEmailCount travels with the rest. Live-testing the phone-only work showed the
+    // service computing it and this route quietly dropping it, so the UI still had no way
+    // to explain a total that is smaller than rawCount.
+    const result = { contacts, total, rawCount, listsCount, noEmailCount };
     const durationMs = Date.now() - started;
     const primaryResult = perUserResults[0];
 
@@ -1065,6 +1118,10 @@ router.get('/contacts', async (req: Request, res: Response) => {
       contacts: result.contacts,
       total: result.total,
       rawCount: result.rawCount,
+      // How many of rawCount have no email. They are INCLUDED in contacts (ENG-2082), so
+      // without this the caller sees total < rawCount and cannot explain the difference.
+      // Adding it to `result` alone was not enough — this response enumerates its fields.
+      noEmailCount: result.noEmailCount,
       listsCount: result.listsCount,
       durationMs,
       ...(primaryResult?.nextCursor !== undefined && { nextCursor: primaryResult.nextCursor }),
@@ -1712,7 +1769,9 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
       if (!req.body?.inlineConfig) {
         return res.status(400).json({ message: 'preview mode requires inlineConfig in request body' });
       }
-      config = req.body.inlineConfig;
+      // A preview run buys real Enigma values, so the client's inline config
+      // gets the same card-revenue sanitising a saved config gets (ENG-1388).
+      config = stripImplicitCardRevenueRouting(req.body.inlineConfig);
     } else {
       const stored = await svcGetEnrichmentConfig({ listId, userId }, enrichmentConfigDeps);
       if (stored.isDefault) {
@@ -1727,7 +1786,8 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
     const leadIds = Array.isArray(req.body?.leadIds)
       ? req.body.leadIds.filter((id: unknown): id is string => typeof id === 'string')
       : undefined;
-    const deps = buildV3OrchestratorDeps(userId);
+    // ENG-1388: user-initiated runs may use Enigma card revenue (flag/allowlist-gated).
+    const deps = buildV3OrchestratorDeps(userId, { enigma: true });
     const socketId = typeof req.body?.socketId === 'string' ? req.body.socketId : undefined;
     console.log(`[v3][route] enrich-v3 POST listId=${listId} userId=${userId} mode=${mode} socketId=${socketId ?? '∅'} leadIds=${leadIds?.length ?? 'all'}`);
     const { buildListContext } = await import('../emma/enrichmentToolRunner');
@@ -1819,10 +1879,11 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
       return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
-    // HubSpot connection drives the sync-status filter + per-lead resolution.
-    // The syncStatus param is only honored when the list is actually connected.
-    const hsConn = getHubspotConnection(list);
-    const syncStatusFilter = hsConn.connected ? syncStatusQuery : '';
+    // The connected CRM (HubSpot or Attio — a list is only ever connected to
+    // one) drives the sync-status filter + per-lead resolution. The
+    // syncStatus param is only honored when the list is actually connected.
+    const crmConn = getExternalCrmConnection(list);
+    const syncStatusFilter = crmConn.connected ? syncStatusQuery : '';
 
     // Validate inputs
     const validPage = Math.max(1, page);
@@ -1902,7 +1963,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
           const normalized = (lead.linkedin as string).trim().toLowerCase().replace(/\/?$/, '/');
           if (!connectedLinkedInUrlSet.has(normalized)) return false;
         }
-        if (syncStatusFilter && resolveSyncStatus(lead, hsConn.connected) !== syncStatusFilter) {
+        if (syncStatusFilter && resolveSyncStatus(lead, crmConn.connected) !== syncStatusFilter) {
           return false;
         }
         return true;
@@ -1965,8 +2026,8 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
             engagementCount: engagementCounts.total,
             engagementCountLast7Days: engagementCounts.last7Days,
             totalAllMessages: engagementCounts.totalAllMessages,
-          }),
-          syncStatus: resolveSyncStatus(lead, hsConn.connected),
+          }, userId),
+          syncStatus: resolveSyncStatus(lead, crmConn.connected),
         };
       })
     );
@@ -1982,7 +2043,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
       totalPages: knownTotalPages ?? (hasMoreLeads ? null : validPage), // null means unknown total
       hasMore: hasMoreLeads,
       totalFilteredCount, // Total ICP count when icpsOnly is enabled, null otherwise
-      hubspotConnected: hsConn.connected,
+      crmConnected: crmConn.connected,
     });
   } catch (error: any) {
     console.error('Error fetching leads:', error);
@@ -2044,11 +2105,11 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
-    // Stamp an initial per-lead sync status when this list is connected to
-    // HubSpot. If auto-sync is on, the subsequent autoSyncLead push overwrites
-    // this with 'synced'/'sync_failed' via the adapter.
-    const hsConn = getHubspotConnection(list);
-    if (hsConn.connected) {
+    // Stamp an initial per-lead sync status when this list is connected to a
+    // CRM (HubSpot or Attio). If auto-sync is on, the subsequent autoSyncLead
+    // push overwrites this with 'synced'/'sync_failed' via the adapter.
+    const crmConn = getExternalCrmConnection(list);
+    if (crmConn.connected) {
       leadData.syncMetadata = { ...(leadData.syncMetadata || {}), syncStatus: 'sync_pending' };
     }
 
@@ -2057,7 +2118,9 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     void Promise.allSettled([
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'hubspot', 'created'),
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'attio', 'created'),
-      autoEnrollLeadInSequences(userId, listId, (lead as any).leadId, leadData.email ?? ''),
+      autoEnrollLeadInSequences(userId, listId, (lead as any).leadId, {
+        email: leadData.email ?? '', linkedin: (leadData as any).linkedin ?? '',
+      }),
       // Single-lead create always validates the email in background (locked design).
       // Failures are swallowed so a transient enrich.so outage doesn't block creation.
       validateLeadEmailInBackground(listId, (lead as any).leadId, leadData.email ?? '', userId),
@@ -2240,10 +2303,14 @@ router.post('/lists/:listId/leads/find', async (req: Request, res: Response) => 
  *       an angle (broad vs. region-focused, etc.) before clicking Find
  *       & Import.
  *
- *       Results are cached per persona on `user.icpResult[i].extractedFilters`
- *       keyed by a hash of the persona content + a code-bumped version.
- *       Cache hits skip the LLM entirely; cache misses regenerate and
- *       persist via userDb.updateUser.
+ *       Results are cached per persona, keyed by a hash of the persona
+ *       content + a code-bumped version, on whichever store the persona
+ *       came from: `user.icpResult[i].extractedFilters` for onboarding
+ *       personas, or `marketStrategy.icp[i].extractedFilters` (on the org
+ *       record for org members, the user record for solo users) for
+ *       Market-Strategy-sourced ones — except the org-owner-fallback case,
+ *       which is never cached (see the write-back comment below). Cache
+ *       hits skip the LLM entirely; cache misses regenerate and persist.
  * @access Private
  */
 router.get('/icp/filters', async (req: Request, res: Response) => {
@@ -2264,26 +2331,64 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
     // Resolve the persona list. Three stores hold ICP data and a user may
     // have ICPs in only one of them:
     //   1. user.icpResult — personas generated during onboarding / mirrored
-    //      from Emma's brand build. Carries the extractedFilters cache.
+    //      from Emma's brand build. Carries an extractedFilters cache.
     //   2. marketStrategy.icp — personas authored on the /market-strategy
     //      page or by Emma's update_market_strategy tool. For org members
     //      this lives on the ORG (see routes/marketStrategy.ts: "If user is
     //      in an org, always read market strategy from the org"), so an org
-    //      owner can have 5 ICPs the user record never sees.
+    //      owner can have 5 ICPs the user record never sees. Also carries
+    //      its own per-entry extractedFilters cache (see the write-back
+    //      comment below) — except the org-owner-fallback case, which is
+    //      never cached.
     // Prefer icpResult (it has the cache); otherwise fall back to the
     // marketStrategy.icp store, converting to the icpResult shape with the
     // same mapping Emma's brand-build mirror uses.
+    //
+    // marketStrategy.icp edits are never mirrored back onto icpResult (see
+    // the write-back comment below), so if the user corrects their ICPs on
+    // the Market Strategy page after onboarding, a plain "icpResult wins
+    // when non-empty" rule would serve the stale onboarding personas
+    // forever (ENG-1955). Resolve marketStrategy once up front and use it
+    // whenever it was saved more recently than icpResult was last
+    // generated.
+    let marketStrategy: any = user?.marketStrategy;
+    // True when resolveOrgProfileField had to fall back to the org OWNER's
+    // user record (org has no marketStrategy of its own and the caller isn't
+    // the owner). That fallback's updatedAt belongs to the owner's timeline,
+    // not the calling member's — comparing it against the caller's own
+    // icpCompletedAt would pit two unrelated users' clocks against each
+    // other, so the staleness override below must not apply (ENG-1955).
+    let marketStrategyFromOwnerFallback = false;
+    if (user?.orgId) {
+      const org: any = await orgDb.getOrgById(user.orgId, ['orgId', 'ownerUserId', 'marketStrategy']);
+      if (org) {
+        marketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy');
+        marketStrategyFromOwnerFallback =
+          !org.marketStrategy && !!org.ownerUserId && org.ownerUserId !== user.userId;
+      }
+    }
+    const marketIcp = Array.isArray(marketStrategy?.icp) ? marketStrategy.icp : [];
+    // Prefer icpUpdatedAt — bumped only by a write that actually touches
+    // `icp` — over the whole-object updatedAt, which every marketStrategy
+    // write bumps regardless of which field changed (businessOverview- or
+    // competitors-only saves included). Falling back to updatedAt when
+    // icpUpdatedAt is absent keeps existing records (saved before this field
+    // existed) working exactly as before; it only stops applying once a
+    // write path that sets icpUpdatedAt touches the record (ENG-1955
+    // follow-up — a competitors edit or an Emma "update the competitors"
+    // tool call was otherwise silently and permanently switching the org
+    // off its cached, richer icpResult-derived ICP filters).
+    const marketStrategyIcpTimestamp = marketStrategy?.icpUpdatedAt || marketStrategy?.updatedAt;
+    const marketStrategyIsNewer =
+      !marketStrategyFromOwnerFallback &&
+      marketIcp.length > 0 &&
+      !!marketStrategyIcpTimestamp &&
+      !!user?.icpCompletedAt &&
+      new Date(marketStrategyIcpTimestamp).getTime() > new Date(user.icpCompletedAt).getTime();
+
     let personas: any[] = Array.isArray(user?.icpResult) ? user.icpResult : [];
     let fromMarketStrategy = false;
-    if (personas.length === 0) {
-      let marketStrategy: any = user?.marketStrategy;
-      if (user?.orgId) {
-        const org: any = await orgDb.getOrgById(user.orgId);
-        if (org) {
-          marketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy');
-        }
-      }
-      const marketIcp = Array.isArray(marketStrategy?.icp) ? marketStrategy.icp : [];
+    if (personas.length === 0 || marketStrategyIsNewer) {
       if (marketIcp.length > 0) {
         const { mapMarketIcpToResult } = await import('../services/onboardingBrandBuildService');
         personas = mapMarketIcpToResult(marketIcp);
@@ -2333,14 +2438,36 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
       });
     }
 
-    // Persist the extracted filters as a cache — but ONLY for personas that
-    // came from user.icpResult. We deliberately do NOT write back when the
-    // personas were derived from marketStrategy.icp: materializing them onto
-    // user.icpResult would make the user record take precedence over the
-    // (possibly org-level) marketStrategy on the next click, so later edits
-    // to the org's ICPs would be masked by a stale user-level snapshot. The
-    // marketStrategy store stays the source of truth; we just re-run the LLM
-    // on each click there (rare, explicit, ~3s).
+    // Persist the extracted filters as a cache. Which store gets the write
+    // mirrors where `persona` actually came from:
+    //   - icpResult (fromMarketStrategy === false): write onto the user's
+    //     own icpResult, as before.
+    //   - marketStrategy.icp, solo user: write onto the user's own
+    //     marketStrategy so the next click for this user is instant.
+    //   - marketStrategy.icp, org member reading the ORG's own
+    //     marketStrategy: write onto the ORG record so every member
+    //     benefits, not just the one who clicked.
+    //   - marketStrategy.icp via the org-owner-fallback (org has no
+    //     marketStrategy of its own, so we're reading the OWNER's personal
+    //     record instead): never write. The write target would be a
+    //     different user's record than the caller's, driven solely by the
+    //     caller's click — not a call this route should make on someone
+    //     else's behalf. This narrow case just keeps re-running the LLM on
+    //     every click, as it did before this caching existed.
+    // All paths re-read before persisting and re-check the content hash, so
+    // a concurrent edit during the ~3s LLM window is never clobbered. The
+    // marketStrategy paths additionally preserve `marketStrategy.updatedAt`
+    // untouched (via spread — never set explicitly): a cache write must
+    // never look like a fresh user edit, which is exactly the failure mode
+    // mirrorIcpsToMarketStrategy's backdating above fixes for the mirror
+    // write (ENG-1955).
+    const extractedFilters = {
+      cacheKey: currentKey,
+      cacheVersion: ICP_FILTER_CACHE_VERSION,
+      variants,
+      generatedAt: new Date().toISOString(),
+    };
+
     if (!fromMarketStrategy) {
       // Re-read user before persisting so we don't clobber concurrent edits
       // made during the ~3s LLM window (e.g., onboarding regenerating
@@ -2360,19 +2487,92 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
 
       if (cacheStillApplies) {
         const nextIcpResult = freshPersonas.map((p: any, i: number) =>
-          i === icpIndex
-            ? {
-                ...p,
-                extractedFilters: {
-                  cacheKey: currentKey,
-                  cacheVersion: ICP_FILTER_CACHE_VERSION,
-                  variants,
-                  generatedAt: new Date().toISOString(),
-                },
-              }
-            : p,
+          i === icpIndex ? { ...p, extractedFilters } : p,
         );
         await userDb.updateUser(userId, { icpResult: nextIcpResult } as any);
+      }
+    } else if (!marketStrategyFromOwnerFallback) {
+      const { mapMarketIcpToResult } = await import('../services/onboardingBrandBuildService');
+
+      // mapMarketIcpToResult filters out non-object entries BEFORE mapping,
+      // so `icpIndex` (an index into that filtered+mapped array, same as
+      // the read path above) does NOT necessarily equal the matching
+      // entry's index in the raw `icp` array whenever a malformed entry
+      // (e.g. `null`) precedes it — POST /market-strategy stores `icp`
+      // verbatim with no shape validation. Match by object identity against
+      // the same filter instead of by raw index, so the write always lands
+      // on the entry the cache was actually computed for.
+      const rawIcpEntryFor = (freshIcp: any[]) => {
+        const filtered = freshIcp.filter((p: any) => p && typeof p === 'object');
+        return filtered[icpIndex];
+      };
+
+      // The hash check above only guards the ONE persona's content — it says
+      // nothing about competitors, businessOverview, or any OTHER icp entry.
+      // Those can still change between this fresh re-read and the write
+      // below (another org member's edit, the Market Strategy route, Emma),
+      // and a blind `{ ...freshSnapshot, icp: nextIcp }` replace would
+      // silently clobber that concurrent change with the now-stale snapshot.
+      // Condition the write on marketStrategy.updatedAt still matching what
+      // we just read: if anything else wrote in between, updatedAt moved and
+      // the condition fails, so we skip this cache write rather than lose
+      // someone else's edit. Self-healing — the next click regenerates and
+      // retries against whatever is current.
+      const conditionOnUnchangedSnapshot = (snapshotUpdatedAt: string | undefined) =>
+        snapshotUpdatedAt === undefined
+          ? undefined
+          : {
+              condition: {
+                expression: '#marketStrategy.#msUpdatedAt = :expectedMsUpdatedAt',
+                names: { '#marketStrategy': 'marketStrategy', '#msUpdatedAt': 'updatedAt' },
+                values: { ':expectedMsUpdatedAt': snapshotUpdatedAt },
+              },
+            };
+
+      if (user.orgId) {
+        const freshOrg: any = await orgDb.getOrgById(user.orgId, ['orgId', 'ownerUserId', 'marketStrategy']);
+        const freshIcp: any[] = Array.isArray(freshOrg?.marketStrategy?.icp) ? freshOrg.marketStrategy.icp : [];
+        const freshMapped = mapMarketIcpToResult(freshIcp);
+        const cacheStillApplies =
+          freshMapped[icpIndex] && personaCacheKey(freshMapped[icpIndex]) === currentKey;
+
+        if (cacheStillApplies) {
+          const targetRaw = rawIcpEntryFor(freshIcp);
+          const nextIcp = freshIcp.map((p: any) =>
+            p === targetRaw ? { ...p, extractedFilters } : p,
+          );
+          try {
+            await orgDb.updateOrg(
+              user.orgId,
+              { marketStrategy: { ...freshOrg.marketStrategy, icp: nextIcp } } as any,
+              conditionOnUnchangedSnapshot(freshOrg?.marketStrategy?.updatedAt),
+            );
+          } catch (err: any) {
+            if (err?.code !== 'ConditionalCheckFailedException') throw err;
+          }
+        }
+      } else {
+        const freshUser: any = await userDb.getUserById(userId);
+        const freshIcp: any[] = Array.isArray(freshUser?.marketStrategy?.icp) ? freshUser.marketStrategy.icp : [];
+        const freshMapped = mapMarketIcpToResult(freshIcp);
+        const cacheStillApplies =
+          freshMapped[icpIndex] && personaCacheKey(freshMapped[icpIndex]) === currentKey;
+
+        if (cacheStillApplies) {
+          const targetRaw = rawIcpEntryFor(freshIcp);
+          const nextIcp = freshIcp.map((p: any) =>
+            p === targetRaw ? { ...p, extractedFilters } : p,
+          );
+          try {
+            await userDb.updateUser(
+              userId,
+              { marketStrategy: { ...freshUser.marketStrategy, icp: nextIcp } } as any,
+              conditionOnUnchangedSnapshot(freshUser?.marketStrategy?.updatedAt),
+            );
+          } catch (err: any) {
+            if (err?.code !== 'ConditionalCheckFailedException') throw err;
+          }
+        }
       }
     }
 
@@ -2417,7 +2617,7 @@ router.get('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
       return res.status(404).json({ message: 'Lead not found' });
     }
 
-    res.json(sanitizeLeadForResponse(lead));
+    res.json(sanitizeLeadForResponse(lead, userId));
   } catch (error: any) {
     console.error('Error fetching lead:', error);
     res.status(500).json({ message: error.message || 'Failed to fetch lead' });
@@ -2585,6 +2785,22 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
       return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
+    // `lifecycle` became a writable attribute on this route when updateLead grew an
+    // explicit handler for it; before that the key was silently dropped. It outranks the
+    // live computation in askCrmService permanently, so it is validated at the edge as a
+    // 400 rather than reaching updateLead's throw and surfacing as a 500.
+    if (updates?.lifecycle !== undefined && updates.lifecycle !== null) {
+      // Trimmed for the check because updateLead trims before storing — validating the
+      // raw value would 400 on "  paying  " while the layer below would have accepted it.
+      // An empty value is the explicit CLEAR, not an invalid stage.
+      const proposedLifecycle = String(updates.lifecycle).trim();
+      if (proposedLifecycle && !isValidLeadLifecycle(proposedLifecycle)) {
+        return res.status(400).json({
+          message: `Invalid lifecycle "${String(updates.lifecycle)}". Expected one of: ${LEAD_LIFECYCLES.join(', ')}.`,
+        });
+      }
+    }
+
     if (updates?.selectedSenderId !== undefined) {
       const normalizedSenderId = normalizeSenderId(updates.selectedSenderId);
       if (normalizedSenderId !== null && typeof normalizedSenderId !== 'string') {
@@ -2599,15 +2815,15 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
       updates.selectedSenderId = normalizedSenderId;
     }
 
-    // When this list is connected to HubSpot with auto-sync OFF, a change to a
-    // HubSpot-mapped field on an already-synced lead means it needs re-pushing —
+    // When this list is connected to a CRM with auto-sync OFF, a change to a
+    // CRM-mapped field on an already-synced lead means it needs re-pushing —
     // surface that as update_pending so it shows in the sync filter. With
     // auto-sync ON the adapter sets synced/sync_failed instead, so we skip.
-    const hsConnUpd = getHubspotConnection(list);
-    if (hsConnUpd.connected && !hsConnUpd.autoSyncEnabled) {
+    const crmConnUpd = getExternalCrmConnection(list);
+    if (crmConnUpd.connected && !crmConnUpd.autoSyncEnabled) {
       const existingForSync = await crmDb.getLeadById(listId, leadId);
       if (existingForSync && resolveSyncStatus(existingForSync, true) === 'synced'
-          && mappedFieldChanged(existingForSync, updates, getMappedAgentwebFields(hsConnUpd.config))) {
+          && mappedFieldChanged(existingForSync, updates, getMappedAgentwebFields(crmConnUpd.config))) {
         updates.syncMetadata = { ...(existingForSync.syncMetadata || {}), syncStatus: 'update_pending' };
       }
     }
@@ -2642,7 +2858,7 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
       void validateLeadEmailInBackground(listId, leadId, updates.email, userId);
     }
 
-    res.json(sanitizeLeadForResponse(updatedLead));
+    res.json(sanitizeLeadForResponse(updatedLead, userId));
   } catch (error: any) {
     console.error('Error updating lead:', error);
     res.status(500).json({ message: error.message || 'Failed to update lead' });
@@ -3104,6 +3320,16 @@ router.post('/lists/:listId/leads/export', async (req: Request, res: Response) =
       }
     }
 
+    // ENG-1388: card revenue is Enigma-licensed internal-use-only data. A CSV
+    // is a file that leaves the system entirely, so a list editor who isn't
+    // Enigma-allowlisted must never get it as a column, regardless of who
+    // originally enriched the lead or how the list is shared.
+    if (shouldHideCardRevenueForViewer(userId)) {
+      for (const key of Array.from(customFieldSet)) {
+        if (isCardRevenueField(key)) customFieldSet.delete(key);
+      }
+    }
+
     const customFields = Array.from(customFieldSet).sort();
     const allColumns = [...standardFields, ...customFields];
 
@@ -3185,7 +3411,19 @@ router.get('/lists/:listId/export-history', async (req: Request, res: Response) 
       return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
-    res.json({ history: list.csvExportHistory || [] });
+    const history = list.csvExportHistory || [];
+    // ENG-1388 (CodeRabbit on agentweb#3108): a past export's fileUrl is a
+    // public S3 link, and export history has no per-entry record of whether
+    // that export included card revenue — the export route only started
+    // excluding it going forward. A non-allowlisted viewer must not be able
+    // to fetch an old export's link through this endpoint just because they
+    // can read the list; fail closed on every entry rather than guess which
+    // ones are safe.
+    const sanitizedHistory = shouldHideCardRevenueForViewer(userId)
+      ? history.map(({ fileUrl, ...rest }: any) => ({ ...rest, fileUrl: null, restricted: true }))
+      : history;
+
+    res.json({ history: sanitizedHistory });
   } catch (error: any) {
     console.error('Error fetching export history:', error);
     res.status(500).json({ message: error.message || 'Failed to fetch export history' });
@@ -4405,10 +4643,22 @@ router.post('/lists/:listId/check-linkedin-connections', async (req: Request, re
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    // Only check connections using the LinkedIn account explicitly assigned to this list.
-    // No fallback to user-level or site-wide accounts.
-    const accountId: string | null = (list as any).linkedInAccountId ?? null;
-    if (!accountId) return res.json({ connected: [], invited: [] });
+    // ENG-1612 gap #6/#4: don't require a list-level linkedInAccountId — fall back to
+    // the caller's own connected account (same fallback POST /check-linkedin-connections
+    // already uses for the cross-list Inbox view) so a list without one still shows real
+    // connection/invite state instead of silently rendering as "not invited".
+    let accountId: string | null = (list as any).linkedInAccountId ?? null;
+    let accountSource: 'list' | 'user' | null = accountId ? 'list' : null;
+    if (!accountId) {
+      const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+      accountId = await linkedInOutreachService.resolveUserOwnedAccountId(userId);
+      if (accountId) accountSource = 'user';
+    }
+    if (!accountId) {
+      // Explicit empty-state: distinguishable from "checked, nothing found" so the UI can
+      // render "connect a LinkedIn account" instead of reading this as zero connections.
+      return res.json({ connected: [], invited: [], accountId: null, noLinkedInAccountConnected: true });
+    }
 
     const { getConnectionByProfileUrlAndAccount } = await import('../services/unipileConnectionsDb');
     const { getSentInvitationByProfileUrlAndAccount } = await import('../services/unipileSentInvitationsDb');
@@ -4417,19 +4667,265 @@ router.post('/lists/:listId/check-linkedin-connections', async (req: Request, re
     const invited: Array<{ url: string; sentAt: string | null }> = [];
     await Promise.all(urls.map(async (url: string) => {
       const normalizedUrl = url.trim().toLowerCase().replace(/\/?$/, '/');
-      const conn = await getConnectionByProfileUrlAndAccount(url, accountId).catch(() => null);
+      const conn = await getConnectionByProfileUrlAndAccount(url, accountId!).catch(() => null);
       if (conn) {
         connected.push({ url: normalizedUrl, connectedAt: conn.connectedAt ?? null });
         return; // already connected — pending-invite state is irrelevant
       }
-      const inv = await getSentInvitationByProfileUrlAndAccount(url, accountId).catch(() => null);
+      const inv = await getSentInvitationByProfileUrlAndAccount(url, accountId!).catch(() => null);
       if (inv) invited.push({ url: normalizedUrl, sentAt: inv.sentAt ?? null });
     }));
 
-    return res.json({ connected, invited });
+    return res.json({ connected, invited, accountId, accountSource });
   } catch (error: any) {
     console.error('Error checking LinkedIn connections:', error);
     return res.status(500).json({ message: error.message || 'Failed to check LinkedIn connections' });
+  }
+});
+
+/**
+ * @route GET /api/crm/linkedin/sent-invitations
+ * @desc List this user's pending (sent, not-yet-accepted) LinkedIn connection invitations
+ *       for a given account, from the AW-UnipileSentInvitations cache (synced ~10 min by
+ *       linkedInConnectionSyncCron). Exposes ENG-1612 gap #1: the backend already
+ *       materializes the full pending set per account, but there was no list endpoint.
+ * @query { accountId?: string } — defaults to the caller's own connected Unipile account.
+ * @access Private
+ */
+router.get('/linkedin/sent-invitations', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const requestedAccountId = typeof req.query.accountId === 'string' ? req.query.accountId : null;
+
+    // Only ever list invitations for an account this user actually owns (their own
+    // connected account, or an org-shared one) — never an arbitrary accountId string.
+    const ownedAccountIds = await linkedInOutreachService.listUserOwnedUnipileAccountIds(userId);
+    let accountId: string | null = requestedAccountId;
+    if (accountId && !ownedAccountIds.includes(accountId)) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+    if (!accountId) accountId = ownedAccountIds[0] ?? null;
+    if (!accountId) {
+      return res.status(400).json({ message: 'No LinkedIn account connected. Connect a LinkedIn account in Settings first.' });
+    }
+
+    const { getAllSentInvitationsByAccount } = await import('../services/unipileSentInvitationsDb');
+    const invitations = await getAllSentInvitationsByAccount(accountId);
+    // Newest first — that's the useful reading order for a "manage my pending invites" view.
+    invitations.sort((a, b) => new Date(b.sentAt).getTime() - new Date(a.sentAt).getTime());
+
+    return res.json({ accountId, invitations });
+  } catch (error: any) {
+    console.error('Error listing LinkedIn sent invitations:', error);
+    return res.status(500).json({ message: error.message || 'Failed to list LinkedIn sent invitations' });
+  }
+});
+
+/**
+ * @route POST /api/crm/linkedin/sent-invitations/:invitationId/withdraw
+ * @desc Withdraw (cancel) a pending LinkedIn connection invitation. Wires the existing
+ *       linkedInOutreachService.cancelInvitation to the UI (ENG-1612 gap #2) and cleans
+ *       up the pending-invite cache write-through so the amber dot/chip clear immediately
+ *       rather than waiting for the next cron prune (mirrors the Emma tool-call cleanup
+ *       in agentModeService.ts's 'cancel-invitation' case).
+ *
+ *       Routes through the same pace/cooldown gate as Emma's cancel-invitation action
+ *       (linkedInDailyVolumeGate.ts) — a UI-initiated withdraw must not bypass the
+ *       account-health pacer that the manual crm.ts send paths currently do (ENG-1612 #5).
+ * @body { accountId: string }
+ * @access Private
+ */
+router.post('/linkedin/sent-invitations/:invitationId/withdraw', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { invitationId } = req.params;
+    const { accountId } = req.body;
+    if (!invitationId) return res.status(400).json({ message: 'invitationId is required' });
+    if (!accountId || typeof accountId !== 'string') {
+      return res.status(400).json({ message: 'accountId is required' });
+    }
+
+    const { resolveLinkedInAccountForWrite, paceLinkedInWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+    const resolvedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
+    if (!resolvedAccount) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+
+    const paced = await paceLinkedInWrite('cancel-invitation', resolvedAccount, accountId);
+    if (paced.refusal) {
+      return res.status(429).json(paced.refusal);
+    }
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const cancelResult = await linkedInOutreachService.cancelInvitation(invitationId, accountId);
+
+    // Best-effort cache write-through, same as the Emma tool path — a failed cleanup
+    // must not turn a successful withdrawal into a reported failure (the 10-min cron
+    // prune is the backstop either way).
+    const { deleteSentInvitationByInvitationId } = await import('../services/unipileSentInvitationsDb');
+    await deleteSentInvitationByInvitationId(accountId, invitationId).catch((err) =>
+      console.error(`[crm] Failed to drop withdrawn invitation ${invitationId} from cache:`, err),
+    );
+
+    return res.json({ success: true, invitationId, accountId, result: cancelResult });
+  } catch (error: any) {
+    console.error('Error withdrawing LinkedIn invitation:', error);
+    return res.status(500).json({ message: error.message || 'Failed to withdraw LinkedIn invitation' });
+  }
+});
+
+/**
+ * @route GET /api/crm/linkedin/received-invitations
+ * @desc List LinkedIn connection invitations received FROM others, so they're visible
+ *       and acceptable from the UI (ENG-1612 gap #3/AC #3) — previously Emma-chat-only
+ *       via linkedInOutreachService.listReceivedInvitations.
+ * @query { accountId?: string, cursor?: string }
+ * @access Private
+ */
+router.get('/linkedin/received-invitations', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const requestedAccountId = typeof req.query.accountId === 'string' ? req.query.accountId : null;
+    const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+
+    const ownedAccountIds = await linkedInOutreachService.listUserOwnedUnipileAccountIds(userId);
+    let accountId: string | null = requestedAccountId;
+    if (accountId && !ownedAccountIds.includes(accountId)) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+    if (!accountId) accountId = ownedAccountIds[0] ?? null;
+    if (!accountId) {
+      return res.status(400).json({ message: 'No LinkedIn account connected. Connect a LinkedIn account in Settings first.' });
+    }
+
+    const result = await linkedInOutreachService.listReceivedInvitations(accountId, cursor);
+    return res.json({ accountId, ...result });
+  } catch (error: any) {
+    console.error('Error listing LinkedIn received invitations:', error);
+    return res.status(500).json({ message: error.message || 'Failed to list LinkedIn received invitations' });
+  }
+});
+
+/**
+ * @route POST /api/crm/linkedin/received-invitations/:invitationId/accept
+ * @desc Accept a received LinkedIn connection invitation (ENG-1612 gap #3/AC #3).
+ * @body { accountId: string, sharedSecret: string }
+ * @access Private
+ */
+router.post('/linkedin/received-invitations/:invitationId/accept', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { invitationId } = req.params;
+    const { accountId, sharedSecret } = req.body;
+    if (!invitationId) return res.status(400).json({ message: 'invitationId is required' });
+    if (!accountId || typeof accountId !== 'string') {
+      return res.status(400).json({ message: 'accountId is required' });
+    }
+    if (!sharedSecret || typeof sharedSecret !== 'string') {
+      return res.status(400).json({ message: 'sharedSecret is required (returned by GET /linkedin/received-invitations)' });
+    }
+
+    const { resolveLinkedInAccountForWrite, paceLinkedInWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+    const resolvedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
+    if (!resolvedAccount) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+
+    const paced = await paceLinkedInWrite('accept-invitation', resolvedAccount, accountId);
+    if (paced.refusal) {
+      return res.status(429).json(paced.refusal);
+    }
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const acceptResult = await linkedInOutreachService.acceptInvitation(invitationId, accountId, sharedSecret);
+
+    return res.json({ success: true, invitationId, accountId, result: acceptResult });
+  } catch (error: any) {
+    console.error('Error accepting LinkedIn invitation:', error);
+    return res.status(500).json({ message: error.message || 'Failed to accept LinkedIn invitation' });
+  }
+});
+
+/**
+ * @route GET /api/crm/linkedin/daily-quota
+ * @desc Remaining daily invite/message quota + any active hourly/burst cooldown for an
+ *       account, from linkedInDailyVolumeGate / linkedInWritePacer state (ENG-1612 gap #6/
+ *       AC #5) — so a Send button can show "7 of 10 invites left today" or "cooling down
+ *       until 14:32" before the user attempts a send that the pacer would refuse anyway.
+ *       Read-only: does not reserve a slot.
+ * @query { accountId?: string }
+ * @access Private
+ */
+router.get('/linkedin/daily-quota', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+    const requestedAccountId = typeof req.query.accountId === 'string' ? req.query.accountId : null;
+    const ownedAccountIds = await linkedInOutreachService.listUserOwnedUnipileAccountIds(userId);
+    let accountId: string | null = requestedAccountId;
+    if (accountId && !ownedAccountIds.includes(accountId)) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+    if (!accountId) accountId = ownedAccountIds[0] ?? null;
+    if (!accountId) {
+      return res.status(400).json({ message: 'No LinkedIn account connected. Connect a LinkedIn account in Settings first.' });
+    }
+
+    const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+    const { resolveDailyInviteCap, dailyMessageCap, peekWriteCooldown } = await import('../services/linkedInWritePacer');
+    const resolvedAccount = await resolveLinkedInAccountForWrite(userId, accountId);
+    if (!resolvedAccount) {
+      return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+    }
+
+    const now = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const inviteCap = resolveDailyInviteCap(resolvedAccount.configuredDailyInviteCap);
+    const inviteWindow = resolvedAccount.dailyVolumeState?.invite;
+    const inviteWindowExpired = !inviteWindow || now - inviteWindow.windowStartedAt >= DAY_MS;
+    const inviteUsed = inviteWindowExpired ? 0 : inviteWindow!.count;
+
+    const messageCap = dailyMessageCap();
+    const messageWindow = resolvedAccount.dailyVolumeState?.message;
+    const messageWindowExpired = !messageWindow || now - messageWindow.windowStartedAt >= DAY_MS;
+    const messageUsed = messageWindowExpired ? 0 : messageWindow!.count;
+
+    return res.json({
+      accountId,
+      invites: {
+        used: inviteUsed,
+        cap: Number.isFinite(inviteCap) ? inviteCap : null, // null = uncapped (operator disabled)
+        remaining: Number.isFinite(inviteCap) ? Math.max(0, inviteCap - inviteUsed) : null,
+        windowResetsAt: inviteWindowExpired ? null : new Date(inviteWindow!.windowStartedAt + DAY_MS).toISOString(),
+      },
+      messages: {
+        used: messageUsed,
+        cap: messageCap > 0 ? messageCap : null, // null = uncapped (operator disabled or Jest)
+        remaining: messageCap > 0 ? Math.max(0, messageCap - messageUsed) : null,
+        windowResetsAt: messageWindowExpired ? null : new Date(messageWindow!.windowStartedAt + DAY_MS).toISOString(),
+      },
+      cooldown: peekWriteCooldown(accountId, now),
+    });
+  } catch (error: any) {
+    console.error('Error fetching LinkedIn daily quota:', error);
+    return res.status(500).json({ message: error.message || 'Failed to fetch LinkedIn daily quota' });
   }
 });
 
@@ -4898,7 +5394,7 @@ router.post('/lists/:listId/leads/:leadId/engagements', async (req: Request, res
     } catch (alertError) {
       console.error('Failed to send lead list alert email:', alertError);
     }
-    res.json({ success: true, lead: sanitizeLeadForResponse(updatedLead) });
+    res.json({ success: true, lead: sanitizeLeadForResponse(updatedLead, userId) });
   } catch (error: any) {
     console.error('Error adding lead engagement:', error);
     res.status(500).json({ message: error.message || 'Failed to add lead engagement' });
@@ -4947,7 +5443,7 @@ router.put('/lists/:listId/leads/:leadId/engagements/:eventId', async (req: Requ
     };
 
     const updatedLead = await crmDb.updateLeadEngagement(listId, leadId, eventId, engagement);
-    res.json({ success: true, lead: sanitizeLeadForResponse(updatedLead) });
+    res.json({ success: true, lead: sanitizeLeadForResponse(updatedLead, userId) });
   } catch (error: any) {
     console.error('Error updating lead engagement:', error);
     res.status(500).json({ message: error.message || 'Failed to update lead engagement' });
@@ -4980,7 +5476,7 @@ router.delete('/lists/:listId/leads/:leadId/engagements/:eventId', async (req: R
     }
 
     const updatedLead = await crmDb.deleteLeadEngagement(listId, leadId, eventId);
-    res.json({ success: true, lead: sanitizeLeadForResponse(updatedLead) });
+    res.json({ success: true, lead: sanitizeLeadForResponse(updatedLead, userId) });
   } catch (error: any) {
     console.error('Error deleting lead engagement:', error);
     res.status(500).json({ message: error.message || 'Failed to delete lead engagement' });
@@ -5026,10 +5522,28 @@ router.get('/sender-emails', async (req: Request, res: Response) => {
 
     // Emit both shapes: the legacy keys (senderType / gmailAccountId) so the
     // current portal keeps rendering, and the neutral ones the new UI reads.
-    const senders = config.senders.map((s) => ({
-      ...serializeSender(s),
-      senderProvider: s.senderProvider,
-      connectedAccountId: s.connectedAccountId,
+    // Also attach today's send usage against each sender's effective cap
+    // (ENG-265) so the settings UI can show "warming up" / "N/limit today"
+    // without a second round trip.
+    const senders = await Promise.all(config.senders.map(async (s) => {
+      const limit = effectiveDailyLimit(s);
+      // A rejected usage read must not blank the whole sender list — none of the rest of this
+      // response (senders, default sender, connected accounts) depends on usage counts. Same
+      // defensive-fallback pattern already used for connected_accounts above and
+      // resendService.getDomain in GET /email-domains.
+      const usage = limit !== null
+        ? await senderUsageTracker.getUsage(userId, s.id).catch((err: any) => {
+            console.warn(`[crm] getUsage failed for sender ${s.id}:`, err?.message || err);
+            return null;
+          })
+        : null;
+      return {
+        ...serializeSender(s),
+        senderProvider: s.senderProvider,
+        connectedAccountId: s.connectedAccountId,
+        effectiveDailyLimit: limit,
+        sentToday: usage?.sentCount ?? 0,
+      };
     }));
 
     res.json({
@@ -5140,6 +5654,8 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
           notes: s.notes ? s.notes.trim() : undefined,
           senderProvider: s.senderProvider ?? s.senderType ?? 'resend',
           connectedAccountId: s.connectedAccountId ?? s.gmailAccountId,
+          dailyLimit: typeof s.dailyLimit === 'number' ? s.dailyLimit : undefined,
+          warmupStartedAt: typeof s.warmupStartedAt === 'string' ? s.warmupStartedAt : undefined,
         }),
       ),
       defaultSenderId: defaultSenderId || (senders.length > 0 ? senders[0].id || '0' : null),
@@ -5187,53 +5703,79 @@ router.post('/email-domain', async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'Invalid domain format' });
     }
 
-    // Check if another user already has this domain
+    // Check if another user already has this domain — fast-fail UX check only (eventually
+    // consistent scan, TOCTOU-prone on its own); claimEmailDomain() below is the actual
+    // cross-user correctness guarantee (ENG-265: this legacy singular route previously bypassed
+    // that protocol entirely, letting it race the plural route's own protection).
     const usersWithDomain = await userDb.getUsersByEmailDomain(normalizedDomain);
     const otherUserWithDomain = usersWithDomain.find(u => u.userId !== userId);
     if (otherUserWithDomain) {
       return res.status(409).json({ message: 'This domain is already in use by another account' });
     }
 
-    // Check if domain already exists in Resend
-    const existingDomains = await resendService.listDomains();
-    const existingDomain = existingDomains.find(d => d.name === normalizedDomain);
+    try {
+      await claimEmailDomain(userId, normalizedDomain);
+    } catch (claimError: any) {
+      if (claimError instanceof EmailDomainAlreadyClaimedError) {
+        return res.status(409).json({ message: 'This domain is already in use by another account' });
+      }
+      throw claimError;
+    }
 
-    if (existingDomain) {
-      // Domain already exists in Resend — return its current status and records
-      const domainDetails = await resendService.getDomain(existingDomain.id);
-      if (!domainDetails) {
-        return res.status(500).json({ message: 'Failed to retrieve existing domain details' });
+    try {
+      // Check if domain already exists in Resend
+      const existingDomains = await resendService.listDomains();
+      const existingDomain = existingDomains.find(d => d.name === normalizedDomain);
+
+      if (existingDomain) {
+        // Domain already exists in Resend — return its current status and records
+        const domainDetails = await resendService.getDomain(existingDomain.id);
+        if (!domainDetails) {
+          await releaseEmailDomainClaim(normalizedDomain, userId);
+          return res.status(500).json({ message: 'Failed to retrieve existing domain details' });
+        }
+
+        // Save the resend domain ID and domain to the user record
+        await userDb.updateUser(userId, {
+          emailDomain: normalizedDomain,
+          resendDomainId: existingDomain.id,
+        });
+        await confirmEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+          console.error(`CRITICAL: failed to confirm email domain claim for "${normalizedDomain}" (user ${userId}) after retries — claim may expire and be taken over:`, e));
+
+        return res.json({
+          message: 'Domain already registered in Resend',
+          domain: domainDetails,
+          alreadyExists: true,
+        });
+      }
+
+      // Create new domain in Resend
+      const result = await resendService.createDomain(normalizedDomain);
+      if (!result) {
+        await releaseEmailDomainClaim(normalizedDomain, userId);
+        return res.status(500).json({ message: 'Failed to create domain in Resend' });
       }
 
       // Save the resend domain ID and domain to the user record
       await userDb.updateUser(userId, {
         emailDomain: normalizedDomain,
-        resendDomainId: existingDomain.id,
+        resendDomainId: result.id,
       });
+      await confirmEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+        console.error(`CRITICAL: failed to confirm email domain claim for "${normalizedDomain}" (user ${userId}) after retries — claim may expire and be taken over:`, e));
 
-      return res.json({
-        message: 'Domain already registered in Resend',
-        domain: domainDetails,
-        alreadyExists: true,
+      res.json({
+        message: 'Domain created successfully. Add the DNS records below to verify.',
+        domain: result,
       });
+    } catch (innerError) {
+      // The claim succeeded but a later step didn't — release it so the domain isn't
+      // permanently stuck unclaimable by anyone.
+      await releaseEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+        console.error(`Failed to release email domain claim for "${normalizedDomain}" after a failed registration:`, e));
+      throw innerError;
     }
-
-    // Create new domain in Resend
-    const result = await resendService.createDomain(normalizedDomain);
-    if (!result) {
-      return res.status(500).json({ message: 'Failed to create domain in Resend' });
-    }
-
-    // Save the resend domain ID and domain to the user record
-    await userDb.updateUser(userId, {
-      emailDomain: normalizedDomain,
-      resendDomainId: result.id,
-    });
-
-    res.json({
-      message: 'Domain created successfully. Add the DNS records below to verify.',
-      domain: result,
-    });
   } catch (error: any) {
     console.error('Error creating email domain:', error);
     res.status(500).json({ message: error.message || 'Failed to create email domain' });
@@ -5257,6 +5799,16 @@ router.delete('/email-domain', async (req: Request, res: Response) => {
     const user = await userDb.getUserById(userId);
     if (!user?.resendDomainId && !user?.emailDomain) {
       return res.status(400).json({ message: 'No domain configured to reset' });
+    }
+
+    // Release the claim before clearing the user record (same reasoning and ordering as
+    // DELETE /email-domains/:domainId) — this is a confirmed claim that never expires on its
+    // own, so a domain deleted only through this legacy route would otherwise remain
+    // permanently claimed, unregistrable through either endpoint, by no one. Idempotent (a
+    // no-op if this domain predates the claim protocol and was never actually claimed) via the
+    // conditional delete already inside releaseEmailDomainClaim.
+    if (user.emailDomain) {
+      await releaseEmailDomainClaim(user.emailDomain, userId);
     }
 
     // Clear domain fields from user record (don't delete from Resend — may be shared or reused)
@@ -5350,6 +5902,376 @@ router.get('/email-domain/status', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Error fetching email domain status:', error);
     res.status(500).json({ message: error.message || 'Failed to fetch email domain status' });
+  }
+});
+
+// ── Multi-domain endpoints (ENG-265) ──────────────────────────────────────
+// The singular /email-domain* routes above stay as-is for backward
+// compatibility during rollout. These plural routes operate on User.emailDomains[]
+// instead of the single emailDomain/resendDomainId scalar fields.
+
+type SenderDomainEntry = { id: string; domain: string; status: string; addedAt: string };
+
+/**
+ * A domain registered before ENG-265's multi-domain support only ever set the legacy scalar
+ * fields (emailDomain/resendDomainId), never emailDomains[]. Surface that legacy domain in the
+ * new plural endpoints too, via a synthesized entry — not a data migration — so an account that
+ * registered before this PR shipped doesn't lose visibility into (and the ability to manage)
+ * its existing domain just because it predates the array.
+ */
+function getEffectiveDomains(
+  user: { emailDomain?: string; resendDomainId?: string; emailDomains?: SenderDomainEntry[] } | null | undefined,
+): SenderDomainEntry[] {
+  const domains = user?.emailDomains || [];
+  if (
+    user?.emailDomain &&
+    user?.resendDomainId &&
+    !domains.some((d) => d.id === user.resendDomainId || d.domain === user.emailDomain)
+  ) {
+    return [...domains, {
+      id: user.resendDomainId,
+      domain: user.emailDomain,
+      status: 'unknown', // re-fetched live from Resend on every GET regardless of this placeholder
+      addedAt: new Date(0).toISOString(), // registration predates this field — no real timestamp to recover
+    }];
+  }
+  return domains;
+}
+
+/**
+ * @route GET /api/crm/email-domains
+ * @desc List every sending domain registered by the authenticated user, each enriched with live Resend status/records
+ * @access Private
+ */
+router.get('/email-domains', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const user = await userDb.getUserById(userId);
+    const domains: SenderDomainEntry[] = getEffectiveDomains(user);
+
+    const enriched = await Promise.all(domains.map(async (d: SenderDomainEntry) => {
+      // A transient failure on ONE domain's live-status lookup must not blank the whole list —
+      // Promise.all rejects on the first rejection, and with up to MAX_EMAIL_DOMAINS_PER_ACCOUNT
+      // (20) outbound Resend calls per page load, some transient failure is not unlikely. Fall
+      // back to the last-known stored status for that one entry instead of failing the request.
+      const details = await resendService.getDomain(d.id).catch((err: any) => {
+        console.warn(`[crm] getDomain failed for ${d.domain}:`, err?.message || err);
+        return null;
+      });
+      return {
+        id: d.id,
+        domain: d.domain,
+        addedAt: d.addedAt,
+        status: details?.status || d.status,
+        records: details?.records || [],
+      };
+    }));
+
+    res.json({ domains: enriched });
+  } catch (error: any) {
+    console.error('Error listing email domains:', error);
+    res.status(500).json({ message: error.message || 'Failed to list email domains' });
+  }
+});
+
+/**
+ * @route POST /api/crm/email-domains
+ * @desc Register an additional sending domain in Resend for the authenticated user
+ * @access Private
+ */
+router.post('/email-domains', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { domain } = req.body;
+    if (!domain || typeof domain !== 'string') {
+      return res.status(400).json({ message: 'Domain is required' });
+    }
+
+    const normalizedDomain = domain.trim().toLowerCase();
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(normalizedDomain)) {
+      return res.status(400).json({ message: 'Invalid domain format' });
+    }
+
+    const user = await userDb.getUserById(userId);
+    // Real, stored array — this (not the effective one below) is what the CAS write further
+    // down is based on and conditioned against; the synthesized legacy entry was never actually
+    // persisted in emailDomains[], so including it in the expected-size check would make the
+    // conditional write fail against the real (smaller) stored array on every attempt.
+    const existingDomains: SenderDomainEntry[] = user?.emailDomains || [];
+    // Includes a legacy scalar-field domain (if any) — cap/duplicate detection only, so it
+    // counts toward the cap and can't be "re-registered" as a spurious duplicate.
+    const effectiveDomains: SenderDomainEntry[] = getEffectiveDomains(user);
+
+    const alreadyOwned = effectiveDomains.find((d: SenderDomainEntry) => d.domain === normalizedDomain);
+    if (alreadyOwned) {
+      return res.status(409).json({ message: 'You have already registered this domain', domain: alreadyOwned });
+    }
+
+    // GET /email-domains fans out one resendService.getDomain() call per entry — bound the
+    // array so that stays a handful of requests, not an unbounded fan-out.
+    const MAX_EMAIL_DOMAINS_PER_ACCOUNT = 20;
+    if (effectiveDomains.length >= MAX_EMAIL_DOMAINS_PER_ACCOUNT) {
+      return res.status(400).json({
+        message: `You've reached the limit of ${MAX_EMAIL_DOMAINS_PER_ACCOUNT} sending domains per account. Remove one before adding another.`,
+        code: 'EMAIL_DOMAIN_CAP_EXCEEDED',
+      });
+    }
+
+    // Check if another user already has this domain (legacy scalar or emailDomains[]).
+    // This is a fast-fail UX check only (eventually-consistent scan, TOCTOU-prone on its
+    // own) — claimEmailDomain() below is the actual cross-user correctness guarantee.
+    const usersWithDomain = await userDb.getUsersByEmailDomain(normalizedDomain);
+    const otherUserWithDomain = usersWithDomain.find(u => u.userId !== userId);
+    if (otherUserWithDomain) {
+      return res.status(409).json({ message: 'This domain is already in use by another account' });
+    }
+
+    // ENG-265: atomic global claim — makes cross-user "first writer wins" actually hold even
+    // when two different users' requests race past the scan check above at the same time.
+    try {
+      await claimEmailDomain(userId, normalizedDomain);
+    } catch (claimError: any) {
+      if (claimError instanceof EmailDomainAlreadyClaimedError) {
+        return res.status(409).json({ message: 'This domain is already in use by another account' });
+      }
+      throw claimError;
+    }
+
+    try {
+      // Check if domain already exists in Resend
+      const resendDomains = await resendService.listDomains();
+      const existingResendDomain = resendDomains.find(d => d.name === normalizedDomain);
+
+      let domainResult: { id: string; name: string; status: string; records: any[] } | null;
+      let alreadyExists = false;
+      if (existingResendDomain) {
+        domainResult = await resendService.getDomain(existingResendDomain.id);
+        alreadyExists = true;
+      } else {
+        domainResult = await resendService.createDomain(normalizedDomain);
+      }
+
+      if (!domainResult) {
+        await releaseEmailDomainClaim(normalizedDomain, userId);
+        return res.status(500).json({ message: 'Failed to register domain in Resend' });
+      }
+
+      const newEntry = {
+        id: domainResult.id,
+        domain: normalizedDomain,
+        status: domainResult.status,
+        addedAt: new Date().toISOString(),
+      };
+
+      // emailDomains[] is read-modify-write. Guard against a lost update from a concurrent
+      // request for the same user (double-click, two tabs) by conditioning the write on the
+      // array being unchanged since we read it; on a race, re-read once and retry rather
+      // than surfacing a spurious 500/409 for what's usually a double-click.
+      let domainsToWrite: SenderDomainEntry[] = [...existingDomains, newEntry];
+      let expectedSize = existingDomains.length;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await userDb.updateUser(userId, {
+            emailDomains: domainsToWrite,
+            emailDomainList: domainsToWrite.map(d => d.domain),
+          }, {
+            condition: {
+              expression: expectedSize === 0
+                ? 'attribute_not_exists(#emailDomains) OR size(#emailDomains) = :expectedSize'
+                : 'size(#emailDomains) = :expectedSize',
+              names: { '#emailDomains': 'emailDomains' },
+              values: { ':expectedSize': expectedSize },
+            },
+          });
+          break;
+        } catch (writeError: any) {
+          if (writeError?.code !== 'ConditionalCheckFailedException' || attempt >= 1) {
+            throw writeError;
+          }
+          const freshUser = await userDb.getUserById(userId);
+          const freshDomains: SenderDomainEntry[] = freshUser?.emailDomains || [];
+          if (freshDomains.some((d: SenderDomainEntry) => d.domain === normalizedDomain)) {
+            // We already hold the claim, so this can only be our own retry/duplicate
+            // submission, not another user — nothing to release, the entry is already there.
+            return res.status(409).json({ message: 'You have already registered this domain' });
+          }
+          // Re-check the cap against the fresh count, not just the value read at the top of the
+          // request — two requests can each start under the cap, race the write, and both retry
+          // against a fresh array that's now one bigger, pushing the account over the limit.
+          // Effective (not just stored) count, so a legacy scalar-field domain is still counted.
+          if (getEffectiveDomains(freshUser).length >= MAX_EMAIL_DOMAINS_PER_ACCOUNT) {
+            await releaseEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+              console.error(`Failed to release email domain claim for "${normalizedDomain}" after hitting the cap on retry:`, e));
+            return res.status(400).json({
+              message: `You've reached the limit of ${MAX_EMAIL_DOMAINS_PER_ACCOUNT} sending domains per account. Remove one before adding another.`,
+              code: 'EMAIL_DOMAIN_CAP_EXCEEDED',
+            });
+          }
+          domainsToWrite = [...freshDomains, newEntry];
+          expectedSize = freshDomains.length;
+        }
+      }
+
+      // The emailDomains[] write landed — promote the claim to confirmed so the abandoned-claim
+      // staleness window in claimEmailDomain no longer applies to it (a completed registration
+      // must never expire and become takeable by another account). confirmEmailDomainClaim
+      // retries transient failures itself; if it still throws here, the domain IS registered
+      // and functional, so we log loudly (real signal for on-call, not routine noise) and still
+      // return success rather than fail an otherwise-successful registration — the residual risk
+      // is a claim that can be taken over by someone else 10 minutes from now despite this user
+      // legitimately owning the domain, which needs a lease/fencing mechanism to close fully
+      // and wasn't worth the added complexity for what the retry already makes a rare case.
+      await confirmEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+        console.error(`CRITICAL: failed to confirm email domain claim for "${normalizedDomain}" (user ${userId}) after retries — claim may expire and be taken over:`, e));
+
+      res.json({
+        message: alreadyExists
+          ? 'Domain already registered in Resend'
+          : 'Domain created successfully. Add the DNS records below to verify.',
+        domain: domainResult,
+        alreadyExists,
+      });
+    } catch (innerError) {
+      // The claim succeeded but a later step didn't — release it so the domain isn't
+      // permanently stuck unclaimable by anyone. releaseEmailDomainClaim already treats a
+      // superseded-claim conflict as a silent no-op internally, so anything that still throws
+      // here is a genuine unexpected failure (not routine) and worth surfacing: an unreleased
+      // claim after a failed registration leaves the domain unclaimable by anyone, including
+      // the user who just failed to register it, until the 10-minute staleness window passes.
+      await releaseEmailDomainClaim(normalizedDomain, userId).catch((e) =>
+        console.error(`Failed to release email domain claim for "${normalizedDomain}" after a failed registration:`, e));
+      throw innerError;
+    }
+  } catch (error: any) {
+    console.error('Error creating email domain:', error);
+    res.status(500).json({ message: error.message || 'Failed to create email domain' });
+  }
+});
+
+/**
+ * @route POST /api/crm/email-domains/:domainId/verify
+ * @desc Trigger Resend verification for one of the user's registered domains
+ * @access Private
+ */
+router.post('/email-domains/:domainId/verify', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { domainId } = req.params;
+    const user = await userDb.getUserById(userId);
+    const entry = getEffectiveDomains(user).find((d: SenderDomainEntry) => d.id === domainId);
+    if (!entry) {
+      return res.status(404).json({ message: 'Domain not found' });
+    }
+
+    await resendService.verifyDomain(entry.id);
+    const domainDetails = await resendService.getDomain(entry.id);
+    if (!domainDetails) {
+      return res.status(500).json({ message: 'Failed to retrieve domain status after verification' });
+    }
+
+    res.json({
+      message: domainDetails.status === 'verified'
+        ? 'Domain verified successfully!'
+        : 'Verification triggered. DNS records may take a few minutes to propagate.',
+      domain: domainDetails,
+    });
+  } catch (error: any) {
+    console.error('Error verifying email domain:', error);
+    res.status(500).json({ message: error.message || 'Failed to verify email domain' });
+  }
+});
+
+/**
+ * @route DELETE /api/crm/email-domains/:domainId
+ * @desc Remove one of the user's registered sending domains (does not delete from Resend — may be shared or reused)
+ * @access Private
+ */
+router.delete('/email-domains/:domainId', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { domainId } = req.params;
+    const user = await userDb.getUserById(userId);
+    const existingDomains: SenderDomainEntry[] = user?.emailDomains || [];
+    const removedEntry = getEffectiveDomains(user).find((d: SenderDomainEntry) => d.id === domainId);
+    if (!removedEntry) {
+      return res.status(404).json({ message: 'Domain not found' });
+    }
+
+    // Release the claim BEFORE touching the user record, and let a genuine failure here
+    // propagate as the normal 500 instead of being swallowed. This claim is confirmed, so it
+    // never expires via claimEmailDomain's staleness window — a release failure silently
+    // eaten after the user record already shows "removed" would leave the domain permanently
+    // unclaimable by anyone, including this owner on retry. Releasing first is the safer
+    // direction to fail in: the delete is conditioned on still owning the claim (idempotent —
+    // ConditionalCheckFailedException is already treated as a no-op inside the service), so a
+    // retry after a real failure here is always safe, whereas the reverse order risks a
+    // permanent lockout with nothing to retry against.
+    await releaseEmailDomainClaim(removedEntry.domain, userId);
+
+    // The removed entry can be a legacy scalar-field domain that was never actually persisted
+    // in emailDomains[] — there's no array element to filter out. Clear the scalar fields
+    // directly instead (same as the singular DELETE /email-domain route).
+    if (!existingDomains.some((d: SenderDomainEntry) => d.id === domainId)) {
+      await userDb.updateUser(userId, { emailDomain: '', resendDomainId: '' });
+      return res.json({ message: 'Domain removed.' });
+    }
+
+    // ENG-265: same lost-update guard as POST /email-domains — condition the write on the
+    // array being unchanged since we read it, and retry once on a race.
+    let domainsToWrite = existingDomains.filter((d: SenderDomainEntry) => d.id !== domainId);
+    let expectedSize = existingDomains.length;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await userDb.updateUser(userId, {
+          emailDomains: domainsToWrite,
+          emailDomainList: domainsToWrite.map((d: SenderDomainEntry) => d.domain),
+        }, {
+          condition: {
+            expression: 'size(#emailDomains) = :expectedSize',
+            names: { '#emailDomains': 'emailDomains' },
+            values: { ':expectedSize': expectedSize },
+          },
+        });
+        break;
+      } catch (writeError: any) {
+        if (writeError?.code !== 'ConditionalCheckFailedException' || attempt >= 1) {
+          throw writeError;
+        }
+        const freshUser = await userDb.getUserById(userId);
+        const freshDomains: SenderDomainEntry[] = freshUser?.emailDomains || [];
+        if (!freshDomains.some((d: SenderDomainEntry) => d.id === domainId)) {
+          // Already removed by the racing request — nothing left to do.
+          return res.json({ message: 'Domain removed.' });
+        }
+        domainsToWrite = freshDomains.filter((d: SenderDomainEntry) => d.id !== domainId);
+        expectedSize = freshDomains.length;
+      }
+    }
+
+    res.json({ message: 'Domain removed.' });
+  } catch (error: any) {
+    console.error('Error removing email domain:', error);
+    res.status(500).json({ message: error.message || 'Failed to remove email domain' });
   }
 });
 
@@ -5780,17 +6702,24 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
     const riskyLeadsList = leads.filter((l: any) => l.email && validationStatus(l) === 'risky');
     const undeliverableCount = undeliverableLeadsList.length;
     const riskyCount = riskyLeadsList.length;
-    // Eligibility = has email && not DNC && not undeliverable. Single boolean
-    // filter (not arithmetic subtraction) so overlapping categories don't
-    // produce negative counts.
+    // ENG-1194: catches malformed addresses and provider-disallowed test domains
+    // (e.g. example.com) that the async email_validation enrichment never covers
+    // — leads it hasn't run against still had a blank status, so they slipped
+    // through as "eligible" and failed with a 422 at send time.
+    const invalidLeadsList = leads.filter((l: any) => l.email && !isEligibleGroupEmailRecipient(l.email));
+    const invalidCount = invalidLeadsList.length;
+    // Eligibility = has email && not DNC && not undeliverable && not
+    // malformed/test-domain. Single boolean filter (not arithmetic
+    // subtraction) so overlapping categories don't produce negative counts.
     const eligibleLeads = leads.filter((l: any) =>
-      l.email && !isDoNotContact(l) && validationStatus(l) !== 'undeliverable',
+      l.email && !isDoNotContact(l) && validationStatus(l) !== 'undeliverable' && isEligibleGroupEmailRecipient(l.email),
     ).length;
 
     // Return small samples (first 50) of email lists so the UI modals can show
     // exactly which addresses fall in each bucket. Cap at 50 to keep payload tight.
     const undeliverableEmails = undeliverableLeadsList.slice(0, 50).map((l: any) => l.email);
     const riskyEmails = riskyLeadsList.slice(0, 50).map((l: any) => l.email);
+    const invalidEmails = invalidLeadsList.slice(0, 50).map((l: any) => l.email);
 
     return res.json({
       totalLeads,
@@ -5800,8 +6729,10 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
       noEmailCount,
       undeliverableCount,
       riskyCount,
+      invalidCount,
       undeliverableEmails,
       riskyEmails,
+      invalidEmails,
     });
   } catch (error) {
     console.error('Error previewing group email:', error);
@@ -5842,8 +6773,10 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
 
     let leads = await fetchAllLeadsForGroupEmail(listId);
 
-    // Only consider eligible leads (have email, not do-not-contact/unsubscribed)
-    const eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
+    // Only consider eligible leads (have email, not do-not-contact/unsubscribed, valid syntax/domain)
+    const eligibleLeads = leads.filter(
+      (l: any) => l.email && !isDoNotContact(l) && isEligibleGroupEmailRecipient(l.email),
+    );
     const eligibleCount = eligibleLeads.length;
 
     // Auto-fix dark mode: inject color-scheme opt-out before format check so
@@ -5945,7 +6878,21 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
 
     // Separate eligible leads from skipped ones (do-not-contact includes unsubscribed + DNC)
     const skippedDoNotContact = leads.filter((l: any) => isDoNotContact(l)).length;
+    // Counted and reported, not silently dropped. The `l.email &&` below has always
+    // excluded address-less leads, but no bucket accounted for them — so total, sent,
+    // failed and the three skipped* counts did not sum to the list size, and the gap was
+    // invisible. The PREVIEW endpoint already reports noEmailCount; this is the send
+    // endpoint catching up. ENG-2082 turns the gap from a rarity into a routine one.
+    const skippedNoEmail = leads.filter((l: any) => !l.email && !isDoNotContact(l)).length;
     let eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
+
+    // ENG-1194: malformed addresses and provider-disallowed test domains (e.g.
+    // example.com) always fail at the provider — same validator preview uses,
+    // so preview's eligible count matches what's actually attempted here.
+    // Unlike undeliverable, there's no override: these can never be sent.
+    const beforeInvalidCount = eligibleLeads.length;
+    eligibleLeads = eligibleLeads.filter((l: any) => isEligibleGroupEmailRecipient(l.email));
+    const skippedInvalid = beforeInvalidCount - eligibleLeads.length;
 
     // Filter undeliverable emails. Two override modes:
     //   - includeUndeliverableEmails: string[]  → per-address whitelist (Proposal B)
@@ -6001,8 +6948,21 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     let failed = 0;
     const failedEmails: string[] = [];
     const failureReasons: Array<{ email: string; reason: string }> = [];
+    // ENG-265: once the sender hits its daily cap, every remaining send would
+    // fail the same way — stop the batch instead of burning through the rest
+    // of the list generating identical failures, and report why.
+    let stoppedEarlyReason: string | null = null;
+    // A send is never recorded back onto the lead record (no timestamp, no engagement
+    // entry), so nothing here can distinguish "already emailed in this exact batch" from
+    // "never contacted" on a later request. Re-running the same send against the FULL
+    // eligible list — even after the cap resets, even from a different sender — would
+    // re-email everyone who already went through in this batch. skippedLeadIds is the only
+    // safe way to resume: it lets the caller re-POST scoped to just these ids (leadIds is
+    // already an accepted filter on this route) instead of the whole list.
+    const skippedLeadIds: string[] = [];
 
-    for (const lead of eligibleLeads) {
+    for (let i = 0; i < eligibleLeads.length; i++) {
+      const lead = eligibleLeads[i];
       try {
         // Substitute variables in subject and content
         const personalizedSubject = substituteVariables(subject, lead);
@@ -6029,6 +6989,11 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
         });
         sent++;
       } catch (err: any) {
+        if (err instanceof SenderDailyLimitExceededError) {
+          stoppedEarlyReason = err.message;
+          skippedLeadIds.push(...eligibleLeads.slice(i).map((l: any) => l.leadId));
+          break;
+        }
         const reason = err.message || String(err);
         console.error(`Failed to send group email to ${lead.email}:`, reason);
         failed++;
@@ -6042,6 +7007,50 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       }
     }
 
+    const skippedDueToLimit = skippedLeadIds.length;
+
+    // Durable record of what's left, so the gap survives closing the tab or coming back a
+    // different day — the in-response skippedLeadIds above is correct but ephemeral (React
+    // state), and a campaign that needs 20 days to clear a 50/day cap will absolutely
+    // outlive one browser session. A resume that finishes everyone clears the record; a
+    // resume that stops early again replaces it with the new (smaller) remaining set while
+    // preserving the campaign's original totals.
+    if (stoppedEarlyReason) {
+      // Conditioned on the record being unchanged since we read it, so a concurrent send/resume
+      // for this same list can't silently clobber this write's skippedLeadIds/sentSoFar (and
+      // vice versa). On a lost race, reload the latest record and fold this send's progress on
+      // top of it rather than overwriting — same retry shape as the emailDomains[] writes above.
+      let existingBatch = await getPendingBatch(userId, listId).catch(() => null);
+      const MAX_PENDING_BATCH_WRITE_ATTEMPTS = 3;
+      for (let attempt = 0; attempt < MAX_PENDING_BATCH_WRITE_ATTEMPTS; attempt++) {
+        try {
+          await upsertPendingBatch(userId, {
+            listId,
+            senderId: sender.id,
+            senderEmail: sender.email,
+            senderName: sender.fromName,
+            subject,
+            htmlContent,
+            textContent,
+            unsubscribeFooterHtml,
+            skippedLeadIds,
+            sentSoFar: (existingBatch?.sentSoFar ?? 0) + sent,
+            totalOriginal: existingBatch?.totalOriginal ?? total,
+            createdAt: existingBatch?.createdAt ?? new Date().toISOString(),
+          }, existingBatch?.updatedAt ?? null);
+          break;
+        } catch (writeError: any) {
+          if (!(writeError instanceof PendingBatchConflictError) || attempt === MAX_PENDING_BATCH_WRITE_ATTEMPTS - 1) {
+            console.error('Failed to persist pending group-email batch:', writeError);
+            break;
+          }
+          existingBatch = await getPendingBatch(userId, listId).catch(() => null);
+        }
+      }
+    } else {
+      await deletePendingBatch(userId, listId).catch(() => {});
+    }
+
     return res.json({
       total,
       sent,
@@ -6052,10 +7061,74 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       skippedDoNotContact,
       skippedMissingVars,
       skippedUndeliverable,
+      skippedInvalid,
+      skippedNoEmail,
+      skippedDueToLimit,
+      skippedLeadIds,
+      stoppedEarlyReason,
     });
   } catch (error) {
     console.error('Error sending group email:', error);
     return res.status(500).json({ message: 'Failed to send group email' });
+  }
+});
+
+/**
+ * @route GET /api/crm/lists/:listId/group-email/pending
+ * @desc Get the durable record of an incomplete group-email campaign for this list, if any
+ *       (ENG-265 — survives closing the tab; see groupEmailPendingBatchService.ts)
+ */
+router.get('/lists/:listId/group-email/pending', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (!(await canAccessCrmList(userId, list))) {
+      return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
+    }
+
+    const batch = await getPendingBatch(userId, listId);
+    res.json({ batch });
+  } catch (error: any) {
+    console.error('Error getting pending group email batch:', error);
+    res.status(500).json({ message: error.message || 'Failed to get pending group email batch' });
+  }
+});
+
+/**
+ * @route DELETE /api/crm/lists/:listId/group-email/pending
+ * @desc Dismiss the pending-batch record without sending the rest
+ */
+router.delete('/lists/:listId/group-email/pending', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (!(await canDestructiveCrmList(userId, list))) {
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
+    }
+
+    await deletePendingBatch(userId, listId);
+    res.json({ message: 'Pending group email dismissed.' });
+  } catch (error: any) {
+    console.error('Error dismissing pending group email batch:', error);
+    res.status(500).json({ message: error.message || 'Failed to dismiss pending group email batch' });
   }
 });
 
@@ -6129,6 +7202,7 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
     let failedCount = 0;
     const failedEmails: string[] = [];
     const failureReasons: Array<{ email: string; reason: string }> = [];
+    let stoppedEarlyReason: string | null = null;
 
     for (const email of validEmails) {
       try {
@@ -6140,6 +7214,10 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
         });
         sent++;
       } catch (err: any) {
+        if (err instanceof SenderDailyLimitExceededError) {
+          stoppedEarlyReason = err.message;
+          break;
+        }
         const reason = err.message || String(err);
         console.error(`Failed to send test group email to ${email}:`, reason);
         failedCount++;
@@ -6154,6 +7232,8 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
       sent,
       failed: failedCount,
       failedEmails,
+      skippedDueToLimit: stoppedEarlyReason ? validEmails.length - sent - failedCount : 0,
+      stoppedEarlyReason,
     });
   } catch (error) {
     console.error('Error sending test group email:', error);
@@ -6349,9 +7429,15 @@ router.post('/lists/:listId/analyze', async (req: Request, res: Response) => {
         }
       }
       // Put core identity fields first for readability, then remaining fields alphabetically
-      const coreFields = ['leadId', 'email', 'firstName', 'lastName', 'company', 'title', 'status', 'stage'];
+      const coreFields = CRM_ANALYZE_CORE_LEAD_FIELDS;
       const remainingFields = [...leadKeySet].filter(k => !coreFields.includes(k)).sort();
-      const leadHeaders = [...coreFields.filter(k => leadKeySet.has(k)), ...remainingFields];
+      // Core columns are emitted unconditionally, not only when some lead happens to have
+      // them. leadKeySet is a union across the list, so a list where EVERY lead is
+      // phone-only (ENG-2082 makes that a normal shape for a phone-first lander) produced a
+      // CSV with no `email` column at all — while the prompt below promises one, so the
+      // generated pandas code does df['email'] and dies with a KeyError. escapeCell already
+      // renders a missing value as an empty cell, so the column costs nothing when unused.
+      const leadHeaders = [...coreFields, ...remainingFields];
 
       const escapeCell = (v: any): string => {
         if (v === undefined || v === null) return '';
@@ -6416,7 +7502,9 @@ router.post('/lists/:listId/analyze', async (req: Request, res: Response) => {
     const { agentModeService } = await import('../services/agentModeService');
     const result = await agentModeService.performDataAnalysis(
       [leadsUrl, eventsUrl],
-      `You are analyzing CRM data for the lead list "${list.name}".\n\nFile 1 (crm_leads_*.csv): leads with fields leadId, email, firstName, lastName, company, title, status, stage, isICP, engagementCount, createdAt.\nFile 2 (crm_email_events_*.csv): email events with fields eventId, leadEmail, eventType (email.sent, email.delivered, email.opened, email.clicked, email.bounced), emailId, createdAt.\n\nUser instruction: ${instruction}`,
+      // Names the columns the CSV is GUARANTEED to carry, from the same constant the
+      // header is built from, rather than a hardcoded list that drifted away from it.
+      `You are analyzing CRM data for the lead list "${list.name}".\n\nFile 1 (crm_leads_*.csv): leads with at least these fields ${CRM_ANALYZE_CORE_LEAD_FIELDS.join(', ')} (further columns may be present; a blank cell means the lead has no value for it — note that a lead may legitimately have a phone and no email).\nFile 2 (crm_email_events_*.csv): email events with fields eventId, leadEmail, eventType (email.sent, email.delivered, email.opened, email.clicked, email.bounced), emailId, createdAt.\n\nUser instruction: ${instruction}`,
       userId
     );
 
@@ -6775,6 +7863,15 @@ router.post('/lists/:listId/leads/:leadId/fields/:field/refresh', async (req: Re
     }
     const lead: any = await crmDb.getLeadById(listId, leadId);
     if (!lead) return res.status(404).json({ message: 'Lead not found' });
+
+    // ENG-1388: card revenue comes from Enigma, never from the web/LLM path
+    // this endpoint runs. Refreshing one here would overwrite a measured value
+    // with a guess (and forceOverwrite is on), so refuse it outright.
+    if (isCardRevenueField(validatedField)) {
+      return res.status(400).json({
+        message: 'Card revenue is measured by Enigma and cannot be refreshed here. Re-run enrichment for this list to fetch it again.',
+      });
+    }
 
     const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
     const service = new CrmEnrichmentService();

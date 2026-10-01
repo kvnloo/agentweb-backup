@@ -3,9 +3,19 @@
 import { AgentModeService } from '../services/agentModeService';
 import * as autoHumanEvalService from '../services/autoHumanEvalService';
 import * as imageGeneration from '../services/imageGeneration';
+import { evaluateCreativeGates } from '../services/creativeGates';
+import { resolveModelForUser } from '../services/modelRoles';
 
 // Mock dependencies
 jest.mock('../services/imageGeneration');
+// Workload-default resolution (org role, then the AW-Settings admin default) is
+// covered in modelRoles.test.ts; here it is the seam generateImage calls.
+jest.mock('../services/modelRoles');
+// Prod's admin-configured image default (agent_mode_image_api_default_model).
+const ADMIN_IMAGE_DEFAULT = 'gemini-3.1-flash-image-preview';
+beforeEach(() => {
+  jest.mocked(resolveModelForUser).mockResolvedValue(ADMIN_IMAGE_DEFAULT);
+});
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     addMessageToSession: jest.fn().mockResolvedValue({}),
@@ -74,6 +84,45 @@ describe('AgentModeService - generate_image function', () => {
           userId: 'user123',
           artifactUrl: 'https://example.com/image.png',
         }),
+      }));
+    });
+
+    it('stores the generation-time creative gate result on the human-eval candidate (ENG-2139)', async () => {
+      const gates = evaluateCreativeGates(
+        { bytes: 2048, decoded: true, width: 1024, height: 1024, format: 'png', luminanceStdDev: 30 },
+        { requestedSize: '9:16' },
+      );
+      mockImageService.generateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/story.png',
+        filename: 'story.png',
+        gates,
+      });
+      const service = agentModeService as unknown as {
+        generateImage(...args: unknown[]): Promise<{ success: boolean }>;
+      };
+
+      const result = await service.generateImage('Story ad', 'story.png', '9:16', 'medium', [], 'user123', 'session123', 'gemini-3-pro-image-preview', undefined, undefined, 'ad');
+
+      expect(result).toMatchObject({ success: true });
+      expect(enqueueAutoHumanEvalSpy).toHaveBeenCalledWith(expect.objectContaining({ creativeGates: gates }));
+    });
+
+    it('gives the rubric judge the generation request as the creative brief (ENG-2140)', async () => {
+      mockImageService.generateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/demo-ad.png',
+        filename: 'demo-ad.png',
+      });
+      const service = agentModeService as unknown as {
+        generateImage(...args: unknown[]): Promise<{ success: boolean }>;
+      };
+
+      await service.generateImage('Demo ad for Acme, CTA Book a demo', 'demo-ad.png', '1080x1350', 'medium', [], 'user123', 'session123', 'gemini-3-pro-image-preview', undefined, undefined, 'ad');
+
+      expect(enqueueAutoHumanEvalSpy).toHaveBeenCalledWith(expect.objectContaining({
+        category: 'ad',
+        creativeBrief: { generationRequest: 'Demo ad for Acme, CTA Book a demo' },
       }));
     });
 
@@ -166,7 +215,7 @@ describe('AgentModeService - generate_image function', () => {
         inputImages: [],
         logoImage: undefined,
         userId: 'user123',
-        imageModel: undefined
+        imageModel: ADMIN_IMAGE_DEFAULT
       });
 
       expect(result.success).toBe(true);
@@ -198,10 +247,36 @@ describe('AgentModeService - generate_image function', () => {
         inputImages: [],
         logoImage: undefined,
         userId: 'user123',
-        imageModel: undefined
+        imageModel: ADMIN_IMAGE_DEFAULT
       });
 
       expect(result.success).toBe(true);
+    });
+  });
+
+  describe('Placement parameter (ENG-2187)', () => {
+    const call = (placement: string | undefined) =>
+      (agentModeService as unknown as {
+        generateImage: (...args: unknown[]) => Promise<{ success: boolean }>;
+      }).generateImage(
+        'Ad prompt', 'ad.png', '1:1', 'medium', [], 'user123', 'session123',
+        'gemini-3-pro-image-preview', undefined, undefined, 'ad', undefined, placement,
+      );
+
+    it('passes a declared placement to the image service so the gates size against it', async () => {
+      mockImageService.generateImage.mockResolvedValue({ success: true, imageUrl: 'https://example.com/a.png', filename: 'ad.png' });
+
+      await call('meta_story_reel');
+
+      expect(mockImageService.generateImage).toHaveBeenCalledWith(expect.objectContaining({ placement: 'meta_story_reel' }));
+    });
+
+    it('drops an unknown placement instead of passing it on', async () => {
+      mockImageService.generateImage.mockResolvedValue({ success: true, imageUrl: 'https://example.com/a.png', filename: 'ad.png' });
+
+      await call('tiktok_feed');
+
+      expect(mockImageService.generateImage.mock.calls[0][0]).not.toHaveProperty('placement');
     });
   });
 
@@ -337,7 +412,7 @@ describe('AgentModeService - generate_image function', () => {
         inputImages: inputImages,
         logoImage: undefined,
         userId: 'user123',
-        imageModel: undefined
+        imageModel: ADMIN_IMAGE_DEFAULT
       });
 
       expect(result.success).toBe(true);
@@ -368,7 +443,7 @@ describe('AgentModeService - generate_image function', () => {
         inputImages: [],
         logoImage: undefined,
         userId: 'user123',
-        imageModel: undefined
+        imageModel: ADMIN_IMAGE_DEFAULT
       });
 
       expect(result.success).toBe(true);
@@ -908,10 +983,6 @@ describe('AgentModeService - generate_image function', () => {
     });
 
     it('falls back on a timeout when the model came from the admin default, not an explicit choice', async () => {
-      const defaultSpy = jest
-        .spyOn(agentModeService as any, 'getImageApiDefaultModel')
-        .mockResolvedValue('gemini-3.1-flash-image-preview');
-
       mockImageService.generateImage
         .mockResolvedValueOnce({
           success: false,
@@ -940,22 +1011,42 @@ describe('AgentModeService - generate_image function', () => {
       expect(result.imageModel).toBe('gpt-image-2');
       expect(mockImageService.generateImage).toHaveBeenCalledTimes(2);
       // Primary attempt uses the resolved admin default...
+      expect(resolveModelForUser).toHaveBeenCalledWith('user123', 'image');
       expect(mockImageService.generateImage).toHaveBeenNthCalledWith(1, expect.objectContaining({
-        imageModel: 'gemini-3.1-flash-image-preview'
+        imageModel: ADMIN_IMAGE_DEFAULT
       }));
       // ...and the fallback fails over to a different provider.
       expect(mockImageService.generateImage).toHaveBeenNthCalledWith(2, expect.objectContaining({
         imageModel: 'gpt-image-2'
       }));
+    });
 
-      defaultSpy.mockRestore();
+    it('resolves a missing image model to the image workload default for the caller (ENG-2183)', async () => {
+      jest.mocked(resolveModelForUser).mockResolvedValueOnce('gpt-image-2');
+      mockImageService.generateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/image.png',
+        filename: 'test.png'
+      });
+
+      const service = agentModeService as unknown as {
+        generateImage(...args: unknown[]): Promise<{ success: boolean }>;
+      };
+
+      const result = await service.generateImage(
+        'Test prompt', 'test.png', '1024x1024', 'medium', [], 'user456', 'session123',
+        undefined, undefined, undefined, 'ad');
+
+      expect(result.success).toBe(true);
+      expect(resolveModelForUser).toHaveBeenCalledTimes(1);
+      expect(resolveModelForUser).toHaveBeenCalledWith('user456', 'image');
+      expect(mockImageService.generateImage).toHaveBeenCalledWith(expect.objectContaining({
+        userId: 'user456',
+        imageModel: 'gpt-image-2'
+      }));
     });
 
     it('does not resolve the admin default or fall back when the LLM explicitly picked a model', async () => {
-      const defaultSpy = jest
-        .spyOn(agentModeService as any, 'getImageApiDefaultModel')
-        .mockResolvedValue('gemini-3.1-flash-image-preview');
-
       mockImageService.generateImage.mockResolvedValueOnce({
         success: false,
         error: 'Failed to generate image: Image generation with gemini-3-pro-image-preview timed out after 600 seconds'
@@ -975,9 +1066,7 @@ describe('AgentModeService - generate_image function', () => {
       expect(result.success).toBe(false);
       expect(mockImageService.generateImage).toHaveBeenCalledTimes(1);
       // An explicit model short-circuits the admin-default lookup entirely.
-      expect(defaultSpy).not.toHaveBeenCalled();
-
-      defaultSpy.mockRestore();
+      expect(resolveModelForUser).not.toHaveBeenCalled();
     });
   });
 });
@@ -1052,5 +1141,114 @@ describe('Category declaration at the enqueue boundary (ENG-343)', () => {
     expect(enqueueSpy).toHaveBeenCalledWith(
       expect.objectContaining({ reviewType: 'creative_image', category: 'organic_post' })
     );
+  });
+});
+
+// ENG-1027 (round 3): a fresh-eyes independent review flagged that no existing test
+// exercised the real generateImage() → describeImage() wiring — only the pure
+// dataFabricationGuard helper functions and a hand-built extractMinimalToolResult
+// input were covered. That leaves the actual call site (argument order, the
+// metricsVerified parameter threading through 13 positional args, and the
+// Promise-race timeout behavior) unverified against a future refactor silently
+// reordering generateImage's parameters. This exercises the real method with a
+// mocked describeImage, the same way the suite above mocks imageService.
+describe('Data-fabrication backstop wiring (ENG-1027)', () => {
+  let agentModeService: AgentModeService;
+  let mockImageService: any;
+  let describeImageSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.spyOn(autoHumanEvalService, 'enqueueAutoHumanEval').mockResolvedValue(null as any);
+
+    mockImageService = {
+      generateImage: jest.fn().mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/dashboard.png',
+        filename: 'dashboard.png'
+      }),
+      isAvailable: jest.fn().mockResolvedValue(true)
+    };
+    (imageGeneration.imageService as any).isAvailable = mockImageService.isAvailable;
+    (imageGeneration.imageService as any).generateImage = mockImageService.generateImage;
+
+    agentModeService = new AgentModeService();
+    describeImageSpy = jest.spyOn(agentModeService, 'describeImage');
+  });
+
+  const DASHBOARD_PROMPT = 'A status tracker dashboard graphic with a metrics preview panel.';
+  const PLAIN_PROMPT = 'A candid phone snapshot of a laptop on a kitchen table at night.';
+
+  const call = (prompt: string, metricsVerified?: boolean) =>
+    (agentModeService as any).generateImage(
+      prompt, 'dashboard.png', '1024x1024', 'medium', [],
+      'user123', 'session123', undefined, undefined, undefined, 'ad', metricsVerified
+    );
+
+  it('calls describeImage with the correct arguments when the prompt is dashboard-shaped', async () => {
+    describeImageSpy.mockResolvedValue({ success: true, description: 'NUMBERS_FOUND: NONE' });
+
+    await call(DASHBOARD_PROMPT);
+
+    expect(describeImageSpy).toHaveBeenCalledWith(
+      undefined,
+      'https://example.com/dashboard.png',
+      expect.stringContaining('NUMBERS_FOUND'),
+      // ENG-1858: the check is metered to the generating user, not "system".
+      { userId: 'user123', sessionId: 'session123', feature: 'describe_image' }
+    );
+  });
+
+  it('surfaces dataReliabilityWarning when the vision check reports fabricated numbers', async () => {
+    describeImageSpy.mockResolvedValue({ success: true, description: 'NUMBERS_FOUND: 68%, $12,450' });
+
+    const result = await call(DASHBOARD_PROMPT);
+
+    expect(result.success).toBe(true);
+    expect(result.dataReliabilityWarning).toEqual(expect.stringContaining('ENG-1027'));
+  });
+
+  it('does not surface a warning when the vision check reports no numbers', async () => {
+    describeImageSpy.mockResolvedValue({ success: true, description: 'NUMBERS_FOUND: NONE' });
+
+    const result = await call(DASHBOARD_PROMPT);
+
+    expect(result.success).toBe(true);
+    expect(result.dataReliabilityWarning).toBeUndefined();
+  });
+
+  it('does not call describeImage at all for a non-dashboard-shaped prompt', async () => {
+    const result = await call(PLAIN_PROMPT);
+
+    expect(result.success).toBe(true);
+    expect(describeImageSpy).not.toHaveBeenCalled();
+    expect(result.dataReliabilityWarning).toBeUndefined();
+  });
+
+  it('skips the check when metricsVerified is explicitly true, even on a dashboard-shaped prompt', async () => {
+    const result = await call(DASHBOARD_PROMPT, true);
+
+    expect(result.success).toBe(true);
+    expect(describeImageSpy).not.toHaveBeenCalled();
+    expect(result.dataReliabilityWarning).toBeUndefined();
+  });
+
+  it('degrades gracefully (no warning, generation still succeeds) when describeImage rejects/times out', async () => {
+    describeImageSpy.mockRejectedValue(new Error('generate_image data-fabrication check timed out after 20000ms'));
+
+    const result = await call(DASHBOARD_PROMPT);
+
+    expect(result.success).toBe(true);
+    expect(result.imageUrl).toBe('https://example.com/dashboard.png');
+    expect(result.dataReliabilityWarning).toBeUndefined();
+  });
+
+  it('degrades gracefully when describeImage resolves but reports failure', async () => {
+    describeImageSpy.mockResolvedValue({ success: false, message: 'No image URL provided' });
+
+    const result = await call(DASHBOARD_PROMPT);
+
+    expect(result.success).toBe(true);
+    expect(result.dataReliabilityWarning).toBeUndefined();
   });
 });

@@ -3,7 +3,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { settingsService } from '../services/settingsService';
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
-import { runVerifiedChat } from './agentModeController';
+import { runVerifiedChat, RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS } from './agentModeController';
+import { cronJobRegistry } from '../utils/cronJobRegistry';
 
 export interface WaitingContent {
   type: 'youtube' | 'url' | 'html';
@@ -209,7 +210,11 @@ export async function handleResult(req: Request, res: Response): Promise<void> {
       { functionName: 'send_for_review', minCount: 1 },
     ];
 
-    runVerifiedChat({
+    // ENG-1189: this headless caller's tool calls self-call back into this
+    // process via mcpFetch, same as every other runVerifiedChat caller —
+    // tracked so a deploy mid-run waits for it instead of abandoning it
+    // against a closed listener.
+    cronJobRegistry.track('resultEndpointVerifiedChat', runVerifiedChat({
       sessionId: session.sessionId,
       userId: anonUserId,
       startingMessage,
@@ -226,11 +231,24 @@ export async function handleResult(req: Request, res: Response): Promise<void> {
       // this: they don't halt in free text, and structured questions are handled by
       // the park/auto-take path regardless.
       completionGate: true,
+    }, {
+      // ENG-1719: headless, maxAttempts:20, nobody blocked waiting — see
+      // RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS's comment in agentModeController.ts
+      // for the real-data reasoning.
+      lockTimeoutMs: RUN_VERIFIED_CHAT_LOCK_TIMEOUT_LONG_MS,
     }).then(result => {
       console.log(`Result endpoint "${resultName}" session ${session.sessionId} completed: success=${result.success}, attempts=${result.attempts}`);
-    }).catch(error => {
+    }).catch(async error => {
+      // ENG-1719: this session was just created for this request, so contention here is
+      // near-impossible in practice — but if it ever happens, it's benign lock contention,
+      // not a real failure, and shouldn't read as one in the logs.
+      const { isSessionBusyError } = await import('../controllers/agentModeController');
+      if (isSessionBusyError(error)) {
+        console.warn(`Result endpoint "${resultName}" session ${session.sessionId} skipped — session was busy with another generation in progress.`);
+        return;
+      }
       console.error(`Result endpoint "${resultName}" session ${session.sessionId} failed:`, error);
-    });
+    }));
 
   } catch (error) {
     console.error('Error handling result endpoint:', error);

@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useCallback } from "react";
+import React, { createContext, useContext, useState, useCallback, useMemo } from "react";
 import axios from "axios";
 import { useAuth } from "./AuthContext";
 import { API_URL } from "../config";
@@ -46,7 +46,6 @@ interface User {
   fromName?: string; // From name for emails
   slackChannel?: string; // @deprecated — use slackChannels
   slackChannels?: string[]; // Slack channels configured for this user
-  slackSuggestedRepliesDisabled?: boolean; // When true, suppress Slack suggested-reply monitoring for this user
   secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
@@ -158,12 +157,18 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
   const [error, setError] = useState<string | null>(null);
   const { token, user } = useAuth();
 
-  const api = axios.create({
+  // Memoized: a fresh instance per render changed every loader's identity and
+  // made consumer effects (Users tab) refetch in an endless loop.
+  const api = useMemo(
+    () =>
+      axios.create({
     baseURL: API_URL,
     headers: {
       Authorization: `Bearer ${token}`,
     },
-  });
+  }),
+    [token]
+  );
 
   const loadUsers = useCallback(async (hideBotLike = true) => {
     try {

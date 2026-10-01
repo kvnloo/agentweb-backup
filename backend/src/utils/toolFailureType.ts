@@ -46,8 +46,12 @@ const UNINSTALLED_RE = /not available\b[\s\S]*install the required skill/i;
 // failed to parse pdf" = bad user input the tool correctly rejected.
 // "local_agent_deprecated" = the retired local-agent relay stubs (ENG-383)
 // refusing by design — a call to a deliberately retired tool is not a tool bug.
+// "the publisher refused this fetch" / "net::err_..." (ENG-1162) = a third-party
+// site's own anti-bot/WAF block, not an AgentWeb config gap — checked here,
+// ahead of CONFIG_RE, so a message-only call (no errorClass) doesn't fall into
+// 'config' merely because the marker text contains the word "Forbidden".
 const BY_DESIGN_RE =
-  /task rejected|matched forbidden pattern|may only be used for|local_agent_deprecated|should delay new invitation|already connected|required function calls have not been made|cannot mark steps as completed|cannot resend|recipient cannot be reached|no (?:search )?results found|corrupted or password-protected|failed to parse pdf/i;
+  /task rejected|matched forbidden pattern|may only be used for|local_agent_deprecated|should delay new invitation|already connected|required function calls have not been made|cannot mark steps as completed|cannot resend|recipient cannot be reached|no (?:search )?results found|corrupted or password-protected|failed to parse pdf|the publisher refused this fetch|net::err_(?:empty_response|connection_refused|connection_reset|connection_closed)/i;
 
 // "too long (N chars)" = an argument-length constraint (e.g. the LinkedIn 200/300
 // invite-note limit) — an arg validation, not a tool defect.
@@ -75,7 +79,41 @@ const CONFIG_RE =
  * @param errorMessage the tool's error message (may be '', undefined)
  */
 export function classifyToolFailureType(errorClass?: string, errorMessage?: string): ToolFailureType {
+  /*
+   * ENG-1795. Deliberately NOT `model_uninstalled_tool` ("not a tool bug; fix the catalog, not
+   * the tool"). The `unavailable` bucket IS a catalog bug — an entitled bundle whose tool pool
+   * emptied out, the ENG-1237 production defect — so routing it to a non-dispatchable type
+   * drops exactly the defect worth investigating out of the investigate bucket. `bug` keeps it
+   * visible, which is where it was under the old single-message behaviour.
+   */
+
   const cls = (errorClass || '').toLowerCase();
+
+  if (cls === 'skill_install_refused') {
+    /*
+     * Two buckets share this class, and they are opposite kinds of event.
+     *
+     *   forbidden   — `__admin_tools__` refused to a non-admin. A ROLE boundary working
+     *                 exactly as designed. Nothing to investigate; proposing a "robustness
+     *                 fix" for the install_skills handler here is pure triage noise.
+     *   unavailable — an entitled bundle whose tool pool emptied out. That IS the ENG-1237
+     *                 catalog defect, and it must stay in the investigate set.
+     *
+     * Distinguished by message rather than by a second error class, because both real callers
+     * (`runRecorder.ts`, `backfillFailureTypes.ts`) already pass errorMessage — so this needs
+     * no new routing, guidance text or consumer trace.
+     *
+     * A MIXED refusal, carrying both an admin id and an entitled-but-empty one, stays `bug`:
+     * the unavailable half is a genuine defect, and under-investigating is the expensive
+     * direction. Absent or unreadable message likewise falls through to `bug`.
+     */
+    // `||`, not `??`: matches `cls` above, and coerces a non-string (0/false/NaN) that a
+    // historical DynamoDB row can hand `backfillFailureTypes.ts` — `?? ''` leaves those
+    // intact and `.toLowerCase()` then throws, aborting the whole backfill scan.
+    const m = (errorMessage || '').toLowerCase();
+    const rolesOnly = m.includes('requires admin access') && !m.includes('permitted to use it');
+    return rolesOnly ? 'by_design' : 'bug';
+  }
   const msg = errorMessage || '';
 
   // 1. Model called a tool that isn't installed. Message-driven: pre-classifier
@@ -88,8 +126,14 @@ export function classifyToolFailureType(errorClass?: string, errorMessage?: stri
   // 2. Working-as-designed: a policy/validator deliberately rejected the call,
   //    or an upstream returned a benign empty result. 'upstream_rejected' =
   //    provider business-rule refusal (LinkedIn cadence); 'empty_result' = the
-  //    call succeeded but yielded no data — neither is a tool bug.
-  if (cls === 'policy_blocked' || cls === 'upstream_rejected' || cls === 'empty_result') return 'by_design';
+  //    call succeeded but yielded no data. 'publisher_refused' (ENG-1162) = a
+  //    third-party site's own anti-bot/WAF block on our anonymous fetch — the
+  //    tool executed correctly, an external party outside our control declined
+  //    it, and there is no credential/config on our side that would fix it, so
+  //    it belongs here rather than 'config'. 'missing_brand_logo' (ENG-1844) = the
+  //    generate/duplicate brand-logo gate correctly refused an invented-logo page —
+  //    the tool worked exactly as designed. None of these are a tool bug.
+  if (cls === 'policy_blocked' || cls === 'upstream_rejected' || cls === 'empty_result' || cls === 'publisher_refused' || cls === 'missing_brand_logo') return 'by_design';
   if (BY_DESIGN_RE.test(msg)) return 'by_design';
 
   // 3. Arguments rejected by schema validation before execution.

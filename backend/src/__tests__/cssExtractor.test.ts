@@ -253,6 +253,8 @@ const mockPage = {
   setUserAgent: jest.fn(),
   setCacheEnabled: jest.fn(),
   setExtraHTTPHeaders: jest.fn(),
+  setRequestInterception: jest.fn(),
+  on: jest.fn(),
   emulateMediaFeatures: jest.fn(),
   goto: jest.fn(),
   reload: jest.fn(),
@@ -279,6 +281,24 @@ jest.mock('../utils/browserUtils', () => ({
 // Mock axios for JSDOM fallback path
 jest.mock('axios');
 
+// Mock the shared SSRF guard so fixture hostnames (example.com, etc.) don't
+// depend on real DNS resolution in CI/sandboxes with no network access.
+// Still blocks the same localhost/private-IP literals the guard blocks for
+// real, so the 'URL validation' SSRF tests below exercise real behavior.
+jest.mock('../utils/ssrfGuard', () => ({
+  resolvePinnedPublicAddress: jest.fn().mockImplementation(async (rawUrl: string) => {
+    const parsed = new URL(rawUrl);
+    const hostname = parsed.hostname.toLowerCase();
+    if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0') {
+      throw new Error('URL resolves to a private/internal address');
+    }
+    if (/^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)/.test(hostname)) {
+      throw new Error('URL resolves to a private/internal address');
+    }
+    return { hostname, address: '93.184.216.34', family: 4 };
+  }),
+}));
+
 import { extractCSSFromURL, analyzeDesignTokens, inferBrandTokens, modernColorToHex, averageBackgroundLightness, isDistinctDarkTheme, DesignTokens } from '../services/cssExtractor';
 
 const { findChromeExecutable } = require('../utils/browserUtils');
@@ -296,15 +316,15 @@ describe('cssExtractor', () => {
     });
 
     it('should throw on SSRF localhost', async () => {
-      await expect(extractCSSFromURL('http://localhost:3000')).rejects.toThrow('Cannot fetch from localhost');
+      await expect(extractCSSFromURL('http://localhost:3000')).rejects.toThrow('URL resolves to a private/internal address');
     });
 
     it('should throw on SSRF private IP ranges', async () => {
-      await expect(extractCSSFromURL('http://192.168.1.1')).rejects.toThrow('Cannot fetch from private IP ranges');
+      await expect(extractCSSFromURL('http://192.168.1.1')).rejects.toThrow('URL resolves to a private/internal address');
     });
 
     it('should throw on SSRF 10.x.x.x private IP', async () => {
-      await expect(extractCSSFromURL('http://10.0.0.1')).rejects.toThrow('Cannot fetch from private IP ranges');
+      await expect(extractCSSFromURL('http://10.0.0.1')).rejects.toThrow('URL resolves to a private/internal address');
     });
 
     it('should throw on non-HTTP protocol', async () => {
@@ -380,6 +400,52 @@ describe('cssExtractor', () => {
           }),
         })
       );
+    });
+
+    it('surfaces a 403 from the JSDOM fallback fetch as a publisher refusal, not a bare status-code message (ENG-1162)', async () => {
+      // Puppeteer already failed (that's why we're here) and this fallback's own
+      // anonymous fetch is ALSO blocked — the same real-world case as ENG-1162's
+      // read_file_content bug, just via a different tool (read_page_source with
+      // extractDesignTokens:true). Without the fix, this throws a bare
+      // "Failed to fetch URL: Request failed with status code 403" that
+      // classifyToolErrorClass's embedded-status regex sweeps into 'auth'.
+      const origImpl = (findChromeExecutable as jest.Mock).getMockImplementation();
+      (findChromeExecutable as jest.Mock).mockReturnValue(undefined);
+      const axios = require('axios');
+      const axiosError: any = new Error('Request failed with status code 403');
+      axiosError.isAxiosError = true;
+      axiosError.response = { status: 403, statusText: 'Forbidden' };
+      (axios.get as jest.Mock).mockRejectedValueOnce(axiosError);
+
+      await expect(extractCSSFromURL('https://blocked-fixture.example.com')).rejects.toThrow(
+        /The publisher refused this fetch \(HTTP 403: Forbidden\) — this is a site-side access block/
+      );
+
+      if (origImpl) {
+        (findChromeExecutable as jest.Mock).mockImplementation(origImpl);
+      } else {
+        (findChromeExecutable as jest.Mock).mockReturnValue('/usr/bin/google-chrome');
+      }
+    });
+
+    it('leaves a non-401/403 fetch failure on the original bare message (no over-broad rewrite)', async () => {
+      const origImpl = (findChromeExecutable as jest.Mock).getMockImplementation();
+      (findChromeExecutable as jest.Mock).mockReturnValue(undefined);
+      const axios = require('axios');
+      const axiosError: any = new Error('Request failed with status code 500');
+      axiosError.isAxiosError = true;
+      axiosError.response = { status: 500, statusText: 'Internal Server Error' };
+      (axios.get as jest.Mock).mockRejectedValueOnce(axiosError);
+
+      await expect(extractCSSFromURL('https://flaky-fixture.example.com')).rejects.toThrow(
+        'Failed to fetch URL: Request failed with status code 500'
+      );
+
+      if (origImpl) {
+        (findChromeExecutable as jest.Mock).mockImplementation(origImpl);
+      } else {
+        (findChromeExecutable as jest.Mock).mockReturnValue('/usr/bin/google-chrome');
+      }
     });
   });
 
@@ -587,6 +653,75 @@ describe('cssExtractor', () => {
       expect(mockPage.setExtraHTTPHeaders).toHaveBeenCalledWith(
         expect.objectContaining({ 'Cache-Control': 'no-cache', Pragma: 'no-cache' })
       );
+    });
+
+    it('pins Chrome DNS resolution for the target hostname via --host-resolver-rules (ENG-328: closes the rebinding TOCTOU between our validation lookup and Chrome\'s own connect-time lookup)', async () => {
+      mockPage.evaluate.mockResolvedValueOnce({
+        customProperties: {},
+        stylesheetText: 'body { color: #111; }',
+        computedElements: {},
+      });
+
+      await extractCSSFromURL('https://example.com');
+
+      const pMock = require('puppeteer-core');
+      const launchArgs = pMock.default.launch.mock.calls[0][0].args;
+      expect(launchArgs).toContain('--host-resolver-rules=MAP example.com 93.184.216.34');
+    });
+
+    it('validates every request, not just navigation — a subresource pointed at a private address is aborted (ENG-328: closes the SSRF bypass where only page.goto was checked)', async () => {
+      mockPage.evaluate.mockResolvedValueOnce({
+        customProperties: {},
+        stylesheetText: 'body { color: #111; }',
+        computedElements: {},
+      });
+
+      await extractCSSFromURL('https://example.com');
+
+      const requestHandlerCall = mockPage.on.mock.calls.find(([event]) => event === 'request');
+      expect(requestHandlerCall).toBeDefined();
+      const requestHandler = requestHandlerCall![1];
+
+      // Simulate a subresource request (isNavigationRequest: false) the scraped
+      // page's own script triggers against an internal address.
+      const abort = jest.fn();
+      const continueReq = jest.fn();
+      requestHandler({
+        isNavigationRequest: () => false,
+        url: () => 'http://10.0.0.5/internal-secret',
+        continue: continueReq,
+        abort,
+      });
+      await new Promise(setImmediate);
+
+      expect(abort).toHaveBeenCalled();
+      expect(continueReq).not.toHaveBeenCalled();
+    });
+
+    it('lets non-network schemes (data:) through without an SSRF check', async () => {
+      mockPage.evaluate.mockResolvedValueOnce({
+        customProperties: {},
+        stylesheetText: 'body { color: #111; }',
+        computedElements: {},
+      });
+
+      await extractCSSFromURL('https://example.com');
+
+      const requestHandlerCall = mockPage.on.mock.calls.find(([event]) => event === 'request');
+      const requestHandler = requestHandlerCall![1];
+
+      const abort = jest.fn();
+      const continueReq = jest.fn();
+      requestHandler({
+        isNavigationRequest: () => false,
+        url: () => 'data:image/png;base64,iVBORw0KGgo=',
+        continue: continueReq,
+        abort,
+      });
+      await new Promise(setImmediate);
+
+      expect(continueReq).toHaveBeenCalled();
+      expect(abort).not.toHaveBeenCalled();
     });
 
     it('captures BOTH renders for a site with a dark variant (ENG-285: rankai.ai)', async () => {

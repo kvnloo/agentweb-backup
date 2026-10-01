@@ -213,13 +213,16 @@ describe('AgentModeController - Error Handling', () => {
       );
       expect(errorCall).toBeDefined();
       expect(errorCall![0]).toBe(mockSessionId);
+      // ENG-2160: this turn ran no tools (empty ledger), so the diagnosis short-circuits to a
+      // fixed, honest message instead of the old generic string — and never claims success.
       expect(errorCall![1]).toEqual(expect.objectContaining({
         role: 'assistant',
-        content: 'I encountered an error processing your request. Please try sending your message again.',
+        content: expect.stringContaining('nothing was done yet'),
         metadata: expect.objectContaining({
           isErrorMessage: true,
         }),
       }));
+      expect(errorCall![1].content).not.toMatch(/successfully/i);
     });
 
     it('should NOT persist error message for SESSION_MESSAGE_LIMIT_EXCEEDED', async () => {
@@ -833,8 +836,18 @@ describe('AgentModeController - Error Handling', () => {
       const diagnosticMsg = '5 of 6 landing pages were generated. The second page failed. You can retry to complete it.';
       mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(diagnosticMsg);
 
+      // ENG-2160: the diagnosis agent is only consulted when the turn's success ledger is
+      // NON-empty (an empty ledger short-circuits to a fixed message). This scenario — "5 of 6
+      // landing pages generated, then failed" — has a real diff, so stage it the way production
+      // runs: calledFunctions is empty before the turn and carries the successes after it.
       const llmError = new Error('Gemini 500: internal server error');
-      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(llmError);
+      let turnRan2 = false;
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(async () => { turnRan2 = true; throw llmError; });
+      mockChatbotDb.getChatSession.mockImplementation(async () => ({
+        ...mockSession,
+        messages: [{ role: 'user', content: 'Create 6 landing pages' }],
+        calledFunctions: turnRan2 ? { generate_landing_page: 6 } : {},
+      }) as any);
 
       const mockReq = {
         user: { userId: mockUserId, email: 'test@example.com' },
@@ -877,8 +890,16 @@ describe('AgentModeController - Error Handling', () => {
     it('should fall back to generic message when diagnosis agent returns null', async () => {
       mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(null);
 
+      // ENG-2160: reach the diagnosis agent (which returns null here) by staging a non-empty
+      // ledger diff — an empty ledger would short-circuit before the agent is ever consulted.
       const llmError = new Error('Some LLM error');
-      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(llmError);
+      let turnRan3 = false;
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(async () => { turnRan3 = true; throw llmError; });
+      mockChatbotDb.getChatSession.mockImplementation(async () => ({
+        ...mockSession,
+        messages: [{ role: 'user', content: 'Test message' }],
+        calledFunctions: turnRan3 ? { search_leads: 1 } : {},
+      }) as any);
 
       const mockReq = {
         user: { userId: mockUserId, email: 'test@example.com' },
@@ -1061,7 +1082,9 @@ describe('AgentModeController - Error Handling', () => {
         expect.objectContaining({
           succeededFunctions: { publish_landing_page_changes: 1, get_deployment_status: 2 },
           failedFunctions: { save_memory: 1, coding_agent: 1 },
-        })
+        }),
+        // ENG-1858: the diagnosis is metered to the session owner, not "system".
+        { userId: 'test-user-123', sessionId: 'test-session-123', feature: 'diagnostic_message' }
       );
     });
 
@@ -1096,7 +1119,9 @@ describe('AgentModeController - Error Handling', () => {
       // Nothing was published THIS turn, so there is nothing to correct.
       expect(errorCall![1].content).toBe(PROD_FALSE_FAILURE);
       expect(mockAgentModeService.generateDiagnosticMessage).toHaveBeenCalledWith(
-        expect.objectContaining({ succeededFunctions: { you_search_web: 4 } })
+        expect.objectContaining({ succeededFunctions: { you_search_web: 4 } }),
+        // ENG-1858: metered to the session owner.
+        { userId: 'test-user-123', sessionId: 'test-session-123', feature: 'diagnostic_message' }
       );
     });
 

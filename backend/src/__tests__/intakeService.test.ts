@@ -26,6 +26,7 @@ jest.mock('../services/linearService', () => ({
   listOpenIssuesByLabel: jest.fn(),
   escalateIssue: jest.fn(),
   getIssueCommentsDetailed: jest.fn().mockResolvedValue([]),
+  findMostRecentArchivedIssueByLabel: jest.fn().mockResolvedValue(null),
 }));
 jest.mock('../services/resendService', () => ({ resendService: { sendSystemEmail: jest.fn() } }));
 jest.mock('../services/shipNotifyService', () => ({ notifyReporterShipped: jest.fn().mockResolvedValue('sent') }));
@@ -148,7 +149,8 @@ describe('fileUserIssue — bug, noResolvableReporter (ENG-939 AC4: unresolved t
   it('still creates/dedupes the Linear canonical (still files)', async () => {
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
     const r = await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'rui@agentweb.pro', noResolvableReporter: true, reportedByAdmin: 'rui@agentweb.pro' });
-    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ labelNames: ['Bug', 'Customer Reported'] }));
+    // ENG-1590: reportedByAdmin set => Delegated-Filed is appended alongside the base labels.
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ labelNames: ['Bug', 'Customer Reported', 'Delegated-Filed'] }));
     expect(r.canonicalUrl).toBe('lin');
   });
 
@@ -716,6 +718,90 @@ describe('intakeService.fileAutoIssue', () => {
       expect.objectContaining({ labelNames: ['Auto', 'Bug', 'Needs PM', 'Scheduled Chat'] }),
     );
     expect(r).toMatchObject({ deduped: false, tracker: 'Linear' });
+  });
+});
+
+describe('intakeService.fileAutoIssue — archived canonical (ENG-730)', () => {
+  const realFlag = process.env.FEATUREBASE_INTAKE;
+  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; });
+  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+
+  // AC1/AC2: the only matching canonical for this class was archived. listOpenIssuesByLabel never
+  // returns archived rows (linearService contract), so `open` is empty here — exactly as it would
+  // be against the live API. The gate must create exactly ONE new canonical and must not throw.
+  it('the only matching canonical is archived -> creates exactly one new canonical, does not throw', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([]); // archived candidate never surfaces here
+    linear.findMostRecentArchivedIssueByLabel.mockResolvedValue({
+      identifier: 'ENG-461',
+      issueId: 'uuid-461',
+      title: 'Scheduled Chat Abandoned Run Recovered: Lead Auto Enrichment',
+      description: 'Alert Class: scheduled-chat-abandoned-run\nSchedule ID: sched-abc',
+    });
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-719', url: 'https://linear.app/x/ENG-719', id: 'uuid-719' });
+
+    const r = await expect(fileAutoIssue({
+      title: 'Scheduled Chat Abandoned Run Recovered: Lead Auto Enrichment',
+      description: 'd',
+      source: 'Scheduled chat (error)',
+      notionContext: { 'Alert Class': 'scheduled-chat-abandoned-run', 'Schedule ID': 'sched-abc' },
+    })).resolves.toMatchObject({ deduped: false, tracker: 'Linear', pageId: 'ENG-719' });
+
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    void r;
+  });
+
+  // AC3: the fresh canonical records the archived predecessor's identifier so occurrence history
+  // stays followable — verified in the description text passed to createInternalLinearIssue.
+  it('records the archived predecessor identifier in the new canonical body', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.findMostRecentArchivedIssueByLabel.mockResolvedValue({
+      identifier: 'ENG-461',
+      issueId: 'uuid-461',
+      title: 'Scheduled Chat Abandoned Run Recovered: Lead Auto Enrichment',
+      description: 'Alert Class: scheduled-chat-abandoned-run',
+    });
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-719', url: 'u' });
+
+    await fileAutoIssue({
+      title: 'Scheduled Chat Abandoned Run Recovered: Lead Auto Enrichment',
+      description: 'd',
+      source: 'Scheduled chat (error)',
+      notionContext: { 'Alert Class': 'scheduled-chat-abandoned-run' },
+    });
+
+    const call = linear.createInternalLinearIssue.mock.calls[0][0];
+    expect(call.description).toContain('Predecessor (archived): ENG-461');
+  });
+
+  // AC4 (no regression): a normal open-canonical match still groups exactly as before — the
+  // archived-predecessor lookup must not even run when a live match exists.
+  it('an open canonical match still groups normally; archived lookup is never consulted', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-900', issueId: 'uuid-900', title: 'Some Auto Issue', description: 'Alert Class: some-class' },
+    ]);
+    const r = await fileAutoIssue({
+      title: 'Some Auto Issue',
+      description: 'd',
+      source: 'Scheduled chat',
+      notionContext: { 'Alert Class': 'some-class' },
+    });
+    expect(r).toMatchObject({ deduped: true, tracker: 'Linear' });
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(linear.findMostRecentArchivedIssueByLabel).not.toHaveBeenCalled();
+  });
+
+  // Best-effort contract: a failure in the archived-predecessor lookup must never block filing.
+  it('archived-predecessor lookup failure does not block filing the new canonical', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.findMostRecentArchivedIssueByLabel.mockRejectedValue(new Error('Linear API hiccup'));
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-719', url: 'u' });
+
+    await expect(fileAutoIssue({
+      title: 'new auto issue',
+      description: 'd',
+      source: 'Scheduled chat',
+    })).resolves.toMatchObject({ deduped: false, tracker: 'Linear' });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
   });
 });
 

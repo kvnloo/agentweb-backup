@@ -1,3 +1,4 @@
+import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 /**
  * Onboarding Epic Phase 2 — ICP discovery service.
  *
@@ -22,6 +23,7 @@
  */
 
 import { LLMService } from "../utils/llmService";
+import type { LLMUsageContext } from "../utils/llmService";
 import { reportUIError } from "../utils/errorReporter";
 import { getGCSPPrivateKey } from "../utils/secretsManager";
 import { getS3ObjectAsString } from "../utils/s3Utils";
@@ -348,10 +350,22 @@ export function mapIcpResultToMarketStrategy(
  * tidy. The eventual-consistency window we already navigated for the
  * cascade trigger doesn't apply here — we're writing to the base table
  * by email via updateUser, which is strongly consistent.
+ *
+ * `completedAt` is stamped onto `marketStrategy.updatedAt` in place of the
+ * wall-clock time of this write. This mirror runs a moment (write + re-read
+ * round-trip) AFTER `icpCompletedAt` is persisted, so timestamping it with
+ * `now()` made every onboarding generation — not just a real edit on the
+ * Market Strategy page — look like it happened *after* `icpCompletedAt`,
+ * which permanently flipped `GET /icp/filters` onto the lossy
+ * marketStrategy-derived persona path (ENG-1955). Backdating to the
+ * generation's own completion time keeps this system write indistinguishable
+ * in age from the icpResult it mirrors, so only a later, genuine
+ * `POST /market-strategy` edit reads as newer.
  */
 async function mirrorIcpsToMarketStrategy(
   userId: string,
   personas: ICPPersona[],
+  completedAt: string,
 ): Promise<void> {
   try {
     const fresh: any = await userDb.getUserById(userId);
@@ -368,15 +382,27 @@ async function mirrorIcpsToMarketStrategy(
       }>;
       createdAt?: string;
       updatedAt?: string;
+      icpUpdatedAt?: string;
     };
     const merged = {
+      ...existing,
       businessOverview: existing.businessOverview ?? "",
       competitors: existing.competitors ?? [],
       icp: mapIcpResultToMarketStrategy(personas),
       createdAt: existing.createdAt ?? now,
-      updatedAt: now,
+      updatedAt: completedAt,
+      // Tracked separately from `updatedAt` (ENG-1955 follow-up): this write
+      // genuinely touches `icp`, so it's correct for icpUpdatedAt to move —
+      // unlike a competitors/businessOverview-only save elsewhere, which must
+      // NOT look like an ICP correction to the staleness check in
+      // routes/crm.ts. Backdated to `completedAt` for the same reason
+      // `updatedAt` is: this write runs moments after icpCompletedAt is
+      // persisted, so timestamping with wall-clock now() would make it look
+      // newer than the generation it mirrors.
+      icpUpdatedAt: completedAt,
     };
     await userDb.updateUser(userId, { marketStrategy: merged } as any);
+    await populateEmptyBrandGuidelines(userId);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(
@@ -714,7 +740,12 @@ export async function regenerateSingleIcpForUser(
       // leaves its spinner stuck. Status belongs to whoever owns it now.
       await userDb.updateUser(userId, { icpResult: sanitizeICPPersonas(currentList) } as any);
     }
-    await mirrorIcpsToMarketStrategy(userId, currentList);
+    // Use whichever icpCompletedAt this write actually landed under — the
+    // patch's freshly-stamped one, or (when another regeneration already
+    // owned the `ready` transition) the one already on the record.
+    const mirroredCompletedAt =
+      patch?.icpCompletedAt ?? current.icpCompletedAt ?? new Date().toISOString();
+    await mirrorIcpsToMarketStrategy(userId, currentList, mirroredCompletedAt);
 
     await regenerateCompetitorEntry(userId, current, brand, fresh, spliceAt, deps);
   } catch (err) {
@@ -750,6 +781,7 @@ async function regenerateCompetitorEntry(
         brand: IcpBrandContext,
         personas: ICPPersona[],
         deps?: unknown,
+        usageContext?: LLMUsageContext,
       ) => Promise<{ per_icp: unknown[] }>;
     };
   },
@@ -760,7 +792,9 @@ async function regenerateCompetitorEntry(
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const competitor =
       deps.competitor ?? require("./onboardingCompetitorService");
-    const result = await competitor.generateCompetitorStrategyForUser(brand, [persona]);
+    // ENG-1858: attribute and charge the refresh to this user, not "system".
+    const usageContext: LLMUsageContext = { userId, feature: "onboarding_competitors" };
+    const result = await competitor.generateCompetitorStrategyForUser(brand, [persona], undefined, usageContext);
     const entry = result?.per_icp?.[0];
     if (!entry) return;
     const next = [...existing];
@@ -824,7 +858,7 @@ export async function triggerIcpDiscoveryForUser(
     // this, v2 onboarding writes to User.icpResult only and the user
     // finishes onboarding with an apparently-blank market strategy.
     // Best-effort — errors logged but do NOT block the cascade.
-    await mirrorIcpsToMarketStrategy(userId, personas);
+    await mirrorIcpsToMarketStrategy(userId, personas, patch.icpCompletedAt!);
 
     // Cascade kickoff: fire-and-forget the competitor step now that ICPs
     // are persisted and `icpStatus === 'ready'`. Without this, the user

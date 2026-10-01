@@ -21,9 +21,13 @@ jest.mock('../services/dripSequenceDb', () => ({
 }));
 
 const mockSendAsSender = jest.fn();
-jest.mock('../services/sendAsSender', () => ({
-  sendAsSender: (...args: any[]) => mockSendAsSender(...args),
-}));
+jest.mock('../services/sendAsSender', () => {
+  const actual = jest.requireActual('../services/senderUsageTracker');
+  return {
+    sendAsSender: (...args: any[]) => mockSendAsSender(...args),
+    SenderDailyLimitExceededError: actual.SenderDailyLimitExceededError,
+  };
+});
 
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
@@ -63,7 +67,7 @@ const baseEnrollment = {
   sequenceId: 'seq-1',
   leadId: 'lead-1',
   listId: 'list-1',
-  leadEmail: 'lead@example.com',
+  leadEmail: 'lead@acme.io',
   userId: 'user-1',
   currentStep: 0,
   status: 'active',
@@ -92,7 +96,7 @@ const sequenceWithStep = {
   ],
 };
 
-const lead = { leadId: 'lead-1', email: 'lead@example.com', firstName: 'Pat' };
+const lead = { leadId: 'lead-1', email: 'lead@acme.io', firstName: 'Pat' };
 
 const senderConfigWith = (senders: any[], defaultSenderId: string | null = null) =>
   mockGetSetting.mockResolvedValue({ settingValue: JSON.stringify({ senders, defaultSenderId }) });
@@ -164,7 +168,7 @@ describe('dripSequenceWorker sender routing — SUCCESS cases', () => {
     expect(mockSendAsSender).toHaveBeenCalledWith(
       'user-1',
       expect.objectContaining({ id: 's1', senderProvider: 'resend', email: 'hi@acme.com' }),
-      expect.objectContaining({ to: 'lead@example.com', subject: 'Hi Pat', html: expect.stringContaining('<p>hi</p>') }),
+      expect.objectContaining({ to: 'lead@acme.io', subject: 'Hi Pat', html: expect.stringContaining('<p>hi</p>') }),
     );
   });
 

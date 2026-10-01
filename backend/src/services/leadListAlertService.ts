@@ -1,6 +1,12 @@
-import { crmDb, userDb } from './db';
+import { crmDb, userDb, orgDb } from './db';
 import { emailService } from './emailService';
 import { sendLeadNotification } from './slackService';
+import {
+  bootstrapMessagingChannels,
+  getMessagingChannel,
+  resolveDestination,
+} from './messagingChannelService';
+import { TEMPLATES } from './whatsappService';
 
 const normalizeEventType = (eventType: string) => eventType.trim().toLowerCase();
 
@@ -26,7 +32,10 @@ const formatLeadName = (lead: any) => {
   const firstName = typeof lead.firstName === 'string' ? lead.firstName.trim() : '';
   const lastName = typeof lead.lastName === 'string' ? lead.lastName.trim() : '';
   const fullName = [firstName, lastName].filter(Boolean).join(' ');
-  return fullName || lead.email || lead.leadId || 'Unknown lead';
+  // phone before leadId: a phone-only capture is a contactable human, and falling through
+  // to the leadId puts a database key in front of the owner as the prospect's name.
+  const phone = typeof lead.phone === 'string' ? lead.phone.trim() : '';
+  return fullName || lead.email || phone || lead.leadId || 'Unknown lead';
 };
 
 const buildEventDetails = (eventType: string, eventData: any) => {
@@ -48,9 +57,18 @@ const buildEventDetails = (eventType: string, eventData: any) => {
     if (eventData.company) details.push({ label: 'Company', value: String(eventData.company) });
     if (eventData.phone) details.push({ label: 'Phone', value: String(eventData.phone) });
     if (eventData.autoDraftStatus) {
+      // Anything that is not 'created' used to render "Failed", so changing the status
+      // value to 'skipped_no_email' upstream changed nothing the owner sees — a phone-only
+      // capture still mailed them a failure notice. "Nothing to draft" is not a failure;
+      // the autoSendStatus block below has had the right shape for this all along.
       const draftLabel = eventData.autoDraftStatus === 'created'
         ? 'Created'
-        : 'Failed';
+        : eventData.autoDraftStatus === 'skipped_no_email'
+          // The upstream reason is 'no_contact_channel' — neither an email NOR a LinkedIn
+          // profile. The internal message was corrected to match; this owner-facing label
+          // was not, so it named one of the two missing channels.
+          ? 'Skipped — lead has no email address or LinkedIn profile to draft for'
+          : 'Failed';
       details.push({ label: 'Auto Draft', value: draftLabel });
 
       if (eventData.autoSendStatus === 'sent') {
@@ -134,10 +152,14 @@ const sendAlertEmail = async ({
   ccEmails?: string[];
 }) => {
   const leadName = formatLeadName(lead);
-  const leadEmail = lead.email || 'Unknown email';
+  // Matches the sibling builder below, which already got this right: an absent address is
+  // not "Unknown email", it is nothing to show. Printing the placeholder also flipped
+  // showLeadEmail TRUE precisely when there was no email, so every phone-only lead was
+  // announced to its owner as `<leadId> (Unknown email)`.
+  const leadEmail = lead.email || '';
   const normalizedLeadName = String(leadName).trim().toLowerCase();
   const normalizedLeadEmail = String(leadEmail).trim().toLowerCase();
-  const showLeadEmail = normalizedLeadName !== normalizedLeadEmail;
+  const showLeadEmail = !!leadEmail && normalizedLeadName !== normalizedLeadEmail;
   const eventTime = createdAt ? new Date(createdAt).toLocaleString() : new Date().toLocaleString();
   const subject = `Lead list alert: ${eventType}`;
   const eventDetails = buildEventDetails(eventType, eventData);
@@ -269,20 +291,32 @@ export const leadListAlertService = {
       ccEmails,
     });
 
-    // Send Slack notification if the user has a slackChannel configured
+    const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+    const crmUrl = `${customerFrontendUrl}/crm?listId=${encodeURIComponent(list.listId)}`;
+    const listName = list.name || 'Lead List';
+
+    // Send Slack notification if the user has a slackChannel configured.
+    // Deliberately still reading the deprecated singular `slackChannel` rather than
+    // the shared resolver: switching to it would newly alert every user who has only
+    // `slackChannels` set, which is a delivery change customers did not ask for and
+    // is outside ENG-273's scope. ENG-2120 transfers org-enabled new-lead
+    // delivery to the CRM insert hook; other legacy events keep this destination.
     if (user.slackChannel) {
       try {
-        const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-        const crmUrl = `${customerFrontendUrl}/crm?listId=${encodeURIComponent(list.listId)}`;
-
-        await sendLeadNotification(user.slackChannel, {
+        // The org delivery path owns new-lead Slack alerts when enabled. A second
+        // legacy send would bypass its masking/filters and create duplicates.
+        const orgOwnsNewLeadAlert = (normalizedEventType === 'api.lead_added' ||
+          (normalizedEventType === 'api.lead_updated' && eventData.orgLeadSubmission === true)) && user.orgId
+          ? (await orgDb.getOrgById(user.orgId))?.leadNotifications?.enabled === true
+          : false;
+        if (!orgOwnsNewLeadAlert) await sendLeadNotification(user.slackChannel, {
           firstName: lead.firstName,
           lastName: lead.lastName,
           email: lead.email,
           company: lead.company,
           phone: lead.phone,
           linkedin: lead.linkedin,
-          listName: list.name || 'Lead List',
+          listName,
           listId: list.listId,
           crmUrl,
           eventType: normalizedEventType,
@@ -292,6 +326,32 @@ export const leadListAlertService = {
         // Log but don't fail — email was already sent successfully
         console.error('Failed to send Slack lead notification:', slackError);
       }
+    }
+
+    // WhatsApp is a peer channel, additive to both the email baseline and Slack.
+    // The Slack version is Block Kit; WhatsApp has no blocks, so it gets a flat
+    // template — name, then what happened plus the CRM link.
+    try {
+      await bootstrapMessagingChannels();
+      const whatsappTo = await resolveDestination(user, 'whatsapp');
+      if (whatsappTo) {
+        const leadName =
+          [lead.firstName, lead.lastName].filter(Boolean).join(' ').trim() ||
+          lead.email ||
+          'A lead';
+        await getMessagingChannel('whatsapp').sendMessage({
+          destination: whatsappTo,
+          text: `${leadName} — ${normalizedEventType} on ${listName}. ${crmUrl}`,
+          template: {
+            name: TEMPLATES.LEAD_ALERT.name,
+            variables: [leadName, `${normalizedEventType} on ${listName}. ${crmUrl}`],
+          },
+        } as any);
+      }
+    } catch (whatsappError) {
+      // Same contract as the Slack path: email already landed, so a channel failure
+      // must never fail the alert.
+      console.error('Failed to send WhatsApp lead notification:', whatsappError);
     }
   },
 

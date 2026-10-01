@@ -632,8 +632,11 @@ describe("POST /api/internal/usage — atomic ledger+charge write outcomes (ENG-
     expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
   });
 
-  it("on a transient conflict (\"conflict\", not a confirmed duplicate), falls back to the non-atomic recordUsage() write so real usage is never silently dropped", async () => {
-    mockIncrementUsageWithChargeEvent.mockResolvedValueOnce("conflict");
+  it("on a conflict that PERSISTS through the retries, falls back to the non-atomic recordUsage() write so real usage is never silently dropped", async () => {
+    // ENG-1934 (CodeRabbit, PR #2904): a single conflict is now retried first
+    // (next test). Only a conflict the retries cannot settle reaches the
+    // fail-toward-charging fallback this test has always protected.
+    mockIncrementUsageWithChargeEvent.mockResolvedValue("conflict");
 
     const res = await request(app)
       .post("/api/internal/usage")
@@ -641,8 +644,26 @@ describe("POST /api/internal/usage — atomic ledger+charge write outcomes (ENG-
       .send({ records: [record({ taskId: "task-abc" })], reportId: "conflict-report-id" });
 
     expect(res.status).toBe(202);
+    expect(mockIncrementUsageWithChargeEvent).toHaveBeenCalledTimes(3);
     expect(mockRecordUsage).toHaveBeenCalledTimes(1);
     expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries the SAME grouped transaction on a conflict — a commit hidden behind it resolves as a duplicate, with no fallback write", async () => {
+    // The conflict arrived after DynamoDB committed. Replaying identical items
+    // (same eventId) reports "duplicate"; falling back instead would write the
+    // aggregate twice and mint an unkeyed spend event.
+    mockIncrementUsageWithChargeEvent.mockResolvedValueOnce("conflict").mockResolvedValueOnce("duplicate");
+
+    const res = await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })], reportId: "hidden-commit" });
+
+    expect(res.status).toBe(202);
+    expect(mockIncrementUsageWithChargeEvent).toHaveBeenCalledTimes(2);
+    expect(mockIncrementUsageWithChargeEvent.mock.calls[1]).toEqual(mockIncrementUsageWithChargeEvent.mock.calls[0]);
+    expect(mockRecordUsage).not.toHaveBeenCalled();
   });
 
   it("only the DUPLICATE group in a mixed batch skips its ledger write -- the genuinely new group still writes atomically, neither goes through the fallback", async () => {

@@ -1,8 +1,10 @@
 import jwt from 'jsonwebtoken';
 import { getJwtSecret } from '../config/jwt';
 import { generateChatResponse, chatbotDb } from './chatbotService';
-import { checkTokenUsage } from './tokenUsageService';
+import { checkTokenUsage, toCustomerTokenUsage } from './tokenUsageService';
 import { userDb } from './db';
+import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
+import { resolveRunFunding, withRunFunding } from './funding/runFunding';
 
 // Narrowed to exactly what this handler touches on a Socket.IO `Socket`, so a
 // test can pass a plain mock without satisfying the full (much larger)
@@ -41,10 +43,16 @@ export async function handleSocketChatMessage(
     // Check token usage limits
     const usageStatus = await checkTokenUsage(userId);
     if (!usageStatus.allowed) {
+      // Same two defects as the MCP middleware carried, and the same fix: the
+      // raw status leaked `costUsed`/`costAllowance` past ENG-1212's projection,
+      // and the copy named tokens (not the gating dimension since ENG-1116) with
+      // no reset date. `code` is unchanged — clients branch on it.
+      const blockCopy = buildUsageBlockCopy({ month: usageStatus.month });
       socket.emit('error', {
-        message: 'Monthly token limit reached. Please contact support or upgrade your plan.',
+        message: blockCopy.message,
         code: 'TOKEN_LIMIT_EXCEEDED',
-        tokenUsage: usageStatus,
+        usageBlock: blockCopy,
+        tokenUsage: toCustomerTokenUsage(usageStatus),
       });
       return;
     }
@@ -76,11 +84,15 @@ export async function handleSocketChatMessage(
 
     const portalType = data.portal || 'partner';
     const orgRole = portalType === 'customer' ? (await userDb.getUserById(userId))?.orgRole : undefined;
-    const response = await generateChatResponse(
+    // ENG-1816 F1: without this, chatbotService's embeddings-attribution fix is a
+    // silent no-op on this entry point — currentRunFunding() would read undefined.
+    // resolveRunFunding always resolves 'agentweb' today, so nothing observable changes.
+    const runFunding = await resolveRunFunding({ userId });
+    const response = await withRunFunding(runFunding, () => generateChatResponse(
       data.sessionId,
       data.message,
       { currentUrl: data.currentUrl, pageContent: data.pageContent, portalType, userId, socketId: socket.id, isDelegatedAdmin, orgRole }
-    );
+    ));
 
     // Send response back to the client
     const responseContent = typeof response === 'string' ? response : (response as any)?.content ?? '';

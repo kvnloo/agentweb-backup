@@ -37,15 +37,34 @@ import WorkPlans from './pages/WorkPlans';
 import ScheduleTemplates from './pages/ScheduleTemplates';
 import ClientHealth from './pages/ClientHealth';
 import AgentRunsInspector from './pages/AgentRunsInspector';
+import EvalLabelling from './pages/EvalLabelling';
+import CreativeCalibration from './pages/CreativeCalibration';
+import ApprovalDesk from './pages/ApprovalDesk';
+import SandboxAccounts from './pages/SandboxAccounts';
 import PromptTemplates from './pages/PromptTemplates';
 import Api from './pages/Api';
 import Marketing from './pages/marketing';
 import { useEffect } from 'react';
+import { useAuth } from './contexts/AuthContext';
 
 const RedirectToTasks = () => {
+  const { user, loading, hasRole } = useAuth();
+
   useEffect(() => {
-    window.location.href = '/tasks';
-  }, []);
+    if (loading) return;
+    if (!user) {
+      window.location.href = '/login';
+    } else if (hasRole('partner')) {
+      window.location.href = '/tasks';
+    } else if (hasRole('customer')) {
+      window.location.href = '/marketing';
+    } else if (hasRole('contractor')) {
+      window.location.href = '/contractor-accesses';
+    } else {
+      // No recognized role — avoid looping back through '/'.
+      window.location.href = '/login';
+    }
+  }, [user, loading, hasRole]);
 
   return null;
 };
@@ -137,6 +156,46 @@ export default function App() {
                       element={
                         <AdminRoute>
                           <ClientHealth />
+                        </AdminRoute>
+                      }
+                    />
+                    <Route
+                      path="eval-labelling"
+                      element={
+                        <AdminRoute>
+                          <EvalLabelling />
+                        </AdminRoute>
+                      }
+                    />
+                    <Route
+                      path="eval-labelling/calibration"
+                      element={
+                        <AdminRoute>
+                          <CreativeCalibration />
+                        </AdminRoute>
+                      }
+                    />
+                    <Route
+                      path="approval-desk"
+                      element={
+                        <AdminRoute>
+                          <ApprovalDesk />
+                        </AdminRoute>
+                      }
+                    />
+                    <Route
+                      path="approval-desk/:manifestId"
+                      element={
+                        <AdminRoute>
+                          <ApprovalDesk />
+                        </AdminRoute>
+                      }
+                    />
+                    <Route
+                      path="sandbox-accounts"
+                      element={
+                        <AdminRoute>
+                          <SandboxAccounts />
                         </AdminRoute>
                       }
                     />

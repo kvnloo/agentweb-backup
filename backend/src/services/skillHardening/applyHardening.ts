@@ -25,9 +25,18 @@ export interface HardeningBlock {
 }
 
 const SAFETY = `## SAFETY & VOLUME LIMITS (apply in ALL modes, including scheduled/unattended runs)
-- HARD CAPS per run: max 5 LinkedIn invites, 10 LinkedIn messages, 25 emails,
-  0 deletions. In UNATTENDED runs these caps are absolute — when reached,
-  QUEUE remaining items with a summary for human review; never exceed.
+- HARD CAPS per run: max 25 emails, 0 deletions.
+  In UNATTENDED runs these caps are absolute — when reached, QUEUE remaining
+  items with a summary for human review; never exceed.
+- LinkedIn invites and messages are capped PER DAY by the backend, not by a fixed
+  number here. Do not self-count: the send-invite/send-message/send-inmail tool
+  call itself refuses with a clear reason once the account's daily cap is
+  reached. On that refusal, STOP sending on this account and queue the rest for
+  a later run — do not retry and do not switch to a different account. (This
+  block is shared by skills that don't all carry linkedin_outreach — a skill
+  without it will simply never hit this case. Skills that DO send LinkedIn
+  outreach additionally carry their own instruction for setting the account's
+  daily cap via linkedin_outreach action set-daily-invite-cap.)
 - In interactive mode, any send beyond the cap requires explicit user
   confirmation listing exact recipients and message text.
 - NEVER delete leads, lists, or drafts in an unattended run under any
@@ -252,6 +261,17 @@ export interface SkillHardeningTarget {
 }
 
 /**
+ * Min-prompt keys whose text defers unattended publish authority to the run's
+ * PUBLISH AUTHORIZATION block (ENG-1336). A target that sets one of these
+ * without also appending the `publishGate` fallback block would produce a
+ * skill row that references an authority it never carries — so planSkillChange
+ * auto-adds `publishGate` (deterministic choice (a): the block itself already
+ * has an explicit "no block = treat as attended" fallback, making auto-add the
+ * safe default rather than a throw that would break config-driven callers).
+ */
+const PUBLISH_DEFERRING_PROMPTS = new Set(["linkedInEngagement", "basicSubscription"]);
+
+/**
  * Plan the full change for one skill (blocks + toolNames additions), idempotently.
  * Never mutates the input. `addedTools` excludes tools already declared, so a
  * re-run adds nothing.
@@ -271,12 +291,21 @@ export function planSkillChange(
       promptSet = true;
     }
   }
-  const afterBlocks = applyHardening(working, target.blocks || []);
+  // ENG-1336: a publish-deferring min-prompt without its fallback block is a
+  // silently invalid config — auto-add publishGate (idempotent; no-op when the
+  // caller already listed it or the marker is present).
+  const blocks =
+    target.setPrompt &&
+    PUBLISH_DEFERRING_PROMPTS.has(target.setPrompt) &&
+    !(target.blocks || []).includes("publishGate")
+      ? [...(target.blocks || []), "publishGate"]
+      : target.blocks || [];
+  const afterBlocks = applyHardening(working, blocks);
   const declared = new Set(afterBlocks.skill.toolNames || []);
   // Every applied block's required tools must be present too (whether the block
   // was just appended or already there), else the block references tools the
   // skill lacks. Combine with explicit addTools, dedupe, drop already-declared.
-  const blockTools = (target.blocks || []).flatMap((k) => BLOCKS[k]?.requiredTools || []);
+  const blockTools = blocks.flatMap((k) => BLOCKS[k]?.requiredTools || []);
   const want = [...(target.addTools || []), ...blockTools];
   const addedTools = want.filter((t, i) => t && !declared.has(t) && want.indexOf(t) === i);
   const toolNames = addedTools.length

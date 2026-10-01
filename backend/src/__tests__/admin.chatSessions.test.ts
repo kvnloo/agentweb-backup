@@ -1,8 +1,8 @@
 import request from "supertest";
 import express from "express";
 import adminRoutes from "../routes/admin";
-import { chatbotDb } from "../services/chatbotService";
-import { settingsService } from "../services/settingsService";
+import { chatbotDb, ChatSession } from "../services/chatbotService";
+import { settingsService, Setting } from "../services/settingsService";
 import * as sessionScoringService from "../services/sessionScoringService";
 
 jest.mock("../services/chatbotService", () => ({
@@ -23,7 +23,9 @@ jest.mock("../services/settingsService", () => ({
 }));
 
 jest.mock("../services/sessionScoringService", () => ({
-  scoreSessionIfNeeded: jest.fn(),
+  // ENG-929: sync scoring now goes through attemptSessionScore, which reports WHY
+  // a session was not scored instead of returning a bare null.
+  attemptSessionScore: jest.fn(),
   scoreSessionWithJudgeIfNeeded: jest.fn(),
   ScoringJudge: {},
 }));
@@ -40,7 +42,7 @@ const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb> & {
   createOrReuseInteractiveShare: jest.MockedFunction<(sessionId: string, days: number) => Promise<string>>;
 };
 const mockSettingsService = settingsService as jest.Mocked<typeof settingsService>;
-const mockScoreSessionIfNeeded = sessionScoringService.scoreSessionIfNeeded as jest.MockedFunction<typeof sessionScoringService.scoreSessionIfNeeded>;
+const mockAttemptSessionScore = sessionScoringService.attemptSessionScore as jest.MockedFunction<typeof sessionScoringService.attemptSessionScore>;
 const mockScoreSessionWithJudgeIfNeeded = sessionScoringService.scoreSessionWithJudgeIfNeeded as jest.MockedFunction<typeof sessionScoringService.scoreSessionWithJudgeIfNeeded>;
 
 const app = express();
@@ -212,24 +214,67 @@ describe("Admin chat sessions endpoint", () => {
         lastEvaluatedKey: undefined,
       });
       mockChatbotDb.getChatSession.mockResolvedValue(session as any);
-      mockScoreSessionIfNeeded.mockResolvedValue(null);
+      mockAttemptSessionScore.mockResolvedValue({ score: null, skipReason: "already-scored" });
       mockScoreSessionWithJudgeIfNeeded.mockResolvedValue(null);
     });
 
-    it("calls scoreSessionIfNeeded for each session when sync=true", async () => {
+    it("calls the session scorer for each session when sync=true", async () => {
       mockSettingsService.getSetting.mockResolvedValue(null as any);
 
       await request(app)
         .get("/api/admin/chat-sessions?sync=true")
         .expect(200);
 
-      expect(mockScoreSessionIfNeeded).toHaveBeenCalledTimes(1);
+      expect(mockAttemptSessionScore).toHaveBeenCalledTimes(1);
     });
 
     it("does not call scoring when sync is not set", async () => {
       await request(app).get("/api/admin/chat-sessions").expect(200);
 
-      expect(mockScoreSessionIfNeeded).not.toHaveBeenCalled();
+      expect(mockAttemptSessionScore).not.toHaveBeenCalled();
+    });
+
+    it("reports a per-session scoring outcome when sync=true (ENG-929)", async () => {
+      mockSettingsService.getSetting.mockResolvedValue(null as any);
+
+      const res = await request(app)
+        .get("/api/admin/chat-sessions?sync=true")
+        .expect(200);
+
+      expect(res.body.sessions[0].scoringOutcome).toEqual({
+        status: "skipped",
+        reason: "already-scored",
+      });
+      expect(res.body.scoringSummary).toEqual({
+        scored: 0,
+        skipped: 1,
+        failed: 0,
+        notAttempted: 0,
+        timedOut: false,
+      });
+    });
+
+    it("reports a failed scoring attempt rather than a silent null score (ENG-929)", async () => {
+      mockSettingsService.getSetting.mockResolvedValue(null as any);
+      mockAttemptSessionScore.mockRejectedValue(new Error("Scoring LLM call timed out after 40000ms"));
+
+      const res = await request(app)
+        .get("/api/admin/chat-sessions?sync=true")
+        .expect(200);
+
+      expect(res.body.sessions[0].satisfactionScore).toBeUndefined();
+      expect(res.body.sessions[0].scoringOutcome).toEqual({
+        status: "failed",
+        reason: "Scoring LLM call timed out after 40000ms",
+      });
+      expect(res.body.scoringSummary.failed).toBe(1);
+    });
+
+    it("omits scoring outcomes entirely when sync is not set", async () => {
+      const res = await request(app).get("/api/admin/chat-sessions").expect(200);
+
+      expect(res.body.sessions[0].scoringOutcome).toBeUndefined();
+      expect(res.body.scoringSummary).toBeUndefined();
     });
 
     it("scores sessions with all configured judges when sync=true", async () => {
@@ -327,7 +372,7 @@ describe("Admin chat sessions endpoint", () => {
       mockSettingsService.getSetting.mockResolvedValue(null as any);
 
       const newScore = { score: 2, reason: "poor", evaluatedAt: "2024-01-01T01:00:00Z", evaluatedMessageIndex: 2, dimensions: { goalCompletion: 2, dataAccuracy: 2, outputQuality: 2 } };
-      mockScoreSessionIfNeeded.mockResolvedValue(newScore as any);
+      mockAttemptSessionScore.mockResolvedValue({ score: newScore as any });
 
       const res = await request(app)
         .get("/api/admin/chat-sessions?sync=true")
@@ -372,8 +417,10 @@ describe("Admin chat sessions endpoint", () => {
       mockSettingsService.getSetting.mockResolvedValue(null as any);
 
       const newScore = { score: 5, reason: "great", evaluatedAt: "2026-08-18T14:01:00.000Z", evaluatedMessageIndex: 2 };
-      mockScoreSessionIfNeeded.mockImplementation(async (session: any) =>
-        session.sessionId === "in-range-unscored" ? newScore : null
+      mockAttemptSessionScore.mockImplementation(async (session: any) =>
+        session.sessionId === "in-range-unscored"
+          ? { score: newScore as any }
+          : { score: null, skipReason: "already-scored" }
       );
 
       const res = await request(app)
@@ -423,7 +470,7 @@ describe("Admin chat sessions endpoint", () => {
 
       const newScore = { score: 5, reason: "great", evaluatedAt: "2026-08-18T14:01:00.000Z", evaluatedMessageIndex: 2 };
       // Both sessions get freshly scored by this backfill run.
-      mockScoreSessionIfNeeded.mockResolvedValue(newScore as any);
+      mockAttemptSessionScore.mockResolvedValue({ score: newScore as any });
 
       const res = await request(app)
         .get("/api/admin/chat-sessions?sync=true&startTime=2026-08-17T14:00:00Z&endTime=2026-08-18T14:00:00Z")
@@ -524,7 +571,7 @@ describe("Admin chat sessions endpoint", () => {
       });
       mockChatbotDb.getChatSession.mockResolvedValue(inRangeUnscored as any);
       mockSettingsService.getSetting.mockResolvedValue(null as any);
-      mockScoreSessionIfNeeded.mockResolvedValue(null);
+      mockAttemptSessionScore.mockResolvedValue({ score: null, skipReason: "already-scored" });
 
       const res = await request(app)
         .get("/api/admin/chat-sessions?sync=true&startTime=2026-08-17T14:00:00Z&endTime=2026-08-18T14:00:00Z")
@@ -741,6 +788,127 @@ describe("Admin chat sessions endpoint", () => {
 
       expect(mockChatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith("search-session", 45);
       expect(res.body.sessions[0].interactiveShareMetadata.token).toBe("searchtok");
+    });
+  });
+
+  describe("POST /chat-sessions/judge-score", () => {
+    const judges = [
+      { id: "judge-1", name: "Test Judge", systemPrompt: "p", createdAt: "2024-01-01", updatedAt: "2024-01-01" },
+    ];
+    const scoringJudgesSetting: Setting = {
+      settingName: "scoring-judges",
+      settingValue: JSON.stringify(judges),
+      updatedAt: "2024-01-01T00:00:00Z",
+      updatedBy: "test",
+    };
+    const makeSession = (id: string): ChatSession => ({
+      sessionId: id,
+      userId: "user-1",
+      createdAt: "2024-01-01T00:00:00Z",
+      updatedAt: "2024-01-01T00:00:00Z",
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "hi" },
+      ],
+    });
+
+    beforeEach(() => {
+      mockSettingsService.getSetting.mockResolvedValue(scoringJudgesSetting);
+    });
+
+    // ENG-2216: a per-session rejection (e.g. the judge's LLM response failed
+    // to parse) used to be discarded entirely — no log, and `failed` carried
+    // only a bare session id with no indication of why. It must now be logged
+    // and the reason must be returned in the response.
+    it("logs the rejection reason and reports it in `failed` instead of swallowing it", async () => {
+      const consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      const session = makeSession("s1");
+      mockChatbotDb.getChatSession.mockResolvedValue(session);
+      mockScoreSessionWithJudgeIfNeeded.mockRejectedValue(
+        new Error('Judge response missing or non-numeric "score" field (got undefined)')
+      );
+
+      const res = await request(app)
+        .post("/api/admin/chat-sessions/judge-score")
+        .send({ sessionIds: ["s1"], judgeId: "judge-1" })
+        .expect(200);
+
+      expect(res.body.scores).toEqual({});
+      expect(res.body.failed).toEqual([
+        {
+          sessionId: "s1",
+          reason: 'Judge response missing or non-numeric "score" field (got undefined)',
+        },
+      ]);
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("s1")
+      );
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Judge response missing or non-numeric "score" field (got undefined)')
+      );
+
+      consoleErrorSpy.mockRestore();
+    });
+
+    it("returns scores for sessions that succeed and failed entries for sessions that reject, in the same request", async () => {
+      const sessionOk = makeSession("ok");
+      const sessionBad = makeSession("bad");
+      mockChatbotDb.getChatSession.mockImplementation(async (id: string) =>
+        id === "ok" ? sessionOk : sessionBad
+      );
+      const goodScore = {
+        score: 4,
+        reason: "good",
+        evaluatedAt: "2024-01-01",
+        evaluatedMessageIndex: 2,
+        judgeName: "Test Judge",
+      };
+      mockScoreSessionWithJudgeIfNeeded.mockImplementation(async (session) =>
+        session.sessionId === "ok" ? goodScore : Promise.reject(new Error("LLM timeout"))
+      );
+
+      const res = await request(app)
+        .post("/api/admin/chat-sessions/judge-score")
+        .send({ sessionIds: ["ok", "bad"], judgeId: "judge-1" })
+        .expect(200);
+
+      expect(res.body.scores).toEqual({ ok: goodScore });
+      expect(res.body.failed).toEqual([{ sessionId: "bad", reason: "LLM timeout" }]);
+    });
+
+    it("stringifies a non-Error rejection reason rather than dropping it", async () => {
+      const session = makeSession("s1");
+      mockChatbotDb.getChatSession.mockResolvedValue(session);
+      mockScoreSessionWithJudgeIfNeeded.mockRejectedValue("weird non-error rejection");
+
+      const res = await request(app)
+        .post("/api/admin/chat-sessions/judge-score")
+        .send({ sessionIds: ["s1"], judgeId: "judge-1" })
+        .expect(200);
+
+      expect(res.body.failed).toEqual([{ sessionId: "s1", reason: "weird non-error rejection" }]);
+    });
+
+    // CodeRabbit (CWE-532): a judge-score failure reason can echo back judge/
+    // provider response content (e.g. the missing-score guard's
+    // JSON.stringify(parsed.score)), which may itself derive from a real
+    // session transcript, so it must not reach logs or the API response
+    // unbounded.
+    it("truncates a very long rejection reason instead of logging/returning it verbatim", async () => {
+      const session = makeSession("s1");
+      mockChatbotDb.getChatSession.mockResolvedValue(session);
+      const longReason = "x".repeat(1000);
+      mockScoreSessionWithJudgeIfNeeded.mockRejectedValue(new Error(longReason));
+
+      const res = await request(app)
+        .post("/api/admin/chat-sessions/judge-score")
+        .send({ sessionIds: ["s1"], judgeId: "judge-1" })
+        .expect(200);
+
+      expect(res.body.failed).toHaveLength(1);
+      expect(res.body.failed[0].sessionId).toBe("s1");
+      expect(res.body.failed[0].reason.length).toBeLessThan(longReason.length);
+      expect(res.body.failed[0].reason.endsWith("…")).toBe(true);
     });
   });
 });

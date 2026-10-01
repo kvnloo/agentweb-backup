@@ -1,6 +1,28 @@
+import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
+import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassification';
+import { resolveModelForUser } from './modelRoles';
+import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
+import { recordCreativeLearningReceipt } from './agentMode/adsLearning';
+import { enforceEvaluationTool, isEvaluationUser } from './evaluationPolicy';
+import { sandboxAwarePollDelayMs } from './agentMode/sandboxPolling';
+import { markSandboxRun, forgetSandboxRun, isSandboxRun, releaseSandboxRun } from './agentMode/sandboxTelemetry';
 import axios from 'axios';
 import { describeGoogleAdsSpendRisk } from '../utils/googleAdsSpendRisk';
+import { applyLeadMetrics, finalizeLeadCosts } from '../utils/metaActionFamilies';
 import { parse as parseCsv } from 'csv-parse/sync';
+import {
+  parseCsvProvenance,
+  tokenizeCsvHeaderCell,
+  findCsvIdNameCollisions,
+  checkCsvIdGrounding,
+  estimateRowsIn,
+  buildDataAnalysisCacheKey,
+} from './agentMode/csvProvenance';
+import {
+  buildListMessage,
+  buildListResult,
+  describeIgnoredCampaignScope,
+} from './agentMode/metaListScope';
 import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
@@ -8,16 +30,24 @@ import { createHash, createHmac, randomUUID } from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
-import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
+import { chatbotDb, ChatMessage, ChatSession, searchPlatformKnowledgeBase } from './chatbotService';
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import {
   decideWorkPlanTurnDisposition,
+  findWorkPlanStepByCount,
+  hadExhaustedTransientStepFailure,
   snapshotWorkPlanTurn,
   type WorkPlanTurnDisposition,
 } from './agentMode/core/workPlanTurnDisposition';
+import { shouldForceScheduledAutocomplete } from './agentMode/core/scheduledAutocomplete';
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
+import { resolveMetaActivationCampaignId } from './agentMode/metaCampaignResolution';
+import {
+  buildImageSwapNotReflected, judgeImageSwap, readCreativeImage, selectSwapImageHash,
+  type CreativeImageReadback, type ImageSwapExpectation, type ImageSwapVerdict,
+} from './agentMode/metaImageSwapCheck';
 import { publishWithdrawnMidFlight, readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { isPublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
@@ -31,7 +61,26 @@ import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
 import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
-import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount } from './agentMode/core/synthesisResidue';
+import {
+  normalizeOpenRouterResponseMetadata,
+  normalizeOpenRouterErrorMetadata,
+} from './agentMode/openRouterMetadata';
+import {
+  assertOpenRouterToolsSupported,
+  openRouterIgnoredProviders,
+  OPENROUTER_PROVIDER_PREFERENCES,
+  selectOpenRouterSamplingParams,
+} from './agentMode/openRouterRequestParams';
+import {
+  createLlmModelRegistry,
+  type LLMModelConfig,
+  type ModelProvider,
+  type ModelTier,
+} from './agentMode/llmModelRegistry';
+import {
+  isMalformedOpenRouterResponseError,
+} from './agentMode/openRouterResponseValidation';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter, extractProducedAssetCount, buildUnavailableCapabilityNotice, buildAcceptanceFailureNotice, assetProducingToolsInPlay } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoAssetUrl,
@@ -40,15 +89,26 @@ import {
   promptCreatesLogo,
   promptRequestsLogo,
 } from './agentMode/brandLogo';
-import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory } from './agentMode/core/toolDispatch';
+import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory, seedSearchCallCountFromHistory } from './agentMode/core/toolDispatch';
+import {
+  describeImageReportsFabricatedMetrics,
+  FABRICATED_METRICS_CHECK_PROMPT,
+  FABRICATED_METRICS_CHECK_TIMEOUT_MS,
+  FABRICATED_METRICS_WARNING,
+  promptRisksFabricatedMetrics,
+} from './agentMode/dataFabricationGuard';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
+import { recoverLeadFromWrongList } from './agentMode/leadRecovery';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
+import { reconcileModelReassessAck, findLastAssistantModel } from '../utils/modelReassessRequest';
+import { reconcileModelMentionAck, buildModelMentionIndex, type ModelMentionIndex } from '../utils/modelMentionRequest';
+import { resolveTurnModelCorrection } from '../utils/modelCorrectionStamp';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
 import { resolveOrgProfileField } from './orgProfileResolver';
-import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
+import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish, resolveSlackSendAuthorized } from '../utils/schedulePublishApproval';
 import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization, describePublishAuthorizationWithholdReason, PublishAuthorizationWithholdReason } from '../utils/schedulePublishAuthorization';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
 import { meteringFeature } from './llmUsageAttributionService';
@@ -57,14 +117,47 @@ import { RunEmitter } from './agentMode/streamEvents';
 // the outreach-onboarding prospect preview cannot drift apart.
 import { isAnonymizedSearchLead } from '../utils/anonymizedLinkedInLead';
 import {
-  applyAnswer,
-  buildPendingUserQuestion,
-  checkQuestionGate,
-  findQuestionByKind,
-  renderQuestionPrompt,
   verifyExplicitStatement,
   type AskUserQuestionOption,
+  type PendingUserQuestion,
 } from './agentMode/core/askUserQuestion';
+import {
+  createApprovalDeck,
+  appendApprovalDeckItem,
+  finalizeApprovalDeck,
+  findApprovalDeckAnswerForDigest,
+  findAnsweredDeckItemByKind,
+  reconstructApprovalDeckFromHistory,
+  applyDeckAnswers,
+  approvedWriteItems,
+  renderApprovalDeckPrompt,
+  type PendingApprovalDeck,
+  type ApprovalDeckItem,
+  type ApprovalDeckAnsweredBy,
+  type InboundDeckAnswer,
+  type QuestionDeckQuestionInput,
+} from './agentMode/core/approvalDeck';
+import {
+  type WorkflowStepDefinition,
+  type WorkflowStepVerification,
+  type WorkflowRunState,
+  type WorkflowVerificationMismatch,
+  summarizeIndependentStepBatch,
+  StepContendedError,
+} from './agentMode/core/workflow';
+import { startWorkflow, advanceIndependentWorkflow, type AdvanceIndependentOutcome } from './agentMode/workflowRunner';
+// ENG-1853: the manifest-level meta_write executor below reads/records
+// against the durable approval-inbox store — approvalInboxService.ts has no
+// dependency back on this file (verified), so this is a one-directional
+// import, not a cycle.
+import { approvalInboxService, type ApprovalDecision, type ApprovalDecisionApprover } from './approvalInboxService';
+// Review fix: the manifest executor below needs the same active-resume
+// primitive approvalInboxExecution.ts already built for the per-decision
+// path — resumeOriginSession is exported from there specifically so this
+// file doesn't grow a second, divergent copy of the same resume/fallback
+// logic. approvalInboxExecution.ts does not import from this file, so this
+// stays a one-directional dependency, not a cycle.
+import { resumeOriginSession } from './approvalInboxExecution';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
 import { settingsService } from './settingsService';
 import {
@@ -90,6 +183,9 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
+import { pickTransport } from './funding/transport';
+import { currentRunFunding } from './funding/runFunding';
+import { recordLlmUsage } from './funding/recordLlmUsage';
 import {
   getModelPrice,
   costScoreFromPrice,
@@ -111,26 +207,60 @@ import {
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { publishWithResolvedBlogPublisher } from './blogPublishers';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
+import { declaredPlacementField } from './agentMode/generateImagePlacement';
+import { isNonConsumableRequiredFunctionCall } from './agentMode/workPlanRequiredCallsPolicy';
+import { recordGeneratedCreative, stampMetaAdCreated, stampMetaAdCreativeChanged, stampMetaCreativeCreated, stampMetaImageUpload, stampMetaPublish } from './creativeLineage';
 import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
-import { SearchResultSource } from '../search/searchProvider';
+import { SearchPurpose, SearchResultSource } from '../search/searchProvider';
 import { CitationRegistry } from '../utils/citations';
 import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 import {
   applyOpenRouterCacheBreakpoints,
   resolveOpenRouterUpstreamModelId,
   type GatewayTaskClass,
+  type GatewayReasoningConfig,
+  resolveGatewayReasoningEffort,
 } from '../utils/openRouterGatewayContract';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
+/*
+ * ENG-1795: the sentence that marks an install refusal as an ID failure rather than a
+ * billing one. `toolErrorClassifier` keys on this exact phrase to route the refusal to
+ * `invalid_args` instead of `subscription_blocked`, so it is a contract between the two
+ * files, not decoration — change it in both or in neither.
+ */
+export const SKILL_UNRESOLVED_MARKER = "Could not resolve these skill IDs to any known skill";
+/*
+ * The skill exists and the account is entitled to it, but nothing is installable behind it
+ * right now — in practice an `__other_skills__` bundle whose unassociated-tool pool is empty.
+ *
+ * Routed to `skill_install_refused`, a class that exists for this case: its guidance defers to
+ * this message for the reason and adds only the verdict — do not retry, do not substitute.
+ * `empty_result` is actively harmful here ("the call succeeded … try a different source",
+ * beneath a refusal forbidding exactly that) and `tool_unavailable` is false and circular
+ * ("this tool is not available", "install via install_skills" — on an install_skills failure).
+ *
+ * NOT visibility-filtered skills (those never reach this bucket — `getPublishedSkills` drops
+ * `pending_review`, so they land in `unresolved`), and NOT the admin bundle (its own
+ * `forbidden` bucket).
+ */
+export const SKILL_UNAVAILABLE_MARKER = "These skills are currently unavailable to install";
+/*
+ * Appended to EVERY refusal, full or partial. The Phoenix session (delegated a1a6345a) showed
+ * a model answering a refused tool with an unrelated tool's output presented as that tool's
+ * result; this sentence is the direct countermeasure, so it must not be scoped to one branch.
+ */
+const SKILL_NO_SUBSTITUTION =
+  " Do NOT substitute a different tool's output for the tool that needed this skill, and do not describe that tool as having run.";
 // Note: list_predefined_work_plans is intentionally NOT admin-gated — it is a
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -308,7 +438,38 @@ export function isVerificationFunctionCallRetryPress(text: string): boolean {
 export function pressesIrreversiblePublishWrite(text: string): boolean {
   return isVerificationFunctionCallRetryPress(text) && IRREVERSIBLE_PUBLISH_TOOLS.some((tool) => text.includes(tool));
 }
-import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
+
+// ENG-1670: a blind fixed backoff is a guess — OpenRouter documents that a
+// 429/5xx can carry `retry-after` (seconds, or an HTTP-date) or the proactive
+// `retry-after-ms`, and the OpenAI SDK's own (disabled here via maxRetries: 0)
+// retry logic already trusts that header over a computed default when it's
+// present and under 60s. Mirror that instead of guessing: honoring the
+// provider's own signal is correct regardless of whether that signal turns
+// out to be 1.5s or 45s, where a fixed backoff is only right by luck.
+//
+// Shared by callLLM's in-call retry loop AND generateMarketingResponse's
+// outer catch (which persists whether a header was actually present, once the
+// call has exhausted its retries and the whole turn is failing) — one
+// definition, so both readings of the same header can never disagree.
+export function getRetryAfterMs(error: unknown): number | undefined {
+  const headers = (error as any)?.headers;
+  if (!headers) return undefined;
+  const msHeader = headers['retry-after-ms'];
+  if (msHeader) {
+    const ms = parseFloat(msHeader);
+    if (!Number.isNaN(ms) && ms >= 0 && ms < 60_000) return ms;
+  }
+  const secHeader = headers['retry-after'];
+  if (secHeader) {
+    const seconds = parseFloat(secHeader);
+    const ms = !Number.isNaN(seconds) ? seconds * 1000 : Date.parse(secHeader) - Date.now();
+    if (!Number.isNaN(ms) && ms >= 0 && ms < 60_000) return ms;
+  }
+  return undefined;
+}
+import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags, isMetaAccountScopeRefusal } from './metaService';
+import { getCustomerUtmDefault, getLanderUtmOverride } from './landerUtmStore';
+import { resolveLanderParams } from '../utils/landerUtm';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import {
   isAnonymizedIdentifier,
@@ -316,7 +477,19 @@ import {
   usableProfileUrl,
   withoutFabricatedProfileFields,
 } from '../utils/linkedInAnonymizedProfile';
-import { PACED_WRITE_ACTIONS, reserveWriteSlot } from './linkedInWritePacer';
+import { PACED_WRITE_ACTIONS } from './linkedInWritePacer';
+import {
+  paceLinkedInWrite,
+  resolveLinkedInAccountForWrite,
+  resolveLinkedInAccountFromList,
+  setDailyInviteCap,
+  type ResolvedLinkedInAccount,
+} from './agentMode/linkedInDailyVolumeGate';
+import {
+  routeLinkedInWriteToAccountWithHeadroom,
+  withAccountRoutingDisclosure,
+  type AccountRoutingDisclosure,
+} from './agentMode/linkedInAccountRouting';
 import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
@@ -333,16 +506,19 @@ import {
   collectPendingDestinations,
   collectPendingCreativeIds,
   computeTrackingOverrideDigest,
+  computeMetaWriteManifestDigest,
   trackingOverrideTokenMatches,
 } from './metaLaunchGate';
+import { buildSandboxFetchHtml } from './sandboxTrackingPreflight';
 import { HubSpotService } from './hubspotService';
+import { handleAttioApi as handleAttioApiImpl } from './agentMode/attioTools';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
-import { resolvePinnedPublicAddress, fetchBufferFollowingRedirects, DEFAULT_MAX_IMAGE_BYTES } from '../utils/ssrfGuard';
+import { resolvePinnedPublicAddress, fetchBufferFollowingRedirects, assertPublicHostname, DEFAULT_MAX_IMAGE_BYTES } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
-import { isTransientLLMError } from '../utils/agentModeErrors';
+import { isTransientLLMError, extractAffordableTokens } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
 import { computeRunVerdict, type RunTerminalInfo } from '../loops/instances/agent-mode/runRecorder';
 // OTel spine (ENG-141) — inert no-ops unless exporter env config is present.
@@ -372,12 +548,14 @@ import {
   validateAndRepairToolArgs,
 } from './agentToolGatewayService';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { isRetryableErrorClass } from './agentMode/core/errorRetryability';
+import { getLandingPageLaunchReadiness } from '../utils/landingPageLaunchReadiness';
 import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
 import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import type { LeadImportRowOutcome } from '../utils/leadSchema';
-import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution } from '../utils/leadSchema';
+import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor } from '../utils/leadSchema';
 
 type MetaApiResult = {
   success: boolean;
@@ -385,6 +563,19 @@ type MetaApiResult = {
   error?: string;
   details?: any;
   [key: string]: any;
+};
+
+// ENG-1635/1644: per-item detail behind an approval deck's fully_applied/
+// partially_applied/unapplied result — see summarizeApprovalDeckRun.
+type ApprovalDeckExecutionSummary = {
+  status: 'fully_applied' | 'partially_applied' | 'unapplied';
+  items: Array<{
+    stepId: string;
+    status: 'verified' | 'failed';
+    appliedObjectId?: string;
+    error?: string;
+    mismatches?: Array<{ parameter: string; requested: unknown; applied: unknown }>;
+  }>;
 };
 
 import {
@@ -402,6 +593,35 @@ import {
 } from '../utils/metaConstants';
 
 /**
+ * ENG-1685: build the S3-safe filename for a generated HTML artifact from its
+ * (human-written, arbitrary-content) title.
+ *
+ * Kraftersland/Helen reported "Download failed" on an HTML report artifact whose
+ * displayed filename was truncated mid-word: `..._Weekly_Performance_Repor.html`
+ * (missing the final "t"). Root cause: the sanitize-then-truncate order was
+ * backwards everywhere this ran — `title.replace(...).substring(0, 50)` blindly
+ * cut the ALREADY-underscore-joined string at a fixed 50-char boundary with no
+ * regard for word breaks, so any title whose sanitized form crossed that
+ * boundary lost a fragment of its last word. The 50-char cap itself had no
+ * documented reason: S3 keys allow up to 1024 bytes and this key already has a
+ * userId + timestamp + random token prefix, leaving hundreds of characters of
+ * real headroom — the low, undocumented number was never load-bearing.
+ *
+ * The truncated filename was NOT independently confirmed to be the cause of the
+ * download failure itself (a live repro of the exact reported file's presign +
+ * S3 fetch succeeded end-to-end against production), but it is a real, visible
+ * bug in the same code path and worth fixing regardless — and downloadAsset.ts's
+ * error handling was hardened separately (ENG-1685) to stop collapsing every
+ * failure class into one indistinguishable "Download failed" toast, which is
+ * what made this report undiagnosable from the client side in the first place.
+ */
+export function buildHtmlArtifactFilename(title: string, now: number = Date.now()): string {
+  const HTML_ARTIFACT_FILENAME_TITLE_MAX = 150;
+  const sanitized = (title || '').replace(/[^a-z0-9]/gi, '_').substring(0, HTML_ARTIFACT_FILENAME_TITLE_MAX);
+  return `html_${now}_${sanitized}.html`;
+}
+
+/**
  * Self-learning loop telemetry for agent-mode tool calls.
  *
  * Emits one decision event + per-tool invoked/succeeded/failed events into the
@@ -412,13 +632,16 @@ import {
  * Keep V0 observability-only: this must not change tool execution, retries,
  * prompts, streaming, or user-facing responses.
  */
-function recordAgentModeToolTelemetry(
+export function recordAgentModeToolTelemetry(
   runId: string,
   sessionId: string,
   iteration: number,
   toolResults: Array<{ status: 'success' | 'error' | 'deferred'; toolCall: any; functionArgs?: any; result?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>,
   budgetContext?: { mediaAssetsProducedThisRun?: number; mediaGenerationDeadlineMs?: number },
+  userId?: string,
 ): void {
+  // ENG-1907: sandbox runs write no reliability telemetry (see agentMode/sandboxTelemetry.ts).
+  if (isSandboxRun(runId, userId)) return;
   const recorder = getAgentRunRecorderSafe();
   if (!recorder || toolResults.length === 0) return;
 
@@ -503,7 +726,7 @@ function recordAgentModeToolTelemetry(
 }
 
 
-function recordAgentModeRunStarted(
+export function recordAgentModeRunStarted(
   runId: string,
   info: { llmModel?: string; sessionType?: string; userId?: string; sessionId?: string },
 ): void {
@@ -512,15 +735,21 @@ function recordAgentModeRunStarted(
   // The traceId is bridged into the recorder's agent_run_started dimensions so
   // Dev-AW-LoopEvents rows can be joined to Langfuse/Okareo traces by ID.
   startInvokeAgentSpan(runId, info);
+  if (isEvaluationUser(info.userId)) {
+    markSandboxRun(runId);
+    return;
+  }
+  forgetSandboxRun(runId);
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   const traceId = getRunTraceId(runId);
   void recorder.runStarted(runId, traceId ? { ...info, traceId } : info);
 }
 
-function recordAgentModeRunCompleted(
+export function recordAgentModeRunCompleted(
   runId: string,
   info: RunTerminalInfo,
+  userId?: string,
 ): void {
   endInvokeAgentSpan(runId, {
     verdict: computeRunVerdict({
@@ -531,6 +760,7 @@ function recordAgentModeRunCompleted(
     }).verdict,
     responseModel: info.llmModel,
   });
+  if (releaseSandboxRun(runId, userId)) return;
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runCompleted(runId, info);
@@ -543,22 +773,25 @@ function recordAgentModeRunCompleted(
  * is the only trace that a truthfulness check was skipped. Best-effort: must
  * never throw into the chat hot path.
  */
-function recordAgentModeClaimCheckError(runId: string, sessionId: string, error: unknown): void {
+export function recordAgentModeClaimCheckError(runId: string, sessionId: string, error: unknown, userId?: string): void {
   console.error('[agent-mode] finalize-guard claim check FAILED (message delivered unchanged):', {
     runId,
     sessionId,
     error: error instanceof Error ? error.message : String(error),
   });
+  if (isSandboxRun(runId, userId)) return;
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.claimCheckError(runId, { error, sessionId });
 }
 
-function recordAgentModeRunFailed(
+export function recordAgentModeRunFailed(
   runId: string,
   info: RunTerminalInfo & { error: unknown },
+  userId?: string,
 ): void {
   endInvokeAgentSpan(runId, { verdict: 'failed', error: info.error, responseModel: info.llmModel });
+  if (releaseSandboxRun(runId, userId)) return;
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runFailed(runId, info);
@@ -812,168 +1045,25 @@ function pdfPageRender(pageData: any): Promise<string> {
     });
 }
 
-// Type for LLM model configuration
-interface LLMModelConfig {
-  client: OpenAI | null; // null for lazy-loaded clients (e.g., Gemini)
-  supportsTemperature: boolean;
-  /** True for Gemini Live models — uses persistent WebSocket, not HTTP generate */
-  isLive?: boolean;
-  /**
-   * True if the model can be used as the describe_image vision model — i.e. it is
-   * multimodal AND reachable/provisioned in this deployment. Verified empirically
-   * (see getVisionModelOptions). Models that are text/voice-only, return 404 from
-   * their provider, or aren't provisioned on the account are intentionally omitted.
-   */
-  supportsVision?: boolean;
-  /** Maximum number of tools this model/deployment accepts (e.g. Azure OpenAI gpt-5.x limits to 128) */
-  maxTools?: number;
-  /** True to restrict model to admin users only */
-  adminOnly?: boolean;
-  /** Internal workload model: callable by services but never selectable in the customer picker. */
-  internalOnly?: boolean;
-  /**
-   * Usage/cost tier for the model picker UI. Only used as a fallback when
-   * getModelPrice() has no entry for this model — otherwise the picker's
-   * tier grouping is derived live from the computed cost score (see
-   * TIER_COST_SCORE_BANDS). Unset defaults to 'medium'.
-   */
-  tier?: ModelTier;
-  /** Short, user-facing one-line description shown next to the model name in the picker. */
-  description?: string;
-  /** Clean, user-facing display name for the picker — e.g. "Grok 4.6", not the raw id. */
-  name?: string;
-  /** Underlying lab, for picking the right provider icon in the picker. Unset defaults to 'other'. */
-  provider?: ModelProvider;
-  /**
-   * True for a superseded version of a model family still kept selectable for
-   * session/schedule continuity (see LEGACY_MODEL_ALIASES and resolveGenerationModel —
-   * this flag only affects picker visibility grouping, never generation). The picker
-   * UI tucks these behind a "Show more" row instead of hiding them from new selection
-   * entirely (that's what adminOnly is for).
-   *
-   * Hand-set here for models superseded for reasons other than pure
-   * dominance (e.g. a straight version retirement). getSupportedModelsWithMetadata
-   * ALSO computes legacy live for any model that a same-`family` model
-   * strictly dominates (see deriveDominanceLegacyIds) — this field and that
-   * computation combine with OR, never override each other.
-   */
-  legacy?: boolean;
-  /**
-   * Groups models that are genuinely the same product line across
-   * generations (e.g. every "GPT-5.x balanced chat" deployment, or every
-   * Claude Opus release) for automatic same-family dominance detection.
-   * Deliberately narrow and hand-assigned — NOT "same provider": Claude
-   * Opus and Claude Sonnet, or Gemini Pro and Gemini Flash, are different
-   * product tiers serving different jobs, not generations of the same
-   * model, so they must never share a family or a stronger sibling tier
-   * would wrongly hide a still-useful different-tier model. Omitted
-   * (no family) means this model is never auto-dominated.
-   */
-  family?: string;
-  /**
-   * Benchmark-derived quality score, 0-100, higher = stronger. Omitted
-   * entirely when there is insufficient benchmark evidence for this model —
-   * never estimated or invented. Does NOT get lowered merely because a
-   * model is `legacy`; legacy affects picker visibility grouping only, not
-   * how good the model actually is.
-   */
-  qualityScore?: number;
-  /** Methodology/source note for qualityScore — benchmark name, source
-   *  version, and evaluation date (e.g. "Artificial Analysis Intelligence
-   *  Index, snapshot 2026-08-19"). Surfaced in the picker's quality tooltip. */
-  qualityScoreSource?: string;
-  // No costScore/costScoreSource field here (unlike qualityScore) — cost is
-  // fully derivable from MODEL_PRICING (see getSupportedModelsWithMetadata),
-  // so it is computed live rather than duplicated as a second hand-typed
-  // number that can drift from what we actually bill.
-}
+export type { ModelTier, ModelProvider } from './agentMode/llmModelRegistry';
 
-/** Usage/cost tiers surfaced in the model picker, ordered most- to least-expensive. */
-export type ModelTier = 'ultra_premium' | 'pro' | 'medium' | 'cheap' | 'ultra_cheap';
-
-/**
- * Cost-score band boundaries backing the picker's tier buckets (Harsha's
- * exact thresholds, revised 2026-08-19 after reviewing the live numbers) —
- * inclusive lower bound, ordered highest band first. costScore is 0-100 and
- * higher = more expensive (see costScoreFromPrice), so a model's tier is
- * simply whichever band its own cost score falls in. Tier IDs (ultra_premium/
- * ultra_cheap) are unchanged from earlier — only the numeric boundaries and
- * the frontend's DISPLAY labels moved ("Flagship"/"Very Cheap", see
- * modelTiers.ts TIER_LABELS); no backend API contract change.
- */
-export const TIER_COST_SCORE_BANDS: ReadonlyArray<{ tier: ModelTier; minCostScore: number }> = [
-  { tier: 'ultra_premium', minCostScore: 71 },
-  { tier: 'pro', minCostScore: 64 },
-  { tier: 'medium', minCostScore: 51 },
-  { tier: 'cheap', minCostScore: 31 },
-  { tier: 'ultra_cheap', minCostScore: 0 },
-];
-
-/** Derives a model's picker tier bucket from its cost score. */
-export function tierFromCostScore(costScore: number): ModelTier {
-  const band = TIER_COST_SCORE_BANDS.find((b) => costScore >= b.minCostScore);
-  // TIER_COST_SCORE_BANDS' last band has minCostScore: 0, which matches any
-  // costScore >= 0 — so `band` is only undefined for a negative/NaN input.
-  return band?.tier ?? 'ultra_cheap';
-}
-
-/** Cheapest-to-most-expensive numeric rank of each tier, for dominance comparison. */
-const TIER_RANK: Record<ModelTier, number> = {
-  ultra_cheap: 0,
-  cheap: 1,
-  medium: 2,
-  pro: 3,
-  ultra_premium: 4,
-};
-
-export interface DominanceCandidate {
-  id: string;
-  /** LLMModelConfig.family — omitted candidates are never auto-dominated. */
-  family?: string;
-  tier: ModelTier;
-  qualityScore?: number;
-  /** The model's OWN static legacy flag (not the final computed one) — only
-   *  a candidate that was not already legacy can dominate another. */
-  legacy: boolean;
-}
-
-/**
- * Ids that should be treated as legacy because a same-`family`, originally
- * non-legacy sibling is at least as cheap (same-or-lower cost tier band) AND
- * at least as good (same-or-higher quality score), strictly so in at least
- * one dimension — e.g. GPT-5.6 Luna (ultra_cheap, quality 52) strictly beats
- * GPT-5.4 Nano (ultra_cheap, quality 40): same band, higher quality, so Nano
- * is dominated. Comparison is scoped to `family`, never "same provider" —
- * Claude Opus and Claude Sonnet are different product tiers, not
- * generations of one model, so a stronger Opus must never hide Sonnet.
- */
-export function deriveDominanceLegacyIds(candidates: DominanceCandidate[]): Set<string> {
-  const dominated = new Set<string>();
-  for (const a of candidates) {
-    if (!a.family || typeof a.qualityScore !== 'number') continue;
-    const beatenBySibling = candidates.some((b) => {
-      if (b.id === a.id || b.family !== a.family || b.legacy || typeof b.qualityScore !== 'number') {
-        return false;
-      }
-      const cheaperOrEqual = TIER_RANK[b.tier] <= TIER_RANK[a.tier];
-      const betterOrEqualQuality = b.qualityScore >= a.qualityScore!;
-      const strictlyBetter = TIER_RANK[b.tier] < TIER_RANK[a.tier] || b.qualityScore > a.qualityScore!;
-      return cheaperOrEqual && betterOrEqualQuality && strictlyBetter;
-    });
-    if (beatenBySibling) dominated.add(a.id);
-  }
-  return dominated;
-}
-
-/** Underlying lab a model is from, for picking the right provider icon in the picker. */
-export type ModelProvider =
-  | 'anthropic' | 'openai' | 'google' | 'xai' | 'deepseek' | 'qwen' | 'mistral' | 'moonshot' | 'zai' | 'other';
+export { TIER_COST_SCORE_BANDS, QUALITY_SCORE_BANDS, tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassification';
+export { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
+export type { DominanceCandidate } from './agentMode/modelSupersession';
 
 /** Metadata for a model as returned to the frontend picker. */
 export interface SupportedModelInfo {
   id: string;
   name: string;
+  /** Cost tier — derived from costScore via tierFromCostScore (see TIER_COST_SCORE_BANDS). */
   tier: ModelTier;
+  /**
+   * Quality tier — derived from qualityScore via tierFromQualityScore (see
+   * QUALITY_SCORE_BANDS). Independent axis from `tier`: a model can be
+   * Flagship on quality but Pro on cost, or vice versa. Omitted when
+   * qualityScore itself is omitted (no benchmark evidence).
+   */
+  qualityTier?: ModelTier;
   description: string;
   provider: ModelProvider;
   /** True for a superseded version the picker should tuck behind "Show more". Omitted (not `false`) for a current/primary model. */
@@ -985,6 +1075,7 @@ export interface SupportedModelInfo {
   costScore?: number;
   costScoreSource?: string;
 }
+
 
 // Type for LLM call options
 /**
@@ -1213,12 +1304,165 @@ function linkedInPublicIdFromUrl(url: string | undefined | null): string | null 
 /** Narrow local shape of a stored google_ads config (ENG-1362). */
 type GoogleAdsConfigShape = { customer_id: string; currency?: string; test_account?: boolean };
 
+/**
+ * Escape a value for interpolation into a Google Drive `q` string literal.
+ *
+ * Drive's query grammar requires BOTH `\` and `'` to be escaped inside a string. The call
+ * sites here escaped only the quote, so a backslash in a value survived verbatim: a file
+ * literally named `report\` produced `name = 'report\'`, whose trailing `\'` reads as an
+ * escaped quote, leaving the string unterminated — an opaque Drive 400 rather than a match.
+ * The same gap is what lets a crafted value manipulate quote parity and reach past the
+ * parent-folder clause the query is scoped by, so this is a correctness AND a scoping fix.
+ *
+ * Backslash MUST be replaced first: doing the quote first would then double-escape the
+ * backslashes it just introduced.
+ */
+function escapeDriveQueryValue(value: string): string {
+  // A non-string reaching here used to throw on `.replace`; `String(...)` would instead embed the
+  // literal `undefined` and run a confidently wrong query. Refuse loudly rather than search for a
+  // file named "undefined" and report it missing.
+  if (typeof value !== 'string') {
+    throw new Error(`Drive query value must be a string, received ${value === null ? 'null' : typeof value}`);
+  }
+  return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+/**
+ * Validate a model-supplied Drive date filter, returning the `YYYY-MM-DD` day it names.
+ *
+ * `modified_after`/`modified_before` reach `list_knowledge_base_files` as a bare
+ * `type: "string"` with no schema constraint and no validation anywhere, and were interpolated
+ * UNESCAPED into the same `q` as the parent-folder clause. Drive's `or` binds looser than `and`,
+ * so `modified_after = "2020-01-01' or name != 'x"` ORs the parent scoping away and matches
+ * everything the query can see — and the Drive client is a SHARED service account holding
+ * `drive.readonly`, so that is other tenants' file names, ids, sizes and modifiedTimes.
+ *
+ * Escaping alone would fix the injection. Validating as well is what stops the OTHER failure:
+ * a value that is merely malformed (a full ISO datetime, say) produced
+ * `'2026-04-15T10:00:00ZT00:00:00'` and an opaque Drive 400 rather than a usable error.
+ *
+ * Deliberately strict — a calendar day, which is the only shape the caller then wraps in
+ * `T00:00:00`/`T23:59:59`. Anything else is refused with the expected format named, rather than
+ * guessed at.
+ */
+function validateDriveDateFilter(value: string, label: string): string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    throw new Error(
+      `${label} must be a calendar date in YYYY-MM-DD form (e.g. "2026-04-15"); received ${JSON.stringify(value)}.`,
+    );
+  }
+  // Rejects 2026-02-31 and friends: Date normalises them, so round-tripping is the check.
+  const parsed = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) {
+    throw new Error(`${label} is not a real calendar date: ${JSON.stringify(value)}.`);
+  }
+  return value;
+}
+
+/**
+ * ENG-1794: normalize a predefined-work-plan title for matching in
+ * `applyPredefinedWorkPlan` (the `launch_predefined_work_plan` tool handler).
+ *
+ * Templates are stored with underscore-joined titles (e.g.
+ * "Founder_Linkedin_Sales_Readiness_Eval"), but a user/model referring to one
+ * in chat naturally types it with spaces and mixed case (e.g. "Founder
+ * LinkedIn Sales Readiness Eval"). The previous match was `.toLowerCase()`
+ * only, so that natural phrasing never matched the stored title at all — the
+ * call failed with "not found" and the model fell back to grepping the full
+ * (370KB+) plan listing via search_tool_response/read_tool_response to find
+ * a title to retry with. When two templates are near-duplicates (identical
+ * welcomeMessage/description, titles differing only by an "_Eval"/"_Audit"
+ * suffix), that fallback search is exactly where the model can pick up the
+ * WRONG template's title from a truncated snippet and silently launch it
+ * with no error, since the retry is then a legitimate exact match against
+ * the wrong record (confirmed live: ENG-1794, session
+ * 3fce3c5a-6b25-4167-987b-b5bd8c7f4c5b launched
+ * "Founder_Linkedin_Sales_Readiness_Audit" instead of "..._Eval").
+ *
+ * Folding underscores/hyphens to spaces and collapsing whitespace before the
+ * case-insensitive comparison lets the natural-language phrasing resolve
+ * directly on the FIRST call, so the risky multi-step fallback search never
+ * has to run for this common case. This only smooths over separator/case
+ * differences — it does not do fuzzy/substring/similarity matching, so two
+ * templates whose titles genuinely differ (e.g. the "_Eval"/"_Audit" suffix
+ * itself) never collide.
+ */
+export function normalizeWorkPlanTitleForMatch(value: unknown): string {
+  return String(value ?? '')
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * ENG-1814: does `a` look like a near-duplicate sibling of `b` -- same word count, differing
+ * in exactly one token -- the shape of the two real, distinct, live-confirmed incidents this
+ * ticket covers (`Founder_Linkedin_Sales_Readiness_Eval` vs `..._Audit`). Deliberately narrow
+ * (exact word-count match, exactly one differing token) so it flags true near-duplicates
+ * without over-triggering on templates that merely share some words -- a genuinely different
+ * template (different word count, or differing in more than one token) never collides. Titles
+ * are compared via normalizeWorkPlanTitleForMatch, so separator/case variance doesn't matter,
+ * only the actual words.
+ */
+export function areNearDuplicateWorkPlanTitles(a: unknown, b: unknown): boolean {
+  const wordsA = normalizeWorkPlanTitleForMatch(a).split(' ').filter(Boolean);
+  const wordsB = normalizeWorkPlanTitleForMatch(b).split(' ').filter(Boolean);
+  if (wordsA.length === 0 || wordsA.length !== wordsB.length) return false;
+  let diffCount = 0;
+  for (let i = 0; i < wordsA.length; i++) {
+    if (wordsA[i] !== wordsB[i]) diffCount++;
+  }
+  return diffCount === 1;
+}
+
+
+async function recordToolReliabilityEvent(params: {
+  toolName: string;
+  result: unknown;
+  startedAt: number;
+  sessionId: string;
+  userId: string;
+  preparedArgs: any;
+  extraContext?: Record<string, any>;
+}): Promise<void> {
+  try {
+    const { recordReliabilityEventSafe } = await import('./reliabilityEventSink');
+    const { classifyToolResultOutcome, summarizeToolError } = await import('./reliabilityEvent');
+    recordReliabilityEventSafe({
+      tool: params.toolName,
+      outcome: classifyToolResultOutcome(params.result),
+      latencyMs: Date.now() - params.startedAt,
+      sessionId: params.sessionId,
+      userId: params.userId,
+      errorSummary: summarizeToolError(params.result),
+      platform: typeof params.preparedArgs?.platform === 'string' ? params.preparedArgs.platform : undefined,
+      userEdit: params.extraContext?.voiceCapture?.draft ? true : undefined,
+    });
+  } catch (reliabilityErr) {
+    console.warn('[AgentMode] H-LEARN reliability record skipped (non-fatal):', reliabilityErr);
+  }
+}
+
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
+  // ENG-1295 hardening: self-consistency cache for perform_data_analysis. Keyed by
+  // userId + a hash of the exact (file_urls, analysis_instruction) pair, so a
+  // literal repeat of the same call can be checked against its own prior grouping-
+  // key result instead of silently returning a contradictory answer. Bounded size
+  // and TTL since this lives on the long-running singleton service instance.
+  private dataAnalysisConsistencyCache: Map<string, { groupingKeyValues: string[]; timestamp: number }> = new Map();
+  private readonly DATA_ANALYSIS_CONSISTENCY_CACHE_MAX = 500;
+  private readonly DATA_ANALYSIS_CONSISTENCY_TTL_MS = 30 * 60 * 1000; // 30 minutes
   // ENG-475: deterministic browser-session persistence (auto load-at-start /
   // save-as-you-go around browser automation tools, so an intermittent login
   // success is captured without depending on the model calling the cookie tools).
   private browserCookieAutoState = createAutoPersistState();
+  // ENG-1624: cached so a sub-folder-access error can name the service account
+  // to share with, without re-fetching the secret on every failure. Only the
+  // email is kept — the private key must never outlive the local
+  // getGoogleDriveClient() call that parses the secret.
+  private driveServiceAccountEmail: string | null = null;
   private toolRegistry: ToolRegistry;
   private mcpClientService: McpClientService;
   private static toolsRegistered: boolean = false;
@@ -1236,9 +1480,15 @@ export class AgentModeService {
   // 2026-08-19 (Harsha, live picker review): Auto/default moved off Opus,
   // through GLM 5.2 and GPT-5.6 Luna, to Gemini 3.7 Flash — Google's newest
   // Flash-line model (GA 2026-08-13), cheap ($0.75/$3.75 per 1M, Google's own
-  // direct rate — not a multi-provider OpenRouter blend), and it dominates
+  // direct rate — not a multi-provider OpenRouter blend), and it dominated
   // every other model in the `gemini-flash` family band for band.
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gemini-3.7-flash';
+  // 2026-09-02 (Harsha, in-session approval): moved again, from Gemini 3.7
+  // Flash to Gemini 3.8 Flash. Same family/tier/pricing, 3.8 dominates 3.7 on
+  // quality (59 vs 56) — the dominance system correctly auto-flagged 3.7
+  // legacy the moment 3.8 was added to the catalog, and leaving the default
+  // pinned to a legacy model would contradict AC2 of the acceptance suite
+  // this default has always carried (see agentModeService.defaultModel*.test.ts).
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gemini-3.8-flash';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
@@ -1257,28 +1507,176 @@ export class AgentModeService {
     this.mcpClientService = new McpClientService();
   }
 
-  public async initialize() {
+  // ENG-1852 follow-up: the EXPENSIVE half of initialize() runs once per
+  // instance; the cheap half still runs on every call.
+  //
+  // Why a guard at all: server.ts kicks boot init off deliberately NON-blocking
+  // ("Initialize Agent Mode tools in background - don't block server startup ...
+  // prevents health check timeouts during deployment"), so a request can land
+  // mid-init. chatbotService's widget path then calls initialize() again per
+  // message on the same shared module singleton. Unguarded, that re-runs a full
+  // registerTools()/initializeMcp()/ensureBuiltInSkills() pass over shared state
+  // on every message, or races boot init and reads a half-populated registry —
+  // the same empty-registry symptom ENG-1852 turned out to be.
+  //
+  // Why loadFoundationTools() stays OUTSIDE the latch: it writes the
+  // process-global static AgentModeService.FOUNDATION_TOOLS, which the admin
+  // route `PUT /foundation-tools` (routes/agentMode.ts) mutates only in the
+  // process that served the request. Before this change, every gate-open widget
+  // message re-read the `foundation_tools` row and refreshed that static. Latching
+  // it would mean an added foundation tool never reaches a process until restart,
+  // surfacing as "tool not available" — the ENG-280/ENG-404 class this very
+  // function's own comment warns about. It is one settings read that swallows its
+  // own errors and always leaves the set populated, so per-call is cheap and safe;
+  // the registration pass is what actually cost anything.
+  //
+  // Why the latch is NOT just "didn't throw": every step of runInitialize()
+  // swallows its own errors (loadFoundationTools, both halves of registerTools,
+  // initializeMcp, ensureBuiltInSkills all catch-and-log; downstream singletons
+  // are void-ed), so runInitialize() is effectively incapable of rejecting.
+  // Latching on mere completion would make a silently-degraded init — e.g. a
+  // transient throw inside registerTools leaving an empty registry — PERMANENT
+  // for the process lifetime, with no reset. That is strictly worse than the bug
+  // this branch fixes: before it, the per-message fresh instance re-ran
+  // registration and self-healed on the next message. So we latch only on signals
+  // that can observably be false, and leave `initialized` false otherwise so the
+  // next caller retries.
+  //
+  // The flag is per-INSTANCE, not module-level, so tests that construct their own
+  // AgentModeService in beforeEach still initialize normally.
+  private initialized = false;
+  private initializationPromise: Promise<void> | null = null;
+  // Set true only when registerTools()'s emmaToolRegistry copy actually completes.
+  //
+  // A registry-size check alone is NOT a success signal, and an earlier version of this
+  // latch that used one was a tautology. registerTools() registers four built-ins
+  // (search_tool_response, read_tool_response, notify_session, wait_seconds)
+  // UNCONDITIONALLY, after both of its try/catch blocks, and ToolRegistry.register is a
+  // Map.set that cannot throw — so getAllTools().length > 0 is always true no matter how
+  // badly registration went. initializeMcp() then adds more afterwards. Confirmed twice:
+  // by fault injection on test-env-1 (the size check latched a fully degraded init, with
+  // "Error registering tools to instance" logged one line earlier) and by an independent
+  // review that ran registerTools() with an empty emmaToolRegistry and observed
+  // initialized=true with a 4-tool registry.
+  //
+  // Both halves of registerTools() have to be checked, because they fail independently:
+  // step 1 (sixteen side-effect imports that POPULATE emmaToolRegistry) sets the static
+  // AgentModeService.toolsRegistered; step 2 (the copy into THIS instance's registry) sets
+  // the flag below. If step 1 throws, step 2 still "succeeds" — it copies zero tools
+  // without error — so the flag below alone would latch a degraded init too.
+  private emmaToolsRegistered = false;
+  // Not a latch signal — only prevents the retry path from re-scanning every skill and
+  // re-updating each built-in on every failed attempt.
+  private builtInSkillsSeeded = false;
+  // DELIBERATELY NOT GATED ON, after four review rounds each caught a success signal
+  // that could never report failure:
+  //
+  //   initializeMcp() — McpClientService.initialize() cannot reject in practice. Its two
+  //   statements before the try (startSessionCleanup, a setInterval+unref; and
+  //   sweepStalePlaywrightConfigs, which has its own outer try/catch) cannot throw, the
+  //   rest of the body is inside try/catch, per-server failures are swallowed deeper
+  //   still in safeConnectToServer, and the config read has its own catch. A flag
+  //   set on its success path is therefore constant true. A tool-count check would be
+  //   wrong too: this deployment's only non-internal MCP server carries secret
+  //   placeholders and is skipped at boot, so a HEALTHY boot registers zero MCP tools.
+  //   There is no signal here to gate on, and shipping one that always reads true is
+  //   worse than none — it reads as coverage.
+  //
+  //   CAVEAT, because this is an operational fact rather than a code invariant: that
+  //   zero-tools property holds for mcp_config.ts AND for the current `mcp_servers`
+  //   settings row, which mcpClientService also reads at every boot. If an operator adds
+  //   a placeholder-free server there, a healthy boot registers a non-zero count and a
+  //   transient outage registers zero — and with no MCP signal in the latch, that outage
+  //   latches for the process lifetime rather than retrying on the next message. If that
+  //   day comes, the fix is a real signal (e.g. a getFailedServers() next to
+  //   serversWithSecretPlaceholders: "every server we actually attempted connected"),
+  //   NOT a tool count.
+  //
+  //   ensureBuiltInSkills() — genuinely failable, but it is DynamoDB seeding, not tool
+  //   registry health. Gating on it meant a persistent write fault (a throttle, a legacy
+  //   row failing welcome-message validation) silently reverted this whole optimization
+  //   to per-message registration PLUS a full skills-table scan per chat message,
+  //   surfaced only by one console.error per message.
+  //
+  // The latch gates on what ENG-1852 was actually about: whether this instance's tool
+  // registry is usable.
+  // initializeDownstreamSingletons() is fire-and-forget and NOT idempotent — three of
+  // its five inits replace live singletons unconditionally. The latch's retry path
+  // would otherwise swap them under in-flight tool calls on every failed attempt.
+  private downstreamSingletonsStarted = false;
+
+  /**
+   * Whether the last initialize() completed with every step reporting success. False
+   * means a degraded init that the next caller will retry — see initialize().
+   */
+  public get isInitialized(): boolean {
+    return this.initialized;
+  }
+
+  public async initialize(): Promise<void> {
+    // Deliberately before and outside the latch — see the note above.
     await this.loadFoundationTools();
+
+    if (this.initialized) return;
+    if (this.initializationPromise) return this.initializationPromise;
+
+    this.initializationPromise = this.runInitialize();
+    try {
+      await this.initializationPromise;
+      // Two conjuncts, both of which can observably be false. A third,
+      // `this.toolRegistry.getAllTools().length > 0`, was here and is deliberately gone:
+      // registerTools() registers four built-ins unconditionally after both of its
+      // try/catch blocks and ToolRegistry.register is a Map.set that cannot throw, so it
+      // could never report failure. That is the same defect this file deleted mcpStepOk
+      // for, and an inert conjunct in an && chain is worse than no conjunct — it reads as
+      // coverage. It also carried a FALSE coverage claim: mutating it to `true` fails no
+      // test, because no test can distinguish it.
+      this.initialized = AgentModeService.toolsRegistered && this.emmaToolsRegistered;
+      if (!this.initialized) {
+        console.error(
+          'AgentMode: initialize() completed but tool registration did not succeed ' +
+          `(toolsRegistered=${AgentModeService.toolsRegistered}, ` +
+          `emmaToolsRegistered=${this.emmaToolsRegistered}, ` +
+          `registrySize=${this.toolRegistry.getAllTools().length}) — ` +
+          'treating init as failed so the next caller retries.',
+        );
+      }
+    } finally {
+      this.initializationPromise = null;
+    }
+  }
+
+  private async runInitialize(): Promise<void> {
     await this.registerTools();
+
     if (process.env.IS_MCP_SERVER !== 'true') {
       await this.initializeMcp();
     } else {
       console.log('AgentMode: Skipping MCP initialization in server mode');
     }
 
-    // Ensure built-in skills exist in the database
-    await this.ensureBuiltInSkills();
+    // Skipped once it has succeeded: it re-scans every skill and issues an update per
+    // built-in, which the retry path would otherwise repeat on every failed attempt.
+    // Its outcome does NOT gate the latch — see the note on the fields above.
+    if (!this.builtInSkillsSeeded) {
+      await this.ensureBuiltInSkills();
+    }
 
     // Bootstrap downstream service singletons. Server boot also calls these
     // (server.ts post-createTestAccount), but the forked Emma worker subprocess
     // (generateMarketingResponseWorker) doesn't run that path — so any tool
     // that resolves a singleton via getEnrichSoService / getUnipile*Service
-    // would throw "service not initialized" inside the worker. Each init is
-    // idempotent and wrapped in try/catch so a single failure (e.g. missing
-    // enrich.so secret in dev) doesn't block the rest. Fire-and-forget so
+    // would throw "service not initialized" inside the worker. Each is wrapped in
+    // try/catch so a single failure (e.g. a missing enrich.so secret in dev) doesn't
+    // block the rest — but they are NOT all idempotent: initEnrichSoService,
+    // initApolloService and initUnipileSearchParamService each replace their singleton
+    // unconditionally, which is why the guard below runs this once. Fire-and-forget so
     // initialize() returns fast — the inits resolve in the background by
     // the time the first tool call lands.
-    void this.initializeDownstreamSingletons();
+    if (!this.downstreamSingletonsStarted) {
+      this.downstreamSingletonsStarted = true;
+      void this.initializeDownstreamSingletons();
+    }
 
     // Start periodic file cache cleanup
     this.startFileCacheCleanup();
@@ -1358,6 +1756,7 @@ export class AgentModeService {
    * Idempotent — skips skills that already exist (matched by name).
    */
   public async ensureBuiltInSkills(): Promise<void> {
+    this.builtInSkillsSeeded = false;
     try {
       const existingSkills = await skillService.getAllSkills();
       const existingNames = new Set(existingSkills.map(s => s.name));
@@ -1390,6 +1789,7 @@ export class AgentModeService {
           console.log(`AgentMode: Created built-in skill "${builtin.name}" (${skill.skillId})`);
         }
       }
+      this.builtInSkillsSeeded = true;
     } catch (error) {
       console.error('AgentMode: Error ensuring built-in skills:', error);
       // Non-fatal — the foundation tools fallback still grants access
@@ -1430,6 +1830,13 @@ export class AgentModeService {
    * Start periodic cleanup of file content cache
    */
   private startFileCacheCleanup() {
+    // Idempotent. On origin/main a fresh instance per widget message meant each call
+    // started an interval on an object that then leaked — the bug this branch fixes. On
+    // the shared singleton a repeat call is no longer hypothetical: the latch's retry
+    // path runs the whole initialization body again whenever init was degraded, and
+    // unguarded each pass would assign a new interval and orphan the previous one, every
+    // orphan retaining this instance through its closure.
+    if (this.fileCacheCleanupInterval) return;
     this.fileCacheCleanupInterval = setInterval(() => {
       this.cleanupFileCache();
     }, this.FILE_CACHE_CLEANUP_INTERVAL_MS);
@@ -1536,6 +1943,7 @@ export class AgentModeService {
         // Import the registry and the tools definitions (for side effects)
         // Dynamic import to avoid circular dependencies
         await import('../emma/registry');
+        await import('../mcp/server/evaluationTools');
         await import('../emma/tools');
         await import('../emma/fathomTools');
         await import('../emma/meetingActionRouter');
@@ -1549,6 +1957,7 @@ export class AgentModeService {
         await import('../emma/siteSigninTools');
         await import('../emma/verificationCodeTool');
         await import('../emma/calendarTools');
+        await import('../emma/jevTools');
         await import('../emma/localAgentTools');
 
         AgentModeService.toolsRegistered = true;
@@ -1558,6 +1967,7 @@ export class AgentModeService {
     }
 
     // 2. Register tools from the emmaToolRegistry into THIS instance's toolRegistry
+    this.emmaToolsRegistered = false;
     try {
       const { emmaToolRegistry } = await import('../emma/registry');
       const toolNames = emmaToolRegistry.getToolNames();
@@ -1585,6 +1995,24 @@ export class AgentModeService {
             requiresUserAccount: toolHandler.requiresUserAccount
           });
         }
+      }
+      // "Didn't throw" is not success. Every statement in this try is non-throwing
+      // (Array.from, Map.get, Map.set), so an empty or unresolvable emmaToolRegistry
+      // copies ZERO tools and completes cleanly — which an earlier version of this
+      // latch accepted, leaving an instance live with only the four built-ins
+      // registered below. That is the ENG-1852 symptom exactly. Require the copy to
+      // be complete and non-empty.
+      // `copied === toolNames.length` was here and is deliberately gone: against the real
+      // McpToolRegistry (a synchronous Map — getToolNames() is Array.from(keys),
+      // getTool() is Map.get) it can never be false, and a condition that cannot fail is
+      // the exact thing three prior rounds shipped by accident. `toolNames.length > 0` is
+      // the term that does real work: it catches an emmaToolRegistry that was never
+      // populated, which is the ENG-1852 state.
+      this.emmaToolsRegistered = toolNames.length > 0;
+      if (!this.emmaToolsRegistered) {
+        console.error(
+          'AgentMode: emmaToolRegistry was empty — no Emma tools copied into this instance.',
+        );
       }
     } catch (error) {
       console.error('AgentMode: Error registering tools to instance:', error);
@@ -1700,12 +2128,20 @@ export class AgentModeService {
         if (toList.length === 0) {
           throw new Error('At least one valid email address is required in the "to" field.');
         }
-        await emailService.sendSessionNotificationEmail(
+        const result = await emailService.sendSessionNotificationEmail(
           toList,
           context.sessionId,
           args.message,
           args.subject
         );
+        if (result?.duplicate) {
+          return {
+            success: true,
+            sent_to: [],
+            duplicate_suppressed: true,
+            message: `A session notification to ${toList.join(', ')} was already sent earlier in this session — skipped to avoid sending a duplicate email.`
+          };
+        }
         return {
           success: true,
           sent_to: toList,
@@ -2030,6 +2466,10 @@ export class AgentModeService {
           defaultHeaders: {
             'HTTP-Referer': 'https://app.agentweb.pro',
             'X-Title': 'AgentWeb',
+            // ENG-1712: opt in to OpenRouter's router-metadata block (resolved
+            // provider + is_byok) so the log-only normalizer below has real
+            // data to read instead of always logging undefined.
+            'X-OpenRouter-Metadata': 'enabled',
           },
         });
 
@@ -2089,6 +2529,17 @@ export class AgentModeService {
   /** Media types the vision APIs decode natively. */
   private static readonly VISION_NATIVE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 
+  // ENG-1670: a scheduled run's own tool-calling loop can fire several Gemini
+  // calls back-to-back within one turn (prod-verified: 4 calls in ~22s on the
+  // "LinkedIn Post Factory" schedule) with nothing pacing them — the schedule
+  // jitter fix (agentModeController.calculateNextRunTime) addresses platform-
+  // wide clustering across DIFFERENT schedules, but does nothing for a single
+  // session's own rapid iteration cadence. Scoped tightly: scheduled runs only
+  // (never adds latency to a live interactive user watching the screen), and
+  // Gemini only (the provider this class of 429 was confirmed against) — not a
+  // blanket delay on every model or every turn.
+  private static readonly SCHEDULED_GEMINI_ITERATION_PACING_MS = 1500;
+
   /**
    * Normalize uploaded image bytes to a vision-decodable representation. This
    * remains local image hygiene; text/tool model routing is handled separately.
@@ -2125,177 +2576,7 @@ export class AgentModeService {
     }
   }
 
-  private llmModels: Record<string, LLMModelConfig> = {
-    // Logical model metadata only. `callLLM` resolves every text/tool request
-    // through OpenRouter; no provider client is constructed from this registry.
-    // supportsVision flags below were verified empirically against the describe_image
-    // path (probe against a real image). All GPT-5 deployments handle vision.
-    // gpt-5-chat-2 and gpt-5.2-chat REMOVED 2026-08-19 as part of migrating off
-    // the Rui-owned Azure resource (ai-ruiwangwarm...) onto agentweb-openrouter-byok:
-    // gpt-5-chat-2 is no longer in Azure's deployable model catalog at all;
-    // gpt-5.2-chat's Azure inference cutoff was 2026-06-29 (fully deprecated,
-    // no working deployment possible on any resource). Both were already
-    // legacy:true and the two lowest-quality entries in the gpt5-chat family.
-    // Safe to remove ONLY because LEGACY_MODEL_ALIASES now redirects both ids
-    // to gpt-5.5 (see below) — a paused schedule/session still holding the old
-    // id resolves forward instead of throwing "Invalid model". Do not delete a
-    // registry entry without an alias first; that was exactly the caution the
-    // prior version of this comment existed to enforce.
-    'gpt-5.4': { name: 'GPT-5.4', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gpt-5.4-nano': { name: 'GPT-5.4 Nano', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gpt-5.5': { name: 'GPT-5.5', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    // List gemini models - client will be lazy-loaded
-    // gemini-3-pro-preview REMOVED (ENG-744): Google shut it down 2026-03-09 and it
-    // returns a hard 404 on a real call, but it stayed selectable here for ~4.5 months,
-    // so picking it was a guaranteed failure. llmPricing.ts already carried the
-    // DEPRECATED 2026-03-09 note; only the registry had not caught up. Migrate to
-    // gemini-3.1-pro-preview (below), which is the newest Gemini Pro that exists.
-    // Its price entry is intentionally left in place — a rate for a removed model is
-    // harmless, a missing rate for a live one is not.
-    // 2026-08-19: Harsha — "the preview gemini models should be moved to
-    // legacy asap." Static legacy: true (not dominance-derived — "preview"
-    // status isn't something a cost/quality comparison would ever catch on
-    // its own; this is a policy call that preview builds shouldn't be a
-    // default-visible pick regardless of how they benchmark).
-    // resolveGenerationModel/resolveFallbackModel are untouched — an
-    // existing session or schedule pinned to either id is unaffected.
-    // Google accepts at most 128 function declarations per request. This limit
-    // applies whether Gemini is reached directly or through OpenRouter: the
-    // gateway can fail over transports, but it cannot make an invalid upstream
-    // request valid. Fresh Emma sidebar sessions expose the legacy full tool
-    // catalog, so omitting this cap made Gemini fail deterministically with 400.
-    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 28, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 26, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    // 2026-08-19: Gemini 3.7 Flash (GA, released 2026-08-13) added — verified
-    // live against three independent sources (ai.google.dev/deepmind.google/
-    // blog.google, OpenRouter, Artificial Analysis), no Gemini 3.7 Pro or
-    // Flash-Lite exists. Google shipped 3.6 Flash first, then 3.7 Flash on top
-    // of it — 3.6 is deliberately skipped (never added to this registry) since
-    // 3.7 supersedes it outright. `family: 'gemini-flash'` (shared with 3.5
-    // Flash, NOT 3.1 Flash Lite — Lite is a distinct "lightest/fastest"
-    // positioning, same reasoning as gpt5-chat vs gpt5-nano) lets the
-    // dominance rule do its job: 3.7 Flash is both cheaper (cost tier 'cheap'
-    // vs 3.5's 'medium') and higher quality (56 vs 52) than 3.5 Flash, so 3.5
-    // Flash is now correctly auto-flagged legacy.
-    'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-7-flash" (high reasoning effort — the canonical/default page), snapshot 2026-08-19' },
-    // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
-    'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
-    // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
-    // the suffix after the prefix passed straight through as OpenRouter's own model
-    // string, so a new upstream model is one registry line, not new routing code.
-    //
-    // Flags below are sourced from a live GET /api/v1/models[/…/endpoints] snapshot
-    // (2026-08-17), not guessed:
-    // - supportsTemperature: mirrors each model's `supported_parameters` value.
-    // - maxTools: deliberately OMITTED for every OpenRouter entry, including this
-    //   one — unlike Azure's documented 128-tool cap, OpenRouter's models AND
-    //   endpoints APIs expose no numeric tool-call limit for any model (checked
-    //   both), so setting a number here would be a guess, not evidence. (The
-    //   128 previously on this line was exactly that guess, copied from the Azure
-    //   convention without verification — removed.)
-    // - supportsVision: deliberately OMITTED even where `architecture.modality`
-    //   reports image/video input — this codebase's own convention for the flag
-    //   (see LLMModelConfig.supportsVision above) requires empirical verification
-    //   against the real describe_image path, which none of these have had yet.
-    //   Metadata-only vision support is not the bar this flag uses elsewhere.
-    // - adminOnly: OMITTED for every OpenRouter entry below (2026-08-19: was
-    //   `true` on each, gated as unproven-in-our-stack — Harsha: "i'm fine to
-    //   include open source / open router stuff for all users not just
-    //   isadmin". Client construction is the same lazy-loaded OpenRouter path
-    //   already used successfully by gpt-4o-mini above.) This does NOT apply
-    //   to non-OpenRouter adminOnly entries elsewhere in this registry (e.g.
-    //   anthropic.claude-opus-4-6-v1), which are gated for unrelated reasons.
-    'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true , qualityScore: 7, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    // Workload-specific research agent. It is intentionally callable only from
-    // DeepResearchService, not exposed as a general chat-picker model.
-    'openrouter/perplexity/sonar-deep-research': { client: null, supportsTemperature: true, internalOnly: true },
-    'openrouter/perplexity/sonar-pro-search': { client: null, supportsTemperature: true, internalOnly: true },
-    // 2026-08-17 (fourth pass — quality cleanup, not additive): six entries added
-    // in the third pass are REMOVED here on Artificial-Analysis benchmark evidence
-    // (cited in the ENG-9 PR, not repeated per-line here): grok-4.3 (AA-flagged
-    // deprecated, score collapsed 53→38, now below GLM-5.2/DeepSeek-V4-Pro/
-    // Kimi-K2.6 at a similar price), mistral-large-2512 (AA Index 16, weakest
-    // score checked), llama-4-maverick (AA Index 14, a year old, Meta has since
-    // moved to proprietary Muse Spark/Code), llama-4-scout (lowest cheap-tier
-    // score; Meta shipped Llama 5 in April 2026, making this a full generation
-    // behind), llama-3.1-8b-instruct (older sibling of the same superseded
-    // family), qwen3.7-flash (no coding-benchmark coverage — it's vision-language,
-    // not a coding model — and its pricing tiers up sharply past 32K-token
-    // prompts). qwen3.8-max is KEPT despite losing head-to-head to grok-4.6 at
-    // the same $2/$6 price — it's Alibaba's only current non-deprecated entrant
-    // (Qwen3.7 Max is independently confirmed deprecated too), so it stays for
-    // lab/family redundancy, not because it's the top pick in its tier.
-    // kimi-k2.6 is SWAPPED for kimi-k2.7-code (live-verified pricing/flags, not
-    // reused from the third pass).
-    //
-    // Net result: Meta/Llama has ZERO entrants after this cleanup. OpenRouter's
-    // catalog has no meta-llama/llama-5* listed as of this snapshot (checked
-    // live) — this is a real, currently-unfillable gap, not an oversight.
-    'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    // 2026-08-19: qualityScore corrected 52 -> 40. The 52 belonged to a
-    // DIFFERENT, newer snapshot ("DeepSeek V4 Flash 0731, Max Effort") —
-    // this registry id resolves on OpenRouter to "DeepSeek V4 Flash 0423",
-    // whose real AA Intelligence Index score is 40 (confirmed live against
-    // AA's own page + independent coverage). Not a stale-number issue like
-    // the Kimi K3 pricing catch — the wrong model's score was attached to
-    // the model we actually invoke. Pricing is unaffected: our MODEL_PRICING
-    // entry ($0.068/$0.168) already matches the real 0423 snapshot.
-    'openrouter/deepseek/deepseek-v4-flash': { name: 'DeepSeek V4 Flash', provider: 'deepseek', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "DeepSeek V4 Flash 0423" page (the snapshot this OpenRouter id actually resolves to), snapshot 2026-08-19' },
-    'openrouter/qwen/qwen3.8-max': { name: 'Qwen3.8 Max', provider: 'qwen', tier: 'pro', description: 'Alibaba\'s flagship model', client: null, supportsTemperature: true, qualityScore: 58, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/mistralai/mistral-small-2603': { name: 'Mistral Small', provider: 'mistral', tier: 'cheap', description: 'Fast and inexpensive', client: null, supportsTemperature: true, qualityScore: 20, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/moonshotai/kimi-k3': { name: 'Kimi K3', provider: 'moonshot', tier: 'ultra_premium', description: 'Frontier-scale reasoning, near the top of the field', client: null, supportsTemperature: true, qualityScore: 60, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/moonshotai/kimi-k2.7-code': { name: 'Kimi K2.7 Code', provider: 'moonshot', tier: 'medium', description: 'Coding-focused, efficient', client: null, supportsTemperature: true, qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/z-ai/glm-5.2': { name: 'GLM 5.2', provider: 'zai', tier: 'medium', description: 'Capable open-weight model, strong value', client: null, supportsTemperature: true, qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/z-ai/glm-4.7-flash': { name: 'GLM 4.7 Flash', provider: 'zai', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 23, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    // 2026-08-19: OpenAI's GPT-5.6 three-tier family (Sol/Terra/Luna, launched
-    // 2026-07-09), added via OpenRouter — live-confirmed slugs and pricing at
-    // openrouter.ai/openai/gpt-5.6-{sol,terra,luna}. adminOnly per the
-    // existing convention for unverified-in-our-stack OpenRouter entries.
-    // Sol: AA Coding Agent Index leader (80) but behind Opus 5 on 9/12
-    // tracked benchmarks including SWE-bench Pro and ARC-AGI-3 — pro tier,
-    // not ultra_premium. Terra: GPT-5.5-competitive quality at ~half cost —
-    // replaces gpt-5.5 as the default GPT-5.x picker row. Luna: cheap/fast,
-    // ~24 benchmark points per API dollar at launch pricing — ultra_cheap.
-    // 2026-08-19: NOT in the 'gpt5-chat' family (unlike Terra/5.5/5.4/etc) —
-    // its own description marks it as a distinct specialized/premium
-    // positioning ("Frontier coding and agentic work"), not a generation of
-    // the "Balanced general-purpose model" line the rest of that family
-    // shares verbatim in their description text. Lumping it in wrongly
-    // flagged GPT-5.6 Terra as legacy: Sol's OpenRouter price is currently
-    // on a promotional discount that happens to land it in the same cost
-    // band as Terra, so same-family dominance concluded Terra was
-    // redundant — a coincidence of a volatile promo price, not a real
-    // "Terra is superseded" fact. Same principle as keeping Kimi K3 out of
-    // a family with Kimi K2.7-Code (a coding-specialized sibling).
-    'openrouter/openai/gpt-5.6-sol': { name: 'GPT-5.6 Sol', provider: 'openai', tier: 'pro', description: 'Frontier coding and agentic work', client: null, supportsTemperature: false, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/openai/gpt-5.6-terra': { name: 'GPT-5.6 Terra', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/openai/gpt-5.6-luna': { name: 'GPT-5.6 Luna', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Fast and inexpensive, still real GPT-5.6 reasoning', client: null, supportsTemperature: false, qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    // List Claude models via AWS Bedrock - client will be lazy-loaded
-    // 2026-08-19: all four below are `legacy` (picker-grouping only, see
-    // LLMModelConfig.legacy) — each superseded by Sonnet 5 / Opus 5. Still
-    // referenced by live TaskSchedules/ChatSessions (opus-4-8 and sonnet-4-6
-    // have active schedules touching them the same day this was written), so
-    // NOT deleted and NOT adminOnly — customers can still select them via
-    // "Show more", they're just no longer the default row per tier.
-    'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 37, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'anthropic.claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'anthropic.claude-opus-4-6-v1': { name: 'Claude Opus 4.6', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: true, adminOnly: true, supportsVision: true, legacy: true , qualityScore: 45, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
-    // temperature is deprecated for this model
-    'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: false, supportsVision: true, legacy: true , qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    // ENG-744 — Claude 5 generation. Opus 5 and Sonnet 5 use the same
-    // cross-account bearer-token path as Opus 4.8; Haiku 4.5 is on the default
-    // account. Account routing lives in utils/bedrockInferenceProfiles.ts.
-    // Opus 5 / Sonnet 5 reject `temperature` with a 400 ("`temperature` is
-    // deprecated for this model") — verified against live Bedrock, not assumed.
-    'anthropic.claude-opus-5': { name: 'Claude Opus 5', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'For complex tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 63, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'anthropic.claude-sonnet-5': { name: 'Claude Sonnet 5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Most efficient for everyday tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 55, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    // Haiku 4.5 still accepts temperature (also live-verified).
-    'anthropic.claude-haiku-4-5-20251001-v1:0': { name: 'Claude Haiku 4.5', provider: 'anthropic', tier: 'cheap', description: 'Fastest for quick answers', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 30, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-  };
+  private llmModels: Record<string, LLMModelConfig> = createLlmModelRegistry();
 
   async getSupportedModels(isAdmin: boolean = false) {
     const models = Object.keys(this.llmModels).filter(
@@ -2307,6 +2588,54 @@ export class AgentModeService {
       return [defaultModel, ...models.filter(m => m !== defaultModel)];
     }
     return models;
+  }
+
+  /**
+   * ENG-1205 AC3: the catalog the in-chat model-mention detector matches against.
+   *
+   * Returned rather than reaching into `llmModels` from the util so the detector
+   * stays pure and testable, and so adding a model to the registry extends
+   * mention coverage with no second list to maintain (ENG-1137: never scatter
+   * checks for individual model names).
+   *
+   * Internal-only and Live models are excluded: a user cannot select either, so
+   * naming one is not a request this can honor. Admin-only models ARE included —
+   * a non-admin naming one must be told it is not available to them, which is
+   * precisely the acknowledgement AC3 asks for, and `isModelSelectableBy` below
+   * is what decides which sentence they get.
+   */
+  getModelMentionCatalog(): Array<{ id: string; name?: string; family?: string }> {
+    return Object.keys(this.llmModels)
+      .filter((id) => !this.llmModels[id].internalOnly && !this.llmModels[id].isLive)
+      .map((id) => ({
+        id,
+        name: this.llmModels[id].name,
+        family: this.llmModels[id].family,
+      }));
+  }
+
+  /** Built once per process — `llmModels` is a static registry, not per-request state. */
+  private modelMentionIndex: ModelMentionIndex | null = null;
+
+  getModelMentionIndex(): ModelMentionIndex {
+    if (!this.modelMentionIndex) {
+      this.modelMentionIndex = buildModelMentionIndex(this.getModelMentionCatalog());
+    }
+    return this.modelMentionIndex;
+  }
+
+  /**
+   * Would the model picker accept this id for this user? Mirrors the two gates
+   * `agentModeController.updateSessionLlmModel` applies, in the same order: the
+   * supported-model allow-list, then the non-admin Opus restriction. Kept next
+   * to the registry it reads so the two cannot drift.
+   */
+  isModelSelectableBy(modelId: string, isAdmin: boolean): boolean {
+    const config = this.llmModels[modelId];
+    if (!config || config.internalOnly || config.isLive) return false;
+    if (config.adminOnly && !isAdmin) return false;
+    if (modelId.includes('opus') && !isAdmin) return false;
+    return true;
   }
 
   /**
@@ -2323,6 +2652,12 @@ export class AgentModeService {
    * agree with the cost meter it's grouping by. Only when a model has no
    * MODEL_PRICING entry (so costScore can't be computed) does tier fall back
    * to the config's static field, and costScore/costScoreSource are omitted.
+   *
+   * qualityTier (ENG-1789) is a SEPARATE axis derived from qualityScore via
+   * tierFromQualityScore/QUALITY_SCORE_BANDS — it groups by benchmark quality,
+   * not cost, and is omitted whenever qualityScore itself is omitted. `tier`
+   * remains the cost-driven field the picker's existing section headers use;
+   * qualityTier is additive, for any quality-driven grouping/filter.
    */
   async getSupportedModelsWithMetadata(isAdmin: boolean = false): Promise<SupportedModelInfo[]> {
     const ids = await this.getSupportedModels(isAdmin);
@@ -2336,6 +2671,7 @@ export class AgentModeService {
         id,
         name: config?.name ?? id,
         tier: typeof costScore === 'number' ? tierFromCostScore(costScore) : (config?.tier ?? 'medium'),
+        qualityTier: typeof config?.qualityScore === 'number' ? tierFromQualityScore(config.qualityScore) : undefined,
         description: config?.description ?? 'General-purpose model',
         provider: config?.provider ?? 'other',
         family: config?.family,
@@ -2354,6 +2690,7 @@ export class AgentModeService {
       id: e.id,
       name: e.name,
       tier: e.tier,
+      ...(e.qualityTier ? { qualityTier: e.qualityTier } : {}),
       description: e.description,
       provider: e.provider,
       ...(e.staticLegacy || dominatedIds.has(e.id) ? { legacy: true as const } : {}),
@@ -2470,6 +2807,7 @@ export class AgentModeService {
       humanPaced = false,
       timeoutMs,
       fallbackModels,
+      taskClass,
     } = options || {};
 
     // AgentWeb owns model selection; OpenRouter owns transport, provider
@@ -2486,7 +2824,30 @@ export class AgentModeService {
       params.response_format = response_format;
     }
 
-    params.provider = { allow_fallbacks: true, require_parameters: true };
+    params.provider = { ...OPENROUTER_PROVIDER_PREFERENCES, require_parameters: true };
+    const ignoredProviders = openRouterIgnoredProviders(upstreamModel);
+    if (ignoredProviders.length > 0) {
+      // Stopgap for ENG-1702 (parent: ENG-753). Our BYOK Google credential is
+      // a legacy Standard API key hitting Google's Sept 2026 Standard-key
+      // cutoff; OpenRouter's own health check showed the "Google" BYOK slot
+      // at 63-85% uptime over 30min vs 99.9%+ on the pooled "Google AI
+      // Studio" slot, and default routing lands on the degraded one. Skip it
+      // until ENG-753 rotates the key to an Auth key and the BYOK slot's
+      // uptime recovers — remove this then, since it forfeits the BYOK cost
+      // discount in exchange for reliability.
+      //
+      // DO NOT change this to 'google-ai-studio' or 'google-vertex' — those
+      // are the slugs OpenRouter's separate BYOK-credential-creation API
+      // uses, not what `provider.ignore` matches on here. This param matches
+      // against the `provider_name` string from GET /v1/models/{id}/endpoints
+      // ("Google" vs "Google AI Studio"), confirmed by 10 live A/B calls
+      // (PR #2732): ignore:['Google'] -> 5/5 landed on Google AI Studio
+      // (correct); ignore:['google-ai-studio'] -> 5/5 landed on Google, i.e.
+      // the DEGRADED slot (backwards). A doc-based static-analysis suggestion
+      // proposed the slug form once already and was reverted for this reason
+      // — verify empirically against live traffic before changing this line.
+      params.provider.ignore = ignoredProviders;
+    }
     // OpenRouter reports its own billed amount as zero for BYOK requests even
     // though the upstream provider still bills the inference. Request the
     // routing flag so metering can distinguish BYOK from a genuinely free call.
@@ -2549,73 +2910,190 @@ export class AgentModeService {
     const requestTools = webSearch
       ? [...normalizedCallerTools, { type: 'openrouter:web_search' }]
       : normalizedCallerTools;
+    // ENG-1831: every chain member receives the same parameter set, and
+    // require_parameters makes one unsupported field unroutable (ENG-199 404).
+    const paramChain = [
+      { modelId: model, upstreamModel, capabilities: this.llmModels[model] },
+      ...(fallbackModels ?? []).map((fallbackModel) => {
+        const normalizedFallback = this.normalizeModelId(fallbackModel);
+        return {
+          modelId: normalizedFallback,
+          upstreamModel: resolveOpenRouterUpstreamModelId(normalizedFallback),
+          capabilities: this.llmModels[normalizedFallback],
+        };
+      }),
+    ];
+    assertOpenRouterToolsSupported(paramChain, requestTools.length);
     if (requestTools.length > 0) {
       params.tools = requestTools;
     }
-    // A server-only tool is selected by OpenRouter. Preserve the historical
-    // `auto` default only for caller-supplied function tools.
-    if (callerTools.length > 0) {
-      params.tool_choice = tool_choice || 'auto';
-    }
+    Object.assign(params, selectOpenRouterSamplingParams({
+      upstreamModel,
+      capabilities: this.llmModels[model],
+      fallbacks: paramChain.slice(1),
+      hasCallerTools: callerTools.length > 0,
+      toolChoice: tool_choice,
+      temperature,
+    }));
 
     // Only add max_completion_tokens if specified
     if (max_completion_tokens) {
       params.max_tokens = max_completion_tokens;
     }
 
-    // OpenRouter's metadata marks GPT-5.x temperature unsupported.
-    const gatewaySupportsTemperature = !upstreamModel.startsWith('openai/gpt-5.');
-    if (
-      this.llmModels[model].supportsTemperature &&
-      gatewaySupportsTemperature &&
-      temperature !== null
-    ) {
-      params.temperature = temperature;
-    }
+    const reasoningEffort = resolveGatewayReasoningEffort(
+      this.llmModels[model], taskClass,
+      (fallbackModels ?? []).map(id => this.llmModels[this.normalizeModelId(id)]),
+    );
+    if (reasoningEffort !== undefined) params.reasoning = { effort: reasoningEffort };
 
     const client = await this.getOpenRouterClient();
     const providerLabel = 'openrouter';
 
+    // ENG-1626: params.provider.allow_fallbacks above already has OpenRouter retry
+    // across its own provider pool for THIS request before it ever surfaces an
+    // error to us -- getOpenRouterClient's maxRetries:0 exists precisely so an SDK
+    // auto-retry can't multiply with that in-flight fallback. This loop is a
+    // different thing: ONE retry of a *fully-exhausted* attempt, after a short
+    // backoff, for the narrow case where the exhaustion was momentary. Session
+    // b32ec8af (2026-08-26): a single "429 Provider returned error" from
+    // OpenRouter (all providers for that model saturated for an instant) killed
+    // an entire Slack-bridged session with zero retry anywhere in this path.
+    // `timeout` is deliberately excluded from the retryable set used elsewhere
+    // (isRetryableErrorClass) -- retrying a call that already burned up to
+    // timeoutMs would double the worst-case wall clock against the turn's own
+    // hard cap, trading one failure mode for a worse one.
+    const isRetryableLlmCallError = (error: unknown): boolean => {
+      const errorClass = classifyToolErrorClass(error);
+      if (errorClass === 'rate_limit' || errorClass === 'network' || errorClass === 'upstream_5xx') return true;
+      // ENG-1681: see openRouterResponseValidation.ts for the full context —
+      // this covers OpenRouter's malformed/empty-response failure classes,
+      // which are not a rate limit, network blip, or 5xx by
+      // classifyToolErrorClass's general taxonomy.
+      return isMalformedOpenRouterResponseError(error);
+    };
+
+    // A single 1.5s retry wasn't enough to clear a burst-triggered 429 — prod
+    // sessions on the LinkedIn Post Factory SCHEDULED schedule (which fires
+    // several tool calls back-to-back) needed the full 15-60min scheduled-run
+    // backoff to recover from what OpenRouter reported as rate-limited. One
+    // extra attempt, backed by the Retry-After header when the provider sends
+    // one, gives a rate limit real room to clear within the same run before
+    // falling back to that expensive path.
+    //
+    // Scoped to scheduled_background ONLY: this loop is shared by every
+    // caller of callLLM, including a live interactive chat with a human
+    // staring at the screen. Retry-After can legitimately be tens of seconds,
+    // and honoring it across two retries could add up to ~2 minutes of dead
+    // air to an interactive turn that used to fail fast after ~1.5s — a much
+    // worse outcome for that caller than the original single-short-retry
+    // behavior. A headless scheduled run has no one watching and already
+    // tolerates a much larger backoff at the schedule level, so it's the only
+    // context where trading latency for a better shot at recovery is a clear
+    // win rather than a regression.
+    const isScheduledLlmCall = taskClass === 'scheduled_background';
+    const maxAttempts = isScheduledLlmCall ? 3 : 2;
+    // ENG-1816 F1: send/validate/retry mechanics live in OpenRouterPlatformTransport
+    // now (relocated unchanged, not rewritten — see transport/openRouterPlatformTransport.ts).
+    // pickTransport always resolves this same transport today; A2 adds ApiKeyTransport.
+    const res = await pickTransport(currentRunFunding(), model).send(client, model, params, {
+      timeoutMs: timeoutMs ?? 5 * 60 * 1000,
+      maxAttempts,
+      isRetryableError: isRetryableLlmCallError,
+      // Bound to the instance method, not a transport-local timer: this is the seam
+      // agentModeService.openRouterClient.test.ts spies on to assert exact backoff
+      // values without actually waiting.
+      sleep: (ms) => this.sleep(ms),
+      computeBackoff: (error, attempt) => {
+        // Retry-After is only honored for scheduled calls (see maxAttempts comment
+        // above) — an interactive/other caller keeps the original fixed, short
+        // backoff so a live turn still fails fast rather than trusting a
+        // provider-reported wait that could be tens of seconds.
+        const retryAfterMs = isScheduledLlmCall ? getRetryAfterMs(error) : undefined;
+        return {
+          ms: retryAfterMs ?? 1500 * Math.pow(2, attempt - 1),
+          honoredRetryAfter: retryAfterMs !== undefined,
+        };
+      },
+      // ENG-2185: a spend-limited OpenRouter key rejects a request whose
+      // WORST-CASE cost (input + requested max_tokens) exceeds its remaining
+      // balance, even though actual usage is normally far less (see
+      // AGENT_MODE_MAX_OUTPUT_TOKENS's own comment). The error names exactly
+      // how many tokens the balance affords, so retry with max_tokens capped
+      // to that instead of hard-failing to the generic fallback — this asks
+      // for no additional spend, it just stops over-asking against what's
+      // already there.
+      adjustParamsForRetry: (error, retryParams) => {
+        const affordableTokens = extractAffordableTokens(error);
+        if (affordableTokens === null) return false;
+        // A key with truly zero balance left would still get rejected at
+        // max_tokens=1 (the retry's own floor below) — that's not a useful
+        // fallback, just a wasted attempt against the same rejection.
+        if (affordableTokens === 0) return false;
+        if (typeof retryParams.max_tokens === 'number' && affordableTokens >= retryParams.max_tokens) return false;
+        // Small safety margin: the provider's affordable estimate is a snapshot
+        // at request time and can shift slightly if the account is being drawn
+        // down concurrently by other in-flight calls.
+        retryParams.max_tokens = Math.max(1, affordableTokens - 100);
+        console.warn(`AgentMode: OpenRouter call for model "${model}" was rejected for insufficient credits; retrying with max_tokens reduced to ${retryParams.max_tokens}`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return true;
+      },
+    });
+
+    // ENG-1712: resolved provider slot + BYOK flag, log-only (no routing
+    // impact) -- lets a production incident/verification tie a specific
+    // call to the provider it actually landed on without reading
+    // credential material out-of-band.
+    const resolvedMetadata = normalizeOpenRouterResponseMetadata(res);
+    console.log(`AgentMode: OpenRouter call succeeded for model "${model}"`, {
+      provider: resolvedMetadata.provider,
+      is_byok: resolvedMetadata.is_byok,
+      ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+    });
+    // Fire-and-forget usage metering; it must never break an LLM call.
+    // ENG-1816 F1: routed through recordLlmUsage, which decides funding ABOVE this
+    // fire-and-forget funnel — see funding/recordLlmUsage.ts for why. Branch on
+    // RunFunding.route, never on usage.is_byok below: that flag also fires for
+    // AgentWeb's own OpenRouter BYOK credential (the Google slot, ENG-1702/753),
+    // indistinguishable on the wire from a customer's BYOK key.
     try {
-      const res = await client.chat.completions.create(
-        params,
-        { timeout: timeoutMs ?? 5 * 60 * 1000, maxRetries: 0 },
-      );
-      // Fire-and-forget usage metering; it must never break an LLM call.
-      try {
-        const usage: any = (res as any)?.usage;
-        if (usage) {
-          const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
-          meterUserUsage({
-            userId: usageContext?.userId,
-            billingUserId: usageContext?.billingUserId,
-            sessionId: usageContext?.sessionId,
-            model,
-            provider: providerLabel,
-            feature: usageContext?.feature || 'agent_task',
-            eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
-            inputTokens: normalizedUsage.inputTokens,
-            outputTokens: normalizedUsage.outputTokens,
-            cacheReadTokens: normalizedUsage.cacheReadTokens,
-            cacheWriteTokens: normalizedUsage.cacheWriteTokens,
-            cacheWriteByTtl: usage.cache_creation_by_ttl,
-            costUsdOverride:
-              usage.is_byok !== true && typeof usage.cost === 'number'
+      const usage: any = (res as any)?.usage;
+      if (usage) {
+        const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
+        recordLlmUsage(currentRunFunding(), {
+          userId: usageContext?.userId,
+          billingUserId: usageContext?.billingUserId,
+          sessionId: usageContext?.sessionId,
+          model,
+          provider: providerLabel,
+          feature: usageContext?.feature || 'agent_task',
+          eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
+          inputTokens: normalizedUsage.inputTokens,
+          outputTokens: normalizedUsage.outputTokens,
+          cacheReadTokens: normalizedUsage.cacheReadTokens,
+          cacheWriteTokens: normalizedUsage.cacheWriteTokens,
+          cacheWriteByTtl: usage.cache_creation_by_ttl,
+          costUsdOverride:
+            usage.is_byok === true
+              ? typeof usage.cost_details?.upstream_inference_cost === 'number' &&
+                Number.isFinite(usage.cost_details.upstream_inference_cost) &&
+                usage.cost_details.upstream_inference_cost > 0
+                ? usage.cost_details.upstream_inference_cost
+                : undefined
+              : typeof usage.cost === 'number'
                 ? usage.cost
                 : undefined,
-          });
-        }
-      } catch {
-        // Metering must never break an LLM call.
+        }, 'agentModeService.callLLM');
       }
-      return res;
-    } catch (error) {
-      console.error(`AgentMode: OpenRouter call failed for model "${model}":`, {
-        error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined,
-      });
-      throw error;
+    } catch {
+      // Metering must never break an LLM call.
     }
+    // Keep default responses untouched; annotate only the effort actually sent.
+    return reasoningEffort !== undefined && res.usage
+      ? { ...res, usage: { ...res.usage, reasoning_effort: reasoningEffort } }
+      : res;
   }
 
   /**
@@ -2777,6 +3255,43 @@ export class AgentModeService {
     }
   }
 
+  /**
+   * ENG-2204: owner opt-OUT for the unattended Slack-send override, resolved
+   * INDEPENDENTLY of publish authorization above rather than riding along on
+   * `publishAuthorizationOverride`/`resolveScheduledPublishAuthorization`. Those exist
+   * to guarantee the prompt and the required-function checker read the identical
+   * publish decision (ENG-827's whole point) — but nothing analogous checks or
+   * enforces slack_send_message authorization elsewhere, so there is no cross-system
+   * disagreement to prevent, and no reason to entangle this with that machinery
+   * (which would mean threading a new field through generateSessionResponse's
+   * positional signature, the worker IPC boundary, and runScheduledChat's separate
+   * `livePublishAuthorization` construction — the exact class of wiring gap this
+   * ticket's review rounds kept finding elsewhere). A second, independent point-read
+   * of the same schedule row (GetItem, not a scan) on the rare sessionType:'scheduled'
+   * turn is a negligible cost next to that risk.
+   *
+   * Same opt-out polarity/fail-closed conventions as requirePublishApproval, purely
+   * for consistency: absent/false = authorized (matches this ticket's fix — no
+   * existing schedule's behavior changes), explicit true = withheld, and anything
+   * this function cannot verify (no session, no parseable schedule, a read error)
+   * withholds rather than authorizes.
+   */
+  private async resolveScheduledSlackSendAuthorized(currentSession: any): Promise<boolean> {
+    if (currentSession?.sessionType !== 'scheduled') return true;
+    const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
+    if (!scheduleId) return false;
+    try {
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      return resolveSlackSendAuthorized(schedule);
+    } catch (error) {
+      console.error(
+        `AgentMode: failed to read schedule ${scheduleId} for session ${currentSession?.sessionId}; withholding the ENG-2204 unattended Slack-send override rather than authorizing it unverified:`,
+        error
+      );
+      return false;
+    }
+  }
+
   /** Cost per video generation in USD. Veo bills per 8s clip, so longer videos cost proportionally more. */
   private estimateVideoGenerationCost(model: string, durationSeconds?: number): number {
     // Per-clip rates sourced from llmPricing (single source of truth).
@@ -2833,7 +3348,13 @@ export class AgentModeService {
     // Workplan progression turns must end in persisted structured state rather
     // than a provider-dependent prose question buried at the end of a response.
     requireWorkPlanDisposition: boolean = false,
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition }> {
+    // ENG-2072: tri-state per-turn signal for "is this an unattended scheduled/
+    // test run" — see ToolContext.isUnattendedRun in mcp/client/toolRegistry.ts.
+    // Supplied by runVerifiedChatInner (true only from runScheduledChat's call,
+    // false/undefined otherwise); every other caller of generateMarketingResponse
+    // is an attended interactive path and leaves this undefined.
+    isUnattendedRun?: boolean,
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition; pendingApprovalDeck?: PendingApprovalDeck }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
@@ -2935,11 +3456,23 @@ export class AgentModeService {
       }
 
       const isAdmin = currentUser?.isAdmin === true;
+
+      // ENG-1205: the correction this turn was admitted under, stamped onto the
+      // turn's assistant messages beside `llm` so a reload can still explain why
+      // the badge disagrees with the picker. The controller wrote this decision
+      // onto the session immediately before dispatch; `resolveTurnModelCorrection`
+      // rejects a slot that does not describe THIS turn, so a resumed or replayed
+      // run degrades to no stamp rather than borrowing a newer turn's model.
+      const turnModelCorrection = resolveTurnModelCorrection(
+        (currentSession as any)?.llmUsagePolicyDecision,
+        llmModel,
+      );
       // Admin tools are available to real admins OR to messages arriving via admin delegated access.
       // iShare sessions always block admin tools even if somehow isDelegatedAccess is set.
       const hasAdminAccess = (isAdmin || isDelegatedAccess) && !isInteractiveShare;
 
       const workPlan = currentSession?.workPlan;
+      const openResearchRequests = currentSession?.openResearchRequests;
       const workPlanTurnBefore = snapshotWorkPlanTurn(currentSession);
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
 
@@ -2958,7 +3491,16 @@ export class AgentModeService {
       let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds, hasAdminAccess);
 
       // 3. Build Initial Messages
-      const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl);
+      let effectiveMessageContent = messageContent;
+      if (currentSession?.sessionVoiceProfile?.voiceCard?.trim()) {
+        try {
+          const { voiceCardPromptSuffix } = await import('./voiceProfileHooks');
+          effectiveMessageContent = messageContent + voiceCardPromptSuffix(currentSession.sessionVoiceProfile);
+        } catch (voiceInjectErr) {
+          console.warn('[AgentMode] H-VOICE prompt inject skipped (non-fatal):', voiceInjectErr);
+        }
+      }
+      const marketingMessages = this.buildMarketingContext(effectiveMessageContent, sessionHistory, currentTaskStatuses, workPlan, screenshotUrl, currentSession?.calledFunctions, currentSession?.declinedWorkPlanRecommendations, openResearchRequests);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
@@ -2984,7 +3526,19 @@ export class AgentModeService {
       // turn message, and the publish sinks re-read live consent at the write itself.
       const publishAuthorization =
         publishAuthorizationOverride ?? (await this.resolveScheduledPublishAuthorization(currentSession));
-      const publishAuthorized = publishAuthorization.authorized;
+      // ENG-2204: the comment above ("this is the UNATTENDED run path, so it always
+      // passes a resolved boolean") was true only when this function had a single
+      // caller. It is also reached by an ATTENDED turn — a schedule-created session
+      // reopened in the main chat UI (ENG-2072) — where isUnattendedRun is left
+      // undefined. Passing a resolved boolean there manufactured a live "PUBLISH
+      // WITHHELD... turn off Require approval before publishing" message for a user
+      // who never attempted to publish anything (live-confirmed on env2: an attended
+      // turn asking to post to Slack got this unrelated publish-authorization
+      // boilerplate instead of the ordinary ask-first flow). getScheduledSessionOverride
+      // already has a dedicated ATTENDED branch for exactly this (publishAuthorized
+      // undefined -> "Emit the base override... No mandate, no publish block") — it was
+      // simply never reached because this call always supplied a resolved value.
+      const publishAuthorized = isUnattendedRun === true ? publishAuthorization.authorized : undefined;
       // ENG-1245: reason is only ever present on the withheld branch, and only when
       // resolveScheduledPublishAuthorization derived it (an override supplied by a
       // caller elsewhere carries no reason, so this falls back to the pre-existing,
@@ -2992,7 +3546,9 @@ export class AgentModeService {
       const sessionTypeLabel = getScheduledSessionOverride(
         currentSession?.sessionType,
         publishAuthorized,
-        (publishAuthorization as { reason?: PublishAuthorizationWithholdReason }).reason
+        isUnattendedRun === true
+          ? (publishAuthorization as { reason?: PublishAuthorizationWithholdReason }).reason
+          : undefined
       );
       const messages: any[] = [
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
@@ -3120,12 +3676,25 @@ export class AgentModeService {
       // publishing tools' own "get explicit approval first" text. Placed here it is the
       // last thing before the model answers, and it is the same authorization object the
       // dispatch guard enforces.
-      if (currentSession?.sessionType === 'scheduled') {
+      // ENG-2204: gate on isUnattendedRun === true, not just sessionType — a schedule-
+      // created session reopened in the attended chat UI keeps sessionType 'scheduled'
+      // but leaves isUnattendedRun undefined (per its own doc comment above: "every
+      // other caller of generateMarketingResponse is an attended interactive path and
+      // leaves this undefined"). This directive now carries a live-approval bypass
+      // (SLACK NOTIFICATIONS IN UNATTENDED RUNS) that must never reach an attended turn,
+      // so undefined must be excluded, not just false — same strict-true discriminator
+      // already used at the Meta-write approval-deck gate below.
+      if (currentSession?.sessionType === 'scheduled' && isUnattendedRun === true) {
+        // ENG-2204: owner opt-out for the Slack-send override — resolved independently
+        // of publishAuthorization, see resolveScheduledSlackSendAuthorized's own comment
+        // for why this isn't threaded through publishAuthorizationOverride instead.
+        const slackSendAuthorized = await this.resolveScheduledSlackSendAuthorized(currentSession);
         const publishDirective = getUnattendedExecutionDirective(
           'scheduled',
           isAdmin,
           publishAuthorization.authorized ? 'authorized' : 'withheld',
-          publishAuthorization.tools
+          publishAuthorization.tools,
+          slackSendAuthorized
         );
         if (publishDirective) messages.push({ role: 'system', content: publishDirective });
       }
@@ -3299,6 +3868,12 @@ export class AgentModeService {
       // coincidentally-identical request is never mistaken for a duplicate.
       const mediaCallKeysThisRun = seedMediaCallKeysFromHistory(sessionHistory as any, Date.now() - 60 * 60 * 1000);
 
+      // ENG-426: session-wide search-call budget. Seeded from the WHOLE persisted session
+      // history (not time-bounded — a new session already starts this at 0, which is
+      // AgentMode's equivalent of Claude Code's `/clear`) and accumulated across this run's
+      // iterations below, mirroring the media-asset run-total pattern just above.
+      let searchCallCountThisRun = seedSearchCallCountFromHistory(sessionHistory as any);
+
       // ENG-907: whole-turn WALL-CLOCK budget — the analogue of the step budget below.
       // A broad research turn can stay far under `maxIterations` and still burn the whole
       // 10-minute controller cap issuing discovery calls; when the cap fires the run is
@@ -3339,6 +3914,39 @@ export class AgentModeService {
           ? turnStartedAtMs + generationTimeoutMs
           : undefined;
       let longestLlmCallMsThisRun = 0;
+      // ENG-2121: mirrors longestLlmCallMsThisRun, but for the tool-DISPATCH phase of an
+      // iteration (executePreparedTools) rather than the LLM call. A heavy knowledge-base
+      // read (or any other slow non-media tool) can burn several minutes of wall clock —
+      // time the reserve calc below never saw, since it only widened for slow LLM calls.
+      // That would let a turn spend most of its budget on a genuinely slow tool call,
+      // still read as comfortably "normal"/"wrap_up" because no single LLM call looked
+      // slow, and then start another equally slow tool call that ran the turn past the
+      // controller's hard cap before the graceful final-synthesis nudge ever got a
+      // chance to fire. Defensive widening for that general shape of turn — reserved for
+      // production session d874874f's own reported symptom (a Meta ad work-plan step cut
+      // off between finishing its KB reads and issuing generate_image), the actual KB
+      // reads there were fast (~14s, ~8s); see the sibling fix below for what actually
+      // ran long in that session.
+      let longestToolDispatchMsThisRun = 0;
+      // ENG-2121: the reserve above only ever widens BETWEEN iterations — it cannot help
+      // a single LLM call that is itself the runaway, including the turn's very first
+      // call, before any prior-call evidence exists to widen the reserve at all.
+      // Production session d874874f hit this gap twice, two different ways: its first
+      // turn got 2 fast tool calls in (iterations 1-2), then a 3rd-iteration LLM call
+      // alone ran ~578s and blew the 600s cap — survived only because the controller's
+      // OWN opportunistic backstop (outside this loop) found those 2 tool calls' results
+      // to salvage into a "reply continue" message. Its next turn ("Continue building
+      // all the creative") had no such luck: iteration 1's LLM call alone ran the entire
+      // ~601s cap with nothing yet dispatched, so the controller had nothing to salvage
+      // and the user got the much worse generic diagnosis-agent fallback ("please click
+      // retry", falsely claiming completed work it never actually did). Bound EVERY LLM
+      // call, on EVERY iteration including the first, to whatever time remains before
+      // the synthesis reserve so a pathological call fails fast (a catchable timeout)
+      // instead of silently consuming the whole turn — and, per the catch block below,
+      // retry that failure with a forced final synthesis on EVERY iteration too
+      // (including the first), so even a bare iteration-1 hang gets one bounded chance
+      // at an honest answer from the model itself instead of an immediate hard failure.
+      const MIN_LLM_CALL_TIMEOUT_MS = 30_000;
       let timeBudgetWrapUpWarned = false;
       // Sticky: once the loop switches to synthesis it never offers tools again this turn.
       let forceFinalSynthesis = false;
@@ -3353,6 +3961,13 @@ export class AgentModeService {
       let responseMessage: any = null;
       let workPlanDispositionRetries = 0;
       let workPlanTurnDisposition: WorkPlanTurnDisposition | undefined;
+      // ENG-1635/1644: mirrors workPlanTurnDisposition's hoist-and-return-at-the-end
+      // pattern above. Without this, the deck built at the loop seam below only ever
+      // reaches the frontend via a full session refetch (a page reload) — the
+      // optimistic assistant bubble this turn's POST /generate response drives has no
+      // way to know a deck exists, so it falls back to the plain-text prompt with no
+      // buttons until the user reloads.
+      let pendingApprovalDeck: PendingApprovalDeck | undefined;
       let skillsUpdated = false;
       let filteredToolsCache: any[] | null = null; // Cache for filtered tools
 
@@ -3365,6 +3980,15 @@ export class AgentModeService {
       const toolSignatureHistory: string[] = [];
       const SIGNATURE_HISTORY_WINDOW = 10;
       const SIGNATURE_REPEAT_THRESHOLD = 3;
+      // ENG-1635/1644 follow-up: cross-TURN retry-backstop TRANSPARENCY for a
+      // Meta write that keeps failing the same way — see the annotation logic
+      // below (and applyMetaWriteRetryBackstop's own header) for why this
+      // never blocks a real attempt, only guarantees the approval card itself
+      // carries the failure history once a target has failed this many times
+      // in a row. 2 = one automatic retry is trusted with no extra noise on the
+      // card (a real chance to self-correct); the card for a 3rd consecutive
+      // attempt at the same target gets the warning annotation.
+      const META_WRITE_RETRY_BACKSTOP_THRESHOLD = 2;
 
       // Track max_tokens continuations to prevent infinite continuation loops
       let maxTokensContinuations = 0;
@@ -3399,6 +4023,15 @@ export class AgentModeService {
       // corrects a fluent but numerically false claim. Sharing a flag would mean
       // standing down one guard silently disables the other.
       const falseClaimGuardEnabled = process.env.AGENT_FALSE_CLAIM_GUARD !== 'false';
+
+      // Kill switch for the unavailable-capability notice below — ON by default; set
+      // AGENT_UNAVAILABLE_CAPABILITY_NOTICE=false to stand it down. Its two sibling guards in
+      // the same block each have one and this did not, which is the difference between a bad
+      // banner being a config change and a bad banner being a revert-and-redeploy. It is also
+      // the guard that most needs one: it is UNCONDITIONAL, so a false positive prepends a
+      // scary warning to an otherwise correct answer on every affected turn.
+      const unavailableCapabilityNoticeEnabled =
+        process.env.AGENT_UNAVAILABLE_CAPABILITY_NOTICE !== 'false';
 
       let wasCancelled = false;
       // ENG-244: set true when the loop exits because the step budget (maxIterations)
@@ -3438,7 +4071,10 @@ export class AgentModeService {
           const timeBudget = evaluateTurnTimeBudget({
             startedAtMs: turnStartedAtMs,
             hardCapMs: turnHardCapMs,
-            longestLlmCallMs: longestLlmCallMsThisRun,
+            // ENG-2121: size the reserve off whichever phase of an iteration was
+            // slowest — the LLM call or the tool dispatch that followed it — so a
+            // heavy KB read grows the headroom exactly like a slow LLM call would.
+            longestLlmCallMs: Math.max(longestLlmCallMsThisRun, longestToolDispatchMsThisRun),
           });
           if (timeBudget.phase === 'final_synthesis' && iteration > 1) {
             forceFinalSynthesis = true;
@@ -3596,6 +4232,15 @@ export class AgentModeService {
           const skillFilter = isLegacySession ? undefined : allowedToolNames;
           filteredToolsCache = await this.getFilteredTools(userId, skillFilter, userAllowedSkillIds);
 
+          if (currentSession?.sessionVoiceProfile?.voiceCard?.trim()) {
+            try {
+              const { augmentPublishToolDefinitions } = await import('./voiceProfileHooks');
+              filteredToolsCache = augmentPublishToolDefinitions(filteredToolsCache, currentSession.sessionVoiceProfile);
+            } catch (voiceToolErr) {
+              console.warn('[AgentMode] H-VOICE publish tool augment skipped (non-fatal):', voiceToolErr);
+            }
+          }
+
           // Exclude tools that are not applicable to the current context (e.g. get_visual_context on non-visual pages)
           if (excludeTools?.length && filteredToolsCache) {
             const excludeSet = new Set(excludeTools);
@@ -3615,6 +4260,23 @@ export class AgentModeService {
           }
         }
 
+        // ENG-1670: pace out a scheduled run's own back-to-back Gemini calls within
+        // this turn. Narrow guard: scheduled only (never adds latency for a live
+        // interactive user), Gemini only (the provider this failure was confirmed
+        // against), iteration > 1 only (the turn's first call has nothing preceding
+        // it in this turn to burst against), and skipped once the turn is already
+        // racing its own wall-clock cap — this is defense against this session's own
+        // request rate, not worth trading against the ENG-907 time budget it would
+        // otherwise eat into.
+        if (
+          isScheduledSession
+          && iteration > 1
+          && llmModel.startsWith('gemini')
+          && !forceFinalSynthesis
+        ) {
+          await this.sleep(AgentModeService.SCHEDULED_GEMINI_ITERATION_PACING_MS);
+        }
+
         // Trim large old tool results to prevent context window overflow
         const trimmedMessages = this.trimToolMessagesForContext(messages);
 
@@ -3624,6 +4286,31 @@ export class AgentModeService {
         const chatTaskClass: GatewayTaskClass = isScheduledSession
           ? 'scheduled_background'
           : 'interactive_chat';
+        // ENG-2121: bound THIS call's own wall-clock time to whatever remains before the
+        // synthesis reserve — including on iteration 1, where longestLlmCallMsThisRun/
+        // longestToolDispatchMsThisRun are both still 0. Undeadlined callers (no
+        // turnHardCapMs) pass `undefined` through and keep callLLM's own default.
+        let llmCallTimeoutMs: number | undefined;
+        if (turnHardCapMs !== undefined) {
+          const preCallBudget = evaluateTurnTimeBudget({
+            startedAtMs: turnStartedAtMs,
+            hardCapMs: turnHardCapMs,
+            longestLlmCallMs: Math.max(longestLlmCallMsThisRun, longestToolDispatchMsThisRun),
+          });
+          // CodeRabbit (PR #3050): the MIN_LLM_CALL_TIMEOUT_MS floor alone can still hand
+          // out a bound LONGER than the wall-clock actually left before turnHardCapMs —
+          // e.g. remainingMs=5000 would floor to 30000, letting this call run 25s past
+          // the outer hard cap and get killed by that uncontrolled race instead of this
+          // one, recreating the exact failure mode this fix exists to prevent. Clamp to
+          // whichever is smaller. A resulting near-zero value is safe, not a footgun:
+          // the openai client's fetchWithTimeout does `setTimeout(() => abort(), ms)`,
+          // so `ms<=0` aborts on the next tick rather than disabling the timeout — this
+          // still reaches the catch below as a clean, classifiable 'timeout' error.
+          llmCallTimeoutMs = Math.min(
+            preCallBudget.remainingMs,
+            Math.max(MIN_LLM_CALL_TIMEOUT_MS, preCallBudget.remainingMs - preCallBudget.reserveMs),
+          );
+        }
         // OTel `chat` span (ENG-141): brackets the primary call AND the backup
         // retry; the `finally` closes it with the FINAL model + usage attrs
         // (response undefined there = both attempts threw → status ERROR).
@@ -3660,6 +4347,10 @@ export class AgentModeService {
             // Scheduled and interactive conversations canary independently;
             // OpenRouter owns provider fallback once either class is enabled.
             taskClass: chatTaskClass,
+            // ENG-2121: bound this call to whatever remains before the synthesis
+            // reserve (computed above) instead of letting it run unbounded — see the
+            // catch block below for what happens when this actually fires.
+            timeoutMs: llmCallTimeoutMs,
           });
         } catch (callError) {
           // OpenRouter performs provider/model failover inside the one request. A
@@ -3668,8 +4359,61 @@ export class AgentModeService {
           if (forceFinalSynthesis && turnHardCapMs !== undefined && isTransientLLMError(callError)) {
             recordSpanError(chatSpan, callError);
             synthesisRetryUnaffordable = true;
+          } else if (
+            // ENG-2121: this call ran into the per-call bound set above (or a genuine
+            // upstream timeout). Retry once with forced final synthesis instead of
+            // throwing this straight up to the controller, which would have no
+            // persisted work from THIS call to salvage and would fall straight to the
+            // generic diagnosis-agent fallback.
+            //
+            // Deliberately NOT gated on `iteration > 1` the way the between-iteration
+            // pre-check above is. That gate exists to stop the loop PROACTIVELY forcing
+            // synthesis before iteration 1 has even attempted the user's request —
+            // reasonable, since nothing has failed yet at that point. This branch only
+            // ever runs REACTIVELY, after a call already failed: the reserve time this
+            // retry spends would otherwise just be thrown away when the loop rethrows
+            // below, so retrying costs nothing extra either way, and even on a bare
+            // iteration-1 timeout the model can still honestly tell the user what
+            // happened (a real "Verified: nothing yet, reply continue" answer built by
+            // the model that was actually working on the request) instead of the
+            // generic diagnosis agent guessing from turnStartCalledFunctions alone —
+            // which is what produced production session d874874f's hallucinated
+            // "I have successfully completed..." fallback on its own iteration-1 hang.
+            // `!forceFinalSynthesis` below still caps this at exactly one retry ever,
+            // so there is no risk of looping.
+            !forceFinalSynthesis
+            && turnHardCapMs !== undefined
+            && classifyToolErrorClass(callError) === 'timeout'
+          ) {
+            recordSpanError(chatSpan, callError);
+            forceFinalSynthesis = true;
+            truncatedByTimeBudget = true;
+            console.warn(
+              `AgentMode: LLM call timed out for session ${sessionId} at iteration ${iteration} — ` +
+              'forcing a final synthesis so the work done so far is delivered instead of a hard failure'
+            );
+            (messages as any[]).push({
+              role: 'user',
+              content: buildTurnTimeBudgetNudge(
+                evaluateTurnTimeBudget({
+                  startedAtMs: turnStartedAtMs,
+                  hardCapMs: turnHardCapMs,
+                  longestLlmCallMs: Math.max(longestLlmCallMsThisRun, longestToolDispatchMsThisRun),
+                }),
+                'final_synthesis',
+              ),
+            });
+            continue;
           } else {
             recordSpanError(chatSpan, callError);
+            // ENG-2121: tag a genuine timeout so the controller's own whole-turn
+            // timeout backstop (which salvages any images/tool work already persisted
+            // this turn — see withGenerationTimeout's caller) treats this the same as
+            // its own hard-cap race firing, rather than skipping straight to the
+            // generic diagnosis-agent fallback because the tag is missing.
+            if (turnHardCapMs !== undefined && classifyToolErrorClass(callError) === 'timeout') {
+              (callError as any).isGenerationTimeout = true;
+            }
             throw callError;
           }
         } finally {
@@ -3770,11 +4514,19 @@ export class AgentModeService {
 
         // Add LLM model to the response message
         responseMessage.llm = llmModel;
+        // ENG-1205: and, when the model that ran is not the one that was asked
+        // for, what was asked for — `llm` alone cannot distinguish "you picked
+        // this" from "you were given this".
+        if (turnModelCorrection) {
+          responseMessage.modelCorrection = turnModelCorrection;
+        }
 
         // Attach token usage from the LLM response to the message
         const responseUsage = response.usage;
         if (responseUsage) {
           responseMessage.usage = {
+            ...(responseUsage.reasoning_effort !== undefined
+              ? { reasoning_effort: responseUsage.reasoning_effort } : {}),
             prompt_tokens: responseUsage.prompt_tokens || 0,
             completion_tokens: responseUsage.completion_tokens || 0,
             total_tokens: responseUsage.total_tokens || 0,
@@ -3830,6 +4582,49 @@ export class AgentModeService {
             `AgentMode: Discarding ${responseMessage.tool_calls.length} tool call(s) requested during the ` +
             `forced final synthesis in session ${sessionId} — the turn's time budget is spent`
           );
+
+          // ENG-1682 follow-up: a step's deliverable can genuinely finish (e.g.
+          // create_html_file succeeds) in the very turn the time budget runs out —
+          // one tool call before the model would have marked the step completed.
+          // Discarding set_work_plan_status like every other call here leaves that
+          // step stuck "pending" in DynamoDB forever even though the work is done,
+          // which is the same "no visible end results" failure this ticket is
+          // about. Apply it directly instead of executing it through the normal
+          // loop: it's a single bounded DB write, not another LLM round trip, so it
+          // costs nothing against the reserve held back for the forced synthesis
+          // call below, and it closes the gap without reopening the loop.
+          const statusCall = responseMessage.tool_calls.find(
+            (call: any) => call.function?.name === 'set_work_plan_status'
+          );
+          if (statusCall) {
+            try {
+              const args = JSON.parse(statusCall.function.arguments || '{}');
+              if (Array.isArray(args.updates)) {
+                const statusResult = await this.setWorkPlanStatus(args.updates, sessionId);
+                if (statusResult?.success) {
+                  console.warn(
+                    `AgentMode: Applied the discarded set_work_plan_status call in session ${sessionId} ` +
+                    'despite the forced synthesis — the underlying work already finished'
+                  );
+                } else {
+                  // CodeRabbit (PR #2713): setWorkPlanStatus can reject an update (out-of-order,
+                  // missing required calls, insufficient assets, unknown step) without throwing —
+                  // logging an unconditional "Applied" here would misreport a rejected update as
+                  // a success. Report what actually happened instead.
+                  console.warn(
+                    `AgentMode: Discarded set_work_plan_status call in session ${sessionId} was rejected ` +
+                    `(${statusResult?.message || 'no message'}) — the step's status was not changed`
+                  );
+                }
+              }
+            } catch (statusError) {
+              console.error(
+                `AgentMode: Failed to apply the discarded set_work_plan_status call in session ${sessionId}:`,
+                statusError
+              );
+            }
+          }
+
           delete responseMessage.tool_calls;
         }
 
@@ -3909,6 +4704,22 @@ export class AgentModeService {
           // never claim a false success. Gated on the per-turn flag, not on `content`:
           // `content` still holds any earlier turn's text and would suppress this.
           if (synthesisResidueGuardEnabled && synthesisResidueDropped) {
+            // ENG-1576 correction: an earlier revision of this PR added
+            // `!truncatedByTimeBudget` here too (matching the sibling plain-empty
+            // branch below, prompted by a CodeRabbit question about whether the two
+            // flags can coincide — they can). That was wrong for THIS branch and got
+            // reverted before merge finished rolling out: `synthesisResidueDropped`
+            // covers ENG-1188's echoed-nudge detection too (isUnusableSynthesis →
+            // isNudgeEcho, including the wall-clock nudge specifically), and
+            // ENG-1188's whole point is that an echoed nudge must NEVER reach the
+            // user — the ledger recap must win even when the turn is also
+            // time-budget-truncated. `nudgeEchoRecovery.test.ts`'s "recovers with
+            // the executed-action ledger when the forced synthesis turn echoes the
+            // time-budget nudge" case pins exactly this combination. Excluding
+            // truncatedByTimeBudget here silently broke that guarantee for one of
+            // the four nudges ENG-1188 exists to cover. The sibling branch below
+            // (plain emptiness, no residue detected at all) has no such guarantee
+            // attached to it and keeps its own truncatedByTimeBudget exclusion.
             if (!turnHadUsableText) {
               console.warn(`AgentMode: Synthesis unrecoverable after residue in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
               content = buildExecutedActionsFallback(toolCalls);
@@ -3926,7 +4737,7 @@ export class AgentModeService {
               }
             }
             if (responseMessage) responseMessage.content = content;
-          } else if (synthesisResidueGuardEnabled && !turnHadUsableText && toolCalls.length > 0) {
+          } else if (synthesisResidueGuardEnabled && !turnHadUsableText && toolCalls.length > 0 && !truncatedByTimeBudget) {
             // Same failure family as the residue case above (a synthesis the run could
             // not produce), just without residue text to detect: the bounded
             // empty-synthesis nudge (MAX_EMPTY_SYNTHESIS_RETRIES) above already asked
@@ -3944,6 +4755,15 @@ export class AgentModeService {
             // non-empty for the rest of the turn even though the iteration actually
             // terminating here came back with nothing, silently disarming this fallback
             // and shipping the stale narration as if it answered the empty turn.
+            //
+            // ENG-1576: also excludes a wall-clock-forced final synthesis
+            // (`truncatedByTimeBudget`) — that path has its own, more specific fallback
+            // below (`TURN_TIME_BUDGET_FALLBACK_CONTENT`, gated on `!content`). Setting
+            // `content` here unconditionally made this generic ledger recap win every
+            // time regardless of truncation reason, silently pre-empting the time-limit
+            // message the user actually needs to see (found via ENG-426 verification:
+            // turnTimeBudgetTruncation.test.ts pinned the time-limit message and this
+            // branch was clobbering it before the post-loop check ever ran).
             console.warn(`AgentMode: Terminating turn stayed empty after ${emptySynthesisRetries} nudge retr${emptySynthesisRetries === 1 ? 'y' : 'ies'} in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
             content = buildExecutedActionsFallback(toolCalls);
             if (responseMessage) responseMessage.content = content;
@@ -3955,7 +4775,40 @@ export class AgentModeService {
           // rendered, QA'd, and saved" when only 4 screenshots succeeded). It reads
           // as a normal answer, so `isUnusableSynthesis` never flags it; this checks
           // the claim's numbers against `toolCalls` instead of the text's shape.
-          if (falseClaimGuardEnabled && content) {
+          //
+          // ENG-1635/1644: ALSO skip when this turn resolves an approval-deck
+          // submission. Deck-approved writes dispatch via
+          // buildMetaWriteWorkflowSteps().execute() in the controller, BEFORE this
+          // function (and its `toolCalls` ledger) ever runs — so a turn that
+          // narrates "all 6 creatives created" off the already-verified
+          // `[Approval deck outcome: ...]` note this function was handed has a
+          // correctly non-empty claim against a `toolCalls` ledger that is
+          // legitimately empty, not a hallucination. Found live-driving: this
+          // guard fired a false "0 of 6 were actually produced" correction directly
+          // under a summary table of 6 real, verified creative IDs. The deck
+          // outcome note is itself a server-computed, per-item, already-verified
+          // record — strictly more precise than this heuristic ever is — so
+          // deferring to it here is correct, not just a suppression.
+          //
+          // ENG-2076: ALSO gated on `assetProducingToolsInPlay` — this guard only
+          // understands image/video/HTML-template generation tools, so a turn that
+          // never called one of them (e.g. a Meta Ads turn built entirely on
+          // `call_meta_marketing_api`, or ANY turn that merely RECAPPED an earlier
+          // turn's true results with no new tool calls of its own) is outside its
+          // domain: `actual` is computed from THIS turn's ledger only, so running
+          // the check anyway always reads "0 of N produced" and appends a false
+          // correction — exactly what derailed a live Meta Ads session right before
+          // its publish-confirmation step. Deliberately turn-scoped, not
+          // session-history-scoped — see the function's own doc comment for why a
+          // session-wide check reintroduces the same bug for any session that mixes
+          // media generation with a later, unrelated recap turn.
+          //
+          // Both narrowings are independent false-positive fixes for the SAME
+          // check, found in two separate reviews — combined with AND, not one
+          // replacing the other: either condition alone means this check must
+          // not run.
+          const turnResolvesApprovalDeck = messageContent.includes('[Approval deck outcome:');
+          if (falseClaimGuardEnabled && content && assetProducingToolsInPlay(toolCalls) && !turnResolvesApprovalDeck) {
             const falseClaim = detectFalseCompletionClaim(content, toolCalls);
             if (falseClaim) {
               console.warn(
@@ -3967,14 +4820,74 @@ export class AgentModeService {
             }
           }
 
+          /*
+           * A capability the skill gate refused, and which never afterwards succeeded, is
+           * stated ABOVE the answer — unconditionally, not gated on detecting a false claim.
+           *
+           * The false-claim guard above already existed when a live delegated session produced
+           * a fabricated "UTM Tagging Audit Summary — PASS, 6/6 ads tagged" table after
+           * `audit_ad_utm_coverage` was gated and `install_skills` was refused by subscription.
+           * It caught that one only because the claim carried a checkable number, and it put the
+           * correction BELOW the fabricated table. Both are why this is prepended and why it
+           * does not try to decide whether the prose claims the tool ran: that a tool was
+           * refused and never succeeded is a fact in the ledger, so this cannot false-positive.
+           */
+          if (unavailableCapabilityNoticeEnabled && content) {
+            const unavailableNotice = buildUnavailableCapabilityNotice(toolCalls);
+            if (unavailableNotice) {
+              console.warn(
+                `AgentMode: a gated tool never succeeded in session ${sessionId} — prepending an ` +
+                `unavailable-capability notice so the answer cannot read as that tool's output`
+              );
+              content = `${unavailableNotice}\n\n${content}`;
+              if (responseMessage) responseMessage.content = content;
+            }
+          }
+
+          /*
+           * ENG-1899: same shape as the unavailable-capability notice directly above — UNCONDITIONAL
+           * on `coding_agent`'s own deterministic acceptance-check result, not on detecting a false
+           * claim in the prose, and PREPENDED so the true state is seen before the model's own
+           * possibly-false claim rather than after it. Own kill switch per this block's convention:
+           * a false positive here prepends a scary banner to an otherwise-correct answer, so standing
+           * it down must be a config change, not a revert-and-redeploy.
+           *
+           * `content` is passed through as `currentContent` so a turn that echoes an EARLIER turn's
+           * already-decorated response from conversation history (live env1 finding: two consecutive
+           * failed coding_agent calls in one session — the original incident's own shape — can produce
+           * exactly this) does not get a second, duplicated banner prepended on top.
+           */
+          const codingAgentAcceptanceNoticeEnabled =
+            process.env.AGENT_CODING_AGENT_ACCEPTANCE_NOTICE !== 'false';
+          if (codingAgentAcceptanceNoticeEnabled && content) {
+            const acceptanceNotice = buildAcceptanceFailureNotice(toolCalls, content);
+            if (acceptanceNotice) {
+              console.warn(
+                `AgentMode: coding_agent's acceptance check failed in session ${sessionId} — ` +
+                `prepending a verification notice so the answer cannot read as a passed check`
+              );
+              content = `${acceptanceNotice}\n\n${content}`;
+              if (responseMessage) responseMessage.content = content;
+            }
+          }
+
+
           if (requireWorkPlanDisposition) {
             const latestSession = await chatbotDb.getChatSession(sessionId, true);
+            // ENG-828: the pending step's own required tool retried once (per the
+            // "Retrying a Transient Failure" carve-out) and failed both times — a
+            // legitimate exhausted-retry outcome, not a malformed turn. Without this,
+            // it falls through to `invalid` below and the generic "couldn't create
+            // the decision card" fallback overwrites the model's own honest
+            // explanation (reproduced live testing this ticket's fix).
+            const pendingStep = findWorkPlanStepByCount(latestSession, workPlanTurnBefore.pendingStepCount);
             workPlanTurnDisposition = decideWorkPlanTurnDisposition({
               before: workPlanTurnBefore,
               after: snapshotWorkPlanTurn(latestSession),
               failed: finishReason === 'content_filter'
                 || stopReason === 'guardrail_intervened'
-                || stopReason === 'content_filtered',
+                || stopReason === 'content_filtered'
+                || hadExhaustedTransientStepFailure(toolCalls, pendingStep?.requiredFunctionCalls),
             });
 
             if (workPlanTurnDisposition.kind === 'invalid') {
@@ -4036,7 +4949,13 @@ export class AgentModeService {
               .filter((m: any) => typeof m.content === 'string')
               .slice(-6);
             try {
-              const suggestions = await this.generateSuggestedReplies(content, recentMsgs);
+              // ENG-1858: reuse the loop's resolved billing subject.
+              const suggestions = await this.generateSuggestedReplies(content, recentMsgs, {
+                userId,
+                billingUserId,
+                sessionId,
+                feature: meteringFeature('suggested_replies', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)),
+              });
               if (suggestions && suggestions.length > 0) {
                 // Stamp into the last assistant responseMessage's metadata so it persists
                 // in DynamoDB and survives page refresh. The message index in the persisted
@@ -4075,6 +4994,11 @@ export class AgentModeService {
           });
         }
 
+        // ENG-2121: wall-clock time this iteration spends dispatching tools — fed back
+        // into the time-budget check above (as longestToolDispatchMsThisRun) so a slow
+        // non-media tool (e.g. a heavy knowledge-base read) grows the synthesis reserve
+        // the same way a slow LLM call already does.
+        const toolDispatchStart = Date.now();
         // Tool-dispatch boundary (core seam): validate/prepare tool calls,
         // decide parallel-vs-sequential, execute through the gateway, classify
         // tool-result errors, process results (screenshot S3, minimal-result, CRM
@@ -4096,6 +5020,7 @@ export class AgentModeService {
           isDelegatedAccess,
           hasAdminAccess,
           isInteractiveShare,
+          isUnattendedRun,
           adminSkillToolNames: ADMIN_SKILL_TOOL_NAMES,
           excludeTools,
           publishedSkillsCount: publishedSkills.length,
@@ -4110,6 +5035,7 @@ export class AgentModeService {
           longestMediaCallMsThisRun,
           priorMediaCallKeys: mediaCallKeysThisRun,
           approvedRevisionImageSources,
+          priorSearchCallCount: searchCallCountThisRun,
           ports: {
             evaluateAgentToolPolicy,
             validateAndRepairToolArgs,
@@ -4129,7 +5055,7 @@ export class AgentModeService {
               recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any, {
                 mediaAssetsProducedThisRun,
                 mediaGenerationDeadlineMs,
-              }),
+              }, userId),
             recordDuplicateSuppression: (entries) =>
               recordAgentModeDuplicateSuppression(agentRuntimeRunId, sessionId, iteration, entries),
             extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
@@ -4142,6 +5068,10 @@ export class AgentModeService {
             socketEmit,
           },
         });
+        const toolDispatchDurationMs = Date.now() - toolDispatchStart;
+        if (toolDispatchDurationMs > longestToolDispatchMsThisRun) {
+          longestToolDispatchMsThisRun = toolDispatchDurationMs;
+        }
         const { pendingCounterUpdates, failedCounterUpdates } = dispatchResult;
         if (dispatchResult.skillsUpdated) {
           skillsUpdated = true;
@@ -4149,6 +5079,9 @@ export class AgentModeService {
         // Carry the running per-run media-asset total forward so the next iteration's
         // budget decision knows whether this run has already produced ≥1 asset.
         mediaAssetsProducedThisRun += dispatchResult.mediaAssetsProduced;
+        // ENG-426: carry the run-wide search-call count forward so the next iteration's
+        // budget check sees calls made earlier THIS turn, on top of prior-turn history.
+        searchCallCountThisRun += dispatchResult.searchCallsThisIteration;
         // ENG-510: carry the run-wide longest media-call latency forward so the next
         // iteration's adaptive hard-cap reserve uses real observed durations.
         longestMediaCallMsThisRun = Math.max(longestMediaCallMsThisRun, dispatchResult.longestMediaCallMs ?? 0);
@@ -4196,18 +5129,195 @@ export class AgentModeService {
           }
         }
 
+        // ENG-738: track research/lookup requests that timed out this iteration (and
+        // clear any earlier open entry a now-successful call just resolved) so a later
+        // turn doesn't silently drop — or misremember — a request the user is still owed.
+        {
+          const { additions, resolvedTools } = AgentModeService.detectOpenResearchRequestChanges(
+            toolCalls.slice(toolCallsLengthBeforeIteration)
+          );
+          if (additions.length > 0 || resolvedTools.length > 0) {
+            try {
+              await chatbotDb.recordOpenResearchRequests(sessionId, additions, resolvedTools);
+            } catch (openRequestError) {
+              console.error('AgentMode: Failed to update open research requests:', openRequestError);
+            }
+          }
+        }
+
         // Human-in-the-loop confirmation gate: if a tool in this iteration requested
         // explicit user confirmation (e.g. a Meta Ads publish/change/delete), STOP the
         // autonomous loop and hand control back to the user. The model CANNOT self-approve
-        // — only a new user message restarts the turn, after which it re-calls the tool
-        // with confirm=true. This is the safety net for the wrong-campaign / wrong-asset
-        // class of mistake: the user sees the resolved target and must approve it.
+        // — a Meta write specifically is only ever executed once the user answers an
+        // approval deck directly in the UI (ENG-1635/1644); the model re-calling the tool
+        // with confirm=true does nothing on its own (see buildMetaWriteApprovalDeck /
+        // callMetaMarketingApi's gate). This is the safety net for the wrong-campaign /
+        // wrong-asset class of mistake: the user sees the resolved target and must
+        // approve it.
         // Post-refactor (core/toolDispatch), this iteration's results live on the
         // toolCalls ledger (each entry carries .result = the minimal result, which
         // preserves awaitingUserConfirmation). Re-shape the new slice for the seam.
         const iterationResults = toolCalls
           .slice(toolCallsLengthBeforeIteration)
           .map((tc: any) => ({ status: tc.error ? 'error' as const : 'success' as const, result: tc.result }));
+        // ENG-1635/1644 gap 5 (Round-3 consequence #1) + Phase 2 v3: when this
+        // iteration halted on ANY Meta write(s) and/or present_question_deck
+        // call(s), wrap them in ONE approval deck instead of the plain text
+        // batch below. Partition first — both deck kinds share the SAME
+        // persist-and-tag seam below (parameterized by which deck got built);
+        // only `otherHalts` (a genuinely unsupported/future halt shape) bails
+        // to the old plain-text path, preserving today's safety net exactly.
+        // Priority within this iteration, deterministic, not a race:
+        //   1. any otherHalts present -> bail entirely (unchanged behavior).
+        //   2. writeHalts present -> build the WRITE deck; writes always win a
+        //      mixed turn (security-critical: a write must never dead-loop
+        //      behind a lower-stakes planning question) — any questionDeckHalts
+        //      in this SAME iteration are dropped from this deck, stashed on
+        //      it as droppedQuestionDeckPayload so the re-ask directive
+        //      reaches Emma once this write-deck is answered or cancelled
+        //      (never through userMessage — same round-6 fix as the outcome
+        //      note).
+        //   3. else questionDeckHalts present -> build the QUESTION deck.
+        const { writeHalts, questionDeckHalts, otherHalts } = this.partitionApprovalHalts(iterationResults);
+
+        // ENG-1635/1644 follow-up: retry-backstop TRANSPARENCY, checked before
+        // building a fresh deck for a write. Found live: a write that fails
+        // Meta-side validation got silently re-proposed identically, turn after
+        // turn, with zero explanation — the model's own in-turn anti-loop
+        // detector (below, in this same function) never caught it because each
+        // retry is only ONE iteration per turn (one halt, one break) — there's
+        // never two identical signatures WITHIN one turn to trip that detector.
+        //
+        // Deliberately NOT a hard block. An earlier version of this fix
+        // intercepted and replaced the turn with a stop message once a target
+        // had failed twice — but that blocks dispatch based on TARGET identity
+        // alone (entity+action+campaign/ad-set), not on whether anything
+        // actually changed. A genuinely corrected 3rd attempt (a real, different,
+        // would-succeed budget) would have been silently blocked too, never even
+        // shown to the user — trading one failure mode (silent identical retry)
+        // for another (silently refusing a good attempt). Caught live re-verifying
+        // this exact fix (Manan: "make sure being overly cautious... does not
+        // impact quality or behavior negatively anywhere").
+        //
+        // Instead: annotate the approval card itself with the failure history —
+        // this is a CODE-level guarantee the user sees the context (never
+        // dependent on Emma choosing to mention it in her own prose), while
+        // NEVER preventing a real attempt from being shown and approved. If the
+        // user approves again knowing this history, that's an informed choice,
+        // not a silent loop — and if it fails again, the next card carries the
+        // same warning, so nothing is ever hidden.
+        if (writeHalts.length > 0 && sessionId) {
+          const sessionForBackstop = await chatbotDb.getChatSession(sessionId);
+          const priorFailure = sessionForBackstop?.lastFailedMetaWrite;
+          if (priorFailure && priorFailure.count >= META_WRITE_RETRY_BACKSTOP_THRESHOLD) {
+            for (const h of writeHalts as any[]) {
+              const dispatch = h?.metaWriteDispatch;
+              if (!dispatch || this.computeMetaWriteTargetSignature(dispatch) !== priorFailure.signature) continue;
+              const warning =
+                `⚠️ This exact target has already failed ${priorFailure.count} time(s) in a row with: ` +
+                `"${priorFailure.error}" — review before approving again.\n\n`;
+              if (typeof h.confirmationDetail === 'string') h.confirmationDetail = warning + h.confirmationDetail;
+              if (typeof h.confirmationPrompt === 'string') h.confirmationPrompt = warning + h.confirmationPrompt;
+              if (typeof h.summary === 'string') h.summary = warning + h.summary;
+            }
+          }
+        }
+
+        // ENG-1853: the real fix for 1635/1644's gap. A PendingApprovalDeck
+        // only ever renders through a connected chat UI — a genuinely
+        // unattended (scheduled/test) run has no live user to show one to,
+        // which is exactly why Haven/Every's real writes could never
+        // actually get staged for review before this. Stage each halted
+        // write from this iteration as a durable approval-inbox decision
+        // instead, all sharing one manifestId — the packet those real
+        // fixtures need (Haven's 5 calls, Every's 7), reviewed and dispatched
+        // together via the Approval Desk rather than one at a time. A live,
+        // attended run (isUnattendedRun false/undefined) falls through to
+        // the existing deck path below completely unaffected.
+        if (isUnattendedRun === true && writeHalts.length > 0 && sessionId) {
+          const staged = await this.stageApprovalInboxMetaWriteManifest(sessionId, writeHalts as any[]);
+          if (staged) {
+            content = staged.turnMessage;
+            (messages as any[]).push({
+              role: 'assistant',
+              content: staged.turnMessage,
+              llm: llmModel,
+              metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true, approvalInboxManifestId: staged.manifestId },
+            });
+            if (onProgress) {
+              runEmitter.emitLegacy({ iteration, status: 'complete', toolCalls: toolCalls.slice() });
+            }
+            break;
+          }
+          // staged === null: the durable write failed — fall through to the
+          // live deck path below as a safety net rather than silently
+          // dropping the halt (matches every other fallback contract in this
+          // seam). Nobody is watching this session live either way, but a
+          // deck at least leaves a durable, re-visitable record in the
+          // session's own message history instead of losing the halt
+          // entirely.
+        }
+
+        const approvalDeck: PendingApprovalDeck | null =
+          sessionId && otherHalts.length === 0
+            ? this.buildApprovalDeckForIteration(writeHalts, questionDeckHalts)
+            : null;
+        if (approvalDeck) {
+          // Found by fresh-mind review: resumeStuckApprovalDeckWorkflowRun's
+          // message-history fallback (see its own header) can only ever find
+          // a reply message for a deck whose run already reached 'completed'
+          // — a run stuck mid-crash never gets one, so that fallback can
+          // never actually fire for the exact case it exists for. THIS is
+          // the real fix: this is the one place a new deck is about to
+          // overwrite session.pendingApprovalDeck — if an older deck is
+          // still sitting there, still fully answered, with its workflow
+          // run stuck 'in_progress' from a prior crash, this is the LAST
+          // moment its items/answers are durably available anywhere. Resume
+          // it here, before the overwrite, not after.
+          const sessionForResume = await chatbotDb.getChatSession(sessionId as string);
+          if (sessionForResume) await this.resumeStuckApprovalDeckWorkflowRun(sessionId as string, sessionForResume);
+
+          const posted = await chatbotDb.updateSessionApprovalDeck(sessionId as string, approvalDeck, {
+            failIfAwaitingExists: true,
+          });
+          if (posted) {
+            pendingApprovalDeck = approvalDeck;
+            const deckPrompt = renderApprovalDeckPrompt(approvalDeck);
+            content = deckPrompt;
+            (messages as any[]).push({
+              role: 'assistant',
+              content: deckPrompt,
+              llm: llmModel,
+              // ENG-1635/1644 Phase B: no tool-call result carries the deck's data (unlike
+              // ask_user_question, this halt is pushed as plain content) — this is the only
+              // correlator the frontend has to know THIS message should render the
+              // interactive ApprovalDeckCard instead of (or over) the plain-text prompt.
+              // Matched against session.pendingApprovalDeck.deckId, same "current slot"
+              // check the ask_user_question card already does for its own questionId.
+              // Applies identically regardless of which deck kind this is (Phase 2) —
+              // the frontend only ever branches on pendingApprovalDeckId matching, never
+              // on deck contents.
+              //
+              // approvalDeckItems: the full structured items array, stamped here so this
+              // message is self-contained for rendering once it's no longer the session's
+              // live slot (a later deck overwrites session.pendingApprovalDeck entirely —
+              // without its own copy, THIS message would have no way to reconstruct its
+              // card and would fall back to plain text forever, even after being answered).
+              // Mirrors ask_user_question's toolCall.result carrying its own question/options.
+              metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true, pendingApprovalDeckId: approvalDeck.deckId, approvalDeckItems: approvalDeck.items }
+            });
+            if (onProgress) {
+              runEmitter.emitLegacy({ iteration, status: 'complete', toolCalls: toolCalls.slice() });
+            }
+            break;
+          }
+          // posted === null: lost the one-live-slot race (something else in this
+          // session claimed the slot between the deck build and this write) — fall
+          // through to the plain per-item prompt below rather than silently dropping
+          // the halt or retrying, exactly like collectConfirmationPrompt already would
+          // have handled these same items.
+        }
+
         const confirmationPrompt = this.collectConfirmationPrompt(iterationResults);
         if (confirmationPrompt) {
           content = confirmationPrompt;
@@ -4331,14 +5441,30 @@ export class AgentModeService {
           const guardOutcome = await runFinalizeGuard({
             finalText: content,
             ledger: finalizeLedger,
+            // Shadow never makes the corrective turn: its text would be discarded.
+            detectOnly: finalizeGuardMode === 'shadow',
             ports: {
+              // ENG-1858: enforce mode is attributed to this run's user/billing subject.
+              // Shadow mode is our own measurement, so it is system spend (no userId).
               judgeExtractClaims: (text, candidateClasses) =>
-                this.judgeFinalizeClaims(text, candidateClasses),
+                this.judgeFinalizeClaims(text, candidateClasses, finalizeGuardMode === 'shadow'
+                  ? { sessionId, feature: 'finalize_guard_shadow_judge' }
+                  : {
+                    userId,
+                    billingUserId,
+                    sessionId,
+                    feature: meteringFeature('finalize_guard_judge', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)),
+                  }),
               requestCorrection: ({ finalText, systemNote }) =>
-                this.requestFinalizeCorrection(finalText, systemNote, llmModel),
+                this.requestFinalizeCorrection(finalText, systemNote, llmModel, {
+                  userId,
+                  billingUserId,
+                  sessionId,
+                  feature: meteringFeature('finalize_guard_correction', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)),
+                }),
               toolResultError,
               mediaGenProducedAsset,
-              recordClaimCheckError: (err) => recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, err),
+              recordClaimCheckError: (err) => recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, err, userId),
             },
           });
           finalizeClaimMismatch = guardOutcome.claimMismatch;
@@ -4351,40 +5477,38 @@ export class AgentModeService {
               ambiguousClaimClasses: guardOutcome.ambiguousClaimClasses,
             });
           }
-          if (guardOutcome.finalText !== content) {
-            if (finalizeGuardMode === 'shadow') {
-              // Shadow mode: log what WOULD have changed, but the user-visible
-              // message and the persisted transcript are left untouched.
-              console.warn(`AgentMode: finalize guard SHADOW ${guardOutcome.action} in session ${sessionId} (message NOT modified)`, {
-                claimClasses: guardOutcome.mismatchedClaimClasses,
-              });
-            } else {
-              console.warn(`AgentMode: finalize guard ${guardOutcome.action} in session ${sessionId}`, {
-                claimClasses: guardOutcome.mismatchedClaimClasses,
-              });
-              content = guardOutcome.finalText;
-              // Keep the persisted transcript consistent with what the user sees:
-              // correct the LAST assistant message in place (same message count) and
-              // stamp guard metadata so the correction is auditable in the session.
-              for (let i = messages.length - 1; i >= 0; i--) {
-                if ((messages[i] as any).role === 'assistant') {
-                  (messages[i] as any).content = content;
-                  (messages[i] as any).metadata = {
-                    ...(messages[i] as any).metadata,
-                    finalizeGuard: {
-                      action: guardOutcome.action,
-                      claimClasses: guardOutcome.mismatchedClaimClasses,
-                    },
-                  };
-                  break;
-                }
+          if (guardOutcome.action === 'detected_mismatch') {
+            // Shadow mode: report the mismatch; the user-visible message and the
+            // persisted transcript are left untouched.
+            console.warn(`AgentMode: finalize guard SHADOW ${guardOutcome.action} in session ${sessionId} (message NOT modified)`, {
+              claimClasses: guardOutcome.mismatchedClaimClasses,
+            });
+          } else if (guardOutcome.finalText !== content) {
+            console.warn(`AgentMode: finalize guard ${guardOutcome.action} in session ${sessionId}`, {
+              claimClasses: guardOutcome.mismatchedClaimClasses,
+            });
+            content = guardOutcome.finalText;
+            // Keep the persisted transcript consistent with what the user sees:
+            // correct the LAST assistant message in place (same message count) and
+            // stamp guard metadata so the correction is auditable in the session.
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if ((messages[i] as any).role === 'assistant') {
+                (messages[i] as any).content = content;
+                (messages[i] as any).metadata = {
+                  ...(messages[i] as any).metadata,
+                  finalizeGuard: {
+                    action: guardOutcome.action,
+                    claimClasses: guardOutcome.mismatchedClaimClasses,
+                  },
+                };
+                break;
               }
             }
           }
         } catch (guardError) {
           // Guard is advisory — a guard bug must never block delivery. Loud, not
           // silent: recorded as claim_check_error (same contract as judge failure).
-          recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, guardError);
+          recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, guardError, userId);
         }
       }
 
@@ -4464,6 +5588,87 @@ export class AgentModeService {
         }
       }
 
+      // ENG-1205 AC3: the NAMED half of the same silence. ENG-1565 (below) fires
+      // on "reassess using a new model"; it deliberately does not fire on a
+      // message that names the model it wants, which is what the founders
+      // session actually contained ("Use Opus 5 model, and make sure you sort
+      // all of the 107 leads...", session d5898ffd, 2026-08-14). That request
+      // and the nine turns after it were answered with nothing.
+      //
+      // Runs BEFORE the generic acknowledgement and suppresses it on a hit: a
+      // message can trip both detectors ("switch to a different model, use Opus
+      // 5"), and two stacked notes saying the same thing is worse than one that
+      // names the model. The specific note is strictly more informative.
+      //
+      // `isAdmin` is the session owner's, already resolved above for the system
+      // prompt — so the entitlement branch of the copy costs no extra read.
+      //
+      // Kill switch: set AGENT_MODEL_MENTION_ACK=false to disable. Absent means ON.
+      let modelAckAppended = false;
+      if (content && !wasCancelled && !mockMode
+          && process.env.AGENT_MODEL_MENTION_ACK !== 'false') {
+        try {
+          const reconciled = reconcileModelMentionAck(
+            content,
+            messageContent,
+            llmModel,
+            this.getModelMentionIndex(),
+            (modelId) => this.isModelSelectableBy(modelId, isAdmin),
+          );
+          if (reconciled !== content) {
+            content = reconciled;
+            modelAckAppended = true;
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if ((messages[i] as any).role === 'assistant') {
+                (messages[i] as any).content = content;
+                break;
+              }
+            }
+          }
+        } catch (modelMentionError) {
+          // Advisory, same reasoning as the reconcilers around it: never block
+          // delivery of a reply the user is waiting on over this note.
+          console.warn('AgentMode: model-mention acknowledgement failed', modelMentionError);
+        }
+      }
+
+      // ENG-1565: model resolution reads ONLY the request's llmModel field (the
+      // picker) — no code path parses chat text for an intent to switch/reassess
+      // models. So a message like "reassess using a new model" is inert by
+      // construction, and previously ran on the same model with no acknowledgement
+      // that nothing changed (production evidence: session
+      // e6c9e693-ff33-4883-a18a-9d674b4074c4, audited on ENG-426).
+      //
+      // Same shape as the reconcilers above: deterministic, append-only, patched
+      // into the last assistant message. `llmModel` here is already the model
+      // resolved for THIS turn; `findLastAssistantModel(sessionHistory)` is the
+      // model that generated the turn before it — comparing the two (rather than
+      // assuming chat text can never change the model) correctly stays silent if
+      // the picker was ALSO flipped in this same request, which really would
+      // change the model despite the chat text.
+      //
+      // Kill switch: set AGENT_MODEL_REASSESS_ACK=false to disable. Absent means ON.
+      if (content && !wasCancelled && !mockMode && !modelAckAppended
+          && process.env.AGENT_MODEL_REASSESS_ACK !== 'false') {
+        try {
+          const modelBefore = findLastAssistantModel(sessionHistory as any);
+          const reconciled = reconcileModelReassessAck(content, messageContent, modelBefore, llmModel);
+          if (reconciled !== content) {
+            content = reconciled;
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if ((messages[i] as any).role === 'assistant') {
+                (messages[i] as any).content = content;
+                break;
+              }
+            }
+          }
+        } catch (modelReassessError) {
+          // Advisory, same reasoning as the cursor notice above: never block
+          // delivery of a reply the user is waiting on over this note.
+          console.warn('AgentMode: model-reassess acknowledgement failed', modelReassessError);
+        }
+      }
+
       // Attach timing metadata, memory usage, and tool calls to the last assistant message
       if (messages.length > 0) {
         const lastAssistantIdx = messages.length - 1 - [...messages].reverse().findIndex((m: any) => m.role === 'assistant');
@@ -4515,7 +5720,7 @@ export class AgentModeService {
         // ENG-143: an unresolved claim mismatch grades the run degraded
         // (claim_mismatch verdict reason) so the 17:30 UTC cluster cron sees it.
         ...(finalizeClaimMismatch ? { claimMismatch: true } : {}),
-      });
+      }, userId);
       // ENG-102: drain telemetry before the worker reports success to the parent
       // process (fire-and-forget would race with IPC teardown — same treatment
       // the suggested-replies tail work already gets). Bounded, so never hangs.
@@ -4534,7 +5739,8 @@ export class AgentModeService {
         // ENG-907: the wall-clock counterpart — the turn delivered a partial answer
         // because it ran out of time, so a scheduled run must continue it.
         ...(truncatedByTimeBudget ? { truncatedByTimeBudget: true } : {}),
-        ...(workPlanTurnDisposition ? { workPlanTurnDisposition } : {})
+        ...(workPlanTurnDisposition ? { workPlanTurnDisposition } : {}),
+        ...(pendingApprovalDeck ? { pendingApprovalDeck } : {})
       };
     } catch (error: any) {
       // Log with full detail so Bedrock validation errors (e.g. "Input is too long") are visible
@@ -4551,8 +5757,15 @@ export class AgentModeService {
 
       // Determine user-friendly message based on error type
       let userMessage: string;
+      // ENG-2121: the openai/OpenRouter client's own APIConnectionTimeoutError (what
+      // callLLM's `timeoutMs` bound actually throws) carries name "Error" and no `.code`
+      // — none of the checks below ever matched it, so a genuine LLM-call timeout fell
+      // through to the generic "I encountered an error" message instead of this timeout-
+      // specific one. classifyToolErrorClass also matches on message text (e.g. "Request
+      // timed out.", the exact string that class uses) as a fallback for exactly this case.
       const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError' || error?.name === 'ModelTimeoutException'
-        || (typeof error?.code === 'string' && ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ECONNABORTED'].includes(error.code));
+        || (typeof error?.code === 'string' && ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ECONNABORTED'].includes(error.code))
+        || classifyToolErrorClass(error) === 'timeout';
       // Bedrock errors surface httpStatusCode via $metadata rather than a top-level status field
       const httpStatus = error?.status ?? error?.$metadata?.httpStatusCode;
       // Check for context-limit patterns in the raw error message before falling through to generic 400
@@ -4590,6 +5803,23 @@ export class AgentModeService {
       wrappedError.originalMessage = error?.message || String(error);
       if (error?.status) wrappedError.status = error.status;
       if (error?.code) wrappedError.code = error.code;
+      // ENG-2121: the loop's per-call time-budget bound tags a genuine timeout with
+      // this flag so the controller's whole-turn timeout backstop (which salvages any
+      // images/tool work already persisted this turn) treats it the same as its own
+      // hard-cap race firing. Without forwarding it here, this wrap would silently
+      // drop the tag and every such turn would fall straight to the generic
+      // diagnosis-agent fallback regardless of what was actually salvageable.
+      if (error?.isGenerationTimeout) wrappedError.isGenerationTimeout = true;
+      // ENG-1670: whether the provider actually sent a Retry-After header is not
+      // guaranteed (OpenRouter's own docs: conditional, not promised even for a
+      // single-provider model). Rather than that staying an unanswerable question
+      // every time this fires, persist the answer for THIS occurrence — the last
+      // investigation into this exact failure class had no way to tell, because
+      // nothing captured it and the raw provider response doesn't survive past
+      // this catch block otherwise.
+      wrappedError.retryAfterHeaderPresent = Boolean((error as any)?.headers?.['retry-after'] || (error as any)?.headers?.['retry-after-ms']);
+      const retryAfterMs = getRetryAfterMs(error);
+      if (retryAfterMs !== undefined) wrappedError.retryAfterMs = retryAfterMs;
       if (partialResponseMessages.length > 0) {
         wrappedError.partialUsageMessages = partialResponseMessages;
       }
@@ -4601,7 +5831,7 @@ export class AgentModeService {
         maxSameToolFailures: maxSameToolFailureCount(_toolCallsForTelemetry),
         llmModel,
         modelAtStart: originalLlmModel,
-      });
+      }, userId);
       // ENG-102: drain telemetry before the error propagates / worker tears down.
       await flushAgentRunRecorderSafe();
       throw wrappedError;
@@ -4773,6 +6003,29 @@ export class AgentModeService {
   }
 
   /**
+   * ENG-1811: is this work plan ACTUALLY finished — every step terminal AND no
+   * outstanding debt from a removed step's required function call that never
+   * genuinely succeeded (workPlan.pendingRequiredFunctionCalls, resolved against real
+   * session.calledFunctions, not just "does anything remain marked pending").
+   *
+   * The debt ledger's only *enforcement* point is setWorkPlanStatusAttempt, which
+   * nothing calls once no steps remain pending — so every OTHER place in the codebase
+   * that infers "plan done" from `steps.every(completed|skipped)` alone can be fooled
+   * by deleting the last pending step(s) via modify_work_plan and never re-adding them.
+   * Use this helper (not a bare `.every(...)`) anywhere that inference feeds a
+   * user-facing "done" claim or gates a retry loop.
+   */
+  public static isWorkPlanFullyResolved(workPlan: any, calledFunctions?: Record<string, number>): boolean {
+    if (!workPlan || !Array.isArray(workPlan.steps)) return true;
+    const allStepsTerminal = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+    if (!allStepsTerminal) return false;
+    const rawCalledFunctionCounts = calledFunctions || {};
+    const unresolvedPendingDebt = (workPlan.pendingRequiredFunctionCalls || [])
+      .filter((fn: string) => (rawCalledFunctionCounts[fn] || 0) === 0);
+    return unresolvedPendingDebt.length === 0;
+  }
+
+  /**
    * Render a session work plan into LLM context message(s).
    *
    * Shared by agent mode (buildMarketingContext) and Emma (chatbotService.generateChatResponse)
@@ -4797,8 +6050,17 @@ export class AgentModeService {
    * stay byte-for-byte identical to current production behavior (header + step list +
    * the ORIGINAL autocomplete wording, nothing else). This keeps Emma's surface
    * unchanged while still fixing the agent-mode loop.
+   *
+   * `calledFunctions` (optional, session.calledFunctions) resolves ENG-1811 debt
+   * (`workPlan.pendingRequiredFunctionCalls`) against real call history. Without it, a
+   * caller that deletes the last pending step(s) via modify_work_plan (never re-adding
+   * them, never calling set_work_plan_status again) makes every step terminal while
+   * debt from the removed step was never satisfied — the ONLY enforcement point for
+   * that ledger is setWorkPlanStatusAttempt, which nothing here ever invokes again, so
+   * the "ALL STEPS ARE DONE" branch below would tell the model to stop and declare
+   * victory despite the outstanding requirement (found live via subagent review, PR #2808).
    */
-  public static buildWorkPlanContextMessages(workPlan?: any, generatedImageFilenames?: string[], includeResumeGuidance: boolean = true): any[] {
+  public static buildWorkPlanContextMessages(workPlan?: any, generatedImageFilenames?: string[], includeResumeGuidance: boolean = true, calledFunctions?: Record<string, number>): any[] {
     if (!workPlan || !Array.isArray(workPlan.steps) || workPlan.steps.length === 0) {
       return [];
     }
@@ -4810,10 +6072,22 @@ export class AgentModeService {
     };
 
     // Check if all steps are terminal (completed or skipped) — no pending work remains
-    const allStepsDone = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+    const allStepsTerminal = workPlan.steps.every((s: any) => s.status === 'completed' || s.status === 'skipped');
+    const rawCalledFunctionCounts = calledFunctions || {};
+    const unresolvedPendingDebt: string[] = (workPlan.pendingRequiredFunctionCalls || [])
+      .filter((fn: string) => (rawCalledFunctionCounts[fn] || 0) === 0);
+    const allStepsDone = allStepsTerminal && unresolvedPendingDebt.length === 0;
 
     let workPlanContent = `⚠️ IMPORTANT: A WORK PLAN ALREADY EXISTS FOR THIS SESSION ⚠️\n\n`;
     workPlanContent += `[Current Active Work Plan: "${workPlan.title}"]\n\n`;
+
+    if (allStepsTerminal && unresolvedPendingDebt.length > 0) {
+      // Every step looks terminal, but a step that got removed via modify_work_plan
+      // required a function call that never actually succeeded (ENG-1811 debt ledger).
+      // Do NOT tell the model the plan is done — that would silently launder the debt.
+      workPlanContent += `❌ This plan is NOT actually finished: ${unresolvedPendingDebt.join(', ')} ${unresolvedPendingDebt.length === 1 ? 'was' : 'were'} required by a step that got removed, but never actually succeeded. Call it for real, or use modify_work_plan to add back a step that genuinely does this work, before treating this plan as complete or reporting it to the user as done.`;
+      return [{ role: 'user', content: `[SYSTEM] ${workPlanContent.trim()}` }];
+    }
 
     if (allStepsDone) {
       // When all steps are done, skip listing step details to avoid the LLM trying to "finish" them.
@@ -4935,15 +6209,163 @@ export class AgentModeService {
         workPlanContent += `   Required assets: ${step.expectedAssetCount} (this step cannot be completed until ${step.expectedAssetCount} images/assets have actually been generated this session)\n`;
       }
 
-      // Include skill IDs if available (for awareness)
+      // Include skill IDs if available (for awareness). ENG-1697: this used to
+      // unconditionally claim "(auto-installed when this step becomes active)",
+      // but that's only true for a predefined-template launch (which installs
+      // the union of all step skills upfront) — an ad-hoc plan's first step, or
+      // any step that becomes active because an earlier step was SKIPPED rather
+      // than completed, never goes through that upfront install. Deliberately
+      // NOT telling the model to proactively call install_skills here: toolDispatch's
+      // gate (search "is not available. You must install the required skill
+      // first") already catches any tool call gated on a missing skill and
+      // instructs recovery at that exact point, reactively and only when truly
+      // needed — restating it here would just invite redundant defensive
+      // install_skills calls on the already-working template-launch path where
+      // skills are already installed. Just drop the false claim.
       if (step.skillIds && step.skillIds.length > 0) {
-        workPlanContent += `   Skills (auto-installed when this step becomes active): ${step.skillIds.join(', ')}\n`;
+        workPlanContent += `   Skills for this step: ${step.skillIds.join(', ')}\n`;
       }
 
       workPlanContent += '\n';
     });
 
     return [{ role: 'assistant', content: workPlanContent.trim() }];
+  }
+
+  // ENG-738: how long an open research request keeps being surfaced as a reminder
+  // before it silently ages out. Bounds the nag lifetime without needing a
+  // separate "dismiss" action — the primary incident session's user asked about
+  // the dropped request ~1h45m after the timeout, well inside this window.
+  private static readonly OPEN_RESEARCH_REQUEST_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+  /**
+   * From one iteration's tool-call entries, work out which RESEARCH_LOOKUP_TOOLS
+   * calls newly timed out (still owed to the user) and which succeeded (clearing
+   * any earlier open entry for that tool). Pure — no I/O — so this is fully
+   * covered by unit tests instead of only exercised through a live session.
+   *
+   * A call only counts as "resolved" on a genuine success — a soft failure
+   * (e.g. perform_deep_research's `{success:false}` after a timeout, ENG-738)
+   * must NOT clear the open entry it's reporting. A non-timeout failure
+   * (invalid args, service unavailable, …) is left alone
+   * entirely: it doesn't add a new open entry (retrying won't fix it, so it's
+   * not "still owed" in the same sense) and doesn't resolve an existing one
+   * (the underlying ask still isn't done).
+   */
+  private static detectOpenResearchRequestChanges(
+    toolCallEntries: Array<{ name: string; arguments?: any; error?: string; result?: any }>,
+    nowIso: string = new Date().toISOString(),
+  ): { additions: Array<{ tool: string; topic: string; failedAt: string; errorSummary: string }>; resolvedTools: string[] } {
+    const additions: Array<{ tool: string; topic: string; failedAt: string; errorSummary: string }> = [];
+    const resolvedTools: string[] = [];
+
+    for (const entry of toolCallEntries || []) {
+      if (!AgentModeService.RESEARCH_LOOKUP_TOOLS.has(entry.name)) continue;
+
+      const softFailure = Boolean(entry.result) && typeof entry.result === 'object' && entry.result.success === false;
+      const failed = Boolean(entry.error) || softFailure;
+
+      if (!failed) {
+        resolvedTools.push(entry.name);
+        continue;
+      }
+
+      const errorText = entry.error || (softFailure ? String(entry.result?.error || entry.result?.message || '') : '');
+      if (classifyToolErrorClass(errorText) === 'timeout') {
+        additions.push({
+          tool: entry.name,
+          topic: AgentModeService.summarizeResearchTopic(entry.arguments),
+          failedAt: nowIso,
+          errorSummary: errorText.slice(0, 200),
+        });
+      }
+    }
+
+    return { additions, resolvedTools };
+  }
+
+  /** Best-effort short human-readable topic from a research-lookup tool's call args. */
+  private static summarizeResearchTopic(args: any): string {
+    if (!args || typeof args !== 'object') return 'unspecified topic';
+    const candidate = args.topic || args.query || args.profile_url || args.q;
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim().slice(0, 150);
+    }
+    try {
+      const serialized = JSON.stringify(args);
+      return serialized && serialized !== '{}' ? serialized.slice(0, 150) : 'unspecified topic';
+    } catch {
+      return 'unspecified topic';
+    }
+  }
+
+  /**
+   * ENG-738: a research/lookup request that timed out and was never retried to
+   * success must not be silently dropped (or misremembered) once the
+   * conversation moves on to something else — this re-injects it as an
+   * authoritative reminder on later turns, the same way buildWorkPlanContextMessages
+   * keeps an active plan visible. Filtered by age so a session that lives for
+   * days doesn't nag about a request from a week ago forever (see
+   * OPEN_RESEARCH_REQUEST_MAX_AGE_MS) — persistence-layer capping (chatbotDb.
+   * recordOpenResearchRequests) additionally bounds the list size.
+   */
+  public static buildOpenResearchRequestReminder(
+    openResearchRequests: Array<{ tool: string; topic: string; failedAt: string; errorSummary: string }> | undefined,
+    nowMs: number = Date.now(),
+  ): any[] {
+    if (!Array.isArray(openResearchRequests) || openResearchRequests.length === 0) {
+      return [];
+    }
+
+    const recent = openResearchRequests.filter((r) => {
+      const failedAtMs = Date.parse(r.failedAt);
+      return Number.isFinite(failedAtMs) && nowMs - failedAtMs <= AgentModeService.OPEN_RESEARCH_REQUEST_MAX_AGE_MS;
+    });
+    if (recent.length === 0) {
+      return [];
+    }
+
+    let content = '⚠️ UNRESOLVED REQUEST(S) FROM EARLIER IN THIS SESSION:\n';
+    recent.forEach((r) => {
+      content += `- ${r.tool} on "${r.topic}" failed with a timeout at ${r.failedAt} and was never completed.\n`;
+    });
+    content += '\nDo NOT silently leave these dropped, and do NOT claim you never attempted them — the record above is authoritative, not your recollection of the conversation. At a natural point in this response (after handling what the user is asking now), either proactively retry the ones you have enough context to retry, or tell the user plainly that they are still outstanding and ask whether to continue now or later.';
+
+    return [{ role: 'assistant', content }];
+  }
+
+  /**
+   * ENG-1974. "Keep chatting" on a workplan recommendation card leaves no
+   * trace anywhere in the conversation — the recommendation's tool-call
+   * result just sits in session.messages as permanent context, so Emma has
+   * no signal the user declined, and any vaguely on-topic next message could
+   * get her to self-launch it via launch_predefined_work_plan (live-confirmed
+   * on env1, twice: neither an accept click nor a suggested reply, just an
+   * ordinary continuation). This states the real fact — a declined
+   * recommendation exists — directly in context, before Emma's own read of
+   * the conversation forms, same discipline as the ENG-1899 acceptance
+   * notice: a ledger fact stated unconditionally beats hoping the model
+   * infers it from an absence of signal.
+   *
+   * Returns [] when nothing has been declined this session, so a session
+   * that never hit this path carries zero extra tokens.
+   */
+  public static buildDeclinedWorkPlanRecommendationContextMessages(
+    declined?: Record<string, { planId: string; planTitle: string; declinedAt: string }>,
+  ): any[] {
+    const entries = declined ? Object.values(declined) : [];
+    if (entries.length === 0) return [];
+
+    const titles = entries.map((e) => `"${e.planTitle}"`).join(', ');
+    const plural = entries.length > 1;
+    const content =
+      `[SYSTEM] The user already declined the following recommended work plan${plural ? 's' : ''} by clicking ` +
+      `"Keep chatting" on ${plural ? 'their' : 'its'} recommendation card: ${titles}. Do not call ` +
+      `launch_predefined_work_plan for ${plural ? 'any of these plans' : 'this plan'} on the strength of an ` +
+      `ordinary, ambiguous, or on-topic message — treat the next message as a genuinely new request. Only launch ` +
+      `${plural ? 'one of them' : 'it'} if the user explicitly says they want to start ${plural ? 'that plan' : 'it'} now.`;
+
+    return [{ role: 'user', content }];
   }
 
   /**
@@ -5009,7 +6431,7 @@ export class AgentModeService {
     return text;
   }
 
-  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string): any[] {
+  private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string, calledFunctions?: Record<string, number>, declinedWorkPlanRecommendations?: Record<string, { planId: string; planTitle: string; declinedAt: string }>, openResearchRequests?: any[]): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
 
@@ -5167,7 +6589,7 @@ export class AgentModeService {
     // regenerate-from-scratch loop after a run timeout.
     if (workPlan) {
       const generatedImageFilenames = AgentModeService.extractGeneratedImageFilenames(sessionHistory);
-      messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan, generatedImageFilenames));
+      messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan, generatedImageFilenames, true, calledFunctions));
     } else {
       // ENG-510: even WITHOUT a work plan (plain multi-image requests — the reported
       // scenario), a run that timed out mid-batch leaves already-generated images in
@@ -5181,6 +6603,17 @@ export class AgentModeService {
         messages.push({ role: 'assistant', content: assetAwarenessText });
       }
     }
+
+    // ENG-1974: declined-recommendation notice is independent of whether an
+    // active work plan exists — a session can have declined one plan and
+    // still be mid-way through an unrelated one, or have declined a plan and
+    // have nothing active at all.
+    messages.push(...AgentModeService.buildDeclinedWorkPlanRecommendationContextMessages(declinedWorkPlanRecommendations));
+
+    // ENG-738: surface any research/lookup request that timed out earlier in this
+    // session and was never retried to success — independent of whether a work
+    // plan exists, since the incident this fixes was a plain conversational ask.
+    messages.push(...AgentModeService.buildOpenResearchRequestReminder(openResearchRequests));
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
     if (screenshotUrl) {
@@ -5241,6 +6674,13 @@ export class AgentModeService {
     'search_knowledge_base',
     'list_knowledge_base_files',
     'read_knowledge_base_files',
+    // Sibling of read_knowledge_base_files for images/video — same gate class as
+    // ENG-152/ENG-260 below: without this, materializing a KB image/video is
+    // invisible on any subscription tier whose allowedSkills doesn't unlock
+    // __other_skills__ (confirmed live: Gemini correctly named the tool, then
+    // reported it "not available on your subscription" because installing
+    // __other_skills__ itself was rejected).
+    'materialize_knowledge_base_asset',
     'you_search_web',         // Explicit You.com web search
     'you_search_news',        // Explicit You.com news search
 
@@ -5257,6 +6697,23 @@ export class AgentModeService {
     // so a user attaching a UI screenshot elsewhere got "describe_image not
     // available" and Emma had to ask them to type out what was on screen (ENG-260).
     'describe_image',
+
+    // PDF export — converts a previously generated HTML file to a PDF. Same
+    // ENG-152/ENG-260 class of bug: this is a basic, universally-useful utility
+    // (there is even a plain HTTP export-pdf endpoint alongside it), not a
+    // gated capability, but it was left in the __other_skills__ catch-all pool.
+    // That pool's membership depends on which OTHER skills happen to be
+    // installed for a given subscription tier, so a fully-entitled account
+    // could still have install_skills(["__other_skills__"]) refused with
+    // "these skills are currently unavailable to install" (ENG-1867).
+    'convert_to_pdf',
+
+    // User-authenticated Drive discovery and direct document reads are basic
+    // file-access primitives. Keep them out of the subscription-gated
+    // __other_skills__ catch-all so connected Drive accounts work without a
+    // skill install.
+    'google_drive',
+    'read_google_doc',
 
     // Work Plans (Emma's execution planning system)
     'create_work_plan',
@@ -5394,6 +6851,12 @@ export class AgentModeService {
     // happened to be on the `images` page — Emma returned "describe_image not
     // available" and had to ask the user to type out what was on screen (ENG-260).
     'describe_image',
+    // PDF export. Force-merged for the same reason as read_file_content/
+    // describe_image: the prod `foundation_tools` AW-Settings override omits
+    // DEFAULT-only additions, so without this convert_to_pdf falls back to
+    // the __other_skills__ catch-all pool and can be refused as "currently
+    // unavailable to install" even on a fully-entitled account (ENG-1867).
+    'convert_to_pdf',
     // Meeting Intelligence (Fathom). Force-merged because the prod
     // `foundation_tools` AW-Settings override predates these tools and omits
     // them — without force-merging, loadFoundationTools strips them in prod so
@@ -5419,6 +6882,19 @@ export class AgentModeService {
     // voluntarily. Restriction to Meta-only is prompt-level (tool description),
     // not code-enforced — see emma/tools.ts for the explicit scope language.
     'ask_user_question',
+    // ENG-1635/1644 Phase 2: registered here for the same reason
+    // ask_user_question is -- without this, subscription/skill filtering
+    // strips a new tool from most real sessions despite it working in every
+    // unit test (this exact class of bug already happened once, ENG-396/400).
+    // MANDATORY, not DEFAULT_FOUNDATION_TOOLS above -- that's a weaker
+    // fallback-only list; this one is force-merged unconditionally, "so no
+    // config can strip them", regardless of any DB override.
+    'present_question_deck',
+    // ENG-1644 Phase B: same reason as present_question_deck immediately
+    // above — without MANDATORY registration, subscription/skill filtering
+    // would strip a durable-decision tool from most real sessions despite
+    // every unit test passing.
+    'stage_pending_decision',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -5446,9 +6922,14 @@ export class AgentModeService {
    * Excludes foundation tools and admin-only tools.
    */
   private getUnassociatedTools(publishedSkills: any[]): { name: string; description: string }[] {
-    // Collect all tool names used by any published skill
+    // Collect all tool names used by any published skill. Callers (e.g.
+    // loadAuthorizedSkillCatalog) pass a catalog that also mixes in unpublished
+    // private/org-shared skills for install purposes — those must NOT count here,
+    // or a single draft skill nobody published can silently steal a tool out of
+    // the shared __other_skills__ bundle for an entire org (ENG-1237).
     const associatedToolNames = new Set<string>();
     publishedSkills.forEach(skill => {
+      if (skill.isPublished !== true) return;
       skill.toolNames?.forEach((t: string) => associatedToolNames.add(t));
     });
 
@@ -5597,6 +7078,95 @@ export class AgentModeService {
     return (await this.loadAuthorizedSkillCatalog(userId)).skills.find(skill => skill.skillId === skillId);
   }
 
+  /**
+   * ENG-1107: run a skill's bounded `openingAction.prefetch` after canonical
+   * authenticated authorization, using the canonical tool gateway
+   * (`executeTool` — never raw dispatch). Read tools only: every call must
+   * name a tool in the skill's own `toolNames`, and validation rejects
+   * anything persisted outside that set before execution. Bounded call count,
+   * deadline, and rendered output; any failure degrades LOUDLY — a plain
+   * failure statement, never a silent blank, never fabricated material.
+   * No LLM narration: results are rendered deterministically.
+   */
+  public async applyOpeningAction(
+    skill: Skill,
+    userId: string,
+    sessionId: string,
+  ): Promise<{ messages: { role: 'assistant'; content: string; metadata: Record<string, string> }[] }> {
+    const action = skill.openingAction;
+    if (!action) return { messages: [] };
+    const { validateOpeningAction, OPENING_ACTION_MAX_CHARS } = await import('../utils/openingActionValidation');
+    const invalid = validateOpeningAction(action, skill.toolNames || []);
+    if (invalid) {
+      return { messages: [{ role: 'assistant', content: `I could not fetch the opening material (${invalid}). Tell me what to work on and we will start from there.`, metadata: { kind: 'skill-prefetch-failed', timestamp: new Date().toISOString() } }] };
+    }
+    const timeoutMs = action.timeoutMs ?? 15000;
+    const maxChars = action.maxChars ?? 4000;
+    const deadline = Date.now() + Math.min(timeoutMs, 30_000);
+    const rendered: string[] = [];
+    const failures: string[] = [];
+    const llmModel = await this.getDefaultModel();
+    // ENG-1107 CodeRabbit: scope gateway failure accounting to this opening
+    // run (per-session run id + session budget scope) so a repeatedly failing
+    // read tool trips the repeated-failure breaker instead of re-executing
+    // for every entry in action.calls.
+    const openingRunId = `opening-action:${sessionId}`;
+    for (const call of action.calls.slice(0, action.maxCalls ?? action.calls.length)) {
+      // ENG-1107 Greptile P1: membership in the skill tool set does not prove
+      // read-only — a skill may carry mutating tools (calendar create/update,
+      // etc.). Prefetch auto-executes on session open with no user instruction,
+      // so only gateway-classified `read` tools may run here; anything else
+      // degrades loudly instead of executing.
+      const policy = evaluateAgentToolPolicy({ toolName: call.tool, args: call.args ?? {} });
+      if (!policy.allowed || policy.effect !== 'read') {
+        failures.push(`${call.tool}: not a read tool (effect=${policy.effect}) — skipped`);
+        continue;
+      }
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) { failures.push('deadline exceeded'); break; }
+      try {
+        // ENG-1107 Greptile P1: race each call against the remaining deadline
+        // so a stalled tool cannot hold session creation open past the bound.
+        // Routed through the canonical gateway (budget/breaker accounting
+        // scoped to this opening run) rather than raw executeTool.
+        const outcome = await Promise.race([
+          executeAgentToolThroughGateway({
+            toolName: call.tool,
+            args: call.args ?? {},
+            runId: openingRunId,
+            budgetScopeId: sessionId,
+            execute: () => this.executeTool(llmModel, call.tool, call.args ?? {}, userId, sessionId, false),
+          }),
+          new Promise<never>((_, reject) => setTimeout(
+            () => reject(new Error(`opening-action deadline exceeded after ${Math.min(timeoutMs, 30_000)}ms`)),
+            remainingMs,
+          )),
+        ]);
+        if (outcome.status === 'error') throw outcome.error;
+        const result = outcome.result;
+        const text = typeof result === 'string' ? result : JSON.stringify(result);
+        rendered.push(`### ${call.tool}\n${text.slice(0, maxChars)}`);
+      } catch (err) {
+        failures.push(`${call.tool}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (rendered.length === 0) {
+      const reason = failures.length ? ` (${failures.join('; ')})` : '';
+      return { messages: [{ role: 'assistant', content: `I could not fetch the opening material${reason}. Tell me what to work on and we will start from there.`, metadata: { kind: 'skill-prefetch-failed', timestamp: new Date().toISOString() } }] };
+    }
+    // ENG-1107 CodeRabbit: cap the FINAL content (body + failure tail), not
+    // just the body — a long failure tail could otherwise exceed the bound.
+    // Reserve space for the failure note first so a large successful result
+    // cannot truncate the loud-failure signal away.
+    const contentLimit = Math.min(maxChars, OPENING_ACTION_MAX_CHARS);
+    const failureNote = failures.length
+      ? `\n\nNote: ${failures.length} of ${action.calls.length} fetches failed (${failures.join('; ')}).`
+      : '';
+    const content = `${rendered.join('\n\n').slice(0, Math.max(0, contentLimit - failureNote.length))}${failureNote}`
+      .slice(0, contentLimit);
+    return { messages: [{ role: 'assistant', content, metadata: { kind: 'skill-prefetch', timestamp: new Date().toISOString() } }] };
+  }
+
   public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
     const { skills: publishedSkills, allowedIds: userAllowedSkillIds } = await this.loadAuthorizedSkillCatalog(userId);
     const installedIds = new Set(associatedSkillIds);
@@ -5617,12 +7187,18 @@ export class AgentModeService {
     if (isWildcard || allowedSet.has(OTHER_SKILLS_VIRTUAL_ID)) {
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
       if (unassociatedTools.length > 0) {
+        // ENG-1237 follow-up: an unpublished/org-shared skill's own card already
+        // lists its toolNames above, and (correctly, post-ENG-1237) no longer
+        // removes those tools from this pool. Only trim the DISPLAY copy here —
+        // installability (the length check above) and execution (buildSkillContext,
+        // which never sees this per-user catalog) stay keyed on the real pool.
+        const displayedToolNames = new Set(skills.flatMap(s => s.toolNames));
         skills.push({
           skillId: OTHER_SKILLS_VIRTUAL_ID,
           name: 'Other Skills',
           description: 'Tools not associated with any specific skill',
           installed: installedIds.has(OTHER_SKILLS_VIRTUAL_ID),
-          toolNames: unassociatedTools.map(t => t.name)
+          toolNames: unassociatedTools.map(t => t.name).filter(name => !displayedToolNames.has(name))
         });
       }
     }
@@ -5649,10 +7225,185 @@ export class AgentModeService {
     return skills;
   }
 
+  /*
+   * ENG-1795. A rejected skill id has two causes that are NOT interchangeable to the
+   * person on the other end of the chat:
+   *
+   *   unentitled — the skill exists and is published, but this account's allowedSkills
+   *                does not unlock it. "Not on your plan" is TRUE, and sales can fix it.
+   *   unresolved — no such skill id exists: retired, renamed, a typo, a virtual bundle
+   *                with nothing in it, or an id the model invented. "Not on your plan"
+   *                is FALSE. Support can fix it; sales cannot.
+   *
+   * Both used to return the single subscription message, which did not merely misreport
+   * the cause — it INSTRUCTED the model to state the plan limitation to the customer as
+   * fact. That is how a lookup failure reaches a paying customer as a billing statement
+   * and sends them to the one team that cannot help them.
+   */
+  private async classifySkillRejections(
+    rejectedSkillIds: string[],
+    userId: string
+  ): Promise<{ unentitled: string[]; unavailable: string[]; unresolved: string[]; forbidden: string[] }> {
+    /*
+     * Partitioned BEFORE the catalog read, because this decision needs no catalog: it is a
+     * static id comparison. Left below the try/catch, a catalog failure dropped
+     * `__admin_tools__` into the `unavailable` fallback — which asserts "this account is
+     * permitted to use it" and "support can look into it", the two false claims the forbidden
+     * bucket exists to remove. A lookup failure must not silently undo a decision that never
+     * depended on the lookup.
+     */
+    const adminRejected = rejectedSkillIds.filter((id) => id === ADMIN_SKILL_VIRTUAL_ID);
+    const classifiable = rejectedSkillIds.filter((id) => id !== ADMIN_SKILL_VIRTUAL_ID);
+
+    /*
+     * `forbidden` asserts a ROLE RESTRICTION — permanent, nothing support can grant, and
+     * classified `by_design` so triage ignores it. That is only true if the caller genuinely is
+     * not an admin, so it is only claimed when we can CONFIRM that.
+     *
+     * The reason this needs confirming: `getSkillsForDisplay` adds the admin bundle inside a
+     * `try { getUserById } catch { }` that swallows a lookup failure. When DynamoDB blips, a
+     * real admin's request is rejected exactly like a non-admin's — and asserting a role
+     * restriction there tells them "not a temporary fault" when it is precisely that, while
+     * `by_design` hides the outage from triage. Unconfirmed cases go to `unavailable` instead,
+     * whose wording ("unavailable right now… support can look into it") is true either way and
+     * whose `bug` failure type keeps a real fault visible.
+     */
+    let forbidden: string[] = [];
+    const adminUnconfirmed: string[] = [];
+    if (adminRejected.length > 0) {
+      try {
+        const { userDb } = await import('./db');
+        const user = await userDb.getUserById(userId);
+        if (user?.isAdmin === true) {
+          // An admin whose bundle was still refused: not a role boundary, so do not claim one.
+          adminUnconfirmed.push(...adminRejected);
+        } else {
+          forbidden = adminRejected;
+        }
+      } catch (err) {
+        console.warn('[installSkills] admin check failed while classifying a refusal:', err);
+        adminUnconfirmed.push(...adminRejected);
+      }
+    }
+
+    let allowedIds: string[];
+    let existingIds: Set<string>;
+    try {
+      /*
+       * `getAllowedSkills` directly, NOT `loadAuthorizedSkillCatalog` — the latter returns
+       * `allowedIds` verbatim from this same call, and the catalog half of its work would be
+       * discarded here. Building it costs `resolveUserSkillAccess` (getUserById + getOrgById),
+       * `getOrgMembers`, and one UNCACHED OwnerIndex query per org member — an N+1 on the
+       * refusal path for a value that is thrown away. `getPublishedSkills` is TTL-cached, so
+       * that half is genuinely cheap.
+       */
+      const [allowed, published] = await Promise.all([
+        getAllowedSkills(userId),
+        skillService.getPublishedSkills(),
+      ]);
+      allowedIds = allowed;
+      existingIds = new Set(published.map(s => s.skillId));
+      // The virtual bundles are real ids with no catalog row; entitlement still governs them.
+      existingIds.add(OTHER_SKILLS_VIRTUAL_ID);
+      existingIds.add(ADMIN_SKILL_VIRTUAL_ID);
+    } catch (err) {
+      /*
+       * We could not read the catalog, so we cannot prove a skill is absent — and an
+       * unproven absence must not be reported as an entitlement failure. Fail into the
+       * branch that makes no claim about the customer's plan.
+       */
+      console.warn('[installSkills] skill catalog lookup failed while classifying a refusal:', err);
+      /*
+       * We could not read the catalog, so we cannot prove WHY an id was rejected. The one
+       * thing we must not do is assert the customer's plan is at fault, so this falls to the
+       * non-billing branch. Note the honest limitation: `unavailable`'s wording claims the
+       * account IS permitted, which is unproven here — accepted as the lesser error, since
+       * over-claiming entitlement misroutes nobody, while under-claiming it bills them.
+       */
+      return {
+        unentitled: [],
+        unavailable: [...classifiable, ...adminUnconfirmed],
+        unresolved: [],
+        forbidden,
+      };
+    }
+
+    const isWildcard = allowedIds.includes('*');
+    const allowedSet = new Set(allowedIds);
+    const unentitled: string[] = [];
+    const unavailable: string[] = [];
+    const unresolved: string[] = [];
+    for (const id of classifiable) {
+      if (!existingIds.has(id)) { unresolved.push(id); continue; }
+      if (!isWildcard && !allowedSet.has(id)) { unentitled.push(id); continue; }
+      /*
+       * Exists AND granted, yet absent from this user's catalog: `__other_skills__` whose
+       * unassociated-tool pool is currently empty. This is the ENG-1237 production repro
+       * (harsha@agentweb.pro) — an unpublished org-shared skill claimed the last remaining
+       * tools, the bundle vanished from the catalog, and the refusal surfaced as "not
+       * available with your current subscription".
+       *
+       * NOT visibility-filtered skills, despite the obvious guess: `getPublishedSkills`
+       * already drops `pending_review`, so such an id never reaches `existingIds` and lands
+       * in `unresolved` instead. That is the better outcome anyway — it confirms nothing
+       * about another owner's draft.
+       */
+      unavailable.push(id);
+    }
+    return { unentitled, unavailable: [...unavailable, ...adminUnconfirmed], unresolved, forbidden };
+  }
+
+  /*
+   * Prose for a set of rejected ids, shared by the full-refusal and PARTIAL-install paths.
+   *
+   * The partial path is why this is extracted. It returns `success: true` (something did
+   * install), so `toolResultError` yields null and no classifier ever runs — the prose IS what
+   * the model reads, unmediated. It used to append a flat
+   * "N skill(s) were not available with your subscription", which reproduced the exact false
+   * billing claim this ticket exists to remove, on a path the split never touched.
+   */
+  private describeRejections(buckets: {
+    unentitled: string[];
+    unavailable: string[];
+    unresolved: string[];
+    forbidden: string[];
+  }): string[] {
+    const parts: string[] = [];
+    if (buckets.unentitled.length > 0) {
+      parts.push(
+        `The requested skills are not available with your current subscription: ${buckets.unentitled.join(', ')}.`
+        + " Tell the user plainly that this capability is not on their plan."
+      );
+    }
+    if (buckets.unresolved.length > 0) {
+      parts.push(
+        `${SKILL_UNRESOLVED_MARKER}: ${buckets.unresolved.join(', ')}.`
+        + " This is an ID problem, not a billing one — do NOT tell the user this capability is missing from their subscription."
+        + " Re-read the available skills list and retry with an exact ID from it."
+      );
+    }
+    if (buckets.unavailable.length > 0) {
+      parts.push(
+        `${SKILL_UNAVAILABLE_MARKER}: ${buckets.unavailable.join(', ')}.`
+        + " The ID is correct and this account is permitted to use it, so retrying the same ID will not help,"
+        + " and this is NOT a billing limitation — do NOT tell the user it is missing from their subscription."
+        + " Say the capability is unavailable right now and that support can look into it."
+      );
+    }
+    if (buckets.forbidden.length > 0) {
+      parts.push(
+        `${SKILL_UNAVAILABLE_MARKER}: ${buckets.forbidden.join(', ')}.`
+        + " This requires admin access — a role restriction, not a billing limit and not a temporary fault."
+        + " Do NOT suggest upgrading a plan and do NOT suggest contacting support about it."
+      );
+    }
+    return parts;
+  }
+
   public async installSkills(skillIds: string[], userId: string, sessionId: string, isDelegatedAccess: boolean = false): Promise<any> {
     try {
       if (!Array.isArray(skillIds) || skillIds.length === 0 || skillIds.some((id) => typeof id !== 'string')) {
-        return { message: "skillIds must be a non-empty array of skill IDs." };
+        return { success: false, message: "skillIds must be a non-empty array of skill IDs." };
       }
 
       const availableSkills = await this.getSkillsForDisplay([], userId);
@@ -5683,9 +7434,26 @@ export class AgentModeService {
 
       if (!installedNames.length) {
         if (rejectedSkillIds.length > 0) {
-          return { message: "The requested skills are not available with your current subscription." };
+          const buckets = await this.classifySkillRejections(rejectedSkillIds, userId);
+          const { unentitled, unavailable, unresolved, forbidden } = buckets;
+          /*
+           * `success: false` matters as much as the text: the success path returns
+           * `success: true`, so a bare `{ message }` left `success` undefined and this refusal
+           * did not necessarily read as a hard failure. Combined with a gated tool upstream,
+           * that is how a model ends up substituting another tool's output and presenting it
+           * as the gated tool's result.
+           */
+          const parts = this.describeRejections(buckets);
+          return {
+            success: false,
+            message: parts.join(' ') + SKILL_NO_SUBSTITUTION,
+            ...(unentitled.length > 0 ? { unentitledSkillIds: unentitled } : {}),
+            ...(unavailable.length > 0 ? { unavailableSkillIds: unavailable } : {}),
+            ...(unresolved.length > 0 ? { unresolvedSkillIds: unresolved } : {}),
+            ...(forbidden.length > 0 ? { forbiddenSkillIds: forbidden } : {}),
+          };
         }
-        return { message: "No valid skills found for the provided IDs." };
+        return { success: false, message: "No valid skills found for the provided IDs." };
       }
 
       const result: any = {
@@ -5694,14 +7462,99 @@ export class AgentModeService {
         installedSkills: installedNames
       };
 
+      /*
+       * ENG-1945: the actual tool names this call just unlocked, resolved the same way
+       * `rejectedToolNames` already is below. toolDispatch's same-batch preview call
+       * (a model very commonly asks for a tool in the SAME response it installs the
+       * skill that gates it) reads this field to fold the newly-allowed names into
+       * `allowedToolNames` before the rest of that batch is gated — without it, that
+       * sibling call has no way to learn what this install just granted.
+       */
+      const installedToolNames = Array.from(
+        new Set(validSkillIds.flatMap((id) => availableById.get(id)?.toolNames || [])),
+      );
+      if (installedToolNames.length > 0) result.installedToolNames = installedToolNames;
+
       if (rejectedSkillIds.length > 0) {
-        result.message += ` ${rejectedSkillIds.length} skill(s) were not available with your subscription.`;
+        /*
+         * ENG-1795. This path returns `success: true` — something DID install — so
+         * `toolResultError` yields null and no classifier ever runs. That makes this prose the
+         * only thing the model reads about the failure, unmediated by any error class.
+         *
+         * It used to be a flat "N skill(s) were not available with your subscription",
+         * asserted over every rejected id regardless of cause. So a hallucinated id reached a
+         * paying customer as a billing statement whenever at least one OTHER skill installed
+         * — the ticket's own premise, surviving on the path the original split never touched.
+         * `message` is in extractMinimalToolResult's allowlist, so it persisted into the
+         * ledger too.
+         */
+        const partialBuckets = await this.classifySkillRejections(rejectedSkillIds, userId);
+        /*
+         * `noSubstitution` matters MORE here than on the full-refusal branch, not less. There,
+         * the dispatcher's downgrade attaches an error class whose retryability line carries
+         * its own stop signal. Here `success: true` means no class is ever assigned, so this
+         * sentence is the only thing standing between "the one skill the gated tool needed was
+         * the one refused" and the model presenting another tool's output as that tool's result.
+         */
+        result.message += ' ' + this.describeRejections(partialBuckets).join(' ') + SKILL_NO_SUBSTITUTION;
+        if (partialBuckets.unentitled.length > 0) result.unentitledSkillIds = partialBuckets.unentitled;
+        if (partialBuckets.unavailable.length > 0) result.unavailableSkillIds = partialBuckets.unavailable;
+        if (partialBuckets.unresolved.length > 0) result.unresolvedSkillIds = partialBuckets.unresolved;
+        if (partialBuckets.forbidden.length > 0) result.forbiddenSkillIds = partialBuckets.forbidden;
+        /*
+         * The refusal has to be a FIELD, not just prose appended to `message`.
+         *
+         * A partial install returns `success: true` — something did install — so every
+         * "did the install work" test downstream reads it as clean, while the one skill the
+         * model actually needed may be exactly the one that was refused. That distinction is
+         * the whole outcome of the call, and a sentence inside `message` is not something any
+         * consumer can key off: not the model, which has to be told WHICH ids it did not get,
+         * and not any future guard, which would be reduced to string-matching prose.
+         */
+        result.rejectedSkillIds = rejectedSkillIds;
+        /*
+         * ENG-1188-follow-up (unavailable-capability notice, per-tool scoping): a rejected skill
+         * id alone does not tell a PURE ledger-only reader (buildUnavailableCapabilityNotice)
+         * which tool names it would have unlocked, so that reader could only ever ask "did SOME
+         * install fail this turn" — arming the notice for every gated tool in the turn, including
+         * ones whose skill installed fine. Resolving the ids to actual tool names here, once,
+         * where the skill catalog is in scope, lets that reader ask the precise question instead:
+         * "was THIS tool's skill among the ones refused".
+         *
+         * `availableById` is NOT the right catalog to resolve these against: it comes from
+         * `getSkillsForDisplay` -> `getSkillsAvailableToUser`, already filtered to this user's
+         * subscription tier. A skill rejected FOR being outside that tier — the exact shape the
+         * live incident's `install_skills` refusal was — was excluded from that map before
+         * `rejectedSkillIds` was even computed, so looking it up there always resolves to
+         * nothing. The full published catalog (unfiltered by tier) is what still knows the
+         * toolNames of a skill the user's plan does not allow.
+         */
+        const fullCatalog = await skillService.getPublishedSkills();
+        const fullCatalogById = new Map(fullCatalog.map((skill) => [skill.skillId, skill]));
+        /*
+         * The virtual skill ids (`__admin_tools__`, `__other_skills__`) are synthesized
+         * in-memory and never appear in either catalog map, so they always resolve to `[]` here.
+         * A rejection mixing a real id with one of these — `['skill-1', '__admin_tools__']` —
+         * would otherwise resolve to skill-1's tool names only, a NON-empty array that reads as
+         * a fully scoped rejection while silently dropping every admin/other_skills tool from it.
+         * A gated tool needing the virtual skill would then wrongly read as available. Better to
+         * emit nothing at all than a partial list that looks complete: any id this can't resolve
+         * makes the whole call unscoped, so the reader falls back to arming every gated tool.
+         */
+        const resolvedPerId = rejectedSkillIds.map(
+          (id) => availableById.get(id)?.toolNames || fullCatalogById.get(id)?.toolNames || [],
+        );
+        const allResolved = resolvedPerId.every((names) => names.length > 0);
+        if (allResolved) {
+          const rejectedToolNames = Array.from(new Set(resolvedPerId.flat()));
+          if (rejectedToolNames.length > 0) result.rejectedToolNames = rejectedToolNames;
+        }
       }
 
       return result;
     } catch (error) {
       console.error('AgentMode: Error in installSkills:', error);
-      return { message: "An error occurred while installing skills." };
+      return { success: false, message: "An error occurred while installing skills." };
     }
   }
 
@@ -5849,7 +7702,11 @@ export class AgentModeService {
       // 4. Apply Subscription Filtering
       // Resolve skill IDs to tool names for the subscription filter step
       const skillIds = precomputedAllowedSkillIds || await getAllowedSkills(userId);
-      const allowedFunctionCalls = await resolveSkillsToToolNames(skillIds);
+      // ENG-1978 (observation only): userId attributes `skill-to-tool-resolution-failed` — this
+      // is the highest-frequency route to it (inside the agent iteration loop), and it is the one
+      // reason that is ALWAYS a genuine full-registry grant, so leaving it unattributed here would
+      // make the single most important signal in the 2-week analysis the one nobody can act on.
+      const allowedFunctionCalls = await resolveSkillsToToolNames(skillIds, userId);
 
       // Foundation tools must always bypass subscription filtering — they are
       // core primitives (work plan, search, save) needed by every session.
@@ -5897,10 +7754,80 @@ export class AgentModeService {
         confirmationPrompt: result.confirmationPrompt,
         confirmationDetail: result.confirmationDetail,
         summary: result.summary,
+        /*
+         * ENG-1526 / ENG-1322. Approval tokens have to survive the minimizer.
+         *
+         * A halt that withholds its own token is a dead end, not a loop. Both gates tell
+         * the model to replay the call "with the token exactly as returned here" — and
+         * this minimizer dropped it, because everything it does not name is discarded.
+         * So the model was handed an instruction it could not follow: the override could
+         * never be applied and the removal could never be completed, no matter how many
+         * times a user approved.
+         *
+         * It failed CLOSED, which is why nothing unsafe happened and why it went unnoticed
+         * — the tracking gate simply kept blocking. But ENG-1526's own claim that "the
+         * path is a loop, not a dead end" was not true in production, and a recovery path
+         * people cannot complete is one they route around.
+         *
+         * Found by driving the real agent, not the handler: handler-level tests call the
+         * dispatcher directly and never reach this function, so they proved the tokens
+         * were ISSUED while saying nothing about whether they were DELIVERED.
+         *
+         * Named explicitly rather than pattern-matched on `_token`: these two exist to be
+         * replayed by the caller, and a blanket rule would eventually relay a field that
+         * does not.
+         */
+        ...(result.tracking_override_token
+          ? { tracking_override_token: result.tracking_override_token } : {}),
+        ...(result.conversion_action_removal_token
+          ? { conversion_action_removal_token: result.conversion_action_removal_token } : {}),
+        // ENG-1635: same class of bug as the two tokens above (ENG-1526/ENG-1322) — this
+        // minimizer discards anything it doesn't name, and buildMetaWriteManifestQuestion
+        // (the loop seam, right after this) reads metaWriteManifestDigest off the SAME
+        // halted result to decide whether every item in this iteration is a Meta write.
+        // Without this, every batch silently falls back to the old per-item prompt —
+        // found live on env1, not by a handler-level test (same discovery gap the
+        // comment above describes: handler tests call the dispatcher directly and never
+        // reach this function).
+        ...(result.metaWriteManifestDigest
+          ? { metaWriteManifestDigest: result.metaWriteManifestDigest } : {}),
+        // ENG-1635/1644 Round 3: same class of bug as the fields above — this minimizer
+        // discards anything it doesn't name, and buildMetaWriteApprovalDeck (the loop
+        // seam, right after this) needs metaWriteDispatch on the SAME halted result to
+        // later let a workflow step execute the approved write without the model ever
+        // re-calling this tool. Named here explicitly so it doesn't get silently dropped
+        // the same way metaWriteManifestDigest itself was, undetected by 20 passing
+        // tests, until live-driving on env1 caught it.
+        ...(result.metaWriteDispatch
+          ? { metaWriteDispatch: result.metaWriteDispatch } : {}),
       };
-      // ENG-396: also preserve the structured AskUserQuestion payload so the chat
-      // card can render its options and the frontend can post back a structured
-      // selection. Without this the per-tool minimizers drop these unknown fields.
+      // ENG-1635/1644 Phase 2g (extended in the ask_user_question-retirement
+      // migration): same class of bug as metaWriteManifestDigest/
+      // metaWriteDispatch above — this minimizer discards anything it doesn't
+      // name, and the iteration-end seam's partitionApprovalHalts reads
+      // questionDeckPayload off the SAME halted result to classify this as a
+      // question-deck halt at all. Checked by SHAPE (Array.isArray), not by
+      // `result.type` string — partitionApprovalHalts itself classifies this
+      // way (agentModeService.ts's partitionApprovalHalts), and ask_user_question's
+      // migrated execute() + resolveCampaignObjectiveGate's Path 3 BOTH still set
+      // `type: 'ask_user_question'` (unchanged calling-convention tag) while ALSO
+      // carrying questionDeckPayload — checking type first here silently stripped
+      // questionDeckPayload for both of them and fell back to the old plain-text
+      // prompt every time, found live on env1 driving the real objective gate
+      // (not by any handler-level test — same discovery gap the comments above
+      // describe: those tests call the dispatcher directly and never reach this
+      // function). Must be checked BEFORE the true-legacy-shape branch below.
+      if (Array.isArray(result.questionDeckPayload)) {
+        return {
+          ...base,
+          type: result.type,
+          questionDeckPayload: result.questionDeckPayload,
+        };
+      }
+      // ENG-396: true legacy shape (no questionDeckPayload — real options/
+      // questionId directly on the result). No current producer emits this
+      // anymore (both ask_user_question and the objective gate migrated to
+      // questionDeckPayload above); kept only as a defensive fallback.
       if (result.type === 'ask_user_question') {
         return {
           ...base,
@@ -5997,6 +7924,26 @@ export class AgentModeService {
       return { success: result?.success, degraded: true, droppedFacets: result.data.droppedFacets };
     }
 
+    // ENG-1720: a `send-invite` that de-duplicates returns
+    // `{ success: true, alreadyInvited: true }` — "Skipped to avoid a duplicate,
+    // no invite quota was used". Nothing is delivered, the pacer's daily volume
+    // does not move, and no ledger row is written.
+    //
+    // Without this branch that outcome falls into the `{}` default above, and the
+    // stored ledger entry becomes indistinguishable from a real delivery: the
+    // requirement verdict reads `{}`, `toolCallSucceeded` finds no error and no
+    // `success: false`, and counts it as a send. Observed in production twice —
+    // a run that contacted nobody stored `status: success`, `passed: true`,
+    // `{ actual: 2, required: 1 }`, `functionCallMisses: []`.
+    //
+    // The predicate that consumes this (`isDeliveredSend`) cannot work on data
+    // that was erased before it was stored, so the flag has to survive the
+    // minimizer. `success` rides along for the same reason the branch above keeps
+    // it — a bare marker with no outcome is not enough to score on.
+    if (toolName === 'linkedin_outreach' && result?.alreadyInvited === true) {
+      return { success: result?.success, alreadyInvited: true };
+    }
+
     // ENG-518: preserve the enrichment run summary's scalar counts so the scheduled
     // completion gate can (a) tell an enrichable preview (processedCount > 0) from an
     // unenrichable one and (b) pair previews to executes per list. The large `samples`
@@ -6009,6 +7956,21 @@ export class AgentModeService {
         processedCount: result?.processedCount,
         failedCount: result?.failedCount,
         failureBreakdown: result?.failureBreakdown,
+      };
+    }
+
+    // ENG-738: previously fell through to the generic `{}` fallback below, which
+    // dropped success/error — the open-research-request tracker
+    // (detectOpenResearchRequestChanges) needs these on the MINIMIZED entry to
+    // tell a real success from a still-unresolved timeout result, since only
+    // this minimized form (not the full result) reaches toolCalls.
+    if (toolName === 'perform_deep_research') {
+      const r = result || {};
+      return {
+        ...(r.success !== undefined ? { success: r.success } : {}),
+        ...(typeof r.error === 'string' && r.error ? { error: r.error.slice(0, 200) } : {}),
+        ...(r.data?.research_url ? { research_url: r.data.research_url } : {}),
+        ...(r.data?.research_depth ? { research_depth: r.data.research_depth } : {}),
       };
     }
 
@@ -6076,7 +8038,11 @@ export class AgentModeService {
         // returns success:true with no imageUrl. Dropping this flag made that state
         // indistinguishable from a broken generation downstream (the auto-revision
         // path reported it as "failed to extract asset URL").
-        ...(actualResult.awaitingUserConfirmation === true && { awaitingUserConfirmation: true })
+        ...(actualResult.awaitingUserConfirmation === true && { awaitingUserConfirmation: true }),
+        // ENG-1027: the post-generation data-fabrication check's warning must survive
+        // this minimizer (everything unnamed here is dropped) or Emma never sees it
+        // and silently presents invented numbers as real data.
+        ...(actualResult.dataReliabilityWarning && { dataReliabilityWarning: actualResult.dataReliabilityWarning })
       };
     }
 
@@ -6317,6 +8283,77 @@ export class AgentModeService {
       };
     }
 
+    /*
+     * install_skills: the OUTCOME survives minimization.
+     *
+     * `installSkills` never throws — every refusal path returns `{ success: false, message }`.
+     * A HARD refusal does still reach the ledger with an `error`, because the dispatcher's
+     * downgrade (toolDispatch.ts, `toolResultError`) converts a `success: false` result into a
+     * tool failure. Verified end-to-end through executePreparedTools, not assumed.
+     *
+     * What that downgrade cannot see is a PARTIAL install: it returns `success: true` because
+     * something installed, so no error is raised, while the one skill the gated tool needed may
+     * be exactly the one that was refused. `rejectedSkillIds` is the only fact that separates a
+     * half-granted install from a granted one, and the default `{}` below stripped it — leaving
+     * the ledger asserting a clean install on the exact shape where the model did not get what
+     * it asked for.
+     *
+     * `success`/`message` ride along so the ledger entry is self-describing rather than
+     * depending on the downgrade staying wired the way it is today. Ids and a short message,
+     * never a payload.
+     */
+    if (toolName === 'install_skills') {
+      // Some registries hand results back wrapped as a JSON string in `content` (see the
+      // branches above). Parse it the same way, so the outcome is read from wherever it is.
+      let actualResult = result;
+      if (result?.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error('AgentMode: Failed to parse install_skills result.content as JSON:', e);
+        }
+      }
+      const a = (actualResult && typeof actualResult === 'object' ? actualResult : {}) as Record<string, any>;
+      return {
+        // `success` only when the result actually carries it. Defaulting a missing flag to
+        // false would let an unrecognised shape read as a FAILED install — reporting a failure
+        // that did not happen is the expensive direction to be wrong here, so an absent flag
+        // stays absent rather than being invented.
+        ...(a.success !== undefined ? { success: a.success === true } : {}),
+        ...(a.message !== undefined ? { message: a.message } : {}),
+        ...(Array.isArray(a.installedSkills) ? { installedSkills: a.installedSkills } : {}),
+        ...(Array.isArray(a.rejectedSkillIds) && a.rejectedSkillIds.length > 0
+          ? { rejectedSkillIds: a.rejectedSkillIds }
+          : {}),
+        // Same reasoning as rejectedSkillIds above: this is what lets a ledger-only reader
+        // scope "was THIS gated tool's skill among the ones refused" instead of "did any
+        // install fail this turn" (buildUnavailableCapabilityNotice, synthesisResidue.ts).
+        ...(Array.isArray(a.rejectedToolNames) && a.rejectedToolNames.length > 0
+          ? { rejectedToolNames: a.rejectedToolNames }
+          : {}),
+        /*
+         * ENG-1795: WHY each id was refused, not just that it was. Carried for the same reason
+         * `rejectedSkillIds` is — a ledger-only reader cannot re-derive it, and the causes are
+         * not interchangeable: "your plan excludes this" is actionable by sales, "no such id"
+         * by the model retrying, and the other two by neither. Without these, anything reading
+         * the ledger can only ask "did an install fail", which is the coarse question that let
+         * a lookup failure be reported as a billing limit in the first place.
+         */
+        ...(Array.isArray(a.unentitledSkillIds) && a.unentitledSkillIds.length > 0
+          ? { unentitledSkillIds: a.unentitledSkillIds }
+          : {}),
+        ...(Array.isArray(a.unavailableSkillIds) && a.unavailableSkillIds.length > 0
+          ? { unavailableSkillIds: a.unavailableSkillIds }
+          : {}),
+        ...(Array.isArray(a.unresolvedSkillIds) && a.unresolvedSkillIds.length > 0
+          ? { unresolvedSkillIds: a.unresolvedSkillIds }
+          : {}),
+        ...(Array.isArray(a.forbiddenSkillIds) && a.forbiddenSkillIds.length > 0
+          ? { forbiddenSkillIds: a.forbiddenSkillIds }
+          : {}),
+      };
+    }
+
     // For report_product_issues, preserve success/message/results so the sidebar can show status
     if (toolName === 'report_product_issues') {
       return {
@@ -6359,6 +8396,22 @@ export class AgentModeService {
     // URL) from a failed/in-flight one. Without this the default `{}` below strips the
     // deployedUrl, and a final message that falsely claims the deploy "timed out" would
     // have no ledger evidence to reconcile against.
+    //
+    // ENG-1868: "deployed" is a build claim, not a launch-ready claim — a page can build
+    // fine and still fail its post-deploy smoke test or ship with no conversion tracking,
+    // neither visible from status/buildStatus alone. Compute launchReadiness here (not
+    // just pass the raw smokeTestResult/trackingInstalled fields through) so each of these
+    // tools' ledger entries carries a derived verdict from whatever signals its OWN raw
+    // result shape actually has — harmless when the underlying signal isn't populated yet
+    // (e.g. smokeTestResult is fire-and-forget after deploy, so it's genuinely absent
+    // mid-generation; ready:true is the correct default until the smoke test has actually
+    // had a chance to run). Review note: this is NOT uniform across all 5 — get_landing_page_
+    // preview_url's raw result (getPreviewDeploymentUrl) never carries smokeTestResult/
+    // trackingInstalled at all, so its verdict is structurally always ready:true regardless
+    // of the real page's state. Low-impact (a draft-branch preview URL, not the production
+    // deployedUrl/customDomainUrl) and NOT recovered by landingDeploymentReport.ts's merge
+    // step either — the preview URL and the production URL are different strings, so they
+    // never share a dedup key. Accept the gap: previews are explicitly not the launch URL.
     if (
       toolName === 'generate_landing_page' ||
       toolName === 'deploy_landing_page' ||
@@ -6384,6 +8437,7 @@ export class AgentModeService {
         ...(a.name !== undefined ? { name: a.name } : {}),
         ...(a.id !== undefined ? { id: a.id } : {}),
         ...(a.leadListId !== undefined ? { leadListId: a.leadListId } : {}),
+        launchReadiness: a.launchReadiness ?? getLandingPageLaunchReadiness(a),
       };
     }
 
@@ -7432,11 +9486,27 @@ export class AgentModeService {
     renderDeadlineMs?: number;
     runBudgetDeadlineMs?: number;
     turnHardCapMs?: number;
+    agentRuntimeRunId?: string;
+    // ENG-2072: tri-state — see ToolContext.isUnattendedRun. Threaded through
+    // as-is (not coerced to a truthy check like isDelegatedAccess below) because
+    // an explicit `false` (attended) must survive distinctly from `undefined`
+    // (caller has not resolved a value, fall back to session.sessionType).
+    isUnattendedRun?: boolean;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
     if (input.screenshotUrl) toolOptions.screenshotUrl = input.screenshotUrl;
     if (input.isDelegatedAccess) toolOptions.isDelegatedAccess = true;
+    if (input.isUnattendedRun !== undefined) toolOptions.isUnattendedRun = input.isUnattendedRun;
+    // ENG-1945 follow-up: the SERVER's own id for the run this tool call is executing
+    // within — never something the model supplies or can even see elsewhere, unlike the
+    // `run_id` argument report_product_issues accepts (that one is for citing a DIFFERENT,
+    // already-completed run — e.g. a reviewer analysing another session, ENG-939). Threading
+    // the real value through as ground truth lets a tool verify a same-turn claim against
+    // the run it is ACTUALLY in, instead of requiring the model to correctly type back an
+    // opaque id it was never given — which live testing showed it cannot do (it guessed the
+    // literal string "current-run").
+    if (input.agentRuntimeRunId) toolOptions.currentRunId = input.agentRuntimeRunId;
     // Thread the run's media-gen deadline into the tool context ONLY for compose_video —
     // the sole tool that consumes it (to hand off before the run's hard wall-clock timeout,
     // ENG-123). Scoping it here keeps every other tool's context unchanged.
@@ -7587,7 +9657,10 @@ export class AgentModeService {
     }
   }
 
+
+
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
+    await enforceEvaluationTool(userId, toolName, extraContext);
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
     const initialPolicyDecision = evaluateAgentToolPolicy({
@@ -7644,6 +9717,7 @@ export class AgentModeService {
       return this.getMockToolResult(toolName, preparedArgs);
     }
 
+    const reliabilityStartedAt = Date.now();
     try {
       // ENG-475: bracket browser-automation tools with deterministic cookie
       // persistence. runTool drives the existing save/load_browser_cookies tools;
@@ -7662,16 +9736,35 @@ export class AgentModeService {
         if (!toolFailed && shouldPersistAfterBrowserTool(toolName)) {
           await autoSaveCookies(this.browserCookieAutoState, sessionId, autoDeps);
         }
+        await recordToolReliabilityEvent({
+          toolName,
+          result,
+          startedAt: reliabilityStartedAt,
+          sessionId,
+          userId,
+          preparedArgs,
+          extraContext,
+        });
         return result;
       }
 
-      return await this.toolRegistry.execute(toolName, preparedArgs, {
+      const toolResult = await this.toolRegistry.execute(toolName, preparedArgs, {
         userId,
         sessionId,
         llmModel,
         service: this,
         ...extraContext,
       });
+      await recordToolReliabilityEvent({
+        toolName,
+        result: toolResult,
+        startedAt: reliabilityStartedAt,
+        sessionId,
+        userId,
+        preparedArgs,
+        extraContext,
+      });
+      return toolResult;
 
       // // If result is already MCP-wrapped (from external MCP tools via mcpClientService),
       // // pass it through unchanged. External tools return { content: string, raw: { content: [...] } }
@@ -7689,6 +9782,22 @@ export class AgentModeService {
       //   }
       // };
     } catch (error) {
+      try {
+        const { recordReliabilityEventSafe } = await import('./reliabilityEventSink');
+        const { classifyToolResultOutcome, summarizeToolError } = await import('./reliabilityEvent');
+        recordReliabilityEventSafe({
+          tool: toolName,
+          outcome: classifyToolResultOutcome(undefined, error),
+          latencyMs: Date.now() - reliabilityStartedAt,
+          sessionId,
+          userId,
+          errorSummary: summarizeToolError(undefined, error),
+          platform: typeof (preparedArgs as any)?.platform === 'string' ? (preparedArgs as any).platform : undefined,
+          userEdit: extraContext?.voiceCapture?.draft ? true : undefined,
+        });
+      } catch (reliabilityErr) {
+        console.warn('[AgentMode] H-LEARN reliability record skipped (non-fatal):', reliabilityErr);
+      }
       console.error(`AgentMode: Error executing tool ${toolName}:`, error);
       throw error;
     }
@@ -7928,7 +10037,7 @@ export class AgentModeService {
    *   (`agent_mode_vision_model`) is used. describe_image is a vision utility, so it
    *   runs on its own dedicated vision model — independent of the chat/default model.
    */
-  public async describeImage(llmModel: string | undefined, imageUrl: string, prompt?: string): Promise<any> {
+  public async describeImage(llmModel: string | undefined, imageUrl: string, prompt?: string, usageContext?: LLMUsageContext): Promise<any> {
     try {
       if (!imageUrl) {
         return {
@@ -8060,6 +10169,23 @@ export class AgentModeService {
       // Create messages for vision API
       const messages = [
         {
+          role: 'system' as const,
+          // Describe only what is visibly on screen. A vision model has no way to
+          // confirm from a single image whether a depicted product, version number,
+          // or model name currently exists — its training data has a cutoff, and
+          // the subject may simply postdate it (this exact prompt has previously
+          // caused a real AgentWeb screenshot of AgentWeb's own model picker to be
+          // called a "fictional mockup" of models that "don't exist"). Authenticity/
+          // existence verdicts are a caller decision (verified via search or other
+          // tools), never this tool's to assert.
+          content:
+            'You describe images factually. Report only what is visibly present: text, layout, colors, objects, ' +
+            'and composition. Never assert or speculate about whether depicted content — a product, brand, ' +
+            'version number, model name, or claim — is real, fake, fictional, outdated, or currently exists. ' +
+            'You cannot verify that from an image alone, and confident guesses here are frequently wrong. If ' +
+            'something looks unfamiliar, describe it neutrally exactly as shown, without a verdict on its legitimacy.'
+        },
+        {
           role: 'user' as const,
           content: [
             {
@@ -8079,6 +10205,8 @@ export class AgentModeService {
       // gateway, so AgentWeb never makes a second vision completion itself.
       const response = await this.callVisionLLMWithTimeout(visionModelUsed, messages, {
         max_completion_tokens: 2000,
+        // ENG-1858: vision analysis is the requesting user's work, not "system".
+        usageContext: usageContext ?? { feature: 'describe_image' },
       });
 
       const description = response.choices[0]?.message?.content || 'Unable to analyze image';
@@ -8117,6 +10245,8 @@ export class AgentModeService {
       end_time?: string;
       /** Attributable user — charges this describe_video LLM spend to their cap (ENG-200). */
       userId?: string;
+      /** Chat session the analysis belongs to, so the ledger row is traceable (ENG-1961). */
+      sessionId?: string;
     }
   ): Promise<any> {
     let tempDirPath: string | null = null;
@@ -8329,8 +10459,17 @@ export class AgentModeService {
 
       // Charge (record + deduct when a userId is present; absorb under "system"
       // otherwise). The client above is un-metered, so this is the single meter.
+      // ENG-1961: named `describe_video` rather than the catch-all `agent_task`,
+      // and carrying the session, so this spend is attributable the same way
+      // describeImage's is. The user was already correct (ENG-200).
       meterUsageFromResponse(
-        { userId: options?.userId, model: modelName, provider: 'gemini', feature: 'agent_task' },
+        {
+          userId: options?.userId,
+          ...(options?.sessionId ? { sessionId: options.sessionId } : {}),
+          model: modelName,
+          provider: 'gemini',
+          feature: 'describe_video',
+        },
         response
       );
 
@@ -8524,6 +10663,21 @@ export class AgentModeService {
     return { cleanedText, links };
   }
 
+  /** ENG-1295: bound the self-consistency cache so the long-lived singleton doesn't grow unboundedly. */
+  private pruneDataAnalysisConsistencyCache(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.dataAnalysisConsistencyCache) {
+      if (now - entry.timestamp > this.DATA_ANALYSIS_CONSISTENCY_TTL_MS) {
+        this.dataAnalysisConsistencyCache.delete(key);
+      }
+    }
+    while (this.dataAnalysisConsistencyCache.size > this.DATA_ANALYSIS_CONSISTENCY_CACHE_MAX) {
+      const oldestKey = this.dataAnalysisConsistencyCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.dataAnalysisConsistencyCache.delete(oldestKey);
+    }
+  }
+
   public async performDataAnalysis(fileUrls: string[], analysisInstruction: string, userId: string): Promise<any> {
     try {
       const urlsToProcess = Array.isArray(fileUrls) ? fileUrls.filter(url => !!url) : [];
@@ -8642,6 +10796,9 @@ export class AgentModeService {
       // Human-readable source description per file, parallel to fileParts, used to
       // build the filename manifest in the prompt.
       const fileSources: string[] = [];
+      // Decoded raw content per file, parallel to fileSources — kept only for the
+      // ENG-1295 provenance stub's rows_in estimate, not sent anywhere else.
+      const fileRawContents: string[] = [];
       let totalSize = 0;
 
       for (const fileUrl of urlsToProcess) {
@@ -8685,6 +10842,7 @@ export class AgentModeService {
               }
             });
             fileSources.push(fileUrl);
+            fileRawContents.push(s3Content);
             continue;
           }
 
@@ -8723,6 +10881,7 @@ export class AgentModeService {
               }
             });
             fileSources.push(fileUrl);
+            fileRawContents.push(s3Content);
             continue;
           }
 
@@ -8745,7 +10904,8 @@ export class AgentModeService {
           // Send to Gemini as text/csv so the file materializes on the sandbox
           // filesystem (see SANDBOX_FILE_MIME note above). The actual content may
           // be CSV, JSON, or plain text — the model is told this in the prompt.
-          const base64Content = Buffer.from(fileData).toString('base64');
+          const fileBuffer = Buffer.from(fileData);
+          const base64Content = fileBuffer.toString('base64');
 
           fileParts.push({
             inlineData: {
@@ -8754,6 +10914,7 @@ export class AgentModeService {
             }
           });
           fileSources.push(fileUrl);
+          fileRawContents.push(fileBuffer.toString('utf-8'));
 
         } catch (error) {
           console.error(`Error processing file ${fileUrl}:`, error);
@@ -8837,6 +10998,15 @@ export class AgentModeService {
       // the post-loop block) — folding every intermediate code stdout into the
       // analysis would bury the real summary under print()-debugging noise.
       const codeExecOutputs: string[] = [];
+      // ENG-1295: the generated CSV text (if any), kept separately from resultParts
+      // so the provenance stub and self-consistency check below can parse it.
+      let generatedCsvText: string | null = null;
+      // ENG-1600: Gemini can return more than one text/csv inline part. Every one is shown to
+      // the caller as Computed Data, but only one can back the provenance stub and the
+      // cross-call cache. Comparing an arbitrary part against a previous run's arbitrary part
+      // fabricates an inconsistency and hard-rejects a correct analysis, so the count is
+      // tracked and the comparison is skipped when it exceeds one.
+      let generatedCsvPartCount = 0;
 
       // Extract parts from response
       const responseParts = candidates[0].content.parts || [];
@@ -8873,10 +11043,37 @@ export class AgentModeService {
         // Handle inline data (images/charts from code execution) (handle both camelCase and snake_case)
         if ((part as any).inlineData && (part as any).inlineData.data) {
           const mimeType = (part as any).inlineData.mimeType || 'image/png';
-          if (!mimeType.startsWith('image/')) {
+          if (mimeType === 'text/csv') {
+            // Gemini's code-execution sandbox returns generated tabular data (e.g. a
+            // df.to_csv() write) as an inlineData part with mimeType text/csv rather
+            // than through stdout/codeExecutionResult. Discarding this — as the old
+            // code did for every non-image inlineData — left the caller with only the
+            // model's separate narrative `text` summary, ungrounded by the real
+            // computed output. That is how perform_data_analysis reported hallucinated
+            // ad-group names and contradictory row counts (ENG-1295).
+            codeExecuted = true;
+            try {
+              const csvText = Buffer.from((part as any).inlineData.data, 'base64').toString('utf-8').trim();
+              if (csvText) {
+                resultParts.push(`**Computed Data:**\n${csvText}`);
+                generatedCsvText = csvText;
+                generatedCsvPartCount++;
+                // ENG-1295 follow-up: this Gemini response shape is rare and non-deterministic, so it
+                // could not be re-triggered on demand to confirm the fix still fires in real traffic.
+                // A positive signal here means the next organic occurrence shows up in CloudWatch.
+                console.log('AgentMode: performDataAnalysis surfaced generated CSV via inlineData (mimeType=text/csv)');
+              }
+            } catch (error) {
+              console.error('AgentMode: performDataAnalysis error decoding generated CSV inlineData:', error);
+            }
+          } else if (!mimeType.startsWith('image/')) {
             // Gemini returned non-image data (e.g. Vega-Lite JSON from altair) — skip it
             console.warn(`AgentMode: performDataAnalysis skipping non-image inlineData with mimeType=${mimeType}`);
           } else {
+            // A rendered chart image is itself proof that code actually ran in the
+            // sandbox (ENG-1295 hard guard below) — set this regardless of whether
+            // the subsequent S3 upload succeeds.
+            codeExecuted = true;
             try {
               const imageData = (part as any).inlineData.data;
 
@@ -8904,10 +11101,30 @@ export class AgentModeService {
         } else if ((part as any).inline_data && (part as any).inline_data.data) {
           // Handle snake_case format
           const mimeType = (part as any).inline_data.mimeType || (part as any).inline_data.mime_type || 'image/png';
-          if (!mimeType.startsWith('image/')) {
+          if (mimeType === 'text/csv') {
+            // See the camelCase inlineData branch above (ENG-1295): a generated CSV
+            // must be surfaced, not discarded, or the caller only sees the model's
+            // ungrounded narrative summary.
+            codeExecuted = true;
+            try {
+              const csvText = Buffer.from((part as any).inline_data.data, 'base64').toString('utf-8').trim();
+              if (csvText) {
+                resultParts.push(`**Computed Data:**\n${csvText}`);
+                generatedCsvText = csvText;
+                generatedCsvPartCount++;
+                // ENG-1295 follow-up: snake_case variant of the same rare shape — logged separately
+                // so the two branches are distinguishable in CloudWatch.
+                console.log('AgentMode: performDataAnalysis surfaced generated CSV via inline_data (mimeType=text/csv)');
+              }
+            } catch (error) {
+              console.error('AgentMode: performDataAnalysis error decoding generated CSV inline_data (snake_case):', error);
+            }
+          } else if (!mimeType.startsWith('image/')) {
             // Gemini returned non-image data (e.g. Vega-Lite JSON from altair) — skip it
             console.warn(`AgentMode: performDataAnalysis skipping non-image inline_data with mimeType=${mimeType}`);
           } else {
+            // See the camelCase branch above — a rendered chart proves code executed.
+            codeExecuted = true;
             try {
               const imageData = (part as any).inline_data.data;
 
@@ -8933,6 +11150,30 @@ export class AgentModeService {
             }
           }
         }
+      }
+
+      // ENG-1295 hard guard: real external data was supplied (file_urls resolved to
+      // at least one sandbox file) but nothing in the response shows code actually
+      // executing over it — no generated CSV, no rendered image, no codeExecutionResult
+      // stdout. A bare narrative `text` part in this case is unverifiable prose about
+      // data the model never touched — exactly how perform_data_analysis reported
+      // hallucinated ad-group names and contradictory counts in prod session d789c175.
+      // Reject rather than pass it off as computed output. Calls with no file_urls are
+      // unaffected: there is no external tabular data to hallucinate about, so
+      // inline-only summarization remains a legitimate use of this tool.
+      if (fileParts.length > 0 && !codeExecuted) {
+        console.warn(
+          `AgentMode: performDataAnalysis got narrative text with no verified code execution over ${fileParts.length} supplied file(s) (model=${modelName})`
+        );
+        return {
+          success: false,
+          message:
+            'The analysis model returned a narrative summary without any verified code execution over the supplied file_urls — ' +
+            'this cannot be trusted as computed output and was not returned. Retry with a more explicit instruction that forces ' +
+            'Python code execution over the file(s) (e.g. "You MUST read and parse the file(s) with Python and print exact ' +
+            'computed values — do not summarize without computing").',
+          error: 'execution_failed'
+        };
       }
 
       // Fallback narrative: the model produced executed-code output but no
@@ -8975,6 +11216,105 @@ export class AgentModeService {
         };
       }
 
+      // ENG-1295 hardening: cross-call self-consistency and a provenance stub
+      // (including intra-CSV id/name collision and source-grounding checks) for
+      // generated CSV data.
+      if (generatedCsvText) {
+        const provenance = parseCsvProvenance(generatedCsvText);
+        if (provenance) {
+          // 1. Cross-call self-consistency: an exact repeat call whose grouping-key
+          // set changed since its last run.
+          const cacheKey = buildDataAnalysisCacheKey(userId, urlsToProcess, analysisInstruction);
+          // ENG-1600: with several CSV parts, `provenance` describes only one of them and which
+          // one depends on part order. Comparing that against a previous run — which may have
+          // captured a different part — is a fabricated inconsistency, and this check hard-rejects.
+          const comparable = generatedCsvPartCount <= 1;
+          const prior = comparable ? this.dataAnalysisConsistencyCache.get(cacheKey) : undefined;
+          if (prior) {
+            const priorSet = new Set(prior.groupingKeyValues);
+            const currentSet = new Set(provenance.groupingKeyValues);
+            const isConsistent = priorSet.size === currentSet.size &&
+              [...priorSet].every(v => currentSet.has(v));
+            if (!isConsistent) {
+              console.warn(
+                `AgentMode: performDataAnalysis inconsistent result on an identical repeat call (userId=${userId}): ` +
+                `prior grouping keys=[${prior.groupingKeyValues.join(', ')}] vs current=[${provenance.groupingKeyValues.join(', ')}]`
+              );
+              return {
+                success: false,
+                message:
+                  'This exact analysis call (identical file_urls and analysis_instruction) previously returned a DIFFERENT set of ' +
+                  'result names than this run — the data-analysis model is not consistently computing over the real data, so ' +
+                  'neither result can be trusted. Do NOT retry with the identical arguments. Instead, re-run grouping strictly by ' +
+                  'a stable ID field (not a name) so the result is verifiable against the source data.',
+                error: 'inconsistent_result'
+              };
+            }
+          }
+          // Only cache a single-part result: storing one arbitrary part of a multi-part answer
+          // would poison the NEXT call's comparison exactly the same way.
+          if (comparable) {
+            this.dataAnalysisConsistencyCache.set(cacheKey, { groupingKeyValues: provenance.groupingKeyValues, timestamp: Date.now() });
+            this.pruneDataAnalysisConsistencyCache();
+          }
+
+          // 2. Provenance stub: cheap-to-verify rows_in / rows_out / distinct
+          // grouping-key values, so the caller doesn't have to trust the narrative
+          // summary about what the tool actually computed. Includes two
+          // informational (not hard-reject) caveats:
+          // - id grounding: a distinct id in the CSV that can't be found anywhere
+          //   in the raw source file(s) — a substring miss can also mean the
+          //   model reformatted the id, so this doesn't block a possibly-correct
+          //   result.
+          // - id/name collisions: the same id mapped to more than one name within
+          //   this CSV (the exact shape of the prod hallucination). Deliberately
+          //   NOT a hard reject — a real entity (an ad group, a CRM lead's
+          //   company) can legitimately be renamed within a query's date window,
+          //   which produces this same shape from genuinely correct data. We
+          //   can't tell "renamed" apart from "fabricated" from the CSV alone, so
+          //   this is surfaced for the caller to judge rather than risking a hard
+          //   failure on a correct result.
+          const rowsInPerFile = fileRawContents.map(c => estimateRowsIn(c)).filter((n): n is number => n !== null);
+          const rowsIn = rowsInPerFile.length > 0 ? rowsInPerFile.reduce((a, b) => a + b, 0) : null;
+          const MAX_DISTINCT_VALUES_SHOWN = 25;
+          const distinctPreview = provenance.groupingKeyValues.slice(0, MAX_DISTINCT_VALUES_SHOWN);
+          const moreCount = provenance.groupingKeyValues.length - distinctPreview.length;
+          const grounding = checkCsvIdGrounding(provenance.header, provenance.rows, fileRawContents);
+          const collisions = findCsvIdNameCollisions(provenance.header, provenance.rows);
+          if (collisions.length > 0) {
+            console.warn(
+              `AgentMode: performDataAnalysis intra-CSV id/name collision (userId=${userId}, informational): ` +
+              collisions.map(c => `id=${c.id} names=[${c.names.join(', ')}]`).join('; ')
+            );
+          }
+          resultParts.push(
+            `**Provenance:**\n` +
+            `rows_in: ${rowsIn !== null ? rowsIn : 'unknown (no parsable input file)'}\n` +
+            `rows_out: ${provenance.rowsOut}\n` +
+            `distinct grouping-key values (${provenance.groupingKeyValues.length}): ${distinctPreview.join(', ')}` +
+            (moreCount > 0 ? ` … (+${moreCount} more)` : '') +
+            (grounding && grounding.unverified > 0
+              ? `\n⚠️ ${grounding.unverified} of ${grounding.checked} id(s) in this result could not be found in the raw source file(s) — treat those rows as unverified.`
+              : '') +
+            (collisions.length > 0
+              ? `\n⚠️ ${collisions.length} id(s) map to more than one name within this result — e.g. id "${collisions[0].id}" as [${collisions[0].names.join(', ')}]. ` +
+                'This can mean the source entity was renamed during the query window, or that a row was fabricated/corrupted — verify before trusting these names.'
+              : '')
+          );
+
+          // 3. Explicit untrusted-narrative caveat: make it part of the tool's own
+          // contract that the free-form prose has not been cross-checked, rather
+          // than relying on the calling agent to know to verify it independently
+          // (the ad-hoc behavior that happened to save prod session d789c175).
+          if (hasNarrativeText) {
+            resultParts.push(
+              '**Note:** The prose above has not been independently verified. Treat **Computed Data** and **Provenance** as ' +
+              'the trusted, verified source — cross-check any names, ids, or counts mentioned in the prose against them before repeating them.'
+            );
+          }
+        }
+      }
+
       // Combine all results
       const analysisResult = resultParts.join('\n\n');
 
@@ -8995,6 +11335,13 @@ export class AgentModeService {
         /payload size exceeds|request too large|too large|exceeds.*limit/i.test(errorMessage);
       const isTimeout = (error as any)?.code === 'ECONNABORTED' ||
         /timeout|timed out|ETIMEDOUT/i.test(errorMessage);
+      // ENG-1295 (recommendation #4): a raw Gemini 400/422 that ISN'T already
+      // classified as payload-too-large is an invalid-argument rejection (e.g. a
+      // malformed file_urls entry, an unfetchable reference, or a request the
+      // sandbox otherwise refused). Previously this fell through to the generic
+      // "check that the file URLs are accessible" message with no distinct error
+      // code — the exact ambiguous failure hit in prod session 97a28948.
+      const isInvalidArgument = !isPayloadTooLarge && (statusCode === 400 || statusCode === 422);
       if (isPayloadTooLarge) {
         return {
           success: false,
@@ -9007,6 +11354,13 @@ export class AgentModeService {
           success: false,
           message: `The data analysis timed out — the dataset or analysis task is too large for a single call. Break it into smaller pieces: (1) split the data into smaller subsets, (2) call perform_data_analysis separately for each subset with a focused analysis_instruction, then (3) synthesize the individual results into a final summary.`,
           error: errorMessage
+        };
+      }
+      if (isInvalidArgument) {
+        return {
+          success: false,
+          message: `The data analysis request was rejected as invalid by the model API (HTTP ${statusCode}). This usually means a file_urls entry could not be read or parsed, or the request violated a sandbox limit. Verify each file_urls entry is a real, fetchable S3 URL or tool-response key, and that analysis_instruction does not reference unsupported content. Do NOT blindly retry the identical call — fix the arguments first.`,
+          error: 'invalid_argument'
         };
       }
       return {
@@ -9464,12 +11818,20 @@ export class AgentModeService {
       }
 
       // Prepare market strategy data - merge with existing if available
+      const updateTimestamp = new Date().toISOString();
       const marketStrategyData = {
+        ...existingMarketStrategy,
+        ...otherFields,
         businessOverview: businessOverview !== undefined ? businessOverview : (existingMarketStrategy?.businessOverview || ''),
         competitors: mergedCompetitors,
         icp: mergedICP,
-        createdAt: existingMarketStrategy?.createdAt || new Date().toISOString(),
-        updatedAt: new Date().toISOString()
+        createdAt: existingMarketStrategy?.createdAt || updateTimestamp,
+        updatedAt: updateTimestamp,
+        // Tracked separately from updatedAt (ENG-1955 follow-up): Emma is
+        // explicitly told to send only the fields that changed, so a
+        // competitors-only tool call must not look like an ICP correction to
+        // routes/crm.ts's staleness check.
+        icpUpdatedAt: icp !== undefined ? updateTimestamp : existingMarketStrategy?.icpUpdatedAt,
       };
 
       // Update org-level or personal market strategy
@@ -9478,6 +11840,8 @@ export class AgentModeService {
       } else {
         await userDb.updateUser(userId, { marketStrategy: marketStrategyData });
       }
+
+      await populateEmptyBrandGuidelines(userId);
 
       // Track what was updated vs added
       const updatedEntries: string[] = [];
@@ -11009,6 +13373,10 @@ export class AgentModeService {
         leads: matchingLeads.map((lead: any) => ({
           leadId: lead.leadId,
           email: lead.email || '',
+          // ENG-2082: a phone-only lead is contactable. Omitting the number here showed the
+          // model a row with NO contact channel at all, which reads as junk — and
+          // `email is_empty` in delete_leads_by_filter matches exactly these rows.
+          phone: lead.phone || '',
           firstName: lead.firstName || '',
           lastName: lead.lastName || '',
           company: lead.company || '',
@@ -11144,7 +13512,8 @@ export class AgentModeService {
   ): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
+      const { sanitizeEnrichmentMetadataForResponse, stripCardRevenueKeys, shouldHideCardRevenueForViewer } = await import('../utils/enrichmentMetadataPresentation');
+      const hideCardRevenueForCaller = shouldHideCardRevenueForViewer(userId);
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
 
       if ((!filters || filters.length === 0) && !options?.search?.trim()) {
@@ -11326,6 +13695,8 @@ export class AgentModeService {
             leadId: entry.lead.leadId,
             ...(isMultiList ? { listId: entry.listId, listName: entry.listName } : {}),
             email: entry.lead.email || '',
+            // ENG-2082: see get_leads — a phone-only lead has a contact channel; show it.
+            phone: entry.lead.phone || '',
             firstName: entry.lead.firstName || '',
             lastName: entry.lead.lastName || '',
             company: entry.lead.company || '',
@@ -11334,8 +13705,12 @@ export class AgentModeService {
             icpScore: entry.lead.icpMatch?.score || null,
             engagementCount: entry.lead.engagementCount || 0,
             isEngaged: entry.lead.isEngaged || false,
-            customFields: entry.lead.customFields || {},
-            ...(sanitizedEnrichmentMetadata ? { enrichmentMetadata: sanitizedEnrichmentMetadata } : {}),
+            customFields: hideCardRevenueForCaller
+              ? (stripCardRevenueKeys(entry.lead.customFields) ?? {})
+              : (entry.lead.customFields || {}),
+            ...(sanitizedEnrichmentMetadata
+              ? { enrichmentMetadata: hideCardRevenueForCaller ? stripCardRevenueKeys(sanitizedEnrichmentMetadata) : sanitizedEnrichmentMetadata }
+              : {}),
             // ENG-1175. This is the call both launch gates make to answer "did
             // the gclid survive to the stored row?" — Google Pre-Launch Gate
             // step 6.6 and the Meta gate's T11. Without these fields the gate
@@ -11398,10 +13773,10 @@ export class AgentModeService {
   public async getLeadDetails(listId: string, leadId: string, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
+      const { sanitizeEnrichmentMetadataForResponse, stripCardRevenueKeys, shouldHideCardRevenueForViewer } = await import('../utils/enrichmentMetadataPresentation');
 
       // Verify list ownership (org members can access lists owned by other org members)
-      const list = await crmDb.getLeadListById(listId);
+      let list = await crmDb.getLeadListById(listId);
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
@@ -11410,9 +13785,29 @@ export class AgentModeService {
         return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
       }
 
-      const lead = await crmDb.getLeadById(listId, leadId);
+      const requestedListId = listId;
+      let lead = await crmDb.getLeadById(listId, leadId);
+      let correctedListId: string | null = null;
+      if (!lead) {
+        // ENG-969 follow-up: the requested list_id may just be stale/wrong
+        // rather than the lead not existing at all. See leadRecovery.ts for
+        // the full rationale (tiering, retry, and why it always fails safe).
+        const found = await recoverLeadFromWrongList(crmDb, userId, requestedListId, leadId);
+        if (found) {
+          lead = found;
+          listId = found.listId;
+          correctedListId = found.listId;
+        }
+      }
       if (!lead) {
         return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
+      }
+      if (correctedListId) {
+        // Point `list` at the list the lead actually belongs to (never mutate the
+        // fetched record in place) — downstream code reads list.linkedInAccountId,
+        // which is per-list.
+        const correctedList = await crmDb.getLeadListById(correctedListId);
+        if (correctedList) list = correctedList;
       }
 
       // Per-field provenance sidecar — lets the agent answer "where does this
@@ -11423,6 +13818,10 @@ export class AgentModeService {
       const sanitizedEnrichmentMetadata = sanitizeEnrichmentMetadataForResponse(
         lead.enrichmentMetadata as Record<string, any> | undefined,
       );
+      // ENG-1388: this list may be org-shared, and canOrgMemberAccessList above
+      // has no Enigma-allowlist awareness — strip card revenue for a caller
+      // who isn't allowlisted, same boundary as the customer-portal REST path.
+      const hideCardRevenueForCaller = shouldHideCardRevenueForViewer(userId);
 
       // Check LinkedIn connection status from cache (non-blocking, swallows errors)
       let linkedInConnectionStatus: {
@@ -11484,8 +13883,14 @@ export class AgentModeService {
       return {
         success: true,
         message: `Lead details for ${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
+        // Tell the caller the list_id it passed was wrong so it corrects its own
+        // working state for later calls, instead of repeating the same mismatch.
+        ...(correctedListId
+          ? { note: `list_id "${requestedListId}" does not contain this lead. Corrected to its actual list_id "${correctedListId}" — use that for future calls with lead_id "${leadId}".` }
+          : {}),
         lead: {
           leadId: lead.leadId,
+          listId: lead.listId,
           email: lead.email || '',
           firstName: lead.firstName || '',
           lastName: lead.lastName || '',
@@ -11495,8 +13900,12 @@ export class AgentModeService {
           notes: lead.notes || '',
           linkedin: lead.linkedin || '',
           linkedInConnectionStatus,
-          customFields: lead.customFields || {},
-          ...(sanitizedEnrichmentMetadata ? { enrichmentMetadata: sanitizedEnrichmentMetadata } : {}),
+          customFields: hideCardRevenueForCaller
+            ? (stripCardRevenueKeys(lead.customFields) ?? {})
+            : (lead.customFields || {}),
+          ...(sanitizedEnrichmentMetadata
+            ? { enrichmentMetadata: hideCardRevenueForCaller ? stripCardRevenueKeys(sanitizedEnrichmentMetadata) : sanitizedEnrichmentMetadata }
+            : {}),
           icpMatch: lead.icpMatch || null,
           isEngaged: lead.isEngaged || false,
           emailDraft: emailDraftPreview,
@@ -11652,6 +14061,8 @@ export class AgentModeService {
           matches.push({
             leadId: lead.leadId,
             email: lead.email || '',
+            // ENG-2082: see get_leads — a phone-only lead has a contact channel; show it.
+            phone: lead.phone || '',
             firstName: lead.firstName || '',
             lastName: lead.lastName || '',
             company: lead.company || '',
@@ -12037,7 +14448,13 @@ export class AgentModeService {
               matchCount++;
               if (sampleLeads.length < sampleLimit) {
                 sampleLeads.push({
+                  // ENG-2082: this is the preview for a DESTRUCTIVE op, and `email is_empty`
+                  // matches phone-only leads exactly. Without the number every sample row
+                  // rendered blank, so the operator confirmed a delete against rows that
+                  // looked like empty junk and were in fact contactable leads.
+                  leadId: lead.leadId,
                   email: lead.email || '',
+                  phone: lead.phone || '',
                   firstName: lead.firstName || '',
                   lastName: lead.lastName || '',
                   company: lead.company || ''
@@ -12249,20 +14666,12 @@ export class AgentModeService {
         return { success: false, message: 'Access denied', error: 'You do not have permission to view this list' };
       }
 
-      const defaultStatuses = [
-        { value: 'new', label: 'New', color: 'gray', type: 'active' },
-        { value: 'contacted', label: 'Contacted', color: 'blue', type: 'active' },
-        { value: 'qualified', label: 'Qualified', color: 'indigo', type: 'active' },
-        { value: 'proposal_sent', label: 'Proposal Sent', color: 'purple', type: 'active' },
-        { value: 'negotiating', label: 'Negotiating', color: 'yellow', type: 'active' },
-        { value: 'won', label: 'Won', color: 'green', type: 'won' },
-        { value: 'lost', label: 'Lost', color: 'red', type: 'lost' },
-        { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
-      ];
-
       return {
         success: true,
-        statuses: list.statusConfig || defaultStatuses,
+        // Was a second copy of createLeadList's literal. Shared now, so a list created
+        // before statusConfig was persisted reads back the same vocabulary a list created
+        // today stores — and it honours listType, which the local copy did not.
+        statuses: list.statusConfig || defaultStatusConfigFor((list as any)?.listType),
         listName: list.name,
       };
     } catch (error) {
@@ -12579,45 +14988,50 @@ export class AgentModeService {
 
       // Accept both shapes — see note in sendEmailFromConfiguredSender.
       const leadSenderProvider: string = (sender as any).senderProvider || (sender as any).senderType || 'resend';
+      const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
+      if (leadSenderProvider !== 'resend' && !connectedAccountId) {
+        return {
+          success: false,
+          message: `${providerLabel(leadSenderProvider)} sender misconfigured`,
+          error: `The ${providerLabel(leadSenderProvider)} sender is missing its connected account id`,
+        };
+      }
 
-      if (leadSenderProvider !== 'resend') {
-        // Send through the customer's own connected mailbox (Gmail / Outlook)
-        const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
-        if (!connectedAccountId) {
-          return {
-            success: false,
-            message: `${providerLabel(leadSenderProvider)} sender misconfigured`,
-            error: `The ${providerLabel(leadSenderProvider)} sender is missing its connected account id`,
-          };
-        }
-        const { bootstrapEmailProviders, getEmailProvider } = await import('./emailProviderService');
-        await bootstrapEmailProviders();
-        const provider = getEmailProvider(leadSenderProvider);
-        const body = draft.htmlContent || draft.textContent || '';
+      // ENG-265: route through sendAsSender (not the provider APIs directly) so this
+      // chat-driven send is subject to the same daily-cap/warmup enforcement as every
+      // other send path. resolveSenderForSend gives the authoritative CrmSender
+      // (dailyLimit/warmupStartedAt included) — the same lookup crm.ts's send routes use.
+      const { resolveSenderForSend } = await import('./crmSenderService');
+      const { sendAsSender, SenderDailyLimitExceededError } = await import('./sendAsSender');
+      // Fail closed rather than falling back to a synthesized sender: resolveSenderForSend
+      // re-reads the persisted config, so a null here means the sender that existed a moment
+      // ago (from getCrmSenders) is now gone — a real (if narrow) race, not a legitimate
+      // ad-hoc-sender case. A synthesized fallback would carry no dailyLimit/warmupStartedAt
+      // and sendAsSender would treat it as uncapped, silently skipping enforcement.
+      const crmSender = await resolveSenderForSend(senderOwnerUserId, sender.id, sender.email);
+      if (!crmSender) {
+        return {
+          success: false,
+          message: 'Sender no longer available',
+          error: 'This sender was removed or changed just now. Please pick a sender again and retry.',
+        };
+      }
+
+      try {
         // senderOwnerUserId, not userId: the connected account belongs to whoever owns the
         // sender config, and a refreshed/rotated token must be written back to them (ENG-299).
-        const sendResult = await provider.sendEmail(senderOwnerUserId, connectedAccountId, {
-          to: lead.email,
-          subject: draft.subject,
-          body,
-          isHtml: !!draft.htmlContent,
-        });
-        emailId = sendResult.messageId;
-      } else {
-        // Send via Resend (custom domain sender)
-        const { resendService } = await import('./resendService');
-        const from = `${sender.fromName} <${sender.email}>`;
-        const result = await resendService.sendEmail({
-          from,
+        const sendResult = await sendAsSender(senderOwnerUserId, crmSender, {
           to: lead.email,
           subject: draft.subject,
           html: draft.htmlContent,
-          text: draft.textContent
+          text: draft.textContent,
         });
-        if (!result) {
-          return { success: false, message: 'Email send failed', error: 'Failed to send email via Resend' };
+        emailId = sendResult.messageId;
+      } catch (error) {
+        if (error instanceof SenderDailyLimitExceededError) {
+          return { success: false, message: 'Daily sending limit reached', error: error.message };
         }
-        emailId = result.id;
+        throw error;
       }
 
       // Clear the draft after successful send
@@ -12633,7 +15047,15 @@ export class AgentModeService {
       };
     } catch (error) {
       console.error('AgentMode: Error sending email to lead:', error);
-      return { success: false, message: 'Failed to send email', error: error instanceof Error ? error.message : 'Unknown error' };
+      const { emailProviderErrorStatus } = await import('./emailProviderService');
+      return {
+        success: false,
+        message: 'Failed to send email',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        // ENG-1300: Gmail/Outlook throw fully-typed EmailProviderError
+        // subclasses with no HTTP status of their own — mapped by name.
+        code: emailProviderErrorStatus(error)
+      };
     }
   }
 
@@ -12755,62 +15177,68 @@ export class AgentModeService {
       // persisted key. A sender resolved outside loadSenderConfig may only carry the latter.
       const senderProvider: string = (sender as any).senderProvider || (sender as any).senderType || 'resend';
 
-      if (senderProvider !== 'resend') {
-        const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
-        if (!connectedAccountId) {
-          return {
-            success: false,
-            message: `${providerLabel(senderProvider)} sender misconfigured`,
-            error: `The ${providerLabel(senderProvider)} sender is missing its connected account id`,
-          };
-        }
-        const { bootstrapEmailProviders, getEmailProvider } = await import('./emailProviderService');
-        const label = providerLabel(senderProvider);
-        await bootstrapEmailProviders();
-        const provider = getEmailProvider(senderProvider);
-        const body = htmlBody || textBody || '';
-        try {
-          const sendResult = await provider.sendEmail(userId, connectedAccountId, {
-            to,
-            subject: params.subject,
-            body,
-            isHtml: !!htmlBody,
-          });
-          emailId = sendResult.messageId;
-        } catch (providerErr: any) {
-          // Translate OAuth failures into an actionable message that names the
-          // affected sender. Raw errors like "unauthorized_client" / "invalid_grant"
-          // are otherwise opaque and get mis-paraphrased by the LLM (e.g. "no account
-          // configured"). Nearly all are resolved by reconnecting in Settings.
-          const raw = providerErr instanceof Error ? providerErr.message : String(providerErr);
-          const needsReconnect = /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
-          if (needsReconnect) {
-            return {
-              success: false,
-              message: `${label} sender needs reconnecting`,
-              error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
-            };
-          }
-          return {
-            success: false,
-            message: `${label} send failed`,
-            error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
-          };
-        }
-      } else {
-        const { resendService } = await import('./resendService');
-        const from = `${sender.fromName} <${sender.email}>`;
-        const result = await resendService.sendEmail({
-          from,
+      const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
+      if (senderProvider !== 'resend' && !connectedAccountId) {
+        return {
+          success: false,
+          message: `${providerLabel(senderProvider)} sender misconfigured`,
+          error: `The ${providerLabel(senderProvider)} sender is missing its connected account id`,
+        };
+      }
+      const label = providerLabel(senderProvider);
+
+      // ENG-265: route through sendAsSender so this chat-driven ad-hoc send is subject
+      // to the same daily-cap/warmup enforcement as every other send path.
+      const { resolveSenderForSend } = await import('./crmSenderService');
+      const { sendAsSender, SenderDailyLimitExceededError } = await import('./sendAsSender');
+      // Fail closed rather than falling back to a synthesized sender — see the matching
+      // comment in sendEmailToLead for why a null here must not become an uncapped send.
+      const crmSender = await resolveSenderForSend(userId, sender.id, sender.email);
+      if (!crmSender) {
+        return {
+          success: false,
+          message: 'Sender no longer available',
+          error: 'This sender was removed or changed just now. Please pick a sender again and retry.',
+        };
+      }
+
+      try {
+        const sendResult = await sendAsSender(userId, crmSender, {
           to,
           subject: params.subject,
           html: htmlBody,
           text: textBody,
         });
-        if (!result) {
-          return { success: false, message: 'Email send failed', error: `Failed to send email to "${to}" via the configured sender ${sender.email}. This is often caused by an invalid or rejected recipient address, or the sender domain not being verified. Please double-check the recipient address.` };
+        emailId = sendResult.messageId;
+      } catch (error: any) {
+        if (error instanceof SenderDailyLimitExceededError) {
+          return { success: false, message: 'Daily sending limit reached', error: error.message };
         }
-        emailId = result.id;
+        // Translate OAuth failures into an actionable message that names the
+        // affected sender. Raw errors like "unauthorized_client" / "invalid_grant"
+        // are otherwise opaque and get mis-paraphrased by the LLM (e.g. "no account
+        // configured"). Nearly all are resolved by reconnecting in Settings.
+        const raw = error instanceof Error ? error.message : String(error);
+        const needsReconnect = senderProvider !== 'resend' && /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
+        // ENG-1300: Gmail/Outlook throw fully-typed EmailProviderError subclasses
+        // with no HTTP status of their own — mapped by name. undefined for Resend
+        // and any other error shape, which is fine: the fields below are additive.
+        const { emailProviderErrorStatus } = await import('./emailProviderService');
+        const code = emailProviderErrorStatus(error);
+        if (needsReconnect) {
+          return {
+            success: false,
+            message: `${label} sender needs reconnecting`,
+            error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
+            code,
+          };
+        }
+        return {
+          success: false,
+          message: `${label} send failed`,
+          error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
+          code,
+        };
       }
 
       return {
@@ -12823,7 +15251,13 @@ export class AgentModeService {
       };
     } catch (error) {
       console.error('AgentMode: Error sending email from configured sender:', error);
-      return { success: false, message: 'Failed to send email', error: error instanceof Error ? error.message : 'Unknown error' };
+      const { emailProviderErrorStatus } = await import('./emailProviderService');
+      return {
+        success: false,
+        message: 'Failed to send email',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        code: emailProviderErrorStatus(error)
+      };
     }
   }
 
@@ -13014,6 +15448,36 @@ export class AgentModeService {
         };
       }
 
+      // No contact channel at all, nothing to draft. ENG-2082 opened lead capture to
+      // phone-only submissions, and this runs fire-and-forget from the forward-lead webhook
+      // whenever the list has autoDraftEnabled — so without a guard every phone-only capture
+      // spends two billed LLM calls writing a polished email to a person who has no address
+      // and a LinkedIn note for a lead with no LinkedIn, then reports success.
+      //
+      // Gated on email AND linkedin, not email alone. This function also produces the
+      // LinkedIn connection-request note below, and linkedInInviteCrmMirror creates leads
+      // that have a linkedin and NO email — refusing those would delete a working feature
+      // to fix a new one.
+      //
+      // `skipped` so the caller can tell "nothing to do" from "this broke": webhooks.ts maps
+      // a plain falsy result to autoDraftStatus='failed' and puts the error in the OWNER
+      // ALERT, which would mean every phone-only capture emails its owner a failure notice.
+      // Its sibling autoSend path already has the right word for this — 'skipped_no_email'.
+      // Trimmed on both sides. The note gate below trims and this did not, so
+      // `linkedin: '   '` passed here, closed there, and fell through to the
+      // nothing-generated arm.
+      if (!String(lead.email ?? '').trim() && !String(lead.linkedin ?? '').trim()) {
+        return {
+          success: false,
+          skipped: true,
+          reason: 'no_contact_channel',
+          // The guard widened to email-or-linkedin; the message did not follow it, so a
+          // LinkedIn-less, email-less lead reported a problem it only half had.
+          message: 'No contact channel',
+          error: 'This lead has neither an email address nor a LinkedIn profile — there is nothing to draft.'
+        };
+      }
+
       // Check do-not-contact status
       const { isDoNotContact: isDNC, getDoNotContactReason: getDNCReason } = await import('../utils/leadContactStatus');
       if (isDNC(lead)) {
@@ -13070,8 +15534,15 @@ export class AgentModeService {
       if (lead.notes) {
         emailPrompt += `\n- Notes: ${lead.notes}`;
       }
-      if (lead.customFields && Object.keys(lead.customFields).length > 0) {
-        emailPrompt += `\n- Custom Fields: ${JSON.stringify(lead.customFields, null, 2)}`;
+      // ENG-1388: this draft is meant to be sent to the external lead/prospect,
+      // so card revenue (Enigma, internal-use-only) must never inform it —
+      // unconditionally, regardless of whether the requesting user is
+      // themselves Enigma-allowlisted. That allowlist governs internal
+      // visibility, not what may go into outward-facing content.
+      const { stripCardRevenueKeys } = await import('../utils/enrichmentMetadataPresentation');
+      const emailPromptCustomFields = stripCardRevenueKeys(lead.customFields);
+      if (emailPromptCustomFields && Object.keys(emailPromptCustomFields).length > 0) {
+        emailPrompt += `\n- Custom Fields: ${JSON.stringify(emailPromptCustomFields, null, 2)}`;
       }
 
       // Add engagement history
@@ -13172,66 +15643,75 @@ ${emailDraftFormat === 'text'
   "htmlContent": "Complete HTML email body (well-formatted, professional, email-friendly HTML)"
 }`}`;
 
-      const reportGenerationModel = await this.getReportGenerationDefaultModel();
-      const completion = await this.callLLM(
-        reportGenerationModel,
-        [
+      // The EMAIL draft runs only when there is an address to send to. This function also
+      // produces the LinkedIn connection-request note below, and linkedInInviteCrmMirror
+      // creates leads that have a linkedin and no email — so the guard at the top of this
+      // function cannot refuse them outright. But widening that guard on its own left this
+      // path still running for them: two billed LLM calls producing a polished draft
+      // addressed to nobody, which is the exact harm the guard was added to prevent.
+      let emailDraft: any = null;
+      let emailData: any = null;
+      if (lead.email) {
+        const reportGenerationModel = await this.getReportGenerationDefaultModel();
+        const completion = await this.callLLM(
+          reportGenerationModel,
+          [
+            {
+              role: "system",
+              content: emailDraftFormat === 'text'
+                ? "You are an expert email marketing strategist. Create personalized, professional plain text emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and textContent fields. Use plain text only - no HTML tags or formatting markup."
+                : "You are an expert email marketing strategist. Create personalized, professional emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and htmlContent fields.",
+            },
+            { role: "user", content: emailPrompt },
+          ],
           {
-            role: "system",
-            content: emailDraftFormat === 'text'
-              ? "You are an expert email marketing strategist. Create personalized, professional plain text emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and textContent fields. Use plain text only - no HTML tags or formatting markup."
-              : "You are an expert email marketing strategist. Create personalized, professional emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and htmlContent fields.",
+          temperature: 0.8,
+            max_completion_tokens: 3000,
+            response_format: { type: 'json_object' },
+            usageContext: { userId, sessionId, feature: 'email_draft' },
+            taskClass: 'content_generation',
           },
-          { role: "user", content: emailPrompt },
-        ],
-        {
-        temperature: 0.8,
-          max_completion_tokens: 3000,
-          response_format: { type: 'json_object' },
-          usageContext: { userId, sessionId, feature: 'email_draft' },
-          taskClass: 'content_generation',
-        },
-      );
+        );
 
-      const responseContent = completion.choices[0].message.content;
-      if (!responseContent) {
-        throw new Error('No content generated from LLM');
-      }
-
-      // Parse the JSON response
-      let emailData;
-      try {
-        const cleanedContent = responseContent.replace(/```json\s*|\s*```/g, '').trim();
-        emailData = JSON.parse(cleanedContent);
-      } catch (parseError) {
-        console.error('AgentMode: Error parsing email draft JSON:', parseError);
-        throw new Error('Failed to parse email draft response');
-      }
-
-      // Validate required fields based on format
-      if (emailDraftFormat === 'text') {
-        if (!emailData.subject || !emailData.textContent) {
-          throw new Error('LLM response missing required fields (subject, textContent)');
+        const responseContent = completion.choices[0].message.content;
+        if (!responseContent) {
+          throw new Error('No content generated from LLM');
         }
-      } else {
-        if (!emailData.subject || !emailData.htmlContent) {
-          throw new Error('LLM response missing required fields (subject, htmlContent)');
+
+        // Parse the JSON response
+        try {
+          const cleanedContent = responseContent.replace(/```json\s*|\s*```/g, '').trim();
+          emailData = JSON.parse(cleanedContent);
+        } catch (parseError) {
+          console.error('AgentMode: Error parsing email draft JSON:', parseError);
+          throw new Error('Failed to parse email draft response');
         }
-      }
 
-      // Save draft to lead record with sessionId
-      const now = new Date().toISOString();
-      const emailDraft: any = {
-        subject: emailData.subject,
-        createdAt: existingDraft?.createdAt || now,
-        updatedAt: now,
-        sessionId: sessionId
-      };
+        // Validate required fields based on format
+        if (emailDraftFormat === 'text') {
+          if (!emailData.subject || !emailData.textContent) {
+            throw new Error('LLM response missing required fields (subject, textContent)');
+          }
+        } else {
+          if (!emailData.subject || !emailData.htmlContent) {
+            throw new Error('LLM response missing required fields (subject, htmlContent)');
+          }
+        }
 
-      if (emailDraftFormat === 'text') {
-        emailDraft.textContent = emailData.textContent;
-      } else {
-        emailDraft.htmlContent = emailData.htmlContent;
+        // Save draft to lead record with sessionId
+        const now = new Date().toISOString();
+        emailDraft = {
+          subject: emailData.subject,
+          createdAt: existingDraft?.createdAt || now,
+          updatedAt: now,
+          sessionId: sessionId
+        };
+
+        if (emailDraftFormat === 'text') {
+          emailDraft.textContent = emailData.textContent;
+        } else {
+          emailDraft.htmlContent = emailData.htmlContent;
+        }
       }
 
       // Build activity history section for message prompt (reuse already-fetched engagements)
@@ -13251,9 +15731,20 @@ ${emailDraftFormat === 'text'
       // Create message draft optimised for LinkedIn connection invites. The char limit
       // depends on the sending account tier: 300 for Premium, 200 for free. Resolve the
       // account the same way the send-invite route does (list-assigned → user's own).
+      // The email draft was gated on lead.email; this is the other half, and it was
+      // missing. A commit claimed "the two drafts are independent now — email gated on
+      // lead.email, note on lead.linkedin" and only shipped the first clause, so every
+      // ordinary email-only lead captured into an autoDraft list paid a second billed LLM
+      // call plus two LinkedIn API round trips to write a connection note for a lead with
+      // no LinkedIn URL — and stored it as messageDraft. Exactly the mirror of the harm
+      // the guard was added to stop; the env2 check only exercised the LinkedIn-only
+      // direction, so nothing caught it.
+      const wantsLinkedInNote = !!String((lead as any).linkedin ?? '').trim();
       const { linkedInOutreachService, LinkedInOutreachService } = await import('./linkedInOutreachService');
-      const inviteAccountId = (list as any)?.linkedInAccountId
-        || await linkedInOutreachService.resolveUserOwnedAccountId(userId);
+      const inviteAccountId = wantsLinkedInNote
+        ? ((list as any)?.linkedInAccountId
+          || await linkedInOutreachService.resolveUserOwnedAccountId(userId))
+        : null;
       const inviteCharLimit = inviteAccountId
         ? await linkedInOutreachService.getInviteCharLimitForAccount(userId, inviteAccountId)
         : 200;
@@ -13261,11 +15752,22 @@ ${emailDraftFormat === 'text'
       const leadTitle = (lead as any).title || '';
       const leadCompany = (lead as any).company || '';
       const leadDesc = [leadName || null, leadTitle, leadCompany ? `at ${leadCompany}` : null].filter(Boolean).join(', ');
-      const emailSummary = (emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent || '').slice(0, 300);
+      // `emailData` is null for a LinkedIn-only lead — that is the entire point of
+      // gating the email draft. The line below dereferenced it unconditionally, one line
+      // ABOVE the ternary that correctly handles null, so the LinkedIn-only lead this
+      // block exists to serve threw `Cannot read properties of null (reading
+      // 'textContent')` and produced no note at all. Found on env2, not by the unit
+      // test: that test asserts no email-strategist prompt was sent, which stays true
+      // when the function throws before reaching any prompt.
+      // The `|| ''` also bound to the false branch only, so a text draft with an empty
+      // textContent threw here too.
+      const emailSummary = emailData
+        ? String((emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent) || '').slice(0, 300)
+        : '';
       const messagePrompt = `You are writing a LinkedIn connection request note. The goal is to get the recipient to accept.
 
 Recipient: ${leadDesc}
-Context from their email (use to understand the outreach angle): Subject: ${emailData.subject} — ${emailSummary}
+${emailData ? `Context from their email (use to understand the outreach angle): Subject: ${emailData.subject} — ${emailSummary}` : 'No email draft for this lead (no address on file) — write the note from their profile alone.'}
 ${messageActivityContext}
 
 Write a note that:
@@ -13284,23 +15786,26 @@ Good: "Sarah, Island's browser-isolation is one of the smarter takes on shadow I
 
 Reply with ONLY valid JSON: {"content": "the note text"}`;
 
-      const messageCompletion = await this.callLLM('gemini-3.5-flash', [
-        { role: 'user', content: messagePrompt },
-      ], {
-        temperature: 0.8,
-        max_completion_tokens: 2048,
-        usageContext: { userId, sessionId, feature: 'invite_message' },
-        taskClass: 'content_generation',
-      });
+      const messageCompletion = wantsLinkedInNote
+        ? await this.callLLM('gemini-3.5-flash', [
+          { role: 'user', content: messagePrompt },
+        ], {
+          temperature: 0.8,
+          max_completion_tokens: 2048,
+          usageContext: { userId, sessionId, feature: 'invite_message' },
+          taskClass: 'content_generation',
+        })
+        : null;
 
-      const messageResponseContent = messageCompletion.choices[0].message.content;
-      if (!messageResponseContent) {
+      const messageResponseContent = messageCompletion?.choices?.[0]?.message?.content ?? null;
+      // Only a lead we actually asked for a note about can be missing one.
+      if (wantsLinkedInNote && !messageResponseContent) {
         throw new Error('No message content generated from LLM');
       }
 
       // Parse the JSON response — Gemini may wrap it in markdown or prose
-      let messageData;
-      try {
+      let messageData: any = null;
+      if (messageResponseContent) try {
         const cleanedMsg = messageResponseContent.replace(/```json\s*/g, '').replace(/\s*```/g, '').trim();
         const bs = cleanedMsg.indexOf('{');
         const be = cleanedMsg.lastIndexOf('}');
@@ -13337,28 +15842,50 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         };
       }
 
-      // Update lead with both email draft and message draft
-      await crmDb.updateLead(listId, leadId, {
-        emailDraft: emailDraft,
-        emailDraftFormat: emailDraftFormat,
+      // Update lead with whichever drafts were actually produced. With both gated off
+      // there is nothing to write, and an empty update is not free: it costs a read plus
+      // an UpdateItem that only bumps updatedAt and re-projects the GSIs.
+      const draftUpdates = {
+        ...(emailDraft && { emailDraft, emailDraftFormat }),
         ...(messageDraft && { messageDraft: messageDraft })
-      });
+      };
+      if (Object.keys(draftUpdates).length > 0) {
+        await crmDb.updateLead(listId, leadId, draftUpdates);
+      }
 
       return {
         success: true,
-        message: existingDraft
-          ? 'Email and message drafts updated successfully'
-          : 'Email and message drafts created successfully',
+        // `skipped` when NEITHER draft was produced. webhooks.ts maps `success && !skipped`
+        // to autoDraftStatus='created', so without this the owner alert said "Auto Draft:
+        // Created" over nothing at all — reachable when the note LLM returns parseable but
+        // contentless JSON, or when `linkedin` is whitespace (the entry guard uses raw
+        // truthiness, the note gate trims, so the two disagree on that value).
+        ...(!emailData && !messageDraft ? { skipped: true, reason: 'nothing_generated' } : {}),
+        // Say what actually happened. Each draft is now gated on its own channel, so all
+        // four combinations are reachable and the old two-way message described one.
+        message: emailData && messageDraft
+          ? (existingDraft
+            ? 'Email and message drafts updated successfully'
+            : 'Email and message drafts created successfully')
+          : emailData
+            ? (existingDraft ? 'Email draft updated successfully' : 'Email draft created successfully')
+            : messageDraft
+              ? 'LinkedIn message draft created — no email draft, this lead has no address'
+              : 'No draft created — nothing usable was generated for this lead',
         data: {
-          email: emailDraftFormat === 'text'
-            ? {
-              subject: emailData.subject,
-              textContent: emailData.textContent
-            }
-            : {
-              subject: emailData.subject,
-              htmlContent: emailData.htmlContent
-            },
+          // null, not a fabricated shape: webhooks.ts reads data.email to decide whether to
+          // auto-send, and an object with undefined fields would read as a real draft.
+          email: !emailData
+            ? null
+            : emailDraftFormat === 'text'
+              ? {
+                subject: emailData.subject,
+                textContent: emailData.textContent
+              }
+              : {
+                subject: emailData.subject,
+                htmlContent: emailData.htmlContent
+              },
           message: messageDraft ? { content: messageDraft.content } : null
         }
       };
@@ -13836,7 +16363,13 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       const personas = await generateIcpsForUser(brand, { llm: deps.llm }, userId);
       let competitorResult: any = { per_icp: [] };
       if (Array.isArray(personas) && personas.length > 0) {
-        competitorResult = await generateCompetitorStrategyForUser(brand, personas, deps);
+        // ENG-1858: attribute and charge the regeneration to the requesting user.
+        competitorResult = await generateCompetitorStrategyForUser(
+          brand,
+          personas,
+          deps,
+          { userId, feature: 'onboarding_competitors' },
+        );
       }
 
       const icp = mapIcpResultToMarketStrategy(personas);
@@ -15053,7 +17586,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
     }
   }
 
-  async generateSessionTitle(userMessage: string): Promise<string> {
+  async generateSessionTitle(userMessage: string, usageContext?: LLMUsageContext): Promise<string> {
     try {
       const defaultModel = await this.getDefaultModel();
 
@@ -15066,7 +17599,12 @@ Write it like a task name: "Competitive Analysis Report", "SaaS Product Launch A
 Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference content quality.`
         },
         { role: 'user', content: userMessage.slice(0, 500) }
-      ], { response_format: { type: 'json_object' }, taskClass: 'interactive_chat' });
+      ], {
+        response_format: { type: 'json_object' },
+        taskClass: 'interactive_chat',
+        // ENG-1858: attribute to the requesting user, not "system".
+        usageContext: usageContext ?? { feature: 'session_title' },
+      });
       // response_format: json_object forces Gemini/GPT to output valid JSON.
       // For Bedrock (Claude), response_format is ignored but the prompt instruction is sufficient.
       // No max_completion_tokens — Gemini treats it as total (input+output) tokens, causing empty
@@ -15107,7 +17645,7 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
    * to produce a context-aware error message instead of the generic fallback.
    * Returns null if diagnosis fails (caller should use the generic message).
    */
-  async generateDiagnosticMessage(context: DiagnosisContext): Promise<string | null> {
+  async generateDiagnosticMessage(context: DiagnosisContext, usageContext?: LLMUsageContext): Promise<string | null> {
     try {
       // ENG-971: the truthfulness rules exist because this agent wrote "the system
       // timed out ... so your changes were not saved. Please try your request again"
@@ -15127,6 +17665,8 @@ TRUTHFULNESS RULES (these override tone):
 - An error, timeout, or interruption ENDS the run; it does not undo, roll back, or discard work that already succeeded. Never say or imply that completed work was lost, was not saved, or must be redone.
 - Only tell the user to retry the parts that did NOT succeed. If a publish, deploy, or send succeeded, explicitly tell the user NOT to re-run it.
 - Do not attribute a failure to an operation that appears in the succeeded list.
+- If the succeeded list is absent or says NONE, then NOTHING completed in this run. Do not describe any step — loading, connecting, signing in, navigating, fetching, reading, analyzing — as having happened. Report only that the run failed before any operation completed, plus what the user can do next. Never infer the steps from the user's request: the request describes what was ASKED FOR, never what occurred.
+- A tool on the succeeded list RAN; that is NOT the same as its goal being achieved or the task being done. This message exists BECAUSE the run failed — report it as a failure with what (if anything) completed, never as a success. You are never shown tool RESULTS, so never claim what any tool FOUND, RETURNED, ANALYZED, matched, or PRODUCED (e.g. do not say "I analyzed the guest data" because a search tool ran — you cannot see whether it found anything). And never tell the user to run or retry an internal step; the only action you may suggest is that they resend their request.
 - The numbers beside each operation are HOW MANY TIMES IT RAN — never how many leads, rows, emails, posts, files, or records it handled. You are not shown those quantities. Never restate a run count as a quantity of things: "add_leads_to_list: 3" means that tool ran 3 times, NOT that 3 leads were added. If you do not know how many items an operation processed, say what ran without inventing a number.`;
 
       const parts: string[] = [
@@ -15141,6 +17681,18 @@ TRUTHFULNESS RULES (these override tone):
       }
       if (context.succeededFunctions && Object.keys(context.succeededFunctions).length > 0) {
         parts.push(`Succeeded operations, as {operation: number of times it RAN} — NOT a count of records handled (these COMPLETED — do not report them as lost): ${JSON.stringify(context.succeededFunctions)}`);
+      } else {
+        // An empty ledger used to be expressed by OMITTING this line entirely, which left
+        // the model with only the error and the user's request — and it filled the gap by
+        // narrating the request back as if it had happened. Observed in prod on 2026-09-25
+        // (session 7adc834c-3afc-4120-abbb-77caf573b80a): zero tools dispatched, yet the
+        // user was told "I have successfully loaded your browser cookies and navigated to
+        // the event management page." The existing output guards cannot catch this —
+        // stripUnfoundedEntityCounts only removes unproven QUANTITIES, and the
+        // reconcileFalse* passes only correct false NEGATIVES (work landed, reported as
+        // lost). Nothing corrected a false POSITIVE, so state the absence explicitly
+        // rather than leaving it to be inferred from silence.
+        parts.push('Succeeded operations: NONE. No operation completed in this run — it failed before anything ran. Do not describe any step as completed.');
       }
       if (context.failedFunctions && Object.keys(context.failedFunctions).length > 0) {
         parts.push(`Failed operations, as {operation: number of times it FAILED} — NOT a count of records handled: ${JSON.stringify(context.failedFunctions)}`);
@@ -15162,6 +17714,8 @@ TRUTHFULNESS RULES (these override tone):
         max_completion_tokens: 200,
         temperature: 0.3,
         taskClass: 'nonstandard_consumer',
+        // ENG-1858: the failed run's user pays for explaining its failure.
+        usageContext: usageContext ?? { feature: 'diagnostic_message' },
       });
 
       const timeoutPromise = new Promise<null>((resolve) =>
@@ -15187,7 +17741,7 @@ TRUTHFULNESS RULES (these override tone):
    * Uses gemini-3.1-flash-lite for fast, low-cost summarization.
    * Returns null if generation fails (caller should keep existing title).
    */
-  async generateScheduledChatSummary(startingMessage: string, response: string, succeededToolNames?: string[]): Promise<string | null> {
+  async generateScheduledChatSummary(startingMessage: string, response: string, succeededToolNames?: string[], usageContext?: LLMUsageContext): Promise<string | null> {
     try {
       // ENG-803: the summary becomes the run's title suffix, so it must describe
       // what the run DID, not what its prose claimed. Previously this saw only the
@@ -15211,6 +17765,8 @@ TRUTHFULNESS RULES (these override tone):
         max_completion_tokens: 20,
         temperature: 0.3,
         taskClass: 'scheduled_background',
+        // ENG-1858: part of the schedule owner's run.
+        usageContext: usageContext ?? { feature: 'scheduled_run_summary' },
       });
 
       const summary = (response_ as any).choices?.[0]?.message?.content?.trim();
@@ -15247,7 +17803,7 @@ TRUTHFULNESS RULES (these override tone):
     lastRunStatus: string | null;
     lastRunSummary: string | null;
     consecutiveNoOutputRuns: number;
-  }): Promise<ScheduledRunPreCheckLLMResult | null> {
+  }, usageContext?: LLMUsageContext): Promise<ScheduledRunPreCheckLLMResult | null> {
     try {
       const systemPrompt = `You are a fast, cheap pre-check gate for a recurring automated marketing task ("scheduled chat"). Your ONLY job is to judge, from the task's own instructions and its recent run history, whether this run is very likely to have NOTHING new or actionable to do — a near-certain repeat of "nothing to publish".
 
@@ -15275,6 +17831,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         temperature: 0,
         response_format: { type: 'json_object' },
         taskClass: 'scheduled_background',
+        // ENG-1858: part of the schedule owner's run.
+        usageContext: usageContext ?? { feature: 'scheduled_run_precheck' },
       });
 
       const timeoutPromise = new Promise<null>((resolve) =>
@@ -15312,7 +17870,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    */
   async generateSuggestedReplies(
     lastAssistantMessage: string,
-    recentMessages: Array<{ role: string; content: string }>
+    recentMessages: Array<{ role: string; content: string }>,
+    usageContext?: LLMUsageContext,
   ): Promise<string[] | null> {
     const SUGGESTION_TIMEOUT_MS = 5_000;
     try {
@@ -15335,6 +17894,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         temperature: 0.7,
         response_format: { type: 'text' },
         taskClass: 'interactive_chat',
+        // ENG-1858: chips are part of the user's turn.
+        usageContext: usageContext ?? { feature: 'suggested_replies' },
       });
 
       const timeoutPromise = new Promise<null>(resolve =>
@@ -15368,8 +17929,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    * error) — the guard then delivers the message unchanged and records a loud
    * claim_check_error (see core/finalizeGuard.ts).
    *
-   * Deliberately uses FINALIZE_GUARD_JUDGE_MODEL (the same cheap/fast model as
-   * triageSlackMessage) instead of the run's own llmModel: this is a bounded
+   * Deliberately uses FINALIZE_GUARD_JUDGE_MODEL (a cheap/fast classification
+   * model) instead of the run's own llmModel: this is a bounded
    * classification task, not conversational generation, and every flagged
    * reply pays for this call, so keeping it cheap directly reduces the
    * guard's latency/cost footprint at scale (PR #2005 left this as a
@@ -15379,6 +17940,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   private async judgeFinalizeClaims(
     finalText: string,
     candidateClasses: readonly ClaimClass[],
+    usageContext?: LLMUsageContext,
   ): Promise<JudgedClaim[]> {
     const response = await this.callLLM(FINALIZE_GUARD_JUDGE_MODEL, [
       {
@@ -15392,7 +17954,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
           + finalText,
       },
-    ], { max_completion_tokens: 500, temperature: 0, taskClass: 'nonstandard_consumer' });
+    ], {
+      max_completion_tokens: 500,
+      temperature: 0,
+      taskClass: 'nonstandard_consumer',
+      // ENG-1858: the guard audits the user's own reply, so the user's run pays.
+      usageContext: usageContext ?? { feature: 'finalize_guard_judge' },
+    });
 
     const text = (response as any)?.choices?.[0]?.message?.content;
     if (typeof text !== 'string' || !text.trim()) {
@@ -15419,6 +17987,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     finalText: string,
     systemNote: string,
     llmModel: string,
+    usageContext?: LLMUsageContext,
   ): Promise<string> {
     const response = await this.callLLM(llmModel, [
       {
@@ -15428,44 +17997,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + 'Rewrite the reply now. Keep everything that is accurate, but only claim actions the run log confirms succeeded, '
           + 'clearly state what was NOT completed, and tell the user what to do next. Reply ONLY with the corrected message text.',
       },
-    ], { temperature: 0, taskClass: 'nonstandard_consumer' });
+    ], {
+      temperature: 0,
+      taskClass: 'nonstandard_consumer',
+      // ENG-1858: see judgeFinalizeClaims.
+      usageContext: usageContext ?? { feature: 'finalize_guard_correction' },
+    });
 
     const text = (response as any)?.choices?.[0]?.message?.content;
     if (typeof text !== 'string' || !text.trim()) {
       throw new Error('finalize-guard correction returned no content');
     }
     return text.trim();
-  }
-
-  /**
-   * Triage a Slack message to determine if it requires handling (e.g. a client question).
-   * Uses gemini-3.1-flash-lite for fast, low-cost classification.
-   * Returns true if the message needs to be handled, false otherwise.
-   */
-  public async triageSlackMessage(message: string): Promise<boolean> {
-    try {
-      const systemPrompt = `You are a triage assistant for a marketing agency. Determine if the following Slack message is a question or request that requires a response from the team. Reply with only "yes" or "no".
-
-Reply "yes" for: questions, requests for help, task assignments, inquiries about status, client feedback needing follow-up.
-Reply "no" for: greetings with no question, one-word reactions, automated notifications, purely informational updates with no action needed.`;
-
-      const response = await this.callLLM(DIAGNOSIS_MODEL, [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: message },
-      ], {
-        max_completion_tokens: 10,
-        temperature: 0,
-        taskClass: 'mcp_api',
-      });
-
-      const content = (response as any)?.choices?.[0]?.message?.content?.trim().toLowerCase() || '';
-      const needsHandling = content.startsWith('yes');
-      console.log(`AgentMode triageSlackMessage: "${message.substring(0, 80)}" → ${needsHandling ? 'needs handling' : 'skip'}`);
-      return needsHandling;
-    } catch (error) {
-      console.error('AgentMode: triageSlackMessage failed, defaulting to handle:', error);
-      return true; // default to handling on error to avoid missing client questions
-    }
   }
 
   public async listMetaAdsCampaigns(userId: string): Promise<any> {
@@ -15515,12 +18058,37 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`
       );
 
-      if (campaignsData.error) {
+      /*
+       * A later page's failure must not throw away the pages that succeeded.
+       *
+       * ENG-1300 makes fetchWithRetryAndPaging set `data.error` when any page returns non-2xx,
+       * so callers cannot mistake a partial multi-page read for a clean one. Correct — but this
+       * branch reads `error` as "the whole read failed" and returns success:false with NO
+       * campaigns, so a 5xx on page 3 discarded the rows from pages 1 and 2 that were read
+       * perfectly well. That is the ENG-1584 failure from the other direction: not a short list
+       * presented as complete, but a real list presented as nothing at all.
+       *
+       * A hard failure is still right when nothing was read. When rows exist AND the read
+       * reported itself truncated, fall through to the partial path below, which returns those
+       * rows with an explicit INCOMPLETE warning and the failed page's reason.
+       */
+      const hasPartialRows = Array.isArray(campaignsData.data) && campaignsData.data.length > 0;
+      if (campaignsData.error && !(hasPartialRows && campaignsData.pagingTruncated)) {
         console.error('AgentMode: Campaigns API Error:', campaignsData.error);
         return {
           success: false,
-          message: `Failed to fetch campaigns: ${campaignsData.error.message}`,
-          error: campaignsData.error.message
+          // Masked like the paging sibling below: Graph error text can name the object
+          // ("Object with ID '120...' does not exist"), and this string reaches the user.
+          // Both fields. `extractToolResultMessage` reads `error` BEFORE `message`, so masking
+          // only `message` masked nothing — the raw id reached the model through `error`. The
+          // paging sibling below is on a success result carrying only `message`, which is why
+          // one field was enough there and is not here.
+          message: `Failed to fetch campaigns: ${AgentModeService.maskMetaIds(campaignsData.error.message)}`,
+          error: AgentModeService.maskMetaIds(campaignsData.error.message),
+          // ENG-1300: fetchWithRetryAndPaging exposes the real HTTP status as a
+          // non-enumerable __httpStatus field — never campaignsData.error.code,
+          // which is Meta's own business error code, not an HTTP status.
+          code: (campaignsData as any).__httpStatus
         };
       }
 
@@ -15531,9 +18099,39 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         objective: campaign.objective
       }));
 
+      /*
+       * `fetchWithRetryAndPaging` is bounded (META_PAGING_MAX_PAGES), and this URL sets no
+       * `limit`, so Meta serves its default page size. A bounded read that reports a bare count
+       * is the ENG-1584 sentence — "Found N campaign(s)" reads as "these are all of them". The
+       * helper reports `pagingTruncated`; say so rather than discarding it.
+       *
+       * `pagingTruncated` now covers BOTH stop reasons — the page bound and a page that came
+       * back unreadable — because `fetchWithRetry` returns a non-ok Response once its retries
+       * are exhausted instead of throwing. The `campaignsData.error` check above only ever sees
+       * page 1, so a 429 on page 2 used to reach here indistinguishable from a complete read.
+       * The wording no longer names the page bound as the cause, and the failed page's own
+       * Graph message is passed through when there is one.
+       */
+      const campaignsTruncated = campaignsData.pagingTruncated === true;
+      /*
+       * Graph's own error text reaches the user here, and some of it names the object:
+       * `Unsupported get request. Object with ID '120...' does not exist`. The product rule that
+       * raw Meta ids are never shown to users does not stop applying because the string came
+       * from Meta — this PR stripped ids out of every launch-gate block message for the same
+       * reason. Long digit runs are the only id shape Graph emits, so masking them keeps the
+       * diagnostic ("rate limit", "unsupported request") and drops the identifier.
+       */
+      const pagingErrorMessage = typeof campaignsData.pagingError?.message === 'string'
+        ? campaignsData.pagingError.message.replace(/\d{8,}/g, '[id]')
+        : undefined;
       return {
         success: true,
-        message: `Found ${campaigns.length} campaign(s)`,
+        complete: !campaignsTruncated,
+        ...(campaignsTruncated ? { hasMore: true } : {}),
+        message: campaignsTruncated
+          ? `Found ${campaigns.length} campaign(s), but THIS LIST IS INCOMPLETE — the read stopped before the end of the account`
+            + `${pagingErrorMessage ? ` (${pagingErrorMessage})` : ''}. Do NOT conclude a campaign is absent from it.`
+          : `Found ${campaigns.length} campaign(s) (complete list).`,
         campaigns: campaigns,
         totalCount: campaigns.length
       };
@@ -15690,16 +18288,104 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  private async getMetaCredentials(userId: string, accountId?: string) {
+  /**
+   * ENG-1801: resolve WHICH userId's Meta credentials getMetaCredentials should
+   * read, given an optional admin-only client_id scope override.
+   *
+   * In-process pattern (no delegate token, no HTTP self-call) — mirrors
+   * assessClientHealth (clientHealthService.ts) / diagnoseLeadsAtZero
+   * (l2DiagnoseService.ts), which already read a resolved TARGET's own
+   * connected_accounts by userId rather than the caller's. Unscoped
+   * (clientId undefined/null) passes the caller straight through — zero
+   * behavior change from before this fix. Scoped calls fail loud — never
+   * silently substitute the caller's own account — on a non-admin caller, a
+   * blank client_id, an unresolvable client_id, or a target without
+   * customer-portal access.
+   */
+  private async resolveMetaCredentialScope(
+    callerUserId: string,
+    clientId: unknown,
+    callerIsAdminHint: boolean | undefined,
+    toolName: string
+  ): Promise<{ effectiveUserId: string; strict: boolean }> {
+    if (clientId === undefined || clientId === null) {
+      return { effectiveUserId: callerUserId, strict: false };
+    }
+    if (typeof clientId !== 'string' || !clientId.trim()) {
+      throw this.makeMetaAuthError(
+        `client_id must be a non-blank string (email or userId); received ${typeof clientId === 'string' ? 'a blank string' : typeof clientId}.`
+      );
+    }
+
     const { userDb } = await import('./db');
-    const user = await userDb.getUserById(userId);
-    if (!user) throw this.makeMetaAuthError('User not found');
+    const caller = await userDb.getUserById(callerUserId);
+    const isAdmin = callerIsAdminHint !== undefined ? callerIsAdminHint : caller?.isAdmin === true;
+    if (!isAdmin) {
+      throw this.makeMetaAuthError('client_id is admin-only — this account is not an admin.');
+    }
+
+    const trimmed = clientId.trim();
+    const target = trimmed.includes('@')
+      ? await userDb.getUserByEmail(trimmed)
+      : await userDb.getUserById(trimmed);
+    if (!target) {
+      throw this.makeMetaAuthError(`No client account found for "${trimmed}".`);
+    }
+    if (!(target as any).roles?.includes('customer')) {
+      throw this.makeMetaAuthError(`"${trimmed}" does not have customer portal access — cannot scope Meta Ads tools to it.`);
+    }
+
+    const { recordAdminAudit } = await import('./adminAuditLog');
+    recordAdminAudit({
+      actorUserId: callerUserId,
+      actorEmail: caller?.email,
+      action: 'meta_ads_client_scope',
+      tool: toolName,
+      targetUserId: (target as any).userId,
+      targetEmail: (target as any).email,
+    });
+
+    return { effectiveUserId: (target as any).userId, strict: true };
+  }
+
+  // ENG-1801: `clientScope` must never be wired from a write/mutate Meta tool
+  // (createMetaAdsCampaign, updateMetaAdsAd, deleteMetaAdsCampaign, etc.) without
+  // its own fresh authorization decision — this function is the shared resolver
+  // for 30+ call sites, and only the 3 read-only reporting tools
+  // (listMetaAdsCampaignsNew, getMetaAdsMetrics, callMetaAdsInsightsApiWrapper)
+  // are meant to ever construct and pass this argument today.
+  private async getMetaCredentials(
+    userId: string,
+    accountId?: string,
+    clientScope?: { clientId?: string; callerIsAdmin?: boolean; toolName: string }
+  ) {
+    const { effectiveUserId, strict } = await this.resolveMetaCredentialScope(
+      userId,
+      clientScope?.clientId,
+      clientScope?.callerIsAdmin,
+      clientScope?.toolName ?? 'meta_ads_tool'
+    );
+
+    // ENG-1801 fix: a client_id-scoped (cross-tenant, admin) call never
+    // auto-selects an account and never falls back to the shared-token legacy
+    // adAccount field — both fallback branches below are only reachable via
+    // the `!accountId` path, so this one guard structurally disables both for
+    // the scoped path while leaving the unscoped path's fallback code untouched.
+    if (strict && !accountId) {
+      throw this.makeMetaAuthError(
+        `client_id-scoped calls require an explicit account_id — call assess_client_health with client_name_or_email="${clientScope?.clientId}" first; its ad_account_id field is this client's Meta ad account.`
+      );
+    }
+
+    const { userDb } = await import('./db');
+    const user = await userDb.getUserById(effectiveUserId);
+    if (!user) throw this.makeMetaAuthError(strict ? 'Client account no longer exists.' : 'User not found');
 
     // Source ad accounts from the org-shared set so a teammate's Meta ad account
     // shared with the org (sharedWithOrg=true) is usable, not just visible. The
     // legacy `user.adAccount` fallback below intentionally stays caller-scoped.
     const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
-    const connectedAccounts = await getAccountsWithOwnerIncludingOrgShared(userId);
+    const connectedAccounts = await getAccountsWithOwnerIncludingOrgShared(effectiveUserId);
 
     // Helper to strip 'act_' prefix
     const clean = (id: string) => (id || '').replace('act_', '');
@@ -15717,15 +18403,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Fall back to legacy adAccount field + centralized Secrets Manager token.
       // This covers users who had their Meta Marketing connected account removed but still
       // have adAccount configured (e.g. Waldium-style agency-managed accounts).
-      const legacyAccountId = (user.adAccount || '').replace('act_', '').trim();
-      if (legacyAccountId) {
-        const { getMetaAccessToken } = await import('../utils/secretsManager');
-        const accessToken = await getMetaAccessToken();
-        console.log(`[AgentMode] No connected Meta account for user ${userId}; falling back to legacy adAccount ${legacyAccountId}`);
-        return { accountId: legacyAccountId, accessToken };
+      // ENG-1801: never for a client_id-scoped call — see guard above's doc comment.
+      if (!strict) {
+        const legacyAccountId = (user.adAccount || '').replace('act_', '').trim();
+        if (legacyAccountId) {
+          const { getMetaAccessToken } = await import('../utils/secretsManager');
+          const accessToken = await getMetaAccessToken();
+          console.log(`[AgentMode] No connected Meta account for user ${effectiveUserId}; falling back to legacy adAccount ${legacyAccountId}`);
+          return { accountId: legacyAccountId, accessToken };
+        }
       }
-      console.error(`[AgentMode] No valid Meta connected account found for user ${userId}`);
-      throw this.makeMetaAuthError('Meta Ads account is not connected. Use the search_user_guide tool to find setup instructions and share them with the user.');
+      console.error(`[AgentMode] No valid Meta connected account found for user ${effectiveUserId}`);
+      throw this.makeMetaAuthError(
+        strict
+          ? `Client "${user.email || effectiveUserId}" has no connected Meta ad account. Client-scoped calls never fall back to the legacy shared-token account.`
+          : 'Meta Ads account is not connected. Use the search_user_guide tool to find setup instructions and share them with the user.'
+      );
     }
 
     // 2. Handle specific account selection if accountId is provided
@@ -15734,10 +18427,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const selected = fbAccounts.find(acc => clean(acc.account_id || acc.config?.ad_account_id) === cleanTargetId);
 
       if (!selected) {
-        throw this.makeMetaAuthError(`Meta ad account with ID "${accountId}" not found in connected accounts. Ensure you have the correct ID from list_connected_accounts.`);
+        throw this.makeMetaAuthError(
+          strict
+            ? `Meta ad account with ID "${accountId}" was not found among "${user.email || effectiveUserId}"'s connected accounts.`
+            : `Meta ad account with ID "${accountId}" not found in connected accounts. Ensure you have the correct ID from list_connected_accounts.`
+        );
       }
 
-      await this.ensureUsableMetaToken(selected, selected.userId || userId);
+      await this.ensureUsableMetaToken(selected, selected.userId || effectiveUserId);
       await this.assertMetaAdsScope(selected);
 
       return {
@@ -15747,7 +18444,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     }
 
-    // 3. Handle multiple accounts ambiguity
+    // 3. Handle multiple accounts ambiguity (strict === false past this point —
+    // a client_id-scoped call without accountId already threw above)
     if (fbAccounts.length > 1) {
       const accountList = fbAccounts
         .map(acc => {
@@ -15761,10 +18459,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // 4. Default to the single available account
     const selected = fbAccounts[0];
 
-    await this.ensureUsableMetaToken(selected, selected.userId || userId);
+    await this.ensureUsableMetaToken(selected, selected.userId || effectiveUserId);
     await this.assertMetaAdsScope(selected);
 
-    console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${userId} (Account: ${selected.account_name})`);
+    console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${effectiveUserId} (Account: ${selected.account_name})`);
 
     return {
       accountId: clean(selected.account_id || selected.config?.ad_account_id),
@@ -15789,6 +18487,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       breakdowns?: string[];
       action_breakdowns?: string[];
       filtering?: any[];
+      client_id?: string;
     }
   ): Promise<any> {
     try {
@@ -15803,6 +18502,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         breakdowns,
         action_breakdowns,
         filtering,
+        client_id,
       } = args;
 
       if (!ALLOWED_NODE_TYPES.includes(object_type)) {
@@ -15910,7 +18610,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const normalizedFiltering = normalizeMetaInsightsFiltering(filtering);
 
       const { accountId, accessToken } =
-        await this.getMetaCredentials(userId, account_id);
+        await this.getMetaCredentials(
+          userId,
+          account_id,
+          client_id ? { clientId: client_id, toolName: 'call_meta_ads_insights_api' } : undefined
+        );
 
       const actualNodeId =
         object_type === "account"
@@ -15964,9 +18668,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // Polling Engine
         let attempts = 0;
         const maxAttempts = 60;
+        // ENG-1908: see sandboxAwarePollDelayMs — a sandbox account's report is
+        // already complete the instant it's created, so it never waits the real delay.
+        const pollDelayMs = sandboxAwarePollDelayMs(accessToken, 10000);
         while (attempts < maxAttempts) {
           attempts++;
-          await new Promise((resolve) => setTimeout(resolve, 10000));
+          await new Promise((resolve) => setTimeout(resolve, pollDelayMs));
           const statusRes = await axios.get(`${baseUrl}/${rid}`, {
             params: { access_token: accessToken },
           });
@@ -16119,9 +18826,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // which tells the model nothing it can act on and reads as an opaque
       // outage. Meta's actual explanation lives in response.data.error — surface
       // it, minus the credential material Meta echoes back (ENG-630).
+      // ENG-1300: the real HTTP status is `error.response?.status` (axios shape) —
+      // NEVER the Meta business `.code` nested in response.data.error, which
+      // coincidentally overlaps the HTTP range (e.g. Meta code 404 is unrelated
+      // to HTTP 404).
       return {
         success: false,
         error: describeMetaGraphApiError(error) || error.message,
+        code: error?.status ?? error?.response?.status,
       };
     }
   }
@@ -16132,7 +18844,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       case 'LIST':
         // Thread the campaign_id filter and any explicit fields selection so the caller can
         // read budget/bid config and target a single campaign (ENG-398).
-        return this.listMetaAdsCampaignsNew(userId, account_id, { campaignId: campaign_id, fields: params?.fields });
+        return this.listMetaAdsCampaignsNew(userId, account_id, { campaignId: AgentModeService.optionalScopeId(campaign_id, 'campaign_id'), fields: params?.fields });
       case 'CREATE':
         return this.createMetaAdsCampaign(userId, { ...params, account_id });
       case 'UPDATE':
@@ -16152,7 +18864,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       case 'LIST':
         // Thread the ad_set_id target and any explicit fields selection so the caller can
         // read optimization_goal / promoted_object / etc. for a single ad set (ENG-398).
-        return this.listMetaAdsAdSets(userId, campaign_id, account_id, { adSetId: ad_set_id, fields: params?.fields });
+        return this.listMetaAdsAdSets(userId, campaign_id, account_id, { adSetId: AgentModeService.optionalScopeId(ad_set_id, 'ad_set_id'), fields: params?.fields });
       case 'CREATE':
         // Explicitly pass account_id in args for createMetaAdsAdSet as it expects it in the args object
         return this.createMetaAdsAdSet(userId, { ...params, account_id, campaign_id });
@@ -16168,10 +18880,40 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'PREVIEW' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}, ad_set_id?: string, campaign_id?: string): Promise<MetaApiResult> {
     switch (action) {
-      case 'LIST':
-        return this.listMetaAdsAdCreatives(userId, account_id);
+      case 'LIST': {
+        // ENG-1476: ad_set_id never reached this edge either. Meta has no campaign->adcreatives
+        // edge, so campaign scoping is deliberately absent — use AD LIST with campaign_id, which
+        // returns creative{...} inline on each ad.
+        const result = await this.listMetaAdsAdCreatives(userId, account_id, ad_set_id ?? params?.ad_set_id);
+
+        /*
+         * If a caller supplied campaign_id anyway, say so. Returning an account-wide list
+         * labelled "(complete list)" while quietly discarding the requested scope is the exact
+         * defect this PR exists to remove — it would just be wearing a different hat. The scope
+         * is unsupportable here, so the honest move is to name it, not to drop it silently.
+         */
+        // Both spellings. The tool executor passes campaign_id POSITIONALLY into
+        // callMetaMarketingApi, never nested in params — reading only params here made this
+        // warning unreachable on the one path that actually matters.
+        const ignoredCampaignId = campaign_id ?? params?.campaign_id;
+        if (ignoredCampaignId && result?.success) {
+          // Rebuilt via buildListResult rather than spread: `{...result, scopeIgnored}` appends
+          // the new key AFTER `creatives`, putting it behind the S3 preview cut on exactly the
+          // large lists where it matters.
+          const r = result as any;
+          return buildListResult({
+            payloadKey: 'creatives',
+            payload: r.creatives ?? [],
+            message: `${r.message}${describeIgnoredCampaignScope(String(ignoredCampaignId))}`,
+            truncated: r.hasMore,
+            scope: r.scope,
+            scopeIgnored: { campaign_id: String(ignoredCampaignId) },
+          }) as MetaApiResult;
+        }
+        return result;
+      }
       case 'GET': {
         // Read ONE creative back by id (ENG-471). The service method has existed
         // and is already used by COPY_AD/RETAG_UTM — only the model-facing
@@ -16196,36 +18938,42 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // Fails closed: an unverifiable node is refused rather than returned. We
         // request account_id explicitly, so its absence on an otherwise valid
         // node means the assumption behind this check no longer holds.
+        //
+        // Delegated to `MetaService.assertOwnedByAccount` rather than compared inline. The
+        // hand-rolled version this replaces named the OWNING account in the mismatch message
+        // (`belongs to ad account <owner>`), which is the oracle the guard exists to prevent:
+        // anyone able to guess a creative id could learn which ad account owns it, from the
+        // very error refusing to disclose it. The shared helper keeps all three branches
+        // (unverifiable owner / unresolved selection / mismatch) but emits ONE generic sentence
+        // and sends the discriminating detail to the server log. It also means this refusal is
+        // now recognised by `isMetaAccountScopeRefusal`, so callers can tell it apart from a
+        // transient Graph failure instead of degrading past it.
         if (creative && creative.id) {
-          const norm = (id: unknown) => String(id ?? '').replace(/^act_/, '').trim();
-          const owner = norm(creative.account_id);
-          const selected = norm(accountId);
-          if (!owner) {
-            throw new Error(
-              `Could not verify which ad account creative ${params.creative_id} belongs to; refusing to return it.`,
-            );
-          }
-          // Both sides must be known. An empty resolved account cannot be
-          // compared against anything, so treating it as "no mismatch" would
-          // reopen the exact bypass this check exists to close — the guard
-          // would silently pass every creative the token can reach.
-          if (!selected) {
-            throw new Error(
-              `Could not determine which ad account was selected; refusing to return creative ${params.creative_id}.`,
-            );
-          }
-          if (owner !== selected) {
-            throw new Error(
-              `Ad creative ${params.creative_id} belongs to ad account ${owner}, not the selected account ${selected}.`,
-            );
-          }
+          MetaService.assertOwnedByAccount(creative.account_id, params.creative_id, 'Ad creative', accountId);
         }
 
         return {
           success: true,
-          message: `Fetched ad creative ${params.creative_id}`,
+          // No raw id in the prose — same rule the guard three lines above exists to enforce, and
+          // nothing is lost: `creative.id`/`creative.name` are always requested (metaService.ts)
+          // and remain on the structured `creative` object below for the model to reference.
+          message: creative?.name
+            ? `Fetched the requested ad creative "${creative.name}".`
+            : `Fetched the requested ad creative.`,
           creative,
         };
+      }
+      case 'PREVIEW': {
+        const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+        const creative: any = await metaService.getAdCreative(accessToken, params.creative_id);
+        MetaService.assertOwnedByAccount(creative?.account_id, params.creative_id, 'Ad creative', accountId);
+        const previews = await metaService.generateAdPreview(accessToken, params.creative_id, params.ad_format);
+        return {
+          success: true,
+          message: `Generated ${params.ad_format} preview. Meta preview iframes expire after 24 hours.`,
+          ad_format: params.ad_format,
+          previews,
+        } as any;
       }
       case 'CREATE':
         return this.createMetaAdsAdCreative(userId, { ...params, account_id });
@@ -16240,10 +18988,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'PREVIEW' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}, campaign_id?: string): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsAds(userId, ad_set_id, account_id);
+        // ENG-1476: campaign_id used to stop here — it was never a parameter of this method,
+        // so an explicitly campaign-scoped LIST silently became an account-wide one. Accept it
+        // from the top-level argument or from params, since callers have used both spellings.
+        return this.listMetaAdsAds(userId, ad_set_id ?? params?.ad_set_id, account_id, campaign_id ?? params?.campaign_id);
+      case 'PREVIEW': {
+        const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+        await metaService.getAd(accessToken, ad_id!, accountId);
+        const previews = await metaService.generateAdPreview(accessToken, ad_id!, params.ad_format);
+        return {
+          success: true,
+          message: `Generated ${params.ad_format} preview. Meta preview iframes expire after 24 hours.`,
+          ad_format: params.ad_format,
+          previews,
+        } as any;
+      }
       case 'CREATE':
         return this.createMetaAdsAd(userId, { ...params, account_id, adset_id: ad_set_id });
       case 'UPDATE':
@@ -16284,7 +19046,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
 
       // Step 1: Fetch the source ad (now includes creative sub-fields)
-      const sourceAd = await metaService.getAd(accessToken, sourceAdId);
+      const sourceAd = await metaService.getAd(accessToken, sourceAdId, accountId);
       const creativeRef = sourceAd?.creative;
       const oldCreativeId = creativeRef?.id || creativeRef?.creative_id;
       if (!oldCreativeId) {
@@ -16415,6 +19177,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         creative_id: newCreativeId,
         status: params.status || 'PAUSED',
       });
+      if (newAd?.id) {
+        // ENG-2141: a copied ad that reuses a generated image is another ad for that creative.
+        void stampMetaPublish({
+          userId, accountId, metaCreativeId: String(newCreativeId), adId: String(newAd.id), params: newCreativeParams, via: 'copy_ad',
+        });
+      }
 
       return {
         success: true,
@@ -16427,11 +19195,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error copying Meta ad:', error);
+      // ENG-1300: metaService's handleError rethrows the SDK's FacebookRequestError
+      // unchanged (only attaching structuredError), so its own `.status` (the real
+      // HTTP status) survives — never structuredError.code, which is Meta's business
+      // error code and only coincidentally overlaps the HTTP range.
       return {
         success: false,
         message: this.enrichMetaError(error, 'copy Meta ad'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -16454,7 +19227,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta pages.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — metaService's handleError rethrows the
+        // original FacebookRequestError, so its `.status` is the real HTTP status.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -16480,7 +19256,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           // discovery impossible in-product (ENG-399). The pixel id is the dataset id that
           // GET_MATCH_QUALITY consumes, so derive it directly and issue no per-pixel call at all.
           // Same conclusion the lander pixel resolver already reached (metaService.ts).
-          const pixels = await metaService.listPixels(accountId, accessToken);
+          const { pixels, truncated } = await metaService.listPixels(accountId, accessToken);
           const results = pixels.map((pixel: any) => ({
             pixel_id: pixel.id,
             pixel_name: pixel.name,
@@ -16488,11 +19264,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             dataset_id: pixel.id,
             datasets: [{ id: pixel.id, name: pixel.name }]
           }));
-          return {
-            success: true,
-            message: `Found ${pixels.length} pixel(s); each pixel id doubles as its dataset id for GET_MATCH_QUALITY`,
-            pixels: results
-          };
+          // ENG-1625 follow-up: this used to be `Found ${pixels.length} pixel(s)` with no
+          // bound — the exact ENG-1476/ENG-1584 sentence shape.
+          return buildListResult({
+            payloadKey: 'pixels',
+            payload: results,
+            message: `${buildListMessage({
+              noun: 'pixel(s)',
+              totalCount: results.length,
+              truncated,
+              campaignScopable: false,
+            })} Each pixel id doubles as its dataset id for GET_MATCH_QUALITY.`,
+            truncated,
+          }) as MetaApiResult;
         }
         case 'GET_MATCH_QUALITY': {
           const datasetId = params.dataset_id;
@@ -16596,7 +19380,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to manage Meta datasets.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — metaService's handleError rethrows the
+        // original FacebookRequestError, so its `.status` is the real HTTP status.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -16604,11 +19391,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async listMetaAdsCampaignsNew(
     userId: string,
     account_id?: string,
-    options: { campaignId?: string; fields?: string | string[] } = {}
+    options: { campaignId?: string; fields?: string | string[] } = {},
+    clientScope?: { clientId?: string; callerIsAdmin?: boolean; toolName: string }
   ): Promise<any> {
     let connection: any;
     try {
-      const credentials = await this.getMetaCredentials(userId, account_id);
+      const credentials = await this.getMetaCredentials(userId, account_id, clientScope);
       const { accountId, accessToken } = credentials;
       connection = (credentials as any).connection;
       // Only forward the read-options bag when the caller supplied a campaign_id filter or
@@ -16619,17 +19407,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // budget_remaining, bid_strategy), the intended ENG-398 change, for every plain LIST
       // caller regardless of this branch.
       const hasSelector = Boolean(options.campaignId || options.fields);
-      const campaigns = (hasSelector
+      const result = hasSelector
         ? await metaService.listCampaigns(accountId, accessToken, options)
-        : await metaService.listCampaigns(accountId, accessToken)) || [];
-      const totalCount = Array.isArray(campaigns) ? campaigns.length : 0;
+        : await metaService.listCampaigns(accountId, accessToken);
+      const campaigns = result?.campaigns ?? [];
 
-      return {
-        success: true,
-        message: `Found ${totalCount} campaign(s)`,
-        campaigns: campaigns,
-        totalCount: totalCount
-      };
+      // ENG-1625 follow-up: this used to be `Found ${totalCount} campaign(s)` with no scope
+      // or bound — the exact ENG-1476/ENG-1584 sentence shape. Assembled via buildListResult
+      // so completeness metadata precedes the payload (S3 offload cut — see metaListScope.ts).
+      return buildListResult({
+        payloadKey: 'campaigns',
+        payload: campaigns,
+        message: buildListMessage({
+          noun: 'campaign(s)',
+          totalCount: campaigns.length,
+          truncated: result?.truncated,
+          // Campaign LIST has no parent scope to name (it either lists the whole account or
+          // fetches one campaign by id, never "campaigns scoped to X").
+          campaignScopable: false,
+        }),
+        truncated: result?.truncated,
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       // A permission refusal from Meta is not a "no campaigns" result — throw the
@@ -16640,7 +19438,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: error.message || 'Failed to fetch Meta ad campaigns.',
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -16780,7 +19580,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad campaign'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -16813,53 +19615,63 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // billing_event, destination_type, promoted_object, bid_strategy), the intended
       // ENG-398 change, for every plain LIST caller regardless of this branch.
       const hasSelector = Boolean(options.adSetId || options.fields);
-      const adSets = (hasSelector
+      const result = hasSelector
         ? await metaService.listAdSets(accountId, accessToken, campaignId, options)
-        : await metaService.listAdSets(accountId, accessToken, campaignId)) || [];
-      const totalCount = Array.isArray(adSets) ? adSets.length : 0;
+        : await metaService.listAdSets(accountId, accessToken, campaignId);
+      const adSets = result?.adSets ?? [];
 
-      return {
-        success: true,
-        message: `Found ${totalCount} ad set(s)`,
-        adSets: adSets,
-        totalCount: totalCount
-      };
+      // ENG-1625 follow-up: this used to be `Found ${totalCount} ad set(s)` with no scope or
+      // bound — the exact ENG-1476/ENG-1584 sentence shape, and campaign_id scoping went
+      // through a bare param Meta's docs do not list as supported on this edge (fixed in
+      // metaService.listAdSets to go through the campaign node instead).
+      return buildListResult({
+        payloadKey: 'adSets',
+        payload: adSets,
+        message: buildListMessage({
+          noun: 'ad set(s)',
+          totalCount: adSets.length,
+          scope: result?.scope,
+          truncated: result?.truncated,
+          campaignScopable: true,
+        }),
+        truncated: result?.truncated,
+        scope: result?.scope,
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error fetching Meta ad sets:', error);
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta ad sets.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
 
   public async createMetaAdsAdSet(userId: string, args: any): Promise<any> {
     try {
-      // ENG-838: dayparting is not implemented. `MetaAdsAdSetParams` has no
-      // `adset_schedule` and nothing in this codebase ever sends one, so a
-      // scheduled-delivery request used to be dropped in silence and the ad set
-      // shipped 24/7. That is how Open Future Forum spent $1,000 for 2 sign-ups
-      // on 3am impressions. Fail loudly instead: a caller who asked for a
-      // schedule must not receive an always-on ad set and a success message.
-      // Note `start_time`/`end_time` are the flight window, not dayparting, and
-      // stay supported.
+      // ENG-842: dayparting (adset_schedule / pacing_type). Meta requires a
+      // LIFETIME budget for scheduled delivery — a daily-budget ad set (or one
+      // with no budget at all) ignores the schedule and runs 24/7, which is
+      // exactly the Open Future Forum failure mode (#2244/ENG-838) this slice
+      // closes.
       //
-      // This runs BEFORE getMetaCredentials deliberately. Credential resolution
-      // can refresh a token against Meta and can throw its own auth error, so
-      // resolving first would both make a network call for a request we are
-      // certain to reject and mask a deterministic "not supported" answer behind
-      // an unrelated credential failure. A rejection that is knowable from the
-      // arguments alone should never depend on account state.
-      if (args.adset_schedule !== undefined || args.pacing_type !== undefined) {
-        const requested = args.adset_schedule !== undefined ? 'adset_schedule' : 'pacing_type';
-        throw new Error(
-          `Dayparting is not supported yet, so "${requested}" cannot be honored and this ad set was NOT created. ` +
-          `Creating it anyway would deliver 24/7 against a schedule you did not choose. ` +
-          `Either remove ${requested} and accept continuous delivery, or set the schedule manually in Ads Manager after creation. ` +
-          `Tracked as ENG-838.`
-        );
+      // Only the pacing_type default can be decided from args alone before
+      // credential resolution — an explicit caller value always wins. The
+      // lifetime-budget/daily-budget rejection CANNOT run here (CodeRabbit
+      // finding, PR #2755): under Advantage Campaign Budget (CBO) the
+      // ad-set-level args.daily_budget/lifetime_budget are irrelevant and get
+      // stripped below once campaignHasBudget is known — the budget that
+      // actually controls delivery is the CAMPAIGN's. Gating on the raw args
+      // here would let a CBO ad set with a real daily-budget campaign sail
+      // through with a dummy lifetime_budget, silently reproducing ENG-838
+      // through the CBO path. The real gate runs after campaignHasBudget is
+      // resolved, below.
+      const requestsDaypartingSchedule = args.adset_schedule !== undefined || args.pacing_type !== undefined;
+      if (requestsDaypartingSchedule && args.adset_schedule !== undefined && args.pacing_type === undefined) {
+        args.pacing_type = ['day_parting'];
       }
 
       const { accountId, accessToken } = await this.getMetaCredentials(userId, args.account_id);
@@ -16870,6 +19682,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const campaign = await metaService.getCampaign(accountId, accessToken, args.campaign_id);
       const objective = args.campaign_objective || campaign.objective;
       const campaignHasBudget = !!(campaign.daily_budget || campaign.lifetime_budget);
+
+      // ENG-842 dayparting gate (moved here per CodeRabbit finding on #2755):
+      // validate against the EFFECTIVE budget source — the campaign's own
+      // budget under CBO, otherwise the ad set's own args — not the raw args,
+      // which are meaningless under CBO once stripped below.
+      if (requestsDaypartingSchedule) {
+        const effectiveLifetimeBudget = campaignHasBudget ? campaign.lifetime_budget : args.lifetime_budget;
+        const effectiveDailyBudget = campaignHasBudget ? campaign.daily_budget : args.daily_budget;
+        if (effectiveDailyBudget !== undefined || effectiveLifetimeBudget === undefined) {
+          throw new Error(
+            `Dayparting (adset_schedule/pacing_type) requires a lifetime_budget, not a daily_budget. ` +
+            `Meta ignores the schedule on a daily-budget ad set (or campaign, under Advantage Campaign ` +
+            `Budget) and delivers 24/7 against a schedule nobody chose. Provide lifetime_budget (and ` +
+            `end_time) instead — for a CBO campaign this means the CAMPAIGN's budget must be a lifetime ` +
+            `budget. Tracked as ENG-842.`
+          );
+        }
+        if (!args.end_time) {
+          throw new Error(
+            `end_time is required when using adset_schedule with a lifetime_budget. Tracked as ENG-842.`
+          );
+        }
+      }
 
       // 1. Budget Validation — depends on whether campaign has ACB/CBO
       const dailyBudget = args.daily_budget;
@@ -17124,30 +19959,42 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad set'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
 
-  public async listMetaAdsAdCreatives(userId: string, account_id?: string): Promise<any> {
+  public async listMetaAdsAdCreatives(userId: string, account_id?: string, adSetId?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const creatives = (await metaService.listAdCreatives(accountId, accessToken)) || [];
-      const totalCount = Array.isArray(creatives) ? creatives.length : 0;
+      const result = await metaService.listAdCreatives(accountId, accessToken, { adSetId });
+      const creatives = result?.creatives ?? [];
 
-      return {
-        success: true,
-        message: `Found ${totalCount} ad creative(s)`,
-        creatives: creatives,
-        totalCount: totalCount
-      };
+      return buildListResult({
+        payloadKey: 'creatives',
+        payload: creatives,
+        message: buildListMessage({
+          noun: 'ad creative(s)',
+          totalCount: creatives.length,
+          scope: result?.scope,
+          truncated: result?.truncated,
+          // Meta has no campaign->adcreatives edge, so a campaign scope is never applied here.
+          campaignScopable: false,
+        }),
+        truncated: result?.truncated,
+        scope: result?.scope,
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error fetching Meta ad creatives:', error);
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta ad creatives.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17206,14 +20053,40 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return params;
   }
 
-  public async createMetaAdsAdCreative(userId: string, params: MetaAdsAdCreativeParams & { account_id?: string }): Promise<any> {
+  public async createMetaAdsAdCreative(
+    userId: string,
+    params: MetaAdsAdCreativeParams & { account_id?: string; lander_id?: string },
+  ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
+      const [customerDefault, landerOverride] = await Promise.all([
+        getCustomerUtmDefault(userId),
+        params.lander_id ? getLanderUtmOverride(params.lander_id, userId) : Promise.resolve(null),
+      ]);
+      const visitor = params.url_tags
+        ? Object.fromEntries(new URLSearchParams(params.url_tags.replace(/^[?&]/, '')).entries())
+        : undefined;
+      const resolvedUrlTags = customerDefault || landerOverride
+        ? Object.entries(
+            resolveLanderParams({ visitor, override: landerOverride ?? undefined, customerDefault: customerDefault ?? undefined }).params,
+          )
+            .map(([key, value]) => `${key}=${/^\{\{[^{}]+\}\}$/.test(value) ? value : encodeURIComponent(value)}`)
+            .join('&')
+        : params.url_tags;
+      const { lander_id: _landerId, ...creativeParams } = params;
+      let resolvedParams: MetaAdsAdCreativeParams = {
+        ...creativeParams,
+        ...(resolvedUrlTags ? { url_tags: resolvedUrlTags } : {}),
+      };
       // asset_feed_spec.images only accepts image hashes — resolve any placement_assets URLs to hashes first.
-      let resolvedParams = await this.resolvePlacementAssetHashes(userId, params, params.account_id);
+      resolvedParams = await this.resolvePlacementAssetHashes(userId, resolvedParams, params.account_id);
       // IG placements require an instagram_user_id in object_story_spec — auto-resolve from the Page.
       resolvedParams = await this.resolvePlacementInstagramActor(resolvedParams, accessToken);
       const creative = await metaService.createAdCreative(accountId, accessToken, resolvedParams);
+      // ENG-2141: link the generated images this creative uses to it (inert unless enabled).
+      if (creative?.id) {
+        void stampMetaCreativeCreated({ userId, accountId, metaCreativeId: String(creative.id), params: resolvedParams });
+      }
 
       return {
         success: true,
@@ -17227,30 +20100,43 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad creative'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
 
-  public async listMetaAdsAds(userId: string, adSetId?: string, account_id?: string): Promise<any> {
+  public async listMetaAdsAds(userId: string, adSetId?: string, account_id?: string, campaignId?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const ads = (await metaService.listAds(accountId, accessToken, adSetId)) || [];
-      const totalCount = Array.isArray(ads) ? ads.length : 0;
+      const result = await metaService.listAds(accountId, accessToken, adSetId, { campaignId });
+      const ads = result?.ads ?? [];
 
-      return {
-        success: true,
-        message: `Found ${totalCount} ad(s)`,
-        ads: ads,
-        totalCount: totalCount
-      };
+      // Message shape and field order both live in agentMode/metaListScope.ts — see that module
+      // for why completeness must precede the payload (the S3 preview cut).
+      return buildListResult({
+        payloadKey: 'ads',
+        payload: ads,
+        message: buildListMessage({
+          noun: 'ad(s)',
+          totalCount: ads.length,
+          scope: result?.scope,
+          truncated: result?.truncated,
+          campaignScopable: true,
+        }),
+        truncated: result?.truncated,
+        scope: result?.scope,
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error fetching Meta ads:', error);
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta ads.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17259,6 +20145,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
       const ad = await metaService.createAd(accountId, accessToken, params);
+      // ENG-2141: link the ad to the generated creatives its Meta creative was built from.
+      if (ad?.id && params.creative_id) {
+        void stampMetaAdCreated({ userId, accountId, metaCreativeId: String(params.creative_id), adId: String(ad.id) });
+      }
 
       return {
         success: true,
@@ -17272,7 +20162,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: this.enrichMetaError(error, 'create Meta ad'),
         error: error.message,
-        details: error.structuredError
+        details: error.structuredError,
+        // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17285,7 +20177,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         normalizedParams.daily_budget = Math.round(normalizedParams.budget_amount * 100);
         delete normalizedParams.budget_amount;
       }
-      await metaService.updateCampaign(accessToken, campaignId, normalizedParams);
+      await metaService.updateCampaign(accessToken, campaignId, normalizedParams, accountId);
 
       if (normalizedParams.spend_cap === undefined || normalizedParams.spend_cap === null) {
         return {
@@ -17332,15 +20224,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to update Meta ad campaign.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
 
   public async deleteMetaAdsCampaign(userId: string, campaignId: string, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
-      await metaService.deleteCampaign(accessToken, campaignId);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      await metaService.deleteCampaign(accessToken, campaignId, accountId);
       return {
         success: true,
         message: `Campaign deleted successfully`
@@ -17351,14 +20245,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to delete Meta ad campaign.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
 
   public async updateMetaAdsAdSet(userId: string, adSetId: string, params: any, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       const toCents = (val?: number) => val !== undefined ? Math.round(val * 100) : undefined;
       const normalizedParams = {
         ...params,
@@ -17366,7 +20262,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ...(params.lifetime_budget !== undefined && { lifetime_budget: toCents(params.lifetime_budget) }),
         ...(params.bid_amount !== undefined && { bid_amount: toCents(params.bid_amount) }),
       };
-      await metaService.updateAdSet(accessToken, adSetId, normalizedParams);
+      await metaService.updateAdSet(accessToken, adSetId, normalizedParams, accountId);
       return {
         success: true,
         message: `Ad set updated successfully`
@@ -17377,15 +20273,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to update Meta ad set.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
 
   public async deleteMetaAdsAdSet(userId: string, adSetId: string, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
-      await metaService.deleteAdSet(accessToken, adSetId);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      await metaService.deleteAdSet(accessToken, adSetId, accountId);
       return {
         success: true,
         message: `Ad set deleted successfully`
@@ -17396,7 +20294,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to delete Meta ad set.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17420,7 +20320,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // but the ad keeps its old creative), so handle it explicitly before any other branch.
       if (params.creative_id) {
         const newCreativeId = params.creative_id;
-        await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } });
+        await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } }, accountId);
 
         // Apply any other ad-level params (status, name, etc.) in a separate update
         const adLevelParams: any = {};
@@ -17428,12 +20328,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           if (key !== 'creative_id') adLevelParams[key] = params[key];
         }
         if (Object.keys(adLevelParams).length > 0) {
-          await metaService.updateAd(accessToken, adId, adLevelParams);
+          await metaService.updateAd(accessToken, adId, adLevelParams, accountId);
         }
 
         // The same silent-success trap applies here: POST /{ad-id} can return 200 while the
         // ad keeps its old creative. Read back the ad to confirm the swap actually took.
-        const verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId);
+        const verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, accountId);
         if (!verification.attached) {
           return {
             success: false,
@@ -17446,6 +20346,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           };
         }
 
+        await recordCreativeLearningReceipt(userId, accountId, adId, newCreativeId, verification.verified);
+        // ENG-2141: the ad's previous creative links end here; link it to the new one if generated.
+        void stampMetaAdCreativeChanged({ userId, accountId, metaCreativeId: String(newCreativeId), adId });
         return {
           success: true,
           message: `Ad updated successfully. Swapped in creative ${newCreativeId}.`,
@@ -17460,11 +20363,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
 
       if (creativeKeys.length > 0) {
-        return await this.updateAdViaCreativeSwap(userId, accessToken, accountId, adId, params, creativeKeys);
+        const result = await this.updateAdViaCreativeSwap(userId, accessToken, accountId, adId, params, creativeKeys);
+        if (result.success === true && result.verified === true && result.new_creative_id) {
+          await recordCreativeLearningReceipt(userId, accountId, adId, result.new_creative_id, true);
+        }
+        return result;
       }
 
       // Standard ad-level update (status, name, etc.)
-      await metaService.updateAd(accessToken, adId, params);
+      await metaService.updateAd(accessToken, adId, params, accountId);
       return {
         success: true,
         message: `Ad updated successfully`
@@ -17475,7 +20382,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: this.enrichMetaError(error, 'update Meta ad'),
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17498,7 +20407,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     console.log(`AgentMode: Detected creative content update for ad ${adId}. Keys: ${creativeKeys.join(', ')}. Using creative swap approach.`);
 
     // Step 1: Fetch the ad to get its creative_id
-    const adData = await metaService.getAd(accessToken, adId);
+    const adData = await metaService.getAd(accessToken, adId, accountId);
     const oldCreativeId = adData?.creative?.creative_id || adData?.creative?.id;
     if (!oldCreativeId) {
       return {
@@ -17532,6 +20441,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     // Determine current creative type and extract existing fields
     let newCreativeParams: any;
+    // Set when the caller asked for a new single image / video thumbnail, so the created creative
+    // can be read back before it is attached (ENG-2169).
+    let imageSwap: ImageSwapExpectation | undefined;
 
     if (params.placement_assets) {
       // Placement-customized image creative (asset_feed_spec): map different images to different
@@ -17556,7 +20468,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         name: params.name || `${creativeData.name || 'Creative'} (updated)`,
         page_id: pageId,
         video_id: params.video_id || vd.video_id,
-        image_hash: params.image_hash || vd.image_hash,
+        // A new image_url drops the old thumbnail's hash (ENG-2169).
+        image_hash: selectSwapImageHash(params.image_hash, params.image_url, vd.image_hash),
         image_url: params.image_url || vd.image_url,
         body: params.body || vd.message || creativeData.body || '',
         title: params.title || vd.title || creativeData.title || '',
@@ -17564,6 +20477,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
         url_tags: carriedUrlTags,
       };
+      if (params.image_hash || params.image_url) {
+        imageSwap = { oldHash: vd.image_hash, oldUrl: vd.image_url, requestedHash: params.image_hash, requestedUrl: params.image_url };
+      }
     } else if (existingSpec.link_data?.child_attachments) {
       // Carousel creative – update the main link and optionally per-card links
       const ld = existingSpec.link_data;
@@ -17591,7 +20507,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       newCreativeParams = {
         name: params.name || `${creativeData.name || 'Creative'} (updated)`,
         page_id: pageId,
-        image_hash: params.image_hash || ld.image_hash,
+        // A new image_url drops the old image's hash (ENG-2169).
+        image_hash: selectSwapImageHash(params.image_hash, params.image_url, ld.image_hash),
         image_url: params.image_url || ld.picture || ld.image_url,
         body: params.body || ld.message || creativeData.body || '',
         title: params.title || ld.name || creativeData.title || '',
@@ -17599,6 +20516,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
         url_tags: carriedUrlTags,
       };
+      if (params.image_hash || params.image_url) {
+        imageSwap = {
+          oldHash: ld.image_hash, oldUrl: ld.picture || ld.image_url,
+          requestedHash: params.image_hash, requestedUrl: params.image_url,
+        };
+      }
     } else {
       return {
         success: false,
@@ -17625,6 +20548,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     }
 
+    // ENG-2169: read the created creative back before attaching it. If it still carries the old
+    // image (or not the requested hash), attaching it would "succeed" while the ad keeps serving
+    // the image it was meant to replace — fail loudly instead and leave the ad untouched.
+    let imageVerdict: ImageSwapVerdict | undefined;
+    if (imageSwap) {
+      let liveImage: CreativeImageReadback | undefined;
+      try {
+        const created = await metaService.getAdCreative(accessToken, newCreativeId);
+        liveImage = readCreativeImage(created?.object_story_spec);
+      } catch (err: unknown) {
+        // Best-effort, like verifyCreativeSwap: an unreadable creative is not proof of a stale image.
+        console.warn(`AgentMode: image read-back failed for new creative ${newCreativeId}:`,
+          err instanceof Error ? err.message : err);
+      }
+      imageVerdict = judgeImageSwap(imageSwap, liveImage);
+      if (imageVerdict === 'stale' && liveImage) {
+        return buildImageSwapNotReflected({ adId, oldCreativeId, newCreativeId, expected: imageSwap, live: liveImage });
+      }
+    }
+
     console.log(`AgentMode: New creative ${newCreativeId} created. Updating ad ${adId} to use it.`);
 
     // Step 4: Apply any ad-level params (status, name) provided alongside creative content. These
@@ -17636,7 +20579,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
     }
     if (Object.keys(adLevelParams).length > 0) {
-      await metaService.updateAd(accessToken, adId, adLevelParams);
+      await metaService.updateAd(accessToken, adId, adLevelParams, accountId);
     }
 
     // Step 5: Attach the new creative, then read back to VERIFY it took effect. Meta's POST /{ad-id}
@@ -17649,8 +20592,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     let verification: Awaited<ReturnType<AgentModeService['verifyCreativeSwap']>> | undefined;
 
     for (let attempt = 1; attempt <= SWAP_VERIFY_ATTEMPTS; attempt++) {
-      await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } });
-      verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, newLinkUrl);
+      await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } }, accountId);
+      verification = await this.verifyCreativeSwap(accessToken, adId, newCreativeId, accountId, newLinkUrl);
 
       const destinationOk = !newLinkUrl || !verification.liveLinkUrl
         || this.linkUrlMatches(verification.liveLinkUrl, newLinkUrl);
@@ -17669,6 +20612,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     const v = verification!;
+    // ENG-2141: the ad now carries this creative (attach calls returned; propagation may lag). Its
+    // performance from here on belongs to the generated images the new creative uses.
+    void stampMetaPublish({
+      userId, accountId, metaCreativeId: String(newCreativeId), adId, params: newCreativeParams, via: 'swap_creative',
+    });
     const reviewNote = v.effectiveStatus
       ? ` Ad review status: ${v.effectiveStatus}${v.reviewFeedback ? ` (${v.reviewFeedback})` : ''}.`
       : '';
@@ -17733,10 +20681,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       message: `Ad updated successfully. Created new creative (${newCreativeId}) with updated ${creativeKeys.join(', ')} `
         + `and swapped it in for the old creative (${oldCreativeId})`
         + (v.liveLinkUrl ? `. Verified live destination URL: ${v.liveLinkUrl}` : '.')
-        + reviewNote,
+        + reviewNote
+        // No proof of a stale image, but no proof of the new one either — never let that read as confirmed.
+        + (imageVerdict && imageVerdict !== 'confirmed'
+          ? ` NOTE: the new creative's image could not be confirmed (${imageVerdict} read-back) — do not tell the `
+            + `user the image changed until it is checked in Ads Manager.`
+          : ''),
       old_creative_id: oldCreativeId,
       new_creative_id: newCreativeId,
       verified: true,
+      ...(imageVerdict && { image_verified: imageVerdict === 'confirmed' }),
       live_link_url: v.liveLinkUrl,
       effective_status: v.effectiveStatus,
       review_feedback: v.reviewFeedback,
@@ -17752,10 +20706,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     accessToken: string,
     adId: string,
     newCreativeId: string,
+    accountId: string,
     expectedLinkUrl?: string
   ): Promise<{ attached: boolean; verified: boolean; liveCreativeId?: string; liveLinkUrl?: string; effectiveStatus?: string; reviewFeedback?: string }> {
     try {
-      const ad = await metaService.getAd(accessToken, adId);
+      const ad = await metaService.getAd(accessToken, adId, accountId);
       const liveCreativeId = ad?.creative?.creative_id || ad?.creative?.id;
       const attached = String(liveCreativeId) === String(newCreativeId);
 
@@ -17836,8 +20791,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async deleteMetaAdsAd(userId: string, adId: string, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
-      await metaService.deleteAd(accessToken, adId);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      await metaService.deleteAd(accessToken, adId, accountId);
       return {
         success: true,
         message: `Ad deleted successfully`
@@ -17848,7 +20803,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to delete Meta ad.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17870,9 +20827,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    */
   public async retagMetaAdUtm(userId: string, adId: string, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
 
-      const adData = await metaService.getAd(accessToken, adId);
+      const adData = await metaService.getAd(accessToken, adId, accountId);
       const creativeId = adData?.creative?.creative_id || adData?.creative?.id;
       if (!creativeId) {
         return {
@@ -17917,7 +20874,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to retag Meta ad UTMs.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -17956,6 +20915,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           image
         };
       }
+      // ENG-2141: a generated image uploaded by its S3 URL gains this hash (inert unless enabled).
+      void stampMetaImageUpload({ userId, imageUrl, imageHash });
       return {
         success: true,
         message: `Image uploaded successfully`,
@@ -17985,6 +20946,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               classification: structured.classification,
             }
           : undefined,
+        // ENG-1300: top-level `code` is the real numeric HTTP status, deliberately
+        // separate from meta_error.code above (Meta's business error code). Covers
+        // both the SDK-shaped Meta upload failure (error.status) and a plain axios
+        // failure downloading the source image (error.response?.status).
+        code: error?.status ?? error?.response?.status,
       };
     }
   }
@@ -18007,7 +20973,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to upload Meta ad video. Ensure the URL is publicly accessible.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18017,6 +20985,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     userId: string,
     campaign_ids: string[] | string,
     requestedAccountId?: string,
+    clientScope?: { clientId?: string; callerIsAdmin?: boolean; toolName: string },
   ): Promise<any> {
     try {
       const campaignFilterIds = normalizeMetaCampaignIds(campaign_ids);
@@ -18036,7 +21005,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       let accountId: string;
       let accessToken: string;
       try {
-        ({ accountId, accessToken } = await this.getMetaCredentials(userId, requestedAccountId));
+        ({ accountId, accessToken } = await this.getMetaCredentials(userId, requestedAccountId, clientScope));
       } catch (error: any) {
         const credentialFailure =
           error?.isMetaAuthError ||
@@ -18081,7 +21050,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const [campaignsData, adSetsData, adsData, adInsightsData, adSetInsightsData, campaignInsightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
         fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
         fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
+        // ENG-1742 follow-up: unencoded `{...}` in a nested field selector is silently
+        // mangled by Graph — on this `ads` edge it doesn't hard-error, it just drops the
+        // `creative` field from every result with no indication anything is missing.
+        // Confirmed live 2026-09-04: this exact string returned every ad with `creative`
+        // entirely absent; the encoded form returns real thumbnail_url/title/body/image_url.
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/ads?fields=id,name,status,adset_id,campaign_id,${encodeURIComponent('creative{thumbnail_url,title,body,image_url}')}${filteringParam}&access_token=${accessToken}`),
         // Ad-level insights for ads processing
         fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
         // Adset-level insights for ad sets processing
@@ -18096,6 +21070,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`)
       ]);
 
+
+      /*
+       * ENG-1584 sibling: `fetchWithRetryAndPaging` is bounded (META_PAGING_MAX_PAGES) and
+       * these URLs set no `limit`, so an account past the default page-size bound got a
+       * dashboard silently missing rows with no signal at all — the helper already reports
+       * `pagingTruncated` for exactly this (see the checked sibling in listMetaAdsCampaigns
+       * above), it was just never read here across any of the 9 parallel fetches.
+       */
+      const truncatedSections = ([
+        ['Campaigns', campaignsData],
+        ['Ad Sets', adSetsData],
+        ['Ads', adsData],
+        ['Ad-level Insights', adInsightsData],
+        ['Adset-level Insights', adSetInsightsData],
+        ['Campaign-level Insights', campaignInsightsData],
+        ['Demographics Breakdown', insightsDemographicsData],
+        ['Placement Breakdown', insightsPlacementData],
+        ['Device Breakdown', insightsDeviceData],
+      ] as const)
+        .filter(([, response]) => (response as any)?.pagingTruncated === true)
+        .map(([section]) => section);
 
       // Keep connection lookup, permission, and query failures distinct so Emma
       // can prompt for the right remedy instead of always asking for reconnect.
@@ -18121,6 +21116,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         typedError.metaMetricsErrorType = connectionFailure
           ? 'connection'
           : (permissionFailure ? 'permission' : 'api');
+        // ENG-1300: the real HTTP status, never `code` above (Meta's business code).
+        typedError.status = (response as any)?.__httpStatus;
         throw typedError;
       }
       // ENG-104: breakdown endpoints are NON-fatal (we proceed without them), but
@@ -18180,11 +21177,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         timeframe
       }, userId);
 
+      const truncationNote = truncatedSections.length > 0
+        ? ` THIS DATA IS INCOMPLETE for: ${truncatedSections.join(', ')} — the read stopped before the end of the account. Do not conclude an ad/campaign is absent based on these sections.`
+        : '';
       const result = {
         success: true,
-        message: breakdownStatus.partialFailure
+        message: (breakdownStatus.partialFailure
           ? `Meta ads metrics loaded for ${timeframe} timeframe (some breakdown sections unavailable: ${breakdownStatus.unavailableSections.join(', ')})`
-          : `Meta ads metrics loaded for ${timeframe} timeframe`,
+          : `Meta ads metrics loaded for ${timeframe} timeframe`) + truncationNote,
         timeframe,
         attributionWindow: { start: sinceStr, end: untilStr, days: attributionDays },
         campaignSummary,
@@ -18195,6 +21195,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         sections: breakdownStatus.sections,
         partialFailure: breakdownStatus.partialFailure,
         unavailableSections: breakdownStatus.unavailableSections,
+        // ENG-1584 sibling: which sections hit the page-count bound, so a caller cannot mistake
+        // a short list for the whole account (see truncatedSections above).
+        ...(truncatedSections.length > 0 ? { truncatedSections, complete: false } : { complete: true }),
       };
 
       return result;
@@ -18209,7 +21212,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message,
         error: message,
-        errorType
+        errorType,
+        // ENG-1300: real HTTP status when the failure came from a coded fetch
+        // (typedError.status above); getMetaCredentials failures don't carry one.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -18296,6 +21302,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           // message whichever layer sees it first. A GET with no id must never
           // fall through to something account-wide.
           throw new Error('AD_CREATIVE GET requires "params.creative_id".');
+        } else if (action === 'PREVIEW' && !params.creative_id) {
+          throw new Error('AD_CREATIVE PREVIEW requires "params.creative_id".');
+        } else if (action === 'PREVIEW' && !params.ad_format) {
+          throw new Error('AD_CREATIVE PREVIEW requires "params.ad_format".');
         }
         break;
 
@@ -18310,6 +21320,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           throw new Error('AD COPY_AD requires "ad_id" (the source ad to copy).');
         } else if (action === 'RETAG_UTM' && !ad_id) {
           throw new Error('AD RETAG_UTM requires "ad_id".');
+        } else if (action === 'PREVIEW' && !ad_id) {
+          throw new Error('AD PREVIEW requires "ad_id".');
+        } else if (action === 'PREVIEW' && !params.ad_format) {
+          throw new Error('AD PREVIEW requires "params.ad_format".');
         }
         break;
 
@@ -18350,6 +21364,402 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * ENG-1635: best-effort extraction of the Meta object id a write's dispatch
+   * result carries, for the manifest outcome record. A CREATE echoes the new
+   * object nested under its entity-shaped key (`campaign.id` / `adSet.id` /
+   * `ad.id` / `creative.id` / `audience.id`); an UPDATE/DELETE typically has no
+   * such nested object at all (just a message) — undefined in that case is
+   * correct, not a bug, since there's nothing new to name.
+   */
+  private static extractDispatchedObjectId(result: any): string | undefined {
+    if (!result || typeof result !== 'object') return undefined;
+    for (const key of ['campaign', 'adSet', 'ad', 'creative', 'audience']) {
+      const id = result[key]?.id;
+      if (typeof id === 'string' && id) return id;
+    }
+    return undefined;
+  }
+
+  /**
+   * ENG-1635: resolve the account id a write will ACTUALLY execute against —
+   * mirroring buildMetaWriteConfirmation's own resolution (see its comment
+   * above `scopeAccountId`) — and compute this call's manifest digest against
+   * THAT id, never the raw `account_id` argument.
+   *
+   * A raw argument can be omitted (the common single-connected-account case;
+   * `POST /emma/meta-ads/marketing-api` validates nothing) or vary
+   * cosmetically call to call while resolving to the same real account. Two
+   * calls that both omit/vary the raw argument but resolve to DIFFERENT real
+   * accounts must never hash the same, and a legitimately-identical write
+   * must not hash differently just because its raw argument differs from an
+   * earlier call's — so every manifest digest, at both producer (preview) and
+   * grant (claim) time, has to go through this same resolution. Both current
+   * callers (claimMetaWriteManifestGrant below, and the manifest producer)
+   * share this rather than each resolving credentials their own way.
+   */
+  private async resolveMetaWriteManifestDigest(
+    userId: string,
+    entity_type: string,
+    action: string,
+    account_id: string,
+    campaign_id: string | undefined,
+    ad_set_id: string | undefined,
+    ad_id: string | undefined,
+    params: any,
+  ): Promise<string> {
+    let scopeAccountId: string = account_id ?? '';
+    try {
+      const creds = await this.getMetaCredentials(userId, account_id);
+      if (creds.accountId) scopeAccountId = creds.accountId;
+    } catch {
+      // Same degrade-not-block behavior as buildMetaWriteConfirmation: a credential
+      // failure surfaces during actual execution, not here — fall back to the raw
+      // argument rather than letting digest computation itself throw.
+    }
+    return computeMetaWriteManifestDigest(getJwtSecret(), {
+      entity_type, action, account_id: scopeAccountId, campaign_id, ad_set_id, ad_id, params,
+    });
+  }
+
+  /**
+   * ENG-1642: check whether this exact Meta write is authorized by an
+   * answered `meta_write_manifest` question in the session, and if so claim
+   * it (at-most-once). `granted` is true only when a fresh claim succeeds
+   * THIS call — a digest not in any manifest, an unanswered/non-human-
+   * attributed manifest, or a digest already consumed all return false,
+   * which falls through to the normal confirmation halt. `digest` is always
+   * returned (even on a false grant) so a caller that DOES grant can record
+   * this write's execution outcome (ENG-1635) against the exact digest the
+   * user approved, without re-resolving credentials a third time.
+   */
+  private async claimMetaWriteManifestGrant(
+    userId: string,
+    sessionId: string,
+    entity_type: string,
+    action: string,
+    account_id: string,
+    campaign_id: string | undefined,
+    ad_set_id: string | undefined,
+    ad_id: string | undefined,
+    params: any,
+    grantSourceDeck?: PendingApprovalDeck,
+  ): Promise<
+    | { granted: true; digest: string }
+    // `reason` distinguishes two genuinely different cases a caller needs to
+    // treat differently (see buildMetaWriteWorkflowSteps's own use of it):
+    // 'not_approved' — this digest was never authorized at all (rejected,
+    // never in any deck, or a genuine client-side forgery attempt) — a real
+    // failure. 'already_consumed' — this digest WAS authorized and has
+    // already been (or is concurrently being) claimed by ANOTHER caller —
+    // not a failure of THIS attempt, just a lost race for an at-most-once
+    // resource; the write may well be succeeding right now via whoever won.
+    | { granted: false; digest: string; reason: 'not_approved' | 'already_consumed' }
+  > {
+    const digest = await this.resolveMetaWriteManifestDigest(
+      userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
+    );
+    const session = await chatbotDb.getChatSession(sessionId);
+    // Session already recorded this exact digest consumed — a repeat of the
+    // same call re-confirms rather than executing again (acceptance
+    // criterion 3).
+    if (session?.consumedMetaWriteManifestDigests?.[digest]) return { granted: false, digest, reason: 'already_consumed' };
+    // ENG-1635/1644 gap 5 (plan's Migration note): sourced from the answered
+    // approval deck now, not a `meta_write_manifest`-kind AskUserQuestion —
+    // see approvalDeck.ts's findApprovalDeckAnswerForDigest header. This is
+    // the ONLY path a Meta write may be granted through; `params.confirm`
+    // alone is never sufficient (see the gate below, which no longer reads
+    // it at all before calling this).
+    //
+    // `grantSourceDeck` is an explicit override for resumeStuckApprovalDeckWorkflowRun's
+    // benefit ONLY: `session.pendingApprovalDeck` is whatever deck is
+    // CURRENTLY live, which for a step being resumed after a crash may
+    // already have been overwritten by a later, unrelated deck — reading it
+    // here would make every one of the crashed deck's still-approved writes
+    // fail closed as "no longer authorized," permanently losing them instead
+    // of resuming them. The normal (non-resume) call path never passes this,
+    // so its behavior is unchanged: it still reads the live session field,
+    // which IS the deck that was just answered.
+    const outcome = findApprovalDeckAnswerForDigest(grantSourceDeck ?? session?.pendingApprovalDeck, digest);
+    if (!outcome.granted) return { granted: false, digest, reason: 'not_approved' };
+    const granted = await chatbotDb.claimMetaWriteManifestDigest(sessionId, digest);
+    return granted ? { granted: true, digest } : { granted: false, digest, reason: 'already_consumed' };
+  }
+
+  /**
+   * ENG-1635: when every `awaitingUserConfirmation` result this iteration is a Meta
+   * write (each carries the `metaWriteManifestDigest` set on the halt above), build ONE
+   * approval deck covering all of them instead of the plain per-call text batching
+   * below — so a single submission grants every listed write via
+   * `claimMetaWriteManifestGrant` (now sourced from this deck, gap 5) rather than
+   * requiring N separate `confirm:true` re-calls, one human reply each. Fixes the
+   * "12 serial prompts" defect (ENG-1635) at its root: `collectConfirmationPrompt`
+   * already batched the DISPLAY of N halts into one message, but never authorized more
+   * than one write per answer — each of the N still needed its own individually-gated
+   * replay.
+   *
+   * Fires on a SINGLE halted write too (deck of size 1) — gap 5's fix (ENG-1635/1644
+   * Round 3) made confirm=true permanently inert as an independent path, so a lone
+   * write has no path forward EXCEPT this one; a separate single-write text path can
+   * no longer coexist with this one without dead-ending every solo write.
+   *
+   * Returns null (falls back to `collectConfirmationPrompt`'s plain prompt, unchanged)
+   * when: the iteration has no halted writes, or ANY halted result in the iteration is
+   * NOT a Meta write (e.g. an image-edit confirmation, which carries no digest and
+   * whose own confirm=true gate is unhardened and out of scope for this ticket — mixing
+   * it into a deck item would either need its own grant mechanism this ticket never
+   * built, or would silently downgrade its protection to "was in an approved deck," a
+   * guarantee this ticket never verified for that tool).
+   */
+  /**
+   * ENG-1635/1644 Phase 2 v3: split one iteration's halts into the three
+   * buckets the generalized seam needs. A halt only ever lands in ONE bucket:
+   * a real Meta-write shape (digest + dispatch) -> writeHalts; a real
+   * present_question_deck shape (questionDeckPayload array) -> questionDeckHalts;
+   * anything else that set awaitingUserConfirmation -> otherHalts (e.g. a
+   * genuinely unsupported/future halt type — the seam bails to the old
+   * plain-text path on any of these, preserving today's safety net exactly).
+   */
+  private partitionApprovalHalts(
+    toolResults: Array<{ status: 'success' | 'error'; result?: any }>
+  ): { writeHalts: any[]; questionDeckHalts: any[]; otherHalts: any[] } {
+    const writeHalts: any[] = [];
+    const questionDeckHalts: any[] = [];
+    const otherHalts: any[] = [];
+    for (const tr of toolResults) {
+      if (tr.status !== 'success') continue;
+      const r: any = tr.result;
+      if (!r || r.awaitingUserConfirmation !== true) continue;
+      if (typeof r.metaWriteManifestDigest === 'string' && r.metaWriteManifestDigest && r.metaWriteDispatch) {
+        writeHalts.push(r);
+      } else if (Array.isArray(r.questionDeckPayload)) {
+        questionDeckHalts.push(r);
+      } else {
+        otherHalts.push(r);
+      }
+    }
+    return { writeHalts, questionDeckHalts, otherHalts };
+  }
+
+  /** Build a write-only deck from ALREADY-PARTITIONED write halts (see
+   *  partitionApprovalHalts above — the caller guarantees every entry here
+   *  has a real digest + dispatch, so no mixed-shape bail is needed here). */
+  private buildMetaWriteApprovalDeckFromHalts(writeHalts: any[]): PendingApprovalDeck | null {
+    if (writeHalts.length === 0) return null;
+    try {
+      let deck = createApprovalDeck(uuidv4(), new Date().toISOString());
+      writeHalts.forEach((r, i) => {
+        deck = appendApprovalDeckItem(deck, {
+          itemId: `write-${i + 1}`,
+          kind: 'meta_write',
+          question: r.confirmationDetail || r.confirmationPrompt || r.summary || 'this action',
+          // Haven's CS-64 "REJECT — <correction>" convention (gap 1) applies to
+          // a Meta write item too — the correction is captured as data on the
+          // answer, never auto-applied; a rejected item simply never becomes a
+          // workflow step (see approvedWriteItems), the correction text itself
+          // is for whatever surfaces it back to Emma next turn.
+          allowFreeText: true,
+          metaWriteManifestDigest: r.metaWriteManifestDigest,
+          metaWriteDispatch: r.metaWriteDispatch,
+        });
+      });
+      return finalizeApprovalDeck(deck, new Date().toISOString());
+    } catch (err) {
+      // Should be unreachable (every item built above is well-formed), but a
+      // malformed deck must fall back to the old per-item prompt, never throw and
+      // silently drop the halt.
+      console.error('AgentMode: buildMetaWriteApprovalDeckFromHalts failed, falling back to plain prompt:', err);
+      return null;
+    }
+  }
+
+  /**
+   * ENG-1853: the async-run sibling of buildMetaWriteApprovalDeckFromHalts —
+   * stages every halted Meta write from one unattended-run iteration as
+   * durable approval-inbox decisions sharing one manifestId, instead of a
+   * session-scoped PendingApprovalDeck nobody is connected to see. Each
+   * write's own createDecision call is idempotent on its digest (existing
+   * `AW-ApprovalDecisions` contract).
+   *
+   * Review fix (double-dispatch risk): uses Promise.allSettled, not
+   * Promise.all, and NEVER falls back to the live-deck path once ANYTHING
+   * has been durably staged. The original Promise.all shape meant a single
+   * genuine createDecision failure (not the idempotent-conflict branch,
+   * which createDecision already swallows internally — a real transient
+   * error) discarded every OTHER write that had already succeeded, and the
+   * caller then built a live PendingApprovalDeck covering the full batch —
+   * including the already-staged ones. If that stale deck were ever later
+   * answered, it would dispatch through buildMetaWriteWorkflowSteps'
+   * claimMetaWriteManifestGrant, a completely separate claim mechanism this
+   * path never touches, which would not see the write as consumed and could
+   * dispatch it a second time. Falling back to the live deck is only safe
+   * when NOTHING was staged (nothing durable exists yet to double-claim).
+   *
+   * Review fix (manifestId misreporting): createDecision returns the
+   * EXISTING record (with its ORIGINAL manifestId) on an idempotent hit —
+   * it never adopts a newly-passed manifestId. A retried iteration that
+   * re-stages an already-staged digest would previously still report the
+   * freshly-minted manifestId regardless, which could point the turn's own
+   * "resume" message and the reviewer's queue link at a manifestId that
+   * contains none (or only some) of the decisions it claims to. This now
+   * reads back every real createDecision result and reports the actual
+   * manifestId(s) the staged decisions really landed under.
+   *
+   * approver defaults to 'matt' — the named reviewer ENG-1644's own seed
+   * acceptance cases used for this exact class of decision (Haven/Every).
+   * Not yet configurable per-account; a real per-account assignment is
+   * future work, not silently invented here.
+   */
+  private async stageApprovalInboxMetaWriteManifest(
+    sessionId: string,
+    writeHalts: any[],
+  ): Promise<{ manifestId: string; turnMessage: string } | null> {
+    const manifestId = uuidv4();
+    // Same default window stage_pending_decision uses for a team decision —
+    // one consistent "how long before this goes stale" answer across every
+    // producer of this table.
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+    const settled = await Promise.allSettled(
+      writeHalts.map((r) =>
+        approvalInboxService.createDecision({
+          gateType: 'meta_write',
+          approver: 'matt',
+          subjectLabel: `Meta Ads · Account ${r?.target?.account_id || r?.metaWriteDispatch?.account_id || 'unknown'}`,
+          businessImpact: r?.confirmationDetail || r?.confirmationPrompt || r?.summary || 'A Meta Ads change is waiting for review.',
+          evidencePacket: { researchSummary: r?.summary },
+          metaWriteManifestDigest: r.metaWriteManifestDigest,
+          metaWriteDispatch: r.metaWriteDispatch,
+          originSessionId: sessionId,
+          manifestId,
+          expiresAt,
+        }),
+      ),
+    );
+
+    const staged = settled
+      .filter((s): s is PromiseFulfilledResult<ApprovalDecision> => s.status === 'fulfilled')
+      .map((s) => s.value);
+    const failedCount = settled.length - staged.length;
+
+    if (staged.length === 0) {
+      // Nothing durable exists anywhere for this batch — the live-deck
+      // fallback below is fully safe (nothing it could double-claim).
+      for (const s of settled) {
+        if (s.status === 'rejected') {
+          console.error('[agent-mode-service] failed to stage an approval-inbox meta_write decision, falling back to the live deck path:', s.reason?.message || s.reason);
+        }
+      }
+      return null;
+    }
+    if (failedCount > 0) {
+      // Some writes ARE now durably staged — must not fall back to a live
+      // deck for the rest (see header). The un-staged write(s) are simply
+      // not tracked this iteration; they are not silently duplicated.
+      console.error(
+        `[agent-mode-service] partially failed to stage an approval-inbox meta_write manifest — ${staged.length}/${settled.length} succeeded. ` +
+        `The other ${failedCount} write(s) were NOT staged and will need the model to re-attempt them on a later turn — ` +
+        `never falling back to a live deck here, since that would risk double-dispatching the ${staged.length} write(s) already staged.`,
+      );
+    }
+
+    // staged items may have landed under a PRE-EXISTING manifestId (an
+    // idempotent hit on an already-staged digest, e.g. from an earlier
+    // partial attempt) rather than the manifestId just minted — report
+    // honestly rather than assuming uniformity.
+    const manifestIds = [...new Set(staged.map((d) => d.manifestId))];
+    const reportedManifestId = manifestIds.length === 1 ? manifestIds[0] : manifestId;
+    if (manifestIds.length > 1) {
+      // Second-review fix: this genuinely CAN'T be made fully correct
+      // without a return-contract change (multiple real manifestIds, no
+      // single one actually contains every staged decision) — nothing
+      // consumes the returned manifestId beyond this point today
+      // (metadata.approvalInboxManifestId is write-only, confirmed via
+      // grep), so a full fix is premature. Logged so this is visible
+      // rather than silently wrong if/when something starts reading it.
+      console.warn(
+        `[agent-mode-service] staged approval-inbox decisions landed under ${manifestIds.length} DIFFERENT pre-existing manifestIds (${manifestIds.join(', ')}) in one staging call — reporting the freshly-minted ${manifestId}, which may not contain every decision just staged.`,
+      );
+    }
+
+    const count = staged.length;
+    return {
+      manifestId: reportedManifestId,
+      turnMessage:
+        count === 1
+          ? `This change needs review before it runs — queued for the assigned approver in the Approval Desk. I'll resume automatically once it's resolved.`
+          : `This packet of ${count} change${count === 1 ? '' : 's'} needs review before ${count === 1 ? 'it runs' : 'they run'} — queued for the assigned approver in the Approval Desk. I'll resume automatically once it's resolved.`,
+    };
+  }
+
+  /** Build a question-only deck from ALREADY-PARTITIONED question-deck halts.
+   *  Each halt's questionDeckPayload is an array (present_question_deck can
+   *  front-load several questions in one call) — if the model somehow made
+   *  more than one present_question_deck call in the same iteration, every
+   *  question across all of them merges into this one deck, same "merge
+   *  same-iteration halts" behavior the write-deck builder already has. */
+  private buildQuestionApprovalDeckFromHalts(questionHalts: any[]): PendingApprovalDeck | null {
+    const questions: QuestionDeckQuestionInput[] = [];
+    for (const r of questionHalts) {
+      if (Array.isArray(r.questionDeckPayload)) questions.push(...r.questionDeckPayload);
+    }
+    if (questions.length === 0) return null;
+    try {
+      let deck = createApprovalDeck(uuidv4(), new Date().toISOString());
+      questions.forEach((q, i) => {
+        deck = appendApprovalDeckItem(deck, {
+          itemId: `question-${i + 1}`,
+          // ask_user_question's migrated payload carries its own kind/immutable
+          // (e.g. 'meta_objective', immutable:true for the objective gate) —
+          // present_question_deck's questions never set either, so this falls
+          // back to the pre-existing 'plan_choice'/not-immutable default.
+          kind: typeof q.kind === 'string' && q.kind.trim() !== '' ? q.kind : 'plan_choice',
+          question: q.question,
+          options: q.options,
+          allowEmmaDecide: q.allowEmmaDecide === true,
+          ...(q.immutable === true ? { immutable: true } : {}),
+        });
+      });
+      return finalizeApprovalDeck(deck, new Date().toISOString());
+    } catch (err) {
+      // Same fallback contract as the write-deck builder above — a malformed
+      // deck (e.g. a bad recommended-option count) falls back to the old
+      // plain-text prompt rather than throwing and dropping the halt.
+      console.error('AgentMode: buildQuestionApprovalDeckFromHalts failed, falling back to plain prompt:', err);
+      return null;
+    }
+  }
+
+  /**
+   * ENG-1635/1644 Phase 2 v3: the iteration-end priority rule, deterministic
+   * not a race. Callers pass ALREADY-PARTITIONED halts (partitionApprovalHalts
+   * above) with otherHalts already confirmed empty. Writes always win a mixed
+   * turn — security-critical: a write must never dead-loop behind a
+   * lower-stakes planning question — so any questionDeckHalts present
+   * alongside a write are dropped from the deck that gets built and stashed
+   * on it as droppedQuestionDeckPayload instead, so the re-ask directive can
+   * reach Emma once this write-deck is answered or cancelled.
+   */
+  private buildApprovalDeckForIteration(writeHalts: any[], questionDeckHalts: any[]): PendingApprovalDeck | null {
+    if (writeHalts.length > 0) {
+      let deck = this.buildMetaWriteApprovalDeckFromHalts(writeHalts);
+      if (deck && questionDeckHalts.length > 0) {
+        const dropped: QuestionDeckQuestionInput[] = [];
+        for (const r of questionDeckHalts) {
+          if (Array.isArray(r.questionDeckPayload)) dropped.push(...r.questionDeckPayload);
+        }
+        if (dropped.length > 0) {
+          deck = { ...deck, droppedQuestionDeckPayload: dropped };
+        }
+      }
+      return deck;
+    }
+    if (questionDeckHalts.length > 0) {
+      return this.buildQuestionApprovalDeckFromHalts(questionDeckHalts);
+    }
+    return null;
+  }
+
+  /**
    * Loop halt seam for the human-in-the-loop confirmation gate. Scans one iteration's
    * tool results and returns the user-facing prompt to surface (or null to continue).
    * Only tool results that set `awaitingUserConfirmation === true` halt the turn — this
@@ -18378,10 +21788,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (items.length === 1) return items[0].prompt;
     // Multiple actions batched in one turn (e.g. "edit these two images"): one intro,
     // each target listed once, one footer — instead of repeating the full wrapper N times.
+    // ENG-1635/1644 gap 5: same fix as the single-item confirmationPrompt above — never
+    // invite a typed "yes"/"confirm" reply, that flag is fully inert now. This whole
+    // function is a fallback-only path (see its own doc comment / the caller's
+    // fall-through contract); the normal path deck-routes every write instead.
     return `Based on your request, here are the ${items.length} changes I'm about to make — ` +
       `please review each target before I proceed:\n\n` +
       items.map((i, n) => `${n + 1}. ${i.detail}`).join('\n\n') +
-      `\n\nReply "yes" / "confirm" to proceed with all of these, or tell me what to change.`;
+      `\n\nThis needs your explicit approval through a review card, not a typed reply — ` +
+      `if no card appears here, refresh the page or ask again and I'll represent it as one.`;
   }
 
   /**
@@ -18391,6 +21806,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * stops the agent acting on an ambiguous target (e.g. publishing an ad into the
    * wrong campaign). ID→name lookups degrade gracefully to the raw ID if Meta is
    * unreachable — confirmation must still be required even when resolution fails.
+   *
+   * `tenancyRefused` is the ONE resolution failure that must not degrade: see the resolvers
+   * below. The caller blocks the write on it instead of prompting.
    */
   private async buildMetaWriteConfirmation(
     userId: string,
@@ -18401,29 +21819,104 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     ad_set_id: string | undefined,
     ad_id: string | undefined,
     params: any
-  ): Promise<{ summary: string; target: Record<string, any> }> {
+  ): Promise<{ summary: string; target: Record<string, any>; tenancyRefused: boolean; tenancyRefusalMessage?: string }> {
     let accessToken = '';
+    /*
+     * The account the write will ACTUALLY execute against — not the raw argument.
+     *
+     * `getMetaCredentials` resolves the account when the caller omitted it (the common
+     * single-connected-account case, and `POST /emma/meta-ads/marketing-api` validates
+     * nothing). Destructuring only `accessToken` threw that resolved id away and left every
+     * ownership check below comparing against `undefined`, which `assertOwnedByAccount`
+     * correctly fails closed on — so a user's own campaign came back refused as a cross-tenant
+     * violation, and the prompt rendered "in ad account undefined". The guard was right; it was
+     * being handed the wrong account. Execution resolves the same way, so this is also the id
+     * the confirmation text must name.
+     */
+    /*
+     * Always a DEFINED string — never `undefined`.
+     *
+     * `getAdSet`/`getAd` take an optional ad-account id where `undefined` means "the caller is
+     * deliberately opting out of the ownership check" (the post-write read-back callers rely on
+     * that). `getCampaign` takes it as a required positional and fails closed on a blank. So an
+     * unresolved account made the SAME state mean opposite things: campaign refused, ad and ad
+     * set silently unscoped — and an unscoped node read is a cross-tenant oracle, because Meta
+     * ids are global and one token spans several ad accounts. Another tenant's ad name would be
+     * rendered into the prompt the user approves.
+     *
+     * `''` is defined, so the guard runs and `assertOwnedByAccount` refuses a blank selected
+     * account. Opting out stays possible for the callers that mean it; it is just no longer
+     * something an unresolved credential can do by accident.
+     */
+    let scopeAccountId: string = account_id ?? '';
     try {
-      ({ accessToken } = await this.getMetaCredentials(userId, account_id));
+      const creds = await this.getMetaCredentials(userId, account_id);
+      accessToken = creds.accessToken;
+      if (creds.accountId) scopeAccountId = creds.accountId;
     } catch {
       // Credential failure surfaces during execution; still require confirmation here.
     }
 
-    const target: Record<string, any> = { entity_type, action, account_id };
+    const target: Record<string, any> = { entity_type, action, account_id: scopeAccountId };
     const lines: string[] = [];
 
-    // Best-effort resolvers — each guarded so a Meta lookup failure never blocks the gate.
+    /*
+     * Best-effort resolvers — each guarded so a Meta lookup failure never blocks the gate.
+     *
+     * That `catch` was written for a transient Graph blip, and for that it is right: a name we
+     * could not fetch degrades to the raw id and the user is still asked to approve.
+     *
+     * The ownership check these resolvers now pass `scopeAccountId` to throws through the SAME
+     * catch, and it does not mean "we could not look" — it means "we looked, and this node is
+     * not in the selected ad account". Swallowed as a blip, the prompt degraded to `ID <id>`
+     * and the write went on to confirmation, which is the gate approving a write to a node the
+     * guard had already refused. A refusal that only makes the prompt vaguer is not a guard.
+     *
+     * So the two are told apart (`isMetaAccountScopeRefusal`) and only the transient one keeps
+     * the best-effort behaviour. The refusal is recorded as a bare boolean on purpose: WHICH
+     * node was refused, what it is called, and which account owns it are exactly the oracle
+     * details `assertOwnedByAccount` refuses to emit, and they must not be reconstructed here.
+     */
+    let tenancyRefused = false;
+    /*
+     * The guard's OWN sentence, kept rather than re-written.
+     *
+     * assertOwnedByAccount deliberately varies its remedy by branch — the no-owner branch says
+     * "ownership could not be CONFIRMED ... Retry" and specifically avoids "select the other
+     * account", because there is no other account to select. Collapsing all of that into a
+     * boolean and emitting one fixed sentence here handed exactly that unusable remedy back on
+     * exactly that branch. The message is non-oracle by construction (no name, no owning
+     * account, no id), so relaying it discloses nothing the guard did not already choose to say.
+     */
+    let tenancyRefusalMessage: string | undefined;
+    const degradeUnlessRefused = (err: unknown): undefined => {
+      if (isMetaAccountScopeRefusal(err)) {
+        tenancyRefused = true;
+        const m = (err as { message?: unknown } | undefined)?.message;
+        if (typeof m === 'string' && !tenancyRefusalMessage) tenancyRefusalMessage = m;
+      }
+      return undefined;
+    };
     const resolveCampaign = async (id?: string) => {
       if (!id || !accessToken) return undefined;
-      try { return await metaService.getCampaign(account_id, accessToken, id); } catch { return undefined; }
+      try { return await metaService.getCampaign(scopeAccountId, accessToken, id); }
+      catch (err) { return degradeUnlessRefused(err); }
     };
     const resolveAdSet = async (id?: string) => {
       if (!id || !accessToken) return undefined;
-      try { return await metaService.getAdSet(accessToken, id); } catch { return undefined; }
+      // This result's NAME is rendered into the prompt the user approves, so the node must be
+      // proven to belong to the selected account first — otherwise an id from another ad account
+      // discloses that account's ad set name to this user.
+      try { return await metaService.getAdSet(accessToken, id, scopeAccountId); }
+      catch (err) { return degradeUnlessRefused(err); }
     };
     const resolveAd = async (id?: string) => {
       if (!id || !accessToken) return undefined;
-      try { return await metaService.getAd(accessToken, id); } catch { return undefined; }
+      // Same reason as resolveAdSet above: this result's NAME is rendered into the prompt the
+      // user approves, so an ad id from another ad account the token can reach would disclose
+      // that account's ad name to this user.
+      try { return await metaService.getAd(accessToken, id, scopeAccountId); }
+      catch (err) { return degradeUnlessRefused(err); }
     };
     const nameOf = (entity: any, id?: string) =>
       entity?.name ? `"${entity.name}" (${entity.id || id})` : (id ? `ID ${id}` : 'unknown');
@@ -18432,19 +21925,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (action === 'CREATE') {
         target.campaign_name = params.name;
         target.objective = params.objective;
-        lines.push(`Create a NEW campaign "${params.name}" (objective: ${params.objective || 'unspecified'}) in ad account ${account_id}.`);
+        lines.push(`Create a NEW campaign "${params.name}" (objective: ${params.objective || 'unspecified'}) in ad account ${scopeAccountId}.`);
       } else {
         const campaign = await resolveCampaign(campaign_id);
         target.campaign = nameOf(campaign, campaign_id);
         target.campaign_id = campaign_id;
-        lines.push(`${action} campaign ${target.campaign} in ad account ${account_id}.`);
+        lines.push(`${action} campaign ${target.campaign} in ad account ${scopeAccountId}.`);
       }
     } else if (entity_type === 'AD_SET') {
       if (action === 'CREATE') {
         const campaign = await resolveCampaign(campaign_id);
         target.campaign = nameOf(campaign, campaign_id);
         target.ad_set_name = params.name;
-        lines.push(`Create a NEW ad set "${params.name}" UNDER campaign ${target.campaign} (ad account ${account_id}).`);
+        lines.push(`Create a NEW ad set "${params.name}" UNDER campaign ${target.campaign} (ad account ${scopeAccountId}).`);
       } else {
         const adSet = await resolveAdSet(ad_set_id);
         const campaign = await resolveCampaign(adSet?.campaign_id);
@@ -18459,7 +21952,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         target.ad_name = params.name;
         target.ad_set = nameOf(adSet, ad_set_id);
         target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
-        lines.push(`Publish a NEW ad "${params.name}" into ad set ${target.ad_set}${target.campaign ? `, which belongs to campaign ${target.campaign}` : ''} (ad account ${account_id}).`);
+        lines.push(`Publish a NEW ad "${params.name}" into ad set ${target.ad_set}${target.campaign ? `, which belongs to campaign ${target.campaign}` : ''} (ad account ${scopeAccountId}).`);
       } else if (action === 'COPY_AD') {
         const sourceAd = await resolveAd(ad_id);
         const targetAdSetId = params.adset_id || sourceAd?.adset_id;
@@ -18494,21 +21987,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     } else if (entity_type === 'AD_CREATIVE') {
       // Account-level asset (CREATE only — uploads/list are not gated).
       target.creative_name = params.name;
-      lines.push(`Create a NEW ad creative${params.name ? ` "${params.name}"` : ''} in ad account ${account_id}.`);
+      lines.push(`Create a NEW ad creative${params.name ? ` "${params.name}"` : ''} in ad account ${scopeAccountId}.`);
     } else if (entity_type === 'CUSTOM_AUDIENCE') {
       if (action === 'UPLOAD_USERS') {
         target.audience_id = params.id;
-        lines.push(`Upload user data (PII) to custom audience ID ${params.id} in ad account ${account_id}.`);
+        lines.push(`Upload user data (PII) to custom audience ID ${params.id} in ad account ${scopeAccountId}.`);
       } else {
         target.audience_name = params.name;
         target.subtype = params.subtype;
-        lines.push(`Create a NEW ${params.subtype ? `${params.subtype} ` : ''}custom audience "${params.name}" in ad account ${account_id}.`);
+        lines.push(`Create a NEW ${params.subtype ? `${params.subtype} ` : ''}custom audience "${params.name}" in ad account ${scopeAccountId}.`);
       }
     }
 
     // Surface content/destination changes so the user can catch a wrong-asset edit.
     const contentChanges: Record<string, any> = {};
-    for (const key of ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'creative_id', 'placement_assets']) {
+    for (const key of ['link_url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'status', 'daily_budget', 'lifetime_budget', 'creative_id', 'placement_assets', 'adset_schedule', 'pacing_type']) {
       if (params[key] !== undefined) contentChanges[key] = params[key];
     }
     if (Object.keys(contentChanges).length > 0) {
@@ -18531,7 +22024,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
     }
 
-    return { summary: lines.join(' '), target };
+    return { summary: lines.join(' '), target, tenancyRefused, tenancyRefusalMessage };
   }
 
   private static readonly META_OBJECTIVE_VALUES = [
@@ -18578,52 +22071,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * (verified explicit-statement) success durable for the rest of the session,
    * the same way a card answer is — so a target-confirmation retry (or any
    * later CAMPAIGN CREATE in this session) finds it via Path 2 instead of
-   * re-deriving it against a possibly different later message. Synthesizes a
-   * single-option "question" that's already answered — never shown to the
-   * user (no card was needed; the user already stated it themselves), just a
-   * structural record for the gate to find.
+   * re-deriving it against a possibly different later message.
+   *
+   * ENG-1635/1644 PR2: writes to session.objectiveConfirmations (a plain
+   * advisory map field, see its own doc comment on ChatSession) instead of
+   * the old pendingUserQuestion primitive — this record is never shown to
+   * the user as a card (no card was needed; the user already stated it
+   * themselves), and the deck/message-history mechanism that replaced
+   * pendingUserQuestion for real cards has no equivalent "never rendered"
+   * mode, so reusing it here would risk a synthetic bookkeeping message
+   * actually appearing in the user's chat transcript.
    */
   private async persistExplicitObjectiveConfirmation(
     sessionId: string,
     objective: string,
     quote: string,
     objectiveKind: string,
+    sourceQuestionId?: string,
   ): Promise<void> {
-    const question = buildPendingUserQuestion({
-      questionId: uuidv4(),
-      question: 'Meta campaign objective (confirmed from the user\'s own explicit statement).',
-      options: [
-        {
-          id: 'confirmed',
-          label: objective,
-          consequence: 'Confirmed by the user\'s own words — not shown as a card.',
-          recommended: true,
-          why: `The user explicitly stated this: "${quote}"`,
-          payload: { objective },
-        },
-        {
-          // Structural placeholder only — the primitive requires 2–4 options
-          // and exactly one recommended. This one was never actually offered;
-          // it can never be selected since this record is built pre-answered.
-          id: 'not-applicable',
-          label: 'N/A',
-          consequence: 'Not a real choice — this record reflects an explicit user statement, not a live card.',
-          payload: {},
-        },
-      ],
-      immutable: true,
-      allowEmmaDecide: false,
-      kind: objectiveKind,
-      createdAt: new Date().toISOString(),
-    });
-    const answered = applyAnswer(question, {
-      optionId: 'confirmed',
-      delegated: false,
+    await chatbotDb.updateSessionObjectiveConfirmation(sessionId, objectiveKind, {
+      objective,
       answeredBy: 'user',
-      rationale: `Explicitly stated by the user: "${quote}"`,
       at: new Date().toISOString(),
+      quote: sourceQuestionId ? `Consumed answered objective card ${sourceQuestionId}` : quote,
     });
-    await chatbotDb.updateSessionAskUserQuestion(sessionId, answered);
   }
 
   /**
@@ -18637,8 +22108,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    *
    * 1. Explicitly stated by the user THIS turn — verified against the actual
    *    message text (verifyExplicitStatement), never trusted on a model flag.
-   * 2. A prior ask_user_question (kind 'meta_objective') answered by the user
-   *    or delegation — live or archived in this session (checkQuestionGate).
+   * 2. A prior confirmation already settled this session — objectiveConfirmations
+   *    (persistExplicitObjectiveConfirmation), a prior answered deck-of-one item
+   *    (findAnsweredDeckItemByKind), answered by the user or delegation.
    * 3. Neither: this method emits the blocking question itself (grounded,
    *    static per the 80/20 design) and refuses the create.
    */
@@ -18730,17 +22202,39 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // the claim; fall through to the deterministic ask gate below.
     }
 
-    // Path 2: already settled via a prior ask_user_question in this session,
-    // scoped to THIS campaign (see objectiveKind above).
+    // Path 2: already settled — cheapest check first (ENG-1635/1644 PR2:
+    // objectiveConfirmations, no message fetch needed — this is now the
+    // primary sink persistExplicitObjectiveConfirmation writes to), then a
+    // prior deck-of-one item (the current mechanism, post
+    // ask_user_question-retirement), then a prior ask_user_question (legacy
+    // — kept as a fallback for any record settled before that migration,
+    // deleted in PR2 Part B once the 40 pre-migration stale records are
+    // drained), scoped to THIS campaign (see objectiveKind above).
     const session = await chatbotDb.getChatSession(sessionId);
-    const candidate = findQuestionByKind(session?.pendingUserQuestion, session?.answeredQuestions, objectiveKind);
-    const outcome = checkQuestionGate(candidate);
-    if (outcome.allowed) {
-      const objective = (outcome.payload as any)?.objective;
+    const objectiveConfirmation = session?.objectiveConfirmations?.[objectiveKind];
+    if (objectiveConfirmation && AgentModeService.META_OBJECTIVE_VALUES.includes(objectiveConfirmation.objective)) {
+      return { allowed: true, objective: objectiveConfirmation.objective };
+    }
+    // Deck-history has no archive field (approvalDeck.ts file header) —
+    // findAnsweredDeckItemByKind scans message-metadata pairs, the same
+    // self-contained pairing the frontend already reconstructs historical
+    // cards from.
+    const deckHistoryMessages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
+    const deckOutcome = findAnsweredDeckItemByKind(deckHistoryMessages as any, objectiveKind);
+    if (deckOutcome.found) {
+      const pickedOption = deckOutcome.item.options?.find((o) => o.id === deckOutcome.answer.verdict);
+      const objective = (pickedOption?.payload as any)?.objective;
       if (typeof objective === 'string' && AgentModeService.META_OBJECTIVE_VALUES.includes(objective)) {
         return { allowed: true, objective };
       }
     }
+    // ENG-1635/1644 PR2: the legacy findQuestionByKind/checkQuestionGate and
+    // findAnsweredObjectiveCandidate/summarizeAnsweredObjectiveQuestions
+    // fallbacks (scanned session.pendingUserQuestion/answeredQuestions) are
+    // deleted — nothing writes those fields anymore (persistExplicitObjectiveConfirmation
+    // migrated to objectiveConfirmations, checked above), and the pre-migration
+    // stale records those fallbacks existed to serve have been drained (see
+    // the one-off migration that nulled them, PR2 Part E).
 
     // Path 3: nothing settled — surface the blocking ask ourselves. Never
     // proceed on a guess (this is the load-bearing refusal). Recommendation is
@@ -18779,44 +22273,57 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       },
     ];
 
-    const question = buildPendingUserQuestion({
-      questionId: uuidv4(),
-      question: 'Which Meta campaign objective should this campaign use? It cannot be changed after creation.',
+    // ENG-1635/1644 (ask_user_question retirement): no more buildPendingUserQuestion
+    // + synchronous updateSessionAskUserQuestion write. Return the same bare
+    // halt-marker shape ask_user_question's own execute() now returns (a
+    // 1-entry questionDeckPayload) — gate.response is returned directly as
+    // callMetaMarketingApi's own result (verified: emma/tools.ts's
+    // call_meta_marketing_api execute() returns it unwrapped), so this flows
+    // through the exact same iteration-end seam
+    // (partitionApprovalHalts/buildApprovalDeckForIteration) that already
+    // persists and renders any other halt as a real deck-of-one card — no
+    // gate-specific persistence code needed here anymore. If another
+    // halt/deck is already awaiting in this session, that shared seam's own
+    // failIfAwaitingExists guard falls through to the old plain-text prompt,
+    // the same fallback every other halt type already gets on a lost race,
+    // not a special case for this gate anymore.
+    const questionText = 'Which Meta campaign objective should this campaign use? It cannot be changed after creation.';
+    // The old card's separate `intro` sentence has no equivalent field on the
+    // deck primitive (ApprovalDeckItem/QuestionDeckQuestionInput carry only
+    // `question`) — folded into the question text itself rather than adding a
+    // schema field for a narrow, purely informational retry hint.
+    // ENG-1635/1644 PR2: "answered an objective question earlier, just not
+    // for THIS campaign" now derives from objectiveConfirmations (any entry
+    // at all, regardless of key) rather than the deleted legacy scan — same
+    // near-miss UX hint, sourced from the current sink instead of a decaying
+    // legacy one.
+    const hasAnsweredObjectiveCard = Object.keys(session?.objectiveConfirmations ?? {}).length > 0;
+    const question = hasAnsweredObjectiveCard
+      ? `You answered an objective question earlier, but it did not match this campaign and account, so I need this one confirmed.\n\n${questionText}`
+      : questionText;
+
+    const questionDeckPayload: QuestionDeckQuestionInput[] = [{
+      question,
       options,
-      immutable: true,
       allowEmmaDecide: true,
       kind: objectiveKind,
-      createdAt: new Date().toISOString(),
-    });
-
-    const posted = await chatbotDb.updateSessionAskUserQuestion(sessionId, question, { failIfAwaitingExists: true });
-    if (!posted) {
-      return {
-        allowed: false,
-        response: {
-          success: false,
-          error: 'ASK_USER_QUESTION_ALREADY_PENDING',
-          message:
-            'A question is already waiting for the user to answer. Wait until it is answered before creating this campaign.',
-        } as any,
-      };
-    }
-
-    const prompt = renderQuestionPrompt(question);
+      immutable: true,
+    }];
     return {
       allowed: false,
       response: {
         success: true,
         awaitingUserConfirmation: true,
         type: 'ask_user_question',
+        // sessionId is echoed back because this method can auto-provision one
+        // internally when the caller passed none (see the anomaly branch
+        // above) — without it on the response, a caller that started with no
+        // session has no way to learn which session the halt (and the deck
+        // built from it) actually landed on.
         sessionId,
-        questionId: question.questionId,
-        question: question.question,
-        options: question.options,
-        recommendedOptionId: question.recommendedOptionId,
-        allowEmmaDecide: question.allowEmmaDecide,
-        confirmationPrompt: prompt,
-        summary: prompt,
+        questionDeckPayload,
+        confirmationPrompt: questionText,
+        summary: questionText,
         message:
           'The campaign objective is immutable and has not been confirmed by the user yet. Do NOT retry the create yourself — the run halts here until they pick an option or delegate.',
       } as any,
@@ -18904,11 +22411,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     // Target-confirmation guardrail for mutating actions (publish/change/delete).
-    // The agent must echo the resolved target back to the user and re-call with
-    // confirm=true. This prevents acting on an ambiguous target (e.g. publishing
-    // an ad into the wrong campaign or editing the wrong asset). `confirm` is a
-    // gate-only flag and is stripped before dispatch so it never reaches Meta.
-    const confirmed = params.confirm === true;
+    // ENG-1635/1644 gap 5: `params.confirm` used to be read here into a
+    // `confirmed` boolean that could independently satisfy the halt below —
+    // that was the bypass (see the gate's own comment further down). The flag
+    // is no longer read as a trust signal at all; it is still stripped before
+    // dispatch below (`'confirm' in params`) purely so it never leaks to Meta
+    // as a literal field, not because it still means anything to this gate.
     /*
      * ENG-941, Greptile security P1 ("Confirmed replay can add override"): the preview and
      * the confirmed execution are two separate calls with separately supplied params, so a
@@ -18932,10 +22440,99 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       : '';
     const overrideApproved =
       overrideClaimed && trackingOverrideTokenMatches((params as any)?.tracking_override_token, overrideDigest);
-    if (AgentModeService.isMetaWriteAction(entity_type, action) && (!confirmed || (overrideClaimed && !overrideApproved))) {
-      const { summary, target } = await this.buildMetaWriteConfirmation(
+
+    // ENG-1635/1644 gap 5 (critical, code-verified fix — see the reviewed plan):
+    // an approved deck authorizes its exact writes without re-confirmation, and
+    // this is now the ONLY path a Meta write may proceed through. `confirmed`
+    // (params.confirm, model-controlled) used to be OR'd alongside this grant
+    // check — `!confirmed && !manifestGranted` meant confirmed=true ALONE, with
+    // no grant at all, skipped the halt below. That is the exact failure mode
+    // of the 2026-07-19 RankAI incident (see askUserQuestion.ts's header),
+    // reproduced by this gate itself: a model could call this tool with
+    // confirm:true on a first, never-previewed call and the write would
+    // execute with no human ever asked. The grant check below now runs
+    // unconditionally for every Meta write action (not gated on `!confirmed`),
+    // and `confirmed` no longer appears in the halt condition at all — see
+    // below. `params.confirm` is now fully inert as a trust signal; it is not
+    // read anywhere in this function anymore (only stripped before dispatch,
+    // see above, so it never leaks to Meta as a literal field).
+    let manifestGranted = false;
+    if (
+      AgentModeService.isMetaWriteAction(entity_type, action) &&
+      sessionId
+    ) {
+      const grant = await this.claimMetaWriteManifestGrant(
+        userId, sessionId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
+      );
+      manifestGranted = grant.granted;
+    }
+
+    if (
+      AgentModeService.isMetaWriteAction(entity_type, action) &&
+      (!manifestGranted || (overrideClaimed && !overrideApproved))
+    ) {
+      /*
+       * MERGE NOTE: main's manifest grant decides WHETHER this gate runs; the tenancy fields
+       * decide what it says when it does. Independent, so both are kept — dropping
+       * `tenancyRefused` here would silently restore the bug where a node the ownership guard
+       * had already refused still reached a confirmation prompt.
+       *
+       * ⚠ A manifest grant SKIPS this block, and with it the tenancy refusal. Do not read that
+       * as safe on the grounds that the write re-checks: it does not. `updateCampaign`,
+       * `updateAdSet`, `updateAd` and the three deletes take an access token and a node id and
+       * no ad-account id at all, so nothing below this point verifies ownership.
+       *
+       * Not a regression — before this PR there was no tenancy check on this path either, and
+       * ENG-1642 changes who may skip the confirmation, not what the writes check. But the
+       * manifest path is the one write route with no ownership check anywhere in it, and that
+       * belongs on the write-scoping work rather than being assumed away here.
+       */
+      const { summary, target, tenancyRefused, tenancyRefusalMessage } = await this.buildMetaWriteConfirmation(
         userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
+      // ENG-1635: this call's manifest digest, computed once here (against the SAME
+      // resolved account buildMetaWriteConfirmation just used) so the manifest producer
+      // at the loop seam (collectConfirmationPrompt's caller) can batch every halted
+      // write from this iteration into one approval without re-resolving credentials
+      // or re-deriving the digest a second way.
+      const metaWriteManifestDigest = await this.resolveMetaWriteManifestDigest(
+        userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
+      );
+      /*
+       * A node the ownership guard refused is out of scope for this write, full stop. Asking the
+       * user to approve it — even under a degraded `ID <id>` label — would be the gate granting
+       * exactly what the guard exists to deny, since an approval here is what unlocks the
+       * confirmed replay. Refuse before the prompt is built.
+       *
+       * The refusal says nothing about the node beyond the selected account the caller already
+       * supplied: no name, no owning account, no id. `assertOwnedByAccount` withholds those
+       * because a block that answers "which account owns this?" is the oracle it is preventing,
+       * and relaying it through the confirmation gate would hand back the same answer.
+       *
+       * ⚠ `target.account_id`, NOT the raw `account_id` argument. `buildMetaWriteConfirmation`
+       * scopes against the account `getMetaCredentials` RESOLVED — which is the whole point of
+       * that fix — but this message beside it still read the raw argument, so a caller that
+       * omitted `account_id` (single-account users; the REST route validates nothing) was told
+       * the target "is not available in the selected ad account (undefined)". The refusal was
+       * correct and its explanation named an account that does not exist.
+       */
+      if (tenancyRefused) {
+        const refusal =
+          `Blocked: the target of this Meta Ads ${entity_type} ${action} is not available in the selected ` +
+          `ad account (${target.account_id || 'none could be determined'}), so it was not prepared for confirmation ` +
+          `and nothing was sent to Meta. ` +
+          `Do not ask the user to approve this change. ` +
+          // The guard's own remedy, which differs by branch — see tenancyRefusalMessage above.
+          AgentModeService.remedyFromScopeRefusal(tenancyRefusalMessage);
+        return {
+          success: false,
+          blocked: true,
+          reason: 'account_scope',
+          message: refusal,
+          // Same reason as the validation branch above: `error` is what the model actually reads.
+          error: `ACCOUNT_SCOPE_REFUSED: ${refusal}`,
+        } as any;
+      }
       // `awaitingUserConfirmation` + `confirmationPrompt` are consumed by the agent loop
       // (collectConfirmationPrompt) to HALT the turn and surface the prompt to the user.
       // The turn cannot continue until a NEW human message arrives — the model cannot
@@ -18945,17 +22542,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         requiresConfirmation: true,
         awaitingUserConfirmation: true,
         summary,
+        // ENG-1635/1644 gap 5: never invite a typed "yes"/"confirm" reply — that flag is
+        // fully inert now (see the `message` field below and callMetaMarketingApi's gate).
+        // This exact field is only ever surfaced to the user when deck-routing itself
+        // failed (a malformed deck, or a lost one-live-slot race — see
+        // buildApprovalDeckForIteration's fallback contract) — the normal path never
+        // reaches it, this write instead becomes a real approval-deck card.
         confirmationPrompt:
           `Based on your request, here's the exact Meta Ads change I'm about to make — ` +
           `please check it's the right target before I proceed:\n\n${summary}\n\n` +
-          `Reply "yes" / "confirm" if this is correct, or tell me what to change ` +
-          `(for example, a different campaign, ad set, or asset).`,
+          `This needs your explicit approval through a review card, not a typed reply — ` +
+          `if no card appears here, refresh the page or ask again and I'll represent it as one.`,
         // Per-item body (no intro/footer) used when several writes are batched in one turn.
         confirmationDetail: summary,
-        message: `Confirm this Meta Ads ${entity_type} ${action} before it runs: ${summary} ` +
-          `Show the user the exact target above (campaign / ad set / asset) and get explicit approval. ` +
+        message: `This Meta Ads ${entity_type} ${action} needs review before it runs: ${summary} ` +
+          `Show the user the exact target above (campaign / ad set / asset). ` +
           `If more than one campaign or asset could match the request, ask the user to disambiguate first. ` +
-          `Once approved, call call_meta_marketing_api again with the same arguments plus params.confirm=true.` +
+          `Do NOT re-call call_meta_marketing_api with params.confirm=true — that flag no longer grants ` +
+          `anything on its own (ENG-1635/1644). This write is now included in the pending approval review ` +
+          `presented to the user automatically; take no further action that depends on it until they submit ` +
+          `their answer.` +
           (overrideClaimed
             ? ` This call also waives the tracking pre-flight check, so the user must be shown the ` +
               `WARNING above and approve it explicitly; the replay must additionally carry ` +
@@ -18964,14 +22570,91 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // Only issued when an override was actually described in this preview, so it can only
         // ever approve a waiver the user was shown.
         ...(overrideClaimed ? { tracking_override_token: overrideDigest } : {}),
-        target
+        target,
+        // ENG-1635: internal-only correlator for the manifest producer — never part of the
+        // model-facing `message`, so nothing tells the model this exists or invites it to
+        // forge one. Consumed exclusively by collectConfirmationPrompt's caller in the same
+        // process, never serialized to the client.
+        metaWriteManifestDigest,
+        // ENG-1635/1644 Round 3 consequence #3: the dispatch parameters needed to
+        // execute this exact write LATER, without the model ever re-calling this tool
+        // — a workflow step (built from an approved deck item) reads this to call
+        // dispatchAuthorizedMetaWrite directly. Deliberately the RAW account_id (the
+        // same variable both claimMetaWriteManifestGrant's call above and
+        // metaWriteManifestDigest's own computation used) rather than target.account_id
+        // — resolveMetaWriteManifestDigest resolves credentials internally itself, so
+        // re-deriving the digest from these exact fields at claim time (execute() calls
+        // claimMetaWriteManifestGrant before dispatching) must start from the SAME input
+        // that produced the digest being matched, not a value resolveMetaWriteManifestDigest
+        // was never given and has no proven-idempotent relationship to. Internal-only,
+        // same as the digest above — never part of the model-facing `message`.
+        //
+        // ENG-1644: `resolvedAccountId` is ADDITIVE, alongside the raw `account_id` above,
+        // never replacing it — `account_id` must stay raw for the digest-matching reason
+        // just explained. `target.account_id` is the account `getMetaCredentials` actually
+        // resolved for THIS preview, frozen here as a plain value. A cross-session resume
+        // (days later, outside this process) must dispatch against this frozen id, not
+        // re-derive one from the user's live connected-accounts state at claim time — that
+        // state can drift between preview and a delayed approval in a way it structurally
+        // cannot within the same request. See ENG-1644 for the durable consumer; same-session
+        // dispatch (buildMetaWriteWorkflowSteps/resumeStuckApprovalDeckWorkflowRun) also
+        // prefers this value when present, closing the same latent gap there too.
+        metaWriteDispatch: { entity_type, action, account_id, resolvedAccountId: target.account_id, campaign_id, ad_set_id, ad_id, params },
       } as any;
     }
-    if ('confirm' in params) {
+    // ENG-1635/1644 Round 3 consequence #3: everything past this point (strip the
+    // gate-only flags, run the ENG-941 tracking pre-flight, dispatch to the
+    // entity-specific write method) is shared with a workflow step's execute()
+    // dispatching an approved deck item directly — see dispatchAuthorizedMetaWrite's
+    // own header for why that reuses this exact method rather than re-deriving it.
+    const dispatchResult: MetaApiResult = await this.dispatchAuthorizedMetaWrite(
+      userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, overrideApproved, sessionId,
+    );
+
+    // ENG-1635/1644 Migration note: the old per-write outcome recording +
+    // reconciliation (recordMetaWriteManifestOutcome / reconcileMetaWriteManifestIfComplete)
+    // that used to run here is RETIRED, not kept running alongside its
+    // replacement — a manifest-granted write dispatched through THIS function
+    // (the model-driven path; the normal path is now submitApprovalDeckAnswers's
+    // step-per-write dispatch, which never re-enters this function at all) has
+    // its outcome recorded as a workflow checkpoint instead, and
+    // summarizeApprovalDeckRun reads run.checkpoints directly rather than a
+    // separate outcome map — one source of truth, not two that could drift.
+    return dispatchResult;
+  }
+
+  /**
+   * Already-authorized Meta write dispatch — everything that happens AFTER a write has
+   * cleared its gate. Strips the gate-only flags (confirm, tracking_override_token,
+   * override_tracking_check — none of these are real Meta fields and none may reach the
+   * Graph API), runs the ENG-941 deterministic tracking pre-flight, then dispatches to
+   * the entity-specific write method. Extracted verbatim (byte-for-byte behavior,
+   * ENG-1635/1644 Round 3 consequence #3) from callMetaMarketingApi's own post-gate body
+   * so a workflow step's execute() for an approved deck item can call this SAME logic
+   * directly instead of re-invoking callMetaMarketingApi itself — re-entering that gate
+   * would need its own fresh manifestGranted, sourced from the same digest gap 4's
+   * per-step digest-match check already claimed/consumed, which fails by construction
+   * (an at-most-once claim cannot be claimed twice). This method performs NO
+   * authorization of its own — every caller MUST have already established it (the
+   * gate above, for a model-driven call; a claimed digest match, for a workflow step).
+   */
+  private async dispatchAuthorizedMetaWrite(
+    userId: string,
+    entity_type: string,
+    action: string,
+    account_id: string,
+    campaign_id: string | undefined,
+    ad_set_id: string | undefined,
+    ad_id: string | undefined,
+    params: any,
+    overrideApproved: boolean,
+    sessionId: string | undefined,
+  ): Promise<MetaApiResult> {
+    if (params && typeof params === 'object' && 'confirm' in params) {
       params = { ...params };
       delete params.confirm;
     }
-    if ('tracking_override_token' in params) {
+    if (params && typeof params === 'object' && 'tracking_override_token' in params) {
       params = { ...params };
       delete (params as any).tracking_override_token;
     }
@@ -18989,13 +22672,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
      * the Graph API. Per ENG-388 (Harsha's decision) the conversational override is the
      * only override path — no portal control — and it is recorded on the run record.
      *
-     * Order matters and is deliberate: this sits AFTER the ENG-400 confirmation gate,
-     * so it only runs on a confirmed call. The two ask different questions — that gate
-     * asks "did a human intend this?", this one asks "can it report a conversion?" —
-     * and doing the network checks on an unconfirmed preview would waste them.
+     * Order matters and is deliberate: this sits AFTER the caller's own confirmation
+     * gate, so it only runs on an authorized call. The two ask different questions —
+     * that gate asks "did a human intend this?", this one asks "can it report a
+     * conversion?" — and doing the network checks on an unconfirmed preview would
+     * waste them.
      */
-    // Reaching here with an override means it survived the binding check above, so it is one
-    // the user was shown and approved — never one the model added to the replay.
+    // Reaching here with an override means it survived the binding check the caller
+    // already did, so it is one the user was shown and approved — never one the model
+    // added to the replay.
     const overrideTrackingCheck = overrideApproved;
     if (params && typeof params === 'object' && 'override_tracking_check' in params) {
       params = { ...params };
@@ -19003,13 +22688,33 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
     if (isMetaSpendStartingWrite(entity_type, action, params)) {
       const gateCreds = await this.getMetaCredentials(userId, account_id);
+      // ENG-1636: an AD status flip usually arrives with only ad_id, but the gate needs
+      // the parent campaign to scope its tracking checks — and blocked such calls with
+      // "no campaign was identified" even though Meta carries campaign_id on the ad
+      // object. Resolve the parent instead of refusing a call whose campaign is one
+      // read away. A failed lookup falls through with the campaign still unset, so the
+      // gate blocks loudly exactly as before: failure to verify is never permission to
+      // proceed.
+      const gateCampaignId = await resolveMetaActivationCampaignId({
+        entityType: entity_type,
+        campaignId: campaign_id,
+        adId: ad_id,
+        accessToken: gateCreds.accessToken,
+        accountId: gateCreds.accountId,
+        resolver: metaService,
+      });
+      // ENG-1909: undefined for any real account (byte-for-byte unchanged gate call —
+      // `preflightMetaTrackingGate`'s `deps.fetchHtml ?? defaultFetchHtml` falls back to the
+      // real fetcher); for a sandbox account, answers destination checks from its own frozen
+      // dataset instead of making a real outbound fetch to a fictional/example.invalid URL.
+      const sandboxFetchHtml = await buildSandboxFetchHtml(userId);
       const gate = await runMetaTrackingGate(
         gateCreds,
-        campaign_id,
+        gateCampaignId,
         `${entity_type}_${action}`,
         overrideTrackingCheck,
         sessionId,
-        {},
+        { fetchHtml: sandboxFetchHtml },
         // Activating one ad is judged on that ad's own destination, not its siblings'.
         entity_type === 'AD' ? ad_id : undefined,
         /*
@@ -19028,36 +22733,855 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (!gate.proceed) return gate.blockResult as MetaApiResult;
     }
 
-    switch (entity_type) {
-      case 'CAMPAIGN':
-        // Map master params to specific params if needed, but schema is unified so passing through is safe
-        return this.manageMetaAdsCampaigns(userId, action as any, account_id, campaign_id, params);
+    // ENG-1635: wrapped in an IIFE (rather than each case returning directly, as
+    // before) purely so an authorized write's outcome can be recorded right after
+    // dispatch resolves, in ONE place, without duplicating the switch or touching
+    // every branch. Every case's behavior is unchanged byte for byte from the
+    // original callMetaMarketingApi body — this only interposes AFTER the result
+    // exists and BEFORE it returns.
+    return (async (): Promise<MetaApiResult> => {
+      switch (entity_type) {
+        case 'CAMPAIGN':
+          // Map master params to specific params if needed, but schema is unified so passing through is safe
+          return this.manageMetaAdsCampaigns(userId, action as any, account_id, campaign_id, params);
 
-      case 'AD_SET':
-        // Validation for Ad Set CREATE handled within manageMetaAdsAdSets -> createMetaAdsAdSet
-        return this.manageMetaAdsAdSets(userId, action as any, account_id, campaign_id, ad_set_id, params);
+        case 'AD_SET':
+          // Validation for Ad Set CREATE handled within manageMetaAdsAdSets -> createMetaAdsAdSet
+          return this.manageMetaAdsAdSets(userId, action as any, account_id, campaign_id, ad_set_id, params);
 
-      case 'AD_CREATIVE':
-        return this.manageMetaAdsAdCreatives(userId, action as any, account_id, params);
+        case 'AD_CREATIVE':
+          // campaign_id is forwarded so AD_CREATIVE LIST can SAY it cannot honour it, rather than
+          // dropping it silently — the same threading the AD case below does (ENG-1476).
+          return this.manageMetaAdsAdCreatives(userId, action as any, account_id, params, ad_set_id, campaign_id);
 
-      case 'AD':
-        return this.manageMetaAdsAds(userId, action as any, account_id, ad_set_id, ad_id, params);
+        case 'AD':
+          // campaign_id is forwarded here (ENG-1476). It was already in scope for the tracking
+          // gate above and was simply never handed to the AD handler, which is why an
+          // AD LIST scoped to a campaign returned the entire account instead.
+          return this.manageMetaAdsAds(userId, action as any, account_id, ad_set_id, ad_id, params, campaign_id);
 
-      case 'CUSTOM_AUDIENCE':
-        return this.manageMetaCustomAudiences(userId, action as any, account_id, params);
+        case 'CUSTOM_AUDIENCE':
+          return this.manageMetaCustomAudiences(userId, action as any, account_id, params);
 
-      case 'TARGETING':
-        return this.searchAdTargeting(userId, account_id, params.q, params.type, params.location_types);
+        case 'TARGETING':
+          return this.searchAdTargeting(userId, account_id, params.q, params.type, params.location_types);
 
-      case 'PAGE':
-        return this.listMetaPages(userId, account_id);
+        case 'PAGE':
+          return this.listMetaPages(userId, account_id);
 
-      case 'DATASET':
-        return this.manageMetaDatasets(userId, action as any, account_id, params);
+        case 'DATASET':
+          return this.manageMetaDatasets(userId, action as any, account_id, params);
 
-      default:
-        throw new Error(`Invalid entity_type: ${entity_type}`);
+        default:
+          throw new Error(`Invalid entity_type: ${entity_type}`);
+      }
+    })();
+  }
+
+  /**
+   * ENG-1635/1644 Round 3 consequence #3: build ONE WorkflowStepDefinition per
+   * approved deck write item. execute() dispatches directly via
+   * dispatchAuthorizedMetaWrite — it does NOT re-invoke callMetaMarketingApi
+   * (see that method's own header: re-entering its gate would need a fresh
+   * manifestGranted sourced from the same digest this step is about to claim,
+   * and an at-most-once claim cannot be claimed twice). Instead it
+   * independently re-claims the digest via claimMetaWriteManifestGrant right
+   * before dispatching — gap 4's per-step digest re-verification — so a step
+   * can only ever execute the exact write this deck answer approved, and only
+   * once: a step is called at most once (crash-restart skips any step that
+   * already has a checkpoint, per findNextIndependentStep), and even a
+   * hypothetical second attempt would find the digest already consumed and
+   * refuse rather than double-dispatch.
+   *
+   * overrideApproved is always `false` here — Phase A does not carry a
+   * tracking-override waiver through the deck path (no UI/mechanism exists
+   * yet for the user to approve one as part of a deck item); the ENG-941
+   * pre-flight runs for real rather than silently honoring a stale
+   * override_tracking_check flag from the original halted call.
+   */
+  private buildMetaWriteWorkflowSteps(
+    sessionId: string,
+    userId: string,
+    approved: Array<{ item: ApprovalDeckItem }>,
+    // Passed by resumeStuckApprovalDeckWorkflowRun only — see
+    // claimMetaWriteManifestGrant's own header for why a resumed step must
+    // NOT rely on session.pendingApprovalDeck for its grant check.
+    grantSourceDeck?: PendingApprovalDeck,
+  ): WorkflowStepDefinition[] {
+    return approved.map(({ item }) => {
+      const dispatch = item.metaWriteDispatch!;
+      return {
+        id: item.itemId,
+        inputs: [],
+        outputs: [],
+        requiredParameters: [],
+        execute: async (): Promise<Record<string, unknown>> => {
+          const grant = await this.claimMetaWriteManifestGrant(
+            userId, sessionId, dispatch.entity_type, dispatch.action, dispatch.account_id,
+            dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
+            grantSourceDeck,
+          );
+          if (!grant.granted) {
+            if (grant.reason === 'already_consumed') {
+              // Found by review: a concurrent driver of the SAME run (e.g.
+              // two overlapping resumeStuckApprovalDeckWorkflowRun calls)
+              // could already be dispatching, or have already dispatched,
+              // this exact write. This is not a real failure — throwing a
+              // plain Error here would let advanceIndependentWorkflow record
+              // a 'failed' checkpoint that could win the version race over
+              // the OTHER driver's real 'verified' one, permanently
+              // mis-recording a successful write as failed.
+              throw new StepContendedError(
+                'This write is already being handled by a concurrent request.',
+              );
+            }
+            throw new Error(
+              'This write is no longer authorized — its approval was not found or was already consumed.',
+            );
+          }
+          // ENG-1644: dispatch against the FROZEN resolved account (falling back to
+          // the raw id only for pre-migration records that predate this field) —
+          // never re-derive from live connected-accounts state here. The grant claim
+          // above correctly used the raw id (matching the digest's own input); this
+          // is the one place that must use the resolved one.
+          const dispatchResult = await this.dispatchAuthorizedMetaWrite(
+            userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId ?? dispatch.account_id,
+            dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
+            false, sessionId,
+          );
+          return { dispatchResult: dispatchResult as unknown as Record<string, unknown> };
+        },
+        verify: AgentModeService.verifyMetaWriteDispatchResult,
+      };
+    });
+  }
+
+  /**
+   * ENG-1853: shared verify() body for a meta_write workflow step, extracted
+   * out of buildMetaWriteWorkflowSteps (byte-for-byte unchanged behavior) so
+   * buildApprovalInboxMetaWriteWorkflowSteps below can use the exact same
+   * read-back/mismatch contract rather than a second copy that could drift.
+   */
+  private static async verifyMetaWriteDispatchResult(executeResult: Record<string, unknown>): Promise<WorkflowStepVerification> {
+    const result = executeResult.dispatchResult as MetaApiResult | undefined;
+    if (!result || result.success !== true) {
+      // `message` is the enriched, actionable text (enrichMetaError — e.g. "Your ad
+      // set budget must be more than ₹94.91" with the Meta code/subcode) whenever the
+      // underlying write method built one; `error` is the raw SDK message (e.g. just
+      // "Invalid parameter") and was being checked FIRST, so the `||` chain always
+      // short-circuited on it and silently discarded the enriched text before it ever
+      // reached the deck outcome summary / answerAck. Found live: a repeatedly-failing
+      // ad-set create (real cause: account currency's minimum budget) got silently
+      // re-proposed identically 3 times with no explanation ever surfaced, because
+      // Emma never actually received anything more specific than "Invalid parameter."
+      return { verified: false, error: result?.message || result?.error || 'Meta write failed' };
     }
+    // Reuses whatever read-back mismatch detection the underlying write
+    // method already performs (Phase 1's existing resolver — today,
+    // AD_SET CREATE's bid_strategy/budget/timing comparison; not yet a
+    // uniform contract across every entity_type/action). A write method
+    // with no built-in read-back has nothing further to check here
+    // beyond its own reported success, which is what the check above
+    // already gates on.
+    if (
+      result.readBackVerified === true &&
+      Array.isArray(result.readBackMismatches) &&
+      result.readBackMismatches.length > 0
+    ) {
+      return {
+        verified: false,
+        mismatches: result.readBackMismatches.map((m: any) => ({
+          parameter: m.parameter, requested: m.requested, applied: m.applied,
+        })),
+      };
+    }
+    return {
+      verified: true,
+      verifiedFields: {
+        appliedObjectId: AgentModeService.extractDispatchedObjectId(result),
+        ...(result.readBackVerified === true ? { readBack: result.readBack } : {}),
+      },
+    };
+  }
+
+  /**
+   * ENG-1853: build one WorkflowStepDefinition per meta_write decision in an
+   * approval-inbox manifest. UNLIKE buildMetaWriteWorkflowSteps above,
+   * execute() does NOT call claimMetaWriteManifestGrant — that function's
+   * grants are session-scoped, same-session preview-then-confirm, and this
+   * digest was already claimed once, durably, when the reviewer approved it
+   * (approvalInboxService.claimDecision, atomic, at-most-once). Re-deriving a
+   * grant here would re-check authorization against an already-consumed
+   * digest and fail by construction (claimMetaWriteManifestGrant's own
+   * 'already_consumed' branch). The decision's own already-claimed verdict —
+   * status 'dispatching', set by approvalInboxExecution.executeResolvedDecision
+   * only on an 'approve' verdict — IS the authorization for this step.
+   *
+   * Confirmed with pheonix (who built the underlying ENG-1644 schema):
+   * decisionId === metaWriteManifestDigest for a meta_write decision was a
+   * deliberate Phase A choice specifically to make this reuse possible.
+   */
+  private buildApprovalInboxMetaWriteWorkflowSteps(
+    userId: string,
+    originSessionId: string,
+    decisions: ApprovalDecision[],
+  ): WorkflowStepDefinition[] {
+    return decisions.map((decision) => {
+      const dispatch = decision.metaWriteDispatch!;
+      return {
+        id: decision.decisionId,
+        inputs: [],
+        outputs: [],
+        requiredParameters: [],
+        execute: async (): Promise<Record<string, unknown>> => {
+          // Review fix: advanceIndependentWorkflow provides no mutual
+          // exclusion between two concurrent drivers of the SAME run picking
+          // the same un-checkpointed step (unlike buildMetaWriteWorkflowSteps
+          // above, this builder has no claimMetaWriteManifestGrant call to
+          // fall back on for that protection) — two concurrent approve-all
+          // requests for this manifest (a client retry, two tabs, two EB
+          // instances) could otherwise both reach dispatchAuthorizedMetaWrite
+          // for the same real Meta write before either checkpoint lands.
+          // claimDispatch is this step's own at-most-once gate.
+          // Third-review fix: claimDispatch itself can THROW for a genuine
+          // transient reason (not the normal "someone else already claimed
+          // it" case) — the ORIGINAL code let that propagate straight out
+          // of execute(), which advanceIndependentWorkflow treats as a real
+          // step failure and permanently checkpoints as 'failed', even
+          // though dispatchAuthorizedMetaWrite was NEVER called — the write
+          // was never attempted, yet gets permanently recorded as having
+          // failed, with no retry path anywhere (independent steps are
+          // never re-offered once checkpointed). Unlike the finalization
+          // claim (where the real write has ALREADY happened by the time it
+          // runs, so failing open is correct), failing open HERE would risk
+          // an actual double Meta write if two callers both hit a transient
+          // claimDispatch error and both proceed to dispatch — the opposite
+          // mistake. The correct response to "I don't know whether I hold
+          // the claim" is the same as "I definitely lost the race":
+          // StepContendedError, which records no checkpoint at all and lets
+          // a later retry of approve-all attempt this exact step again.
+          let claimed: boolean;
+          try {
+            claimed = await approvalInboxService.claimDispatch(decision.decisionId);
+          } catch (err: any) {
+            console.warn('[agent-mode-service] claimDispatch threw (treating as contended, not failed):', decision.decisionId, err?.message || err);
+            claimed = false;
+          }
+          if (!claimed) {
+            // Same StepContendedError treatment as the live-deck sibling's
+            // 'already_consumed' branch — a concurrent driver already owns
+            // this dispatch, so no checkpoint is written here (a false
+            // 'failed' could win the version race over the other driver's
+            // real 'verified' one).
+            throw new StepContendedError('This write is already being dispatched by a concurrent request.');
+          }
+          const dispatchResult = await this.dispatchAuthorizedMetaWrite(
+            userId, dispatch.entity_type, dispatch.action, dispatch.resolvedAccountId ?? dispatch.account_id,
+            dispatch.campaign_id, dispatch.ad_set_id, dispatch.ad_id, dispatch.params,
+            false, originSessionId,
+          );
+          return { dispatchResult: dispatchResult as unknown as Record<string, unknown> };
+        },
+        verify: AgentModeService.verifyMetaWriteDispatchResult,
+      };
+    });
+  }
+
+  /** Builds the message resumeOriginSession delivers once a meta_write
+   *  manifest finishes dispatching — mirrors buildResolutionMessage's shape
+   *  in approvalInboxExecution.ts (one line per item, a closing directive)
+   *  but summarizes a whole packet's read-back outcome instead of a single
+   *  decision's verdict. */
+  private static buildManifestResolutionMessage(
+    decisions: ApprovalDecision[],
+    summary: ApprovalDeckExecutionSummary | null,
+  ): string {
+    const status = (summary?.status ?? 'unapplied').replace(/_/g, ' ');
+    const lines = [
+      `[Approval Inbox manifest] ${decisions.length} Meta write(s) in this packet were approved and dispatched — result: ${status}.`,
+    ];
+    for (const decision of decisions) {
+      const item = summary?.items.find((i) => i.stepId === decision.decisionId);
+      if (item?.status === 'verified') {
+        lines.push(`- ${decision.subjectLabel}: applied${item.appliedObjectId ? ` (id ${item.appliedObjectId})` : ''}.`);
+      } else {
+        lines.push(`- ${decision.subjectLabel}: FAILED — ${item?.error || 'no result recorded'}.`);
+      }
+    }
+    lines.push('Use this as the resolved outcome to continue this work.');
+    return lines.join('\n');
+  }
+
+  /**
+   * ENG-1853: the actual fix for 1635/1644's gap — dispatches an approved
+   * approval-inbox manifest's meta_write items together, as one packet, and
+   * reads every one of them back. Called once by the approve-all route, after
+   * every decision in the manifest has already been individually resolved
+   * (each meta_write item reaching 'dispatching' via
+   * approvalInboxExecution.executeResolvedDecision as the reviewer answered
+   * it one at a time) — never per-item, since Haven's 5 calls must dispatch
+   * and reconcile as one unit, not fire the moment each button is clicked.
+   *
+   * Drives the independent-step workflow engine against the packet's OWN
+   * origin session — matches every one of 1635/1644/1853's own wording
+   * ("resumes the originating agent", "exact agent execution"). Every
+   * meta_write decision in a manifest is expected to share one
+   * originSessionId (they were all staged from the same halted turn); if
+   * they don't, this refuses rather than guessing which session to drive
+   * against — a malformed manifest should fail loud, not dispatch against
+   * the wrong session's workflow slot.
+   *
+   * `approver` scopes this to the caller's OWN items only — second-review
+   * fix. Nothing today can actually construct a manifest whose meta_write
+   * decisions span more than one approver (stageApprovalInboxMetaWriteManifest
+   * hardcodes a single approver for every item it stages), but the data
+   * model doesn't forbid it, and without this filter, whichever approver's
+   * approve-all call happens to run would dispatch every OTHER approver's
+   * already-separately-approved items too — items that approver never saw
+   * in their own queue. Defense in depth against a real, if not yet
+   * reachable, cross-approver blast-radius surprise.
+   */
+  async executeApprovalInboxMetaWriteManifest(manifestId: string, approver: ApprovalDecisionApprover): Promise<
+    | { outcome: 'no_meta_write_items' }
+    | { outcome: 'not_all_resolved'; unresolved: string[] }
+    | { outcome: 'no_origin_session' | 'mixed_origin_sessions' }
+    | { outcome: 'conflict' }
+    | { outcome: 'already_executed' }
+    | { outcome: 'executed'; summary: ApprovalDeckExecutionSummary | null }
+  > {
+    const decisions = await approvalInboxService.listByManifest(manifestId);
+    const metaWriteDecisions = decisions.filter((d) => d.gateType === 'meta_write' && d.verdict === 'approve' && d.approver === approver);
+    if (metaWriteDecisions.length === 0) return { outcome: 'no_meta_write_items' };
+
+    // Third-review fix: this MUST run before the unresolved check below, not
+    // after — found by tracing a real two-call sequence, not a single-pass
+    // read. A successful dispatch moves every decision's status from
+    // 'dispatching' to 'executed'/'execution_failed' (recordExecutionResult,
+    // further down). Both of those fail `status !== 'dispatching'`, so the
+    // OLD ordering meant every retry of an already-fully-dispatched manifest
+    // (a client retry after a lost response, a double-click — precisely what
+    // the already_executed check below exists to catch, per its own
+    // original comment) fell into 'not_all_resolved' first and never
+    // reached the already_executed check at all — that check was dead code
+    // for its own stated purpose. originSessionId/session need to be
+    // resolved here, ahead of self-heal, so this can run first.
+    const originSessionIdsForCheck = new Set(metaWriteDecisions.map((d) => d.originSessionId).filter(Boolean));
+    if (originSessionIdsForCheck.size === 1) {
+      const candidateSessionId = [...originSessionIdsForCheck][0] as string;
+      const candidateSession = await chatbotDb.getChatSession(candidateSessionId);
+      const candidateWorkflowId = `approval-inbox-manifest-${manifestId}`;
+      if (candidateSession?.workflowRun?.workflowId === candidateWorkflowId && candidateSession.workflowRun.status === 'completed') {
+        return { outcome: 'already_executed' };
+      }
+    }
+
+    // Second-review fix: a decision can be stuck at 'approved' forever if
+    // executeResolvedDecision's markDispatching call failed transiently (a
+    // DynamoDB blip, or the process restarting between claimDecision and
+    // markDispatching — a rolling deploy landing in that exact window is a
+    // real trigger in a repo that auto-deploys on every merge to main).
+    // Nothing else anywhere retries markDispatching (its only caller is
+    // that one line), and until this PR the frontend rendered an 'approved'
+    // meta_write item as fully answered (green, done) while it silently
+    // blocked the ENTIRE manifest's approve-all forever. Self-heal here:
+    // 'approved' + verdict 'approve' is EXACTLY the state markDispatching
+    // is meant to move past, and markDispatching is safe to call again (an
+    // unconditional update gated only on the row existing) — so retry it
+    // once before concluding anything is genuinely unresolved.
+    const wedged = metaWriteDecisions.filter((d) => d.status === 'approved');
+    if (wedged.length > 0) {
+      const healedIds = new Set<string>();
+      await Promise.all(
+        wedged.map((d) =>
+          approvalInboxService.markDispatching(d.decisionId)
+            .then(() => { healedIds.add(d.decisionId); })
+            .catch((err: any) => {
+              console.warn('[agent-mode-service] self-heal markDispatching retry failed:', d.decisionId, err?.message || err);
+            }),
+        ),
+      );
+      // Re-read to pick up anything that changed for reasons other than the
+      // retry above — but listByManifest queries a GSI, which cannot be a
+      // strongly-consistent read. Third-review fix: without the override
+      // below, a markDispatching call that just SUCCEEDED could still read
+      // back as stale 'approved' here purely from GSI propagation lag,
+      // making a genuinely-healed item look unresolved. Trust the write's
+      // own success signal (we know the update landed) over a possibly-
+      // lagging read for exactly the ids that succeeded above.
+      const refreshed = await approvalInboxService.listByManifest(manifestId);
+      const refreshedById = new Map(refreshed.map((d) => [d.decisionId, d]));
+      for (let i = 0; i < metaWriteDecisions.length; i++) {
+        const id = metaWriteDecisions[i].decisionId;
+        const fresh = refreshedById.get(id);
+        if (fresh) metaWriteDecisions[i] = fresh;
+        if (healedIds.has(id) && metaWriteDecisions[i].status === 'approved') {
+          metaWriteDecisions[i] = { ...metaWriteDecisions[i], status: 'dispatching' };
+        }
+      }
+    }
+
+    // Defense in depth — the approve-all route is expected to have already
+    // enforced "every item in the manifest individually resolved" before
+    // calling here; this refuses again rather than trusting the caller.
+    const unresolved = metaWriteDecisions.filter((d) => d.status !== 'dispatching').map((d) => d.decisionId);
+    if (unresolved.length > 0) return { outcome: 'not_all_resolved', unresolved };
+
+    const originSessionIds = new Set(metaWriteDecisions.map((d) => d.originSessionId).filter(Boolean));
+    if (originSessionIds.size === 0) return { outcome: 'no_origin_session' };
+    if (originSessionIds.size > 1) return { outcome: 'mixed_origin_sessions' };
+    const originSessionId = [...originSessionIds][0] as string;
+
+    const session = await chatbotDb.getChatSession(originSessionId);
+    if (!session) return { outcome: 'no_origin_session' };
+
+    const steps = this.buildApprovalInboxMetaWriteWorkflowSteps(session.userId, originSessionId, metaWriteDecisions);
+    const definition = { workflowId: `approval-inbox-manifest-${manifestId}`, steps };
+
+    // A run for this exact manifest already existing and 'completed' means a
+    // previous call already dispatched this packet — approve-all must be
+    // idempotent (a double-click, or a retried request after the response
+    // was lost) rather than re-dispatching real Meta writes a second time.
+    if (session.workflowRun?.workflowId === definition.workflowId && session.workflowRun.status === 'completed') {
+      return { outcome: 'already_executed' };
+    }
+
+    const started = await startWorkflow(originSessionId, definition, undefined).catch(() => null);
+    if (!started) {
+      // Either this exact manifest run is already mid-flight (a concurrent
+      // approve-all call) or the session has some OTHER active run (e.g. a
+      // live chat deck) — either way, drive whatever's actually running
+      // rather than silently doing nothing, since a stuck prior attempt at
+      // this same manifest must not block it forever (same reasoning as
+      // resumeStuckApprovalDeckWorkflowRun above, generalized to this
+      // manifest's own workflowId).
+      const fresh = await chatbotDb.getChatSession(originSessionId);
+      if (fresh?.workflowRun?.workflowId !== definition.workflowId) return { outcome: 'conflict' };
+    }
+
+    const outcome = await this.driveIndependentWorkflowToCompletion(originSessionId, definition);
+    if (outcome.kind === 'conflict' || outcome.kind === 'no_active_run' || outcome.kind === 'contended') {
+      return { outcome: 'conflict' };
+    }
+    const summary = this.summarizeApprovalDeckRun(outcome.run);
+
+    // Second-review fix: claimDispatch (inside each workflow step) already
+    // guarantees the real Meta write itself can never be dispatched twice —
+    // but it does NOT stop two concurrent approve-all callers from BOTH
+    // reaching this point once the one real dispatch is checkpointed (a
+    // second driver's own poll loop simply observes the already-verified
+    // checkpoint and returns 'completed' too — traced through
+    // advanceIndependentWorkflow directly). Without this claim, both callers
+    // would redundantly recordExecutionResult and, worse, both call
+    // resumeOriginSession — the in-memory tryClaimSessionGeneration lock
+    // only serializes the actual generateSessionResponse call within a
+    // single process, so a losing caller still falls back to a duplicate
+    // passive note today, and would be a second REAL active resume on any
+    // future multi-instance deployment. Anchored on the manifest's first
+    // decision by id (any deterministic, caller-independent choice works —
+    // every concurrent caller computes the same anchor from the same
+    // metaWriteDecisions list). A losing claim means another caller already
+    // is (or will) finalize this manifest — return the outcome without
+    // repeating recordExecutionResult/resumeOriginSession.
+    // Fail OPEN, not closed, as a LAST resort only: claimManifestFinalization
+    // can legitimately return false (another caller already won), but an
+    // unexpected THROW (a genuine DynamoDB error, not a lost race) must
+    // never be allowed to skip recording/resuming below — the real Meta
+    // write has ALREADY succeeded and been checkpointed by this point, so
+    // silently dropping the finalization step here would leave a
+    // genuinely-applied write permanently stuck unrecorded and the origin
+    // session never told, recoverable only if the reviewer happens to
+    // retry. Caught by asking "what does this code do right now" while
+    // answering the standing safety question before merge, not by any
+    // review.
+    //
+    // Third-review fix: fail-open alone isn't quite right either — every
+    // concurrent caller for this manifest writes to the exact SAME single
+    // item (the anchor), which is precisely the condition under which a
+    // burst of conditional updates is most likely to hit transient
+    // throttling — i.e. exactly the high-concurrency scenario this claim
+    // exists to protect, not a rare unrelated outage. Failing open on the
+    // FIRST throw would silently reintroduce the double-finalization race
+    // under that exact condition. A short bounded retry absorbs a brief
+    // throttling blip (on top of whatever the AWS SDK's own default retry
+    // already absorbed inside each individual call) before conceding and
+    // falling back to fail-open as a genuine last resort.
+    const anchorDecisionId = [...metaWriteDecisions].sort((a, b) => a.decisionId.localeCompare(b.decisionId))[0].decisionId;
+    const FINALIZATION_CLAIM_RETRIES = 3;
+    let wonFinalization = true;
+    let claimSucceeded = false;
+    let lastClaimError: any;
+    for (let attempt = 0; attempt < FINALIZATION_CLAIM_RETRIES && !claimSucceeded; attempt++) {
+      try {
+        wonFinalization = await approvalInboxService.claimManifestFinalization(anchorDecisionId);
+        claimSucceeded = true;
+      } catch (err: any) {
+        lastClaimError = err;
+        if (attempt < FINALIZATION_CLAIM_RETRIES - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)));
+        }
+      }
+    }
+    if (!claimSucceeded) {
+      console.warn(
+        '[agent-mode-service] claimManifestFinalization threw on every retry (treating as won, proceeding to finalize):',
+        anchorDecisionId, lastClaimError?.message || lastClaimError,
+      );
+    }
+    if (!wonFinalization) {
+      return { outcome: 'executed', summary };
+    }
+
+    // Populate the previously-unused readBack/execution result per decision —
+    // the literal ENG-1635 acceptance criterion ("Read back every external
+    // object and reconcile it to the manifest... Emit one result: fully
+    // applied, partially applied, or unapplied").
+    const summaryByStepId = new Map((summary?.items ?? []).map((i) => [i.stepId, i]));
+    await Promise.all(
+      metaWriteDecisions.map(async (decision) => {
+        const item = summaryByStepId.get(decision.decisionId);
+        const success = item?.status === 'verified';
+        try {
+          await approvalInboxService.recordExecutionResult(
+            decision.decisionId,
+            success ? 'executed' : 'execution_failed',
+            {
+              success,
+              message: success
+                ? 'Dispatched to Meta and read back successfully.'
+                : (item?.error || (item?.mismatches ? `Read-back mismatch: ${JSON.stringify(item.mismatches)}` : 'Dispatch did not complete.')),
+              appliedObjectId: item?.appliedObjectId,
+              readBack: item,
+              at: new Date().toISOString(),
+            },
+          );
+        } catch (err: any) {
+          console.warn('[agent-mode-service] failed to record approval-inbox manifest execution result:', decision.decisionId, err?.message || err);
+        }
+      }),
+    );
+
+    // Review fix (critical): this manifest executor recorded every outcome
+    // but never told the origin session about any of it — the turn message
+    // staged at halt time literally promises "I'll resume automatically once
+    // it's resolved," and nothing did, for the exact flagship scenario
+    // (Haven's 5 calls, Every's 7) this ticket exists to fix. Never lets a
+    // resume failure fail the whole approve-all response — the dispatch
+    // itself already succeeded/failed and is already durably recorded above;
+    // resumeOriginSession has its own passive-note fallback and never
+    // throws, but this still guards defensively.
+    try {
+      await resumeOriginSession(originSessionId, AgentModeService.buildManifestResolutionMessage(metaWriteDecisions, summary));
+    } catch (err: any) {
+      console.warn('[agent-mode-service] failed to resume origin session after manifest execution:', originSessionId, err?.message || err);
+    }
+
+    return { outcome: 'executed', summary };
+  }
+
+  /**
+   * Drives an independent-step workflow run to a terminal state, shared by
+   * both callers of advanceIndependentWorkflow (submitApprovalDeckAnswers'
+   * own drive, and resumeStuckApprovalDeckWorkflowRun below). Treats
+   * 'step_verified'/'step_failed'/'contended' identically as "keep going" —
+   * see AdvanceIndependentOutcome's own header for why 'contended' belongs
+   * in that set: it means a concurrent driver of this SAME run already
+   * claimed the step's real side effect, not that anything actually failed.
+   *
+   * Bounded: a run stuck emitting 'contended' past MAX_CONTENDED_RETRIES
+   * (the other driver never finishing, e.g. it crashed too) stops rather
+   * than spinning forever — the caller treats that exactly like 'conflict'/
+   * 'no_active_run' (give up cleanly; a later call gets another chance).
+   */
+  private async driveIndependentWorkflowToCompletion(
+    sessionId: string,
+    definition: { workflowId: string; steps: WorkflowStepDefinition[] },
+  ): Promise<AdvanceIndependentOutcome> {
+    const MAX_CONTENDED_RETRIES = 20;
+    let contendedStreak = 0;
+    let outcome = await advanceIndependentWorkflow(sessionId, definition);
+    while (outcome.kind === 'step_verified' || outcome.kind === 'step_failed' || outcome.kind === 'contended') {
+      if (outcome.kind === 'contended') {
+        contendedStreak++;
+        if (contendedStreak > MAX_CONTENDED_RETRIES) break;
+      } else {
+        contendedStreak = 0;
+      }
+      outcome = await advanceIndependentWorkflow(sessionId, definition);
+    }
+    return outcome;
+  }
+
+  /**
+   * Self-heal for a real gap found by fresh-mind PR review, not the original
+   * plan: advanceIndependentWorkflow (workflowRunner.ts) has no caller
+   * anywhere except submitApprovalDeckAnswers below, and an independent-step
+   * run never reaches 'failed' — only 'completed' (every step attempted) or
+   * stuck 'in_progress' forever if the process dies mid-drain (core/
+   * workflow.ts's own header on findNextIndependentStep explains why). Left
+   * unresumed, that stuck run also permanently blocks startWorkflow's
+   * failIfActiveExists guard for EVERY later deck in this session
+   * (updateSessionWorkflowRun only allows a new run once the prior one is
+   * 'completed'/'failed') — so the next unrelated deck this session ever
+   * answers would silently fail with a misleading 'conflict' outcome and
+   * dispatch nothing, a variant of the exact Vincent Hu incident (stuck
+   * batch, manual rebuild needed) this ticket exists to prevent, just
+   * triggered by infra instead of a Meta API error.
+   *
+   * Called from two places: here (before handling a NEW deck ANSWER), and —
+   * this is the one that actually matters — right before a fresh deck is
+   * about to be PERSISTED and overwrite `session.pendingApprovalDeck` (see
+   * the call site right before `updateSessionApprovalDeck(..., approvalDeck,
+   * ...)` in the main iteration loop). A no-op when nothing is stuck.
+   *
+   * The stuck run's own workflowId encodes its deckId
+   * (`approval-deck-<deckId>`, see submitApprovalDeckAnswers below). If that
+   * deck is still `session.pendingApprovalDeck`, its items are read
+   * directly — this is the ONLY path that can actually succeed, and it's
+   * why the second call site above is load-bearing: it's the last point in
+   * the whole turn where that's still guaranteed true, before a new deck
+   * would silently take the slot. The message-history fallback below is
+   * defensive depth only, not a real second path in practice — a reply
+   * message (`metadata.approvalDeckAnswer`) is only ever persisted AFTER
+   * `submitApprovalDeckAnswers` returns `'submitted'`, which requires the
+   * run to have already reached `'completed'`; a run stuck `'in_progress'`
+   * from a crash therefore can never have one. Found by a second fresh-mind
+   * review: the original design leaned on this fallback as the answer for
+   * "a later deck has already overwritten pendingApprovalDeck," but that's
+   * exactly the state combination that can't occur. Real fix was adding the
+   * earlier call site, not improving this fallback — kept here anyway in
+   * case some future/unanticipated path does leave such a message behind.
+   */
+  private async resumeStuckApprovalDeckWorkflowRun(sessionId: string, session: ChatSession): Promise<void> {
+    const run = session.workflowRun;
+    if (!run || run.status !== 'in_progress') return;
+    const prefix = 'approval-deck-';
+    if (!run.workflowId.startsWith(prefix)) return; // not one of ours — leave it alone
+    const stuckDeckId = run.workflowId.slice(prefix.length);
+
+    let stuckDeck: PendingApprovalDeck | null = null;
+    if (session.pendingApprovalDeck?.deckId === stuckDeckId && session.pendingApprovalDeck.status === 'answered') {
+      stuckDeck = session.pendingApprovalDeck;
+    } else {
+      const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
+      stuckDeck = reconstructApprovalDeckFromHistory(messages as any, stuckDeckId);
+    }
+    if (!stuckDeck) return;
+
+    const approved = approvedWriteItems(stuckDeck);
+    if (approved.length === 0) return;
+    // Explicit grantSourceDeck: this deck may no longer be
+    // session.pendingApprovalDeck (a later deck can have overwritten it) —
+    // claimMetaWriteManifestGrant must check authorization against THIS
+    // deck's own recorded answers, not whatever deck is live now.
+    const steps = this.buildMetaWriteWorkflowSteps(sessionId, session.userId, approved, stuckDeck);
+    const definition = { workflowId: run.workflowId, steps };
+    const stepIdToDispatch = new Map(approved.map(({ item }) => [item.itemId, item.metaWriteDispatch!] as const));
+
+    const outcome = await this.driveIndependentWorkflowToCompletion(sessionId, definition);
+    if (outcome.kind !== 'completed') return; // conflict/no_active_run/contended-exhausted — another request already resolved it (or is still resolving it)
+    const summary = this.summarizeApprovalDeckRun(outcome.run);
+    if (summary) {
+      await this.applyMetaWriteRetryBackstop(sessionId, session, summary, stepIdToDispatch);
+    }
+  }
+
+  /**
+   * ENG-1635/1644: resolve a full submission of deck answers, and — for every
+   * item the user approved — drive it to completion via the independent-step
+   * workflow engine before returning. This is what actually executes a deck's
+   * approved writes; the model never re-calls call_meta_marketing_api for
+   * them (see the halt's rewritten model-facing message, gap 5 Round 3
+   * consequence #2).
+   *
+   * Re-reads the session fresh (never trusts an in-memory snapshot), so a
+   * concurrent submission or a session that has moved on loses cleanly rather
+   * than corrupting either the answer or the run.
+   */
+  async submitApprovalDeckAnswers(
+    sessionId: string,
+    expectedDeckId: string,
+    inboundAnswers: InboundDeckAnswer[],
+    answeredBy: ApprovalDeckAnsweredBy,
+  ): Promise<
+    | { outcome: 'invalid'; reason: string }
+    | { outcome: 'conflict' }
+    | { outcome: 'submitted'; run: WorkflowRunState | null; summary: ApprovalDeckExecutionSummary | null; answeredDeck: PendingApprovalDeck }
+  > {
+    const session = await chatbotDb.getChatSession(sessionId);
+    if (session) await this.resumeStuckApprovalDeckWorkflowRun(sessionId, session);
+    const deck = session?.pendingApprovalDeck;
+    if (!deck) return { outcome: 'invalid', reason: 'No pending approval deck in this session.' };
+    // Stale-card guard, same shape as askUserQuestion.ts's resolveInboundAnswer
+    // check on questionId. itemIds are only deck-scoped by convention
+    // (write-1, write-2, ...) — two different decks with the same item count
+    // collide on itemId, so without this a stale/replayed submission (double-
+    // click before the button disables, browser back+resubmit, a client retry
+    // after the first attempt already succeeded) would silently apply to
+    // whatever deck happens to be pending now instead of the one the user
+    // actually looked at.
+    if (expectedDeckId && expectedDeckId !== deck.deckId) {
+      return {
+        outcome: 'invalid',
+        reason: `Answer deckId (${expectedDeckId}) does not match the currently pending deck (${deck.deckId}).`,
+      };
+    }
+
+    let answered: PendingApprovalDeck;
+    try {
+      answered = applyDeckAnswers(deck, inboundAnswers, answeredBy, new Date().toISOString());
+    } catch (err: any) {
+      return { outcome: 'invalid', reason: err?.message || 'Invalid deck submission.' };
+    }
+
+    const persisted = await chatbotDb.updateSessionApprovalDeck(sessionId, answered, {
+      requireStillAwaiting: deck.deckId,
+    });
+    if (!persisted) return { outcome: 'conflict' };
+
+    const approved = approvedWriteItems(answered);
+    if (approved.length === 0) {
+      // Every item was rejected — nothing to execute, no workflow needed. `summary:
+      // null` here is distinct from an 'unapplied' summary: nothing was ATTEMPTED
+      // at all, versus every item being attempted and every one failing.
+      return { outcome: 'submitted', run: null, summary: null, answeredDeck: answered };
+    }
+
+    const steps = this.buildMetaWriteWorkflowSteps(sessionId, session!.userId, approved);
+    const definition = { workflowId: `approval-deck-${deck.deckId}`, steps };
+    // ENG-1635/1644 follow-up: the retry-backstop needs each step's real target
+    // identity after the run completes, keyed the same way checkpoints are
+    // (stepId === item.itemId — see buildMetaWriteWorkflowSteps).
+    const stepIdToDispatch = new Map(approved.map(({ item }) => [item.itemId, item.metaWriteDispatch!] as const));
+
+    const started = await startWorkflow(sessionId, definition, undefined).catch(() => null);
+    if (!started) return { outcome: 'conflict' };
+
+    // Keep advancing until every step has been attempted — step_verified/
+    // step_failed/contended all mean "keep going" here, UNLIKE the
+    // sequential engine's advanceWorkflow (see advanceIndependentWorkflow's
+    // own header, and driveIndependentWorkflowToCompletion's for 'contended').
+    const outcome = await this.driveIndependentWorkflowToCompletion(sessionId, definition);
+    if (outcome.kind === 'conflict' || outcome.kind === 'no_active_run' || outcome.kind === 'contended') {
+      return { outcome: 'conflict' };
+    }
+    const summary = this.summarizeApprovalDeckRun(outcome.run);
+    if (summary) {
+      await this.applyMetaWriteRetryBackstop(sessionId, session!, summary, stepIdToDispatch);
+    }
+    return { outcome: 'submitted', run: outcome.run, summary, answeredDeck: answered };
+  }
+
+  /**
+   * ENG-1635/1644 follow-up: records a per-target consecutive-failure streak so
+   * the loop-seam annotation logic (agentModeService's main iteration loop, see
+   * its own comment right before this field is read) can guarantee the failure
+   * history is visible on the next approval card for the same target — found
+   * live, a write that failed 3x in a row got silently re-proposed identically
+   * each time, with zero explanation, because nothing surfaced the failure
+   * independent of whether the model chose to mention it in prose (the enriched
+   * error reaching Emma via answerAck, fixed separately, was necessary but not
+   * sufficient — she still didn't reliably act on it every time).
+   *
+   * Deliberately does NOT block or gate dispatch itself — see the annotation
+   * logic's own comment for why an earlier hard-block version of this was
+   * reverted (it could silently refuse a genuinely corrected, would-succeed
+   * attempt, trading one failure mode for a worse one). This is purely
+   * bookkeeping: a success against the streak's target clears it, a failure
+   * increments it, and code elsewhere reads it to decide whether to add a
+   * warning to the next card — never whether to allow the attempt at all.
+   *
+   * Tracks ONE target's streak at a time (the most recently failed one in this
+   * batch) — decks are small in practice and the reproduced bug was always a
+   * single-item repeated retry; a full per-signature map would be real
+   * over-engineering for a batch shape that's never actually occurred.
+   */
+  private async applyMetaWriteRetryBackstop(
+    sessionId: string,
+    session: ChatSession,
+    summary: ApprovalDeckExecutionSummary,
+    stepIdToDispatch: Map<string, NonNullable<ApprovalDeckItem['metaWriteDispatch']>>,
+  ): Promise<void> {
+    const current = session.lastFailedMetaWrite ?? null;
+    let next = current;
+    for (const item of summary.items) {
+      const dispatch = stepIdToDispatch.get(item.stepId);
+      if (!dispatch) continue;
+      const signature = this.computeMetaWriteTargetSignature(dispatch);
+      if (item.status === 'verified') {
+        // A success against the same target the streak was tracking means
+        // whatever was wrong got fixed — the backstop's job here is done.
+        if (current?.signature === signature) next = null;
+        continue;
+      }
+      if (item.status === 'failed') {
+        const sameTargetAsBefore = current?.signature === signature;
+        next = {
+          signature,
+          error: item.error || 'Meta write failed',
+          count: sameTargetAsBefore ? current!.count + 1 : 1,
+          at: new Date().toISOString(),
+        };
+      }
+    }
+    if (next === current) return;
+    try {
+      await chatbotDb.updateSessionLastFailedMetaWrite(sessionId, next);
+    } catch (err) {
+      console.error('AgentMode: failed to update lastFailedMetaWrite retry-backstop counter:', err);
+    }
+  }
+
+  private computeMetaWriteTargetSignature(dispatch: {
+    entity_type: string;
+    action: string;
+    account_id: string;
+    campaign_id?: string;
+    ad_set_id?: string;
+    ad_id?: string;
+  }): string {
+    // Target identity only — deliberately NOT the params/digest. A genuinely
+    // corrected retry (different budget, same ad set) still targets the same
+    // entity, and should still count toward the same streak; the backstop is
+    // about a TARGET repeatedly failing, not about byte-identical arguments.
+    return [
+      dispatch.entity_type,
+      dispatch.action,
+      dispatch.account_id,
+      dispatch.campaign_id ?? '',
+      dispatch.ad_set_id ?? '',
+      dispatch.ad_id ?? '',
+    ].join(':');
+  }
+
+  /**
+   * ENG-1635/1644: turn a completed independent-step run's checkpoints into
+   * one fully_applied/partially_applied/unapplied result with per-item detail
+   * — the checkpoint-scanning replacement for the retired
+   * metaWriteManifestOutcomes map / reconcileMetaWriteManifestIfComplete
+   * (see the Migration note in the reviewed plan: these are REPLACED, not
+   * kept running alongside the new step-based tracking). The three-way
+   * status itself is domain-agnostic (summarizeIndependentStepBatch, pure,
+   * workflow.ts); this layer adds the Meta-specific per-item shape
+   * (appliedObjectId, error/mismatches) that a domain-agnostic engine file
+   * has no business knowing about. Returns null while the run has not
+   * reached 'completed' yet — same as the pure function underneath.
+   */
+  private summarizeApprovalDeckRun(run: WorkflowRunState): ApprovalDeckExecutionSummary | null {
+    const status = summarizeIndependentStepBatch(run);
+    if (!status) return null;
+    const items = run.checkpoints.map((c) => ({
+      stepId: c.stepId,
+      status: c.status,
+      ...(c.status === 'verified'
+        ? { appliedObjectId: (c.verifiedFields as any)?.appliedObjectId as string | undefined }
+        : {}),
+      ...(c.status === 'failed'
+        ? Array.isArray(c.discrepancy)
+          ? { mismatches: c.discrepancy as WorkflowVerificationMismatch[] }
+          : { error: (c.discrepancy as { error: string } | undefined)?.error }
+        : {}),
+    }));
+    return { status, items };
   }
 
   /**
@@ -19074,13 +23598,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       switch (action) {
         case 'LIST': {
-          const result = await metaService.listCustomAudiences(accountId, accessToken);
-          const audiences = Array.isArray(result) ? result : [];
-          return {
-            success: true,
-            message: `Found ${audiences.length} custom audience(s)`,
-            audiences: audiences
-          };
+          const { audiences, truncated } = await metaService.listCustomAudiences(accountId, accessToken);
+          // ENG-1625 follow-up: this used to be `Found ${audiences.length} custom audience(s)`
+          // with no bound — the exact ENG-1476/ENG-1584 sentence shape (the old code also
+          // hard-capped at 50 with no truncation signal past that cap).
+          return buildListResult({
+            payloadKey: 'audiences',
+            payload: audiences,
+            message: buildListMessage({
+              noun: 'custom audience(s)',
+              totalCount: audiences.length,
+              truncated,
+              campaignScopable: false,
+            }),
+            truncated,
+          }) as MetaApiResult;
         }
         case 'CREATE': {
           // Validate required fields
@@ -19137,7 +23669,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // Ensure response data is a string for parsing
               userPayload = typeof response.data === 'object' ? JSON.stringify(response.data) : response.data;
             } catch (fetchError: any) {
-              throw new Error(`Failed to fetch CSV content from URL: ${fetchError.message}`);
+              // ENG-1300: this rethrow reaches the outer catch below, which extracts
+              // error?.status ?? error?.response?.status — without forwarding it here,
+              // a 403/404 fetching the CSV would be lost before it ever gets there.
+              const wrapped: any = new Error(`Failed to fetch CSV content from URL: ${fetchError.message}`);
+              wrapped.status = fetchError?.response?.status;
+              throw wrapped;
             }
           }
 
@@ -19274,7 +23811,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message,
-        error: error.message
+        error: error.message,
+        // ENG-1300: top-level `code` is the real numeric HTTP status — never
+        // structured.code above, which is Meta's business error code (e.g. the
+        // 1870090 subcode branch here has nothing to do with an HTTP status).
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -19902,8 +24443,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         workflow,
         ledger: { failures: [{ step: 'launch', message: error.message }] },
         message: error.message || `Failed to launch ${workflow} campaign.`,
+        // ENG-1300: SDK-shaped error (metaService.handleError preserves .status) —
+        // never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
+  }
+
+  // ENG-1300: executeAudienceCampaignLaunch rethrows a plain Error whenever a
+  // step it calls (manageMetaCustomAudiences, listMetaAdsAdSets,
+  // createMetaAdsAdSet — all already fixed to return a numeric `code` on
+  // failure) reports success:false, so the caller's classification is lost one
+  // rethrow before it ever reaches launchAudienceCampaign's outer catch. Carry
+  // it forward instead of discarding it.
+  private rethrowStepFailure(result: { message?: string; code?: number }, fallbackMessage: string): never {
+    const err: any = new Error(result.message || fallbackMessage);
+    err.status = result.code;
+    throw err;
   }
 
   private async executeAudienceCampaignLaunch(
@@ -19927,12 +24483,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
        */
       if (isMetaSpendStartingWrite('AD_SET', 'CREATE', args?.ad_set_params)) {
         const gateCreds = await this.getMetaCredentials(userId, args.account_id);
+        // ENG-1909: see the comment at the callMetaMarketingApi call site above — undefined
+        // (real fetch, unchanged) for any real account, dataset-backed for a sandbox one.
+        const sandboxFetchHtml = await buildSandboxFetchHtml(userId);
         const gate = await runMetaTrackingGate(
           gateCreds,
           args.campaign_id,
           `${workflow.toUpperCase()}_LAUNCH`,
           args?.override_tracking_check === true,
           args?.session_id,
+          { fetchHtml: sandboxFetchHtml },
         );
         if (!gate.proceed) return gate.blockResult;
       }
@@ -19952,7 +24512,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         const lookalikeName = `${args.audience_name} - Lookalike`;
         const lookalikeListResult = await this.manageMetaCustomAudiences(userId, 'LIST', args.account_id, {});
         if (!lookalikeListResult.success) {
-          throw new Error(lookalikeListResult.message || 'Failed to list existing Meta custom audiences.');
+          this.rethrowStepFailure(lookalikeListResult, 'Failed to list existing Meta custom audiences.');
         }
         // Greptile follow-up findings: name-only matching isn't enough — a
         // same-named lookalike from an earlier launch with a DIFFERENT
@@ -19990,7 +24550,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             confirm: true,
           });
           if (!lookalikeResult.success) {
-            throw new Error(lookalikeResult.message || 'Failed to create Lookalike Audience.');
+            this.rethrowStepFailure(lookalikeResult, 'Failed to create Lookalike Audience.');
           }
           lookalikeAudience = lookalikeResult.audience;
         }
@@ -20035,7 +24595,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const adSetName = args.ad_set_params?.name;
       const existingAdSetsResult = await this.listMetaAdsAdSets(userId, args.campaign_id, args.account_id);
       if (!existingAdSetsResult.success) {
-        throw new Error(existingAdSetsResult.message || 'Failed to list existing Meta ad sets.');
+        this.rethrowStepFailure(existingAdSetsResult, 'Failed to list existing Meta ad sets.');
       }
       // Greptile follow-up findings: name + targeted-audience alone isn't
       // enough — a same-named ad set targeting the same audience but with
@@ -20124,7 +24684,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           targeting,
         });
         if (!adSetResult.success) {
-          throw new Error(adSetResult.message || 'Failed to create ad set.');
+          this.rethrowStepFailure(adSetResult, 'Failed to create ad set.');
         }
         adSet = adSetResult.adSet;
       }
@@ -20202,7 +24762,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to search ad targeting.',
-        error: error.message
+        error: error.message,
+        // ENG-1300: SDK-shaped error — never a Meta business code.
+        code: error?.status ?? error?.response?.status
       };
     }
   }
@@ -20362,19 +24924,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  // Action type mappings (shared across all processing functions)
-  private readonly FORM_ACTIONS = new Set([
-    'leadgen',
-    'on_facebook_lead',
-    'onsite_conversion.lead_form',
-    'offsite_conversion.fb_pixel_custom',
-    'offsite_conversion.fb_pixel_lead'
-  ]);
-  private readonly WEBSITE_ACTIONS = new Set([
-    'website_lead',
-    'lead'
-  ]);
-
   // Helper function to process campaign data from Meta API
   private processCampaignData(campaigns: any[], insights: any[], adSets: any[]): any[] {
     const campaignMap = new Map();
@@ -20423,27 +24972,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         campaign.reach = parseInt(insight.reach) || 0;
 
         // Process lead generation metrics from actions and cost_per_action_type
-        if (insight.actions && Array.isArray(insight.actions)) {
-          for (const action of insight.actions) {
-            if (this.WEBSITE_ACTIONS.has(action.action_type)) {
-              campaign.websiteLeads += parseInt(action.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(action.action_type)) {
-              campaign.formLeads += parseInt(action.value) || 0;
-            }
-          }
-        }
-
-        if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
-          for (const costAction of insight.cost_per_action_type) {
-            if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
-              campaign.costPerWebsiteLead = parseFloat(costAction.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(costAction.action_type)) {
-              campaign.costPerFormLead = parseFloat(costAction.value) || 0;
-            }
-          }
-        }
+        applyLeadMetrics(campaign, insight);
       }
     }
 
@@ -20459,19 +24988,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         campaign.frequency = campaign.impressions / campaign.reach;
       }
 
-      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
-      if (campaign.websiteLeads > 0) {
-        campaign.formLeads = 0; // Set form submissions to 0 when website leads exist
-        campaign.costPerWebsiteLead = campaign.costPerWebsiteLead || (campaign.spend / campaign.websiteLeads);
-        campaign.costPerFormLead = 0;
-      } else if (campaign.formLeads > 0) {
-        campaign.costPerFormLead = campaign.costPerFormLead || (campaign.spend / campaign.formLeads);
-      }
-
-      campaign.totalLeads = (campaign.websiteLeads || 0) + (campaign.formLeads || 0);
-      if (campaign.totalLeads > 0) {
-        campaign.costPerLead = campaign.spend / campaign.totalLeads;
-      }
+      // ENG-1575: the buckets are disjoint now (see applyLeadMetrics), so website leads no
+      // longer need to suppress form leads. That suppression is what reported every Instant
+      // Form lead as a website lead on any account that also had website conversions.
+      finalizeLeadCosts(campaign);
     }
 
     // Return all campaigns regardless of activity
@@ -20525,27 +25045,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         adSet.reach = parseInt(insight.reach) || 0;
 
         // Process lead generation metrics from actions and cost_per_action_type
-        if (insight.actions && Array.isArray(insight.actions)) {
-          for (const action of insight.actions) {
-            if (this.WEBSITE_ACTIONS.has(action.action_type)) {
-              adSet.websiteLeads += parseInt(action.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(action.action_type)) {
-              adSet.formLeads += parseInt(action.value) || 0;
-            }
-          }
-        }
-
-        if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
-          for (const costAction of insight.cost_per_action_type) {
-            if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
-              adSet.costPerWebsiteLead = parseFloat(costAction.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(costAction.action_type)) {
-              adSet.costPerFormLead = parseFloat(costAction.value) || 0;
-            }
-          }
-        }
+        applyLeadMetrics(adSet, insight);
       }
     }
 
@@ -20561,19 +25061,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         adSet.frequency = adSet.impressions / adSet.reach;
       }
 
-      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
-      if (adSet.websiteLeads > 0) {
-        adSet.formLeads = 0; // Set form submissions to 0 when website leads exist
-        adSet.costPerWebsiteLead = adSet.costPerWebsiteLead || (adSet.spend / adSet.websiteLeads);
-        adSet.costPerFormLead = 0;
-      } else if (adSet.formLeads > 0) {
-        adSet.costPerFormLead = adSet.costPerFormLead || (adSet.spend / adSet.formLeads);
-      }
-
-      adSet.totalLeads = (adSet.websiteLeads || 0) + (adSet.formLeads || 0);
-      if (adSet.totalLeads > 0) {
-        adSet.costPerLead = adSet.spend / adSet.totalLeads;
-      }
+      // ENG-1575: the buckets are disjoint now (see applyLeadMetrics), so website leads no
+      // longer need to suppress form leads. That suppression is what reported every Instant
+      // Form lead as a website lead on any account that also had website conversions.
+      finalizeLeadCosts(adSet);
     }
 
     // Return all ad sets regardless of activity
@@ -20636,27 +25127,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ad.reach += parseInt(insight.reach) || 0;
 
         // Process lead generation metrics from actions and cost_per_action_type
-        if (insight.actions && Array.isArray(insight.actions)) {
-          for (const action of insight.actions) {
-            if (this.WEBSITE_ACTIONS.has(action.action_type)) {
-              ad.websiteLeads += parseInt(action.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(action.action_type)) {
-              ad.formLeads += parseInt(action.value) || 0;
-            }
-          }
-        }
-
-        if (insight.cost_per_action_type && Array.isArray(insight.cost_per_action_type)) {
-          for (const costAction of insight.cost_per_action_type) {
-            if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
-              ad.costPerWebsiteLead = parseFloat(costAction.value) || 0;
-            }
-            if (this.FORM_ACTIONS.has(costAction.action_type)) {
-              ad.costPerFormLead = parseFloat(costAction.value) || 0;
-            }
-          }
-        }
+        applyLeadMetrics(ad, insight);
       }
     }
 
@@ -20672,19 +25143,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ad.frequency = ad.impressions / ad.reach;
       }
 
-      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
-      if (ad.websiteLeads > 0) {
-        ad.formLeads = 0; // Set form submissions to 0 when website leads exist
-        ad.costPerWebsiteLead = ad.costPerWebsiteLead || (ad.spend / ad.websiteLeads);
-        ad.costPerFormLead = 0;
-      } else if (ad.formLeads > 0) {
-        ad.costPerFormLead = ad.costPerFormLead || (ad.spend / ad.formLeads);
-      }
-
-      ad.totalLeads = (ad.websiteLeads || 0) + (ad.formLeads || 0);
-      if (ad.totalLeads > 0) {
-        ad.costPerLead = ad.spend / ad.totalLeads;
-      }
+      // ENG-1575: the buckets are disjoint now (see applyLeadMetrics), so website leads no
+      // longer need to suppress form leads. That suppression is what reported every Instant
+      // Form lead as a website lead on any account that also had website conversions.
+      finalizeLeadCosts(ad);
     }
 
     // Return all ads regardless of activity
@@ -20740,33 +25202,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
 
       // Process lead generation metrics from actions and cost_per_action_type
-      if (item.actions && Array.isArray(item.actions)) {
-        for (const action of item.actions) {
-          if (this.WEBSITE_ACTIONS.has(action.action_type)) {
-            processedItem.websiteLeads += parseInt(action.value) || 0;
-          }
-          if (this.FORM_ACTIONS.has(action.action_type)) {
-            processedItem.formLeads += parseInt(action.value) || 0;
-          }
-        }
-      }
+      applyLeadMetrics(processedItem, item);
 
-      if (item.cost_per_action_type && Array.isArray(item.cost_per_action_type)) {
-        for (const costAction of item.cost_per_action_type) {
-          if (this.WEBSITE_ACTIONS.has(costAction.action_type)) {
-            processedItem.costPerWebsiteLead = parseFloat(costAction.value) || 0;
-          }
-          if (this.FORM_ACTIONS.has(costAction.action_type)) {
-            processedItem.costPerFormLead = parseFloat(costAction.value) || 0;
-          }
-        }
-      }
-
-      // Apply same logic as Meta Campaigns page: prioritize website leads over form submissions
-      if (processedItem.websiteLeads > 0) {
-        processedItem.formLeads = 0; // Set form submissions to 0 when website leads exist
-        processedItem.costPerFormLead = 0;
-      }
+      // ENG-1575: buckets are disjoint (see applyLeadMetrics) — no suppression needed.
 
       // Calculate totals
       processedItem.totalLeads = (processedItem.websiteLeads || 0) + (processedItem.formLeads || 0);
@@ -21176,9 +25614,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Connection-level failures (timeouts, circuit open) require a different instruction:
     // tell the LLM to stop retrying and surface the error to the user instead of
     // spinning through other variants of the same tool.
+    //
+    // ENG-1844 review: this used to be a bare `.includes('Connection timeout')` /
+    // `.includes('service temporarily unavailable')` — loose enough that ANY future
+    // tool error whose message happened to contain either fragment would get this
+    // "external service unreachable" framing, regardless of tool or actual cause. That
+    // is the exact wrong-outage-framing bug class ENG-1844 exists to fix, just at a
+    // different, ungated trigger site. Both real origins (mcpClientService.ts) always
+    // emit the FULL phrase below — matching on that instead of the bare fragment keeps
+    // this scoped to genuine MCP-server connection failures.
     const isConnectionTimeout =
-      safeMessage.includes('Connection timeout') ||
-      safeMessage.includes('service temporarily unavailable');
+      safeMessage.includes('Connection timeout for ') ||
+      safeMessage.includes('service temporarily unavailable — retrying in');
     if (isConnectionTimeout) {
       return `⚠️ External Service Unavailable: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: Do NOT retry this tool or other variants of it. The external service is temporarily unreachable. Stop the current plan and inform the user that the search service is currently unavailable. Suggest they try again later.`;
     }
@@ -21226,6 +25673,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (safeMessage.includes('Scheduled chat not found')) {
         return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The schedule_id doesn't exist or doesn't belong to this user. Call list_scheduled_chats to get a valid schedule_id before retrying update/toggle/delete.`;
       }
+      // ENG-1672: the schedule is at or over DynamoDB's 400KB item ceiling, almost
+      // always from accumulated promptRevisions/runResults history — automatic
+      // trimming already ran and still couldn't make room. Retrying the same-size
+      // payload will fail identically; only a shorter starting_message helps.
+      if (safeMessage.includes('too large to save')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: This schedule is at or over DynamoDB's 400KB per-item storage limit — automatic history trimming already ran and there is no more room. This is NOT a transient error; do not retry with the same-length starting_message. Call get_scheduled_chat_storage_diagnostics with this schedule_id for a byte breakdown, then shorten starting_message further before retrying.`;
+      }
+      // A bare connection-level failure (no HTTP response at all) means the write's
+      // outcome is UNKNOWN — it may have actually applied even though this call
+      // reported failure. Blindly resubmitting an "update" risks recording a
+      // redundant prompt-revision snapshot for a change that already landed.
+      if (/fetch failed|ECONNRESET|socket hang up|network error/i.test(safeMessage)) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: This is a transient connection failure, not a validation error — the write's outcome is unknown, and it may have already applied even though this call reported failure. Before retrying, call list_scheduled_chats (or get_scheduled_chat_storage_diagnostics) with this schedule_id to check the schedule's CURRENT state rather than blindly resubmitting the same change.`;
+      }
     }
     // ENG-971: bookkeeping / side-effect tools (save_memory, save_org_memory, …)
     // record a note ABOUT the work — they are not the work. A trailing save_memory
@@ -21237,6 +25698,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // asked for: the failure is real and must be reported, it is just SCOPED to the note.
     if (isBookkeepingTool(toolName)) {
       return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: ${toolName} is a NON-CRITICAL bookkeeping call — it only stores a note for future sessions. Its failure is scoped to that note: it did not undo, roll back, or lose any work already completed in this session, and it is NOT a session, system, or connection timeout. Do NOT tell the user that the system timed out, that their changes were not saved, or that they should re-run work that already succeeded — re-running a publish or deploy that already landed is the worst outcome here. Say in one line that the note could not be saved, then report the true outcome of the rest of the session exactly as the earlier tool results confirmed it.`;
+    }
+    // ENG-1855: install_skills refusing the __other_skills__ bundle (which gates
+    // publish_landing_page_changes, among other unassociated tools) reaches the
+    // model ONLY as this generic wrapper — installSkills returns success:false,
+    // so it never throws, and this is the sole place that failure is described
+    // (see toolDispatch.ts's success-with-encoded-error downgrade). A real
+    // incident showed the model filling that silence with a fabricated manual
+    // workaround ("navigate to Landing Pages and click Publish") for a button
+    // that does not exist anywhere in the product. Don't assert no workaround
+    // exists for every tool this bundle could gate — just forbid inventing one.
+    if (toolName === 'install_skills' && safeMessage.includes(OTHER_SKILLS_VIRTUAL_ID)) {
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: The tool this would have unlocked is temporarily unavailable. Do NOT invent a manual UI workaround (a button, a page, a settings toggle) unless you have concrete, verified confirmation one exists — guessing one into existence sends the user on a search that may never succeed. Tell them plainly that this is temporarily unavailable and to check back or retry.`;
     }
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }
@@ -21253,11 +25726,561 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production' ? 'prod/AgentWeb/Google/Share' : 'dev/AgentWeb/Google/Share';
     const credentials = JSON.parse(await getSecret(secretName));
+    this.driveServiceAccountEmail = credentials.client_email || null;
     const auth = new google.auth.GoogleAuth({
       credentials,
       scopes: ['https://www.googleapis.com/auth/drive.readonly'],
     });
     return google.drive({ version: 'v3', auth });
+  }
+
+  private getGoogleDriveServiceAccountEmail(): string {
+    return this.driveServiceAccountEmail || 'the AgentWeb Google Drive service account';
+  }
+
+  /**
+   * ENG-1624: classify a Drive failure into a short, safe reason for a
+   * model-visible payload. Never put the raw error object (or its message)
+   * there — mirrors metaService.ts's drainCursor, which deliberately doesn't
+   * log/surface FacebookRequestError objects because a paged Graph URL carries
+   * the access token in its query string; a Drive error can carry similarly
+   * sensitive request context. The full error is still logged server-side by
+   * the caller, same as before — only this classified string reaches the model.
+   */
+  /**
+   * Drive answers 403 for THROTTLING as well as for permission denial.
+   *
+   * `userRateLimitExceeded`, `rateLimitExceeded`, `dailyLimitExceeded` and
+   * `sharingRateLimitExceeded` all arrive as HTTP 403 with the real cause in
+   * `error.errors[].reason`. Keying on the status alone therefore called a throttled request
+   * "permission denied", and the caller's remedy became "share this folder with the service
+   * account" for a folder that is already shared — a remedy that cannot work, told to a user
+   * whose only real option was to wait.
+   *
+   * Reads both shapes googleapis surfaces: `err.errors` on the GaxiosError itself, and the raw
+   * `err.response.data.error.errors` when the error crossed a module boundary un-normalised.
+   */
+  /**
+   * The remedy half of an ad-account scope refusal — everything after the marker sentence.
+   *
+   * A bare `slice(indexOf('. ') + 2)` looked fine and fails badly: when the separator is absent
+   * `indexOf` returns -1, `slice(1)` drops the first CHARACTER, and the user reads "he requested
+   * campaign is not available...". Falls back to the generic remedy instead of emitting a
+   * mangled sentence, because a refusal that looks corrupted reads as a bug in the product.
+   */
+  private static remedyFromScopeRefusal(refusal: string | undefined): string {
+    const GENERIC = 'If the target belongs to a different ad account, select that account and try again.';
+    if (!refusal) return GENERIC;
+    const at = refusal.indexOf('. ');
+    if (at < 0) return GENERIC;
+    const remedy = refusal.slice(at + 2).trim();
+    return remedy || GENERIC;
+  }
+
+  /**
+   * Strip long digit runs from text that reaches a user.
+   *
+   * Graph error bodies name the object ("Object with ID '120...' does not exist"), and the
+   * product rule against showing raw Meta ids does not stop applying because the string came
+   * from Meta. A helper rather than a repeated regex because the last attempt masked one field
+   * and left the sibling field — which is the one actually read — untouched.
+   */
+  private static maskMetaIds(text: unknown): string {
+    return String(text ?? '').replace(/\d{8,}/g, '[id]');
+  }
+
+  private static driveErrorReasons(err: any): string[] {
+    const raw = [
+      ...(Array.isArray(err?.errors) ? err.errors : []),
+      ...(Array.isArray(err?.response?.data?.error?.errors) ? err.response.data.error.errors : []),
+    ];
+    return raw.map((e: any) => String(e?.reason ?? '')).filter(Boolean);
+  }
+
+  /** True when a 401/403 is really a quota/throttle answer, not an access decision. */
+  private static isDriveThrottle(err: any): boolean {
+    return AgentModeService.driveErrorReasons(err).some(r => /ratelimitexceeded|dailylimitexceeded/i.test(r));
+  }
+
+  /**
+   * The HTTP status of a Drive error, as a NUMBER.
+   *
+   * gaxios surfaces `code` as a string in some shapes (notably when the response body carries no
+   * `error.code`), and every `code === 403` comparison in this file is strict — so a string
+   * `'403'` silently matched nothing and fell through to the generic "temporary Drive error"
+   * branch. Coercing once, in one place, is what stops each new handler from inheriting that.
+   */
+  private static driveErrorCode(err: any): number | undefined {
+    const raw = err?.code ?? err?.status;
+    const n = typeof raw === 'number' ? raw : Number(raw);
+    return Number.isFinite(n) ? n : undefined;
+  }
+
+  /**
+   * The refusal a THROTTLED Drive call should return, or null when it is not a throttle.
+   *
+   * Drive answers 403 for quota exhaustion as well as for permission denial, and every handler
+   * in this file read the status alone — so a rate-limited user was told their connection had
+   * expired, or that Emma lacks access to a folder she can see, or that a Sheet "was not created
+   * by Emma". All false, and all pointing at a fix that cannot work. One sentence, one place, so
+   * the next handler cannot reintroduce it.
+   */
+  private static driveThrottleRefusal(err: any): { success: false; message: string } | null {
+    const code = AgentModeService.driveErrorCode(err);
+    if ((code !== 403 && code !== 401) || !AgentModeService.isDriveThrottle(err)) return null;
+    return {
+      success: false,
+      message:
+        'Google Drive is rate-limiting this account right now — this is a temporary quota answer, '
+        + 'NOT a permissions problem, so nothing needs to be shared or reconnected. Wait a minute and retry.',
+    };
+  }
+
+  private classifyDriveError(err: any): string {
+    const code = AgentModeService.driveErrorCode(err);
+    if ((code === 403 || code === 401) && AgentModeService.isDriveThrottle(err)) return 'rate limited';
+    if (code === 403 || code === 401) return 'permission denied';
+    if (code === 429) return 'rate limited';
+    if (code === 400) return 'invalid request';
+    /*
+     * Both timeout shapes. `did not respond within` is `metaService.withReadDeadline`'s wording
+     * and no Drive call can produce it — a Drive request timeout comes from node-fetch as
+     * `network timeout at: <url>`, so this branch was dead for the very calls it was added for
+     * and every one of them fell through to the generic "temporary Drive error".
+     */
+    if (typeof err?.message === 'string' && /did not respond within|network timeout at/i.test(err.message)) {
+      return 'temporary Drive error (timed out)';
+    }
+    return 'temporary Drive error';
+  }
+
+  /**
+   * ENG-1624: getGoogleDriveFolderTreeIds bounds folder COUNT (maxFolders) and
+   * queryDriveFilesAcrossFolders bounds per-batch file COUNT (perBatchTarget),
+   * but neither bounded elapsed TIME — both await Drive list calls sequentially,
+   * so a large or slow-to-respond tree/query was many serial round-trips with no
+   * deadline. Same shape as metaService.ts's META_LIST_MAX_MS / drainCursor: a
+   * count bound limits WORK, not TIME, when calls are awaited one at a time.
+   *
+   * A Drive list call here fetches only id+name (folder discovery) or a handful
+   * of scalar fields (file listing) with no nested expansions, so it's a much
+   * lighter call than a Meta ad-list page with `creative{...}` expansion —
+   * intentionally far short of Meta's 45s: long enough that an ordinary
+   * customer's tree (tens of folders) finishes in a fraction of it, short
+   * enough that a pathological or throttled tree can't visibly stall a turn.
+   * Crossing it sets `truncated`/`capped` — the same "incomplete, do not
+   * conclude absence" signal the count bounds already use, not a new failure
+   * mode.
+   *
+   * ⚠ Raised from 15s. The reasoning above is sound about the SHAPE of the calls and wrong about
+   * the consequence of stopping: an incomplete read is not a free outcome. It is what makes the
+   * agent say "that file is not in your Drive" about a folder it only partly looked at — the
+   * ENG-1584 sentence, on the Drive side. The tree is not too large to read; we were not giving
+   * it long enough, exactly as the launch pre-flight was not.
+   *
+   * 15s bought a snappier turn at the cost of a wrong answer. 90s reads an ordinary customer's
+   * tree comfortably and a large one completely, still finishes far inside nginx/ALB's 600s, and
+   * costs nothing at all in the common case — it is a deadline, not a delay, so a tree that
+   * takes two seconds still takes two seconds.
+   */
+  private static readonly DRIVE_LIST_WALK_MAX_MS = 90_000;
+
+  /**
+   * ENG-1476 follow-up: per-REQUEST deadline, derived from the walk-wide one rather than fixed.
+   *
+   * `DRIVE_LIST_WALK_MAX_MS` is checked BETWEEN requests, so it bounds how many calls the walk
+   * makes but cannot interrupt one already issued that never answers — Node's fetch applies no
+   * default deadline. Same reasoning as `metaService`'s `withReadDeadline` sitting alongside
+   * `META_LIST_MAX_MS`: an elapsed bound limits the WORK, a per-call timeout is what stops a
+   * single stalled read from holding the turn.
+   *
+   * Deliberately the REMAINING walk budget, not a fixed ceiling. A fixed value (10s was the
+   * first attempt) is arbitrary in both directions: too low fails a legitimately slow call that
+   * the walk still had time for — a read that used to succeed now errors — and too high is
+   * meaningless, since the walk stops at its own deadline anyway. Deriving it means a request
+   * can use exactly the time the walk still has and no more, so this can never fail a call the
+   * walk would not have abandoned regardless.
+   *
+   * googleapis' `MethodOptions` extends gaxios' `GaxiosOptions`, so `timeout` is accepted as the
+   * SECOND argument to a method. The floor keeps a near-expired budget from sending `timeout: 0`,
+   * which gaxios reads as "no timeout".
+   */
+  private static readonly DRIVE_REQUEST_TIMEOUT_FLOOR_MS = 1_000;
+
+  private static driveRequestTimeout(deadline: number): number {
+    return Math.max(AgentModeService.DRIVE_REQUEST_TIMEOUT_FLOOR_MS, deadline - Date.now());
+  }
+
+  /**
+   * Per-request options for a Drive call inside a walk: the remaining budget as a timeout, AND
+   * the retries turned off.
+   *
+   * `timeout` alone bounds nothing here. `googleapis-common/apirequest.js:263` sets
+   * `options.retry = true` by default, and gaxios only skips retrying an `AbortError` — a
+   * node-fetch request timeout raises a `FetchError`, so `noResponseRetries: 2` applies and one
+   * logical request is issued THREE times, each with the full timeout. Measured: 1 attempt /
+   * ~1.0s with retry off, 3 attempts / ~3.6s with googleapis' default against a server that
+   * accepts and never responds. A 15s walk budget became ~45s, and `readGoogleDriveSharedFile`
+   * does this twice in sequence.
+   *
+   * (Bare gaxios and google-auth-library's DefaultTransporter do NOT retry, so probing those
+   * says the timeout is fine. It is the googleapis layer that turns retries on.)
+   *
+   * Retrying is also wrong on its own terms: the budget is what is running out, so a second and
+   * third attempt spend time the walk does not have and triple Drive quota use on exactly the
+   * calls most likely to be near a limit.
+   */
+  /** A Drive failure worth one more attempt: transport-level, not an answer from Drive. */
+  /**
+   * A model-supplied scope id, with "" read as "not supplied".
+   *
+   * `resolveScopeId` refuses a blank scope id deep in metaService, and it is right to: a blank
+   * computed internally means a scope failed to resolve, and widening the read to the whole
+   * account is how ENG-1476 showed a customer another campaign's ads. But a MODEL emitting
+   * `campaign_id: ""` for an optional field means "I am not scoping this", and turning that
+   * into a hard error is a failure the user sees for no reason.
+   *
+   * So the interpretation happens here, at the boundary where caller intent is known, and the
+   * guard stays strict underneath. Logged, so a model that does this constantly is visible
+   * rather than silently accommodated.
+   */
+  private static optionalScopeId(value: unknown, label: string): string | undefined {
+    if (value === undefined || value === null) return undefined;
+    const trimmed = String(value).trim();
+    if (trimmed) return trimmed;
+    console.log(`[AgentMode] ${label} arrived empty from the caller; treating as not supplied.`);
+    return undefined;
+  }
+
+  private static isTransientDriveError(err: any): boolean {
+    const code = AgentModeService.driveErrorCode(err);
+    if (code !== undefined && code < 500) return false;           // 4xx is an answer, not a blip
+    if (code !== undefined && code >= 500) return true;           // 5xx
+    const msg = typeof err?.message === 'string' ? err.message : '';
+    return /network timeout at|econnreset|econnrefused|enotfound|eai_again|socket hang up|fetch failed/i.test(msg);
+  }
+
+  /**
+   * One retry for a transient Drive failure — but only if a full second attempt still fits
+   * inside the walk's remaining budget.
+   *
+   * Turning googleapis' retries off was necessary (it reused the SAME timeout on each of three
+   * attempts, so one hung request cost 3× the budget) but it also removed the cheap win: a
+   * single dropped connection used to be absorbed and now surfaces as an incomplete read. This
+   * restores that without the overrun, because the decision is made against `deadline` and the
+   * second attempt's timeout is recomputed from what is actually left.
+   *
+   * Deliberately not retrying 4xx: a 403, 404 or a throttle is Drive ANSWERING, and repeating
+   * the question does not change the answer — it just spends budget the walk needs.
+   */
+  private static async withDriveRetry<T>(deadline: number, run: () => Promise<T>): Promise<T> {
+    try {
+      return await run();
+    } catch (err: any) {
+      if (!AgentModeService.isTransientDriveError(err)) throw err;
+      // A second attempt must fit whole; a sliver of budget buys nothing but another timeout.
+      if (Date.now() + AgentModeService.DRIVE_REQUEST_TIMEOUT_FLOOR_MS >= deadline) throw err;
+      console.log('AgentMode: retrying a transient Drive failure once within the walk budget:', err?.message);
+      return await run();
+    }
+  }
+
+  private static driveRequestOptions(deadline: number): { timeout: number; retryConfig: { noResponseRetries: number } } {
+    return {
+      timeout: AgentModeService.driveRequestTimeout(deadline),
+      retryConfig: { noResponseRetries: 0 },
+    };
+  }
+
+  // ENG-1624: a registered gdrive: KB folder is authorized by its root ID only, but
+  // every Drive query in this file was scoped to `'<folderId>' in parents` — direct
+  // children only. A file living in a sub-folder (any depth) of a registered root
+  // resolved as not-found, and the sub-folder itself as "Not authorized" (our own
+  // flat allowlist check, not a real Google permission failure). This walks the
+  // folder tree from a registered root so callers can search/list across the whole
+  // tree instead of just its direct children. `restricted` surfaces sub-folders that
+  // couldn't be listed (e.g. an unshared shortcut target) so callers can give an
+  // actionable error instead of a bare "not found". `rootRestricted` is the same
+  // signal for the registered root itself — kept separate from `restricted` so it
+  // isn't reported to the caller as if it were a sub-folder found underneath itself.
+  // `truncated` is set when the `maxFolders` bound stops the walk before the whole
+  // tree was covered, so a caller can say "incomplete" instead of asserting absence.
+  private async getGoogleDriveFolderTreeIds(
+    drive: any,
+    rootFolderId: string,
+    maxFolders: number = 500
+  ): Promise<{
+    folderIds: string[];
+    restricted: Array<{ id: string; name: string }>;
+    rootRestricted: boolean;
+    /**
+     * The walk stopped because Drive THROTTLED it, not because the tree was too large.
+     *
+     * Kept distinct from `truncated` because the two need opposite sentences: a large tree tells
+     * the user to narrow the search, a quota answer tells them to wait. Folding a throttle into
+     * `truncated` is what made a rate-limited read report "the folder tree is large enough that
+     * the scan stopped" about a folder with four files in it.
+     */
+    throttled: boolean;
+    /**
+     * The walk stopped short because a sub-folder read FAILED transiently, as opposed to hitting
+     * the folder-count bound or the wall clock.
+     *
+     * `truncated` alone cannot carry this: two of its three causes are deterministic — the same
+     * tree stops in the same place every time — so a message telling the model to "retry, a
+     * sub-folder may have failed transiently" was advice that could not work for two of them,
+     * and the retryable classification meant each futile attempt re-walked the whole budget.
+     */
+    transientFailure: boolean;
+    /**
+     * The walk hit a deterministic bound — the folder-count ceiling or the wall clock.
+     *
+     * Not exclusive with `transientFailure`, and correlated with it: `withDriveRetry` spends
+     * budget on a transient failure, which makes the clock more likely to run out in the same
+     * walk. A walk with both must NOT advise a retry, because the bound will stop it in the same
+     * place next time — verified by probe: a transport failure on one child followed by the
+     * folder-count ceiling sets both flags.
+     */
+    boundedStop: boolean;
+    truncated: boolean;
+    folderNames: Map<string, string>;
+  }> {
+    const folderIdSet = new Set<string>([rootFolderId]);
+    const folderIds: string[] = [rootFolderId];
+    const folderNames = new Map<string, string>();
+    const queue: string[] = [rootFolderId];
+    const restricted: Array<{ id: string; name: string }> = [];
+    let rootRestricted = false;
+    let throttled = false;
+    let transientFailure = false;
+    let boundedStop = false;
+    let truncated = false;
+    /*
+     * "The walk is incomplete" and "stop walking" are DIFFERENT facts, and conflating them cost
+     * the whole tree.
+     *
+     * `truncated` is what the caller is told; `stopWalk` is what ends the loop. Only two things
+     * genuinely mean there is no point continuing: the wall-clock deadline, and the maxFolders
+     * bound (both apply to the walk as a whole). A transient failure on ONE sub-folder applies
+     * to that sub-folder alone — the 403/401 branch below has always taken that view, skipping
+     * the folder and walking on. Setting `truncated` from the error branch made the loop
+     * condition `!truncated` abandon the entire BFS, so a single 502 on sub-folder 3 of 40 left
+     * the remaining 37 unvisited, with the same "incomplete" signal a much smaller gap produces.
+     */
+    let stopWalk = false;
+    const deadline = Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS;
+
+    while (queue.length > 0 && !stopWalk) {
+      if (Date.now() >= deadline) {
+        truncated = true;
+        boundedStop = true;
+        stopWalk = true;
+        break;
+      }
+      const current = queue.shift()!;
+      let pageToken: string | undefined;
+      do {
+        if (Date.now() >= deadline) {
+          truncated = true;
+          boundedStop = true;
+          stopWalk = true;
+          break;
+        }
+        let resp: any;
+        try {
+          // Each request carries its own deadline (see driveRequestTimeout): the loop-level
+          // check above only runs BEFORE a request starts, so it cannot interrupt one already
+          // in flight. A failure here is caught below and reported as an incomplete walk.
+          // Options built INSIDE the closure so a retry recomputes its timeout from the budget
+          // actually remaining, rather than reusing the first attempt's.
+          resp = await AgentModeService.withDriveRetry(deadline, () => drive.files.list({
+            q: `'${current}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+            fields: 'nextPageToken, files(id, name)',
+            pageSize: 1000,
+            ...(pageToken && { pageToken }),
+            supportsAllDrives: true,
+            includeItemsFromAllDrives: true,
+          }, AgentModeService.driveRequestOptions(deadline)));
+        } catch (err: any) {
+          const code = AgentModeService.driveErrorCode(err);
+          /*
+           * A THROTTLED 403 is not an access decision, so it must not land in the permission
+           * buckets: `rootRestricted`/`restricted` are what produce "share it with the service
+           * account", and telling a rate-limited user to share an already-shared folder is a
+           * remedy that cannot work. Falls through to the incomplete-walk branch below, whose
+           * "the walk did not finish, retry" is the correct answer for a quota answer.
+           */
+          if (AgentModeService.isDriveThrottle(err)) throttled = true;
+          if ((code === 403 || code === 401) && !AgentModeService.isDriveThrottle(err)) {
+            if (current === rootFolderId) {
+              rootRestricted = true;
+            } else {
+              restricted.push({ id: current, name: folderNames.get(current) || current });
+            }
+          } else {
+            /*
+             * Not a permission answer — a timeout or transport failure. The walk did not finish,
+             * so the tree is partial and every conclusion drawn from it is provisional. Without
+             * this, a fired per-request timeout left `truncated` false and a caller reported a
+             * definitive "file not found" from a search that never completed.
+             *
+             * Records the incompleteness WITHOUT ending the walk (see `stopWalk` above): the
+             * other 39 sub-folders can still be listed, and a partial tree covering 39 of 40 is
+             * worth far more than one covering 2.
+             */
+            truncated = true;
+            transientFailure = true;
+          }
+          console.log(`AgentMode: Could not list subfolders of Drive folder ${current}:`, err);
+          break;
+        }
+
+        for (const f of resp.data.files || []) {
+          if (!f.id || folderIdSet.has(f.id)) continue;
+          if (folderIds.length >= maxFolders) {
+            truncated = true;
+            boundedStop = true;
+            stopWalk = true;
+            break;
+          }
+          folderIdSet.add(f.id);
+          folderIds.push(f.id);
+          if (f.name) folderNames.set(f.id, f.name);
+          queue.push(f.id);
+        }
+
+        pageToken = stopWalk ? undefined : (resp.data.nextPageToken || undefined);
+      } while (pageToken);
+    }
+
+    return { folderIds, restricted, rootRestricted, truncated, throttled, transientFailure, boundedStop, folderNames };
+  }
+
+  // ENG-1624: `'<id>' in parents` clauses joined with OR grow ~52 chars per Drive
+  // id (33-char id + boilerplate). `q` travels as a URL query parameter, so a
+  // 500-folder tree building one query risks a 400/414 from Drive rather than
+  // degrading gracefully. Chunk into batches and merge results de-duplicated by
+  // file id — a file with multiple parents can legitimately appear in more than
+  // one batch.
+  private static readonly DRIVE_FOLDER_QUERY_BATCH_SIZE = 50;
+
+  // ENG-1624 rework: this used to fetch a single page per batch (pageSize
+  // pageSizePerBatch, no nextPageToken follow-through), so a batch holding more
+  // matches than that one page silently dropped the rest. `perBatchTarget` is now
+  // pursued via in-batch pagination — following nextPageToken — until either the
+  // batch is genuinely exhausted or `perBatchTarget` items have been accumulated
+  // FOR THAT BATCH. The target is deliberately per-batch, not a budget shared
+  // across batches: each batch is fetched with the same `orderBy`, so the
+  // per-batch top-K is a superset of what the true global top-K could need from
+  // that batch — a shared budget would let one batch starve another and return
+  // the wrong page contents, not just a wrong total. `capped` reports whether any
+  // batch stopped at its target with more available, i.e. whether the merged
+  // result can be trusted as exhaustive.
+  private async queryDriveFilesAcrossFolders(
+    drive: any,
+    folderIds: string[],
+    extraClause: string,
+    fields: string,
+    perBatchTarget: number,
+    orderBy?: string,
+    /**
+     * A budget SHARED with the caller, when the caller makes several of these calls in sequence.
+     *
+     * Without it each call opens its own `DRIVE_LIST_WALK_MAX_MS`, which composes badly: the
+     * knowledge-base listing runs one query per registered Drive source in a sequential loop, so
+     * six sources meant six full budgets — 6 x 90s = 540s on top of the tree walk, past the 600s
+     * nginx/ALB ceiling the budget was chosen to sit inside. At the old 15s that overrun was
+     * invisible (6 x 15s); raising the budget is what made it reachable.
+     */
+    sharedDeadlineAt?: number,
+  ): Promise<{ files: Map<string, any>; capped: boolean; incomplete: boolean; failed?: any }> {
+    const merged = new Map<string, any>();
+    let capped = false;
+    /*
+     * `capped` covers three stops and only two of them mean the read is INCOMPLETE.
+     *
+     * The third — "this batch hit offset+limit+1 and there is more" — is ordinary pagination,
+     * already reported exactly by `totalFilesIsLowerBound`, with `files` correct and `hasMore`
+     * exact. Folding it into the incompleteness signal made every routine paginated listing
+     * announce "some folders were too large to fully scan or could not be accessed": the
+     * wrong-cause sentence, on healthy reads, which is the failure this PR exists to remove.
+     */
+    let incomplete = false;
+    // Distinguished from `capped`: "we stopped at a bound" and "a request errored" are different
+    // facts and their callers need different things. The listing path reports a failed source as
+    // failed rather than merely short; the search path treats either as incomplete.
+    let failed: any;
+    // ENG-1624: same time bound as getGoogleDriveFolderTreeIds, and for the same
+    // reason — batches and pages here are walked sequentially with no overall
+    // bound otherwise. Crossing it sets `capped`, which the listing maps into
+    // `folderScanIncomplete` — it did NOT until a starved source was found being
+    // reported as an empty folder; it was mapped only to a counting-precision
+    // flag. Reusing the existing
+    // "incomplete, do not conclude absence" signal.
+    const deadline = sharedDeadlineAt ?? (Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS);
+    for (let i = 0; i < folderIds.length; i += AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE) {
+      if (Date.now() >= deadline) {
+        capped = true;
+        incomplete = true;
+        break;
+      }
+      const batch = folderIds.slice(i, i + AgentModeService.DRIVE_FOLDER_QUERY_BATCH_SIZE);
+      const parentClause = `(${batch.map(id => `'${id}' in parents`).join(' or ')})`;
+      let batchCount = 0;
+      let pageToken: string | undefined;
+      do {
+        if (Date.now() >= deadline) {
+          capped = true;
+          incomplete = true;
+          pageToken = undefined;
+          break;
+        }
+        let resp: any;
+        try {
+          // Same budgeted single retry as the folder walk — see withDriveRetry.
+          resp = await AgentModeService.withDriveRetry(deadline, () => drive.files.list({
+          q: `${parentClause} and ${extraClause}`,
+          // nextPageToken must be requested explicitly — it isn't returned by
+          // default, which is exactly why the old single-page fetch had no way
+          // to know it was truncating.
+          fields: `nextPageToken, ${fields}`,
+          pageSize: Math.min(perBatchTarget - batchCount, 1000),
+          ...(pageToken && { pageToken }),
+          ...(orderBy && { orderBy }),
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true,
+          }, AgentModeService.driveRequestOptions(deadline)));
+        } catch (err) {
+          /*
+           * A failed request — most likely the per-request timeout firing near the end of the
+           * budget — must degrade this read to INCOMPLETE, never discard it. Throwing here
+           * reaches callers that swallow it (searchKnowledgeBase logs and continues), so every
+           * row already merged would be dropped and the answer would present an empty result as
+           * a complete search: the exact defect this file is being changed to prevent, caused by
+           * the guard against it. `capped` is the signal the callers already surface.
+           */
+          console.log('AgentMode: Drive file query batch failed; reporting the read as incomplete:', err);
+          capped = true;
+          incomplete = true;
+          failed = err;
+          break;
+        }
+        const files = resp.data.files || [];
+        for (const f of files) {
+          if (f.id) merged.set(f.id, f);
+        }
+        batchCount += files.length;
+        pageToken = resp.data.nextPageToken || undefined;
+        if (batchCount >= perBatchTarget && pageToken) {
+          // Hit this batch's target with more still available — stop here
+          // rather than draining a huge folder, but the caller needs to know
+          // this batch's contribution isn't necessarily complete.
+          capped = true;
+          pageToken = undefined;
+        }
+      } while (pageToken);
+    }
+    return { files: merged, capped, incomplete, failed };
   }
 
   private extractGoogleFileId(urlOrId: string): string {
@@ -21331,6 +26354,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Limit max results to 10
       const limitedMaxResults = Math.min(maxResults, 10);
 
+      // ENG-1624: set when a registered root's folder tree couldn't be fully
+      // walked/read (truncated by maxFolders, or a root/sub-folder 403'd) — the
+      // Drive portion of these results is then not exhaustive, and the final
+      // message must say so rather than reading as a complete search.
+      let driveScanIncomplete = false;
+
       // Search platform knowledge base (both public and private)
       const searchResults = await searchPlatformKnowledgeBase(query, limitedMaxResults, userId);
 
@@ -21351,17 +26380,33 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           const folders = await this.getUserGoogleDriveFolders(userId);
           if (folders.length > 0) {
             const drive = await this.getGoogleDriveClient();
-            // Build query: search across all shared folders
-            const parentClauses = folders.map(f => `'${f.folderId}' in parents`).join(' or ');
-            const driveResponse = await drive.files.list({
-              q: `(${parentClauses}) and fullText contains '${query.replace(/'/g, "\\'")}' and trashed = false`,
-              fields: 'files(id, name, mimeType, parents)',
-              pageSize: limitedMaxResults,
-              supportsAllDrives: true,
-              includeItemsFromAllDrives: true,
-            });
+            // Walk each registered root's whole folder tree (ENG-1624) so search
+            // covers files nested in sub-folders too, not just direct children.
+            const folderTrees = await Promise.all(
+              folders.map(f => this.getGoogleDriveFolderTreeIds(drive, f.folderId))
+            );
+            if (folderTrees.some(t => t.truncated || t.rootRestricted || t.restricted.length > 0)) {
+              driveScanIncomplete = true;
+            }
+            // De-dupe across roots: a file with multiple parents (or two registered
+            // roots sharing a sub-tree) can otherwise appear twice.
+            const allFolderIds = [...new Set(folderTrees.flatMap(t => t.folderIds))];
+            const { files: driveFilesMap, capped: driveQueryCapped } = await this.queryDriveFilesAcrossFolders(
+              drive,
+              allFolderIds,
+              `fullText contains '${escapeDriveQueryValue(query)}' and trashed = false`,
+              'files(id, name, mimeType, parents)',
+              limitedMaxResults
+            );
+            // A per-batch cap on the file query itself is a different reason the
+            // Drive portion isn't exhaustive than an unreadable folder — fold it
+            // into the same signal so a capped search result set isn't presented
+            // as exhaustive either.
+            if (driveQueryCapped) {
+              driveScanIncomplete = true;
+            }
 
-            const driveFiles = driveResponse.data.files || [];
+            const driveFiles = Array.from(driveFilesMap.values()).slice(0, limitedMaxResults);
             for (const file of driveFiles) {
               // Read file content for text-based files
               if (file.id && file.mimeType && !file.mimeType.startsWith('application/vnd.google-apps.folder')) {
@@ -21381,8 +26426,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             }
           }
         } catch (driveError) {
+          /*
+           * The whole Drive source dropped out of this search, so the result set is missing an
+           * entire source — the strongest form of incomplete there is here.
+           *
+           * Logging and continuing on its own let that be reported as a successful search that
+           * simply found nothing in Drive. The escaper's own refusal (escapeDriveQueryValue
+           * throws on a non-string) lands right here, so the guard added to stop a confidently
+           * wrong query could itself produce a confidently wrong ANSWER. `driveScanIncomplete`
+           * is the existing signal for "do not read absence into this result"; it belongs on
+           * this branch more than on any of the narrower ones that already set it.
+           */
           console.log('AgentMode: Error searching Google Drive shared folders:', driveError);
-          // Don't fail the whole search if Drive search fails
+          driveScanIncomplete = true;
+          // Don't fail the whole search if Drive search fails — but never report it as complete.
         }
       }
 
@@ -21464,11 +26521,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (results.length === 0) {
         return {
           success: true,
-          message: `No knowledge base results found for "${query}"`,
+          message: driveScanIncomplete
+            ? `No knowledge base results found for "${query}" — note: some Google Drive folders could not be fully scanned, so this is not confirmed exhaustive.`
+            : `No knowledge base results found for "${query}"`,
           query,
           results: [],
           returnedResults: 0,
-          hasMore: false
+          hasMore: false,
+          ...(driveScanIncomplete && { scanIncomplete: true })
         };
       }
 
@@ -21492,15 +26552,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // more exists upstream, which is why the message says "raise max_results"
       // rather than promising a specific remainder.
       const hasMore = results.length > boundedResults.length;
+      const scanIncompleteNote = driveScanIncomplete
+        ? ' Some Google Drive folders could not be fully scanned, so this is not confirmed exhaustive.'
+        : '';
       return {
         success: true,
-        message: hasMore
+        message: (hasMore
           ? `Showing the first ${boundedResults.length} knowledge base results for "${query}" — raise max_results to see more.`
-          : `Found ${boundedResults.length} knowledge base results for "${query}"`,
+          : `Found ${boundedResults.length} knowledge base results for "${query}"`) + scanIncompleteNote,
         query,
-        results: boundedResults,
+        // Completeness AHEAD of the payload, the same rule listKnowledgeBaseFiles and
+        // searchGoogleDrive follow. Ten results at ~5KB each clears the 8,000-char offload
+        // threshold comfortably, after which the model reads a sealed 20,000-char prefix and
+        // anything serialized after `results` is simply not there. The prose in `message` says
+        // the same thing and is first, so this was mitigated rather than broken — but the
+        // structured flags are what a future consumer will key on.
         returnedResults: boundedResults.length,
-        hasMore
+        hasMore,
+        ...(driveScanIncomplete && { scanIncomplete: true }),
+        results: boundedResults,
       };
     } catch (error) {
       console.error('AgentMode: Error searching knowledge base:', error);
@@ -21533,6 +26603,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const queryLower = query.toLowerCase();
       const results: Array<{ content: string; source: string }> = [];
       let foreplayResultCount = 0;
+      // ENG-1300: swipefile/board-list failures below are caught and swallowed
+      // so a bad Foreplay board never sinks the whole search — but that meant an
+      // outright auth/rate-limit failure on EVERY source silently reported as
+      // "no ads found" (success:true), exactly the "run looks successful while
+      // operating on partial input" pattern ENG-1300 exists to catch. Track the
+      // top-level failures (not the deliberately-tolerated per-board ones) and
+      // only surface them as a real failure when there are zero results to show
+      // for it — a genuine empty match must still report success.
+      let topLevelError: any = null;
 
       // Search swipefile ads
       try {
@@ -21554,6 +26633,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       } catch (swipeErr) {
         console.log('AgentMode: Error searching Foreplay swipefile:', swipeErr);
+        topLevelError = swipeErr;
       }
 
       // Search board ads
@@ -21579,11 +26659,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               }
             }
           } catch (boardErr) {
+            // Deliberately tolerated — one bad board must not sink every other
+            // board's results, so this one is never promoted to topLevelError.
             console.log(`AgentMode: Error searching Foreplay board ${board.name}:`, boardErr);
           }
         }
       } catch (boardsErr) {
         console.log('AgentMode: Error listing Foreplay boards for search:', boardsErr);
+        topLevelError = topLevelError || boardsErr;
+      }
+
+      if (results.length === 0 && topLevelError) {
+        return {
+          success: false,
+          message: `Failed to search Foreplay ads: ${topLevelError?.message || 'Unknown error'}`,
+          error: topLevelError?.message || 'Unknown error',
+          code: topLevelError?.response?.status,
+          results: [],
+          totalResults: 0
+        };
       }
 
       if (results.length === 0) {
@@ -21608,7 +26702,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to search Foreplay ads. Please try again.',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
+        // ENG-1300: plain axios error — Foreplay has no known business-code field.
+        code: (error as any)?.response?.status
       };
     }
   }
@@ -21696,7 +26792,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to search Foreplay discovery. Please try again.',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
+        code: (error as any)?.response?.status
       };
     }
   }
@@ -21711,6 +26808,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }): Promise<any> {
     try {
       console.log('AgentMode: Listing knowledge base files for user:', userId, 'options:', options);
+
+      // Refuse a malformed date filter here, before any source is read, so the caller gets the
+      // expected format back instead of a per-folder Drive 400 buried in `listingFailed`.
+      try {
+        if (options?.modified_after) validateDriveDateFilter(options.modified_after, 'modified_after');
+        if (options?.modified_before) validateDriveDateFilter(options.modified_before, 'modified_before');
+      } catch (dateError: any) {
+        return { success: false, message: dateError?.message || 'Invalid date filter' };
+      }
 
       // Get user's private knowledge bases
       const userKnowledgeBaseTasks = await taskDb.getTasksWithKnowledgeBase(userId);
@@ -21791,62 +26897,215 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       // Include Google Drive shared folders
+      // ENG-1624: set when Drive enumeration failed entirely (outer catch below)
+      // — a listing that's missing every Drive source must say so, not read as
+      // "this account has no Drive folders."
+      let driveEnumerationFailed = false;
       if (!options?.kb_type || options.kb_type === 'google-drive') try {
         const folders = await this.getUserGoogleDriveFolders(userId);
         if (folders.length > 0) {
           const drive = await this.getGoogleDriveClient();
           const driveLimit = options?.limit ?? 100;
           const driveOffset = options?.offset ?? 0;
-          for (const folder of folders) {
+
+          // ENG-1624: walk every registered root's tree up front. Two
+          // registered roots can be in an ancestor/descendant relationship —
+          // a customer registers both a parent folder and one of its own
+          // sub-folders (e.g. Harsha's mitigation for Phoenix, which added
+          // the ratio sub-folders directly alongside the already-registered
+          // parent). Now that this PR walks the whole tree instead of direct
+          // children only, the parent's listing legitimately includes the
+          // child's files too, so the same file can appear under two
+          // entries. Walking every tree first lets nesting be detected
+          // STRUCTURALLY (one root's resolved folderIds actually containing
+          // another registered root's own id) before any file query runs.
+          // getGoogleDriveFolderTreeIds never rejects — its own Drive errors
+          // are caught internally as restricted/rootRestricted — so this
+          // can't silently drop a root the way a failing Promise.all
+          // normally would.
+          const treeResults = await Promise.all(
+            folders.map(folder =>
+              this.getGoogleDriveFolderTreeIds(drive, folder.folderId).then(tree => ({ folder, ...tree }))
+            )
+          );
+
+          /*
+           * ONE budget for the whole listing, not one per source.
+           *
+           * The file queries below run sequentially, one per registered Drive source, and each
+           * used to open a fresh DRIVE_LIST_WALK_MAX_MS. Six registered sources therefore meant
+           * six full budgets end to end — 540s at the current 90s — which blows past the 600s
+           * nginx/ALB ceiling that budget was picked to sit inside. Sharing a deadline keeps the
+           * whole listing inside one budget: sources still get read in order, and a listing that
+           * runs out reports the remaining sources as incomplete rather than silently costing
+           * the user a dropped request.
+           */
+          const listingDeadlineAt = Date.now() + AgentModeService.DRIVE_LIST_WALK_MAX_MS;
+          for (const { folder, folderIds, restricted, rootRestricted, truncated, throttled } of treeResults) {
             try {
-              // Build Drive query with optional date filter
-              let driveQuery = `'${folder.folderId}' in parents and trashed = false`;
+              // Structural, not name-based: a root only counts as nested
+              // when its OWN id was actually discovered inside another
+              // root's resolved tree. This can't false-positive from a
+              // truncated ancestor scan — truncation just means some
+              // folders were never visited, so an undiscovered descendant
+              // simply isn't found here either, and no relationship is
+              // claimed (falls back to the plain file-id dedup in the
+              // top-level totalFiles below).
+              const ancestor = treeResults.find(other =>
+                other.folder.folderId !== folder.folderId &&
+                other.folderIds.includes(folder.folderId)
+              );
+
+              // Exclude folder entries themselves — previously these showed up as
+              // 0-byte files instead of being descended into.
+              let extraClause = `mimeType != 'application/vnd.google-apps.folder' and trashed = false`;
+              /*
+               * Escaped exactly like the `name`/`fullText` literals beside it. These two were
+               * missed when escapeDriveQueryValue was introduced, and they sit in the same `q`
+               * as the parent-folder clause that scopes this read to the caller's own folders —
+               * so an unescaped quote here reached past that scoping on a SHARED, read-all
+               * service account. Already validated to YYYY-MM-DD at the top of this method, so
+               * this is the second lock rather than the first.
+               */
               if (options?.modified_after) {
-                driveQuery += ` and modifiedTime >= '${options.modified_after}T00:00:00'`;
+                extraClause += ` and modifiedTime >= '${escapeDriveQueryValue(options.modified_after)}T00:00:00'`;
               }
               if (options?.modified_before) {
-                driveQuery += ` and modifiedTime <= '${options.modified_before}T23:59:59'`;
+                extraClause += ` and modifiedTime <= '${escapeDriveQueryValue(options.modified_before)}T23:59:59'`;
               }
 
-              // Fetch enough to support pagination: offset + limit
-              const response = await drive.files.list({
-                q: driveQuery,
-                fields: 'files(id, name, mimeType, size, modifiedTime)',
-                orderBy: 'modifiedTime desc',
-                pageSize: Math.min(driveOffset + driveLimit, 1000),
-                supportsAllDrives: true,
-                includeItemsFromAllDrives: true,
-              });
+              // ENG-1624: the tree can span more folders than fit in one `q` string
+              // (see queryDriveFilesAcrossFolders), so this is queried in batches and
+              // merged/de-duplicated by file id — NOT per batch, or offset/limit
+              // pagination below would silently skip and repeat files across batch
+              // boundaries.
+              //
+              // Per-batch target is offset+limit+1, not offset+limit: each batch is
+              // fetched at the same `orderBy`, so the global top-K of the union is
+              // always a subset of the union of each batch's own top-K — the `files`
+              // returned are correct regardless of the target. The `+1` is what makes
+              // `hasMore` exact: the merged set then holds at least
+              // min(trueTotal, K+1) files, so `allFiles.length > offset+limit` is
+              // true exactly when more files really exist beyond this page.
+              const perBatchTarget = driveOffset + driveLimit + 1;
+              const { files: filesMap, capped, incomplete: queryIncomplete, failed: queryFailed } = await this.queryDriveFilesAcrossFolders(
+                drive,
+                folderIds,
+                extraClause,
+                'files(id, name, mimeType, size, modifiedTime)',
+                perBatchTarget,
+                'modifiedTime desc',
+                listingDeadlineAt,
+              );
 
-              const allFiles = (response.data.files || []).map((f) => ({
-                fileName: f.name || 'unknown',
-                fileSize: f.size ? parseInt(f.size, 10) : 0,
-                mimeType: f.mimeType || 'unknown',
-                driveFileId: f.id,
-                modifiedTime: f.modifiedTime,
-              }));
+              // Per-batch `orderBy` only sorts within its own batch; re-sort the
+              // merged set so global ordering (and therefore offset/limit slicing)
+              // is correct.
+              const allFiles = Array.from(filesMap.values())
+                .map((f) => ({
+                  fileName: f.name || 'unknown',
+                  fileSize: f.size ? parseInt(f.size, 10) : 0,
+                  mimeType: f.mimeType || 'unknown',
+                  driveFileId: f.id,
+                  modifiedTime: f.modifiedTime,
+                }))
+                .sort((a, b) => (b.modifiedTime || '').localeCompare(a.modifiedTime || ''));
 
               const totalMatchingFiles = allFiles.length;
               const driveFiles = allFiles.slice(driveOffset, driveOffset + driveLimit);
+              // ENG-1624: a scan that stopped early (folder-count bound or the root
+              // itself being unreadable) must not present its partial file list as
+              // complete.
+              /*
+               * `capped` belongs here too.
+               *
+               * It means the file query stopped at a bound — including the shared listing
+               * deadline, which a slow FIRST source can exhaust before a later source is queried
+               * at all. Mapping it only to `totalFilesIsLowerBound` (a counting-precision flag)
+               * presented a source that was never read as an EMPTY FOLDER: totalFiles 0,
+               * hasMore false, no incompleteness, no "do not conclude absence". That is ENG-1584
+               * on the Drive side, and it was created by the fix that gave the listing one shared
+               * budget — the remedy for one composition bug producing a false absence instead.
+               */
+              // `queryIncomplete`, not `capped`: the latter also fires on ordinary pagination.
+              const folderScanIncomplete = truncated || rootRestricted || queryIncomplete;
+              // Same distinction the readers draw: a throttled scan is incomplete for a reason
+              // the user acts on differently (wait) than a large one (narrow).
+              const folderScanThrottled = throttled;
+              // A batch that hit its per-batch target means `totalMatchingFiles`
+              // wasn't fully counted — it's a floor, not an exact total. Getting an
+              // exact total would mean fully paginating every batch, which isn't
+              // worth the API cost just to render one page.
+              const totalFilesIsLowerBound = capped;
 
+              /*
+               * ⚠ Field order is load-bearing: every completeness signal goes BEFORE `files`.
+               *
+               * A knowledge-base listing routinely clears the S3 offload threshold, after which
+               * the model is handed a SEALED fixed-length PREFIX of this JSON — anything
+               * serialized after the file array is simply not there. Measured at the default
+               * limit of 100 files, one Drive source alone reached ~20.5k chars with
+               * `listingFailed` landing past the 20k cut: the flag existed, was correct, and
+               * was unreadable on exactly the listings that need it. Same failure the
+               * `buildListResult` helper exists to prevent on the Meta side.
+               *
+               * `files` LAST, always. Anything appended after it is invisible.
+               */
               knowledgeBases.push({
                 identifier: `gdrive:${folder.folderId}`,
                 name: folder.name,
                 type: 'google-drive',
                 updatedAt: allFiles.length > 0 ? allFiles[0].modifiedTime : undefined,
-                files: driveFiles,
                 totalFiles: totalMatchingFiles,
-                hasMore: driveOffset + driveLimit < totalMatchingFiles,
+                hasMore: allFiles.length > driveOffset + driveLimit,
                 offset: driveOffset,
                 limit: driveLimit,
+                ...(totalFilesIsLowerBound && { totalFilesIsLowerBound: true }),
+                // A request that errored means this source is not merely short, it is unreliable
+                // — reported as failed even when some rows were already merged, so an empty or
+                // partial list is never mistaken for the folder's true contents.
+                ...(queryFailed ? { listingFailed: true, listingFailedReason: this.classifyDriveError(queryFailed) } : {}),
+                // ENG-1624: a sub-folder that couldn't be listed (e.g. an unshared
+                // shortcut target) previously shrank the listing with no signal to
+                // the caller. Name it so the caller can request access instead of
+                // silently seeing an incomplete file list.
+                ...(restricted.length > 0 && { inaccessibleFolders: restricted.map(r => r.name) }),
+                ...(rootRestricted && { inaccessibleRoot: true }),
+                ...(folderScanIncomplete && { folderScanIncomplete: true }),
+                ...(folderScanThrottled && { folderScanThrottled: true }),
+                // ENG-1624: this root's own id was found inside another
+                // registered root's resolved tree — its files are already
+                // counted there too. Kept as its own entry (never silently
+                // dropped), just labeled, so a saved gdrive:<this-id>
+                // reference still resolves exactly as it does today.
+                ...(ancestor && { nestedUnder: `gdrive:${ancestor.folder.folderId}` }),
+                files: driveFiles,
               });
-            } catch (folderErr) {
+            } catch (folderErr: any) {
+              // ENG-1624: this used to just log and move on, which silently
+              // dropped the whole KB from the response — indistinguishable from
+              // "this folder has no files." Round 2 (the BFS walk + batched,
+              // paginated file query) turned a single files.list call into many,
+              // multiplying how often a Drive error lands here. A failure for
+              // one folder must not abort the others (kept below, same as
+              // before) — but the caller now still sees this source, marked as
+              // failed rather than absent.
               console.log(`AgentMode: Error listing files in Drive folder ${folder.name}:`, folderErr);
+              knowledgeBases.push({
+                identifier: `gdrive:${folder.folderId}`,
+                name: folder.name,
+                type: 'google-drive',
+                listingFailed: true,
+                listingFailedReason: this.classifyDriveError(folderErr),
+                // Same ordering rule as the success path above — `files` last.
+                files: [],
+              });
             }
           }
         }
       } catch (driveError) {
         console.error('AgentMode: Error listing Google Drive shared folders:', driveError);
+        driveEnumerationFailed = true;
       }
 
       // Include ClickUp docs
@@ -22017,10 +27276,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         console.error('AgentMode: Error listing Foreplay ads:', foreplayError);
       }
 
-      const totalFiles = knowledgeBases.reduce(
-        (sum: number, kb: any) => sum + (kb.files?.length || 0),
-        0
-      );
+      // ENG-1624: a plain per-KB sum double-counts once nesting/multi-parent
+      // overlap between registered Drive roots is possible (see the
+      // treeResults/nestedUnder logic above) — the same underlying Drive file
+      // can legitimately appear in more than one root's `files` array. De-dupe
+      // by driveFileId for google-drive entries specifically; other KB types
+      // (private/public/ClickUp/Foreplay) have no equivalent shared identity
+      // and are summed as before.
+      const seenDriveFileIds = new Set<string>();
+      const totalFiles = knowledgeBases.reduce((sum: number, kb: any) => {
+        if (kb.type !== 'google-drive') return sum + (kb.files?.length || 0);
+        let kbCount = 0;
+        for (const f of kb.files || []) {
+          if (!f.driveFileId || !seenDriveFileIds.has(f.driveFileId)) {
+            if (f.driveFileId) seenDriveFileIds.add(f.driveFileId);
+            kbCount++;
+          }
+        }
+        return sum + kbCount;
+      }, 0);
 
       const appliedFiltersEarly = [
         options?.modified_after ? `modified_after=${options.modified_after}` : null,
@@ -22037,30 +27311,99 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // Point the model to the catalog so empty doesn't read as "Docs unavailable".
         // Scoped to the explicit drive query: an unfiltered/other empty gets the plain
         // message (this path lists all sources, and nudging Docs there is off-topic).
-        const message = options?.kb_type === 'google-drive'
-          ? 'No Google Drive shared folders found here — this lists only READ-ONLY shared folders (surfaced via the service account). Creating and editing Google Docs & Sheets is a SEPARATE capability — call list_available_skills to find and install the skill that provides Google Docs / Sheets create/edit tools.'
-          : 'No knowledge bases found';
+        //
+        // ENG-1624: an empty result caused by driveEnumerationFailed is a DIFFERENT
+        // claim than a genuinely empty account — the former means "we don't know",
+        // the latter means "there is nothing." Collapsing them into the same plain
+        // message would tell a caller no Drive folders are registered when the
+        // truth is the enumeration call itself failed.
+        let message: string;
+        if (driveEnumerationFailed) {
+          message = options?.kb_type === 'google-drive'
+            ? 'Google Drive sources could not be enumerated — this does not mean no folders are registered, only that the enumeration attempt itself failed. Try again.'
+            : 'No knowledge bases found in other sources, and Google Drive sources could not be enumerated — this does not mean no Drive folders exist, only that the enumeration attempt itself failed. Try again.';
+        } else {
+          message = options?.kb_type === 'google-drive'
+            ? 'No Google Drive shared folders found here — this lists only READ-ONLY shared folders (surfaced via the service account). Creating and editing Google Docs & Sheets is a SEPARATE capability — call list_available_skills to find and install the skill that provides Google Docs / Sheets create/edit tools.'
+            : 'No knowledge bases found';
+        }
         return {
           success: true,
           message,
           knowledge_bases: [],
           totalKnowledgeBases: 0,
           totalFiles: 0,
+          ...(driveEnumerationFailed && { driveEnumerationFailed: true }),
           ...(appliedFiltersEarly.length > 0 && { appliedFilters: appliedFiltersEarly }),
         };
       }
 
       const hasMorePages = knowledgeBases.some((kb: any) => kb.hasMore);
+      // ENG-1624: a folder-scan cutoff (folder-count bound, or the root/a
+      // sub-folder being unreadable) is a different signal than "more files exist
+      // to paginate" — it means the listing itself may be incomplete, not just
+      // capped.
+      const hasIncompleteFolderScan = knowledgeBases.some((kb: any) => kb.folderScanIncomplete);
+      /*
+       * The third consumer of the throttle split, which was missed when the other two got it.
+       * A throttled walk sets `truncated` as well, so this listing said "too large to fully scan
+       * or could not be accessed" about a rate-limited read — the wrong-cause sentence, telling
+       * the user to narrow a search that will throttle identically.
+       */
+      /*
+       * Both sentences, when both are true.
+       *
+       * These are `.some()` over DIFFERENT sources, so suppressing the size/permission sentence
+       * whenever any source was throttled hid a real incompleteness on every other source. The
+       * two facts are independent and the model needs both: wait for the throttled one, narrow
+       * or share the others.
+       */
+      const hasThrottledFolderScan = knowledgeBases.some((kb: any) => kb.folderScanThrottled);
+      /*
+       * Only claim "too large or inaccessible" about a source that is NOT merely throttled.
+       *
+       * A throttled walk sets `throttled` AND `truncated` in the same branch, so for a single
+       * source both flags describe the same stop — and the two sentences then contradict each
+       * other outright: "a temporary quota answer, not a size or permissions problem" followed
+       * immediately by "too large to fully scan or could not be accessed". Suppressing the size
+       * sentence whenever ANY source was throttled was also wrong, because it hid a real
+       * incompleteness on the other sources. Per-source is the only reading that is right in
+       * both shapes.
+       */
+      const hasIncompleteFolderScanBeyondThrottle = knowledgeBases.some(
+        (kb: any) => kb.folderScanIncomplete && !kb.folderScanThrottled,
+      );
+      // A Drive KB's file query hit its per-batch target — its `totalFiles` is a
+      // floor, not an exact count, even though `files`/`hasMore` are still correct.
+      const hasLowerBoundTotals = knowledgeBases.some((kb: any) => kb.totalFilesIsLowerBound);
+      // A Drive KB whose listing errored — shown rather than dropped, but its `files` must not
+      // be read as the folder's true contents. NOT necessarily empty: `queryDriveFilesAcrossFolders`
+      // sets `failed` after merging whatever batches did succeed, so a failed source can carry a
+      // PARTIAL list. Saying "shown as empty" there described a state that does not exist and
+      // invited the model to trust a short list as complete.
+      const failedDriveCount = knowledgeBases.filter((kb: any) => kb.listingFailed).length;
+      // A Drive KB nested inside another registered Drive KB's tree — its files
+      // are already reflected in the parent's own listing (and in the
+      // de-duplicated totalFiles above), not additional ones.
+      const hasNestedRoots = knowledgeBases.some((kb: any) => kb.nestedUnder);
       const appliedFilters = appliedFiltersEarly;
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
-        knowledge_bases: knowledgeBases,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)${appliedFilters.length ? ` (filters: ${appliedFilters.join(', ')})` : ''}${hasMorePages ? '. Some sources have more files — use limit/offset to paginate.' : ''}${hasThrottledFolderScan ? ' Google Drive rate-limited the scan of some folders — a temporary quota answer, not a size or permissions problem; wait a minute and retry rather than narrowing.' : ''}${hasIncompleteFolderScanBeyondThrottle ? ' Some Google Drive folders were too large to fully scan or could not be accessed — their file listings may be incomplete.' : ''}${hasLowerBoundTotals ? ' Some Google Drive totalFiles counts are a lower bound, not exact — the query hit its per-page cap before counting everything.' : ''}${failedDriveCount > 0 ? ` ${failedDriveCount} Google Drive source(s) could not be fully listed (see listingFailed) — their file lists may be empty OR partial, so treat any file missing from them as unknown, not absent.` : ''}${driveEnumerationFailed ? ' Google Drive sources could not be fully enumerated — some may be missing from this listing entirely.' : ''}${hasNestedRoots ? ' Some Google Drive sources are nested inside another registered source (see nestedUnder) — their files are the same files already counted under the parent, not additional ones.' : ''}. For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them — each doc file entry has a docId you can pass as parent_doc_id to write_clickup_doc to create content inside that doc. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For ClickUp task-hierarchy folders (clickup-folder:), these are for reference only and cannot be used as doc write targets. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
+        // Same rule as the per-source objects: every completeness flag ahead of the payload,
+        // because `knowledge_bases` is what pushes this result past the offload threshold and
+        // anything after it falls outside the sealed prefix the model actually reads.
         totalKnowledgeBases: knowledgeBases.length,
         totalFiles,
         ...(appliedFilters.length > 0 && { appliedFilters }),
         ...(hasMorePages && { hasMore: true }),
+        ...(hasIncompleteFolderScan && { folderScanIncomplete: true }),
+        ...(hasThrottledFolderScan && { folderScanThrottled: true }),
+        ...(hasLowerBoundTotals && { totalFilesIsLowerBound: true }),
+        ...(failedDriveCount > 0 && { driveListingFailures: failedDriveCount }),
+        ...(driveEnumerationFailed && { driveEnumerationFailed: true }),
+        knowledge_bases: knowledgeBases,
       };
     } catch (error) {
       console.error('AgentMode: Error listing knowledge base files:', error);
@@ -22371,6 +27714,49 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     };
   }
 
+  /**
+   * The two "the name search did not finish" refusals, kept in one place because they are one
+   * decision: whether the thing that stopped the read is worth trying again.
+   *
+   * `failed` — a request errored (5xx, a transport blip, the per-request timeout firing on one
+   * unlucky call). That is transient by nature, so "retry" is a remedy that can actually work.
+   *
+   * `capped` with no failure — the ONLY way to reach that here is
+   * `queryDriveFilesAcrossFolders` crossing DRIVE_LIST_WALK_MAX_MS. (Its other capping path,
+   * `batchCount >= perBatchTarget`, cannot fire on a zero-result search.) That bound is
+   * wall-clock, spent walking a folder tree whose size does not change between attempts, and it
+   * is a SECOND such budget after `getGoogleDriveFolderTreeIds` already spent up to the same
+   * amount enumerating the sub-folders. A tree big enough to exhaust it therefore exhausts it
+   * again, in the same place, on every retry.
+   *
+   * So the two branches must not share a remedy. Telling the model to "retry the read" on the
+   * capped branch is the ENG-1636 failure in miniature — naming a remedy that cannot work — and
+   * worse than useless here, because the retry is not free: each attempt burns up to two full
+   * DRIVE_LIST_WALK_MAX_MS budgets and the turn's own time, and a deterministic non-answer
+   * repeated is a loop. The
+   * capped branch is given remedies that change the SCOPE of the search, which is the only
+   * variable that can move the outcome.
+   */
+  private driveNameSearchIncompleteMessage(fileName: string, rootName: string, failed?: any): string {
+    const preamble =
+      `Could not determine whether "${fileName}" is in Google Drive folder "${rootName}" — `;
+    if (failed) {
+      return preamble
+        + `the file search itself failed (${this.classifyDriveError(failed)}). This is a FAILED read, not a `
+        + `confirmed absence: do not report the file as missing. Retry the read.`;
+    }
+    return preamble
+      + `the file search ran out of its time budget before it had covered the whole folder tree. `
+      + `This is an INCOMPLETE read, not a confirmed absence: do not report the file as missing. `
+      + `Do NOT retry this same call — the budget is a fixed wall-clock bound spent walking this `
+      + `folder's sub-folders, so a tree this large will stop in the same place every time. `
+      + `The only thing that changes the outcome is a SMALLER search scope: ask the user for the `
+      + `file's direct Google Drive link, or for the specific sub-folder it lives in so that `
+      + `sub-folder can be registered as its own knowledge base source. If neither is available, `
+      + `tell the user plainly that this folder exceeded the read budget for a single search — `
+      + `do not describe it as a temporary glitch and do not try again.`;
+  }
+
   // Helper: read a file from a Google Drive shared folder
   private async readGoogleDriveSharedFile(kbIdentifier: string, fileName: string, userId: string): Promise<any> {
     const folderId = kbIdentifier.replace('gdrive:', '');
@@ -22382,26 +27768,145 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     const folderMeta = folders.find(f => f.folderId === folderId);
+    const rootName = folderMeta?.name || folderId;
 
     try {
       const drive = await this.getGoogleDriveClient();
 
-      // Find the file by name in the folder
-      const listResponse = await drive.files.list({
-        q: `'${folderId}' in parents and name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
-        fields: 'files(id, name, mimeType, size, modifiedTime)',
-        pageSize: 1,
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-      });
+      // Find the file by name anywhere in the registered folder's tree (ENG-1624:
+      // not just its direct children).
+      const { folderIds, restricted, rootRestricted, truncated: folderScanTruncated, throttled: folderScanThrottled, transientFailure: folderScanTransient, boundedStop: folderScanBounded, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
+      // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
+      // lets an ambiguous name (same filename in two sub-folders) be detected and
+      // reported instead of one candidate being picked arbitrarily.
+      const { files: filesMap, capped: nameQueryCapped, failed: nameQueryFailed } =
+        await this.queryDriveFilesAcrossFolders(
+          drive,
+          folderIds,
+          `name = '${escapeDriveQueryValue(fileName)}' and trashed = false`,
+          'files(id, name, mimeType, size, modifiedTime, parents, shortcutDetails)',
+          2
+        );
+      const files = Array.from(filesMap.values());
 
-      const files = listResponse.data.files || [];
       if (files.length === 0) {
-        return { success: false, message: `File "${fileName}" not found in Google Drive folder "${folderMeta?.name || folderId}"` };
+        /*
+         * "Searched and absent" versus "could not search" — the whole point of this branch.
+         *
+         * queryDriveFilesAcrossFolders swallows a request failure and reports it as
+         * `failed`/`capped` rather than throwing (throwing would discard rows it had already
+         * merged). Destructuring only `files` therefore turned a timeout or 5xx on the name
+         * query into a confident `File "X" not found in Google Drive folder "Y"` — a definitive
+         * absence claim from a read that errored. Before the helper caught the error the
+         * rejection reached the outer try and said the read failed, which was correct.
+         *
+         * Checked before the folder-scan signals below because it is the stronger fact: the
+         * name query is what would have found the file, so if IT did not complete, nothing here
+         * knows whether the file is there.
+         */
+        /*
+         * `rootRestricted` is checked BEFORE the incomplete-search branch, and the order is the
+         * point.
+         *
+         * Drive answers 403 for a permission denial AND for `userRateLimitExceeded`. The walk
+         * now separates the two (`isDriveThrottle`), so `rootRestricted` means a real access
+         * decision — but an unreadable root still very often makes the name query fail too, so
+         * both flags are set at once. Ranking the search failure first replaced the one remedy the user can act on —
+         * share the folder with the service account — with "retry the read", which cannot work
+         * while the folder stays unshared. Same "remedy that cannot work" shape as ENG-1636.
+         *
+         * The incomplete-search caveat is not lost: it is appended, so the message carries the
+         * actionable cause AND the fact that absence was never confirmed.
+         */
+        /*
+         * A quota answer is not a shape answer, and it outranks everything below.
+         *
+         * A throttled walk sets `truncated`, and the only branch that consumed it said "the
+         * folder tree is large enough that the scan stopped" — so a rate-limited user was told
+         * their folder was too big and invited to narrow a search that would throttle just the
+         * same. Every other branch here describes the folder; this one describes Drive.
+         */
+        if (folderScanThrottled) {
+          return {
+            success: false,
+            message: `File "${fileName}" was not found, but Google Drive rate-limited the scan of `
+              + `folder "${rootName}", so the search did not finish. This is a temporary quota answer, `
+              + `NOT a permissions or size problem — nothing needs to be shared and narrowing will not `
+              + `help. Wait a minute and try again. Do NOT report the file as absent.`,
+          };
+        }
+        if (rootRestricted) {
+          return {
+            success: false,
+            message: `File "${fileName}" not found — the Google Drive folder "${rootName}" itself could not be accessed. Share it with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+              + (nameQueryFailed || nameQueryCapped ? ' The file search did not complete either, so this is not a confirmed absence.' : '')
+          };
+        }
+        if (nameQueryFailed || nameQueryCapped) {
+          return {
+            success: false,
+            message: this.driveNameSearchIncompleteMessage(fileName, rootName, nameQueryFailed)
+          };
+        }
+        if (restricted.length > 0) {
+          const names = restricted.map(r => `"${r.name}"`).join(', ');
+          return {
+            success: false,
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}". Sub-folder(s) ${names} could not be accessed — share them with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+          };
+        }
+        if (folderScanTruncated) {
+          return {
+            success: false,
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder scan did not cover the whole tree, so this is not a confirmed absence. `
+              // Deterministic bound checked FIRST: the causes are not exclusive, and a walk that
+              // hit both will hit the bound again next time, so a retry cannot help.
+              + (folderScanTransient && !folderScanBounded
+                ? `A sub-folder read failed part-way, so retrying may well complete the scan.`
+                : `It stopped at a fixed folder-count or time bound, so a tree this size will stop in the same place every time. Do NOT retry this same call — narrow to a specific sub-folder, or ask the user for a direct Google Drive link.`)
+          };
+        }
+        return { success: false, message: `File "${fileName}" not found in Google Drive folder "${rootName}"` };
       }
 
-      const file = files[0];
-      const isGoogleDoc = file.mimeType === 'application/vnd.google-apps.document' || file.mimeType === 'application/vnd.google-apps.spreadsheet';
+      if (files.length > 1) {
+        // A Drive file can have more than one parent — index [0] may be a
+        // folder outside the tree that was actually searched, which would
+        // point someone at the wrong place. Prefer whichever parent is
+        // actually in `folderIds`; only fall back to [0] when none of the
+        // file's parents resolve within the searched tree (shouldn't happen
+        // in practice, since the file matched a query scoped to folderIds).
+        const folderIdSet = new Set(folderIds);
+        const candidates = files.map(f => {
+          const parentId = (f.parents || []).find((p: string) => folderIdSet.has(p)) ?? (f.parents || [])[0];
+          const location = parentId === folderId ? rootName : (folderNames.get(parentId) || parentId || 'an unresolved sub-folder');
+          return `"${f.name}" in "${location}"`;
+        }).join(', ');
+        return {
+          success: false,
+          message: `Multiple files named "${fileName}" found in Google Drive folder "${rootName}": ${candidates}. Use a more specific file name, or move the duplicates so names are unique.`
+        };
+      }
+
+      const matchedFile = files[0];
+      let file = matchedFile;
+      if (matchedFile.mimeType === 'application/vnd.google-apps.shortcut') {
+        const targetId = matchedFile.shortcutDetails?.targetId;
+        if (!targetId) {
+          throw new Error(`Google Drive shortcut "${fileName}" has no target`);
+        }
+        const targetMeta = await drive.files.get({
+          fileId: targetId,
+          fields: 'id,name,mimeType,size,modifiedTime',
+          supportsAllDrives: true,
+        });
+        file = targetMeta.data;
+      }
+
+      const isGoogleDoc =
+        file.mimeType === 'application/vnd.google-apps.document' ||
+        file.mimeType === 'application/vnd.google-apps.spreadsheet' ||
+        file.mimeType === 'application/vnd.google-apps.presentation';
       const [contentStr, commentsStr] = await Promise.all([
         this.readGoogleDriveFileContent(drive, file.id!, file.name || fileName, file.mimeType || ''),
         isGoogleDoc ? this.fetchDriveFileComments(drive, file.id!) : Promise.resolve(''),
@@ -22426,9 +27931,233 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error) {
       console.error('AgentMode: Error reading Google Drive file:', error);
+      // ENG-1300: carry the real numeric HTTP status through so a clean
+      // 401/403/404 classifies as auth/not_found instead of the generic
+      // Error/bug fallback once toolResultError rebuilds an Error from the
+      // message alone.
+      const code = (error as any)?.code || (error as any)?.status;
       return {
         success: false,
-        message: `Failed to read Google Drive file "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to read Google Drive file "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+        code,
+      };
+    }
+  }
+
+  // Maximum bytes materialize_knowledge_base_asset will download/upload for one file.
+  private static readonly MATERIALIZE_ASSET_MAX_BYTES = 200 * 1024 * 1024;
+
+  /**
+   * Turn an image/video file from a connected Google Drive knowledge base
+   * folder into a real, hosted S3 asset with a usable URL.
+   *
+   * readGoogleDriveSharedFile / readGoogleDriveFileContent are text-oriented:
+   * a binary file falls through to `content.toString('base64')` inside a
+   * knowledge-base tool response capped at 1,000,000 characters, which
+   * silently truncates (and corrupts) anything but a tiny file, and nothing
+   * downstream consumes that base64 blob anyway (ad-creative tools need a
+   * real image_url/image_hash/video_id). This bypasses that path entirely:
+   * download raw bytes -> upload to S3 -> return a URL other tools can use
+   * directly, mirroring the existing removeC2PAFromImage upload pattern.
+   */
+  public async materializeKnowledgeBaseAsset(
+    kbIdentifier: string,
+    fileName: string,
+    userId: string
+  ): Promise<any> {
+    if (!kbIdentifier || !fileName) {
+      return { success: false, message: 'kb_identifier and file_name are required' };
+    }
+
+    if (!kbIdentifier.startsWith('gdrive:')) {
+      return {
+        success: false,
+        message: 'materialize_knowledge_base_asset currently only supports Google Drive knowledge base sources (kb_identifier starting with "gdrive:")'
+      };
+    }
+
+    const folderId = kbIdentifier.replace('gdrive:', '');
+    const folders = await this.getUserGoogleDriveFolders(userId);
+    if (!folders.some(f => f.folderId === folderId)) {
+      return { success: false, message: 'Not authorized to access this Google Drive folder' };
+    }
+    const rootName = folders.find(f => f.folderId === folderId)?.name || folderId;
+
+    try {
+      const drive = await this.getGoogleDriveClient();
+
+      // Search the whole folder tree rooted at the registered folder (ENG-1624),
+      // not just its direct children.
+      const { folderIds, restricted, rootRestricted, truncated, throttled: folderScanThrottled, transientFailure: folderScanTransient, boundedStop: folderScanBounded, folderNames } = await this.getGoogleDriveFolderTreeIds(drive, folderId);
+      // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
+      // lets an ambiguous name (same filename in two sub-folders) be detected and
+      // reported instead of one candidate being materialized arbitrarily.
+      const { files: filesMap, capped: nameQueryCapped, failed: nameQueryFailed } =
+        await this.queryDriveFilesAcrossFolders(
+          drive,
+          folderIds,
+          `name = '${escapeDriveQueryValue(fileName)}' and trashed = false`,
+          'files(id, name, mimeType, size, parents)',
+          2
+        );
+      const files = Array.from(filesMap.values());
+
+      if (files.length === 0) {
+        // Same distinction readGoogleDriveSharedFile draws, for the same reason: the helper
+        // reports a failed request as `failed`/`capped` instead of throwing, so ignoring both
+        // flags turned an errored search into a definitive "not found". Shared wording too, so
+        // the transient/deterministic split cannot drift between the two call sites.
+        /*
+         * `rootRestricted` is checked BEFORE the incomplete-search branch, and the order is the
+         * point.
+         *
+         * Drive answers 403 for a permission denial AND for `userRateLimitExceeded`. The walk
+         * now separates the two (`isDriveThrottle`), so `rootRestricted` means a real access
+         * decision — but an unreadable root still very often makes the name query fail too, so
+         * both flags are set at once. Ranking the search failure first replaced the one remedy the user can act on —
+         * share the folder with the service account — with "retry the read", which cannot work
+         * while the folder stays unshared. Same "remedy that cannot work" shape as ENG-1636.
+         *
+         * The incomplete-search caveat is not lost: it is appended, so the message carries the
+         * actionable cause AND the fact that absence was never confirmed.
+         */
+        /*
+         * A quota answer is not a shape answer, and it outranks everything below.
+         *
+         * A throttled walk sets `truncated`, and the only branch that consumed it said "the
+         * folder tree is large enough that the scan stopped" — so a rate-limited user was told
+         * their folder was too big and invited to narrow a search that would throttle just the
+         * same. Every other branch here describes the folder; this one describes Drive.
+         */
+        if (folderScanThrottled) {
+          return {
+            success: false,
+            message: `File "${fileName}" was not found, but Google Drive rate-limited the scan of `
+              + `folder "${rootName}", so the search did not finish. This is a temporary quota answer, `
+              + `NOT a permissions or size problem — nothing needs to be shared and narrowing will not `
+              + `help. Wait a minute and try again. Do NOT report the file as absent.`,
+          };
+        }
+        if (rootRestricted) {
+          return {
+            success: false,
+            message: `File "${fileName}" not found — the Google Drive folder "${rootName}" itself could not be accessed. Share it with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+              + (nameQueryFailed || nameQueryCapped ? ' The file search did not complete either, so this is not a confirmed absence.' : '')
+          };
+        }
+        if (nameQueryFailed || nameQueryCapped) {
+          return {
+            success: false,
+            message: this.driveNameSearchIncompleteMessage(fileName, rootName, nameQueryFailed)
+          };
+        }
+        if (restricted.length > 0) {
+          const names = restricted.map(r => `"${r.name}"`).join(', ');
+          return {
+            success: false,
+            message: `File "${fileName}" not found in Google Drive folder. Sub-folder(s) ${names} could not be accessed — share them with ${this.getGoogleDriveServiceAccountEmail()} to allow access.`
+          };
+        }
+        if (truncated) {
+          return {
+            success: false,
+            message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder scan did not cover the whole tree, so this is not a confirmed absence. `
+              // Deterministic bound checked FIRST: the causes are not exclusive, and a walk that
+              // hit both will hit the bound again next time, so a retry cannot help.
+              + (folderScanTransient && !folderScanBounded
+                ? `A sub-folder read failed part-way, so retrying may well complete the scan.`
+                : `It stopped at a fixed folder-count or time bound, so a tree this size will stop in the same place every time. Do NOT retry this same call — narrow to a specific sub-folder, or ask the user for a direct Google Drive link.`)
+          };
+        }
+        return { success: false, message: `File "${fileName}" not found in Google Drive folder` };
+      }
+
+      if (files.length > 1) {
+        // A Drive file can have more than one parent — index [0] may be a
+        // folder outside the tree that was actually searched, which would
+        // point someone at the wrong place. Prefer whichever parent is
+        // actually in `folderIds`; only fall back to [0] when none of the
+        // file's parents resolve within the searched tree (shouldn't happen
+        // in practice, since the file matched a query scoped to folderIds).
+        const folderIdSet = new Set(folderIds);
+        const candidates = files.map(f => {
+          const parentId = (f.parents || []).find((p: string) => folderIdSet.has(p)) ?? (f.parents || [])[0];
+          const location = parentId === folderId ? rootName : (folderNames.get(parentId) || parentId || 'an unresolved sub-folder');
+          return `"${f.name}" in "${location}"`;
+        }).join(', ');
+        return {
+          success: false,
+          message: `Multiple files named "${fileName}" found in Google Drive folder "${rootName}": ${candidates}. Use a more specific file name, or move the duplicates so names are unique.`
+        };
+      }
+
+      const file = files[0];
+      const mimeType = file.mimeType || '';
+      if (!mimeType.startsWith('image/') && !mimeType.startsWith('video/')) {
+        return {
+          success: false,
+          message: `"${fileName}" is a ${mimeType || 'unknown type'} file. materialize_knowledge_base_asset only handles images/videos — use read_knowledge_base_files for text/document content.`
+        };
+      }
+
+      const size = file.size ? parseInt(file.size, 10) : 0;
+      if (size > AgentModeService.MATERIALIZE_ASSET_MAX_BYTES) {
+        return {
+          success: false,
+          message: `"${fileName}" is ${Math.round(size / (1024 * 1024))}MB, over the ${AgentModeService.MATERIALIZE_ASSET_MAX_BYTES / (1024 * 1024)}MB limit for asset materialization`
+        };
+      }
+
+      const mediaResponse = await drive.files.get(
+        { fileId: file.id!, alt: 'media', supportsAllDrives: true },
+        { responseType: 'arraybuffer' }
+      );
+      const buffer = Buffer.from(mediaResponse.data as any);
+
+      // Drive's reported `size` can be missing/stale (e.g. 0 during virus-scan) —
+      // re-check the actual downloaded bytes so an oversized file can't slip
+      // through on bad metadata and get uploaded/reported with a wrong size.
+      if (buffer.length > AgentModeService.MATERIALIZE_ASSET_MAX_BYTES) {
+        return {
+          success: false,
+          message: `"${fileName}" is ${Math.round(buffer.length / (1024 * 1024))}MB, over the ${AgentModeService.MATERIALIZE_ASSET_MAX_BYTES / (1024 * 1024)}MB limit for asset materialization`
+        };
+      }
+
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const uploadResult = await uploadFileToS3(buffer, file.name || fileName, userId, mimeType);
+
+      if (!uploadResult.success || !uploadResult.url) {
+        return {
+          success: false,
+          message: uploadResult.error || 'Failed to upload asset to S3',
+          error: uploadResult.error || 's3_upload_failed'
+        };
+      }
+
+      return {
+        success: true,
+        message: `Materialized "${fileName}" from Google Drive as a hosted asset.`,
+        url: uploadResult.url,
+        file_name: file.name || fileName,
+        mime_type: mimeType,
+        size,
+        kb_identifier: kbIdentifier
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error materializing knowledge base asset:', error);
+      const code = AgentModeService.driveErrorCode(error);
+      if (code === 404) {
+        return { success: false, message: `File "${fileName}" not found or not accessible` };
+      }
+      const throttled = AgentModeService.driveThrottleRefusal(error);
+      if (throttled) return throttled;
+      if (code === 403 || code === 401) {
+        return { success: false, message: 'Access denied reading this Google Drive file' };
+      }
+      return {
+        success: false,
+        message: `Failed to materialize "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
       };
     }
   }
@@ -22478,9 +28207,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error) {
       console.error('AgentMode: Error reading ClickUp doc:', error);
+      // ENG-1300: carry the real numeric HTTP status through so a clean
+      // 401/403/404 classifies as auth/not_found instead of the generic
+      // Error/bug fallback once toolResultError rebuilds an Error from the
+      // message alone.
+      const code = (error as any)?.response?.status || (error as any)?.code;
       return {
         success: false,
-        message: `Failed to read ClickUp document "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to read ClickUp document "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+        code,
       };
     }
   }
@@ -22530,9 +28265,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error) {
       console.error('AgentMode: Error reading ClickUp task:', error);
+      // ENG-1300: carry the real numeric HTTP status through — see readClickUpSharedDoc above.
+      const code = (error as any)?.response?.status || (error as any)?.code;
       return {
         success: false,
-        message: `Failed to read ClickUp task "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to read ClickUp task "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+        code,
       };
     }
   }
@@ -22544,7 +28282,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     content: string,
     userId: string,
     parentDocId?: string
-  ): Promise<{ success: boolean; message: string; docId?: string }> {
+  ): Promise<{ success: boolean; message: string; docId?: string; code?: number }> {
     try {
       const clickUpToken = await getClickUpAccessToken(userId);
       if (!clickUpToken) {
@@ -22605,9 +28343,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         errorMessage = `${clickUpError.err}${clickUpError.ECODE ? ` (ClickUp code: ${clickUpError.ECODE})` : ''}`;
       }
 
+      // ENG-1300: carry the real numeric HTTP status through — see readClickUpSharedDoc
+      // above. Deliberately NOT the ECODE extracted above, which is ClickUp's own
+      // business code (e.g. "OAUTH_019"), not an HTTP status.
+      const code = error?.response?.status;
+
       return {
         success: false,
-        message: `Failed to create ClickUp document "${name}": ${errorMessage}`
+        message: `Failed to create ClickUp document "${name}": ${errorMessage}`,
+        code,
       };
     }
   }
@@ -22661,18 +28405,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           const saDrive = await this.getGoogleDriveClient();
           return await readWithDrive(saDrive);
         } catch (saErr: any) {
-          const is404 = saErr?.code === 404 || saErr?.status === 404;
+          // ENG-1300: carry the real numeric HTTP status through so a clean
+          // 401/403/404 classifies as auth/not_found instead of the generic
+          // Error/bug fallback once toolResultError rebuilds an Error from the
+          // message alone.
+          const code = saErr?.code || saErr?.status;
+          const is404 = code === 404;
           const msg = is404
             ? `File not found or not accessible. Share the file with the service account, or connect Google Drive in Settings for files you own.`
             : `Failed to read file: ${saErr instanceof Error ? saErr.message : 'Unknown error'}`;
-          return { success: false, message: msg };
+          return { success: false, message: msg, code };
         }
       }
-      const is404 = oauthErr?.code === 404 || oauthErr?.status === 404;
+      const code = oauthErr?.code || oauthErr?.status;
+      const is404 = code === 404;
       const msg = is404
         ? `File not found or you don't have access (fileId: ${fileId}).`
         : `Failed to read file: ${oauthErr instanceof Error ? oauthErr.message : 'Unknown error'}`;
-      return { success: false, message: msg };
+      return { success: false, message: msg, code };
     }
   }
 
@@ -22753,14 +28503,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         files: formatted,
       };
     } catch (err: any) {
-      const code = err?.code || err?.status;
+      /*
+       * ENG-1300 (from main) wanted `code` carried onto the result so a clean 401/403/404
+       * classifies as auth/not_found rather than the generic fallback — the `, code }`
+       * returns below are its half of that change and are kept.
+       *
+       * `driveErrorCode` rather than `err?.code || err?.status`: gaxios can surface the
+       * status as a STRING, and every comparison below is strict, so '403' matched no
+       * branch and fell through to the generic message — losing the very classification
+       * ENG-1300 was adding. Same binding, normalised once.
+       */
+      const code = AgentModeService.driveErrorCode(err);
+      const throttled = AgentModeService.driveThrottleRefusal(err);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Google Drive access denied. Your Google Drive connection may have expired — reconnect in Settings → Connected Accounts.' };
+        return { success: false, message: 'Google Drive access denied. Your Google Drive connection may have expired — reconnect in Settings → Connected Accounts.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Folder not found. Check the URL or ID and try again.' };
+        return { success: false, message: 'Folder not found. Check the URL or ID and try again.', code };
       }
-      return { success: false, message: err?.message || 'Failed to list folder contents' };
+      return { success: false, message: err?.message || 'Failed to list folder contents', code };
     }
   }
 
@@ -22780,14 +28542,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       return { success: true, folder_id: folderId, folder_url: folderUrl, name: resp.data.name };
     } catch (err: any) {
-      const code = err?.code || err?.status;
+      /*
+       * ENG-1300 (from main) wanted `code` carried onto the result so a clean 401/403/404
+       * classifies as auth/not_found rather than the generic fallback — the `, code }`
+       * returns below are its half of that change and are kept.
+       *
+       * `driveErrorCode` rather than `err?.code || err?.status`: gaxios can surface the
+       * status as a STRING, and every comparison below is strict, so '403' matched no
+       * branch and fell through to the generic message — losing the very classification
+       * ENG-1300 was adding. Same binding, normalised once.
+       */
+      const code = AgentModeService.driveErrorCode(err);
+      const throttled = AgentModeService.driveThrottleRefusal(err);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot create folder in that location — Emma does not have access to the specified parent folder.' };
+        return { success: false, message: 'Cannot create folder in that location — Emma does not have access to the specified parent folder.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Parent folder not found. Check the folder ID and try again.' };
+        return { success: false, message: 'Parent folder not found. Check the folder ID and try again.', code };
       }
-      return { success: false, message: err?.message || 'Failed to create Google Drive folder' };
+      return { success: false, message: err?.message || 'Failed to create Google Drive folder', code };
     }
   }
 
@@ -22798,7 +28572,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const auth = await this.getGoogleDriveOAuthClient(userId);
       const drive = google.drive({ version: 'v3', auth });
 
-      const namePart = `name contains '${query.replace(/'/g, "\\'")}'`;
+      const namePart = `name contains '${escapeDriveQueryValue(query)}'`;
       const typePart = type === 'folder'
         ? ` and mimeType = 'application/vnd.google-apps.folder'`
         : type === 'file'
@@ -22808,7 +28582,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       const resp = await drive.files.list({
         q,
-        fields: 'files(id,name,mimeType,webViewLink,parents)',
+        // `nextPageToken` is requested so this read can tell a complete result from a capped
+        // one. Without it the 20-row cap below was invisible and unknowable.
+        fields: 'nextPageToken, files(id,name,mimeType,webViewLink,parents)',
         orderBy: 'modifiedTime desc',
         pageSize: 20,
         supportsAllDrives: true,
@@ -22816,8 +28592,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       const files = resp.data.files || [];
+      /*
+       * ENG-1584, same sentence, different edge.
+       *
+       * `Found ${n} item(s) matching "x"` off a hard `pageSize: 20` with no `nextPageToken`
+       * requested reads as "these are all the matches" and means "these are the first 20". A
+       * model that searches for a file, sees it missing, and reports it absent is the exact
+       * failure that told a customer a protected ad did not exist. The sibling
+       * `listGoogleDriveFolder` already reports `hasMore`; this read did not.
+       *
+       * Deliberately NOT drained into full pagination: a name-substring search is an
+       * interactive lookup, not an inventory, and 20 newest-first matches is the right size.
+       * The bound is fine — going UNANNOUNCED was the defect.
+       */
+      const hasMore = !!resp.data.nextPageToken;
       if (files.length === 0) {
-        return { success: true, message: `No items found matching "${query}".`, results: [] };
+        return {
+          success: true,
+          complete: !hasMore,
+          message: hasMore
+            ? `No items found in the first page of matches for "${query}", but MORE PAGES EXIST — this is not evidence that nothing matches. Narrow the query and search again.`
+            : `No items found matching "${query}" (complete search).`,
+          results: [],
+        };
       }
 
       const results = files.map(f => ({
@@ -22828,13 +28625,36 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         parent_folder_ids: f.parents,
       }));
 
-      return { success: true, message: `Found ${results.length} item(s) matching "${query}".`, results };
+      // Completeness ahead of the payload — anything after `results` can fall outside the
+      // sealed prefix the model reads once this result is offloaded.
+      return {
+        success: true,
+        complete: !hasMore,
+        ...(hasMore && { hasMore: true }),
+        totalCount: results.length,
+        message: hasMore
+          ? `Found ${results.length} item(s) matching "${query}", but THIS LIST IS INCOMPLETE — Drive had more matches and the search stopped at its 20-item bound. Do NOT conclude a file is absent from Drive because it is not here. Narrow the query and search again.`
+          : `Found ${results.length} item(s) matching "${query}" (complete list).`,
+        results,
+      };
     } catch (err: any) {
-      const code = err?.code || err?.status;
+      /*
+       * ENG-1300 (from main) wanted `code` carried onto the result so a clean 401/403/404
+       * classifies as auth/not_found rather than the generic fallback — the `, code }`
+       * returns below are its half of that change and are kept.
+       *
+       * `driveErrorCode` rather than `err?.code || err?.status`: gaxios can surface the
+       * status as a STRING, and every comparison below is strict, so '403' matched no
+       * branch and fell through to the generic message — losing the very classification
+       * ENG-1300 was adding. Same binding, normalised once.
+       */
+      const code = AgentModeService.driveErrorCode(err);
+      const throttled = AgentModeService.driveThrottleRefusal(err);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Google Drive access denied. Ensure Drive is connected in Settings → Connected Accounts.' };
+        return { success: false, message: 'Google Drive access denied. Ensure Drive is connected in Settings → Connected Accounts.', code };
       }
-      return { success: false, message: err?.message || 'Failed to search Google Drive' };
+      return { success: false, message: err?.message || 'Failed to search Google Drive', code };
     }
   }
 
@@ -22849,7 +28669,121 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   };
 
   private static escapeHtml(s: string): string {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  /**
+   * Decodes the 5 entities `escapeHtml` produces, back to their plain characters. Order
+   * matters: `&amp;` must be decoded LAST, since decoding it first would turn a literal
+   * `&amp;lt;` (an already-escaped `&lt;` that was itself escaped again) into `&lt;`,
+   * silently re-introducing a markup-meaningful character into a plain-text field.
+   */
+  private static unescapeHtml(s: string): string {
+    return s
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, '&');
+  }
+
+  /**
+   * Escapes every string leaf of an arbitrarily-nested value while preserving its
+   * structure — unlike `String(value)`, which collapses an object/array to
+   * "[object Object]" and turns `null`/`undefined` into the literal text "null"/
+   * "undefined". Needed because caller-supplied template variable values are not
+   * contractually flat strings (existing callers pass array-of-object items), and
+   * this feeds `JSON.stringify` afterward, which already renders `null`/numbers/
+   * booleans correctly on its own — only string leaves need escaping.
+   */
+  private static deepEscapeHtmlValues(value: any): any {
+    if (typeof value === 'string') return AgentModeService.escapeHtml(value);
+    if (Array.isArray(value)) return value.map((v) => AgentModeService.deepEscapeHtmlValues(v));
+    if (value !== null && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.entries(value).map(([k, v]) => [k, AgentModeService.deepEscapeHtmlValues(v)])
+      );
+    }
+    return value;
+  }
+
+  /** Escapes every regex metacharacter so a value can be used as a literal match. */
+  private static escapeRegExp(s: string): string {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  /**
+   * Collects every string leaf (however deeply nested) that contains a raw `<` or `>`,
+   * mapped to its escaped form — so the LLM's OUTPUT can be corrected if it decoded
+   * either back to raw HTML. Escaping the PROMPT proves nothing about the RESPONSE:
+   * substitution is LLM-driven, not a deterministic string-replace, so nothing
+   * guarantees the model reproduces an escaped entity as-is rather than "cleaning up"
+   * what looks like a stray HTML entity mid-generation.
+   *
+   * Deliberately narrower than the 5-character escape set (& < > " ') applied on the way
+   * IN: `<`/`>` can construct a genuinely new element regardless of surrounding markup,
+   * so a raw one resurfacing is unambiguously dangerous. `&`, `"`, and `'` alone cannot —
+   * they only matter for breaking out of an ALREADY-quoted attribute using that exact
+   * quote character, a narrower, template-structure-dependent risk the live template
+   * doesn't even have today (text-node placeholders only). Including them here caused a
+   * real false-positive class: an ordinary apostrophe in a real name ("O'Brien's Q3")
+   * could trip this check if that short substring coincidentally reappeared anywhere
+   * else in the output, failing a legitimate report for no real security benefit.
+   */
+  private static collectRawToEscapedMap(value: any, out: Map<string, string>): void {
+    if (typeof value === 'string') {
+      if (/[<>]/.test(value)) out.set(value, AgentModeService.escapeHtml(value));
+    } else if (Array.isArray(value)) {
+      value.forEach((v) => AgentModeService.collectRawToEscapedMap(v, out));
+    } else if (value !== null && typeof value === 'object') {
+      Object.values(value).forEach((v) => AgentModeService.collectRawToEscapedMap(v, out));
+    }
+  }
+
+  /**
+   * ENG-1960: detect probable rich-text markup in template VARIABLE VALUES without
+   * rewriting customer data. The upstream tool description asks the model to provide
+   * plain text, but prompt-only enforcement can regress silently.
+   *
+   * This deliberately requires real markup structure: an HTML tag, fenced code,
+   * Markdown heading/list, bold pair, or link. A lone "*" in a name/value is not
+   * enough. Only paths are reported; raw values can contain customer/CRM data and
+   * must not be copied into logs.
+   */
+  private static collectTemplateValueMarkup(
+    value: any,
+    path: string,
+    stats: { count: number; paths: string[] },
+    nested = false,
+  ): void {
+    if (typeof value === 'string') {
+      const looksLikeMarkup =
+        /<\/?[a-z][^>]*>/i.test(value) ||
+        /(^|\n)\s{0,3}(?:#{1,6}\s+|[-+*]\s+|\d+[.)]\s+|>\s+)/m.test(value) ||
+        /```/.test(value) ||
+        /`[^`\n]+`/.test(value) ||
+        /\*\*[^*\n]+\*\*/.test(value) ||
+        /__[^_\n]+__/.test(value) ||
+        /(^|[^*])\*[^*\n]+\*(?!\*)/.test(value) ||
+        /(^|[\s([{>"'])_[^_\n]+_(?=$|[\s)\]}.!,?:;"'])/.test(value) ||
+        /\[[^\]\n]+\]\([^)\n]+\)/.test(value);
+      if (looksLikeMarkup) {
+        stats.count += 1;
+        if (stats.paths.length < 20) stats.paths.push(path);
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item, index) =>
+        AgentModeService.collectTemplateValueMarkup(item, `${path}[${index}]`, stats, nested)
+      );
+      return;
+    }
+    if (value !== null && typeof value === 'object') {
+      Object.values(value).forEach((item) =>
+        AgentModeService.collectTemplateValueMarkup(item, `${path}.<field>`, stats, true)
+      );
+    }
   }
 
   /** Convert inline markdown to HTML string. */
@@ -23569,14 +29503,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       console.error('AgentMode: Error creating Google Doc:', error);
-      const code = error?.code || error?.status;
+      /*
+       * ENG-1300 (from main) wanted `code` carried onto the result so a clean 401/403/404
+       * classifies as auth/not_found rather than the generic fallback — the `, code }`
+       * returns below are its half of that change and are kept.
+       *
+       * `driveErrorCode` rather than `err?.code || err?.status`: gaxios can surface the
+       * status as a STRING, and every comparison below is strict, so '403' matched no
+       * branch and fell through to the generic message — losing the very classification
+       * ENG-1300 was adding. Same binding, normalised once.
+       */
+      const code = AgentModeService.driveErrorCode(error);
+      const throttled = AgentModeService.driveThrottleRefusal(error);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot create Doc in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.' };
+        return { success: false, message: 'Cannot create Doc in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.' };
+        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.', code };
       }
-      return { success: false, message: `Failed to create Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      return { success: false, message: `Failed to create Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
     }
   }
 
@@ -23604,14 +29550,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       console.error('AgentMode: Error updating Google Doc:', error);
-      const code = error?.code || error?.status;
+      /*
+       * ENG-1300 (from main) wanted `code` carried onto the result so a clean 401/403/404
+       * classifies as auth/not_found rather than the generic fallback — the `, code }`
+       * returns below are its half of that change and are kept.
+       *
+       * `driveErrorCode` rather than `err?.code || err?.status`: gaxios can surface the
+       * status as a STRING, and every comparison below is strict, so '403' matched no
+       * branch and fell through to the generic message — losing the very classification
+       * ENG-1300 was adding. Same binding, normalised once.
+       */
+      const code = AgentModeService.driveErrorCode(error);
+      const throttled = AgentModeService.driveThrottleRefusal(error);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot update this Google Doc — you may not have edit access to it, or it may have been deleted.' };
+        return { success: false, message: 'Cannot update this Google Doc — you may not have edit access to it, or it may have been deleted.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Google Doc not found. Check the URL or ID and try again.' };
+        return { success: false, message: 'Google Doc not found. Check the URL or ID and try again.', code };
       }
-      return { success: false, message: `Failed to update Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      return { success: false, message: `Failed to update Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
     }
   }
 
@@ -23670,14 +29628,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         try { await drive.files.delete({ fileId: sheetId }); } catch {}
       }
       console.error('AgentMode: Error creating Google Sheet:', error);
-      const code = error?.code || error?.status;
+      /*
+       * ENG-1300 (from main) wanted `code` carried onto the result so a clean 401/403/404
+       * classifies as auth/not_found rather than the generic fallback — the `, code }`
+       * returns below are its half of that change and are kept.
+       *
+       * `driveErrorCode` rather than `err?.code || err?.status`: gaxios can surface the
+       * status as a STRING, and every comparison below is strict, so '403' matched no
+       * branch and fell through to the generic message — losing the very classification
+       * ENG-1300 was adding. Same binding, normalised once.
+       */
+      const code = AgentModeService.driveErrorCode(error);
+      const throttled = AgentModeService.driveThrottleRefusal(error);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot create Sheet in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.' };
+        return { success: false, message: 'Cannot create Sheet in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.' };
+        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.', code };
       }
-      return { success: false, message: `Failed to create Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      return { success: false, message: `Failed to create Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
     }
   }
 
@@ -23706,14 +29676,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       console.error('AgentMode: Error updating Google Sheet:', error);
-      const code = error?.code || error?.status;
+      /*
+       * ENG-1300 (from main) wanted `code` carried onto the result so a clean 401/403/404
+       * classifies as auth/not_found rather than the generic fallback — the `, code }`
+       * returns below are its half of that change and are kept.
+       *
+       * `driveErrorCode` rather than `err?.code || err?.status`: gaxios can surface the
+       * status as a STRING, and every comparison below is strict, so '403' matched no
+       * branch and fell through to the generic message — losing the very classification
+       * ENG-1300 was adding. Same binding, normalised once.
+       */
+      const code = AgentModeService.driveErrorCode(error);
+      const throttled = AgentModeService.driveThrottleRefusal(error);
+      if (throttled) return throttled;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot update this Google Sheet — it was not created by Emma. Emma can only edit Sheets she created.' };
+        return { success: false, message: 'Cannot update this Google Sheet — it was not created by Emma. Emma can only edit Sheets she created.', code };
       }
       if (code === 404) {
-        return { success: false, message: 'Google Sheet not found. Check the URL or ID and try again.' };
+        return { success: false, message: 'Google Sheet not found. Check the URL or ID and try again.', code };
       }
-      return { success: false, message: `Failed to update Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      return { success: false, message: `Failed to update Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}`, code };
     }
   }
 
@@ -23769,7 +29751,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       console.error('AgentMode: Error reading Foreplay ad:', error);
       return {
         success: false,
-        message: `Failed to read Foreplay ad "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to read Foreplay ad "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+        code: (error as any)?.response?.status
       };
     }
   }
@@ -23779,7 +29762,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     query: string,
     maxResults: number = 10,
     freshness?: string,
-    includeDomains?: string[]
+    includeDomains?: string[],
+    userId?: string,
+    purpose: SearchPurpose = 'agent_research',
   ): Promise<any> {
     return this.searchWithYou({
       toolName: 'you_search_web',
@@ -23788,20 +29773,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       resultSource: 'web',
       freshness,
       includeDomains,
+      userId,
+      purpose,
     });
   }
 
-  public async youSearchNews(query: string, maxResults: number = 10, freshness?: string): Promise<any> {
+  public async youSearchNews(query: string, maxResults: number = 10, freshness?: string, userId?: string): Promise<any> {
     return this.searchWithYou({
       toolName: 'you_search_news',
       query,
       maxResults,
       resultSource: 'news',
       freshness: freshness || inferSearchFreshness(query) || 'week',
+      userId,
+      purpose: 'news',
     });
   }
 
-  public async googleSearchWeb(query: string, maxResults: number = 10): Promise<any> {
+  public async googleSearchWeb(query: string, maxResults: number = 10, userId?: string, purpose: SearchPurpose = 'agent_research'): Promise<any> {
     const toolName = 'google_search_web';
     const resultSource: SearchResultSource = 'web';
     try {
@@ -23810,6 +29799,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const searchResponse = await this.performGoogleSearch({
         query,
         maxResults: limitedMaxResults,
+        userId,
+        purpose,
       });
       const normalizedResults = searchResponse.results || [];
       const formattedContent = this.formatWebSearchResults({
@@ -23839,6 +29830,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         toolName,
         resultSource,
         error: error instanceof Error ? error.message : 'Unknown error',
+        // ENG-1300: googleapis' customsearch client throws a GaxiosError, whose
+        // .status/.code are genuinely the numeric HTTP status (unlike Meta's
+        // business-code .code) — same convention already established for
+        // Drive/Calendar. .status checked first since GaxiosError's own docs
+        // treat it as canonical; .code and .response?.status are fallbacks
+        // for other error shapes that can reach this catch.
+        code: (error as any)?.status ?? (error as any)?.code ?? (error as any)?.response?.status,
       };
     }
   }
@@ -23850,6 +29848,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     resultSource: SearchResultSource;
     freshness?: string;
     includeDomains?: string[];
+    userId?: string;
+    purpose: SearchPurpose;
   }): Promise<any> {
     const { toolName, query, maxResults, resultSource } = params;
     try {
@@ -23871,6 +29871,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             resultSource,
             freshness: params.freshness,
             includeDomains: params.includeDomains,
+            userId: params.userId,
+            purpose: params.purpose,
           });
           break;
         } catch (error) {
@@ -24145,6 +30147,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     resultSource?: SearchResultSource;
     freshness?: string;
     includeDomains?: string[];
+    userId?: string;
+    purpose?: SearchPurpose;
   }) {
     const freshness = params.freshness || inferSearchFreshness(params.query);
     const provider = new YouSearchProvider();
@@ -24153,7 +30157,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       count: params.maxResults,
       freshness,
       resultSource: params.resultSource || 'all',
-      purpose: params.resultSource === 'news' ? 'news' : 'agent_research',
+      purpose: params.purpose || (params.resultSource === 'news' ? 'news' : 'agent_research'),
+      userId: params.userId,
       ...(params.includeDomains?.length ? { includeDomains: params.includeDomains } : {}),
     });
 
@@ -24170,13 +30175,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async performGoogleSearch(params: {
     query: string;
     maxResults: number;
+    userId?: string;
+    purpose?: SearchPurpose;
   }) {
     const provider = new GoogleSearchProvider();
     const response = await provider.search({
       query: params.query,
       count: params.maxResults,
       resultSource: 'web',
-      purpose: 'agent_research',
+      purpose: params.purpose || 'agent_research',
+      userId: params.userId,
     });
 
     console.log(`Google Custom Search returned ${response.results.length} web results for query: "${params.query}"`);
@@ -24973,6 +30981,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         throw new Error('source_url must be an HTTP or HTTPS URL');
       }
 
+      // SSRF guard: convert_to_pdf is a foundation tool reachable by every
+      // session by default, and renderHtmlToPdf navigates a real browser to
+      // sourceUrl server-side. Without this, a user could point it at an
+      // internal address (e.g. the cloud metadata endpoint) and get the
+      // response rendered back to them as a downloadable PDF. renderHtmlToPdf
+      // also re-validates on every navigation request (including redirect
+      // hops), so this call fails fast for the common case without spinning
+      // up a browser first.
+      await assertPublicHostname(sourceUrl);
+
       // Shared render path: orientation is auto-detected (16:9 decks print
       // landscape) unless the caller forces it, and wide content is scaled to
       // fit so the right side is never clipped.
@@ -25245,10 +31263,35 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         errorMessage = 'Request timeout while fetching file';
       }
 
+      // ENG-1162: a 401/403 from this plain external-URL fetch (not S3, not an
+      // AgentWeb-connected account) means the PUBLISHER refused the request —
+      // bot-blocking, a WAF, or a paywall — not an AgentWeb auth/permission
+      // problem. Left as a bare "HTTP 403: Forbidden", classifyToolErrorClass's
+      // embedded-status regex sweeps this into the generic 'auth' class, whose
+      // model-visible guidance says to have the user "reconnect the account" —
+      // nonsensical for an anonymous read, and it gave no signal that a failed
+      // read is NOT evidence the content doesn't exist (the run silently
+      // degraded to search instead of reporting the source as unverified).
+      // Named here so classifyToolErrorClass can match the marker and route to
+      // 'publisher_refused' instead.
+      //
+      // This rewrite is local to THIS call site, not a systemic guard — the
+      // classifier can only recognize the marker text below, not "this was an
+      // anonymous unauthenticated fetch" in the abstract. Any other tool that
+      // anonymously fetches an arbitrary external URL (not S3, not a connected
+      // account) and forwards a bare `HTTP ${status}: ...`-shaped message on a
+      // 401/403 will fall right back into classifyToolErrorClass's generic
+      // embedded-status regex and get the wrong 'auth'/"reconnect the account"
+      // guidance. Apply the same isAxiosError-gated rewrite there too.
+      const isPublisherRefusal = error.isAxiosError && (statusCode === 401 || statusCode === 403);
+      if (isPublisherRefusal) {
+        errorMessage = `The publisher refused this fetch (${errorMessage}) — this is a site-side access block (bot filtering, WAF, or paywall), not an AgentWeb account or permissions problem.`;
+      }
+
       return {
         success: false,
         message: errorMessage,
-        error: error.message,
+        error: isPublisherRefusal ? errorMessage : error.message,
         file_url: typeof fileUrl === 'string' ? fileUrl : undefined
       };
     }
@@ -25268,7 +31311,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     imageModel?: string,
     logoImage?: string,
     confirm?: boolean,
-    category?: string
+    category?: string,
+    metricsVerified?: boolean,
+    placement?: string
   ): Promise<any> {
     // ENG-343: the producing flow must self-declare the eval use case — Matt's
     // review feedback differs entirely between ads and organic posts, and a
@@ -25370,7 +31415,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const modelExplicitlyChosen = typeof imageModel === 'string' && imageModel.trim().length > 0;
       const resolvedImageModel = modelExplicitlyChosen
         ? imageModel
-        : await this.getImageApiDefaultModel();
+        : await resolveModelForUser(userId, 'image');
 
       const inputImagesForRequest = inputImages || [];
       const primaryRequest = {
@@ -25381,7 +31426,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         inputImages: inputImagesForRequest,
         logoImage,
         userId,
-        imageModel: resolvedImageModel
+        imageModel: resolvedImageModel,
+        // ENG-2187: the ad placement, when declared, sizes the creative gates' checks.
+        ...declaredPlacementField(placement)
       };
 
       let result: any;
@@ -25500,7 +31547,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           console.warn('Failed to store image generation metadata:', error);
         }
 
-        void enqueueAutoHumanEval({
+        const humanEvalCandidate = enqueueAutoHumanEval({
           reviewType: 'creative_image',
           userId,
           sessionId,
@@ -25511,6 +31558,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             `Image generated: ${result.filename || filename}. ` +
             `Model: ${imageModelUsed}. Size: ${size || 'default'}. Quality: ${quality || 'default'}.`,
           sourceKey: `image:${sessionId}:${result.filename || filename}:${result.imageUrl}`,
+          creativeGates: result.gates,
+          // ENG-2140: the generation request is the only brief agent mode has; the placement
+          // comes from the gate result.
+          creativeBrief: { generationRequest: prompt },
           action: {
             type: 'agent_mode_image_revision',
             sessionId,
@@ -25519,6 +31570,43 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             filename: result.filename || filename,
           },
         });
+        // ENG-2141: creative lineage record (inert unless CREATIVE_LINEAGE_ENABLED + table). Not
+        // awaited and never throws; it links the human-eval candidate once that exists.
+        void recordGeneratedCreative(
+          { userId, artifactUrl: result.imageUrl, sessionId, category, prompt, generatorModel: imageModelUsed, gates: result.gates },
+          humanEvalCandidate,
+        );
+
+        // ENG-1027 data-fabrication backstop: the tool-description guidance alone is
+        // instruction-following-dependent, and live verification showed the image
+        // model can invent metrics even in prompts that never asked for real data
+        // (a bare "metrics preview" dashboard element is enough). For prompts shaped
+        // like a dashboard/table that Emma hasn't declared use verified real values
+        // (metricsVerified), run one bounded describe_image check against the actual
+        // output and surface a warning so Emma discloses rather than silently
+        // presenting invented numbers. Timeboxed tighter than describe_image's own
+        // 90s ENG-294 bound — this is an added, best-effort safety net the user never
+        // explicitly asked for, not worth spending that much turn budget on.
+        let dataReliabilityWarning: string | undefined;
+        if (promptRisksFabricatedMetrics(prompt, metricsVerified)) {
+          console.log(`AgentMode: generate_image data-fabrication check triggered (session ${sessionId})`);
+          try {
+            const visionCheck = await withTimeoutOrReject(
+              // ENG-1858: the check is part of this user's image generation.
+              this.describeImage(undefined, result.imageUrl, FABRICATED_METRICS_CHECK_PROMPT, { userId, sessionId, feature: 'describe_image' }),
+              FABRICATED_METRICS_CHECK_TIMEOUT_MS,
+              'generate_image data-fabrication check'
+            );
+            if (visionCheck?.success && describeImageReportsFabricatedMetrics(visionCheck.description)) {
+              dataReliabilityWarning = FABRICATED_METRICS_WARNING;
+              console.log(`AgentMode: generate_image data-fabrication check WARNED (session ${sessionId})`);
+            } else {
+              console.log(`AgentMode: generate_image data-fabrication check clear (session ${sessionId})`);
+            }
+          } catch (visionErr) {
+            console.warn('AgentMode: generate_image data-fabrication check failed/timed out (non-fatal):', visionErr);
+          }
+        }
 
         return {
           success: true,
@@ -25529,6 +31617,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           size: size,
           quality: quality,
           imageModel: imageModelUsed,
+          ...(dataReliabilityWarning ? { dataReliabilityWarning } : {}),
           ...(fallbackUsed ? { fallbackUsed: true, primaryError } : {})
         };
       } else {
@@ -26193,6 +32282,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       if (!researchResult.success || !researchResult.markdownContent) {
+        // ENG-738: deepResearchService already retried once at a reduced depth
+        // internally if the first attempt timed out (see DEPTH_DEGRADE there);
+        // a failure reaching here means that already happened and still didn't
+        // produce content, so tell the model plainly rather than inviting an
+        // identical, doomed-to-repeat retry of the same call.
         return {
           success: false,
           message: researchResult.error || 'Deep research failed',
@@ -26225,15 +32319,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       console.log('AgentMode: Deep research uploaded to S3:', uploadResult.url);
 
+      // ENG-738: a success that only landed after an automatic depth downgrade
+      // must report the depth actually delivered, not the one originally
+      // requested — reporting the request depth here would misrepresent the
+      // result (e.g. claiming "comprehensive" when the agent produced "overview").
+      const actualDepth = researchResult.actualDepth || depth;
+      const successDepthNote = researchResult.degradedFrom
+        ? ` at "${actualDepth}" depth (automatically reduced from "${researchResult.degradedFrom}" after the first attempt timed out)`
+        : '';
+
       return {
         success: true,
-        message: `Deep research completed successfully. Generated ${wordCount} words of content and saved to S3.`,
+        message: `Deep research completed successfully${successDepthNote}. Generated ${wordCount} words of content and saved to S3.`,
         data: {
           research_url: uploadResult.url,
           title: researchResult.title,
           summary: researchResult.researchSummary,
           word_count: wordCount,
-          research_depth: depth,
+          research_depth: actualDepth,
           topic: topic
         }
       };
@@ -26301,20 +32404,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           userId
         });
 
-        if (!researchResult.success || !researchResult.markdownContent) {
+        const researchContent = researchResult.markdownContent;
+        if (!researchResult.success || !researchContent) {
           throw new Error(researchResult.error || 'Deep research failed');
         }
 
-        console.log('AgentMode: Deep research complete. Length:', researchResult.markdownContent.length);
+        console.log('AgentMode: Deep research complete. Length:', researchContent.length);
         console.log('AgentMode: Restyling research content with style:', style);
 
         // Restyle with inline image placeholders
         blogData = await restyleContent(
-          researchResult.markdownContent,
+          researchContent,
           titleDraft,
           'professional',
           style,
-          true // includeInlineImages = true for deep research
+          true, // includeInlineImages = true for deep research
+          userId
         );
 
         if (!blogData.title || !blogData.content) {
@@ -26354,7 +32459,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           length,
           researchContext,
           requirements,
-          style
+          style,
+          userId
         );
 
         if (!blogData.title || !blogData.content) {
@@ -26398,7 +32504,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
 
       if (!uploadResult.success || !uploadResult.url) {
-        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        uploadErr.status = uploadResult.statusCode;
+        throw uploadErr;
       }
 
       const htmlUrl = uploadResult.url;
@@ -26427,7 +32535,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to create blog article',
-        error: error.message
+        error: error.message,
+        // ENG-1300: real HTTP status from the S3 upload, when the failure came
+        // from there (uploadFileToS3 exposes AWS SDK v2's numeric statusCode —
+        // never .code, a string error name on that SDK).
+        code: error?.status
       };
     }
   }
@@ -26634,10 +32746,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
 
+      // ENG-1300: carry the real HTTP status through when this catch is reached
+      // directly (Payload CMS publish errors and the initial HTML-fetch axios
+      // call) — WebflowBlogPublisher/WordPressBlogPublisher catch and return
+      // their own failures below this method and never throw here.
+      const code = error.response?.status;
+
       return {
         success: false,
         message: errorMessage,
-        error: error.message || 'Unknown error'
+        error: error.message || 'Unknown error',
+        code,
       };
     }
   }
@@ -27280,7 +33399,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
 
       if (!uploadResult.success || !uploadResult.url) {
-        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        uploadErr.status = uploadResult.statusCode;
+        throw uploadErr;
       }
 
       const htmlUrl = uploadResult.url;
@@ -27299,7 +33420,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: 'Failed to create social media posts',
-        error: error.message
+        error: error.message,
+        // ENG-1300: this function never actually calls any per-platform social
+        // API — it's a local markdown-to-HTML preview generator, and the only
+        // external call is the S3 upload. Real HTTP status from there, when
+        // that's what failed (uploadFileToS3's numeric statusCode).
+        code: error?.status
       };
     }
   }
@@ -28043,7 +34169,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       // Upload to S3 with the same path as the original file
       const { uploadFileToS3WithPath } = await import('../utils/s3Utils');
-      const uploadResult = await uploadFileToS3WithPath(content, filename, 'text/html', path);
+      const { sanitizeGeneratedHtml } = await import('../utils/htmlSanitizer');
+      // ENG-1997 — this is the shared upload sink for BOTH updateHtmlFile's
+      // part/full replacements and updateHtmlFileCss's selector-based edits.
+      // The latter's `setAttribute` operation lets the model set an arbitrary
+      // attribute name/value pair directly (e.g. onerror/onclick), and its
+      // replace/append/etc. actions splice raw HTML with no escaping — same
+      // "LLM-authored HTML reaches a public S3 file unsanitized" trust gap
+      // createHtmlFile had, one step more direct since there's no need to even
+      // reproduce untrusted quoted text, the tool call arguments ARE the payload.
+      const sanitizedContent = sanitizeGeneratedHtml(content);
+      const uploadResult = await uploadFileToS3WithPath(sanitizedContent, filename, 'text/html', path);
 
       if (!uploadResult.success || !uploadResult.url) {
         throw new Error(uploadResult.error || 'Failed to upload updated file');
@@ -28296,6 +34432,49 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
+      // ENG-1960: make prompt-only plain-text guidance observable. Detection is
+      // intentionally non-mutating: some customer values legitimately contain punctuation
+      // that resembles Markdown, and changing them here would be a data-integrity regression.
+      const markupStats = { count: 0, paths: [] as string[] };
+      for (const [key, value] of Object.entries(variableValuesObj)) {
+        AgentModeService.collectTemplateValueMarkup(value, `variable_values.${key}`, markupStats);
+      }
+      for (const [key, value] of Object.entries(arrayVariableValuesObj)) {
+        AgentModeService.collectTemplateValueMarkup(value, `array_variable_values.${key}`, markupStats);
+      }
+      if (markupStats.count > 0) {
+        console.warn('[ENG-1960] create_html_from_template received markup-like variable values', {
+          count: markupStats.count,
+          paths: markupStats.paths,
+          paths_truncated: markupStats.count > markupStats.paths.length,
+        });
+      }
+
+      // ENG-1877: variable values come from campaign names, CRM data, and other
+      // caller-supplied strings — none of it trusted HTML. The LLM is instructed below
+      // to copy values through verbatim ("EXACT REPLACEMENT"), so an unescaped `<script>`
+      // or `<img onerror=...>` in a value reaches the rendered report unchanged. Escaping
+      // here (not on the LLM's output afterward) is the only point where "this came from
+      // a value" and "this is the template's own static markup" are still distinguishable
+      // — post-hoc sanitizing final_html can't tell the two apart.
+      const escapedVariableValuesObj = Object.fromEntries(
+        Object.entries(variableValuesObj).map(([key, value]) => [key, AgentModeService.deepEscapeHtmlValues(value)])
+      );
+      const escapedArrayVariableValuesObj = Object.fromEntries(
+        Object.entries(arrayVariableValuesObj).map(([key, values]) => [
+          key,
+          AgentModeService.deepEscapeHtmlValues(values),
+        ])
+      );
+
+      // Raw (pre-escape) values that actually contained a dangerous character, mapped to
+      // their escaped form — used to CORRECT the LLM's OUTPUT below if it resurfaces.
+      // Escaping the prompt only proves the request was safe; it does not prove the
+      // model didn't decode an entity back to raw HTML.
+      const rawToEscapedMap = new Map<string, string>();
+      AgentModeService.collectRawToEscapedMap(variableValuesObj, rawToEscapedMap);
+      AgentModeService.collectRawToEscapedMap(arrayVariableValuesObj, rawToEscapedMap);
+
       // Use LLM to handle variable substitution
       const substitutionPrompt = `You are a template engine. Your task is to replace variables in HTML templates with provided values while preserving the exact same format and structure.
 
@@ -28306,10 +34485,10 @@ TEMPLATE SUBJECT:
 ${template.subject}
 
 VARIABLE VALUES:
-${JSON.stringify(variableValuesObj, null, 2)}
+${JSON.stringify(escapedVariableValuesObj, null, 2)}
 
 ARRAY VARIABLE VALUES:
-${JSON.stringify(arrayVariableValuesObj, null, 2)}
+${JSON.stringify(escapedArrayVariableValuesObj, null, 2)}
 
 CRITICAL INSTRUCTIONS:
 1. PRESERVE THE EXACT FORMAT: Keep the same HTML structure, tags, classes, and styling as the original template
@@ -28347,6 +34526,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
           response_format: { type: 'json_object' },
           max_completion_tokens: maxTokens,
           taskClass: 'content_generation',
+          // ENG-1858: the user's template work — attribute it to them, not "system".
+          usageContext: { userId, sessionId, feature: 'html_template' },
         });
 
         const finishReason = substitutionResponse.choices[0].finish_reason;
@@ -28391,8 +34572,52 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         throw new Error('LLM substitution result missing final_html or final_subject fields');
       }
 
-      const finalHtml = substitutionData.final_html;
-      const finalSubject = substitutionData.final_subject;
+      let finalHtml = substitutionData.final_html;
+      let finalSubject = substitutionData.final_subject;
+
+      // ENG-1877: correct the output if the model reproduced a value's RAW, unescaped
+      // form instead of the escaped one we sent it — escaping the prompt only proves the
+      // REQUEST was safe, not that the model preserved it through generation. Auto-
+      // correcting (rather than rejecting outright) means a model that imperfectly
+      // handles escaping on some OTHER template degrades to "silently corrected", not
+      // "report generation hard-fails" — this function is shared by ~35 existing
+      // templates across the platform, most never tested against this change, and a
+      // reject-on-detect design would turn any of their LLM's occasional imperfect
+      // escaping into a customer-visible outage for reasons unrelated to security.
+      //
+      // Applied to finalHtml ONLY, never finalSubject — per docs/html-templates.md,
+      // `subject` is a real email subject line (round-4 review finding), never rendered
+      // as HTML, so it has no injection surface to correct in the first place; escaping
+      // it at all just corrupts a real customer-visible field with literal entity text.
+      //
+      // Two more round-4 findings fixed here: (1) longest-value-first ordering — when one
+      // flagged value is a literal substring of another (plausible with real HTML-snippet
+      // data), correcting the shorter one first destroys the exact string the longer one's
+      // pattern needs, silently no-oping its own correction. (2) a replacer FUNCTION, not
+      // a plain string — `String.replace` treats `$&`, `$$`, etc. in a plain replacement
+      // string as special patterns; an escaped value that happens to contain `$` next to
+      // certain characters could reinject the raw matched text, un-doing the very
+      // escaping this loop exists to enforce. A function's return value is used literally,
+      // with no `$`-pattern interpretation.
+      //
+      // Case-insensitive: a model reproducing `<SCRIPT>` instead of `<script>` is still a
+      // browser-executable tag — an exact-case match would let that trivial reformatting
+      // evade correction entirely. A false correction is possible if a raw dangerous
+      // substring coincidentally already existed in the template's own static markup, but
+      // replacing that one occurrence with its escaped form is a far safer failure mode
+      // than either a silently reopened injection or a hard failure.
+      const correctionsByLengthDesc = [...rawToEscapedMap.entries()].sort(
+        ([a], [b]) => b.length - a.length
+      );
+      for (const [rawValue, escapedValue] of correctionsByLengthDesc) {
+        const pattern = new RegExp(AgentModeService.escapeRegExp(rawValue), 'gi');
+        finalHtml = finalHtml.replace(pattern, () => escapedValue);
+      }
+
+      // finalSubject is plain text (never HTML-rendered), so any HTML entity that leaked
+      // through from the escaped prompt values doesn't protect anything — it just shows
+      // literal "&amp;"/"&#39;" etc. in a real customer's email subject. Decode them back.
+      finalSubject = AgentModeService.unescapeHtml(finalSubject);
 
       // Verify the substitution was correct
       const remainingPlaceholders = finalHtml.match(/\{\{[^}]+\}\}/g) || [];
@@ -28510,11 +34735,19 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       if (!isEmail && isCompleteHtmlDocument(contentDraft)) {
         console.log('AgentMode: create_html_file — draft is already complete HTML, uploading directly (skipping render)');
         const { uploadFileToS3 } = await import('../utils/s3Utils');
-        const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
-        const uploadableHtml = await this.inlinePrivateS3Images(contentDraft, documentType, userId);
+        const { sanitizeGeneratedHtml } = await import('../utils/htmlSanitizer');
+        const filename = buildHtmlArtifactFilename(title);
+        // ENG-1997 — the passthrough uploads the model's own draft verbatim with no
+        // render step in between, so if it faithfully reproduced markup from
+        // untrusted quoted content (a CRM note, a client quote), nothing else in
+        // this path would ever catch it. Sanitize before it ever reaches S3.
+        const sanitizedContent = sanitizeGeneratedHtml(contentDraft);
+        const uploadableHtml = await this.inlinePrivateS3Images(sanitizedContent, documentType, userId);
         const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
         if (!uploadResult.success || !uploadResult.url) {
-          throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+          const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+          uploadErr.status = uploadResult.statusCode;
+          throw uploadErr;
         }
         return {
           success: true,
@@ -28744,12 +34977,21 @@ Please generate a complete, professional HTML document that properly formats and
 
       // Upload to S3
       const { uploadFileToS3 } = await import('../utils/s3Utils');
-      const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
-      const uploadableHtml = await this.inlinePrivateS3Images(htmlContent, documentType, userId);
+      const { sanitizeGeneratedHtml } = await import('../utils/htmlSanitizer');
+      const filename = buildHtmlArtifactFilename(title);
+      // ENG-1997 — the render step has no {{variable}} boundary to escape values
+      // into (unlike createHtmlFromTemplate/ENG-1877): it's told to copy names,
+      // quotes, and numbers from the draft verbatim, so any markup embedded in
+      // untrusted quoted content can survive the render unchanged. Sanitize the
+      // finished document before it reaches S3.
+      const sanitizedHtmlContent = sanitizeGeneratedHtml(htmlContent);
+      const uploadableHtml = await this.inlinePrivateS3Images(sanitizedHtmlContent, documentType, userId);
       const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
 
       if (!uploadResult.success || !uploadResult.url) {
-        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        const uploadErr: any = new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        uploadErr.status = uploadResult.statusCode;
+        throw uploadErr;
       }
 
       const s3Url = uploadResult.url;
@@ -28768,7 +35010,9 @@ Please generate a complete, professional HTML document that properly formats and
       return {
         success: false,
         message: 'Failed to create HTML file',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
+        // ENG-1300: real HTTP status from the S3 upload, when that's what failed.
+        code: (error as any)?.status
       };
     }
   }
@@ -28911,9 +35155,14 @@ Return the HTML body fragment for this section only.`;
     try {
       const { renderMarkdownReportDocumentAsync } = await import('../utils/markdownHtmlReport');
       const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const { sanitizeGeneratedHtml } = await import('../utils/htmlSanitizer');
       const fallbackHtml = await renderMarkdownReportDocumentAsync(title, contentDraft);
-      const uploadableHtml = await this.inlinePrivateS3Images(fallbackHtml, documentType, userId);
-      const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+      // ENG-1997 — renderMarkdownReportDocumentAsync already escapes text nodes,
+      // but sanitize defensively here too so this path never silently becomes the
+      // odd one out if that changes.
+      const sanitizedFallbackHtml = sanitizeGeneratedHtml(fallbackHtml);
+      const uploadableHtml = await this.inlinePrivateS3Images(sanitizedFallbackHtml, documentType, userId);
+      const filename = buildHtmlArtifactFilename(title);
       uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
       if (!uploadResult.success || !uploadResult.url) {
         throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
@@ -29390,7 +35639,7 @@ ${strippedHtml}`;
 
   // Work Plan Management Methods
 
-  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, sessionId: string, autocomplete?: boolean): Promise<any> {
+  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, sessionId: string, autocomplete?: boolean, isUnattendedRun?: boolean): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -29418,13 +35667,32 @@ ${strippedHtml}`;
           ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
           ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools })
         })),
-        autocomplete: autocomplete || false,
+        // ENG-2058: an interactive (autocomplete: false) plan on a scheduled run stalls
+        // forever — the "wait for the user to approve each step" contract has no user
+        // to ask, so the run just burns its completion-gate continuation budget presenting
+        // results and asking for approval, then records a deferredUnresolved failure. Force
+        // hands-off mode whenever this turn is genuinely unattended — see
+        // shouldForceScheduledAutocomplete (ENG-2072).
+        autocomplete: shouldForceScheduledAutocomplete(session, isUnattendedRun) ? true : (autocomplete || false),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
 
       // Update the session with the work plan
       await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+
+      // ENG-1698: session.calledFunctions accumulates for the life of the session with
+      // no per-plan scoping. Without this reset, a brand new plan on an existing session
+      // inherits whatever tool-call credit is left over from a completely unrelated
+      // earlier plan (or an earlier attempt at this same plan) — a later step can be
+      // marked completed via stale credit without the model calling the tool again for
+      // it. Reset on every genuinely NEW plan start; modifyWorkPlan (steps added
+      // mid-run) deliberately does NOT reset this, since that's still the same run.
+      try {
+        await chatbotDb.updateCalledFunctions(sessionId, {});
+      } catch (resetError) {
+        console.error('AgentMode: Error resetting calledFunctions for new work plan:', resetError);
+      }
 
       return {
         success: true,
@@ -29458,7 +35726,7 @@ ${strippedHtml}`;
    *
    * Refuses to overwrite an existing active (non-empty) work plan unless force=true.
    */
-  public async applyPredefinedWorkPlan(planTitleOrId: string, sessionId: string, userId?: string, options?: { force?: boolean }): Promise<any> {
+  public async applyPredefinedWorkPlan(planTitleOrId: string, sessionId: string, userId?: string, options?: { force?: boolean; confirmedDeclinedPlan?: boolean; skipDeclineGate?: boolean; isUnattendedRun?: boolean }): Promise<any> {
     try {
       const { getAccessiblePredefinedWorkPlanCandidates } = await import('./predefinedWorkPlanResolver');
 
@@ -29485,16 +35753,80 @@ ${strippedHtml}`;
       // behavior — title-based launches from Emma — unchanged.
       const candidates = await getAccessiblePredefinedWorkPlanCandidates(userId);
 
-      const needle = planTitleOrId.toLowerCase();
-      const predefinedPlan = candidates.find(
-        (p) => p.planId === planTitleOrId || (p.title && p.title.toLowerCase() === needle)
-      );
+      // ENG-1794: case/whitespace/underscore-insensitive title match (see
+      // normalizeWorkPlanTitleForMatch above) — planId still wins on an exact
+      // match first, since a title collision must never shadow a stable id.
+      const matchedByPlanId = candidates.some((p) => p.planId === planTitleOrId);
+      const needle = normalizeWorkPlanTitleForMatch(planTitleOrId);
+      const predefinedPlan = candidates.find((p) => p.planId === planTitleOrId)
+        ?? candidates.find((p) => p.title && normalizeWorkPlanTitleForMatch(p.title) === needle);
 
       if (!predefinedPlan) {
         return { success: false, message: `Work plan template "${planTitleOrId}" not found` };
       }
       if (predefinedPlan.visibility === 'private' && (!userId || userId.startsWith('anon_'))) {
         return { success: false, message: 'Not authorized to use this private work plan' };
+      }
+
+      // ENG-1814: a title-based match (not a stable planId) that has a near-duplicate
+      // sibling in the accessible set is exactly the shape of two real, live-confirmed
+      // incidents (Founder_Linkedin_Sales_Readiness_Eval/_Audit) where the model picked
+      // the wrong one of two similarly-named templates while sifting a large
+      // list_predefined_work_plans result, then launched it without ever re-confirming
+      // with the user. A planId-based match is exempt — an id is unambiguous by
+      // construction, and this is exactly the retry path this response's own message
+      // points the model at once the user disambiguates.
+      //
+      // Round-2 review: also catches an EXACT-duplicate title (a different planId whose
+      // normalized title is identical, not just one-word-different) -- arguably more
+      // dangerous than a near-duplicate, since normalizeWorkPlanTitleForMatch resolves
+      // both candidates equally and `.find()` above silently picked whichever happened
+      // to come first in the candidates array, with zero signal distinguishing intent.
+      // Nothing in workPlanService.ts enforces title uniqueness across visibility scopes,
+      // so this is a real (if narrow) possibility, not just theoretical.
+      if (!matchedByPlanId) {
+        const normalizedTargetTitle = normalizeWorkPlanTitleForMatch(predefinedPlan.title);
+        const ambiguousSibling = candidates.find((p) =>
+          p.planId !== predefinedPlan.planId && p.title
+            // Exact-duplicate check needs the same empty-guard the near-duplicate
+            // check already has -- otherwise two degenerately-titled (blank/
+            // separator-only) but genuinely unrelated templates normalize to the
+            // same '' and falsely pair up as ambiguous siblings.
+            && ((normalizedTargetTitle !== '' && normalizeWorkPlanTitleForMatch(p.title) === normalizedTargetTitle)
+              || areNearDuplicateWorkPlanTitles(p.title, predefinedPlan.title))
+        );
+        if (ambiguousSibling) {
+          return {
+            success: false,
+            message: `"${predefinedPlan.title}" has a similarly-named template ("${ambiguousSibling.title}") that could easily be confused for it. Confirm with the user exactly which one they meant, then call launch_predefined_work_plan again with that plan's planId (not its title) to proceed.`,
+            requiresConfirmation: true,
+          };
+        }
+      }
+
+      // ENG-1974: the user already declined this exact plan via "Keep chatting"
+      // on its recommendation card. recommendationId is a deterministic hash
+      // of (sessionId, planId) — recompute it here for the RESOLVED planId
+      // (not the raw planTitleOrId argument) so this correlates exactly
+      // whether launch_predefined_work_plan was called with a title or an id;
+      // no fuzzy title matching needed. `accept` always passes
+      // skipDeclineGate — the user's own explicit accept click must never be
+      // blocked by an earlier decline of any recommendation. Same risk tier
+      // as the force:true retry above (reversible, conversational), not the
+      // harder human-attributed tier checkQuestionGate exists for.
+      if (!options?.skipDeclineGate && !options?.confirmedDeclinedPlan) {
+        const declinedRecommendationId = createHash('sha256')
+          .update(`${sessionId}:${predefinedPlan.planId}`)
+          .digest('hex')
+          .slice(0, 32);
+        const declined = session.declinedWorkPlanRecommendations?.[declinedRecommendationId];
+        if (declined) {
+          return {
+            success: false,
+            message: `The user already declined "${declined.planTitle}" (clicked "Keep chatting" on its recommendation). Ask the user to confirm they want to start it now, then call launch_predefined_work_plan again with confirmedDeclinedPlan=true to proceed.`,
+            requiresConfirmation: true,
+          };
+        }
       }
 
       // Convert template steps -> session work plan (all steps start pending).
@@ -29512,9 +35844,20 @@ ${strippedHtml}`;
           skillIds: step.skillIds,
           ...(step.expectedAssetCount !== undefined && { expectedAssetCount: step.expectedAssetCount }),
           ...(step.expectedAssetCountTools !== undefined && { expectedAssetCountTools: step.expectedAssetCountTools }),
+          // ENG-1765: this whitelist previously omitted inputRequest, silently
+          // dropping every predefined template's authored guided-input-card data
+          // on launch -- the only code that reads step.inputRequest (below, in
+          // setWorkPlanStatusAttempt) could therefore never fire for any
+          // predefined-plan launch, live-confirmed dead against 26 of 28 real
+          // production templates.
+          ...(step.inputRequest !== undefined && { inputRequest: step.inputRequest }),
         })),
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
-        autocomplete: predefinedPlan.autocomplete || false,
+        // ENG-2058: same rationale as createWorkPlan above — an unattended scheduled
+        // run has no user to approve an interactive step, so a template's own
+        // autocomplete (or lack of one) is overridden hands-off. ENG-2072: gated on
+        // shouldForceScheduledAutocomplete, not sessionType alone — see its doc comment.
+        autocomplete: shouldForceScheduledAutocomplete(session, options?.isUnattendedRun) ? true : (predefinedPlan.autocomplete || false),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         // ENG-1472: which predefined template this session's plan was launched
@@ -29524,6 +35867,66 @@ ${strippedHtml}`;
         templatePlanId: predefinedPlan.planId,
       };
       await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+
+      // ENG-1765: the reactive "surface the next pending step's inputRequest"
+      // check in setWorkPlanStatusAttempt only runs after a set_work_plan_status
+      // call — it never runs on a fresh launch. Most predefined templates put
+      // their inputRequest on step 1 itself, which starts pending with nothing
+      // before it to trigger that reactive scan, so without this it would still
+      // never surface even after restoring the field above. Surface it here too,
+      // the same way, so a launch's own first pending input-requesting step is
+      // never silently skipped.
+      //
+      // Reviewer finding: this write must use the same failIfAwaitingExists
+      // guard as the reactive block. Without it, updateSessionWorkPlanInputRequest
+      // attaches no ConditionExpression at all and blindly overwrites
+      // pendingWorkPlanInput — a force=true relaunch could silently clobber a
+      // genuinely still-awaiting card from whatever was active before, leaving
+      // it orphaned (pointing at a step that's no longer in the active plan)
+      // instead of failing closed. On a guard failure this just logs and skips
+      // surfacing the new step's card rather than blocking the launch — the
+      // plan itself is still valid without it, and the model can still recover
+      // by asking conversationally like it already does today.
+      // User-facing signal (not just a server log) when this doesn't surface:
+      // the model is told via the returned message so it can ask for the same
+      // information conversationally instead of the user silently never seeing
+      // a card and the model never knowing to ask.
+      let inputRequestNotSurfaced: { title: string; prompt?: string } | null = null;
+      const launchInputStep = workPlan.steps
+        .slice()
+        .sort((a, b) => a.stepCount - b.stepCount)
+        .find((s) => s.status === 'pending' && (s as any).inputRequest);
+      if (launchInputStep) {
+        const req = (launchInputStep as any).inputRequest;
+        try {
+          const written = await chatbotDb.updateSessionWorkPlanInputRequest(
+            sessionId,
+            buildWorkPlanInputRequest({
+              ...req,
+              requestId: uuidv4(),
+              stepCount: launchInputStep.stepCount,
+            }),
+            { failIfAwaitingExists: true },
+          );
+          if (!written) {
+            // Guarded off: a genuinely still-awaiting request from before this
+            // launch won the race, per design (see comment above) — not an error.
+            inputRequestNotSurfaced = { title: req.title, prompt: req.prompt };
+          }
+        } catch (inputRequestError) {
+          console.error('AgentMode: Error surfacing input request for launched work plan:', inputRequestError);
+          inputRequestNotSurfaced = { title: req.title, prompt: req.prompt };
+        }
+      }
+
+      // ENG-1698: same reset as createWorkPlan — see that call site's comment. A
+      // predefined-plan launch on an existing session (including a force=true
+      // relaunch of the same plan) must not inherit tool-call credit from before.
+      try {
+        await chatbotDb.updateCalledFunctions(sessionId, {});
+      } catch (resetError) {
+        console.error('AgentMode: Error resetting calledFunctions for new predefined work plan:', resetError);
+      }
 
       // Auto-install ALL skills from ALL steps upfront so their tools are available
       // from the next message (tool filtering is computed at the start of each message).
@@ -29555,9 +35958,16 @@ ${strippedHtml}`;
         }
       }
 
+      // ENG-1765: tell the model when step 1's input card didn't surface, so it
+      // asks for the same information conversationally instead of the session
+      // silently sitting on a step whose required input nobody was ever asked for.
+      const inputRequestNote = inputRequestNotSurfaced
+        ? ` Note: this plan's first step normally asks "${inputRequestNotSurfaced.title}" via a structured card, but that card could not be shown right now — ask the user for this information directly instead: ${inputRequestNotSurfaced.prompt || inputRequestNotSurfaced.title}`
+        : '';
+
       return {
         success: true,
-        message: `Started work plan "${predefinedPlan.title}" with ${workPlan.steps.length} steps`,
+        message: `Started work plan "${predefinedPlan.title}" with ${workPlan.steps.length} steps${inputRequestNote}`,
         workPlan,
         welcomeMessage: workPlan.welcomeMessage,
         formattedContent: `Started work plan "${predefinedPlan.title}":\n${workPlan.steps.map((s: any) => `${s.stepCount}. ${s.title}`).join('\n')}`,
@@ -29704,9 +36114,121 @@ ${strippedHtml}`;
     }
   }
 
-  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean): Promise<any> {
+  // ENG-1875: LLM-judge check for whether the user's most recent REAL message
+  // explicitly authorized removing the scope named in `candidates`, so a
+  // `modify_work_plan removeStepCounts` call that would otherwise create new
+  // ENG-1811 debt doesn't ledger it when the user genuinely asked for the cut.
+  // Sibling to ENG-1819's userExplicitlyRequestedStop (agentModeController.ts)
+  // -- same model/timeout/parse shape, reusing that ticket's live-tested
+  // finding that gemini-3.1-flash-lite needs headroom for an internal
+  // reasoning trace before it emits "yes"/"no". Deliberately a separate
+  // function rather than a shared refactor: the two fail in different
+  // directions on purpose (see below), and this codebase already accepts
+  // duplicating debt-check logic outright (workPlanCompletedWithoutDebt's own
+  // comment, ~line 3735 in agentModeController.ts) rather than risk a shared
+  // path used by ~150 mocking test files.
+  //
+  // Fails SAFE toward "not authorized": any error/timeout/no-message returns
+  // `false`, so the debt is ledgered exactly as before this fix existed. This
+  // is the opposite bias from ENG-1819 (which fails toward NOT suppressing a
+  // continuation) because the risk here is asymmetric the other way -- a
+  // false "yes" would silently reopen the exact ENG-1811 gaming hole this
+  // ledger exists to close, while a false "no" only costs one harmless extra
+  // attempt at already-removed scope.
+  //
+  // Known, accepted limitation (fresh-eyes review, PR #2959): the judge only
+  // sees the user's raw message text, not the assistant's preceding turn. A
+  // common real flow -- assistant proposes "I'll skip step 2 since X, sound
+  // good?" and the user replies with a bare "yes"/"go ahead" -- won't mention
+  // the scope by name and will likely be judged "no", ledgering debt even
+  // though the removal was genuinely authorized. This under-covers the fix's
+  // own motivating scenario, but fails in the SAFE direction (extra debt, not
+  // a reopened gaming hole) -- not fixed here because doing so needs the
+  // assistant's own preceding message as judge context too, a real scope
+  // increase for a Low-priority, narrowly-scoped ticket, not a copy of an
+  // existing pattern the way the rest of this fix is.
+  private readonly STEP_REMOVAL_JUDGE_MODEL = 'gemini-3.1-flash-lite';
+  private readonly STEP_REMOVAL_JUDGE_TIMEOUT_MS = 8000;
+
+  private async wasStepRemovalUserAuthorized(
+    sessionId: string,
+    candidates: Array<{ fn: string; stepTitle: string }>,
+  ): Promise<boolean> {
     try {
-      const session = await chatbotDb.getChatSession(sessionId);
+      const recent = await chatbotDb.getMostRecentRealUserMessage(sessionId);
+      if (!recent?.content) return false;
+      const scopeList = candidates
+        .map((c) => `- step "${c.stepTitle}" (still needs to call: ${c.fn})`)
+        .join('\n');
+      const system = `You classify one message from a user talking to an AI assistant that is running a multi-step work plan on their behalf.
+
+The assistant is about to remove one or more steps from the plan before completing required actions those steps call for. Decide whether the user's message EXPLICITLY instructs removing, skipping, or dropping this specific scope -- as opposed to a general instruction, unrelated request, or the assistant's own unprompted decision.
+
+The steps being removed:
+${scopeList}
+
+Answer "yes" only if the user's message clearly and explicitly authorizes skipping this scope (even if phrased casually -- "skip step 2", "don't bother with the export", "we don't need that anymore").
+
+Answer "no" for everything else, including messages that don't mention this scope at all, or only vaguely relate to it.
+
+Reply with ONLY one word: yes or no.`;
+      const llmPromise = this.callLLM(
+        this.STEP_REMOVAL_JUDGE_MODEL,
+        [
+          { role: 'system', content: system },
+          { role: 'user', content: recent.content.slice(0, 2500) },
+        ],
+        {
+          temperature: 0,
+          max_completion_tokens: 500,
+          taskClass: 'scheduled_background',
+          // ENG-1816 F1: this judge previously carried no userId, so its spend booked
+          // to "system" and escaped both billing and the funding policy. Read the
+          // run's owner from the ambient store instead of threading a new parameter
+          // through this method's signature. billingUserId deliberately omitted: this
+          // reaches meterWithResolvedBilling, which only resolves the org-root billing
+          // subject when billingUserId is absent (ENG-1858) — passing ownerUserId here
+          // would re-suppress that resolution for org members, the exact ENG-1217 bug.
+          usageContext: {
+            feature: 'step_removal_authorization_judge',
+            userId: currentRunFunding()?.ownerUserId,
+          },
+        },
+      );
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('step-removal judge timed out')), this.STEP_REMOVAL_JUDGE_TIMEOUT_MS)
+      );
+      const res: any = await Promise.race([llmPromise, timeoutPromise]);
+      if (res?.choices?.[0]?.finish_reason === 'length') {
+        console.warn(
+          `AgentMode: work-plan step-removal authorization judge for session ${sessionId} was ` +
+          `truncated (finish_reason: length) before producing an answer -- treating as "no", but ` +
+          `this may be silently missing a real authorization.`
+        );
+      }
+      const raw = (res?.choices?.[0]?.message?.content ?? '').trim().toLowerCase();
+      return raw.startsWith('yes');
+    } catch (err) {
+      console.error(`AgentMode: work-plan step-removal authorization judge failed for session ${sessionId}:`, err);
+      return false; // fail-safe: never skip debt on judge failure
+    }
+  }
+
+  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; userInstructions?: string; requiredFunctionCalls?: string[]; skillIds?: string[]; expectedAssetCount?: number; expectedAssetCountTools?: string[] }>, removeStepCounts: number[], sessionId: string, autocomplete?: boolean, isUnattendedRun?: boolean): Promise<any> {
+    try {
+      // ENG-1793: consistentRead=true so this read of session.workPlan /
+      // calledFunctions / failedFunctions / calledFunctionsVersion -- the fields
+      // the requiredFunctionCalls protection below (see the update-loop comment)
+      // depends on -- is strongly consistent, not the default eventually-consistent
+      // read. Those fields live on the AW-ChatSessions record itself, so this needs
+      // getChatSession -> getChatSessionRecord's own dynamodb.get to pass
+      // ConsistentRead: true (see chatbotService.ts); it is NOT satisfied by
+      // getMessagesFromMessagesTable's consistent read, which covers a different
+      // table (AW-ChatMessages) that this call site does not depend on. Without a
+      // strongly consistent read of the session record, a required call's failure
+      // recorded earlier in this very turn, immediately before this modify_work_plan
+      // call, could be missed.
+      const session = await chatbotDb.getChatSession(sessionId, true);
       if (!session || !session.workPlan) {
         return {
           success: false,
@@ -29716,8 +36238,99 @@ ${strippedHtml}`;
 
       const workPlan = { ...session.workPlan };
 
-      // Update autocomplete if explicitly provided
-      if (autocomplete !== undefined) {
+      // Snapshot of every step as it existed before this call's removeStepCounts
+      // filtering runs below, keyed by stepCount. Still used further down for
+      // expectedAssetCount/expectedAssetCountTools: when a step reusing a
+      // just-removed stepCount reaches the "add new step" branch in THIS SAME
+      // call, reattach the pre-removal asset-count requirement instead of
+      // treating it as having no history. (requiredFunctionCalls no longer
+      // uses this snapshot -- see pendingRequiredFunctionCalls below, which
+      // closes the same gap completely instead of only within one call.)
+      const originalStepsBeforeRemoval = new Map<number, (typeof workPlan.steps)[number]>(
+        workPlan.steps.map((s: any) => [s.stepCount, s]),
+      );
+
+      // ENG-1811: before removing anything, carry forward any genuinely
+      // unresolved requiredFunctionCalls from the steps about to be removed
+      // into a session-lifetime, stepCount-agnostic debt ledger
+      // (workPlan.pendingRequiredFunctionCalls). This is deliberately NOT
+      // scoped to "does a later step reuse this same stepCount" -- that
+      // per-call/per-stepCount approach (the first attempt at this fix) was
+      // itself defeated live, unprompted, on test-env1: the model removed
+      // steps 2 and 3 via removeStepCounts in one modify_work_plan call, then
+      // re-added them with omitted requiredFunctionCalls in a SEPARATE, LATER
+      // call that didn't mention removeStepCounts at all -- that later call's
+      // own invocation has no memory of the earlier removal, so a per-call
+      // snapshot can never see across it. A plain session-level ledger does,
+      // because workPlan (and this field on it) is the one thing every
+      // invocation reads fresh and writes back. See setWorkPlanStatusAttempt
+      // for where this is enforced: it blocks a batch from resolving the LAST
+      // remaining pending step(s) (finishing the plan) while any entry here
+      // still hasn't succeeded, regardless of which step (if any) still lists
+      // it as required.
+      const priorPendingRequiredFunctionCalls = workPlan.pendingRequiredFunctionCalls || [];
+      if (removeStepCounts && removeStepCounts.length > 0) {
+        const succeededFunctionCountsAtRemoval = session.calledFunctions || {};
+        const priorSet = new Set(priorPendingRequiredFunctionCalls);
+        const newlyUnresolved = new Set(priorPendingRequiredFunctionCalls);
+        // ENG-1875: only functions NEWLY going into debt by this call are
+        // candidates for the authorization judge below -- debt already
+        // standing from an earlier, unauthorized removal is never re-judged
+        // or revoked here, only ever added to.
+        //
+        // Judged PER REMOVED STEP, not once for the whole call: a single
+        // removeStepCounts batch can mix a step the user genuinely authorized
+        // with one the model is removing for its own unrelated reason (or to
+        // dodge a required call). A single call-wide yes/no would let one
+        // authorized step's "yes" spare an unrelated, unauthorized step in
+        // the same batch -- reopening ENG-1811's gaming hole through a
+        // batching side door (found by fresh-eyes review of the original
+        // single-verdict version). Each step's own requiredFunctionCalls are
+        // still judged together as one unit -- they're removed as one
+        // decision, not gameable by splitting further.
+        const candidateNewDebtByStep = new Map<number, { stepTitle: string; fns: string[] }>();
+        for (const step of workPlan.steps) {
+          if (!removeStepCounts.includes(step.stepCount)) continue;
+          for (const fn of step.requiredFunctionCalls || []) {
+            if ((succeededFunctionCountsAtRemoval[fn] || 0) === 0) {
+              if (!priorSet.has(fn)) {
+                if (!candidateNewDebtByStep.has(step.stepCount)) {
+                  candidateNewDebtByStep.set(step.stepCount, { stepTitle: step.title, fns: [] });
+                }
+                candidateNewDebtByStep.get(step.stepCount)!.fns.push(fn);
+              } else {
+                newlyUnresolved.add(fn);
+              }
+            }
+          }
+        }
+        await Promise.all(
+          Array.from(candidateNewDebtByStep.values()).map(async ({ stepTitle, fns }) => {
+            const authorized = await this.wasStepRemovalUserAuthorized(
+              sessionId,
+              fns.map((fn) => ({ fn, stepTitle })),
+            );
+            for (const fn of fns) {
+              if (authorized) {
+                console.log(`ENG-1875: skipping debt for ${fn} in session ${sessionId} -- judged user-authorized removal`);
+              } else {
+                newlyUnresolved.add(fn);
+              }
+            }
+          }),
+        );
+        workPlan.pendingRequiredFunctionCalls = Array.from(newlyUnresolved);
+      }
+
+      // Update autocomplete if explicitly provided. ENG-2058: a genuinely unattended
+      // scheduled run always stays hands-off — there is no user to approve an
+      // interactive step — so this overrides any explicit `false` (or a plan created
+      // before this fix) rather than only applying when the caller passed a value.
+      // ENG-2072: gated on shouldForceScheduledAutocomplete, not sessionType alone —
+      // see its doc comment.
+      if (shouldForceScheduledAutocomplete(session, isUnattendedRun)) {
+        workPlan.autocomplete = true;
+      } else if (autocomplete !== undefined) {
         workPlan.autocomplete = autocomplete;
       }
 
@@ -29725,6 +36338,164 @@ ${strippedHtml}`;
       if (removeStepCounts && removeStepCounts.length > 0) {
         workPlan.steps = workPlan.steps.filter(s => !removeStepCounts.includes(s.stepCount));
       }
+
+      // ENG-1793: a production predefined-plan session (a90b38fc-...) called
+      // modify_work_plan mid-run for its "Create HTML report" step right after
+      // that step's required create_html_from_template call had just FAILED.
+      // The template authored requiredFunctionCalls: ["create_html_from_template"]
+      // for that step, but the modify_work_plan update happened to pass
+      // requiredFunctionCalls: [] for it -- a defined, non-undefined value, so
+      // the old merge below ("use newStep's value if provided, else keep the
+      // old one") silently replaced the real requirement with an empty one.
+      // set_work_plan_status's completion gate (setWorkPlanStatusAttempt) then
+      // had nothing left to check for that step and let it complete despite the
+      // failed required call never succeeding.
+      //
+      // ENG-1799 (follow-up): the original fix here only protected a function
+      // that had already FAILED at least once (failed>0 && succeeded===0). A
+      // production predefined-plan session (3fce3c5a-...) showed the same class
+      // of gap for functions that were simply never called at all -- never
+      // attempted, so never in failedFunctions either, but still genuinely
+      // required and unsatisfied. That shape passed the old check trivially
+      // (failed===0 fails the `failed > 0` test), so modify_work_plan could
+      // silently drop a still-unmet requirement the model had not gotten
+      // around to calling yet, the same gate-bypass shape, just without a
+      // prior failed attempt on record.
+      //
+      // Fix: requiredFunctionCalls can still be freely modified -- added to,
+      // reordered, or have functions removed -- EXCEPT it may never silently
+      // drop a function that has not yet SUCCEEDED for this session, whether
+      // it previously failed or was never attempted at all. A function that
+      // was never required to begin with, or that has already succeeded at
+      // least once, is unaffected and can still be dropped normally (e.g. a
+      // genuine, deliberate scope reduction).
+      //
+      // NOT exempt once a step has resolved (completed/skipped): a resolved
+      // step can be reset back to 'pending' later (e.g. "assets need
+      // regenerating" -- see the ENG-1188/CodeRabbit PR #2430 cutoff-timestamp
+      // handling above, which explicitly treats that reset as a supported
+      // transition) without restoring requiredFunctionCalls to anything. An
+      // earlier version of this fix exempted resolved steps on the theory
+      // that "the gate that mattered already ran" -- but that only holds
+      // until the very next reset-to-pending, at which point a
+      // never-actually-called requirement cleared while 'completed' stays
+      // silently cleared through the reset and the step re-completes with no
+      // gate at all. Note this protection is NOT a pure no-op for every
+      // resolved step: `session.calledFunctions[fn]` decrements back toward 0
+      // once the step consuming its credit completes (ENG-1698's
+      // decrementCalledFunctionsClamped), so a function called exactly once
+      // for its own step looks like `succeeded === 0` again immediately after
+      // that step's own legitimate completion -- indistinguishable from
+      // "never called." That's intentional, not a bug: it forces a genuine
+      // scope-reduction edit on an already-resolved step to re-prove the
+      // requirement rather than trust stale state, matching the
+      // "fail closed" posture the rest of this fix takes, and is itself
+      // covered by a dedicated test below rather than assumed harmless.
+      const succeededFunctionCounts = session.calledFunctions || {};
+      const mergeRequiredFunctionCalls = (
+        existingRequired: string[] | undefined,
+        requested: string[] | undefined,
+      ): string[] | undefined => {
+        if (requested === undefined) return existingRequired;
+        const unresolvedRequirements = (existingRequired || []).filter((fn) => {
+          if (requested.includes(fn)) return false;
+          const succeeded = succeededFunctionCounts[fn] || 0;
+          return succeeded === 0;
+        });
+        return unresolvedRequirements.length > 0 ? [...requested, ...unresolvedRequirements] : requested;
+      };
+
+      // ENG-1800: sibling protection for the asset-count completion gate
+      // (expectedAssetCount/expectedAssetCountTools) -- see the merge call
+      // below for the full incident writeup and the applied fix.
+      const findAssetCountCutoff = (
+        allSteps: Array<{ stepCount: number; status?: string; resolvedAt?: string; completedAt?: string }>,
+        stepCount: number,
+      ): string | undefined => {
+        const earlier = allSteps
+          .filter((s) => s.stepCount < stepCount)
+          .sort((a, b) => b.stepCount - a.stepCount);
+        for (const s of earlier) {
+          if (s.status === 'completed' || s.status === 'skipped') {
+            const resolvedAt = s.resolvedAt || s.completedAt;
+            if (resolvedAt) return resolvedAt;
+          }
+        }
+        return undefined;
+      };
+      const computeStepProducedAssetCount = (
+        tools: string[] | undefined,
+        sinceIso: string | undefined,
+      ): number => tools?.length
+        ? extractProducedAssetCount(session.messages, sinceIso, tools)
+        : Math.max(
+            AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length,
+            extractProducedAssetCount(session.messages, sinceIso),
+          );
+
+      // ENG-1800: a production predefined-plan session (ca06a9e0-...) hit the
+      // asset-count gate's workplan_insufficient_assets block for "Render the
+      // Full Size Matrix" (expectedAssetCount 12, expectedAssetCountTools
+      // ["playwright_browser_take_screenshot"], only 1 real screenshot
+      // produced). Instead of producing the remaining assets, the model called
+      // modify_work_plan TWICE in the same run to shrink expectedAssetCount
+      // first to 1, then to 0 for that step (and later 0 for two more steps) --
+      // silently clearing the exact gate it was failing. Nothing distinguished
+      // that self-serving edit from a genuine user-approved scope reduction
+      // (the blocked response's own guidance tells the model to do exactly
+      // this once the USER approves a smaller set), so the steps completed
+      // with 1 of the promised 12 assets and the closing synthesis then
+      // falsely claimed "✅ Deliverables Generated & Verified" across "all 12
+      // units".
+      //
+      // Fix: expectedAssetCount can still be freely changed (raised, lowered,
+      // or cleared) EXCEPT it may never be silently LOWERED while the step's
+      // own actual produced-asset count has not yet met the EXISTING (pre-edit)
+      // requirement -- the exact "shrink the goalpost to dodge a failing gate"
+      // bypass this incident hit. The moment the step has genuinely produced
+      // enough assets to meet its current target, the requirement is
+      // unaffected and can be freely lowered or cleared afterward (the same
+      // "failed and later succeeded" carve-out ENG-1793/ENG-1799 established
+      // for requiredFunctionCalls above).
+      //
+      // NOT exempt once a step has resolved (completed/skipped) -- same
+      // reasoning as mergeRequiredFunctionCalls above: a resolved step can be
+      // reset back to 'pending' without restoring expectedAssetCount, and for
+      // a step that resolved normally `produced` was already >= `existing`
+      // when it completed, so this protection is a no-op in the normal case
+      // and only bites the reset-then-shrink-then-recomplete abuse path.
+      //
+      // Fresh-eyes review of this PR also found `expectedAssetCountTools`
+      // itself had ZERO protection: leaving expectedAssetCount unchanged
+      // (e.g. still 12) while silently retargeting expectedAssetCountTools to
+      // an unrelated tool the model already called 12+ times for other
+      // reasons achieves the identical "dodge a failing gate" outcome through
+      // a field this check never looked at. mergeExpectedAssetCountTools
+      // below applies the same guard: don't allow the counted-tools list to
+      // change while the CURRENT requirement (measured against the EXISTING
+      // tools) hasn't genuinely been met.
+      const mergeExpectedAssetCount = (
+        existingStep: { stepCount: number; status?: string; expectedAssetCount?: number; expectedAssetCountTools?: string[] },
+        requested: number | undefined,
+      ): number | undefined => {
+        if (requested === undefined) return existingStep.expectedAssetCount;
+        const existing = existingStep.expectedAssetCount;
+        if (typeof existing !== 'number' || existing <= 0 || requested >= existing) return requested;
+        const sinceIso = findAssetCountCutoff(workPlan.steps, existingStep.stepCount);
+        const produced = computeStepProducedAssetCount(existingStep.expectedAssetCountTools, sinceIso);
+        return produced < existing ? existing : requested;
+      };
+      const mergeExpectedAssetCountTools = (
+        existingStep: { stepCount: number; status?: string; expectedAssetCount?: number; expectedAssetCountTools?: string[] },
+        requested: string[] | undefined,
+      ): string[] | undefined => {
+        if (requested === undefined) return existingStep.expectedAssetCountTools;
+        const existing = existingStep.expectedAssetCount;
+        if (typeof existing !== 'number' || existing <= 0) return requested;
+        const sinceIso = findAssetCountCutoff(workPlan.steps, existingStep.stepCount);
+        const produced = computeStepProducedAssetCount(existingStep.expectedAssetCountTools, sinceIso);
+        return produced < existing ? existingStep.expectedAssetCountTools : requested;
+      };
 
       // Update or add steps
       for (const newStep of steps) {
@@ -29736,17 +36507,43 @@ ${strippedHtml}`;
             title: newStep.title,
             description: newStep.description,
             ...(newStep.userInstructions !== undefined && { userInstructions: newStep.userInstructions }),
-            requiredFunctionCalls: newStep.requiredFunctionCalls !== undefined ? newStep.requiredFunctionCalls : workPlan.steps[existingIndex].requiredFunctionCalls,
+            requiredFunctionCalls: mergeRequiredFunctionCalls(
+              workPlan.steps[existingIndex].requiredFunctionCalls,
+              newStep.requiredFunctionCalls,
+            ),
             skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds,
-            // Allow scope changes: an explicit expectedAssetCount overrides (including 0
-            // to clear the asset gate when the user approves a smaller set); omitting it
-            // preserves the existing value. Same override-or-preserve semantics for
-            // expectedAssetCountTools (ENG-1331).
-            expectedAssetCount: newStep.expectedAssetCount !== undefined ? newStep.expectedAssetCount : workPlan.steps[existingIndex].expectedAssetCount,
-            expectedAssetCountTools: newStep.expectedAssetCountTools !== undefined ? newStep.expectedAssetCountTools : workPlan.steps[existingIndex].expectedAssetCountTools
+            // Allow scope changes: an explicit expectedAssetCount/expectedAssetCountTools
+            // overrides (including 0/[] to clear the asset gate when the user approves a
+            // smaller set) UNLESS the step hasn't actually produced enough assets to meet
+            // its current requirement yet -- see mergeExpectedAssetCount/
+            // mergeExpectedAssetCountTools (ENG-1800) above. Omitting either preserves the
+            // existing value.
+            expectedAssetCount: mergeExpectedAssetCount(workPlan.steps[existingIndex], newStep.expectedAssetCount),
+            expectedAssetCountTools: mergeExpectedAssetCountTools(workPlan.steps[existingIndex], newStep.expectedAssetCountTools)
           };
         } else {
-          // Add new step (stepCount will be fixed by updateSessionWorkPlan)
+          // Add new step (stepCount will be fixed by updateSessionWorkPlan).
+          //
+          // requiredFunctionCalls is taken as given here, unprotected -- ENG-1811's
+          // pendingRequiredFunctionCalls ledger (populated above whenever a step is
+          // removed) is what actually guarantees a genuinely unresolved requirement
+          // can't be walked away from, enforced at completion time in
+          // setWorkPlanStatusAttempt regardless of which step (if any) still lists
+          // it. That covers this stepCount being reused in this same call, a later
+          // separate call, or never being reused at all -- strictly more than a
+          // per-call reattachment here could.
+          //
+          // expectedAssetCount/expectedAssetCountTools have no equivalent
+          // session-level ledger yet (the "produced count" calculation is inherently
+          // step-relative, not easily genericized the way a function name is) -- if
+          // this stepCount was just removed via removeStepCounts in THIS SAME call,
+          // still reattach its pre-removal asset-count requirement as a best-effort
+          // guard using the pre-removal step as the baseline. A genuinely new
+          // stepCount, or one whose removal happened in an earlier, separate call,
+          // has no such reattachment (a known, narrower residual gap -- see ENG-1808).
+          const removedOriginal = removeStepCounts?.includes(newStep.stepCount)
+            ? originalStepsBeforeRemoval.get(newStep.stepCount)
+            : undefined;
           workPlan.steps.push({
             stepCount: newStep.stepCount,
             title: newStep.title,
@@ -29757,8 +36554,12 @@ ${strippedHtml}`;
             notes: undefined,
             requiredFunctionCalls: newStep.requiredFunctionCalls,
             skillIds: newStep.skillIds,
-            ...(newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount }),
-            ...(newStep.expectedAssetCountTools !== undefined && { expectedAssetCountTools: newStep.expectedAssetCountTools })
+            ...(removedOriginal
+              ? { expectedAssetCount: mergeExpectedAssetCount(removedOriginal, newStep.expectedAssetCount) }
+              : (newStep.expectedAssetCount !== undefined && { expectedAssetCount: newStep.expectedAssetCount })),
+            ...(removedOriginal
+              ? { expectedAssetCountTools: mergeExpectedAssetCountTools(removedOriginal, newStep.expectedAssetCountTools) }
+              : (newStep.expectedAssetCountTools !== undefined && { expectedAssetCountTools: newStep.expectedAssetCountTools }))
           });
         }
       }
@@ -29790,368 +36591,586 @@ ${strippedHtml}`;
     updates: Array<{ stepCount: number; status: 'pending' | 'completed' | 'skipped'; notes?: string }>,
     sessionId: string
   ): Promise<any> {
-    try {
-      // ENG-1188 (Greptile): consistentRead, not the default eventually-consistent
-      // read -- a turn that writes an "Image generated" marker and then
-      // immediately calls set_work_plan_status in the same turn can otherwise race
-      // a stale replica and see too few images, rejecting genuinely-complete work
-      // as insufficientAssets. ENG-510 built this parameter for exactly this "just
-      // wrote it, must see it now" shape (agentModeController.ts already uses it
-      // for the analogous timed-out-run read).
-      const session = await chatbotDb.getChatSession(sessionId, true);
-      if (!session || !session.workPlan) {
-        return {
-          success: false,
-          message: 'No work plan found in this session. Create one first using create_work_plan.'
-        };
-      }
-
-      // ENG-1188 (Greptile follow-up): each step's PRE-BATCH resolvedAt/completedAt
-      // AND status, captured before any update in THIS call runs. workPlan.steps
-      // below starts as the SAME array session.workPlan.steps points at (the
-      // spread on the next line only copies the top-level object), so an
-      // in-place `workPlan.steps[i] = {...}` replacement further down is visible
-      // through both references — reading a "live" cutoff would see this batch's
-      // OWN just-assigned timestamps, collapsing every step resolved together in
-      // one call to the same instant and wrongly excluding assets a later step in
-      // that same batch actually produced in an earlier turn.
-      //
-      // Status is captured alongside the timestamp (CodeRabbit, PR #2430): a step
-      // that was completed/skipped and later reset to 'pending' (e.g. its assets
-      // need regenerating) keeps its old resolvedAt/completedAt untouched — only
-      // a 'completed'/'skipped' transition refreshes those fields. Blindly trusting
-      // that stale timestamp as a cutoff for a later step would wrongly widen the
-      // asset-count window with assets from the step's earlier, now-superseded
-      // attempt — see the cutoff walk below for how a reset step's PRE-BATCH
-      // status routes it to its fresh LIVE timestamp instead.
-      const originalStepStateByCount = new Map<number, { resolvedAt: string | undefined; status: string }>(
-        session.workPlan.steps.map((s: any) => [s.stepCount, { resolvedAt: s.resolvedAt || s.completedAt, status: s.status }])
-      );
-
-      const workPlan = { ...session.workPlan };
-      const updatedSteps: Array<{ stepCount: number; title: string; status: string }> = [];
-      const notFoundSteps: number[] = [];
-      const missingFunctionCalls: Array<{ stepCount: number; title: string; missing: string[] }> = [];
-      const outOfOrderSteps: Array<{ stepCount: number; title: string; pendingSteps: string[] }> = [];
-
-      // Get function call counts from session (make a copy to modify)
-      const calledFunctionCounts = { ...(session.calledFunctions || {}) };
-      let countsModified = false;
-
-      const insufficientAssets: Array<{ stepCount: number; title: string; expected: number; produced: number }> = [];
-
-      // Process each update
-      for (const update of updates) {
-        const stepIndex = workPlan.steps.findIndex(s => s.stepCount === update.stepCount);
-
-        if (stepIndex < 0) {
-          notFoundSteps.push(update.stepCount);
+    // ENG-1626: set_work_plan_status persists workplan step progression — a
+    // production session (822c1ed4) hit set_work_plan_status twice while the
+    // customer watched "Step 9 of 10" live, with no system-level retry, so a
+    // transient DynamoDB/network blip anywhere in the read-modify-write below
+    // surfaced immediately as a customer-visible failure. One transparent retry
+    // for a classified-transient error (timeout/network/rate_limit/upstream_5xx)
+    // before giving up — the same classifier the model-visible retry guidance
+    // already uses, so this and that guidance never disagree about what's
+    // retryable. Deliberate gate refusals (missing steps, out-of-order
+    // completion, etc.) never throw, so they pass straight through on the
+    // first attempt untouched.
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        return await this.setWorkPlanStatusAttempt(updates, sessionId);
+      } catch (error) {
+        lastError = error;
+        const errorClass = classifyToolErrorClass(error);
+        if (attempt < 2 && isRetryableErrorClass(errorClass)) {
+          console.warn(`AgentMode: set_work_plan_status failed with a transient error (${errorClass}) for session ${sessionId}; retrying once`);
           continue;
         }
+        break;
+      }
+    }
+    console.error('AgentMode: Error setting work plan status:', lastError);
+    return {
+      success: false,
+      message: 'Failed to update work plan status',
+      error: lastError instanceof Error ? lastError.message : 'Unknown error'
+    };
+  }
 
-        const step = workPlan.steps[stepIndex];
+  private async setWorkPlanStatusAttempt(
+    updates: Array<{ stepCount: number; status: 'pending' | 'completed' | 'skipped'; notes?: string }>,
+    sessionId: string
+  ): Promise<any> {
+    // ENG-1188 (Greptile): consistentRead, not the default eventually-consistent
+    // read -- a turn that writes an "Image generated" marker and then
+    // immediately calls set_work_plan_status in the same turn can otherwise race
+    // a stale replica and see too few images, rejecting genuinely-complete work
+    // as insufficientAssets. ENG-510 built this parameter for exactly this "just
+    // wrote it, must see it now" shape (agentModeController.ts already uses it
+    // for the analogous timed-out-run read).
+    const session = await chatbotDb.getChatSession(sessionId, true);
+    if (!session || !session.workPlan) {
+      return {
+        success: false,
+        message: 'No work plan found in this session. Create one first using create_work_plan.'
+      };
+    }
 
-        // Cross-step ordering gate (ENG-1188 root cause fault #3): the xCures
-        // incident marked "QA, Contact Sheet & Delivery" completed while "Render
-        // the Full Size Matrix" — an earlier step — was still pending, so delivery
-        // never actually gated on the rendering it claimed to deliver. Neither gate
-        // below catches this: both only look at the step being completed, never at
-        // whether the steps before it are actually done. Checked against the
-        // in-progress workPlan.steps (not a snapshot from before the loop), so
-        // several steps completed in the same batch, in order, chain correctly —
-        // and a batch that completes them out of order is caught per-step.
-        if (update.status === 'completed') {
-          const pendingEarlierSteps = workPlan.steps.filter(
-            (s: any) => s.stepCount < step.stepCount && s.status !== 'completed' && s.status !== 'skipped'
-          );
-          if (pendingEarlierSteps.length > 0) {
-            outOfOrderSteps.push({
-              stepCount: update.stepCount,
-              title: step.title,
-              pendingSteps: pendingEarlierSteps.map((s: any) => `${s.stepCount} "${s.title}"`),
-            });
-            continue; // Skip updating this step
+    // ENG-1626 (code review): the retry wrapper in setWorkPlanStatus can re-invoke
+    // this attempt after a classified-transient error whose underlying DynamoDB
+    // writes actually committed server-side (ack-lost) -- the client sees a
+    // timeout/network failure, but updateSessionWorkPlan/updateCalledFunctions
+    // below are unconditional SETs with no idempotency key. Blindly re-running a
+    // step's mutation would re-decrement an already-decremented
+    // calledFunctionCounts and re-stamp resolvedAt, corrupting the asset-count
+    // cutoff window for later steps.
+    //
+    // ENG-1626 (CodeRabbit follow-up): an early return here for the whole batch
+    // was too broad -- it also skipped the post-write side effects below
+    // (updateSessionWorkPlanInputRequest, i.e. the NEXT step's decision card,
+    // and addAssociatedSkills). If attempt 1's updateSessionWorkPlan committed
+    // but a later call in that same attempt threw, the retry would see every
+    // step already at its target status and return success WITHOUT ever
+    // creating the decision card or installing the next step's skills -- the
+    // exact "customer never sees a card" failure this issue is about. Those
+    // calls are independently safe to repeat (updateSessionWorkPlanInputRequest
+    // is guarded by failIfAwaitingExists and returns null rather than
+    // throwing if one already exists; addAssociatedSkills filters against
+    // already-associated ids), so only the unsafe per-step mutation
+    // (calledFunctionCounts decrement, resolvedAt/completedAt stamp) is
+    // skipped below -- scoped per step, not per batch, so a batch mixing an
+    // already-applied step with a genuinely new one handles each correctly.
+    const alreadyAppliedStepCounts = new Set(
+      updates
+        .filter(update => {
+          const step = session.workPlan!.steps.find((s: any) => s.stepCount === update.stepCount);
+          return !!step && step.status === update.status;
+        })
+        .map(update => update.stepCount)
+    );
+
+    // ENG-1188 (Greptile follow-up): each step's PRE-BATCH resolvedAt/completedAt
+    // AND status, captured before any update in THIS call runs. workPlan.steps
+    // below starts as the SAME array session.workPlan.steps points at (the
+    // spread on the next line only copies the top-level object), so an
+    // in-place `workPlan.steps[i] = {...}` replacement further down is visible
+    // through both references — reading a "live" cutoff would see this batch's
+    // OWN just-assigned timestamps, collapsing every step resolved together in
+    // one call to the same instant and wrongly excluding assets a later step in
+    // that same batch actually produced in an earlier turn.
+    //
+    // Status is captured alongside the timestamp (CodeRabbit, PR #2430): a step
+    // that was completed/skipped and later reset to 'pending' (e.g. its assets
+    // need regenerating) keeps its old resolvedAt/completedAt untouched — only
+    // a 'completed'/'skipped' transition refreshes those fields. Blindly trusting
+    // that stale timestamp as a cutoff for a later step would wrongly widen the
+    // asset-count window with assets from the step's earlier, now-superseded
+    // attempt — see the cutoff walk below for how a reset step's PRE-BATCH
+    // status routes it to its fresh LIVE timestamp instead.
+    const originalStepStateByCount = new Map<number, { resolvedAt: string | undefined; status: string }>(
+      session.workPlan.steps.map((s: any) => [s.stepCount, { resolvedAt: s.resolvedAt || s.completedAt, status: s.status }])
+    );
+
+    const workPlan = { ...session.workPlan };
+    const updatedSteps: Array<{ stepCount: number; title: string; status: string }> = [];
+    const notFoundSteps: number[] = [];
+    const missingFunctionCalls: Array<{ stepCount: number; title: string; missing: string[] }> = [];
+    const outOfOrderSteps: Array<{ stepCount: number; title: string; pendingSteps: string[] }> = [];
+
+    // Get function call counts from session (make a copy to modify). This local
+    // copy drives this call's own gating decisions (does THIS step have enough
+    // available calls) and is inherently a single-request snapshot. The actual
+    // persisted decrement (see countsModified below) is applied as a delta
+    // against a fresh read at write time, not this snapshot, to avoid clobbering
+    // a concurrent writer (ENG-1698).
+    const calledFunctionCounts = { ...(session.calledFunctions || {}) };
+    let countsModified = false;
+    const pendingCalledFunctionDecrements: Record<string, number> = {};
+
+    const insufficientAssets: Array<{ stepCount: number; title: string; expected: number; produced: number }> = [];
+
+    // Process each update
+    for (const update of updates) {
+      const stepIndex = workPlan.steps.findIndex(s => s.stepCount === update.stepCount);
+
+      if (stepIndex < 0) {
+        notFoundSteps.push(update.stepCount);
+        continue;
+      }
+
+      const step = workPlan.steps[stepIndex];
+
+      // ENG-1626 (CodeRabbit follow-up): this step already carries the
+      // requested status from a prior (ack-lost) attempt -- report it as
+      // updated so the persistence/input-request/skills block below still
+      // runs, and still apply `notes` (a plain overwrite with no side
+      // effects, same as the normal path below), but skip every gate and the
+      // resolvedAt/completedAt/calledFunctionCounts mutation for it (those
+      // already ran once; re-running them would corrupt state).
+      if (alreadyAppliedStepCounts.has(update.stepCount)) {
+        workPlan.steps[stepIndex] = { ...workPlan.steps[stepIndex], notes: update.notes };
+        updatedSteps.push({ stepCount: update.stepCount, title: step.title, status: update.status });
+        continue;
+      }
+
+      // Cross-step ordering gate (ENG-1188 root cause fault #3): the xCures
+      // incident marked "QA, Contact Sheet & Delivery" completed while "Render
+      // the Full Size Matrix" — an earlier step — was still pending, so delivery
+      // never actually gated on the rendering it claimed to deliver. Neither gate
+      // below catches this: both only look at the step being completed, never at
+      // whether the steps before it are actually done. Checked against the
+      // in-progress workPlan.steps (not a snapshot from before the loop), so
+      // several steps completed in the same batch, in order, chain correctly —
+      // and a batch that completes them out of order is caught per-step.
+      if (update.status === 'completed') {
+        const pendingEarlierSteps = workPlan.steps.filter(
+          (s: any) => s.stepCount < step.stepCount && s.status !== 'completed' && s.status !== 'skipped'
+        );
+        if (pendingEarlierSteps.length > 0) {
+          outOfOrderSteps.push({
+            stepCount: update.stepCount,
+            title: step.title,
+            pendingSteps: pendingEarlierSteps.map((s: any) => `${s.stepCount} "${s.title}"`),
+          });
+          continue; // Skip updating this step
+        }
+      }
+
+      // Validate required function calls if marking as completed
+      if (update.status === 'completed' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
+        // Count how many times each function is required
+        const requiredCounts: Record<string, number> = {};
+        for (const fn of step.requiredFunctionCalls) {
+          requiredCounts[fn] = (requiredCounts[fn] || 0) + 1;
+        }
+
+        // Check if we have enough calls for each required function
+        const missing: string[] = [];
+        for (const [fn, requiredCount] of Object.entries(requiredCounts)) {
+          const availableCount = calledFunctionCounts[fn] || 0;
+          if (availableCount < requiredCount) {
+            missing.push(`${fn} (need ${requiredCount}, have ${availableCount})`);
           }
         }
 
-        // Validate required function calls if marking as completed
-        if (update.status === 'completed' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
-          // Count how many times each function is required
-          const requiredCounts: Record<string, number> = {};
-          for (const fn of step.requiredFunctionCalls) {
-            requiredCounts[fn] = (requiredCounts[fn] || 0) + 1;
-          }
+        if (missing.length > 0) {
+          missingFunctionCalls.push({
+            stepCount: update.stepCount,
+            title: step.title,
+            missing
+          });
+          continue; // Skip updating this step
+        }
 
-          // Check if we have enough calls for each required function
-          const missing: string[] = [];
-          for (const [fn, requiredCount] of Object.entries(requiredCounts)) {
-            const availableCount = calledFunctionCounts[fn] || 0;
-            if (availableCount < requiredCount) {
-              missing.push(`${fn} (need ${requiredCount}, have ${availableCount})`);
-            }
-          }
+        // If validation passed and marking as completed, decrement the function counts.
+        // ENG-2206: skip tools whose credit is a session-wide fact, not a per-step
+        // artifact — see workPlanRequiredCallsPolicy.ts's doc comment.
+        for (const fn of step.requiredFunctionCalls) {
+          if (isNonConsumableRequiredFunctionCall(fn)) continue;
+          calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
+          pendingCalledFunctionDecrements[fn] = (pendingCalledFunctionDecrements[fn] || 0) + 1;
+          countsModified = true;
+        }
+      }
 
-          if (missing.length > 0) {
-            missingFunctionCalls.push({
-              stepCount: update.stepCount,
-              title: step.title,
-              missing
-            });
-            continue; // Skip updating this step
-          }
-
-          // If validation passed and marking as completed, decrement the function counts
-          for (const fn of step.requiredFunctionCalls) {
-            calledFunctionCounts[fn] = (calledFunctionCounts[fn] || 0) - 1;
+      // ENG-1698: a skipped step never reaches the 'completed' branch above, so any
+      // calls it DID make toward its own requiredFunctionCalls (before being skipped)
+      // were never decremented — that credit stays in the shared pool, available to
+      // silently satisfy ANY later step requiring the same tool name without the model
+      // calling it again for that step's own purpose. Mirror the completed-branch
+      // decrement here, clamped at 0 (not gated on availability like completed's is,
+      // since a step can be skipped without ever having made its required calls at
+      // all — clamping avoids driving the count negative and over-penalizing a later
+      // step that makes a genuinely fresh call).
+      if (update.status === 'skipped' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
+        for (const fn of step.requiredFunctionCalls) {
+          // ENG-2206: same carve-out as the completed branch above.
+          if (isNonConsumableRequiredFunctionCall(fn)) continue;
+          const current = calledFunctionCounts[fn] || 0;
+          if (current > 0) {
+            calledFunctionCounts[fn] = current - 1;
+            pendingCalledFunctionDecrements[fn] = (pendingCalledFunctionDecrements[fn] || 0) + 1;
             countsModified = true;
           }
         }
+      }
 
-        // Asset-count completion gate. When a step declares expectedAssetCount, it may
-        // not be marked completed until IT has actually produced that many media
-        // assets. This prevents the xCures failure mode: a "Generate 3 Images Per
-        // Hook — 18 total" step being marked done with only 3 images produced (the model
-        // self-reported "Hooks 2-6 generate-pending" yet completed the step). The
-        // required-function-calls gate above could not catch this — it only checked that
-        // generate_image was called ≥1×, and the call counter was inflated to 76 by
-        // non-producing confirmation-gate returns. Counting real assets is the fix.
-        // The user can still legitimately reduce scope via modify_work_plan (lowering or
-        // clearing expectedAssetCount), so this never becomes an unrecoverable block.
-        //
-        // ENG-1188: scoped to images generated SINCE the previous step resolved, not
-        // the whole session — otherwise an earlier step's images satisfy a later
-        // step's requirement without it producing anything of its own (e.g. step 1's
-        // 18 hero images would silently cover step 2's own "3 required" declaration).
-        // No earlier step (or none with a resolvedAt yet) means no cutoff, matching
-        // the session-wide count this replaces for step 1.
-        //
-        // ENG-1188 (Greptile follow-up): the cutoff comes from each earlier step's
-        // PRE-BATCH resolvedAt (originalStepStateByCount, captured before this call
-        // started), walking back to the nearest earlier step that already had one —
-        // NOT the live in-progress workPlan.steps. A step resolved earlier in this
-        // SAME batch shares this instant as its live timestamp, which would exclude
-        // assets this step actually produced in an earlier turn; a step resolved
-        // in this same batch simply contributes no cutoff of its own, same as a
-        // step that has never resolved.
-        //
-        // ENG-1188 (CodeRabbit follow-up): a step can be reset to 'pending' after
-        // having been completed/skipped before (e.g. its assets need
-        // regenerating) — only 'completed'/'skipped' transitions stamp
-        // resolvedAt/completedAt, so a reset step KEEPS its stale timestamp from
-        // the earlier, now-superseded attempt. The ordering gate above means the
-        // only way we can reach a 'completed' update here with an earlier step's
-        // PRE-BATCH status of 'pending' is if that earlier step is ALSO being
-        // resolved within this very batch (otherwise it would still be pending
-        // live, too, and the ordering gate would have rejected this update
-        // already). In that case, trust the fresh, just-stamped LIVE timestamp
-        // for that step instead of its stale pre-batch one — that boundary is
-        // exactly "when did this step's redo actually finish," which correctly
-        // excludes both the stale pre-reset attempt's assets AND any redo-work
-        // assets produced leading up to this exact re-completion. A step with NO
-        // prior resolution at all (genuinely first-time-completed within this
-        // batch) still contributes no cutoff, same as the existing behavior.
-        if (update.status === 'completed'
-          && typeof step.expectedAssetCount === 'number'
-          && step.expectedAssetCount > 0) {
-          const earlierStepCounts = workPlan.steps
-            .filter((s: any) => s.stepCount < step.stepCount)
-            .map((s: any) => s.stepCount as number)
-            .sort((a: number, b: number) => b - a); // nearest first
-          let sinceIso: string | undefined;
-          for (const count of earlierStepCounts) {
-            const preBatch = originalStepStateByCount.get(count);
-            if (!preBatch) continue;
-            if (preBatch.status === 'completed' || preBatch.status === 'skipped') {
-              if (preBatch.resolvedAt) { sinceIso = preBatch.resolvedAt; break; }
-              continue;
-            }
-            if (preBatch.resolvedAt) {
-              const live = workPlan.steps.find((s: any) => s.stepCount === count);
-              if (live?.resolvedAt) { sinceIso = live.resolvedAt; break; }
-            }
+      // Asset-count completion gate. When a step declares expectedAssetCount, it may
+      // not be marked completed until IT has actually produced that many media
+      // assets. This prevents the xCures failure mode: a "Generate 3 Images Per
+      // Hook — 18 total" step being marked done with only 3 images produced (the model
+      // self-reported "Hooks 2-6 generate-pending" yet completed the step). The
+      // required-function-calls gate above could not catch this — it only checked that
+      // generate_image was called ≥1×, and the call counter was inflated to 76 by
+      // non-producing confirmation-gate returns. Counting real assets is the fix.
+      // The user can still legitimately reduce scope via modify_work_plan (lowering or
+      // clearing expectedAssetCount), so this never becomes an unrecoverable block.
+      //
+      // ENG-1188: scoped to images generated SINCE the previous step resolved, not
+      // the whole session — otherwise an earlier step's images satisfy a later
+      // step's requirement without it producing anything of its own (e.g. step 1's
+      // 18 hero images would silently cover step 2's own "3 required" declaration).
+      // No earlier step (or none with a resolvedAt yet) means no cutoff, matching
+      // the session-wide count this replaces for step 1.
+      //
+      // ENG-1188 (Greptile follow-up): the cutoff comes from each earlier step's
+      // PRE-BATCH resolvedAt (originalStepStateByCount, captured before this call
+      // started), walking back to the nearest earlier step that already had one —
+      // NOT the live in-progress workPlan.steps. A step resolved earlier in this
+      // SAME batch shares this instant as its live timestamp, which would exclude
+      // assets this step actually produced in an earlier turn; a step resolved
+      // in this same batch simply contributes no cutoff of its own, same as a
+      // step that has never resolved.
+      //
+      // ENG-1188 (CodeRabbit follow-up): a step can be reset to 'pending' after
+      // having been completed/skipped before (e.g. its assets need
+      // regenerating) — only 'completed'/'skipped' transitions stamp
+      // resolvedAt/completedAt, so a reset step KEEPS its stale timestamp from
+      // the earlier, now-superseded attempt. The ordering gate above means the
+      // only way we can reach a 'completed' update here with an earlier step's
+      // PRE-BATCH status of 'pending' is if that earlier step is ALSO being
+      // resolved within this very batch (otherwise it would still be pending
+      // live, too, and the ordering gate would have rejected this update
+      // already). In that case, trust the fresh, just-stamped LIVE timestamp
+      // for that step instead of its stale pre-batch one — that boundary is
+      // exactly "when did this step's redo actually finish," which correctly
+      // excludes both the stale pre-reset attempt's assets AND any redo-work
+      // assets produced leading up to this exact re-completion. A step with NO
+      // prior resolution at all (genuinely first-time-completed within this
+      // batch) still contributes no cutoff, same as the existing behavior.
+      if (update.status === 'completed'
+        && typeof step.expectedAssetCount === 'number'
+        && step.expectedAssetCount > 0) {
+        const earlierStepCounts = workPlan.steps
+          .filter((s: any) => s.stepCount < step.stepCount)
+          .map((s: any) => s.stepCount as number)
+          .sort((a: number, b: number) => b - a); // nearest first
+        let sinceIso: string | undefined;
+        for (const count of earlierStepCounts) {
+          const preBatch = originalStepStateByCount.get(count);
+          if (!preBatch) continue;
+          if (preBatch.status === 'completed' || preBatch.status === 'skipped') {
+            if (preBatch.resolvedAt) { sinceIso = preBatch.resolvedAt; break; }
+            continue;
           }
-          // ENG-1331: extractGeneratedImageFilenames only recognizes generate_image's
-          // own marker, so a step whose deliverable is Playwright-rendered
-          // screenshots (no generate_image call at all) would always read 0 there.
-          // extractProducedAssetCount reads the same persisted toolCalls ledger for
-          // every known asset-producing tool.
-          //
-          // When the step names its own expectedAssetCountTools, trust that
-          // explicitly and skip the max-with-legacy-signal blend below: the whole
-          // point of naming the tool(s) is precision, and blending in
-          // extractGeneratedImageFilenames' generate_image count would reopen the
-          // exact ambiguity the author resolved by naming their tool(s) at all (e.g.
-          // an unrelated generate_image call elsewhere in the step inflating a
-          // screenshot-only count). Without a declared list, take the max of both
-          // signals so neither detection path can pull the count DOWN relative to
-          // the other — the safe default for a step that hasn't disambiguated.
-          const producedAssetCount = step.expectedAssetCountTools?.length
-            ? extractProducedAssetCount(session.messages, sinceIso, step.expectedAssetCountTools)
-            : Math.max(
-                AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length,
-                extractProducedAssetCount(session.messages, sinceIso),
-              );
-          if (producedAssetCount < step.expectedAssetCount) {
-            insufficientAssets.push({
-              stepCount: update.stepCount,
-              title: step.title,
-              expected: step.expectedAssetCount,
-              produced: producedAssetCount,
-            });
-            continue; // Skip updating this step
+          if (preBatch.resolvedAt) {
+            const live = workPlan.steps.find((s: any) => s.stepCount === count);
+            if (live?.resolvedAt) { sinceIso = live.resolvedAt; break; }
           }
         }
-
-        // Update the step status
-        const resolvedNow = update.status === 'completed' || update.status === 'skipped'
-          ? new Date().toISOString()
-          : undefined;
-        workPlan.steps[stepIndex] = {
-          ...workPlan.steps[stepIndex],
-          status: update.status,
-          notes: update.notes,
-          completedAt: update.status === 'completed' ? resolvedNow : workPlan.steps[stepIndex].completedAt,
-          // ENG-1188 (Greptile follow-up): set for 'skipped' too, unlike completedAt
-          // — see the field's doc comment in chatbotService.ts for why this can't
-          // just reuse completedAt.
-          resolvedAt: resolvedNow || workPlan.steps[stepIndex].resolvedAt,
-        };
-
-        updatedSteps.push({
-          stepCount: update.stepCount,
-          title: workPlan.steps[stepIndex].title,
-          status: update.status
-        });
-      }
-
-      // Ordering gate failure — a step was completed while an earlier step in the
-      // plan is still pending. Same all-or-nothing shape as the two gates below:
-      // the caller can just resend the batch in the correct order.
-      if (outOfOrderSteps.length > 0) {
-        const errorDetails = outOfOrderSteps.map(oos =>
-          `Step ${oos.stepCount} "${oos.title}": earlier step(s) not yet done: ${oos.pendingSteps.join(', ')}`
-        ).join('\n');
-
-        return {
-          success: false,
-          message: 'Cannot mark steps as completed. Earlier steps in the plan are not done yet.',
-          outOfOrderSteps,
-          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nComplete (or explicitly skip) the earlier step(s) first, then mark this step as completed.`
-        };
-      }
-
-      // Check if there are missing function calls - this is a critical error
-      if (missingFunctionCalls.length > 0) {
-        const errorDetails = missingFunctionCalls.map(mfc =>
-          `Step ${mfc.stepCount} "${mfc.title}": missing required function calls: ${mfc.missing.join(', ')}`
-        ).join('\n');
-
-        return {
-          success: false,
-          message: 'Cannot mark steps as completed. Required function calls have not been made yet.',
-          missingFunctionCalls,
-          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nPlease make the required function calls first, then mark the steps as completed.`
-        };
-      }
-
-      // Asset-count gate failure — the step's declared media assets are not all produced.
-      if (insufficientAssets.length > 0) {
-        const errorDetails = insufficientAssets.map(ia =>
-          `Step ${ia.stepCount} "${ia.title}": ${ia.produced} of ${ia.expected} required images/assets have been generated (${ia.expected - ia.produced} still missing)`
-        ).join('\n');
-
-        return {
-          success: false,
-          message: 'Cannot mark steps as completed. The required number of assets has not been generated yet.',
-          insufficientAssets,
-          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nGenerate the remaining assets with generate_image, then mark the step completed. If the user has explicitly approved a smaller set, call modify_work_plan to lower the step's expected asset count first.`
-        };
-      }
-
-      // Check if any steps were not found
-      if (notFoundSteps.length > 0 && updatedSteps.length === 0) {
-        return {
-          success: false,
-          message: `Steps not found: ${notFoundSteps.join(', ')}`
-        };
-      }
-
-      // Only update if there are changes
-      if (updatedSteps.length > 0) {
-        workPlan.updatedAt = new Date().toISOString();
-        // Update the session (will throw error if stepCount is not sequential)
-        await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
-
-        // A configured input belongs to the step that just became active, not
-        // to a particular portal. Persist the same request the customer portal
-        // renders and an MCP client elicits natively. Answered historical
-        // requests may be replaced; a concurrent live request never is.
-        const nextInputStep = workPlan.steps
-          .sort((a: any, b: any) => a.stepCount - b.stepCount)
-          .find((s: any) => s.status === 'pending' && s.inputRequest);
-        if (nextInputStep?.inputRequest) {
-          await chatbotDb.updateSessionWorkPlanInputRequest(
-            sessionId,
-            buildWorkPlanInputRequest({
-              ...nextInputStep.inputRequest,
-              requestId: uuidv4(),
-              stepCount: nextInputStep.stepCount,
-            }),
-            { failIfAwaitingExists: true },
-          );
-        }
-
-        // Update function counts if they were modified
-        if (countsModified) {
-          await chatbotDb.updateCalledFunctions(sessionId, calledFunctionCounts);
-        }
-
-        // Auto-install skills for the next pending step
-        const completedStepCounts = updatedSteps.filter(s => s.status === 'completed').map(s => s.stepCount);
-        if (completedStepCounts.length > 0) {
-          const nextPendingStep = workPlan.steps
-            .sort((a: any, b: any) => a.stepCount - b.stepCount)
-            .find((s: any) => s.status === 'pending');
-          if (nextPendingStep?.skillIds?.length) {
-            try {
-              const currentAssociated = session.associatedSkills || [];
-              const newSkillIds = nextPendingStep.skillIds.filter((id: string) => !currentAssociated.includes(id));
-              if (newSkillIds.length > 0) {
-                await chatbotDb.addAssociatedSkills(sessionId, newSkillIds);
-                console.log(`AgentMode: Auto-installed skills for step ${nextPendingStep.stepCount}: ${newSkillIds.join(', ')}`);
-              }
-            } catch (skillErr) {
-              console.error('AgentMode: Error auto-installing skills for next step:', skillErr);
-            }
-          }
+        // ENG-1331: extractGeneratedImageFilenames only recognizes generate_image's
+        // own marker, so a step whose deliverable is Playwright-rendered
+        // screenshots (no generate_image call at all) would always read 0 there.
+        // extractProducedAssetCount reads the same persisted toolCalls ledger for
+        // every known asset-producing tool.
+        //
+        // When the step names its own expectedAssetCountTools, trust that
+        // explicitly and skip the max-with-legacy-signal blend below: the whole
+        // point of naming the tool(s) is precision, and blending in
+        // extractGeneratedImageFilenames' generate_image count would reopen the
+        // exact ambiguity the author resolved by naming their tool(s) at all (e.g.
+        // an unrelated generate_image call elsewhere in the step inflating a
+        // screenshot-only count). Without a declared list, take the max of both
+        // signals so neither detection path can pull the count DOWN relative to
+        // the other — the safe default for a step that hasn't disambiguated.
+        const producedAssetCount = step.expectedAssetCountTools?.length
+          ? extractProducedAssetCount(session.messages, sinceIso, step.expectedAssetCountTools)
+          : Math.max(
+              AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length,
+              extractProducedAssetCount(session.messages, sinceIso),
+            );
+        if (producedAssetCount < step.expectedAssetCount) {
+          insufficientAssets.push({
+            stepCount: update.stepCount,
+            title: step.title,
+            expected: step.expectedAssetCount,
+            produced: producedAssetCount,
+          });
+          continue; // Skip updating this step
         }
       }
 
-      const message = updatedSteps.length === 1
-        ? `Step ${updatedSteps[0].stepCount} status updated to ${updatedSteps[0].status}`
-        : `Updated ${updatedSteps.length} step${updatedSteps.length > 1 ? 's' : ''}`;
+      // Update the step status
+      const resolvedNow = update.status === 'completed' || update.status === 'skipped'
+        ? new Date().toISOString()
+        : undefined;
+      workPlan.steps[stepIndex] = {
+        ...workPlan.steps[stepIndex],
+        status: update.status,
+        notes: update.notes,
+        completedAt: update.status === 'completed' ? resolvedNow : workPlan.steps[stepIndex].completedAt,
+        // ENG-1188 (Greptile follow-up): set for 'skipped' too, unlike completedAt
+        // — see the field's doc comment in chatbotService.ts for why this can't
+        // just reuse completedAt.
+        resolvedAt: resolvedNow || workPlan.steps[stepIndex].resolvedAt,
+      };
 
-      const formattedContent = updatedSteps.map(s =>
-        `Updated step ${s.stepCount} "${s.title}" to ${s.status}`
+      updatedSteps.push({
+        stepCount: update.stepCount,
+        title: workPlan.steps[stepIndex].title,
+        status: update.status
+      });
+    }
+
+    // Ordering gate failure — a step was completed while an earlier step in the
+    // plan is still pending. Same all-or-nothing shape as the two gates below:
+    // the caller can just resend the batch in the correct order.
+    if (outOfOrderSteps.length > 0) {
+      const errorDetails = outOfOrderSteps.map(oos =>
+        `Step ${oos.stepCount} "${oos.title}": earlier step(s) not yet done: ${oos.pendingSteps.join(', ')}`
       ).join('\n');
 
       return {
-        success: updatedSteps.length > 0,
-        message: notFoundSteps.length > 0
-          ? `${message}. Steps not found: ${notFoundSteps.join(', ')}`
-          : message,
-        updatedSteps,
-        notFoundSteps: notFoundSteps.length > 0 ? notFoundSteps : undefined,
-        formattedContent
-      };
-    } catch (error) {
-      console.error('AgentMode: Error setting work plan status:', error);
-      return {
         success: false,
-        message: 'Failed to update work plan status',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        // ENG-1626: this is a deliberate business-rule gate, not a malfunction --
+        // blocked/reason lets recordToolFailure (agentToolGatewayService) recognize
+        // it as a ToolResultPolicyBlockedError and skip it, the same telemetry
+        // carve-out ENG-1636 established. Without this, a self-corrected refusal
+        // like this one incremented failedFunctions.set_work_plan_status and read
+        // as an infra flake on the failure-cluster dashboard.
+        blocked: true,
+        reason: 'workplan_out_of_order',
+        message: 'Cannot mark steps as completed. Earlier steps in the plan are not done yet.',
+        outOfOrderSteps,
+        formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nComplete (or explicitly skip) the earlier step(s) first, then mark this step as completed.`
       };
     }
+
+    // Check if there are missing function calls - this is a critical error
+    if (missingFunctionCalls.length > 0) {
+      const errorDetails = missingFunctionCalls.map(mfc =>
+        `Step ${mfc.stepCount} "${mfc.title}": missing required function calls: ${mfc.missing.join(', ')}`
+      ).join('\n');
+
+      return {
+        success: false,
+        // ENG-1626: deliberate gate, see the out-of-order gate above for why
+        // blocked/reason is set here.
+        blocked: true,
+        reason: 'workplan_missing_function_calls',
+        message: 'Cannot mark steps as completed. Required function calls have not been made yet.',
+        missingFunctionCalls,
+        formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nPlease make the required function calls first, then mark the steps as completed.`
+      };
+    }
+
+    // Asset-count gate failure — the step's declared media assets are not all produced.
+    if (insufficientAssets.length > 0) {
+      const errorDetails = insufficientAssets.map(ia =>
+        `Step ${ia.stepCount} "${ia.title}": ${ia.produced} of ${ia.expected} required images/assets have been generated (${ia.expected - ia.produced} still missing)`
+      ).join('\n');
+
+      return {
+        success: false,
+        // ENG-1626: deliberate gate, see the out-of-order gate above for why
+        // blocked/reason is set here.
+        blocked: true,
+        reason: 'workplan_insufficient_assets',
+        message: 'Cannot mark steps as completed. The required number of assets has not been generated yet.',
+        insufficientAssets,
+        formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nGenerate the remaining assets with generate_image, then mark the step completed. If the user has explicitly approved a smaller set, call modify_work_plan to lower the step's expected asset count first.`
+      };
+    }
+
+    // ENG-1811: a step removed via modify_work_plan's removeStepCounts can carry
+    // requiredFunctionCalls that never succeeded -- genuinely necessary work that
+    // was never done. Refuse to let this batch finish the WHOLE plan (resolve the
+    // last remaining pending step(s)) while any such debt is still outstanding,
+    // regardless of whether any current step still lists it as required. Scoped to
+    // "finishing the plan" rather than every individual step transition so
+    // unrelated, still-in-progress steps keep completing normally in the
+    // meantime -- only the moment the run would otherwise look fully done is
+    // gated, which is the only place a silently-dropped requirement actually
+    // matters.
+    //
+    // Reads session.calledFunctions directly (the raw, never-mutated snapshot
+    // from the top of this function), NOT the local calledFunctionCounts copy --
+    // that copy gets decremented in-place, once per required call, as THIS SAME
+    // batch's own steps pass their gates above (the pre-existing ENG-1698
+    // credit-consumption mechanic). A debt name that's ALSO genuinely required
+    // and satisfied by an ordinary step completing earlier in this very loop
+    // would decrement calledFunctionCounts back toward 0, making a real success
+    // moments earlier look like it never happened -- a real bug found by review,
+    // reproduced standalone before this comment was written: a session with a
+    // pending debt for `list_html_templates`, a single step requiring exactly
+    // that function, called exactly once and genuinely succeeding, still got
+    // permanently blocked from ever finishing. The real persisted decrement
+    // (decrementCalledFunctionsClamped) only runs after this whole gate passes
+    // anyway, so there's no correctness reason to consult the hypothetical
+    // post-decrement value at decision time -- only whether the function
+    // actually succeeded at all this session.
+    const rawCalledFunctionCounts = session.calledFunctions || {};
+    const unresolvedPendingRequiredFunctionCalls = (workPlan.pendingRequiredFunctionCalls || [])
+      .filter(fn => (rawCalledFunctionCounts[fn] || 0) === 0);
+    if (unresolvedPendingRequiredFunctionCalls.length > 0) {
+      const noStepsRemainPending = !workPlan.steps.some(s => s.status === 'pending');
+      if (noStepsRemainPending) {
+        return {
+          success: false,
+          // ENG-1626: deliberate gate, see the out-of-order gate above for why
+          // blocked/reason is set here.
+          blocked: true,
+          reason: 'workplan_unresolved_removed_requirements',
+          message: 'Cannot finish this work plan. A required function call from a removed step was never made.',
+          pendingRequiredFunctionCalls: unresolvedPendingRequiredFunctionCalls,
+          formattedContent: `❌ Cannot mark this plan finished yet: ${unresolvedPendingRequiredFunctionCalls.join(', ')} ${unresolvedPendingRequiredFunctionCalls.length === 1 ? 'was' : 'were'} required by a step that got removed, but never actually succeeded.\n\nCall it for real, or use modify_work_plan to add back a step that genuinely does this work, before finishing the plan.`
+        };
+      }
+    }
+    // Auto-clear any debts that have since genuinely succeeded (by any means --
+    // not necessarily via the stepCount that originally required them), so the
+    // ledger doesn't grow stale forever once real work actually happens.
+    if (workPlan.pendingRequiredFunctionCalls && workPlan.pendingRequiredFunctionCalls.length > 0) {
+      workPlan.pendingRequiredFunctionCalls = unresolvedPendingRequiredFunctionCalls;
+    }
+
+    // Check if any steps were not found
+    if (notFoundSteps.length > 0 && updatedSteps.length === 0) {
+      return {
+        success: false,
+        // ENG-1626: deliberate gate (bad stepCount), see the out-of-order gate
+        // above for why blocked/reason is set here.
+        blocked: true,
+        reason: 'workplan_step_not_found',
+        message: `Steps not found: ${notFoundSteps.join(', ')}`
+      };
+    }
+
+    // Only update if there are changes
+    if (updatedSteps.length > 0) {
+      workPlan.updatedAt = new Date().toISOString();
+      // Update the session (will throw error if stepCount is not sequential)
+      await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+
+      // A configured input belongs to the step that just became active, not
+      // to a particular portal. Persist the same request the customer portal
+      // renders and an MCP client elicits natively. Answered historical
+      // requests may be replaced; a concurrent live request never is.
+      const nextInputStep = workPlan.steps
+        .sort((a: any, b: any) => a.stepCount - b.stepCount)
+        .find((s: any) => s.status === 'pending' && s.inputRequest);
+
+      // ENG-1682: a step's own pendingWorkPlanInput is only cleared by the
+      // structured WorkPlanInputCard submission (updateSessionWorkPlanInputRequest
+      // with a null value). A user who answers the step conversationally in chat
+      // instead -- the ordinary way people talk to Emma -- never hits that path,
+      // so the now-resolved step's request stays status:'awaiting' forever. The
+      // customer portal's Details surface (the default landing view) treats any
+      // 'awaiting' input as still-active and hides the entire message list --
+      // every later step's deliverable included -- behind that stale card for
+      // the rest of the session. Clear it the moment its own step resolves, the
+      // same instant we'd otherwise replace it with the next step's request.
+      const resolvedStepCounts = new Set(
+        updatedSteps
+          .filter(s => s.status === 'completed' || s.status === 'skipped')
+          .map(s => s.stepCount),
+      );
+      const staleInputForResolvedStep = Boolean(
+        session.pendingWorkPlanInput
+          && session.pendingWorkPlanInput.status === 'awaiting'
+          && resolvedStepCounts.has(session.pendingWorkPlanInput.stepCount),
+      );
+
+      // CodeRabbit (PR #2713): bypassing failIfAwaitingExists entirely for the write
+      // below would also skip its pendingUserQuestion check, letting a NEW work-plan
+      // input land while a genuinely concurrent ask_user_question is still awaiting --
+      // two simultaneous prompts, an invalid state neither surface expects. Clear the
+      // known-stale record as its OWN guarded step first (matched by requestId, so a
+      // race that already replaced it fails closed instead of clobbering the newer
+      // one), THEN let the write below keep its full, unmodified guard -- it now
+      // correctly finds pendingWorkPlanInput cleared while still enforcing the
+      // pendingUserQuestion half of the check.
+      if (staleInputForResolvedStep) {
+        await chatbotDb.updateSessionWorkPlanInputRequest(sessionId, null, {
+          requireStillAwaiting: session.pendingWorkPlanInput!.requestId,
+        });
+      }
+
+      if (nextInputStep?.inputRequest) {
+        await chatbotDb.updateSessionWorkPlanInputRequest(
+          sessionId,
+          buildWorkPlanInputRequest({
+            ...nextInputStep.inputRequest,
+            requestId: uuidv4(),
+            stepCount: nextInputStep.stepCount,
+          }),
+          { failIfAwaitingExists: true },
+        );
+      }
+
+      // Update function counts if they were modified. Applied as a clamped delta
+      // against a fresh read (ENG-1698) rather than this call's local snapshot,
+      // so it can't clobber a concurrent writer (e.g. a new plan's reset, or
+      // another in-flight tool-dispatch increment).
+      if (countsModified) {
+        await chatbotDb.decrementCalledFunctionsClamped(sessionId, pendingCalledFunctionDecrements);
+      }
+
+      // Auto-install skills for the next pending step
+      const completedStepCounts = updatedSteps.filter(s => s.status === 'completed').map(s => s.stepCount);
+      if (completedStepCounts.length > 0) {
+        const nextPendingStep = workPlan.steps
+          .sort((a: any, b: any) => a.stepCount - b.stepCount)
+          .find((s: any) => s.status === 'pending');
+        if (nextPendingStep?.skillIds?.length) {
+          try {
+            const currentAssociated = session.associatedSkills || [];
+            const newSkillIds = nextPendingStep.skillIds.filter((id: string) => !currentAssociated.includes(id));
+            if (newSkillIds.length > 0) {
+              await chatbotDb.addAssociatedSkills(sessionId, newSkillIds);
+              console.log(`AgentMode: Auto-installed skills for step ${nextPendingStep.stepCount}: ${newSkillIds.join(', ')}`);
+            }
+          } catch (skillErr) {
+            console.error('AgentMode: Error auto-installing skills for next step:', skillErr);
+          }
+        }
+      }
+    }
+
+    const message = updatedSteps.length === 1
+      ? `Step ${updatedSteps[0].stepCount} status updated to ${updatedSteps[0].status}`
+      : `Updated ${updatedSteps.length} step${updatedSteps.length > 1 ? 's' : ''}`;
+
+    const formattedContent = updatedSteps.map(s =>
+      `Updated step ${s.stepCount} "${s.title}" to ${s.status}`
+    ).join('\n');
+
+    return {
+      success: updatedSteps.length > 0,
+      message: notFoundSteps.length > 0
+        ? `${message}. Steps not found: ${notFoundSteps.join(', ')}`
+        : message,
+      updatedSteps,
+      notFoundSteps: notFoundSteps.length > 0 ? notFoundSteps : undefined,
+      formattedContent
+    };
   }
 
   public async listBooks(userId: string, type?: string, status?: string): Promise<any> {
@@ -31227,7 +38246,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      const { getAccountsWithOwnerIncludingOrgShared, getAccountByIdConsistent } = await import('./connectedAccountsDb');
+      const { getAccountsWithOwnerIncludingOrgShared, getAccountByIdConsistent, SOCIAL_POSTING_PLATFORMS } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
       // Fetch all accessible accounts (own + org-shared) once, so org-shared accounts
@@ -31236,7 +38255,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // which returns null for accounts owned by an org member — use this instead.
       const allAccounts = await getAccountsWithOwnerIncludingOrgShared(userId);
       const socialAccounts = allAccounts.filter((a: any) =>
-        ['twitter', 'linkedin', 'instagram', 'youtube'].includes(a.platform)
+        (SOCIAL_POSTING_PLATFORMS as readonly string[]).includes(a.platform)
       );
 
       let account: any;
@@ -31329,6 +38348,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return { success: false, message: result.message };
       }
 
+      // H-VOICE: when the UI passes the Emma draft alongside the approved text,
+      // persist a session Voice Card observation (fail-open).
+      try {
+        const sessionId = toolContext?.sessionId as string | undefined;
+        const draftContent = toolContext?.voiceCapture?.draft as string | undefined;
+        if (sessionId && draftContent) {
+          const { captureVoiceEditOnPublish } = await import('./voiceProfileHooks');
+          const { chatbotDb } = await import('./chatbotService');
+          const session = await chatbotDb.getChatSession(sessionId);
+          await captureVoiceEditOnPublish({
+            sessionId,
+            platform: account.platform,
+            draftContent,
+            approvedContent: content,
+            existingProfile: session?.sessionVoiceProfile,
+          });
+        }
+      } catch (voiceCaptureErr) {
+        console.warn('[AgentMode] H-VOICE capture skipped (non-fatal):', voiceCaptureErr);
+      }
+
       return {
         success: true,
         message: result.message,
@@ -31340,7 +38380,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         ? 'Account token expired. Please reconnect the account in Settings.'
         : (error?.message ?? 'Unknown error');
       console.error('AgentMode: Error posting on account:', error);
-      return { success: false, message: `Failed to post: ${message}` };
+      // ENG-1300: the LinkedIn adapter (and X's mapListScopeError) attach the
+      // real HTTP status as .code on the thrown error — carry it through so a
+      // 401/403 classifies as auth/config instead of the generic bug fallback.
+      return { success: false, message: `Failed to post: ${message}`, code: error?.code };
     }
   }
 
@@ -31446,7 +38489,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (message.includes('access token expired')) {
         message = 'Account token expired. Please reconnect the account in Settings.';
       }
-      return { success: false, message: `Failed to repost: ${message}` };
+      return { success: false, message: `Failed to repost: ${message}`, code: error?.code };
     }
   }
 
@@ -31560,7 +38603,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         return {
           success: false,
-          message: `Failed to comment: ${message}`
+          message: `Failed to comment: ${message}`,
+          code: error?.code
         };
       }
 
@@ -31650,7 +38694,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
       return {
         success: false,
-        message: `Failed to list comments: ${message}`
+        message: `Failed to list comments: ${message}`,
+        code: error?.code
       };
     }
   }
@@ -31734,7 +38779,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         return {
           success: false,
-          message: `Failed to react: ${message}`
+          message: `Failed to react: ${message}`,
+          code: error?.code
         };
       }
 
@@ -31800,6 +38846,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           success: false,
           message: `Failed to load posts: ${accountResult.error}`,
           error: accountResult.error,
+          code: accountResult.code,
         };
       }
 
@@ -31869,7 +38916,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       } catch (error: any) {
         return {
           success: false,
-          message: `Failed to load metrics: ${error.message}`
+          message: `Failed to load metrics: ${error.message}`,
+          code: error?.code
         };
       }
 
@@ -31943,7 +38991,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       return {
         success: false,
         message: 'Failed to get post analytics',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
+        code: (error as any)?.code
       };
     }
   }
@@ -31994,6 +39043,94 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     };
   }
 
+  /**
+   * ENG-1558 follow-up: classic search-people results almost never carry
+   * `work_experience` (confirmed live — every item across two production
+   * test searches omitted it; see outreachProspectPreviewService's own
+   * "search results often omit it" comment), so calling
+   * filterByCompanySize directly on raw search items resolves an employer
+   * for ~0% of candidates and excludes everyone as unverifiable regardless
+   * of the requested bounds. importLeadsFromSearch already avoids this with
+   * a 4-tier resolution chain (work_experience → title-regex → batched LLM
+   * → Unipile getProfile) before its own company-size filter; this mirrors
+   * that same chain for the single search-people call so the two paths
+   * agree, and reshapes the result as `work_experience` since that's what
+   * filterByCompanySize's employerOf() reads.
+   */
+  private async resolveEmployersForSizeFilter(
+    items: any[],
+    accountId: string,
+    userId: string,
+  ): Promise<Array<{ work_experience: Array<{ company: string; current: true }> }>> {
+    const names: Array<string | null> = items.map((item: any) => {
+      if (item?.work_experience?.length) {
+        const current = item.work_experience.find((w: any) => w?.current) || item.work_experience[0];
+        if (current?.company) return current.company;
+      }
+      return null;
+    });
+
+    items.forEach((item: any, i: number) => {
+      if (!names[i] && typeof item?.headline === 'string') {
+        const parsed = parseCompanyFromTitle(item.headline);
+        if (parsed) names[i] = parsed;
+      }
+    });
+
+    const llmIndices: number[] = [];
+    const llmTitles: string[] = [];
+    items.forEach((item: any, i: number) => {
+      if (!names[i] && typeof item?.headline === 'string' && item.headline) {
+        llmIndices.push(i);
+        llmTitles.push(item.headline);
+      }
+    });
+    if (llmTitles.length > 0) {
+      try {
+        const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, this, userId);
+        for (let k = 0; k < llmIndices.length; k++) {
+          const v = results[k];
+          if (v && v !== 'NONE') names[llmIndices[k]] = v;
+        }
+      } catch (e: any) {
+        console.warn('[resolveEmployersForSizeFilter] LLM batch company-parse failed:', e?.message ?? String(e));
+      }
+    }
+
+    // CodeRabbit: an unbounded Promise.all here would let one hung Unipile
+    // request stall the whole interactive search-people turn — the same
+    // failure mode filterByCompanySize already guards against with a timeout
+    // + chunked concurrency. Mirror that here rather than reintroducing it.
+    const lookupTargets = items
+      .map((item: any, i: number) => ({ item, i }))
+      .filter(({ item, i }) => !names[i] && item?.public_identifier && accountId);
+    for (let start = 0; start < lookupTargets.length; start += EMPLOYER_PROFILE_LOOKUP_CONCURRENCY) {
+      const batch = lookupTargets.slice(start, start + EMPLOYER_PROFILE_LOOKUP_CONCURRENCY);
+      await Promise.all(batch.map(async ({ item, i }) => {
+        try {
+          const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
+          const profile = await withTimeoutOrReject(
+            getUnipileProfileService().getProfile(item.public_identifier, accountId),
+            EMPLOYER_PROFILE_LOOKUP_TIMEOUT_MS,
+            `LinkedIn profile lookup for ${item.public_identifier}`,
+          );
+          const raw = (profile as any)?.rawData ?? profile;
+          const exp = raw?.work_experience;
+          if (Array.isArray(exp) && exp.length) {
+            const cur = exp.find((w: any) => w?.current) || exp[0];
+            if (cur?.company) names[i] = cur.company;
+          }
+        } catch (e: any) {
+          console.warn('[resolveEmployersForSizeFilter] getProfile fallback failed:', e?.message ?? String(e));
+        }
+      }));
+    }
+
+    return names.map((name) => ({
+      work_experience: name ? [{ company: name, current: true as const }] : [],
+    }));
+  }
+
   async linkedinOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
@@ -32006,14 +39143,70 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // Same set the pacer uses, deliberately not a second hand-maintained copy: a
     // sixth write action added to one list and not the other would be either
     // silently unpaced or silently unauthorized.
-    if (PACED_WRITE_ACTIONS.has(action)) {
-      const { getAccountsByUserIdIncludingOrgShared } = await import('./connectedAccountsDb');
-      const userAccounts = await getAccountsByUserIdIncludingOrgShared(userId);
-      const authorized = userAccounts.some((a: any) => a.platform === 'unipile' && a.account_id === account_id);
-      if (!authorized) {
+    //
+    // Also resolves the account's owner + daily-cap config here (via
+    // resolveLinkedInAccountForWrite — services/agentMode/linkedInDailyVolumeGate.ts),
+    // from the same lookup this authorization check already needs, avoiding a
+    // second DB read. The daily cap is self-reported (set directly by the user
+    // in Settings, or by Emma via the set-daily-invite-cap action after asking
+    // about Premium status), never auto-detected — see linkedInWritePacer.ts's
+    // module doc comment for why. Unset defaults to the conservative free-tier
+    // number, never to the Premium max. The resolved owner may differ from the
+    // calling user for an org-shared account — writes below go through the
+    // owner's record, not the caller's.
+    // set-daily-invite-cap shares this same ownership check (a config write on
+    // the account still needs to be the caller's own/shared account) but is
+    // deliberately NOT in PACED_WRITE_ACTIONS — it doesn't touch LinkedIn at
+    // all, so none of the burst/hourly/daily send-pacing below applies to it.
+    // ENG-1719: withdraw-stale-invitations shares the ownership check for the same
+    // reason set-daily-invite-cap does — it writes to the account, so it must be the
+    // caller's own or org-shared one. It is deliberately NOT in PACED_WRITE_ACTIONS:
+    // the umbrella call itself performs no LinkedIn write, and pacing it here would
+    // consume a slot on top of the one each individual withdrawal already reserves
+    // inside the drain.
+    let resolvedLinkedInAccount: ResolvedLinkedInAccount | null = null;
+    // Fetched once here (only for the PACED_WRITE_ACTIONS branch, which is the
+    // only one that can also route below) and reused for the routing scan
+    // instead of making it repeat the same org-member fetch a second time.
+    let linkedInAccountsForRouting: any[] | undefined;
+    if (
+      PACED_WRITE_ACTIONS.has(action)
+      || action === 'set-daily-invite-cap'
+      || action === 'withdraw-stale-invitations'
+    ) {
+      if (PACED_WRITE_ACTIONS.has(action)) {
+        const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+        linkedInAccountsForRouting = await getAccountsWithOwnerIncludingOrgShared(userId);
+        resolvedLinkedInAccount = resolveLinkedInAccountFromList(linkedInAccountsForRouting, account_id);
+      } else {
+        resolvedLinkedInAccount = await resolveLinkedInAccountForWrite(userId, account_id);
+      }
+      if (!resolvedLinkedInAccount) {
         return { success: false, error: `Account ${account_id} is not connected to your profile. Connect a LinkedIn Outreach account in Settings to use this action.` };
       }
     }
+
+    // ENG-1132/ENG-1614: the requested account may be at its own daily
+    // invite/message cap while another account the org has connected and
+    // explicitly shared has headroom to spare. Route the WHOLE write there
+    // instead of failing — this only decides which account gets checked
+    // against the existing pacer/cap below; it never loosens either.
+    // No-op for accept/cancel-invitation (not volume-classed) and for a
+    // single-account customer (no alternate exists): today's behavior is
+    // unchanged in both cases.
+    let accountRouting: AccountRoutingDisclosure | null = null;
+    if (PACED_WRITE_ACTIONS.has(action) && resolvedLinkedInAccount) {
+      const routed = await routeLinkedInWriteToAccountWithHeadroom(
+        userId, action, account_id, resolvedLinkedInAccount, linkedInAccountsForRouting,
+      );
+      if (routed) {
+        console.log(`[AgentMode] linkedinOutreach: ${routed.reason}`);
+        accountRouting = { fromAccountId: account_id, toAccountId: routed.accountId, reason: routed.reason };
+        account_id = routed.accountId;
+        resolvedLinkedInAccount = routed.account;
+      }
+    }
+    const withRouting = (data: any) => withAccountRoutingDisclosure(accountRouting, data);
 
     // For read-only actions (get-profile, search-people, get-company), fall back to
     // site-wide Unipile accounts when the user has no personally-connected account.
@@ -32091,7 +39284,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         ownerUserId: userId,
         state: 'disconnected',
       });
-      return this.linkedInDisconnectedResponse();
+      return withRouting(this.linkedInDisconnectedResponse());
     }
     if (sessionState === 'unknown') {
       console.log(`[AgentMode] linkedinOutreach: account ${account_id} preflight indeterminate — proceeding, reactive handler remains the backstop`);
@@ -32113,26 +39306,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // batch of already-invited leads would both crawl and eat the hourly ceiling
     // that the genuinely-new invites later in the same run need. Each case below
     // therefore calls this immediately before its own Unipile write.
+    // Daily-volume + hourly/burst pacing lives in
+    // services/agentMode/linkedInDailyVolumeGate.ts — see that module's doc
+    // comment for the ownership and check-ordering fixes it encodes.
     const paceWrite = async (): Promise<{ refusal: any } | null> => {
       if (!PACED_WRITE_ACTIONS.has(action)) return null;
-      const slot = await reserveWriteSlot(account_id);
-      if (slot.allowed) return null;
-      console.log(`[AgentMode] linkedinOutreach: ${action} on ${account_id} refused by write pacer — ${slot.reason}`);
-      return {
-        refusal: {
-          success: false,
-          message: 'LinkedIn write actions are being paced',
-          error: [
-            slot.reason,
-            '',
-            'This is a deliberate safety limit on our side, not a LinkedIn rejection: sending or',
-            'withdrawing too quickly is what causes LinkedIn to revoke the account\'s session, which',
-            'blocks ALL outreach until the account owner manually reconnects.',
-            '',
-            'Do NOT retry this action now. Report what was completed and leave the rest for the next run.',
-          ].join('\n'),
-        },
-      };
+      const result = await paceLinkedInWrite(action, resolvedLinkedInAccount!, account_id);
+      return result.refusal ? { refusal: withRouting(result.refusal) } : null;
     };
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
@@ -32147,6 +39327,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             keywords, search_url, title, company, cursor,
             company_id, location, location_id,
             industry, industry_id, school, school_id,
+            company_size_min, company_size_max,
           } = args;
           // Unipile classic search needs at least one of keywords/search_url/cursor.
           // The downstream linkedInOutreachService.searchPeople synthesizes keywords
@@ -32190,7 +39371,47 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             // count has to be reported, or the agent is left guessing which of three
             // very different situations it is in.
             const anonymizedFiltered = searchResult.items.length - usableItems.length;
-            const trimmedItems = usableItems.map((item: any) => {
+            // ENG-1558: Unipile has no native headcount filter for people search
+            // (only for its Companies category), so a company-size ask is applied
+            // as a post-filter here — resolve each candidate's current employer
+            // and drop those outside the requested range (or unverifiable). No-op
+            // (zero extra Unipile/LLM calls) when the caller didn't ask for it.
+            //
+            // Classic search-people items almost never carry `work_experience`
+            // (confirmed live, ENG-1558 follow-up), so the employer has to be
+            // resolved first via the same tiered chain importLeadsFromSearch
+            // uses — otherwise every candidate reads as unverifiable and the
+            // filter excludes 100% of results regardless of the bounds asked for.
+            const wantsSizeFilter = company_size_min != null || company_size_max != null;
+            let sizeFilterInput = usableItems;
+            if (wantsSizeFilter) {
+              const resolved = await this.resolveEmployersForSizeFilter(usableItems, account_id, userId);
+              // CodeRabbit: only fill in the synthetic work_experience when the
+              // item didn't already carry a usable one — otherwise this
+              // overwrites a real Tier-1 work_experience (with `position`, etc.)
+              // with the resolver's bare { company, current } shape, silently
+              // dropping fields for the rare item that already had them. The
+              // "usable" check has to match the current/first-entry semantics
+              // resolveEmployersForSizeFilter's Tier 1 and filterByCompanySize's
+              // employerOf() both use — a bare .some() across every entry can
+              // keep an item whose CURRENT entry has no company, discarding a
+              // real resolved value and later reading as unverifiable anyway.
+              const hasCurrentCompany = (item: any): boolean => {
+                const exp = Array.isArray(item?.work_experience) ? item.work_experience : [];
+                const current = exp.find((w: any) => w?.current) || exp[0];
+                return !!current?.company;
+              };
+              sizeFilterInput = usableItems.map((item: any, i: number) => (
+                hasCurrentCompany(item) ? item : { ...item, ...resolved[i] }
+              ));
+            }
+            const { items: sizedItems, excludedUnverifiable: companySizeFiltered } =
+              await linkedInOutreachService.filterByCompanySize(
+                sizeFilterInput,
+                { min: company_size_min, max: company_size_max },
+                account_id,
+              );
+            const trimmedItems = sizedItems.map((item: any) => {
               const trimmed: any = {
                 provider_id: item.provider_id,
                 public_identifier: item.public_identifier,
@@ -32216,6 +39437,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               ...searchResult,
               items: trimmedItems,
               ...(anonymizedFiltered > 0 ? { anonymizedFiltered } : {}),
+              ...(companySizeFiltered > 0 ? { companySizeFiltered } : {}),
             });
             if (trimmedItems.length === 0 && anonymizedFiltered > 0) {
               // Say plainly what happened, so this does not get reported to the
@@ -32226,6 +39448,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                   `All ${anonymizedFiltered} result(s) were anonymized by LinkedIn (out-of-network), so none are usable. ` +
                   `The search itself worked — this is a reach limit, not an outage and not an empty niche. ` +
                   `Broaden the query, or search from an account whose network covers these people.`,
+                data: searchData,
+              };
+            }
+            if (trimmedItems.length === 0 && companySizeFiltered > 0) {
+              // Same transparency principle as the anonymized case above: a
+              // company-size ask that excluded every real candidate is a
+              // narrow-niche result, not an empty search and not an outage.
+              return {
+                success: true,
+                message:
+                  `Found candidates, but excluded all ${companySizeFiltered} of them because their employer's size ` +
+                  `either fell outside the requested range or couldn't be verified. The search itself worked — ` +
+                  `try widening the company_size range, or drop it to see the unfiltered results.`,
                 data: searchData,
               };
             }
@@ -32357,19 +39592,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
 
         case 'list-sent-invitations': {
-          const invitationsResult = await linkedInOutreachService.listSentInvitations(account_id, args.cursor);
-          // Trim to id fields only — full invitation objects grow ~10 entries/day and can
-          // reach 200+ entries, causing severe context window bloat in scheduled sessions.
-          if (Array.isArray(invitationsResult?.items)) {
-            const trimmedItems = invitationsResult.items.map((item: any) => ({
-              id: item.id,
-              invited_user_id: item.invited_user_id,
-              invited_user_public_id: item.invited_user_public_id,
-              invited_user: item.invited_user,
-            }));
-            return { success: true, data: { ...invitationsResult, items: trimmedItems } };
-          }
-          return { success: true, data: invitationsResult };
+          // ENG-1718: this used to ask one question — is `items` an array? — and on
+          // `false` return `{ success: true, data: <whatever came back> }`. The SDK
+          // is constructed at its default `validateRequestPayloadLevel: 'warn'`, so a
+          // 2xx body failing its own response schema is logged and passed through
+          // unchanged; any such body therefore became a SUCCESSFUL EMPTY RESULT.
+          // That is the `{}` iTrials saw while a cooldown was actively firing, with
+          // 126 pending invitations sitting in our own ledger unread — this action
+          // never consulted it. See linkedInSentInvitationsView.ts for the full
+          // chain; every outcome is now named, and none of them is a bare empty.
+          const { getSentInvitationsView } = await import('./agentMode/linkedInSentInvitationsView');
+          const { getAllSentInvitationsByAccount } = await import('./unipileSentInvitationsDb');
+          const view = await getSentInvitationsView(account_id, args.cursor, {
+            fetchLive: (id, cur) => linkedInOutreachService.listSentInvitations(id, cur),
+            fetchCached: (id) => getAllSentInvitationsByAccount(id),
+          });
+          return { success: true, data: view };
         }
 
         case 'list-received-invitations': {
@@ -32394,9 +39632,84 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const sharedSecret = args.shared_secret;
           if (!invitationId) throw new Error('invitation_id is required for accept-invitation');
           if (!sharedSecret) throw new Error('shared_secret is required for accept-invitation (use the value from list-received-invitations)');
+
+          // ENG-1595 identity binding: resolve the invitee's identity from Unipile's
+          // OWN received-invitations record for THIS invitationId, before accepting —
+          // never from caller-supplied profile_url/provider_id/name args. Those are
+          // LLM-supplied and unverified against invitation_id; unlike send-invite
+          // (where the supplied identity IS the send target by construction), a
+          // mismatched pair here would accept invitation A but mirror the CRM write
+          // onto an unrelated person B. Bounded scan: received invitations are a
+          // live feed, not something to page through unboundedly on a request path.
+          let acceptedSenderProfile: { public_id?: string; provider_id?: string; full_name?: string } | null = null;
+          try {
+            const MAX_PAGES = 5;
+            let cursor: string | undefined;
+            for (let page = 0; page < MAX_PAGES && !acceptedSenderProfile; page++) {
+              const received = await linkedInOutreachService.listReceivedInvitations(account_id, cursor);
+              const items = Array.isArray(received?.items) ? received.items : [];
+              const match = items.find((it: any) => String(it?.id) === String(invitationId));
+              if (match) {
+                acceptedSenderProfile = match.sender_profile || null;
+                break;
+              }
+              cursor = received?.cursor;
+              if (!cursor) break;
+            }
+          } catch (lookupErr) {
+            console.warn(`[AgentMode] accept-invitation: could not verify sender identity for invitation ${invitationId} (CRM mirror will be skipped):`, lookupErr);
+          }
+
           const acceptPaced = await paceWrite();
           if (acceptPaced) return acceptPaced.refusal;
           const acceptResult = await linkedInOutreachService.acceptInvitation(invitationId, account_id, sharedSecret);
+
+          // ENG-1595: mirror the now-accepted INBOUND connection into the CRM, same
+          // best-effort pattern send-invite uses below — an accepted connection must
+          // be as findable/engageable as one this account invited, or name-based CRM
+          // search silently misses a real, legitimate contact (the reported symptom).
+          // No-ops cleanly when identity couldn't be verified or list can't be
+          // resolved — mirrors nothing rather than guessing or trusting the caller.
+          //
+          // Deliberately NOT falling back to resolveListIdForAccount here (unlike
+          // send-invite). Sending an invite is always a deliberate targeting action —
+          // the account-bound list is a safe default. Accepting an inbound request is
+          // not: it could be a genuine prospect or an unrelated personal connection,
+          // and the account owner never decided "every accept is a lead." Only mirror
+          // when the caller explicitly names a list_id — i.e. when the task driving
+          // this run has actually judged this specific person relevant.
+          try {
+            const publicId = acceptedSenderProfile?.public_id;
+            const mirrorProfileUrl = publicId ? `https://www.linkedin.com/in/${publicId}/` : null;
+            if (mirrorProfileUrl) {
+              const { mirrorLinkedInInviteToCrm, splitInvitedUserName, INVITE_ACCEPTED_EVENT } = await import('./linkedInInviteCrmMirror');
+              const mirrorListId = args.list_id;
+              if (mirrorListId) {
+                const { crmDb } = await import('./db');
+                const mirrorList = await crmDb.getLeadListById(mirrorListId);
+                const { canDestructiveCrmList } = await import('./crmAccessControl');
+                if (mirrorList && (await canDestructiveCrmList(userId, mirrorList))) {
+                  const { firstName, lastName } = splitInvitedUserName(acceptedSenderProfile?.full_name);
+                  await mirrorLinkedInInviteToCrm({
+                    userId,
+                    listId: mirrorListId,
+                    linkedinUrl: mirrorProfileUrl,
+                    leadId: args.lead_id,
+                    firstName,
+                    lastName,
+                    accountId: account_id,
+                    invitationId,
+                    eventType: INVITE_ACCEPTED_EVENT,
+                  });
+                } else {
+                  console.warn(`[AgentMode] accept-invitation: skipping CRM mirror — list ${mirrorListId} not accessible to user ${userId}`);
+                }
+              }
+            }
+          } catch (mirrorErr) {
+            console.warn('[AgentMode] accept-invitation: failed to mirror accepted connection to CRM (non-fatal):', mirrorErr);
+          }
+
           return { success: true, data: acceptResult };
         }
 
@@ -32435,12 +39748,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 accountId: account_id,
               });
               if (!identity.allowed) {
-                return {
+                return withRouting({
                   success: false,
                   error: identity.refusal.message,
                   code: identity.refusal.code,
                   details: identity.refusal.details,
-                };
+                });
               }
             }
           }
@@ -32536,12 +39849,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 sentAt: pending.sentAt,
                 invitationId: pending.invitationId,
               });
-              return {
+              return withRouting({
                 success: true,
                 alreadyInvited: true,
                 message: `A LinkedIn connection invitation is already pending for this profile (sent ${pending.sentAt ?? 'previously'}). Skipped to avoid a duplicate — no invite quota was used. Move on to the next lead.`,
                 data: { alreadyInvited: true, sentAt: pending.sentAt ?? null },
-              };
+              });
             }
           }
 
@@ -32558,13 +39871,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // for the whole hour the breaker is armed, on every queued invite. Check it
           // here, before the slot is taken.
           if (linkedInOutreachService.isUnderInvitationCooldown(account_id)) {
-            return {
+            return withRouting({
               success: false,
               error:
                 'Cannot resend yet — this LinkedIn Outreach account is under an active account-level '
                 + 'invitation cooldown (its invitation cap was hit on an earlier send this run). '
                 + 'Skip the remaining invites and report what was completed.',
-            };
+            });
           }
           // Past every skip path (already-pending, identity mismatch, cooldown): this
           // call is going to reach LinkedIn, so now is when it should cost a slot.
@@ -32610,14 +39923,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               invitationId: (inviteResult && (inviteResult.invitation_id || inviteResult.id)) || undefined,
             });
 
-            return { success: true, data: inviteResult };
+            return { success: true, data: withRouting(inviteResult) };
           } catch (inviteErr: any) {
             if (inviteErr?.noteQuotaExceeded) {
               // Decision gate — do NOT decide for the customer. Ask them, then re-call
               // send-invite with on_note_quota. In a scheduled run there is no one to
               // answer, so the agent stops here and the invite is simply left un-sent
               // (the lead stays eligible); the customer resolves it by reopening the chat.
-              return {
+              return withRouting({
                 success: false,
                 requiresDecision: true,
                 noteQuotaExceeded: true,
@@ -32625,7 +39938,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                   `This LinkedIn account's monthly quota for personalized invitation notes is spent, so the note "${message}" cannot be attached. ` +
                   `Do NOT decide on your own — ask the user whether to send the connection request WITHOUT the note or skip this person. ` +
                   `Then re-call send-invite with the same target plus on_note_quota="send_without_note" to send note-less, or leave it un-sent if they choose to skip.`,
-              };
+              });
             }
             throw inviteErr;
           }
@@ -32659,11 +39972,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               const syncAt = (sendLead as any).linkedinMessageSyncAt as string | undefined;
               const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
               if (!syncAt || syncAt < oneDayAgo) {
-                return {
+                return withRouting({
                   success: false,
                   error: `LinkedIn conversation history is stale (last synced: ${syncAt ?? 'never'}). Call update-conversation-history with list_id="${sendListId}" and lead_id="${sendLeadId}" before sending to ensure you have up-to-date context.`,
                   requiresSync: true,
-                };
+                });
               }
 
               // Anti-spam: check if this exact message was already sent to this lead.
@@ -32685,12 +39998,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 );
                 if (duplicateEvent) {
                   console.warn(`[AgentMode] send-message: duplicate message blocked for lead ${sendLeadId} — identical text was already sent`);
-                  return {
+                  return withRouting({
                     success: false,
                     error: `This exact message was already sent to this lead (duplicate detected). Choose a different follow-up message or skip this lead.`,
                     duplicate: true,
                     alreadySentAt: duplicateEvent.createdAt,
-                  };
+                  });
                 }
               }
             }
@@ -32710,12 +40023,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 accountId: account_id,
               });
               if (!identity.allowed) {
-                return {
+                return withRouting({
                   success: false,
                   error: identity.refusal.message,
                   code: identity.refusal.code,
                   details: identity.refusal.details,
-                };
+                });
               }
             }
           }
@@ -32751,7 +40064,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             }
           }
 
-          return { success: true, data: messageResponse };
+          return { success: true, data: withRouting(messageResponse) };
         }
 
         case 'send-inmail': {
@@ -32793,7 +40106,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             }
           }
 
-          return { success: true, data: inmailResponse };
+          return { success: true, data: withRouting(inmailResponse) };
         }
 
         case 'update-conversation-history': {
@@ -32801,10 +40114,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const { list_id, lead_id } = args;
           if (!list_id || !lead_id) throw new Error('list_id and lead_id are required for update-conversation-history');
 
-          // Resolve the Unipile attendee/provider ID for this contact
+          // Resolve the Unipile attendee/provider ID for this contact. When a raw
+          // provider_id is supplied directly (not a profile_url), it has not been
+          // validated against Unipile yet — resolveProviderId only validates the
+          // profile_url path. getMessagesWithContact treats a 404 from Unipile's
+          // chat_attendee lookup as "never messaged" (ENG-1623), which is
+          // indistinguishable from a 404 caused by an invalid/nonexistent
+          // provider_id. Without this check, a bad provider_id would silently
+          // "succeed" with 0 messages instead of surfacing a clear error.
           const providerId = isUrl
             ? await linkedInOutreachService.resolveProviderId(target, true, account_id)
-            : target;
+            : await linkedInOutreachService.getProfile(target, account_id).then(() => target);
 
           // Load the lead to get the normalized LinkedIn URL used as the storage key
           const { crmDb } = await import('./db');
@@ -32879,6 +40199,71 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: cancelResult };
         }
 
+        // ENG-1719 / ENG-1609 AC #8: bulk-withdraw the oldest pending invitations.
+        //
+        // Routed through paceLinkedInWrite per withdrawal, exactly like the
+        // single-shot cancel-invitation above, so the drain inherits the spacing
+        // gap and the hourly ceiling instead of working around them — and,
+        // because dailyVolumeClassFor returns null for cancel, does not consume
+        // the account's daily invite budget.
+        case 'withdraw-stale-invitations': {
+          const {
+            withdrawStaleInvitations,
+            DEFAULT_MAX_WITHDRAWALS_PER_RUN,
+          } = await import('./agentMode/linkedInStaleInvitationDrain');
+          const {
+            getAllSentInvitationsByAccount,
+            deleteSentInvitationByInvitationId,
+          } = await import('./unipileSentInvitationsDb');
+
+          const rawDays = Number(args.older_than_days);
+          if (!Number.isFinite(rawDays) || rawDays < 1) {
+            throw new Error('older_than_days is required for withdraw-stale-invitations and must be at least 1');
+          }
+          const rawMax = Number(args.max_withdrawals);
+
+          const result = await withdrawStaleInvitations({
+            accountId: account_id,
+            olderThanDays: rawDays,
+            maxWithdrawals: Number.isFinite(rawMax) && rawMax > 0 ? rawMax : DEFAULT_MAX_WITHDRAWALS_PER_RUN,
+            deps: {
+              fetchPending: (acc) => getAllSentInvitationsByAccount(acc),
+              // The pacer's own refusal text, or null to proceed. Reusing
+              // paceLinkedInWrite rather than reserveWriteSlot directly keeps the
+              // drain on the identical path every other LinkedIn write takes.
+              pace: async (acc) => {
+                const paced = await paceLinkedInWrite('cancel-invitation', resolvedLinkedInAccount!, acc);
+                // resolvedLinkedInAccount is non-null here: this action is in the
+                // ownership gate above, which returns early when it cannot resolve.
+                if (!paced.refusal) return null;
+                // ENG-1873: hand back WHICH gate refused, not just its prose, so the
+                // drain result and its notice can say so truthfully.
+                console.log(
+                  `[AgentMode] withdraw-stale-invitations stopped on ${acc}: gate=${paced.refusal.gate} — `
+                  + `${paced.refusal.message}`,
+                );
+                return { gate: paced.refusal.gate, reason: paced.refusal.error };
+              },
+              cancel: async (invitationId, acc) => {
+                await linkedInOutreachService.cancelInvitation(invitationId, acc);
+              },
+              forget: (acc, invitationId) => deleteSentInvitationByInvitationId(acc, invitationId),
+              recordWithdrawal: async (candidate) => {
+                const { recordInviteWithdrawnInCrm } = await import('./linkedInInviteCrmMirror');
+                return recordInviteWithdrawnInCrm({
+                  userId,
+                  accountId: account_id,
+                  linkedinUrl: candidate.publicProfileUrl,
+                  invitationId: candidate.invitationId,
+                  sentAt: candidate.sentAt,
+                  ...(args.list_id ? { listId: args.list_id } : {}),
+                });
+              },
+            },
+          });
+          return { success: true, data: result };
+        }
+
         case 'search-parameters': {
           // Resolve a free-text query (company / location / industry / school / service)
           // to LinkedIn entity IDs via the cache-first wrapper around Unipile's
@@ -32919,8 +40304,32 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           };
         }
 
+        case 'set-daily-invite-cap': {
+          // Self-reported, not detected — see linkedInWritePacer.ts's module doc
+          // comment for why this is a direct question to the user rather than an
+          // API probe. Use this ONLY after the user has told you, in THIS
+          // conversation, whether their connected LinkedIn account has Premium —
+          // never guess, never infer it from anything else, and never call this
+          // for an unattended/scheduled run (there's no one to ask).
+          // Writes through the account OWNER's record, not necessarily the
+          // caller's — see linkedInDailyVolumeGate.ts's module doc comment.
+          const clampedCap = await setDailyInviteCap(
+            resolvedLinkedInAccount!,
+            account_id,
+            args.daily_invite_cap,
+          );
+          return {
+            success: true,
+            data: {
+              account_id,
+              daily_invite_cap: clampedCap,
+              ...(clampedCap !== Number(args.daily_invite_cap) ? { note: `Requested ${args.daily_invite_cap} was clamped to the system-wide maximum of ${clampedCap}.` } : {}),
+            },
+          };
+        }
+
         default: {
-          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history','search-parameters'];
+          const validActions = ['search-people','get-profile','list-connections','list-sent-invitations','list-received-invitations','send-invite','send-message','send-inmail','get-company','cancel-invitation','accept-invitation','update-conversation-history','search-parameters','set-daily-invite-cap'];
           throw new Error(`Unsupported LinkedIn outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
         }
       }
@@ -32952,7 +40361,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           ownerUserId: userId,
           state: 'disconnected',
         });
-        return this.linkedInDisconnectedResponse();
+        return withRouting(this.linkedInDisconnectedResponse());
       }
 
       // Account-level invitation throttle (ENG-126). Once a LinkedIn account hits
@@ -32966,7 +40375,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // and reports proactively. The raw phrase is preserved in the body so the
       // error classifier still buckets this as an upstream_rejected business rule.
       if (action === 'send-invite' && /cannot resend yet/i.test(errorMessage)) {
-        return {
+        return withRouting({
           success: false,
           message: 'LinkedIn invitation limit reached',
           error: [
@@ -32977,14 +40386,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             'To free up capacity the user can withdraw old unanswered invitations (use list-sent-invitations to see the backlog, then cancel-invitation on the stale ones) or wait a few days before the next outreach run. Prefer queueing these invites for a later run over retrying now.',
           ].join('\n'),
           accountThrottled: true,
-        };
+        });
       }
 
-      return {
+      // ENG-1300: LinkedInOutreachService.handleError already classifies the
+      // status into structuredError.status/.classification for its own
+      // reconnect-detection logic above — read the same field here so the
+      // generic fallback path also reaches the tool-error classifier as
+      // auth/rate_limit/etc. instead of a bare Error/bug.
+      return withRouting({
         success: false,
         message: 'LinkedIn outreach action failed',
-        error: errorMessage
-      };
+        error: errorMessage,
+        code: (error as any)?.code ?? structuredError?.status
+      });
     }
   }
 
@@ -33213,7 +40628,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // collapsing to a bare "Request failed with code 403" — see describeXApiError.
       const errorMessage = describeXApiError(error);
       console.error('AgentMode: twitter_manage_post failed:', errorMessage);
-      return { success: false, message: 'Twitter action failed', error: errorMessage };
+      // ENG-1300: same gap as twitterOutreach's catch — this flattens every thrown
+      // error to a message string, which is all toolResultError has to reconstruct
+      // an Error from downstream, so the numeric HTTP status (twitter-api-v2 puts
+      // it on `.code`) must ride along on the result object or a write-path 401/403
+      // (e.g. a reply blocked by X's engagement-gate scope) never classifies as
+      // auth/config either.
+      const code = typeof (error as { code?: unknown })?.code === 'number' ? (error as { code: number }).code : undefined;
+      return { success: false, message: 'Twitter action failed', error: errorMessage, ...(code !== undefined ? { code } : {}) };
     }
   }
 
@@ -33422,7 +40844,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // collapsing to a bare "Request failed with code 403" — see describeXApiError.
       const errorMessage = describeXApiError(error);
       console.error('AgentMode: twitter_outreach failed:', errorMessage);
-      return { success: false, message: 'Twitter outreach action failed', error: errorMessage };
+      // ENG-1300: this catch flattens every thrown error (including
+      // mapListScopeError's reconnect error) to a message string, which is all
+      // toolResultError has to reconstruct an Error from downstream — so the
+      // numeric HTTP status (twitter-api-v2's ApiResponseError, and our own
+      // mapListScopeError, both put it on `.code`) must ride along on the result
+      // object itself or classifyToolErrorClass never sees it and the whole
+      // auth/config classification this ticket exists for silently never fires.
+      const code = typeof (error as { code?: unknown })?.code === 'number' ? (error as { code: number }).code : undefined;
+      return { success: false, message: 'Twitter outreach action failed', error: errorMessage, ...(code !== undefined ? { code } : {}) };
     }
   }
 
@@ -33886,11 +41316,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
      *  lead back to the persona that sourced it. Distinct from the
      *  `lead.icpMatch` scoring field (post-import scoring). */
     icpSource?: string;
+    /** ENG-1558: post-filter on each lead's resolved employer headcount —
+     *  same semantics as search-people's company_size_min/max. Applied AFTER
+     *  the 4-tier company-resolution chain below (not on raw work_experience
+     *  alone), so a lead whose company only resolved via title-parse/LLM/
+     *  profile fallback is still correctly sized instead of excluded early. */
+    company_size_min?: number;
+    company_size_max?: number;
   }): Promise<any> {
     const {
       listId, keywords, search_url, title, company, company_id,
       location, location_id, industry, industry_id, school, school_id,
       cursor, limit = 20, auto_enrich = false, icpSource,
+      company_size_min, company_size_max,
     } = args;
 
     if (!listId) return { success: false, error: 'listId is required' };
@@ -33985,6 +41423,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const allCreated: Array<{ leadId: string; email?: string; lead?: any }> = [];
     // Out-of-network "LinkedIn Member" hits dropped before the write.
     let anonymizedSkipped = 0;
+    // ENG-1558: leads dropped by the company_size_min/max post-filter
+    // (outside the requested range, or an unverifiable employer).
+    let companySizeFiltered = 0;
+    // ENG-1558 follow-up: consecutive pages the size filter emptied
+    // completely. A narrow company_size range against a market where it's
+    // genuinely rare could otherwise burn all MAX_ITERATIONS pages — each
+    // costing a full searchPeople call plus per-employer lookups — before
+    // giving up. Bail out well before that once the filter has clearly
+    // proven unproductive, rather than paying the full cap's cost every time.
+    let consecutiveEmptiedBySizeFilter = 0;
+    const SIZE_FILTER_EARLY_EXIT_AFTER = 3;
+    let earlyExitOnSizeFilter = false;
 
     while (iterationCount < MAX_ITERATIONS) {
       iterationCount++;
@@ -34106,7 +41556,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         candidates.push({ lead: leads[i], item: items[i] });
       }
-      const importable: any[] = candidates.map((c) => c.lead);
+      let importable: any[] = candidates.map((c) => c.lead);
       if (importable.length === 0) {
         if (!nextCursor) break;
         continue;
@@ -34150,6 +41600,49 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           console.warn('[importLeadsFromSearch] getProfile fallback failed:', e?.message ?? String(e));
         }
       }));
+
+      // Phase 3.5 (ENG-1558): company-size post-filter, run AFTER every
+      // resolution tier above so lead.company reflects the best available
+      // employer name — filtering on Tier-1 (work_experience) alone, like
+      // search-people does, would wrongly exclude leads whose company only
+      // resolved via title-parse/LLM/profile fallback. Adapts each lead's
+      // flat `.company` string into the work_experience shape
+      // filterByCompanySize expects, tagging each with its array index so
+      // the kept subset can be mapped back without disturbing `importable`'s
+      // order (batchCreateLeads' returned sourceIndex must match).
+      if (company_size_min != null || company_size_max != null) {
+        const preFilterCount = importable.length;
+        const sizableItems = importable.map((lead: any, idx: number) => ({
+          __idx: idx,
+          work_experience: lead.company ? [{ company: lead.company, current: true }] : [],
+        }));
+        const { items: kept } = await linkedInOutreachService.filterByCompanySize(
+          sizableItems,
+          { min: company_size_min, max: company_size_max },
+          accountId,
+        );
+        const keepIdx = new Set(kept.map((it: any) => it.__idx));
+        companySizeFiltered += importable.length - keepIdx.size;
+        importable = importable.filter((_: any, i: number) => keepIdx.has(i));
+
+        if (preFilterCount > 0 && importable.length === 0) {
+          consecutiveEmptiedBySizeFilter++;
+          if (consecutiveEmptiedBySizeFilter >= SIZE_FILTER_EARLY_EXIT_AFTER) {
+            // The filter has proven unproductive several pages running —
+            // stop paying for more searchPeople + per-employer lookup calls
+            // rather than grinding to MAX_ITERATIONS on a range that's
+            // clearly not matching this market.
+            earlyExitOnSizeFilter = true;
+            break;
+          }
+        } else {
+          consecutiveEmptiedBySizeFilter = 0;
+        }
+      }
+      if (importable.length === 0) {
+        if (!nextCursor) break;
+        continue;
+      }
 
       const result = await crmDb.batchCreateLeads(listId, importable);
       cumulativeNew += result.newCount ?? 0;
@@ -34230,14 +41723,29 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       iterations: iterationCount,
       trimmed: trimmedCount,
       anonymizedSkipped,
+      companySizeFiltered,
       safetyCapHit,
     };
     if (searchError) response.searchError = searchError;
     if (searchUnavailable) response.searchUnavailable = true;
+    if (earlyExitOnSizeFilter) response.earlyExitOnSizeFilter = true;
     if (cumulativeNew === 0 && totalFetched === 0 && !searchError) {
       response.message = 'No results found for the given search criteria.';
+    } else if (earlyExitOnSizeFilter) {
+      // ENG-1558 follow-up: distinct from (and takes priority over) the
+      // generic "excluded all, search exhausted normally" message below —
+      // this stopped BEFORE exhausting, so there may be more matches the
+      // cursor can still reach.
+      response.message = cumulativeNew > 0
+        ? `Imported ${cumulativeNew} lead(s), then stopped early after ${SIZE_FILTER_EARLY_EXIT_AFTER} consecutive pages where the company_size filter excluded every result. There may be more matches — resume from the returned cursor, or widen the range.`
+        : `Stopped after ${SIZE_FILTER_EARLY_EXIT_AFTER} consecutive pages where every result was excluded by the company_size filter (out of range, or an unverifiable employer) — this looks like a narrow niche for this market, not an empty search. Widen the company_size range, or drop it to import the unfiltered results.`;
     } else if (cumulativeNew === 0 && anonymizedSkipped > 0 && !searchError) {
       response.message = `${anonymizedSkipped} search result(s) were out-of-network LinkedIn profiles with no name or profile URL and were not imported. Widen the search or connect a LinkedIn account with closer network reach.`;
+    } else if (cumulativeNew === 0 && companySizeFiltered > 0 && !searchError) {
+      // ENG-1558: same transparency principle as the anonymized-skip case
+      // above — a company-size ask that excluded every candidate is a
+      // narrow-niche result, not an empty search and not an outage.
+      response.message = `${companySizeFiltered} search result(s) were excluded because their employer's size either fell outside the requested range or couldn't be verified. Widen the company_size range, or drop it to import the unfiltered results.`;
     }
     // Preview strictly the records that were written and survived trimming.
     response.importedLeads = allCreated.slice(0, 5).map((c) => c.lead).filter(Boolean);
@@ -34281,6 +41789,119 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // No serving URLs (e.g. a campaign with no ads yet) ⇒ nothing to gate.
     if (finalUrls.length === 0) return { proceed: true };
     return this.runGoogleAdsTrackingGate(customerId, campaignResourceName, action, override, sessionId, finalUrls);
+  }
+
+  /**
+   * ENG-1944: enabling a CAMPAIGN never touches its ad groups, keywords, or ads — those
+   * default to PAUSED on creation (RULE 11) and nothing else ever flips them. A campaign can
+   * read back ENABLED while every ad group/keyword/ad beneath it is still PAUSED, delivering
+   * zero traffic with no signal anything is wrong — this is exactly what happened to a live
+   * $250/day launch for days before anyone noticed. Advisory only (like the tracking gate's
+   * own warning path): a real staged rollout — enable the campaign, review ad groups before
+   * turning them on — is legitimate, so this informs rather than blocks. A lookup failure
+   * here must not fail an otherwise-successful launch, so it degrades to no warning.
+   */
+  private makeGoogleAdsAuthError(message: string): Error {
+    const err = new Error(message) as any;
+    err.isGoogleAdsAuthError = true;
+    return err;
+  }
+
+  /**
+   * ENG-1944: mirrors resolveMetaCredentialScope. Google Ads tools had no equivalent —
+   * a delegated/admin session's call always resolved against the CALLER's own connected
+   * Google identity, never the requested client's, so a staff member auditing a client's
+   * account got "not found in your connected accounts" for an account that plainly exists
+   * on the client's own record. Unscoped (clientId undefined/null) is a no-op — zero
+   * behavior change for the ordinary customer-session path. Scoped calls fail loud, same
+   * as Meta: never silently substitute the caller's own account.
+   *
+   * Deliberately read-only in effect: only wired into the two reporting/list surfaces
+   * (handleCallGoogleAdsReportingApi, and LIST/SEARCH actions of handleCallGoogleAdsApi).
+   * A client-scoped WRITE would let an admin session mutate a client's live campaign
+   * without that client's own fresh authorization decision — the same risk ENG-1801
+   * already ruled out for Meta's mutate tool — so callers must refuse client_id on any
+   * non-read action rather than pass it here.
+   */
+  private async resolveGoogleAdsCredentialScope(
+    callerUserId: string,
+    clientId: unknown,
+    callerIsAdminHint: boolean | undefined,
+    toolName: string
+  ): Promise<{ effectiveUserId: string; strict: boolean }> {
+    if (clientId === undefined || clientId === null) {
+      return { effectiveUserId: callerUserId, strict: false };
+    }
+    if (typeof clientId !== 'string' || !clientId.trim()) {
+      throw this.makeGoogleAdsAuthError(
+        `client_id must be a non-blank string (email or userId); received ${typeof clientId === 'string' ? 'a blank string' : typeof clientId}.`
+      );
+    }
+
+    const { userDb } = await import('./db');
+    const caller = await userDb.getUserById(callerUserId);
+    const isAdmin = callerIsAdminHint !== undefined ? callerIsAdminHint : caller?.isAdmin === true;
+    if (!isAdmin) {
+      throw this.makeGoogleAdsAuthError('client_id is admin-only — this account is not an admin.');
+    }
+
+    const trimmed = clientId.trim();
+    const target = trimmed.includes('@')
+      ? await userDb.getUserByEmail(trimmed)
+      : await userDb.getUserById(trimmed);
+    if (!target) {
+      throw this.makeGoogleAdsAuthError(`No client account found for "${trimmed}".`);
+    }
+    if (!(target as any).roles?.includes('customer')) {
+      throw this.makeGoogleAdsAuthError(`"${trimmed}" does not have customer portal access — cannot scope Google Ads tools to it.`);
+    }
+
+    const { recordAdminAudit } = await import('./adminAuditLog');
+    recordAdminAudit({
+      actorUserId: callerUserId,
+      actorEmail: caller?.email,
+      action: 'google_ads_client_scope',
+      tool: toolName,
+      targetUserId: (target as any).userId,
+      targetEmail: (target as any).email,
+    });
+
+    return { effectiveUserId: (target as any).userId, strict: true };
+  }
+
+  private async checkGoogleAdsPausedChildren(
+    userId: string,
+    customerId: string,
+    campaignResourceName: string,
+  ): Promise<string | undefined> {
+    try {
+      const adGroups = await googleAdsService.listAdGroups(userId, customerId, campaignResourceName);
+      if (adGroups.length === 0) return undefined;
+      const pausedAdGroups = adGroups.filter((g: any) => g.status === 'PAUSED');
+
+      let totalKeywords = 0, pausedKeywords = 0, totalAds = 0, pausedAds = 0;
+      await Promise.all(adGroups.map(async (group: any) => {
+        const [keywords, ads] = await Promise.all([
+          googleAdsService.listKeywords(userId, customerId, group.resourceName).catch(() => []),
+          googleAdsService.listAds(userId, customerId, group.resourceName).catch(() => []),
+        ]);
+        totalKeywords += keywords.length;
+        pausedKeywords += keywords.filter((k: any) => k.status === 'PAUSED').length;
+        totalAds += ads.length;
+        pausedAds += ads.filter((a: any) => a.status === 'PAUSED').length;
+      }));
+
+      const problems: string[] = [];
+      if (pausedAdGroups.length > 0) problems.push(`${pausedAdGroups.length}/${adGroups.length} ad group(s)`);
+      if (pausedKeywords > 0) problems.push(`${pausedKeywords}/${totalKeywords} keyword(s)`);
+      if (pausedAds > 0) problems.push(`${pausedAds}/${totalAds} ad(s)`);
+      if (problems.length === 0) return undefined;
+
+      return `Campaign is ENABLED, but ${problems.join(', ')} underneath it are still PAUSED — this campaign will deliver ZERO traffic until those are also explicitly enabled (AD_GROUP/KEYWORD/AD UPDATE with status=ENABLED). Do not report this launch as live until they are.`;
+    } catch (err) {
+      console.error('[ENG-1944] paused-child-entity check failed (non-fatal, launch still proceeds):', err);
+      return undefined;
+    }
   }
 
   /**
@@ -34495,9 +42116,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION' | 'OFFLINE_CONVERSION';
     action: string;
     [key: string]: any;
-  }, opts?: { sessionId?: string }): Promise<any> {
+  }, opts?: { sessionId?: string; clientScope?: { clientId?: string; callerIsAdmin?: boolean; toolName: string } }): Promise<any> {
     try {
       const { customer_id, entity_type, action } = args;
+      // ENG-1944: client_id is admin-only and read-only-scoped here (see
+      // resolveGoogleAdsCredentialScope) — a client-scoped write would let an admin
+      // session mutate a client's live campaign without that client's own authorization.
+      if (opts?.clientScope?.clientId !== undefined && opts?.clientScope?.clientId !== null) {
+        if (action !== 'LIST' && action !== 'SEARCH') {
+          return {
+            success: false,
+            error: `client_id scoping only supports read actions (LIST/SEARCH) — refusing a client-scoped ${entity_type} ${action}. Have the client's own session make this change, or drop client_id to act as yourself.`,
+          };
+        }
+        const scope = await this.resolveGoogleAdsCredentialScope(
+          userId, opts.clientScope.clientId, opts.clientScope.callerIsAdmin, opts.clientScope.toolName ?? 'call_google_ads_api'
+        );
+        userId = scope.effectiveUserId;
+      }
       /*
        * ENG-1526. The override is bound to a disclosed approval, exactly as Meta's is.
        *
@@ -34601,7 +42237,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           await googleAdsService.resumeCampaign(userId, customer_id, args.campaign_resource_name);
           // Relayed, not swallowed: the launch is permitted, but the operator has to be
           // told the page proves only that SOME Google tag is present (ENG-1358).
-          return { success: true, message: 'Campaign resumed', ...(resumeTrackingWarning ? { trackingWarning: resumeTrackingWarning } : {}) };
+          const resumePausedChildrenWarning = await this.checkGoogleAdsPausedChildren(userId, customer_id, args.campaign_resource_name);
+          return {
+            success: true, message: 'Campaign resumed',
+            ...(resumeTrackingWarning ? { trackingWarning: resumeTrackingWarning } : {}),
+            ...(resumePausedChildrenWarning ? { pausedChildEntitiesWarning: resumePausedChildrenWarning } : {}),
+          };
         }
         if (action === 'REMOVE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for REMOVE action' };
@@ -34654,11 +42295,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             budgetResourceName: args.budget_resource_name,
             finalUrlSuffix: args.final_url_suffix,
+            targetGoogleSearch: args.target_google_search,
+            targetSearchNetwork: args.target_search_network,
+            targetContentNetwork: args.target_content_network,
+            targetPartnerSearchNetwork: args.target_partner_search_network,
           });
           if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
           // Same relay as RESUME: permitted, but the operator is told what could not be
           // verified rather than reading a bare success (ENG-1358).
-          return { success: true, message: 'Campaign updated', ...(trackingWarning ? { trackingWarning } : {}) };
+          const updatePausedChildrenWarning = args.status === 'ENABLED'
+            ? await this.checkGoogleAdsPausedChildren(userId, customer_id, args.campaign_resource_name)
+            : undefined;
+          return {
+            success: true, message: 'Campaign updated',
+            ...(trackingWarning ? { trackingWarning } : {}),
+            ...(updatePausedChildrenWarning ? { pausedChildEntitiesWarning: updatePausedChildrenWarning } : {}),
+          };
         }
         if (action === 'ADD_PROXIMITY') {
           if (!args.campaign_resource_name || args.radius === undefined || !args.address) {
@@ -34827,13 +42479,66 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
            * recording, and conversions already recorded stay in reporting, exactly as a
            * REMOVED campaign still returns its historical metrics.
            */
-          if (args.confirm_conversion_action_removal !== true) {
+          /*
+           * ENG-1322 follow-up. The removal flag is BOUND to a disclosed approval, exactly
+           * as ENG-1526 bound override_tracking_check.
+           *
+           * `confirm_conversion_action_removal: true` used to be sufficient on its own, and
+           * the model sets its own arguments — so the only thing standing between a model
+           * that decided to "clean up" a conversion action and a permanent, unrecoverable
+           * removal was a sentence in the tool description asking it not to. ENG-941 already
+           * wrote down why that is not a control: "an override the model can introduce after
+           * approval is not user-granted, whatever the tool description says." This is the
+           * same shape guarding a strictly worse outcome — a removed conversion action cannot
+           * be re-enabled, and every campaign bidding toward it stops counting it.
+           *
+           * So: a claimed removal with no matching token HALTS and discloses, and issues an
+           * HMAC over this exact call. Only a replay presenting that token removes anything.
+           * A forged token, or a token minted for a DIFFERENT conversion action, falls back
+           * into a fresh disclosure rather than proceeding — which is the case that matters,
+           * because the destructive argument here is the resource name.
+           */
+          const removalClaimed = args.confirm_conversion_action_removal === true;
+          // Computed unconditionally, NOT only when the flag is claimed. The digest covers
+          // the call being disclosed, not the caller's intent to confirm — and the halt
+          // below has to hand back a usable token whether or not the flag was set. Gating
+          // it on the flag made the FIRST (unflagged) call disclose an empty string, which
+          // the model then replayed faithfully and was refused for, turning a two-step loop
+          // into three and making the token look broken. Issuing it here is not a weakening:
+          // the token is only ever returned alongside the disclosure of this exact resource
+          // name, which is what binds it.
+          const removalDigest = computeTrackingOverrideDigest(getJwtSecret(), {
+            customer_id, entity_type, action,
+            conversion_action_resource_name: args.conversion_action_resource_name,
+          });
+          const removalApproved =
+            removalClaimed && trackingOverrideTokenMatches(args.conversion_action_removal_token, removalDigest);
+
+          if (!removalApproved) {
+            const target = args.conversion_action_resource_name;
             return {
-              success: false,
-              error: 'CONVERSION_ACTION REMOVE stops this conversion action recording, permanently — '
-                + 'it cannot be re-enabled afterwards, and any campaign bidding toward it as a goal '
-                + 'will stop counting it. Conversions already recorded stay in your reports. Confirm '
-                + 'with the user, then retry with confirm_conversion_action_removal=true.',
+              success: true,
+              requiresConfirmation: true,
+              awaitingUserConfirmation: true,
+              summary: `Permanently stop conversion action ${target} from recording`,
+              confirmationPrompt:
+                `This PERMANENTLY stops a Google Ads conversion action from recording.\n\n`
+                + `It cannot be re-enabled afterwards, and any campaign bidding toward it as a `
+                + `goal will stop counting it — which changes how those campaigns bid. `
+                + `Conversions it already recorded stay in your reports, so this is not data `
+                + `loss, but it is not reversible either.\n\n`
+                + `Conversion action: ${target}\n\n`
+                + `Reply "yes" / "confirm" to remove it, or tell me to leave it alone.`,
+              confirmationDetail: `Permanently stop conversion action ${target} from recording`,
+              message:
+                `CONVERSION_ACTION REMOVE permanently stops ${target} recording and cannot be `
+                + `undone. Show the user the warning above and get explicit approval — do not `
+                + `decide this yourself. Once approved, call call_google_ads_api again with the `
+                + `same arguments PLUS conversion_action_removal_token exactly as returned here; `
+                + `without it nothing is removed.`,
+              // Only issued alongside a disclosure of this exact resource name, so the token
+              // can only ever approve the removal the user was actually shown.
+              conversion_action_removal_token: removalDigest,
             };
           }
           await googleAdsService.removeConversionAction(userId, customer_id, args.conversion_action_resource_name);
@@ -35100,15 +42805,23 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       return { success: false, error: `Unsupported entity_type=${entity_type} action=${action}` };
     } catch (error: any) {
+      // ENG-1300: `code` here is the real numeric HTTP status (googleAdsService.
+      // callApi rethrows the SAME axios error, so error.response.status is
+      // intact) — NOT `gadsErrorCodes` below, which are Google Ads' own string
+      // enum names (e.g. "REQUEST_ERROR"), not HTTP statuses. Conflating the two
+      // would misclassify: a business code that happens to fall in 100-599
+      // would be read as if it were the transport status.
+      const code = error?.response?.status;
       if (error instanceof NegativeCampaignCriteriaValidationError) {
         return {
           success: false,
           errorType: error.errorType,
           errorCode: error.errorCode,
           error: error.message,
+          code,
         };
       }
-      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
+      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true, code };
       console.error('[AgentMode] handleCallGoogleAdsApi error:', error);
       const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
       const gadsErrorCodes = gadsErrors
@@ -35126,20 +42839,36 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           errorType: gadsError ? 'GOOGLE_ADS_API_ERROR' : 'INTERNAL_ERROR',
           errorCode: gadsErrorCodes[0] || 'UNKNOWN_GOOGLE_ADS_ERROR',
           error: gadsError || error.message || 'Unknown error',
+          code,
         };
       }
-      return { success: false, error: gadsError || error.message || 'Unknown error' };
+      return { success: false, error: gadsError || error.message || 'Unknown error', code };
     }
   }
 
   public async handleCallGoogleAdsReportingApi(userId: string, args: {
     customer_id: string;
-    mode: 'raw' | 'dashboard';
+    mode: 'raw' | 'dashboard' | 'serving_chain';
     query?: string;
     campaign_ids?: string[];
     date_preset?: string;
-  }): Promise<any> {
+  }, opts?: { clientScope?: { clientId?: string; callerIsAdmin?: boolean; toolName: string } }): Promise<any> {
     try {
+      // ENG-1944: fully read-only tool, so client_id is always safe to honor here —
+      // no write-scope restriction needed (see handleCallGoogleAdsApi for why that
+      // restriction exists on the mixed read/write tool).
+      if (opts?.clientScope?.clientId !== undefined && opts?.clientScope?.clientId !== null) {
+        const scope = await this.resolveGoogleAdsCredentialScope(
+          userId, opts.clientScope.clientId, opts.clientScope.callerIsAdmin, opts.clientScope.toolName ?? 'call_google_ads_reporting_api'
+        );
+        userId = scope.effectiveUserId;
+      }
+      if (args.mode === 'serving_chain') {
+        const report = await googleAdsService.getServingChainStatus(userId, args.customer_id, args.campaign_ids);
+        const success = report.state === 'READY' || report.state === 'DELIVERING';
+        return { success, report, ...(success ? {} : { error: JSON.stringify(report) }) };
+      }
+
       if (args.mode === 'dashboard') {
         const summary = await googleAdsService.getQuickMetrics(userId, args.customer_id, {
           campaignIds: args.campaign_ids,
@@ -35159,13 +42888,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return { success: true, results, totalRows: results.length };
       }
 
-      return { success: false, error: 'mode must be "raw" or "dashboard"' };
+      return { success: false, error: 'mode must be "raw", "dashboard", or "serving_chain"' };
     } catch (error: any) {
-      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
+      // ENG-1300: see handleCallGoogleAdsApi's catch above for why `code` is
+      // error.response.status specifically, never a Google Ads business code.
+      const code = error?.response?.status;
+      if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true, code };
       console.error('[AgentMode] handleCallGoogleAdsReportingApi error:', error);
       const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
       const gadsError = gadsErrors.length ? gadsErrors.map((e: any) => e.message).join('; ') : undefined;
-      return { success: false, error: gadsError || error.message || 'Unknown error' };
+      return { success: false, error: gadsError || error.message || 'Unknown error', code };
     }
   }
 
@@ -35193,11 +42925,156 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     throw new Error('No HubSpot account connected. Please connect HubSpot in Settings → External CRM Sync or via OAuth in Connected Accounts.');
   }
 
+  /**
+   * HubSpot's free-text 403 message, made safe to log.
+   *
+   * A review flagged that the previous version wrote `response.data.message` verbatim on
+   * the strength of a comment asserting it "carries no credentials" — asserted, never
+   * measured. HubSpot's MISSING_SCOPES message is widely reported in the form
+   * "This oauth-token (<token>) does not have proper permissions!", which would put a
+   * live access token in the application log on exactly the branch this diagnostic is
+   * for: the same class of leak redactAxiosCredentials exists to prevent.
+   *
+   * `category` and `correlationId` already satisfy the diagnostic goal, so the message is
+   * kept only for the scope hint it carries — with anything token-shaped removed and a
+   * hard length cap, the way describeRefreshFailure caps its body.
+   */
+  /** The same redaction applied to a whole HubSpot error body before it leaves us. */
+  private static redactHubSpotBody(body: unknown, depth = 0): unknown {
+    // Walk EVERY string, not just a top-level `message`. HubSpot returns at least four
+    // shapes and only one was covered: `{errors:[{message}]}` (which this codebase
+    // already depends on — throwIfBatchPartialFailure reads data.errors[0].message), a
+    // bare string body from a proxy or WAF, `{context:{detail}}`, and a top-level array.
+    // Having accepted that a token can ride in free text, the coverage has to match the
+    // threat model rather than the one sentence that was reported.
+    // Fail CLOSED. Returning the raw sub-tree here would hand back tokens intact — a
+    // theoretical leak in a control whose whole premise is that free text can carry a
+    // credential. Losing a deeply nested diagnostic is the cheaper failure. Real HubSpot
+    // bodies are depth <= 3, so this is unreachable either way.
+    if (depth > 6) return '<depth-capped>';
+    if (typeof body === 'string') return AgentModeService.redactHubSpotMessage(body);
+    if (Array.isArray(body)) return body.map((v) => AgentModeService.redactHubSpotBody(v, depth + 1));
+    if (!body || typeof body !== 'object') return body ?? null;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(body as Record<string, unknown>)) {
+      out[k] = AgentModeService.redactHubSpotBody(v, depth + 1);
+    }
+    return out;
+  }
+
+  private static redactHubSpotMessage(msg: unknown): string | null {
+    if (typeof msg !== 'string') return msg == null ? null : '<non-string>';
+    let out = msg
+      // HubSpot's own "(oauth-token)" parenthetical, and any bare long token-ish run.
+      // No dot inside: `(marketing.campaigns.revenue.read)` is a SCOPE NAME and is the
+      // very hint this field is kept for. Rules 1 and 2 use different character classes
+      // on purpose — do not tidy them into agreement.
+      .replace(/\(\s*[A-Za-z0-9_-]{20,}\s*\)/g, '(<redacted>)')
+      .replace(/\b(?:pat-[a-z0-9-]+|na1-[A-Za-z0-9-]{8,}|[A-Za-z0-9_-]{40,})\b/g, '<redacted>');
+    if (out.length > 300) out = `${out.slice(0, 300)}…<truncated>`;
+    return out;
+  }
+
+  /** Marketing Hub objects served by call_hubspot_api. CONTACT_LIST is CRM, not here. */
+  private static readonly HUBSPOT_MARKETING_ENTITIES = new Set([
+    'CAMPAIGN', 'EMAIL', 'FORM', 'LANDING_PAGE', 'BLOG_POST', 'WORKFLOW', 'SOCIAL',
+  ]);
+
+  /**
+   * Returns an actionable error when the resolved OAuth grant holds no marketing scopes
+   * at all and the caller asked for a marketing object. Returns null to proceed.
+   *
+   * Best-effort by design: any problem resolving the account returns null so the call
+   * goes ahead and HubSpot decides. This guard exists to improve a message, and must
+   * never become a new way for a working call to fail.
+   */
+  private async hubspotMarketingPreflight(
+    userId: string,
+    svc: HubSpotService,
+    entityType: string,
+    action: string,
+  ): Promise<{ success: false; error: string } | null> {
+    if (!AgentModeService.HUBSPOT_MARKETING_ENTITIES.has(entityType)) return null;
+    // FORM SUBMIT is the one guarded action that needs no OAuth scope at all: submitForm
+    // posts to api.hsforms.com keyed by portalId + formGuid and sends NO bearer token
+    // (hubspotService.submitForm). Every other method behind these seven entities goes
+    // through authHeaders() against api.hubapi.com. Refusing it would break a call that
+    // works on a CRM-only grant today — and tell the customer to reconnect to fix a
+    // request that carries no token.
+    if (entityType === 'FORM' && action === 'SUBMIT') return null;
+    try {
+      // The account that ACTUALLY served this call, read off the instance. undefined means
+      // the pasted private-app-token path ran, whose scopes we cannot see and must not
+      // guess at.
+      //
+      // Deliberately not re-derived, and deliberately not carried on `this`. An earlier
+      // version recorded it in a field on this service — which is a process-wide
+      // singleton with a second writer — and the pasted-token fallback does real I/O
+      // (getLeadListsByUserId) between the reset and the read, so a concurrent call
+      // finishing the OAuth path left its id in the slot. A review reproduced that
+      // crossing 300/300.
+      const accountId = svc.accountId;
+      if (!accountId) return null;
+      const { getAccountsByUserId } = await import('./connectedAccountsDb');
+      const accounts = await getAccountsByUserId(userId);
+      const hs = accounts.filter((a: any) => a.platform === 'hubspot');
+      const acct = hs.find((a: any) => a.account_id === accountId);
+      if (!acct) return null;
+      const granted: string[] = ((acct.config as any)?.granted_scopes ?? []) as string[];
+      if (!Array.isArray(granted) || granted.length === 0) return null;
+      const { INTEGRATION_CONFIG } = await import('../config/integrations');
+      const marketingOnly: readonly string[] = (INTEGRATION_CONFIG as any)?.hubspot?.marketingOnlyScopes ?? [];
+      if (marketingOnly.length === 0) return null;
+      if (granted.some((g) => marketingOnly.includes(g))) return null;
+      // hubspotAuth persists whether the user CHOSE marketing at connect time. If they
+      // did and HubSpot still granted no marketing scope, HubSpot declined the
+      // optional_scope — the portal has no Marketing Hub. Telling them to reconnect and
+      // pick marketing sends them through the exact round trip that changes nothing,
+      // which is the behaviour this whole change exists to stop.
+      const askedForMarketing = (acct.config as any)?.hubspot_account_type === 'marketing';
+      return {
+        success: false,
+        error: askedForMarketing
+          ? `This HubSpot portal does not have Marketing Hub, so it cannot read or write `
+            + `${entityType} (a Marketing Hub object). Marketing access was requested when the `
+            + `account was connected and HubSpot did not grant it. Reconnecting will not change `
+            + `this — the portal's HubSpot plan has to include Marketing Hub.`
+          : `This HubSpot connection was authorised for CRM access only, so it cannot read or write `
+            + `${entityType} (a Marketing Hub object). Reconnect HubSpot in Settings → Connected Accounts `
+            + `and choose the marketing option to grant marketing access. Reconnecting with CRM access `
+            + `again will not change this.`,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   public async handleHubspotApi(userId: string, args: any): Promise<any> {
     const entityType: string = (args?.entity_type ?? '').toUpperCase();
     const action: string = (args?.action ?? '').toUpperCase();
     try {
       const svc = await this.resolveHubSpotService(userId, args?.account_id);
+
+      // Refuse a call the connection provably cannot serve, BEFORE spending a round trip
+      // on a guaranteed 403 whose message does not name the real problem.
+      //
+      // Every entity below CONTACT_LIST is a Marketing Hub object; CONTACT_LIST is CRM
+      // (crm.lists.*). In production 6 of 10 HubSpot grants hold NONE of
+      // integrations.hubspot.marketingOnlyScopes, so every marketing call they make 403s
+      // and the customer is told to "check your subscription tier and OAuth scopes" —
+      // true but unactionable, and it does not tell them which.
+      //
+      // Deliberately coarse: it fires only when the grant holds ZERO marketing scopes,
+      // where a 403 is certain. A grant holding `content` but not `forms` still reaches
+      // HubSpot and fails there. A precise per-entity scope map is the obvious next step,
+      // but it would be guesswork today — the 403 diagnostic added below is what will
+      // supply the real requirements.
+      //
+      // OAuth only. resolveHubSpotService falls back to a pasted private-app token whose
+      // scopes we cannot see, and blocking on scopes we do not know would break working
+      // setups.
+      const preflight = await this.hubspotMarketingPreflight(userId, svc, entityType, action);
+      if (preflight) return preflight;
 
       // ─── CONTACT_LIST ──────────────────────────────────────────────────────
       if (entityType === 'CONTACT_LIST') {
@@ -35614,18 +43491,53 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         // HubSpot returns 403 both for tier/scope limits and for tokens granted
         // before newer scopes were added to the app — distinguish them.
         const missingScopes = err?.response?.data?.category === 'MISSING_SCOPES';
+
+        // Log what HubSpot actually said. We hold the payload here and, until now, threw
+        // it away: `hubspotError` goes back to the model but the only thing written to
+        // the log is our own paraphrase, so a recurring production 403 (seen 09-23 and
+        // 09-26, same scheduled slot) could not be diagnosed at all.
+        //
+        // The distinction matters because the two causes have OPPOSITE remedies. A
+        // missing scope is fixed by reconnecting. A subscription-tier limit is not —
+        // telling that customer to reconnect sends them through an OAuth round trip that
+        // changes nothing. Right now we cannot tell them apart from the outside.
+        //
+        // `response.data` is HubSpot's error body: category, message, correlationId. It
+        // carries no credentials — unlike the axios error object, whose `config.data`
+        // holds client_secret (see redactAxiosCredentials in hubspotService).
+        const hsBody = err?.response?.data;
+        console.error(
+          `[AgentMode] call_hubspot_api 403 entity=${entityType} action=${action} `
+          + `category=${hsBody?.category ?? 'none'} missingScopes=${missingScopes} `
+          + `message=${JSON.stringify(AgentModeService.redactHubSpotMessage(hsBody?.message))} `
+          + `correlationId=${hsBody?.correlationId ?? 'none'}`
+        );
         return {
           success: false,
           error: missingScopes
             ? 'Your HubSpot connection is missing the required permissions. Please reconnect your HubSpot account in Settings → Connected Accounts to grant them.'
             : 'HubSpot API access denied. Check your HubSpot subscription tier and OAuth scopes (content, automation required for some entity types).',
-          hubspotError: err?.response?.data ?? null,
+          // Redacted on the way OUT as well as into the log: this body reaches the LLM
+          // context and anything that persists or shares tool results, which is a wider
+          // surface than our own logs, not a narrower one.
+          hubspotError: AgentModeService.redactHubSpotBody(err?.response?.data),
           status: 403,
         };
       }
-      return { success: false, error: err?.message ?? 'HubSpot API call failed.', hubspotError: err?.response?.data ?? null, status: err?.response?.status ?? null };
+      return { success: false, error: err?.message ?? 'HubSpot API call failed.', hubspotError: AgentModeService.redactHubSpotBody(err?.response?.data), status: err?.response?.status ?? null };
     }
   }
+
+  /**
+   * Emma tool: read-only Attio lead counts, for CPL/attribution reporting,
+   * plus Attio list/list-entry management. Extracted to
+   * services/agentMode/attioTools.ts (self-contained, no monolith coupling)
+   * per this file's subtraction-biased complexity policy.
+   */
+  public async handleAttioApi(userId: string, args: any): Promise<any> {
+    return handleAttioApiImpl(userId, args);
+  }
+
 
 }
 
@@ -35659,6 +43571,34 @@ function computeFindLeadsCriteriaHash(filters: {
   // SHA-1 of canonical JSON, truncated to 16 hex chars — collision risk is
   // negligible for the per-list cardinality we expect here.
   return require('crypto').createHash('sha1').update(JSON.stringify(obj)).digest('hex').slice(0, 16);
+}
+
+// Mirrors LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS /
+// COMPANY_SIZE_LOOKUP_CONCURRENCY (kept as separate local constants rather
+// than importing that class here — this file already reaches the singleton
+// via the top-level `linkedInOutreachService` import, and the class itself
+// is only ever pulled in via dynamic import for a handful of static helpers).
+const EMPLOYER_PROFILE_LOOKUP_TIMEOUT_MS = 30_000;
+const EMPLOYER_PROFILE_LOOKUP_CONCURRENCY = 5;
+
+/**
+ * Races a promise against a timeout, mirroring
+ * LinkedInOutreachService's private withTimeout (not accessible from here) —
+ * used so a single hung Unipile call can't stall an interactive chat turn.
+ * The timer is unref'd so it never keeps the process alive.
+ */
+function withTimeoutOrReject<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err: any = new Error(`${label} timed out after ${ms}ms`);
+      err.isTimeout = true;
+      err.classification = 'TIMEOUT_ERROR';
+      reject(err);
+    }, ms);
+    if (typeof (timer as any).unref === 'function') (timer as any).unref();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 /**

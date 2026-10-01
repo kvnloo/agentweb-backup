@@ -80,10 +80,44 @@ describe('AgentModeService.buildWorkPlanContextMessages', () => {
     // Optional per-step details
     expect(content).toContain('Description: Gather business information');
     expect(content).toContain('Required Functions: update_brand_guidelines');
-    expect(content).toContain('Skills (auto-installed when this step becomes active): brand-skill');
+    // ENG-1697: no longer claims unconditional auto-install (false for ad-hoc
+    // plans/skip-advanced steps) -- the reactive toolDispatch gate already
+    // handles missing-skill recovery, so this doesn't need to restate it.
+    expect(content).toContain('Skills for this step: brand-skill');
 
     // Not in autocomplete mode -> no autocomplete instruction
     expect(content).not.toContain('AUTOCOMPLETE MODE');
+  });
+
+  it('ENG-1697: never claims a skipped-past step\'s skills were auto-installed', () => {
+    // Step 1 was SKIPPED (not completed) -- the completion-triggered
+    // auto-install block never fires for a skip, so step 2's skills were
+    // never installed even though it's now the active step. The rendered
+    // text must not promise otherwise.
+    const planWithSkippedFirstStep = {
+      title: 'Client Onboarding',
+      steps: [
+        {
+          stepCount: 1,
+          title: 'Analyze website',
+          status: 'skipped' as const,
+        },
+        {
+          stepCount: 2,
+          title: 'Update brand guidelines',
+          status: 'pending' as const,
+          skillIds: ['brand-skill'],
+        },
+      ],
+      createdAt: '2025-01-15T09:00:00.000Z',
+      updatedAt: '2025-01-15T10:00:00.000Z',
+    };
+
+    const messages = AgentModeService.buildWorkPlanContextMessages(planWithSkippedFirstStep);
+    const content: string = messages[0].content;
+
+    expect(content).not.toContain('auto-installed');
+    expect(content).toContain('Skills for this step: brand-skill');
   });
 
   it('includes the autocomplete instruction when autocomplete is enabled', () => {
@@ -338,5 +372,43 @@ describe('AgentModeService.buildWorkPlanContextMessages', () => {
       expect(content).not.toContain('EXCEPTION');
       expect(content).not.toContain('search_user_assets');
     });
+  });
+});
+
+/**
+ * ENG-1974: "Keep chatting" leaves no backend/model signal that a
+ * recommendation was declined -- this states the real fact directly in
+ * context, before the model's own read of the conversation forms, same
+ * discipline as ENG-1899's acceptance notice.
+ */
+describe('AgentModeService.buildDeclinedWorkPlanRecommendationContextMessages', () => {
+  it('returns [] when nothing has been declined', () => {
+    expect(AgentModeService.buildDeclinedWorkPlanRecommendationContextMessages(undefined)).toEqual([]);
+    expect(AgentModeService.buildDeclinedWorkPlanRecommendationContextMessages({})).toEqual([]);
+  });
+
+  it('names the declined plan and instructs not to launch it without a fresh explicit instruction', () => {
+    const messages = AgentModeService.buildDeclinedWorkPlanRecommendationContextMessages({
+      'reco-1': { planId: 'plan-onboard', planTitle: 'Client Onboarding', declinedAt: '2026-09-17T00:00:00.000Z' },
+    });
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].role).toBe('user');
+    expect(messages[0].content).toContain('"Client Onboarding"');
+    expect(messages[0].content).toContain('Keep chatting');
+    expect(messages[0].content).toContain('launch_predefined_work_plan');
+    expect(messages[0].content).toMatch(/explicitly says/i);
+  });
+
+  it('names every declined plan when multiple exist, with plural phrasing', () => {
+    const messages = AgentModeService.buildDeclinedWorkPlanRecommendationContextMessages({
+      'reco-1': { planId: 'plan-onboard', planTitle: 'Client Onboarding', declinedAt: '2026-09-17T00:00:00.000Z' },
+      'reco-2': { planId: 'plan-linkedin', planTitle: 'LinkedIn Lead Gen', declinedAt: '2026-09-17T00:05:00.000Z' },
+    });
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toContain('"Client Onboarding"');
+    expect(messages[0].content).toContain('"LinkedIn Lead Gen"');
+    expect(messages[0].content).toContain('plans');
   });
 });

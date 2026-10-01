@@ -1,0 +1,14 @@
+{
+  "packetManifestSha256": "acaad691d5bb9041dfe02bc16a9dd7ad4d78598b3b745c6acc2a885519917c60",
+  "dailyRows": 134,
+  "periodRows": 28,
+  "totals": {
+    "spend": 205532,
+    "impressions": 22005,
+    "clicks": 804,
+    "inline_link_clicks": 436,
+    "reported_leads": 32,
+    "reported_complete_registrations": 17,
+    "reported_purchases": 0
+  }
+}

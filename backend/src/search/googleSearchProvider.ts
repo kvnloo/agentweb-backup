@@ -6,6 +6,7 @@ import {
   SearchProviderResponse,
   SearchRequest,
 } from './searchProvider';
+import { recordVendorUsage } from '../services/usageRecorderService';
 
 interface GoogleSearchCredentials {
   apiKey: string;
@@ -36,6 +37,17 @@ export class GoogleSearchProvider implements SearchProvider {
     // even though this is the only call site and it never runs at module load.
     const { google } = await import('googleapis');
     const customsearch = google.customsearch('v1');
+    void recordVendorUsage({
+      userId: request.userId,
+      provider: 'google_cse',
+      operation: 'query',
+      feature: request.purpose || 'agent_research',
+      unit: 'query',
+      quantity: 1,
+      // ENG-1929: priced inside the recorder, so a missing rate cannot throw
+      // into the search that follows.
+      rateKey: 'query',
+    });
     const response = await customsearch.cse.list({
       auth: credentials.apiKey,
       cx: credentials.searchEngineId,

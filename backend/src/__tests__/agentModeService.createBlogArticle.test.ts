@@ -20,6 +20,13 @@ jest.mock('../services/chatbotService', () => ({
   }
 }));
 
+jest.mock('../services/deepResearchService', () => ({
+  deepResearchService: {
+    isAvailable: jest.fn(),
+    performDeepResearch: jest.fn()
+  }
+}));
+
 describe('AgentModeService - create_blog_article function', () => {
   let agentModeService: AgentModeService;
   let mockGenerateBlogContent: jest.Mock;
@@ -27,22 +34,25 @@ describe('AgentModeService - create_blog_article function', () => {
   let mockGenerateBlogHtml: jest.Mock;
   let mockRestyleContent: jest.Mock;
   let mockUploadFileToS3: jest.Mock;
+  let mockDeepResearchService: { isAvailable: jest.Mock; performDeepResearch: jest.Mock };
 
   beforeEach(() => {
     jest.clearAllMocks();
-    
+
     // Create AgentModeService instance
     agentModeService = new AgentModeService();
 
     // Get mocked functions
     const blogModule = require('../controllers/blog');
     const s3UtilsModule = require('../utils/s3Utils');
-    
+    const deepResearchModule = require('../services/deepResearchService');
+
     mockGenerateBlogContent = blogModule.generateBlogContent;
     mockGenerateBlogImage = blogModule.generateBlogImage;
     mockGenerateBlogHtml = blogModule.generateBlogHtml;
     mockRestyleContent = blogModule.restyleContent;
     mockUploadFileToS3 = s3UtilsModule.uploadFileToS3;
+    mockDeepResearchService = deepResearchModule.deepResearchService;
   });
 
   describe('Default Style', () => {
@@ -88,7 +98,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'medium',
         '',
         '',
-        'default'
+        'default',
+        'user123'
       );
 
       // Verify generateBlogImage was called
@@ -160,7 +171,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'medium',
         '',
         '',
-        'default' // Should default to 'default'
+        'default', // Should default to 'default'
+        'user123'
       );
 
       expect(mockGenerateBlogHtml).toHaveBeenCalledWith(
@@ -218,7 +230,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'medium',
         '',
         '',
-        'substack'
+        'substack',
+        'user123'
       );
 
       // Verify generateBlogHtml was called with substack style
@@ -271,7 +284,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'long',
         'Research context',
         'Requirements',
-        'substack'
+        'substack',
+        'user123'
       );
 
       // Verify style is passed to HTML generation
@@ -322,7 +336,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'short',
         'Research context here',
         'Special requirements',
-        'substack'
+        'substack',
+        'user456'
       );
     });
 
@@ -361,7 +376,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'medium',
         '',
         '',
-        'default'
+        'default',
+        'user123'
       );
     });
   });
@@ -451,6 +467,48 @@ describe('AgentModeService - create_blog_article function', () => {
       expect(result.error).toBe('S3 upload failed');
     });
 
+    // ENG-1300: uploadFileToS3 now exposes AWS SDK v2's numeric statusCode;
+    // prove it survives the nested rethrow to createBlogArticle's own catch.
+    it('ENG-1300: a coded S3 upload failure classifies as auth/config end-to-end', async () => {
+      const mockBlogData = {
+        title: 'Test Title',
+        description: 'Test description',
+        content: 'Test content',
+        imagePrompt: 'Test prompt'
+      };
+
+      mockGenerateBlogContent.mockResolvedValue(mockBlogData);
+      mockGenerateBlogImage.mockResolvedValue({
+        imageUrl: 'https://example.com/image.png',
+        filename: 'image.png'
+      });
+      mockGenerateBlogHtml.mockReturnValue('<html>Test</html>');
+      mockUploadFileToS3.mockResolvedValue({
+        success: false,
+        error: 'Access Denied',
+        statusCode: 403,
+      });
+
+      const result = await (agentModeService as any).createBlogArticle(
+        'Test Title Draft',
+        '# Test Content Draft',
+        'medium',
+        '',
+        '',
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(403);
+      const { toolResultError } = await import('../utils/toolResultError');
+      const { classifyToolErrorClass } = await import('../utils/toolErrorClassifier');
+      const { classifyToolFailureType } = await import('../utils/toolFailureType');
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+    });
+
     it('should handle exceptions during blog creation', async () => {
       mockGenerateBlogContent.mockRejectedValue(new Error('Network error'));
 
@@ -508,7 +566,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'medium',
         '',
         '',
-        'default'
+        'default',
+        'user123'
       );
 
       expect(result.success).toBe(true);
@@ -551,7 +610,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'medium',
         '',
         '',
-        'substack'
+        'substack',
+        'user123'
       );
 
       expect(mockGenerateBlogHtml).toHaveBeenCalledWith(
@@ -641,7 +701,8 @@ describe('AgentModeService - create_blog_article function', () => {
         'medium',
         'Original research context',
         '',
-        'default'
+        'default',
+        'user123'
       );
     });
 
@@ -679,6 +740,68 @@ describe('AgentModeService - create_blog_article function', () => {
       expect(result.success).toBe(true);
       expect(result.data.deepResearchUsed).toBe(false);
     });
+
+    // ENG-738: deepResearchService.performDeepResearch already retries once at
+    // a cheaper depth internally when its own call times out. A failure
+    // reaching createBlogArticle means that already happened and still didn't
+    // produce content, so the whole article request fails with the real
+    // reason rather than shipping a restyled draft built from nothing.
+    it('fails with the underlying reason when deep research fails', async () => {
+      mockDeepResearchService.performDeepResearch.mockResolvedValue({
+        success: false,
+        error: 'Deep research failed: Request timed out',
+      });
+
+      const result = await (agentModeService as any).createBlogArticle(
+        'Test Title Draft',
+        '# Test Content Draft',
+        'medium',
+        '',
+        '',
+        'user123',
+        'session123',
+        'default',
+        true
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('timed out');
+      expect(mockRestyleContent).not.toHaveBeenCalled();
+    });
+  });
+
+  // ENG-2183: #3067 resolves the content_generation model per organization, so
+  // the caller's userId must reach whichever blog call picks the model.
+  describe('Content model user threading (ENG-2183)', () => {
+    const blogData = { title: 'T', description: 'D', content: 'Body', imagePrompt: 'P' };
+    let service: { createBlogArticle(...args: unknown[]): Promise<{ success: boolean }> };
+
+    beforeEach(() => {
+      service = agentModeService as unknown as typeof service;
+      mockGenerateBlogImage.mockResolvedValue({ imageUrl: 'https://example.com/hero.png', filename: 'hero.png' });
+      mockGenerateBlogHtml.mockReturnValue('<html>T</html>');
+      mockUploadFileToS3.mockResolvedValue({ success: true, url: 'https://s3.example.com/blog.html' });
+    });
+
+    it('passes the caller userId to generateBlogContent', async () => {
+      mockGenerateBlogContent.mockResolvedValue(blogData);
+
+      const result = await service.createBlogArticle('Title', 'Draft', 'short', '', '', 'org-member-7', 'session1', 'substack');
+
+      expect(result.success).toBe(true);
+      expect(mockGenerateBlogContent).toHaveBeenCalledTimes(1);
+      expect(mockGenerateBlogContent).toHaveBeenCalledWith('Title', 'Draft', 'short', '', '', 'substack', 'org-member-7');
+    });
+
+    it('passes the caller userId to restyleContent on the deep-research path', async () => {
+      mockDeepResearchService.performDeepResearch.mockResolvedValue({ success: true, markdownContent: '# Research' });
+      mockRestyleContent.mockResolvedValue(blogData);
+
+      const result = await service.createBlogArticle('Title', 'Draft', 'short', '', '', 'org-member-7', 'session1', 'default', true);
+
+      expect(result.success).toBe(true);
+      expect(mockGenerateBlogContent).not.toHaveBeenCalled();
+      expect(mockRestyleContent).toHaveBeenCalledWith('# Research', 'Title', 'professional', 'default', true, 'org-member-7');
+    });
   });
 });
-

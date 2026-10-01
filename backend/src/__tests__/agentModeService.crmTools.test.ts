@@ -12,6 +12,9 @@ jest.mock('../services/db', () => ({
     getLeadsByICPFlag: jest.fn(),
     getLeadsByEngagedFlag: jest.fn(),
     getLeadById: jest.fn(),
+    getLeadByIdAcrossLists: jest.fn(),
+    getLeadListsByUserId: jest.fn(),
+    getLeadListsForUser: jest.fn(),
     updateLead: jest.fn(),
     batchCreateLeads: jest.fn(),
     deleteLead: jest.fn(),
@@ -39,13 +42,32 @@ jest.mock('../services/resendService', () => ({
 jest.mock('../services/gmailService', () => ({
   gmailService: {
     sendEmail: jest.fn(),
-  }
+  },
+  // ENG-1300: real typed error classes — plain classes, no side effects to
+  // import — needed so a test can construct one and prove
+  // emailProviderErrorStatus() maps it correctly.
+  GmailTokenRevokedError: jest.requireActual('../services/gmailService').GmailTokenRevokedError,
+}));
+
+// ENG-265: sendEmailToLead/sendEmailFromConfiguredSender now re-resolve the sender via
+// resolveSenderForSend (crmSenderService.ts) as the authoritative source, instead of trusting
+// the getCrmSenders() snapshot they already have — see the "fail closed" fix in
+// agentModeService.ts. This suite doesn't back real settingsService/DynamoDB data, so wire
+// resolveSenderForSend to mirror whatever getCrmSenders() is mocked to return per-test
+// (getCrmSenders is always called first in real production order, so its mock is already
+// configured by the time this runs) rather than repeating each test's sender fixture twice.
+jest.mock('../services/crmSenderService', () => ({
+  resolveSenderForSend: jest.fn(),
 }));
 
 import { AgentModeService } from '../services/agentModeService';
 import { crmDb, userDb, orgDb } from '../services/db';
 import { resendService } from '../services/resendService';
-import { gmailService } from '../services/gmailService';
+import { gmailService, GmailTokenRevokedError } from '../services/gmailService';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
+import { resolveSenderForSend } from '../services/crmSenderService';
 import { LEAD_IMPORT_WRITE_BUDGET_MS } from '../utils/leadImportLedger';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
@@ -118,6 +140,24 @@ describe('AgentModeService - CRM Tools', () => {
     // clearAllMocks() does not reset implementations, so set this deterministically
     // on every test; deny tests override to false explicitly.
     (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+
+    (resolveSenderForSend as jest.Mock).mockImplementation(async (uid: string, senderId?: string, senderEmail?: string) => {
+      const result = await (service as any).getCrmSenders(uid);
+      if (!result?.success) return null;
+      const needle = String(senderEmail || '').toLowerCase();
+      const found =
+        result.senders.find((s: any) => senderId && s.id === senderId) ??
+        result.senders.find((s: any) => s.email?.toLowerCase() === needle) ??
+        null;
+      if (!found) return null;
+      // Mirror crmSenderService.normalizeSender: the fixtures in this file use the legacy
+      // senderType/gmailAccountId keys the same way a real persisted sender might.
+      return {
+        ...found,
+        senderProvider: found.senderProvider || found.senderType || 'resend',
+        connectedAccountId: found.connectedAccountId || found.gmailAccountId,
+      };
+    });
   });
 
   // ─── getLeads ──────────────────────────────────────────────────────────
@@ -883,11 +923,150 @@ describe('AgentModeService - CRM Tools', () => {
     it('should return not found for missing lead', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      // No other accessible list holds this lead_id either — a genuine miss.
+      mockCrmDb.getLeadListsByUserId.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadListsForUser.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValue(null as any);
 
       const result = await service.getLeadDetails(listId, leadId, userId);
 
       expect(result.success).toBe(false);
       expect(result.message).toBe('Lead not found');
+      // Both tiers ran, found nothing, and still landed on a clean not-found.
+      expect(mockCrmDb.getLeadByIdAcrossLists).toHaveBeenCalledWith([], leadId);
+    });
+
+    it('ENG-969: corrects a stale list_id when the lead is in one of the caller\'s OWN other lists (tier 1, no org fan-out)', async () => {
+      // The actual production case (session 6082779b-f9f1-4e38-a8eb-34abbc3da419) was
+      // always a same-user list mixup, so tier 1 (getLeadListsByUserId — one cheap
+      // query) should resolve it without ever calling the org-wide fan-out.
+      const otherListId = 'list-def';
+      const otherList = { ...mockList, listId: otherListId, name: 'Other List', linkedInAccountId: 'acc-other' };
+      const leadInOtherList = { ...mockLead, listId: otherListId };
+
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      mockCrmDb.getLeadListsByUserId.mockResolvedValue([mockList, otherList] as any);
+      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValue(leadInOtherList as any);
+      mockCrmDb.getLeadListById.mockImplementation((id: string) =>
+        Promise.resolve(id === otherListId ? (otherList as any) : (mockList as any))
+      );
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      expect(result.lead.listId).toBe(otherListId);
+      expect(result.note).toContain(listId);
+      expect(result.note).toContain(otherListId);
+      expect(mockCrmDb.getLeadByIdAcrossLists).toHaveBeenCalledWith([otherListId], leadId);
+      // Tier 2 (full org fan-out) must never run when tier 1 already found it.
+      expect(mockCrmDb.getLeadListsForUser).not.toHaveBeenCalled();
+      // Engagement lookups must use the corrected list, not the one originally requested.
+      expect(mockCrmDb.getLeadEngagementCount).toHaveBeenCalledWith(otherListId, leadId, userId);
+    });
+
+    it('ENG-969: falls back to tier 2 (org-wide) when the lead is not in any of the caller\'s own lists', async () => {
+      const orgPeerListId = 'list-peer';
+      const orgPeerList = { ...mockList, listId: orgPeerListId, userId: 'peer-user', name: 'Peer List' };
+      const leadInPeerList = { ...mockLead, listId: orgPeerListId };
+
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      mockCrmDb.getLeadListsByUserId.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadListsForUser.mockResolvedValue([mockList, orgPeerList] as any);
+      mockCrmDb.getLeadByIdAcrossLists
+        .mockResolvedValueOnce(null as any) // tier 1: own lists — miss
+        .mockResolvedValueOnce(leadInPeerList as any); // tier 2: org-wide — hit
+      mockCrmDb.getLeadListById.mockImplementation((id: string) =>
+        Promise.resolve(id === orgPeerListId ? (orgPeerList as any) : (mockList as any))
+      );
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      expect(result.lead.listId).toBe(orgPeerListId);
+      expect(mockCrmDb.getLeadListsByUserId).toHaveBeenCalledWith(userId);
+      expect(mockCrmDb.getLeadListsForUser).toHaveBeenCalledWith(userId);
+      expect(mockCrmDb.getLeadByIdAcrossLists).toHaveBeenNthCalledWith(1, [], leadId);
+      expect(mockCrmDb.getLeadByIdAcrossLists).toHaveBeenNthCalledWith(2, [orgPeerListId], leadId);
+    });
+
+    it('ENG-969: does not leak a lead from a list the caller cannot access', async () => {
+      // getLeadByIdAcrossLists is only ever given getLeadListsByUserId's / getLeadListsForUser's
+      // own output, so a list the caller can't see is never a candidate in the first place.
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      mockCrmDb.getLeadListsByUserId.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadListsForUser.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValue(null as any);
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Lead not found');
+    });
+
+    it('ENG-969: retries the whole recovery once after a throttle, and succeeds on the retry', async () => {
+      // The AWS SDK already retries an individual throttled DynamoDB call a few
+      // times internally, so a throw reaching our code means that already
+      // failed. One bounded retry (after a real pause) still gives a short,
+      // transient burst a second chance to resolve the correction.
+      const otherListId = 'list-def';
+      const otherList = { ...mockList, listId: otherListId, name: 'Other List' };
+      const leadInOtherList = { ...mockLead, listId: otherListId };
+
+      mockCrmDb.getLeadListById.mockImplementation((id: string) =>
+        Promise.resolve(id === otherListId ? (otherList as any) : (mockList as any))
+      );
+      mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      mockCrmDb.getLeadListsByUserId
+        .mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException'))
+        .mockResolvedValueOnce([mockList, otherList] as any);
+      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValueOnce(leadInOtherList as any);
+      mockCrmDb.getLeadEngagementCount.mockResolvedValue({ total: 0, last7Days: 0, totalAllMessages: 0 });
+      mockCrmDb.getLeadEngagements.mockResolvedValue({ engagements: [] } as any);
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(true);
+      expect(result.lead.listId).toBe(otherListId);
+      expect(mockCrmDb.getLeadListsByUserId).toHaveBeenCalledTimes(2);
+    });
+
+    it('ENG-969: degrades to a plain not-found (not a new error) when the recovery lookup fails on both attempts', async () => {
+      // AW-LeadLists runs on fixed provisioned capacity in production — a sustained
+      // throttle here must never leave the caller worse off than before this fix existed.
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      mockCrmDb.getLeadListsByUserId.mockRejectedValue(new Error('ProvisionedThroughputExceededException'));
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Lead not found');
+      expect(result.error).toBe('The specified lead does not exist in this list');
+      // Must NOT surface as the generic catch-all 'Failed to get lead details'.
+      expect(mockCrmDb.getLeadListsForUser).not.toHaveBeenCalled();
+      // Proves the retry actually happened, not just a single attempt.
+      expect(mockCrmDb.getLeadListsByUserId).toHaveBeenCalledTimes(2);
+    });
+
+    it('ENG-969: degrades to a plain not-found when tier 2 throws on both attempts', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue(null as any);
+      mockCrmDb.getLeadListsByUserId.mockResolvedValue([mockList] as any);
+      mockCrmDb.getLeadByIdAcrossLists.mockResolvedValue(null as any); // tier 1 always misses
+      mockCrmDb.getLeadListsForUser.mockRejectedValue(new Error('ProvisionedThroughputExceededException'));
+
+      const result = await service.getLeadDetails(listId, leadId, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Lead not found');
+      expect(mockCrmDb.getLeadListsForUser).toHaveBeenCalledTimes(2);
     });
 
     it('should expose enrichmentMetadata provenance so the agent can cite data sources', async () => {
@@ -2053,7 +2232,7 @@ describe('AgentModeService - CRM Tools', () => {
       const result = await service.sendEmailToLead(listId, leadId, userId);
 
       expect(result.success).toBe(false);
-      expect(result.message).toContain('Email send failed');
+      expect(result.message).toContain('Failed to send email');
     });
 
     it('should send via Gmail when senderType is gmail', async () => {
@@ -2139,6 +2318,37 @@ describe('AgentModeService - CRM Tools', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toBe('Token revoked');
+    });
+
+    // ENG-1300: Gmail/Outlook throw fully-typed EmailProviderError subclasses
+    // that carry no HTTP status of their own by design — "Gmail access was
+    // revoked" matches no classifyToolErrorClass message heuristic either, so
+    // this classified as generic Error/bug. emailProviderErrorStatus() maps
+    // the real typed error (not just its message) to a representative status.
+    it('ENG-1300: a real GmailTokenRevokedError classifies as auth/config end-to-end', async () => {
+      const gmailSender = {
+        id: 'sender-g2',
+        email: 'test@gmail.com',
+        fromName: 'Test',
+        senderType: 'gmail' as const,
+        gmailAccountId: 'test@gmail.com',
+      };
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadById.mockResolvedValue({ ...leadWithDraft, selectedSenderId: 'sender-g2' } as any);
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [gmailSender],
+        defaultSenderId: 'sender-g2',
+      });
+      mockGmail.sendEmail.mockRejectedValue(new GmailTokenRevokedError());
+
+      const result = await service.sendEmailToLead(listId, leadId, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(401);
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
     });
 
     it('should deny access when user is not an org member', async () => {
@@ -2368,6 +2578,32 @@ describe('AgentModeService - CRM Tools', () => {
       expect(mockGmail.sendEmail).toHaveBeenCalled();
     });
 
+    // ENG-1300: same fix as sendEmailToLead above — a real typed provider error
+    // classifies via emailProviderErrorStatus() instead of falling through to
+    // the generic Error/bug class.
+    it('ENG-1300: a real GmailTokenRevokedError classifies as auth/config end-to-end', async () => {
+      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+        success: true,
+        senders: [
+          { id: 'sender-g', email: 'me@gmail.com', fromName: 'Manan', senderType: 'gmail', gmailAccountId: 'me@gmail.com' },
+        ],
+        defaultSenderId: 'sender-g',
+      });
+      mockGmail.sendEmail.mockRejectedValue(new GmailTokenRevokedError());
+
+      const result = await service.sendEmailFromConfiguredSender(userId, {
+        to: 'someone@external.com',
+        subject: 'Hello',
+        html: '<p>Hi</p>',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe(401);
+      const classified = toolResultError(result);
+      expect(classifyToolErrorClass(classified)).toBe('auth');
+      expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+    });
+
     it('should include senderType in the availableSenders list on no match', async () => {
       jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
         success: true,
@@ -2541,7 +2777,7 @@ describe('AgentModeService - CRM Tools', () => {
       });
 
       expect(result.success).toBe(false);
-      expect(result.message).toContain('Email send failed');
+      expect(result.message).toContain('Custom domain send failed');
     });
 
     it('should return error when gmail-type sender is missing gmailAccountId', async () => {

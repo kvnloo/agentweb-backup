@@ -491,6 +491,25 @@ describe('scheduledRunSignalsConditionalSkip', () => {
   //     that did not produce what was required. create_image_task_from_prompt
   //     and create_revision are also [DEPRECATED], further lowering their
   //     real-world likelihood.
+  //   - present_question_deck -> ask_user_question (ENG-1635/1644): both build
+  //     a blocking question halt, but for different SITUATIONS, not the same
+  //     requirement — present_question_deck front-loads 1-6 predictable
+  //     planning questions determinable up front, ask_user_question is the
+  //     narrow escape hatch for a genuinely unpredictable question that only
+  //     comes up mid-execution (present_question_deck's own description says
+  //     so explicitly). Calling one is not evidence the other's requirement
+  //     was also satisfied. Not aliased; logged here so it isn't silently
+  //     missed.
+  //   - stage_pending_decision -> ask_user_question / present_question_deck:
+  //     stage_pending_decision's own description says to use it "instead of
+  //     ask_user_question/present_question_deck when the answer genuinely
+  //     belongs to someone OTHER than the person you're talking to right
+  //     now" — a durable, named-approver decision routed to Slack (or a
+  //     customer email), answered possibly days later, not a blocking
+  //     in-session halt. Different AUDIENCE and different timing, not the
+  //     same requirement — calling one is not evidence the other's
+  //     requirement was also satisfied. Not aliased; logged here so it
+  //     isn't silently missed.
   it('redirect audit: pins every "use/prefer tool X instead" cross-reference between two registered tools (ENG-1276 follow-up #3)', () => {
     const allTools = emmaToolRegistry.getAllTools();
     const allNames = allTools.map((t) => t.name);
@@ -529,15 +548,21 @@ describe('scheduledRunSignalsConditionalSkip', () => {
         'generate_video -> compose_video',
         'get_deployment_status -> coding_agent',
         'get_meta_ads_metrics -> call_meta_ads_insights_api',
+        'list_knowledge_base_files -> materialize_knowledge_base_asset',
+        'list_knowledge_base_files -> read_knowledge_base_files',
         'perform_deep_research -> create_blog_article',
+        'present_question_deck -> ask_user_question',
         'read_file_content -> describe_image',
         'read_file_content -> describe_video',
+        'read_knowledge_base_files -> materialize_knowledge_base_asset',
         'recommend_predefined_work_plan -> launch_predefined_work_plan',
         'remove_c2pa_from_image -> remove_image_background',
         'remove_image_background -> generate_image',
         'remove_image_background -> update_html_file',
         'search_leads -> ask_crm',
         'send_email_from_sender -> email',
+        'stage_pending_decision -> ask_user_question',
+        'stage_pending_decision -> present_question_deck',
         'twitter_manage_post -> post_on_connected_account',
         'update_book_content -> generate_book_content',
       ].sort()
@@ -1660,5 +1685,88 @@ describe('runScheduledChat — conditional skip day', () => {
         attempt: 20,
       })
     );
+  });
+});
+
+/**
+ * ENG-1599 review (CodeRabbit) — the publish-press breaker's externalWritesSucceeded
+ * ledger only held allToolCalls (calls made in the CURRENT turn/segment), never
+ * params.priorToolCalls (calls an abandoned, resumed segment already made) — unlike
+ * allActualFunctionCallsForReporting and skipLedgerToolCalls just above, which both
+ * already seed from priorToolCalls for exactly this reason (ENG-657/ENG-844). So a
+ * resumed run whose abandoned portion already published via a qualified consentOnly
+ * route (this ticket's own post_on_connected_account / twitter_manage_post pair)
+ * would not see that write, and would press the resumed segment to publish AGAIN —
+ * the very duplicate this breaker exists to prevent.
+ */
+describe('runVerifiedChat — publish-press breaker sees priorToolCalls on resume (ENG-1599)', () => {
+  const mockSession = {
+    sessionId: 'test-session-resume-1599',
+    userId: 'test-user',
+    title: 'Scheduled: resume test',
+    messages: [],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
+    mockChatbotDb.updateSessionLlmModel.mockResolvedValue(mockSession);
+    mockAgentModeService.getDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
+    mockAgentModeService.getScheduledChatsDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
+    mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
+    mockAgentModeService.generateSessionTitle.mockResolvedValue('Generated Title');
+  });
+
+  const baseParams = {
+    sessionId: 'test-session-resume-1599',
+    userId: 'test-user',
+    startingMessage: 'Post today\'s tweet.',
+    keywords: [] as string[],
+    requiredFunctions: [{ functionName: 'twitter_manage_post', minCount: 1 }],
+    completionGate: true,
+    maxAttempts: 20,
+  };
+
+  it('stops on the FIRST press instead of re-pressing, when the abandoned segment already published', async () => {
+    // The resumed segment's own turn makes no new tool calls at all — it just
+    // narrates. Only priorToolCalls carries the earlier, already-succeeded write.
+    mockWorker.runInWorker.mockResolvedValue({
+      content: 'Resuming — nothing further to do this turn.',
+      toolCalls: [],
+      knowledgeBaseQueries: [], sources: [], responseMessages: [],
+    });
+
+    const result = await runVerifiedChat({
+      ...baseParams,
+      priorToolCalls: [
+        { name: 'post_on_connected_account', arguments: { platform: 'twitter', content: 'Already posted before the abandon.' } },
+      ],
+    });
+
+    // Exactly one turn spent on the resumed segment — proves it did NOT press
+    // again asking the model to call twitter_manage_post.
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(false);
+    expect((result as any).publishRequirementMismatch).toBe(true);
+    expect((result as any).publishHeldForApproval).toBeUndefined();
+  });
+
+  it('control: without the prior write, the same shape presses normally (proves the fix, not the setup, explains the stop)', async () => {
+    mockWorker.runInWorker.mockResolvedValue({
+      content: 'Nothing to report.',
+      toolCalls: [],
+      knowledgeBaseQueries: [], sources: [], responseMessages: [],
+    });
+
+    const result = await runVerifiedChat({ ...baseParams, priorToolCalls: [], maxAttempts: 3 });
+
+    // No qualifying write anywhere (prior or current) — a genuine withhold,
+    // pressed to its normal budget, not stopped on attempt 1.
+    expect(mockWorker.runInWorker.mock.calls.length).toBeGreaterThan(1);
+    expect(result.success).toBe(false);
+    expect((result as any).publishRequirementMismatch).toBeUndefined();
   });
 });

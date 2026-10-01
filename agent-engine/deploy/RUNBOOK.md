@@ -138,11 +138,6 @@ To rotate a secret: create a new **version** of the existing secret ID
 (`gcloud secrets versions add <id> --data-file=-`). No code or deploy change
 needed — `secrets_manager.py` always fetches `latest`.
 
-**Known outstanding rotation**: the Azure OpenAI keys are Rui's original,
-unrotated keys, just relocated out of plaintext `.env`. Tracked as a
-follow-up (comment on ENG-389) — Harsha needs to generate a replacement key
-in Azure Portal for `storybook.openai.azure.com`.
-
 ### Design decisions (why GCP Secret Manager, not AWS)
 
 The rest of the org's secrets live in AWS Secrets Manager. Agent-engine uses

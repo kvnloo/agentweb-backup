@@ -1,3 +1,4 @@
+jest.mock('../services/brandGuidelinesPopulation', () => ({ populateEmptyBrandGuidelines: jest.fn().mockResolvedValue(undefined) }));
 /**
  * Onboarding Epic Phase 2 — ICP discovery service tests.
  *
@@ -816,6 +817,40 @@ describe("onboardingIcpService", () => {
       // createdAt preserved, updatedAt bumped.
       expect(secondWrite.marketStrategy.createdAt).toBe("2026-04-01T00:00:00.000Z");
       expect(secondWrite.marketStrategy.updatedAt).not.toBe("2026-04-01T00:00:00.000Z");
+    });
+
+    // ENG-1955: the mirror write happens strictly AFTER icpCompletedAt is
+    // persisted (write + re-read round-trip), so timestamping the mirror
+    // with wall-clock `now()` always looked "newer" than icpCompletedAt —
+    // GET /icp/filters's staleness check would then treat every onboarding
+    // generation as if the user had just corrected their ICPs on the
+    // Market Strategy page, permanently skipping the icpResult cache path.
+    // The mirror must instead backdate marketStrategy.updatedAt to the
+    // icpCompletedAt of the generation it mirrors.
+    it("backdates marketStrategy.updatedAt to icpCompletedAt, not wall-clock now", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          brandGuidelines: { brandData: { brandName: "Linear" } },
+        })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "running",
+          icpStartedAt: "2026-04-24T11:59:00.000Z",
+        })
+        .mockResolvedValueOnce({ userId: "user-1" });
+      userDb.updateUser.mockResolvedValue({});
+
+      const llm = new FakeLlm({ icps: fivePersonas });
+      await triggerIcpDiscoveryForUser("user-1", { llm: llm as any });
+
+      const firstWrite = userDb.updateUser.mock.calls[0][1];
+      const secondWrite = userDb.updateUser.mock.calls[1][1];
+      expect(secondWrite.marketStrategy.updatedAt).toBe(firstWrite.icpCompletedAt);
+      // icpUpdatedAt (ENG-1955 follow-up) must be backdated the same way —
+      // this write genuinely sets `icp`, but it's still a system mirror, not
+      // wall-clock "now", for the same reason updatedAt is backdated above.
+      expect(secondWrite.marketStrategy.icpUpdatedAt).toBe(firstWrite.icpCompletedAt);
     });
 
     it("seeds marketStrategy when User has no prior marketStrategy", async () => {

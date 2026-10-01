@@ -286,7 +286,7 @@ describe('AgentApiKeyService', () => {
 
   describe('updateLastUsed', () => {
     it('should fire-and-forget update lastUsedAt', async () => {
-      await service.updateLastUsed('key-123');
+      await service.updateLastUsed('key-123', 'user-123');
 
       expect(mockUpdate).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -302,7 +302,7 @@ describe('AgentApiKeyService', () => {
       });
 
       // Should not throw
-      await expect(service.updateLastUsed('key-123')).resolves.toBeUndefined();
+      await expect(service.updateLastUsed('key-123', 'user-123')).resolves.toBeUndefined();
     });
   });
 });

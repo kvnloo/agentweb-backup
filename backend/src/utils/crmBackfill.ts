@@ -136,6 +136,7 @@ export function computeBackfillScores(
   // at_risk stable for already-paying users.
   const lifecycleSignals: LifecycleSignals = {
     email: lead.email ?? undefined,
+    phone: (lead as any).phone ?? undefined,
     hasUserRecord,
     subscriptionState,
     lastActivityAt,

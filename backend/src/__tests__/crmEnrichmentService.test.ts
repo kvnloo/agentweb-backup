@@ -3273,7 +3273,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
 
     await service.execute(baseSpec());
 
-    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    expect(matchOrg).toHaveBeenCalledWith('acme.com', { userId: 'user-1' });
     expect(mockAgentModeService.youSearchWeb).not.toHaveBeenCalled();
     expect(mockGeminiCreate).toHaveBeenCalled();
     // First call is field-alias resolution; Apollo context appears in a later extraction call.
@@ -3300,7 +3300,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
 
     await service.execute(baseSpec());
 
-    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    expect(matchOrg).toHaveBeenCalledWith('acme.com', { userId: 'user-1' });
     expect(mockAgentModeService.youSearchWeb).toHaveBeenCalled();
   });
 
@@ -3418,7 +3418,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
 
     await service.execute(baseSpec());
 
-    expect(matchOrg).toHaveBeenCalledWith('beta.com');
+    expect(matchOrg).toHaveBeenCalledWith('beta.com', { userId: 'user-1' });
   });
 
   it('falls back to web search when Apollo matchOrg rejects', async () => {
@@ -3436,7 +3436,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
 
     await service.execute(baseSpec());
 
-    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    expect(matchOrg).toHaveBeenCalledWith('acme.com', { userId: 'user-1' });
     expect(mockAgentModeService.youSearchWeb).toHaveBeenCalled();
   });
 
@@ -3460,7 +3460,7 @@ describe('enrichLead — apolloTechStack waterfall', () => {
 
     await service.execute(baseSpec());
 
-    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+    expect(matchOrg).toHaveBeenCalledWith('acme.com', { userId: 'user-1' });
     expect(mockAgentModeService.youSearchWeb).toHaveBeenCalled();
   });
 });

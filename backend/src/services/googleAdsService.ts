@@ -187,7 +187,209 @@ function assertBidTargetIsAddressable(params: {
   }
 }
 
+export type GoogleAdsServingState = 'BLOCKED_BY_CAMPAIGN' | 'BLOCKED_BY_BUDGET' | 'BLOCKED_BY_AD_GROUP'
+  | 'BLOCKED_BY_AD' | 'BLOCKED_BY_POLICY' | 'BLOCKED_BY_KEYWORD' | 'READY' | 'DELIVERING' | 'UNVERIFIED';
+
+export interface GoogleAdsServingBlocker {
+  state: GoogleAdsServingState;
+  entityId: string;
+  reason: string;
+  adGroupId?: string;
+}
+
+export interface GoogleAdsServingPath {
+  adGroupId: string;
+  adGroup: { id: string; resourceName: string; status: string };
+  state: GoogleAdsServingState;
+  blockers: GoogleAdsServingBlocker[];
+  // Raw readback is retained so the agent can cite exact creative/keyword evidence.
+  ads: any[];
+  keywords: any[];
+  telemetry: { impressions: number; costMicros: number } | null;
+}
+
+export interface GoogleAdsServingCampaign {
+  campaignId: string;
+  campaign?: Record<string, unknown>;
+  budget?: Record<string, unknown>;
+  state: GoogleAdsServingState;
+  adGroups: GoogleAdsServingPath[];
+  blockers: GoogleAdsServingBlocker[];
+}
+
+export interface GoogleAdsServingReport {
+  customerId: string;
+  checkedAt: string;
+  timeZone: string | null;
+  currency: string | null;
+  window: { preset: 'TODAY'; startDate: string; endDate: string } | null;
+  state: GoogleAdsServingState;
+  campaigns: GoogleAdsServingCampaign[];
+  blockers: GoogleAdsServingBlocker[];
+}
+
 export class GoogleAdsService {
+  /** ENG-1922: Search-only readback. Configuration and account-local TODAY metrics
+   * are independent evidence. Historical delivery never overrides a blocked path.
+   * Google enums: https://developers.google.com/google-ads/api/fields/v24/ad_group_criterion
+   */
+  async getServingChainStatus(userId: string, customerId: string, campaignIds?: string[]): Promise<GoogleAdsServingReport> {
+    const checkedAt = new Date().toISOString();
+    const report: GoogleAdsServingReport = { customerId, checkedAt, timeZone: null, currency: null, window: null,
+      state: 'UNVERIFIED', campaigns: [], blockers: [] };
+    const blocker = (state: GoogleAdsServingState, entityId: string, reason: string, adGroupId?: string): GoogleAdsServingBlocker =>
+      ({ state, entityId, reason, ...(adGroupId ? { adGroupId } : {}) });
+    const assert = (condition: unknown, reason: string): void => { if (!condition) throw new Error(reason); };
+    const id = (value: unknown): value is string => typeof value === 'string' && /^\d+$/.test(value);
+    const number = (value: unknown): number => {
+      assert((typeof value === 'string' && /^\d+$/.test(value)) || typeof value === 'number', 'Missing or malformed numeric evidence');
+      const n = Number(value);
+      assert(Number.isSafeInteger(n) && n >= 0, 'Invalid numeric evidence');
+      return n;
+    };
+    const status = (value: unknown, allowed: string[]): void => assert(typeof value === 'string' && allowed.includes(value), 'Missing or unknown status');
+    const priority: GoogleAdsServingState[] = ['UNVERIFIED', 'DELIVERING', 'READY', 'BLOCKED_BY_CAMPAIGN',
+      'BLOCKED_BY_BUDGET', 'BLOCKED_BY_AD_GROUP', 'BLOCKED_BY_AD', 'BLOCKED_BY_POLICY', 'BLOCKED_BY_KEYWORD'];
+    const rollup = (states: GoogleAdsServingState[]): GoogleAdsServingState => priority.find(s => states.includes(s)) || 'UNVERIFIED';
+    try {
+      assert(id(customerId) && (campaignIds === undefined || (Array.isArray(campaignIds) && campaignIds.length > 0 && campaignIds.every(id))), 'Invalid customer or campaign IDs');
+      const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+      const read = async (query: string): Promise<any[]> => {
+        const completeness: { truncated?: boolean } = {};
+        const rows = await this.search(customerId, accessToken, query, loginCustomerId, completeness);
+        assert(!completeness.truncated && Array.isArray(rows) && rows.every(r => r && typeof r === 'object' && !Array.isArray(r)), 'Incomplete Google Ads read');
+        return rows;
+      };
+      const customers = await read('SELECT customer.time_zone, customer.currency_code FROM customer');
+      assert(customers.length === 1 && typeof customers[0]?.customer?.timeZone === 'string' && typeof customers[0]?.customer?.currencyCode === 'string', 'Missing account timezone/currency');
+      report.timeZone = customers[0].customer.timeZone;
+      report.currency = customers[0].customer.currencyCode;
+      const parts = new Intl.DateTimeFormat('en-US', { timeZone: customers[0].customer.timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date(checkedAt));
+      const date = ['year', 'month', 'day'].map(key => parts.find(p => p.type === key)!.value).join('-');
+      report.window = { preset: 'TODAY', startDate: date, endDate: date };
+      const filter = campaignIds ? `campaign.id IN (${campaignIds.join(',')})` : "campaign.status != 'REMOVED'";
+      const campaigns = await read(`SELECT campaign.id, campaign.resource_name, campaign.status, campaign.start_date_time, campaign.end_date_time, campaign.advertising_channel_type, campaign.campaign_budget, campaign_budget.id, campaign_budget.resource_name, campaign_budget.status, campaign_budget.amount_micros, campaign_budget.explicitly_shared FROM campaign WHERE ${filter}`);
+      const seen = new Set<string>();
+      for (const row of campaigns) {
+        assert(id(row.campaign?.id) && !seen.has(row.campaign.id) && (!campaignIds || campaignIds.includes(row.campaign.id)), 'Missing, duplicate or unexpected campaign');
+        seen.add(row.campaign.id);
+        const campaign = row.campaign;
+        const result: GoogleAdsServingCampaign = { campaignId: campaign.id, campaign, budget: row.campaignBudget, state: 'UNVERIFIED', adGroups: [], blockers: [] };
+        report.campaigns.push(result);
+        try {
+          assert(campaign.advertisingChannelType === 'SEARCH', 'Unsupported campaign type: Search only');
+          assert(campaign.resourceName === `customers/${customerId}/campaigns/${campaign.id}`, 'Missing campaign hierarchy');
+          const budget = row.campaignBudget;
+          assert(id(budget?.id) && budget.resourceName === `customers/${customerId}/campaignBudgets/${budget.id}` && campaign.campaignBudget === budget.resourceName && typeof budget.explicitlyShared === 'boolean', 'Missing attached budget');
+          status(campaign.status, ['ENABLED', 'PAUSED', 'REMOVED']);
+          status(budget.status, ['ENABLED', 'PAUSED', 'REMOVED']);
+          const amount = number(budget.amountMicros);
+          const parentBlockers: GoogleAdsServingBlocker[] = [];
+          // ENG-2031: v23+ renamed campaign.start_date/end_date to start_date_time/end_date_time
+          // ("yyyy-MM-dd HH:mm:ss" in the serving customer's timezone). GAQL returns the raw
+          // string; compare on the date prefix so a set-to-midnight start and a 23:59:59 end
+          // behave exactly like the old YYYY-MM-DD window check.
+          const campaignDay = (value: unknown): string | null => typeof value === 'string'
+            && /^\d{4}-\d{2}-\d{2}/.test(value) ? value.slice(0, 10) : null;
+          const validDay = (day: string | null): day is string => day !== null
+            && Number.isFinite(Date.parse(day)) && new Date(day).toISOString().slice(0, 10) === day;
+          const startDay = campaignDay(campaign.startDateTime);
+          const endDay = campaignDay(campaign.endDateTime);
+          assert(validDay(startDay) && (campaign.endDateTime == null || campaign.endDateTime === '' || validDay(endDay)), 'Missing or malformed campaign dates');
+          if (campaign.status !== 'ENABLED' || (startDay as string) > date || (endDay !== null && endDay < date)) {
+            parentBlockers.push(blocker('BLOCKED_BY_CAMPAIGN', campaign.id, `${campaign.status}; dates=${startDay}..${endDay ?? 'indefinite'}`));
+          }
+          if (budget.status !== 'ENABLED' || amount === 0) parentBlockers.push(blocker('BLOCKED_BY_BUDGET', budget.id, `${budget.status}; amountMicros=${budget.amountMicros}`));
+          const groups = await read(`SELECT campaign.id, ad_group.id, ad_group.resource_name, ad_group.status FROM ad_group WHERE campaign.id = ${campaign.id} AND ad_group.status != 'REMOVED'`);
+          assert(groups.length > 0, 'Missing ad groups');
+          const groupIds = new Set<string>();
+          for (const g of groups) {
+            assert(id(g.adGroup?.id) && g.campaign?.id === campaign.id && g.adGroup.resourceName === `customers/${customerId}/adGroups/${g.adGroup.id}` && !groupIds.has(g.adGroup.id), 'Missing or inconsistent ad group hierarchy');
+            groupIds.add(g.adGroup.id);
+            result.adGroups.push({ adGroupId: g.adGroup.id, adGroup: g.adGroup, state: 'UNVERIFIED', blockers: [], ads: [], keywords: [], telemetry: null });
+          }
+          const ads = await read(`SELECT ad_group.id, ad_group_ad.resource_name, ad_group_ad.ad.id, ad_group_ad.status, ad_group_ad.policy_summary.approval_status, ad_group_ad.policy_summary.review_status FROM ad_group_ad WHERE campaign.id = ${campaign.id} AND ad_group_ad.status != 'REMOVED' AND ad_group.status != 'REMOVED'`);
+          const keywords = await read(`SELECT ad_group.id, ad_group_criterion.resource_name, ad_group_criterion.criterion_id, ad_group_criterion.status, ad_group_criterion.negative, ad_group_criterion.approval_status, ad_group_criterion.primary_status FROM ad_group_criterion WHERE campaign.id = ${campaign.id} AND ad_group_criterion.type = 'KEYWORD' AND ad_group_criterion.status != 'REMOVED' AND ad_group.status != 'REMOVED'`);
+          // No config fields in this query: zero rows means zero observed delivery,
+          // only after a complete successful read. Errors are never zero telemetry.
+          const telemetry = await read(`SELECT ad_group.id, metrics.impressions, metrics.cost_micros FROM ad_group WHERE campaign.id = ${campaign.id} AND ad_group.status != 'REMOVED' AND segments.date = '${date}'`);
+          for (const list of [ads, keywords, telemetry]) {
+            const children = new Set<string>();
+            for (const r of list) {
+              assert(groupIds.has(r.adGroup?.id), 'Child without known ad group');
+              const key = list === ads ? r.adGroupAd?.resourceName : list === keywords ? r.adGroupCriterion?.resourceName : r.adGroup.id;
+              assert(typeof key === 'string' && !children.has(key), 'Missing or duplicate child evidence');
+              children.add(key);
+            }
+          }
+          for (const path of result.adGroups) {
+            const groupId = path.adGroupId;
+            try {
+              path.blockers = parentBlockers.map(b => ({ ...b, adGroupId: groupId }));
+              status(path.adGroup.status, ['ENABLED', 'PAUSED', 'REMOVED']);
+              if (path.adGroup.status !== 'ENABLED') path.blockers.push(blocker('BLOCKED_BY_AD_GROUP', groupId, path.adGroup.status, groupId));
+              path.ads = ads.filter(r => r.adGroup.id === groupId).map(r => r.adGroupAd);
+              path.keywords = keywords.filter(r => r.adGroup.id === groupId).map(r => r.adGroupCriterion);
+              assert(path.ads.length > 0, 'Missing ad creative hierarchy');
+              for (const a of path.ads) {
+                assert(id(a.ad?.id) && a.resourceName === `customers/${customerId}/adGroupAds/${groupId}~${a.ad.id}`, 'Missing ad identity');
+                status(a.status, ['ENABLED', 'PAUSED', 'REMOVED']);
+                status(a.policySummary?.approvalStatus, ['APPROVED', 'APPROVED_LIMITED', 'DISAPPROVED', 'AREA_OF_INTEREST_ONLY']);
+                status(a.policySummary?.reviewStatus, ['REVIEWED', 'REVIEW_IN_PROGRESS', 'UNDER_APPEAL', 'ELIGIBLE_MAY_SERVE']);
+              }
+              const enabledAds = path.ads.filter((a: any) => a.status === 'ENABLED');
+              if (!enabledAds.length) {
+                path.blockers.push(...path.ads.map((a: any) => blocker('BLOCKED_BY_AD', a.ad.id, a.status, groupId)));
+              } else if (!enabledAds.some((a: any) =>
+                ['APPROVED', 'APPROVED_LIMITED', 'AREA_OF_INTEREST_ONLY'].includes(a.policySummary.approvalStatus) &&
+                ['REVIEWED', 'ELIGIBLE_MAY_SERVE'].includes(a.policySummary.reviewStatus))) {
+                path.blockers.push(...enabledAds.map((a: any) => blocker('BLOCKED_BY_POLICY', a.ad.id, `${a.policySummary.approvalStatus}; ${a.policySummary.reviewStatus}`, groupId)));
+              }
+              for (const k of path.keywords) {
+                assert(id(k.criterionId) && k.resourceName === `customers/${customerId}/adGroupCriteria/${groupId}~${k.criterionId}` && typeof k.negative === 'boolean', 'Missing keyword identity');
+                status(k.status, ['ENABLED', 'PAUSED', 'REMOVED']);
+                if (!k.negative) {
+                  status(k.approvalStatus, ['APPROVED', 'PENDING_REVIEW', 'DISAPPROVED', 'UNDER_REVIEW']);
+                  status(k.primaryStatus, ['ELIGIBLE', 'PAUSED', 'REMOVED', 'PENDING', 'NOT_ELIGIBLE']);
+                }
+              }
+              const positiveKeywords = path.keywords.filter((k: any) => !k.negative);
+              if (!positiveKeywords.some((k: any) => k.status === 'ENABLED' && k.approvalStatus === 'APPROVED' && k.primaryStatus === 'ELIGIBLE')) {
+                path.blockers.push(...(positiveKeywords.length ? positiveKeywords.map((k: any) => blocker('BLOCKED_BY_KEYWORD', k.criterionId, `${k.status}; ${k.approvalStatus}; ${k.primaryStatus}`, groupId)) : [blocker('BLOCKED_BY_KEYWORD', groupId, 'No positive keywords', groupId)]));
+              }
+              const metrics = telemetry.find(r => r.adGroup.id === groupId)?.metrics;
+              path.telemetry = metrics === undefined && !telemetry.some(r => r.adGroup.id === groupId)
+                ? { impressions: 0, costMicros: 0 } : { impressions: number(metrics?.impressions), costMicros: number(metrics?.costMicros) };
+              path.state = path.blockers[0]?.state || (path.telemetry.impressions > 0 || path.telemetry.costMicros > 0 ? 'DELIVERING' : 'READY');
+            } catch (error) {
+              path.state = 'UNVERIFIED';
+              path.blockers.push(blocker('UNVERIFIED', groupId, error instanceof Error ? error.message : 'Failed child read', groupId));
+            }
+          }
+          result.blockers = result.adGroups.flatMap((g) => g.blockers);
+          result.state = rollup(result.adGroups.map((g) => g.state));
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : 'API or permission failure';
+          result.blockers.push(blocker('UNVERIFIED', campaign.id, reason));
+          for (const path of result.adGroups) {
+            path.state = 'UNVERIFIED';
+            path.blockers.push(blocker('UNVERIFIED', path.adGroupId, reason, path.adGroupId));
+          }
+        }
+      }
+      for (const missing of campaignIds || []) {
+        if (!seen.has(missing)) report.campaigns.push({ campaignId: missing, state: 'UNVERIFIED', adGroups: [], blockers: [blocker('UNVERIFIED', missing, 'Campaign not returned')] });
+      }
+      report.state = rollup(report.campaigns.map((c) => c.state));
+      report.blockers = report.campaigns.flatMap((c) => c.blockers);
+      if (!report.campaigns.length) report.blockers.push(blocker('UNVERIFIED', customerId, 'No campaigns returned'));
+    } catch (error) {
+      report.state = 'UNVERIFIED';
+      report.blockers.push(blocker('UNVERIFIED', customerId, error instanceof Error ? error.message : 'API or permission failure'));
+    }
+    return report;
+  }
+
   // Single-flight refresh guard: userId:accountId → in-flight promise
   private refreshInFlight = new Map<string, Promise<string>>();
 
@@ -245,19 +447,68 @@ export class GoogleAdsService {
     }
   }
 
-  async search(customerId: string, accessToken: string, query: string, loginCustomerId?: string): Promise<any[]> {
+  /**
+   * @param completeness Optional out-param. When the `MAX_PAGES` cap stops the walk with rows
+   *   still unread, `completeness.truncated` is set to true.
+   *
+   *   An out-param rather than a widened return type because `search` returns `any[]` to a long
+   *   tail of callers that map straight over it; changing the shape would touch every one of
+   *   them for a signal only the audit path reads. Same trade-off `adUtmAuditService` already
+   *   made for `CampaignAuditReport[]`.
+   *
+   *   Why it exists at all: the cap silently dropped rows, so a caller that counted what it got
+   *   back could not tell a complete read from a capped one. The UTM audit then printed
+   *   "✅ All N campaign(s) on google carry UTM tracking" about ads it had never seen — the
+   *   fabricated-PASS shape this whole change set exists to remove. ~500k rows makes it
+   *   unlikely, not impossible, and "unlikely" is not what a ✅ claims.
+   */
+  async search(
+    customerId: string,
+    accessToken: string,
+    query: string,
+    loginCustomerId?: string,
+    completeness?: { truncated?: boolean },
+  ): Promise<any[]> {
     const MAX_PAGES = 50; // safety cap (~500k rows at the default page size) to avoid a runaway loop
     const all: any[] = [];
     let pageToken: string | undefined;
     let pages = 0;
+    let expectedCount: number | undefined;
     do {
       const body: any = { query };
+      if (completeness) body.searchSettings = { returnTotalResultsCount: true };
       if (pageToken) body.pageToken = pageToken;
       const data = await this.callApi('POST', `/customers/${customerId}/googleAds:search`, accessToken, body, loginCustomerId);
+      // All search callers share this network boundary; never turn a partial/error
+      // envelope or malformed row into a successful (possibly empty) read.
+      if (!data || typeof data !== 'object' || Array.isArray(data) || data.error || data.partialFailureError ||
+          (data.results !== undefined && (!Array.isArray(data.results) || data.results.some((row: unknown) =>
+            !row || typeof row !== 'object' || Array.isArray(row)))) ||
+          (data.nextPageToken !== undefined && typeof data.nextPageToken !== 'string')) {
+        throw new Error('Incomplete or malformed Google Ads search response');
+      }
+      if (completeness) {
+        const rawCount = data.totalResultsCount === undefined && (data.results === undefined || data.results.length === 0)
+          ? 0
+          : data.totalResultsCount;
+        if (rawCount === undefined) {
+          throw new Error('Missing Google Ads result count');
+        }
+        const count = Number(rawCount);
+        if (!/^\d+$/.test(String(rawCount)) || !Number.isSafeInteger(count)) {
+          throw new Error('Malformed Google Ads result count');
+        }
+        if (expectedCount !== undefined && expectedCount !== count) completeness.truncated = true;
+        expectedCount = count;
+      }
       if (data.results) all.push(...data.results);
       pageToken = data.nextPageToken;
       pages++;
     } while (pageToken && pages < MAX_PAGES);
+    // A token still in hand means Google had more rows and the cap stopped the walk.
+    if (completeness && (pageToken || (expectedCount !== undefined && !/\bLIMIT\b/i.test(query) && expectedCount !== all.length))) {
+      completeness.truncated = true;
+    }
     return all;
   }
 
@@ -828,11 +1079,13 @@ export class GoogleAdsService {
 
   // ── Campaigns ────────────────────────────────────────────────────────────
 
-  async listCampaigns(userId: string, customerId: string): Promise<{ resourceName: string; id: string; name: string; status: string; type: string }[]> {
+  /** @param completeness Optional out-param — see `search`. Set when the page cap truncated the read. */
+  async listCampaigns(userId: string, customerId: string, completeness?: { truncated?: boolean }): Promise<{ resourceName: string; id: string; name: string; status: string; type: string }[]> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const results = await this.search(customerId, accessToken,
       'SELECT campaign.resource_name, campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type FROM campaign ORDER BY campaign.id',
       loginCustomerId,
+      completeness,
     );
     return results.map((r: any) => ({
       resourceName: r.campaign.resourceName,
@@ -1046,9 +1299,16 @@ export class GoogleAdsService {
     cpcBidCeilingMicros?: number;
     budgetResourceName?: string;
     finalUrlSuffix?: string;
+    targetGoogleSearch?: boolean;
+    targetSearchNetwork?: boolean;
+    targetContentNetwork?: boolean;
+    targetPartnerSearchNetwork?: boolean;
   }): Promise<boolean> {
     if (params.biddingStrategy && params.biddingStrategyResourceName) {
       throw new Error('Provide either bidding_strategy (a standard strategy) or bidding_strategy_resource_name (a portfolio/shared strategy), not both.');
+    }
+    if (params.targetSearchNetwork === true && params.targetGoogleSearch !== true) {
+      throw new Error('target_search_network=true requires target_google_search=true; nothing was sent to Google Ads.');
     }
     assertBidTargetIsAddressable(params);
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
@@ -1058,6 +1318,20 @@ export class GoogleAdsService {
     if (params.status) { update.status = params.status; updateMask.push('status'); }
     if (params.budgetResourceName) { update.campaignBudget = params.budgetResourceName; updateMask.push('campaign_budget'); }
     if (params.finalUrlSuffix !== undefined) { update.finalUrlSuffix = params.finalUrlSuffix; updateMask.push('final_url_suffix'); }
+    const networkSettings: Record<string, boolean> = {};
+    const networkSettingFields = [
+      ['targetGoogleSearch', 'target_google_search'],
+      ['targetSearchNetwork', 'target_search_network'],
+      ['targetContentNetwork', 'target_content_network'],
+      ['targetPartnerSearchNetwork', 'target_partner_search_network'],
+    ] as const;
+    for (const [paramName, maskName] of networkSettingFields) {
+      if (params[paramName] !== undefined) {
+        networkSettings[paramName] = params[paramName];
+        updateMask.push(`network_settings.${maskName}`);
+      }
+    }
+    if (Object.keys(networkSettings).length > 0) update.networkSettings = networkSettings;
     if (params.biddingStrategyResourceName) {
       // Portfolio/shared strategy: bidding_strategy is a scalar resource-name field, so masking
       // the leaf directly is correct (and setting it detaches any prior embedded strategy).
@@ -1569,6 +1843,8 @@ export class GoogleAdsService {
     userId: string,
     customerId: string,
     campaignId?: string,
+    /** Optional out-param — see `search`. Set when either underlying query hit the page cap. */
+    completeness?: { truncated?: boolean },
   ): Promise<Array<{
     adId: string;
     campaignId: string;
@@ -1592,9 +1868,10 @@ export class GoogleAdsService {
       'asset_group.id, asset_group.final_urls ' +
       'FROM asset_group' + where;
 
+    // Either query hitting the cap makes the combined result partial, so both feed the same flag.
     const [adRows, assetGroupRows] = await Promise.all([
-      this.search(customerId, accessToken, adQuery, loginCustomerId),
-      this.search(customerId, accessToken, assetGroupQuery, loginCustomerId),
+      this.search(customerId, accessToken, adQuery, loginCustomerId, completeness),
+      this.search(customerId, accessToken, assetGroupQuery, loginCustomerId, completeness),
     ]);
 
     const urls = (value: any): string[] =>

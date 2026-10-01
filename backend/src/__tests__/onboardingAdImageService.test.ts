@@ -38,9 +38,15 @@ jest.mock("../services/onboardingAdImageChatSessionMirror", () => ({
     .mockResolvedValue("mocked-onboarding-session-id"),
 }));
 
+jest.mock("../services/creativeRubricOnboarding", () => ({
+  judgeOnboardingAdImages: jest.fn(async () => null),
+}));
+
+import { judgeOnboardingAdImages } from "../services/creativeRubricOnboarding";
 import {
   AD_IMAGE_SYSTEM_PROMPT,
   buildSixLayerPromptForVariant,
+  portraitFeedLayout,
   claimAdImageRun,
   extractAdImageBrandContext,
   generateAdImagesForUser,
@@ -48,7 +54,10 @@ import {
   pickFormatSplit,
   startAdImageGenerationForUser,
   triggerAdImageGenerationForUser,
+  type AdImageGeneratorDep,
 } from "../services/onboardingAdImageService";
+import { evaluateCreativeGates } from "../services/creativeGates";
+import { adImageReadyPatch } from "../services/adImageStatusService";
 const { userDb, orgDb } = require("../services/db");
 
 class FakeImageGen {
@@ -150,6 +159,27 @@ describe("onboardingAdImageService", () => {
   });
 
   describe("buildSixLayerPromptForVariant", () => {
+    it("labels the 1080x1350 layout as a 4:5 feed portrait, never a Story (ENG-2139)", () => {
+      const prompt = buildSixLayerPromptForVariant({
+        variantIndex: 0,
+        format: "1080x1350",
+        concept: "VM",
+        copyAngle: "PA",
+        formatArchetype: "A",
+        brand,
+        persona: onePersona,
+      });
+      expect(prompt).toContain("Feed portrait 4:5:");
+      expect(prompt).not.toMatch(/Story 4:5/);
+    });
+
+    it("relabels a stored template row that still says Story 4:5 (ENG-2139)", () => {
+      const stored = ["Story 4:5: UI element occupies upper 60% of tall canvas", "- Lower 40% reserved for CTA"].join("\n");
+      expect(portraitFeedLayout(stored)).toBe(
+        ["Feed portrait 4:5: UI element occupies upper 60% of tall canvas", "- Lower 40% reserved for CTA"].join("\n"),
+      );
+    });
+
     it("includes all 6 layers in order", () => {
       const prompt = buildSixLayerPromptForVariant({
         variantIndex: 0,
@@ -213,6 +243,26 @@ describe("onboardingAdImageService", () => {
         persona: onePersona,
       });
       expect(prompt).toContain("1080x1350");
+    });
+
+    // ENG-421 audit defect (fixed in ENG-2139): 1080x1350 is Meta's 4:5 feed
+    // portrait. Story/Reel is 9:16 1080x1920, so calling this size "Story/Reel"
+    // told the model the wrong placement.
+    it("labels 1080x1350 as a 4:5 feed portrait, not Story/Reel", () => {
+      const prompt = buildSixLayerPromptForVariant({
+        variantIndex: 1,
+        format: "1080x1350",
+        concept: "VM",
+        copyAngle: "PA",
+        formatArchetype: "A",
+        brand,
+        persona: onePersona,
+      });
+      const layer1 = prompt.split("LAYER 1: FORMAT & DIMENSIONS")[1].split("LAYER 2")[0];
+      expect(layer1).toContain("Meta Feed ad — 1080x1350px. Aspect ratio 4:5.");
+      expect(layer1).not.toMatch(/story|reel/i);
+      expect(AD_IMAGE_SYSTEM_PROMPT).toContain("1080 x 1350px (Meta Feed — portrait 4:5)");
+      expect(AD_IMAGE_SYSTEM_PROMPT).not.toMatch(/1350px \(Story\/Reel/);
     });
 
     it("embeds the persona's pain in Layer 3 (focal point)", () => {
@@ -295,6 +345,66 @@ describe("onboardingAdImageService", () => {
         expect(typeof v.prompt).toBe("string");
         expect(v.imageUrl.length).toBeGreaterThan(0);
       }
+    });
+
+    it("stores the generator's advisory gate result on each successful variant (ENG-2139)", async () => {
+      const gates = evaluateCreativeGates(
+        { bytes: 1000, decoded: true, width: 1080, height: 1080, format: "png", luminanceStdDev: 40 },
+        { requestedSize: "1080x1080" },
+      );
+      let call = 0;
+      const gen: AdImageGeneratorDep = {
+        generateImage: async () => {
+          call += 1;
+          return call === 2
+            ? { success: false, error: "provider down" }
+            : { success: true, imageUrl: `https://s3.example.com/ad-${call}.png`, gates };
+        },
+      };
+
+      const result = await generateAdImagesForUser(creativeDir, brand, [onePersona], "user-1", {
+        imageGen: gen,
+        loadTemplate: async () => { throw new Error("no dynamo in tests"); },
+        globalDirectives: {},
+      });
+
+      expect(result.variants.map((v) => v.gates?.passed)).toEqual([true, undefined, true]);
+      expect(result.variants[1].imageUrl).toContain("placeholder://");
+    });
+
+    it("keeps each variant's gates and attribution through the ready patch that is stored (ENG-2187)", async () => {
+      const placements: Array<string | undefined> = [];
+      const gen: AdImageGeneratorDep = {
+        generateImage: async (params) => {
+          placements.push(params.placement);
+          return {
+            success: true,
+            imageUrl: `https://s3.example.com/${params.filename}`,
+            gates: evaluateCreativeGates(
+              { bytes: 1000, decoded: true, width: 1080, height: 1080, format: "png", luminanceStdDev: 40 },
+              { requestedSize: params.size, placement: params.placement },
+            ),
+          };
+        },
+      };
+
+      const result = await generateAdImagesForUser(creativeDir, brand, [onePersona], "user-1", {
+        imageGen: gen,
+        loadTemplate: async () => { throw new Error("no dynamo in tests"); },
+        globalDirectives: {},
+      });
+      const patch = adImageReadyPatch({ adImageStatus: "running" }, result);
+
+      expect(placements).toEqual(["meta_feed_square", "meta_feed_square", "meta_feed_portrait"]);
+      const stored = patch?.adImageResult?.variants ?? [];
+      expect(stored).toHaveLength(3);
+      for (const [i, v] of stored.entries()) {
+        expect(v.gates).toEqual(result.variants[i].gates);
+        expect(v.archetype).toBe(result.variants[i].archetype);
+        expect(v.concept).toBe(result.variants[i].concept);
+        expect(v.promptVersion).toBe(result.variants[i].promptVersion);
+      }
+      expect(stored.map((v) => v.gates?.placement)).toEqual(["meta_feed_square", "meta_feed_square", "meta_feed_portrait"]);
     });
 
     it("uses 60/40 format split — 2 squares, 1 vertical", async () => {
@@ -549,6 +659,38 @@ describe("onboardingAdImageService", () => {
       for (const p of gen.lastParams) {
         expect(p.logoImage).toBe("https://s3/brand/logo.png");
       }
+    });
+
+    it("hands the stored run, and the run it replaced, to the rubric judge hook (ENG-2192)", async () => {
+      const previousVariants = [{ id: "variant-1", imageUrl: "https://s3/old-1.png", prompt: "old" }];
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { brandName: "Linear", logoUrl: "https://s3/brand/logo.png" } },
+          adImageStartedAt: RUN_AT,
+          adImageCompletedAt: "2026-08-01T00:00:00.000Z",
+          adImageResult: { variants: previousVariants },
+        })
+        .mockResolvedValueOnce({ userId: "u1", adImageStatus: "running", adImageStartedAt: RUN_AT });
+      userDb.updateUser.mockResolvedValue({});
+
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: new FakeImageGen(okResponder) as unknown as AdImageGeneratorDep,
+        verifyLogoUrl: async () => true,
+      });
+      await new Promise((resolve) => setImmediate(resolve)); // the hook is dispatched, not awaited
+
+      const written = userDb.updateUser.mock.calls[0][1];
+      expect(written.adImageStatus).toBe("ready");
+      expect(jest.mocked(judgeOnboardingAdImages)).toHaveBeenCalledWith({
+        userId: "u1",
+        completedAt: written.adImageCompletedAt,
+        variants: written.adImageResult.variants,
+        previous: { completedAt: "2026-08-01T00:00:00.000Z", variants: previousVariants },
+      });
     });
 
     it("fails the run pointing at brand config when no logo is persisted — never generates (AC-3)", async () => {

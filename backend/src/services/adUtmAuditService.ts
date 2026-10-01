@@ -41,18 +41,41 @@ import { AdPlatform, UTM_KEYS, UtmKey, readUtmKeys } from "../utils/adUtm";
  * adapter implements this over a real platform service. Deliberately contains
  * NO write method — the audit cannot mutate through a port it was never given.
  */
+/**
+ * A port read that MAY report its own completeness.
+ *
+ * Deliberately a union with the bare array: Meta's reads are paginated and bounded
+ * (`metaService`'s drainCursor reports `truncated`), so that adapter can say whether it saw
+ * everything. Google now does too — `googleAdsService.search` stops at a 50-page cap and
+ * reports it through a `completeness` out-param, so `googleAdReadPort` returns the object form.
+ *
+ * ⚠ The bare-array arm is NOT a licence to stay silent. It survives for LinkedIn alone, whose
+ * `fetchAllPages` has no cap and errors rather than returning a partial page, so its reads are
+ * complete by construction. Any adapter over a BOUNDED read must return the object form: this
+ * doc previously said Google and LinkedIn both "expose no equivalent signal", and that belief
+ * is exactly what let a page-capped Google read print "✅ All N campaign(s) carry UTM tracking"
+ * about ads it never fetched. `truncated: undefined` means "this platform cannot be truncated",
+ * never "we did not check" — and it must never be rendered as a verified "complete".
+ */
+export type PortRead<T> = T[] | { items: T[]; truncated?: boolean };
+
+/** Normalise either shape. `truncated` stays undefined when the platform does not report it. */
+export function readPortResult<T>(read: PortRead<T>): { items: T[]; truncated?: boolean } {
+  return Array.isArray(read) ? { items: read } : { items: read.items ?? [], truncated: read.truncated };
+}
+
 export interface AdReadPort {
   listCampaigns(
     userId: string,
     accountId: string,
-  ): Promise<Array<{ id: string; name: string }>>;
+  ): Promise<PortRead<{ id: string; name: string }>>;
 
   listAdDestinations(
     userId: string,
     accountId: string,
     campaignId: string,
   ): Promise<
-    Array<{
+    PortRead<{
       adId: string;
       /**
        * EVERY destination URL on the ad. A Meta carousel has one per card, so an
@@ -83,6 +106,13 @@ export interface CampaignAuditReport {
    * unreadable ad is surfaced for a human to look at, never auto-fixed.
    */
   unreadableAdIds: string[];
+  /**
+   * The ad read for THIS campaign stopped at a bound, so `untaggedAdIds` / `unreadableAdIds`
+   * cover only part of it. A campaign that looks clean here may simply have had its untagged
+   * ads never fetched — so `tagged: true` alongside this flag means "nothing found wrong in
+   * what we read", not "nothing wrong".
+   */
+  adReadIncomplete?: true;
 }
 
 /**
@@ -174,16 +204,40 @@ export async function auditCampaigns(
   userId: string,
   accountId: string,
   port: AdReadPort,
+  /**
+   * Optional out-param reporting whether every read behind this audit was complete.
+   *
+   * An out-param rather than a wider return type on purpose: `CampaignAuditReport[]` is
+   * destructured at ~30 call sites, and rewriting all of them to unwrap an envelope is a large
+   * mechanical edit whose main risk is silently weakening an assertion along the way. Callers
+   * that do not care are unaffected; the one caller that renders a clean bill of health passes
+   * an object and reads `incomplete` afterwards.
+   *
+   * `incomplete` is set only when a read said so. A platform that does not report completeness
+   * leaves it untouched — absence means "not reported", never "verified complete".
+   */
+  completeness?: { incomplete?: boolean; campaignListIncomplete?: boolean },
 ): Promise<CampaignAuditReport[]> {
   if (!VALID_PLATFORMS.includes(platform)) {
     throw new Error(`adUtmAudit: unsupported platform "${platform}"`);
   }
 
-  const campaigns = await port.listCampaigns(userId, accountId);
+  const { items: campaigns, truncated: campaignsTruncated } = readPortResult(
+    await port.listCampaigns(userId, accountId),
+  );
+  if (campaignsTruncated && completeness) {
+    // Campaigns we never saw cannot be audited, so no account-level conclusion is complete —
+    // including "all clean", which is the claim this exists to stop.
+    completeness.incomplete = true;
+    completeness.campaignListIncomplete = true;
+  }
   const reports: CampaignAuditReport[] = [];
 
   for (const campaign of campaigns) {
-    const ads = await port.listAdDestinations(userId, accountId, campaign.id);
+    const { items: ads, truncated: adsTruncated } = readPortResult(
+      await port.listAdDestinations(userId, accountId, campaign.id),
+    );
+    if (adsTruncated && completeness) completeness.incomplete = true;
 
     const untaggedAdIds: string[] = [];
     const unreadableAdIds: string[] = [];
@@ -208,6 +262,7 @@ export async function auditCampaigns(
       missingKeys: REQUIRED_KEYS.filter((k) => missing.has(k)),
       untaggedAdIds,
       unreadableAdIds,
+      ...(adsTruncated ? { adReadIncomplete: true as const } : {}),
     });
   }
 

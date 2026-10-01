@@ -18,6 +18,7 @@ import {
 } from '../services/linkedInConnectionHealth';
 import { settingsService } from '../services/settingsService';
 import { dripSequenceDb } from '../services/dripSequenceDb';
+import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { crmDb } from '../services/db';
 import { leadListAlertService } from '../services/leadListAlertService';
 import {
@@ -77,7 +78,36 @@ const isInviteReconcileEnabled = (): boolean => process.env.LINKEDIN_INVITE_CRM_
  * to no single customer, so nothing that writes into a customer's CRM may act on
  * them.
  */
-async function getAllUnipileAccountIds(): Promise<{
+/**
+ * Resolves every known Unipile account_id and (where owned) its ownerUserId.
+ *
+ * Uses userDb.scanWithFilter (raw items, no counts) rather than getAllUsers —
+ * the latter fires 3 extra per-user queries (task/workflow/chat session
+ * counts) that exist only for its own admin-dashboard `UserWithCounts` shape
+ * and are entirely unused here. That made this function far more expensive
+ * than the lookup it performs, and — combined with the per-user scan failing
+ * silently below — turned a slow lookup into a fragile one: a transient
+ * failure anywhere in that N×3-query fan-out used to return an EMPTY map with
+ * no error, which the account_status webhook (unipileWebhook.ts) would then
+ * treat as "this account has no owner" — paging oncall with a misleading
+ * "no owner record" message and, critically, never writing needs_reconnect,
+ * silently dropping the health signal.
+ *
+ * The per-user section below now throws on a genuine failure instead of
+ * swallowing it, so a caller can tell "no owner" apart from "lookup failed":
+ *  - the cron's own call site (runLinkedInConnectionSync) is wrapped by
+ *    server.ts's existing top-level `.catch(console.error)` on every
+ *    invocation, so a thrown error here surfaces as a logged failure for that
+ *    cycle rather than a silent, misleadingly-empty result.
+ *  - the webhook route's own try/catch turns a thrown error into a non-200
+ *    response, so Unipile's own retry (5x/30s) gets a chance to succeed
+ *    against a transient failure instead of the delivery being acked away.
+ *
+ * Site-wide accounts (a small, rarely-changed settings blob) keep their own
+ * tolerant catch — a parse failure there is lower-stakes and unrelated to the
+ * scan-cost problem this rewrite targets.
+ */
+export async function getAllUnipileAccountIds(): Promise<{
   ids: string[];
   ownerByAccountId: Map<string, string>;
 }> {
@@ -95,12 +125,19 @@ async function getAllUnipileAccountIds(): Promise<{
     }
   } catch { /* ignore */ }
 
-  // Per-user connected Unipile accounts
-  try {
-    const { userDb } = await import('../services/db');
-    const users = await userDb.getAllUsers();
-    for (const user of users) {
-      if (!user.connected_accounts) continue;
+  // Per-user connected Unipile accounts. The scan call itself is deliberately
+  // NOT wrapped in a try/catch — a genuine failure here (DB unreachable,
+  // throttled) must propagate (see the function-level doc comment above). But
+  // each USER's record is processed in its own try/catch: one malformed
+  // connected_accounts value (e.g. not an array) must not discard every other
+  // account already resolved in this same call — that would turn a single
+  // bad record into a total outage for every other customer's health check,
+  // which is worse than the original bug this rewrite fixed.
+  const { userDb } = await import('../services/db');
+  const users = await userDb.scanWithFilter('attribute_exists(connected_accounts)', {});
+  for (const user of users) {
+    if (!user.connected_accounts) continue;
+    try {
       for (const acct of user.connected_accounts as any[]) {
         if (acct.platform === 'unipile') {
           const accountId = acct.config?.unipile_account_id || acct.account_id;
@@ -114,8 +151,10 @@ async function getAllUnipileAccountIds(): Promise<{
           }
         }
       }
+    } catch (error) {
+      console.error(`${TAG} Skipping malformed connected_accounts for user ${user.userId}:`, error);
     }
-  } catch { /* ignore */ }
+  }
 
   return { ids: Array.from(ids), ownerByAccountId };
 }
@@ -291,12 +330,31 @@ export async function enrollNewConnections(newConnections: UnipileConnection[]):
             lastKey = (page as any).lastEvaluatedKey ?? null;
 
             for (const lead of items) {
-              if (!lead.linkedin || !lead.email) continue;
+              // `!lead.email` was here, on the one enrolment path whose trigger is
+              // literally "a LinkedIn connection was accepted". A LinkedIn-only lead —
+              // precisely the lead this cron exists to serve — was skipped for having no
+              // email address it was never going to be sent to. Same defect as the
+              // auto-enroll paths, on the fifth and last enrolment site.
+              if (!lead.linkedin) continue;
               const normalized = normalizeLinkedInUrl(lead.linkedin);
               if (normalized !== conn.publicProfileUrl) continue;
+              const channels = requiredChannels(seq);
+              if (!leadIsReachable(lead, channels)) continue;
+
+              // The shared identity, not the raw address. Keying on `lead.email` here
+              // while every other path keys on `enrollmentIdentity` split one person
+              // into two enrollments: a lead with a malformed address and a good profile
+              // is stored under the profile URL by the routes and under the junk address
+              // by this cron, so neither dedup check saw the other's row.
+              const identity = enrollmentIdentity(lead);
+              if (!identity) continue;
 
               // Found a matching lead — enroll if not already enrolled
-              const existing = await dripSequenceDb.getExistingEnrollment(seq.sequenceId, lead.email);
+              let existing = null as Awaited<ReturnType<typeof dripSequenceDb.getExistingEnrollment>>;
+              for (const candidate of enrollmentIdentityCandidates(lead)) {
+                existing = await dripSequenceDb.getExistingEnrollment(seq.sequenceId, candidate);
+                if (existing) break;
+              }
               if (existing) continue;
 
               await dripSequenceDb.enrollLead({
@@ -304,10 +362,10 @@ export async function enrollNewConnections(newConnections: UnipileConnection[]):
                 userId: seq.userId,
                 listId: list.listId,
                 leadId: lead.leadId,
-                leadEmail: lead.email,
+                leadEmail: identity,
               });
               enrolled++;
-              console.log(`${TAG} Enrolled lead ${lead.email} into sequence ${seq.sequenceId} (LinkedIn connected)`);
+              console.log(`${TAG} Enrolled lead ${identity} into sequence ${seq.sequenceId} (LinkedIn connected)`);
             }
           } while (lastKey);
         }

@@ -1,0 +1,27 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "me/adaccounts",
+    "query": {
+      "fields": "id,name,account_id,currency,account_status"
+    }
+  },
+  "status": 200,
+  "body": {
+    "data": [
+      {
+        "id": "act_120000000000001",
+        "name": "Object 1",
+        "account_id": "120000000000001",
+        "currency": "USD",
+        "account_status": 1
+      }
+    ],
+    "paging": {
+      "cursors": {
+        "before": "c2FuaXRpemVkLWN1cnNvci0yNQ==",
+        "after": "c2FuaXRpemVkLWN1cnNvci0yNg=="
+      }
+    }
+  }
+}

@@ -8,8 +8,10 @@ import path from 'path';
 import { clearTerminalProgress } from '../utils/sseProgress';
 import { DRAIN_CEILING_MS, DRAIN_POLL_INTERVAL_MS } from '../utils/shutdownConstants';
 import type { WorkPlanTurnDisposition } from './agentMode/core/workPlanTurnDisposition';
+import type { PendingApprovalDeck } from './agentMode/core/approvalDeck';
+import type { RunFunding } from './funding/runFunding';
 
-interface GenerateMarketingResponseParams {
+export interface GenerateMarketingResponseParams {
   messageContent: string;
   sessionHistory: any[];
   userId: string;
@@ -23,6 +25,15 @@ interface GenerateMarketingResponseParams {
   // ENG-473: when set, the worker persists each settled turn to the session as it
   // completes so a hard process kill leaves a visible partial transcript.
   persistIncrementally?: boolean;
+  // ENG-1816 F1: the run's funding decision, resolved once by the caller and carried
+  // across the fork IPC boundary exactly like publishAuthorizationOverride below —
+  // plain serializable data, never a positional argument (this interface already has
+  // ~15 fields; generateMarketingResponse's own signature has ~19 positional params).
+  // The worker enters an AsyncLocalStorage scope with this value before calling into
+  // agentModeService, so every nested callLLM call sees it without being edited.
+  // Optional only for callers not yet updated; absent is treated as 'agentweb' (F1
+  // never assigns any other route, so this is not yet a real branch in practice).
+  runFunding?: RunFunding;
   // ENG-827 (Greptile): the publish authorization the CALLER already resolved, carried
   // across the worker boundary so the system prompt is built from the same value the
   // required-function checker uses. Two independent reads can land either side of a
@@ -39,9 +50,12 @@ interface GenerateMarketingResponseParams {
   // any unapproved source image for this run.
   approvedRevisionImageSources?: string[];
   requireWorkPlanDisposition?: boolean;
+  // ENG-2072: tri-state — see ToolContext.isUnattendedRun in mcp/client/toolRegistry.ts.
+  // Plain boolean, so it survives the IPC serialization to the worker process.
+  isUnattendedRun?: boolean;
 }
 
-interface GenerateMarketingResponseResult {
+export interface GenerateMarketingResponseResult {
   content: string;
   toolCalls: any[];
   knowledgeBaseQueries: string[];
@@ -52,6 +66,9 @@ interface GenerateMarketingResponseResult {
   // run, so the caller's final batch persists only the remaining tail.
   persistedResponseCount?: number;
   workPlanTurnDisposition?: WorkPlanTurnDisposition;
+  // ENG-1635/1644: the deck built this turn, when present — plain data, survives
+  // the fork IPC boundary like publishAuthorizationOverride above.
+  pendingApprovalDeck?: PendingApprovalDeck;
 }
 
 export class GenerateMarketingResponseWorkerService {
@@ -216,6 +233,35 @@ export class GenerateMarketingResponseWorkerService {
         }
         if (message.partialUsageMessages?.length) {
           error.partialUsageMessages = message.partialUsageMessages;
+        }
+        // ENG-1670: restore the original provider error's status/code so
+        // classifyZeroAssistantFailure (agentModeController) can tell a
+        // transient 429 apart from a real system error — without these, a
+        // rate-limited scheduled run gets misreported to the user as an
+        // "unexpected system error" instead of the accurate retry-in-progress copy.
+        if (message.status !== undefined) {
+          error.status = message.status;
+        }
+        if (message.code !== undefined) {
+          error.code = message.code;
+        }
+        // ENG-1670: restore whether OpenRouter actually sent a Retry-After header
+        // for this occurrence, so a future recurrence of this failure class is
+        // self-diagnosing from the persisted session record instead of needing
+        // logs that have already rotated out by the time anyone investigates.
+        if (message.retryAfterHeaderPresent !== undefined) {
+          error.retryAfterHeaderPresent = message.retryAfterHeaderPresent;
+        }
+        if (message.retryAfterMs !== undefined) {
+          error.retryAfterMs = message.retryAfterMs;
+        }
+        // ENG-2121: restore the whole-turn-timeout tag so the controller's own
+        // backstop (withGenerationTimeout's caller — salvages any images/tool work
+        // already persisted this turn) treats a bounded per-call LLM timeout the
+        // same as its own hard-cap race firing, instead of silently losing the
+        // signal at this same IPC boundary ENG-1670 already had to patch once.
+        if (message.isGenerationTimeout) {
+          error.isGenerationTimeout = message.isGenerationTimeout;
         }
         pending.reject(error);
       }

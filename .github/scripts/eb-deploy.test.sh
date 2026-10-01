@@ -225,6 +225,40 @@ case "$operation" in
     exit 0
     ;;
 
+  describe-target-group-attributes)
+    # Fixture `tg_attrs`: current deregistration_delay value, or "ERROR|<msg>".
+    if [ -f "${MOCK_DIR}/tg_attrs_exit" ]; then
+      code=$(cat "${MOCK_DIR}/tg_attrs_exit")
+      printf 'mock aws: simulated describe-target-group-attributes failure\n' >&2
+      exit "$code"
+    fi
+    val='20'
+    [ -f "${MOCK_DIR}/tg_attrs" ] && val=$(cat "${MOCK_DIR}/tg_attrs")
+    printf '%s\n' "$val"
+    exit 0
+    ;;
+
+  modify-target-group-attributes)
+    printf '%s\n' "$all_args" >>"${MOCK_DIR}/modify_tg_calls"
+    if [ -f "${MOCK_DIR}/modify_tg_exit" ]; then
+      code=$(cat "${MOCK_DIR}/modify_tg_exit")
+      printf 'mock aws: simulated modify-target-group-attributes failure\n' >&2
+      exit "$code"
+    fi
+    # Applying the mutation updates what the next describe call reports,
+    # unless the fixture wants to prove a silent-drop scenario (tg_attrs_stuck).
+    if [ ! -f "${MOCK_DIR}/tg_attrs_stuck" ]; then
+      for pair in $all_args; do
+        case "$pair" in
+          Key=deregistration_delay.timeout_seconds,Value=*)
+            printf '%s\n' "${pair#*Value=}" >"${MOCK_DIR}/tg_attrs"
+            ;;
+        esac
+      done
+    fi
+    exit 0
+    ;;
+
   describe-target-health)
     # Fixture `target_health`: "<target-id><TAB><State>" lines, NONE, or ERROR|.
     if [ -f "${MOCK_DIR}/target_health" ]; then
@@ -772,6 +806,77 @@ run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
 check 'ENG-878: a Green deploy never invokes the probe' 0 'SUCCESS: environment'
 
 # ---------------------------------------------------------------------------
+# ENG-823 — ensure_deregistration_delay sets DeregistrationDelay directly
+# against the live target group after a verified deploy, since two straight
+# `.ebextensions` fixes both silently failed to apply it.
+# ---------------------------------------------------------------------------
+
+# Not opted in (EB_DEREGISTRATION_DELAY_SECONDS unset): zero extra AWS calls.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
+check 'ENG-823: opted-out deploy still succeeds' 0 'SUCCESS: environment'
+if grep -qF 'DeregistrationDelay' "${WORKDIR}/out.txt"; then
+  printf '  FAIL ENG-823: opted-out deploy made a DeregistrationDelay call anyway\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+else
+  pass 'ENG-823: opted-out deploy makes no DeregistrationDelay call'
+fi
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+
+# Opted in, target group currently at the AWS default: applies and verifies.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf '20\n' >"$M/tg_attrs"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_DEREGISTRATION_DELAY_SECONDS='600'
+check 'ENG-823: opted-in deploy still succeeds' 0 'SUCCESS: environment'
+check 'ENG-823: sets DeregistrationDelay on the live target group' 0 \
+  'Setting DeregistrationDelay on target group def: 20s -> 600s.'
+check 'ENG-823: confirms the value by re-reading it, not by trusting the call' 0 \
+  'Confirmed DeregistrationDelay=600s on target group def.'
+
+# Already at the desired value: no-op, no mutation call.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf '600\n' >"$M/tg_attrs"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_DEREGISTRATION_DELAY_SECONDS='600'
+check 'ENG-823: already-correct value is a no-op' 0 \
+  'already 600s on target group def; no change needed.'
+if [ -f "$M/modify_tg_calls" ]; then
+  printf '  FAIL ENG-823: no-op case still called modify-target-group-attributes\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+else
+  pass 'ENG-823: already-correct value makes no modify call'
+fi
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+
+# The regression this exists to catch: modify-target-group-attributes reports
+# success but the value is silently dropped, exactly like .ebextensions did
+# twice. Must fail the job rather than report a false green.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf '20\n' >"$M/tg_attrs"
+: >"$M/tg_attrs_stuck"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_DEREGISTRATION_DELAY_SECONDS='600'
+check 'ENG-823: a silently-dropped value fails the job, not a false green' 1 \
+  'still reads 20s, not the desired 600s'
+
+# A denied elbv2 call fails loudly rather than reporting the deploy as fully
+# applied when it was not.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf '20\n' >"$M/tg_attrs"
+printf '1\n' >"$M/modify_tg_exit"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_DEREGISTRATION_DELAY_SECONDS='600'
+check 'ENG-823: a denied modify-target-group-attributes call fails the job' 1 \
+  'modify-target-group-attributes failed for'
+
+# ---------------------------------------------------------------------------
 # ENG-878 follow-up — EB_HEALTH_PROBE_DRYRUN exercises the probe on a healthy
 # deploy.
 #
@@ -1083,6 +1188,171 @@ if [ "${real_now}" -gt 1000000000 ]; then
   pass 'ENG-1522: with EB_CLOCK_FILE unset, now_seconds() returns real epoch time'
 else
   printf '  FAIL ENG-1522: now_seconds() did not fall back to date +%%s when unset\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+# ENG-1183 — the deploy budgets must be consistent with the deployment policy.
+#
+# Three numbers govern a deploy and they are declared in two different files:
+# `timeout-minutes` and EB_TOTAL_TIMEOUT_SECONDS/EB_SETTLE_TIMEOUT_SECONDS in
+# deploy.yml, and EB's own command Timeout in backend/.ebextensions. Nothing
+# related them to each other, so they drifted: the settle cap sat on the
+# script's 600s default -- a Rolling-era number -- for the two months after
+# rolling.config switched the environment to Immutable on 2026-07-01.
+#
+# The settle cap is not a soft wait. On expiry wait_for_environment_ready()
+# calls fail(), so an environment that is merely busy is reported as
+# "Version was NOT applied". Under Immutable, busy-for-longer-than-600s is
+# ordinary: 24 consecutive production deploys measured median ~535s, max 1352s.
+#
+# These are structural assertions over the workflow and the EB config -- no
+# script under test -- the same shape as the ENG-1522 block above, and they
+# live in this suite for the same reason: it is already wired into
+# `CI script tests`, and orphaned suites in this repo have a habit of going
+# silently red (staging-deploy-gate, coverage-report, paths-filter negation).
+printf '\nENG-1183: deploy budgets are consistent with the deployment policy\n'
+
+REPO_ROOT="${SCRIPT_DIR}/../.."
+DEPLOY_WORKFLOW="${WORKFLOW_DIR}/deploy.yml"
+
+# Emits one `job|timeout-minutes|total|settle` record per step that actually
+# runs eb-deploy.sh. Steps are flushed when the next one starts, so the `run:`
+# line at the bottom of a step is still attributed to it.
+eb_budget_records() {
+  awk '
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/     { job=$1; sub(/:$/,"",job); next }
+    /^      - /                           { if (has) print job "|" tmo "|" tot "|" stl
+                                            has=0; tmo=""; tot=""; stl="" }
+    /^        timeout-minutes:/           { tmo=$2 }
+    /EB_TOTAL_TIMEOUT_SECONDS:/           { v=$2; gsub(/[^0-9]/,"",v); tot=v }
+    /EB_SETTLE_TIMEOUT_SECONDS:/          { v=$2; gsub(/[^0-9]/,"",v); stl=v }
+    /run: bash \.github\/scripts\/eb-deploy\.sh/ { has=1 }
+    END                                   { if (has) print job "|" tmo "|" tot "|" stl }
+  ' "$1"
+}
+
+# The script's own default, read rather than hardcoded: raising it there instead
+# of in the workflow is an equally valid fix and must keep this suite green.
+DEFAULT_SETTLE=$(grep -m1 '^EB_SETTLE_TIMEOUT_SECONDS=' "${EB_DEPLOY_SCRIPT}")
+DEFAULT_SETTLE="${DEFAULT_SETTLE##*:-}"   # ...:-600}"  ->  600}"
+DEFAULT_SETTLE="${DEFAULT_SETTLE%%\}*}"   # 600}"       ->  600
+
+# EB's command Timeout on the Immutable environment. Waiting less than this
+# means failing a deploy while EB still considers the in-flight command live.
+EB_COMMAND_TIMEOUT=""
+for cfg in "${REPO_ROOT}"/backend/.ebextensions/*.config; do
+  [ -e "${cfg}" ] || continue
+  if grep -qE 'DeploymentPolicy:[[:space:]]*Immutable' "${cfg}"; then
+    EB_COMMAND_TIMEOUT=$(awk '/^[[:space:]]+Timeout:[[:space:]]*[0-9]+/ {print $2; exit}' "${cfg}")
+  fi
+done
+
+# Worst observed single Immutable rollout on production (1352s) plus margin.
+# What must remain of the budget after settling to still run our own deploy.
+MIN_OWN_DEPLOY_SECONDS=1400
+
+BUDGET_RECORDS=$(eb_budget_records "${DEPLOY_WORKFLOW}")
+
+# Fail-open guard first: every assertion below is a no-op if the extractor
+# matched nothing, which is indistinguishable from a clean repo.
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if [ "$(printf '%s\n' "${BUDGET_RECORDS}" | grep -c '|')" -ge 2 ]; then
+  pass 'ENG-1183: the budget extractor found both eb-deploy.sh steps'
+else
+  printf '  FAIL ENG-1183: extractor found %s eb-deploy.sh step(s) in deploy.yml (fail-open)\n' \
+    "$(printf '%s\n' "${BUDGET_RECORDS}" | grep -c '|')"
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if [ -n "${EB_COMMAND_TIMEOUT}" ]; then
+  pass "ENG-1183: read EB command Timeout=${EB_COMMAND_TIMEOUT}s from the Immutable config"
+else
+  printf '  FAIL ENG-1183: no .ebextensions config declares DeploymentPolicy: Immutable with a Timeout\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+while IFS='|' read -r job tmo tot stl; do
+  [ -n "${job}" ] || continue
+  [ -n "${stl}" ] || stl="${DEFAULT_SETTLE}"
+  step_budget=$(( tmo * 60 ))
+
+  # The script budget must expire first, or the runner SIGKILLs it mid-poll and
+  # the diagnostic that names the real cause is replaced by "step timed out".
+  TESTS_RUN=$(( TESTS_RUN + 1 ))
+  if [ "${tot}" -lt "${step_budget}" ]; then
+    pass "ENG-1183: ${job} script budget ${tot}s expires before the ${step_budget}s step timeout"
+  else
+    printf '  FAIL ENG-1183: %s budget %ss >= step timeout %ss; the script can never report why\n' \
+      "${job}" "${tot}" "${step_budget}"
+    TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+  fi
+
+  TESTS_RUN=$(( TESTS_RUN + 1 ))
+  if [ "${stl}" -lt "${tot}" ]; then
+    pass "ENG-1183: ${job} settle cap ${stl}s fits inside the ${tot}s budget"
+  else
+    printf '  FAIL ENG-1183: %s settle cap %ss >= budget %ss\n' "${job}" "${stl}" "${tot}"
+    TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+  fi
+
+  # Immutable-only bounds. partner-deploy is a different application with no
+  # .ebextensions in this repo and ~60s deploys, so the 600s default is already
+  # 10x headroom there and these two would be meaningless. If the environment
+  # ever stops being Immutable these are skipped rather than compared against
+  # an empty timeout -- the check above already went red naming that as the
+  # reason, and every number here would need re-deriving anyway.
+  case "${job}" in
+    backend-*) ;;
+    *) continue ;;
+  esac
+  [ -n "${EB_COMMAND_TIMEOUT}" ] || continue
+
+  TESTS_RUN=$(( TESTS_RUN + 1 ))
+  if [ "${stl}" -ge "${EB_COMMAND_TIMEOUT}" ]; then
+    pass "ENG-1183: ${job} settle cap ${stl}s >= EB command Timeout ${EB_COMMAND_TIMEOUT}s"
+  else
+    printf '  FAIL ENG-1183: %s settle cap %ss gives up before EB command Timeout %ss; a busy-but-healthy environment is failed as "Version was NOT applied"\n' \
+      "${job}" "${stl}" "${EB_COMMAND_TIMEOUT}"
+    TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+  fi
+
+  TESTS_RUN=$(( TESTS_RUN + 1 ))
+  headroom=$(( tot - stl ))
+  if [ "${headroom}" -ge "${MIN_OWN_DEPLOY_SECONDS}" ]; then
+    pass "ENG-1183: ${job} leaves ${headroom}s after settling for its own Immutable rollout"
+  else
+    printf '  FAIL ENG-1183: %s leaves only %ss after settling, below the %ss an Immutable rollout has been measured to need\n' \
+      "${job}" "${headroom}" "${MIN_OWN_DEPLOY_SECONDS}"
+    TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+  fi
+done <<EOF
+${BUDGET_RECORDS}
+EOF
+
+# Self-check. Every assertion above currently passes, so without proving the
+# extractor can see a violation, a broken parser reads exactly like a healthy
+# repo -- the fail-open shape CodeRabbit caught in paths-filter-hygiene.
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+budget_probe_dir="$(mktemp -d "${WORKDIR}/budgetprobe.XXXXXX")"
+cat >"${budget_probe_dir}/deploy.yml" <<'PROBE'
+jobs:
+  backend-deploy:
+    steps:
+      - name: Deploy to Elastic Beanstalk and verify the environment took it
+        timeout-minutes: 10
+        env:
+          EB_TOTAL_TIMEOUT_SECONDS: '600'
+          EB_SETTLE_TIMEOUT_SECONDS: '30'
+        run: bash .github/scripts/eb-deploy.sh
+PROBE
+probe_record=$(eb_budget_records "${budget_probe_dir}/deploy.yml")
+if [ "${probe_record}" = "backend-deploy|10|600|30" ]; then
+  pass 'ENG-1183: self-check — the extractor reads a step it has never seen'
+else
+  printf '  FAIL ENG-1183: extractor returned %s on the probe workflow (fail-open)\n' \
+    "${probe_record:-<nothing>}"
   TESTS_FAILED=$(( TESTS_FAILED + 1 ))
 fi
 

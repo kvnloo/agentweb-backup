@@ -37,6 +37,7 @@ import { DynamoDB } from 'aws-sdk';
 import {
   planModelMigration,
   collectCandidates,
+  applyCandidate,
   SAME_FAMILY_MODEL_REPLACEMENTS,
 } from '../scripts/migrateStaleModelReferences';
 
@@ -270,5 +271,60 @@ describe('collectCandidates — dry-run scan across every blast-radius location 
 
     const candidates = await collectCandidates(doc, '', validModelIds, normalizeModelId);
     expect(candidates).toHaveLength(0);
+  });
+});
+
+describe('applyCandidate — write-time behavior (ENG-1333)', () => {
+  let doc: DynamoDB.DocumentClient;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    doc = new DynamoDB.DocumentClient();
+  });
+
+  it('migrating a stale AW-ChatSessions.llmModel does NOT touch updatedAt', async () => {
+    mockUpdate.mockResolvedValue({});
+
+    const candidate = {
+      table: 'AW-ChatSessions',
+      recordId: 'session-1',
+      field: 'llmModel',
+      oldModel: 'gemini-3-pro-preview',
+      plan: { action: 'migrate' as const, newModel: 'gemini-3.1-pro-preview' },
+    };
+
+    const result = await applyCandidate(doc, '', candidate);
+
+    expect(result).toBe('updated');
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    const params = mockUpdate.mock.calls[0][0];
+    // ENG-1333: a data-hygiene rewrite of a stale model id is not real session
+    // activity — bumping updatedAt here is what corrupted get_chat_history's
+    // time-range scoping (763 rows returned for a 24h window, 95% of them
+    // months-old sessions whose only "recent" thing was this migration write).
+    expect(params.UpdateExpression).not.toMatch(/\bupdatedAt\b/);
+    expect(params.ExpressionAttributeValues).not.toHaveProperty(':now');
+    expect(params.UpdateExpression).toMatch(/#field = :new/);
+    expect(params.ExpressionAttributeValues[':new']).toBe('gemini-3.1-pro-preview');
+    // The audit fact still needs to be recorded somewhere — just not on updatedAt.
+    expect(params.UpdateExpression).toMatch(/modelMigratedAt = :migratedAt/);
+    expect(params.ExpressionAttributeValues[':migratedAt']).toEqual(expect.any(String));
+  });
+
+  it('still applies the same non-updatedAt-touching write to the other scanned tables', async () => {
+    mockUpdate.mockResolvedValue({});
+
+    const candidate = {
+      table: 'AW-TaskSchedules',
+      recordId: 'schedule-1',
+      field: 'llmModel',
+      oldModel: 'openrouter/x-ai/grok-4.3',
+      plan: { action: 'migrate' as const, newModel: 'openrouter/x-ai/grok-4.6' },
+    };
+
+    await applyCandidate(doc, '', candidate);
+
+    const params = mockUpdate.mock.calls[0][0];
+    expect(params.UpdateExpression).not.toMatch(/\bupdatedAt\b/);
   });
 });

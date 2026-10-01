@@ -52,6 +52,7 @@ jest.mock('../services/contactEventsDb', () => ({
 
 import { crmDb, userDb } from '../services/db';
 import AWS from 'aws-sdk';
+import { LEAD_LIFECYCLES } from '../utils/leadSchema';
 
 describe('CRM Database Service', () => {
   beforeEach(() => {
@@ -270,6 +271,31 @@ describe('CRM Database Service', () => {
 
       const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
       expect(putCall.Item.linkedin).toBe('https://www.linkedin.com/in/janedoe');
+    });
+
+    it('surfaces utmSource/utmMedium in list.fieldNames so they are discoverable for CRM sync mapping', async () => {
+      const listId = 'list_123';
+      const leadData = {
+        email: 'test@example.com',
+        utmSource: 'google',
+        utmMedium: 'cpc',
+      };
+
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.createLead(listId, leadData);
+
+      const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
+      const fieldNames = updateCall.ExpressionAttributeValues[':fieldNames'];
+      expect(fieldNames).toEqual(expect.arrayContaining(['utmSource', 'utmMedium']));
     });
 
     it('should handle leads without email', async () => {
@@ -536,7 +562,143 @@ describe('CRM Database Service', () => {
     });
   });
 
+  describe('getLeadByHubSpotContactId', () => {
+    // There is no index on syncMetadata.hubspot_contact_id, so this is a partition Query
+    // with a FilterExpression — DynamoDB applies the filter AFTER reading and caps each
+    // page at 1MB. A single-shot query only searches the first page, so on a large list the
+    // match is missed and the reverse-sync callers create the duplicate they exist to avoid.
+    it('keeps paging until it finds the match', async () => {
+      mockDocumentClientMethods.query
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [], LastEvaluatedKey: { listId: 'list_123', leadId: 'p1' } }) })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [], LastEvaluatedKey: { listId: 'list_123', leadId: 'p2' } }) })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [{ leadId: 'found', listId: 'list_123' }] }) });
+
+      const lead = await crmDb.getLeadByHubSpotContactId('list_123', 'c99');
+
+      expect(lead).toEqual({ leadId: 'found', listId: 'list_123' });
+      expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(3);
+      // page 2 and 3 must carry the cursor from the page before
+      expect(mockDocumentClientMethods.query.mock.calls[1][0].ExclusiveStartKey).toEqual({ listId: 'list_123', leadId: 'p1' });
+      expect(mockDocumentClientMethods.query.mock.calls[2][0].ExclusiveStartKey).toEqual({ listId: 'list_123', leadId: 'p2' });
+    });
+
+    it('returns null once the pages run out', async () => {
+      mockDocumentClientMethods.query
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [], LastEvaluatedKey: { leadId: 'p1' } }) })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [] }) });
+
+      expect(await crmDb.getLeadByHubSpotContactId('list_123', 'c99')).toBeNull();
+      expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(2);
+    });
+
+    // F3: the CAP had no test at all. Three tests covered the paging loop and none covered
+    // what happens when it runs out with a cursor still in hand — so `throw err` could be
+    // reverted to `return null` with 276 tests green. All three CONSUMER tests inject a
+    // hand-built `{ lookupExhausted: true }` error, so they pass whether or not this
+    // function ever throws one. This pins the contract at the layer that produces it.
+    it('THROWS a tagged error when the page cap is reached, rather than returning null', async () => {
+      // Every page returns a cursor and no match, so the loop exhausts MAX_PAGES.
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: [], LastEvaluatedKey: { leadId: 'p' } }),
+      });
+
+      await expect(crmDb.getLeadByHubSpotContactId('list_123', 'c99')).rejects.toMatchObject({
+        lookupExhausted: true,
+      });
+      // Null here is what mints the duplicate: callers act on it by CREATING.
+      expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(20);
+    });
+
+    it('the exhausted error names the list and contact so the log is actionable', async () => {
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: [], LastEvaluatedKey: { leadId: 'p' } }),
+      });
+
+      await expect(crmDb.getLeadByHubSpotContactId('list_abc', 'c42'))
+        .rejects.toThrow(/list_abc.*c42|c42.*list_abc/);
+    });
+
+    it('stops on the first page when the match is there', async () => {
+      mockDocumentClientMethods.query.mockReturnValueOnce({
+        promise: jest.fn().mockResolvedValue({ Items: [{ leadId: 'found' }], LastEvaluatedKey: { leadId: 'p1' } }),
+      });
+
+      expect(await crmDb.getLeadByHubSpotContactId('list_123', 'c99')).toEqual({ leadId: 'found' });
+      expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('updateLead', () => {
+    // ENG-2082: setLeadFields derives domain/lifecycle on an email write, but updateLead is
+    // the ORDINARY path — a person editing the lead — and was left out of the first pass.
+    // Caught live: a phone-only lead given an address came back with both still null.
+    it('derives domain when an email is set, and does NOT stamp lifecycle', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: { leadId: 'lead_123', listId: 'list_123' } }),
+      });
+
+      await crmDb.updateLead('list_123', 'lead_123', { email: 'Ada@Example.com' });
+
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      // Asserted through the NAME PLACEHOLDER, not the bare attribute: `domain` is a
+      // DynamoDB reserved keyword, and a bare `domain = :x` throws ValidationException
+      // against a real table. These tests mock dynamodb.update and cannot see that, so the
+      // placeholder mapping is the thing worth pinning.
+      expect(call.ExpressionAttributeNames['#derivedDomainAttr']).toBe('domain');
+      expect(call.UpdateExpression).toContain('#derivedDomainAttr = :derivedDomain');
+      expect(call.UpdateExpression).not.toMatch(/(^|[^#\w])domain = /);
+      expect(call.ExpressionAttributeValues[':derivedDomain']).toBe('example.com');
+      // Lifecycle is deliberately NOT stamped here. askCrmService reads
+      // `lead.lifecycle ?? computeLifecycle(...)`, so a stored value freezes the live
+      // computation — and nothing in production advances it. A lead with an open deal
+      // would start answering "inbox" instead of "in_deal".
+      // BOTH forms, because a stamp can be written either way and the earlier version of
+      // this assertion only caught one. A PLACEHOLDER stamp (#derivedLifecycleAttr) shows
+      // up in ExpressionAttributeNames; a BARE stamp does not — and bare is legal here,
+      // since `lifecycle` is not a DynamoDB reserved word (unlike `domain`). Checking only
+      // the names map let `SET lifecycle = if_not_exists(lifecycle, :x)` be reinstated with
+      // the whole suite green.
+      expect(Object.values(call.ExpressionAttributeNames ?? {})).not.toContain('lifecycle');
+      expect(String(call.UpdateExpression)).not.toMatch(/(^|[^#\w])lifecycle\b/);
+      expect(call.ExpressionAttributeValues[':derivedLifecycle']).toBeUndefined();
+    });
+
+    it('does not derive when the email is being cleared', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: { leadId: 'lead_123', listId: 'list_123' } }),
+      });
+
+      await crmDb.updateLead('list_123', 'lead_123', { email: '' });
+
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.UpdateExpression).toContain('REMOVE');
+      expect(call.UpdateExpression).not.toContain('derivedDomain');
+      expect(call.UpdateExpression).not.toContain('derivedLifecycle');
+    });
+
+    it('lets an explicit domain or lifecycle win', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: { leadId: 'lead_123', listId: 'list_123' } }),
+      });
+
+      await crmDb.updateLead('list_123', 'lead_123', {
+        email: 'ada@example.com', domain: 'override.com', lifecycle: 'paying',
+      } as any);
+
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      // Not derived...
+      expect(call.UpdateExpression).not.toContain('derivedDomain');
+      expect(call.UpdateExpression).not.toContain('derivedLifecycle');
+      // ...and the explicit values are actually WRITTEN. The earlier version of this test
+      // asserted only the two `not`s, which passed because updateLead had no handler for
+      // either field and silently dropped both — the test name said the opposite of what
+      // the code did, and it passed with the whole derivation reverted.
+      expect(call.ExpressionAttributeNames['#domainAttr']).toBe('domain');
+      expect(call.ExpressionAttributeValues[':domainAttr']).toBe('override.com');
+      expect(call.ExpressionAttributeNames['#lifecycleAttr']).toBe('lifecycle');
+      expect(call.ExpressionAttributeValues[':lifecycleAttr']).toBe('paying');
+    });
+
     it('should update lead fields', async () => {
       const listId = 'list_123';
       const leadId = 'lead_123';
@@ -837,6 +999,155 @@ describe('CRM Database Service', () => {
       mergeSpy.mockRestore();
     });
 
+    // ENG-2082: `domain` and `lifecycle` are derived from email, and creation is the only
+    // place that derived them (buildLeadCrmFields, called solely from createLead). Every
+    // LATER write of an email left the row in email-index with no domain and no lifecycle —
+    // permanently invisible to getLeadsByStatus and every inbox view built on it. A
+    // phone-only lead starts with no email, so enrichment filling one in is exactly the
+    // common case now.
+    it('derives domain when an email is written, and does NOT stamp lifecycle', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+      const mergeSpy = jest.spyOn(crmDb, 'mergeFieldNames').mockResolvedValue();
+
+      await crmDb.setLeadFields('list_123', 'lead_123', { topLevel: { email: 'ada@Example.com' } });
+
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      // Through the name placeholder — `domain` is a DynamoDB reserved keyword.
+      expect(call.ExpressionAttributeNames['#derivedDomainAttr']).toBe('domain');
+      expect(call.UpdateExpression).toContain('#derivedDomainAttr = :derivedDomain');
+      expect(call.UpdateExpression).not.toMatch(/(^|[^#\w])domain = /);
+      expect(call.ExpressionAttributeValues[':derivedDomain']).toBe('example.com');
+      // Same reasoning as updateLead, and the same both-forms check: a bare
+      // `lifecycle = …` stamp populates neither map, so the names assertion alone bound
+      // nothing.
+      expect(Object.values(call.ExpressionAttributeNames ?? {})).not.toContain('lifecycle');
+      expect(String(call.UpdateExpression)).not.toMatch(/(^|[^#\w])lifecycle\b/);
+      expect(call.ExpressionAttributeValues[':derivedLifecycle']).toBeUndefined();
+      mergeSpy.mockRestore();
+    });
+
+    it('does not touch domain or lifecycle when no email is written', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+      const mergeSpy = jest.spyOn(crmDb, 'mergeFieldNames').mockResolvedValue();
+
+      await crmDb.setLeadFields('list_123', 'lead_123', { topLevel: { title: 'CTO' } });
+
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.UpdateExpression).not.toContain('derivedDomain');
+      expect(call.UpdateExpression).not.toContain('derivedLifecycle');
+      mergeSpy.mockRestore();
+    });
+
+    it('lets an explicit domain or lifecycle win over the derived one', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+      const mergeSpy = jest.spyOn(crmDb, 'mergeFieldNames').mockResolvedValue();
+
+      await crmDb.setLeadFields('list_123', 'lead_123', {
+        topLevel: { email: 'ada@example.com', domain: 'override.com', lifecycle: 'paying' },
+      });
+
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.UpdateExpression).not.toContain('derivedDomain');
+      expect(call.UpdateExpression).not.toContain('derivedLifecycle');
+      // And the caller-supplied key must be ESCAPED on BOTH halves. An earlier version
+      // asserted only the value, which certified a bare `domain = :tl_domain` — a
+      // ValidationException against a real table — as the desired behaviour.
+      const domainRef = Object.entries(call.ExpressionAttributeNames as Record<string, string>)
+        .find(([, v]) => v === 'domain')?.[0];
+      expect(domainRef).toBeDefined();
+      const domainValueRef = String(call.UpdateExpression).match(
+        new RegExp(`${domainRef} = (:\\w+)`),
+      )?.[1];
+      expect(domainValueRef).toBeDefined();
+      expect(call.ExpressionAttributeValues[domainValueRef!]).toBe('override.com');
+      expect(call.UpdateExpression).not.toMatch(/(^|[^#\w])domain = /);
+
+      const lifecycleRef = Object.entries(call.ExpressionAttributeNames as Record<string, string>)
+        .find(([, v]) => v === 'lifecycle')?.[0];
+      const lifecycleValueRef = String(call.UpdateExpression).match(
+        new RegExp(`${lifecycleRef} = (:\\w+)`),
+      )?.[1];
+      expect(call.ExpressionAttributeValues[lifecycleValueRef!]).toBe('paying');
+      mergeSpy.mockRestore();
+    });
+
+    // `lifecycle` was unwritable through updateLead until an explicit handler was added
+    // for it, so nothing on this path had to validate it. It outranks the live
+    // computation in askCrmService permanently (`lead.lifecycle ?? computeLifecycle(...)`),
+    // which makes an unvalidated write a one-way door.
+    it('refuses an unknown lifecycle rather than storing it permanently', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+      });
+
+      await expect(
+        crmDb.updateLead('list_123', 'lead_123', { lifecycle: 'super_duper_customer' } as any),
+      ).rejects.toThrow(/Invalid lead lifecycle/);
+      expect(mockDocumentClientMethods.update).not.toHaveBeenCalled();
+    });
+
+    it('accepts every value the lead vocabulary actually defines', async () => {
+      for (const stage of LEAD_LIFECYCLES) {
+        mockDocumentClientMethods.update.mockReset();
+        mockDocumentClientMethods.update.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+        });
+        await crmDb.updateLead('list_123', 'lead_123', { lifecycle: stage } as any);
+        const call = mockDocumentClientMethods.update.mock.calls[0][0];
+        expect(call.ExpressionAttributeValues[':lifecycleAttr']).toBe(stage);
+        expect(call.ExpressionAttributeNames['#lifecycleAttr']).toBe('lifecycle');
+      }
+    });
+
+    // Symmetry with `domain`, which REMOVEs on empty. Clearing is the only route back to
+    // the computed value; the first version of the handler hit no branch at all for an
+    // empty string — neither written nor cleared, and silent about it.
+    it('CLEARS lifecycle on an empty value instead of silently ignoring it', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+      });
+
+      await crmDb.updateLead('list_123', 'lead_123', { lifecycle: '' } as any);
+
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(call.ExpressionAttributeNames['#lifecycleAttr']).toBe('lifecycle');
+      expect(call.UpdateExpression).toMatch(/REMOVE[\s\S]*#lifecycleAttr/);
+      expect(call.ExpressionAttributeValues[':lifecycleAttr']).toBeUndefined();
+    });
+
+    // The name placeholder was indexed before the value one was. A key with a character
+    // DynamoDB disallows in a placeholder (`-`, `.`, space) therefore still produced a
+    // syntax ValidationException from the value half — invisible here until asserted,
+    // because the mocked client never parses the expression. Both halves are generated
+    // now, so no key can reach the wire verbatim.
+    it('generates BOTH placeholders for a topLevel key DynamoDB would reject verbatim', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+      const mergeSpy = jest.spyOn(crmDb, 'mergeFieldNames').mockResolvedValue();
+
+      await crmDb.setLeadFields('list_123', 'lead_123', {
+        topLevel: { 'lead-source.v2 tag': 'webinar' },
+      });
+
+      const call = mockDocumentClientMethods.update.mock.calls[0][0];
+      // Neither the raw key nor a `:tl_<key>` derived from it may appear anywhere.
+      expect(call.UpdateExpression).not.toContain('lead-source.v2 tag');
+      expect(Object.keys(call.ExpressionAttributeValues)).not.toContain(':tl_lead-source.v2 tag');
+      // Every placeholder DynamoDB sees must match its own grammar.
+      for (const ref of Object.keys(call.ExpressionAttributeValues)) {
+        expect(ref).toMatch(/^:[A-Za-z0-9_]+$/);
+      }
+      for (const ref of Object.keys(call.ExpressionAttributeNames ?? {})) {
+        expect(ref).toMatch(/^#[A-Za-z0-9_]+$/);
+      }
+      // And the value still lands, routed through the generated pair.
+      const nameRef = Object.entries(call.ExpressionAttributeNames as Record<string, string>)
+        .find(([, v]) => v === 'lead-source.v2 tag')?.[0];
+      expect(nameRef).toBeDefined();
+      const valueRef = String(call.UpdateExpression).match(new RegExp(`${nameRef} = (:\\w+)`))?.[1];
+      expect(call.ExpressionAttributeValues[valueRef!]).toBe('webinar');
+      mergeSpy.mockRestore();
+    });
+
     // Greptile P1 on #2291: internal per-booking idempotency markers (e.g. Calendly
     // webhook completion flags) must never show up in CSV exports or the Configure
     // Display Fields UI the way customFields does — `system` is the existing sidecar
@@ -900,7 +1211,12 @@ describe('CRM Database Service', () => {
 
       expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
       const second = mockDocumentClientMethods.update.mock.calls[1][0];
-      expect(second.UpdateExpression).toContain('email = if_not_exists(email, :tl_email)');
+      // Through the generated name placeholder: every topLevel key is escaped now,
+      // because DynamoDB has ~570 reserved words and a bare one throws only against a
+      // real table.
+      expect(second.ExpressionAttributeNames['#tl0']).toBe('email');
+      expect(second.UpdateExpression).toContain('#tl0 = if_not_exists(#tl0, :tl0)');
+      expect(second.ExpressionAttributeValues[':tl0']).toBe('a@b.com');
       expect(second.UpdateExpression).toContain(
         'enrichmentMetadata.#em0 = if_not_exists(enrichmentMetadata.#em0, :em0)',
       );

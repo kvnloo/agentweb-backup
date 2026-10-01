@@ -22,6 +22,8 @@ const sendEmail = jest.fn();
 jest.mock('../services/emailProviderService', () => ({
   bootstrapEmailProviders: jest.fn(async () => undefined),
   getEmailProvider: jest.fn(() => ({ sendEmail })),
+  // ENG-1300: real impl — pure/deterministic, safe to keep real under this mock.
+  emailProviderErrorStatus: jest.requireActual('../services/emailProviderService').emailProviderErrorStatus,
 }));
 
 jest.mock('../services/settingsService', () => ({

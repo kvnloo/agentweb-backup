@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import {
   Box,
   Typography,
@@ -369,21 +369,7 @@ export default function GTMPlans() {
     }
   };
 
-  useEffect(() => {
-    fetchPlans();
-    // Load notification preferences from localStorage
-    const savedPrefs = localStorage.getItem("gtm-plans-notification-prefs");
-    if (savedPrefs) {
-      try {
-        const prefs = JSON.parse(savedPrefs);
-        setNotificationOptions(prefs);
-      } catch (e) {
-        console.error("Error loading notification preferences:", e);
-      }
-    }
-  }, []);
-
-  const fetchPlans = async () => {
+  const fetchPlans = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
@@ -417,7 +403,21 @@ export default function GTMPlans() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [token, deepLinkPlanId]);
+
+  useEffect(() => {
+    fetchPlans();
+    // Load notification preferences from localStorage
+    const savedPrefs = localStorage.getItem("gtm-plans-notification-prefs");
+    if (savedPrefs) {
+      try {
+        const prefs = JSON.parse(savedPrefs);
+        setNotificationOptions(prefs);
+      } catch (e) {
+        console.error("Error loading notification preferences:", e);
+      }
+    }
+  }, [fetchPlans]);
 
   // Common Items functions
   const fetchCommonItems = async () => {

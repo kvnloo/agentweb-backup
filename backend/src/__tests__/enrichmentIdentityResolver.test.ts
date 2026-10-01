@@ -775,6 +775,126 @@ describe('resolveIdentity — write semantics', () => {
     expect(call.meta.company.provider).toBe('enrich.so');
   });
 
+  // ENG-2082: phone-only capture made a lead with no email AND no LinkedIn routine. The
+  // only anchor findSiblingLeads can match on then is name+company, and
+  // findLeadsByNameCompany is a table-wide GSI query with no listId/userId predicate — so
+  // the "sibling" may belong to a different customer entirely.
+  it('does NOT copy a sibling email when the only possible anchor was name+company', async () => {
+    const deps = makeDeps({
+      findSiblingLeads: jest.fn().mockResolvedValue([
+        {
+          leadId: 'stranger-1',
+          listId: 'some-other-customers-list',
+          userId: 'a-different-tenant',
+          firstName: 'Ada',
+          lastName: 'Lovelace',
+          email: 'ada@another-customer.com',
+          company: 'Analytical Engines',
+        },
+      ]),
+    });
+    await resolveIdentity(
+      makeInput({
+        // no email, no linkedin — exactly a phone-only capture that collected a name
+        lead: { leadId: LEAD_ID, firstName: 'Ada', lastName: 'Lovelace', company: 'Analytical Engines' },
+        needsPersonFields: false,
+        needsCompanyFields: false,
+        mode: 'enrich',
+      }),
+      deps,
+    );
+
+    const call = (deps.writeLeadFields as jest.Mock).mock.calls[0]?.[0];
+    expect(call?.fields ?? {}).not.toHaveProperty('email');
+  });
+
+  // The hole the first version of this guard left: it tested whether OUR lead had a strong
+  // anchor, but findSiblingLeads merges three index queries — so a lead WITH a linkedin
+  // still pulls in name+company matches, and those were waved through.
+  it('refuses a name+company sibling even when this lead HAS a linkedin', async () => {
+    const deps = makeDeps({
+      findSiblingLeads: jest.fn().mockResolvedValue([
+        {
+          leadId: 'stranger', listId: 'another-customers-list', userId: 'other-tenant',
+          firstName: 'Ada', lastName: 'Lovelace', email: 'ada@another-customer.com',
+          matchedBy: 'nameCompany',
+        },
+      ]),
+    });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, linkedin: 'https://linkedin.com/in/ada' },
+        needsPersonFields: false, needsCompanyFields: false, mode: 'enrich',
+      }),
+      deps,
+    );
+    const call = (deps.writeLeadFields as jest.Mock).mock.calls[0]?.[0];
+    expect(call?.fields ?? {}).not.toHaveProperty('email');
+  });
+
+  it('accepts an email from a sibling the LINKEDIN index matched', async () => {
+    const deps = makeDeps({
+      findSiblingLeads: jest.fn().mockResolvedValue([
+        { leadId: 's1', listId: 'l', userId: 'u1', email: 'ada@example.com', matchedBy: 'linkedin' },
+      ]),
+    });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, linkedin: 'https://linkedin.com/in/ada' },
+        needsPersonFields: false, needsCompanyFields: false, mode: 'enrich',
+      }),
+      deps,
+    );
+    const call = (deps.writeLeadFields as jest.Mock).mock.calls[0]?.[0];
+    expect(call?.fields ?? {}).toMatchObject({ email: 'ada@example.com' });
+  });
+
+  it('non-email fields still copy across a name+company match', async () => {
+    const deps = makeDeps({
+      findSiblingLeads: jest.fn().mockResolvedValue([
+        { leadId: 's1', listId: 'l', userId: 'u1', company: 'Analytical Engines',
+          website: 'https://analytical.example', email: 'ada@another.com', matchedBy: 'nameCompany' },
+      ]),
+    });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Ada', lastName: 'Lovelace' },
+        needsPersonFields: false, needsCompanyFields: false, mode: 'enrich',
+      }),
+      deps,
+    );
+    const fields = (deps.writeLeadFields as jest.Mock).mock.calls[0]?.[0]?.fields ?? {};
+    expect(fields).not.toHaveProperty('email');
+    expect(fields).toMatchObject({ website: 'https://analytical.example' });
+  });
+
+  it('still copies a sibling email when LinkedIn anchored the match', async () => {
+    const deps = makeDeps({
+      findSiblingLeads: jest.fn().mockResolvedValue([
+        {
+          leadId: 'sibling-1',
+          listId: 'other-list',
+          userId: 'u1',
+          firstName: 'Ada',
+          lastName: 'Lovelace',
+          email: 'ada@example.com',
+        },
+      ]),
+    });
+    await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, linkedin: 'https://linkedin.com/in/ada' },
+        needsPersonFields: false,
+        needsCompanyFields: false,
+        mode: 'enrich',
+      }),
+      deps,
+    );
+
+    const call = (deps.writeLeadFields as jest.Mock).mock.calls[0]?.[0];
+    expect(call?.fields ?? {}).toMatchObject({ email: 'ada@example.com' });
+  });
+
   it('does NOT copy a sibling lead\'s linkedin or title (profile-anchored), but does copy company', async () => {
     // Regression (joe@us.com / "Joe Hio"): a sibling lead sharing the same email
     // held a wrong-person linkedin URL (awais-haider). Copying it verbatim

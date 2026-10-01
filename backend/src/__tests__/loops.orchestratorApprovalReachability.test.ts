@@ -105,6 +105,25 @@ describe('orchestrator approval-to-attribution reachability', () => {
   beforeEach(() => _resetRegistryForTesting());
   afterEach(() => _resetRegistryForTesting());
 
+  it('retains pre-cap proposals so digests can count distinct tools (ENG-937)', async () => {
+    const store = new InMemoryLearningStore();
+    register(store, mutation());
+    const proposals = ['a', 'a', 'b'].map((toolName, i) => ({
+      ...proposal(), proposalId: asMutationId(`class-${i}`), payload: { toolName },
+    }));
+    registerOrReplaceRuleSet('reachability-rules', {
+      evaluate: jest.fn().mockResolvedValue(proposals),
+    });
+
+    const result = await runLoop(manifest(), ports());
+
+    expect(result.proposals).toEqual(proposals.slice(0, 1));
+    expect(result.proposalsTruncated).toBe(2);
+    expect(result.uncappedProposals).toEqual(proposals);
+    const { _internal } = await import('../loops/instances/agent-mode');
+    expect(_internal.digestTemplate().counts(result, 0)).toContain('showing 1 of 2');
+  });
+
   it('records a successful mutation as pending without reintroducing a gate', async () => {
     const store = new InMemoryLearningStore();
     register(store, mutation());

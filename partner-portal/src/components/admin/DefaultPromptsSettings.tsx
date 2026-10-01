@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   Box,
   Typography,
@@ -21,32 +21,13 @@ export default function DefaultPromptsSettings() {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
 
-  useEffect(() => {
-    loadAllSettings();
-  }, []);
-
-  const loadAllSettings = async () => {
-    try {
-      setLoading(true);
-      setError('');
-      
-      // Load report revision system instruction
-      await loadReportRevisionPrompt();
-    } catch (error) {
-      console.error('Error loading settings:', error);
-      setError('Failed to load settings');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const loadReportRevisionPrompt = async () => {
+  const loadReportRevisionPrompt = useCallback(async () => {
     try {
       const response = await axios.get(
         buildApiUrl('/api/settings/report_revision_system_instruction'),
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      
+
       if (response.data && response.data.settingValue) {
         setReportRevisionPrompt(response.data.settingValue);
       } else {
@@ -58,7 +39,26 @@ export default function DefaultPromptsSettings() {
       // Load default prompt on error
       setReportRevisionPrompt(getDefaultReportRevisionPrompt());
     }
-  };
+  }, [token]);
+
+  const loadAllSettings = useCallback(async () => {
+    try {
+      setLoading(true);
+      setError('');
+
+      // Load report revision system instruction
+      await loadReportRevisionPrompt();
+    } catch (error) {
+      console.error('Error loading settings:', error);
+      setError('Failed to load settings');
+    } finally {
+      setLoading(false);
+    }
+  }, [loadReportRevisionPrompt]);
+
+  useEffect(() => {
+    loadAllSettings();
+  }, [loadAllSettings]);
 
   const getDefaultReportRevisionPrompt = () => {
     return `You are an expert web developer and content editor. You will be given an HTML report and revision instructions. 

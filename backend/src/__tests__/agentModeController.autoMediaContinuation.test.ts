@@ -34,6 +34,7 @@ jest.mock('../services/durableLandingService', () => ({
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getChatSession: jest.fn(),
+    getChatSessionRecord: jest.fn(),
     addMessageToSession: jest.fn(),
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
@@ -198,6 +199,7 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
     delete process.env.AGENT_RUN_STORE;
     mockSendOncallAlert.mockResolvedValue(undefined);
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession as any);
+    (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(mockSession as any);
     (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
     mockChatbotDb.addMessageToSession.mockResolvedValue(mockSession as any);
     mockChatbotDb.addMessagesToSession.mockResolvedValue(undefined as any);
@@ -261,6 +263,54 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
     // continuation's own lock is released.
     expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
     expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+  });
+
+  it('ENG-1495: the live-delivered continuation message carries the real persisted messageIndex, not just the content', async () => {
+    // The default beforeEach mocks addMessagesToSession to resolve undefined (most
+    // tests here don't care about the return value) -- override it for this test with
+    // a realistic persisted-session shape so the messageIndex genuinely flows through
+    // generateSessionResponse's own stamping into the socket emit, rather than only
+    // exercising the defensive undefined-fallback path every other test in this file does.
+    mockChatbotDb.addMessagesToSession.mockResolvedValue({
+      ...mockSession,
+      messages: [
+        ...(mockSession.messages || []),
+        {
+          role: 'assistant',
+          content: 'All 4 creatives are ready.',
+          timestamp: '2026-08-14T18:20:51.000Z',
+          metadata: { timestamp: '2026-08-14T18:20:51.000Z' },
+          messageIndex: 42,
+        },
+      ],
+    } as any);
+
+    mockWorkerService.runInWorker
+      .mockResolvedValueOnce(
+        workerResponse(
+          '⚠️ Media generation paused for this turn — 3 of 4 images are done. Reply "continue" to get the last one.',
+          [imageToolCall(1), imageToolCall(2), imageToolCall(3), deferredToolCall()],
+        ),
+      )
+      .mockResolvedValueOnce(
+        workerResponse('All 4 creatives are ready.', [
+          { ...imageToolCall(4) },
+        ]),
+      );
+
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    await flush();
+
+    expect(mockIoEmit).toHaveBeenCalledWith(
+      'session-message-appended',
+      expect.objectContaining({
+        sessionId: mockSessionId,
+        message: expect.objectContaining({
+          content: 'All 4 creatives are ready.',
+          messageIndex: 42,
+        }),
+      }),
+    );
   });
 
   it('does not auto-continue when nothing was deferred (ordinary single-image turn)', async () => {
@@ -335,6 +385,107 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
     expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
 
     consoleErrorSpy.mockRestore();
+  });
+
+  /**
+   * ENG-1719 — live-found alongside the identical work-plan defect (see
+   * agentModeController.workPlanAutoContinuation.test.ts). A media continuation round
+   * killed by withGenerationTimeout rejects rather than resolving, and `stillDeferred` was
+   * assigned only in `.then()` — a timed-out round silently ended the retry chain without
+   * consuming a round, so AUTO_MEDIA_CONTINUATION_MAX_ROUNDS's exhaustion message/alert
+   * never fired and an unresolved media batch died with no notice.
+   */
+  describe('ENG-1719: a media continuation round killed by the generation timeout', () => {
+    const timeoutError = () => Object.assign(new Error('Generation timed out'), { isGenerationTimeout: true });
+    // hasPersistedMediaBudgetDeferral only checks the marker's timestamp is >= the round's
+    // start — a far-future timestamp satisfies that regardless of real wall-clock timing,
+    // since this file uses real timers (setImmediate-based flush), not fake ones.
+    const deferredMarkerMessage = () => ({
+      role: 'assistant',
+      content: 'placeholder',
+      timestamp: '2030-01-01T00:00:00.000Z',
+      metadata: { timestamp: '2030-01-01T00:00:00.000Z', mediaBudgetDeferred: true },
+    });
+
+    it('still clears the progress entry when the round times out, so the tab does not spin forever', async () => {
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockWorkerService.runInWorker
+        .mockResolvedValueOnce(
+          workerResponse(
+            '⚠️ Media generation paused for this turn — 3 of 4 images are done. Reply "continue" to get the last one.',
+            [imageToolCall(1), imageToolCall(2), imageToolCall(3), deferredToolCall()],
+          ),
+        )
+        // The continuation round itself times out. The post-timeout re-read below reports
+        // the batch as no longer deferred, so nothing retries — isolates this test to the
+        // progress-cleanup behavior specifically.
+        .mockRejectedValueOnce(timeoutError());
+      (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue(mockSession as any); // no deferral marker
+
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq(), res);
+      await flush();
+
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+      expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+      expect(autoContinuationSessions.has(mockSessionId)).toBe(false);
+
+      consoleErrorSpy.mockRestore();
+    });
+
+    it('keeps the retry chain alive by re-reading the persisted deferral marker instead of ending silently', async () => {
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockWorkerService.runInWorker
+        .mockResolvedValueOnce(
+          workerResponse(
+            '⚠️ Media generation paused for this turn — 3 of 4 images are done. Reply "continue" to get the last one.',
+            [imageToolCall(1), imageToolCall(2), imageToolCall(3), deferredToolCall()],
+          ),
+        )
+        .mockRejectedValueOnce(timeoutError())
+        .mockResolvedValueOnce(workerResponse('All 4 creatives are ready.', [imageToolCall(4)]));
+      (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue({
+        ...mockSession,
+        messages: [deferredMarkerMessage()],
+      } as any);
+
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq(), res);
+      await flush();
+
+      // 1 customer turn + the timed-out round + the re-fired round that finally lands it.
+      // Before the fix the chain stopped at 2, leaving the 4th image permanently missing.
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(3);
+      expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+
+      consoleErrorSpy.mockRestore();
+    });
+
+    it('fails CLOSED when the post-timeout re-read also fails, rather than retrying blind', async () => {
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockWorkerService.runInWorker
+        .mockResolvedValueOnce(
+          workerResponse(
+            '⚠️ Media generation paused for this turn — 3 of 4 images are done. Reply "continue" to get the last one.',
+            [imageToolCall(1), imageToolCall(2), imageToolCall(3), deferredToolCall()],
+          ),
+        )
+        .mockRejectedValueOnce(timeoutError());
+      (mockChatbotDb as any).getChatSessionRecord.mockRejectedValue(new Error('DynamoDB throttled'));
+
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq(), res);
+      await flush();
+
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('media auto-continuation could not re-read session'),
+        expect.any(Error),
+      );
+      expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+
+      consoleErrorSpy.mockRestore();
+    });
   });
 
   /**
@@ -592,6 +743,55 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
       // No unwanted extra continuation call — nothing was actually left deferred.
       expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
       expect(mockIoEmit).not.toHaveBeenCalled();
+    });
+
+    // ENG-1719: the work-plan/media guard on this timeout path was gated on
+    // hasPersistedMediaBudgetDeferral ALONE — true whenever a deferral marker exists,
+    // regardless of whether any image actually completed. buildTimeoutContinuationMessage
+    // (what actually decides whether the media continuation fires) returns null when zero
+    // images completed — so a deferral marker persisted with zero completed images
+    // suppressed the work-plan continuation for a media continuation that was NEVER
+    // going to fire either. Neither ran. This is the interaction-bug regression test.
+    it('still auto-continues the WORK PLAN when a deferral marker exists but zero images completed', async () => {
+      const futureIso = new Date(Date.now() + 5000).toISOString();
+      const pendingWorkPlan = {
+        planId: 'plan-1',
+        autocomplete: true,
+        steps: [{ stepCount: 1, status: 'pending' }],
+      };
+      // A deferral marker WAS persisted, but no image-generated markers — the cap fired
+      // before the first image in the batch finished, so buildTimeoutContinuationMessage
+      // will see zero images and return null (media's own gate never opens).
+      mockChatbotDb.getChatSession.mockImplementation(async (id: string, consistentRead?: boolean) =>
+        consistentRead
+          ? ({ ...mockSession, workPlan: pendingWorkPlan, messages: [deferredMarker(futureIso)] } as any)
+          : (mockSession as any),
+      );
+      // scheduleAutoWorkPlanContinuation's own pre-fire recheck reads the base record via
+      // getChatSessionRecord, independent of the getChatSession(..., true) call above.
+      (mockChatbotDb as any).getChatSessionRecord.mockResolvedValue({ ...mockSession, workPlan: pendingWorkPlan } as any);
+      mockWorkerService.runInWorker
+        .mockRejectedValueOnce(timeoutError()) // the customer's own turn hits the hard cap
+        .mockResolvedValueOnce(workerResponse('Step 1 complete.', [])); // the work-plan auto-continuation
+
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq(), res);
+      // Nothing was salvageable for the CUSTOMER-FACING response in this exact scenario
+      // (zero images, no other salvaged work) — it correctly falls through to the generic
+      // 504. That's expected and irrelevant to what this test checks: the work-plan
+      // continuation is scheduled via setImmediate BEFORE that fallthrough decision, so it
+      // fires regardless of what the customer's own response ends up being.
+      expect(res.status).toHaveBeenCalledWith(504);
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+
+      await flush();
+
+      // Before the fix: neither continuation fired (stuck at 1 call forever). After the
+      // fix: the work-plan continuation correctly takes over since media's own gate never
+      // would have opened for this turn.
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+      const secondCallArgs = mockWorkerService.runInWorker.mock.calls[1][0] as any;
+      expect(secondCallArgs.messageContent).toMatch(/automatic continuation/i);
     });
 
     it('also auto-resumes on the interactive-share route after a whole-turn hard timeout', async () => {

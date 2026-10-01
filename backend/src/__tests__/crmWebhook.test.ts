@@ -22,14 +22,20 @@ jest.mock('../services/db', () => ({
   crmDb: {
     getLeadListById: jest.fn(),
     getLeadByEmail: jest.fn(),
+    getLeadByAttioRecordId: jest.fn().mockResolvedValue(null),
+    getLeadByHubSpotContactId: jest.fn().mockResolvedValue(null),
+    createLead: jest.fn().mockResolvedValue({ leadId: 'new-lead' }),
     updateLead: jest.fn(),
+    deleteLead: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
+const mockUpdateSyncTimestamp = jest.fn().mockResolvedValue(undefined);
 jest.mock('../services/externalCrmSyncService', () => ({
   externalCrmSyncService: {
     getConfig: jest.fn(),
     resolveAuthForList: jest.fn(),
+    updateSyncTimestamp: (...a: any[]) => mockUpdateSyncTimestamp(...a),
   },
 }));
 
@@ -42,10 +48,17 @@ jest.mock('../services/hubspotService', () => ({
 }));
 
 const mockAttioGetPersonValues = jest.fn();
+const mockAttioSvcExtras = {
+  loadAttributeTypes: jest.fn().mockResolvedValue(new Map([
+    ['object:people:email_addresses', 'email_address'],
+    ['object:people:phone_numbers', 'phone_number'],
+  ])),
+  getCompanyById: jest.fn().mockResolvedValue(null),
+};
 jest.mock('../services/attioService', () => ({
   AttioService: {
-    fromToken: jest.fn().mockReturnValue({ getPersonValues: mockAttioGetPersonValues }),
-    create: jest.fn().mockResolvedValue({ getPersonValues: mockAttioGetPersonValues }),
+    fromToken: jest.fn().mockReturnValue({ getPersonValues: mockAttioGetPersonValues, ...mockAttioSvcExtras }),
+    create: jest.fn().mockResolvedValue({ getPersonValues: mockAttioGetPersonValues, ...mockAttioSvcExtras }),
   },
 }));
 
@@ -69,7 +82,19 @@ const mockConfig = (provider: string) => ({
   webhookSecret: VALID_SECRET,
   deleteOnPull: false,
   autoSyncEnabled: false,
-  contactFieldMapping: [],
+  // Mirrors DEFAULT_ATTIO_CONTACT_MAPPING (externalCrmSyncService.ts) — the
+  // Attio webhook path is config-driven now (ENG-1380), so its tests need a
+  // realistic mapping. HubSpot's webhook handler hardcodes its own field
+  // list and never reads this, so it's safe to share across both providers.
+  contactFieldMapping: [
+    { agentwebField: 'email', crmProperty: 'email_addresses', direction: 'both', enabled: true },
+    { agentwebField: 'firstName', crmProperty: 'first_name', direction: 'both', enabled: true },
+    { agentwebField: 'lastName', crmProperty: 'last_name', direction: 'both', enabled: true },
+    { agentwebField: 'phone', crmProperty: 'phone_numbers', direction: 'both', enabled: true },
+    { agentwebField: 'title', crmProperty: 'job_title', direction: 'both', enabled: true },
+    { agentwebField: 'company', crmProperty: 'company', direction: 'both', enabled: true },
+    { agentwebField: 'linkedin', crmProperty: 'linkedin', direction: 'push', enabled: true },
+  ],
   dealFieldMapping: [],
   customFieldMapping: [],
   createdAt: '2026-01-01T00:00:00Z',
@@ -187,6 +212,122 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     );
   });
 
+  // ENG-2082: a lead we pushed to HubSpot carries a hubspot_contact_id and, for a
+  // phone-only capture, no address. This whole branch shipped with no coverage — reverting
+  // the fix left the suite fully green, which is how the "both adopt it now" claim went
+  // unchecked.
+  it('resolves by hubspot_contact_id when the email lookup misses, and ADOPTS the address', async () => {
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockResolvedValue({
+      leadId: 'lead-phone-only',
+      listId: VALID_LIST_ID,
+      phone: '2125559876',
+      syncMetadata: { hubspot_contact_id: '12345' },
+    });
+
+    const res = await request(app)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send([{
+        subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '12345',
+        propertyName: 'email', propertyValue: 'late@acme.com',
+      }]);
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 50));
+    expect(crmDb.createLead).not.toHaveBeenCalled();
+    expect(crmDb.updateLead).toHaveBeenCalledWith(
+      VALID_LIST_ID, 'lead-phone-only',
+      expect.objectContaining({ email: 'late@acme.com' }),
+    );
+  });
+
+  // This test was vacuous as first written: it sent a `firstname` change, so no email
+  // could be resolved and the handler `continue`d before reaching the adoption branch at
+  // all. updateLead was never called and the assertion reduced to
+  // `({}).email === undefined` — it passed with the guard deleted. The event has to carry
+  // an address, and the lead has to be found with one already, or nothing is under test.
+  it('does not overwrite an address the lead already has', async () => {
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockResolvedValue({
+      leadId: 'lead-1', listId: VALID_LIST_ID, email: 'john@acme.com',
+      syncMetadata: { hubspot_contact_id: '12345' },
+    });
+
+    await request(app)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      // Two properties for the same contact, so there is still something to write once
+      // the address is dropped — with email alone the update is empty and correctly never
+      // issued, which would make the assertion below vacuous again for a new reason.
+      .send([
+        { subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '12345',
+          propertyName: 'firstname', propertyValue: 'Johnny' },
+        { subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '12345',
+          propertyName: 'email', propertyValue: 'different@acme.com' },
+      ]);
+
+    await new Promise(r => setTimeout(r, 50));
+    // The branch must actually have been reached — without this the rest is vacuous.
+    expect(crmDb.updateLead).toHaveBeenCalled();
+    const updates = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
+    expect(updates.firstName).toBe('Johnny');
+    expect(updates.email).toBeUndefined();
+  });
+
+  // A throw out of the deletion lookup does not just skip that contact: it escapes
+  // handleHubSpotEvent into the fire-and-forget wrapper and abandons every remaining
+  // objectId in the batch. HubSpot already has its 200, so nothing retries.
+  it('an exhausted DELETION lookup does not abandon the rest of the batch', async () => {
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue({
+      ...mockConfig('hubspot'), deleteOnPull: true,
+    });
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockImplementation(async (_l: string, id: string) => {
+      if (String(id) === '111') {
+        throw Object.assign(new Error('exhausted 20 pages'), { lookupExhausted: true });
+      }
+      return { leadId: 'lead-222', listId: VALID_LIST_ID, phone: '2125550000',
+               syncMetadata: { hubspot_contact_id: '222' } };
+    });
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+
+    await request(app)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send([
+        { subscriptionType: 'contact.deletion', portalId: 99999, objectId: '111' },
+        { subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '222',
+          propertyName: 'email', propertyValue: 'survivor@acme.com' },
+      ]);
+
+    await new Promise(r => setTimeout(r, 80));
+    // The lead we could not identify must NOT be deleted...
+    expect(crmDb.deleteLead).not.toHaveBeenCalled();
+    // ...and the event behind it must still have been processed.
+    expect(crmDb.updateLead).toHaveBeenCalledWith(
+      VALID_LIST_ID, 'lead-222',
+      expect.objectContaining({ email: 'survivor@acme.com' }),
+    );
+  });
+
+  it('refuses to create when the contact-id lookup was exhausted', async () => {
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockRejectedValue(
+      Object.assign(new Error('exhausted 20 pages'), { lookupExhausted: true }),
+    );
+
+    await request(app)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send([{
+        subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '12345',
+        propertyName: 'email', propertyValue: 'someone@acme.com',
+      }]);
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(crmDb.createLead).not.toHaveBeenCalled();
+  });
+
   // ─── Happy paths ──────────────────────────────────────────────────────────────
 
   it('updates lead standard fields on HubSpot contact.propertyChange', async () => {
@@ -280,6 +421,72 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
       'lead-3',
       expect.objectContaining({ firstName: 'Alice', lastName: 'Smith', title: 'CTO' })
     );
+    // Live-caught gap: a webhook-driven update applied the data change but
+    // never stamped lastPullSyncAt, so the CRM Sync dialog's "last pulled"
+    // indicator looked permanently stale even though auto-pull was working.
+    expect(mockUpdateSyncTimestamp).toHaveBeenCalledWith(expect.anything(), 'pull', true);
+  });
+
+  // CodeRabbit-flagged: without a per-event try/catch, a throw from
+  // applyAttioPersonEvent aborted the loop AND skipped updateSyncTimestamp
+  // entirely (the throw propagates past it) — a failed delivery left
+  // lastPullSyncAt/lastSyncStatus silently stale with zero indication
+  // anything went wrong, reintroducing the exact invisible-failure problem
+  // the stamp exists to prevent.
+  it('stamps lastPullSyncAt with success:false when applying the Attio event throws', async () => {
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue(mockConfig('attio'));
+    mockAttioGetPersonValues.mockResolvedValue({
+      email_addresses: [{ email_address: 'attio@company.com' }],
+      name: [{ first_name: 'Alice', last_name: 'Smith' }],
+    });
+    const existingLead = { leadId: 'lead-3', email: 'attio@company.com', firstName: 'Alice' };
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(existingLead);
+    (crmDb.updateLead as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB throttled'));
+
+    const event = {
+      event_type: 'record.updated',
+      workspace_id: 'ws-abc',
+      data: {
+        object: { slug: 'people' },
+        record: { id: { record_id: 'rec-xyz' } },
+      },
+    };
+
+    const res = await request(app)
+      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send(event);
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateSyncTimestamp).toHaveBeenCalledWith(expect.anything(), 'pull', false);
+  });
+
+  // CodeRabbit-flagged: the per-event try/catch above only covers
+  // applyAttioPersonEvent failures — a throw from auth/service resolution
+  // (e.g. a bad or expired manual token) happens BEFORE the loop even
+  // starts, and previously skipped updateSyncTimestamp entirely too.
+  it('stamps lastPullSyncAt with success:false when Attio auth/service resolution throws', async () => {
+    (externalCrmSyncService.getConfig as jest.Mock).mockResolvedValue(mockConfig('attio'));
+    (externalCrmSyncService.resolveAuthForList as jest.Mock).mockRejectedValueOnce(new Error('token decryption failed'));
+
+    const event = {
+      event_type: 'record.updated',
+      workspace_id: 'ws-abc',
+      data: {
+        object: { slug: 'people' },
+        record: { id: { record_id: 'rec-xyz' } },
+      },
+    };
+
+    const res = await request(app)
+      .post(`/api/crm/attio/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send(event);
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 50));
+    expect(mockUpdateSyncTimestamp).toHaveBeenCalledWith(expect.anything(), 'pull', false);
   });
 
   it('skips Attio event for non-people objects (e.g. companies)', async () => {

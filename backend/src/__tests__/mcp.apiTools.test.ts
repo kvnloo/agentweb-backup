@@ -38,6 +38,7 @@ const mockMcpFetch = mcpFetch as jest.MockedFunction<typeof mcpFetch>;
 
 // Import the registry (which gets populated by apiTools import)
 import { mcpToolRegistry } from '../mcp/server/registry';
+import type { SessionScoringStatus } from '../services/scoreBackfill';
 
 // Import apiTools to trigger tool registrations
 import '../mcp/server/apiTools';
@@ -67,7 +68,7 @@ describe('apiTools', () => {
     it('should register API-wrapping tools', () => {
       const names = mcpToolRegistry.getToolNames();
       const expectedTools = [
-        'emma_create_session', 'emma_send_message', 'emma_answer_question', 'emma_get_session', 'emma_list_sessions',
+        'emma_create_session', 'emma_send_message', 'emma_answer_question_deck', 'emma_get_session', 'emma_list_sessions',
         'list_tasks', 'manage_task', 'execute_task', 'list_task_executions',
         'list_schedules', 'manage_schedule',
         'list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat',
@@ -87,7 +88,7 @@ describe('apiTools', () => {
       const allNames = mcpToolRegistry.getToolNames();
       const externalDefs = mcpToolRegistry.getToolDefinitions();
       const externalNames = externalDefs.map((d: any) => d.name);
-      const internalTools = ['install_skills', 'list_available_skills', 'create_blog_article', 'publish_blog_article', 'you_search_web', 'you_search_news', 'google_search_web', 'generate_image', 'send_email', 'save_file'];
+      const internalTools = ['install_skills', 'list_available_skills', 'create_blog_article', 'publish_blog_article', 'you_search_web', 'you_search_news', 'google_search_web', 'send_email', 'save_file', 'post_on_account'];
       for (const name of internalTools) {
         // Registered in the registry (available to Emma internally)
         expect(allNames).toContain(name);
@@ -95,6 +96,7 @@ describe('apiTools', () => {
         expect(externalNames).not.toContain(name);
       }
       expect(allNames).not.toContain('search_web');
+      expect(externalNames).toContain('generate_image');
     });
 
     it('should NOT register old tool names (portal_*, read_brand_guidelines, etc.)', () => {
@@ -215,6 +217,16 @@ describe('apiTools', () => {
   });
 
   describe('manage_brand - update', () => {
+    it.each([
+      [{ mission: 'Make IT easy' }, { valueProposition: 'Make IT easy' }],
+      [{ tone_of_voice: 'Direct', target_audience: 'IT teams', key_messages: ['Simplify IT'] },
+       { toneOfVoice: 'Direct', targetAudience: 'IT teams', keyMessages: ['Simplify IT'] }],
+    ])('maps persisted brand fields %j', async (input, expected) => {
+      mockMcpFetch.mockResolvedValue({ success: true });
+      await mcpToolRegistry.execute('manage_brand', { action: 'update', ...input }, context);
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({ body: expected }));
+    });
+
     it('should call POST /api/brand/guidelines with body', async () => {
       mockMcpFetch.mockResolvedValue({ success: true });
 
@@ -225,7 +237,7 @@ describe('apiTools', () => {
       expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
         method: 'POST',
         path: '/api/brand/guidelines',
-        body: { company_name: 'New Corp' },
+        body: { brandName: 'New Corp' },
       }));
     });
   });
@@ -312,15 +324,22 @@ describe('apiTools', () => {
 
   });
 
-  // ─── emma_answer_question (ENG-400: MCP transport for the AskUserQuestion primitive) ───
+  // ENG-1635/1644 PR2: the emma_answer_question tool + its whole describe
+  // block are deleted — the tool itself is deleted (nothing populates
+  // session.pendingUserQuestion anymore), emma_answer_question_deck below is
+  // the sole MCP transport for every producer that used to reach it.
 
-  describe('emma_answer_question', () => {
-    it('posts a direct pick through the structured questionAnswer channel, using option_id as the default label', async () => {
+  // ─── emma_answer_question_deck (ENG-1635/1644: MCP transport for the deck-of-one
+  // ask_user_question/objective-gate build) ───
+
+  describe('emma_answer_question_deck', () => {
+    it('posts a direct pick through the structured deckAnswer channel, using option_id as the default label', async () => {
       mockMcpFetch.mockResolvedValue({ response: 'OK' });
 
-      await mcpToolRegistry.execute('emma_answer_question', {
+      await mcpToolRegistry.execute('emma_answer_question_deck', {
         session_id: 'sess-1',
-        question_id: 'q-1',
+        deck_id: 'deck-1',
+        item_id: 'item-1',
         option_id: 'leads',
       }, context);
 
@@ -330,7 +349,7 @@ describe('apiTools', () => {
         body: {
           sessionId: 'sess-1',
           userMessage: 'leads',
-          questionAnswer: { questionId: 'q-1', optionId: 'leads', delegated: false },
+          deckAnswer: { deckId: 'deck-1', answers: [{ itemId: 'item-1', verdict: 'leads', delegated: false }] },
         },
       }));
     });
@@ -338,9 +357,10 @@ describe('apiTools', () => {
     it('uses a provided label as the human-readable chat message instead of the raw option_id', async () => {
       mockMcpFetch.mockResolvedValue({ response: 'OK' });
 
-      await mcpToolRegistry.execute('emma_answer_question', {
+      await mcpToolRegistry.execute('emma_answer_question_deck', {
         session_id: 'sess-1',
-        question_id: 'q-1',
+        deck_id: 'deck-1',
+        item_id: 'item-1',
         option_id: 'leads',
         label: 'Leads',
       }, context);
@@ -352,9 +372,10 @@ describe('apiTools', () => {
     it('posts a delegation ("Let Emma decide") with delegated:true and no option_id required', async () => {
       mockMcpFetch.mockResolvedValue({ response: 'OK' });
 
-      await mcpToolRegistry.execute('emma_answer_question', {
+      await mcpToolRegistry.execute('emma_answer_question_deck', {
         session_id: 'sess-1',
-        question_id: 'q-1',
+        deck_id: 'deck-1',
+        item_id: 'item-1',
         delegate: true,
       }, context);
 
@@ -362,26 +383,27 @@ describe('apiTools', () => {
         body: {
           sessionId: 'sess-1',
           userMessage: 'Let Emma decide',
-          questionAnswer: { questionId: 'q-1', optionId: undefined, delegated: true },
+          deckAnswer: { deckId: 'deck-1', answers: [{ itemId: 'item-1', verdict: '', delegated: true }] },
         },
       }));
     });
 
     it('refuses (without calling the API) a direct pick missing option_id', async () => {
-      const result = await mcpToolRegistry.execute('emma_answer_question', {
+      const result = await mcpToolRegistry.execute('emma_answer_question_deck', {
         session_id: 'sess-1',
-        question_id: 'q-1',
+        deck_id: 'deck-1',
+        item_id: 'item-1',
       }, context);
 
       expect(mockMcpFetch).not.toHaveBeenCalled();
       expect(JSON.parse(result.content[0].text).success).toBe(false);
     });
 
-    it('is registered with session_id and question_id required', () => {
+    it('is registered with session_id, deck_id and item_id required', () => {
       const defs = mcpToolRegistry.getToolDefinitions();
-      const answerQuestion = defs.find((d: any) => d.name === 'emma_answer_question');
-      expect(answerQuestion).toBeDefined();
-      expect(answerQuestion.inputSchema.required).toEqual(['session_id', 'question_id']);
+      const answerDeck = defs.find((d: any) => d.name === 'emma_answer_question_deck');
+      expect(answerDeck).toBeDefined();
+      expect(answerDeck.inputSchema.required).toEqual(['session_id', 'deck_id', 'item_id']);
     });
   });
 
@@ -401,8 +423,7 @@ describe('apiTools', () => {
   // the model supply the value. `required` is what actually gets the category
   // declared. If it is dropped here, the model stops sending it and EVERY image
   // generation fails at the guard, so this schema is load-bearing, not cosmetic.
-  // `generate_image` is `internal: true`, so it is absent from getToolDefinitions()
-  // — read it via getTool() or this assertion silently tests nothing.
+  // Read via getTool() so the assertion still holds if listing ever flips.
   describe('generate_image category declaration (ENG-343)', () => {
     const schema = () => mcpToolRegistry.getTool('generate_image')!.definition.inputSchema;
 
@@ -1633,6 +1654,104 @@ describe('apiTools', () => {
 
       expect(session.delegateInfo).toBeNull();
     });
+
+    // ENG-929: sync=true promises to score everything unscored. A scorer that
+    // failed and a session that is legitimately unscorable both came back as
+    // `satisfactionScore: null`, so the daily report silently under-sampled —
+    // and the sessions it dropped were disproportionately the long, expensive
+    // ones. The outcome must reach the caller.
+    it('should surface the per-session scoring outcome and a coverage summary under sync=true', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [
+          {
+            sessionId: 'sess-failed',
+            userId: 'user-1',
+            title: 'Scheduled: long expensive run',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            sessionType: 'scheduled',
+            satisfactionScore: null,
+            scoringOutcome: { status: 'failed', reason: 'Scoring LLM call timed out after 40000ms' },
+            messages: [{ role: 'user', content: 'run' }, { role: 'assistant', content: 'done' }],
+          },
+          {
+            sessionId: 'sess-inflight',
+            userId: 'user-2',
+            title: 'Scheduled: still running',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            sessionType: 'scheduled',
+            satisfactionScore: null,
+            scoringOutcome: { status: 'skipped', reason: 'in-flight' },
+            messages: [{ role: 'user', content: 'run' }],
+          },
+        ],
+        scoringSummary: { scored: 0, skipped: 1, failed: 1, notAttempted: 0, timedOut: false },
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+        sync: true,
+      }, context);
+
+      const parsed = JSON.parse((result as any).content[0].text);
+
+      expect(parsed.sessions[0].scoringOutcome).toEqual({
+        status: 'failed',
+        reason: 'Scoring LLM call timed out after 40000ms',
+      });
+      expect(parsed.sessions[1].scoringOutcome).toEqual({ status: 'skipped', reason: 'in-flight' });
+      expect(parsed.scoringSummary).toEqual({
+        scored: 0, skipped: 1, failed: 1, notAttempted: 0, timedOut: false,
+      });
+    });
+
+    it('should report a null scoringOutcome when sync was not requested', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-plain',
+          userId: 'user-1',
+          title: 'Plain',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          messages: [],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const parsed = JSON.parse((result as any).content[0].text);
+
+      expect(parsed.sessions[0].scoringOutcome).toBeNull();
+      expect(parsed.scoringSummary).toBeNull();
+    });
+
+    it('should tell the caller that a null satisfactionScore is not the same as a failed one', () => {
+      const tool = mcpToolRegistry.getTool('get_chat_history');
+      expect(tool?.definition.description).toMatch(/scoringOutcome/);
+      expect(tool?.definition.description).toMatch(/failed/i);
+    });
+
+    // The description is the only contract an external agent sees. If it documents
+    // a status literal the code never emits, an agent filtering on the documented
+    // spelling silently drops that cohort — which is the ENG-929 failure mode.
+    it('documents the scoringOutcome status literals exactly as the code emits them', () => {
+      const description = mcpToolRegistry.getTool('get_chat_history')!.definition.description!;
+      const emittedStatuses: SessionScoringStatus[] = [
+        'scored', 'skipped', 'failed', 'not-attempted',
+      ];
+      for (const status of emittedStatuses) {
+        expect(description).toContain(`status '${status}'`);
+      }
+      // camelCase is the scoringSummary *count* key, never a status value.
+      expect(description).not.toContain("status 'notAttempted'");
+    });
   });
 
   // ─── get_account_status ───────────────────────────────────────────────
@@ -1825,4 +1944,66 @@ describe('apiTools', () => {
     });
   });
 
+});
+
+describe('ENG-1015 durable session polling', () => {
+  const context = { userId: 'user-123', agentUserId: 'user-123' };
+  const session = { sessionId: 's1', messages: [], hasActiveProgress: false };
+  async function poll(runId?: string) {
+    const result = await mcpToolRegistry.execute('emma_get_session', { session_id: 's1', run_id: runId }, context);
+    return JSON.parse(result.content[0].text);
+  }
+  beforeEach(() => mockMcpFetch.mockReset());
+  it('does not infer completion from an idle session without a run ID', async () => {
+    mockMcpFetch.mockResolvedValueOnce(session);
+    expect((await poll()).completion_confirmed).toBe(false);
+    expect(mockMcpFetch).toHaveBeenCalledTimes(1);
+  });
+  it.each(['completed', 'failed', 'interrupted'])('confirms durable terminal status %s for the requested session and run', async status => {
+    const run = { runId: 'r1', sessionId: 's1', status, finishReason: 'stop' };
+    mockMcpFetch.mockResolvedValueOnce(session).mockResolvedValueOnce(run);
+    const body = await poll('r1');
+    expect(body.completion_confirmed).toBe(true);
+    expect(body.run).toEqual(run);
+    expect(mockMcpFetch).toHaveBeenLastCalledWith({ method: 'GET', path: '/api/agent-mode/runs/r1', context });
+  });
+  it.each([
+    null, [], 'completed', {},
+    { runId: 'r1', sessionId: 's1', status: 'running' },
+    { runId: 'r1', sessionId: 's1', status: 'completed', finishReason: 'detached_still_building' },
+    { runId: 'r1', sessionId: 'other', status: 'completed' },
+    { runId: 'other', sessionId: 's1', status: 'completed' },
+    { runId: 'r1', sessionId: 's1', status: 'completed', finishReason: {} },
+  ])('withholds confirmation for absent, malformed, unrelated or detached evidence: %j', async run => {
+    mockMcpFetch.mockResolvedValueOnce(session).mockResolvedValueOnce(run);
+    expect((await poll('r1')).completion_confirmed).toBe(false);
+  });
+  it('does not call a task complete while the session awaits input', async () => {
+    mockMcpFetch.mockResolvedValueOnce({ ...session, pendingUserQuestion: { status: 'awaiting' } })
+      .mockResolvedValueOnce({ runId: 'r1', sessionId: 's1', status: 'completed' });
+    expect((await poll('r1')).completion_confirmed).toBe(false);
+  });
+  it('does not call a task complete while the session awaits work-plan input', async () => {
+    mockMcpFetch.mockResolvedValueOnce({ ...session, pendingWorkPlanInput: { status: 'awaiting' } })
+      .mockResolvedValueOnce({ runId: 'r1', sessionId: 's1', status: 'completed' });
+    expect((await poll('r1')).completion_confirmed).toBe(false);
+  });
+  it.each(['timeout_partial_media', 'timeout_partial_work'])(
+    'does not confirm partial timeout finish reason %s',
+    async finishReason => {
+      mockMcpFetch.mockResolvedValueOnce(session)
+        .mockResolvedValueOnce({ runId: 'r1', sessionId: 's1', status: 'completed', finishReason });
+      expect((await poll('r1')).completion_confirmed).toBe(false);
+    }
+  );
+  it('withholds confirmation if the run endpoint fails', async () => {
+    mockMcpFetch.mockResolvedValueOnce(session).mockRejectedValueOnce(new Error('404'));
+    expect((await poll('r1')).completion_confirmed).toBe(false);
+  });
+  it('preserves session refusal and does not attempt the run read', async () => {
+    mockMcpFetch.mockRejectedValueOnce(new Error('Forbidden'));
+    await expect(mcpToolRegistry.execute('emma_get_session', { session_id: 's1', run_id: 'r1' }, context))
+      .rejects.toThrow('Forbidden');
+    expect(mockMcpFetch).toHaveBeenCalledTimes(1);
+  });
 });

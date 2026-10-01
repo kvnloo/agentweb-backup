@@ -7,8 +7,12 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { crmDb, userDb, tempEmailDb } from '../services/db';
 import { dripSequenceDb } from '../services/dripSequenceDb';
-import { getUserIdByHubSpotPortalId } from '../services/connectedAccountsDb';
+import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
+import { getUserIdByHubSpotPortalId, getAccountsByAttioWorkspaceId } from '../services/connectedAccountsDb';
 import { HubSpotService } from '../services/hubspotService';
+import { AttioService } from '../services/attioService';
+import { AttioAdapter } from '../services/adapters/attioAdapter';
+import { applyAttioPersonEvent } from '../utils/attioPersonWebhookEvent';
 import { getHubSpotClientSecretForAppId } from '../config/integrations';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
 import { agentModeService } from '../services/agentModeService';
@@ -23,7 +27,7 @@ import { normalizeAttribution, promoteAttributionFromCustomFields } from '../typ
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
-import { isSmokeTestEmail } from '../utils/smokeTestLead';
+import { isSmokeTestLead, isSmokeTestPhone, phoneDigits, phoneLeadId } from '../utils/smokeTestLead';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from '../services/asyncJobQueue';
 import { handleHardBounceRecipients } from '../services/emailDeliverabilityService';
 // ENG-926 §C: the per-list budget and the per-account BUC pause used to live here as
@@ -108,23 +112,40 @@ function validatedEventTimeSeconds(capturedAtMs: unknown): number | undefined {
  * autoEnrollListIds containing this list. Mirrors the authenticated CRM path
  * (routes/crm.ts) so leads captured via the public forward-lead webhook also
  * land in list-bound drip sequences. Errors are logged but never surfaced.
+ *
+ * Exported for tests only. The crm.ts twin was exported for exactly this reason and
+ * then guarded; this copy was left private, so reinstating its `if (!lead.email) return`
+ * gate passed 219/219 webhooks tests — half the fix had no regression guard at all.
  */
-async function autoEnrollLeadInSequences(
+export async function autoEnrollLeadInSequences(
   userId: string,
   listId: string,
   leadId: string,
-  leadEmail: string,
+  lead: { email?: string; linkedin?: string } | string,
 ): Promise<void> {
-  if (!leadEmail) return;
+  // Channel-aware, matching the enrol routes and crm.ts's copy of this function.
+  //
+  // The `if (!leadEmail) return` gate meant that once enrolling a LinkedIn-only list
+  // became possible, by-list enrolment switched auto-enroll ON for that list while
+  // every lead arriving by webhook afterwards was silently dropped for having no
+  // address — the capability worked once, for the leads present at the time.
+  const leadObj = typeof lead === 'string' ? { email: lead } : (lead ?? {});
   try {
     const sequences = await dripSequenceDb.getSequencesByAutoEnrollList(userId, listId);
     for (const seq of sequences) {
+      const channels = requiredChannels(seq);
+      if (!leadIsReachable(leadObj, channels)) continue;
+      const identity = enrollmentIdentity(leadObj);
+      // An empty identity is invisible to the leadEmail-index dedup, so the row is
+      // recreated and the lead re-messaged on every run.
+      if (!identity) continue;
       await dripSequenceDb.bulkEnroll([{
         sequenceId: seq.sequenceId,
         userId,
         listId,
         leadId,
-        leadEmail,
+        leadEmail: identity,
+        identityCandidates: enrollmentIdentityCandidates(leadObj),
       }]);
     }
   } catch (err) {
@@ -411,9 +432,10 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
 // ONLY the optional, best-effort Meta CAPI send below (capiSendBudget), so the worst case of
 // hitting a limit is "this one submission doesn't get forwarded to Meta" — never a lost lead.
 //
-// (Keying any future request-level limiter here by IP would also be unsound: this app never
-// configures Express's `trust proxy`, so `req.ip` collapses to the same value for every
-// caller — confirmed live in both prod and the test env. See ENG-493.)
+// (A request-level limiter keyed by listId, as capiSendBudget is below, remains the right
+// call regardless: `req.ip` now resolves correctly since app.ts configures `trust proxy`
+// (ENG-493), but per-listId is still the meaningful boundary for this endpoint — a spike
+// from one list's real traffic shouldn't be able to starve every other list's budget.)
 
 // Public endpoint for forwarding leads to CRM
 router.post('/forward-lead', async (req: express.Request, res: express.Response) => {
@@ -525,20 +547,36 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       visitorUserAgent: declaredClientUserAgent,
     } = req.body;
 
-    // Validate required field (email)
-    if (!email || typeof email !== 'string' || !email.trim()) {
+    // ENG-2082: a contactable lead needs an email OR a phone, not specifically an email.
+    // Requiring an email made a phone-only lander — an ordinary thing to want, and something
+    // the generator will happily build — structurally incapable of ever producing a lead:
+    // every submission was rejected here before a row was even constructed, with nothing
+    // upstream warning the owner. Everything downstream already tolerated the absence:
+    // createLead dedupes only "if email is provided", autoEnrollLeadInSequences returns
+    // early on a falsy address, auto-send reports skipped_no_email, and Meta CAPI already
+    // normalises `ph` as a first-class match key. This gate was the only thing requiring one.
+    const normalizedEmail = typeof email === 'string' ? email.trim() : '';
+    const normalizedPhone = typeof phone === 'string' ? phone.trim() : '';
+    // Opt-in exception: a lander whose contact field is deliberately optional (e.g. the
+    // WaterHeater.app free warranty check) sends `allowAnonymousLead: true` so the
+    // submission is still recorded (with its customFields) instead of silently dropped.
+    // Default behaviour for every other caller is unchanged.
+    const allowAnonymousLead = req.body?.allowAnonymousLead === true;
+    if (!normalizedEmail && !normalizedPhone && !allowAnonymousLead) {
       return res.status(400).json({
         success: false,
-        message: 'Email is required'
+        message: 'Email or phone is required'
       });
     }
 
     // Prepare lead data
     const leadData: any = {
-      email: email.trim(),
+      // Omitted entirely rather than written as '' when absent: `email` is the key of the
+      // email-index GSI, and DynamoDB rejects an empty string for an index key attribute.
+      ...(normalizedEmail ? { email: normalizedEmail } : {}),
       firstName: firstName?.trim() || '',
       lastName: lastName?.trim() || '',
-      phone: phone?.trim() || '',
+      phone: normalizedPhone,
       company: company?.trim() || '',
       title: title?.trim() || '',
       notes: notes?.trim() || '',
@@ -566,9 +604,10 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     //
     // Computed once here rather than inside the CAPI block below, because the lead write
     // needs them too and re-deriving the same value twice is how the two drift apart.
-    // ENG-493 is still deferred (flipping Express's global `trust proxy` would also change
-    // auth.ts's IP-keyed rate limiters), so the x-forwarded-for read stays scoped to this
-    // handler.
+    // Reads x-forwarded-for directly rather than relying on req.ip: this endpoint is public
+    // and wants the ORIGINATING address (leftmost of the chain), which is what callers here
+    // expect regardless of the app-wide `trust proxy` hop count (ENG-493) used elsewhere for
+    // rate-limit keying.
     //
     // ⚠ Landing pages do NOT reach this route from the browser — they POST to their own
     // Next.js route, which calls us server-side from Vercel (both `hireemma.ai`'s
@@ -613,6 +652,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // "anything not handled above", so a newly-handled key MUST be added here too.
       // (`clientIp`/`clientUserAgent` are deliberately NOT handled — see the destructure.)
       'visitorIp', 'visitorUserAgent',
+      'allowAnonymousLead',
     ]);
     const PASSTHROUGH_MAX_KEYS = 50;
     const PASSTHROUGH_MAX_VALUE_LENGTH = 1000;
@@ -637,6 +677,13 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // Add source field (from request or default to 'api')
       source: source?.trim() || customFields?.source || 'api',
     };
+
+    // ENG-2082: did the CALLER name a source, or did the line above invent one? The adopt
+    // path needs the distinction. `source` is never absent from incomingCustomFields, so
+    // merging it blindly lets the synthesized 'api' overwrite a real stored value whenever
+    // some other field changes — step 1 of a multi-step lander posts "hero-form", step 2
+    // posts only its answers, and the row ends up reading "api".
+    const callerSuppliedSource = !!(source?.trim() || customFields?.source);
 
     // Attribution — accept either the new `attribution` shape or the legacy
     // flat `utm` shape (same normaliser controllers/auth.ts uses for signup).
@@ -668,8 +715,15 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       leadData.lastTouch = normalizeAttribution(incomingLastTouch) ?? touch;
     }
 
-    // Check if lead already exists by email - merge instead of dropping
-    const existingLead = await crmDb.getLeadByEmail(leadList.listId, email.trim().toLowerCase());
+    // Check if lead already exists by email - merge instead of dropping.
+    // ENG-2082: email is the only identity with an index to look it up by (email-index).
+    // A phone-only lead is instead deduped at write time by a deterministic leadId below,
+    // so two submissions of the same number collapse onto one row without needing a second
+    // GSI. A phone-only lead that later submits WITH an email becomes its own row, which is
+    // the same thing that already happens for two different emails.
+    const existingLead = normalizedEmail
+      ? await crmDb.getLeadByEmail(leadList.listId, normalizedEmail.toLowerCase())
+      : null;
 
     // Only stamp forwardedAt for new leads; for existing leads, preserve the original timestamp
     const mergedCustomFields: Record<string, any> = existingLead
@@ -707,6 +761,13 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // Merge custom fields
       const existingCustomFields = existingLead.customFields || {};
       const mergedCf = { ...existingCustomFields, ...mergedCustomFields };
+      // `source` is defaulted to 'api' whenever the caller omits it, so a blind spread lets
+      // that synthesized value overwrite a real stored source on every repeat submission —
+      // the same data loss the phone adopt path was fixed for, on the far more common email
+      // path. Restore it unless THIS submission actually named one.
+      if (!callerSuppliedSource && 'source' in existingCustomFields) {
+        mergedCf.source = existingCustomFields.source;
+      }
       if (JSON.stringify(existingCustomFields) !== JSON.stringify(mergedCf)) {
         updates.customFields = mergedCf;
         changed = true;
@@ -787,9 +848,162 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
       lead = { ...existingLead, ...updates };
     } else {
-      // Create a new lead
-      lead = await crmDb.createLead(leadList.listId, leadData);
-      isNew = true;
+      // Create a new lead.
+      // ENG-2082: with no email there is nothing to query on beforehand, so a phone-only
+      // lead can key on its own normalized number and let the conditional create dedupe —
+      // the ENG-787 mechanism createLead exposes for exactly this ("a caller that keys a
+      // lead on a stable identity"). phoneDigits is the shared normalizer, so
+      // +1 (415) 555-0142 and 4155550142 resolve to the same row. Derived by the shared
+      // helper, never inline: the smoke test reads this id back to find the row it just
+      // created, and a drift between the two would make it silently miss every capture.
+      //
+      // SYNTHETIC NUMBERS ONLY, deliberately. leadId is the table's RANGE key and
+      // getLeadsByListId pages it with ScanIndexForward:false — "newest leadId
+      // (timestamp-prefixed) first". `lead_ph_…` breaks that assumption: 'p' (0x70) beats
+      // every digit, so a deterministic id sorts ABOVE every lead_<timestamp>_… row. Giving
+      // real captures one would pin every phone-only lead to the top of the customer's list
+      // forever, ordered by hash rather than recency, and — because the query caps at 1MB a
+      // page regardless of Limit — eventually push their email leads off page one entirely.
+      // Worst for phone-first landers, which are precisely who this path was built for.
+      //
+      // Real captures therefore take an ordinary timestamp id and lose the dedupe. This is a
+      // FIX, not a precaution: 61cc335ea opened this endpoint to phone-only submissions and
+      // is already an ancestor of main and deployed, so the deterministic id is live right
+      // now and the first real phone-only capture writes a row that pins to the top of that
+      // customer's list forever. AW-Leads currently holds zero lead_ph_ rows only because
+      // none has landed yet.
+      //
+      // Losing the dedupe costs nothing measurable: 17.5k phone-only rows are already in
+      // production (7.5% of all leads, 100 lists, created continuously Feb-Sep) and not one
+      // has ever been deduped. Email leads dedupe through email-index; phone has no
+      // equivalent GSI, which is the actual gap — ENG-2123 adds that index and restores
+      // dedupe on top of it. Until then the primary key stops doubling as an index.
+      const deterministicLeadId =
+        !normalizedEmail && isSmokeTestPhone(normalizedPhone) ? phoneLeadId(normalizedPhone) : '';
+      try {
+        lead = await crmDb.createLead(
+          leadList.listId,
+          deterministicLeadId
+            ? { ...leadData, leadId: deterministicLeadId, failIfExists: true }
+            : leadData
+        );
+        isNew = true;
+      } catch (createErr: any) {
+        // The conditional create lost to an earlier submission of the same number. That is
+        // this path's DEDUPE succeeding, not a fault: adopt the row that already exists and
+        // report it as a duplicate. isNew stays false, so none of the new-lead side effects
+        // (sequence enrolment, auto-draft/auto-send, owner notify, CAPI) fire a second time
+        // for one person — which is the whole reason the number is keyed deterministically.
+        if (!createErr?.leadAlreadyExists) throw createErr;
+        // Consistent read: the conditional write just told us this exact key exists, so an
+        // eventually-consistent miss here would be a lie, not an answer.
+        lead = await crmDb.getLeadById(leadList.listId, deterministicLeadId, { consistentRead: true });
+        if (!lead) {
+          // Still nothing — the winner's row was deleted between its write and this read, or
+          // the read failed in a way that returned empty. Do NOT throw: throwing reaches the
+          // handler's catch and returns 500 to the lander for a submission that was, from
+          // the visitor's point of view, accepted. Degrade to the id we know, the same way
+          // linkedInInviteCrmMirror does on this identical race.
+          console.warn(
+            `[webhooks] ENG-2082: adopted lead ${deterministicLeadId} not readable after a ` +
+              `losing conditional create in ${leadList.listId} — reporting the duplicate anyway.`
+          );
+          lead = { leadId: deterministicLeadId, listId: leadList.listId, ...leadData };
+        }
+
+        // ENG-2082 follow-up: this path is not only the concurrent race. A deterministic id
+        // plus failIfExists means EVERY repeat submission from the same number lands here,
+        // forever. Without a merge the second submission returns success and silently drops
+        // whatever it carried — the exact failure this file documents for flat custom fields
+        // ("a 201 and a visible lead row with the data gone"), reproduced for a multi-step
+        // phone-only lander whose step 2 posts the qualification answers.
+        //
+        // Mirrors the existingLead branch's rules deliberately rather than sharing them:
+        // that branch is the well-trodden email path and is not worth destabilising here.
+        const normalizeAdopted = (value: any): string =>
+          value === null || value === undefined ? '' : String(value).trim();
+        const adoptedUpdates: any = {};
+        let adoptedChanged = false;
+
+        for (const field of ['firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'] as const) {
+          const newValue = normalizeAdopted(leadData[field]);
+          if (newValue && normalizeAdopted(lead[field]) !== newValue) {
+            adoptedUpdates[field] = newValue;
+            adoptedChanged = true;
+          }
+        }
+
+        const adoptedExistingCustom = lead.customFields || {};
+        const adoptedIncomingCustom = leadData.customFields || {};
+        const adoptedMergedCustom: Record<string, any> = { ...adoptedExistingCustom };
+        let customChanged = false;
+        // Stamped by this handler rather than sent by the visitor: `forwardedAt` is minted
+        // fresh on every submission because this branch builds leadData as if creating, and
+        // `source` defaults to 'api' when the caller sends none (see the destructure above).
+        // Neither is visitor data, and letting either mark a resubmission as a real update
+        // would drive CRM sync and owner alerts off a duplicate that carried nothing new.
+        // They are still merged through — they just do not, alone, constitute a change.
+        const SYSTEM_CUSTOM_KEYS = new Set(['forwardedAt', 'source']);
+        for (const [key, value] of Object.entries(adoptedIncomingCustom)) {
+          if (value === undefined || value === null || value === '') continue;
+          if (normalizeAdopted(adoptedExistingCustom[key]) !== normalizeAdopted(value)) {
+            adoptedMergedCustom[key] = value;
+            if (!SYSTEM_CUSTOM_KEYS.has(key)) customChanged = true;
+          }
+        }
+        if (customChanged) {
+          // Put the STORED system values back before writing. `forwardedAt` is minted fresh
+          // on this branch (existingLead is null, so line ~700 stamps a new one), and the
+          // merged object would otherwise carry it — overwriting the lead's real capture
+          // time whenever anything else changed. That contradicts the invariant stated at
+          // the stamp site ("for existing leads, preserve the original timestamp") and is
+          // customer-visible: forwardedAt is what the owner alert renders as the received
+          // time. The email branch avoids this by omitting the key entirely; this branch
+          // cannot, so it restores it.
+          // forwardedAt unconditionally: it is minted by THIS handler on every submission
+          // (existingLead is null on this branch), so the merged copy is never the
+          // visitor's data and the stored capture time must win. `source` is handled by
+          // provenance just below, exactly as the email branch now does — a caller-supplied
+          // source wins, a defaulted one never overwrites.
+          if ('forwardedAt' in adoptedExistingCustom) {
+            adoptedMergedCustom.forwardedAt = adoptedExistingCustom.forwardedAt;
+          }
+          // Restore `source` ONLY when this submission did not name one. A caller-supplied
+          // source is real data and must win (that is the multi-step case); a defaulted one
+          // must never overwrite what is already stored.
+          if (!callerSuppliedSource && 'source' in adoptedExistingCustom) {
+            adoptedMergedCustom.source = adoptedExistingCustom.source;
+          }
+          adoptedUpdates.customFields = adoptedMergedCustom;
+          adoptedChanged = true;
+        }
+
+        if (adoptedChanged) {
+          await crmDb.updateLead(leadList.listId, lead.leadId, adoptedUpdates);
+          lead = { ...lead, ...adoptedUpdates };
+          // A real, user-visible change — same meaning the email branch gives isUpdated.
+          isUpdated = true;
+        }
+      }
+    }
+
+    // Inserts already notify at the CRM write boundary. Every accepted repeat form
+    // submission also notifies, even when it merges into an unchanged existing row.
+    // A server-generated event ID keeps distinct submissions separate on recovery.
+    //
+    // Gated on the synthetic check for the same reason as the cascade far below: this is a
+    // real org lead notification (Slack/email) and the smoke test must not send one. It
+    // sits ABOVE that gate, so it was firing — and `!isNew` is now EXCLUSIVELY the
+    // smoke-test adopt path for a phone-only capture, since deterministicLeadId was
+    // narrowed to synthetic numbers. buildSmokeTestPhone picks one of only 100 reserved
+    // numbers at random, so collisions are routine by construction and every colliding
+    // resubmission notified a real human about a fake lead. The gate's own comment claims
+    // it skips "the whole cascade"; this is the part that escaped it.
+    if (!isNew && !isSmokeTestLead(lead) && !isSmokeTestLead(leadData)) {
+      const submission = { submissionId: crypto.randomUUID(), submittedAt: new Date().toISOString() };
+      void import('../services/orgLeadNotificationService')
+        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, submission))
+        .catch(() => console.warn('[leadNotifications] submission hook failed', { listId: leadList.listId, leadId: lead.leadId }));
     }
 
     // Send API response immediately so caller is not blocked
@@ -827,7 +1041,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // synthetic lead — CAPI's correctness is already covered by unit tests (metaService.capi
     // .test.ts) and doesn't depend on v0-authored code, so there's nothing extra to verify
     // live here, only real-ad-account conversion data to needlessly pollute.
-    if (pixelId && metaAccountId && eventId && !isSmokeTestEmail(leadData.email) && shouldAttemptCapiSend(leadList.listId) && !isCapiAccountPaused(metaAccountId)) {
+    if (pixelId && metaAccountId && eventId && !isSmokeTestLead(leadData) && shouldAttemptCapiSend(leadList.listId) && !isCapiAccountPaused(metaAccountId)) {
       void (async () => {
         try {
           const owner = await userDb.getUserById(leadList.userId);
@@ -897,7 +1111,13 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     }
 
     // After response is sent: auto-draft, auto-send, and alert (fire-and-forget, fully awaited internally)
-    if (isNew && isSmokeTestEmail(lead.email)) {
+    // Deliberately not `isNew &&`. Before the phone-only adopt path existed, a synthetic
+    // lead could only arrive as a new row, so gating on isNew was equivalent. That path can
+    // now set isUpdated, which reaches the side-effect cascade below — HubSpot/Attio sync,
+    // sequence enrolment, an agent-mode draft — for a lead in the reserved smoke-test range.
+    // `leadData` is checked too: on the adopt path `lead` may be the stored row, whose phone
+    // formatting can differ from the synthetic value this submission actually carried.
+    if (isSmokeTestLead(lead) || isSmokeTestLead(leadData)) {
       // ENG-449 gap #3: the automated post-deploy smoke test submits a REAL lead through a
       // customer's real form to verify the pipeline works, then deletes the row. But deleting
       // the row doesn't undo an already-fired side effect — HubSpot/Attio sync, drip-sequence
@@ -906,7 +1126,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // the instant the lead is created. Skip the whole cascade for a recognized synthetic
       // lead; the lead row itself is still created/returned normally above so the smoke
       // test's CRM-landing check still works.
-      console.log(`[webhooks] Synthetic smoke-test lead (${lead.email}) — skipping CRM sync/sequence enrollment/auto-draft/auto-send/owner-notify side effects`);
+      console.log(`[webhooks] Synthetic smoke-test lead (${lead.email || lead.phone || lead.leadId}) — skipping CRM sync/sequence enrollment/auto-draft/auto-send/owner-notify side effects`);
     } else if (isNew || isUpdated) {
       // Real-time push to any connected external CRM (HubSpot / Attio). The
       // authenticated UI create/update routes do this inline; inbound capture
@@ -922,7 +1142,12 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
       // Enroll the lead into any list-bound drip sequences (uses the list
       // owner's userId since the public webhook request is unauthenticated).
-      void autoEnrollLeadInSequences(leadList.userId, leadList.listId, lead.leadId, lead.email);
+      // Pass the LEAD, not just its address: a LinkedIn-only lead arriving by webhook
+      // was dropped by the old email-only gate even when the watching sequence is
+      // LinkedIn-only.
+      void autoEnrollLeadInSequences(leadList.userId, leadList.listId, lead.leadId, {
+        email: (lead as any).email ?? '', linkedin: (lead as any).linkedin ?? '',
+      });
 
       void (async () => {
         try {
@@ -947,7 +1172,14 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
                 leadList.userId,
                 'text'
               );
-              if (!autoDraftResult?.success) {
+              if (autoDraftResult?.skipped) {
+                // Nothing to draft is not a failure. Without this, a lead with no contact
+                // channel reports autoDraftStatus='failed' and the reason lands in the
+                // owner alert — so every phone-only capture into an autoDraft list would
+                // email its owner a failure notice. Mirrors autoSend's 'skipped_no_email'.
+                console.log(`Auto draft skipped (${autoDraftResult.reason || 'no_contact_channel'}) for lead ${lead.leadId}`);
+                autoDraftStatus = 'skipped_no_email';
+              } else if (!autoDraftResult?.success) {
                 const errMsg = autoDraftResult?.error || autoDraftResult?.message || 'Unknown auto-draft error';
                 console.error('Auto draft creation failed:', errMsg);
                 autoDraftStatus = 'failed';
@@ -1049,6 +1281,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
             lead,
             alertEventType,
             {
+              orgLeadSubmission: true,
               source: mergedCustomFields.source,
               forwardedAt: mergedCustomFields.forwardedAt,
               company: leadData.company,
@@ -1100,41 +1333,245 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 // ─────────────────────────────────────────────────────────────────────────────
 // ATTIO WEBHOOK RECEIVER
 //
-// Attio sends events here for each user who has registered a webhook.
-// The payload identifies the workspace via workspace_id — matched against
-// connected accounts to find the user.
+// Attio's model is per-workspace (each connected account registers its own
+// webhook subscription via AttioService.registerWebhook — see
+// utils/attioWebhookSubscription.ts) rather than HubSpot's single app-wide
+// subscription list, but the request-handling shape mirrors HubSpot's
+// handler below: ACK 200 immediately, verify the signature, dedup via the
+// durable job queue, then demux across every list bound to the matched
+// workspace.
 //
-// Events handled:
-//   record.created  → log for future sync (pull new person into leads)
-//   record.updated  → log for future sync (update matching lead)
-//   record.deleted  → log for future sync (flag lead as removed)
+// Events handled: record.created/updated/deleted (People only — Companies
+// are skipped, matching HubSpot's own webhook scope, which doesn't touch
+// Companies either) and list-entry.created/updated/deleted (the Deal-analog,
+// for parity with HubSpot's deal.propertyChange handling).
 // ─────────────────────────────────────────────────────────────────────────────
-router.post('/attio', async (req: express.Request, res: express.Response) => {
+
+const attioAdapter = new AttioAdapter();
+
+function verifyAttioSignature(signingKey: string, rawBody: Buffer, signature: string): boolean {
   try {
-    const event = req.body;
-    const eventType: string = event?.event_type ?? event?.type ?? 'unknown';
-    const workspaceId: string = event?.workspace_id ?? '';
-    const objectType: string = event?.data?.object?.slug ?? '';
-    const recordId: string = event?.data?.record?.id?.record_id ?? '';
+    const expected = crypto.createHmac('sha256', signingKey).update(rawBody).digest('hex');
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+  } catch {
+    return false;
+  }
+}
 
-    console.log(`[Attio Webhook] event=${eventType} object=${objectType} record=${recordId} workspace=${workspaceId}`);
+interface AttioJobPayload {
+  workspaceId: string;
+  accountId: string; // the specific matched account's id — resolved at signature-verification time
+  userId: string;
+  events: any[];
+}
 
-    // Only process people and companies record events
-    const isRelevantObject = objectType === 'people' || objectType === 'companies';
-    const isRelevantEvent = ['record.created', 'record.updated', 'record.deleted'].includes(eventType);
+export async function processAttioWebhookJob(payload: AttioJobPayload): Promise<void> {
+  const svc = await AttioService.create(payload.userId, payload.accountId);
+  const lists = await crmDb.getLeadListsByUserId(payload.userId);
+  const matchingLists = (lists as any[]).filter(
+    l => l.externalCrmSyncConfigs?.attio?.accountId === payload.accountId,
+  );
 
-    if (!isRelevantObject || !isRelevantEvent) {
-      return res.status(200).json({ received: true, processed: false, reason: 'event not in scope' });
+  // Person attribute types are workspace-wide, not list-scoped, and
+  // loadAttributeTypes has no cache of its own — without sharing one fetch
+  // across this whole job, every record.* event (times every matching list)
+  // reissues the same Attio HTTP request. Fetched lazily (only if the
+  // delivery actually contains a record.* event) and once, then handed to
+  // every applyAttioPersonEvent call below.
+  let peopleAttrCache: Map<string, string> | undefined;
+  if (payload.events.some(e => (e?.event_type ?? '').startsWith('record.'))) {
+    peopleAttrCache = await svc.loadAttributeTypes('people');
+  }
+  // Deal-list attribute types ARE list-scoped (config.attioDealListId), so
+  // cache per distinct deal list id instead — different AgentWeb lists can
+  // point at different Attio deal lists.
+  const dealAttrCacheByListId = new Map<string, Map<string, string>>();
+
+  // CodeRabbit finding (ENG-1380): a per-event failure was recorded into
+  // lastSyncStatus but the job itself still resolved normally, so the
+  // durable job queue called markJobComplete instead of markJobFailed —
+  // a transient failure (Attio fetch error, DynamoDB delete error) was
+  // never retried by the queue's bounded-retry mechanism. OR'd across every
+  // list, not reset per-list, and only thrown after the loop below finishes
+  // — every matching list must still be fully attempted regardless of an
+  // earlier list's failure, exactly as before; only whether the job as a
+  // whole gets retried changes.
+  let anyJobEventFailed = false;
+
+  for (const list of matchingLists) {
+    const syncConfig = await externalCrmSyncService.getConfig(payload.userId, list.listId, 'attio');
+    if (!syncConfig || syncConfig.webhookEnabled === false) continue;
+
+    // Live-caught gap: a webhook-driven update applies correctly (the lead's
+    // data genuinely changes), but nothing stamped lastPullSyncAt/lastSyncStatus
+    // for it — only a manual "Pull" click did. The CRM Sync dialog's "last
+    // pulled" indicator looked permanently stale even while auto-pull was
+    // working. Stamp once per list per job (not per event) once at least one
+    // relevant event was actually attempted against it — set before the call,
+    // not after, so a thrown error still counts as an attempt (and correctly
+    // marks the stamp as a failure, not skips it entirely).
+    let appliedAnyEvent = false;
+    let anyEventFailed = false;
+
+    for (const event of payload.events) {
+      const eventType: string = event?.event_type ?? '';
+      try {
+        if (eventType.startsWith('record.')) {
+          appliedAnyEvent = true;
+          // applyAttioPersonEvent catches its own fetch/deletion failures
+          // internally and returns false rather than throwing (CodeRabbit
+          // finding, ENG-1380) — check the return value, not just the catch.
+          const applied = await applyAttioPersonEvent(list.listId, syncConfig, svc, event, peopleAttrCache);
+          if (!applied) anyEventFailed = true;
+        } else if (eventType.startsWith('list-entry.')) {
+          const entryId: string = event?.id?.entry_id ?? event?.data?.entry_id ?? '';
+          if (entryId) {
+            appliedAnyEvent = true;
+            const dealListId = syncConfig.attioDealListId;
+            let dealAttrCache = dealListId ? dealAttrCacheByListId.get(dealListId) : undefined;
+            if (dealListId && !dealAttrCache) {
+              dealAttrCache = await svc.loadAttributeTypes('people', dealListId);
+              dealAttrCacheByListId.set(dealListId, dealAttrCache);
+            }
+            await attioAdapter.applyListEntryWebhookEvent(list.listId, syncConfig, svc, entryId, eventType, dealAttrCache);
+          }
+        }
+      } catch (err: any) {
+        console.error(`[Attio Webhook] Failed to apply ${eventType} to list ${list.listId}:`, err?.message ?? err);
+        anyEventFailed = true;
+      }
     }
 
-    // TODO: Trigger sync handler when sync service is implemented
-    // await attioSyncService.handleWebhookEvent(workspaceId, eventType, event.data);
-
-    res.status(200).json({ received: true, processed: true });
-  } catch (error: any) {
-    console.error('[Attio Webhook] error:', error);
-    res.status(200).json({ received: true, processed: false, error: error.message });
+    if (appliedAnyEvent) {
+      await externalCrmSyncService.updateSyncTimestamp(syncConfig, 'pull', !anyEventFailed);
+    }
+    if (anyEventFailed) anyJobEventFailed = true;
   }
+
+  // Thrown only after every matching list has been attempted — the caller's
+  // markJobFailed/retry path re-processes this same payload later. Safe to
+  // retry the whole delivery: every event application here (person create/
+  // update, list-entry field merge) is an idempotent upsert, so re-applying
+  // an event that already succeeded on a prior attempt is a no-op, not a
+  // duplicate side effect.
+  if (anyJobEventFailed) {
+    throw new Error('[Attio Webhook] One or more events failed to apply — see prior logs for detail');
+  }
+}
+
+registerProcessor('attio_webhook', processAttioWebhookJob);
+
+router.post('/attio', (req: express.Request, res: express.Response) => {
+  // Attio's webhook-URL verification handshake, if it applies here — echo
+  // X-Hook-Secret back so the subscription activates. (Also handled in
+  // crmWebhook.ts's per-list endpoint; kept defensively for this endpoint
+  // too since it's cheap and the create-webhook flow doesn't rule it out.)
+  const hookSecret = req.headers['x-hook-secret'] as string | undefined;
+  if (hookSecret) {
+    res.set('X-Hook-Secret', hookSecret);
+    return res.status(200).json({ received: true });
+  }
+
+  // Return 200 immediately — Attio retries on non-2xx or timeout (at-least-once
+  // delivery, up to 10 retries over ~3 days). All processing is fire-and-forget.
+  res.status(200).json({ received: true });
+
+  void (async () => {
+    try {
+      const rawBody = req.body as Buffer;
+      const payload: any = JSON.parse(rawBody.toString('utf8'));
+      // Real shape (live-verified, ENG-1380): { webhook_id, events: [{ event_type,
+      // id: { workspace_id, object_id, record_id, ... }, actor }] }. workspace_id
+      // lives on each individual event's `id`, not at the top level — the original
+      // stub's `event?.workspace_id` assumption never matched a real delivery.
+      const rawEvents: any[] = Array.isArray(payload?.events) ? payload.events : [payload];
+      // Real deliveries carry a handful of events at most; cap defensively so a
+      // malformed or oversized body can't fan out into an unbounded number of
+      // per-event Attio API calls and DB writes in processAttioWebhookJob.
+      const MAX_EVENTS_PER_DELIVERY = 200;
+      if (rawEvents.length > MAX_EVENTS_PER_DELIVERY) {
+        console.warn(`[Attio Webhook] Delivery carries ${rawEvents.length} events — processing only the first ${MAX_EVENTS_PER_DELIVERY}`);
+      }
+      const events = rawEvents.slice(0, MAX_EVENTS_PER_DELIVERY);
+      const workspaceId: string = events[0]?.id?.workspace_id ?? '';
+      if (!workspaceId) {
+        console.warn('[Attio Webhook] No workspace_id on delivery — ignored');
+        return;
+      }
+
+      const candidates = await getAccountsByAttioWorkspaceId(workspaceId);
+      if (candidates.length === 0) {
+        console.warn(`[Attio Webhook] No connected account found for workspace ${workspaceId}`);
+        return;
+      }
+
+      // Attio-Signature (duplicated as X-Attio-Signature for legacy support) —
+      // HMAC-SHA256 of the raw body with the matched account's own signing
+      // key. Try each candidate's key rather than committing to a single
+      // guess (same multi-tenant-collision defense as getAccountsByAttioWorkspaceId
+      // itself documents).
+      const signature = (req.headers['attio-signature'] ?? req.headers['x-attio-signature']) as string | undefined;
+      // Fail closed: the unsigned-request bypass is only allowed when
+      // NODE_ENV is explicitly 'development', mirroring this codebase's own
+      // TABLE_PREFIX convention (constants.ts) of treating anything that
+      // isn't exactly 'development' as needing production-safe behavior.
+      // The previous `isProd = NODE_ENV === 'production'` check was
+      // fail-open: an unset, staging, mistyped, or otherwise non-'production'
+      // NODE_ENV value in a real deployment let a completely unauthenticated
+      // request through, matched against the first candidate account, and
+      // processed as if legitimate.
+      const isDev = process.env.NODE_ENV === 'development';
+      let matched: { userId: string; accountId: string } | null = null;
+
+      if (signature) {
+        for (const { userId, account } of candidates) {
+          const signingKey = (account.config as any).webhook_signing_key;
+          if (signingKey && verifyAttioSignature(signingKey, rawBody, signature)) {
+            matched = { userId, accountId: account.account_id };
+            break;
+          }
+        }
+        if (!matched) {
+          console.warn(`[Attio Webhook] Signature did not verify against any connected account for workspace ${workspaceId} — request ignored`);
+          return;
+        }
+      } else if (!isDev) {
+        console.warn('[Attio Webhook] Missing Attio-Signature — request rejected (unsigned requests are only allowed when NODE_ENV=development)');
+        return;
+      } else {
+        console.warn('[Attio Webhook] No Attio-Signature header — proceeding without verification (dev only)');
+        matched = { userId: candidates[0].userId, accountId: candidates[0].account.account_id };
+      }
+
+      const dedupeKey = (req.headers['idempotency-key'] as string | undefined)
+        ?? crypto.createHash('sha256').update(rawBody).digest('hex');
+      const jobPayload: AttioJobPayload = { workspaceId, accountId: matched.accountId, userId: matched.userId, events };
+
+      const enqueueResult = await enqueueJob('attio_webhook', dedupeKey, jobPayload, { claimImmediately: true });
+      if (enqueueResult === 'duplicate') {
+        console.log(`[Attio Webhook] Duplicate delivery (${dedupeKey.slice(0, 12)}...) — already queued, skipping`);
+        return;
+      }
+
+      const stopHeartbeat = enqueueResult === 'enqueued' ? startHeartbeat('attio_webhook', dedupeKey) : () => {};
+      try {
+        await processAttioWebhookJob(jobPayload);
+        if (enqueueResult === 'enqueued') {
+          await markJobComplete('attio_webhook', dedupeKey);
+        }
+      } catch (processingError: any) {
+        if (enqueueResult === 'enqueued') {
+          await markJobFailed('attio_webhook', dedupeKey, processingError);
+        } else {
+          console.error('[Attio Webhook] Processing failed with no durable record (queue unavailable):', processingError?.message ?? processingError);
+        }
+      } finally {
+        stopHeartbeat();
+      }
+    } catch (error: any) {
+      console.error('[Attio Webhook] error:', error);
+    }
+  })();
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1296,7 +1733,37 @@ export async function processHubspotWebhookJob(payload: HubspotJobPayload): Prom
             continue;
           }
 
-          const lead = await crmDb.getLeadByEmail(list.listId, email.toLowerCase());
+          // Email first, then the contact id we already stored when WE pushed this lead.
+          // Email alone is not an identity for a lead that has none: ENG-2082 leads sync to
+          // HubSpot with a hubspot_contact_id and no address, so the moment HubSpot returns
+          // one this lookup missed, the edit was dropped and — on a creation event — a
+          // SECOND row was created carrying the same hubspot_contact_id as the first. The
+          // Attio path and crmWebhook.ts:136 already resolve by id; this one did not.
+          // Email first, then the contact id — UNCONDITIONALLY. An earlier version gated the
+          // fallback on `isCreation || isDeleted` to save the partition walk, which quietly
+          // disabled the whole feature: a HubSpot creation event for a lead we pushed
+          // without an address carries no email, so the handler `continue`s at `if (!email)`
+          // above before any lookup happens. The address therefore only ever arrives as a
+          // contact.propertyChange — precisely the case that gate excluded. The walk is
+          // bounded by MAX_PAGES inside the lookup; correctness is not negotiable for it.
+          const leadByEmail = await crmDb.getLeadByEmail(list.listId, email.toLowerCase());
+          let lead = leadByEmail;
+          if (!lead) {
+            try {
+              lead = await crmDb.getLeadByHubSpotContactId(list.listId, String(objectId));
+            } catch (lookupErr: any) {
+              // ANY failure means we cannot prove the lead is absent, and the branches
+              // below act on that assumption. `lookupExhausted` is only the page-cap case;
+              // a throttle or timeout used to fall through as `lead = null`. Less severe
+              // here than in crmWebhook — creation is gated on data.isCreation — but the
+              // edit is still applied to the wrong row or dropped, so skip either way.
+              const why = lookupErr?.lookupExhausted
+                ? lookupErr.message
+                : `contact-id lookup failed (${lookupErr?.message || lookupErr})`;
+              console.warn(`[HubSpot Webhook] ${why} — skipping list ${list.listId}`);
+              continue;
+            }
+          }
 
           // Deletion: flag an existing lead as CRM-removed (nothing to do if absent).
           if (data.isDeleted) {
@@ -1316,6 +1783,13 @@ export async function processHubspotWebhookJob(payload: HubspotJobPayload): Prom
           if (data.properties.jobtitle        !== undefined) fields.title     = data.properties.jobtitle;
           if (data.properties.company         !== undefined) fields.company   = data.properties.company;
           if (data.properties.hs_linkedin_url !== undefined) fields.linkedin  = data.properties.hs_linkedin_url;
+          // Adopt the address when we resolved this lead by CONTACT ID rather than by email.
+          // The whole point of that fallback is the lead had no email and HubSpot now has
+          // one — writing every other property but not that one leaves the row address-less,
+          // so getLeadByEmail misses again on the next webhook and the fallback (a full
+          // partition walk) runs forever. Only when it is genuinely new: never clobber a
+          // different address we already hold.
+          if (email && !lead?.email) fields.email = email.toLowerCase();
 
           const standardHubspotProps = ['email', 'firstname', 'lastname', 'phone', 'jobtitle', 'company', 'hs_linkedin_url'];
           const customFieldUpdates: any = {};

@@ -19,7 +19,7 @@ jest.mock('../services/db', () => ({
   },
 }));
 
-import { mirrorLinkedInInviteToCrm } from '../services/linkedInInviteCrmMirror';
+import { mirrorLinkedInInviteToCrm, recordInviteWithdrawnInCrm, INVITE_WITHDRAWN_EVENT } from '../services/linkedInInviteCrmMirror';
 
 const LIST = 'list_1782945941846_b0ptvsguv';
 
@@ -223,6 +223,146 @@ describe('mirrorLinkedInInviteToCrm', () => {
       eventType: 'linkedin.invite.sent',
       createdAt: '2026-07-31T00:00:00.000Z',
     }), expect.objectContaining({ expectedUpdatedAt: expect.any(String) }));
+  });
+
+  // ---- eventType (ENG-1595): mirroring an ACCEPTED inbound connection, not just a
+  // SENT invitation, through the same function ----
+
+  describe('eventType — accepted vs sent (ENG-1595)', () => {
+    it('defaults to linkedin.invite.sent when eventType is omitted', async () => {
+      await mirrorLinkedInInviteToCrm({
+        listId: LIST,
+        linkedinUrl: 'https://www.linkedin.com/in/david-yao',
+      });
+      expect(addLeadEngagement).toHaveBeenCalledWith(LIST, 'lead_new_1', expect.objectContaining({
+        eventType: 'linkedin.invite.sent',
+      }), expect.anything());
+    });
+
+    it('stamps linkedInInviteSentAt (never linkedInInviteAcceptedAt) for a SENT mirror', async () => {
+      await mirrorLinkedInInviteToCrm({
+        listId: LIST,
+        linkedinUrl: 'https://www.linkedin.com/in/david-yao',
+        sentAt: '2026-08-01T00:00:00.000Z',
+      });
+      const call = updateLead.mock.calls[0];
+      expect(call[2]).toHaveProperty('linkedInInviteSentAt', '2026-08-01T00:00:00.000Z');
+      expect(call[2]).not.toHaveProperty('linkedInInviteAcceptedAt');
+    });
+
+    it('stamps linkedInInviteAcceptedAt (never linkedInInviteSentAt) for an ACCEPTED mirror — an accepted inbound connection must never be recorded as an outbound send', async () => {
+      await mirrorLinkedInInviteToCrm({
+        listId: LIST,
+        linkedinUrl: 'https://www.linkedin.com/in/david-yao',
+        eventType: 'linkedin.invite.accepted',
+        sentAt: '2026-08-01T00:00:00.000Z',
+      });
+      const call = updateLead.mock.calls[0];
+      expect(call[2]).toHaveProperty('linkedInInviteAcceptedAt', '2026-08-01T00:00:00.000Z');
+      expect(call[2]).not.toHaveProperty('linkedInInviteSentAt');
+    });
+
+    it('does not overwrite an existing linkedInInviteSentAt when mirroring a later ACCEPTED event for the same lead', async () => {
+      findLeadByLinkedinInList.mockResolvedValue({
+        leadId: 'lead_existing',
+        listId: LIST,
+        status: 'contacted',
+        linkedInInviteSentAt: '2026-07-01T00:00:00.000Z',
+        updatedAt: '2026-07-01T00:00:00.000Z',
+      });
+      await mirrorLinkedInInviteToCrm({
+        listId: LIST,
+        linkedinUrl: 'https://www.linkedin.com/in/david-yao',
+        eventType: 'linkedin.invite.accepted',
+      });
+      const call = updateLead.mock.calls[0];
+      // The update only ever SETS the accepted field — it never touches
+      // linkedInInviteSentAt, so a real prior outbound timestamp survives.
+      expect(call[2]).not.toHaveProperty('linkedInInviteSentAt');
+      expect(call[2]).toHaveProperty('linkedInInviteAcceptedAt');
+    });
+
+    it('logs linkedin.invite.accepted when the caller mirrors an accepted inbound connection', async () => {
+      await mirrorLinkedInInviteToCrm({
+        listId: LIST,
+        linkedinUrl: 'https://www.linkedin.com/in/david-yao',
+        eventType: 'linkedin.invite.accepted',
+      });
+      expect(addLeadEngagement).toHaveBeenCalledWith(LIST, 'lead_new_1', expect.objectContaining({
+        eventType: 'linkedin.invite.accepted',
+      }), expect.anything());
+    });
+
+    it('a prior SENT engagement does not suppress a fresh ACCEPTED mirror for the same person/account', async () => {
+      findLeadByLinkedinInList.mockResolvedValue({
+        leadId: 'lead_existing',
+        listId: LIST,
+        status: 'contacted',
+        updatedAt: '2026-08-01T00:00:00.000Z',
+        engagements: [{
+          eventType: 'linkedin.invite.sent',
+          createdAt: '2026-07-20T00:00:00.000Z',
+          eventData: { accountId: 'acct_1', linkedin: 'https://www.linkedin.com/in/david-yao' },
+        }],
+      });
+      const res = await mirrorLinkedInInviteToCrm({
+        listId: LIST,
+        linkedinUrl: 'https://www.linkedin.com/in/david-yao',
+        accountId: 'acct_1',
+        eventType: 'linkedin.invite.accepted',
+      });
+      // Different event types are different real-world events — both get recorded,
+      // not just the first one seen.
+      expect(res?.engagementLogged).toBe(true);
+      expect(addLeadEngagement).toHaveBeenCalledWith(LIST, 'lead_existing', expect.objectContaining({
+        eventType: 'linkedin.invite.accepted',
+      }), expect.anything());
+    });
+
+    it('a prior ACCEPTED engagement does not suppress a fresh SENT mirror for the same person/account', async () => {
+      findLeadByLinkedinInList.mockResolvedValue({
+        leadId: 'lead_existing',
+        listId: LIST,
+        status: 'contacted',
+        updatedAt: '2026-08-01T00:00:00.000Z',
+        engagements: [{
+          eventType: 'linkedin.invite.accepted',
+          createdAt: '2026-07-20T00:00:00.000Z',
+          eventData: { accountId: 'acct_1', linkedin: 'https://www.linkedin.com/in/david-yao' },
+        }],
+      });
+      const res = await mirrorLinkedInInviteToCrm({
+        listId: LIST,
+        linkedinUrl: 'https://www.linkedin.com/in/david-yao',
+        accountId: 'acct_1',
+      });
+      expect(res?.engagementLogged).toBe(true);
+      expect(addLeadEngagement).toHaveBeenCalledWith(LIST, 'lead_existing', expect.objectContaining({
+        eventType: 'linkedin.invite.sent',
+      }), expect.anything());
+    });
+
+    it('is still idempotent within the SAME eventType — re-mirroring an already-recorded accept is skipped', async () => {
+      findLeadByLinkedinInList.mockResolvedValue({
+        leadId: 'lead_existing',
+        listId: LIST,
+        status: 'contacted',
+        engagements: [{
+          eventType: 'linkedin.invite.accepted',
+          createdAt: '2026-07-20T00:00:00.000Z',
+          eventData: { accountId: 'acct_1', linkedin: 'https://www.linkedin.com/in/david-yao', invitationId: 'inv_1' },
+        }],
+      });
+      const res = await mirrorLinkedInInviteToCrm({
+        listId: LIST,
+        linkedinUrl: 'https://www.linkedin.com/in/david-yao',
+        accountId: 'acct_1',
+        eventType: 'linkedin.invite.accepted',
+        invitationId: 'inv_1',
+      });
+      expect(res?.engagementLogged).toBe(false);
+      expect(addLeadEngagement).not.toHaveBeenCalled();
+    });
   });
 
   // ---- caller-supplied leadId must match the invitee (Greptile P1) ----
@@ -685,5 +825,85 @@ describe('mirrorLinkedInInviteToCrm', () => {
         listId: LIST, linkedinUrl: PROFILE, accountId: 'acct_1', invitationId: 'inv_1',
       })).rejects.toThrow('dynamo down');
     });
+  });
+});
+
+// ENG-1719 / CodeRabbit on PR #2801. The first version of recordInviteWithdrawnInCrm
+// had the duplicate GUARD but not the CAS: addLeadEngagement appends
+// unconditionally unless expectedUpdatedAt is supplied, so the read and the append
+// are two operations and two concurrent drains can both observe "not present" and
+// both append.
+describe('recordInviteWithdrawnInCrm', () => {
+  const URL = 'https://www.linkedin.com/in/withdrawee/';
+  // What normalizeLinkedInUrl stores — the trailing slash is stripped, so a
+  // fixture using the raw URL would never match the duplicate check.
+  const NORM = 'https://www.linkedin.com/in/withdrawee';
+  const lead = (engagements: any[] = [], updatedAt = '2026-09-01T00:00:00.000Z') => ({
+    leadId: 'lead_w1', updatedAt, engagements,
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    addLeadEngagement.mockResolvedValue({});
+    getLeadById.mockResolvedValue(null);
+  });
+
+  it('guards the append on the lead being unchanged since the read', async () => {
+    findLeadByLinkedinInList.mockResolvedValue(lead());
+
+    await recordInviteWithdrawnInCrm({
+      userId: 'u1', accountId: 'acc-1', linkedinUrl: URL, invitationId: 'inv-1', listId: LIST,
+    });
+
+    expect(addLeadEngagement).toHaveBeenCalledWith(
+      LIST, 'lead_w1',
+      expect.objectContaining({ eventType: INVITE_WITHDRAWN_EVENT }),
+      { expectedUpdatedAt: '2026-09-01T00:00:00.000Z' },
+    );
+  });
+
+  it('on a lost race, re-reads and skips when the winner already wrote it', async () => {
+    findLeadByLinkedinInList.mockResolvedValue(lead());
+    const precondition: any = new Error('stale'); precondition.preconditionFailed = true;
+    addLeadEngagement.mockRejectedValueOnce(precondition);
+    // The winner's engagement is present on re-read.
+    getLeadById.mockResolvedValue(lead([{
+      eventType: INVITE_WITHDRAWN_EVENT,
+      eventData: { linkedin: NORM, accountId: 'acc-1', invitationId: 'inv-1' },
+    }], '2026-09-01T00:00:05.000Z'));
+
+    const res = await recordInviteWithdrawnInCrm({
+      userId: 'u1', accountId: 'acc-1', linkedinUrl: URL, invitationId: 'inv-1', listId: LIST,
+    });
+
+    expect(res).toEqual({ leadId: 'lead_w1', listId: LIST, engagementLogged: true });
+    // One failed attempt, then the duplicate check stops it — no blind second append.
+    expect(addLeadEngagement).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not append twice for the same withdrawal', async () => {
+    findLeadByLinkedinInList.mockResolvedValue(lead([{
+      eventType: INVITE_WITHDRAWN_EVENT,
+      eventData: { linkedin: NORM, accountId: 'acc-1', invitationId: 'inv-1' },
+    }]));
+
+    await recordInviteWithdrawnInCrm({
+      userId: 'u1', accountId: 'acc-1', linkedinUrl: URL, invitationId: 'inv-1', listId: LIST,
+    });
+
+    expect(addLeadEngagement).not.toHaveBeenCalled();
+  });
+
+  it('never creates a lead — a withdrawal is not an act of outreach', async () => {
+    findLeadByLinkedinInList.mockResolvedValue(null);
+
+    const res = await recordInviteWithdrawnInCrm({
+      userId: 'u1', accountId: 'acc-1', linkedinUrl: URL, invitationId: 'inv-1', listId: LIST,
+    });
+
+    expect(res).toBeNull();
+    expect(createLead).not.toHaveBeenCalled();
+    expect(updateLead).not.toHaveBeenCalled();
+    expect(addLeadEngagement).not.toHaveBeenCalled();
   });
 });

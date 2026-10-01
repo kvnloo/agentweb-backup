@@ -25,6 +25,9 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as ts from 'typescript';
+
+import { METERED_VENDOR_PROVIDERS } from '../services/usageAnalyticsService';
 
 const SRC_ROOT = path.join(__dirname, '..');
 
@@ -50,8 +53,68 @@ interface VendorSignature {
 const USAGE_RECORDER_IMPORT = /import\s*\{[^}]*\b(?:recordUsage|recordVendorUsage)\b[^}]*\}\s*from\s*['"][^'"]*usageRecorderService['"]/;
 const USAGE_RECORDER_CALL = /\b(?:recordUsage|recordVendorUsage)\s*\(/;
 
-function isMetered(content: string): boolean {
+function isMeteredDirectly(content: string): boolean {
   return USAGE_RECORDER_IMPORT.test(content) && USAGE_RECORDER_CALL.test(content);
+}
+
+/** `import { a, b } from './x'` / `import x from '../y'` — relative imports only. */
+const LOCAL_IMPORT = /import\s+(?:\{([^}]*)\}|(\w+))\s+from\s+['"](\.[^'"]*)['"]/g;
+
+/**
+ * Resolve a relative specifier against the importing file, to a key in the
+ * in-memory file map. `.ts` is appended because that is what the map holds; an
+ * index file is tried too, since `./foo` may mean `foo/index.ts`.
+ */
+function resolveLocalImport(fromRel: string, spec: string): string[] {
+  const dir = fromRel.includes("/") ? fromRel.slice(0, fromRel.lastIndexOf("/")) : "";
+  const parts = (dir ? `${dir}/${spec}` : spec).split("/");
+  const stack: string[] = [];
+  for (const part of parts) {
+    if (part === "." || part === "") continue;
+    if (part === "..") stack.pop();
+    else stack.push(part);
+  }
+  const base = stack.join("/");
+  return [`${base}.ts`, `${base}/index.ts`];
+}
+
+/**
+ * True when `rel` records usage — directly, or through ONE hop of a local
+ * helper that does.
+ *
+ * ENG-1797: the direct-only check was a false negative that mattered.
+ * `v0Service.ts` meters every one of its eleven call sites through
+ * `meteredV0`, never importing the recorder itself, so the guard could not see
+ * it — and the module stayed allowlisted as unmetered. Removing that metering
+ * would have shipped green, which is the one thing ENG-701 exists to prevent.
+ *
+ * ONE hop, deliberately. It covers the helper pattern actually in use and
+ * keeps this a pure, terminating function over the file map; arbitrary depth
+ * would need cycle handling and would start calling a module "metered" on the
+ * strength of a relationship no reader could see.
+ *
+ * The imported name must also be CALLED here. An unused helper import proves
+ * nothing, which is the same strictness the direct check already applies after
+ * ENG-701's review finding.
+ */
+function isMetered(rel: string, content: string, files: ReadonlyMap<string, string>): boolean {
+  if (isMeteredDirectly(content)) return true;
+
+  for (const match of content.matchAll(LOCAL_IMPORT)) {
+    const named = (match[1] || match[2] || "")
+      .split(",")
+      .map((n) => n.trim().split(/\s+as\s+/).pop()!.trim())
+      .filter(Boolean);
+    if (!named.length) continue;
+
+    for (const candidate of resolveLocalImport(rel, match[3])) {
+      const helper = files.get(candidate);
+      if (helper === undefined || !isMeteredDirectly(helper)) continue;
+      if (named.some((name) => new RegExp(`\\b${name}\\s*\\(`).test(content))) return true;
+    }
+  }
+
+  return false;
 }
 
 interface AllowlistEntry {
@@ -75,6 +138,7 @@ const VENDOR_SIGNATURES: VendorSignature[] = [
   { vendor: 'Google Custom Search', re: /google\.customsearch\(/ },
   { vendor: 'Apollo', re: /api\.apollo\.io/ },
   { vendor: 'enrich.so', re: /dev\.enrich\.so/ },
+  { vendor: 'Enigma', re: /api\.enigma\.com/ },
   { vendor: 'ElevenLabs', re: /api\.elevenlabs\.io/ },
   { vendor: '2captcha', re: /2captcha\.com/ },
   { vendor: 'Placid', re: /api\.placid\.app/ },
@@ -95,60 +159,6 @@ const VENDOR_SIGNATURES: VendorSignature[] = [
  * meter the module instead.
  */
 const VENDOR_ALLOWLIST: AllowlistEntry[] = [
-  {
-    path: 'services/v0Service.ts',
-    vendor: 'v0 (Vercel)',
-    issue: 'ENG-694',
-    reason: '9 billable v0.chats.create/sendMessage sites; none record usage yet.',
-  },
-  {
-    path: 'search/youSearchProvider.ts',
-    vendor: 'You.com search',
-    issue: 'ENG-695',
-    reason: 'ydc-index.io queries are unmetered; the owning user is discarded at the seam.',
-  },
-  {
-    path: 'search/googleSearchProvider.ts',
-    vendor: 'Google Custom Search',
-    issue: 'ENG-695',
-    reason: 'Same search seam as You.com — billed customsearch.cse.list calls are unmetered.',
-  },
-  {
-    path: 'services/apolloServiceFactory.ts',
-    vendor: 'Apollo',
-    issue: 'ENG-696',
-    reason: 'apolloService.ts only tracks a call-count quota; no $ ledger entry is written.',
-  },
-  {
-    path: 'services/enrichSoServiceFactory.ts',
-    vendor: 'enrich.so',
-    issue: 'ENG-696',
-    reason: 'Structural twin of Apollo — call-count quota only, no $ ledger entry.',
-  },
-  {
-    path: 'services/voiceoverService.ts',
-    vendor: 'ElevenLabs',
-    issue: 'ENG-698',
-    reason: 'Text-to-speech calls are unmetered.',
-  },
-  {
-    path: 'emma/solveRecaptchaTool.ts',
-    vendor: '2captcha',
-    issue: 'ENG-698',
-    reason: 'submit2CaptchaTask solve calls are unmetered.',
-  },
-  {
-    path: 'controllers/tasks.ts',
-    vendor: 'Placid',
-    issue: 'ENG-698',
-    reason: 'Editor-token and rendered-image fetch calls are unmetered.',
-  },
-  {
-    path: 'services/remotionService.ts',
-    vendor: 'Remotion Lambda',
-    issue: 'ENG-699',
-    reason: 'renderMediaOnLambda submissions are unmetered.',
-  },
 ];
 
 // ─── Pure scanning logic (unit-tested against fixtures below) ────────────────
@@ -169,7 +179,7 @@ function scanForVendorViolations(
   for (const [rel, content] of files) {
     for (const { vendor, re } of signatures) {
       if (!re.test(content)) continue;
-      if (isMetered(content)) continue; // metered — no allowlist needed
+      if (isMetered(rel, content, files)) continue; // metered — no allowlist needed
 
       const entry = allowlistByPath.get(rel);
       if (!entry) {
@@ -220,7 +230,7 @@ function findStaleAllowlistEntries(
       continue;
     }
 
-    if (isMetered(content)) {
+    if (isMetered(entry.path, content, files)) {
       stale.push(
         `${entry.path} (now records usage via usageRecorderService — ${entry.issue} shipped, remove from VENDOR_ALLOWLIST)`
       );
@@ -380,6 +390,148 @@ function loadRealRepoFiles(): Map<string, string> {
   return files;
 }
 
+/**
+ * Provider keys passed to `recordVendorUsage` as a shared constant rather than
+ * a string literal. Resolved by name so the registry check below still sees
+ * them.
+ *
+ * Kept as an explicit alias map, not a looser regex: a NEW constant-valued
+ * provider then fails the registry check loudly and gets an entry here, which
+ * is the behaviour we want. A regex broad enough to guess would instead
+ * silently "resolve" the wrong thing.
+ */
+const PROVIDER_CONSTANT_ALIASES: Record<string, string> = {
+  TWITTER_PROVIDER: 'twitter', // services/twitterService.ts (ENG-664)
+};
+
+/** Lines of a `recordVendorUsage({ ... })` call to scan for its provider key. */
+const CALL_WINDOW_LINES = 15;
+
+/**
+ * Every provider key the repo actually meters, read from the `provider:` field
+ * of each `recordVendorUsage` call.
+ *
+ * Scoped to a window after each call site rather than the whole file, because
+ * the search providers carry an unrelated `provider: this.name` on their own
+ * result objects — a file-wide scan would report `this` as a vendor.
+ */
+function meteredProviderKeysInRepo(files: ReadonlyMap<string, string>): string[] {
+  const found = new Set<string>();
+  for (const content of files.values()) {
+    const lines = content.split('\n');
+    lines.forEach((line, i) => {
+      if (!/recordVendorUsage\s*\(/.test(line)) return;
+      const window = lines.slice(i, i + CALL_WINDOW_LINES).join('\n');
+      for (const m of window.matchAll(/provider:\s*(?:(['"])([^'"]+)\1|([A-Z][A-Z0-9_]*))/g)) {
+        const key = m[2] ?? PROVIDER_CONSTANT_ALIASES[m[3]!];
+        if (key) found.add(key);
+      }
+    });
+  }
+  return [...found].sort();
+}
+
+describe('helper-indirected metering (ENG-1797)', () => {
+  const SIGS: VendorSignature[] = [{ vendor: 'FakeVendor', re: /fake-vendor\.example\.com/ }];
+
+  const METERED_HELPER = `
+    import { recordVendorUsage } from "./usageRecorderService";
+    export function meteredFake(ctx: any, call: any) { recordVendorUsage(ctx); return call; }
+  `;
+  const CALLER = `
+    import { meteredFake } from "./fakeMetering";
+    meteredFake({}, () => fetch('https://fake-vendor.example.com/bill-me'));
+  `;
+
+  it('sees a module metered through ONE hop of a local helper', () => {
+    // The false negative this fixes: v0Service.ts meters all eleven of its call
+    // sites through meteredV0 and never imports the recorder itself, so the
+    // direct-only check reported it as unmetered.
+    const files = new Map([
+      ['services/fakeMetering.ts', METERED_HELPER],
+      ['services/fakeVendorThing.ts', CALLER],
+    ]);
+
+    expect(scanForVendorViolations(files, SIGS, [])).toEqual([]);
+  });
+
+  it('does NOT count an unused helper import', () => {
+    // Same strictness the direct check already applies: an import proves
+    // nothing unless the thing is actually called.
+    const files = new Map([
+      ['services/fakeMetering.ts', METERED_HELPER],
+      [
+        'services/fakeVendorThing.ts',
+        `import { meteredFake } from "./fakeMetering";
+         fetch('https://fake-vendor.example.com/bill-me');`,
+      ],
+    ]);
+
+    expect(scanForVendorViolations(files, SIGS, [])).toHaveLength(1);
+  });
+
+  it('does NOT count a helper that is not itself metered', () => {
+    const files = new Map([
+      ['services/fakeMetering.ts', 'export function meteredFake(c: any, call: any) { return call; }'],
+      ['services/fakeVendorThing.ts', CALLER],
+    ]);
+
+    expect(scanForVendorViolations(files, SIGS, [])).toHaveLength(1);
+  });
+
+  it('does not follow a SECOND hop, so "metered" never rests on an invisible chain', () => {
+    const files = new Map([
+      ['services/fakeMetering.ts', METERED_HELPER],
+      ['services/middle.ts', 'import { meteredFake } from "./fakeMetering";\nexport const passThrough = meteredFake;'],
+      ['services/fakeVendorThing.ts', `import { passThrough } from "./middle";\npassThrough({}, () => fetch('https://fake-vendor.example.com/bill-me'));`],
+    ]);
+
+    expect(scanForVendorViolations(files, SIGS, [])).toHaveLength(1);
+  });
+
+  it('flags an allowlist entry as stale once the module becomes helper-metered', () => {
+    // This is the state v0Service.ts was in: genuinely metered, still
+    // allowlisted as unmetered, with nothing to say so.
+    const files = new Map([
+      ['services/fakeMetering.ts', METERED_HELPER],
+      ['services/fakeVendorThing.ts', CALLER],
+    ]);
+    const allowlist: AllowlistEntry[] = [
+      { path: 'services/fakeVendorThing.ts', vendor: 'FakeVendor', issue: 'ENG-9999', reason: 'unmetered' },
+    ];
+
+    const stale = findStaleAllowlistEntries(files, SIGS, allowlist);
+    expect(stale).toHaveLength(1);
+    expect(stale[0]).toMatch(/now records usage/);
+  });
+
+  it('catches the regression the amnesty used to hide: metering removed from the helper', () => {
+    // The inverse test. With the helper no longer metering, the caller must be
+    // reported — previously the allowlist entry made this ship green.
+    const files = new Map([
+      ['services/fakeMetering.ts', 'export function meteredFake(c: any, call: any) { return call; }'],
+      ['services/fakeVendorThing.ts', CALLER],
+    ]);
+
+    const violations = scanForVendorViolations(files, SIGS, []);
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toMatch(/records no usage/);
+  });
+
+  it('resolves a parent-relative helper import', () => {
+    const files = new Map([
+      ['services/fakeMetering.ts', METERED_HELPER],
+      [
+        'search/fakeVendorThing.ts',
+        `import { meteredFake } from "../services/fakeMetering";
+         meteredFake({}, () => fetch('https://fake-vendor.example.com/bill-me'));`,
+      ],
+    ]);
+
+    expect(scanForVendorViolations(files, SIGS, [])).toEqual([]);
+  });
+});
+
 describe('Vendor metering coverage guard (ENG-701, real repo)', () => {
   it('no unmetered paid-vendor egress outside the allowlist', () => {
     const violations = scanForVendorViolations(loadRealRepoFiles(), VENDOR_SIGNATURES, VENDOR_ALLOWLIST);
@@ -401,15 +553,116 @@ describe('Vendor metering coverage guard (ENG-701, real repo)', () => {
     // shrink: a slice issue ships metering into the module, which the
     // staleness test above then requires removing the entry for.
     expect(VENDOR_ALLOWLIST.map((e) => `${e.vendor} (${e.path}) — ${e.issue}`).sort()).toEqual([
-      '2captcha (emma/solveRecaptchaTool.ts) — ENG-698',
-      'Apollo (services/apolloServiceFactory.ts) — ENG-696',
-      'ElevenLabs (services/voiceoverService.ts) — ENG-698',
-      'Google Custom Search (search/googleSearchProvider.ts) — ENG-695',
-      'Placid (controllers/tasks.ts) — ENG-698',
-      'Remotion Lambda (services/remotionService.ts) — ENG-699',
-      'You.com search (search/youSearchProvider.ts) — ENG-695',
-      'enrich.so (services/enrichSoServiceFactory.ts) — ENG-696',
-      'v0 (Vercel) (services/v0Service.ts) — ENG-694',
     ]);
+    // Empty since ENG-698 (2026-09-14): every known paid-vendor egress module now
+    // records usage. The staleness and scan tests above still run, so a NEW
+    // unmetered vendor fails the build exactly as before — an empty amnesty list
+    // is the goal state, not a switched-off guard.
+  });
+
+  /**
+   * ENG-1837. The admin provider picker offers METERED_VENDOR_PROVIDERS, so
+   * that list has to mean "has a live adapter" and not "was true when someone
+   * last edited it".
+   *
+   * Both directions are failures, and they fail differently:
+   *  - a key in the registry with no adapter → a dropdown option that can only
+   *    ever render empty, which reads as "this vendor costs nothing";
+   *  - an adapter missing from the registry → a metered vendor that is absent
+   *    from the picker until it happens to have spend in the selected window.
+   */
+  it('METERED_VENDOR_PROVIDERS matches the providers actually metered in the repo (ENG-1837)', () => {
+    expect(meteredProviderKeysInRepo(loadRealRepoFiles())).toEqual(
+      [...METERED_VENDOR_PROVIDERS].sort()
+    );
+  });
+});
+
+// ─── ENG-1929: no cost computed inline in a metering call ────────────────────
+
+/**
+ * Every `recordVendorUsage({ ... costUsd: <call> })` where `costUsd` contains a
+ * function call.
+ *
+ * That argument is evaluated BEFORE the fire-and-forget call, so a pricing
+ * function that throws (the rate card threw on a missing rate by design, and
+ * X's pricer still does) propagates into the vendor request and fails the
+ * user's search or render. Pricing belongs inside the recorder, via `rateKey`,
+ * or in a value computed beforehand within its own guard. A plain value —
+ * literal, identifier, property access, arithmetic on those — cannot throw
+ * and is allowed.
+ *
+ * AST rather than regex, for the same reasons sdkConstructionGuard gives:
+ * comments, strings and formatting cannot fool it.
+ */
+function findInlineCostComputations(files: ReadonlyMap<string, string>): string[] {
+  const found: string[] = [];
+  for (const [rel, content] of files) {
+    if (!content.includes('recordVendorUsage')) continue;
+    const sourceFile = ts.createSourceFile(rel, content, ts.ScriptTarget.Latest, true);
+    const containsCall = (node: ts.Node): boolean =>
+      ts.isCallExpression(node) || ts.isNewExpression(node) || ts.forEachChild(node, containsCall) === true;
+    const visit = (node: ts.Node): void => {
+      if (
+        ts.isCallExpression(node) &&
+        ts.isIdentifier(node.expression) &&
+        node.expression.text === 'recordVendorUsage' &&
+        node.arguments[0] &&
+        ts.isObjectLiteralExpression(node.arguments[0])
+      ) {
+        for (const prop of node.arguments[0].properties) {
+          if (
+            ts.isPropertyAssignment(prop) &&
+            ts.isIdentifier(prop.name) &&
+            prop.name.text === 'costUsd' &&
+            containsCall(prop.initializer)
+          ) {
+            const { line } = sourceFile.getLineAndCharacterOfPosition(prop.getStart());
+            found.push(`${rel}:${line + 1}`);
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+  }
+  return found.sort();
+}
+
+describe('no cost computed inline in a metering call (ENG-1929)', () => {
+  const fixture = (content: string) => new Map([['services/newVendor.ts', content]]);
+
+  it('flags a pricing call evaluated as the costUsd argument', () => {
+    expect(
+      findInlineCostComputations(
+        fixture("void recordVendorUsage({ provider: 'x', costSource: 'allocated', costUsd: priceIt('x', 1) });"),
+      ),
+    ).toEqual(['services/newVendor.ts:1']);
+  });
+
+  it('flags a call nested inside an expression', () => {
+    expect(
+      findInlineCostComputations(fixture("recordVendorUsage({ costUsd: 2 * lookupRate('x') });")),
+    ).toHaveLength(1);
+  });
+
+  it('allows rateKey, and a costUsd that is already a value', () => {
+    expect(
+      findInlineCostComputations(
+        fixture(
+          [
+            "void recordVendorUsage({ provider: 'x', rateKey: 'query', quantity: 1 });",
+            "void recordVendorUsage({ costSource: 'allocated', costUsd: cost.costUsd });",
+            "void recordVendorUsage({ costSource: 'allocated', costUsd: rate * quantity });",
+            "void recordVendorUsage({ costSource: 'allocated', costUsd: 0 });",
+            '// recordVendorUsage({ costUsd: computeAllocatedCost() }) in a comment',
+          ].join('\n'),
+        ),
+      ),
+    ).toEqual([]);
+  });
+
+  it('backend/src has no inline cost computation in any recordVendorUsage call', () => {
+    expect(findInlineCostComputations(loadRealRepoFiles())).toEqual([]);
   });
 });

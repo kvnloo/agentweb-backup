@@ -270,7 +270,9 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
           passed: true,
         }),
         mockScheduleId,
-        undefined
+        undefined,
+        // ENG-1552: a manual resend never records delivery state.
+        { recordDelivery: false }
       );
     });
 
@@ -324,7 +326,9 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
           passed: true,
         }),
         mockScheduleId,
-        undefined
+        undefined,
+        // ENG-1552: a manual resend never records delivery state.
+        { recordDelivery: false }
       );
     });
 
@@ -372,7 +376,9 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
           actualResponse: 'Stored response from error case',
         }),
         mockScheduleId,
-        undefined
+        undefined,
+        // ENG-1552: a manual resend never records delivery state.
+        { recordDelivery: false }
       );
     });
   });

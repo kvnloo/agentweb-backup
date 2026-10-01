@@ -203,10 +203,51 @@ describe('AgentModeService.callLLM — OpenRouter provider + cost (ENG-9)', () =
     );
   });
 
-  it('falls back to the price book for BYOK usage instead of recording OpenRouter billed cost as economic cost', async () => {
+  it('meters a long-context Astra BYOK call at its upstream inference cost', async () => {
+    const astraModel = 'openrouter/openai/gpt-6-astra';
+    create.mockResolvedValue({
+      id: 'gen-astra-byok',
+      usage: {
+        prompt_tokens: 300_000,
+        completion_tokens: 1_000,
+        cost: 0,
+        is_byok: true,
+        cost_details: { upstream_inference_cost: 6.05 },
+      },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[astraModel].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(astraModel, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: astraModel,
+        provider: 'openrouter',
+        costUsdOverride: 6.05,
+      })
+    );
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['zero', 0],
+    ['NaN', Number.NaN],
+    ['negative', -1],
+  ])('falls back to the price book when BYOK upstream inference cost is %s', async (_label, upstreamCost) => {
     create.mockResolvedValue({
       id: 'gen-byok',
-      usage: { prompt_tokens: 9, completion_tokens: 3, cost: 0, is_byok: true },
+      usage: {
+        prompt_tokens: 9,
+        completion_tokens: 3,
+        cost: 0,
+        is_byok: true,
+        ...(upstreamCost === undefined
+          ? {}
+          : { cost_details: { upstream_inference_cost: upstreamCost } }),
+      },
       choices: [{ message: { content: 'ok' } }],
     });
     (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
@@ -386,16 +427,40 @@ describe('AgentModeService.callLLM — OpenRouter provider + cost (ENG-9)', () =
     );
   });
 
-  it('does not retry a transient 429 after OpenRouter exhausts its provider fallbacks', async () => {
+  // ENG-1626: session b32ec8af (2026-08-26) — a single "429 Provider returned
+  // error" from OpenRouter (its own provider-fallback pool momentarily
+  // saturated for that model) killed an entire Slack-bridged session with zero
+  // retry anywhere in callLLM. This pair now pins ONE short-backoff retry of a
+  // fully-exhausted attempt, bounded so it can't itself spiral.
+  it('retries a transient 429 once and succeeds when the retry clears', async () => {
+    const rateLimitErr = Object.assign(new Error('Rate limit exceeded'), { status: 429 });
+    create.mockRejectedValueOnce(rateLimitErr).mockResolvedValueOnce(fakeResponse);
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+    jest.spyOn(svc as any, 'sleep').mockResolvedValue(undefined);
+
+    const result = await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(result).toBe(fakeResponse);
+    expect(create).toHaveBeenCalledTimes(2);
+    // The failed first attempt must never be metered -- meterUserUsage only runs
+    // after a successful `create()` return, so a retry can raise `create` calls
+    // without ever double-billing the customer for the discarded attempt.
+    expect(mockMeterUser).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives up after exactly one retry when a transient 429 persists', async () => {
     const rateLimitErr = Object.assign(new Error('Rate limit exceeded'), { status: 429 });
     create.mockRejectedValue(rateLimitErr);
     (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+    jest.spyOn(svc as any, 'sleep').mockResolvedValue(undefined);
 
     await expect(svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
       usageContext: { userId: 'u1', feature: 'agent_task' },
     })).rejects.toBe(rateLimitErr);
 
-    expect(create).toHaveBeenCalledTimes(1);
+    expect(create).toHaveBeenCalledTimes(2);
   });
 
   it('does not retry a non-transient 402 (exhausted balance) — fails immediately', async () => {

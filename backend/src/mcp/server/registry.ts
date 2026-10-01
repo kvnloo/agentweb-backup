@@ -1,18 +1,35 @@
+import { enforceEvaluationTool } from '../../services/evaluationPolicy';
+import { currentRunFunding, resolveRunFunding, withRunFunding } from '../../services/funding/runFunding';
 import { isAnonymousUserId, buildAnonymousToolRefusal } from '../anonymousToolAccess';
 import { refuseUnauthorizedScheduledPublish, attachPublishRevalidation } from '../../utils/scheduledPublishConsentGuard';
 
 export interface McpToolHandler {
   name: string;
+  /**
+   * `definition.inputSchema.properties` names are load-bearing beyond this tool's
+   * own handler: `validateAndRepairToolArgs` (agentToolGatewayService.ts, ENG-1668)
+   * silently hoists fields out of a stray wrapper object the model might invent
+   * (e.g. `params: { your_field: ... }`) whenever the wrapper key is a generic name
+   * like `params`/`args`/`data`/`config` (see LIKELY_WRAPPER_KEY_NAMES there) AND the
+   * nested key matches one of YOUR schema's property names that's still empty. This
+   * runs for every tool, not just the one it was built for — if your schema reuses a
+   * very common field name, a stray wrapper on an unrelated tool call could in
+   * principle land a value in your field. It never overwrites a value you already
+   * set, and only fires for those generic wrapper-like key names, but if that ever
+   * matters for your tool, read agentToolGatewayService.ts's validateAndRepairToolArgs
+   * before assuming a nested-looking argument was ignored.
+   */
   definition: any;
   execute: (args: any, context?: any) => Promise<any>;
   /**
    * When true, the tool is hidden from external MCP clients' `tools/list`.
    *
    * Hiding only — a client that knows the name can still call it. That is
-   * deliberate for the cost-driven tools (image generation, the searches,
-   * `save_file`): ENG-973 meters the `/api/emma/*` routes they self-call, so
-   * naming one buys no free spend. Where the damage would be the *action*
-   * rather than the cost, use `internalOnly` instead.
+   * deliberate for the cost-driven tools (the searches, `save_file`):
+   * ENG-973 meters the `/api/emma/*` routes they self-call, so naming one
+   * buys no free spend. `generate_image` is listed for external MCP
+   * (metered on `/api/emma/generate-image`). Where the damage would be the
+   * *action* rather than the cost, use `internalOnly` instead.
    */
   internal?: boolean;
   /**
@@ -38,8 +55,9 @@ export interface McpToolHandler {
    * ENG-1276 follow-up — declares that EVERY call to this tool, for ANY
    * arguments, has no external side effect (nothing published, sent, or
    * written to a customer's live account/CRM — pure read/compute/research).
-   * Consulted by the scheduled-run conditional-skip veto
-   * (`isReadOnlyToolName` in agentModeController.ts) so a schedule's "check
+   * Consulted by the scheduled-run conditional-skip veto and the ENG-1297
+   * read-only press circuit breaker (`isReadOnlyToolName` in
+   * utils/toolWriteClassification.ts) so a schedule's "check
    * something first" step doesn't get misclassified as a write just because
    * its name doesn't lead with get/read/list/... — the exact bug that broke
    * perform_data_analysis (ENG-1276).
@@ -88,6 +106,7 @@ export class McpToolRegistry {
   }
 
   async execute(name: string, args: any, context?: any) {
+    await enforceEvaluationTool(context?.userId, name);
     const handler = this.tools.get(name);
     if (!handler) {
       throw new Error(`Tool ${name} not found`);
@@ -135,7 +154,30 @@ export class McpToolRegistry {
     // A publishing handler may do minutes of work (media download, video upload)
     // between being admitted here and actually committing the post, so admission
     // alone is not enough — hand it a re-validation to run at its last moment.
-    return await handler.execute(args, attachPublishRevalidation(name, context, args));
+    const publishContext = attachPublishRevalidation(name, context, args);
+
+    // ENG-1816 F1: resolve funding ONLY when no ambient RunFunding is already active.
+    // This method is the single dispatch point for BOTH Emma's own in-process tool
+    // calls (agentModeService.ts, already inside the worker's withRunFunding scope)
+    // AND genuinely external entry points that never go through the worker at all —
+    // e.g. an internal MCP_ACCESS_TOKEN caller hitting POST /mcp directly, which
+    // reaches create_blog_article -> agentModeService.createBlogArticle ->
+    // generateBlogContent/restyleContent with no scope ever entered, so their
+    // currentRunFunding()-based attribution fix silently read undefined. Found by
+    // an independent review of this same PR's earlier leak fixes.
+    //
+    // Checking currentRunFunding() first, and only resolving when it's absent, is
+    // load-bearing, not a micro-optimization: a run's funding must be resolved ONCE,
+    // at that run's true entry point. Unconditionally re-resolving here would
+    // overwrite an outer, already-correct funding decision for the duration of every
+    // nested tool call inside an agent-mode turn — harmless today (F1 always
+    // resolves 'agentweb'), but wrong the moment a real customer route exists,
+    // since a fresh resolve could return something different mid-run.
+    if (currentRunFunding() || !context?.userId) {
+      return await handler.execute(args, publishContext);
+    }
+    const runFunding = await resolveRunFunding({ userId: context.userId });
+    return await withRunFunding(runFunding, () => handler.execute(args, publishContext));
   }
 }
 

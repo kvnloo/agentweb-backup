@@ -6,8 +6,10 @@ import { evaluateLlmUsageMode, type LlmUsageMode, type LlmUsagePolicy,
   type ResolvedAlertThresholds,
 } from "./llmUsagePolicyService";
 import { applyLlmUsageCredits, getLlmUsageCreditAdjustment } from './llmUsageCreditService';
+import { resolveEnforcementCostBasisMicroUsd } from './spendEnforcementBasis';
 import { randomUUID } from 'crypto';
 import { recordLlmChargeEvent, LLM_CHARGE_EVENTS_TABLE } from './llmChargeAuditDb';
+import { buildUsageBlockCopy, type UsageBlockCopy } from '../utils/usageBlockCopy';
 
 export interface TokenUsageStatus {
   allowed: boolean;
@@ -45,6 +47,60 @@ export interface TokenUsageStatus {
 }
 
 /**
+ * The customer-facing projection of `TokenUsageStatus` (ENG-1212 AC4).
+ *
+ * `costUsed` and `costAllowance` are dropped. `hasCostAllowance` replaces the
+ * only thing the client ever did with the latter — a null check.
+ */
+export type CustomerTokenUsageStatus = Omit<TokenUsageStatus, 'costUsed' | 'costAllowance'> & {
+  /**
+   * Whether a dollar ceiling exists at all, without saying what it is.
+   *
+   * The portal never rendered `costAllowance`; it tested `costAllowance != null`
+   * to decide which dimension is the quota (UsageMeter, SubscriptionCard
+   * `showCostQuota`). This carries that one bit and nothing more.
+   */
+  hasCostAllowance: boolean;
+  /**
+   * ENG-1344 AC6: the block explanation, composed server-side so the portal
+   * modal and the ENG-1035 MCP 429 cannot describe the same block differently.
+   * Always present — the client decides WHEN to show it (only while blocked),
+   * the server decides WHAT it says.
+   */
+  usageBlock: UsageBlockCopy;
+};
+
+/**
+ * Strip internal dollar amounts at the API boundary (ENG-1212 AC4: "No internal
+ * USD amounts are returned by customer APIs; authorized admin diagnostics may
+ * include them", and the ticket's own outcome, "without exposing dollar
+ * ceilings").
+ *
+ * The sibling `/usage-runway` route has always done this via `toCustomerRunway`;
+ * `/usage` returned `checkTokenUsage` verbatim, so `costUsed` and
+ * `costAllowance` reached every authenticated customer in plain USD. That was
+ * not a deliberate product choice — the UI states the opposite intent in two
+ * places: SubscriptionCard renders the cost quota "ONLY as a percentage bar
+ * (never the dollar figures)" and "Dollars stay admin-only; to the user this is
+ * simply 'usage'". `costUsed` had no non-test reader anywhere in the portal.
+ *
+ * `costPercentUsed` stays: a percentage is not a dollar amount, and it is what
+ * the bar actually renders. Admin dollar figures are unaffected — the partner
+ * portal builds them from subscription-type policy, not from this endpoint.
+ *
+ * Strip at the boundary, once, here — the internal type is unchanged, so
+ * emailService and the policy services keep the figures they need.
+ */
+export function toCustomerTokenUsage(status: TokenUsageStatus): CustomerTokenUsageStatus {
+  const { costUsed: _costUsed, costAllowance, ...customerSafe } = status;
+  return {
+    ...customerSafe,
+    hasCostAllowance: costAllowance != null,
+    usageBlock: buildUsageBlockCopy({ month: status.month }),
+  };
+}
+
+/**
  * For org members, returns the org owner's userId so that all quota checks
  * and usage increments are applied to the owner (the subscription holder).
  * Returns the original userId for solo users and org owners.
@@ -72,6 +128,25 @@ export async function resolveBillingUserId(userId: string): Promise<string> {
   ) {
     return userId;
   }
+
+  // ENG-1215: the org can name an owner that does not resolve. Two shapes exist
+  // in real data: `ownerUserId` absent from the row entirely, and an id left
+  // dangling when the owner was deleted while members remained.
+  //
+  // Returning either one hands every caller a billing subject that
+  // `getUserTokenUsage` throws `User not found` on. That is not confined to the
+  // usage surfaces it was first seen on (a 500 from /usage-runway): this
+  // function also resolves the subject for `checkTokenUsage`, the gate on the
+  // chat path, so a member whose OWN record is perfectly healthy is locked out
+  // of the product by a defect in a row they cannot see.
+  //
+  // Fall back to the member's own partition, exactly as the `!org` case above
+  // does. There is no org counter to pool onto when the root does not exist, so
+  // the member is billed and quota'd on their own — the restrictive direction,
+  // never an uncapped one.
+  if (!org.ownerUserId) return userId;
+  const billingRoot = await userDb.getUserById(org.ownerUserId);
+  if (!billingRoot) return userId;
 
   return org.ownerUserId;
 }
@@ -174,6 +249,7 @@ export async function getUserTokenAllowance(
   effectiveAllowance: number | null;
   costAllowance: number | null;
   llmUsagePolicy: LlmUsagePolicy | null;
+  subscriptionType: string;
 }> {
   const subscriptionTypeName = await getUserSubscriptionType(userId);
   const config = await getSubscriptionTypeConfig(subscriptionTypeName);
@@ -185,7 +261,7 @@ export async function getUserTokenAllowance(
   const bonus = user?.tokenAllowanceBonus || 0;
 
   if (baseAllowance === null || baseAllowance === undefined) {
-    return { allowance: null, bonus, effectiveAllowance: null, costAllowance, llmUsagePolicy };
+    return { allowance: null, bonus, effectiveAllowance: null, costAllowance, llmUsagePolicy, subscriptionType: subscriptionTypeName };
   }
 
   return {
@@ -194,6 +270,7 @@ export async function getUserTokenAllowance(
     effectiveAllowance: baseAllowance + bonus,
     costAllowance,
     llmUsagePolicy,
+    subscriptionType: subscriptionTypeName,
   };
 }
 
@@ -246,7 +323,7 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
 
   const billingUserId = await resolveBillingUserId(userId);
   const usage = await getUserTokenUsage(billingUserId);
-  const [{ allowance, bonus, effectiveAllowance, costAllowance, llmUsagePolicy }, billingUser] = await Promise.all([
+  const [{ allowance, bonus, effectiveAllowance, costAllowance, llmUsagePolicy, subscriptionType }, billingUser] = await Promise.all([
     getUserTokenAllowance(billingUserId),
     userDb.getUserById(billingUserId),
   ]);
@@ -277,7 +354,16 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
   const versionedCostPolicyEnforced = !!llmUsagePolicy && llmUsagePolicy.enforcementState !== "observe";
   const enforceCostCap = versionedCostPolicyEnforced || process.env.ENFORCE_COST_CAP === "true";
 
-  const rawCostUsedMicroUsd = Math.max(0, Math.round((usage.totalCost || 0) * 1_000_000));
+  const legacyRawCostUsedMicroUsd = Math.max(0, Math.round((usage.totalCost || 0) * 1_000_000));
+  // ENG-1250 §9.6 enforcement cutover (dark by default): swap the raw spend basis
+  // onto the vendor-inclusive spend ledger; the credit/threshold/predicate path
+  // below is reused unchanged so the only divergence is vendor inclusion.
+  const { rawCostUsedMicroUsd } = await resolveEnforcementCostBasisMicroUsd({
+    billingUserId,
+    billingMonth: usage.month,
+    legacyRawCostUsedMicroUsd,
+    tier: subscriptionType,
+  });
   const creditAdjustment = getLlmUsageCreditAdjustment(billingUser?.llmUsageCredits, usage.month);
   const adjustedUsage = llmUsagePolicy
     ? applyLlmUsageCredits({

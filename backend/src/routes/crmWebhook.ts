@@ -21,6 +21,7 @@ import { externalCrmSyncService, ExternalCrmSyncConfig } from '../services/exter
 import { HubSpotService } from '../services/hubspotService';
 import { AttioService } from '../services/attioService';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
+import { applyAttioPersonEvent } from '../utils/attioPersonWebhookEvent';
 
 const router = express.Router();
 
@@ -132,7 +133,27 @@ async function handleHubSpotEvent(
     // can't resolve its email. Find the lead by stored hubspot_contact_id instead.
     if (data.isDeleted) {
       if (config.deleteOnPull) {
-        const lead = await crmDb.getLeadByHubSpotContactId(listId, objectId);
+        // THIRD call site. The other two catch `lookupExhausted`; this one did not, and an
+        // uncaught throw here does not just skip this contact — it escapes
+        // handleHubSpotEvent into the fire-and-forget wrapper, abandoning every remaining
+        // objectId in the same batch. HubSpot already has its 200, so nothing retries and
+        // those events are gone. Before the cap started throwing this returned null and the
+        // loop simply moved on, which is the behaviour restored here.
+        let lead: any = null;
+        try {
+          lead = await crmDb.getLeadByHubSpotContactId(listId, objectId);
+        } catch (lookupErr: any) {
+          // Same reasoning as the property-change branch, and the same blast radius as
+          // before: a throw here escapes handleHubSpotEvent into the fire-and-forget
+          // wrapper and abandons every remaining objectId in this delivery — HubSpot
+          // already has its 200, so nothing retries. The previous version only caught the
+          // page-cap case, so a throttle still took the whole batch down.
+          const why = lookupErr?.lookupExhausted
+            ? lookupErr.message
+            : `contact-id lookup failed (${lookupErr?.message || lookupErr})`;
+          console.warn(`[CrmWebhook/HubSpot] ${why} — cannot confirm which lead objectId=${objectId} refers to; not deleting.`);
+          continue;
+        }
         console.log(`[CrmWebhook/HubSpot] deletion lookup for objectId=${objectId}: lead=${lead?.leadId ?? 'not found'}`);
         if (lead) {
           await crmDb.deleteLead(listId, lead.leadId);
@@ -179,7 +200,34 @@ async function handleHubSpotEvent(
     }
     leadFields.syncMetadata = { hubspot_contact_id: objectId };
 
-    const lead = await crmDb.getLeadByEmail(listId, email.toLowerCase());
+    // Email first, then the contact id we stored when WE pushed this lead. Email alone is
+    // not an identity for a lead that has none — an ENG-2082 lead syncs to HubSpot with a
+    // hubspot_contact_id and no address, so once HubSpot returns one this missed and
+    // created a SECOND row carrying the same hubspot_contact_id. Worse here than in
+    // webhooks.ts: that path at least gates creation on data.isCreation, this one does not,
+    // so a bare property change was enough to duplicate the lead.
+    let lead = await crmDb.getLeadByEmail(listId, email.toLowerCase());
+    if (!lead) {
+      try {
+        lead = await crmDb.getLeadByHubSpotContactId(listId, String(objectId));
+      } catch (lookupErr: any) {
+        // ANY failure here means we could not prove the lead is absent, and this path has
+        // no isCreation gate — falling through to `if (!lead) createLead` mints a second
+        // row carrying an already-used hubspot_contact_id, which is the exact duplicate
+        // this lookup exists to prevent.
+        //
+        // `lookupExhausted` is only the page-cap case. A throttle, a timeout or anything
+        // handleDynamoDbError rethrows used to land on `lead = null` and create — under
+        // precisely the load the cap was designed for, since a bulk import into the
+        // customer's HubSpot fires thousands of these, each missing on email and walking
+        // the partition. Skipping loses an edit; creating corrupts the list.
+        const why = lookupErr?.lookupExhausted
+          ? lookupErr.message
+          : `contact-id lookup failed (${lookupErr?.message || lookupErr})`;
+        console.warn(`[CrmWebhook/HubSpot] ${why} — skipping objectId=${objectId}`);
+        continue;
+      }
+    }
 
     if (!lead) {
       // New contact in HubSpot — create it in our list
@@ -196,7 +244,12 @@ async function handleHubSpotEvent(
         : undefined;
 
       const updates: Record<string, any> = { ...leadFields };
-      delete updates.email;
+      // Keep the address ONLY when the lead does not already have one — i.e. when it was
+      // resolved by hubspot_contact_id, which is exactly the case this delete was written
+      // before. Dropping it unconditionally assumed "we found it BY email, so email already
+      // matches"; the contact-id fallback broke that assumption and left the row
+      // permanently address-less.
+      if (lead?.email) delete updates.email;
       delete updates.syncMetadata;
       delete updates.customFields;
       if (mergedCustomFields) updates.customFields = mergedCustomFields;
@@ -212,8 +265,9 @@ async function handleHubSpotEvent(
 // ─── Attio event handler ──────────────────────────────────────────────────────
 
 /**
- * Attio sends a single event per request.
- * We only handle 'people' object events — companies are ignored.
+ * Attio sends a single event per request. Per-event handling lives in
+ * `applyAttioPersonEvent` (shared with the OAuth-app shared endpoint in
+ * `webhooks.ts`) — this just normalizes the payload shape and resolves auth.
  */
 async function handleAttioEvent(
   userId: string,
@@ -222,92 +276,44 @@ async function handleAttioEvent(
   body: any
 ): Promise<void> {
   const events: any[] = Array.isArray(body?.events) ? body.events : Array.isArray(body) ? body : [body];
+  if (events.length === 0) return;
 
-  const auth = await externalCrmSyncService.resolveAuthForList(userId, listId, 'attio');
-  const svc = auth.type === 'token'
-    ? AttioService.fromToken(auth.apiKey!)
-    : await AttioService.create(auth.userId!, auth.accountId!);
+  // try/catch around auth/service resolution too, not just the per-event
+  // loop below — without it, a throw here (e.g. a bad/expired manual token)
+  // skipped the updateSyncTimestamp call at the bottom entirely, the same
+  // invisible-failure problem the per-event try/catch exists to prevent,
+  // just one step earlier.
+  let anyEventFailed = false;
+  try {
+    const auth = await externalCrmSyncService.resolveAuthForList(userId, listId, 'attio');
+    const svc = auth.type === 'token'
+      ? AttioService.fromToken(auth.apiKey!)
+      : await AttioService.create(auth.userId!, auth.accountId!);
 
-  for (const event of events) {
-    const eventType: string = event?.event_type ?? '';
-    const recordId: string = event?.data?.record?.id?.record_id ?? event?.id?.record_id ?? '';
-    const actorType: string = event?.actor?.type ?? event?.data?.actor?.type ?? '';
-    const objectSlug: string = event?.data?.object?.slug ?? '';
-
-    const relevant = ['record.created', 'record.updated', 'record.deleted'].includes(eventType);
-    if (!relevant || !recordId) continue;
-    // Only process People records — skip Companies and other object types
-    if (objectSlug && objectSlug !== 'people') continue;
-    if (actorType === 'api-token') {
-      console.log(`[CrmWebhook/Attio] Skipping API-sourced event for recordId=${recordId}`);
-      continue;
-    }
-
-    if (eventType === 'record.deleted') {
-      if (!config.deleteOnPull) {
-        console.log(`[CrmWebhook/Attio] deletion event for recordId=${recordId} ignored (deleteOnPull is disabled)`);
-        continue;
-      }
+    // Per-event try/catch — without it, a single throw aborted the whole
+    // loop and skipped every remaining event, not just the failed one.
+    // applyAttioPersonEvent also catches its own fetch/deletion failures
+    // internally and returns false rather than throwing (CodeRabbit finding,
+    // ENG-1380) — the boolean check below, not just the catch, is what
+    // detects those.
+    for (const event of events) {
       try {
-        const values = await svc.getPersonValues(recordId);
-        const email = values.email_addresses?.[0]?.email_address ?? '';
-        if (!email) continue;
-        const lead = await crmDb.getLeadByEmail(listId, email.toLowerCase());
-        if (lead) {
-          await crmDb.deleteLead(listId, lead.leadId);
-          console.log(`[CrmWebhook/Attio] Deleted lead ${lead.leadId} from list ${listId}`);
-        }
+        const applied = await applyAttioPersonEvent(listId, config, svc, event);
+        if (!applied) anyEventFailed = true;
       } catch (err: any) {
-        console.error(`[CrmWebhook/Attio] Failed to process deletion for recordId=${recordId}:`, err?.message);
-      }
-      continue;
-    }
-
-    // Fetch person values from Attio for created/updated
-    let values: Record<string, any>;
-    try {
-      values = await svc.getPersonValues(recordId);
-    } catch (err: any) {
-      console.error(`[CrmWebhook/Attio] Failed to fetch person values for recordId=${recordId}:`, err?.message);
-      continue;
-    }
-
-    const email = values.email_addresses?.[0]?.email_address ?? '';
-    if (!email) {
-      console.log(`[CrmWebhook/Attio] No email for recordId=${recordId}, skipping`);
-      continue;
-    }
-
-    const firstName = values.name?.[0]?.first_name ?? '';
-    const lastName = values.name?.[0]?.last_name ?? '';
-    const phone = values.phone_numbers?.[0]?.original_phone_number ?? '';
-    const title = values.job_title?.[0]?.value ?? '';
-    const linkedin = values.linkedin?.[0]?.value ?? '';
-
-    const lead = await crmDb.getLeadByEmail(listId, email.toLowerCase());
-
-    if (!lead) {
-      const newLead: Record<string, any> = { email: email.toLowerCase(), syncMetadata: { attio_record_id: recordId } };
-      if (firstName) newLead.firstName = firstName;
-      if (lastName) newLead.lastName = lastName;
-      if (phone) newLead.phone = phone;
-      if (title) newLead.title = title;
-      if (linkedin) newLead.linkedin = linkedin;
-      await crmDb.createLead(listId, newLead);
-      console.log(`[CrmWebhook/Attio] Created lead for ${email} in list ${listId}`);
-    } else {
-      const updates: Record<string, any> = {};
-      if (firstName) updates.firstName = firstName;
-      if (lastName) updates.lastName = lastName;
-      if (phone) updates.phone = phone;
-      if (title) updates.title = title;
-      if (linkedin) updates.linkedin = linkedin;
-      if (Object.keys(updates).length > 0) {
-        await crmDb.updateLead(listId, lead.leadId, updates);
-        console.log(`[CrmWebhook/Attio] Updated lead ${lead.leadId} in list ${listId}`);
+        console.error(`[CrmWebhook] Failed to apply Attio event for list ${listId}:`, err?.message ?? err);
+        anyEventFailed = true;
       }
     }
+  } catch (err: any) {
+    console.error(`[CrmWebhook] Failed to resolve Attio auth/service for list ${listId}:`, err?.message ?? err);
+    anyEventFailed = true;
   }
+
+  // Stamp lastPullSyncAt/lastSyncStatus so the CRM Sync dialog reflects this
+  // webhook-driven auto-pull, not only a manual Pull click — same gap fixed
+  // for the shared OAuth-app endpoint's processAttioWebhookJob.
+  await externalCrmSyncService.updateSyncTimestamp(config, 'pull', !anyEventFailed);
 }
 
 export default router;

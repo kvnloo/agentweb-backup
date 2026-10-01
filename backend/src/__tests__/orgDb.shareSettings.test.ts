@@ -145,3 +145,27 @@ describe("pruneEditorListsForUser", () => {
     expect(written).toContain("u-b"); // concurrent grant preserved
   });
 });
+
+
+describe('updateModelRoles persistence invariants', () => {
+  beforeEach(() => { mockUpdate.mockReset(); });
+  it('atomically replaces only the model map and advances the revision', async () => {
+    const prior = '2099-01-01T00:00:00.000Z';
+    const revision = await orgDb.updateModelRoles('org-roles', { chat: 'gemini-3.8-flash' }, prior);
+    const write = mockUpdate.mock.calls[0][0];
+    expect(write.Key).toEqual({ orgId: 'org-roles' });
+    expect(write.UpdateExpression).toBe('SET modelRoles = :s, updatedAt = :u');
+    expect(write.ConditionExpression).toBe('attribute_exists(orgId) AND updatedAt = :expected');
+    expect(write.ExpressionAttributeValues[':s']).toEqual({ chat: 'gemini-3.8-flash' });
+    expect(Date.parse(revision)).toBeGreaterThan(Date.parse(prior));
+  });
+  it('does not recreate a deleted organization on reset', async () => {
+    await orgDb.updateModelRoles('org-roles', {}, undefined);
+    expect(mockUpdate.mock.calls[0][0].ConditionExpression).toBe('attribute_exists(orgId) AND attribute_not_exists(updatedAt)');
+  });
+  it('propagates conditional failures instead of retrying stale replacements', async () => {
+    mockUpdate.mockRejectedValueOnce({ code: 'ConditionalCheckFailedException' });
+    await expect(orgDb.updateModelRoles('org-roles', {}, 'stale')).rejects.toEqual({ code: 'ConditionalCheckFailedException' });
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+  });
+});

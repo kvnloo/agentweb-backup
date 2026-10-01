@@ -113,3 +113,110 @@ describe('DeepResearchService OpenRouter cutover', () => {
     await expect(service.isAvailable()).resolves.toBe(false);
   });
 });
+
+// ENG-738: a genuine timeout on a degradable depth used to surface as a bare
+// failure with nothing to show for it. The service now retries once at the
+// next cheaper depth within a reserved slice of the same overall budget.
+describe('DeepResearchService depth-degrading timeout retry (ENG-738)', () => {
+  let service: DeepResearchService;
+  const timeoutError = () => Object.assign(new Error('Request timed out'), { name: 'TimeoutError' });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new DeepResearchService();
+    mockGetOpenRouterClient.mockResolvedValue({});
+  });
+
+  it('retries once at a cheaper depth after the primary attempt times out, and reports the depth actually delivered', async () => {
+    mockCallLLM
+      .mockRejectedValueOnce(timeoutError())
+      .mockResolvedValueOnce({
+        choices: [{ message: { content: '# Retry title\n\nRetry body.' } }],
+      });
+
+    const result = await service.performDeepResearch({ topic: 'A', depth: 'comprehensive', userId: 'user-1' });
+
+    expect(mockCallLLM).toHaveBeenCalledTimes(2);
+    expect(result.success).toBe(true);
+    expect(result.markdownContent).toBe('# Retry title\n\nRetry body.');
+    expect(result.degradedFrom).toBe('comprehensive');
+    expect(result.actualDepth).toBe('detailed');
+  });
+
+  it('degrades detailed to overview on timeout', async () => {
+    mockCallLLM
+      .mockRejectedValueOnce(timeoutError())
+      .mockResolvedValueOnce({ choices: [{ message: { content: '# T\n\nB' } }] });
+
+    const result = await service.performDeepResearch({ topic: 'A', depth: 'detailed' });
+
+    expect(result.degradedFrom).toBe('detailed');
+    expect(result.actualDepth).toBe('overview');
+  });
+
+  it('reserves a slice of the total budget for the retry, shrinking the primary attempt', async () => {
+    mockCallLLM
+      .mockRejectedValueOnce(timeoutError())
+      .mockResolvedValueOnce({ choices: [{ message: { content: '# T\n\nB' } }] });
+
+    await service.performDeepResearch({ topic: 'A', depth: 'comprehensive' });
+
+    const primaryTimeoutMs = mockCallLLM.mock.calls[0][2].timeoutMs;
+    const retryTimeoutMs = mockCallLLM.mock.calls[1][2].timeoutMs;
+    expect(primaryTimeoutMs).toBe(7 * 60 * 1000);
+    expect(retryTimeoutMs).toBe(2 * 60 * 1000);
+    expect(primaryTimeoutMs + retryTimeoutMs).toBe(9 * 60 * 1000);
+  });
+
+  it('does not retry when already at the cheapest depth', async () => {
+    mockCallLLM.mockRejectedValueOnce(timeoutError());
+
+    const result = await service.performDeepResearch({ topic: 'A', depth: 'overview' });
+
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(false);
+    expect(mockCallLLM.mock.calls[0][2].timeoutMs).toBe(9 * 60 * 1000);
+  });
+
+  it('does not retry when no depth was requested at all (e.g. the blog-article caller)', async () => {
+    mockCallLLM.mockRejectedValueOnce(timeoutError());
+
+    const result = await service.performDeepResearch({ topic: 'A' });
+
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(false);
+  });
+
+  it('does not retry a non-timeout failure, even at a degradable depth', async () => {
+    mockCallLLM.mockRejectedValueOnce(new Error('400 invalid request'));
+
+    const result = await service.performDeepResearch({ topic: 'A', depth: 'comprehensive' });
+
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(false);
+    expect(result.degradedFrom).toBeUndefined();
+  });
+
+  it('reports the primary failure, not the retry failure, when both attempts time out', async () => {
+    mockCallLLM
+      .mockRejectedValueOnce(Object.assign(new Error('primary timed out'), { name: 'TimeoutError' }))
+      .mockRejectedValueOnce(Object.assign(new Error('retry timed out'), { name: 'TimeoutError' }));
+
+    const result = await service.performDeepResearch({ topic: 'A', depth: 'comprehensive' });
+
+    expect(mockCallLLM).toHaveBeenCalledTimes(2);
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('primary timed out');
+    expect(result.degradedFrom).toBeUndefined();
+  });
+
+  it('does not retry when the primary attempt succeeds', async () => {
+    mockCallLLM.mockResolvedValueOnce({ choices: [{ message: { content: '# T\n\nB' } }] });
+
+    const result = await service.performDeepResearch({ topic: 'A', depth: 'comprehensive' });
+
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(true);
+    expect(result.degradedFrom).toBeUndefined();
+  });
+});

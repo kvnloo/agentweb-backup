@@ -1,0 +1,18 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "1200000000000172",
+    "query": {}
+  },
+  "status": 200,
+  "body": {
+    "id": "1200000000000172",
+    "account_id": "120000000000001",
+    "time_ref": 1789258765,
+    "time_completed": 1789258768,
+    "async_status": "Job Completed",
+    "async_percent_completion": 100,
+    "date_start": "2026-09-05",
+    "date_stop": "2026-09-11"
+  }
+}

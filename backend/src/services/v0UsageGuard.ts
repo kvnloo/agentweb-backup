@@ -12,7 +12,8 @@ const dynamodb = new AWS.DynamoDB.DocumentClient({
 export type V0UsageOperation =
   | 'first_page_chat_create'
   | 'additional_page_chat_create'
-  | 'correction_message';
+  | 'correction_message'
+  | 'iterate_message';
 
 export interface V0UsageRecord {
   idempotencyKey: string;
@@ -118,6 +119,16 @@ export function buildV0IdempotencyKey(input: {
   prompt?: string;
   chatId?: string;
   attempt?: number;
+  /**
+   * ENG-1694: a content discriminator, present ONLY for `iterate_message`. Every other
+   * operation deliberately omits the prompt from its identity (see below) because a retry
+   * of "the same generation" legitimately varies its enriched prompt. Iterate is the
+   * opposite case — each send IS a different user instruction, so reusing the
+   * correction-message key shape (operation, user, scope, chatId) collapsed edit B into
+   * edit A's already-`succeeded` record and silently skipped it. Appended only when
+   * supplied, so every existing chat-create/correction-message key stays byte-identical.
+   */
+  contentHash?: string;
 }): string {
   // The key deliberately does NOT include the prompt. The enriched prompt varies
   // between attempts (brand context is not stable), so keying on it meant retries
@@ -136,7 +147,21 @@ export function buildV0IdempotencyKey(input: {
     input.slug || '',
     input.chatId || '',
     ...(input.attempt === undefined ? [] : [String(input.attempt)]),
+    ...(input.contentHash === undefined ? [] : [input.contentHash]),
   ].join('#');
+}
+
+/**
+ * The metering identity of one reservation: the guard's own key plus the
+ * moment the reservation was taken.
+ *
+ * Deliberately derived from the guard rather than invented alongside it. Two
+ * independent notions of "the same v0 call" would drift, and the failure would
+ * be silent -- the guard deduping while the ledger charged twice, or the
+ * reverse.
+ */
+export function meteringKeyFor(idempotencyKey: string, reservedAt: string): string {
+  return `v0:${idempotencyKey}#${reservedAt}`;
 }
 
 async function bestEffortPut(
@@ -261,7 +286,11 @@ export async function guardedV0ChatCreate<T = any>(input: {
   scopeId: string;
   slug?: string;
   prompt: string;
-  create: () => Promise<T>;
+  /**
+   * Receives the METERING key for this reservation (ENG-702 AC1). Existing
+   * `() => Promise<T>` callbacks stay assignable, so adoption is per-call-site.
+   */
+  create: (meteringKey: string) => Promise<T>;
 }): Promise<T | { id: string; reused: true }> {
   const idempotencyKey = buildV0IdempotencyKey(input);
   const existing = memoryUsage.get(idempotencyKey) || await bestEffortGet(idempotencyKey);
@@ -304,7 +333,12 @@ export async function guardedV0ChatCreate<T = any>(input: {
   }
 
   try {
-    const response = await input.create();
+    // The reservation's own timestamp discriminates attempts. Every retry
+    // inside ONE reservation shares this key and is charged once, which is the
+    // "duplicates under one reservation" defect ENG-702 names; a
+    // guard-permitted retry after a failure mints a new reservation, gets a new
+    // key, and is charged in full because it really did call v0 again.
+    const response = await input.create(meteringKeyFor(idempotencyKey, now));
     const chatId = (response as any)?.id;
     if (!chatId) throw new Error('v0 chat creation did not return an id');
     await save({ ...reserved, status: 'succeeded', chatId });
@@ -328,7 +362,8 @@ export async function guardedV0CorrectionMessage<T>(input: {
    * double-fire. (ENG-287 residual)
    */
   attempt?: number;
-  send: () => Promise<T>;
+  /** Receives the METERING key for this reservation (ENG-702 AC1). */
+  send: (meteringKey: string) => Promise<T>;
 }): Promise<T | { skipped: true }> {
   const idempotencyKey = buildV0IdempotencyKey({
     userId: input.userId,
@@ -369,7 +404,86 @@ export async function guardedV0CorrectionMessage<T>(input: {
   if (!reservedInDynamo) return { skipped: true };
 
   try {
-    const response = await input.send();
+    const response = await input.send(meteringKeyFor(idempotencyKey, now));
+    await save({ ...reserved, status: 'succeeded' });
+    return response;
+  } catch (error: any) {
+    await save({ ...reserved, status: 'failed', failureReason: error?.message || String(error) });
+    throw error;
+  }
+}
+
+/**
+ * Reservation for an `iterate` send, keyed on the edit's CONTENT (ENG-1694).
+ *
+ * `guardedV0CorrectionMessage`'s key shape — (operation, user, scope, chatId[, attempt]) —
+ * is right for the correction loop, where every round targets the SAME defect and a retry
+ * must reuse the prior round's identity. Iterate is the opposite: each call is a genuinely
+ * different user instruction on the same chat. Reusing that key shape meant edit B's key
+ * collided with edit A's `succeeded` record and `guardedV0CorrectionMessage` returned
+ * `{skipped: true}` for edit B — the call never reached v0 and the page silently did not
+ * change. Threading `hashV0Prompt(message)` through as `contentHash` gives edit A and edit
+ * B distinct keys, so they no longer collide; a genuine re-send of the SAME edit (crash,
+ * timeout, client retry) still dedupes exactly as `guardedV0CorrectionMessage` does today.
+ *
+ * This is a second, INSTANCE-CROSSING safety net alongside `iterateLandingPage`'s existing
+ * `pendingIteration`/`isSameEdit` check on the page record. That check already resumes a
+ * same-instance retry without re-sending and adopts an edit that landed while the caller
+ * was retrying; it does not protect two concurrent instances racing the same edit. This
+ * guard does — and because both are keyed off the same `hashV0Prompt(message)` value, a
+ * `skipped: true` here means exactly what `isSameEdit` means: this edit is already reserved
+ * or done, do not send it again.
+ */
+export async function guardedV0IterateMessage<T>(input: {
+  userId: string;
+  scopeId: string;
+  chatId: string;
+  message: string;
+  /** Receives the METERING key for this reservation (ENG-702 AC1). */
+  send: (meteringKey: string) => Promise<T>;
+}): Promise<T | { skipped: true }> {
+  const contentHash = hashV0Prompt(input.message);
+  const idempotencyKey = buildV0IdempotencyKey({
+    userId: input.userId,
+    operation: 'iterate_message',
+    scopeId: input.scopeId,
+    chatId: input.chatId,
+    contentHash,
+  });
+  const existing = memoryUsage.get(idempotencyKey) || await bestEffortGet(idempotencyKey);
+  if (existing?.status === 'succeeded' || existing?.status === 'skipped') {
+    return { skipped: true };
+  }
+  const nowMs = Date.now();
+  // A failed or crash-abandoned reservation must not skip forever — the caller's own
+  // retry (or a fresh instance) has to be able to send this edit. Same reclaim semantics
+  // as guardedV0CorrectionMessage.
+  if (isReservationBlocking(existing, nowMs)) {
+    return { skipped: true };
+  }
+
+  const now = new Date(nowMs).toISOString();
+  const reserved: V0UsageRecord = {
+    idempotencyKey,
+    userId: input.userId,
+    operation: 'iterate_message',
+    scopeId: input.scopeId,
+    chatId: input.chatId,
+    promptHash: contentHash,
+    status: 'reserved',
+    createdAt: now,
+    updatedAt: now,
+  };
+  memoryUsage.set(idempotencyKey, reserved);
+  const reservedInDynamo = await reserveInDynamo(
+    reserved,
+    new Date(nowMs - V0_RESERVATION_TTL_MS).toISOString(),
+    new Date(nowMs - V0_CHAT_REUSE_CEILING_MS).toISOString(),
+  );
+  if (!reservedInDynamo) return { skipped: true };
+
+  try {
+    const response = await input.send(meteringKeyFor(idempotencyKey, now));
     await save({ ...reserved, status: 'succeeded' });
     return response;
   } catch (error: any) {

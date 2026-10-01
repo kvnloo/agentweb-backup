@@ -45,7 +45,9 @@ jest.mock('../services/connectedAccountsDb', () => ({
 jest.mock('../config/integrations', () => ({
   getHubSpotConfig: jest.fn().mockResolvedValue({ clientId: 'x', clientSecret: 'y', tokenUrl: 'u', redirectUri: 'r', scopes: [], authorizationUrl: 'a', tokenInfoUrl: 't' }),
   INTEGRATION_CONFIG: {
-    hubspot: { scopes: [] },
+    // Real config: an empty stub makes the marketing pre-flight silently no-op, so this
+    // suite — which owns every marketing action — could not see the guard at all.
+    hubspot: jest.requireActual('../config/integrations').INTEGRATION_CONFIG.hubspot,
     linkedinAds: { apiVersion: '202603', apiBaseUrl: 'https://api.linkedin.com', scopes: [], redirectUri: '', authorizationUrl: '', tokenUrl: '', profileUrl: '' },
     linkedin: { scopes: [], redirectUri: '', authorizationUrl: '', tokenUrl: '', profileUrl: '' },
     meta: { scopes: [], redirectUri: '', authorizationUrl: '', tokenUrl: '' },
@@ -98,6 +100,9 @@ jest.mock('../mcp/server/apiTools', () => ({ adminToolNames: [] }));
 
 import { agentModeService } from '../services/agentModeService';
 import { crmDb } from '../services/db';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
 
 const mockGetLeadLists = crmDb.getLeadListsByUserId as jest.Mock;
 
@@ -344,6 +349,20 @@ describe('CAMPAIGN — error handling', () => {
     expect(result.status).toBe(403);
   });
 
+  // ENG-1300 follow-up: result.status has always been correct here — the gap was
+  // toolResultError never reading a `status` field (only `code`), so a real 403
+  // still classified as the generic 'Error'/'bug' in tool telemetry. Proves the
+  // full chain, not just that the field exists on the result.
+  it('ENG-1300: a 403 classifies as auth/config end-to-end, not the generic Error/bug fallback', async () => {
+    const err: any = new Error('Forbidden');
+    err.response = { status: 403 };
+    mockListCampaigns.mockRejectedValue(err);
+    const result = await hubspot({ action: 'LIST' });
+    const classified = toolResultError(result);
+    expect(classifyToolErrorClass(classified)).toBe('auth');
+    expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+  });
+
   it('returns reconnect guidance on 403 with MISSING_SCOPES category', async () => {
     const err: any = new Error('Forbidden');
     err.response = { status: 403, data: { category: 'MISSING_SCOPES', message: 'scopes missing' } };
@@ -351,6 +370,11 @@ describe('CAMPAIGN — error handling', () => {
     const result = await hubspot({ action: 'LIST' });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/reconnect your hubspot account/i);
+    // NOTE: hubspotError is now a REDACTED COPY of HubSpot's body, not the raw object —
+    // the message reaches LLM context, so a token embedded in it must not. This passes
+    // unchanged only because 'scopes missing' has nothing token-shaped in it. The
+    // redaction itself is pinned in agentModeService.hubspot403Diagnostic.test.ts; this
+    // assertion exists to prove the pass-through keeps a benign body intact.
     expect(result.hubspotError).toEqual({ category: 'MISSING_SCOPES', message: 'scopes missing' });
     expect(result.status).toBe(403);
   });

@@ -163,6 +163,8 @@ export function detectTrackingSnippets(html: string): string[] {
 const MAX_REDIRECTS = 5;
 
 export interface RedirectFetchDeps {
+  /** Wall-clock bound for the whole chain — see fetchHtmlFollowingRedirects. */
+  deadlineAt?: number;
   /** One HTTP GET that does NOT auto-follow redirects and surfaces 3xx as a resolved
    *  response (so we can read Location and re-check SSRF ourselves). */
   get: (url: string) => Promise<{ status: number; headers: Record<string, any>; data: any }>;
@@ -185,10 +187,21 @@ export interface RedirectFetchDeps {
  * Pure and injectable (deps) so the redirect/SSRF behaviour is unit-testable
  * without real network or DNS.
  */
+/**
+ * @param deps.deadlineAt Optional wall-clock bound for the WHOLE chain.
+ *
+ * The hop count bounds how many requests are made, not how long they take. With a per-hop
+ * timeout of 25s and one retry, six hops is 300s for a single destination — and a caller
+ * checking its own budget between URLs cannot see that. `ssrfGuard.ts` carries a chain-wide
+ * deadline for exactly this reason; this sibling did not.
+ */
 export async function fetchHtmlFollowingRedirects(startUrl: string, deps: RedirectFetchDeps): Promise<string> {
   const maxRedirects = deps.maxRedirects ?? MAX_REDIRECTS;
   let url = startUrl;
   for (let hop = 0; hop <= maxRedirects; hop++) {
+    if (deps.deadlineAt !== undefined && Date.now() >= deps.deadlineAt) {
+      throw new Error(`redirect chain abandoned: out of time budget after ${hop} hop(s)`);
+    }
     await deps.assertPublic(url); // re-validate the resolved host at EVERY hop
     const res = await deps.get(url);
     if (res.status >= 200 && res.status < 300) {

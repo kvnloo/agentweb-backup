@@ -6,8 +6,21 @@ import { callerCan, can, roleOf } from "../services/orgAuthz";
 import { v4 as uuidv4 } from "uuid";
 import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
+import { getUserSubscriptionResolution } from "../services/subscriptionService";
 
 const router = Router();
+
+const ORGANIZATION_CREATION_TIERS = new Set([
+  "starter",
+  // Basic is the persisted label for the Starter checkout plan.
+  "basic",
+  "pro",
+  // Complete is the legacy paid label for the Pro checkout plan.
+  "complete",
+  "partner",
+  "super premium",
+  "managed",
+]);
 
 type MarketStrategy = NonNullable<Organization["marketStrategy"]>;
 type MarketIcp = MarketStrategy["icp"][number];
@@ -75,6 +88,18 @@ function buildOrgMarketStrategyForCopy(user: any): MarketStrategy | undefined {
     icp: shouldFillIcps ? fallbackIcps : (existing?.icp ?? []),
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
+    // Tracked separately from updatedAt (ENG-1955 follow-up). When this copy
+    // fills in icp from the owner's onboarding icpResult, it's a system copy
+    // of that generation, not a fresh manual edit — backdate to the owner's
+    // own icpCompletedAt (mirrors mirrorIcpsToMarketStrategy's reasoning) so
+    // routes/crm.ts's staleness check doesn't mistake "profile copied to org"
+    // for "ICP corrected", which would permanently switch every org member
+    // off their cached, richer icpResult-derived filters for no reason. When
+    // icp isn't being (re)filled here, carry the existing value forward
+    // unchanged — this copy didn't touch icp content.
+    icpUpdatedAt: shouldFillIcps
+      ? (user.icpCompletedAt ?? now)
+      : existing?.icpUpdatedAt,
   };
 }
 
@@ -242,6 +267,10 @@ function deriveDomainFromEmail(email: string): string | undefined {
 
 function sanitizeConnectedAccountForOrgResponse(account: any): any {
   const safeConfig: Record<string, any> = {};
+  // Daily outreach limits are account-activity data, not org-shared connection
+  // metadata. The owner-facing account endpoint has its own explicit contract;
+  // this member-visible projection must not expose the cap, count, or window.
+  const privateOperationalKeys = new Set(['daily_invite_cap', 'daily_volume']);
   for (const [key, value] of Object.entries(account.config || {})) {
     const normalizedKey = key.toLowerCase();
     const looksCredentialLike =
@@ -251,7 +280,7 @@ function sanitizeConnectedAccountForOrgResponse(account: any): any {
       normalizedKey.includes("secret") ||
       normalizedKey === "api_key" ||
       normalizedKey === "apikey";
-    if (!looksCredentialLike) {
+    if (!looksCredentialLike && !privateOperationalKeys.has(normalizedKey)) {
       safeConfig[key] = value;
     }
   }
@@ -383,6 +412,18 @@ router.post("/", async (req: Request, res: Response) => {
     const { name } = req.body;
     if (!name || typeof name !== "string" || name.trim().length === 0) {
       return res.status(400).json({ error: "Organization name is required" });
+    }
+
+    const { subscriptionType, resolved } = await getUserSubscriptionResolution(userId);
+    if (!resolved) {
+      return res.status(503).json({
+        error: "Subscription status is temporarily unavailable. Please try again.",
+      });
+    }
+    if (!ORGANIZATION_CREATION_TIERS.has(subscriptionType.trim().toLowerCase())) {
+      return res.status(403).json({
+        error: "A Starter plan or higher is required to create an organization.",
+      });
     }
 
     const now = new Date().toISOString();

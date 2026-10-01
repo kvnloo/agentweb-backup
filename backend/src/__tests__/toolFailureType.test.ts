@@ -38,6 +38,14 @@ describe('classifyToolFailureType', () => {
         classifyToolFailureType('Error', 'Task rejected: local agent may only be used for web browsing and data extraction'),
       ).toBe('by_design');
     });
+    // ENG-1844: the brand-logo gate correctly refusing to generate an invented-logo
+    // page is the tool working as designed, not a bug — must not inflate the 'bug'
+    // reliability count for a defect-free gate.
+    it('classifies missing_brand_logo errorClass', () => {
+      expect(
+        classifyToolFailureType('missing_brand_logo', 'API error (422): No brand logo is saved in Brand Guidelines.'),
+      ).toBe('by_design');
+    });
     it('classifies the local agent deprecation stub error (ENG-383) — retired-by-design, not a bug', () => {
       expect(
         classifyToolFailureType(
@@ -177,6 +185,45 @@ describe('402 alternation is HTTP-status-anchored, not a bare number (ENG-664)',
   it('still classifies a real HTTP 402 credit message as config', () => {
     expect(classifyToolFailureType('', 'X API error (HTTP 402): out of credits')).toBe('config');
     expect(classifyToolFailureType('', 'status code 402 payment required')).toBe('config');
+  });
+});
+
+describe('publisher_refused → by_design, not config or bug (ENG-1162)', () => {
+  it('treats a publisher bot-block/WAF refusal as by_design — the tool worked, a third party declined it', () => {
+    expect(classifyToolFailureType('publisher_refused')).toBe('by_design');
+  });
+
+  it('does not route it to config — there is no credential/account fix on our side', () => {
+    expect(
+      classifyToolFailureType(
+        'publisher_refused',
+        'The publisher refused this fetch (HTTP 403: Forbidden) — this is a site-side access block (bot filtering, WAF, or paywall), not an AgentWeb account or permissions problem.',
+      ),
+    ).not.toBe('config');
+  });
+
+  it('classifies the real net::ERR_EMPTY_RESPONSE browser-navigation shape as by_design, not bug', () => {
+    expect(
+      classifyToolFailureType(
+        'publisher_refused',
+        'Error: browserBackend.callTool: net::ERR_EMPTY_RESPONSE at https://ramaonhealthcare.com/example',
+      ),
+    ).toBe('by_design');
+  });
+
+  it('still classifies as by_design from the MESSAGE alone, without errorClass — the marker text contains "Forbidden", which would otherwise match CONFIG_RE and silently fall to config', () => {
+    expect(
+      classifyToolFailureType(
+        '',
+        'The publisher refused this fetch (HTTP 403: Forbidden) — this is a site-side access block (bot filtering, WAF, or paywall), not an AgentWeb account or permissions problem.',
+      ),
+    ).toBe('by_design');
+    expect(
+      classifyToolFailureType(
+        undefined,
+        'Error: browserBackend.callTool: net::ERR_EMPTY_RESPONSE at https://ramaonhealthcare.com/example',
+      ),
+    ).toBe('by_design');
   });
 });
 

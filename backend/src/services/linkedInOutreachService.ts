@@ -159,6 +159,14 @@ export class LinkedInOutreachService {
       ? new Error(structuredError.message)
       : (error instanceof Error ? error : new Error(structuredError.message));
     (enhancedError as any).structuredError = structuredError;
+    // ENG-1300: classifyToolErrorClass (and toolResultError's reconstruction)
+    // only look at a top-level .status/.statusCode/.code — structuredError.status
+    // computed above is nested and invisible to them, so every caller through
+    // handleError classified as generic Error/bug regardless of the real HTTP
+    // status. Mirror it to the top level so all of them pick it up at once.
+    if (!Number.isNaN(status)) {
+      (enhancedError as any).code = status;
+    }
     throw enhancedError;
   }
 
@@ -449,6 +457,21 @@ export class LinkedInOutreachService {
    * works at all matches this; a zero on it is about the ACCOUNT, not the query.
    */
   static readonly SEARCH_CAPABILITY_CANARY_KEYWORDS = 'marketing';
+
+  /**
+   * Concurrency cap for filterByCompanySize's per-employer lookups (ENG-1558
+   * follow-up). Each distinct employer costs two sequential outbound calls
+   * (resolve name -> id, then fetch the company profile), so an unthrottled
+   * `Promise.all` over a page with 15-20 distinct employers could fire
+   * 30-40 concurrent Unipile requests from a single search — an
+   * uncomfortable burst against the shared/platform-fallback account other
+   * users are also hitting. Chunking bounds it to
+   * `2 * COMPANY_SIZE_LOOKUP_CONCURRENCY` concurrent requests at a time,
+   * matching the plain chunked-Promise.all pattern already used elsewhere
+   * in this codebase for external lookups (e.g. emailDeliverabilityService's
+   * MX_LOOKUP_CONCURRENCY) rather than pulling in a semaphore/library.
+   */
+  static readonly COMPANY_SIZE_LOOKUP_CONCURRENCY = 5;
 
   /**
    * People-search capability canary (ENG-975).
@@ -1147,6 +1170,111 @@ export class LinkedInOutreachService {
     return this.resolveSearchParamId('COMPANY', company, accountId);
   }
 
+  /**
+   * Filter search-people result items by their current employer's headcount
+   * (ENG-1558). Unipile has no native headcount filter for the People search
+   * category — only for Companies — so this resolves each item's employer
+   * NAME (from `work_experience`, free text) to a company ID via the same
+   * cached resolver `searchPeople` itself uses, then reads `employee_count`
+   * off the cached company profile (UnipileCompanyService — 30-day TTL, same
+   * service the `get-company` tool action already uses). Both hops are
+   * already-cached lookups; nothing new to cache here.
+   *
+   * A candidate whose employer can't be resolved, or whose profile carries
+   * no employee_count, is EXCLUDED rather than silently let through — the
+   * caller explicitly asked for a size-filtered list, so an unverifiable
+   * result is worse than a smaller, honest one. `excludedUnverifiable`
+   * reports how many so the caller can be transparent about it (mirrors the
+   * ENG-1002 anonymizedFiltered pattern), the same way an out-of-network
+   * result or a reach limit gets reported instead of silently vanishing.
+   *
+   * No-op (returns items unchanged) when neither bound is given, so callers
+   * that never ask for this pay no extra latency or Unipile calls.
+   */
+  async filterByCompanySize(
+    items: any[],
+    range: { min?: number; max?: number },
+    accountId: string,
+  ): Promise<{ items: any[]; excludedUnverifiable: number }> {
+    // CodeRabbit: contradictory or negative bounds would otherwise silently
+    // exclude every verifiable candidate (min > max fails both comparisons
+    // for any real count) with no signal to the caller about why — fail
+    // fast instead of burning employer lookups on an unsatisfiable range.
+    if (
+      (range.min != null && range.min < 0) ||
+      (range.max != null && range.max < 0) ||
+      (range.min != null && range.max != null && range.min > range.max)
+    ) {
+      throw new Error('company_size_min and company_size_max must be non-negative and min must not exceed max');
+    }
+    if (range.min == null && range.max == null) return { items, excludedUnverifiable: 0 };
+
+    const employerOf = (item: any): string | null => {
+      const exp = Array.isArray(item?.work_experience) ? item.work_experience : [];
+      const current = exp.find((w: any) => w?.current) || exp[0];
+      return typeof current?.company === 'string' && current.company.trim()
+        ? current.company.trim()
+        : null;
+    };
+
+    // Resolve each DISTINCT employer once, not once per candidate — a page
+    // of results routinely has several candidates at the same company.
+    const uniqueNames = Array.from(
+      new Set(items.map(employerOf).filter((n): n is string => !!n)),
+    );
+
+    const headcountByName = new Map<string, number | null>();
+    const lookupOne = async (name: string) => {
+      try {
+        const companyId = await this.resolveCompanyId(name, accountId);
+        if (!companyId) { headcountByName.set(name, null); return; }
+        const { getUnipileCompanyService } = await import('./unipileCompanyServiceFactory');
+        // CodeRabbit: getCompanyProfile has no timeout of its own — one hung
+        // Unipile request would otherwise stall this whole lookup batch
+        // (Promise.all never settles until every member does). Bound it and
+        // treat a timeout as unverifiable, same as any other lookup failure.
+        const result = await LinkedInOutreachService.withTimeout(
+          getUnipileCompanyService().getCompany(companyId, accountId),
+          LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+          `LinkedIn company lookup for ${companyId}`,
+        );
+        const count =
+          typeof result.rawData?.employee_count === 'number'
+            ? result.rawData.employee_count
+            : typeof result.rawData?.insights?.employeesCount?.totalCount === 'number'
+            ? result.rawData.insights.employeesCount.totalCount
+            : null;
+        headcountByName.set(name, count);
+      } catch (error: any) {
+        // A single company lookup failing (rate limit, transient 5xx) must
+        // not fail the whole search — treat that one employer as
+        // unverifiable, same as a resolver miss.
+        this.log(`Company size lookup failed for "${name}" — treating as unverifiable`, {
+          reason: error?.message,
+        });
+        headcountByName.set(name, null);
+      }
+    };
+    // Chunked, not one big Promise.all — see COMPANY_SIZE_LOOKUP_CONCURRENCY.
+    const CONCURRENCY = LinkedInOutreachService.COMPANY_SIZE_LOOKUP_CONCURRENCY;
+    for (let i = 0; i < uniqueNames.length; i += CONCURRENCY) {
+      const batch = uniqueNames.slice(i, i + CONCURRENCY);
+      await Promise.all(batch.map(lookupOne));
+    }
+
+    let excludedUnverifiable = 0;
+    const filtered = items.filter((item) => {
+      const name = employerOf(item);
+      const count = name ? headcountByName.get(name) ?? null : null;
+      if (count == null) { excludedUnverifiable++; return false; }
+      if (range.min != null && count < range.min) return false;
+      if (range.max != null && count > range.max) return false;
+      return true;
+    });
+
+    return { items: filtered, excludedUnverifiable };
+  }
+
   private async resolveSearchParamId(
     type: 'COMPANY' | 'LOCATION' | 'INDUSTRY' | 'SCHOOL' | 'SERVICE',
     keywords: string,
@@ -1398,12 +1526,30 @@ export class LinkedInOutreachService {
   ): Promise<Array<{ id: string; provider_id: string; text: string | null; is_sender: 0 | 1; is_event: 0 | 1; sender_id: string; timestamp: string }>> {
     const client = await this.getClient();
 
-    // Step 1: find the chat between our account and this attendee
-    const chatsResult = await client.messaging.getAllChatsFromAttendee({
-      attendee_id: attendeeId,
-      account_id,
-      limit: 1,
-    });
+    // Step 1: find the chat between our account and this attendee.
+    // Unipile only has a chat_attendee record once a chat exists — a 1st-degree
+    // connection who has never been messaged has no such record, so this 404s
+    // instead of resolving with items: []. That is "no conversation yet", not a
+    // failure (ENG-1623), so classify it the same way handleError would and swallow
+    // only the NOT_FOUND case; anything else (auth/session/etc.) still propagates.
+    let chatsResult;
+    try {
+      chatsResult = await client.messaging.getAllChatsFromAttendee({
+        attendee_id: attendeeId,
+        account_id,
+        limit: 1,
+      });
+    } catch (error: any) {
+      try {
+        await this.handleError(error, 'getMessagesWithContact');
+      } catch (enhanced: any) {
+        if (enhanced?.structuredError?.classification === 'NOT_FOUND') {
+          this.log('getMessagesWithContact: no chat_attendee record yet (never messaged)', { attendeeId, account_id });
+          return [];
+        }
+        throw enhanced;
+      }
+    }
 
     if (!chatsResult?.items?.length) {
       this.log('getMessagesWithContact: no chat found for attendee', { attendeeId, account_id });

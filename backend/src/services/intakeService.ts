@@ -165,6 +165,17 @@ export interface FileUserIssueParams {
   /** Chat session id of the reporter, so eng can jump straight to the offending session. */
   sessionId?: string;
   /**
+   * Who TRIGGERED this filing — the account whose action ran it, which is not
+   * necessarily who it is filed for. ENG-1961: the dedup judge is an LLM call
+   * that used to book to the `system` placeholder; it is now charged here.
+   *
+   * Deliberately distinct from `userEmail`. Under ENG-939 `userEmail` is the
+   * AFFECTED user of a cross-user telemetry review, who asked for nothing — so
+   * metering against them would charge a customer for an admin's triage. The
+   * actor is the one who spent the tokens.
+   */
+  actingUserId?: string;
+  /**
    * Stable identity of THIS report by THIS reporter (`utils/reportIntake.reportFingerprint`).
    * ENG-529 AC5 / ENG-598 option A: stamped on the created Featurebase ticket and looked up before
    * creating another, so a retry that outlives the in-process replay guard replays instead of
@@ -253,6 +264,7 @@ async function fileFeatureRequest(p: FileUserIssueParams): Promise<FiledUserResu
   const dup = await findDuplicate(
     { type: 'feature_request', title: p.title, description: p.description },
     posts.map((x) => ({ ref: x.id, title: x.title, description: x.description })),
+    { userId: p.actingUserId, sessionId: p.sessionId },
   );
 
   if (dup) {
@@ -371,6 +383,7 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
     : await findDuplicate(
         { type: 'bug', title: p.title, description: p.description },
         cans.map((c) => ({ ref: c.identifier, title: c.title, description: c.description })),
+        { userId: p.actingUserId, sessionId: p.sessionId },
       );
 
   // Reopen, not refile (ENG-240 contract #3): when no OPEN canonical matches but the report explicitly
@@ -388,6 +401,7 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
         const rdup = await findDuplicate(
           { type: 'bug', title: p.title, description: p.description },
           resolved.map((c) => ({ ref: c.identifier, title: c.title, description: c.description })),
+          { userId: p.actingUserId, sessionId: p.sessionId },
         );
         reopenTarget = rdup ? rByRef.get(rdup.ref) || null : null;
       }
@@ -453,7 +467,9 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
       ].join('\n'),
       // Stage labels + no-rot defaults (ENG-187): every customer bug lands in Todo, assigned,
       // with a funnel-derived priority — never unowned in Backlog.
-      labelNames: ['Bug', 'Customer Reported', ...stageTags],
+      // ENG-1590: Delegated-Filed marks issues filed via a delegated admin session; absence is the
+      // queryable self-filed signal (matches the repo's Auto-label convention — no paired default).
+      labelNames: ['Bug', 'Customer Reported', ...(p.reportedByAdmin ? ['Delegated-Filed'] : []), ...stageTags],
       priority,
       stateName: BUG_CANONICAL_STATE,
       assigneeId: BUG_DEFAULT_ASSIGNEE_ID,
@@ -695,11 +711,34 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
     // (escalateIssue is raise-only and a distinct, intentional ENG-358 behavior); routing is not.
     return { pageId: match.identifier, url: `${LINEAR_ISSUE_BASE}/${match.identifier}`, deduped: true, tracker: 'Linear' };
   }
+
+  // No LIVE canonical matched (none, or the only match(es) were archived — listOpenIssuesByLabel
+  // never returns an archived row, see linearService). ENG-730: archival is otherwise a SILENT
+  // dedupe-breaking event — the occurrence history for this alert class goes cold with no trace.
+  // Best-effort look up the most recently archived issue of the same class/idempotency-key/title
+  // so the fresh canonical records what it replaces (AC3). Never blocks filing: any failure here
+  // just means the new canonical carries no predecessor line, exactly like before this change.
+  let archivedPredecessorLine = '';
+  try {
+    const { findMostRecentArchivedIssueByLabel } = await import('./linearService');
+    const archived = await findMostRecentArchivedIssueByLabel('Auto', (i) => {
+      if (classNeedle && classNeedle.test(i.description || '')) return true;
+      if (idKeys.length && idKeys.some((k) => (i.description || '').includes(k))) return true;
+      return norm(i.title) === norm(p.title);
+    });
+    if (archived) {
+      archivedPredecessorLine = `Predecessor (archived): ${archived.identifier} — that canonical was archived, so this occurrence could not be attached to it and a new canonical was filed instead.`;
+    }
+  } catch (e) {
+    console.warn('[intake] archived-predecessor lookup failed:', e instanceof Error ? e.message : e);
+  }
+
   const body = [
     p.description,
     '',
     '---',
     `Source: ${p.source} — auto-identified by the system.`,
+    ...(archivedPredecessorLine ? [archivedPredecessorLine] : []),
     ...contextLines(p.notionContext),
   ].join('\n');
   const li = await createInternalLinearIssue({

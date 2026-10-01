@@ -1329,6 +1329,199 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
     expect(mockAxios.delete).not.toHaveBeenCalled();
   });
 
+  // ENG-1839 follow-up. The required-Tests gate is correct for a repo that runs tests and
+  // UNSATISFIABLE for one that does not. Generated landing-page repos contain no
+  // .github/workflows, so no check named "Tests" could ever appear and publish returned 409
+  // required_tests_pending forever — its own message said "retry after GitHub starts it",
+  // which GitHub never would. That is one of the reasons a customer's rebuilt page could not
+  // be published at all.
+  it("publishes a repo that defines no workflows — no Tests check can ever exist", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: { check_runs: [] } })   // nothing reported at all
+      .mockResolvedValueOnce({ data: { total_count: 0 } })   // ...and no workflows exist
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } });
+    mockAxios.post
+      .mockResolvedValueOnce({ data: { number: 123 } })
+      .mockResolvedValueOnce({ data: { sha: "merge-sha" } });
+    mockAxios.delete.mockResolvedValueOnce({ data: {} });
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://x.agentwebforms.com");
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    expect(mockAxios.post).toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    // Both signals must have been consulted before skipping the gate.
+    expect(mockAxios.get).toHaveBeenCalledWith(
+      expect.stringContaining("/check-runs"), expect.anything()
+    );
+    expect(mockAxios.get).toHaveBeenCalledWith(
+      expect.stringContaining("/actions/workflows"), expect.anything()
+    );
+  });
+
+  it("FAIL-CLOSED: an unreadable workflow list keeps the gate rather than skipping it", async () => {
+    // "Could not determine whether this repo has CI" must never be treated as "it has none".
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: { check_runs: [] } })   // nothing reported
+      .mockRejectedValueOnce(new Error("GitHub 502"));       // workflow list unreadable
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+  });
+
+  it("FAIL-CLOSED: a 200 with no total_count keeps the gate", async () => {
+    // The `?? 1` default IS the fail-closed guarantee, and mutation testing showed nothing
+    // pinned it — changing it to `?? 0` left the whole suite green. A proxy or a changed API
+    // shape returning 200 with an unexpected body must not be read as "this repo has no CI".
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: { check_runs: [] } })
+      .mockResolvedValueOnce({ data: {} }); // 200, but no total_count
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+  });
+
+  // ENG-1856. The `checkRuns.length === 0` requirement this test used to pin was itself the
+  // bug: Vercel's own GitHub integration auto-deploys and posts a check run for ANY PR on a
+  // connected project, unconditionally, and this route always opens a PR as its first step —
+  // so `checkRuns.length` was never actually 0 on a real publish attempt, the workflow-count
+  // check never ran, and the gate blocked every single publish forever. Confirmed live: zero
+  // of a random sample of generated repos ever had a merged publish PR since this gate shipped.
+  it("skips the gate when a non-Tests check exists but the repo genuinely has zero workflows", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        // Vercel's bot check — present on every real publish attempt, unrelated to test execution.
+        data: { check_runs: [{ name: "Vercel Preview Comments", status: "completed", conclusion: "success", app: { slug: "vercel" } }] },
+      })
+      .mockResolvedValueOnce({ data: { total_count: 0 } }) // no Actions workflow can ever run
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } });
+    mockAxios.post
+      .mockResolvedValueOnce({ data: { number: 123 } })
+      .mockResolvedValueOnce({ data: { sha: "merge-sha" } });
+    mockAxios.delete.mockResolvedValueOnce({ data: {} });
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://x.agentwebforms.com");
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    // The workflow count is now consulted whenever no "Tests" check reported, regardless of
+    // what ELSE has reported — that's the whole fix.
+    expect(mockAxios.get).toHaveBeenCalledWith(
+      expect.stringContaining("/actions/workflows"), expect.anything()
+    );
+  });
+
+  it("still blocks a repo that genuinely has an Actions workflow but no Tests check yet", async () => {
+    // The workflow-count check itself must still fail closed for a repo that DOES have real
+    // CI configured — this is what keeps the gate meaningful, not merely satisfiable.
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "Vercel Preview Comments", status: "completed", conclusion: "success", app: { slug: "vercel" } }] },
+      })
+      .mockResolvedValueOnce({ data: { total_count: 1 } }); // a real Actions workflow exists
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockAxios.post).not.toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+  });
+
+  it("keeps the gate for a check from an app that is NOT the known-benign allowlist", async () => {
+    // This is the narrower protection ENG-1856 preserves: only a check identified as Vercel's
+    // own app is filtered out. Any OTHER app's check — a real CI tool, or anything unexpected —
+    // still counts toward checkRuns.length and keeps the gate, never even asking about
+    // workflows. Filtering everything unconditionally was the wrong fix; this pins the boundary.
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "buildkite", status: "completed", conclusion: "success", app: { slug: "buildkite" } }] },
+      });
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(mockAxios.get).not.toHaveBeenCalledWith(
+      expect.stringContaining("/actions/workflows"), expect.anything()
+    );
+  });
+
+  it("still blocks a repo WITH CI whose Tests check has not completed", async () => {
+    // The gate must keep working where it was always meaningful.
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } })
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({
+        data: { check_runs: [{ name: "Tests", status: "in_progress", conclusion: null }] },
+      });
+    mockAxios.post.mockResolvedValueOnce({ data: { number: 123 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("required_tests_pending");
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+  });
+
   it("SUCCESS: a duplicate PR creation response reuses the concurrently created PR", async () => {
     mockGetLandingPageById.mockResolvedValueOnce(PAGE);
     mockAxios.get
@@ -1545,6 +1738,75 @@ describe("GET /api/landing-pages/v0/generated", () => {
     expect(res.body.pages[0].customDomainUrl).toBe("https://hireemma.ai");
   });
 
+  it("FAIL: a half-configured custom domain must not hide a broken subdomain's warning", async () => {
+    // ENG-1839. The reachability sweep deliberately does not probe an unverified domain — a
+    // pending custom domain has no DNS yet, so failing it would be an expected failure
+    // reported as a fault. But `rank` preferred `type: "custom"` regardless of status, so a
+    // pending custom domain won, and the winning row could never carry a verdict. Result: a
+    // managed subdomain CONFIRMED unreachable went unreported for as long as a custom domain
+    // sat half-configured on the same project — the ticket's own "stops watching the broken
+    // thing" failure, moved from the write path to the read path. It also rewrote the page's
+    // URL from the working subdomain to a host with no DNS.
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
+      { id: "page-1", name: "Page 1", userId: "test-user-id", vercelProjectId: "proj-1", status: "deployed" },
+    ]);
+    mockListDomainsForPages.mockResolvedValueOnce([
+      {
+        id: "dom-sub", domain: "acme.agentwebforms.com", vercelProjectId: "proj-1",
+        type: "subdomain", status: "active", updatedAt: "2026-02-01T00:00:00Z",
+        reachabilityStatus: "unreachable",
+        reachabilityError: "The connection closed during the SSL handshake.",
+      },
+      {
+        id: "dom-cust", domain: "newsite.acme.io", vercelProjectId: "proj-1",
+        type: "custom", status: "pending_verification", updatedAt: "2026-03-01T00:00:00Z",
+      },
+    ]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    const page = res.body.pages[0];
+    // The warning must still reach the customer.
+    expect(page.domainStatus).toBe("error");
+    expect(page.domainErrorMessage).toMatch(/SSL handshake/i);
+    // ...and the reported URL must stay on the host that actually resolves.
+    expect(page.domainHost).toBe("acme.agentwebforms.com");
+    expect(page.customDomainUrl).toBe("https://acme.agentwebforms.com");
+  });
+
+  it("an unverified custom domain alone must not become the page's reported host", async () => {
+    /*
+     * ENG-1839. `rank` is a COMPARATOR, not a filter, and the winner is seeded
+     * unconditionally — so rank 0 means "loses a comparison", never "is rejected". With a
+     * pending custom domain as the project's only attached row there is nothing to lose to,
+     * so it was adopted anyway and the page reported a host with no DNS. Exactly the failure
+     * the three tiers exist to prevent, surviving in the one shape where ranking never runs.
+     *
+     * Production reaches this shape via `DELETE /api/domains/:id`, the page-subdomain cascade
+     * cleanup, and the detach/re-add window in this PR's own repair script.
+     */
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
+      {
+        id: "page-1", name: "Page 1", userId: "test-user-id", vercelProjectId: "proj-1",
+        status: "deployed", deployedUrl: "https://lp-acme.vercel.app",
+      },
+    ]);
+    mockListDomainsForPages.mockResolvedValueOnce([
+      {
+        id: "dom-cust", domain: "newsite.acme.io", vercelProjectId: "proj-1",
+        type: "custom", status: "pending_verification", updatedAt: "2026-03-01T00:00:00Z",
+      },
+    ]);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated");
+
+    expect(res.status).toBe(200);
+    const page = res.body.pages[0];
+    expect(page.domainHost).toBeUndefined();
+    expect(page.customDomainUrl).toBeUndefined();
+  });
+
   it("FAIL: org member viewing a shared page → enriched from the page OWNER's domains", async () => {
     // The caller (member) owns no domains; the shared page's owner does. The
     // member must see the same attached subdomain the owner sees, not a stale
@@ -1704,6 +1966,24 @@ describe("DELETE /api/landing-pages/v0/generated/:id", () => {
 // Rate Limiting
 // =============================================================================
 describe("POST /api/landing-pages/v0/generated/:id/duplicate", () => {
+  it("FAIL (ENG-1238): an externally-imported record is rejected before any generation", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Imported",
+      status: "deployed",
+      sourceType: "external",
+      canonicalUrl: "https://example.com/page",
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(409);
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+  });
+
   it("SUCCESS: re-generates with org-aware brand context passed through", async () => {
     const orgBrand = {
       brandData: { brandName: "OrgBrand" },

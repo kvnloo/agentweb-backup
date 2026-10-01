@@ -16,6 +16,8 @@
 
 import AWS from "aws-sdk";
 import { LLM_CHARGE_EVENTS_TABLE, LlmChargeAuditEvent } from "./llmChargeAuditDb";
+import { SPEND_EVENTS_TABLE, SpendEvent, validateSpendEvent } from "./spendEventDb";
+import { applySettledSpendEvents } from "./spendProjectionDb";
 
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const TABLE_NAME = `${TABLE_PREFIX}AW-UsageRecords`;
@@ -208,7 +210,13 @@ function buildIncrementUsageUpdate(inc: UsageRecordIncrement): {
   const addClauses: string[] = [];
   if (isUnitEntry) {
     names["#quantity"] = "quantity";
-    values[":qty"] = Math.max(0, Math.round(inc.quantity || 0));
+    // Fractional on purpose, never rounded (ENG-1878). ElevenLabs bills per
+    // 1,000 characters and records a 24-character clip as 0.024 units; rounding
+    // wrote 0 for every clip under 500 characters, so the aggregate lost the
+    // usage its own spend event kept. DynamoDB numbers are exact decimals, so
+    // ADD accumulates these without float drift. Still never negative or NaN.
+    const quantity = Number(inc.quantity);
+    values[":qty"] = Number.isFinite(quantity) && quantity > 0 ? quantity : 0;
     addClauses.push("#quantity :qty");
   } else {
     Object.assign(values, {
@@ -346,8 +354,17 @@ export const usageRecordDb = {
    */
   async incrementUsageWithChargeEvent(
     inc: UsageRecordIncrement,
-    chargeEvent: LlmChargeAuditEvent
+    chargeEvent: LlmChargeAuditEvent,
+    /**
+     * ENG-1934: the same group's spend events — one per priced portion —
+     * written as further items of the same transaction, so the ledger can
+     * never hold an engine charge the aggregate lacks, or the reverse. Omitted
+     * (kill switch off, or an unpriced group), the transaction is exactly the
+     * two items it was.
+     */
+    spendEvents: SpendEvent[] = []
   ): Promise<"applied" | "duplicate" | "conflict"> {
+    spendEvents.forEach(validateSpendEvent);
     const ledgerParams = buildIncrementUsageUpdate(inc);
     const ledgerItem: AWS.DynamoDB.DocumentClient.TransactWriteItem = {
       Update: { TableName: TABLE_NAME, ...ledgerParams },
@@ -361,18 +378,186 @@ export const usageRecordDb = {
       },
     };
 
+    const transactItems = [
+      ledgerItem,
+      chargeItem,
+      ...spendEvents.map(
+        (event): AWS.DynamoDB.DocumentClient.TransactWriteItem => ({
+          Put: {
+            TableName: SPEND_EVENTS_TABLE,
+            Item: event,
+            ConditionExpression: "attribute_not_exists(billingUserId) AND attribute_not_exists(eventId)",
+          },
+        }),
+      ),
+    ];
+
     try {
       await getDocumentClient()
-        .transactWrite({ TransactItems: [ledgerItem, chargeItem] })
+        .transactWrite({ TransactItems: transactItems })
         .promise();
+      // ENG-1250 §3b: fold the just-committed settled events into the persisted
+      // projection. Fire-and-forget and never-throws — observe-only maintenance
+      // must not fail the charging transaction it rides behind. Only on a
+      // genuinely new write ("applied"); a duplicate replay must not double-add.
+      //
+      // At-least-once, deliberately (CodeRabbit F5, skipped): this delivery is
+      // best-effort, so a crash between the commit and this call drops the
+      // projection update. That is acceptable while the rail is DARK — the drift
+      // it causes is healed by the periodic reconcile (spendReconciliation) and
+      // the backfill (spendProjectionBackfill), and nothing enforces on the
+      // projection until AW_SPEND_LEDGER_ENFORCEMENT flips. Durable delivery (a
+      // DynamoDB-stream/outbox consumer) is a pre-flip follow-up, not built here;
+      // a stream/outbox would be disproportionate for an observe-only rail.
+      void applySettledSpendEvents(spendEvents);
       return "applied";
     } catch (error: any) {
       // Same classification as db.ts's applyMonthlyChargeAtomic: a
       // TransactWriteItems condition failure surfaces as
       // TransactionCanceledException with a per-item CancellationReasons
-      // array (index order matches TransactItems: 0 = ledger, 1 = charge),
-      // not the single-item ConditionalCheckFailedException recordLlmChargeEvent
-      // catches on its own standalone put.
+      // array (index order matches TransactItems: 0 = ledger, 1 = charge,
+      // 2+ = spend events when present), not the single-item
+      // ConditionalCheckFailedException recordLlmChargeEvent catches on its
+      // own standalone put.
+      //
+      // "duplicate" stays keyed on the CHARGE event alone. The spend events
+      // derive their ids from it and were only ever written in this same
+      // transaction, so a genuine retry fails every condition together. A spend-event-only
+      // failure has no legitimate cause; it falls through to a throw, and the
+      // route's fallback writes the usage rather than silently skipping it.
+      const reasons = error?.CancellationReasons as Array<{ Code?: string }> | undefined;
+      if (error?.code === "TransactionConflictException") return "conflict";
+      if (error?.code === "TransactionCanceledException" && reasons) {
+        if (reasons[1]?.Code === "ConditionalCheckFailed") return "duplicate";
+        const isPureConflict =
+          reasons.some((reason) => reason?.Code === "TransactionConflict") &&
+          reasons.every((reason) => reason?.Code === "TransactionConflict" || reason?.Code === "None");
+        if (isPureConflict) return "conflict";
+      }
+      throw error;
+    }
+  },
+
+  /**
+   * The vendor equivalent of `incrementUsageWithChargeEvent` (ENG-702 AC1).
+   *
+   * Writes the daily aggregate row and its immutable spend event in ONE
+   * transaction, conditional on the caller-supplied idempotency token. A
+   * replayed token therefore no-ops the spend event AND skips the aggregate's
+   * contribution *together* — never independently, which is the exact defect
+   * ENG-1251 was raised to close on the LLM side: a retried batch could
+   * previously dedupe its charge event while its ledger contribution landed
+   * a second time.
+   *
+   * Targets AW-SpendEvents, not AW-LlmChargeEvents. That table declares itself
+   * "deliberately LLM-only: it is not the future cross-vendor wallet", so
+   * vendor events have no business in it.
+   *
+   * No TTL is written, unlike the LLM charge event above. AW-SpendEvents is
+   * retained by decision (ENG-1796) — see spendEventDb.
+   */
+  async incrementUsageWithSpendEvent(
+    inc: UsageRecordIncrement,
+    spendEvent: SpendEvent
+  ): Promise<"applied" | "duplicate" | "conflict"> {
+    // Fail before the transaction rather than writing a malformed row: the
+    // store's guarantees (month agrees with instant, integer micro-dollars,
+    // allocated costs carry a rate version) are worth nothing if the
+    // transactional path can bypass them.
+    validateSpendEvent(spendEvent);
+
+    const ledgerParams = buildIncrementUsageUpdate(inc);
+    const ledgerItem: AWS.DynamoDB.DocumentClient.TransactWriteItem = {
+      Update: { TableName: TABLE_NAME, ...ledgerParams },
+    };
+    const spendItem: AWS.DynamoDB.DocumentClient.TransactWriteItem = {
+      Put: {
+        TableName: SPEND_EVENTS_TABLE,
+        Item: spendEvent,
+        ConditionExpression: "attribute_not_exists(billingUserId) AND attribute_not_exists(eventId)",
+      },
+    };
+
+    try {
+      await getDocumentClient()
+        .transactWrite({ TransactItems: [ledgerItem, spendItem] })
+        .promise();
+      // ENG-1250 §3b: fold this just-committed settled event into the persisted
+      // projection (fire-and-forget, never-throws). "applied" only, so a
+      // deduped replay never double-adds.
+      //
+      // At-least-once, deliberately (CodeRabbit F5, skipped): a crash before this
+      // runs drops the update; the reconcile + backfill heal the drift and
+      // nothing enforces until the flag flips, so a stream/outbox is a pre-flip
+      // follow-up, not warranted for this dark, observe-only rail.
+      void applySettledSpendEvents([spendEvent]);
+      return "applied";
+    } catch (error: any) {
+      // Same classification as incrementUsageWithChargeEvent: a transaction
+      // condition failure surfaces as TransactionCanceledException with a
+      // per-item CancellationReasons array (index order matches TransactItems:
+      // 0 = ledger, 1 = spend event), not the single-item
+      // ConditionalCheckFailedException a standalone put would raise.
+      const reasons = error?.CancellationReasons as Array<{ Code?: string }> | undefined;
+      if (error?.code === "TransactionConflictException") return "conflict";
+      if (error?.code === "TransactionCanceledException" && reasons) {
+        if (reasons[1]?.Code === "ConditionalCheckFailed") return "duplicate";
+        const isPureConflict =
+          reasons.some((reason) => reason?.Code === "TransactionConflict") &&
+          reasons.every((reason) => reason?.Code === "TransactionConflict" || reason?.Code === "None");
+        if (isPureConflict) return "conflict";
+      }
+      throw error;
+    }
+  },
+
+  /**
+   * The unpriced counterpart to incrementUsageWithSpendEvent (ENG-1958).
+   *
+   * An unpriced vendor call has no spend event (the billing boundary forbids a
+   * $0 one), so it cannot use the spend-event transaction to dedupe. But a
+   * KEYED unpriced call can still be replayed, and the plain ADD it used to
+   * fall back to double-counted the aggregate's quantity/callCount on retry.
+   *
+   * This pairs the aggregate ADD with a conditional Put of a tiny dedupe marker
+   * in the SAME table and key schema (userId HASH / sk RANGE) -- no new table,
+   * index or key shape. The marker lives in its own `idem#<billingUserId>`
+   * partition so it can never collide with a real usage row, carries no
+   * provider/unit/cost so it is invisible to isVendorEntry and the spend reads,
+   * and self-expires via the table's native `ttl`. A replay's Put fails the
+   * condition, cancels the transaction, and the aggregate is not touched.
+   */
+  async incrementUsageWithDedupeMarker(
+    inc: UsageRecordIncrement,
+    markerBillingUserId: string,
+    idempotencyKey: string
+  ): Promise<"applied" | "duplicate" | "conflict"> {
+    const ledgerParams = buildIncrementUsageUpdate(inc);
+    const ledgerItem: AWS.DynamoDB.DocumentClient.TransactWriteItem = {
+      Update: { TableName: TABLE_NAME, ...ledgerParams },
+    };
+    const markerItem: AWS.DynamoDB.DocumentClient.TransactWriteItem = {
+      Put: {
+        TableName: TABLE_NAME,
+        Item: {
+          userId: `idem#${markerBillingUserId}`,
+          sk: idempotencyKey,
+          // A retry window, not a spend record: a week is generous, and the
+          // native table TTL reclaims it so markers never accumulate.
+          ttl: Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60,
+        },
+        ConditionExpression: "attribute_not_exists(userId) AND attribute_not_exists(sk)",
+      },
+    };
+
+    try {
+      await getDocumentClient()
+        .transactWrite({ TransactItems: [ledgerItem, markerItem] })
+        .promise();
+      return "applied";
+    } catch (error: any) {
+      // Index order matches TransactItems: 0 = ledger, 1 = marker. Only a
+      // condition failure on the MARKER (index 1) means "already seen".
       const reasons = error?.CancellationReasons as Array<{ Code?: string }> | undefined;
       if (error?.code === "TransactionConflictException") return "conflict";
       if (error?.code === "TransactionCanceledException" && reasons) {

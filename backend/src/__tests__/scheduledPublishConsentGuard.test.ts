@@ -3,9 +3,19 @@ import {
   publishWithdrawnMidFlight,
   attachPublishRevalidation,
 } from '../utils/scheduledPublishConsentGuard';
+import { chatbotDb } from '../services/chatbotService';
+import { scheduleDb } from '../services/db';
+import { getAccountsWithOwnerIncludingOrgShared } from '../services/connectedAccountsDb';
 
 jest.mock('../services/chatbotService', () => ({ chatbotDb: { getChatSession: jest.fn() } }));
 jest.mock('../services/db', () => ({ scheduleDb: { getScheduleById: jest.fn() } }));
+// ENG-1616 — mocked so the default-deps integration test below (which deliberately
+// exercises defaultDeps() itself, not a hand-written mock) can control what account
+// list the real resolveAccountPlatform sees, without hitting DynamoDB.
+jest.mock('../services/connectedAccountsDb', () => ({
+  getAccountsWithOwnerIncludingOrgShared: jest.fn(),
+  SOCIAL_POSTING_PLATFORMS: ['twitter', 'linkedin', 'instagram', 'youtube'],
+}));
 
 /**
  * ENG-827 (Greptile) — a revocation that lands MID-TURN must stop the publish.
@@ -130,6 +140,169 @@ describe('refuseUnauthorizedScheduledPublish (ENG-827)', () => {
       const refusal = await refuseUnauthorizedScheduledPublish(
         'twitter_manage_post', { sessionId: 'sess-1' }, d, { action: 'post_thread' }
       );
+      expect(refusal).not.toBeNull();
+    });
+  });
+
+  /**
+   * ENG-1616 — the reverse (ENG-1599) route requires trusting `args.platform`, but
+   * `postOnConnectedAccount` ignores `platform` outright once `account_id` is present,
+   * so the route failed closed on ANY account_id-bearing call, regardless of whether
+   * the account was actually the authorized one. `list_connected_accounts` pairs every
+   * account_id with its platform and tells the model to use account_id once it knows
+   * it, so a call shaped `post_on_connected_account(account_id: '...')` is a plausible
+   * way this route gets invoked — this closes that gap proactively.
+   *
+   * This is NOT a reproduction of an observed production failure: no account_id-shaped
+   * call has been seen hitting this refusal in production. (Session 672b3af7 on
+   * schedule 1d001fba-0fb7-4bcd-80f6-6041b244a442, 2026-08-27 — the incident ENG-1616
+   * was filed from — is a different call: it passed `platform`, not `account_id`, and
+   * ran hours BEFORE ENG-1599 merged later that same day, so it never touched this
+   * route at all. ENG-1599's own platform-only route already covers it.)
+   */
+  describe('the ENG-1599 reverse route with account_id present (ENG-1616)', () => {
+    const SESSION_WITH_USER = { ...SCHEDULED_SESSION, userId: 'harsha-user-id' };
+    const TWITTER_ONLY_SCHEDULE = {
+      ...AUTHORIZED_SCHEDULE,
+      requiredFunctionCalls: ['twitter_manage_post'],
+      autopublishAuthorizedTools: ['twitter_manage_post'],
+    };
+    const TWITTER_ONLY_ADMISSION = {
+      authorized: true,
+      tools: ['twitter_manage_post'],
+      recordedAt: '2026-08-27T08:18:05.550Z',
+    };
+
+    it('ALLOWS a standalone tweet by account_id once the account is verified as the connected Twitter account', async () => {
+      const d = {
+        ...deps(
+          { ...SESSION_WITH_USER, publishAdmission: TWITTER_ONLY_ADMISSION },
+          TWITTER_ONLY_SCHEDULE
+        ),
+        resolveAccountPlatform: jest.fn(async () => 'twitter'),
+      };
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'post_on_connected_account',
+        { sessionId: 'sess-1' },
+        d,
+        { account_id: '1340767380', content: 'one tweet' }
+      );
+      expect(refusal).toBeNull();
+      expect(d.resolveAccountPlatform).toHaveBeenCalledWith('1340767380', 'harsha-user-id');
+    });
+
+    it('still REFUSES when the resolved account is a DIFFERENT platform than the grant covers', async () => {
+      const d = {
+        ...deps(
+          { ...SESSION_WITH_USER, publishAdmission: TWITTER_ONLY_ADMISSION },
+          TWITTER_ONLY_SCHEDULE
+        ),
+        resolveAccountPlatform: jest.fn(async () => 'linkedin'),
+      };
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'post_on_connected_account',
+        { sessionId: 'sess-1' },
+        d,
+        { account_id: 'li-account', content: 'one post' }
+      );
+      expect(refusal).not.toBeNull();
+    });
+
+    it('still fails CLOSED when no resolver is available (preserves the prior default)', async () => {
+      const d = deps(
+        { ...SESSION_WITH_USER, publishAdmission: TWITTER_ONLY_ADMISSION },
+        TWITTER_ONLY_SCHEDULE
+      );
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'post_on_connected_account',
+        { sessionId: 'sess-1' },
+        d,
+        { account_id: '1340767380', content: 'one tweet' }
+      );
+      expect(refusal).not.toBeNull();
+    });
+
+    it('still fails CLOSED when the account lookup itself errors', async () => {
+      const d = {
+        ...deps(
+          { ...SESSION_WITH_USER, publishAdmission: TWITTER_ONLY_ADMISSION },
+          TWITTER_ONLY_SCHEDULE
+        ),
+        resolveAccountPlatform: jest.fn(async () => { throw new Error('throttled'); }),
+      };
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'post_on_connected_account',
+        { sessionId: 'sess-1' },
+        d,
+        { account_id: '1340767380', content: 'one tweet' }
+      );
+      expect(refusal).not.toBeNull();
+    });
+
+    it('does not bother resolving the account when the exact tool name is already granted', async () => {
+      const d = {
+        ...deps(SCHEDULED_SESSION, AUTHORIZED_SCHEDULE),
+        resolveAccountPlatform: jest.fn(),
+      };
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'post_on_connected_account',
+        { sessionId: 'sess-1' },
+        d,
+        { account_id: 'some-id', content: 'x' }
+      );
+      expect(refusal).toBeNull();
+      expect(d.resolveAccountPlatform).not.toHaveBeenCalled();
+    });
+
+    /**
+     * ENG-1616 — every test above supplies its OWN hand-written `resolveAccountPlatform`
+     * mock, so none of them ever runs `defaultDeps()`'s actual implementation: the
+     * dynamic `import('../services/connectedAccountsDb')`, the `SOCIAL_POSTING_PLATFORMS`
+     * filter, and the `.find()` by account_id. That is the one piece of new logic in this
+     * PR that isn't a pure function, and a typo in the import or an inverted filter there
+     * would ship green without this test. Omitting `deps` (4th positional arg not passed,
+     * i.e. undefined) makes `refuseUnauthorizedScheduledPublish` build its own deps via
+     * `defaultDeps()`, exercising the real wiring end to end.
+     */
+    it('defaultDeps().resolveAccountPlatform (the real implementation, not a mock) authorizes by account_id', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        ...SESSION_WITH_USER,
+        publishAdmission: TWITTER_ONLY_ADMISSION,
+      });
+      (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue(TWITTER_ONLY_SCHEDULE);
+      (getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([
+        { account_id: '1340767380', platform: 'twitter', account_name: '@harshmoney123' },
+        { account_id: 'other-id', platform: 'linkedin', account_name: 'unrelated' },
+      ]);
+
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'post_on_connected_account',
+        { sessionId: 'sess-1' },
+        undefined,
+        { account_id: '1340767380', content: 'one tweet' }
+      );
+
+      expect(refusal).toBeNull();
+      expect(getAccountsWithOwnerIncludingOrgShared).toHaveBeenCalledWith('harsha-user-id');
+    });
+
+    it('defaultDeps().resolveAccountPlatform (the real implementation) still refuses when no account matches', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        ...SESSION_WITH_USER,
+        publishAdmission: TWITTER_ONLY_ADMISSION,
+      });
+      (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue(TWITTER_ONLY_SCHEDULE);
+      (getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([
+        { account_id: 'other-id', platform: 'linkedin', account_name: 'unrelated' },
+      ]);
+
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'post_on_connected_account',
+        { sessionId: 'sess-1' },
+        undefined,
+        { account_id: '1340767380', content: 'one tweet' }
+      );
+
       expect(refusal).not.toBeNull();
     });
   });

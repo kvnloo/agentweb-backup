@@ -11,10 +11,21 @@ const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-  },
+  // Leave the SDK's normal credential-provider chain intact when explicit
+  // credentials are not configured. Supplying empty strings here masks valid
+  // shared-profile / instance-role credentials used by migration scripts
+  // (same fix as db.ts's guard — this file was never updated to match).
+  ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY
+    ? {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          ...(process.env.AWS_SESSION_TOKEN
+            ? { sessionToken: process.env.AWS_SESSION_TOKEN }
+            : {}),
+        },
+      }
+    : {}),
 });
 
 export type WorkPlanVisibility = 'system' | 'private' | 'public' | 'pending_review';

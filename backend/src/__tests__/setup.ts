@@ -34,10 +34,18 @@ process.env.AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION || '
 process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE = '';
 process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS = '';
 
+// Same placeholder-leak class as above: routes/slack.ts's verifySlackRequest
+// deliberately treats an ABSENT SLACK_SIGNING_SECRET as "tests intentionally
+// omit Slack credentials" and skips verification when NODE_ENV==='test'. A
+// local .env still carrying the unfilled '.env.example' placeholder text
+// (e.g. 'your_slack_signing_secret', a truthy string) defeats that check and
+// makes every unsigned test request 401 in that dev's own runs, though not
+// in CI (a clean checkout's local .env may not define this key at all). Same
+// dotenv-refill hazard as above applies too — set to '' (not delete) for the
+// same hasOwnProperty reason documented there.
+process.env.SLACK_SIGNING_SECRET = '';
+
 // Set Azure OpenAI embeddings environment variables for tests
-process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY = process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY || 'test-embeddings-api-key';
-process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT = process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT || 'https://test-embeddings.openai.azure.com';
-process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT = process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT || 'text-embedding-ada-002';
 
 // Set Google OAuth environment variables for tests (required by passport-google-oauth20)
 process.env.GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || 'test-google-client-id';
@@ -76,3 +84,10 @@ if (typeof realFetch === 'function') {
 }
 
 export {};
+
+// Keep the pre-Dynamo route characterizations unchanged while mocking their new I/O.
+if (/[\\/](hubspotAuth|fathomAuth)\.test\.ts$/.test(expect.getState().testPath || '')) {
+  jest.doMock('../services/db', () => ({
+    oauthSessionDb: require('./fixtures/oauthSessionDb').createOAuthSessionDbMock(),
+  }));
+}

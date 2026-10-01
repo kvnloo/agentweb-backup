@@ -196,7 +196,19 @@ describe('AgentModeController — import row counts in the diagnosis message (EN
   });
 
   it('says nothing about rows when the session carries no import results', async () => {
-    mockChatbotDb.getChatSession.mockResolvedValue(sessionWithImport([]) as any);
+    // ENG-2160: the diagnosis agent is only consulted when the turn's success ledger is
+    // non-empty. This case is "the turn did non-import work (so the agent runs) but wrote no
+    // import rows" — stage a real diff with NO import messages, so importTotalsSummary is null
+    // yet the agent is still asked. (A fully-empty turn would short-circuit before the agent.)
+    let turnRanNoImport = false;
+    mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(async () => {
+      turnRanNoImport = true;
+      throw new Error('Bedrock 500: internal server error');
+    });
+    mockChatbotDb.getChatSession.mockImplementation(async () => ({
+      ...sessionWithImport([]),
+      calledFunctions: turnRanNoImport ? { add_leads_to_list: 3, get_lead_lists: 1 } : {},
+    }) as any);
     mockAgentModeService.generateDiagnosticMessage.mockResolvedValue('I added 75 leads.');
 
     const errorCall = await driveTurn();

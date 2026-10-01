@@ -33,6 +33,13 @@ import {
   DEFAULT_INVITE_CHAR_LIMIT,
 } from "../services/outreachInviteDraftService";
 
+/**
+ * ENG-1723: how long the onboarding save will wait on the optional schedule
+ * auto-create before returning without it. The prospects are already persisted
+ * by then, so the customer must never wait on this.
+ */
+const AUTO_CREATE_TIMEOUT_MS = 5000;
+
 const router = express.Router();
 
 /**
@@ -246,6 +253,18 @@ router.post(
             message: result.message ?? "LinkedIn search failed",
             code: "unipile_error",
           });
+        case "search_unavailable":
+          // ENG-1559: a probeSearchCapability control query confirmed the
+          // account can't search at all right now — a platform outage, not
+          // "no prospects match this ICP". 503 (not 502) since this is our
+          // own capability check, not a raw upstream error passthrough. The
+          // FE's generic error-state handling (retry/skip) already applies;
+          // this message just tells the user the truth about why.
+          return res.status(503).json({
+            message:
+              "LinkedIn search is temporarily unavailable. Try again in a few minutes, or skip this step — Emma will still draft messages from the ICP.",
+            code: "search_unavailable",
+          });
         default:
           return res
             .status(500)
@@ -317,7 +336,45 @@ router.post("/outreach/save", authenticateToken, async (req, res) => {
     });
 
     if (result.ok) {
-      return res.status(200).json({ leadListId: result.leadListId });
+      // ENG-1723 / ENG-1609 AC #10: onboarding has just established both of the
+      // customer-side predicates — an ICP, and the lead list minted from it — so
+      // this is the point at which the outreach schedule can be created without
+      // any chat interaction. Default-off behind OUTREACH_SCHEDULE_AUTO_CREATE_ENABLED;
+      // with the flag unset this evaluates the trigger, writes nothing, and the
+      // response is byte-identical to before.
+      //
+      // Best-effort by contract: the prospects ARE saved by this point, and a
+      // failure to auto-create a schedule must never turn a successful save into
+      // an error the customer sees.
+      let autoCreate: any;
+      try {
+        const { runOutreachScheduleAutoCreate } = await import(
+          "../services/agentMode/outreachScheduleAutoCreateWiring"
+        );
+        autoCreate = await runOutreachScheduleAutoCreate({
+          userId,
+          leadListId: result.leadListId,
+          icpDescription:
+            typeof body.icpLabel === "string" ? body.icpLabel : undefined,
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error("[onboarding/outreach/save] auto-create failed:", err);
+      }
+      if (autoCreate) {
+        console.log(
+          `[onboarding/outreach/save] schedule auto-create for ${userId}: ${autoCreate.outcome} (${autoCreate.reason}) — ${autoCreate.detail}`,
+        );
+      }
+
+      return res.status(200).json({
+        leadListId: result.leadListId,
+        // Only surfaced when something actually happened, so the flag-off
+        // response stays exactly what it was.
+        ...(autoCreate && autoCreate.outcome !== "skipped"
+          ? { outreachSchedule: { scheduleId: autoCreate.scheduleId, outcome: autoCreate.outcome } }
+          : {}),
+      });
     }
 
     switch (result.error) {

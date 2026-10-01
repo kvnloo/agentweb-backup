@@ -12,9 +12,10 @@
  * This module derives an explicit `Retryable: yes/no` verdict + actionable next
  * step from the toolErrorClassifier classes (utils/toolErrorClassifier.ts):
  *
- *   rate_limit / timeout / network / upstream_5xx → transient → retryable
+ *   rate_limit / timeout / network / upstream_5xx / truncated_response → transient → retryable
  *   auth / upstream_rejected / invalid_args (schema reject) / tool_unavailable /
- *   invalid_output / policy_blocked                → terminal  → NOT retryable
+ *   invalid_output / policy_blocked / subscription_blocked / skill_install_refused
+ *                                                  → terminal  → NOT retryable
  *   anything else (legacy/unknown classes)         → conservative: NOT retryable
  *                                                    as an identical call
  *
@@ -36,6 +37,18 @@ export const RETRYABLE_ERROR_CLASSES: ReadonlySet<string> = new Set([
   'timeout',
   'network',
   'upstream_5xx',
+  /*
+   * Retryable because the common causes (a throttle, a transient page failure) clear on their
+   * own, and because the alternative verdict is worse: a "do NOT retry" on a read that was
+   * merely rate-limited leaves the model with no way to finish and every incentive to report
+   * the thing it was looking for as missing. The next step below tells it which sub-case it is.
+   */
+  'read_incomplete',
+  // A tool call's arguments were a clean-but-incomplete JSON prefix (the
+  // stream got cut off, not a bad-args mistake) — retrying the identical
+  // call can plausibly produce a complete response next time (ENG-1477
+  // follow-up).
+  'truncated_response',
 ]);
 
 /**
@@ -51,6 +64,22 @@ export const FAST_TRIP_ERROR_CLASSES: ReadonlySet<string> = new Set([
   'tool_unavailable',
   'invalid_output',
   'policy_blocked',
+  'subscription_blocked',
+  // ENG-1795: a refused install repeats identically on retry, same as its siblings here.
+  'skill_install_refused',
+  'scope_refused',
+  // ENG-1844: the brand-logo gate blocks EVERY identical retry until the user uploads
+  // a logo out-of-band — no argument change on this call can satisfy it.
+  'missing_brand_logo',
+  // finding 8: the one non-retryable class that was missing, on the class whose whole meaning is
+  // "an identical retry is known-pointless".
+  'read_bounded',
+  // publisher_refused is deliberately excluded (ENG-1162): read_file_content's publisher-refusal
+  // message doesn't embed the URL, so two different blocked sources (e.g. two different hosts)
+  // collide on the same breaker key — fast-tripping would trip the breaker across legitimately
+  // different resources, the same same-error-text-different-args hazard empty_result/not_found
+  // are excluded for above. It stays out of RETRYABLE_ERROR_CLASSES too, so it still falls to the
+  // conservative default (NOT retryable) via the normal 3-strike threshold.
 ]);
 
 export function isRetryableErrorClass(errorClass: string): boolean {
@@ -71,11 +100,46 @@ const NEXT_STEP_BY_CLASS: Record<string, string> = {
   auth: 'authentication/permission problem. Do NOT retry — the same call will keep failing. Tell the user to (re)connect the account or fix permissions.',
   upstream_rejected: 'the provider deliberately refused this action (business rule). Do NOT retry the same call — explain the refusal to the user and follow its guidance.',
   invalid_args: 'the arguments were invalid. Do NOT repeat the identical call — fix the arguments to exactly match the tool schema first, then retry with the corrected arguments.',
-  tool_unavailable: 'this tool is not available in this session. Do NOT retry it — install the required skill via install_skills or use a different tool.',
+  tool_unavailable: 'this tool is not available in this session. Do NOT retry it — install the required skill via install_skills, or tell the user the capability is not enabled. Do NOT present another tool\'s output as this tool\'s result.',
+  /*
+   * install_skills itself refusing — NOT a missing tool (ENG-1795).
+   *
+   * `tool_unavailable` was the closest existing class and its tail sentence is right, but its
+   * head is false here and its remedy is circular: install_skills DID run, and telling the
+   * model to "install the required skill via install_skills" points it at the very call that
+   * just refused. It also contradicted the refusal's own prose, which for an admin-only bundle
+   * says explicitly not to suggest support or an upgrade.
+   *
+   * The refusal text already carries the specific, accurate reason — which of four causes, and
+   * which ids. This line's only job is the verdict: stop, and do not fake it with another tool.
+   */
+  skill_install_refused: 'the install was refused and the message above says why. Do NOT retry it — the same call will be refused again. Relay that reason to the user as written, and do NOT substitute another tool\'s output for the tool that needed the skill.',
+  scope_refused: 'the requested object is not in the selected ad account. Do NOT retry it, and do NOT fall back to an account-wide or unscoped list — widening the read is precisely what this refusal prevents. Select the ad account that owns the object, or tell the user it is not available in the one they are using.',
+  read_bounded: 'the read stopped at a fixed scope or time bound and will stop in the same place every time, so retrying the identical call cannot help — and it is NOT evidence that anything is absent; never report an item as missing based on it. Narrow the scope instead: a specific sub-folder, campaign or ad set, or ask the user for a direct link.',
+  read_incomplete: 'the read did not finish, so it is NOT evidence that anything is absent — never report an item as missing based on this result. If it was throttled or failed transiently, wait briefly and retry ONCE; if it stopped at a scope or budget bound, narrow the scope (a specific folder, campaign or ad set, or ask the user for a direct link) rather than repeating the identical call.',
+  /*
+   * The plan does not include the skill. The ONLY correct next move is to tell the user; there
+   * is no alternative tool that produces this tool's result, and saying "use a different tool"
+   * here is what turns a refusal into a fabricated answer (ENG-1625).
+   */
+  subscription_blocked: 'the required skill is not included in the user\'s subscription. Do NOT retry it and do NOT substitute another tool — tell the user plainly that this capability is not on their plan.',
+  // ENG-1844: this is a correctly-working, by-design gate (ENG-326) — not a bug, an
+  // outage, or a platform-availability problem. Do NOT tell the user the service is
+  // unreachable/unavailable and do NOT offer to file a product issue about it — a real
+  // incident produced exactly that framing when this fell through to the generic
+  // unclassified bucket. The reason text above already names the real, one-step fix.
+  missing_brand_logo: 'no brand logo is saved in Brand Guidelines — this is a correctly-working content gate, NOT a service outage, a bug, or a platform-availability problem. Do NOT say the tool/service is unreachable or unavailable, and do NOT offer to file a product issue about it. Do NOT retry this call as-is. Tell the user plainly: upload a logo in Brand Guidelines (brand config), then ask you to generate again.',
   invalid_output: 'the tool ran but produced no usable output. Do NOT repeat the identical call — change the arguments/approach or use a different tool.',
   policy_blocked: 'the tool gateway policy blocked this call. Do NOT retry it — follow the policy guidance or tell the user what is blocked.',
   not_found: 'the target was not found. Do NOT repeat the identical call — verify the identifier/name first or ask the user.',
   empty_result: 'the call succeeded but returned nothing. Do NOT repeat the identical call — broaden the query or try a different source.',
+  // ENG-1162: a publisher-side refusal (bot-block/WAF/paywall 401/403, or a
+  // browser navigation net::ERR_* failure) is not an AgentWeb account problem
+  // and, critically, is NOT proof the content is missing — the failure mode
+  // this ticket exists to fix was a run silently treating a blocked fetch as
+  // if the source didn't exist and quietly falling back to search.
+  publisher_refused: 'the publisher refused or failed to serve this content (bot-block, WAF, paywall, or a dropped/empty response) — this is NOT an AgentWeb account or permissions problem, and NOT evidence the content does not exist. If a different fetch path exists (another tool, a cached/alternate URL, or a search result covering the same content) try that once; otherwise report this source as UNVERIFIED rather than silently dropping the candidate or treating a search summary as equivalent verification.',
+  truncated_response: 'your previous response for this call was cut off mid-generation — there is nothing wrong with the arguments themselves. Retry the SAME tool call and emit the complete arguments in one go, including every required field.',
 };
 
 const DEFAULT_NEXT_STEP =

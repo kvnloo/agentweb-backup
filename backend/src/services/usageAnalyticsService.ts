@@ -201,6 +201,20 @@ export interface CostByModelRow extends CounterTotals {
   model: string;
 }
 
+/** One upstream provider's spend (ENG-1859). */
+export interface CostByProviderRow extends CounterTotals {
+  provider: string;
+}
+
+/**
+ * Rows written before ENG-1859... in fact before ENG-693, which is when the
+ * ledger started persisting `provider` at all. They are real spend with no
+ * provider recorded, so they get their own bucket: attributing them to a
+ * provider would invent data, and dropping them would make the provider rows
+ * sum to less than the headline with nothing saying why.
+ */
+export const PROVIDER_UNRECORDED = "(recorded before provider tracking)";
+
 export interface CostSeriesRow {
   date: string;
   model: string;
@@ -244,6 +258,12 @@ export interface CostAggregation {
   totals: CounterTotals;
   /** Sorted by spend, highest first. */
   byModel: CostByModelRow[];
+  /**
+   * Spend grouped by the upstream that served it (ENG-1859) — "which provider
+   * is our token spend going to", which by-model cannot answer once one model
+   * is reachable through more than one provider.
+   */
+  byProvider: CostByProviderRow[];
   /** Per (date, model) buckets, sorted by date then model — the time series. */
   series: CostSeriesRow[];
   /** Secondary cut over the stored feature dimension, sorted by spend. */
@@ -258,6 +278,12 @@ export interface CostAggregation {
   userCount: number;
   /** Per-X-account spend with @handle enrichment, sorted by spend. */
   byXAccount: CostByXAccountRow[];
+  /**
+   * Every provider scope the admin picker may offer (ENG-1837), computed over
+   * the UNFILTERED window so it does not collapse to whatever is selected.
+   * Ordered: "all", "llm", then vendors alphabetically.
+   */
+  availableProviders: string[];
 }
 
 function zeroTotals(): CounterTotals {
@@ -307,6 +333,32 @@ function bucketByModel(items: UsageRecordRow[]): CostByModelRow[] {
 }
 
 /**
+ * Spend by upstream provider (ENG-1859).
+ *
+ * Reads the `provider` attribute the ledger has persisted since ENG-693.
+ * Deliberately NOT derived from the model id: the same model is reachable
+ * through more than one upstream (`anthropic.claude-sonnet-4-6` via Bedrock and
+ * `anthropic/claude-sonnet-4.6` via OpenRouter), which is the whole reason this
+ * cut is not answerable from `byModel`.
+ */
+function bucketByProvider(items: UsageRecordRow[]): CostByProviderRow[] {
+  const byProvider = new Map<string, CostByProviderRow>();
+  for (const item of items) {
+    const provider = item.provider || PROVIDER_UNRECORDED;
+    let bucket = byProvider.get(provider);
+    if (!bucket) {
+      bucket = { provider, ...zeroTotals() };
+      byProvider.set(provider, bucket);
+    }
+    addInto(bucket, item);
+  }
+  const rows = [...byProvider.values()];
+  rows.forEach(finalizeUsd);
+  rows.sort((a, b) => b.costMicroUsd - a.costMicroUsd || a.provider.localeCompare(b.provider));
+  return rows;
+}
+
+/**
  * True when a ledger `model` is a per-vendor namespaced id ("twitter:post",
  * "v0:generate") rather than an LLM model. Mirrors the frontend `providerOfModel`:
  * a colon followed by a WORD is a vendor namespace; a colon followed by only DIGITS
@@ -317,6 +369,80 @@ function isVendorNamespacedModel(model: string | undefined): boolean {
   const i = m.indexOf(":");
   if (i <= 0) return false;
   return !/^\d+$/.test(m.slice(i + 1));
+}
+
+/**
+ * Vendors with a LIVE metering adapter — i.e. a `recordVendorUsage` call site —
+ * and therefore the providers an admin can meaningfully select (ENG-1837).
+ *
+ * Deliberately NOT derived from `vendorRateCard`'s `VendorRateProvider`. That
+ * card prices elevenlabs, 2captcha and placid, which are priced but NOT yet
+ * metered (ENG-698, blocked on the ENG-1598 Placid credential). Offering them
+ * would render a permanently empty view, and "no rows" reads as "this vendor
+ * costs nothing" rather than "we do not measure this vendor yet" — the same
+ * silent-zero failure ENG-693 AC4 exists to prevent.
+ *
+ * Add a key here in the same commit that adds its adapter; the coverage guard
+ * (__tests__/vendorMeteringCoverageGuard.test.ts) asserts the two agree.
+ */
+export const METERED_VENDOR_PROVIDERS = [
+  "twitter",
+  "v0",
+  "you.com",
+  "google_cse",
+  "apollo",
+  "enrich.so",
+  "enigma",
+  "remotion",
+  "elevenlabs",
+  "2captcha",
+  "placid",
+] as const;
+
+/** Non-vendor scopes the aggregation accepts alongside a vendor key. */
+export const AGGREGATION_SCOPES = ["all", "llm"] as const;
+
+/**
+ * The VENDOR a ledger row belongs to, or undefined when it is an LLM row.
+ *
+ * Reads both signals `recordVendorUsage` writes — the `provider` attribute and
+ * the `"{provider}:{operation}"` model namespace — because the filter in
+ * getCostAggregation matches on either. Deriving the option list from only one
+ * of them would drop a vendor from the dropdown while its rows stayed perfectly
+ * filterable, which is worse than not offering it at all.
+ *
+ * `provider` alone is NOT sufficient, and assuming it was shipped a bug to
+ * production: ENG-693 gave LLM rows a `provider` too, so `bedrock`, `gemini`,
+ * `openai`, `azure-openai` and `openrouter` all arrived in a picker that offers
+ * per-unit vendors. The discriminator is the same one the "llm" scope filters
+ * on — `isVendorEntry` needs provider AND unit — so the option list and the
+ * filter cannot disagree about what counts as a vendor.
+ */
+function providerOfRow(row: UsageRecordRow): string | undefined {
+  if (isVendorEntry(row)) return row.provider;
+  if (isVendorNamespacedModel(row.model)) {
+    return (row.model || "").slice(0, (row.model || "").indexOf(":"));
+  }
+  return undefined;
+}
+
+/**
+ * Provider options for the admin picker: every scope, every vendor with a live
+ * adapter, and every vendor actually present in the window.
+ *
+ * The union matters in both directions. The registry keeps a vendor
+ * discoverable BEFORE it has accrued any spend (the reason ENG-664 always
+ * offered "twitter"), and the window scan surfaces a vendor that started
+ * metering after the registry was last edited — so a forgotten registry entry
+ * degrades to a missing empty-state, never to hidden spend.
+ */
+function buildAvailableProviders(allItems: readonly UsageRecordRow[]): string[] {
+  const vendors = new Set<string>(METERED_VENDOR_PROVIDERS);
+  for (const item of allItems) {
+    const p = providerOfRow(item);
+    if (p) vendors.add(p);
+  }
+  return [...AGGREGATION_SCOPES, ...[...vendors].sort()];
 }
 
 /**
@@ -375,6 +501,9 @@ export async function getCostAggregation(
 
   // Headline cut: spend by model.
   const byModel = bucketByModel(items);
+
+  // Sibling cut: spend by upstream provider (ENG-1859).
+  const byProvider = bucketByProvider(items);
 
   // Time series: per (date, model) buckets.
   const seriesBuckets = new Map<string, CostSeriesRow>();
@@ -469,7 +598,21 @@ export async function getCostAggregation(
   // the scoped lookup that avoids a full-table scan (there is no accountId GSI).
   const byXAccount = await buildXAccountBreakdown(items);
 
-  return { start, end, totals, byModel, series, byFeature, topUsers, userCount: userItems.size, byXAccount };
+  return {
+    start,
+    end,
+    totals,
+    byModel,
+    byProvider,
+    series,
+    byFeature,
+    topUsers,
+    userCount: userItems.size,
+    byXAccount,
+    // Built from allItems, NOT items: the picker must keep offering every
+    // provider while one of them is selected. Free — the scan already happened.
+    availableProviders: buildAvailableProviders(allItems),
+  };
 }
 
 const X_FEATURE_PREFIX = "x-account:";

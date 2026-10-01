@@ -63,7 +63,7 @@ describe('EnrichSoService.validateEmail', () => {
     const result = await svc.validateEmail('a@b.com');
 
     expect(http.validateEmail).toHaveBeenCalledTimes(1);
-    expect(http.validateEmail).toHaveBeenCalledWith('a@b.com');
+    expect(http.validateEmail).toHaveBeenCalledWith('a@b.com', undefined);
     expect(result.status).toBe('deliverable');
     expect(result.confidence).toBe('high');  // definitive → high
     expect(result.fromCache).toBe(false);

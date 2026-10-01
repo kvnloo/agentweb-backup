@@ -6,6 +6,7 @@ jest.mock('../services/googleAdsService', () => ({
     listBudgets: jest.fn().mockResolvedValue([{ resourceName: 'customers/123/campaignBudgets/1', name: 'Test Budget', amountMicros: '10000000', explicitlyShared: false, referenceCount: 1 }]),
     listBiddingStrategies: jest.fn().mockResolvedValue([{ resourceName: 'customers/123/biddingStrategies/555', id: '555', name: 'Portfolio tCPA', type: 'TARGET_CPA', status: 'ENABLED' }]),
     createBudget: jest.fn().mockResolvedValue({ resourceName: 'customers/123/campaignBudgets/1' }),
+    updateBudget: jest.fn().mockResolvedValue(undefined),
     createCampaign: jest.fn().mockResolvedValue({ resourceName: 'customers/123/campaigns/1' }),
     pauseCampaign: jest.fn().mockResolvedValue(undefined),
     resumeCampaign: jest.fn().mockResolvedValue(undefined),
@@ -43,6 +44,7 @@ jest.mock('../services/googleAdsService', () => ({
     createAssetGroup: jest.fn().mockResolvedValue({ resourceName: 'customers/123/assetGroups/1' }),
     retagAdUtm: jest.fn().mockResolvedValue({ success: true }),
     retagAssetGroupUtm: jest.fn().mockResolvedValue({ success: true }),
+    getServingChainStatus: jest.fn(),
     queryReporting: jest.fn().mockResolvedValue([
       { campaign: { id: '1' }, metrics: { clicks: '100' } },
     ]),
@@ -56,6 +58,11 @@ jest.mock('../services/googleAdsService', () => ({
 
 import { AgentModeService } from '../services/agentModeService';
 import { googleAdsService } from '../services/googleAdsService';
+import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { classifyToolFailureType } from '../utils/toolFailureType';
+import { emmaToolRegistry } from '../emma/registry';
+import '../emma/tools';
 
 let service: AgentModeService;
 beforeEach(() => {
@@ -115,6 +122,29 @@ describe('handleCallGoogleAdsApi', () => {
     });
     expect(result.success).toBe(true);
     expect(result.budgetResourceName).toBeDefined();
+  });
+
+  it('handles BUDGET UPDATE action', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'BUDGET',
+      action: 'UPDATE',
+      budget_resource_name: 'customers/123/campaignBudgets/1',
+      amount_micros: 20_000_000,
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.updateBudget).toHaveBeenCalledWith('user-123', '1234567890', 'customers/123/campaignBudgets/1', 20_000_000);
+  });
+
+  it('returns error for BUDGET UPDATE without budget_resource_name', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'BUDGET',
+      action: 'UPDATE',
+      amount_micros: 20_000_000,
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/budget_resource_name/i);
   });
 
   it('handles LOCATION SEARCH action', async () => {
@@ -199,6 +229,31 @@ describe('handleCallGoogleAdsApi', () => {
       '1234567890',
       'customers/123/campaigns/1',
       expect.objectContaining({ finalUrlSuffix: 'utm_source=google&utm_medium=cpc' })
+    );
+  });
+
+  it('forwards false campaign network settings instead of dropping them', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'UPDATE',
+      campaign_resource_name: 'customers/123/campaigns/1',
+      target_google_search: true,
+      target_search_network: false,
+      target_content_network: false,
+      target_partner_search_network: false,
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.updateCampaign).toHaveBeenCalledWith(
+      'user-123',
+      '1234567890',
+      'customers/123/campaigns/1',
+      expect.objectContaining({
+        targetGoogleSearch: true,
+        targetSearchNetwork: false,
+        targetContentNetwork: false,
+        targetPartnerSearchNetwork: false,
+      }),
     );
   });
 
@@ -584,6 +639,23 @@ describe('handleCallGoogleAdsApi', () => {
 });
 
 describe('handleCallGoogleAdsReportingApi', () => {
+  it('preserves blocked serving-chain evidence at the tool-error boundary', async () => {
+    const report = {
+      state: 'BLOCKED_BY_AD',
+      checkedAt: '2026-09-17T02:00:00.000Z',
+      blockers: [{ state: 'BLOCKED_BY_AD', entityId: '3' }],
+    };
+    (googleAdsService.getServingChainStatus as jest.Mock).mockResolvedValueOnce(report);
+
+    const result = await service.handleCallGoogleAdsReportingApi('user-123', {
+      customer_id: '1234567890',
+      mode: 'serving_chain',
+    });
+
+    expect(result).toEqual({ success: false, report, error: JSON.stringify(report) });
+    expect(toolResultError(result)?.message).toBe(JSON.stringify(report));
+  });
+
   it('handles dashboard mode', async () => {
     const result = await service.handleCallGoogleAdsReportingApi('user-123', {
       customer_id: '1234567890',
@@ -1041,6 +1113,51 @@ describe('handleCallGoogleAdsApi — error handling', () => {
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/Unsupported entity_type/);
   });
+
+  // ENG-1300: the "CODE: message" formatter above renders Google Ads' own
+  // business error codes (e.g. "BAD_FIELD") into the message text — that is
+  // NOT an HTTP status and classifyToolErrorClass would misclassify if it were
+  // used for `code`. The real HTTP status is error.response.status, and
+  // googleAdsService.callApi rethrows the SAME axios error unchanged, so it's
+  // still there for the taking.
+  it('ENG-1300: a 403 (error.response.status) classifies as auth/config end-to-end, distinct from the Google Ads business error code in the message', async () => {
+    (googleAdsService.listCampaigns as jest.Mock).mockRejectedValueOnce({
+      response: {
+        status: 403,
+        data: { error: { details: [{ errors: [
+          { errorCode: { authorizationError: 'USER_PERMISSION_DENIED' }, message: 'User does not have permission to access customer.' },
+        ] }] } },
+      },
+    });
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'LIST',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('USER_PERMISSION_DENIED');
+    const classified = toolResultError(result);
+    expect(classifyToolErrorClass(classified)).toBe('auth');
+    expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+  });
+
+  it('ENG-1300: a 429 (error.response.status) classifies as rate_limit, not conflated with a Google Ads QUOTA_ERROR business code', async () => {
+    (googleAdsService.listCampaigns as jest.Mock).mockRejectedValueOnce({
+      response: {
+        status: 429,
+        data: { error: { details: [{ errors: [
+          { errorCode: { quotaError: 'RESOURCE_EXHAUSTED' }, message: 'Too many requests.' },
+        ] }] } },
+      },
+    });
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'LIST',
+    });
+    const classified = toolResultError(result);
+    expect(classifyToolErrorClass(classified)).toBe('rate_limit');
+  });
 });
 
 describe('handleCallGoogleAdsReportingApi — error handling', () => {
@@ -1074,9 +1191,21 @@ describe('handleCallGoogleAdsReportingApi — error handling', () => {
       mode: 'sideways' as any,
     });
     expect(result.success).toBe(false);
-    expect(result.error).toBe('mode must be "raw" or "dashboard"');
+    expect(result.error).toBe('mode must be "raw", "dashboard", or "serving_chain"');
   });
 
+  it('ENG-1300: a 403 (error.response.status) classifies as auth/config end-to-end', async () => {
+    (googleAdsService.getQuickMetrics as jest.Mock).mockRejectedValueOnce({
+      response: { status: 403, data: { error: { details: [{ errors: [{ message: 'Permission denied.' }] }] } } },
+    });
+    const result = await service.handleCallGoogleAdsReportingApi('user-123', {
+      customer_id: '1234567890',
+      mode: 'dashboard',
+    });
+    const classified = toolResultError(result);
+    expect(classifyToolErrorClass(classified)).toBe('auth');
+    expect(classifyToolFailureType(classifyToolErrorClass(classified))).toBe('config');
+  });
 });
 
 // ENG-1514. A PAUSED create must round-trip as PAUSED.
@@ -1167,5 +1296,51 @@ describe('handleCallGoogleAdsApi — a PAUSED create must not come back ENABLED 
       '1234567890',
       expect.objectContaining({ status: 'ENABLED' }),
     );
+  });
+});
+
+// ENG-1668. Production session 87334a61-2e06-4018-960e-9e7759403423 showed
+// gemini-3.7-flash calling KEYWORD UPDATE, KEYWORD ADD_NEGATIVE, and BUDGET
+// UPDATE without the resource-name argument each one requires, even though
+// the top-of-tool ACTION MATRIX names it. The per-field `description` for
+// budget_resource_name, campaign_resource_name, and criterion_resource_name
+// — the text a model leans on when scanning an individual parameter — did
+// not mention these three action combos at all, only ones it does NOT gate
+// (CAMPAIGN CREATE, ADD_PROXIMITY/AD_GROUP LIST, KEYWORD REMOVE). Assert the
+// field descriptions name every write action that actually requires them, so
+// a future edit to the ACTION MATRIX can't drift out of sync with the
+// per-field docs again.
+describe('call_google_ads_api tool schema — per-field description coverage (ENG-1668)', () => {
+  const properties = emmaToolRegistry.getTool('call_google_ads_api')!.definition.inputSchema.properties as Record<string, { description?: string }>;
+
+  it('documents budget_resource_name as required for BUDGET UPDATE', () => {
+    expect(properties.budget_resource_name.description).toMatch(/BUDGET UPDATE/);
+  });
+
+  it('documents campaign_resource_name as usable for KEYWORD ADD_NEGATIVE', () => {
+    expect(properties.campaign_resource_name.description).toMatch(/ADD_NEGATIVE/);
+  });
+
+  it('documents criterion_resource_name as required for KEYWORD UPDATE', () => {
+    expect(properties.criterion_resource_name.description).toMatch(/KEYWORD UPDATE/);
+  });
+});
+
+// ENG-1922: the registered Emma tool must preserve verifier evidence, including
+// refusal to certify incomplete data, rather than falling back to raw metrics.
+describe('Search serving-chain Emma dispatch', () => {
+  it.each(['BLOCKED_BY_AD', 'READY', 'DELIVERING', 'UNVERIFIED'])('preserves %s without inventing a live/spending claim', async state => {
+    const report = { state, campaigns: [{ campaignId: '1', state, adGroups: [{ adGroupId: '2', state }] }] };
+    (googleAdsService.getServingChainStatus as jest.Mock).mockResolvedValue(report);
+    const tool = emmaToolRegistry.getTool('call_google_ads_reporting_api')!;
+    const result = await tool.execute({ customer_id: '123', mode: 'serving_chain', campaign_ids: ['1'] }, { userId: 'user-123' });
+    expect(googleAdsService.getServingChainStatus).toHaveBeenCalledWith('user-123', '123', ['1']);
+    expect(googleAdsService.queryReporting).not.toHaveBeenCalled();
+    expect(googleAdsService.getQuickMetrics).not.toHaveBeenCalled();
+    const success = state === 'READY' || state === 'DELIVERING';
+    expect(result).toEqual({ success, report, ...(success ? {} : { error: JSON.stringify(report) }) });
+    expect(toolResultError(result)?.message).toBe(success ? undefined : JSON.stringify(report));
+    expect(tool.definition.inputSchema.properties!.mode.enum).toContain('serving_chain');
+    expect(tool.definition.description).toContain('READY is not evidence of delivery');
   });
 });
