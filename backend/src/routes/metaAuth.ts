@@ -382,7 +382,15 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
             // otherwise silently erase a previously confirmed has_meta_pages:false
             // back to 'unknown'. Fall back to the existing account's recorded
             // value whenever this session's probe came back undetermined.
-            const existingAccount = await getAccountById(adAccount.account_id, userId, 'meta');
+            //
+            // Includes the legacy 'facebook' platform value alongside 'meta'
+            // (code review follow-up) — getMetaCredentials elsewhere in this
+            // codebase treats them as the same account for backward
+            // compatibility with connections made before the platform name was
+            // standardized; a lookup scoped to 'meta' alone would silently miss
+            // the recorded value on any account still stored under the old name,
+            // for precisely the users reconnecting because their ads are failing.
+            const existingAccount = await getAccountById(adAccount.account_id, userId, ['meta', 'facebook'] as any);
             const existingConfig = existingAccount?.config as Record<string, any> | undefined;
             let has_meta_pages = session.has_meta_pages !== undefined
                 ? session.has_meta_pages
