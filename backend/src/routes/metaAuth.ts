@@ -383,9 +383,17 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
             // back to 'unknown'. Fall back to the existing account's recorded
             // value whenever this session's probe came back undetermined.
             const existingAccount = await getAccountById(adAccount.account_id, userId, 'meta');
+            const existingConfig = existingAccount?.config as Record<string, any> | undefined;
             let has_meta_pages = session.has_meta_pages !== undefined
                 ? session.has_meta_pages
-                : (existingAccount?.config as Record<string, any> | undefined)?.has_meta_pages;
+                : existingConfig?.has_meta_pages;
+            // Same fallback discipline as has_meta_pages above — read back by
+            // getAccessiblePageIds, which a gate uses to check one SPECIFIC
+            // page_id (e.g. an AD_CREATIVE CREATE call's target) rather than
+            // only the aggregate boolean (ENG-2232).
+            const accessible_page_ids: string[] | undefined = session.meta_page_ids !== undefined
+                ? session.meta_page_ids
+                : existingConfig?.accessible_page_ids;
 
             // ENG-2232: "this login can see at least one Page" isn't the same as
             // "this specific ad account's existing ads run under one of them" —
@@ -431,6 +439,9 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
                     // reason has_meta_pages is false is a wrong-Page mismatch rather than
                     // zero Pages — read back by getMetaAdsNoPagesMessage (ENG-2232).
                     ...(existing_ads_page_id ? { existing_ads_page_id } : {}),
+                    // The actual accessible Page ids, read back by getAccessiblePageIds
+                    // for the AD_CREATIVE CREATE page_id gate (ENG-2232).
+                    ...(accessible_page_ids !== undefined ? { accessible_page_ids } : {}),
                 }
             });
             connectedAccounts.push(account);

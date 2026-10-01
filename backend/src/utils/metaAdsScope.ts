@@ -133,6 +133,14 @@ export interface MetaAdsScopeConfigLike {
    * when some OTHER Page is reachable.
    */
   existing_ads_page_id?: unknown;
+  /**
+   * The actual accessible Facebook Page ids, probed alongside `has_meta_pages`
+   * (ENG-2232) — lets a gate check a SPECIFIC page_id (e.g. the one an
+   * AD_CREATIVE CREATE call is about to use) against the real set, rather
+   * than only the aggregate "has at least one" boolean. `undefined` means
+   * "never probed", same tri-state discipline as every other field here.
+   */
+  accessible_page_ids?: unknown;
 }
 
 /**
@@ -191,6 +199,31 @@ export const buildMetaAdsWrongPageMessage = (existingAdsPageId: string): string 
   `fail. Reconnect Meta under Settings -> Connected accounts and select that Page on the "Choose Pages" step, ` +
   `and/or ask whoever manages it in Meta Business Settings to add this person with "Create ads" (Advertiser) ` +
   `access, then run this again. No ads were created.`;
+
+/**
+ * ENG-2232: the precise sibling of both messages above, for AD_CREATIVE
+ * CREATE specifically — that call always carries a concrete `page_id`
+ * (Meta requires it), so this names exactly the Page it tried to use instead
+ * of a historical inference.
+ */
+export const buildMetaAdsPageNotAccessibleMessage = (requestedPageId: string): string =>
+  `Meta Ads access does not include Facebook Page ${requestedPageId} — this ad creative can't be created under ` +
+  `that Page. Reconnect Meta under Settings -> Connected accounts and select that Page on the "Choose Pages" ` +
+  `step, and/or ask whoever manages it in Meta Business Settings to add this person with "Create ads" ` +
+  `(Advertiser) access, then run this again. No ads were created.`;
+
+/**
+ * The accessible Facebook Page ids themselves, when probed. `undefined`
+ * (not `[]`) when never probed, so a gate can tell "we don't know" apart
+ * from "we checked and it's empty" (ENG-2232).
+ */
+export const getAccessiblePageIds = (
+  config: MetaAdsScopeConfigLike | null | undefined
+): string[] | undefined => {
+  const ids = config?.accessible_page_ids;
+  if (!Array.isArray(ids)) return undefined;
+  return ids.filter((id): id is string => typeof id === 'string');
+};
 
 /** The right message for a confirmed-missing Page state — generic or Page-specific. */
 export const getMetaAdsNoPagesMessage = (config: MetaAdsScopeConfigLike | null | undefined): string => {

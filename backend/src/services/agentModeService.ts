@@ -22448,6 +22448,33 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       } as any;
     }
 
+    // ENG-2232: deterministic Page-access preflight for AD_CREATIVE CREATE
+    // specifically — the CAMPAIGN CREATE gate above only catches a build that
+    // starts with a NEW campaign; adding a creative to an EXISTING campaign
+    // never goes through that gate at all. validateMetaActionParams above
+    // already guarantees params.page_id is present (Meta requires it for
+    // every creative), so this checks the ACTUAL target Page directly —
+    // more precise than the CAMPAIGN CREATE gate's historical-existing-ads
+    // heuristic, since a Meta CAMPAIGN object carries no page_id to compare
+    // against in the first place.
+    if (entity_type === 'AD_CREATIVE' && action === 'CREATE') {
+      const { connection: creativeGateConnection } = await this.getMetaCredentials(userId, account_id);
+      const { getAccessiblePageIds, buildMetaAdsPageNotAccessibleMessage } = await import('../utils/metaAdsScope');
+      const accessiblePageIds = getAccessiblePageIds(creativeGateConnection?.config);
+      const requestedPageId = typeof params.page_id === 'string' ? params.page_id : undefined;
+      // Only a verdict when we've actually probed (accessiblePageIds defined) —
+      // a legacy/never-probed connection must not be blocked on an unknown.
+      if (accessiblePageIds !== undefined && requestedPageId && !accessiblePageIds.includes(requestedPageId)) {
+        const pageMessage = buildMetaAdsPageNotAccessibleMessage(requestedPageId);
+        return {
+          success: false,
+          message: pageMessage,
+          error: `META_PAGE_ACCESS_MISSING: ${pageMessage}`,
+          hint: 'Reconnect Meta and select that Page on the "Choose Pages" step, or get "Create ads" (Advertiser) access on it, then retry.'
+        } as any;
+      }
+    }
+
     // Target-confirmation guardrail for mutating actions (publish/change/delete).
     // ENG-1635/1644 gap 5: `params.confirm` used to be read here into a
     // `confirmed` boolean that could independently satisfy the halt below —

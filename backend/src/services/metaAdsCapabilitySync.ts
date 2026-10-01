@@ -127,7 +127,15 @@ export const syncMetaAdsCapability = async (
       const currentExistingAdsPageId =
         typeof config.existing_ads_page_id === 'string' ? config.existing_ads_page_id : undefined;
       const existingAdsPageIdChanged = currentExistingAdsPageId !== newExistingAdsPageId;
-      if (config.has_meta_pages !== newHasPages || existingAdsPageIdChanged) {
+      const newAccessiblePageIds: string[] = pages.map((p: any) => p.id);
+      const currentAccessiblePageIds: string[] = Array.isArray(config.accessible_page_ids)
+        ? config.accessible_page_ids
+        : [];
+      // Order-independent — Graph API doesn't guarantee stable ordering across calls.
+      const accessiblePageIdsChanged =
+        newAccessiblePageIds.length !== currentAccessiblePageIds.length ||
+        new Set(newAccessiblePageIds).size !== new Set([...newAccessiblePageIds, ...currentAccessiblePageIds]).size;
+      if (config.has_meta_pages !== newHasPages || existingAdsPageIdChanged || accessiblePageIdsChanged) {
         const { updateAccountConfig: persistPageAccess } = await import('./connectedAccountsDb');
         await persistPageAccess(userId, platform as any, account.account_id, {
           has_meta_pages: newHasPages,
@@ -138,9 +146,14 @@ export const syncMetaAdsCapability = async (
           // about it changed, so an unrelated has_meta_pages flip doesn't
           // rewrite a field that was never set to begin with.
           ...(existingAdsPageIdChanged ? { existing_ads_page_id: newExistingAdsPageId ?? null } : {}),
+          // The actual accessible Page ids, read back by getAccessiblePageIds
+          // for the AD_CREATIVE CREATE page_id gate (ENG-2232). Same
+          // only-when-changed discipline as the fields above.
+          ...(accessiblePageIdsChanged ? { accessible_page_ids: newAccessiblePageIds } : {}),
         });
         config.has_meta_pages = newHasPages;
         config.existing_ads_page_id = newExistingAdsPageId;
+        config.accessible_page_ids = newAccessiblePageIds;
         console.log(
           `[MetaAdsCapabilitySync] Page access ${newHasPages ? 'confirmed' : 'missing'} for user ${userId} account ${account.account_id} ` +
           `(${pages.length} Page(s)${newExistingAdsPageId ? `, existing ads use Page ${newExistingAdsPageId}` : ''})`
