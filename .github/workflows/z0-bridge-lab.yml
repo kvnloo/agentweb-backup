@@ -1,0 +1,23 @@
+name: z0 bridge lab
+
+on:
+  push:
+    branches:
+      - rfc/z0-bridge-v1-fresh-upstream
+
+jobs:
+  bridge-contract:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npx jest --runInBand src/__tests__/z0BridgeContract.test.ts src/__tests__/z0RouteShadow.test.ts --forceExit
