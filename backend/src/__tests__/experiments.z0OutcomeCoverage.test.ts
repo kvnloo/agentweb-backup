@@ -5,6 +5,7 @@ import {
   outcomeDataPromotionEligible,
   projectOutcomeExpectationToZ0,
   validateZ0OutcomeCoverageSummaryV1,
+  type Z0OutcomeCoverageSummaryV1,
 } from '../services/z0OutcomeCoverage';
 import type { Z0OutcomeFetchLike } from '../services/z0OutcomeObservation';
 
@@ -22,7 +23,7 @@ const input = {
   },
 };
 
-const summary = {
+const summary: Z0OutcomeCoverageSummaryV1 = {
   schema: 'z0int.agentweb_outcome_coverage.v1',
   as_of: '2026-10-01T12:00:00+00:00',
   policy: {
@@ -54,7 +55,7 @@ const summary = {
     causal_quality_proven: false,
     reasons: [],
   },
-} as const;
+};
 
 function response(payload: unknown, status = 200): Z0OutcomeFetchLike {
   return jest.fn(async () => ({
