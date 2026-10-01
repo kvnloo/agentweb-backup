@@ -197,34 +197,63 @@ router.post('/scoring-judges', authenticateToken, requireAdmin, async (req, res)
       return res.status(400).json({ error: 'name and systemPrompt are required' });
     }
 
-    const setting = await settingsService.getSetting('scoring-judges');
-    const judges = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
+    // ENG-2223: plain read-then-write let two concurrent admin saves race and silently lose
+    // one's judge (last-write-wins on the whole array). Guarded via setSettingIfValueMatches
+    // (ENG-965) — conditioned on the exact raw value this attempt read — with a bounded retry
+    // on ConditionalCheckFailedException, same pattern as htmlTemplateService.upsertPublicTemplate.
+    const MAX_ATTEMPTS = 5;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const setting = await settingsService.getSetting('scoring-judges');
+      const judges = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
 
-    // ENG-2218: this route only ever builds name/systemPrompt/llmModel and always mints a new
-    // id, so calling it against an id that already exists (e.g. the shadow judge) doesn't
-    // "update" that row — it silently drops any fields this route doesn't know about (shadow,
-    // sampleRate, ...) and leaves the original row untouched under a duplicate id. Reject that
-    // rather than let it happen quietly; PUT /scoring-judges/:judgeId merges onto the existing
-    // row and is the correct call for updating a judge that already exists.
-    if (id && judges.some((j: { id?: string }) => j.id === id)) {
-      return res.status(409).json({
-        error: `Judge "${id}" already exists. Use PUT /scoring-judges/${id} to update it instead of POST.`,
-      });
+      // ENG-2218: this route only ever builds name/systemPrompt/llmModel and always mints a new
+      // id, so calling it against an id that already exists (e.g. the shadow judge) doesn't
+      // "update" that row — it silently drops any fields this route doesn't know about (shadow,
+      // sampleRate, ...) and leaves the original row untouched under a duplicate id. Reject that
+      // rather than let it happen quietly; PUT /scoring-judges/:judgeId merges onto the existing
+      // row and is the correct call for updating a judge that already exists.
+      if (id && judges.some((j: { id?: string }) => j.id === id)) {
+        return res.status(409).json({
+          error: `Judge "${id}" already exists. Use PUT /scoring-judges/${id} to update it instead of POST.`,
+        });
+      }
+
+      const now = new Date().toISOString();
+      const newJudge: any = {
+        id: `judge_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        name: name.trim(),
+        systemPrompt: systemPrompt.trim(),
+        createdAt: now,
+        updatedAt: now,
+      };
+      if (llmModel) newJudge.llmModel = llmModel.trim();
+
+      const nextJudges = [...judges, newJudge];
+
+      try {
+        if (setting != null) {
+          await settingsService.setSettingIfValueMatches(
+            'scoring-judges',
+            JSON.stringify(nextJudges),
+            setting.settingValue,
+            'Custom scoring judges',
+            req.user?.email,
+          );
+        } else {
+          // Genuinely no row yet — nothing to condition on (same bootstrap gap as
+          // htmlTemplateService.upsertPublicTemplate).
+          await settingsService.setSetting('scoring-judges', JSON.stringify(nextJudges), 'Custom scoring judges', req.user?.email);
+        }
+        return res.json({ judge: newJudge });
+      } catch (err) {
+        if ((err as { code?: string } | undefined)?.code === 'ConditionalCheckFailedException') {
+          continue; // stale read — retry from a fresh one
+        }
+        throw err;
+      }
     }
 
-    const now = new Date().toISOString();
-    const newJudge: any = {
-      id: `judge_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      name: name.trim(),
-      systemPrompt: systemPrompt.trim(),
-      createdAt: now,
-      updatedAt: now,
-    };
-    if (llmModel) newJudge.llmModel = llmModel.trim();
-
-    judges.push(newJudge);
-    await settingsService.setSetting('scoring-judges', JSON.stringify(judges), 'Custom scoring judges', req.user?.email);
-    res.json({ judge: newJudge });
+    throw new Error(`POST /scoring-judges: exceeded ${MAX_ATTEMPTS} attempts — too much write contention on scoring-judges`);
   } catch (error) {
     console.error('Error creating scoring judge:', error);
     res.status(500).json({ error: 'Failed to create scoring judge' });
@@ -237,33 +266,54 @@ router.put('/scoring-judges/:judgeId', authenticateToken, requireAdmin, async (r
     const { judgeId } = req.params;
     const { name, systemPrompt, llmModel } = req.body;
 
-    const setting = await settingsService.getSetting('scoring-judges');
-    if (!setting?.settingValue) {
-      return res.status(404).json({ error: 'No scoring judges found' });
-    }
+    // ENG-2223: same CAS-guarded read-modify-write as POST above, conditioned on the exact raw
+    // value this attempt read and retried (re-read, re-apply the same field-level merge, re-write)
+    // on a ConditionalCheckFailedException — never a blind overwrite of a concurrent save.
+    const MAX_ATTEMPTS = 5;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const setting = await settingsService.getSetting('scoring-judges');
+      if (!setting?.settingValue) {
+        return res.status(404).json({ error: 'No scoring judges found' });
+      }
 
-    const judges = JSON.parse(setting.settingValue);
-    const index = judges.findIndex((j: any) => j.id === judgeId);
-    if (index === -1) {
-      return res.status(404).json({ error: 'Judge not found' });
-    }
-    // ENG-2218: mutate the stored row in place field-by-field (never replace it wholesale) so
-    // fields this route's request body doesn't carry — shadow, sampleRate, or anything future —
-    // survive an update untouched. This is what lets the Scoring Judges admin UI edit the shadow
-    // judge's name/model/prompt without stripping its shadow/sampling status.
-    if (name) judges[index].name = name.trim();
-    if (systemPrompt) judges[index].systemPrompt = systemPrompt.trim();
-    if (llmModel !== undefined) {
-      if (llmModel) {
-        judges[index].llmModel = llmModel.trim();
-      } else {
-        delete judges[index].llmModel;
+      const judges = JSON.parse(setting.settingValue);
+      const index = judges.findIndex((j: any) => j.id === judgeId);
+      if (index === -1) {
+        return res.status(404).json({ error: 'Judge not found' });
+      }
+      // ENG-2218: mutate the stored row in place field-by-field (never replace it wholesale) so
+      // fields this route's request body doesn't carry — shadow, sampleRate, or anything future —
+      // survive an update untouched. This is what lets the Scoring Judges admin UI edit the shadow
+      // judge's name/model/prompt without stripping its shadow/sampling status.
+      if (name) judges[index].name = name.trim();
+      if (systemPrompt) judges[index].systemPrompt = systemPrompt.trim();
+      if (llmModel !== undefined) {
+        if (llmModel) {
+          judges[index].llmModel = llmModel.trim();
+        } else {
+          delete judges[index].llmModel;
+        }
+      }
+      judges[index].updatedAt = new Date().toISOString();
+
+      try {
+        await settingsService.setSettingIfValueMatches(
+          'scoring-judges',
+          JSON.stringify(judges),
+          setting.settingValue,
+          'Custom scoring judges',
+          req.user?.email,
+        );
+        return res.json({ judge: judges[index] });
+      } catch (err) {
+        if ((err as { code?: string } | undefined)?.code === 'ConditionalCheckFailedException') {
+          continue; // stale read — retry from a fresh one
+        }
+        throw err;
       }
     }
-    judges[index].updatedAt = new Date().toISOString();
 
-    await settingsService.setSetting('scoring-judges', JSON.stringify(judges), 'Custom scoring judges', req.user?.email);
-    res.json({ judge: judges[index] });
+    throw new Error(`PUT /scoring-judges/${judgeId}: exceeded ${MAX_ATTEMPTS} attempts — too much write contention on scoring-judges`);
   } catch (error) {
     console.error('Error updating scoring judge:', error);
     res.status(500).json({ error: 'Failed to update scoring judge' });

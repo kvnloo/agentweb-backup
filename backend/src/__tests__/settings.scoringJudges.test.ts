@@ -3,6 +3,10 @@ import express from 'express';
 import settingsRoutes from '../routes/settings';
 import { settingsService } from '../services/settingsService';
 
+// Minimal shape for asserting against a stored/parsed scoring-judges row in the CAS-retry
+// tests below — just enough fields to check id/name without reaching for `any`.
+type StoredJudge = { id: string; name: string; [key: string]: unknown };
+
 jest.mock('../middleware/auth', () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
     req.user = { userId: 'admin-1', email: 'admin@example.com', isAdmin: true };
@@ -15,6 +19,7 @@ jest.mock('../services/settingsService', () => ({
   settingsService: {
     getSetting: jest.fn(),
     setSetting: jest.fn(),
+    setSettingIfValueMatches: jest.fn(),
     deleteSetting: jest.fn(),
   },
 }));
@@ -39,10 +44,6 @@ jest.mock('../services/agentModeService', () => ({
 }));
 
 const mockSettingsService = settingsService as jest.Mocked<typeof settingsService>;
-
-// A minimal, properly-typed stand-in for setSetting's resolved value — the ENG-2218 tests below
-// only care that the promise resolves, not its contents.
-const stubSetting = () => ({ settingName: 'scoring-judges', settingValue: '[]', updatedAt: 't', updatedBy: 'a' });
 
 const app = express();
 app.use(express.json());
@@ -117,7 +118,7 @@ describe('POST /api/settings/scoring-judges', () => {
       settingValue: JSON.stringify([{ id: 'j1', name: 'A', systemPrompt: 'p', createdAt: 't', updatedAt: 't' }]),
       description: '', updatedBy: 'a', updatedAt: 't',
     });
-    mockSettingsService.setSetting.mockResolvedValue(stubSetting());
+    mockSettingsService.setSettingIfValueMatches.mockResolvedValue(undefined);
 
     const res = await request(app)
       .post('/api/settings/scoring-judges')
@@ -127,7 +128,8 @@ describe('POST /api/settings/scoring-judges', () => {
     expect(res.body.judge.name).toBe('Brand New');
     expect(res.body.judge.shadow).toBeUndefined();
     expect(res.body.judge.sampleRate).toBeUndefined();
-    const stored = JSON.parse(mockSettingsService.setSetting.mock.calls[0][1]);
+    expect(mockSettingsService.setSetting).not.toHaveBeenCalled();
+    const stored = JSON.parse(mockSettingsService.setSettingIfValueMatches.mock.calls[0][1]);
     expect(stored).toHaveLength(2);
   });
 
@@ -148,7 +150,7 @@ describe('POST /api/settings/scoring-judges', () => {
       ]),
       description: '', updatedBy: 'a', updatedAt: 't',
     });
-    mockSettingsService.setSetting.mockResolvedValue(stubSetting());
+    mockSettingsService.setSettingIfValueMatches.mockResolvedValue(undefined);
 
     const res = await request(app)
       .post('/api/settings/scoring-judges')
@@ -156,6 +158,69 @@ describe('POST /api/settings/scoring-judges', () => {
 
     expect(res.status).toBe(409);
     expect(mockSettingsService.setSetting).not.toHaveBeenCalled();
+    expect(mockSettingsService.setSettingIfValueMatches).not.toHaveBeenCalled();
+  });
+
+  it('ENG-2223: retries the create once against a fresh read after a CAS conflict, then succeeds', async () => {
+    const v0 = JSON.stringify([{ id: 'j1', name: 'A', systemPrompt: 'p', createdAt: 't', updatedAt: 't' }]);
+    // Simulates another admin's save landing between this request's read and its write: the
+    // first getSetting-in-attempt read is stale (v0), the retry's read sees the row another
+    // writer already advanced to (v1, with a second judge j2 that must survive).
+    const v1 = JSON.stringify([
+      { id: 'j1', name: 'A', systemPrompt: 'p', createdAt: 't', updatedAt: 't' },
+      { id: 'j2', name: 'B (from other writer)', systemPrompt: 'p2', createdAt: 't', updatedAt: 't' },
+    ]);
+    mockSettingsService.getSetting
+      .mockResolvedValueOnce({ settingName: 'scoring-judges', settingValue: v0, description: '', updatedBy: 'a', updatedAt: 't' })
+      .mockResolvedValueOnce({ settingName: 'scoring-judges', settingValue: v1, description: '', updatedBy: 'a', updatedAt: 't' });
+
+    const conflict = Object.assign(new Error('conditional check failed'), {
+      code: 'ConditionalCheckFailedException',
+    });
+    mockSettingsService.setSettingIfValueMatches
+      .mockRejectedValueOnce(conflict) // first attempt: conditioned on stale v0, loses the race
+      .mockResolvedValueOnce(undefined); // retry: conditioned on fresh v1, succeeds
+
+    const res = await request(app)
+      .post('/api/settings/scoring-judges')
+      .send({ name: 'Brand New', systemPrompt: 'Rate it' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.judge.name).toBe('Brand New');
+    expect(mockSettingsService.setSettingIfValueMatches).toHaveBeenCalledTimes(2);
+
+    // First attempt was conditioned on the stale value it read.
+    expect(mockSettingsService.setSettingIfValueMatches.mock.calls[0][2]).toBe(v0);
+    // Retry re-read fresh and is conditioned on THAT value, not the stale one.
+    expect(mockSettingsService.setSettingIfValueMatches.mock.calls[1][2]).toBe(v1);
+    // The retry's payload preserves the concurrent writer's j2 alongside the new judge — the
+    // CAS retry never silently drops the other writer's change.
+    const finalStored = JSON.parse(mockSettingsService.setSettingIfValueMatches.mock.calls[1][1]) as StoredJudge[];
+    expect(finalStored.map((j) => j.id)).toEqual(expect.arrayContaining(['j1', 'j2']));
+    expect(finalStored.find((j) => j.name === 'B (from other writer)')).toBeDefined();
+    expect(finalStored.find((j) => j.name === 'Brand New')).toBeDefined();
+    expect(finalStored).toHaveLength(3);
+  });
+
+  it('ENG-2223: fails loudly instead of looping forever when CAS conflicts exceed the retry budget', async () => {
+    mockSettingsService.getSetting.mockResolvedValue({
+      settingName: 'scoring-judges',
+      settingValue: JSON.stringify([{ id: 'j1', name: 'A', systemPrompt: 'p', createdAt: 't', updatedAt: 't' }]),
+      description: '', updatedBy: 'a', updatedAt: 't',
+    });
+    const conflict = Object.assign(new Error('conditional check failed'), {
+      code: 'ConditionalCheckFailedException',
+    });
+    mockSettingsService.setSettingIfValueMatches.mockRejectedValue(conflict);
+
+    const res = await request(app)
+      .post('/api/settings/scoring-judges')
+      .send({ name: 'Contended', systemPrompt: 'Rate it' });
+
+    expect(res.status).toBe(500);
+    // Bounded — same retry budget as the codebase's other setSettingIfValueMatches caller
+    // (htmlTemplateService.upsertPublicTemplate's MAX_ATTEMPTS = 5), never an infinite loop.
+    expect(mockSettingsService.setSettingIfValueMatches).toHaveBeenCalledTimes(5);
   });
 });
 
@@ -168,7 +233,7 @@ describe('PUT /api/settings/scoring-judges/:judgeId', () => {
       settingValue: JSON.stringify(existing),
       description: '', updatedBy: 'a', updatedAt: 't',
     });
-    mockSettingsService.setSetting.mockResolvedValue({} as any);
+    mockSettingsService.setSettingIfValueMatches.mockResolvedValue(undefined);
 
     const res = await request(app)
       .put('/api/settings/scoring-judges/j1')
@@ -176,6 +241,7 @@ describe('PUT /api/settings/scoring-judges/:judgeId', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.judge.llmModel).toBe('gemini-3.1-flash-lite');
+    expect(mockSettingsService.setSetting).not.toHaveBeenCalled();
   });
 
   it('clears llmModel when an empty string is sent', async () => {
@@ -184,7 +250,7 @@ describe('PUT /api/settings/scoring-judges/:judgeId', () => {
       settingValue: JSON.stringify(existing),
       description: '', updatedBy: 'a', updatedAt: 't',
     });
-    mockSettingsService.setSetting.mockResolvedValue({} as any);
+    mockSettingsService.setSettingIfValueMatches.mockResolvedValue(undefined);
 
     const res = await request(app)
       .put('/api/settings/scoring-judges/j1')
@@ -222,7 +288,7 @@ describe('PUT /api/settings/scoring-judges/:judgeId', () => {
       settingValue: JSON.stringify([shadowJudge]),
       description: '', updatedBy: 'a', updatedAt: 't0',
     });
-    mockSettingsService.setSetting.mockResolvedValue(stubSetting());
+    mockSettingsService.setSettingIfValueMatches.mockResolvedValue(undefined);
 
     const res = await request(app)
       .put('/api/settings/scoring-judges/outcome-judge-b-shadow')
@@ -237,10 +303,74 @@ describe('PUT /api/settings/scoring-judges/:judgeId', () => {
     expect(res.body.judge.id).toBe('outcome-judge-b-shadow');
 
     // Also assert what was actually persisted, not just the response.
-    const stored = JSON.parse(mockSettingsService.setSetting.mock.calls[0][1]);
+    expect(mockSettingsService.setSetting).not.toHaveBeenCalled();
+    const stored = JSON.parse(mockSettingsService.setSettingIfValueMatches.mock.calls[0][1]);
     expect(stored).toHaveLength(1);
     expect(stored[0].shadow).toBe(true);
     expect(stored[0].sampleRate).toBe(0.33);
+  });
+
+  it('ENG-2223: a concurrent edit (CAS conflict) retries against the fresh row and preserves both changes', async () => {
+    // Two admins editing DIFFERENT judges in the same stored array at nearly the same time.
+    // v0 is what this request reads first; v1 is what the row actually looks like by the time
+    // this request's write is attempted, because another admin's edit to judge j-other landed
+    // first and advanced the row's raw settingValue.
+    const v0 = JSON.stringify([
+      { ...existing[0] },
+      { id: 'j-other', name: 'Other', systemPrompt: 'op', createdAt: 't', updatedAt: 't' },
+    ]);
+    const v1 = JSON.stringify([
+      { ...existing[0] },
+      { id: 'j-other', name: 'Other (renamed by concurrent admin)', systemPrompt: 'op', createdAt: 't', updatedAt: 't2' },
+    ]);
+    mockSettingsService.getSetting
+      .mockResolvedValueOnce({ settingName: 'scoring-judges', settingValue: v0, description: '', updatedBy: 'a', updatedAt: 't' })
+      .mockResolvedValueOnce({ settingName: 'scoring-judges', settingValue: v1, description: '', updatedBy: 'a', updatedAt: 't2' });
+
+    const conflict = Object.assign(new Error('conditional check failed'), {
+      code: 'ConditionalCheckFailedException',
+    });
+    mockSettingsService.setSettingIfValueMatches
+      .mockRejectedValueOnce(conflict)
+      .mockResolvedValueOnce(undefined);
+
+    const res = await request(app)
+      .put('/api/settings/scoring-judges/j1')
+      .send({ llmModel: 'gemini-3.1-flash-lite' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.judge.llmModel).toBe('gemini-3.1-flash-lite');
+    expect(mockSettingsService.setSettingIfValueMatches).toHaveBeenCalledTimes(2);
+
+    const finalStored = JSON.parse(mockSettingsService.setSettingIfValueMatches.mock.calls[1][1]) as StoredJudge[];
+    const j1 = finalStored.find((j) => j.id === 'j1');
+    const jOther = finalStored.find((j) => j.id === 'j-other');
+    expect(j1).toBeDefined();
+    expect(jOther).toBeDefined();
+    // This request's own change was applied...
+    expect(j1?.llmModel).toBe('gemini-3.1-flash-lite');
+    // ...and the concurrent admin's change to the OTHER judge, picked up on the retry's fresh
+    // read, was never clobbered.
+    expect(jOther?.name).toBe('Other (renamed by concurrent admin)');
+  });
+
+  it('ENG-2223: fails loudly instead of silently dropping the update when retries are exhausted', async () => {
+    mockSettingsService.getSetting.mockResolvedValue({
+      settingName: 'scoring-judges',
+      settingValue: JSON.stringify(existing),
+      description: '', updatedBy: 'a', updatedAt: 't',
+    });
+    const conflict = Object.assign(new Error('conditional check failed'), {
+      code: 'ConditionalCheckFailedException',
+    });
+    mockSettingsService.setSettingIfValueMatches.mockRejectedValue(conflict);
+
+    const res = await request(app)
+      .put('/api/settings/scoring-judges/j1')
+      .send({ llmModel: 'gemini-3.1-flash-lite' });
+
+    expect(res.status).toBe(500);
+    expect(mockSettingsService.setSettingIfValueMatches).toHaveBeenCalledTimes(5);
   });
 });
 
