@@ -24,6 +24,17 @@ export interface SubscriptionType {
   monthlyExtraCostAllowance?: number | null; // Monthly extra API cost limit in USD (enrichment, etc.); null/undefined = unlimited
   llmUsagePolicy?: LlmUsagePolicy; // Versioned admin-managed full-choice/optimized/paused policy
   llmUsageTopUp?: LlmUsageTopUpConfig; // Admin-priced packages that extend this month's hard ceiling
+  /**
+   * Seat-based billing (ENG-2243..2246), Phase 2. Admin-configured pricing for
+   * extra seats beyond this tier's free base. `priceCents` is the full monthly
+   * charge per extra seat; `usageCreditMicroUsd` is the portion of that charge
+   * (a separate ticket) grants back as shared LLM usage credit. `baseSeats`
+   * mirrors `orgSeatService.baseSeatsForTier` for this tier so the admin UI
+   * and any future caller can read it from config instead of the hardcoded
+   * lookup — `orgSeatService.baseSeatsForTier` remains the source of truth
+   * used for enforcement today; this field is not yet wired to replace it.
+   */
+  seatPricing?: { priceCents: number; usageCreditMicroUsd: number; baseSeats: number };
 }
 
 // Default pages that are always available regardless of subscription type
