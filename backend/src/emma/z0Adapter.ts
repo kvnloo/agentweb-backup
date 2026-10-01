@@ -9,6 +9,7 @@ import { createHash } from 'crypto';
 import {
   Z0_BRIDGE_SCHEMA_V1,
   bridgeFailureDisposition,
+  validateZ0BridgeRequestV1,
   validateZ0BridgeResponseV1,
   type Z0BridgeKind,
   type Z0BridgeMode,
@@ -134,7 +135,7 @@ function buildBridgeRequest(params: {
   experimental: boolean;
   payload: Record<string, unknown>;
 }): Z0BridgeRequestV1 {
-  return {
+  const request: Z0BridgeRequestV1 = {
     schema: Z0_BRIDGE_SCHEMA_V1,
     operation_id: params.operationId,
     trace_id: params.traceId,
@@ -151,6 +152,15 @@ function buildBridgeRequest(params: {
     },
     payload: params.payload,
   };
+  const errors = validateZ0BridgeRequestV1(request);
+  if (errors.length) {
+    throw new Error(`bridge_policy_violation: ${errors.join('; ')}`);
+  }
+  return request;
+}
+
+function bridgePolicyMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function unwrapBridgeResponse(
@@ -227,18 +237,29 @@ export async function runZ0Route(args: Z0RouteArgs, options: Z0RouteOptions) {
   if (args.expected_parent_ms !== undefined) routePayload.expected_parent_ms = args.expected_parent_ms;
   if (args.max_tokens !== undefined) routePayload.max_tokens = args.max_tokens;
 
-  const body = buildBridgeRequest({
-    operationId: args.operation_id,
-    traceId,
-    parentAgent,
-    mode: bridgeMode,
-    kind: bridgeKind,
-    capability: args.function,
-    allowRemote: args.allow_remote === true,
-    freeOnly: true,
-    experimental: args.experimental === true,
-    payload: routePayload,
-  });
+  let body: Z0BridgeRequestV1;
+  try {
+    body = buildBridgeRequest({
+      operationId: args.operation_id,
+      traceId,
+      parentAgent,
+      mode: bridgeMode,
+      kind: bridgeKind,
+      capability: args.function,
+      allowRemote: args.allow_remote === true,
+      freeOnly: true,
+      experimental: args.experimental === true,
+      payload: routePayload,
+    });
+  } catch (error) {
+    return skipped(config.mode, 'bridge_policy_violation', bridgePolicyMessage(error), {
+      trace_id: traceId,
+      parent_agent: parentAgent,
+      execution_status: 'rejected',
+      reconcile_required: false,
+      bridge_retry: 'none',
+    });
+  }
 
   const endpoint = bridgeMode === 'shadow' ? '/v1/plan' : '/v1/intelligence';
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -390,24 +411,35 @@ export async function runZ0ChoiceExperiment(
   const traceId = agentWebChoiceExperimentTraceId(parentAgent, args);
   const bridgeMode: Z0BridgeMode = 'shadow';
   const bridgeKind: Z0BridgeKind = 'decide';
-  const body = buildBridgeRequest({
-    operationId: args.operation_id,
-    traceId,
-    parentAgent,
-    mode: bridgeMode,
-    kind: bridgeKind,
-    capability: `experiment.${args.decision_id}`,
-    allowRemote: true,
-    freeOnly: false,
-    experimental: true,
-    payload: {
-      function: 'experimental_choice',
-      decision_id: args.decision_id,
-      state: args.state,
-      instructions: args.instructions,
-      options: args.options,
-    },
-  });
+  let body: Z0BridgeRequestV1;
+  try {
+    body = buildBridgeRequest({
+      operationId: args.operation_id,
+      traceId,
+      parentAgent,
+      mode: bridgeMode,
+      kind: bridgeKind,
+      capability: `experiment.${args.decision_id}`,
+      allowRemote: true,
+      freeOnly: false,
+      experimental: true,
+      payload: {
+        function: 'experimental_choice',
+        decision_id: args.decision_id,
+        state: args.state,
+        instructions: args.instructions,
+        options: args.options,
+      },
+    });
+  } catch (error) {
+    return {
+      ok: false, skipped: true, executed: false, applied: false,
+      mode: 'shadow', reason: 'bridge_policy_violation',
+      message: bridgePolicyMessage(error),
+      trace_id: traceId, parent_agent: parentAgent,
+      execution_status: 'rejected', reconcile_required: false, bridge_retry: 'none',
+    };
+  }
   const fetchImpl = options.fetchImpl ?? fetch;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
@@ -544,23 +576,34 @@ export async function runZ0NoulExperiment(
   const traceId = agentWebNoulExperimentTraceId(parentAgent, args);
   const bridgeMode: Z0BridgeMode = 'shadow';
   const bridgeKind: Z0BridgeKind = 'decide';
-  const body = buildBridgeRequest({
-    operationId: args.operation_id,
-    traceId,
-    parentAgent,
-    mode: bridgeMode,
-    kind: bridgeKind,
-    capability: `experiment.${args.decision_id}`,
-    allowRemote: true,
-    freeOnly: false,
-    experimental: true,
-    payload: {
-      function: 'experimental_noul',
-      decision_id: args.decision_id,
-      state: args.state,
-      proposition: args.proposition,
-    },
-  });
+  let body: Z0BridgeRequestV1;
+  try {
+    body = buildBridgeRequest({
+      operationId: args.operation_id,
+      traceId,
+      parentAgent,
+      mode: bridgeMode,
+      kind: bridgeKind,
+      capability: `experiment.${args.decision_id}`,
+      allowRemote: true,
+      freeOnly: false,
+      experimental: true,
+      payload: {
+        function: 'experimental_noul',
+        decision_id: args.decision_id,
+        state: args.state,
+        proposition: args.proposition,
+      },
+    });
+  } catch (error) {
+    return {
+      ok: false, skipped: true, executed: false, applied: false,
+      mode: 'shadow', reason: 'bridge_policy_violation',
+      message: bridgePolicyMessage(error),
+      trace_id: traceId, parent_agent: parentAgent,
+      execution_status: 'rejected', reconcile_required: false, bridge_retry: 'none',
+    };
+  }
   const fetchImpl = options.fetchImpl ?? fetch;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
