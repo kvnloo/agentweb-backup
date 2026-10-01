@@ -429,6 +429,10 @@ export interface GeneratedLandingPage {
   userId: string;
   name: string;
   prompt: string;
+  /**
+   * Immutable Taste snapshot for this artifact. Aggregate-only; never raw sources.
+   */
+  tasteReceipt?: import("./tasteProfileService").TasteApplicationReceipt;
   status: "generating" | "draft" | "deploying" | "deployed" | "failed";
   /**
    * Whether the domain this page is served from actually responds (ENG-1839). Written by the
@@ -1128,6 +1132,8 @@ export interface GenerateLandingPageOptions {
   mode?: "unified" | "separate";
   /** The agent-mode session that spawned this build (durable-execution marker). */
   originatingSessionId?: string;
+  /** Taste provenance resolved before generation and persisted with the artifact. */
+  tasteReceipt?: import("./tasteProfileService").TasteApplicationReceipt;
   /** See GeneratedLandingPage.bridgeOutUrl's own doc comment. */
   bridgeOutUrl?: string;
   /**
@@ -1180,7 +1186,8 @@ async function addSubPage(
   templateHtml?: string,
   originatingSessionId?: string,
   bridgeOutUrl?: string,
-  metaPixelOverride?: { pixelId: string; accountId: string }
+  metaPixelOverride?: { pixelId: string; accountId: string },
+  tasteReceipt?: import("./tasteProfileService").TasteApplicationReceipt
 ): Promise<GeneratedLandingPage> {
   /*
    * ENG-1141: the coding-agent engine has NO Meta tracking installation of its own — it never
@@ -1211,10 +1218,11 @@ async function addSubPage(
     return addPageViaCodingAgent(site, userId, prompt, name, brandContext, {
       leadListId,
       originatingSessionId,
+      tasteReceipt,
     });
   }
   return addPageToExistingRepo(
-    site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl, metaPixelOverride
+    site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl, metaPixelOverride, tasteReceipt
   );
 }
 
@@ -1233,6 +1241,7 @@ export async function generateLandingPage(
   const bridgeOutUrl = opts?.bridgeOutUrl;
   const metaPixelOverride = opts?.metaPixelOverride;
   const googleAds = opts?.googleAds;
+  const tasteReceipt = opts?.tasteReceipt;
 
   if (multiSite) {
     // 1. Explicit target site → add a page/variant to it (shares the subdomain).
@@ -1246,7 +1255,7 @@ export async function generateLandingPage(
           return reuse;
         }
         return addSubPage(
-          site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl, metaPixelOverride
+          site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl, metaPixelOverride, tasteReceipt
         );
       }
       // siteId given but not a usable site (deleted / never deployed) → fall through.
@@ -1256,7 +1265,7 @@ export async function generateLandingPage(
     //    subdomain). The costlier, opt-in path (e.g. distinct campaign URLs).
     if (mode === "separate") {
       return generateFirstPage(
-        userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl, metaPixelOverride, googleAds
+        userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl, metaPixelOverride, googleAds, tasteReceipt
       );
     }
 
@@ -1272,11 +1281,11 @@ export async function generateLandingPage(
         return reuse;
       }
       return addSubPage(
-        existing, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl, metaPixelOverride
+        existing, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl, metaPixelOverride, tasteReceipt
       );
     }
     return generateFirstPage(
-      userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl, metaPixelOverride, googleAds
+      userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl, metaPixelOverride, googleAds, tasteReceipt
     );
   }
 
@@ -1304,7 +1313,7 @@ export async function generateLandingPage(
     // ── Add new page route to existing repo (no v0 call) ──
     // Legacy (DURABLE_LANDING_GENERATION off) also adds sub-pages, so the override has to
     // reach here too — otherwise the picker is silently ignored wherever the flag isn't on.
-    return addPageToExistingRepo(siteRecord, userId, prompt, name, brandContext, leadListId, templateHtml, undefined, bridgeOutUrl, metaPixelOverride);
+    return addPageToExistingRepo(siteRecord, userId, prompt, name, brandContext, leadListId, templateHtml, undefined, bridgeOutUrl, metaPixelOverride, tasteReceipt);
   }
 
   const existingPages = await listLandingPages(userId);
@@ -1322,7 +1331,7 @@ export async function generateLandingPage(
     await cleanupOrphanedFailedPages(userId, existingPages, recyclable.id);
   }
 
-  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id, undefined, bridgeOutUrl, metaPixelOverride, googleAds);
+  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id, undefined, bridgeOutUrl, metaPixelOverride, googleAds, tasteReceipt);
 }
 
 /**
@@ -1418,7 +1427,8 @@ async function generateFirstPage(
   originatingSessionId?: string,
   bridgeOutUrl?: string,
   metaPixelOverride?: { pixelId: string; accountId: string },
-  googleAds?: { conversionId: string; conversionLabel: string; customerId?: string }
+  googleAds?: { conversionId: string; conversionLabel: string; customerId?: string },
+  tasteReceipt?: import("./tasteProfileService").TasteApplicationReceipt
 ): Promise<GeneratedLandingPage> {
   // Reuse a recyclable failed record's id when retrying, otherwise mint a new one.
   const id = existingId ?? uuidv4();
@@ -1475,6 +1485,7 @@ async function generateFirstPage(
     // A new site's root record IS its own site — explicit identity that replaces
     // the old "guess the oldest repo" heuristic.
     siteId: id,
+    ...(tasteReceipt ? { tasteReceipt } : {}),
     createdAt: now,
     updatedAt: now,
   };
@@ -1762,7 +1773,8 @@ async function addPageToExistingRepo(
   templateHtml?: string,
   originatingSessionId?: string,
   bridgeOutUrl?: string,
-  metaPixelOverride?: { pixelId: string; accountId: string }
+  metaPixelOverride?: { pixelId: string; accountId: string },
+  tasteReceipt?: import("./tasteProfileService").TasteApplicationReceipt
 ): Promise<GeneratedLandingPage> {
   const id = uuidv4();
   const now = new Date().toISOString();
@@ -1846,6 +1858,7 @@ async function addPageToExistingRepo(
     // siteId === id, so a sub-page inherits the root's siteId (or the root's id).
     siteId: existingPage.siteId ?? existingPage.id,
     ...(originatingSessionId ? { originatingSessionId } : {}),
+    ...(tasteReceipt ? { tasteReceipt } : {}),
     deployedUrl: baseUrl ? `${baseUrl}/${slug}` : undefined,
     createdAt: now,
     updatedAt: now,
