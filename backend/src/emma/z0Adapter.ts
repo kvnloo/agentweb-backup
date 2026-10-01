@@ -6,6 +6,15 @@
  * an ambiguous response: the same operation identity must be reconciled.
  */
 import { createHash } from 'crypto';
+import {
+  Z0_BRIDGE_SCHEMA_V1,
+  bridgeFailureDisposition,
+  validateZ0BridgeResponseV1,
+  type Z0BridgeKind,
+  type Z0BridgeMode,
+  type Z0BridgeRequestV1,
+  type Z0BridgeResponseV1,
+} from './z0BridgeProtocol';
 
 export type Z0AgentWebMode = 'off' | 'shadow' | 'active';
 
@@ -109,6 +118,83 @@ function skipped(
   };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function buildBridgeRequest(params: {
+  operationId: string;
+  traceId: string;
+  parentAgent: string;
+  mode: Z0BridgeMode;
+  kind: Z0BridgeKind;
+  capability: string;
+  allowRemote: boolean;
+  freeOnly: boolean;
+  experimental: boolean;
+  payload: Record<string, unknown>;
+}): Z0BridgeRequestV1 {
+  return {
+    schema: Z0_BRIDGE_SCHEMA_V1,
+    operation_id: params.operationId,
+    trace_id: params.traceId,
+    parent_agent: params.parentAgent,
+    mode: params.mode,
+    kind: params.kind,
+    capability: params.capability,
+    policy: {
+      allow_remote: params.allowRemote,
+      free_only: params.freeOnly,
+      experimental: params.experimental,
+      risk_class: params.kind === 'decide' ? 'read' : 'generate',
+      approval_state: 'not_required',
+    },
+    payload: params.payload,
+  };
+}
+
+function unwrapBridgeResponse(
+  payload: unknown,
+  expected: {
+    operationId: string;
+    traceId: string;
+    mode: Z0BridgeMode;
+    kind: Z0BridgeKind;
+  },
+):
+  | { bridge: Z0BridgeResponseV1; output: Record<string, unknown> }
+  | { error: string } {
+  const errors = validateZ0BridgeResponseV1(payload);
+  if (errors.length) return { error: errors.join('; ') };
+
+  const bridge = payload as Z0BridgeResponseV1;
+  if (
+    bridge.operation_id !== expected.operationId ||
+    bridge.trace_id !== expected.traceId ||
+    bridge.mode !== expected.mode ||
+    bridge.kind !== expected.kind
+  ) {
+    return { error: 'bridge response identity/mode/kind mismatch' };
+  }
+  if (!isRecord(bridge.output)) {
+    return { error: 'bridge response output must be an object' };
+  }
+  return { bridge, output: bridge.output };
+}
+
+function bridgeFailureExtra(
+  mode: Z0BridgeMode,
+  kind: Z0BridgeKind,
+  failure: 'http_4xx' | 'http_5xx' | 'timeout' | 'transport' | 'invalid_response',
+) {
+  const disposition = bridgeFailureDisposition(mode, failure, kind);
+  return {
+    execution_status: disposition.status,
+    reconcile_required: disposition.reconcile_required,
+    bridge_retry: disposition.retry,
+  };
+}
+
 export async function runZ0Route(args: Z0RouteArgs, options: Z0RouteOptions) {
   const config = options.config ?? readZ0AgentWebConfig();
 
@@ -129,23 +215,32 @@ export async function runZ0Route(args: Z0RouteArgs, options: Z0RouteOptions) {
   }
 
   const traceId = agentWebTraceId(parentAgent, args);
-  const body: Record<string, unknown> = {
-    harness: 'agentweb',
-    trace_id: traceId,
-    parent_agent: parentAgent,
+  const bridgeMode: Z0BridgeMode = config.mode === 'active' ? 'active' : 'shadow';
+  const bridgeKind: Z0BridgeKind = bridgeMode === 'shadow' ? 'plan' : 'dispatch';
+  const routePayload: Record<string, unknown> = {
     function: args.function,
     task: args.task,
-    allow_remote: args.allow_remote === true,
-    experimental: args.experimental === true,
-    free_only: true,
   };
-  if (args.context !== undefined) body.context = args.context;
-  if (args.state !== undefined) body.state = args.state;
-  if (args.expected_parent_tokens !== undefined) body.expected_parent_tokens = args.expected_parent_tokens;
-  if (args.expected_parent_ms !== undefined) body.expected_parent_ms = args.expected_parent_ms;
-  if (args.max_tokens !== undefined) body.max_tokens = args.max_tokens;
+  if (args.context !== undefined) routePayload.context = args.context;
+  if (args.state !== undefined) routePayload.state = args.state;
+  if (args.expected_parent_tokens !== undefined) routePayload.expected_parent_tokens = args.expected_parent_tokens;
+  if (args.expected_parent_ms !== undefined) routePayload.expected_parent_ms = args.expected_parent_ms;
+  if (args.max_tokens !== undefined) routePayload.max_tokens = args.max_tokens;
 
-  const endpoint = config.mode === 'shadow' ? '/v1/plan' : '/v1/intelligence';
+  const body = buildBridgeRequest({
+    operationId: args.operation_id,
+    traceId,
+    parentAgent,
+    mode: bridgeMode,
+    kind: bridgeKind,
+    capability: args.function,
+    allowRemote: args.allow_remote === true,
+    freeOnly: true,
+    experimental: args.experimental === true,
+    payload: routePayload,
+  });
+
+  const endpoint = bridgeMode === 'shadow' ? '/v1/plan' : '/v1/intelligence';
   const fetchImpl = options.fetchImpl ?? fetch;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
@@ -159,32 +254,40 @@ export async function runZ0Route(args: Z0RouteArgs, options: Z0RouteOptions) {
     });
 
     if (!response.ok) {
+      const failure = response.status >= 500 ? 'http_5xx' : 'http_4xx';
       return skipped(config.mode, 'http_error', `z0intelligence returned HTTP ${response.status}`, {
         trace_id: traceId,
         parent_agent: parentAgent,
-        execution_status: config.mode === 'active' ? 'unknown' : 'not_executed',
-        reconcile_required: config.mode === 'active',
+        ...bridgeFailureExtra(bridgeMode, bridgeKind, failure),
       });
     }
 
     const payload = (await response.json()) as unknown;
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-      return skipped(config.mode, 'invalid_response', 'z0intelligence returned a non-object response', {
+    const unwrapped = unwrapBridgeResponse(payload, {
+      operationId: args.operation_id,
+      traceId,
+      mode: bridgeMode,
+      kind: bridgeKind,
+    });
+    if ('error' in unwrapped) {
+      return skipped(config.mode, 'invalid_response', unwrapped.error, {
         trace_id: traceId,
         parent_agent: parentAgent,
-        execution_status: config.mode === 'active' ? 'unknown' : 'not_executed',
-        reconcile_required: config.mode === 'active',
+        ...bridgeFailureExtra(bridgeMode, bridgeKind, 'invalid_response'),
       });
     }
 
     return {
-      ...(payload as Record<string, unknown>),
+      ...unwrapped.output,
       z0: true,
       skipped: false,
       mode: config.mode,
       trace_id: traceId,
       parent_agent: parentAgent,
-      reconcile_required: false,
+      reconcile_required: unwrapped.bridge.reconcile_required,
+      bridge_schema: unwrapped.bridge.schema,
+      bridge_status: unwrapped.bridge.status,
+      bridge_retry: unwrapped.bridge.retry,
     };
   } catch (error) {
     const isTimeout = error instanceof Error && error.name === 'AbortError';
@@ -193,10 +296,9 @@ export async function runZ0Route(args: Z0RouteArgs, options: Z0RouteOptions) {
       : 'z0intelligence transport failed', {
       trace_id: traceId,
       parent_agent: parentAgent,
-      execution_status: config.mode === 'active' ? 'unknown' : 'not_executed',
-      reconcile_required: config.mode === 'active',
+      ...bridgeFailureExtra(bridgeMode, bridgeKind, isTimeout ? 'timeout' : 'transport'),
       instruction:
-        config.mode === 'active'
+        bridgeMode === 'active'
           ? 'Retry only with the identical operation_id and request; never mint a new execution identity.'
           : 'Shadow planning made no physical model call.',
     });
@@ -286,18 +388,26 @@ export async function runZ0ChoiceExperiment(
   }
 
   const traceId = agentWebChoiceExperimentTraceId(parentAgent, args);
-  const body = {
-    harness: 'agentweb',
-    trace_id: traceId,
-    parent_agent: parentAgent,
-    function: 'experimental_choice',
-    decision_id: args.decision_id,
-    state: args.state,
-    instructions: args.instructions,
-    options: args.options,
-    allow_remote: true,
+  const bridgeMode: Z0BridgeMode = 'shadow';
+  const bridgeKind: Z0BridgeKind = 'decide';
+  const body = buildBridgeRequest({
+    operationId: args.operation_id,
+    traceId,
+    parentAgent,
+    mode: bridgeMode,
+    kind: bridgeKind,
+    capability: `experiment.${args.decision_id}`,
+    allowRemote: true,
+    freeOnly: false,
     experimental: true,
-  };
+    payload: {
+      function: 'experimental_choice',
+      decision_id: args.decision_id,
+      state: args.state,
+      instructions: args.instructions,
+      options: args.options,
+    },
+  });
   const fetchImpl = options.fetchImpl ?? fetch;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
@@ -310,31 +420,41 @@ export async function runZ0ChoiceExperiment(
       signal: controller.signal,
     });
     if (!response.ok) {
+      const failure = response.status >= 500 ? 'http_5xx' : 'http_4xx';
       return {
         ok: false, skipped: true, executed: false, applied: false,
         mode: 'shadow', reason: 'http_error',
         message: `z0intelligence returned HTTP ${response.status}`,
         trace_id: traceId, parent_agent: parentAgent,
-        execution_status: 'unknown', reconcile_required: true,
+        ...bridgeFailureExtra(bridgeMode, bridgeKind, failure),
       };
     }
     const payload = (await response.json()) as unknown;
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    const unwrapped = unwrapBridgeResponse(payload, {
+      operationId: args.operation_id,
+      traceId,
+      mode: bridgeMode,
+      kind: bridgeKind,
+    });
+    if ('error' in unwrapped) {
       return {
         ok: false, skipped: true, executed: false, applied: false,
         mode: 'shadow', reason: 'invalid_response',
-        message: 'z0intelligence returned a non-object experiment response',
+        message: unwrapped.error,
         trace_id: traceId, parent_agent: parentAgent,
-        execution_status: 'unknown', reconcile_required: true,
+        ...bridgeFailureExtra(bridgeMode, bridgeKind, 'invalid_response'),
       };
     }
     return {
-      ...(payload as Record<string, unknown>),
+      ...unwrapped.output,
       z0: true,
       skipped: false,
       trace_id: traceId,
       parent_agent: parentAgent,
-      reconcile_required: false,
+      reconcile_required: unwrapped.bridge.reconcile_required,
+      bridge_schema: unwrapped.bridge.schema,
+      bridge_status: unwrapped.bridge.status,
+      bridge_retry: unwrapped.bridge.retry,
     };
   } catch (error) {
     const isTimeout = error instanceof Error && error.name === 'AbortError';
@@ -347,8 +467,7 @@ export async function runZ0ChoiceExperiment(
         : 'z0intelligence transport failed',
       trace_id: traceId,
       parent_agent: parentAgent,
-      execution_status: 'unknown',
-      reconcile_required: true,
+      ...bridgeFailureExtra(bridgeMode, bridgeKind, isTimeout ? 'timeout' : 'transport'),
       instruction: 'Reconcile the identical decision_id + operation_id + request; never mint a new trace.',
     };
   } finally {
@@ -423,17 +542,25 @@ export async function runZ0NoulExperiment(
     };
   }
   const traceId = agentWebNoulExperimentTraceId(parentAgent, args);
-  const body = {
-    harness: 'agentweb',
-    trace_id: traceId,
-    parent_agent: parentAgent,
-    function: 'experimental_noul',
-    decision_id: args.decision_id,
-    state: args.state,
-    proposition: args.proposition,
-    allow_remote: true,
+  const bridgeMode: Z0BridgeMode = 'shadow';
+  const bridgeKind: Z0BridgeKind = 'decide';
+  const body = buildBridgeRequest({
+    operationId: args.operation_id,
+    traceId,
+    parentAgent,
+    mode: bridgeMode,
+    kind: bridgeKind,
+    capability: `experiment.${args.decision_id}`,
+    allowRemote: true,
+    freeOnly: false,
     experimental: true,
-  };
+    payload: {
+      function: 'experimental_noul',
+      decision_id: args.decision_id,
+      state: args.state,
+      proposition: args.proposition,
+    },
+  });
   const fetchImpl = options.fetchImpl ?? fetch;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
@@ -446,31 +573,41 @@ export async function runZ0NoulExperiment(
       signal: controller.signal,
     });
     if (!response.ok) {
+      const failure = response.status >= 500 ? 'http_5xx' : 'http_4xx';
       return {
         ok: false, skipped: true, executed: false, applied: false,
         mode: 'shadow', reason: 'http_error',
         message: `z0intelligence returned HTTP ${response.status}`,
         trace_id: traceId, parent_agent: parentAgent,
-        execution_status: 'unknown', reconcile_required: true,
+        ...bridgeFailureExtra(bridgeMode, bridgeKind, failure),
       };
     }
     const payload = (await response.json()) as unknown;
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    const unwrapped = unwrapBridgeResponse(payload, {
+      operationId: args.operation_id,
+      traceId,
+      mode: bridgeMode,
+      kind: bridgeKind,
+    });
+    if ('error' in unwrapped) {
       return {
         ok: false, skipped: true, executed: false, applied: false,
         mode: 'shadow', reason: 'invalid_response',
-        message: 'z0intelligence returned a non-object experiment response',
+        message: unwrapped.error,
         trace_id: traceId, parent_agent: parentAgent,
-        execution_status: 'unknown', reconcile_required: true,
+        ...bridgeFailureExtra(bridgeMode, bridgeKind, 'invalid_response'),
       };
     }
     return {
-      ...(payload as Record<string, unknown>),
+      ...unwrapped.output,
       z0: true,
       skipped: false,
       trace_id: traceId,
       parent_agent: parentAgent,
-      reconcile_required: false,
+      reconcile_required: unwrapped.bridge.reconcile_required,
+      bridge_schema: unwrapped.bridge.schema,
+      bridge_status: unwrapped.bridge.status,
+      bridge_retry: unwrapped.bridge.retry,
     };
   } catch (error) {
     const isTimeout = error instanceof Error && error.name === 'AbortError';
@@ -483,8 +620,7 @@ export async function runZ0NoulExperiment(
         : 'z0intelligence transport failed',
       trace_id: traceId,
       parent_agent: parentAgent,
-      execution_status: 'unknown',
-      reconcile_required: true,
+      ...bridgeFailureExtra(bridgeMode, bridgeKind, isTimeout ? 'timeout' : 'transport'),
       instruction: 'Reconcile the identical decision_id + operation_id + request; never mint a new trace.',
     };
   } finally {
