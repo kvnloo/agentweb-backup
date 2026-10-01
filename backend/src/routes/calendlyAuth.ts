@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getCalendlyConfig, CalendlyOAuthConfig } from '../config/integrations';
 import { createAccount, getAccountsByUserId, CalendlyConfig } from '../services/connectedAccountsDb';
+import { redactAccountSecrets } from '../utils/accountSecretRedaction';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
 import { storeTokenSession, retrieveTokenSession } from '../services/oauthTokenSessionStore';
@@ -495,7 +496,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
 
     res.json({
       success: true,
-      account,
+      account: redactAccountSecrets(account),
       ...(bookingTrackingActive ? {} : {
         upgradeRequired: true,
         upgradeMessage:

@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getYouTubeConfig } from '../config/integrations';
 import { createAccount } from '../services/connectedAccountsDb';
+import { redactAccountSecrets } from '../utils/accountSecretRedaction';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
 
@@ -278,7 +279,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
       },
     });
 
-    res.json({ success: true, account });
+    res.json({ success: true, account: redactAccountSecrets(account) });
   } catch (error: any) {
     console.error('[YouTube OAuth /connect]', error);
     const details = IS_PRODUCTION ? undefined : error.message;

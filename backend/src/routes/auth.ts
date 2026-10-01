@@ -13,6 +13,7 @@ import rateLimit from 'express-rate-limit';
 import { resolveAnalyticsConfig, resolveConfigTarget } from '../services/analyticsConfigResolver';
 import { resolveOrgProfileField } from '../services/orgProfileResolver';
 import { EvaluationDenied, isEvaluationUser, requireActiveEvaluation, sandboxInfo as buildSandboxInfo } from '../services/evaluationPolicy';
+import { sanitizeUserForResponse } from '../utils/accountSecretRedaction';
 
 const router = express.Router();
 
@@ -79,7 +80,7 @@ router.get('/me', authenticateToken, async (req, res) => {
       return res.status(404).json({ message: 'User not found' });
     }
     // Don't send sensitive information
-    const { password, ...userWithoutPassword } = user;
+    const userWithoutPassword = sanitizeUserForResponse(user);
 
     // Add delegation information if this is a delegate session
     const response: any = userWithoutPassword;

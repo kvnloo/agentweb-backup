@@ -11,6 +11,7 @@ import { userDb, taskDb, subscriberDb, crmDb, orgDb } from "../services/db";
 import { mintDelegateToken, mintEvaluationDelegateToken } from "../services/delegateAccessToken";
 import { linkedInOutreachService } from "../services/linkedInOutreachService";
 import { deleteAccountById, createAccount } from "../services/connectedAccountsDb";
+import { sanitizeUserForResponse } from "../utils/accountSecretRedaction";
 import { waitlistDb } from "../services/waitlistDb";
 import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
@@ -1006,10 +1007,10 @@ router.get("/users/:userId", async (req, res) => {
     }
 
     // Strip encrypted secret values, expose only key names
-    const { secrets, ...rest } = user as any;
+    const secretNames = (user as any).secrets ? Object.keys((user as any).secrets) : [];
     res.json({
-      ...rest,
-      secretNames: secrets ? Object.keys(secrets) : [],
+      ...sanitizeUserForResponse(user),
+      secretNames,
     });
   } catch (error) {
     console.error("Error getting user:", error);
@@ -1038,7 +1039,7 @@ router.post("/users/:userId/deactivate", async (req, res) => {
 
     const updatedUser = await userDb.deactivateUser(userId);
     syncUserUpdateToLeadList(user.email, { isActive: false });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error deactivating user:", error);
     res.status(500).json({ message: "Error deactivating user" });
@@ -1061,7 +1062,7 @@ router.post("/users/:userId/reactivate", async (req, res) => {
 
     const updatedUser = await userDb.reactivateUser(userId);
     syncUserUpdateToLeadList(user.email, { isActive: true });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error reactivating user:", error);
     res.status(500).json({ message: "Error reactivating user" });
@@ -1082,7 +1083,7 @@ router.put("/users/:userId/support-note", async (req, res) => {
 
     // Update the user's support note
     const updatedUser = await userDb.updateUser(userId, { supportNote });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user support note:", error);
     res.status(500).json({ message: "Error updating support note" });
@@ -1114,7 +1115,7 @@ router.put("/users/:userId/funnel-status", async (req, res) => {
     const updatedUser = await userDb.updateUser(userId, {
       funnelStatus: normalizedStatus || null,
     });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user funnel status:", error);
     res.status(500).json({ message: "Error updating funnel status" });
@@ -1135,7 +1136,7 @@ router.put("/users/:userId/name", async (req, res) => {
     const updatedUser = await userDb.updateUser(userId, {
       displayName: displayName || null,
     });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user display name:", error);
     res.status(500).json({ message: "Error updating user display name" });
@@ -1271,7 +1272,7 @@ router.put("/users/:userId/stripe-customer-id", async (req, res) => {
 
     // Update the user's Stripe Customer ID
     const updatedUser = await userDb.updateUser(userId, { stripe_customer_id: stripeCustomerId });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating Stripe Customer ID:", error);
     res.status(500).json({ message: "Error updating Stripe Customer ID" });
@@ -1292,7 +1293,7 @@ router.put("/users/:userId/ad-account", async (req, res) => {
 
     // Update the user's ad account
     const updatedUser = await userDb.updateUser(userId, { adAccount });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user ad account:", error);
     res.status(500).json({ message: "Error updating ad account" });
@@ -1317,7 +1318,7 @@ router.put("/users/:userId/email-sender", async (req, res) => {
       defaultSenderUsername,
       fromName
     });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user email sender:", error);
     res.status(500).json({ message: "Error updating email sender" });
@@ -1377,7 +1378,7 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
     const updatedUser = await userDb.updateUser(userId, {
       slackChannels: channels.length > 0 ? channels : (null as any),
     });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user slack channels:", error);
     res.status(500).json({ message: "Error updating slack channels" });
@@ -1485,7 +1486,7 @@ router.put("/users/:userId/seo-domains", async (req, res) => {
     const updatedUser = await userDb.updateUser(userId, {
       seoDomains: seoDomains || []
     });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user SEO domains:", error);
     res.status(500).json({ message: "Error updating SEO domains" });
@@ -1611,7 +1612,7 @@ router.put("/users/:userId/google-drive-folders", async (req, res) => {
     }));
 
     const updatedUser = await userDb.updateUser(userId, { googleDriveFolders: sanitizedFolders });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user Google Drive folders:", error);
     res.status(500).json({ message: "Error updating Google Drive folders" });
@@ -1641,7 +1642,7 @@ router.put("/users/:userId/cms-type", async (req, res) => {
     const updatedUser = await userDb.updateUser(userId, {
       cmsType: cmsTypeValue
     });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user CMS Type:", error);
     res.status(500).json({ message: "Error updating CMS Type" });
@@ -1668,7 +1669,7 @@ router.put("/users/:userId/email", async (req, res) => {
       return res.status(400).json({ message: result.message });
     }
 
-    res.json(result.user);
+    res.json(sanitizeUserForResponse(result.user));
   } catch (error) {
     console.error("Error updating user email:", error);
     res.status(500).json({ message: "Error updating user email" });
@@ -5320,7 +5321,7 @@ router.put("/users/:userId/subscription-type", async (req, res) => {
     // Update the user's subscription type
     const updatedUser = await userDb.updateUser(userId, { subscriptionType });
     syncUserUpdateToLeadList(user.email, { subscriptionType });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error updating user subscription type:", error);
     res.status(500).json({ message: "Error updating subscription type" });
@@ -5344,7 +5345,7 @@ router.post("/users/:userId/token-bonus", async (req, res) => {
 
     await grantTokenBonus(userId, bonusTokens);
     const updatedUser = await userDb.getUserById(userId);
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error granting token bonus:", error);
     res.status(500).json({ message: "Error granting token bonus" });
@@ -5427,7 +5428,7 @@ router.post("/users/:userId/send-intro-email", async (req, res) => {
     await emailService.sendTeamIntroductionEmail(user.email, user.displayName);
     const sentAt = new Date().toISOString();
     const updatedUser = await userDb.updateUser(userId, { introductionEmailSent: sentAt });
-    res.json(updatedUser);
+    res.json(sanitizeUserForResponse(updatedUser));
   } catch (error) {
     console.error("Error sending team introduction email:", error);
     res.status(500).json({ message: "Error sending team introduction email" });
@@ -5883,7 +5884,7 @@ router.post("/users/:userId/sync-stripe", async (req, res) => {
     // fills NULL fields and cannot unstick such an account.
     const updates = await reconcileStripeUserById(userId);
     const updatedUser = await userDb.getUserById(userId);
-    res.json({ updates, user: updatedUser });
+    res.json({ updates, user: updatedUser ? sanitizeUserForResponse(updatedUser) : null });
   } catch (error: any) {
     console.error("Error syncing Stripe subscription:", error.message);
     res.status(500).json({ message: "Failed to sync Stripe subscription" });

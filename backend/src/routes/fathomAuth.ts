@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getFathomConfig } from '../config/integrations';
 import { createAccount, updateAccountConfig } from '../services/connectedAccountsDb';
+import { redactAccountSecrets } from '../utils/accountSecretRedaction';
 import { FathomApiService } from '../services/fathomApiService';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
@@ -204,7 +205,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
       console.warn(`[Fathom] Webhook registration failed for user ${userId}:`, webhookErr?.message);
     }
 
-    res.json({ success: true, account });
+    res.json({ success: true, account: redactAccountSecrets(account) });
   } catch (error: any) {
     console.error('[Fathom OAuth /connect]', error);
     const details = IS_PRODUCTION ? undefined : error.message;

@@ -1,6 +1,7 @@
 import express from 'express';
 import { twitterService } from '../services/twitterService';
 import { createAccount, deleteAccountById, TwitterXConfig } from '../services/connectedAccountsDb';
+import { redactAccountSecrets } from '../utils/accountSecretRedaction';
 import { authenticateToken } from '../middleware/auth';
 import { INTEGRATION_CONFIG } from '../config/integrations';
 
@@ -157,9 +158,10 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
 
     // Strip OAuth tokens from the response — the frontend only needs account
     // metadata; sending access_token/refresh_token risks leaking them into
-    // ALB logs, browser history, or middleware caches.
-    const { config: _config, ...safeAccount } = account;
-    res.json({ success: true, account: safeAccount });
+    // ALB logs, browser history, or middleware caches. Shared helper (ENG-2258)
+    // so the other 9 OAuth callback routes get the same treatment instead of
+    // each needing its own ad hoc strip.
+    res.json({ success: true, account: redactAccountSecrets(account) });
   } catch (error: any) {
     console.error('[Twitter OAuth /finalize]', error);
     const details = IS_PRODUCTION ? undefined : error.message;

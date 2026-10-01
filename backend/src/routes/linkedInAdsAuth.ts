@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getLinkedInAdsConfig } from '../config/integrations';
 import { createAccount } from '../services/connectedAccountsDb';
+import { redactAccountSecrets } from '../utils/accountSecretRedaction';
 import { listAdAccounts } from '../services/linkedInAdsService';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
@@ -274,7 +275,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
 
     await safeAutoResolve('LinkedIn Ads Connect', userId, 'linkedin_ads', adAccountId);
 
-    res.json({ success: true, account });
+    res.json({ success: true, account: redactAccountSecrets(account) });
   } catch (error: any) {
     console.error('[LinkedIn Ads OAuth] Connect error:', error);
     const details = IS_PRODUCTION ? undefined : error.message;

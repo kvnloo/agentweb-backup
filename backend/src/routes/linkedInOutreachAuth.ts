@@ -1,6 +1,7 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { createAccount } from '../services/connectedAccountsDb';
+import { redactAccountSecrets } from '../utils/accountSecretRedaction';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { clearDisconnectFlag } from '../services/linkedInConnectionHealth';
 
@@ -196,7 +197,7 @@ router.post('/save-account', authenticateToken, async (req: any, res: any) => {
     await clearDisconnectFlag(userId, unipileAccountId);
 
     console.log(`[LinkedIn Outreach] Connected account ${unipileAccountId} (name: "${accountName}") for user ${userId}`);
-    res.json({ success: true, account });
+    res.json({ success: true, account: redactAccountSecrets(account) });
 
   } catch (error: any) {
     console.error('[LinkedIn Outreach] Error saving account:', error);
