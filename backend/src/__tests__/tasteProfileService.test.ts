@@ -446,4 +446,115 @@ describe('TasteProfileService', () => {
     expect(settingsChanged.receipt.settingsRevision).not.toBe(profileChanged.receipt.settingsRevision);
   });
 
+
+  it('applies explicit feedback only to the artifact surface and preserves the base profile', async () => {
+    const { store } = memoryHarness();
+    const service = new TasteProfileService({ getBookmarks: jest.fn() }, store);
+
+    await service.importCollection(
+      'user-a',
+      [
+        { title: 'minimal minimal minimal minimal editorial editorial' },
+        { title: 'minimal minimal minimal' },
+      ],
+      'feedback-refs'
+    );
+
+    const baseProfile = await service.getProfile('user-a');
+    const beforeLanding = await service.getApplication('user-a', 'landing_page');
+    const beforeImage = await service.getApplication('user-a', 'image');
+
+    await service.recordFeedback(
+      'user-a',
+      'landing_page',
+      'page-1',
+      'more',
+      beforeLanding.receipt
+    );
+
+    // Imported profile remains source-derived; feedback is an application overlay.
+    expect(await service.getProfile('user-a')).toEqual(baseProfile);
+
+    const afterLanding = await service.getApplication('user-a', 'landing_page');
+    const afterImage = await service.getApplication('user-a', 'image');
+
+    expect(afterLanding.receipt.profileRevision).not.toBe(beforeLanding.receipt.profileRevision);
+    expect(afterLanding.profile.styleSignals[0].score)
+      .toBeGreaterThan(beforeLanding.profile.styleSignals[0].score);
+    expect(afterImage.receipt.profileRevision).toBe(beforeImage.receipt.profileRevision);
+  });
+
+  it('keeps contradictory feedback inspectable while deterministic + and - events cancel', async () => {
+    const { store } = memoryHarness();
+    const service = new TasteProfileService({ getBookmarks: jest.fn() }, store);
+
+    await service.importCollection(
+      'user-a',
+      [
+        { title: 'minimal minimal minimal minimal editorial editorial' },
+        { title: 'minimal minimal minimal' },
+      ],
+      'feedback-cancel'
+    );
+
+    const before = await service.getApplication('user-a', 'landing_page');
+    await service.recordFeedback('user-a', 'landing_page', 'page-1', 'more', before.receipt);
+    await service.recordFeedback('user-a', 'landing_page', 'page-1', 'less', before.receipt);
+
+    const events = await service.listFeedback('user-a', 'page-1');
+    expect(events).toHaveLength(2);
+    expect(events.map((event) => event.direction).sort()).toEqual(['less', 'more']);
+
+    const after = await service.getApplication('user-a', 'landing_page');
+    expect(after.receipt.profileRevision).toBe(before.receipt.profileRevision);
+    expect(after.profile.styleSignals).toEqual(before.profile.styleSignals);
+  });
+
+  it('reverses feedback without deleting audit history and treats Ignore as inert', async () => {
+    const { store } = memoryHarness();
+    const service = new TasteProfileService({ getBookmarks: jest.fn() }, store);
+
+    await service.importCollection(
+      'user-a',
+      [
+        { title: 'minimal minimal minimal minimal editorial editorial' },
+        { title: 'minimal minimal minimal' },
+      ],
+      'feedback-reversal'
+    );
+
+    const before = await service.getApplication('user-a', 'landing_page');
+    const ignored = await service.recordFeedback(
+      'user-a',
+      'landing_page',
+      'page-1',
+      'ignore',
+      before.receipt
+    );
+    expect((await service.getApplication('user-a', 'landing_page')).receipt.profileRevision)
+      .toBe(before.receipt.profileRevision);
+
+    const liked = await service.recordFeedback(
+      'user-a',
+      'landing_page',
+      'page-1',
+      'more',
+      before.receipt
+    );
+    expect((await service.getApplication('user-a', 'landing_page')).receipt.profileRevision)
+      .not.toBe(before.receipt.profileRevision);
+
+    const reversed = await service.reverseFeedback('user-a', liked.eventId);
+    expect(reversed.reversedAt).toEqual(expect.any(String));
+
+    const events = await service.listFeedback('user-a', 'page-1');
+    expect(events).toHaveLength(2);
+    expect(events.find((event) => event.eventId === ignored.eventId)?.direction).toBe('ignore');
+    expect(events.find((event) => event.eventId === liked.eventId)?.reversedAt)
+      .toEqual(expect.any(String));
+
+    const after = await service.getApplication('user-a', 'landing_page');
+    expect(after.receipt.profileRevision).toBe(before.receipt.profileRevision);
+  });
+
 });
