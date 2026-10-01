@@ -54,6 +54,40 @@ export function baseSeatsForTier(tierName: string): number | null {
 }
 
 /**
+ * Admin-configured pricing for extra org seats on a given tier (Phase 2,
+ * ENG-2243..2246). `priceCents` is the full monthly charge per extra seat;
+ * `usageCreditMicroUsd` is the portion of that charge a separate ticket
+ * grants back as shared LLM usage credit. `baseSeats` mirrors
+ * `baseSeatsForTier` above for display/config purposes only — it is not yet
+ * wired to replace that hardcoded lookup.
+ */
+export interface SeatPricingConfig {
+  priceCents: number;
+  usageCreditMicroUsd: number;
+  baseSeats: number;
+}
+
+/**
+ * Validates an already-normalized (numbers coerced) `SeatPricingConfig`,
+ * mirroring the `validateLlmUsagePolicy`/`validateLlmUsageTopUpConfig`
+ * pattern: collect every violation and let the caller decide what to do
+ * with them (admin.ts throws, joining them into one message).
+ */
+export function validateSeatPricingConfig(config: SeatPricingConfig): string[] {
+  const errors: string[] = [];
+  if (!Number.isInteger(config.priceCents) || config.priceCents <= 0) {
+    errors.push('priceCents must be a positive integer');
+  }
+  if (!Number.isInteger(config.usageCreditMicroUsd) || config.usageCreditMicroUsd <= 0) {
+    errors.push('usageCreditMicroUsd must be a positive integer');
+  }
+  if (!Number.isInteger(config.baseSeats) || config.baseSeats < 0) {
+    errors.push('baseSeats must be a non-negative integer');
+  }
+  return errors;
+}
+
+/**
  * `null` return means "unlimited for this org" (tier has no base seat
  * concept) — callers must treat `null` as "do not enforce a cap", not as 0.
  */

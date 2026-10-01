@@ -2,11 +2,13 @@ import { Router, Request, Response } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb, orgDb, Organization } from "../services/db";
 import { defaultShareSettings } from "../services/orgShareService";
-import { callerCan, can, roleOf } from "../services/orgAuthz";
+import { callerCan, can, roleOf, isBillingRoot } from "../services/orgAuthz";
 import { v4 as uuidv4 } from "uuid";
 import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
-import { getUserSubscriptionResolution } from "../services/subscriptionService";
+import { getUserSubscriptionResolution, getUserSubscriptionType } from "../services/subscriptionService";
+import { purchaseExtraSeat, removeExtraSeat } from "../services/orgSeatBillingService";
+import { baseSeatsForTier, effectiveSeatCap } from "../services/orgSeatService";
 
 const router = Router();
 
@@ -1072,6 +1074,86 @@ router.delete("/:orgId", async (req: Request, res: Response) => {
   } catch (error) {
     console.error("Error deleting organization:", error);
     return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Seat-based billing (ENG-2243..2246) error mapping shared by both routes
+// below. orgSeatBillingService throws plain `Error`s with descriptive
+// messages for expected, client-correctable conditions (org/owner not found,
+// owner has no Stripe subscription yet, tier has no seatPricing configured,
+// or — removeExtraSeat only — removal would drop below occupied seats). Those
+// map to 404/400 with their own message, since it's safe and useful to show
+// the caller (they're the org's billing owner). Anything else — a raw Stripe
+// SDK error, a DB failure, or any other unexpected exception — must NOT reach
+// the client as-is: Stripe error text/stack can carry internal identifiers or
+// implementation detail that has no business being in a 500 body, so those
+// collapse to a generic message. The full error is always logged server-side.
+function mapSeatBillingError(error: any, res: Response): Response {
+  const message = typeof error?.message === "string" ? error.message : "";
+
+  if (message.startsWith("Cannot remove extra seat")) {
+    return res.status(400).json({ error: message });
+  }
+  if (/\bnot found\b/i.test(message)) {
+    return res.status(404).json({ error: "Organization not found" });
+  }
+  if (message.includes("has no Stripe subscription") || message.includes("no seatPricing configured")) {
+    return res.status(400).json({ error: message });
+  }
+
+  console.error("Error managing extra seat:", error);
+  return res.status(500).json({ error: "Internal server error" });
+}
+
+// Seat-based billing (ENG-2243..2246): purchase/remove an extra paid team
+// seat for the org. Owner-only (isBillingRoot) — this charges the org's
+// billing owner's Stripe subscription, not a generic "manager" action.
+router.post("/:orgId/seats", async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Not authenticated" });
+
+    const { orgId } = req.params;
+    const org = await orgDb.getOrgById(orgId, ["orgId", "ownerUserId"]);
+    if (!org) return res.status(404).json({ error: "Organization not found" });
+
+    if (!isBillingRoot({ userId }, org)) {
+      return res.status(403).json({ error: "Only the organization's billing owner can purchase extra seats" });
+    }
+
+    const { newTotalSeats } = await purchaseExtraSeat(orgId);
+    const ownerTier = await getUserSubscriptionType(org.ownerUserId);
+    const effectiveCap = effectiveSeatCap(baseSeatsForTier(ownerTier), newTotalSeats);
+
+    return res.json({ newTotalSeats, effectiveCap });
+  } catch (error: any) {
+    return mapSeatBillingError(error, res);
+  }
+});
+
+router.delete("/:orgId/seats", async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Not authenticated" });
+
+    const { orgId } = req.params;
+    const org = await orgDb.getOrgById(orgId, ["orgId", "ownerUserId"]);
+    if (!org) return res.status(404).json({ error: "Organization not found" });
+
+    if (!isBillingRoot({ userId }, org)) {
+      return res.status(403).json({ error: "Only the organization's billing owner can remove extra seats" });
+    }
+
+    const { newTotalSeats } = await removeExtraSeat(orgId);
+    const ownerTier = await getUserSubscriptionType(org.ownerUserId);
+    const effectiveCap = effectiveSeatCap(baseSeatsForTier(ownerTier), newTotalSeats);
+
+    return res.json({ newTotalSeats, effectiveCap });
+  } catch (error: any) {
+    // removeExtraSeat throws a plain, descriptive Error when removing a seat
+    // would drop the org below its currently-occupied extra-seat count —
+    // that's a client-correctable 400, not a server failure.
+    return mapSeatBillingError(error, res);
   }
 });
 
