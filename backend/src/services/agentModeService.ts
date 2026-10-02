@@ -1,3 +1,4 @@
+import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
 import { classifyMetaBudgetChange } from './agentMode/metaBudgetAnomaly';
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
 import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassification';
@@ -20230,7 +20231,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       console.error('AgentMode: Error updating Meta ad campaign:', error);
       return {
         success: false,
-        message: error.message || 'Failed to update Meta ad campaign.',
+        message: this.enrichMetaError(error, 'update Meta ad campaign'),
         error: error.message,
         // ENG-1300: SDK-shaped error — never a Meta business code.
         code: error?.status ?? error?.response?.status
@@ -20274,7 +20275,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       console.error('AgentMode: Error updating Meta ad set:', error);
       return {
         success: false,
-        message: error.message || 'Failed to update Meta ad set.',
+        message: this.enrichMetaError(error, 'update Meta ad set'),
         error: error.message,
         // ENG-1300: SDK-shaped error — never a Meta business code.
         code: error?.status ?? error?.response?.status
@@ -21232,6 +21233,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     const originalMsg = error.message || `Failed to ${context}.`;
 
     switch (subcode) {
+      case META_BUDGET_THROTTLE_SUBCODE:
+        // ENG-2280: Meta's per-object budget-edit limit (~4/hour), not a generic failure.
+        return (
+          `Meta budget-edit limit reached (subcode ${META_BUDGET_THROTTLE_SUBCODE}): this object's budget was changed too many times in the last hour. ` +
+          'Nothing changed. Wait up to an hour and retry once with the final budget, rather than retrying now.'
+        );
       case 1341012:
         return (
           'Page permission denied (subcode 1341012): The page_id used is not accessible with your current credentials. ' +
@@ -22881,7 +22888,23 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // every branch. Every case's behavior is unchanged byte for byte from the
     // original callMetaMarketingApi body — this only interposes AFTER the result
     // exists and BEFORE it returns.
-    return (async (): Promise<MetaApiResult> => {
+    // ENG-2280: rate shaping on the shared authorized-write path (model calls and
+    // approved-deck dispatch alike). In-memory only; see metaWriteRateShaper.ts.
+    const shapedObjectId = entity_type === 'CAMPAIGN' ? campaign_id : entity_type === 'AD_SET' ? ad_set_id : ad_id;
+    const shapeAccount = account_id || 'unknown';
+    const isWrite = AgentModeService.isMetaWriteAction(entity_type, action);
+    if (isWrite) {
+      const shape = metaWriteRateShaper.shapeWrite(shapeAccount, entity_type, action, shapedObjectId, params);
+      if (shape.kind === 'throttled') {
+        return { success: false, throttled: true, reason: shape.reason, retryAfterMs: shape.retryAfterMs, message: shape.message, error: shape.message } as any;
+      }
+      if (shape.kind === 'coalesced') {
+        return { success: true, coalesced: true, message: `No change sent: ${entity_type} ${shapedObjectId} already has these budget values from an edit in the last hour (coalesced, no Meta budget-edit slot used).` } as any;
+      }
+    } else {
+      metaWriteRateShaper.recordRead(shapeAccount);
+    }
+    const shapedResult = await (async (): Promise<MetaApiResult> => {
       switch (entity_type) {
         case 'CAMPAIGN':
           // Map master params to specific params if needed, but schema is unified so passing through is safe
@@ -22917,7 +22940,14 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         default:
           throw new Error(`Invalid entity_type: ${entity_type}`);
       }
-    })();
+    })().catch(error => {
+      if (isWrite) metaWriteRateShaper.releaseBudgetEdit(entity_type, shapedObjectId);
+      throw error;
+    });
+    if (isWrite && shapedResult && (shapedResult as any).success === false) {
+      metaWriteRateShaper.releaseBudgetEdit(entity_type, shapedObjectId);
+    }
+    return shapedResult;
   }
 
   /**

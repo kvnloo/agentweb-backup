@@ -2,6 +2,7 @@ import { AgentModeService } from '../services/agentModeService';
 import { metaService } from '../services/metaService';
 import { computeTrackingOverrideDigest } from '../services/metaLaunchGate';
 import { getJwtSecret } from '../config/jwt';
+import { metaWriteRateShaper } from '../services/agentMode/metaWriteRateShaper';
 
 jest.mock('../services/metaLaunchGate', () => ({
   ...jest.requireActual('../services/metaLaunchGate'),
@@ -18,6 +19,7 @@ const invoke = (params: any, entity = 'CAMPAIGN') => service.callMetaMarketingAp
 );
 
 beforeEach(() => {
+  metaWriteRateShaper.reset(); // ENG-2280: process-wide shaper; this suite edits one object many times
   service = new AgentModeService();
   jest.spyOn(service as any, 'getMetaCredentials').mockResolvedValue({ accountId: ACCOUNT, accessToken: 'token' });
   jest.spyOn(service as any, 'getLastUserMessageText').mockResolvedValue(undefined);

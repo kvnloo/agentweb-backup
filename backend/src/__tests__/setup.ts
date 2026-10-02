@@ -91,3 +91,10 @@ if (/[\\/](hubspotAuth|fathomAuth)\.test\.ts$/.test(expect.getState().testPath |
     oauthSessionDb: require('./fixtures/oauthSessionDb').createOAuthSessionDbMock(),
   }));
 }
+
+// ENG-2280: the Meta write rate shaper is process-wide by design; reset it so one
+// test's burst/budget-edit history never throttles an unrelated test's writes.
+beforeEach(() => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  require('../services/agentMode/metaWriteRateShaper').metaWriteRateShaper.reset();
+});
