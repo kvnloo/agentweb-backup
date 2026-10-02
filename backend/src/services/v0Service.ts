@@ -528,6 +528,12 @@ export interface PendingIteration {
   baseVersionId: string;
   messageHash: string;
   startedAt: string;
+  /**
+   * ENG-1728: true only between the pre-send write and v0 accepting the message. Absent
+   * means the send is known to have reached v0 (including records written before this
+   * field existed, which were only ever written after the send).
+   */
+  unsent?: boolean;
 }
 
 export interface GeneratedLandingPage {
@@ -6407,13 +6413,40 @@ export async function iterateLandingPage(
       return await finishIteration(id, record, baseVersionId);
     }
 
+    // ENG-1728: the base this edit is anchored to. For a retry of a recorded edit it is the
+    // ORIGINAL pre-send base, never the version we just read — v0 may already be past it.
+    const anchorBaseVersionId = isSameEdit ? pending!.baseVersionId : baseVersionId;
+
     if (!isSameEdit) {
+      // Persist the pre-send base BEFORE v0 is called (ENG-1728). Recording it only after
+      // the send left a crash window: v0 had the message, the record did not, so the retry
+      // read the post-edit version as its base, the usage guard skipped the already-sent
+      // message, and the retry waited for a version no send would ever create.
+      const nowIso = new Date().toISOString();
+      await dynamodb
+        .update({
+          TableName: TABLE_NAME,
+          Key: { id },
+          UpdateExpression: "SET pendingIteration = :p, updatedAt = :now",
+          ExpressionAttributeValues: {
+            ":p": { baseVersionId, messageHash, startedAt: nowIso, unsent: true },
+            ":now": nowIso,
+          },
+        })
+        .promise();
+    }
+
+    // A recorded edit without `unsent` is known to be with v0: resume the wait, never re-send.
+    // With `unsent` the process died between the pre-send write above and v0 accepting,
+    // so route through the usage guard: keyed on (chat, content hash), it returns
+    // `{skipped: true}` if a send did reach v0 (no second call or charge) and sends otherwise.
+    // Either way the wait below is anchored to the ORIGINAL base.
+    if (isSameEdit && !pending!.unsent) {
+      console.log(`[V0 SERVICE] iterate: message already sent and still generating — resuming the wait, not re-sending`);
+    } else {
       // responseMode async: sync mode blocks the HTTP call for the whole edit, which is the
-      // 300s race that made a slow iteration fail while v0 applied and CHARGED for it anyway
-      // — leaving the edit stranded (the record stayed `deployed`, which deployLandingPage
-      // refuses). Async returns in seconds; the version wait below absorbs the real time.
-      // Safe now only because that wait is anchored to `afterVersionId` — without it, a deploy
-      // could grab the PRE-iteration version and silently ship the page without the edit.
+      // 300s race that made a slow iteration fail while v0 applied and CHARGED for it anyway.
+      // Async is safe only because the version wait below is anchored to the pre-send base.
       await guardedV0IterateMessage({
         userId: iterateActorUserId,
         scopeId: id,
@@ -6427,22 +6460,20 @@ export async function iterateLandingPage(
         ),
       });
 
-      // Record it the instant v0 accepts, BEFORE the wait — if the wait dies (timeout, crash,
-      // lost response), the retry must know the message is already with v0.
-      const nowIso = new Date().toISOString();
+      // Stamp the send the instant v0 accepts (or the guard confirms a prior send), BEFORE
+      // the wait — if the wait dies, the retry must know the message is already with v0.
+      const sentIso = new Date().toISOString();
       await dynamodb
         .update({
           TableName: TABLE_NAME,
           Key: { id },
           UpdateExpression: "SET pendingIteration = :p, updatedAt = :now",
           ExpressionAttributeValues: {
-            ":p": { baseVersionId, messageHash, startedAt: nowIso },
-            ":now": nowIso,
+            ":p": { baseVersionId: anchorBaseVersionId, messageHash, startedAt: isSameEdit ? pending!.startedAt : sentIso },
+            ":now": sentIso,
           },
         })
         .promise();
-    } else {
-      console.log(`[V0 SERVICE] iterate: message already sent and still generating — resuming the wait, not re-sending`);
     }
 
     // Do not return until v0 publishes a version that is NOT the one we started from. This is
@@ -6452,7 +6483,7 @@ export async function iterateLandingPage(
       v0,
       chatId,
       "v0 iterate",
-      { deadline, afterVersionId: pending && isSameEdit ? pending.baseVersionId : baseVersionId }
+      { deadline, afterVersionId: anchorBaseVersionId }
     );
 
     return await finishIteration(id, record, newVersionId);
