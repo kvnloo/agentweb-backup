@@ -1426,7 +1426,7 @@ AD RETAG_UTM (ENG-239 — retrofit UTMs onto ONE existing ad that's missing them
 
 REQUIRED PARAMS PER ENTITY + ACTION:
   CAMPAIGN CREATE:      name, objective, special_ad_categories (e.g. ["NONE"])
-                        Optional: status, spend_cap (major currency units, e.g. dollars), advantage_campaign_budget + budget_amount (dollars).
+                        Optional: status, spend_cap (major currency units, e.g. dollars), advantage_campaign_budget + budget_amount (major units of the ad account currency).
                         Any OTHER param is REJECTED before the campaign is created, naming the field — nothing is ever accepted and silently dropped. Campaign-level budget goes through advantage_campaign_budget + budget_amount (never a bare daily_budget/lifetime_budget); scheduling (start_time/stop_time) comes from the AD SETS, because Meta accepts those on a campaign create and then ignores them; ad-set fields (bid_strategy, targeting, optimization_goal, billing_event) belong on AD_SET CREATE.
   AD_SET CREATE:        name, optimization_goal, billing_event, targeting (with geo_locations), daily_budget OR lifetime_budget (not both; lifetime_budget requires end_time)
                         Optional but WRITABLE on create: bid_strategy (LOWEST_COST_WITHOUT_CAP | LOWEST_COST_WITH_BID_CAP | COST_CAP) and bid_amount.
@@ -1572,8 +1572,8 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
             },
             special_ad_categories: { type: "array", items: { type: "string" }, description: 'Special ad categories. Use ["NONE"] if not applicable.' },
             advantage_campaign_budget: { type: "boolean", description: "Enable Advantage Campaign Budget." },
-            spend_cap: { type: "integer", minimum: 1, description: "CAMPAIGN CREATE/UPDATE: lifetime hard-stop spend cap for the campaign, as a positive WHOLE number of MAJOR account-currency units (e.g. 3000 = $3,000; 300 = NT$300) — never cents/minor units; the server converts and echoes raw + major values. The write is verified by an independent read-back — see SPEND CAP in the tool description; only claim the cap is set when spend_cap_verified is true. Read it back any time via CAMPAIGN LIST with params.fields including spend_cap." },
-            budget_amount: { type: "number", description: "Campaign-level daily budget in dollars (when advantage_campaign_budget is true)." },
+            spend_cap: { type: "number", minimum: 0.01, description: "CAMPAIGN CREATE/UPDATE: lifetime hard-stop spend cap for the campaign, as a positive amount of MAJOR account-currency units (e.g. 3000 = $3,000; 100.50 = $100.50; 300 = NT$300) — never cents/minor units; the server converts and echoes raw + major values. The write is verified by an independent read-back — see SPEND CAP in the tool description; only claim the cap is set when spend_cap_verified is true. Read it back any time via CAMPAIGN LIST with params.fields including spend_cap." },
+            budget_amount: { type: "number", description: "Campaign-level daily budget in major units of the ad account currency (when advantage_campaign_budget is true)." },
 
             // --- Ad Set ---
             optimization_goal: { type: "string", description: "Optimization goal (must be compatible with campaign objective)." },
