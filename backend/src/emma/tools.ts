@@ -6376,6 +6376,7 @@ emmaToolRegistry.register({
 
 emmaToolRegistry.register({
   name: 'create_clickup_task',
+  requiresUserAccount: true,
   definition: {
     name: 'create_clickup_task',
     description: 'Create a TASK in a specific ClickUp List (not a Doc), with status, standard fields and custom-field values. Custom fields are given by field name (or id) and are validated against the List\'s custom-field schema: dropdown/label values are matched by option name, numbers/currency/dates are coerced. Call once per task. Use get_clickup_list_fields first if you are unsure of the field names or dropdown options. Errors return a typed code: AUTH_FAILED, UNKNOWN_FIELD, INVALID_VALUE, LIST_NOT_FOUND, API_ERROR.',
@@ -6430,6 +6431,7 @@ emmaToolRegistry.register({
 
 emmaToolRegistry.register({
   name: 'get_clickup_list_fields',
+  requiresUserAccount: true,
   definition: {
     name: 'get_clickup_list_fields',
     description: 'Read the custom-field schema (names, types, dropdown options) of a ClickUp List, so values for create_clickup_task map correctly.',
