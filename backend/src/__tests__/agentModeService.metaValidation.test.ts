@@ -645,7 +645,7 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
     });
 
     it('blocks AD_SET UPDATE without confirm and does not call metaService.updateAdSet', async () => {
-      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint' });
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint', daily_budget: '900000' }); // ENG-2279: prior budget read; same-size change is 'normal'
       (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
 
       const result = await callApi(service, 'AD_SET', 'UPDATE', {

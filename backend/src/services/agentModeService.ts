@@ -22352,15 +22352,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const prior = entity_type === 'CAMPAIGN'
         ? await metaService.getCampaign(accountId || '', accessToken, campaign_id!)
         : await metaService.getAdSet(accessToken, ad_set_id!, accountId || '');
+      // Same currency-aware normalizer the writers use (ENG-2277): every money input is major units.
+      const money = await this.normalizeMetaMoneyParams(accountId || '', accessToken, params);
       const changes = fields.flatMap(field => {
-        const alias = entity_type === 'CAMPAIGN' && field === 'daily_budget' && params.budget_amount !== undefined;
-        const raw = alias ? params.budget_amount : params[field];
-        if (raw === undefined) return [];
-        // Match updateMetaAdsCampaign/updateMetaAdsAdSet, without changing their unit contract.
-        // ENG-2277 rebases should keep this conversion aligned with those writers.
-        const majorUnits = alias || (entity_type === 'AD_SET' && field !== 'spend_cap');
-        const parsed = classifyMetaBudgetChange(0, raw).proposed;
-        const proposed = parsed === undefined ? undefined : majorUnits ? Math.round(parsed * 100) : parsed;
+        const proposed = money.params[field];
+        if (proposed === undefined) return [];
         return [{ field, ...classifyMetaBudgetChange(prior?.[field], proposed) }];
       });
       if (changes.some(change => change.severity === 'unknown')) return { blocked };

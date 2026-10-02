@@ -24,6 +24,7 @@ beforeEach(() => {
   grant = jest.spyOn(service as any, 'claimMetaWriteManifestGrant').mockResolvedValue({ granted: true });
   read = jest.spyOn(metaService, 'getCampaign').mockResolvedValue({ id: 'campaign', daily_budget: '10000', spend_cap: '10000' });
   jest.spyOn(metaService, 'getAdSet').mockResolvedValue({ id: 'adset', daily_budget: '10000', lifetime_budget: '10000' });
+  jest.spyOn(metaService, 'getAdAccountCurrency').mockResolvedValue('USD');
   write = jest.spyOn(service, 'updateMetaAdsCampaign').mockResolvedValue({ success: true });
   jest.spyOn(service, 'updateMetaAdsAdSet').mockResolvedValue({ success: true });
 });
@@ -43,7 +44,7 @@ describe('ENG-2279 budget anomaly confirmation', () => {
     expect(write).not.toHaveBeenCalled();
     expect(grant).not.toHaveBeenCalled();
   });
-  it.each([['CAMPAIGN', 'spend_cap', 21000], ['AD_SET', 'daily_budget', 210], ['AD_SET', 'lifetime_budget', 210]])(
+  it.each([['CAMPAIGN', 'spend_cap', 210], ['AD_SET', 'daily_budget', 210], ['AD_SET', 'lifetime_budget', 210]])(
     '%s %s compares both sides in minor units', async (entity, field, amount) => {
       const result: any = await invoke({ [field]: amount }, entity as string);
       expect(result.awaitingUserConfirmation).toBe(true);
