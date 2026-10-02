@@ -1,3 +1,4 @@
+import { classifyMetaBudgetChange } from './agentMode/metaBudgetAnomaly';
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
 import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassification';
 import { resolveModelForUser } from './modelRoles';
@@ -22331,6 +22332,60 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     };
   }
 
+  /** Read-before-write for both model calls and approved-deck dispatch (ENG-2279). */
+  private async checkMetaBudgetChange(
+    userId: string, entity_type: string, action: string, account_id: string,
+    campaign_id: string | undefined, ad_set_id: string | undefined, ad_id: string | undefined,
+    params: any, sessionId?: string,
+  ) {
+    if (action !== 'UPDATE' || !['CAMPAIGN', 'AD_SET'].includes(entity_type)) return undefined;
+    const fields = ['daily_budget', 'lifetime_budget', 'spend_cap'];
+    if (!fields.some(field => params[field] !== undefined) &&
+        !(entity_type === 'CAMPAIGN' && params.budget_amount !== undefined)) return undefined;
+    const blocked = {
+      success: false, blocked: true, reason: 'meta_budget_prior_unavailable',
+      error: 'META_BUDGET_UNVERIFIED: Could not compare the prior and proposed budget. Nothing was written. PAUSE_AND_VERIFY: offer to pause delivery first, then verify the amounts and currency units.',
+    };
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      // Never pass undefined: it disables the optional ad-set ownership check.
+      const prior = entity_type === 'CAMPAIGN'
+        ? await metaService.getCampaign(accountId || '', accessToken, campaign_id!)
+        : await metaService.getAdSet(accessToken, ad_set_id!, accountId || '');
+      const changes = fields.flatMap(field => {
+        const alias = entity_type === 'CAMPAIGN' && field === 'daily_budget' && params.budget_amount !== undefined;
+        const raw = alias ? params.budget_amount : params[field];
+        if (raw === undefined) return [];
+        // Match updateMetaAdsCampaign/updateMetaAdsAdSet, without changing their unit contract.
+        // ENG-2277 rebases should keep this conversion aligned with those writers.
+        const majorUnits = alias || (entity_type === 'AD_SET' && field !== 'spend_cap');
+        const parsed = classifyMetaBudgetChange(0, raw).proposed;
+        const proposed = parsed === undefined ? undefined : majorUnits ? Math.round(parsed * 100) : parsed;
+        return [{ field, ...classifyMetaBudgetChange(prior?.[field], proposed) }];
+      });
+      if (changes.some(change => change.severity === 'unknown')) return { blocked };
+      const text = sessionId ? await this.getLastUserMessageText(sessionId) : undefined;
+      const spendConcern = typeof text === 'string' &&
+        /(?:over.?spend|spend(?:ing)? too much|(?:worried|concern|unexpected|excessive|too high).{0,80}(?:spend|budget|cost)|(?:spend|budget|cost).{0,80}(?:worried|concern|unexpected|excessive|too high))/i.test(text);
+      const severity = changes.some(change => change.severity === 'critical') ? 'critical'
+        : changes.some(change => change.severity === 'warning') ? 'warning' : 'normal';
+      const { budget_confirmation_token, ...writeParams } = params;
+      const token = computeTrackingOverrideDigest(getJwtSecret(), {
+        gate: 'meta-budget-change', userId, sessionId, entity_type, action, account_id: accountId,
+        campaign_id, ad_set_id, ad_id, params: writeParams, changes,
+      });
+      return {
+        changes, severity, spendConcern, token,
+        suggestedAction: 'PAUSE_AND_VERIFY',
+        requiresConfirmation: (severity !== 'normal' || spendConcern) &&
+          !trackingOverrideTokenMatches(budget_confirmation_token, token),
+      };
+    } catch {
+      // A read/credential/transcript failure must never turn an existing grant into permission.
+      return { blocked };
+    }
+  }
+
   /**
    * Master method for calling Meta Marketing API.
    * Routes the request to the appropriate entity manager based on entity_type.
@@ -22488,6 +22543,16 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
      * path is a loop rather than a dead end. Nothing changes for a launch that waives
      * nothing: those never need a token.
      */
+    const budgetAnomaly = await this.checkMetaBudgetChange(
+      userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId,
+    );
+    if (budgetAnomaly?.blocked) return budgetAnomaly.blocked as any;
+    const budgetReconfirmation = budgetAnomaly?.requiresConfirmation === true;
+    if (budgetReconfirmation) {
+      // Part of the NEW manifest digest: the old grant cannot approve this disclosure.
+      params = { ...params, budget_confirmation_token: budgetAnomaly.token };
+    }
+
     const overrideClaimed = (params as any)?.override_tracking_check === true;
     const overrideDigest = overrideClaimed
       ? computeTrackingOverrideDigest(getJwtSecret(), {
@@ -22515,7 +22580,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     let manifestGranted = false;
     if (
       AgentModeService.isMetaWriteAction(entity_type, action) &&
-      sessionId
+      !budgetReconfirmation && sessionId
     ) {
       const grant = await this.claimMetaWriteManifestGrant(
         userId, sessionId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
@@ -22525,7 +22590,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
     if (
       AgentModeService.isMetaWriteAction(entity_type, action) &&
-      (!manifestGranted || (overrideClaimed && !overrideApproved))
+      (budgetReconfirmation || !manifestGranted || (overrideClaimed && !overrideApproved))
     ) {
       /*
        * MERGE NOTE: main's manifest grant decides WHETHER this gate runs; the tenancy fields
@@ -22543,7 +22608,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
        * manifest path is the one write route with no ownership check anywhere in it, and that
        * belongs on the write-scoping work rather than being assumed away here.
        */
-      const { summary, target, tenancyRefused, tenancyRefusalMessage } = await this.buildMetaWriteConfirmation(
+      let { summary, target, tenancyRefused, tenancyRefusalMessage } = await this.buildMetaWriteConfirmation(
         userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
       // ENG-1635: this call's manifest digest, computed once here (against the SAME
@@ -22589,6 +22654,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           error: `ACCOUNT_SCOPE_REFUSED: ${refusal}`,
         } as any;
       }
+      if (budgetAnomaly?.changes) {
+        summary += ` Budget review (${budgetAnomaly.severity}): ` + budgetAnomaly.changes.map(change =>
+          `${change.field}: ${change.prior} -> ${change.proposed} minor currency units` +
+          (change.ratio === null ? ' (zero prior)' : ` (${change.ratio}x)`),
+        ).join('; ') + '. PAUSE_AND_VERIFY: offer to pause delivery first, then verify amounts and currency units before approving the increase.';
+      }
       // `awaitingUserConfirmation` + `confirmationPrompt` are consumed by the agent loop
       // (collectConfirmationPrompt) to HALT the turn and surface the prompt to the user.
       // The turn cannot continue until a NEW human message arrives — the model cannot
@@ -22611,6 +22682,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           `if no card appears here, refresh the page or ask again and I'll represent it as one.`,
         // Per-item body (no intro/footer) used when several writes are batched in one turn.
         confirmationDetail: summary,
+        ...(budgetAnomaly?.changes ? { budgetAnomaly: {
+          severity: budgetAnomaly.severity, changes: budgetAnomaly.changes,
+          spendConcern: budgetAnomaly.spendConcern, suggestedAction: budgetAnomaly.suggestedAction,
+        } } : {}),
         message: `This Meta Ads ${entity_type} ${action} needs review before it runs: ${summary} ` +
           `Show the user the exact target above (campaign / ad set / asset). ` +
           `If more than one campaign or asset could match the request, ask the user to disambiguate first. ` +
@@ -22706,6 +22781,21 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     overrideApproved: boolean,
     sessionId: string | undefined,
   ): Promise<MetaApiResult> {
+    const budgetAnomaly = await this.checkMetaBudgetChange(
+      userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId,
+    );
+    if (budgetAnomaly?.blocked) return budgetAnomaly.blocked as any;
+    if (budgetAnomaly?.requiresConfirmation) {
+      // Approval-deck workflows bypass callMetaMarketingApi. A stale/old grant must
+      // return to the same preview path, never silently apply an unreviewed increase.
+      return this.callMetaMarketingApi(
+        userId, entity_type as any, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId,
+      );
+    }
+    if (params && typeof params === 'object' && 'budget_confirmation_token' in params) {
+      params = { ...params };
+      delete params.budget_confirmation_token;
+    }
     if (params && typeof params === 'object' && 'confirm' in params) {
       params = { ...params };
       delete params.confirm;
@@ -22920,7 +23010,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    */
   private static async verifyMetaWriteDispatchResult(executeResult: Record<string, unknown>): Promise<WorkflowStepVerification> {
     const result = executeResult.dispatchResult as MetaApiResult | undefined;
-    if (!result || result.success !== true) {
+    if (!result || result.success !== true || result.awaitingUserConfirmation === true) {
       // `message` is the enriched, actionable text (enrichMetaError — e.g. "Your ad
       // set budget must be more than ₹94.91" with the Meta code/subcode) whenever the
       // underlying write method built one; `error` is the raw SDK message (e.g. just
