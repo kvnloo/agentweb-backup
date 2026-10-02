@@ -19538,6 +19538,100 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return `${minorUnits} (= ${major} in the ad account's currency)`;
   }
 
+  /**
+   * ENG-2278 (ENG-2046 A1b): budget writes get the same independent read-back as spend caps.
+   * "Campaign/Ad set updated successfully" on a money field without reading it back was the
+   * same silent-success failure mode ENG-1018 closed for spend_cap. Three outcomes, never two:
+   *   CONFIRMED   — every requested budget field read back equal (minor units).
+   *   MISMATCH    — Meta returned the field with a DIFFERENT value on every attempt.
+   *   UNCONFIRMED — the read failed or the field was absent; not a failed write, never success.
+   * Only the read is retried; the write is never re-sent.
+   */
+  private static readonly BUDGET_VERIFY_FIELDS = ['daily_budget', 'lifetime_budget'] as const;
+
+  private async verifyMetaBudget(
+    read: () => Promise<any>,
+    intended: Record<string, any>
+  ): Promise<{
+    status: 'CONFIRMED' | 'MISMATCH' | 'UNCONFIRMED';
+    requested: Record<string, number>;
+    applied: Record<string, number | undefined>;
+    detail: string;
+    attempts: number;
+  }> {
+    const requested: Record<string, number> = {};
+    for (const f of AgentModeService.BUDGET_VERIFY_FIELDS) {
+      if (intended[f] !== undefined && intended[f] !== null) requested[f] = Number(intended[f]);
+    }
+    let applied: Record<string, number | undefined> = {};
+    let status: 'MISMATCH' | 'UNCONFIRMED' = 'UNCONFIRMED';
+    let detail = 'not read';
+    for (let attempt = 1; attempt <= AgentModeService.SPEND_CAP_VERIFY_ATTEMPTS; attempt++) {
+      try {
+        const fresh: any = await read();
+        applied = {};
+        let absent = false;
+        const diffs: string[] = [];
+        for (const [f, want] of Object.entries(requested)) {
+          const raw = fresh?.[f];
+          const got = raw === undefined || raw === null || raw === '' ? undefined : Number(raw);
+          applied[f] = got;
+          if (got === undefined || !Number.isFinite(got)) absent = true;
+          else if (got !== want) diffs.push(`${f}: requested ${want}, Meta has ${got}`);
+        }
+        if (!absent && diffs.length === 0) {
+          return { status: 'CONFIRMED', requested, applied, detail: 'budget read back as requested', attempts: attempt };
+        }
+        status = diffs.length > 0 ? 'MISMATCH' : 'UNCONFIRMED';
+        detail = diffs.length > 0 ? diffs.join('; ') : 'the budget field was absent on read-back';
+      } catch (error: any) {
+        status = 'UNCONFIRMED';
+        detail = `read-back failed: ${error?.message || 'unknown error'}`;
+      }
+      if (attempt < AgentModeService.SPEND_CAP_VERIFY_ATTEMPTS) {
+        await new Promise(resolve => setTimeout(resolve, AgentModeService.SPEND_CAP_VERIFY_BACKOFF_MS));
+      }
+    }
+    return { status, requested, applied, detail, attempts: AgentModeService.SPEND_CAP_VERIFY_ATTEMPTS };
+  }
+
+  private static hasBudgetField(params: Record<string, any>): boolean {
+    return AgentModeService.BUDGET_VERIFY_FIELDS.some(f => params[f] !== undefined && params[f] !== null);
+  }
+
+  /** Shape a verifyMetaBudget verdict into tool-result fields. Never success:false — the write landed. */
+  private static budgetVerdictFields(
+    what: string,
+    check: Awaited<ReturnType<AgentModeService['verifyMetaBudget']>>
+  ): Record<string, any> {
+    const fmt = (rec: Record<string, number | undefined>) => Object.entries(rec)
+      .map(([f, v]) => `${f}=${v === undefined ? 'absent' : AgentModeService.describeSpendCap(v)}`).join(', ');
+    const base = {
+      budget_verification: check.status,
+      budget_requested: check.requested,
+      budget_applied: check.applied,
+    };
+    if (check.status === 'CONFIRMED') {
+      return { ...base, budget_message: `budget verified: ${fmt(check.applied)}` };
+    }
+    if (check.status === 'MISMATCH') {
+      return {
+        ...base,
+        error: 'BUDGET_MISMATCH',
+        budget_message: `⚠️ The budget on ${what} does NOT match what was requested after ${check.attempts} read-back(s): ` +
+          `requested ${fmt(check.requested)}; Meta has ${fmt(check.applied)}. Tell the user both values; ` +
+          `do NOT claim the requested budget is in place.`,
+      };
+    }
+    return {
+      ...base,
+      error: 'BUDGET_UNCONFIRMED',
+      budget_message: `⚠️ The budget write on ${what} was accepted by Meta but could NOT be confirmed after ` +
+        `${check.attempts} read-back(s) — ${check.detail}. This is not a failure, but do NOT tell the user the ` +
+        `budget (${fmt(check.requested)}) is in place until a re-read confirms it.`,
+    };
+  }
+
   public async createMetaAdsCampaign(userId: string, params: MetaAdsCampaignParams & { account_id?: string }): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
@@ -20189,11 +20283,27 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       }
       await metaService.updateCampaign(accessToken, campaignId, normalizedParams, accountId);
 
+      // ENG-2278: budget fields are verified independently of the spend cap.
+      const budgetFields = AgentModeService.hasBudgetField(normalizedParams)
+        ? AgentModeService.budgetVerdictFields(
+          `campaign ${campaignId}`,
+          await this.verifyMetaBudget(() => metaService.getCampaign(accountId, accessToken, campaignId), normalizedParams)
+        )
+        : undefined;
+      const withBudget = (r: any) => {
+        if (!budgetFields) return r;
+        const { budget_message, error, ...rest } = budgetFields;
+        const out: any = { ...r, ...rest, message: `${r.message} — ${budget_message}` };
+        if (error && !r.error) out.error = error;
+        else if (error) out.budget_error = error;
+        return out;
+      };
+
       if (normalizedParams.spend_cap === undefined || normalizedParams.spend_cap === null) {
-        return {
+        return withBudget({
           success: true,
           message: `Campaign updated successfully`
-        };
+        });
       }
 
       // "Campaign updated successfully" with no way to check was the exact reported failure
@@ -20201,12 +20311,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // campaign before claiming the change took effect (ENG-1018).
       const check = await this.verifyCampaignSpendCap(accountId, accessToken, campaignId, normalizedParams.spend_cap);
       if (check.verified) {
-        return {
+        return withBudget({
           success: true,
           message: `Campaign updated successfully (spend cap verified: ${AgentModeService.describeSpendCap(check.applied!)})`,
           spend_cap: check.applied,
           spend_cap_verified: true,
-        };
+        });
       }
       // Deliberately NOT success:false. An unconfirmed read is not a failed write — live,
       // this exact path fired on an update that HAD landed (see verifyCampaignSpendCap), and
@@ -20214,7 +20324,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // bare error string, counted a healthy call as a failure, and told the user to re-apply
       // a cap they already had. success:true with a loud, unmissable message keeps every
       // structured field in front of the model and still forbids claiming the cap is set.
-      return {
+      return withBudget({
         success: true,
         message: `⚠️ The spend cap of ${AgentModeService.describeSpendCap(normalizedParams.spend_cap)} ` +
           `on campaign ${campaignId} could NOT be confirmed after ${check.attempts} read-back(s) — ` +
@@ -20227,7 +20337,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         spend_cap_read: check.applied,
         spend_cap_verified: false,
         error: 'SPEND_CAP_UNCONFIRMED',
-      };
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error updating Meta ad campaign:', error);
@@ -20273,9 +20383,21 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         ...(params.bid_amount !== undefined && { bid_amount: toCents(params.bid_amount) }),
       };
       await metaService.updateAdSet(accessToken, adSetId, normalizedParams, accountId);
+      if (!AgentModeService.hasBudgetField(normalizedParams)) {
+        return {
+          success: true,
+          message: `Ad set updated successfully`
+        };
+      }
+      // ENG-2278: read the ad set back before claiming a budget change took effect.
+      const { budget_message, ...verdict } = AgentModeService.budgetVerdictFields(
+        `ad set ${adSetId}`,
+        await this.verifyMetaBudget(() => metaService.getAdSet(accessToken, adSetId), normalizedParams)
+      );
       return {
         success: true,
-        message: `Ad set updated successfully`
+        message: `Ad set updated successfully — ${budget_message}`,
+        ...verdict,
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;

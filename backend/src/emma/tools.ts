@@ -1396,6 +1396,9 @@ SPEND CAP (campaign hard money stop):
     spend_cap_verified:false with error SPEND_CAP_UNCONFIRMED → the cap could not be confirmed. This does NOT mean it failed: Meta sometimes reports a campaign without the field for a few seconds after a write that did land. Never claim the cap is set, and never announce it as missing either — re-read with CAMPAIGN LIST (campaign_id + params.fields="id,name,spend_cap"). If it is still absent, apply it with CAMPAIGN UPDATE (on CREATE the campaign already exists — use the returned campaign id, do NOT create it again). The message says what was actually read.
   Never report a spend cap as set based on the write response alone.
 
+BUDGET READ-BACK (CAMPAIGN/AD_SET UPDATE with daily_budget, lifetime_budget, or budget_amount):
+  The result carries budget_verification: CONFIRMED (read back as requested — only then say the budget is set), MISMATCH (error BUDGET_MISMATCH — tell the user the requested vs applied values from budget_requested/budget_applied, in cents), or UNCONFIRMED (error BUDGET_UNCONFIRMED — the write was accepted but could not be read back; not a failure, do not re-send blindly, do not claim it is set; re-read with LIST first).
+
 DATASET USAGE:
   LIST              → Returns every pixel on the ad account with its id, name and last_fired_time. Meta unified pixels and datasets, so each pixel id IS its dataset id (returned as dataset_id).
   GET_MATCH_QUALITY → Asks Meta for Event Match Quality (EMQ) scores per event type. Requires params.dataset_id.
