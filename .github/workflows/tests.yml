@@ -68,7 +68,7 @@ jobs:
     name: Backend build
     needs: detect-changes
     if: needs.detect-changes.outputs.backend == 'true' && github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
+    runs-on: avrea-ubuntu-latest
     timeout-minutes: 20
     concurrency:
       group: ${{ github.workflow }}-backend-build-${{ github.ref }}-${{ github.event.pull_request.draft }}
@@ -92,7 +92,7 @@ jobs:
     name: Partner portal build
     needs: detect-changes
     if: needs.detect-changes.outputs.partner == 'true' && github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
+    runs-on: avrea-ubuntu-latest
     timeout-minutes: 20
     concurrency:
       group: ${{ github.workflow }}-partner-build-${{ github.ref }}-${{ github.event.pull_request.draft }}
@@ -156,7 +156,7 @@ jobs:
     name: Local agent relay build
     needs: detect-changes
     if: needs.detect-changes.outputs.relay == 'true' && github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
+    runs-on: avrea-ubuntu-latest
     timeout-minutes: 10
     concurrency:
       group: ${{ github.workflow }}-relay-build-${{ github.ref }}-${{ github.event.pull_request.draft }}
@@ -191,7 +191,7 @@ jobs:
     name: Remotion lambda build
     needs: detect-changes
     if: needs.detect-changes.outputs.remotion == 'true' && github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
+    runs-on: avrea-ubuntu-latest
     timeout-minutes: 10
     concurrency:
       group: ${{ github.workflow }}-remotion-build-${{ github.ref }}-${{ github.event.pull_request.draft }}
