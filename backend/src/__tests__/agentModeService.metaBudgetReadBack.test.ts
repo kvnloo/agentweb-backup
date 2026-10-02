@@ -17,6 +17,7 @@ jest.mock('../services/metaService', () => {
       getCampaign: jest.fn(),
       updateAdSet: jest.fn(),
       getAdSet: jest.fn(),
+      getAdAccountCurrency: jest.fn().mockResolvedValue('USD'),
     }
   };
 });
@@ -54,6 +55,7 @@ describe('AgentModeService - Meta budget write read-back (ENG-2278)', () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
     (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
     (metaService.updateAdSet as jest.Mock).mockResolvedValue({ success: true });
+    (metaService.getAdAccountCurrency as jest.Mock).mockResolvedValue('USD');
   });
 
   afterEach(() => {
@@ -140,7 +142,7 @@ describe('AgentModeService - Meta budget write read-back (ENG-2278)', () => {
     it('keeps the spend-cap verdict and adds the budget verdict alongside it', async () => {
       jest.useFakeTimers();
       (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'c_1', daily_budget: '100', spend_cap: '300000' });
-      const p = service.updateMetaAdsCampaign('user123', 'c_1', { daily_budget: 7500, spend_cap: 300000 });
+      const p = service.updateMetaAdsCampaign('user123', 'c_1', { daily_budget: 75, spend_cap: 3000 });
       await jest.advanceTimersByTimeAsync(15000);
       const result = await p;
       expect(result.spend_cap_verified).toBe(true);
