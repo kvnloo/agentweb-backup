@@ -56,6 +56,13 @@ describe('ENG-755 createTaskInList', () => {
     try { mapCustomFieldValues(fields, { Cost: 'free' }); } catch (e: any) { expect(e.code).toBe('INVALID_VALUE'); }
   });
 
+  it('rejects a zone-less date-time and accepts date-only or explicit-offset values', () => {
+    const fields = schema.fields.map(f => ({ id: f.id, name: f.name, type: f.type, options: (f as any).type_config?.options }));
+    expect(() => mapCustomFieldValues(fields, { Dates: '2026-10-05T09:00' })).toThrow(/explicit timezone/);
+    expect(mapCustomFieldValues(fields, { Dates: '2026-10-05' })).toEqual([{ id: 'f-dates', value: Date.UTC(2026, 9, 5) }]);
+    expect(mapCustomFieldValues(fields, { Dates: '2026-10-05T09:00Z' })).toEqual([{ id: 'f-dates', value: Date.UTC(2026, 9, 5, 9) }]);
+  });
+
   it('maps ClickUp 401 to AUTH_FAILED', async () => {
     mockPost.mockRejectedValue({ response: { status: 401, data: { err: 'Token invalid', ECODE: 'OAUTH_025' } } });
     await expect(createTaskInList('bad', 'L', { name: 'x' })).rejects.toMatchObject({ code: 'AUTH_FAILED' });

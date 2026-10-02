@@ -485,7 +485,11 @@ function coerceFieldValue(field: ClickUpCustomField, raw: unknown): unknown {
       return n;
     }
     case 'date': {
-      const ms = typeof raw === 'number' ? raw : Date.parse(String(raw));
+      const s = String(raw).trim();
+      if (typeof raw !== 'number' && /T\d{2}:\d{2}/.test(s) && !/(Z|[+-]\d{2}:?\d{2})$/i.test(s)) {
+        throw fail(`"${raw}" needs an explicit timezone (Z or ±HH:MM)`);
+      }
+      const ms = typeof raw === 'number' ? raw : Date.parse(s);
       if (!Number.isFinite(ms)) throw fail(`"${raw}" is not a date`);
       return ms;
     }

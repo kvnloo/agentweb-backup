@@ -6399,8 +6399,15 @@ emmaToolRegistry.register({
     const token = await getClickUpAccessToken(context.userId);
     if (!token) return { success: false, code: 'AUTH_FAILED', message: 'ClickUp not connected' };
     let dueDate: number | undefined;
+    if (args.custom_fields != null && (typeof args.custom_fields !== 'object' || Array.isArray(args.custom_fields))) {
+      return { success: false, code: 'INVALID_VALUE', message: 'custom_fields must be an object keyed by field name or id' };
+    }
     if (args.due_date) {
-      dueDate = Date.parse(args.due_date);
+      const dueStr = String(args.due_date).trim();
+      if (/T\d{2}:\d{2}/.test(dueStr) && !/(Z|[+-]\d{2}:?\d{2})$/i.test(dueStr)) {
+        return { success: false, code: 'INVALID_VALUE', message: `due_date "${args.due_date}" needs an explicit timezone (Z or ±HH:MM)` };
+      }
+      dueDate = Date.parse(dueStr);
       if (!Number.isFinite(dueDate)) return { success: false, code: 'INVALID_VALUE', message: `Invalid due_date "${args.due_date}"` };
     }
     try {
