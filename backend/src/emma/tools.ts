@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { agentModeService } from '../services/agentModeService';
+import { getAccessToken as getClickUpAccessToken, createTaskInList as createClickUpTaskInList, getListCustomFields as getClickUpListCustomFields, ClickUpTaskError } from '../services/clickupService';
 import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 import { emmaToolRegistry } from './registry';
 import { auditCampaigns } from '../services/adUtmAuditService';
@@ -1395,6 +1396,9 @@ SPEND CAP (campaign hard money stop):
     spend_cap_verified:true  → the cap is really on the campaign (the value is echoed back as spend_cap). ONLY then may you tell the user a cap is in place.
     spend_cap_verified:false with error SPEND_CAP_UNCONFIRMED → the cap could not be confirmed. This does NOT mean it failed: Meta sometimes reports a campaign without the field for a few seconds after a write that did land. Never claim the cap is set, and never announce it as missing either — re-read with CAMPAIGN LIST (campaign_id + params.fields="id,name,spend_cap"). If it is still absent, apply it with CAMPAIGN UPDATE (on CREATE the campaign already exists — use the returned campaign id, do NOT create it again). The message says what was actually read.
   Never report a spend cap as set based on the write response alone.
+
+BUDGET READ-BACK (CAMPAIGN/AD_SET UPDATE with daily_budget, lifetime_budget, or budget_amount):
+  The result carries budget_verification: CONFIRMED (read back as requested — only then say the budget is set), MISMATCH (error BUDGET_MISMATCH — tell the user the requested vs applied values from budget_requested/budget_applied, in cents), or UNCONFIRMED (error BUDGET_UNCONFIRMED — the write was accepted but could not be read back; not a failure, do not re-send blindly, do not claim it is set; re-read with LIST first).
 
 DATASET USAGE:
   LIST              → Returns every pixel on the ad account with its id, name and last_fired_time. Meta unified pixels and datasets, so each pixel id IS its dataset id (returned as dataset_id).
@@ -6370,6 +6374,87 @@ emmaToolRegistry.register({
       context.userId,
       args.parent_doc_id
     );
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'create_clickup_task',
+  requiresUserAccount: true,
+  definition: {
+    name: 'create_clickup_task',
+    description: 'Create a TASK in a specific ClickUp List (not a Doc), with status, standard fields and custom-field values. Custom fields are given by field name (or id) and are validated against the List\'s custom-field schema: dropdown/label values are matched by option name, numbers/currency/dates are coerced. Call once per task. Use get_clickup_list_fields first if you are unsure of the field names or dropdown options. Errors return a typed code: AUTH_FAILED, UNKNOWN_FIELD, INVALID_VALUE, LIST_NOT_FOUND, API_ERROR.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: { type: 'string', description: 'ClickUp List id (e.g. from the List URL)' },
+        name: { type: 'string', description: 'Task name' },
+        description: { type: 'string', description: 'Task description (markdown)' },
+        status: { type: 'string', description: 'Status name in the List, e.g. "Possibles"' },
+        priority: { type: 'number', description: '1=urgent, 2=high, 3=normal, 4=low' },
+        assignees: { type: 'array', items: { type: 'number' }, description: 'ClickUp user ids' },
+        due_date: { type: 'string', description: 'Due date (ISO 8601)' },
+        custom_fields: { type: 'object', description: 'Map of custom field name (or id) to value, e.g. {"Location": "Boston", "Cost": 1200, "Type": "Conference"}' }
+      },
+      required: ['list_id', 'name']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) throw new Error("Missing user context");
+    const token = await getClickUpAccessToken(context.userId);
+    if (!token) return { success: false, code: 'AUTH_FAILED', message: 'ClickUp not connected' };
+    let dueDate: number | undefined;
+    if (args.custom_fields != null && (typeof args.custom_fields !== 'object' || Array.isArray(args.custom_fields))) {
+      return { success: false, code: 'INVALID_VALUE', message: 'custom_fields must be an object keyed by field name or id' };
+    }
+    if (args.due_date) {
+      const dueStr = String(args.due_date).trim();
+      if (/T\d{2}:\d{2}/.test(dueStr) && !/(Z|[+-]\d{2}:?\d{2})$/i.test(dueStr)) {
+        return { success: false, code: 'INVALID_VALUE', message: `due_date "${args.due_date}" needs an explicit timezone (Z or ±HH:MM)` };
+      }
+      dueDate = Date.parse(dueStr);
+      if (!Number.isFinite(dueDate)) return { success: false, code: 'INVALID_VALUE', message: `Invalid due_date "${args.due_date}"` };
+    }
+    try {
+      const task = await createClickUpTaskInList(token, String(args.list_id), {
+        name: args.name,
+        description: args.description,
+        status: args.status,
+        priority: args.priority,
+        assignees: args.assignees,
+        dueDate,
+        customFields: args.custom_fields,
+      });
+      return { success: true, taskId: task.id, url: task.url, message: `Created ClickUp task "${task.name}"` };
+    } catch (error) {
+      if (error instanceof ClickUpTaskError) return { success: false, code: error.code, message: error.message };
+      throw error;
+    }
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'get_clickup_list_fields',
+  requiresUserAccount: true,
+  definition: {
+    name: 'get_clickup_list_fields',
+    description: 'Read the custom-field schema (names, types, dropdown options) of a ClickUp List, so values for create_clickup_task map correctly.',
+    inputSchema: {
+      type: 'object',
+      properties: { list_id: { type: 'string', description: 'ClickUp List id' } },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) throw new Error("Missing user context");
+    const token = await getClickUpAccessToken(context.userId);
+    if (!token) return { success: false, code: 'AUTH_FAILED', message: 'ClickUp not connected' };
+    try {
+      const fields = await getClickUpListCustomFields(token, String(args.list_id));
+      return { success: true, fields: fields.map(f => ({ id: f.id, name: f.name, type: f.type, options: f.options?.map(o => o.name) })) };
+    } catch (error) {
+      if (error instanceof ClickUpTaskError) return { success: false, code: error.code, message: error.message };
+      throw error;
+    }
   }
 });
 
