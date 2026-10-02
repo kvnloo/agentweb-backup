@@ -591,6 +591,7 @@ import {
   META_GOAL_BID_STRATEGY_MAP,
   META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
+import { resolveOptimisationEvent, pixelReceivedEvent } from './metaOptimisationCoverage';
 
 /**
  * ENG-1685: build the S3-safe filename for a generated HTML artifact from its
@@ -19882,6 +19883,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         bid_strategy: strategy // Ensure we use the resolved strategy
       };
 
+      const optimisationEventWarning = await this.buildMetaOptimisationEventWarning(
+        accessToken,
+        normalizedParams.promoted_object,
+      );
       const adSet = await metaService.createAdSet(accountId, accessToken, normalizedParams);
 
       // ENG-838: surface the bid strategy that actually landed. When the caller
@@ -19903,7 +19908,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         message: `Ad set "${adSet.name}" created successfully`,
         adSet: adSet,
         appliedBidStrategy: strategy,
-        bidStrategyWasDefaulted: args.bid_strategy === undefined
+        bidStrategyWasDefaulted: args.bid_strategy === undefined,
+        ...(optimisationEventWarning ? { warning: optimisationEventWarning, optimisationEventWarning } : {})
       };
 
       let readBack: any;
@@ -19973,6 +19979,45 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         // ENG-1300: SDK-shaped error — never structuredError.code (Meta business code).
         code: error?.status ?? error?.response?.status
       };
+    }
+  }
+
+  private async buildMetaOptimisationEventWarning(
+    accessToken: string,
+    promotedObject: any,
+  ): Promise<string | undefined> {
+    const pixelId = typeof promotedObject?.pixel_id === 'string' ? promotedObject.pixel_id.trim() : '';
+    if (!pixelId) return undefined;
+    const resolved = resolveOptimisationEvent(promotedObject);
+    if (resolved.kind !== 'resolved') return undefined;
+
+    try {
+      const stats = await metaService.getDatasetEventStats(pixelId, accessToken);
+      const rawStats = stats?.event_stats;
+      let rows: any[] = [];
+      if (Array.isArray(rawStats)) {
+        rows = rawStats;
+      } else if (typeof rawStats === 'string' && rawStats.trim()) {
+        const parsed = JSON.parse(rawStats);
+        rows = Array.isArray(parsed) ? parsed : [];
+      }
+      const received = new Set(
+        rows
+          .map((row: any) => row?.event || row?.event_name || row?.name)
+          .filter((event: unknown): event is string => typeof event === 'string' && event.trim().length > 0)
+      );
+      if (pixelReceivedEvent(received, resolved.expectedEventName)) return undefined;
+      return (
+        `Warning: Meta did not report any ${resolved.expectedEventName} events on selected pixel ${pixelId} ` +
+        `in the recent event_stats read used for this ad set. The ad set was created, but optimization may be ` +
+        `learning from little or no recent signal; verify the pixel event before scaling spend.`
+      );
+    } catch (error: any) {
+      return (
+        `Warning: Meta pixel event health for ${resolved.expectedEventName} on selected pixel ${pixelId} is unknown ` +
+        `because Meta event_stats could not be read (${error?.message || String(error)}). The ad set was created, ` +
+        `but do not treat this as a healthy optimization signal until the event is verified.`
+      );
     }
   }
 
@@ -22471,6 +22516,24 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           message: pageMessage,
           error: `META_PAGE_ACCESS_MISSING: ${pageMessage}`,
           hint: 'Reconnect Meta and select that Page on the "Choose Pages" step, or get "Create ads" (Advertiser) access on it, then retry.'
+        } as any;
+      }
+    }
+
+    // ENG-2274: direct AD writes can bypass AD_CREATIVE CREATE entirely by
+    // referencing an existing creative, copying an ad, or swapping a creative
+    // onto an ad. A connection with confirmed zero accessible Pages cannot
+    // safely create/copy/update ads either, so hard-stop before the write path.
+    if (entity_type === 'AD' && ['CREATE', 'UPDATE', 'COPY_AD'].includes(action)) {
+      const { connection: adGateConnection } = await this.getMetaCredentials(userId, account_id);
+      const { getMetaPagesAccessState, getMetaAdsNoPagesMessage } = await import('../utils/metaAdsScope');
+      if (getMetaPagesAccessState(adGateConnection?.config) === 'missing') {
+        const pageMessage = getMetaAdsNoPagesMessage(adGateConnection?.config);
+        return {
+          success: false,
+          message: pageMessage,
+          error: `META_PAGE_ACCESS_MISSING: ${pageMessage}`,
+          hint: 'Reconnect Meta and select the Page on the "Choose Pages" step, or get "Create ads" (Advertiser) access on the Page, then retry.'
         } as any;
       }
     }

@@ -104,6 +104,12 @@ describe('Meta Auth Routes', () => {
         // cross-check in /connect-ad-accounts is a no-op unless a test opts in —
         // matches the real method's own never-throws-returns-[] contract.
         (metaService.getExistingAdPageIds as jest.Mock).mockResolvedValue([]);
+        (metaService.checkOAuthConnectionHealth as jest.Mock).mockResolvedValue({
+            pageCount: 1,
+            pageIds: ['page_1'],
+            grantedPermissions: ['ads_read', 'ads_management', 'pages_show_list', 'pages_read_engagement'],
+            declinedRequiredPermissions: []
+        });
     });
 
     describe('POST /finalize — getAdAccounts error reporting', () => {
@@ -279,6 +285,7 @@ describe('Meta Auth Routes', () => {
             expect(response.status).toBe(200);
             expect(response.body.url).toBeDefined();
             expect(response.body.url).toContain('scope=');
+            expect(response.body.url).toContain('auth_type=rerequest');
             expect(response.body.url).not.toContain('instagram_business_basic'); // Not an IG flow
         });
 
@@ -294,6 +301,7 @@ describe('Meta Auth Routes', () => {
             expect(response.body.url).toBeDefined();
             // It should be injected with the specific IG scopes
             expect(response.body.url).toContain('instagram_business_basic');
+            expect(response.body.url).not.toContain('auth_type=rerequest');
         });
     });
 
@@ -446,6 +454,12 @@ describe('Meta Auth Routes', () => {
             ]);
             (metaService.getPages as jest.Mock).mockResolvedValue([]);
             (metaService.getGrantedScopes as jest.Mock).mockResolvedValue(granted);
+            (metaService.checkOAuthConnectionHealth as jest.Mock).mockResolvedValue({
+                pageCount: 1,
+                pageIds: ['page_1'],
+                grantedPermissions: granted ?? [],
+                declinedRequiredPermissions: []
+            });
             (connectedAccountsDb.createAccount as jest.Mock).mockResolvedValue({
                 platform: 'meta',
                 account_id: 'act_123'
@@ -542,9 +556,20 @@ describe('Meta Auth Routes', () => {
             ]);
             (metaService.getGrantedScopes as jest.Mock).mockResolvedValue(['ads_read']);
             if (pages === 'error') {
-                (metaService.getPages as jest.Mock).mockRejectedValue(new Error('Graph API down'));
+                (metaService.checkOAuthConnectionHealth as jest.Mock).mockResolvedValue({
+                    pageCount: 0,
+                    pageIds: [],
+                    pagesError: 'Graph API down',
+                    grantedPermissions: ['ads_read'],
+                    declinedRequiredPermissions: []
+                });
             } else {
-                (metaService.getPages as jest.Mock).mockResolvedValue(pages);
+                (metaService.checkOAuthConnectionHealth as jest.Mock).mockResolvedValue({
+                    pageCount: pages.length,
+                    pageIds: pages.map(p => p.id),
+                    grantedPermissions: ['ads_read'],
+                    declinedRequiredPermissions: []
+                });
             }
             (connectedAccountsDb.createAccount as jest.Mock).mockResolvedValue({
                 platform: 'meta',
@@ -569,8 +594,12 @@ describe('Meta Auth Routes', () => {
         it('probes PAGE LIST during finalize and reports hasMetaPages: false for zero Pages', async () => {
             const { finalizeRes } = await connectWithPages([]);
 
-            expect(metaService.getPages).toHaveBeenCalledWith('valid_access_token');
+            expect(metaService.checkOAuthConnectionHealth).toHaveBeenCalledWith(
+                'valid_access_token',
+                ['ads_management', 'pages_show_list']
+            );
             expect(finalizeRes.body.hasMetaPages).toBe(false);
+            expect(finalizeRes.body.metaPageCount).toBe(0);
         });
 
         it('reports hasMetaPages: true when at least one Page is accessible', async () => {
@@ -585,6 +614,7 @@ describe('Meta Auth Routes', () => {
             expect(connectRes.status).toBe(200);
             const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
             expect(config.has_meta_pages).toBe(false);
+            expect(config.meta_page_count).toBe(0);
         });
 
         it('persists has_meta_pages: true when Pages are accessible', async () => {
@@ -604,6 +634,23 @@ describe('Meta Auth Routes', () => {
             expect(config.accessible_page_ids).toEqual(['page_1', 'page_2']);
         });
 
+        it('stores declined required permissions from /me/permissions on the connected account', async () => {
+            (metaService.checkOAuthConnectionHealth as jest.Mock).mockResolvedValueOnce({
+                pageCount: 0,
+                pageIds: [],
+                grantedPermissions: ['pages_show_list'],
+                declinedRequiredPermissions: ['ads_read', 'pages_read_engagement'],
+            });
+
+            const { finalizeRes, connectRes } = await connectWithPages([]);
+
+            expect(connectRes.status).toBe(200);
+            expect(finalizeRes.body.declinedRequiredPermissions).toEqual(['ads_read', 'pages_read_engagement']);
+            expect(finalizeRes.body.preconnectInstructions).toContain('Edit access');
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.declined_required_permissions).toEqual(['ads_read', 'pages_read_engagement']);
+        });
+
         it('omits accessible_page_ids (never writes []) when the Page probe itself fails', async () => {
             const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
 
@@ -611,6 +658,7 @@ describe('Meta Auth Routes', () => {
 
             const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
             expect(config.accessible_page_ids).toBeUndefined();
+            expect(config.meta_page_health_error).toBe('Graph API down');
 
             consoleWarnSpy.mockRestore();
         });
@@ -620,8 +668,9 @@ describe('Meta Auth Routes', () => {
 
             const { finalizeRes, connectRes } = await connectWithPages('error');
 
-            expect(metaService.getPages).toHaveBeenCalledWith('valid_access_token');
+            expect(metaService.checkOAuthConnectionHealth).toHaveBeenCalled();
             expect(finalizeRes.body.hasMetaPages).toBeUndefined();
+            expect(finalizeRes.body.metaOAuthHealthError).toBe('Graph API down');
             expect(connectRes.status).toBe(200);
             const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
             expect(config.has_meta_pages).toBeUndefined();
@@ -701,7 +750,12 @@ describe('Meta Auth Routes', () => {
                 { account_id: 'act_123', name: 'Test Ad Account', currency: 'USD', account_status: 1 }
             ]);
             (metaService.getGrantedScopes as jest.Mock).mockResolvedValue(['ads_read']);
-            (metaService.getPages as jest.Mock).mockResolvedValue(pages);
+            (metaService.checkOAuthConnectionHealth as jest.Mock).mockResolvedValue({
+                pageCount: pages.length,
+                pageIds: pages.map(p => p.id),
+                grantedPermissions: ['ads_read'],
+                declinedRequiredPermissions: []
+            });
             (metaService.getExistingAdPageIds as jest.Mock).mockResolvedValue(existingAdPageIds);
             (connectedAccountsDb.createAccount as jest.Mock).mockResolvedValue({
                 platform: 'meta',

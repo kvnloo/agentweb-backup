@@ -1668,6 +1668,58 @@ describe('MetaService', () => {
             );
         });
 
+        it('checks OAuth health from /me/accounts and /me/permissions', async () => {
+            mockFetch
+                .mockResolvedValueOnce({
+                    json: jest.fn().mockResolvedValue({
+                        data: [{ id: 'page_1' }, { id: 'page_2' }],
+                    })
+                } as any)
+                .mockResolvedValueOnce({
+                    json: jest.fn().mockResolvedValue({
+                        data: [
+                            { permission: 'ads_read', status: 'granted' },
+                            { permission: 'pages_read_engagement', status: 'declined' },
+                            { permission: 'public_profile', status: 'declined' },
+                        ],
+                    })
+                } as any);
+
+            const result = await service.checkOAuthConnectionHealth(
+                mockAccessToken,
+                ['ads_read', 'pages_read_engagement']
+            );
+
+            expect(result.pageCount).toBe(2);
+            expect(result.pageIds).toEqual(['page_1', 'page_2']);
+            expect(result.grantedPermissions).toEqual(['ads_read']);
+            expect(result.declinedRequiredPermissions).toEqual(['pages_read_engagement']);
+            expect(result.pagesError).toBeUndefined();
+        });
+
+        it('keeps /me/accounts pagination errors distinct from confirmed zero Pages', async () => {
+            mockFetch
+                .mockResolvedValueOnce({
+                    json: jest.fn().mockResolvedValue({
+                        data: [{ id: 'page_1' }],
+                        paging: { next: 'https://graph.facebook.com/next', cursors: { after: 'cursor_1' } },
+                    })
+                } as any)
+                .mockResolvedValueOnce({
+                    json: jest.fn().mockResolvedValue({ error: { message: 'cursor failed' } })
+                } as any)
+                .mockResolvedValueOnce({
+                    json: jest.fn().mockResolvedValue({ data: [] })
+                } as any);
+
+            const result = await service.checkOAuthConnectionHealth(mockAccessToken, ['ads_read']);
+
+            expect(result.pageCount).toBe(0);
+            expect(result.pageIds).toEqual([]);
+            expect(result.pagesError).toContain('cursor failed');
+            expect(result.declinedRequiredPermissions).toEqual([]);
+        });
+
         it('should handle API errors in listPixels', async () => {
             const mockGetAdsPixels = jest.fn().mockRejectedValue(new Error('Permission denied'));
             (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
