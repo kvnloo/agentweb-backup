@@ -1578,10 +1578,10 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
             // --- Ad Set ---
             optimization_goal: { type: "string", description: "Optimization goal (must be compatible with campaign objective)." },
             billing_event: { type: "string", description: "Billing event (must be compatible with optimization_goal)." },
-            daily_budget: { type: "number", description: "Daily budget in dollars. Min $1, max $5,000." },
-            lifetime_budget: { type: "number", description: "Lifetime budget in dollars. Min $1, max $50,000. Requires end_time." },
+            daily_budget: { type: "number", description: "Daily budget in major units of the ad account currency. Minimum 1, maximum 5,000." },
+            lifetime_budget: { type: "number", description: "Lifetime budget in major units of the ad account currency. Minimum 1, maximum 50,000. Requires end_time." },
             bid_strategy: { type: "string", enum: ["LOWEST_COST_WITHOUT_CAP", "LOWEST_COST_WITH_BID_CAP", "COST_CAP"], description: "Bid strategy." },
-            bid_amount: { type: "number", description: "Bid amount in dollars. Required for BID_CAP and COST_CAP strategies." },
+            bid_amount: { type: "number", description: "Bid amount in major units of the ad account currency. Required for BID_CAP and COST_CAP strategies." },
             targeting: {
               type: "object",
               description: "Targeting specification. geo_locations is required. targeting_automation.advantage_audience (0 or 1) is auto-injected as 0 if omitted — pass explicitly to override. Example: { geo_locations: { countries: ['US'] }, targeting_automation: { advantage_audience: 0 } }"
