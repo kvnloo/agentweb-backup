@@ -14,6 +14,8 @@ import { MetaAdAccount, MetaInstagramAccount } from '../types/meta';
 import { getJwtSecret } from '../config/jwt';
 
 const router = express.Router();
+const META_PRECONNECT_INSTRUCTIONS =
+    'Click Edit access, select all current and future Pages, approve all permissions.';
 
 // Token sessions are stored in DynamoDB (AW-OAuthSessions) with a 10-minute TTL
 // to survive across multiple backend instances behind the load balancer.
@@ -143,7 +145,11 @@ router.get('/init', authenticateToken, async (req: any, res) => {
         });
 
         console.log(`[Meta Init] flow=${flow}, scopes=${flowCfg.scopes.join(',')}`);
-        res.json({ success: true, url });
+        res.json({
+            success: true,
+            url,
+            ...(flow === 'marketing' ? { preconnectInstructions: META_PRECONNECT_INSTRUCTIONS } : {}),
+        });
 
     } catch (error) {
         console.error('[Meta Init] Error:', error);
@@ -365,8 +371,7 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
                 metaPageCount: meta_page_count,
                 declinedRequiredPermissions: declined_required_permissions,
                 metaOAuthHealthError: meta_oauth_health_error || meta_page_health_error,
-                preconnectInstructions:
-                    'Click Edit access, select all current and future Pages, and approve all requested permissions.',
+                preconnectInstructions: META_PRECONNECT_INSTRUCTIONS,
                 tokenSessionId
             });
         }

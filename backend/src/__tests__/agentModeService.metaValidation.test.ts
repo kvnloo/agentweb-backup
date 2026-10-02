@@ -1085,7 +1085,7 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       (metaService.getDatasetEventStats as jest.Mock).mockResolvedValue({
         id: 'px_1',
         name: 'Pixel',
-        event_stats: [{ event: 'Lead', count: 12 }]
+        event_stats: [{ event: 'Lead', last_30d_count: 12 }]
       });
     });
 
@@ -1152,6 +1152,45 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(result.optimisationEventWarning).toContain('unknown');
       expect(result.optimisationEventWarning).toContain('Lead');
       expect(result.warning).toBe(result.optimisationEventWarning);
+    });
+
+    it('does not claim last-30-day event health when Meta returns only an unwindowed count', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_LEADS' });
+      (metaService.getDatasetEventStats as jest.Mock).mockResolvedValueOnce({
+        id: 'px_1',
+        name: 'Pixel',
+        event_stats: [{ event: 'Lead', count: 12 }]
+      });
+
+      const result = await service.createMetaAdsAdSet('user123', {
+        ...websiteGoalParams,
+        optimization_goal: 'OFFSITE_CONVERSIONS',
+        promoted_object: { pixel_id: 'px_1', custom_event_type: 'LEAD' }
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.optimisationEventWarning).toContain('unknown');
+      expect(result.optimisationEventWarning).toContain('explicit last-30-day count');
+      expect(result.optimisationEventWarning).not.toContain('in the last 30 days');
+    });
+
+    it('warns missing when explicit last-30-day stats omit the selected optimization event', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_LEADS' });
+      (metaService.getDatasetEventStats as jest.Mock).mockResolvedValueOnce({
+        id: 'px_1',
+        name: 'Pixel',
+        event_stats: [{ event: 'Purchase', last_30d_count: 4 }]
+      });
+
+      const result = await service.createMetaAdsAdSet('user123', {
+        ...websiteGoalParams,
+        optimization_goal: 'OFFSITE_CONVERSIONS',
+        promoted_object: { pixel_id: 'px_1', custom_event_type: 'LEAD' }
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.optimisationEventWarning).toContain('Lead');
+      expect(result.optimisationEventWarning).toContain('in the last 30 days');
     });
   });
 });

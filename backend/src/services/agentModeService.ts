@@ -19993,24 +19993,19 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
 
     try {
       const stats = await metaService.getDatasetEventStats(pixelId, accessToken);
-      const rawStats = stats?.event_stats;
-      let rows: any[] = [];
-      if (Array.isArray(rawStats)) {
-        rows = rawStats;
-      } else if (typeof rawStats === 'string' && rawStats.trim()) {
-        const parsed = JSON.parse(rawStats);
-        rows = Array.isArray(parsed) ? parsed : [];
+      const health = this.readLast30DayOptimisationEventHealth(stats?.event_stats, resolved.expectedEventName);
+      if (health === 'recent') return undefined;
+      if (health === 'missing') {
+        return (
+          `Warning: Meta did not report any ${resolved.expectedEventName} events on selected pixel ${pixelId} ` +
+          `in the last 30 days. The ad set was created, but optimization may be learning from little or no ` +
+          `recent signal; verify the pixel event before scaling spend.`
+        );
       }
-      const received = new Set(
-        rows
-          .map((row: any) => row?.event || row?.event_name || row?.name)
-          .filter((event: unknown): event is string => typeof event === 'string' && event.trim().length > 0)
-      );
-      if (pixelReceivedEvent(received, resolved.expectedEventName)) return undefined;
       return (
-        `Warning: Meta did not report any ${resolved.expectedEventName} events on selected pixel ${pixelId} ` +
-        `in the recent event_stats read used for this ad set. The ad set was created, but optimization may be ` +
-        `learning from little or no recent signal; verify the pixel event before scaling spend.`
+        `Warning: Meta pixel event health for ${resolved.expectedEventName} on selected pixel ${pixelId} is unknown ` +
+        `because Meta event_stats did not include an explicit last-30-day count for the selected event. The ad set ` +
+        `was created, but do not treat this as a healthy optimization signal until the event is verified.`
       );
     } catch (error: any) {
       return (
@@ -20019,6 +20014,47 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         `but do not treat this as a healthy optimization signal until the event is verified.`
       );
     }
+  }
+
+  private readLast30DayOptimisationEventHealth(
+    rawStats: unknown,
+    expectedEventName: string,
+  ): 'recent' | 'missing' | 'unknown' {
+    let rows: any[] = [];
+    if (Array.isArray(rawStats)) {
+      rows = rawStats;
+    } else if (typeof rawStats === 'string' && rawStats.trim()) {
+      const parsed = JSON.parse(rawStats);
+      rows = Array.isArray(parsed) ? parsed : [];
+    } else {
+      return 'unknown';
+    }
+
+    const hasAnyExplicitLast30 = rows.some((row: any) =>
+      Object.keys(row ?? {}).some((key) => /(last[_-]?30|30[_-]?(day|d)|last[_-]?thirty)/i.test(key))
+    );
+    const matchedRows = rows.filter((row: any) => {
+      const name = row?.event || row?.event_name || row?.name;
+      return typeof name === 'string' && pixelReceivedEvent(new Set([name]), expectedEventName);
+    });
+    if (matchedRows.length === 0) return hasAnyExplicitLast30 ? 'missing' : 'unknown';
+
+    let sawExplicitLast30 = false;
+    for (const row of matchedRows) {
+      for (const [key, value] of Object.entries(row ?? {})) {
+        if (!/(last[_-]?30|30[_-]?(day|d)|last[_-]?thirty)/i.test(key)) continue;
+        const numeric = typeof value === 'number'
+          ? value
+          : typeof value === 'string' && value.trim() !== ''
+            ? Number(value)
+            : NaN;
+        if (!Number.isFinite(numeric)) continue;
+        sawExplicitLast30 = true;
+        if (numeric > 0) return 'recent';
+      }
+    }
+
+    return sawExplicitLast30 ? 'missing' : 'unknown';
   }
 
   public async listMetaAdsAdCreatives(userId: string, account_id?: string, adSetId?: string): Promise<any> {

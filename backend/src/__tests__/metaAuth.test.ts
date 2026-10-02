@@ -286,6 +286,9 @@ describe('Meta Auth Routes', () => {
             expect(response.body.url).toBeDefined();
             expect(response.body.url).toContain('scope=');
             expect(response.body.url).toContain('auth_type=rerequest');
+            expect(response.body.preconnectInstructions).toBe(
+                'Click Edit access, select all current and future Pages, approve all permissions.'
+            );
             expect(response.body.url).not.toContain('instagram_business_basic'); // Not an IG flow
         });
 
@@ -302,6 +305,7 @@ describe('Meta Auth Routes', () => {
             // It should be injected with the specific IG scopes
             expect(response.body.url).toContain('instagram_business_basic');
             expect(response.body.url).not.toContain('auth_type=rerequest');
+            expect(response.body.preconnectInstructions).toBeUndefined();
         });
     });
 
@@ -646,7 +650,9 @@ describe('Meta Auth Routes', () => {
 
             expect(connectRes.status).toBe(200);
             expect(finalizeRes.body.declinedRequiredPermissions).toEqual(['ads_read', 'pages_read_engagement']);
-            expect(finalizeRes.body.preconnectInstructions).toContain('Edit access');
+            expect(finalizeRes.body.preconnectInstructions).toBe(
+                'Click Edit access, select all current and future Pages, approve all permissions.'
+            );
             const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
             expect(config.declined_required_permissions).toEqual(['ads_read', 'pages_read_engagement']);
         });

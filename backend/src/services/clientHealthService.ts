@@ -33,7 +33,17 @@ const OTHER_AD_PLATFORMS: ReadonlySet<string> = new Set(OTHER_AD_PLATFORM_LIST);
 /** The fields the connection classifier reads; ConnectedAccount records satisfy it. */
 export interface AdConnectionAccount {
   platform?: string;
-  config?: { account_type?: string; token_expires_at?: number; refresh_token?: string };
+  config?: {
+    account_type?: string;
+    token_expires_at?: number;
+    refresh_token?: string;
+    has_meta_pages?: boolean;
+    meta_page_count?: number;
+    meta_page_health_error?: string;
+    declined_required_permissions?: string[];
+    meta_oauth_health_error?: string;
+    granted_scopes?: string[];
+  };
 }
 
 function isMetaAdAccount(acc: AdConnectionAccount | null | undefined): acc is AdConnectionAccount {
@@ -173,9 +183,22 @@ interface AdsLayerHealth {
   ad_account_id?: string;
   active_campaigns: number;
   campaigns?: Array<{ id: string; name: string; status: string; objective: string }>;
+  meta_connection_health?: MetaConnectionHealth;
   // ENG-1584 sibling: fetchWithRetryAndPaging is bounded and reports pagingTruncated when a
   // read stops short. false here means active_campaigns undercounts the real total.
   campaigns_complete?: boolean;
+}
+
+interface MetaConnectionHealth {
+  permissions: 'granted' | 'declined' | 'unknown';
+  declined_permissions?: string[];
+  permissions_error?: string;
+  page_access: 'available' | 'missing' | 'unknown';
+  page_count?: number;
+  page_error?: string;
+  selected_event: 'recent' | 'missing' | 'unknown';
+  reconnect_required: boolean;
+  reconnect_instructions?: string;
 }
 
 interface LanderLayerHealth {
@@ -260,6 +283,47 @@ function buildPaymentInfo(user: any): PaymentInfo {
     current_period_end: user.current_period_end || null,
     has_payment_method: user.has_payment_method === true,
     monthly_amount_cents: user.subscription_amount ?? null,
+  };
+}
+
+const META_RECONNECT_INSTRUCTIONS =
+  'Click Edit access, select all current and future Pages, approve all permissions.';
+
+function buildMetaConnectionHealth(account: AdConnectionAccount | undefined): MetaConnectionHealth | undefined {
+  if (!account) return undefined;
+  const config = account.config ?? {};
+  const declined = Array.isArray(config.declined_required_permissions)
+    ? config.declined_required_permissions.filter((p): p is string => typeof p === 'string' && p.trim().length > 0)
+    : [];
+  const permissionsError = typeof config.meta_oauth_health_error === 'string' && config.meta_oauth_health_error.trim()
+    ? config.meta_oauth_health_error.trim()
+    : undefined;
+  const pageError = typeof config.meta_page_health_error === 'string' && config.meta_page_health_error.trim()
+    ? config.meta_page_health_error.trim()
+    : undefined;
+  const pageCount = typeof config.meta_page_count === 'number' ? config.meta_page_count : undefined;
+  const pageAccess =
+    config.has_meta_pages === true ? 'available' :
+    config.has_meta_pages === false ? 'missing' :
+    'unknown';
+  const hasGrantedScopeSignal = Array.isArray(config.granted_scopes) && config.granted_scopes.length > 0;
+  const hasDeclinedSignal = Array.isArray(config.declined_required_permissions);
+  const reconnectRequired = declined.length > 0 || pageAccess === 'missing';
+
+  return {
+    permissions: declined.length > 0
+      ? 'declined'
+      : permissionsError || (!hasGrantedScopeSignal && !hasDeclinedSignal)
+        ? 'unknown'
+        : 'granted',
+    ...(declined.length > 0 ? { declined_permissions: declined } : {}),
+    ...(permissionsError ? { permissions_error: permissionsError } : {}),
+    page_access: pageAccess,
+    ...(pageCount !== undefined ? { page_count: pageCount } : {}),
+    ...(pageError ? { page_error: pageError } : {}),
+    selected_event: 'unknown',
+    reconnect_required: reconnectRequired,
+    ...(reconnectRequired ? { reconnect_instructions: META_RECONNECT_INSTRUCTIONS } : {}),
   };
 }
 
@@ -627,6 +691,7 @@ export async function assessClientHealth(
 
     const adConnection = classifyMetaAdConnection(connectedAccounts, client.adAccount, nowMs);
     const allPlatforms = classifyAdConnections(connectedAccounts, client.adAccount, nowMs);
+    const metaConnectionHealth = buildMetaConnectionHealth(connectedMetaAccount);
     const adsLayer: AdsLayerHealth = {
       connected: !!hasAds,
       connection: adConnection.connection,
@@ -641,6 +706,7 @@ export async function assessClientHealth(
         status: c.status,
         objective: c.objective,
       })),
+      ...(metaConnectionHealth ? { meta_connection_health: metaConnectionHealth } : {}),
       campaigns_complete: campaignsComplete,
     };
 
