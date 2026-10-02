@@ -1,7 +1,8 @@
 import {
-  MetaWriteRateShaper, META_BURST_THRESHOLD, META_BURST_WINDOW_MS, META_BUDGET_WINDOW_MS,
+  MetaWriteRateShaper, metaWriteRateShaper, META_BURST_THRESHOLD, META_BURST_WINDOW_MS, META_BUDGET_WINDOW_MS,
 } from '../services/agentMode/metaWriteRateShaper';
 import { AgentModeService } from '../services/agentModeService';
+import { metaService } from '../services/metaService';
 
 describe('ENG-2280 MetaWriteRateShaper', () => {
   let now = 0;
@@ -74,13 +75,18 @@ describe('ENG-2280 wiring', () => {
   });
 
   it('the authorized dispatch path never sends the 5th budget edit', async () => {
+    metaWriteRateShaper.reset();
     const service = new AgentModeService();
+    jest.spyOn(service as any, 'getMetaCredentials').mockResolvedValue({ accountId: 'act_eng2280', accessToken: 'token' });
+    jest.spyOn(metaService, 'getAdAccountCurrency').mockResolvedValue('USD');
+    // ENG-2279 prior read: each edit is a <=2x change, so the anomaly gate passes.
+    jest.spyOn(metaService, 'getAdSet').mockResolvedValue({ id: 'adset_eng2280', daily_budget: '5000' } as any);
     const write = jest.spyOn(service, 'updateMetaAdsAdSet').mockResolvedValue({ success: true } as any);
     const dispatch = (budget: number) => (service as any).dispatchAuthorizedMetaWrite(
       'user', 'AD_SET', 'UPDATE', 'act_eng2280', undefined, 'adset_eng2280', undefined, { daily_budget: budget }, false, undefined,
     );
-    for (let i = 1; i <= 4; i++) expect((await dispatch(10 * i)).success).toBe(true);
-    const fifth = await dispatch(99);
+    for (let i = 1; i <= 4; i++) expect((await dispatch(40 + i)).success).toBe(true);
+    const fifth = await dispatch(60);
     expect(fifth.success).toBe(false);
     expect((fifth as any).throttled).toBe(true);
     expect((fifth as any).retryAfterMs).toBeGreaterThan(0);

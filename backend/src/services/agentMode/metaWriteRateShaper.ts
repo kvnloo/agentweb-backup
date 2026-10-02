@@ -96,6 +96,12 @@ export class MetaWriteRateShaper {
     return { kind: 'send' };
   }
 
+  /** Test seam: forget all history. */
+  reset() {
+    this.budgetEdits.clear();
+    this.burst.clear();
+  }
+
   /** A write Meta rejected did not change the budget: release its slot so it isn't double-counted. */
   releaseBudgetEdit(entityType: string, objectId: string | undefined) {
     const record = objectId ? this.budgetEdits.get(`${entityType}:${objectId}`) : undefined;
