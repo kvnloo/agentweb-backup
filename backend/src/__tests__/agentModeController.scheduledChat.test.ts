@@ -1742,6 +1742,72 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(fallbackCall).toBeUndefined();
     });
 
+    // ENG-2209: a deploy drain rejects dispatch with "Worker is draining" AFTER the
+    // session already has assistant turns, so the run is not zero-output and used to
+    // be dropped as an error with no retry (plus a Linear issue per occurrence).
+    describe('worker drain after assistant turns (ENG-2209)', () => {
+      const answered = [
+        { role: 'user', content: 'Run the daily queue.' },
+        { role: 'assistant', content: 'Here is the queue so far: 3 posts.' },
+      ];
+      const drain = () => new Error('Worker is draining — no new requests accepted');
+
+      it('requeues the run and does not file an auto-issue when nothing was published', async () => {
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(drain());
+        (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue(answered);
+
+        const result: any = await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+          baseSchedule.scheduleId,
+          expect.objectContaining({ status: 'active', zeroAssistantRetryCount: 1, nextRunTime: expect.any(String) })
+        );
+        expect(result.requeuedAt).toEqual(expect.any(String));
+        await new Promise((r) => setImmediate(r));
+        expect(mockFileAutoIssue).not.toHaveBeenCalled();
+      });
+
+      it('never restarts from scratch over a confirmed publish that cannot be resumed', async () => {
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(drain());
+        (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue(answered);
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          calledFunctions: { post_on_connected_account: 1 },
+        } as any);
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        const freshRequeue = mockScheduleDb.updateSchedule.mock.calls.find(
+          (c: any[]) => c[1]?.zeroAssistantRetryCount === 1 && !c[1]?.pendingResumeSessionId
+        );
+        expect(freshRequeue).toBeUndefined();
+        await new Promise((r) => setImmediate(r));
+        expect(mockFileAutoIssue).toHaveBeenCalled();
+      });
+
+      it('leaves non-drain errors after a real answer unrequeued (unchanged)', async () => {
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(new Error('failed while sending the notification email'));
+        (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue(answered);
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        const requeue = mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.zeroAssistantRetryCount === 1);
+        expect(requeue).toBeUndefined();
+      });
+    });
+
     it('should still requeue after zero assistant output even when persisting the job-incomplete message fails', async () => {
       // The job-incomplete persist runs inside a try/catch (ENG-209): if DynamoDB
       // rejects, the error must be swallowed so the requeue still proceeds and the
