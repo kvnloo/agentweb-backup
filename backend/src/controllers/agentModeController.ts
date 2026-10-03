@@ -7504,8 +7504,6 @@ export async function runScheduledChat(
         const nextRetryCount = zeroOutputNextRetryCount;
         if (nextRetryCount <= ZERO_ASSISTANT_MAX_REQUEUES) {
           const retryAt = new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString();
-          zeroAssistantRequeuedAt = retryAt;
-
           try {
             await scheduleDb.updateSchedule(schedule.scheduleId, {
               status: 'active',
@@ -7515,6 +7513,7 @@ export async function runScheduledChat(
               lastZeroAssistantOutputSessionId: sessionId || '',
               updatedAt: new Date().toISOString(),
             });
+            zeroAssistantRequeuedAt = retryAt;
           } catch (requeueError) {
             console.error(`Failed to requeue zero-output scheduled chat ${schedule.scheduleId}:`, requeueError);
           }
