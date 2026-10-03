@@ -1212,6 +1212,9 @@ const LEGACY_MODEL_ALIASES: Record<string, string> = {
   'gpt-5-chat-2': 'gpt-5.5',
   'gpt-5.2-chat': 'gpt-5.5',
   'gemini-2.5-flash': 'gemini-3.1-flash-lite',
+  // ENG-2178: schedules created before the OpenRouter migration pin the bare
+  // "gpt-4o-mini" id; the same model is now served via OpenRouter.
+  'gpt-4o-mini': 'openrouter/openai/gpt-4o-mini',
 };
 
 // Context passed to the diagnosis agent when the main agent fails
