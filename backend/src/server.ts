@@ -395,6 +395,9 @@ const runDrain = async (reason: string): Promise<void> => {
     process.exit(1);
   }, DRAIN_CEILING_MS + 3 * 60 * 1000).unref();
 
+  const drainDeadline = Date.now() + DRAIN_CEILING_MS;
+  const remainingDrainMs = () => Math.max(0, drainDeadline - Date.now());
+
   // 1. Disable cron immediately — agent-engine's next /run-scheduled-chats call
   //    gets 503 and reroutes to the new instance within one 5-second poll cycle.
   //    All setInterval/setTimeout workers skip their next tick.
@@ -408,12 +411,10 @@ const runDrain = async (reason: string): Promise<void> => {
     // ignore — scheduler may not have started
   }
 
-  // 3. Drain the LLM worker (scheduled chats / EMMA runs), every other
-  //    in-flight cron job (LinkedIn sync, drip worker, meta token refresh,
-  //    etc. — see cronJobRegistry), in-flight interactive Agent Mode turns,
-  //    AND in-flight Gemini Live Voice tool calls, concurrently, up to the
-  //    same ceiling, so the total wait is the max of the four rather than
-  //    their sum.
+  // 3. Drain admitted cron/MCP, interactive session, and live-voice work
+  //    concurrently. Keep the worker accepting work until these upstream turns
+  //    settle: an admitted MCP call may still be persisting before it dispatches
+  //    to the worker. Both phases share one deadline, not two drain ceilings.
   //
   //    This MUST run BEFORE the HTTP listener closes below (ENG-1189): every
   //    one of these self-calls back into THIS process via mcpFetch's
@@ -426,12 +427,12 @@ const runDrain = async (reason: string): Promise<void> => {
   //    server.close() refuses every new loopback connection a retry would
   //    need, no matter how long the retry waits.
   const { drainActiveSessionGenerations } = await import('./controllers/agentModeController');
-  const [, cronDrain, sessionDrain, liveVoiceDrain] = await Promise.all([
-    generateMarketingResponseWorkerService.shutdown(),
-    cronJobRegistry.drain(),
-    drainActiveSessionGenerations(),
-    drainLiveVoiceToolExecutions(),
+  const [cronDrain, sessionDrain, liveVoiceDrain] = await Promise.all([
+    cronJobRegistry.drain(remainingDrainMs()),
+    drainActiveSessionGenerations(remainingDrainMs()),
+    drainLiveVoiceToolExecutions(remainingDrainMs()),
   ]);
+  await generateMarketingResponseWorkerService.shutdown(remainingDrainMs());
   if (!cronDrain.drained) {
     console.warn(
       `[gracefulShutdown] Cron drain ceiling reached — ${cronDrain.stuckCount} job(s) still in-flight:`,
