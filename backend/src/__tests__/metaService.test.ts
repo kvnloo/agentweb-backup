@@ -1523,7 +1523,8 @@ describe('MetaService', () => {
             expect(FacebookAdsApi.init).toHaveBeenCalledWith(mockAccessToken);
             expect(User).toHaveBeenCalledWith('me');
             expect(mockGetAccounts).toHaveBeenCalledWith(
-                expect.arrayContaining(['id', 'name', 'access_token', 'category', 'tasks'])
+                expect.arrayContaining(['id', 'name', 'access_token', 'category', 'tasks']),
+                expect.objectContaining({ limit: expect.any(Number) })
             );
             expect(result).toHaveLength(1);
             expect(result[0]).toEqual({

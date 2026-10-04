@@ -75,7 +75,12 @@ export function evaluateTurnTimeBudget(input: TurnTimeBudgetInput): TurnTimeBudg
 
   const baseReserve = positiveOr(input.synthesisReserveMs, DEFAULT_SYNTHESIS_RESERVE_MS);
   const slowestCallReserve = positiveOr(input.longestLlmCallMs, 0) * SYNTHESIS_RESERVE_SLOWEST_CALL_MULTIPLIER;
-  const reserveMs = Math.min(Math.max(baseReserve, slowestCallReserve), totalMs / 2);
+  // ENG-2231: every input here can be fractional (totalMs/2 on an odd totalMs;
+  // slowestCallReserve from the *1.25 multiplier on an odd longestLlmCallMs) — floor
+  // once at the source so every downstream consumer of reserveMs (there are several,
+  // including the ms value handed straight to the OpenAI SDK's `timeout` option, which
+  // throws "timeout must be an integer" on anything fractional) inherits the guarantee.
+  const reserveMs = Math.floor(Math.min(Math.max(baseReserve, slowestCallReserve), totalMs / 2));
 
   if (remainingMs <= reserveMs) {
     return { phase: 'final_synthesis', elapsedMs, remainingMs, reserveMs };

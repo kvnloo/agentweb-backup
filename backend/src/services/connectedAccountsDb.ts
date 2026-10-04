@@ -448,6 +448,12 @@ export interface ConnectedAccount {
   updated_at: string;
 }
 
+// ENG-2258: redaction helpers that strip access/refresh tokens and other
+// connected-account secrets from a response live in
+// `utils/accountSecretRedaction.ts`, not here — this module is `jest.mock`'d
+// wholesale across ~90 test files, so a route-facing helper needs to live
+// somewhere those mocks don't shadow it.
+
 /**
  * Input type for creating a connected account
  */

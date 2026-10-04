@@ -423,7 +423,7 @@ router.post(
       }
 
       // Import stripeService to use the new methods
-      const { stripeService } = await import("../services/stripeService");
+      const { stripeService, findBasePlanItem } = await import("../services/stripeService");
 
       // Find the active subscription
       const currentSub = await stripeService.findActiveSubscription(user.stripe_customer_id);
@@ -433,8 +433,14 @@ router.post(
         });
       }
 
-      // Check if user is already on this price
-      const currentPriceId = currentSub.items.data[0]?.price?.id;
+      // Check if user is already on this price. Uses `findBasePlanItem`
+      // rather than `items.data[0]` — a subscription can carry a
+      // seat-billing extra-seat line item (ENG-2243..2246) alongside the
+      // plan item, and `items.data` order is not guaranteed. Reading
+      // `items.data[0]` here could compare the seat's price instead of the
+      // plan's, corrupting the upgrade/downgrade and tier-cache logic below
+      // (ENG-2257). See `findBasePlanItem`'s doc comment in stripeService.ts.
+      const currentPriceId = findBasePlanItem(currentSub)?.price?.id;
       if (currentPriceId === resolvedPriceId) {
         return res.status(400).json({
           error: "You are already on this plan.",

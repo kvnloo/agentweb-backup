@@ -100,6 +100,10 @@ describe('Meta Auth Routes', () => {
     beforeEach(() => {
         jest.clearAllMocks();
         mockSessionStore.clear();
+        // ENG-2232: default to "no existing ads sampled" so the wrong-Page
+        // cross-check in /connect-ad-accounts is a no-op unless a test opts in —
+        // matches the real method's own never-throws-returns-[] contract.
+        (metaService.getExistingAdPageIds as jest.Mock).mockResolvedValue([]);
     });
 
     describe('POST /finalize — getAdAccounts error reporting', () => {
@@ -518,6 +522,246 @@ describe('Meta Auth Routes', () => {
 
             const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
             expect(config.scopes).toEqual(['ads_management', 'pages_show_list']);
+        });
+    });
+
+    /**
+     * ENG-2232 — Page access is a second, independent Meta grant from the ads
+     * scope: production account 1209971551106961 had ads_read granted and 0
+     * accessible Pages both before AND after the customer reconnected, and
+     * nothing probed or recorded that until the first AD_CREATIVE failed —
+     * after 4 campaigns and 4 ad sets were already built and approved.
+     */
+    describe('POST /finalize + /connect-ad-accounts — Page access capture (ENG-2232)', () => {
+        const connectWithPages = async (pages: any[] | 'error') => {
+            (axios.get as jest.Mock).mockResolvedValue({
+                data: { access_token: 'valid_access_token', expires_in: 3600 }
+            });
+            (metaService.getAdAccounts as jest.Mock).mockResolvedValue([
+                { account_id: 'act_123', name: 'Test Ad Account', currency: 'USD', account_status: 1 }
+            ]);
+            (metaService.getGrantedScopes as jest.Mock).mockResolvedValue(['ads_read']);
+            if (pages === 'error') {
+                (metaService.getPages as jest.Mock).mockRejectedValue(new Error('Graph API down'));
+            } else {
+                (metaService.getPages as jest.Mock).mockResolvedValue(pages);
+            }
+            (connectedAccountsDb.createAccount as jest.Mock).mockResolvedValue({
+                platform: 'meta',
+                account_id: 'act_123'
+            });
+            jest.spyOn(jwt, 'verify').mockReturnValue({ userId: 'test_user_id', flow: 'marketing' } as any);
+
+            const finalizeRes = await request(app)
+                .post('/auth/meta/finalize')
+                .send({ code: 'valid_code', state: 'valid_state' });
+
+            const connectRes = await request(app)
+                .post('/auth/meta/connect-ad-accounts')
+                .send({
+                    tokenSessionId: finalizeRes.body.tokenSessionId,
+                    adAccounts: [{ account_id: 'act_123', name: 'Test Ad Account', currency: 'USD', account_status: 1 }]
+                });
+
+            return { finalizeRes, connectRes };
+        };
+
+        it('probes PAGE LIST during finalize and reports hasMetaPages: false for zero Pages', async () => {
+            const { finalizeRes } = await connectWithPages([]);
+
+            expect(metaService.getPages).toHaveBeenCalledWith('valid_access_token');
+            expect(finalizeRes.body.hasMetaPages).toBe(false);
+        });
+
+        it('reports hasMetaPages: true when at least one Page is accessible', async () => {
+            const { finalizeRes } = await connectWithPages([{ id: 'page_1', name: 'My Health Surveys' }]);
+
+            expect(finalizeRes.body.hasMetaPages).toBe(true);
+        });
+
+        it('persists has_meta_pages: false on the connected ad account config', async () => {
+            const { connectRes } = await connectWithPages([]);
+
+            expect(connectRes.status).toBe(200);
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.has_meta_pages).toBe(false);
+        });
+
+        it('persists has_meta_pages: true when Pages are accessible', async () => {
+            await connectWithPages([{ id: 'page_1', name: 'My Health Surveys' }]);
+
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.has_meta_pages).toBe(true);
+        });
+
+        it('persists accessible_page_ids alongside has_meta_pages (ENG-2232)', async () => {
+            await connectWithPages([
+                { id: 'page_1', name: 'My Health Surveys' },
+                { id: 'page_2', name: 'Other Page' },
+            ]);
+
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.accessible_page_ids).toEqual(['page_1', 'page_2']);
+        });
+
+        it('omits accessible_page_ids (never writes []) when the Page probe itself fails', async () => {
+            const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+            await connectWithPages('error');
+
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.accessible_page_ids).toBeUndefined();
+
+            consoleWarnSpy.mockRestore();
+        });
+
+        it('omits has_meta_pages (never writes false) when the Page probe itself fails', async () => {
+            const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+            const { finalizeRes, connectRes } = await connectWithPages('error');
+
+            expect(metaService.getPages).toHaveBeenCalledWith('valid_access_token');
+            expect(finalizeRes.body.hasMetaPages).toBeUndefined();
+            expect(connectRes.status).toBe(200);
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.has_meta_pages).toBeUndefined();
+
+            consoleWarnSpy.mockRestore();
+        });
+
+        /**
+         * ENG-2232 code review follow-up: the "fall back to the existing
+         * account's recorded value" branch above (fix commit 75528ce01) had no
+         * test exercising it with a REAL existing value — every prior test left
+         * `getAccountById` at its automock default of `undefined`, so this
+         * branch always took the "nothing to fall back to" path regardless of
+         * whether the fallback logic itself was correct.
+         */
+        it('falls back to the existing account\'s recorded has_meta_pages when a reconnect\'s probe fails', async () => {
+            const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+            (connectedAccountsDb.getAccountById as jest.Mock).mockResolvedValue({
+                platform: 'meta',
+                account_id: 'act_123',
+                config: { has_meta_pages: false, accessible_page_ids: [] },
+            });
+
+            const { connectRes } = await connectWithPages('error');
+
+            expect(connectRes.status).toBe(200);
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.has_meta_pages).toBe(false);
+            expect(config.accessible_page_ids).toEqual([]);
+
+            consoleWarnSpy.mockRestore();
+        });
+
+        /**
+         * ENG-2232 code review follow-up: getAccountById elsewhere in this
+         * codebase (getMetaCredentials) treats the legacy 'facebook' platform
+         * value as the same account as 'meta' for backward compatibility with
+         * connections made before the platform name was standardized. A lookup
+         * scoped to 'meta' alone would silently miss the recorded value on any
+         * account still stored under the old name.
+         */
+        it('finds the existing value even when it is recorded under the legacy \'facebook\' platform value', async () => {
+            const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+            (connectedAccountsDb.getAccountById as jest.Mock).mockImplementation(
+                async (accountId: string, userId: string, platform?: string | string[]) => {
+                    const platforms = Array.isArray(platform) ? platform : [platform];
+                    if (!platforms.includes('facebook')) return null;
+                    return {
+                        platform: 'facebook',
+                        account_id: accountId,
+                        config: { has_meta_pages: false, accessible_page_ids: [] },
+                    };
+                }
+            );
+
+            const { connectRes } = await connectWithPages('error');
+
+            expect(connectRes.status).toBe(200);
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.has_meta_pages).toBe(false);
+
+            consoleWarnSpy.mockRestore();
+        });
+    });
+
+    /**
+     * ENG-2232 — the subtler sibling: "at least one Page" isn't the same as
+     * "the Page this account's existing ads actually run under". An account
+     * can hold access to some unrelated Page while its real ads keep failing.
+     */
+    describe('POST /connect-ad-accounts — wrong-Page cross-check (ENG-2232)', () => {
+        const connectWithPagesAndExistingAds = async (pages: any[], existingAdPageIds: string[]) => {
+            (axios.get as jest.Mock).mockResolvedValue({
+                data: { access_token: 'valid_access_token', expires_in: 3600 }
+            });
+            (metaService.getAdAccounts as jest.Mock).mockResolvedValue([
+                { account_id: 'act_123', name: 'Test Ad Account', currency: 'USD', account_status: 1 }
+            ]);
+            (metaService.getGrantedScopes as jest.Mock).mockResolvedValue(['ads_read']);
+            (metaService.getPages as jest.Mock).mockResolvedValue(pages);
+            (metaService.getExistingAdPageIds as jest.Mock).mockResolvedValue(existingAdPageIds);
+            (connectedAccountsDb.createAccount as jest.Mock).mockResolvedValue({
+                platform: 'meta',
+                account_id: 'act_123'
+            });
+            jest.spyOn(jwt, 'verify').mockReturnValue({ userId: 'test_user_id', flow: 'marketing' } as any);
+
+            const finalizeRes = await request(app)
+                .post('/auth/meta/finalize')
+                .send({ code: 'valid_code', state: 'valid_state' });
+
+            const connectRes = await request(app)
+                .post('/auth/meta/connect-ad-accounts')
+                .send({
+                    tokenSessionId: finalizeRes.body.tokenSessionId,
+                    adAccounts: [{ account_id: 'act_123', name: 'Test Ad Account', currency: 'USD', account_status: 1 }]
+                });
+
+            return { finalizeRes, connectRes };
+        };
+
+        it('downgrades has_meta_pages to false and names the Page when existing ads use a Page outside the accessible set', async () => {
+            const { connectRes } = await connectWithPagesAndExistingAds(
+                [{ id: 'page_unrelated', name: 'Some Other Page' }],
+                ['1010991085424542'],
+            );
+
+            expect(connectRes.status).toBe(200);
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.has_meta_pages).toBe(false);
+            expect(config.existing_ads_page_id).toBe('1010991085424542');
+        });
+
+        it('keeps has_meta_pages true when the accessible Pages include the one existing ads use', async () => {
+            const { connectRes } = await connectWithPagesAndExistingAds(
+                [{ id: '1010991085424542', name: 'My Health Surveys' }],
+                ['1010991085424542'],
+            );
+
+            expect(connectRes.status).toBe(200);
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.has_meta_pages).toBe(true);
+            expect(config.existing_ads_page_id).toBeUndefined();
+        });
+
+        it('keeps has_meta_pages true when no existing-ad Page could be sampled (best-effort, no verdict either way)', async () => {
+            const { connectRes } = await connectWithPagesAndExistingAds(
+                [{ id: 'page_1', name: 'My Health Surveys' }],
+                [],
+            );
+
+            expect(connectRes.status).toBe(200);
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.has_meta_pages).toBe(true);
+        });
+
+        it('does not run the cross-check at all when the login has zero Pages (already false, nothing to tighten)', async () => {
+            await connectWithPagesAndExistingAds([], ['1010991085424542']);
+
+            expect(metaService.getExistingAdPageIds).not.toHaveBeenCalled();
         });
     });
 });

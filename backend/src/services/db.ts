@@ -887,6 +887,14 @@ export interface Organization {
   shareAnalyticsWithOrg?: boolean;
   secrets?: Record<string, string>; // Encrypted per-org secrets (key → encrypted value)
   orgMemoryEnabled?: boolean; // Whether org-wide Emma memory is enabled (default: true)
+  /**
+   * Seat-based billing (ENG-TBD). Number of paid extra seats beyond the
+   * owner's tier's free base (see orgSeatService.baseSeatsForTier). This is a
+   * mirror of the Stripe subscription's seat line-item quantity, kept in sync
+   * by the billing webhook — never incremented/decremented directly on
+   * member join/leave. Absent/0 = no extra seats purchased.
+   */
+  purchasedExtraSeats?: number;
 }
 
 export interface OrgShareSettings {
@@ -11940,6 +11948,15 @@ export const oauthSessionDb = {
     scopes: string[];
     /** Scopes actually GRANTED, when the provider could tell us (ENG-629). */
     granted_scopes?: string[];
+    /** Whether at least one Facebook Page is accessible, when probed (ENG-2232). */
+    has_meta_pages?: boolean;
+    /**
+     * The accessible Facebook Page ids themselves, when probed (ENG-2232).
+     * Lets /connect-ad-accounts cross-check each selected ad account's
+     * existing ads against the actual set, instead of just the boolean —
+     * without re-fetching Pages once per ad account in that loop.
+     */
+    meta_page_ids?: string[];
     flow: string;
   } | PendingOAuthSession): Promise<void> {
     const TEN_MINUTES_SECONDS = 10 * 60;
@@ -11979,6 +11996,8 @@ export const oauthSessionDb = {
     expires_in?: number;
     scopes: string[];
     granted_scopes?: string[];
+    has_meta_pages?: boolean;
+    meta_page_ids?: string[];
     flow: string;
   } | null> {
     try {

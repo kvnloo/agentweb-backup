@@ -81,7 +81,12 @@ describe('AgentModeService - Meta Pages', () => {
       expect(metaService.getPages).toHaveBeenCalledWith('mock-access-token');
     });
 
-    it('should return empty array when no pages exist', async () => {
+    it('should warn — not just report zero — when no pages exist (ENG-2232)', async () => {
+      // Previously this was a bare "Found 0 Facebook Page(s)" with no guidance,
+      // which is how a customer built 4 campaigns + 4 ad sets before discovering
+      // (only at AD_CREATIVE CREATE) that ad creation was impossible without a
+      // Page. The message must now say the consequence and the fix, and tell
+      // the model not to proceed with the build.
       const mockUser = {
         id: 'user123',
         connected_accounts: [
@@ -104,7 +109,10 @@ describe('AgentModeService - Meta Pages', () => {
       const result = await agentModeService.listMetaPages('user123');
 
       expect(result.success).toBe(true);
-      expect(result.message).toBe('Found 0 Facebook Page(s)');
+      expect(result.message).toMatch(/Found 0 Facebook Page\(s\)/);
+      expect(result.message).toMatch(/Choose Pages/);
+      expect(result.message.toLowerCase()).toContain('advertiser');
+      expect(result.message.toLowerCase()).toContain('do not proceed');
       expect(result.pages).toEqual([]);
       expect(result.totalCount).toBe(0);
     });

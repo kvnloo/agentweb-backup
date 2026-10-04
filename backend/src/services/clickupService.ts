@@ -395,3 +395,157 @@ export async function readTaskContent(accessToken: string, taskId: string): Prom
 
   return parts.join('\n');
 }
+
+// ---------------------------------------------------------------------------
+// ENG-755: create tasks in a ClickUp List with custom-field values.
+// ---------------------------------------------------------------------------
+
+export type ClickUpTaskErrorCode = 'AUTH_FAILED' | 'UNKNOWN_FIELD' | 'INVALID_VALUE' | 'LIST_NOT_FOUND' | 'API_ERROR';
+
+export class ClickUpTaskError extends Error {
+  constructor(public readonly code: ClickUpTaskErrorCode, message: string) {
+    super(message);
+    this.name = 'ClickUpTaskError';
+  }
+}
+
+export interface ClickUpCustomField {
+  id: string;
+  name: string;
+  type: string;
+  options?: Array<{ id: string; name: string; orderindex?: number }>;
+}
+
+export interface CreateClickUpTaskInput {
+  name: string;
+  description?: string;
+  status?: string;
+  priority?: number;
+  assignees?: number[];
+  dueDate?: number;
+  /** Keyed by custom field name (case-insensitive) or id. */
+  customFields?: Record<string, unknown>;
+}
+
+function clickupHeaders(accessToken: string) {
+  return { Authorization: accessToken, 'Content-Type': 'application/json' };
+}
+
+function toTaskError(error: any): ClickUpTaskError {
+  if (error instanceof ClickUpTaskError) return error;
+  const status = error?.response?.status;
+  const body = error?.response?.data;
+  const detail = body?.err ? `${body.err}${body.ECODE ? ` (${body.ECODE})` : ''}` : error?.message || 'Unknown error';
+  if (status === 401 || status === 403) return new ClickUpTaskError('AUTH_FAILED', `ClickUp rejected the credentials: ${detail}`);
+  if (status === 404) return new ClickUpTaskError('LIST_NOT_FOUND', `ClickUp list not found: ${detail}`);
+  return new ClickUpTaskError('API_ERROR', `ClickUp API error: ${detail}`);
+}
+
+export async function getListCustomFields(accessToken: string, listId: string): Promise<ClickUpCustomField[]> {
+  try {
+    const response = await axios.get<any>(`${CLICKUP_API_V2}/list/${encodeURIComponent(listId)}/field`, {
+      headers: clickupHeaders(accessToken),
+    });
+    return (response.data?.fields || []).map((f: any) => ({
+      id: f.id,
+      name: f.name,
+      type: f.type,
+      options: f.type_config?.options?.map((o: any) => ({ id: o.id, name: o.name ?? o.label, orderindex: o.orderindex })),
+    }));
+  } catch (error) {
+    throw toTaskError(error);
+  }
+}
+
+function coerceFieldValue(field: ClickUpCustomField, raw: unknown): unknown {
+  const fail = (why: string) => new ClickUpTaskError('INVALID_VALUE', `Invalid value for custom field "${field.name}" (${field.type}): ${why}`);
+  const findOption = (v: unknown) => {
+    const s = String(v).trim().toLowerCase();
+    return field.options?.find(o => o.id === v || (o.name || '').trim().toLowerCase() === s);
+  };
+  switch (field.type) {
+    case 'drop_down': {
+      const opt = findOption(raw);
+      if (!opt) throw fail(`"${raw}" is not one of: ${(field.options || []).map(o => o.name).join(', ')}`);
+      return opt.id;
+    }
+    case 'labels': {
+      const values = Array.isArray(raw) ? raw : [raw];
+      return values.map(v => {
+        const opt = findOption(v);
+        if (!opt) throw fail(`"${v}" is not one of: ${(field.options || []).map(o => o.name).join(', ')}`);
+        return opt.id;
+      });
+    }
+    case 'number':
+    case 'currency':
+    case 'emoji': {
+      const n = typeof raw === 'number' ? raw : Number(String(raw).replace(/[$,\s]/g, ''));
+      if (raw === '' || raw === null || !Number.isFinite(n)) throw fail(`"${raw}" is not a number`);
+      return n;
+    }
+    case 'date': {
+      const s = String(raw).trim();
+      if (typeof raw !== 'number' && /T\d{2}:\d{2}/.test(s) && !/(Z|[+-]\d{2}:?\d{2})$/i.test(s)) {
+        throw fail(`"${raw}" needs an explicit timezone (Z or ±HH:MM)`);
+      }
+      const ms = typeof raw === 'number' ? raw : Date.parse(s);
+      if (!Number.isFinite(ms)) throw fail(`"${raw}" is not a date`);
+      return ms;
+    }
+    case 'checkbox':
+      if (typeof raw === 'boolean') return raw;
+      if (raw === 'true' || raw === 'false') return raw === 'true';
+      throw fail(`"${raw}" is not a boolean`);
+    case 'url':
+    case 'email':
+    case 'phone':
+    case 'text':
+    case 'short_text':
+      if (raw === null || raw === undefined || typeof raw === 'object') throw fail('expected a string');
+      return String(raw);
+    default:
+      return raw;
+  }
+}
+
+/** Map user-supplied custom field name/id -> value into ClickUp's { id, value } payload, validated against the list schema. */
+export function mapCustomFieldValues(
+  schema: ClickUpCustomField[],
+  values: Record<string, unknown>
+): Array<{ id: string; value: unknown }> {
+  return Object.entries(values).map(([key, raw]) => {
+    const k = key.trim().toLowerCase();
+    const field = schema.find(f => f.id === key) || schema.find(f => (f.name || '').trim().toLowerCase() === k);
+    if (!field) {
+      throw new ClickUpTaskError('UNKNOWN_FIELD', `Unknown custom field "${key}". Available fields: ${schema.map(f => f.name).join(', ') || '(none)'}`);
+    }
+    return { id: field.id, value: coerceFieldValue(field, raw) };
+  });
+}
+
+export async function createTaskInList(
+  accessToken: string,
+  listId: string,
+  input: CreateClickUpTaskInput
+): Promise<{ id: string; name: string; url?: string }> {
+  if (!input.name?.trim()) throw new ClickUpTaskError('INVALID_VALUE', 'Task name is required');
+  const customFields = input.customFields && Object.keys(input.customFields).length > 0
+    ? mapCustomFieldValues(await getListCustomFields(accessToken, listId), input.customFields)
+    : undefined;
+  const body: Record<string, unknown> = { name: input.name };
+  if (input.description !== undefined) body.markdown_description = input.description;
+  if (input.status !== undefined) body.status = input.status;
+  if (input.priority !== undefined) body.priority = input.priority;
+  if (input.assignees?.length) body.assignees = input.assignees;
+  if (input.dueDate !== undefined) body.due_date = input.dueDate;
+  if (customFields) body.custom_fields = customFields;
+  try {
+    const response = await axios.post<any>(`${CLICKUP_API_V2}/list/${encodeURIComponent(listId)}/task`, body, {
+      headers: clickupHeaders(accessToken),
+    });
+    return { id: response.data.id, name: response.data.name, url: response.data.url };
+  } catch (error) {
+    throw toTaskError(error);
+  }
+}
