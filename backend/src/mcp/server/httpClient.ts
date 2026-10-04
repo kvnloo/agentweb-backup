@@ -227,7 +227,10 @@ export async function mcpFetch(options: McpFetchOptions): Promise<any> {
   }
 
   if (!response.ok) {
-    const message = typeof data === 'object' ? (data.message || data.error || JSON.stringify(data)) : data;
+    const restarting = data && typeof data === 'object' && data.code === 'SERVER_RESTARTING';
+    const message = restarting
+      ? 'The server is restarting. The message may have been saved. Check the session before retrying to avoid duplicate messages.'
+      : typeof data === 'object' ? (data.message || data.error || JSON.stringify(data)) : data;
     const err = new Error(`API error (${response.status}): ${message}`);
     // Routes sometimes emit BOTH a human `message` (which wins above, and is
     // what a real UI would show) and a stable machine-readable `error` code —

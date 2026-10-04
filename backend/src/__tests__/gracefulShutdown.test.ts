@@ -3,7 +3,7 @@
  *   1. instanceState — isCronEnabled / disableCron
  *   2. GenerateMarketingResponseWorkerService — drain-aware shutdown
  *   3. agentModeController — 503 guard when cron is disabled
- *   4. cronJobRegistry — drains concurrently with the worker shutdown
+ *   4. server drain — admitted turns settle before worker shutdown
  *   5. server.ts — drain-before-close ordering (ENG-1189)
  */
 
@@ -89,6 +89,22 @@ describe('GenerateMarketingResponseWorkerService.shutdown', () => {
     await shutdownPromise;
   });
 
+  it.each([0, 25])('uses the remaining %i ms budget instead of a fresh drain ceiling', async (budgetMs) => {
+    jest.useFakeTimers();
+    const svc = makeWorkerService();
+    const reject = jest.fn();
+    const timeout = setTimeout(() => {}, 99999);
+    svc['pendingRequests'].set('stuck', { resolve: jest.fn(), reject, timeout });
+    const started = Date.now();
+    const shutdown = svc.shutdown(budgetMs);
+    await jest.advanceTimersByTimeAsync(budgetMs);
+    await shutdown;
+    expect(Date.now() - started).toBe(budgetMs);
+    expect(reject).toHaveBeenCalledWith(expect.objectContaining({ message: 'Worker shutdown — drain ceiling exceeded' }));
+    expect(svc['pendingRequests'].size).toBe(0);
+    jest.useRealTimers();
+  });
+
   it('blocks until in-flight requests complete, then resolves', async () => {
     const svc = makeWorkerService();
 
@@ -171,32 +187,37 @@ describe('isCronEnabled 503 guard — pattern verification', () => {
 });
 
 // --------------------------------------------------------------------------
-// 4. cronJobRegistry — drains concurrently with the worker shutdown
-//
-// gracefulShutdown() runs `Promise.all([workerService.shutdown(), cronJobRegistry.drain()])`
-// rather than awaiting them sequentially. This proves the two waits overlap —
-// total elapsed time is the MAX of the two drains, not their sum — so the
-// unified drain step stays within the existing 10-min ceiling / 13-min
-// force-exit budget instead of doubling it.
+// 4. Execute the production drain block without booting server.ts. Admitted
+// MCP calls must be able to reach the worker before its shutdown begins.
 // --------------------------------------------------------------------------
-describe('cronJobRegistry drains concurrently with the worker shutdown', () => {
-  it('takes the max of the two drain durations, not the sum, under Promise.all', async () => {
-    const { CronJobRegistry } = require('../utils/cronJobRegistry');
-    const registry = new CronJobRegistry();
-
-    // Fake "worker shutdown" — resolves after 150ms.
-    const fakeWorkerShutdown = () => new Promise((resolve) => setTimeout(resolve, 150));
-
-    // Fake in-flight cron job — resolves after 250ms (the longer of the two).
-    registry.track('slowJob', new Promise((resolve) => setTimeout(resolve, 250)));
-
-    const start = Date.now();
-    await Promise.all([fakeWorkerShutdown(), registry.drain(5000, 20)]);
-    const elapsed = Date.now() - start;
-
-    // If the two ran sequentially this would be ~400ms; concurrently it's ~250ms.
-    expect(elapsed).toBeGreaterThanOrEqual(240);
-    expect(elapsed).toBeLessThan(400);
+describe('server drain keeps the worker available to admitted turns', () => {
+  it('does not shut down the worker until registry and session drains settle', async () => {
+    const source = fs.readFileSync(path.join(__dirname, '../server.ts'), 'utf8');
+    const start = source.indexOf('  const [', source.indexOf('const runDrain'));
+    const end = source.indexOf('  if (!cronDrain.drained)', start);
+    const block = source.slice(start, end);
+    const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+    const run = new AsyncFunction(
+      'generateMarketingResponseWorkerService', 'cronJobRegistry',
+      'drainActiveSessionGenerations', 'drainLiveVoiceToolExecutions',
+      'remainingDrainMs', block
+    );
+    let resolveRegistry!: (value: any) => void;
+    let resolveSession!: (value: any) => void;
+    const registry = new Promise(resolve => { resolveRegistry = resolve; });
+    const session = new Promise(resolve => { resolveSession = resolve; });
+    const shutdown = jest.fn().mockResolvedValue(undefined);
+    const remainingDrainMs = jest.fn().mockReturnValue(123);
+    const pending = run({ shutdown }, { drain: () => registry },
+      () => session, async () => ({ drained: true }), remainingDrainMs);
+    await Promise.resolve();
+    expect(shutdown).not.toHaveBeenCalled();
+    resolveRegistry({ drained: true });
+    await Promise.resolve();
+    expect(shutdown).not.toHaveBeenCalled();
+    resolveSession({ drained: true });
+    await pending;
+    expect(shutdown).toHaveBeenCalledWith(123);
   });
 });
 
@@ -226,7 +247,7 @@ describe('server.ts shutdown sequencing (source-pinned, ENG-1189)', () => {
 
 
   it('drains the worker/cron/session in-flight work before closing the HTTP listener', () => {
-    const drainCallIndex = serverSrc.indexOf('generateMarketingResponseWorkerService.shutdown(),');
+    const drainCallIndex = serverSrc.indexOf('await generateMarketingResponseWorkerService.shutdown(remainingDrainMs());');
     const serverCloseIndex = serverSrc.indexOf('server.close((err)');
 
     expect(drainCallIndex).toBeGreaterThan(-1);
@@ -241,7 +262,7 @@ describe('server.ts shutdown sequencing (source-pinned, ENG-1189)', () => {
   });
 
   it('A-019 closes MCP session transports after in-flight drain and before the HTTP listener', () => {
-    const drainCallIndex = serverSrc.indexOf('generateMarketingResponseWorkerService.shutdown(),');
+    const drainCallIndex = serverSrc.indexOf('await generateMarketingResponseWorkerService.shutdown(remainingDrainMs());');
     const mcpShutdownIndex = serverSrc.indexOf('await mcpShutdown();');
     const serverCloseIndex = serverSrc.indexOf('server.close((err)');
 
@@ -251,7 +272,7 @@ describe('server.ts shutdown sequencing (source-pinned, ENG-1189)', () => {
   });
 
   it('drains the worker/cron/session in-flight work before closing Socket.IO', () => {
-    const drainCallIndex = serverSrc.indexOf('generateMarketingResponseWorkerService.shutdown(),');
+    const drainCallIndex = serverSrc.indexOf('await generateMarketingResponseWorkerService.shutdown(remainingDrainMs());');
     const ioCloseIndex = serverSrc.indexOf('io.close((err)');
 
     expect(drainCallIndex).toBeGreaterThan(-1);
