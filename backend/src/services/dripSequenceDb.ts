@@ -404,7 +404,13 @@ async function enrollLead(input: CreateEnrollmentInput): Promise<SequenceEnrollm
   return enrollment;
 }
 
-/** Bulk-enroll multiple leads; skips leads already enrolled (active or completed/converted). */
+/** Bulk-enroll multiple leads; skips leads already enrolled (active or completed/converted).
+ * TODO: enforce cross-request uniqueness with an approved data-plane design.
+ * Enrollment keys are random IDs; leadEmail-index is eventually consistent, so a
+ * process-local mutex or conditional put on enrollmentId cannot guarantee uniqueness
+ * across workers (or even immediately after a prior write). Do not change keys or add
+ * persisted lock records without the separate data-plane approval.
+ */
 async function bulkEnroll(
   inputs: CreateEnrollmentInput[],
 ): Promise<{ enrolled: number; skipped: number }> {

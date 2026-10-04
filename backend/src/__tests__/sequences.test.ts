@@ -124,6 +124,78 @@ const mockSequence = {
   updatedAt: '2026-01-01T00:00:00.000Z',
 };
 
+describe('Opslane by-list filter regressions', () => {
+  it.each(['', '   '])('uses lifecycle with blank status %p without enabling whole-list auto-enrollment', async (status) => {
+    const { crmDb } = require('../services/db');
+    crmDb.getAllLeadsByListId.mockResolvedValue([
+      { leadId: 'inbox', email: 'a@acme.io' },
+      { leadId: 'paying', email: 'b@acme.io', subscriptionState: 'active' },
+    ]);
+    const res = await request(app).post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1', lifecycle: 'inbox', status });
+    expect(res.status).toBe(200);
+    expect(dripSequenceDb.bulkEnroll.mock.calls[0][0].map((lead: any) => lead.leadId)).toEqual(['inbox']);
+    expect(dripSequenceDb.updateSequence).not.toHaveBeenCalled();
+  });
+
+  it('rejects a present empty lifecycle', async () => {
+    const res = await request(app).post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1', lifecycle: '' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_lifecycle');
+  });
+  it('rejects explicit status outside a stored status vocabulary', async () => {
+    const { crmDb } = require('../services/db');
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', statusConfig: [{ value: 'new' }, { value: 'won' }] });
+    const res = await request(app).post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1', status: 'nwe' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_status');
+    expect(res.body.message).toContain('new');
+    expect(res.body.message).toContain('won');
+    expect(crmDb.getLeadsByStatus).not.toHaveBeenCalled();
+    expect(dripSequenceDb.bulkEnroll).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, []])('preserves custom statuses without a stored vocabulary %p', async (statusConfig) => {
+    const { crmDb } = require('../services/db');
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', statusConfig });
+    crmDb.getLeadsByStatus.mockResolvedValue([{ leadId: 'custom', email: 'a@acme.io' }]);
+    const res = await request(app).post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1', status: 'custom' });
+    expect(res.status).toBe(200);
+    expect(dripSequenceDb.bulkEnroll.mock.calls[0][0].map((lead: any) => lead.leadId)).toEqual(['custom']);
+  });
+  it('validates lifecycle even with explicit status', async () => {
+    const res = await request(app).post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1', lifecycle: 'inbxo', status: 'new' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_lifecycle');
+    expect(dripSequenceDb.bulkEnroll).not.toHaveBeenCalled();
+  });
+
+  it('intersects explicit status with derived lifecycle', async () => {
+    const { crmDb } = require('../services/db');
+    crmDb.getLeadsByStatus.mockResolvedValue([
+      { leadId: 'inbox', email: 'a@acme.io', status: 'new' },
+      { leadId: 'paying', email: 'b@acme.io', status: 'new', subscriptionState: 'active' },
+    ]);
+    const res = await request(app).post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1', lifecycle: 'inbox', status: 'new' });
+    expect(res.status).toBe(200);
+    expect(dripSequenceDb.bulkEnroll.mock.calls[0][0].map((lead: any) => lead.leadId)).toEqual(['inbox']);
+    expect(dripSequenceDb.updateSequence).not.toHaveBeenCalled();
+  });
+  it.each(['', '   '])('rejects unknown lifecycle with blank status %p', async (status) => {
+    const res = await request(app).post('/seq_1/enrollments/by-list')
+      .send({ listId: 'list-1', lifecycle: 'inbxo', status });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_lifecycle');
+    expect(dripSequenceDb.bulkEnroll).not.toHaveBeenCalled();
+    expect(dripSequenceDb.updateSequence).not.toHaveBeenCalled();
+  });
+});
+
 // ─── App setup ────────────────────────────────────────────────────────────────
 
 const app = express();
@@ -525,7 +597,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     const crmDbMock = require('../services/db').crmDb;
     crmDbMock.getLeadsByStatus = jest.fn().mockResolvedValue({ items: [] });
     crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
-      { leadId: 'inbox-1', email: 'a@example.com' },
+      { leadId: 'inbox-1', email: 'a@acme.io' },
       { leadId: 'unknown-1', company: 'No contact channel' },
     ]);
 
@@ -536,7 +608,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     expect(res.status).toBe(200);
     expect(crmDbMock.getLeadsByStatus).not.toHaveBeenCalled();
     expect(dripSequenceDb.bulkEnroll).toHaveBeenCalledWith([
-      expect.objectContaining({ leadId: 'inbox-1', leadEmail: 'a@example.com' }),
+      expect.objectContaining({ leadId: 'inbox-1', leadEmail: 'a@acme.io' }),
     ]);
     await new Promise((r) => setTimeout(r, 10));
     expect(dripSequenceDb.updateSequence).not.toHaveBeenCalled();
@@ -591,7 +663,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
       {
         leadId: 'risk-1',
-        email: 'risk@example.com',
+        email: 'risk@acme.io',
         lifecycle: 'paying',
         subscriptionState: 'past_due',
       },
@@ -626,13 +698,13 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     crmDbMock.getAllLeadsByListId = jest.fn().mockResolvedValue([
       {
         leadId: 'paying-with-deal',
-        email: 'paying@example.com',
+        email: 'paying@acme.io',
         lifecycle: 'paying',
         openDealStages: ['Negotiation'],
       },
       {
         leadId: 'inbox-with-deal',
-        email: 'inbox@example.com',
+        email: 'inbox@acme.io',
         lifecycle: 'inbox',
         openDealStages: ['Negotiation'],
       },
@@ -661,7 +733,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
       .mockResolvedValueOnce([
         {
           leadId: 'stale-activity',
-          email: 'churn@example.com',
+          email: 'churn@acme.io',
           lifecycle: 'paying',
           lastActivityAt: '2026-01-01T00:00:00.000Z',
         },
@@ -669,7 +741,7 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
       .mockResolvedValueOnce([
         {
           leadId: 'stale-usage',
-          email: 'risk@example.com',
+          email: 'risk@acme.io',
           lifecycle: 'paying',
           lastUsageAt: '2026-01-01T00:00:00.000Z',
         },
@@ -719,11 +791,11 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     const legacyLastKey = { listId: 'list-1', status: 'retired_stage', leadId: 'legacy-1' };
     crmDbMock.getLeadsByStatus = jest.fn()
       .mockResolvedValueOnce({
-        items: [{ leadId: 'legacy-1', email: 'legacy@example.com', status: 'retired_stage' }],
+        items: [{ leadId: 'legacy-1', email: 'legacy@acme.io', status: 'retired_stage' }],
         lastEvaluatedKey: legacyLastKey,
       })
       .mockResolvedValueOnce({
-        items: [{ leadId: 'legacy-2', email: 'legacy2@example.com', status: 'retired_stage' }],
+        items: [{ leadId: 'legacy-2', email: 'legacy2@acme.io', status: 'retired_stage' }],
         lastEvaluatedKey: null,
       });
 
@@ -767,6 +839,8 @@ describe('POST /:sequenceId/enrollments/by-list - auto-enroll wiring', () => {
     expect(crmDbMock.getLeadsByStatus).toHaveBeenCalledWith(
       'list-1',
       'custom_pipeline_stage',
+      200,
+      undefined,
     );
   });
 
