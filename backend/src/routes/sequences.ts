@@ -381,7 +381,9 @@ router.post(
   authenticateToken,
   async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
-    const { listId, lifecycle, status, startAt, confirm } = req.body;
+    const { listId, lifecycle, status: rawStatus, startAt, confirm } = req.body;
+    // Blank status is absent, including for lifecycle validation and auto-enrollment.
+    const status = rawStatus != null && String(rawStatus).trim() !== '' ? String(rawStatus) : undefined;
     if (!listId) return res.status(400).json({ error: 'listId is required' });
 
     try {
@@ -407,17 +409,32 @@ router.post(
         ? storedStatusConfig
         : defaultStatusConfigFor((list as any)?.listType);
       const listStatuses = new Set(effectiveStatusConfig.map((entry: any) => String(entry?.value)));
+      // Defaults are not a stored vocabulary: older lists may have arbitrary statuses.
+      if (status != null && Array.isArray(storedStatusConfig) && storedStatusConfig.length > 0 && !listStatuses.has(status)) {
+        return res.status(400).json({
+          error: 'invalid_status',
+          message: `Unknown status "${status}". Allowed values: ${Array.from(listStatuses).join(', ')}.`,
+        });
+      }
 
       const legacyValue = lifecycle != null ? String(lifecycle) : undefined;
+      // With both fields supplied, lifecycle is canonical (not the legacy status alias).
+      // Validate it even when a status query would otherwise return no candidates.
+      if (status != null && legacyValue !== undefined && !LIFECYCLE_STAGES.has(legacyValue)) {
+        return res.status(400).json({
+          error: 'invalid_lifecycle',
+          message: `Unknown lifecycle stage "${legacyValue}". Use status for custom lead statuses.`,
+        });
+      }
       const legacyIsLifecycle =
-        Boolean(legacyValue) &&
-        LIFECYCLE_STAGES.has(legacyValue!) &&
-        !listStatuses.has(legacyValue!);
+        legacyValue !== undefined &&
+        LIFECYCLE_STAGES.has(legacyValue) &&
+        (status != null || !listStatuses.has(legacyValue));
 
       let legacyStatusProbeLeads: any[] | undefined;
       if (
         status == null &&
-        legacyValue &&
+        legacyValue !== undefined &&
         !legacyIsLifecycle &&
         !listStatuses.has(legacyValue)
       ) {
@@ -449,6 +466,10 @@ router.post(
         );
       } else {
         leads = await crmDb.getAllLeadsByListId(listId);
+      }
+      // Both filters are an intersection: status match AND derived lifecycle match.
+      if (requestedStatus && requestedLifecycle) {
+        leads = leads.filter((lead: any) => lifecycleForLead(lead) === requestedLifecycle);
       }
 
       // Filtered HERE, before coverage — not at the mapper. A lead the sequence can reach
