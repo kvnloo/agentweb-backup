@@ -1,4 +1,5 @@
 import { crmDb } from './db';
+import { matchLifecyclePresenceFilter } from '../utils/lifecycleFilterSemantics';
 import { usablePublicIdentifier, usableProfileUrl, withoutFabricatedProfileFields } from '../utils/linkedInAnonymizedProfile';
 import { agentModeService } from './agentModeService';
 import { settingsService } from './settingsService';
@@ -240,6 +241,8 @@ export class CrmEnrichmentService {
     if (spec.filters && spec.filters.length > 0) {
       filtered = filtered.filter(lead => {
         return spec.filters!.every(filter => {
+          const lifecyclePresence = matchLifecyclePresenceFilter(filter.field, filter.operator);
+          if (lifecyclePresence !== undefined) return lifecyclePresence;
           const value = lead[filter.field] ?? lead?.customFields?.[filter.field];
           switch (filter.operator) {
             case 'equals': return value === filter.value;
