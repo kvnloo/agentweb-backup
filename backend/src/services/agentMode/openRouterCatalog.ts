@@ -26,6 +26,8 @@ export interface OpenRouterCatalogEntry {
     completion?: unknown;
     input_cache_read?: unknown;
     input_cache_write?: unknown;
+    /** Tiered price overrides (e.g. long-context surcharges). */
+    overrides?: unknown;
   } | null;
 }
 
@@ -82,10 +84,16 @@ export function normalizeOpenRouterCatalogEntry(
   if (inPerM === null || outPerM === null) {
     return { ok: false, id, reason: 'missing or invalid prompt/completion pricing' };
   }
-  // Free/zero-priced entries are never auto-registered: a zero price would
-  // silently under-bill if one were ever enabled.
-  if (inPerM === 0 && outPerM === 0) {
+  // Free/zero-priced entries are never auto-registered: a zero price on either
+  // token side would silently under-bill if one were ever enabled.
+  if (inPerM === 0 || outPerM === 0) {
     return { ok: false, id, reason: 'zero pricing' };
+  }
+  // ModelPrice is flat; tiered overrides (e.g. >272k-token surcharges) cannot be
+  // represented, so recording only the base price would under-bill.
+  const overrides = entry.pricing?.overrides;
+  if (overrides !== undefined && overrides !== null && !(Array.isArray(overrides) && overrides.length === 0)) {
+    return { ok: false, id, reason: 'tiered pricing overrides unsupported' };
   }
 
   const price: ModelPrice = { inPerM, outPerM };
