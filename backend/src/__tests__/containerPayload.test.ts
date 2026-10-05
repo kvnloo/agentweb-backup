@@ -38,6 +38,14 @@ describe('reply-guy container payload (ENG-715 AC1/AC2/AC4)', () => {
     expect(out.map(c => c.id)).toEqual(['b', 'c']);
   });
 
+  it('treats the same URL under a different ID as the same post', () => {
+    const sameUrl = { url: 'https://x.com/someone/status/z' };
+    const out = selectReplyCandidates([cand('p', sameUrl), cand('q', sameUrl), cand('r')]);
+    expect(out.map(c => c.id)).toEqual(['p', 'r']);
+    const prev = selectReplyCandidates([cand('n', sameUrl), cand('m')], { previousIds: [sameUrl.url] });
+    expect(prev.map(c => c.id)).toEqual(['m']);
+  });
+
   it('renders every shown candidate with text, link and reply', () => {
     const text = renderReplyGuyOpening({ ok: true, candidates: [cand('1'), cand('2', { url: '' })] });
     expect(text).toContain('Post body 1');

@@ -56,8 +56,10 @@ export function selectReplyCandidates(
     const suggestedReply = nonEmpty(c?.suggestedReply);
     if (!postText || !url || !suggestedReply) continue;
     const id = nonEmpty(c?.id) ?? url;
-    if (seen.has(id)) continue;
+    // Identity is the ID *and* the URL: either one already seen means the same post.
+    if (seen.has(id) || seen.has(url)) continue;
     seen.add(id);
+    seen.add(url);
     out.push({ id, postText, url, suggestedReply });
   }
   return out;
