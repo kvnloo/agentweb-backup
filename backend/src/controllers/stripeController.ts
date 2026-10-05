@@ -16,6 +16,7 @@ import {
   handleSubscriptionScheduleEnded,
   reconcileAllStripeUsers,
   findBasePlanItem,
+  getSubscriptionPeriodEndIso,
 } from '../services/stripeService';
 
 const CUSTOMER_FRONTEND_URL =
@@ -333,9 +334,8 @@ async function sendStripeEventToCrm(event: any): Promise<void> {
     }
 
     const status = (obj.status as string | undefined) || undefined;
-    const currentPeriodEnd = typeof obj.current_period_end === 'number'
-      ? new Date(obj.current_period_end * 1000).toISOString()
-      : undefined;
+    // Basil moved current_period_end onto subscription items (ENG-405).
+    const currentPeriodEnd = getSubscriptionPeriodEndIso(obj);
 
     const { onStripeSubscriptionEvent } = await import('../services/crmSignalHooks');
     await onStripeSubscriptionEvent({
