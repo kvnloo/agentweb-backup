@@ -21,6 +21,7 @@ import axios from 'axios';
 import { extractVariables, leadHasVariable, isSupportedVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
 import { LEAD_LIFECYCLES, defaultStatusConfigFor } from '../utils/leadSchema';
+import { computeLifecycle, LifecycleStage } from '../services/lifecycleService';
 import {
   requiredChannels, leadIsReachable, skipKeyForChannels, enrollmentIdentity,
   enrollmentIdentityCandidates,
@@ -40,6 +41,84 @@ import {
  * fail silently.
  */
 const LIFECYCLE_STAGES: ReadonlySet<string> = new Set<string>(LEAD_LIFECYCLES);
+
+function lifecycleForLead(lead: any): LifecycleStage {
+  const currentLifecycle = LIFECYCLE_STAGES.has(lead?.lifecycle)
+    ? lead.lifecycle as LifecycleStage
+    : undefined;
+  const computed = computeLifecycle({
+    email: lead?.email ?? undefined,
+    phone: lead?.phone ?? undefined,
+    domain: lead?.domain ?? undefined,
+    hasUserRecord: lead?.hasUserRecord ?? undefined,
+    subscriptionState: lead?.subscriptionState ?? undefined,
+    lastActivityAt: lead?.lastActivityAt ?? undefined,
+    lastUsageAt: lead?.lastUsageAt ?? undefined,
+    healthScore: lead?.healthScore ?? undefined,
+    currentLifecycle,
+    openDealStages: lead?.openDealStages ?? undefined,
+  });
+
+  if (!currentLifecycle || computed === currentLifecycle) return computed;
+
+  const subscriptionIsDefinitive =
+    lead?.subscriptionState === 'active' ||
+    lead?.subscriptionState === 'trialing' ||
+    lead?.subscriptionState === 'past_due' ||
+    lead?.subscriptionState === 'canceled';
+  const hasOpenDeal =
+    Array.isArray(lead?.openDealStages) && lead.openDealStages.length > 0;
+  const dealCanPromoteCurrent =
+    hasOpenDeal &&
+    (currentLifecycle === 'unknown' ||
+      currentLifecycle === 'inbox' ||
+      currentLifecycle === 'signed_up');
+  const provesSignup =
+    lead?.hasUserRecord === true &&
+    (currentLifecycle === 'unknown' || currentLifecycle === 'inbox');
+
+  const nowMs = Date.now();
+  const ageDays = (value: unknown): number | null => {
+    if (typeof value !== 'string' || !value) return null;
+    const parsed = Date.parse(value);
+    if (Number.isNaN(parsed) || parsed > nowMs) return null;
+    return (nowMs - parsed) / (24 * 60 * 60 * 1000);
+  };
+  const activityProvesChurn = (ageDays(lead?.lastActivityAt) ?? 0) > 60;
+  const payingOrAtRisk =
+    currentLifecycle === 'paying' || currentLifecycle === 'at_risk';
+  const healthProvesRisk =
+    payingOrAtRisk &&
+    typeof lead?.healthScore === 'number' &&
+    lead.healthScore < 40;
+  const usageProvesRisk =
+    payingOrAtRisk && (ageDays(lead?.lastUsageAt) ?? 0) > 30;
+
+  return subscriptionIsDefinitive ||
+    dealCanPromoteCurrent ||
+    provesSignup ||
+    activityProvesChurn ||
+    healthProvesRisk ||
+    usageProvesRisk
+    ? computed
+    : currentLifecycle;
+}
+
+async function getAllLeadsByStatus(
+  listId: string,
+  status: string,
+  pageSize = 200,
+): Promise<any[]> {
+  const items: any[] = [];
+  let lastKey: any = undefined;
+  do {
+    const page = await crmDb.getLeadsByStatus(listId, status, pageSize, lastKey);
+    if (Array.isArray(page)) return page;
+    items.push(...((page as any).items ?? (page as any).leads ?? []));
+    lastKey = (page as any).lastEvaluatedKey;
+  } while (lastKey);
+  return items;
+}
 
 const router = express.Router();
 
@@ -302,7 +381,9 @@ router.post(
   authenticateToken,
   async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
-    const { listId, lifecycle, startAt, confirm } = req.body;
+    const { listId, lifecycle, status: rawStatus, startAt, confirm } = req.body;
+    // Blank status is absent, including for lifecycle validation and auto-enrollment.
+    const status = rawStatus != null && String(rawStatus).trim() !== '' ? String(rawStatus) : undefined;
     if (!listId) return res.status(400).json({ error: 'listId is required' });
 
     try {
@@ -320,47 +401,75 @@ router.post(
         return res.status(403).json({ error: 'Forbidden' });
       }
 
-      // Load ALL leads. Lifecycle-filtered enroll keeps its existing path; the
-      // default list enroll uses the paginated loader so counts/enrollment are complete.
-      let leads: any[];
-      if (lifecycle) {
-        const r = await crmDb.getLeadsByStatus(listId, lifecycle);
-        leads = Array.isArray(r) ? r : ((r as any).items ?? (r as any).leads ?? []);
-        // Only complain when the value is a lifecycle stage AND NOT a status this list
-        // actually defines. `at_risk` and `churned` are BOTH lifecycle stages and default
-        // lead statuses (db.ts:5364), and a list can define any statusConfig it likes — so
-        // the first version of this guard answered a perfectly valid `status: churned`
-        // filter that happened to match nothing with a 400 telling the caller to "filter by
-        // a lead status instead", which is exactly what they had done.
-        // A list with no stored statusConfig does not have NO statuses — it falls back to
-        // the default set, which contains `churned` (and `at_risk` for a customers list).
-        // Reading absent as empty put the original 400 straight back for every list
-        // created before createLeadList started persisting a default.
-        const storedStatusConfig = (list as any)?.statusConfig;
-        const effectiveStatusConfig = Array.isArray(storedStatusConfig) && storedStatusConfig.length > 0
-          ? storedStatusConfig
-          : defaultStatusConfigFor((list as any)?.listType);
-        const listStatuses = new Set(
-          effectiveStatusConfig.map((s: any) => String(s?.value)),
-        );
-        if (leads.length === 0 && LIFECYCLE_STAGES.has(String(lifecycle)) && !listStatuses.has(String(lifecycle))) {
-          console.error(
-            `[sequences] ENG-2127: lifecycle filter "${lifecycle}" matched 0 leads in list ` +
-            `${listId} because getLeadsByStatus queries the \`status\` attribute, not ` +
-            `\`lifecycle\`. This filter cannot match; enrolling nothing.`,
-          );
+      // The historical request field `lifecycle` also carried lead status values.
+      // Keep that compatibility for current or still-materialized legacy statuses, while
+      // lifecycle-only values are derived from the complete lead rows.
+      const storedStatusConfig = (list as any)?.statusConfig;
+      const effectiveStatusConfig = Array.isArray(storedStatusConfig) && storedStatusConfig.length > 0
+        ? storedStatusConfig
+        : defaultStatusConfigFor((list as any)?.listType);
+      const listStatuses = new Set(effectiveStatusConfig.map((entry: any) => String(entry?.value)));
+      // Defaults are not a stored vocabulary: older lists may have arbitrary statuses.
+      if (status != null && Array.isArray(storedStatusConfig) && storedStatusConfig.length > 0 && !listStatuses.has(status)) {
+        return res.status(400).json({
+          error: 'invalid_status',
+          message: `Unknown status "${status}". Allowed values: ${Array.from(listStatuses).join(', ')}.`,
+        });
+      }
+
+      const legacyValue = lifecycle != null ? String(lifecycle) : undefined;
+      // With both fields supplied, lifecycle is canonical (not the legacy status alias).
+      // Validate it even when a status query would otherwise return no candidates.
+      if (status != null && legacyValue !== undefined && !LIFECYCLE_STAGES.has(legacyValue)) {
+        return res.status(400).json({
+          error: 'invalid_lifecycle',
+          message: `Unknown lifecycle stage "${legacyValue}". Use status for custom lead statuses.`,
+        });
+      }
+      const legacyIsLifecycle =
+        legacyValue !== undefined &&
+        LIFECYCLE_STAGES.has(legacyValue) &&
+        (status != null || !listStatuses.has(legacyValue));
+
+      let legacyStatusProbeLeads: any[] | undefined;
+      if (
+        status == null &&
+        legacyValue !== undefined &&
+        !legacyIsLifecycle &&
+        !listStatuses.has(legacyValue)
+      ) {
+        legacyStatusProbeLeads = await getAllLeadsByStatus(listId, legacyValue);
+        if (legacyStatusProbeLeads.length === 0) {
           return res.status(400).json({
-            error: 'lifecycle_filter_unsupported',
-            message:
-              `Filtering by lifecycle stage "${lifecycle}" is not supported yet — leads are ` +
-              `indexed by status, not lifecycle, so this filter matches nothing. Enrol the ` +
-              `whole list, or filter by a lead status instead.`,
-            lifecycle,
-            enrolled: false,
+            error: 'invalid_lifecycle',
+            message: `Unknown lifecycle stage "${legacyValue}". Use status for custom lead statuses.`,
           });
         }
+      }
+
+      const requestedStatus = status != null
+        ? String(status)
+        : (legacyValue && !legacyIsLifecycle ? legacyValue : undefined);
+      const requestedLifecycle = legacyIsLifecycle ? legacyValue : undefined;
+
+      let leads: any[];
+      if (requestedStatus) {
+        if (legacyStatusProbeLeads !== undefined) {
+          leads = legacyStatusProbeLeads;
+        } else {
+          leads = await getAllLeadsByStatus(listId, requestedStatus);
+        }
+      } else if (requestedLifecycle) {
+        const allLeads = await crmDb.getAllLeadsByListId(listId);
+        leads = allLeads.filter(
+          (lead: any) => lifecycleForLead(lead) === requestedLifecycle,
+        );
       } else {
         leads = await crmDb.getAllLeadsByListId(listId);
+      }
+      // Both filters are an intersection: status match AND derived lifecycle match.
+      if (requestedStatus && requestedLifecycle) {
+        leads = leads.filter((lead: any) => lifecycleForLead(lead) === requestedLifecycle);
       }
 
       // Filtered HERE, before coverage — not at the mapper. A lead the sequence can reach
@@ -447,7 +556,9 @@ router.post(
       // unless it's already there. This means new leads added to this list later
       // will be automatically enrolled.
       const existing = sequence.autoEnrollListIds ?? [];
-      if (!existing.includes(listId)) {
+      // A filtered enrollment is a one-shot selection. Persisting only the list id would
+      // discard the filter and auto-enroll every future lead from the list.
+      if (!requestedStatus && !requestedLifecycle && !existing.includes(listId)) {
         void dripSequenceDb.updateSequence(req.params.sequenceId, authReq.user!.userId, {
           autoEnrollListIds: [...existing, listId],
         }).catch((e) => console.error('[sequences] autoEnrollListIds update error:', e));

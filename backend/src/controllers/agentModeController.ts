@@ -7265,8 +7265,16 @@ export async function runScheduledChat(
       zeroAssistantOutput = hasAssistantMessage === false;
     }
 
+    // ENG-2209: a worker drain/shutdown (deploy, restart, instance replacement) is
+    // deploy timing, not a property of the run. When the session already had
+    // assistant turns it is NOT zero-output, so it used to fall through to
+    // "error, no retry" and the scheduled run was simply lost. Route it through the
+    // same ENG-971 recovery as zero output: the publish ledger still decides between
+    // resume (published + settled), pause (published + not resumable) and a fresh
+    // requeue (nothing published) — never a blind restart over published work.
+    const workerShutdownInterrupted = !zeroAssistantOutput && isWorkerShutdownError(error);
     let zeroAssistantRequeuedAt: string | undefined;
-    if (zeroAssistantOutput) {
+    if (zeroAssistantOutput || workerShutdownInterrupted) {
       // ENG-971: zero assistant output does NOT mean the run did nothing. A publish
       // can land and the process die before the summary — exactly the shape of the
       // session this issue came from, minus the closing turn. Requeuing that run
@@ -7496,8 +7504,6 @@ export async function runScheduledChat(
         const nextRetryCount = zeroOutputNextRetryCount;
         if (nextRetryCount <= ZERO_ASSISTANT_MAX_REQUEUES) {
           const retryAt = new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString();
-          zeroAssistantRequeuedAt = retryAt;
-
           try {
             await scheduleDb.updateSchedule(schedule.scheduleId, {
               status: 'active',
@@ -7507,6 +7513,7 @@ export async function runScheduledChat(
               lastZeroAssistantOutputSessionId: sessionId || '',
               updatedAt: new Date().toISOString(),
             });
+            zeroAssistantRequeuedAt = retryAt;
           } catch (requeueError) {
             console.error(`Failed to requeue zero-output scheduled chat ${schedule.scheduleId}:`, requeueError);
           }
@@ -7634,6 +7641,7 @@ export async function runScheduledChat(
         zeroAssistantOutput: true,
         ...(zeroAssistantRequeuedAt ? { requeuedAt: zeroAssistantRequeuedAt } : {}),
       } : {}),
+      ...(workerShutdownInterrupted && zeroAssistantRequeuedAt ? { requeuedAt: zeroAssistantRequeuedAt } : {}),
     };
 
     // Save the error result to database (without actualResponse to save space)
@@ -7652,7 +7660,12 @@ export async function runScheduledChat(
     // used to trip BOTH filers and land two identical Linear issues <1s apart; now it lands one issue
     // plus an occurrence comment.
     const originalMessage = (error as any)?.originalMessage;
-    void fileAutoIssue({
+    // ENG-2209: a drain-interrupted run that was requeued is an expected deploy
+    // event with automatic recovery, not a defect — don't file a Linear issue for
+    // it (the deduped oncall alert below still records the occurrence). One that
+    // could NOT be requeued (paused, cap exhausted, write failed) still files.
+    const skipAutoIssue = workerShutdownInterrupted && Boolean(zeroAssistantRequeuedAt);
+    void (skipAutoIssue ? Promise.resolve() : fileAutoIssue({
       title: zeroAssistantOutput
         ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
         : `Scheduled Chat Error: ${schedule.scheduleName}`,
@@ -7672,7 +7685,7 @@ export async function runScheduledChat(
         'Error Message': errorMessage,
         ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
       }
-    })
+    }))
       .catch(err => console.error('Failed to file scheduled-chat-error issue:', err))
       .then(() => sendAgentModeOncallAlert({
         subject: zeroAssistantOutput
@@ -9249,6 +9262,13 @@ export const agentModeController = {
     // replaced/abandoned some other way would show. Mirrors approvalDeckAnswerMeta.
     let approvalDeckCancelledMeta: { deckId: string } | undefined;
     try {
+      // A-019: do not admit a fresh interactive turn after shutdown drain starts.
+      // This is intentionally before STT, idempotency/session claims, deck writes,
+      // and all provider work. The caller can retry on the replacement instance.
+      if (!isCronEnabled()) {
+        return res.status(503).json({ message: 'Instance draining — retry on new instance' });
+      }
+
       const user = req.user as User;
       const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer, deckAnswer, deckCancel, clientId } = req.body;
       let { userMessage } = req.body;

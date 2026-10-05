@@ -239,9 +239,13 @@ describe('ENG-1133 — a partial lead import survives the dispatch boundary', ()
   it('spends the turn cap as the import write budget', async () => {
     const { emmaToolRegistry } = await import('../../emma/registry');
     await import('../../emma/tools');
-    const { agentModeService } = await import('../../services/agentModeService');
+    // ENG-2103 (F2): addLeadsToList's body now lives in emma/impl/leads.ts —
+    // emma/tools.ts's `add_leads_to_list` execute() calls that module
+    // directly rather than agentModeService, so the spy has to target it
+    // there to actually intercept the dispatch.
+    const leadsImpl = await import('../../emma/impl/leads');
     const addLeadsToList = jest
-      .spyOn(agentModeService, 'addLeadsToList')
+      .spyOn(leadsImpl, 'addLeadsToList')
       .mockResolvedValue({ success: true } as any);
     const turnHardCapMs = Date.now() + 30_000;
 
