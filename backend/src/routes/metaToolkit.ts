@@ -21,6 +21,7 @@ export const META_TOOLKIT_MAX_PER_MINUTE = 60;
 
 export function sendMetaToolkitError(res: Response, error: unknown) {
   if (error instanceof MetaToolkitAuthError) {
+    if (error.retryAfterSeconds) res.setHeader('Retry-After', String(error.retryAfterSeconds));
     return res.status(error.status).json({ error: error.message });
   }
   if (error instanceof MetaToolkitRefusal) {
