@@ -69,6 +69,10 @@ import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { classifyToolFailureType } from '../utils/toolFailureType';
 import { resolveSenderForSend } from '../services/crmSenderService';
 import { LEAD_IMPORT_WRITE_BUDGET_MS } from '../utils/leadImportLedger';
+// ENG-2103 (F2): sendEmailToLead's body now lives in emma/impl/leads.ts and
+// sources getCrmSenders from this shared module directly (not `this.`), so
+// its own tests below mock it here instead of on `service`.
+import * as sharedCrmSenders from '../emma/impl/shared/crmSenders';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
@@ -2136,7 +2140,7 @@ describe('AgentModeService - CRM Tools', () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadById.mockResolvedValue(leadWithDraft as any);
       mockCrmDb.updateLead.mockResolvedValue({} as any);
-      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+      jest.spyOn(sharedCrmSenders, 'getCrmSenders').mockResolvedValue({
         success: true,
         senders: [
           { id: 'sender-1', email: 'sales@acme.com', fromName: 'Sales Team' },
@@ -2168,7 +2172,7 @@ describe('AgentModeService - CRM Tools', () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadById.mockResolvedValue(leadNoSender as any);
       mockCrmDb.updateLead.mockResolvedValue({} as any);
-      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+      jest.spyOn(sharedCrmSenders, 'getCrmSenders').mockResolvedValue({
         success: true,
         senders: [
           { id: 'sender-default', email: 'default@acme.com', fromName: 'Default' },
@@ -2207,7 +2211,7 @@ describe('AgentModeService - CRM Tools', () => {
     it('should return error when no senders configured', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadById.mockResolvedValue(leadWithDraft as any);
-      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+      jest.spyOn(sharedCrmSenders, 'getCrmSenders').mockResolvedValue({
         success: true,
         senders: [],
         defaultSenderId: null
@@ -2222,7 +2226,7 @@ describe('AgentModeService - CRM Tools', () => {
     it('should return error when Resend fails', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadById.mockResolvedValue(leadWithDraft as any);
-      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+      jest.spyOn(sharedCrmSenders, 'getCrmSenders').mockResolvedValue({
         success: true,
         senders: [{ id: 'sender-1', email: 'sales@acme.com', fromName: 'Sales' }],
         defaultSenderId: 'sender-1'
@@ -2247,7 +2251,7 @@ describe('AgentModeService - CRM Tools', () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadById.mockResolvedValue(leadWithGmailSender as any);
       mockCrmDb.updateLead.mockResolvedValue({} as any);
-      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+      jest.spyOn(sharedCrmSenders, 'getCrmSenders').mockResolvedValue({
         success: true,
         senders: [gmailSender],
         defaultSenderId: 'sender-g1',
@@ -2284,7 +2288,7 @@ describe('AgentModeService - CRM Tools', () => {
       const leadWithBrokenSender = { ...leadWithDraft, selectedSenderId: 'sender-g-broken' };
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadById.mockResolvedValue(leadWithBrokenSender as any);
-      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+      jest.spyOn(sharedCrmSenders, 'getCrmSenders').mockResolvedValue({
         success: true,
         senders: [brokenGmailSender],
         defaultSenderId: 'sender-g-broken',
@@ -2307,7 +2311,7 @@ describe('AgentModeService - CRM Tools', () => {
       };
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadById.mockResolvedValue({ ...leadWithDraft, selectedSenderId: 'sender-g2' } as any);
-      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+      jest.spyOn(sharedCrmSenders, 'getCrmSenders').mockResolvedValue({
         success: true,
         senders: [gmailSender],
         defaultSenderId: 'sender-g2',
@@ -2335,7 +2339,7 @@ describe('AgentModeService - CRM Tools', () => {
       };
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.getLeadById.mockResolvedValue({ ...leadWithDraft, selectedSenderId: 'sender-g2' } as any);
-      jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+      jest.spyOn(sharedCrmSenders, 'getCrmSenders').mockResolvedValue({
         success: true,
         senders: [gmailSender],
         defaultSenderId: 'sender-g2',
@@ -2368,7 +2372,7 @@ describe('AgentModeService - CRM Tools', () => {
       mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm({ shareSettings: { crm: { enabled: true, editors: [orgMemberId] } } }) as any);
       mockCrmDb.getLeadById.mockResolvedValue(leadWithDraft as any);
       mockCrmDb.updateLead.mockResolvedValue({} as any);
-      const getCrmSendersSpy = jest.spyOn(service as any, 'getCrmSenders').mockResolvedValue({
+      const getCrmSendersSpy = jest.spyOn(sharedCrmSenders, 'getCrmSenders').mockResolvedValue({
         success: true,
         senders: [{ id: 'sender-1', email: 'owner@acme.com', fromName: 'Owner' }],
         defaultSenderId: 'sender-1',
