@@ -504,6 +504,8 @@ import {
   collectPendingDestinations,
   collectPendingCreativeIds,
   computeMetaWriteManifestDigest,
+  computeTrackingOverrideDigest,
+  trackingOverrideTokenMatches,
 } from './metaLaunchGate';
 import { buildSandboxFetchHtml } from './sandboxTrackingPreflight';
 import { HubSpotService } from './hubspotService';
