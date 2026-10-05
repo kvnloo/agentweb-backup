@@ -15,6 +15,8 @@ jest.mock('../services/metaService', () => {
       getCampaign: jest.fn(),
       createAdSet: jest.fn(),
       getAdSet: jest.fn(),
+      // ENG-2277: createMetaAdsAdSet reads the ad account's currency to normalise money.
+      getAdAccountCurrency: jest.fn().mockResolvedValue('USD'),
       // createMetaAdsAdSet's pre-flight token-freshness check
       // (ensureFreshMetaAdAccountToken) calls this before every ad-set
       // operation; without a mock it throws "not a function" on any
@@ -235,7 +237,7 @@ describe('ENG-838/ENG-842 — ad set bid strategy and dayparting must not silent
       const result = await service.createMetaAdsAdSet('user123', {
         ...baseAdSetParams,
         daily_budget: undefined,
-        end_time: '2026-10-01T00:00:00+0000',
+        end_time: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
         adset_schedule: [{ start_minute: 540, end_minute: 1020, days: [1, 2, 3, 4, 5] }]
       });
 
