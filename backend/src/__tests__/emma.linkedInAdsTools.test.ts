@@ -1,17 +1,20 @@
 /**
  * Tests for LinkedIn Ads tools registered in emmaToolRegistry.
+ *
+ * ENG-2103 (F2) update: `call_linkedin_marketing_api`/`call_linkedin_ads_insights_api`
+ * are now repointed at `emma/impl/adsApis.ts` directly (no private-method
+ * blocker for these two — see that module's/tools.ts's header comments), so
+ * this file's mock moved from `agentModeService` to `adsApisImpl`. `tools.ts`
+ * uses `import * as adsApisImpl from './impl/adsApis'`, so the mock must be a
+ * plain object of `jest.fn()`s, not a Proxy.
  */
-
-// We mock agentModeService before importing tools.ts to ensure it gets the mocked version
-jest.mock('../services/agentModeService', () => ({
-    agentModeService: {
-        callLinkedInMarketingApi: jest.fn(),
-        callLinkedInAdsInsightsApi: jest.fn(),
-    },
+jest.mock('../emma/impl/adsApis', () => ({
+    callLinkedInMarketingApi: jest.fn(),
+    callLinkedInAdsInsightsApi: jest.fn(),
 }));
 
 import { emmaToolRegistry } from '../emma/registry';
-import { agentModeService } from '../services/agentModeService';
+import * as adsApisImpl from '../emma/impl/adsApis';
 
 // Import tools.ts to ensure tools are registered
 import '../emma/tools';
@@ -35,7 +38,7 @@ describe('LinkedIn Ads Emma Tools', () => {
             if (!tool) throw new Error(`Tool ${toolName} not found`);
 
             const mockResponse = { success: true, message: 'Campaign created' };
-            (agentModeService.callLinkedInMarketingApi as jest.Mock).mockResolvedValue(mockResponse);
+            (adsApisImpl.callLinkedInMarketingApi as jest.Mock).mockResolvedValue(mockResponse);
 
             const args = {
                 entity_type: 'CAMPAIGN',
@@ -47,7 +50,7 @@ describe('LinkedIn Ads Emma Tools', () => {
 
             const result = await tool.execute(args, context);
 
-            expect(agentModeService.callLinkedInMarketingApi).toHaveBeenCalledWith(
+            expect(adsApisImpl.callLinkedInMarketingApi).toHaveBeenCalledWith(
                 'user-123',
                 'CAMPAIGN',
                 'CREATE',
@@ -72,7 +75,7 @@ describe('LinkedIn Ads Emma Tools', () => {
             if (!tool) throw new Error(`Tool ${toolName} not found`);
 
             const mockResponse = { success: true, analytics: [] };
-            (agentModeService.callLinkedInAdsInsightsApi as jest.Mock).mockResolvedValue(mockResponse);
+            (adsApisImpl.callLinkedInAdsInsightsApi as jest.Mock).mockResolvedValue(mockResponse);
 
             const args = {
                 account_id: 'urn:li:sponsoredAccount:123',
@@ -86,7 +89,7 @@ describe('LinkedIn Ads Emma Tools', () => {
 
             const result = await tool.execute(args, context);
 
-            expect(agentModeService.callLinkedInAdsInsightsApi).toHaveBeenCalledWith(
+            expect(adsApisImpl.callLinkedInAdsInsightsApi).toHaveBeenCalledWith(
                 'user-123',
                 'urn:li:sponsoredAccount:123',
                 {

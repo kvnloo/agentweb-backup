@@ -9,7 +9,10 @@
  * call sites in agentModeService.ts (create_html_file passthrough, the
  * rendered-HTML upload path, and the markdown-fallback upload path).
  */
-import { buildHtmlArtifactFilename } from '../services/agentModeService';
+// ENG-2103 (F2): buildHtmlArtifactFilename's body moved to
+// emma/impl/htmlCreation.ts (the createHtmlFile/createHtmlTemplate cluster);
+// import it from there instead of agentModeService.ts.
+import { buildHtmlArtifactFilename } from '../emma/impl/htmlCreation';
 
 describe('buildHtmlArtifactFilename (ENG-1685)', () => {
   it('reproduces the reported title without truncating the final word', () => {

@@ -957,8 +957,8 @@ export class MetaService {
       // batch would have a REAL Page silently missing from this list, and the
       // gate would wrongly block a legitimate creative, or the cross-check
       // would wrongly flag a healthy account as broken.
-      const cursor = await MetaService.withReadDeadline(
-        () => user.getAccounts(fields, params),
+      const cursor = await MetaService.withReadDeadline<any>(
+        () => user.getAccounts(fields, params) as Promise<any>,
         'page list',
       );
       const { items, truncated } = await this.drainCursor(cursor, META_LIST_MAX_PAGES);
