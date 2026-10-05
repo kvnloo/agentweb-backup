@@ -335,7 +335,14 @@ async function sendStripeEventToCrm(event: any): Promise<void> {
 
     const status = (obj.status as string | undefined) || undefined;
     // Basil moved current_period_end onto subscription items (ENG-405).
-    const currentPeriodEnd = getSubscriptionPeriodEndIso(obj);
+    // Use the base-plan item, not items.data[0] (a seat add-on may sort
+    // first), keeping the legacy root-field fallback — mirrors routes/crm.ts.
+    const basePlanItem = obj?.items?.data?.length ? findBasePlanItem(obj) : undefined;
+    const currentPeriodEnd = getSubscriptionPeriodEndIso(
+      basePlanItem
+        ? { items: { data: [basePlanItem] }, current_period_end: obj.current_period_end }
+        : obj
+    );
 
     const { onStripeSubscriptionEvent } = await import('../services/crmSignalHooks');
     await onStripeSubscriptionEvent({
