@@ -241,6 +241,10 @@ describe('llmPricing', () => {
       // Models whose provider publishes an explicit cache rate that differs from the
       // 10%/125% convention (see the ModelPrice cache-price docs). gpt-4o's real
       // cached-input rate is $1.25 (50% of input), not the derived 10%.
+      // refreshModelCatalog.ts's writer registers every auto-added model here directly
+      // at add time (ENG-2293) — not inferred from the registry's human-editable
+      // `description` field, which the draft-PR review step explicitly tells
+      // reviewers to rewrite before marking a model ready.
       const explicitCacheOverrides = new Set(['gpt-4o', 'openrouter/anthropic/claude-fable-5.1', 'gemini-3.8-flash', 'openrouter/anthropic/claude-opus-5.5', 'openrouter/x-ai/grok-4.7']);
       for (const [model, price] of Object.entries(MODEL_PRICING)) {
         if (price.outPerM === 0) continue; // embeddings have no cache convention
