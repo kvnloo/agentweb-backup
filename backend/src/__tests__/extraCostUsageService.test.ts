@@ -1,8 +1,4 @@
-import {
-  getUserExtraCostUsage,
-  checkExtraCostUsage,
-  incrementExtraCostUsage,
-} from "../services/tokenUsageService";
+import { incrementExtraCostUsage } from "../services/tokenUsageService";
 
 jest.mock("../services/db", () => ({
   userDb: {
@@ -11,21 +7,10 @@ jest.mock("../services/db", () => ({
   },
 }));
 
-jest.mock("../services/subscriptionService", () => ({
-  getUserSubscriptionType: jest.fn(),
-  getSubscriptionTypeConfig: jest.fn(),
-}));
-
 import { userDb } from "../services/db";
-import {
-  getUserSubscriptionType,
-  getSubscriptionTypeConfig,
-} from "../services/subscriptionService";
 
 const mockGetUserById = userDb.getUserById as jest.Mock;
 const mockUpdateUser = userDb.updateUser as jest.Mock;
-const mockGetUserSubscriptionType = getUserSubscriptionType as jest.Mock;
-const mockGetSubscriptionTypeConfig = getSubscriptionTypeConfig as jest.Mock;
 
 function currentMonth(): string {
   const now = new Date();
@@ -36,89 +21,11 @@ beforeEach(() => {
   jest.clearAllMocks();
 });
 
-// ─── FAIL TESTS ──────────────────────────────────────────────────────────────
-
-describe("getUserExtraCostUsage - failure cases", () => {
-  it("throws when user not found", async () => {
-    mockGetUserById.mockResolvedValue(null);
-    await expect(getUserExtraCostUsage("nonexistent")).rejects.toThrow("User not found");
-  });
-
-  it("returns zero usage when extraCostUsage field is missing", async () => {
-    mockGetUserById.mockResolvedValue({ userId: "u1", email: "a@b.com" });
-    const result = await getUserExtraCostUsage("u1");
-    expect(result.totalCost).toBe(0);
-    expect(result.breakdown).toEqual({});
-    expect(result.month).toBe(currentMonth());
-  });
-
-  it("returns zero when stored month is stale (lazy reset)", async () => {
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      extraCostUsage: {
-        month: "2025-01",
-        totalCost: 12.5,
-        breakdown: { enrichment: 12.5 },
-        resetDate: "2025-02-01T00:00:00.000Z",
-      },
-    });
-    const result = await getUserExtraCostUsage("u1");
-    expect(result.totalCost).toBe(0);
-    expect(result.breakdown).toEqual({});
-    expect(result.month).toBe(currentMonth());
-  });
-});
-
-describe("checkExtraCostUsage - blocked cases", () => {
-  it("blocks when user has exceeded monthly extra cost allowance", async () => {
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      extraCostUsage: {
-        month: currentMonth(),
-        totalCost: 55.0,
-        breakdown: { enrichment: 55.0 },
-        resetDate: "2026-05-01T00:00:00.000Z",
-      },
-    });
-    mockGetUserSubscriptionType.mockResolvedValue("Basic");
-    mockGetSubscriptionTypeConfig.mockResolvedValue({
-      name: "Basic",
-      allowedPages: ["*"],
-      allowedSkills: ["*"],
-      monthlyExtraCostAllowance: 50,
-    });
-
-    const result = await checkExtraCostUsage("u1");
-    expect(result.allowed).toBe(false);
-    expect(result.percentUsed).toBeGreaterThan(100);
-  });
-
-  it("blocks at exactly 100% usage", async () => {
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      extraCostUsage: {
-        month: currentMonth(),
-        totalCost: 50.0,
-        breakdown: { enrichment: 50.0 },
-        resetDate: "2026-05-01T00:00:00.000Z",
-      },
-    });
-    mockGetUserSubscriptionType.mockResolvedValue("Basic");
-    mockGetSubscriptionTypeConfig.mockResolvedValue({
-      name: "Basic",
-      allowedPages: ["*"],
-      allowedSkills: ["*"],
-      monthlyExtraCostAllowance: 50,
-    });
-
-    const result = await checkExtraCostUsage("u1");
-    expect(result.allowed).toBe(false);
-    expect(result.percentUsed).toBe(100);
-  });
-});
+// NOTE (ENG-1250 / ENG-2286): the extraCostUsage READ/GATE path
+// (getUserExtraCostUsage / checkExtraCostUsage) was retired as dead code — it had
+// no live callers — so its tests were removed with it. Only the write
+// (incrementExtraCostUsage), still used by CRM enrichment, remains and is covered
+// here until the write itself is retired under ENG-2286.
 
 describe("incrementExtraCostUsage - failure cases", () => {
   it("skips update when breakdown costs are all zero", async () => {
@@ -130,106 +37,6 @@ describe("incrementExtraCostUsage - failure cases", () => {
   it("does not throw on DB error (graceful degradation)", async () => {
     mockGetUserById.mockRejectedValue(new Error("DB connection failed"));
     await expect(incrementExtraCostUsage("u1", { enrichment: 1.5 })).resolves.toBeUndefined();
-  });
-});
-
-// ─── SUCCESS TESTS ────────────────────────────────────────────────────────────
-
-describe("getUserExtraCostUsage - success", () => {
-  it("returns current month usage with breakdown", async () => {
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      extraCostUsage: {
-        month: currentMonth(),
-        totalCost: 7.8,
-        breakdown: { enrichment: 7.8 },
-        resetDate: "2026-05-01T00:00:00.000Z",
-      },
-    });
-
-    const result = await getUserExtraCostUsage("u1");
-    expect(result.totalCost).toBe(7.8);
-    expect(result.breakdown).toEqual({ enrichment: 7.8 });
-    expect(result.month).toBe(currentMonth());
-  });
-});
-
-describe("checkExtraCostUsage - success", () => {
-  it("allows unlimited usage when no allowance set", async () => {
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      extraCostUsage: {
-        month: currentMonth(),
-        totalCost: 9999,
-        breakdown: { enrichment: 9999 },
-        resetDate: "2026-05-01T00:00:00.000Z",
-      },
-    });
-    mockGetUserSubscriptionType.mockResolvedValue("Enterprise");
-    mockGetSubscriptionTypeConfig.mockResolvedValue({
-      name: "Enterprise",
-      allowedPages: ["*"],
-      allowedSkills: ["*"],
-      // no monthlyExtraCostAllowance
-    });
-
-    const result = await checkExtraCostUsage("u1");
-    expect(result.allowed).toBe(true);
-    expect(result.warning).toBe(false);
-    expect(result.allowance).toBeNull();
-    expect(result.percentUsed).toBe(0);
-  });
-
-  it("warns at 80% extra cost usage", async () => {
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      extraCostUsage: {
-        month: currentMonth(),
-        totalCost: 42.0,
-        breakdown: { enrichment: 42.0 },
-        resetDate: "2026-05-01T00:00:00.000Z",
-      },
-    });
-    mockGetUserSubscriptionType.mockResolvedValue("Basic");
-    mockGetSubscriptionTypeConfig.mockResolvedValue({
-      name: "Basic",
-      allowedPages: ["*"],
-      allowedSkills: ["*"],
-      monthlyExtraCostAllowance: 50,
-    });
-
-    const result = await checkExtraCostUsage("u1");
-    expect(result.allowed).toBe(true);
-    expect(result.warning).toBe(true);
-    expect(result.percentUsed).toBe(84);
-  });
-
-  it("allows below 80% usage", async () => {
-    mockGetUserById.mockResolvedValue({
-      userId: "u1",
-      email: "a@b.com",
-      extraCostUsage: {
-        month: currentMonth(),
-        totalCost: 10.0,
-        breakdown: { enrichment: 10.0 },
-        resetDate: "2026-05-01T00:00:00.000Z",
-      },
-    });
-    mockGetUserSubscriptionType.mockResolvedValue("Basic");
-    mockGetSubscriptionTypeConfig.mockResolvedValue({
-      name: "Basic",
-      allowedPages: ["*"],
-      allowedSkills: ["*"],
-      monthlyExtraCostAllowance: 50,
-    });
-
-    const result = await checkExtraCostUsage("u1");
-    expect(result.allowed).toBe(true);
-    expect(result.warning).toBe(false);
-    expect(result.percentUsed).toBe(20);
   });
 });
 

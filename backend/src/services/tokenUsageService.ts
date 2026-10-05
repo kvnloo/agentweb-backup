@@ -636,76 +636,12 @@ export async function incrementUserTokenUsage(
 // Tracks non-token API costs (Google Search, enrichment, image gen, etc.) per
 // user per month. Uses the same lazy-reset + 24-month history pattern as tokens.
 
-export interface ExtraCostUsageStatus {
-  allowed: boolean;
-  warning: boolean;
-  used: number;       // USD spent this month
-  allowance: number | null; // null = unlimited
-  percentUsed: number;
-  month: string;
-}
-
-/**
- * Get a user's current month extra cost usage, with lazy reset if month changed.
- */
-export async function getUserExtraCostUsage(
-  userId: string
-): Promise<{ month: string; totalCost: number; breakdown: Record<string, number> }> {
-  const user = await userDb.getUserById(userId);
-  if (!user) throw new Error(`User not found: ${userId}`);
-
-  const currentMonth = getCurrentMonth();
-  const usage = user.extraCostUsage;
-
-  if (!usage || usage.month !== currentMonth) {
-    return { month: currentMonth, totalCost: 0, breakdown: {} };
-  }
-
-  return {
-    month: currentMonth,
-    totalCost: usage.totalCost || 0,
-    breakdown: usage.breakdown || {},
-  };
-}
-
-/**
- * Check if a user can incur more extra cost this month.
- * For org members, quota is checked against the org owner's subscription and usage.
- */
-export async function checkExtraCostUsage(userId: string): Promise<ExtraCostUsageStatus> {
-  const billingUserId = await resolveBillingUserId(userId);
-  const usage = await getUserExtraCostUsage(billingUserId);
-  const subscriptionTypeName = await getUserSubscriptionType(billingUserId);
-  const config = await getSubscriptionTypeConfig(subscriptionTypeName);
-  const allowance = config?.monthlyExtraCostAllowance ?? null;
-
-  if (allowance === null || allowance === undefined) {
-    return {
-      allowed: true,
-      warning: false,
-      used: usage.totalCost,
-      allowance: null,
-      percentUsed: 0,
-      month: usage.month,
-    };
-  }
-
-  const percentUsed =
-    allowance > 0
-      ? Math.round((usage.totalCost / allowance) * 100)
-      : usage.totalCost > 0
-      ? 100
-      : 0;
-
-  return {
-    allowed: percentUsed < 100,
-    warning: percentUsed >= 80 && percentUsed < 100,
-    used: usage.totalCost,
-    allowance,
-    percentUsed,
-    month: usage.month,
-  };
-}
+// ENG-1250 / ENG-2286: the extraCostUsage READ/GATE path (ExtraCostUsageStatus,
+// getUserExtraCostUsage, checkExtraCostUsage) is retired as dead code — it had
+// zero callers (the enrichment-cost gate was never wired to a live request path),
+// and paid vendor spend is now enforced through the ledger rail. The write
+// (incrementExtraCostUsage, below) stays until its admin-display + per-lead markup
+// are retired under ENG-2286.
 
 /**
  * Atomically increment extra cost usage for the current month.
