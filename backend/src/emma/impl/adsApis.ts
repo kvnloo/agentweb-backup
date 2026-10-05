@@ -260,6 +260,7 @@ import { buildSandboxFetchHtml } from '../../services/sandboxTrackingPreflight';
 import { assertMetaAccountAllowed } from '../../services/metaTestAccountGuard';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from '../../services/metaAudienceCampaignTokenStore';
 import { getJwtSecret } from '../../config/jwt';
+import { describeMetaWriteParamDrift, formatMetaWriteParamDriftMessage } from '../../services/agentMode/core/approvalDeck';
 
 /** Local copy of `AgentModeService`'s private `MetaApiResult` type — never exported there. */
 type MetaApiResult = {
@@ -361,6 +362,37 @@ export type CallMetaMarketingApiDeps = {
   ) => Promise<MetaApiResult>;
   isMetaWriteAction: (entity_type: string, action: string) => boolean;
   remedyFromScopeRefusal: (refusal: string | undefined) => string;
+  getMetaCredentials: MetaCredentialsResolver;
+  /**
+   * ENG-2277/2278/2279/2280 (main-sync 2026-10-02): stays on the class —
+   * reads credentials, the prior entity state via `metaService`, and
+   * `getLastUserMessageText`, none of which this cluster extracted. Same
+   * treatment as `dispatchAuthorizedMetaWrite` above: a sibling private
+   * method injected whole rather than further decomposed.
+   */
+  checkMetaBudgetChange: (
+    userId: string,
+    entity_type: string,
+    action: string,
+    account_id: string,
+    campaign_id: string | undefined,
+    ad_set_id: string | undefined,
+    ad_id: string | undefined,
+    params: any,
+    sessionId: string | undefined,
+  ) => Promise<{
+    // Matches the actual (TS-widened, no `as const`) literal checkMetaBudgetChange
+    // returns on this branch — not the full MetaApiResult shape (no `message`
+    // field). The call site returns this `as any`, same as every other
+    // gate-blocked branch here.
+    blocked?: { success: boolean; blocked: boolean; reason: string; error: string };
+    changes?: Array<{ field: string; prior: number | undefined; proposed: number | undefined; ratio: number | null; severity: string }>;
+    severity?: string;
+    spendConcern?: boolean;
+    token?: string;
+    suggestedAction?: string;
+    requiresConfirmation?: boolean;
+  } | undefined>;
 };
 
 /**
@@ -1876,6 +1908,34 @@ export async function callMetaMarketingApi(
     // re-derived from params after this point, so nothing downstream can
     // silently drift it (the idx=202→205 LEADS→TRAFFIC flip in the incident).
     params = { ...params, objective: gate.objective };
+
+    // ENG-2232: deterministic Page-access preflight. Page access is a second,
+    // independent Meta grant that the objective gate above says nothing
+    // about, and the PAGE LIST tool's own warning text is only advisory — a
+    // model can still choose to build anyway. This is what the reported
+    // production incident actually needed: the account had 0 accessible
+    // Pages, PAGE LIST said so, and the agent built 4 campaigns + 4 ad sets
+    // before the failure finally surfaced at AD_CREATIVE CREATE. Blocking
+    // here stops the whole build at step 1 instead of after the waste.
+    //
+    // Reuses the credential-resolution call the tracking gate below already
+    // makes for its own account lookup (same `getMetaCredentials(userId,
+    // account_id)` shape, deliberately no clientScope per ENG-1801) — a
+    // second call is the established pattern for a preflight gate here, not
+    // a new one. 'unknown' (never probed, or credentials came from the
+    // legacy adAccount fallback which predates this field) is NOT treated as
+    // 'missing' — only a confirmed-empty PAGE LIST blocks.
+    const { connection: pageGateConnection } = await deps.getMetaCredentials(userId, account_id);
+    const { getMetaPagesAccessState, getMetaAdsNoPagesMessage } = await import('../../utils/metaAdsScope');
+    if (getMetaPagesAccessState(pageGateConnection?.config) === 'missing') {
+      const pageMessage = getMetaAdsNoPagesMessage(pageGateConnection?.config);
+      return {
+        success: false,
+        message: pageMessage,
+        error: `META_PAGE_ACCESS_MISSING: ${pageMessage}`,
+        hint: 'Reconnect Meta and select the Page on the "Choose Pages" step, or get "Create ads" (Advertiser) access on the Page, then retry.'
+      } as any;
+    }
   }
 
   // Pre-validate params before any API round-trip
@@ -1889,6 +1949,33 @@ export async function callMetaMarketingApi(
       error: `PARAM_VALIDATION_ERROR: ${validationError.message}`,
       hint: 'Fix the listed parameters and retry.'
     } as any;
+  }
+
+  // ENG-2232: deterministic Page-access preflight for AD_CREATIVE CREATE
+  // specifically — the CAMPAIGN CREATE gate above only catches a build that
+  // starts with a NEW campaign; adding a creative to an EXISTING campaign
+  // never goes through that gate at all. validateMetaActionParams above
+  // already guarantees params.page_id is present (Meta requires it for
+  // every creative), so this checks the ACTUAL target Page directly —
+  // more precise than the CAMPAIGN CREATE gate's historical-existing-ads
+  // heuristic, since a Meta CAMPAIGN object carries no page_id to compare
+  // against in the first place.
+  if (entity_type === 'AD_CREATIVE' && action === 'CREATE') {
+    const { connection: creativeGateConnection } = await deps.getMetaCredentials(userId, account_id);
+    const { getAccessiblePageIds, buildMetaAdsPageNotAccessibleMessage } = await import('../../utils/metaAdsScope');
+    const accessiblePageIds = getAccessiblePageIds(creativeGateConnection?.config);
+    const requestedPageId = typeof params.page_id === 'string' ? params.page_id : undefined;
+    // Only a verdict when we've actually probed (accessiblePageIds defined) —
+    // a legacy/never-probed connection must not be blocked on an unknown.
+    if (accessiblePageIds !== undefined && requestedPageId && !accessiblePageIds.includes(requestedPageId)) {
+      const pageMessage = buildMetaAdsPageNotAccessibleMessage(requestedPageId);
+      return {
+        success: false,
+        message: pageMessage,
+        error: `META_PAGE_ACCESS_MISSING: ${pageMessage}`,
+        hint: 'Reconnect Meta and select that Page on the "Choose Pages" step, or get "Create ads" (Advertiser) access on it, then retry.'
+      } as any;
+    }
   }
 
   // Target-confirmation guardrail for mutating actions (publish/change/delete).
@@ -1913,6 +2000,16 @@ export async function callMetaMarketingApi(
    * path is a loop rather than a dead end. Nothing changes for a launch that waives
    * nothing: those never need a token.
    */
+  const budgetAnomaly = await deps.checkMetaBudgetChange(
+    userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId,
+  );
+  if (budgetAnomaly?.blocked) return budgetAnomaly.blocked as any;
+  const budgetReconfirmation = budgetAnomaly?.requiresConfirmation === true;
+  if (budgetReconfirmation) {
+    // Part of the NEW manifest digest: the old grant cannot approve this disclosure.
+    params = { ...params, budget_confirmation_token: budgetAnomaly.token };
+  }
+
   const overrideClaimed = (params as any)?.override_tracking_check === true;
   const overrideDigest = overrideClaimed
     ? computeTrackingOverrideDigest(getJwtSecret(), {
@@ -1940,7 +2037,7 @@ export async function callMetaMarketingApi(
   let manifestGranted = false;
   if (
     deps.isMetaWriteAction(entity_type, action) &&
-    sessionId
+    !budgetReconfirmation && sessionId
   ) {
     const grant = await deps.claimMetaWriteManifestGrant(
       userId, sessionId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
@@ -1950,7 +2047,7 @@ export async function callMetaMarketingApi(
 
   if (
     deps.isMetaWriteAction(entity_type, action) &&
-    (!manifestGranted || (overrideClaimed && !overrideApproved))
+    (budgetReconfirmation || !manifestGranted || (overrideClaimed && !overrideApproved))
   ) {
     /*
      * MERGE NOTE: main's manifest grant decides WHETHER this gate runs; the tenancy fields
@@ -1968,7 +2065,7 @@ export async function callMetaMarketingApi(
      * manifest path is the one write route with no ownership check anywhere in it, and that
      * belongs on the write-scoping work rather than being assumed away here.
      */
-    const { summary, target, tenancyRefused, tenancyRefusalMessage } = await deps.buildMetaWriteConfirmation(
+    let { summary, target, tenancyRefused, tenancyRefusalMessage } = await deps.buildMetaWriteConfirmation(
       userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
     );
     // ENG-1635: this call's manifest digest, computed once here (against the SAME
@@ -2014,6 +2111,27 @@ export async function callMetaMarketingApi(
         error: `ACCOUNT_SCOPE_REFUSED: ${refusal}`,
       } as any;
     }
+    // ENG-1748: if this exact target was approved with different params, name the
+    // drifted fields so the user sees what changed. Explanatory only — the
+    // grant decision above is unchanged and nothing executes here.
+    if (!budgetReconfirmation && !manifestGranted && sessionId) {
+      // aws-sdk (constructs a real AWS client at module scope) — established
+      // precedent: round 2's createGTMPlan/chatbotDb.getChatSession finding.
+      const { chatbotDb } = await import('../../services/chatbotService');
+      const driftSession = await chatbotDb.getChatSession(sessionId);
+      const drifted = describeMetaWriteParamDrift(driftSession?.pendingApprovalDeck, {
+        entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params,
+      });
+      if (drifted) {
+        summary += formatMetaWriteParamDriftMessage(drifted);
+      }
+    }
+    if (budgetAnomaly?.changes) {
+      summary += ` Budget review (${budgetAnomaly.severity}): ` + budgetAnomaly.changes.map(change =>
+        `${change.field}: ${change.prior} -> ${change.proposed} minor currency units` +
+        (change.ratio === null ? ' (zero prior)' : ` (${change.ratio}x)`),
+      ).join('; ') + '. PAUSE_AND_VERIFY: offer to pause delivery first, then verify amounts and currency units before approving the increase.';
+    }
     // `awaitingUserConfirmation` + `confirmationPrompt` are consumed by the agent loop
     // (collectConfirmationPrompt) to HALT the turn and surface the prompt to the user.
     // The turn cannot continue until a NEW human message arrives — the model cannot
@@ -2036,6 +2154,10 @@ export async function callMetaMarketingApi(
         `if no card appears here, refresh the page or ask again and I'll represent it as one.`,
       // Per-item body (no intro/footer) used when several writes are batched in one turn.
       confirmationDetail: summary,
+      ...(budgetAnomaly?.changes ? { budgetAnomaly: {
+        severity: budgetAnomaly.severity, changes: budgetAnomaly.changes,
+        spendConcern: budgetAnomaly.spendConcern, suggestedAction: budgetAnomaly.suggestedAction,
+      } } : {}),
       message: `This Meta Ads ${entity_type} ${action} needs review before it runs: ${summary} ` +
         `Show the user the exact target above (campaign / ad set / asset). ` +
         `If more than one campaign or asset could match the request, ask the user to disambiguate first. ` +

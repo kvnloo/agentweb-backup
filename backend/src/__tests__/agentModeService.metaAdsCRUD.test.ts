@@ -8,7 +8,9 @@ jest.mock('../mcp/client/mcpClientService', () => ({
 
 // Mock the dependencies
 jest.mock('../services/metaService', () => ({
+  normalizeMetaMoney: jest.requireActual('../services/metaService').normalizeMetaMoney,
   metaService: {
+    getAdAccountCurrency: jest.fn().mockResolvedValue('USD'),
     listAdSets: jest.fn(),
     createAdSet: jest.fn(),
     updateAdSet: jest.fn(),
@@ -144,7 +146,7 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         const result = await agentModeService.createMetaAdsAdSet('user123', params);
 
         expect(result.success).toBe(true);
-        expect(result.message).toBe('Ad set "New Ad Set" created successfully');
+        expect(result.message).toBe('Ad set "New Ad Set" created successfully (money submitted: daily_budget: 100000 (= $1,000.00); bid_amount: 200 (= $2.00))');
         expect(result.adSet).toEqual(mockAdSetData);
       });
 

@@ -15,6 +15,8 @@ jest.mock('../services/metaService', () => {
       getCampaign: jest.fn(),
       createAdSet: jest.fn(),
       getAdSet: jest.fn(),
+      // ENG-2277: createMetaAdsAdSet reads the ad account's currency to normalise money.
+      getAdAccountCurrency: jest.fn().mockResolvedValue('USD'),
       // createMetaAdsAdSet's pre-flight token-freshness check
       // (ensureFreshMetaAdAccountToken) calls this before every ad-set
       // operation; without a mock it throws "not a function" on any

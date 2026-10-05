@@ -207,6 +207,7 @@ import { readBrandGuidelines, readMarketStrategy, PROMPT_EMBEDDED_COMPETITOR_DET
 import type { AgentModeService } from '../../services/agentModeService';
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
+import { matchLifecyclePresenceFilter } from '../../utils/lifecycleFilterSemantics';
 
 export async function getLeadLists(userId: string): Promise<any> {
     try {
@@ -683,6 +684,9 @@ function leadMatchesSearchAndFilters(
 
     return filters.every((filter: any) => {
       const { field, operator, value } = filter;
+      const lifecyclePresenceMatch = matchLifecyclePresenceFilter(field, operator);
+      if (lifecyclePresenceMatch !== undefined) return lifecyclePresenceMatch;
+
       let fieldValue: any;
       if (field === 'icpScore') {
         fieldValue = lead.icpMatch?.score;
@@ -1632,6 +1636,8 @@ export async function deleteLeadsByFilter(listId: string, filters: Array<{ field
       const leadMatchesFilters = (lead: any): boolean => {
         return filters.every((filter: any) => {
           const { field, operator, value } = filter;
+          const lifecyclePresenceMatch = matchLifecyclePresenceFilter(field, operator);
+          if (lifecyclePresenceMatch !== undefined) return lifecyclePresenceMatch;
 
           let fieldValue: any;
           if (field === 'icpScore') {

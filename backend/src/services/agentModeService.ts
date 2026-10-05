@@ -1,4 +1,7 @@
+import { metaWriteRateShaper, META_BUDGET_THROTTLE_SUBCODE } from './agentMode/metaWriteRateShaper';
+import { classifyMetaBudgetChange } from './agentMode/metaBudgetAnomaly';
 import { deriveDominanceLegacyIds } from './agentMode/modelSupersession';
+import { budgetVerdictFields, hasBudgetField, verifyMetaBudget, type BudgetVerifyOptions } from './agentMode/metaBudgetReadBack';
 import { tierFromCostScore, tierFromQualityScore } from './agentMode/modelClassification';
 // ENG-2103 (F2 design-decision-list follow-up, Pattern A): resolveModelForUser's
 // only call site, generateImage, moved to emma/impl/mediaVideo.ts.
@@ -104,6 +107,7 @@ import {
   appendApprovalDeckItem,
   finalizeApprovalDeck,
   findApprovalDeckAnswerForDigest,
+  describeMetaWriteParamDrift, formatMetaWriteParamDriftMessage,
   findAnsweredDeckItemByKind,
   reconstructApprovalDeckFromHistory,
   applyDeckAnswers,
@@ -465,7 +469,7 @@ export function getRetryAfterMs(error: unknown): number | undefined {
   }
   return undefined;
 }
-import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags, isMetaAccountScopeRefusal } from './metaService';
+import { metaService, MetaService, normalizeMetaMoney, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags, isMetaAccountScopeRefusal } from './metaService';
 import { getCustomerUtmDefault, getLanderUtmOverride } from './landerUtmStore';
 import { resolveLanderParams } from '../utils/landerUtm';
 import { linkedInOutreachService } from './linkedInOutreachService';
@@ -551,6 +555,7 @@ import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecond
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import type { LeadImportRowOutcome } from '../utils/leadSchema';
 import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor } from '../utils/leadSchema';
+import { matchLifecyclePresenceFilter } from '../utils/lifecycleFilterSemantics';
 
 type MetaApiResult = {
   success: boolean;
@@ -1120,6 +1125,9 @@ const LEGACY_MODEL_ALIASES: Record<string, string> = {
   'gpt-5-chat-2': 'gpt-5.5',
   'gpt-5.2-chat': 'gpt-5.5',
   'gemini-2.5-flash': 'gemini-3.1-flash-lite',
+  // ENG-2178: schedules created before the OpenRouter migration pin the bare
+  // "gpt-4o-mini" id; the same model is now served via OpenRouter.
+  'gpt-4o-mini': 'openrouter/openai/gpt-4o-mini',
 };
 
 // Context passed to the diagnosis agent when the main agent fails
@@ -11441,9 +11449,19 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const pages = await metaService.getPages(accessToken);
       const totalCount = Array.isArray(pages) ? pages.length : 0;
 
+      // ENG-2232: a bare "Found 0" here is silent — nothing told the model this
+      // is fatal for every AD_CREATIVE until it hit the permission error after
+      // building out a full campaign. Say the consequence and the fix up front.
+      const message = totalCount === 0
+        ? 'Found 0 Facebook Page(s). No ads can be created without a Page — ask the user to select a Page under ' +
+          'Meta\'s "Choose Pages" step when connecting, or to get "Create ads" (Advertiser) access on the ' +
+          'intended Page, then reconnect and retry. Do not proceed to build campaigns/ad sets/creatives for this ' +
+          'account until PAGE LIST returns at least one Page.'
+        : `Found ${totalCount} Facebook Page(s)`;
+
       return {
         success: true,
-        message: `Found ${totalCount} Facebook Page(s)`,
+        message,
         pages: pages,
         totalCount: totalCount
       };
@@ -11701,25 +11719,43 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     return { ...last, attempts: AgentModeService.SPEND_CAP_VERIFY_ATTEMPTS };
   }
 
-  /**
-   * spend_cap is in the account currency's MINOR units, but `budget_amount` and the ad-set
-   * budgets in the SAME tool are in major units (the backend multiplies those by 100). That
-   * asymmetry is exactly how a model turns "$3,000" into a $30 cap — and our read-back would
-   * then cheerfully confirm 3000 as "verified", because the write DID land; only the meaning
-   * was wrong. Echoing the major-unit equivalent in every spend-cap message makes a 100x slip
-   * visible to the model and the user instead of hiding behind a confident number.
-   */
-  private static describeSpendCap(minorUnits: number): string {
-    const major = (Number(minorUnits) / 100).toLocaleString('en-US', {
-      minimumFractionDigits: 2, maximumFractionDigits: 2,
-    });
-    return `${minorUnits} (= ${major} in the ad account's currency)`;
+  /** Normalize all agent money inputs once, before calling the minor-unit SDK layer. */
+  private async normalizeMetaMoneyParams(accountId: string, accessToken: string, params: any) {
+    const normalized = { ...params };
+    const fields = ['budget_amount', 'daily_budget', 'lifetime_budget', 'bid_amount', 'spend_cap'];
+    const supplied = fields.filter(field => params[field] !== undefined);
+    if (!supplied.length) return { params: normalized, currency: undefined, confirmation: '' };
+    if (params.budget_amount !== undefined && params.daily_budget !== undefined) {
+      throw new Error('Supply budget_amount or daily_budget, not both.');
+    }
+    const currency = await metaService.getAdAccountCurrency(accountId, accessToken);
+    const descriptions: string[] = [];
+    for (const field of supplied) {
+      const money = normalizeMetaMoney(params[field], currency);
+      if (field === 'spend_cap') MetaService.assertValidSpendCap(params[field]);
+      const apiField = field === 'budget_amount' ? 'daily_budget' : field;
+      normalized[apiField] = money.minorUnits;
+      descriptions.push(`${apiField}: ${money.description}`);
+    }
+    delete normalized.budget_amount;
+    return { params: normalized, currency, confirmation: ` (money submitted: ${descriptions.join('; ')})` };
   }
 
+  /** ENG-2278: budget read-back shares the spend-cap retry policy (logic lives in agentMode/metaBudgetReadBack). */
+  private budgetVerifyOptions(): BudgetVerifyOptions {
+    return {
+      attempts: AgentModeService.SPEND_CAP_VERIFY_ATTEMPTS,
+      backoffMs: AgentModeService.SPEND_CAP_VERIFY_BACKOFF_MS,
+    };
+  }
+
+  /** Agent inputs use major currency units; the SDK wrapper receives minor units. */
   public async createMetaAdsCampaign(userId: string, params: MetaAdsCampaignParams & { account_id?: string }): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
-      const campaign = await metaService.createCampaign(accountId, accessToken, params);
+      const money = await this.normalizeMetaMoneyParams(accountId, accessToken, params);
+      const normalizedParams = money.params;
+      const campaign = await metaService.createCampaign(accountId, accessToken, normalizedParams);
 
       // metaService.createCampaign requests only `id` back from the Graph API, so the
       // created object carries no `name` — in production this printed
@@ -11729,20 +11765,20 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const campaignName = campaign?.name || params.name;
       const created = {
         success: true,
-        message: `Campaign "${campaignName}" created successfully`,
+        message: `Campaign "${campaignName}" created successfully${money.confirmation}`,
         campaign: campaign
       };
 
-      if (params.spend_cap === undefined || params.spend_cap === null) return created;
+      if (normalizedParams.spend_cap === undefined || normalizedParams.spend_cap === null) return created;
 
       // A requested spend cap is verified independently — a create used to drop it silently
       // and still report success, leaving the operator believing there was a money backstop
       // when there was none (ENG-1018).
-      const check = await this.verifyCampaignSpendCap(accountId, accessToken, campaign?.id, params.spend_cap);
+      const check = await this.verifyCampaignSpendCap(accountId, accessToken, campaign?.id, normalizedParams.spend_cap);
       if (check.verified) {
         return {
           ...created,
-          message: `${created.message} (spend cap verified: ${AgentModeService.describeSpendCap(check.applied!)})`,
+          message: `${created.message} (spend cap verified: ${normalizeMetaMoney(check.applied!, money.currency, 'minor').description})`,
           spend_cap: check.applied,
           spend_cap_verified: true,
         };
@@ -11750,13 +11786,13 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       return {
         ...created,
         message: `⚠️ Campaign "${campaignName}" was created, but its spend cap of ` +
-          `${AgentModeService.describeSpendCap(params.spend_cap)} could NOT be confirmed after ` +
+          `${normalizeMetaMoney(normalizedParams.spend_cap, money.currency, 'minor').description} could NOT be confirmed after ` +
           `${check.attempts} read-back(s) — ${check.detail}. Do NOT tell the user a spend cap is in ` +
           `place. Meta sometimes needs a moment to reflect this field, so re-read it with CAMPAIGN ` +
           `LIST (campaign_id=${campaign?.id} + params.fields="id,name,spend_cap"); if it is still ` +
           `missing, apply it with CAMPAIGN UPDATE (campaign_id=${campaign?.id}, ` +
-          `params.spend_cap=${params.spend_cap}). Do NOT create the campaign again.`,
-        spend_cap_requested: params.spend_cap,
+          `params.spend_cap=${params.spend_cap}). Do NOT create the campaign again.${money.confirmation}`,
+        spend_cap_requested: normalizedParams.spend_cap,
         spend_cap_read: check.applied,
         spend_cap_verified: false,
         error: 'SPEND_CAP_UNCONFIRMED',
@@ -12045,16 +12081,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         args.destination_type = 'WEBSITE';
       }
 
-      // Convert all currencies to cents
-      const toCents = (val?: number) => val !== undefined ? Math.round(val * 100) : undefined;
-
-      const normalizedParams: MetaAdsAdSetParams = {
-        ...args,
-        daily_budget: campaignHasBudget ? undefined : toCents(args.daily_budget),
-        lifetime_budget: campaignHasBudget ? undefined : toCents(args.lifetime_budget),
-        bid_amount: toCents(args.bid_amount),
-        bid_strategy: strategy // Ensure we use the resolved strategy
-      };
+      const money = await this.normalizeMetaMoneyParams(accountId, accessToken, args);
+      const normalizedParams: MetaAdsAdSetParams = { ...money.params, bid_strategy: strategy };
 
       const adSet = await metaService.createAdSet(accountId, accessToken, normalizedParams);
 
@@ -12063,9 +12091,6 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // choice was previously invisible — a wrong strategy looked identical to a
       // deliberate one. Reporting it makes the default detectable without
       // changing behavior for existing callers.
-      // The user-facing message is deliberately unchanged: that string is
-      // customer-visible copy and is not this issue's to rewrite. The structured
-      // fields below are what make the choice detectable.
       //
       // ENG-838 AC4: `strategy` above is what this process *resolved*, never
       // what Meta stored. Read the entity back and compare, so a write Meta
@@ -12074,7 +12099,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // silent.
       const base = {
         success: true,
-        message: `Ad set "${adSet.name}" created successfully`,
+        message: `Ad set "${adSet.name}" created successfully${money.confirmation}`,
         adSet: adSet,
         appliedBidStrategy: strategy,
         bidStrategyWasDefaulted: args.bid_strategy === undefined
@@ -12127,7 +12152,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           readBackMismatch: true,
           message:
             `Ad set ${adSet.id} was created, but Meta did not apply the settings that were requested ` +
-            `(${detail}). It is live with settings nobody chose — review or pause it in Ads Manager.`,
+            `(${detail}).${money.confirmation} It is live with settings nobody chose — review or pause it in Ads Manager.`,
           error: `Ad set read-back mismatch on ${readBackMismatches.map(m => m.parameter).join(', ')}`,
           readBack,
           readBackVerified: true,
@@ -12356,18 +12381,32 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   public async updateMetaAdsCampaign(userId: string, campaignId: string, params: any, account_id?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const normalizedParams = { ...params };
-      if (normalizedParams.budget_amount !== undefined) {
-        normalizedParams.daily_budget = Math.round(normalizedParams.budget_amount * 100);
-        delete normalizedParams.budget_amount;
-      }
+      const money = await this.normalizeMetaMoneyParams(accountId, accessToken, params);
+      const normalizedParams = money.params;
       await metaService.updateCampaign(accessToken, campaignId, normalizedParams, accountId);
 
+      // ENG-2278: budget fields are verified independently of the spend cap.
+      const budgetFields = hasBudgetField(normalizedParams)
+        ? budgetVerdictFields(
+          `campaign ${campaignId}`,
+          await verifyMetaBudget(() => metaService.getCampaign(accountId, accessToken, campaignId), normalizedParams, this.budgetVerifyOptions()),
+          (v: number) => normalizeMetaMoney(v, money.currency, 'minor').description
+        )
+        : undefined;
+      const withBudget = (r: any) => {
+        if (!budgetFields) return r;
+        const { budget_message, error, ...rest } = budgetFields;
+        const out: any = { ...r, ...rest, message: `${r.message} — ${budget_message}` };
+        if (error && !r.error) out.error = error;
+        else if (error) out.budget_error = error;
+        return out;
+      };
+
       if (normalizedParams.spend_cap === undefined || normalizedParams.spend_cap === null) {
-        return {
+        return withBudget({
           success: true,
-          message: `Campaign updated successfully`
-        };
+          message: `Campaign updated successfully${money.confirmation}`
+        });
       }
 
       // "Campaign updated successfully" with no way to check was the exact reported failure
@@ -12375,12 +12414,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // campaign before claiming the change took effect (ENG-1018).
       const check = await this.verifyCampaignSpendCap(accountId, accessToken, campaignId, normalizedParams.spend_cap);
       if (check.verified) {
-        return {
+        return withBudget({
           success: true,
-          message: `Campaign updated successfully (spend cap verified: ${AgentModeService.describeSpendCap(check.applied!)})`,
+          message: `Campaign updated successfully${money.confirmation} (spend cap verified: ${normalizeMetaMoney(check.applied!, money.currency, 'minor').description})`,
           spend_cap: check.applied,
           spend_cap_verified: true,
-        };
+        });
       }
       // Deliberately NOT success:false. An unconfirmed read is not a failed write — live,
       // this exact path fired on an update that HAD landed (see verifyCampaignSpendCap), and
@@ -12388,26 +12427,26 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       // bare error string, counted a healthy call as a failure, and told the user to re-apply
       // a cap they already had. success:true with a loud, unmissable message keeps every
       // structured field in front of the model and still forbids claiming the cap is set.
-      return {
+      return withBudget({
         success: true,
-        message: `⚠️ The spend cap of ${AgentModeService.describeSpendCap(normalizedParams.spend_cap)} ` +
+        message: `⚠️ The spend cap of ${normalizeMetaMoney(normalizedParams.spend_cap, money.currency, 'minor').description} ` +
           `on campaign ${campaignId} could NOT be confirmed after ${check.attempts} read-back(s) — ` +
           `${check.detail}. The update was accepted by Meta, but do NOT tell the user the cap is in ` +
           `place and never claim it is set. Meta sometimes needs a moment to reflect this field: ` +
           `re-read it with CAMPAIGN LIST (campaign_id=${campaignId} + ` +
           `params.fields="id,name,spend_cap") before reporting anything. If it is still missing, ` +
-          `re-send the identical CAMPAIGN UPDATE — the write is idempotent.`,
+          `re-send the identical CAMPAIGN UPDATE — the write is idempotent.${money.confirmation}`,
         spend_cap_requested: normalizedParams.spend_cap,
         spend_cap_read: check.applied,
         spend_cap_verified: false,
         error: 'SPEND_CAP_UNCONFIRMED',
-      };
+      });
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error updating Meta ad campaign:', error);
       return {
         success: false,
-        message: error.message || 'Failed to update Meta ad campaign.',
+        message: this.enrichMetaError(error, 'update Meta ad campaign'),
         error: error.message,
         // ENG-1300: SDK-shaped error — never a Meta business code.
         code: error?.status ?? error?.response?.status
@@ -12439,24 +12478,32 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   public async updateMetaAdsAdSet(userId: string, adSetId: string, params: any, account_id?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const toCents = (val?: number) => val !== undefined ? Math.round(val * 100) : undefined;
-      const normalizedParams = {
-        ...params,
-        ...(params.daily_budget !== undefined && { daily_budget: toCents(params.daily_budget) }),
-        ...(params.lifetime_budget !== undefined && { lifetime_budget: toCents(params.lifetime_budget) }),
-        ...(params.bid_amount !== undefined && { bid_amount: toCents(params.bid_amount) }),
-      };
+      const money = await this.normalizeMetaMoneyParams(accountId, accessToken, params);
+      const normalizedParams = money.params;
       await metaService.updateAdSet(accessToken, adSetId, normalizedParams, accountId);
+      if (!hasBudgetField(normalizedParams)) {
+        return {
+          success: true,
+          message: `Ad set updated successfully${money.confirmation}`
+        };
+      }
+      // ENG-2278: read the ad set back before claiming a budget change took effect.
+      const { budget_message, ...verdict } = budgetVerdictFields(
+        `ad set ${adSetId}`,
+        await verifyMetaBudget(() => metaService.getAdSet(accessToken, adSetId), normalizedParams, this.budgetVerifyOptions()),
+        (v: number) => normalizeMetaMoney(v, money.currency, 'minor').description
+      );
       return {
         success: true,
-        message: `Ad set updated successfully`
+        message: `Ad set updated successfully${money.confirmation} — ${budget_message}`,
+        ...verdict,
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error updating Meta ad set:', error);
       return {
         success: false,
-        message: error.message || 'Failed to update Meta ad set.',
+        message: this.enrichMetaError(error, 'update Meta ad set'),
         error: error.message,
         // ENG-1300: SDK-shaped error — never a Meta business code.
         code: error?.status ?? error?.response?.status
@@ -13199,6 +13246,12 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     const originalMsg = error.message || `Failed to ${context}.`;
 
     switch (subcode) {
+      case META_BUDGET_THROTTLE_SUBCODE:
+        // ENG-2280: Meta's per-object budget-edit limit (~4/hour), not a generic failure.
+        return (
+          `Meta budget-edit limit reached (subcode ${META_BUDGET_THROTTLE_SUBCODE}): this object's budget was changed too many times in the last hour. ` +
+          'Nothing changed. Wait up to an hour and retry once with the final budget, rather than retrying now.'
+        );
       case 1341012:
         return (
           'Page permission denied (subcode 1341012): The page_id used is not accessible with your current credentials. ' +
@@ -14299,6 +14352,56 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     };
   }
 
+  /** Read-before-write for both model calls and approved-deck dispatch (ENG-2279). */
+  private async checkMetaBudgetChange(
+    userId: string, entity_type: string, action: string, account_id: string,
+    campaign_id: string | undefined, ad_set_id: string | undefined, ad_id: string | undefined,
+    params: any, sessionId?: string,
+  ) {
+    if (action !== 'UPDATE' || !['CAMPAIGN', 'AD_SET'].includes(entity_type)) return undefined;
+    const fields = ['daily_budget', 'lifetime_budget', 'spend_cap'];
+    if (!fields.some(field => params[field] !== undefined) &&
+        !(entity_type === 'CAMPAIGN' && params.budget_amount !== undefined)) return undefined;
+    const blocked = {
+      success: false, blocked: true, reason: 'meta_budget_prior_unavailable',
+      error: 'META_BUDGET_UNVERIFIED: Could not compare the prior and proposed budget. Nothing was written. PAUSE_AND_VERIFY: offer to pause delivery first, then verify the amounts and currency units.',
+    };
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      // Never pass undefined: it disables the optional ad-set ownership check.
+      const prior = entity_type === 'CAMPAIGN'
+        ? await metaService.getCampaign(accountId || '', accessToken, campaign_id!)
+        : await metaService.getAdSet(accessToken, ad_set_id!, accountId || '');
+      // Same currency-aware normalizer the writers use (ENG-2277): every money input is major units.
+      const money = await this.normalizeMetaMoneyParams(accountId || '', accessToken, params);
+      const changes = fields.flatMap(field => {
+        const proposed = money.params[field];
+        if (proposed === undefined) return [];
+        return [{ field, ...classifyMetaBudgetChange(prior?.[field], proposed) }];
+      });
+      if (changes.some(change => change.severity === 'unknown')) return { blocked };
+      const text = sessionId ? await this.getLastUserMessageText(sessionId) : undefined;
+      const spendConcern = typeof text === 'string' &&
+        /(?:over.?spend|spend(?:ing)? too much|(?:worried|concern|unexpected|excessive|too high).{0,80}(?:spend|budget|cost)|(?:spend|budget|cost).{0,80}(?:worried|concern|unexpected|excessive|too high))/i.test(text);
+      const severity = changes.some(change => change.severity === 'critical') ? 'critical'
+        : changes.some(change => change.severity === 'warning') ? 'warning' : 'normal';
+      const { budget_confirmation_token, ...writeParams } = params;
+      const token = computeTrackingOverrideDigest(getJwtSecret(), {
+        gate: 'meta-budget-change', userId, sessionId, entity_type, action, account_id: accountId,
+        campaign_id, ad_set_id, ad_id, params: writeParams, changes,
+      });
+      return {
+        changes, severity, spendConcern, token,
+        suggestedAction: 'PAUSE_AND_VERIFY',
+        requiresConfirmation: (severity !== 'normal' || spendConcern) &&
+          !trackingOverrideTokenMatches(budget_confirmation_token, token),
+      };
+    } catch {
+      // A read/credential/transcript failure must never turn an existing grant into permission.
+      return { blocked };
+    }
+  }
+
   /**
    * ENG-2103 (F2): moved to `emma/impl/adsApis.ts` — kept here as a
    * delegating wrapper. Real callers beyond `emma/tools.ts`:
@@ -14334,6 +14437,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       dispatchAuthorizedMetaWrite: this.dispatchAuthorizedMetaWrite.bind(this),
       isMetaWriteAction: AgentModeService.isMetaWriteAction,
       remedyFromScopeRefusal: AgentModeService.remedyFromScopeRefusal,
+      getMetaCredentials: this.getMetaCredentials.bind(this),
+      checkMetaBudgetChange: this.checkMetaBudgetChange.bind(this),
     });
   }
 
@@ -14364,6 +14469,21 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     overrideApproved: boolean,
     sessionId: string | undefined,
   ): Promise<MetaApiResult> {
+    const budgetAnomaly = await this.checkMetaBudgetChange(
+      userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId,
+    );
+    if (budgetAnomaly?.blocked) return budgetAnomaly.blocked as any;
+    if (budgetAnomaly?.requiresConfirmation) {
+      // Approval-deck workflows bypass callMetaMarketingApi. A stale/old grant must
+      // return to the same preview path, never silently apply an unreviewed increase.
+      return this.callMetaMarketingApi(
+        userId, entity_type as any, action, account_id, campaign_id, ad_set_id, ad_id, params, sessionId,
+      );
+    }
+    if (params && typeof params === 'object' && 'budget_confirmation_token' in params) {
+      params = { ...params };
+      delete params.budget_confirmation_token;
+    }
     if (params && typeof params === 'object' && 'confirm' in params) {
       params = { ...params };
       delete params.confirm;
@@ -14453,7 +14573,23 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
     // every branch. Every case's behavior is unchanged byte for byte from the
     // original callMetaMarketingApi body — this only interposes AFTER the result
     // exists and BEFORE it returns.
-    return (async (): Promise<MetaApiResult> => {
+    // ENG-2280: rate shaping on the shared authorized-write path (model calls and
+    // approved-deck dispatch alike). In-memory only; see metaWriteRateShaper.ts.
+    const shapedObjectId = entity_type === 'CAMPAIGN' ? campaign_id : entity_type === 'AD_SET' ? ad_set_id : ad_id;
+    const shapeAccount = account_id || 'unknown';
+    const isWrite = AgentModeService.isMetaWriteAction(entity_type, action);
+    if (isWrite) {
+      const shape = metaWriteRateShaper.shapeWrite(shapeAccount, entity_type, action, shapedObjectId, params);
+      if (shape.kind === 'throttled') {
+        return { success: false, throttled: true, reason: shape.reason, retryAfterMs: shape.retryAfterMs, message: shape.message, error: shape.message } as any;
+      }
+      if (shape.kind === 'coalesced') {
+        return { success: true, coalesced: true, message: `No change sent: ${entity_type} ${shapedObjectId} already has these budget values from an edit in the last hour (coalesced, no Meta budget-edit slot used).` } as any;
+      }
+    } else {
+      metaWriteRateShaper.recordRead(shapeAccount);
+    }
+    const shapedResult = await (async (): Promise<MetaApiResult> => {
       switch (entity_type) {
         case 'CAMPAIGN':
           // Map master params to specific params if needed, but schema is unified so passing through is safe
@@ -14489,7 +14625,14 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         default:
           throw new Error(`Invalid entity_type: ${entity_type}`);
       }
-    })();
+    })().catch(error => {
+      if (isWrite) metaWriteRateShaper.releaseBudgetEdit(entity_type, shapedObjectId);
+      throw error;
+    });
+    if (isWrite && shapedResult && (shapedResult as any).success === false) {
+      metaWriteRateShaper.releaseBudgetEdit(entity_type, shapedObjectId);
+    }
+    return shapedResult;
   }
 
   /**
@@ -14578,7 +14721,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
    */
   private static async verifyMetaWriteDispatchResult(executeResult: Record<string, unknown>): Promise<WorkflowStepVerification> {
     const result = executeResult.dispatchResult as MetaApiResult | undefined;
-    if (!result || result.success !== true) {
+    if (!result || result.success !== true || result.awaitingUserConfirmation === true) {
       // `message` is the enriched, actionable text (enrichMetaError — e.g. "Your ad
       // set budget must be more than ₹94.91" with the Meta code/subcode) whenever the
       // underlying write method built one; `error` is the raw SDK message (e.g. just

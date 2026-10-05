@@ -71,6 +71,18 @@ describe('httpClient', () => {
       ).rejects.toThrow('User not found: nonexistent');
     });
 
+    it('warns that a SERVER_RESTARTING turn may have saved the message before retrying', async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        headers: { get: () => 'application/json' },
+        json: async () => ({ code: 'SERVER_RESTARTING', message: 'The server is restarting. Please try again in a moment.' }),
+      }) as any;
+      await expect(mcpFetch({ method: 'POST', path: '/api/agent-mode/generate', context: { userId: 'user-123' } }))
+        .rejects.toThrow('The message may have been saved. Check the session before retrying to avoid duplicate messages.');
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+    });
+
     it('should throw on HTTP error responses', async () => {
       const mockResponse = {
         ok: false,

@@ -24,6 +24,7 @@ jest.mock('../services/metaService', () => {
   return {
     ...actual,
     metaService: {
+      getAdAccountCurrency: jest.fn().mockResolvedValue('USD'),
       createCampaign: jest.fn(),
       updateCampaign: jest.fn(),
       getCampaign: jest.fn(),
@@ -89,7 +90,7 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       name: 'Capped campaign',
       objective: 'OUTCOME_TRAFFIC',
       special_ad_categories: ['NONE'],
-      spend_cap: 100000,
+      spend_cap: 1000,
     };
 
     it('forwards spend_cap to Meta and confirms it by reading the campaign back', async () => {
@@ -196,15 +197,14 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
     });
 
     it('spells out the currency equivalent so a cents/dollars slip is visible', async () => {
-      // spend_cap is in cents while budget_amount in the same tool is in dollars; a model
-      // passing 3000 for "$3,000" would otherwise get a confident "verified: 3000".
+      // ENG-2277: every agent money input is in major units, including spend_cap.
       (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new' });
-      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new', spend_cap: '3000' });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new', spend_cap: '300000' });
 
       const result = await service.createMetaAdsCampaign('user123', { ...createParams, spend_cap: 3000 } as any);
 
       expect(result.spend_cap_verified).toBe(true);
-      expect(result.message).toContain('30.00');
+      expect(result.message).toContain('300000 (= $3,000.00)');
     });
 
     it('does not read anything back when no spend cap was requested', async () => {
@@ -227,7 +227,7 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
       (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_1', spend_cap: '300000' });
 
-      const result = await service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 300000 });
+      const result = await service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 3000 });
 
       expect((metaService.updateCampaign as jest.Mock).mock.calls[0][2]).toEqual(
         expect.objectContaining({ spend_cap: 300000 })
@@ -242,7 +242,7 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
       (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_1', spend_cap: '100000' });
 
-      const resultPromise = service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 300000 });
+      const resultPromise = service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 3000 });
       await jest.advanceTimersByTimeAsync(15000);
       const result = await resultPromise;
 
@@ -267,7 +267,7 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
       (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_1' });
 
-      const resultPromise = service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 300000 });
+      const resultPromise = service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 3000 });
       await jest.advanceTimersByTimeAsync(15000);
       const result = await resultPromise;
 
@@ -284,7 +284,7 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
       (metaService.getCampaign as jest.Mock).mockRejectedValue(new Error('Meta API Error: transient'));
 
-      const resultPromise = service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 300000 });
+      const resultPromise = service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 3000 });
       await jest.advanceTimersByTimeAsync(15000);
       const result = await resultPromise;
 

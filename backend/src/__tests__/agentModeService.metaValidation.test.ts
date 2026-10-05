@@ -11,6 +11,7 @@ jest.mock('../services/metaService', () => {
   return {
     ...actual,
     metaService: {
+      getAdAccountCurrency: jest.fn().mockResolvedValue('USD'),
       createCampaign: jest.fn(),
       updateCampaign: jest.fn(),
       deleteCampaign: jest.fn(),
@@ -197,16 +198,15 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
     });
 
     it('rejects a malformed spend_cap on CAMPAIGN UPDATE before writing to Meta', async () => {
-      // UPDATE forwards params verbatim, so without this guard a fractional cap reaches
-      // Meta and comes back as an opaque "Invalid parameter".
+      // Reject negative major-unit caps before reaching Meta.
       const result = await callApi(service, 'CAMPAIGN', 'UPDATE', {
         campaign_id: 'camp_1',
-        params: { spend_cap: 1000.5 },
+        params: { spend_cap: -1000.5 },
       });
 
       expect(result.success).toBe(false);
       expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
-      expect(result.message).toMatch(/positive whole number of cents/i);
+      expect(result.message).toMatch(/positive amount/i);
       expect(metaService.updateCampaign).not.toHaveBeenCalled();
     });
 
@@ -645,7 +645,7 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
     });
 
     it('blocks AD_SET UPDATE without confirm and does not call metaService.updateAdSet', async () => {
-      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint' });
+      (metaService.getAdSet as jest.Mock).mockResolvedValue({ id: 'adset_1', name: 'Maintenance Ad Set', campaign_id: 'camp_maint', daily_budget: '900000' }); // ENG-2279: prior budget read; same-size change is 'normal'
       (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_maint', name: 'Maintenance Campaign' });
 
       const result = await callApi(service, 'AD_SET', 'UPDATE', {

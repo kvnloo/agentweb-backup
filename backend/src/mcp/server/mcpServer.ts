@@ -19,6 +19,7 @@ import {
 } from './mcpSessionStore';
 import { rehydrateAndServe } from './mcpSessionRehydration';
 import { anonymousUserIdForSession, isAnonymousDiscoveryEnabled, isAnonymouslyPermitted } from "./anonymousTransport";
+import { isCronEnabled } from '../../utils/instanceState';
 
 // Rate limiter for MCP requests authenticated via aw_* API keys
 const mcpRateLimiter = new RateLimiter();
@@ -260,14 +261,8 @@ export function setupMcpServer(
   // Export shutdown function for use by main server
   (app as any).mcpShutdown = shutdownAllSessions;
   
-  // Handle graceful shutdown on signals
-  const handleShutdown = async (signal: string) => {
-    console.log(`[MCP] Received ${signal}, initiating graceful shutdown...`);
-    await shutdownAllSessions();
-  };
-
-  process.on('SIGTERM', () => handleShutdown('SIGTERM'));
-  process.on('SIGINT', () => handleShutdown('SIGINT'));
+  // Main server.ts owns SIGTERM/SIGINT ordering. MCP exports mcpShutdown above
+  // but must not race the global drain by closing transports directly on signals.
 
   // Use shared server factory from core module, passing session context
   const createServer = (req?: Request, sessionId?: string) => {
@@ -297,6 +292,19 @@ export function setupMcpServer(
   // Note: express.json() is added here because MCP routes are mounted before global body parser
   app.post("/mcp", express.json(), validateMcpAccessToken, async (req: Request, res: Response) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+    // A-019: once this instance starts draining, refuse NEW external tool work
+    // before it can enter a transport/handler. Internal self-calls from an
+    // already-tracked AgentWeb turn are deliberately exempt: runDrain keeps
+    // this listener open specifically so those calls can finish.
+    const mcpMessages = Array.isArray(req.body) ? req.body : [req.body];
+    if (
+      mcpMessages.some((message: any) => message?.method === 'tools/call') &&
+      (req as any)._mcpIsInternal !== true &&
+      !isCronEnabled()
+    ) {
+      return res.status(503).json({ message: 'Instance draining — retry on new instance' });
+    }
 
     // Log all incoming requests
     console.log(`[MCP-SERVER-DEBUG] POST request - sessionId header: ${sessionId || 'MISSING'}, method: ${req.body?.method || 'unknown'}, has session: ${sessionId ? sessions.has(sessionId) : 'N/A'}`);

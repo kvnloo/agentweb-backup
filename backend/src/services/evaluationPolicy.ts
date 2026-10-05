@@ -46,7 +46,7 @@ export const SANDBOX_TOOL_CLASSES: Record<string, ToolMatcher> = {
   ),
   third_party_writes: anyOf(
     exact('call_google_ads_api', 'call_google_ads_reporting_api', 'call_hubspot_api', 'call_attio_api',
-      'call_linkedin_marketing_api', 'call_linkedin_ads_insights_api', 'write_clickup_doc',
+      'call_linkedin_marketing_api', 'call_linkedin_ads_insights_api', 'write_clickup_doc', 'create_clickup_task',
       'create_google_doc', 'update_google_doc', 'create_google_sheet', 'update_google_sheet'),
     prefix('enrich_leads', 'google_drive_'),
   ),
