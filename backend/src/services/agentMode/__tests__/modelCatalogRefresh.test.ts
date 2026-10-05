@@ -1,7 +1,7 @@
 import { LLM_MODEL_REGISTRY } from '../llmModelRegistry';
 import { deriveDominanceLegacyIds, inferFamily, scheduleBackupModels } from '../modelSupersession';
 import { discoverNewModels, refreshModelCatalog, refreshScores } from '../modelCatalogRefresh';
-import { patchObject } from '../../../scripts/refreshModelCatalog';
+import { patchObject, mergeSetLiteral } from '../../../scripts/refreshModelCatalog';
 
 const grok = ['openrouter/x-ai/grok-4.6', 'openrouter/x-ai/grok-4.7'];
 const candidates = grok.map(id => ({ id, ...LLM_MODEL_REGISTRY[id] }));
@@ -65,6 +65,23 @@ describe('catalog critical invariants', () => {
     expect(scores.changes[grok[1]]).toBeUndefined();
     expect(refreshScores(scoreRegistry, { data: [{ ...valid, slug: 'grok-4-6-high', name: 'Grok 4.6 (high)' }] }, '2026-09-24').changes[grok[0]].qualityScore).toBe(45);
     expect(refreshScores(scoreRegistry, { data: [valid, valid] }, '2026-09-24').changes).toEqual({});
+  });
+  it('merges additions into an override Set regardless of existing quote style, and is idempotent (ENG-2293)', () => {
+    const singleQuoted = "const explicitCacheOverrides = new Set(['gpt-4o', 'openrouter/anthropic/claude-fable-5.1']);";
+    const merged = mergeSetLiteral(singleQuoted, 'explicitCacheOverrides', ['openrouter/new/model-x']);
+    expect(merged).toContain("'gpt-4o'");
+    expect(merged).toContain("'openrouter/anthropic/claude-fable-5.1'");
+    expect(merged).toContain("'openrouter/new/model-x'");
+    // A quote-only extractor would silently DROP these two on a double-quoted line —
+    // this is the exact regression this test locks in (ENG-2293 second review pass).
+    const doubleQuoted = 'const explicitCacheOverrides = new Set(["gpt-4o", "openrouter/anthropic/claude-fable-5.1"]);';
+    const mergedFromDoubleQuoted = mergeSetLiteral(doubleQuoted, 'explicitCacheOverrides', ['openrouter/new/model-x']);
+    expect(mergedFromDoubleQuoted).toContain("'gpt-4o'");
+    expect(mergedFromDoubleQuoted).toContain("'openrouter/anthropic/claude-fable-5.1'");
+    expect(mergedFromDoubleQuoted).toContain("'openrouter/new/model-x'");
+    // Re-running on the already-merged output must not duplicate entries.
+    const twice = mergeSetLiteral(merged, 'explicitCacheOverrides', ['openrouter/new/model-x']);
+    expect(twice).toBe(merged);
   });
   it('patches only requested members and is idempotent', () => {
     const source = "export const X = { /* preserve */ 'a': 1, 'b': 2 };";

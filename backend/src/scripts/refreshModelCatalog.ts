@@ -31,6 +31,22 @@ export function patchObject(source: string, name: string, changes: Record<string
   return source;
 }
 
+/**
+ * Union `additions` into an inline `const <name> = new Set([...])` string literal,
+ * preserving existing entries regardless of whether they're single- or
+ * double-quoted — a quote-only extractor would silently DROP every existing
+ * entry (not error) the first time this line is reformatted to double quotes,
+ * since there is no quote-style lint rule guarding it (ENG-2293).
+ */
+export function mergeSetLiteral(source: string, name: string, additions: readonly string[]): string {
+  const pattern = new RegExp(`(const ${name} = new Set\\(\\[)([^\\]]*)(\\]\\))`);
+  return source.replace(pattern, (_match, pre, body, post) => {
+    const existing = [...(body as string).matchAll(/['"]([^'"]*)['"]/g)].map(m => m[1]);
+    const merged = [...new Set([...existing, ...additions])];
+    return `${pre}${merged.map(id => `'${id}'`).join(', ')}${post}`;
+  });
+}
+
 async function main() {
   const plan = await refreshModelCatalog();
   console.log(JSON.stringify(plan, null, 2));
@@ -61,13 +77,7 @@ export function writeCatalogPlan(plan: Awaited<ReturnType<typeof refreshModelCat
   // today. Register it here, at add time — not by sniffing the registry's
   // human-editable `description` field later, which the draft-PR review step
   // explicitly tells reviewers to rewrite (ENG-2293).
-  if (plan.additions.length) {
-    pin = pin.replace(/(const explicitCacheOverrides = new Set\(\[)([^\]]*)(\]\))/, (_match, pre, body, post) => {
-      const existing = [...(body as string).matchAll(/'([^']*)'/g)].map(m => m[1]);
-      const merged = [...new Set([...existing, ...plan.additions])];
-      return `${pre}${merged.map(id => `'${id}'`).join(', ')}${post}`;
-    });
-  }
+  if (plan.additions.length) pin = mergeSetLiteral(pin, 'explicitCacheOverrides', plan.additions);
   // Prepare every edit before writing; failed upstream requests leave the worktree untouched.
   fs.writeFileSync(registryPath, registry);
   fs.writeFileSync(pricePath, pricing);
