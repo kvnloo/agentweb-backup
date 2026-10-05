@@ -6,7 +6,7 @@
  * LLM-spend. So the risk is small caps (Free tier), not big-ratio whales. Every
  * assertion here is against the cap.
  */
-import { classifyCutoverImpact, CutoverAccountInput } from '../services/spendCutoverImpact';
+import { classifyCutoverImpact, CutoverAccountInput, poolSpendByOwner } from '../services/spendCutoverImpact';
 
 const M = 1_000_000;
 const acct = (over: Partial<CutoverAccountInput> = {}): CutoverAccountInput => ({
@@ -99,5 +99,127 @@ describe('classifyCutoverImpact', () => {
       acct({ billingUserId: 'high', llmMicroUsd: 150 * M, vendorMicroUsd: 0, capMicroUsd: 200 * M }), // 75%
     ]);
     expect(s.accounts.map((a) => a.billingUserId)).toEqual(['high', 'low', 'uncapped']);
+  });
+});
+
+/**
+ * ENG-2286 — the model must measure what the GATE measures.
+ *
+ * The gate resolves an org member onto the org's billing root and never looks at
+ * the member's own id. Summing by the recorded id (which was often the member's)
+ * modelled a gate that does not exist, and flagged three accounts as "newly
+ * paused" on 2026-10-05 — every one of them an org member.
+ */
+describe('poolSpendByOwner', () => {
+  const spend = (llm: number, vendor: number) => ({ llm: llm * M, vendor: vendor * M });
+  const subjects = (entries: Array<[string, { llm: number; vendor: number }]>) => new Map(entries);
+
+  it("folds a member's spend into its owner and the member stops being its own subject", () => {
+    const pooled = poolSpendByOwner(
+      subjects([
+        ['owner', spend(22, 0)],
+        ['member', spend(0, 30)],
+      ]),
+      new Map([['member', 'owner']]),
+    );
+
+    expect([...pooled.keys()]).toEqual(['owner']);
+    expect(pooled.get('owner')).toMatchObject({ billingUserId: 'owner', llm: 22 * M, vendor: 30 * M });
+    expect(pooled.get('owner')!.pooledFrom).toEqual([{ id: 'member', llm: 0, vendor: 30 * M }]);
+  });
+
+  it("pools several members onto one owner and lists each contribution", () => {
+    const pooled = poolSpendByOwner(
+      subjects([
+        ['owner', spend(10, 1)],
+        ['m1', spend(1, 2)],
+        ['m2', spend(3, 4)],
+      ]),
+      new Map([
+        ['m1', 'owner'],
+        ['m2', 'owner'],
+      ]),
+    );
+
+    expect(pooled.get('owner')).toMatchObject({ llm: 14 * M, vendor: 7 * M });
+    expect(pooled.get('owner')!.pooledFrom.map((m) => m.id)).toEqual(['m1', 'm2']);
+  });
+
+  it("an owner with no spend of its own still appears, built from its members", () => {
+    const pooled = poolSpendByOwner(subjects([['member', spend(0, 5)]]), new Map([['member', 'idle-owner']]));
+
+    expect(pooled.get('idle-owner')).toMatchObject({ billingUserId: 'idle-owner', llm: 0, vendor: 5 * M });
+    expect(pooled.has('member')).toBe(false);
+  });
+
+  it("an id absent from the owner map, or mapped to itself, stays its own subject", () => {
+    const pooled = poolSpendByOwner(
+      subjects([
+        ['solo', spend(1, 1)],
+        ['self', spend(2, 2)],
+      ]),
+      new Map([['self', 'self']]),
+    );
+
+    expect(pooled.get('solo')).toMatchObject({ llm: 1 * M, vendor: 1 * M, pooledFrom: [] });
+    expect(pooled.get('self')).toMatchObject({ llm: 2 * M, vendor: 2 * M, pooledFrom: [] });
+  });
+
+  it("does not mutate its inputs", () => {
+    const input = subjects([
+      ['owner', spend(1, 1)],
+      ['member', spend(2, 2)],
+    ]);
+    const owners = new Map([['member', 'owner']]);
+    poolSpendByOwner(input, owners);
+
+    expect(input.get('owner')).toEqual({ llm: 1 * M, vendor: 1 * M });
+    expect(input.size).toBe(2);
+    expect([...owners.entries()]).toEqual([['member', 'owner']]);
+  });
+
+  it("THE ARTIFACT: a Free org member that looked paused against its own $5 cap is not, once pooled onto its Starter owner", () => {
+    // 2026-10-05: 0d1b79d9 (Free) had $30.72 of vendor spend recorded against itself
+    // and was reported as 614% of a $5 cap. The gate measures it against its
+    // owner's pool: Starter, $80 cap, $22.35 used.
+    const perRecorded = subjects([
+      ['owner', spend(22.35, 0)],
+      ['free-member', spend(0, 30.72)],
+    ]);
+
+    // Un-pooled (the old model): the member is its own Free account, paused.
+    const before = classifyCutoverImpact([
+      { billingUserId: 'owner', tier: 'Starter', llmMicroUsd: 22.35 * M, vendorMicroUsd: 0, capMicroUsd: 80 * M },
+      { billingUserId: 'free-member', tier: 'Free', llmMicroUsd: 0, vendorMicroUsd: 30.72 * M, capMicroUsd: 5 * M },
+    ]);
+    expect(before.newlyPaused).toBe(1);
+
+    // Pooled (the gate): one Starter subject at $53.07 of $80 — nobody pauses.
+    const pooled = poolSpendByOwner(perRecorded, new Map([['free-member', 'owner']]));
+    const o = pooled.get('owner')!;
+    const after = classifyCutoverImpact([
+      { billingUserId: 'owner', tier: 'Starter', llmMicroUsd: o.llm, vendorMicroUsd: o.vendor, capMicroUsd: 80 * M },
+    ]);
+    expect(after.assessed).toBe(1);
+    expect(after.newlyPaused).toBe(0);
+    expect(after.accounts[0].percentAfter).toBeCloseTo(66.3, 1);
+  });
+
+  it("pooling can CREATE a real pause the un-pooled view hid", () => {
+    // The other direction matters just as much: members' vendor spend pushing an
+    // owner over its cap is exactly what the gate will enforce.
+    const pooled = poolSpendByOwner(
+      subjects([
+        ['owner', spend(60, 0)],
+        ['member', spend(0, 30)],
+      ]),
+      new Map([['member', 'owner']]),
+    );
+    const o = pooled.get('owner')!;
+    const s = classifyCutoverImpact([
+      { billingUserId: 'owner', tier: 'Starter', llmMicroUsd: o.llm, vendorMicroUsd: o.vendor, capMicroUsd: 80 * M },
+    ]);
+
+    expect(s.newlyPaused).toBe(1); // 60 llm alone is under $80; 90 all-in is over
   });
 });

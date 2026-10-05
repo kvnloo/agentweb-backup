@@ -24,7 +24,8 @@ import { isVendorEntry, usageRecordDb } from "../services/usageRecordDb";
 import { getSubscriptionTypeConfig } from "../services/subscriptionService";
 import { getLlmUsageCreditAdjustment } from "../services/llmUsageCreditService";
 import { userDb } from "../services/db";
-import { classifyCutoverImpact, CutoverAccountInput } from "../services/spendCutoverImpact";
+import { resolveBillingUserId } from "../services/tokenUsageService";
+import { classifyCutoverImpact, CutoverAccountInput, poolSpendByOwner } from "../services/spendCutoverImpact";
 import { SPEND_LEDGER_ENFORCEMENT_ENV, SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV } from "../services/spendEnforcementBasis";
 
 const MICRO = 1e6;
@@ -54,8 +55,21 @@ async function buildInputs(month: string): Promise<CutoverAccountInput[]> {
     perSubject.set(r.billingUserId, acc);
   }
 
+  // Pool onto the billing owner the gate checks (ENG-2286), exactly as
+  // spendCutoverImpact.ts does — otherwise this evidence file would list org members
+  // the gate never measures on their own. An unresolvable id stays its own subject.
+  const ownerOf = new Map<string, string>();
+  for (const id of perSubject.keys()) {
+    try {
+      ownerOf.set(id, await resolveBillingUserId(id));
+    } catch {
+      /* unresolvable: stays its own subject */
+    }
+  }
+  const pooled = poolSpendByOwner(perSubject, ownerOf);
+
   const inputs: CutoverAccountInput[] = [];
-  for (const [billingUserId, agg] of perSubject) {
+  for (const [billingUserId, agg] of pooled) {
     const user = await userDb.getUserById(billingUserId);
     const tier = user?.subscriptionType || "Unknown";
     const policy = (await getSubscriptionTypeConfig(tier))?.llmUsagePolicy ?? null;
