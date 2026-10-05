@@ -11,7 +11,11 @@ jest.mock('../services/metaService', () => {
     metaService: {
       getCampaign: jest.fn(),
       createAdSet: jest.fn(),
-      getAdSet: jest.fn()
+      getAdSet: jest.fn(),
+      // ENG-2277: createMetaAdsAdSet reads the ad account's currency to normalise money.
+      getAdAccountCurrency: jest.fn().mockResolvedValue('USD'),
+      // createMetaAdsAdSet's pre-flight token-freshness check calls this before every ad-set operation.
+      extendAccessToken: jest.fn().mockResolvedValue({ access_token: 'mock-refreshed-token', expires_in: 5184000 })
     }
   };
 });

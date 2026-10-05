@@ -499,8 +499,11 @@ describe('ENG-1358 — every launch route relays the warning, not just RESUME/UP
   it('the two creative routes read gate.warning at all', () => {
     // Guards the wiring itself: if a future edit drops the capture, this fails even when
     // the mock-heavy handler test above cannot reach its success path.
+    // ENG-2103 (F2): handleCallGoogleAdsApi's body moved from agentModeService.ts to
+    // emma/impl/adsCrmApis.ts — retargeted here so this source-scan keeps checking the
+    // file that actually contains the wiring.
     const src = require('fs').readFileSync(
-      require('path').join(__dirname, '../services/agentModeService.ts'), 'utf8');
+      require('path').join(__dirname, '../emma/impl/adsCrmApis.ts'), 'utf8');
     // Matches any gate-result variable name: the point is that both call sites capture
     // the warning, not what the local is called.
     const captures = src.match(/creativeTrackingWarning = \w+\.warning;/g) || [];

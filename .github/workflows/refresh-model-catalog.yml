@@ -14,10 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
@@ -39,14 +39,14 @@ jobs:
       - name: Verify critical catalog and price-book invariants
         working-directory: backend
         run: npx jest --runInBand --runTestsByPath src/services/agentMode/__tests__/modelCatalogRefresh.test.ts src/services/agentMode/__tests__/frontierMonitor.test.ts src/__tests__/llmPricing.test.ts
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: model-catalog-plan
           path: |
             /tmp/model-catalog-plan.json
             docs/openrouter-byok-coverage.md
-      - uses: peter-evans/create-pull-request@v7
+      - uses: peter-evans/create-pull-request@v8
         with:
           branch: automation/model-catalog-refresh
           base: main

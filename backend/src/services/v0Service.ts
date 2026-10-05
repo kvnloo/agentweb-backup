@@ -2151,166 +2151,119 @@ async function addPageToExistingRepo(
           }
         }
 
-        // Same verify-and-retry as deployLandingPage — a sub-page has its OWN form
-        // component, so the Lead event must be checked here too, not just on the first page.
-        if (effectivePixelId) {
-          // ENG-482: validate against the file set that ACTUALLY ships (post-remap), not
-          // previewFiles (v0's raw, unfiltered zip). remapFilesForSubPage's skip-list drops
-          // files like app/layout.tsx — v0's own scaffold layout.tsx can independently
-          // contain something matching the fbq('track','Lead') regex, which used to make
-          // this check pass against code that never reaches the deployed site at all.
-          const pixelCheck = validatePixelLeadEvent(remapFilesForSubPage(previewFiles, slug, name));
-          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
-            console.warn(`[V0 SERVICE] Meta Pixel Lead event missing for /${slug} (attempt ${validationAttempt + 1}): ${pixelCheck.reason}`);
+        // ENG-2099: all three enhancement checks run up front, and whichever ones still
+        // fail are batched into ONE v0 message + ONE wait this attempt, instead of each
+        // check sending its own correction and `continue`-ing on success. The old
+        // per-check continue consumed a whole loop iteration each — on a page needing
+        // all three, bridge-out's own guard (validationAttempt < V0_VALIDATION_MAX_RETRIES)
+        // was already false by the time pixel and ads had each taken a turn, so it was
+        // structurally unreachable, not merely unlucky (ENG-2099). Batching means no
+        // correction can consume another's turn: every configured one is evaluated, and
+        // gets a correction attempt, every round.
+        //
+        // Same file-set rationale as before (ENG-482): validate against what ACTUALLY
+        // ships (post-remap), not previewFiles (v0's raw zip, whose scaffold layout.tsx
+        // can independently satisfy an inline-pattern check against code the site never
+        // serves).
+        const pixelCheck = effectivePixelId
+          ? validatePixelLeadEvent(remapFilesForSubPage(previewFiles, slug, name))
+          : undefined;
+        const adsCheck = subPageGoogleAds
+          ? validateGoogleAdsConversion(remapFilesForSubPage(previewFiles, slug, name))
+          : undefined;
+        const bridgeCheck = (leadListId && bridgeOutUrl)
+          ? validateBridgeOutRedirect(remapFilesForSubPage(previewFiles, slug, name), bridgeOutUrl)
+          : undefined;
 
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: existingPage.siteId ?? existingPage.id,
-              chatId,
-              attempt: validationAttempt,
-              send: (meteringKey) => withRetry(
-                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
-                  chatId,
-                  message:
-                    "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
-                    "generate `const eventId = crypto.randomUUID();`, include it as an \"eventId\" field in the " +
-                    "fetch('/api/capture', ...) JSON body, and on a successful response call " +
-                    "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
-                    `Issue: ${pixelCheck.reason}`,
-                })),
-                "v0 correction message (pixel lead event, additional page)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
+        const canCorrectThisAttempt =
+          validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead;
+        const needsPixelCorrection = !!pixelCheck && !pixelCheck.ok && canCorrectThisAttempt;
+        const needsAdsCorrection = !!adsCheck && !adsCheck.ok && canCorrectThisAttempt;
+        const needsBridgeCorrection = !!bridgeCheck && !bridgeCheck.ok && canCorrectThisAttempt;
 
-            const correctedVersionId = await awaitOptionalV0Correction(
-              `v0 correction (pixel lead event) for /${slug}`,
-              () =>
-                waitForCompletedV0Version(v0, chatId, `v0 correction (pixel lead event) for /${slug}`, {
-                  heartbeat: () => touchLandingPageRecord(id),
-                  deadline: buildDeadline,
-                  afterVersionId: versionId,
-                })
-            ,
-      correctionState
-    );
-            // undefined = v0 never produced a corrected version. Fall through to the
-            // `proceeding without it` path below instead of failing the whole page.
-            if (correctedVersionId) {
-              versionId = correctedVersionId;
-              continue;
-            }
+        if (needsPixelCorrection || needsAdsCorrection || needsBridgeCorrection) {
+          const messageParts: string[] = [];
+          const labelParts: string[] = [];
+          if (needsPixelCorrection) {
+            console.warn(`[V0 SERVICE] Meta Pixel Lead event missing for /${slug} (attempt ${validationAttempt + 1}): ${pixelCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
+              "generate `const eventId = crypto.randomUUID();`, include it as an \"eventId\" field in the " +
+              "fetch('/api/capture', ...) JSON body, and on a successful response call " +
+              "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
+              `Issue: ${pixelCheck!.reason}`
+            );
+            labelParts.push("pixel lead event");
           }
+          if (needsAdsCorrection) {
+            console.warn(`[V0 SERVICE] Google Ads conversion call missing for /${slug} (attempt ${validationAttempt + 1}): ${adsCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
+              "ON A SUCCESSFUL submission response only, call the platform-owned helper with the googleAds " +
+              "argument included: `await fireLeadTracking({ email, eventId, googleAds })`. Do NOT hand-author " +
+              "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
+              "shared root layout. " +
+              `Issue: ${adsCheck!.reason}`
+            );
+            labelParts.push("google ads conversion");
+          }
+          if (needsBridgeCorrection) {
+            console.warn(`[V0 SERVICE] Bridge-out redirect missing for /${slug} (attempt ${validationAttempt + 1}): ${bridgeCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
+              `redirect the visitor via window.location.href to ${bridgeOutUrl} with the submitted email ` +
+              "appended as an email= query param (URL-encoded). " +
+              `Issue: ${bridgeCheck!.reason}`
+            );
+            labelParts.push("bridge-out redirect");
+          }
+          const correctionLabel = labelParts.join(", ");
+
+          await guardedV0CorrectionMessage({
+            userId,
+            scopeId: existingPage.siteId ?? existingPage.id,
+            chatId,
+            attempt: validationAttempt,
+            send: (meteringKey) => withRetry(
+              meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
+                chatId,
+                message: messageParts.join("\n\n"),
+              })),
+              `v0 correction message (${correctionLabel}, additional page)`,
+              undefined, undefined, undefined,
+              { retryOnTimeout: false }
+            ),
+          });
+
+          const correctedVersionId = await awaitOptionalV0Correction(
+            `v0 correction (${correctionLabel}) for /${slug}`,
+            () =>
+              waitForCompletedV0Version(v0, chatId, `v0 correction (${correctionLabel}) for /${slug}`, {
+                heartbeat: () => touchLandingPageRecord(id),
+                deadline: buildDeadline,
+                afterVersionId: versionId,
+              }),
+            correctionState
+          );
+          // undefined = v0 never produced a corrected version for any of the batched
+          // corrections. Fall through to the per-check `proceeding without it` reporting
+          // below instead of failing the whole page.
+          if (correctedVersionId) {
+            versionId = correctedVersionId;
+            continue;
+          }
+        }
+
+        if (pixelCheck) {
           pixelLeadEventVerified = pixelCheck.ok;
           if (!pixelCheck.ok) {
             console.warn(`[V0 SERVICE] Meta Pixel Lead event still missing for /${slug} after retries — proceeding without it: ${pixelCheck.reason}`);
           }
         }
-
-        // ENG-1524. Sibling of the deployLandingPage check, and it has to exist in BOTH
-        // places for the same reason the pixel check does: a sub-page has its own form
-        // component, and `subPageGoogleAds` above inherits the site's conversion pair, so
-        // the generated handler is expected to fire it. Adding this on one branch only is
-        // how the original gap happened.
-        //
-        // Post-remap file set (ENG-482), like the pixel check: previewFiles is v0's raw
-        // zip, and its scaffold layout.tsx can carry a gtag conversion that never ships —
-        // which would satisfy the inline-pattern arm against code the site never sees.
-        if (subPageGoogleAds) {
-          const adsCheck = validateGoogleAdsConversion(remapFilesForSubPage(previewFiles, slug, name));
-          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
-            console.warn(`[V0 SERVICE] Google Ads conversion call missing for /${slug} (attempt ${validationAttempt + 1}): ${adsCheck.reason}`);
-
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: existingPage.siteId ?? existingPage.id,
-              chatId: chatId!,
-              attempt: validationAttempt,
-              send: (meteringKey) => withRetry(
-                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
-                  chatId: chatId!,
-                  message:
-                    "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
-                    "ON A SUCCESSFUL submission response only, call the platform-owned helper with the googleAds " +
-                    "argument included: `await fireLeadTracking({ email, eventId, googleAds })`. Do NOT hand-author " +
-                    "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
-                    "shared root layout. " +
-                    `Issue: ${adsCheck.reason}`,
-                })),
-                "v0 correction message (google ads conversion, sub-page)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
-
-            const correctedVersionId = await awaitOptionalV0Correction(
-              "v0 correction (google ads conversion, sub-page)",
-              () =>
-                waitForCompletedV0Version(v0, chatId!, "v0 correction (google ads conversion, sub-page)", {
-                  heartbeat: () => touchLandingPageRecord(id),
-                  deadline: buildDeadline,
-                  afterVersionId: versionId,
-                })
-            ,
-      correctionState
-    );
-            // undefined = v0 never produced a corrected version. Fall through to the
-            // `proceeding without it` path below instead of failing the whole page.
-            if (correctedVersionId) {
-              versionId = correctedVersionId;
-              continue;
-            }
-          }
-          if (!adsCheck.ok) {
-            console.warn(`[V0 SERVICE] Google Ads conversion call still missing for /${slug} after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
-          }
+        if (adsCheck && !adsCheck.ok) {
+          console.warn(`[V0 SERVICE] Google Ads conversion call still missing for /${slug} after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
         }
-
-        if (leadListId && bridgeOutUrl) {
-          // Same post-remap file set rationale as the pixel check above (ENG-482).
-          const bridgeCheck = validateBridgeOutRedirect(remapFilesForSubPage(previewFiles, slug, name), bridgeOutUrl);
-          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
-            console.warn(`[V0 SERVICE] Bridge-out redirect missing for /${slug} (attempt ${validationAttempt + 1}): ${bridgeCheck.reason}`);
-
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: existingPage.siteId ?? existingPage.id,
-              chatId,
-              attempt: validationAttempt,
-              send: (meteringKey) => withRetry(
-                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
-                  chatId,
-                  message:
-                    "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
-                    `redirect the visitor via window.location.href to ${bridgeOutUrl} with the submitted email ` +
-                    "appended as an email= query param (URL-encoded). " +
-                    `Issue: ${bridgeCheck.reason}`,
-                })),
-                "v0 correction message (bridge-out redirect, additional page)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
-
-            const correctedVersionId = await awaitOptionalV0Correction(
-              `v0 correction (bridge-out redirect) for /${slug}`,
-              () =>
-                waitForCompletedV0Version(v0, chatId, `v0 correction (bridge-out redirect) for /${slug}`, {
-                  heartbeat: () => touchLandingPageRecord(id),
-                  deadline: buildDeadline,
-                  afterVersionId: versionId,
-                })
-            ,
-      correctionState
-    );
-            // undefined = v0 never produced a corrected version. Fall through to the
-            // `proceeding without it` path below instead of failing the whole page.
-            if (correctedVersionId) {
-              versionId = correctedVersionId;
-              continue;
-            }
-          }
+        if (bridgeCheck) {
           bridgeOutVerified = bridgeCheck.ok;
           if (!bridgeCheck.ok) {
             console.warn(`[V0 SERVICE] Bridge-out redirect still missing for /${slug} after retries — proceeding without it: ${bridgeCheck.reason}`);
@@ -3408,156 +3361,111 @@ export async function deployLandingPage(
         // to guarantee the Lead event the way layout.tsx injection guarantees the base pixel.
         // Verify it, and retry (same correction-message mechanism as validateV0Output) if
         // missing. Exhausted retries must NOT fail generation — just record the miss.
-        if (record.metaPixelId) {
-          const pixelCheck = validatePixelLeadEvent(previewFiles);
-          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
-            console.warn(`[V0 SERVICE] Meta Pixel Lead event missing (attempt ${validationAttempt + 1}): ${pixelCheck.reason}`);
+        // ENG-2099: all three enhancement checks run up front, and whichever ones still
+        // fail are batched into ONE v0 message + ONE wait this attempt — see the matching
+        // comment in addPageToExistingRepo (sub-page path) for why the old per-check
+        // continue made bridge-out structurally unreachable whenever pixel and ads both
+        // needed a correction.
+        const pixelCheck = record.metaPixelId ? validatePixelLeadEvent(previewFiles) : undefined;
+        const adsCheck = (record.googleAdsConversionId && record.googleAdsConversionLabel)
+          ? validateGoogleAdsConversion(previewFiles)
+          : undefined;
+        const bridgeCheck = (record.leadListId && record.bridgeOutUrl)
+          ? validateBridgeOutRedirect(previewFiles, record.bridgeOutUrl)
+          : undefined;
 
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: record.siteId ?? record.id,
-              chatId: record.v0ChatId!,
-              attempt: validationAttempt,
-              send: (meteringKey) => withRetry(
-                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
-                  chatId: record.v0ChatId!,
-                  message:
-                    "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
-                    "generate `const eventId = crypto.randomUUID();`, include it as an \"eventId\" field in the " +
-                    "fetch('/api/capture', ...) JSON body, and on a successful response call " +
-                    "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
-                    `Issue: ${pixelCheck.reason}`,
-                })),
-                "v0 correction message (pixel lead event)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
+        const canCorrectThisAttempt =
+          validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead;
+        const needsPixelCorrection = !!pixelCheck && !pixelCheck.ok && canCorrectThisAttempt;
+        const needsAdsCorrection = !!adsCheck && !adsCheck.ok && canCorrectThisAttempt;
+        const needsBridgeCorrection = !!bridgeCheck && !bridgeCheck.ok && canCorrectThisAttempt;
 
-            const correctedVersionId = await awaitOptionalV0Correction(
-              "v0 correction (pixel lead event)",
-              () =>
-                waitForCompletedV0Version(v0, record.v0ChatId!, "v0 correction (pixel lead event)", {
-                  heartbeat: () => touchLandingPageRecord(id),
-                  deadline: buildDeadline,
-                  afterVersionId: versionId,
-                })
-            ,
-      correctionState
-    );
-            // undefined = v0 never produced a corrected version. Fall through to the
-            // `proceeding without it` path below instead of failing the whole page.
-            if (correctedVersionId) {
-              versionId = correctedVersionId;
-              continue;
-            }
+        if (needsPixelCorrection || needsAdsCorrection || needsBridgeCorrection) {
+          const messageParts: string[] = [];
+          const labelParts: string[] = [];
+          if (needsPixelCorrection) {
+            console.warn(`[V0 SERVICE] Meta Pixel Lead event missing (attempt ${validationAttempt + 1}): ${pixelCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
+              "generate `const eventId = crypto.randomUUID();`, include it as an \"eventId\" field in the " +
+              "fetch('/api/capture', ...) JSON body, and on a successful response call " +
+              "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
+              `Issue: ${pixelCheck!.reason}`
+            );
+            labelParts.push("pixel lead event");
           }
+          if (needsAdsCorrection) {
+            console.warn(`[V0 SERVICE] Google Ads conversion call missing (attempt ${validationAttempt + 1}): ${adsCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
+              "ON A SUCCESSFUL submission response only, call the platform-owned helper with the googleAds " +
+              "argument included: `await fireLeadTracking({ email, eventId, googleAds })`. Do NOT hand-author " +
+              "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
+              "root layout. " +
+              `Issue: ${adsCheck!.reason}`
+            );
+            labelParts.push("google ads conversion");
+          }
+          if (needsBridgeCorrection) {
+            console.warn(`[V0 SERVICE] Bridge-out redirect missing (attempt ${validationAttempt + 1}): ${bridgeCheck!.reason}`);
+            messageParts.push(
+              "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
+              `redirect the visitor via window.location.href to ${record.bridgeOutUrl} with the submitted email ` +
+              "appended as an email= query param (URL-encoded). " +
+              `Issue: ${bridgeCheck!.reason}`
+            );
+            labelParts.push("bridge-out redirect");
+          }
+          const correctionLabel = labelParts.join(", ");
+
+          await guardedV0CorrectionMessage({
+            userId,
+            scopeId: record.siteId ?? record.id,
+            chatId: record.v0ChatId!,
+            attempt: validationAttempt,
+            send: (meteringKey) => withRetry(
+              meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
+                chatId: record.v0ChatId!,
+                message: messageParts.join("\n\n"),
+              })),
+              `v0 correction message (${correctionLabel})`,
+              undefined, undefined, undefined,
+              { retryOnTimeout: false }
+            ),
+          });
+
+          const correctedVersionId = await awaitOptionalV0Correction(
+            `v0 correction (${correctionLabel})`,
+            () =>
+              waitForCompletedV0Version(v0, record.v0ChatId!, `v0 correction (${correctionLabel})`, {
+                heartbeat: () => touchLandingPageRecord(id),
+                deadline: buildDeadline,
+                afterVersionId: versionId,
+              }),
+            correctionState
+          );
+          // undefined = v0 never produced a corrected version for any of the batched
+          // corrections. Fall through to the per-check `proceeding without it` reporting
+          // below instead of failing the whole page.
+          if (correctedVersionId) {
+            versionId = correctedVersionId;
+            continue;
+          }
+        }
+
+        if (pixelCheck) {
           pixelLeadEventVerified = pixelCheck.ok;
           if (!pixelCheck.ok) {
             console.warn(`[V0 SERVICE] Meta Pixel Lead event still missing after retries — proceeding without it (never fails generation): ${pixelCheck.reason}`);
           }
         }
-
-        // ENG-1524. Same contract as the pixel check above, for the platform that had none.
-        // Gated on the conversion PAIR, not just the id: without a label the helper cannot
-        // fire anyway (ENG-1328), so demanding the call would be asking v0 to write
-        // something that does nothing.
-        if (record.googleAdsConversionId && record.googleAdsConversionLabel) {
-          const adsCheck = validateGoogleAdsConversion(previewFiles);
-          if (!adsCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
-            console.warn(`[V0 SERVICE] Google Ads conversion call missing (attempt ${validationAttempt + 1}): ${adsCheck.reason}`);
-
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: record.siteId ?? record.id,
-              chatId: record.v0ChatId!,
-              attempt: validationAttempt,
-              send: (meteringKey) => withRetry(
-                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
-                  chatId: record.v0ChatId!,
-                  message:
-                    "The lead capture form is missing the Google Ads conversion. In the form's submit handler, " +
-                    "ON A SUCCESSFUL submission response only, call the platform-owned helper with the googleAds " +
-                    "argument included: `await fireLeadTracking({ email, eventId, googleAds })`. Do NOT hand-author " +
-                    "a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed in the " +
-                    "root layout. " +
-                    `Issue: ${adsCheck.reason}`,
-                })),
-                "v0 correction message (google ads conversion)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
-
-            const correctedVersionId = await awaitOptionalV0Correction(
-              "v0 correction (google ads conversion)",
-              () =>
-                waitForCompletedV0Version(v0, record.v0ChatId!, "v0 correction (google ads conversion)", {
-                  heartbeat: () => touchLandingPageRecord(id),
-                  deadline: buildDeadline,
-                  afterVersionId: versionId,
-                })
-            ,
-      correctionState
-    );
-            // undefined = v0 never produced a corrected version. Fall through to the
-            // `proceeding without it` path below instead of failing the whole page.
-            if (correctedVersionId) {
-              versionId = correctedVersionId;
-              continue;
-            }
-          }
-          if (!adsCheck.ok) {
-            // Never fails generation, same as the pixel path: a lander that captures leads
-            // is worth more than one that refuses to exist. But this is the line that turns
-            // an invisible miss into a visible one.
-            console.warn(`[V0 SERVICE] Google Ads conversion call still missing after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
-          }
+        if (adsCheck && !adsCheck.ok) {
+          // Never fails generation, same as the pixel path: a lander that captures leads
+          // is worth more than one that refuses to exist. But this is the line that turns
+          // an invisible miss into a visible one.
+          console.warn(`[V0 SERVICE] Google Ads conversion call still missing after retries — the page carries the base tag and will report NO conversions: ${adsCheck.reason}`);
         }
-
-        if (record.leadListId && record.bridgeOutUrl) {
-          const bridgeCheck = validateBridgeOutRedirect(previewFiles, record.bridgeOutUrl);
-          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES && shippedHasCaptureForm && !correctionState.chatDead) {
-            console.warn(`[V0 SERVICE] Bridge-out redirect missing (attempt ${validationAttempt + 1}): ${bridgeCheck.reason}`);
-
-            await guardedV0CorrectionMessage({
-              userId,
-              scopeId: record.siteId ?? record.id,
-              chatId: record.v0ChatId!,
-              attempt: validationAttempt,
-              send: (meteringKey) => withRetry(
-                meteredV0({ userId, operation: "correction_message", idempotencyKey: meteringKey }, () => v0.chats.sendMessage({
-                  chatId: record.v0ChatId!,
-                  message:
-                    "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
-                    `redirect the visitor via window.location.href to ${record.bridgeOutUrl} with the submitted email ` +
-                    "appended as an email= query param (URL-encoded). " +
-                    `Issue: ${bridgeCheck.reason}`,
-                })),
-                "v0 correction message (bridge-out redirect)",
-                undefined, undefined, undefined,
-                { retryOnTimeout: false }
-              ),
-            });
-
-            const correctedVersionId = await awaitOptionalV0Correction(
-              "v0 correction (bridge-out redirect)",
-              () =>
-                waitForCompletedV0Version(v0, record.v0ChatId!, "v0 correction (bridge-out redirect)", {
-                  heartbeat: () => touchLandingPageRecord(id),
-                  deadline: buildDeadline,
-                  afterVersionId: versionId,
-                })
-            ,
-      correctionState
-    );
-            // undefined = v0 never produced a corrected version. Fall through to the
-            // `proceeding without it` path below instead of failing the whole page.
-            if (correctedVersionId) {
-              versionId = correctedVersionId;
-              continue;
-            }
-          }
+        if (bridgeCheck) {
           bridgeOutVerified = bridgeCheck.ok;
           if (!bridgeCheck.ok) {
             console.warn(`[V0 SERVICE] Bridge-out redirect still missing after retries — proceeding without it (never fails generation): ${bridgeCheck.reason}`);

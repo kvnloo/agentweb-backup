@@ -382,16 +382,16 @@ export class GenerateMarketingResponseWorkerService {
 
   /**
    * Shutdown the worker process, draining any in-flight requests first.
-   * Blocks until pendingRequests.size === 0 or DRAIN_CEILING_MS elapses.
+   * Blocks until pendingRequests.size === 0 or the remaining drain budget elapses.
    */
-  async shutdown(): Promise<void> {
+  async shutdown(ceilingMs: number = DRAIN_CEILING_MS): Promise<void> {
     this.draining = true;
     console.log(`[Worker] Drain started — ${this.pendingRequests.size} in-flight request(s)`);
 
-    const deadline = Date.now() + DRAIN_CEILING_MS;
+    const deadline = Date.now() + Math.max(0, ceilingMs);
 
     while (this.pendingRequests.size > 0 && Date.now() < deadline) {
-      await new Promise(resolve => setTimeout(resolve, DRAIN_POLL_INTERVAL_MS));
+      await new Promise(resolve => setTimeout(resolve, Math.min(DRAIN_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now()))));
     }
 
     if (this.pendingRequests.size > 0) {

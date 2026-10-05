@@ -6299,6 +6299,179 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       expect(result.bridgeOutVerified).toBe(true);
     });
   });
+
+  // ENG-2099: all three correction guards (pixel, Google Ads, bridge-out) used to share
+  // one validationAttempt counter, and each successful correction `continue`d — consuming
+  // a whole loop iteration. On a page needing all three, pixel ate attempt 0, ads ate
+  // attempt 1, and bridge-out's own guard (attempt < V0_VALIDATION_MAX_RETRIES) was
+  // already false by attempt 2 — never even sent, let alone exhausted. The fix batches
+  // whichever corrections are still needed into one message per attempt instead.
+  describe("ENG-2099: all three enhancement corrections batched — bridge-out no longer starved", () => {
+    const existingSiteAllThree = {
+      ...existingSiteRecord,
+      metaPixelId: "1012387921717047",
+      googleAdsConversionId: "AW-123456789",
+      googleAdsConversionLabel: "abcDEF123",
+      bridgeOutUrl: "https://rankai.ai/book-a-call",
+    };
+
+    const setupSiteRecordWithAllThreeMock = () => {
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Items: [existingSiteAllThree] }),
+      });
+      mockGet.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Item: existingSiteAllThree }),
+      });
+    };
+
+    // A real googleAdsConversionId triggers an EXTRA readRepoFile("app/layout.tsx") GET
+    // (base Google Ads tag install check) between the repair-scan tree GET and
+    // commitFilesToRepoMain's own ref/heads/main GET — setupGitHubMocks's fixed 2-GET
+    // sequence doesn't account for it. `{ data: {} }` (no `.content`) makes readRepoFile
+    // return null, taking the graceful "no layout.tsx — skipping" branch.
+    const setupGitHubMocksWithGoogleAdsLayoutCheck = (extraBlobs: number = 0) => {
+      mockAxiosGet.mockResolvedValueOnce({ data: { tree: [] } });
+      mockAxiosGet.mockResolvedValueOnce({ data: {} });
+      mockAxiosGet.mockResolvedValueOnce({ data: { object: { sha: "abc123" } } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_sha" } });
+      for (let i = 0; i < extraBlobs; i++) {
+        mockAxiosPost.mockResolvedValueOnce({ data: { sha: `blob_sha_extra_${i}` } });
+      }
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "tree_sha" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "commit_sha" } });
+      mockAxiosPatch.mockResolvedValueOnce({ data: {} });
+    };
+
+    /** A real capture form with NONE of the three enhancements wired — every one of
+     * pixel/ads/bridge-out needs a correction, every attempt (the zip never changes,
+     * modeling a v0 that keeps missing all three). */
+    const createZipMissingAllThree = async () => {
+      const AdmZip = (await import("adm-zip")).default;
+      const zip = new AdmZip();
+      zip.addFile(
+        "app/page.tsx",
+        Buffer.from(
+          `export default function Page() {
+             const submit = async (e: any) => {
+               e.preventDefault();
+               await fetch("/api/capture", { method: "POST", body: "{}" });
+             };
+             return <form onSubmit={submit}><input name="email" /><button>Go</button></form>;
+           }`
+        )
+      );
+      return zip.toBuffer();
+    };
+
+    it("sends ONE batched correction per attempt naming all three issues, and still reports every one accurately after exhausting retries", async () => {
+      setupSiteRecordWithAllThreeMock();
+
+      const buggyZip = await createZipMissingAllThree();
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      mockChatsGetById
+        .mockResolvedValueOnce({ latestVersion: { id: "v1" } })
+        .mockResolvedValueOnce({ latestVersion: { id: "v2" } })
+        .mockResolvedValueOnce({ latestVersion: { id: "v3" } });
+      mockChatsDownloadVersion
+        .mockResolvedValueOnce(buggyZip)
+        .mockResolvedValueOnce(buggyZip)
+        .mockResolvedValueOnce(buggyZip);
+      mockChatsSendMessage.mockResolvedValue({});
+
+      setupGitHubMocksWithGoogleAdsLayoutCheck(1);
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a booking page",
+        "All-Three Page",
+        {},
+        "list_all_three",
+        undefined,
+        { bridgeOutUrl: existingSiteAllThree.bridgeOutUrl }
+      );
+
+      // Never fails generation — every one of the three is "verify, don't guarantee".
+      expect(result.status).toBe("deployed");
+
+      // The actual regression: under the old per-correction `continue`, bridge-out's
+      // own correction message was NEVER sent at all once pixel and ads had each
+      // taken a turn — not even once, let alone exhausted. Assert on CONTENT, not
+      // just count, because the old buggy code also happened to call sendMessage
+      // twice (both pixel-only) — a count-only assertion would not catch the bug.
+      expect(mockChatsSendMessage).toHaveBeenCalledTimes(2);
+      for (const call of mockChatsSendMessage.mock.calls) {
+        const message = call[0]?.message as string;
+        expect(message).toContain("Meta Pixel Lead event");
+        expect(message).toContain("Google Ads conversion");
+        expect(message).toContain("bridge-out redirect");
+      }
+
+      // All three correctly reported as missing after exhausting the shared budget —
+      // bridge-out included, which is exactly what ENG-2099 says never happened.
+      expect(result.pixelLeadEventVerified).toBe(false);
+      expect(result.bridgeOutVerified).toBe(false);
+    });
+
+    it("stops batching a correction once v0 fixes it, while the others keep retrying", async () => {
+      setupSiteRecordWithAllThreeMock();
+
+      const buggyZip = await createZipMissingAllThree();
+      // Attempt 0's correction fixes ONLY the pixel; ads and bridge-out remain broken.
+      const AdmZip = (await import("adm-zip")).default;
+      const pixelFixedZip = new AdmZip();
+      pixelFixedZip.addFile(
+        "app/page.tsx",
+        Buffer.from(
+          `export default function Page() {
+             const submit = async (e: any) => {
+               e.preventDefault();
+               const eventId = crypto.randomUUID();
+               await fetch("/api/capture", { method: "POST", body: JSON.stringify({ eventId }) });
+               window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });
+             };
+             return <form onSubmit={submit}><input name="email" /><button>Go</button></form>;
+           }`
+        )
+      );
+      const pixelFixedZipBuffer = pixelFixedZip.toBuffer();
+
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      mockChatsGetById
+        .mockResolvedValueOnce({ latestVersion: { id: "v1" } })
+        .mockResolvedValueOnce({ latestVersion: { id: "v2" } })
+        .mockResolvedValueOnce({ latestVersion: { id: "v3" } });
+      mockChatsDownloadVersion
+        .mockResolvedValueOnce(buggyZip)
+        .mockResolvedValueOnce(pixelFixedZipBuffer)
+        .mockResolvedValueOnce(pixelFixedZipBuffer);
+      mockChatsSendMessage.mockResolvedValue({});
+
+      setupGitHubMocksWithGoogleAdsLayoutCheck(1);
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a booking page",
+        "All-Three Page 2",
+        {},
+        "list_all_three_2",
+        undefined,
+        { bridgeOutUrl: existingSiteAllThree.bridgeOutUrl }
+      );
+
+      expect(result.status).toBe("deployed");
+      expect(result.pixelLeadEventVerified).toBe(true);
+      expect(result.bridgeOutVerified).toBe(false);
+
+      // Attempt 0's message names all three (pixel was still missing going in);
+      // attempt 1's message must NOT re-ask for the pixel — it was already fixed.
+      const secondMessage = mockChatsSendMessage.mock.calls[1]?.[0]?.message as string;
+      expect(secondMessage).not.toContain("Meta Pixel Lead event");
+      expect(secondMessage).toContain("Google Ads conversion");
+      expect(secondMessage).toContain("bridge-out redirect");
+    });
+  });
 });
 
 // =============================================================================

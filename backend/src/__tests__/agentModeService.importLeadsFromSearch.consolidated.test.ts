@@ -64,10 +64,19 @@ jest.mock('../services/connectedAccountsDb', () => ({
 }));
 
 import * as crypto from 'crypto';
-import {
-  AgentModeService,
-  __testHooks as agentModeServiceTestHooks,
-} from '../services/agentModeService';
+import { AgentModeService } from '../services/agentModeService';
+// ENG-2103 (F2 design-decision-list follow-up, Pattern A): importLeadsFromSearch
+// moved to emma/impl/leads.ts, along with parseCompanyFromTitle and
+// batchParseCompaniesFromTitlesWithLLM (promoted to
+// emma/impl/shared/companyTitleParsing.ts) — both are now real, standalone
+// exports rather than reachable only via agentModeService.ts's __testHooks,
+// so these tests import them directly instead.
+import { parseCompanyFromTitle, batchParseCompaniesFromTitlesWithLLM } from '../emma/impl/shared/companyTitleParsing';
+// enqueueFindEmailJobForNewLeads's caller (importLeadsFromSearch) now imports
+// this module as a namespace and calls it as
+// `autoEnrichModule.enqueueFindEmailJobForNewLeads(...)` — spy on that
+// namespace object directly instead of the old __testHooks re-export.
+import * as autoEnrichModule from '../services/agentModeService.autoEnrich';
 
 function makeItem(idx: number): any {
   return { name: `Lead ${idx}`, public_identifier: `lead-${idx}` };
@@ -226,7 +235,7 @@ describe('AgentModeService.importLeadsFromSearch — auto_enrich', () => {
   });
 
   it('auto_enrich=false: no autoEnrichJobId in response', async () => {
-    const stubSpy = jest.spyOn(agentModeServiceTestHooks, 'enqueueFindEmailJobForNewLeads').mockResolvedValue(null);
+    const stubSpy = jest.spyOn(autoEnrichModule, 'enqueueFindEmailJobForNewLeads').mockResolvedValue(null);
     const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', auto_enrich: false });
     expect(result.autoEnrichJobId).toBeUndefined();
     expect(stubSpy).not.toHaveBeenCalled();
@@ -235,7 +244,7 @@ describe('AgentModeService.importLeadsFromSearch — auto_enrich', () => {
 
   it('auto_enrich=true with newCount=0: stub not invoked', async () => {
     mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 0, mergedCount: 0, errors: [], created: [] });
-    const stubSpy = jest.spyOn(agentModeServiceTestHooks, 'enqueueFindEmailJobForNewLeads').mockResolvedValue({ jobId: 'job-1', queued: 1 });
+    const stubSpy = jest.spyOn(autoEnrichModule, 'enqueueFindEmailJobForNewLeads').mockResolvedValue({ jobId: 'job-1', queued: 1 });
     const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', auto_enrich: true });
     expect(stubSpy).not.toHaveBeenCalled();
     expect(result.autoEnrichJobId).toBeUndefined();
@@ -243,7 +252,7 @@ describe('AgentModeService.importLeadsFromSearch — auto_enrich', () => {
   });
 
   it('auto_enrich=true with newCount>0 but stub returns null: graceful fallback', async () => {
-    const stubSpy = jest.spyOn(agentModeServiceTestHooks, 'enqueueFindEmailJobForNewLeads').mockResolvedValue(null);
+    const stubSpy = jest.spyOn(autoEnrichModule, 'enqueueFindEmailJobForNewLeads').mockResolvedValue(null);
     const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', auto_enrich: true });
     expect(stubSpy).toHaveBeenCalled();
     expect(result.autoEnrichJobId).toBeUndefined();
@@ -253,7 +262,7 @@ describe('AgentModeService.importLeadsFromSearch — auto_enrich', () => {
 
   it('auto_enrich=true: passes created lead IDs to stub', async () => {
     mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 2, mergedCount: 0, errors: [], created: [{ leadId: 'lead-A' }, { leadId: 'lead-B' }] });
-    const stubSpy = jest.spyOn(agentModeServiceTestHooks, 'enqueueFindEmailJobForNewLeads').mockResolvedValue({ jobId: 'job-xyz', queued: 2 });
+    const stubSpy = jest.spyOn(autoEnrichModule, 'enqueueFindEmailJobForNewLeads').mockResolvedValue({ jobId: 'job-xyz', queued: 2 });
     const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', auto_enrich: true });
     expect(stubSpy).toHaveBeenCalledWith('user-1', 'list-1', ['lead-A', 'lead-B']);
     expect(result.autoEnrichJobId).toBe('job-xyz');
@@ -262,7 +271,7 @@ describe('AgentModeService.importLeadsFromSearch — auto_enrich', () => {
 
   it('does not surface autoEnrichJobId when stub returns quota-exhausted sentinel', async () => {
     mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [], created: [{ leadId: 'lead-quota-1' }] });
-    const stubSpy = jest.spyOn(agentModeServiceTestHooks, 'enqueueFindEmailJobForNewLeads').mockResolvedValue({ jobId: '', queued: 0, reason: 'quota-exhausted' } as any);
+    const stubSpy = jest.spyOn(autoEnrichModule, 'enqueueFindEmailJobForNewLeads').mockResolvedValue({ jobId: '', queued: 0, reason: 'quota-exhausted' } as any);
     const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', auto_enrich: true });
     expect(result).not.toHaveProperty('autoEnrichJobId');
     expect(result.success).toBe(true);
@@ -282,7 +291,7 @@ const mockChatCreate = jest.fn();
 const fakeGateway = { callLLM: (...args: any[]) => mockChatCreate(...args) };
 
 describe('parseCompanyFromTitle (regex)', () => {
-  const parse = (agentModeServiceTestHooks as any).parseCompanyFromTitle as (t: any) => string | null;
+  const parse = parseCompanyFromTitle;
 
   it('returns null for empty string', () => { expect(parse('')).toBeNull(); });
   it('returns null for null/undefined input', () => { expect(parse(null)).toBeNull(); expect(parse(undefined)).toBeNull(); });
@@ -301,8 +310,7 @@ describe('parseCompanyFromTitle (regex)', () => {
 });
 
 describe('batchParseCompaniesFromTitlesWithLLM', () => {
-  const batchParse: (t: string[], c: any) => Promise<string[]> =
-    (agentModeServiceTestHooks as any).batchParseCompaniesFromTitlesWithLLM;
+  const batchParse: (t: string[], c: any) => Promise<string[]> = batchParseCompaniesFromTitlesWithLLM;
 
   beforeEach(() => { mockChatCreate.mockReset(); });
 
@@ -855,15 +863,20 @@ describe('AgentModeService.importLeadsFromSearch — top-up loop', () => {
       .mockResolvedValueOnce(batchResult(3, 0, 'p1'))
       .mockResolvedValueOnce(batchResult(3, 0, 'p2'));
 
-    const enqueueSpy = jest.fn().mockResolvedValue({ jobId: 'job-1', queued: 4 });
-    const { __testHooks } = require('../services/agentModeService');
-    __testHooks.enqueueFindEmailJobForNewLeads = enqueueSpy;
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): importLeadsFromSearch
+    // moved to emma/impl/leads.ts, which calls
+    // `autoEnrichModule.enqueueFindEmailJobForNewLeads(...)` on the imported
+    // namespace (not agentModeService.ts's __testHooks anymore) — spy on that
+    // namespace object directly, same as this file's other enqueue tests.
+    const enqueueSpy = jest.spyOn(autoEnrichModule, 'enqueueFindEmailJobForNewLeads')
+      .mockResolvedValue({ jobId: 'job-1', queued: 4 });
 
     await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 4, auto_enrich: true });
 
     expect(mockDeleteLead).toHaveBeenCalledWith('list-1', 'p2-2');
     expect(mockDeleteLead).toHaveBeenCalledWith('list-1', 'p2-3');
     expect(enqueueSpy).toHaveBeenCalledWith('user-1', 'list-1', ['p1-1', 'p1-2', 'p1-3', 'p2-1']);
+    enqueueSpy.mockRestore();
   });
 });
 

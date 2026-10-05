@@ -23,6 +23,99 @@ import { type AskUserQuestionOption } from '../services/agentMode/core/askUserQu
 import type { QuestionDeckQuestionInput } from '../services/agentMode/core/approvalDeck';
 import { approvalInboxService, type ApprovalDecisionApprover, type ApprovalDecisionGateType } from '../services/approvalInboxService';
 import { CLIENT_ID_SCHEMA_PROPERTY } from '../mcp/server/toolHelpers';
+// ENG-2103 (F2 pilot): books/whitepapers tool bodies live in a standalone module
+// that does not require constructing AgentModeService — see emma/impl/books.ts.
+import * as booksImpl from './impl/books';
+// ENG-2103 (F2): GTM plans tool cluster, same treatment as booksImpl above.
+import * as gtmPlansImpl from './impl/gtmPlans';
+// ENG-2103 (F2): Google Drive tool cluster, same treatment as booksImpl above.
+import * as googleDriveImpl from './impl/googleDrive';
+// ENG-2103 (F2): Google Docs/Sheets tool cluster, same treatment as booksImpl above.
+import * as googleDocsSheetsImpl from './impl/googleDocsSheets';
+// ENG-2103 (F2): HTML/landing-page misc tool cluster, same treatment as booksImpl above.
+import * as htmlToolsImpl from './impl/htmlTools';
+// ENG-2103 (F2): leads/CRM tool cluster, same treatment as booksImpl above.
+// ENG-2103 (F2 design-decision-list follow-up, Pattern A): import_leads_from_search
+// also now calls leadsImpl directly (see below) — `callLLM` is `public` on
+// AgentModeService, so this file can bind it straight off the singleton, same
+// treatment as create_html_from_template.
+import * as leadsImpl from './impl/leads';
+// ENG-2103 (F2): brand guidelines / market strategy tool cluster, same treatment as booksImpl above.
+import * as brandMarketStrategyImpl from './impl/brandMarketStrategy';
+// ENG-2103 (F2): video-generation / media-post-processing tool cluster, same treatment as booksImpl above.
+import * as mediaVideoImpl from './impl/mediaVideo';
+// ENG-2103 (F2): createHtmlFile/createHtmlTemplate tool cluster, same treatment as booksImpl above.
+import * as htmlCreationImpl from './impl/htmlCreation';
+// ENG-2103 (F2): updateHtmlFile tool cluster, same treatment as booksImpl above.
+import * as htmlUpdateImpl from './impl/htmlUpdate';
+// ENG-2103 (F2): knowledge base tool cluster, same treatment as booksImpl above.
+import * as knowledgeBaseImpl from './impl/knowledgeBase';
+// ENG-2103 (F2): blog tool cluster, same treatment as booksImpl above.
+import * as blogImpl from './impl/blog';
+// ENG-2103 (F2): work plans tool cluster, same treatment as booksImpl above.
+import * as workPlansImpl from './impl/workPlans';
+// ENG-2103 (F2): task management tool cluster, same treatment as booksImpl above.
+import * as tasksImpl from './impl/tasks';
+// ENG-2103 (F2): social posts & connected-account analytics tool cluster, same
+// treatment as booksImpl above — EXCEPT get_post_analytics,
+// list_connected_account_posts, and load_connected_account_metrics, which
+// still call `agentModeService.<method>` directly (see
+// emma/impl/socialAccounts.ts's module header): those 3 methods depend on
+// AgentModeService's private resolveAccessibleAccount, which this file has no
+// legal way to reach, so their delegating wrapper on the class is kept as the
+// call site instead of this module.
+import * as socialAccountsImpl from './impl/socialAccounts';
+// ENG-2103 (F2): LinkedIn posting & outreach tool cluster, same treatment as
+// booksImpl above — EXCEPT linkedin_manage_post, which still calls
+// `agentModeService.linkedinManagePost` directly (see emma/impl/linkedin.ts's
+// module header): it was kept entirely on the class (a sibling-method-spy
+// test-compatibility issue, not a callLLM one), so its native class method is
+// kept as the call site instead of this module. ENG-2103 (F2
+// design-decision-list follow-up, Pattern A): linkedin_outreach now ALSO
+// calls linkedinImpl directly — resolveEmployersForSizeFilter's real
+// this.callLLM coupling moved in with it, and `callLLM` is `public` on
+// AgentModeService, so this file can bind it straight off the singleton
+// without going through the class's own delegating wrapper (same treatment
+// as create_html_from_template).
+import * as linkedinImpl from './impl/linkedin';
+import * as twitterImpl from './impl/twitter';
+// ENG-2103 (F2): Meta/LinkedIn ads APIs tool cluster. Only
+// callLinkedInMarketingApi/callLinkedInAdsInsightsApi are repointed directly
+// here — the other 7 entry points in this cluster (callMetaAdsInsightsApiWrapper,
+// listMetaAdsCampaignsNew, getMetaAdsMetrics, callMetaMarketingApi,
+// launchTargetedAudienceCampaign, launchRetargetingCampaign) all depend on
+// `AgentModeService`'s PRIVATE `getMetaCredentials` (and, for
+// callMetaMarketingApi/launchAudienceCampaign, several more private
+// methods) — this file has no legal way to construct their dependency
+// bags, so those keep calling `agentModeService.<method>` (the class's own
+// delegating wrapper, which injects the private dependencies internally).
+import * as adsApisImpl from './impl/adsApis';
+// ENG-2103 (F2), cluster 19: Google Ads + HubSpot/Attio CRM passthrough
+// tools. handleCallGoogleAdsApi/handleCallGoogleAdsReportingApi/
+// handleHubspotApi call the module directly. handleAttioApi is re-exported
+// from the module (its real body already lives in
+// services/agentMode/attioTools.ts, a pre-existing self-contained
+// extraction) so this file gets one uniform import for the whole cluster.
+import * as adsCrmApisImpl from './impl/adsCrmApis';
+// ENG-2103 (F2), cluster 20: search & research tool cluster (perform_data_analysis,
+// you_search_web, you_search_news, google_search_web, perform_deep_research).
+// All 5 tools.ts call sites repointed to call the module directly.
+import * as searchResearchImpl from './impl/searchResearch';
+// ENG-2103 (F2), cluster 21: video tools cluster (getVideoApiDefaultModel,
+// describeVideo). Both tools.ts call sites repointed to call the module
+// directly.
+import * as videoImpl from './impl/video';
+// ENG-2103 (F2), cluster 22 (last mechanical cluster): skills/admin + file
+// ops + misc tool cluster. getAdminToolNames, readFileContent, and
+// sendEmailFromConfiguredSender are repointed to call the module directly.
+// save_file still calls agentModeService.saveFile directly — saveFile needs
+// AgentModeService's private fileContentCache/cleanupFileCache, which this
+// file has no legal way to reach (see emma/impl/misc.ts's module header).
+// getUnassociatedToolNames and install_skills also keep calling
+// agentModeService.<method> — both were scoped for this cluster but kept
+// entirely on the class instead (deep out-of-scope skills-subsystem
+// coupling), also explained in emma/impl/misc.ts's module header.
+import * as miscImpl from './impl/misc';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -843,8 +936,7 @@ emmaToolRegistry.register({
     // is null and admin tools are skipped (unless delegated-admin context says otherwise).
     const hasAdminAccess = currentUser?.isAdmin === true || context?.isDelegatedAdmin === true;
     if (hasAdminAccess) {
-      const { agentModeService } = await import('../services/agentModeService');
-      const adminToolNamesList = agentModeService.getAdminToolNames();
+      const adminToolNamesList = miscImpl.getAdminToolNames();
       availableSkills.push({
         skillId: '__admin_tools__',
         name: 'Admin Tools',
@@ -1047,7 +1139,14 @@ For target person identification (send-invite, send-message, get-profile, update
         return { success: false, message: 'Provide only one of profile_url or provider_id, not both.' };
       }
     }
-    return await agentModeService.linkedinOutreach(context.userId, args);
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): calls
+    // emma/impl/linkedin.ts directly, not agentModeService.linkedinOutreach —
+    // that class method still exists (routes/emmaApi.ts, crmEnrichmentService.ts
+    // and a large number of direct-instance tests call it directly), but
+    // `callLLM` is `public` on AgentModeService, so this tool can bind it
+    // straight off the singleton without going through the class's own
+    // delegating wrapper.
+    return await linkedinImpl.linkedinOutreach(agentModeService.callLLM.bind(agentModeService), context.userId, args);
   }
 });
 
@@ -1139,7 +1238,7 @@ For CRM logging of sent tweets, optionally pass list_id, lead_id and lead_email.
     if (!context?.userId) {
       throw new Error("Missing user context");
     }
-    return await agentModeService.twitterManagePost(context.userId, args, context);
+    return await twitterImpl.twitterManagePost(context.userId, args, context);
   }
 });
 
@@ -1244,7 +1343,7 @@ For CRM logging of sent DMs, optionally pass list_id, lead_id and lead_email.`,
     if (!context?.userId) {
       throw new Error("Missing user context");
     }
-    return await agentModeService.twitterOutreach(context.userId, args);
+    return await twitterImpl.twitterOutreach(context.userId, args);
   }
 });
 
@@ -2297,7 +2396,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.callLinkedInMarketingApi(
+    return await adsApisImpl.callLinkedInMarketingApi(
       context?.userId,
       args.entity_type,
       args.action,
@@ -2381,7 +2480,7 @@ COMMON FIELDS: impressions, clicks, costInLocalCurrency, totalEngagements, video
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.callLinkedInAdsInsightsApi(
+    return await adsApisImpl.callLinkedInAdsInsightsApi(
       context?.userId,
       args.account_id,
       {
@@ -2444,7 +2543,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.readBrandGuidelines(context?.userId);
+    return await brandMarketStrategyImpl.readBrandGuidelines(context?.userId);
   }
 });
 
@@ -2523,7 +2622,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.updateBrandGuidelines(args, context?.userId);
+    return await brandMarketStrategyImpl.updateBrandGuidelines(args, context?.userId);
   }
 });
 
@@ -2551,7 +2650,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.readMarketStrategy(context?.userId, {
+    return await brandMarketStrategyImpl.readMarketStrategy(context?.userId, {
       competitorOffset: args?.competitorOffset,
       competitorNames: args?.competitorNames,
     });
@@ -2603,7 +2702,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.updateMarketStrategy(args, context?.userId);
+    return await brandMarketStrategyImpl.updateMarketStrategy(args, context?.userId);
   }
 });
 
@@ -2622,7 +2721,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.regenerateMarketStrategy(context?.userId);
+    return await brandMarketStrategyImpl.regenerateMarketStrategy(context?.userId);
   }
 });
 
@@ -2692,7 +2791,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.performDeepResearchTool(
+    return await searchResearchImpl.performDeepResearchTool(
       args.topic,
       args.prompt,
       args.tone || 'professional',
@@ -2731,7 +2830,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listBooks(context?.userId, args.type, args.status);
+    return await booksImpl.listBooks(context?.userId, args.type, args.status);
   }
 });
 
@@ -2752,7 +2851,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getBookDetails(args.book_id, context?.userId);
+    return await booksImpl.getBookDetails(args.book_id, context?.userId);
   }
 });
 
@@ -2781,7 +2880,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    const result = await agentModeService.getBookContent(args.book_id, args.section_id, args.chapter_id, context?.userId);
+    const result = await booksImpl.getBookContent(args.book_id, args.section_id, args.chapter_id, context?.userId);
     if (result.success === false) {
       return {
         content: [
@@ -2846,7 +2945,7 @@ emmaToolRegistry.register({
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
-    return await agentModeService.updateBookContent(
+    return await booksImpl.updateBookContent(
       args.book_id,
       args.section_id,
       args.chapter_id,
@@ -2900,7 +2999,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.generateBookContent(
+    return await booksImpl.generateBookContent(
       args.book_id,
       args.section_id,
       args.chapter_id,
@@ -2959,7 +3058,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createBook(args.title, args.description, args.type, args.author, args.language, args.genre, args.tags || [], context?.userId);
+    return await booksImpl.createBook(args.title, args.description, args.type, args.author, args.language, args.genre, args.tags || [], context?.userId);
   }
 });
 
@@ -2984,7 +3083,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createBookOutline(args.book_id, args.outline_json, context?.userId);
+    return await booksImpl.createBookOutline(args.book_id, args.outline_json, context?.userId);
   }
 });
 
@@ -3009,7 +3108,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.addCharacters(args.book_id, args.characters_json, context?.userId);
+    return await booksImpl.addCharacters(args.book_id, args.characters_json, context?.userId);
   }
 });
 
@@ -3063,7 +3162,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createBlogArticle(
+    return await blogImpl.createBlogArticle(
       args.title_draft,
       args.content_draft,
       args.length || 'medium',
@@ -3122,7 +3221,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.publishBlogArticle(
+    return await blogImpl.publishBlogArticle(
       args.title,
       args.description,
       args.hero_image_url,
@@ -3201,7 +3300,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.repairBlogArticle(
+    return await blogImpl.repairBlogArticle(
       args.article_url,
       context?.userId,
       context?.sessionId
@@ -3248,7 +3347,7 @@ emmaToolRegistry.register({
     // Note: The backend createSocialMediaPosts currently expects an array of posts.
     // If the tool is supposed to generate them first, we might need a middle layer.
     // For now, mirroring the existing (buggy?) behavior but ensuring we pass sessionId.
-    return await agentModeService.createSocialMediaPosts(args.posts, context?.userId, context?.sessionId);
+    return await socialAccountsImpl.createSocialMediaPosts(args.posts, context?.userId, context?.sessionId);
   }
 });
 
@@ -3269,7 +3368,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listHtmlTemplates(context?.userId, args.type);
+    return await htmlToolsImpl.listHtmlTemplates(context?.userId, args.type);
   }
 });
 
@@ -3326,7 +3425,19 @@ emmaToolRegistry.register({
       };
     }
 
-    return await agentModeService.createHtmlFromTemplate(context?.llmModel, args.template_id, variableValues, arrayVariableValues, context?.userId, context?.sessionId);
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): calls
+    // emma/impl/htmlCreation.ts directly, not agentModeService.
+    // createHtmlFromTemplate — that class method still exists (routes/
+    // emmaApi.ts and a dedicated test call it directly), but `callLLM`/
+    // `getDefaultModel`/`resolveGenerationModel` are all `public` on
+    // AgentModeService, so this tool can bind them straight off the
+    // singleton without going through the class's own delegating wrapper.
+    return await htmlCreationImpl.createHtmlFromTemplate(
+      context?.llmModel, args.template_id, variableValues, arrayVariableValues, context?.userId, context?.sessionId,
+      agentModeService.callLLM.bind(agentModeService),
+      agentModeService.getDefaultModel.bind(agentModeService),
+      agentModeService.resolveGenerationModel.bind(agentModeService),
+    );
   }
 });
 
@@ -3385,7 +3496,7 @@ emmaToolRegistry.register({
       };
     }
 
-    return await agentModeService.updateHtmlFile(args.file_url, args.update_type, operations, context?.userId, context?.sessionId);
+    return await htmlUpdateImpl.updateHtmlFile(args.file_url, args.update_type, operations, context?.userId, context?.sessionId);
   }
 });
 
@@ -3403,7 +3514,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listGTMPlans(context?.userId);
+    return await gtmPlansImpl.listGTMPlans(context?.userId);
   }
 });
 
@@ -3424,7 +3535,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.readGTMPlan(args.plan_id, context?.userId);
+    return await gtmPlansImpl.readGTMPlan(args.plan_id, context?.userId);
   }
 });
 
@@ -3505,7 +3616,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createGTMPlan(
+    return await gtmPlansImpl.createGTMPlan(
       args.title, args.description || '', args.dri || undefined, args.phases || [], context?.userId, context?.sessionId
     );
   }
@@ -3544,7 +3655,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.updateGTMPlan(args.plan_id, {
+    return await gtmPlansImpl.updateGTMPlan(args.plan_id, {
       title: args.title,
       description: args.description,
       dri: args.dri,
@@ -3612,7 +3723,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.addGTMPhase(args.plan_id, {
+    return await gtmPlansImpl.addGTMPhase(args.plan_id, {
       title: args.title,
       description: args.description,
       dri: args.dri,
@@ -3669,7 +3780,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.addGTMWorkItems(args.plan_id, args.phase_id, args.work_items, context?.userId);
+    return await gtmPlansImpl.addGTMWorkItems(args.plan_id, args.phase_id, args.work_items, context?.userId);
   }
 });
 
@@ -3742,7 +3853,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.updateGTMWorkItem(args.plan_id, args.phase_id, args.work_item_id, {
+    return await gtmPlansImpl.updateGTMWorkItem(args.plan_id, args.phase_id, args.work_item_id, {
       status: args.status,
       notes: args.notes,
       dri: args.dri,
@@ -3796,7 +3907,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.updateGTMPhase(args.plan_id, args.phase_id, {
+    return await gtmPlansImpl.updateGTMPhase(args.plan_id, args.phase_id, {
       title: args.title,
       description: args.description,
       dri: args.dri,
@@ -3830,7 +3941,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.deleteGTMItems(args.plan_id, args.phase_id, args.work_item_id, context?.userId);
+    return await gtmPlansImpl.deleteGTMItems(args.plan_id, args.phase_id, args.work_item_id, context?.userId);
   }
 });
 
@@ -3846,7 +3957,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getGTMCommonItems();
+    return await gtmPlansImpl.getGTMCommonItems();
   }
 });
 
@@ -3893,7 +4004,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.addGTMCommonItems(args.plan_id, args.items, args.target_phase_id, args.new_phase_name, context?.userId);
+    return await gtmPlansImpl.addGTMCommonItems(args.plan_id, args.items, args.target_phase_id, args.new_phase_name, context?.userId);
   }
 });
 
@@ -3938,7 +4049,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.sendGTMStatusReport(args.plan_id, args.phase_id, {
+    return await gtmPlansImpl.sendGTMStatusReport(args.plan_id, args.phase_id, {
       notifyUser: args.notify_user,
       notifyPlanPoc: args.notify_plan_poc,
       notifyPhasePoc: args.notify_phase_poc,
@@ -3960,7 +4071,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getLeadLists(context?.userId);
+    return await leadsImpl.getLeadLists(context?.userId);
   }
 });
 
@@ -3990,7 +4101,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createLeadList(args.name, args.description || '', context?.userId, args.list_type);
+    return await leadsImpl.createLeadList(args.name, args.description || '', context?.userId, args.list_type);
   }
 });
 
@@ -4026,7 +4137,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.addLeadsToList(args.list_id, args.leads || [], context?.userId, {
+    return await leadsImpl.addLeadsToList(args.list_id, args.leads || [], context?.userId, {
       // The turn's real cap, not `runBudgetDeadlineMs` — that one carries the media-gen
       // soft deadline, which is neither a bound on the turn nor still meaningful once it
       // has passed (ENG-1133).
@@ -4065,13 +4176,24 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.updateEmailDraftForLead(
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): calls
+    // emma/impl/leads.ts directly, not agentModeService.updateEmailDraftForLead —
+    // that class method still exists (routes/webhooks.ts's forward-lead
+    // auto-draft path and a dedicated test call it directly), but `callLLM`
+    // and `getReportGenerationDefaultModel` are both `public` on
+    // AgentModeService, so this tool can bind them straight off the
+    // singleton, same treatment as create_html_from_template /
+    // import_leads_from_search.
+    return leadsImpl.updateEmailDraftForLead(
       args.list_id,
       args.lead_id,
       args.instruction,
       context?.sessionId,
       context?.userId,
-      args.email_format
+      args.email_format,
+      agentModeService.callLLM.bind(agentModeService),
+      agentModeService.getReportGenerationDefaultModel.bind(agentModeService),
+      agentModeService.getSenderForLead.bind(agentModeService),
     );
   }
 });
@@ -4117,7 +4239,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getLeads(args.list_id, context?.userId, {
+    return await leadsImpl.getLeads(args.list_id, context?.userId, {
       search: args.search,
       status: args.status,
       icpOnly: args.icp_only,
@@ -4184,7 +4306,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.searchLeads(args.list_id, args.filters, context?.userId, args.limit, {
+    return await leadsImpl.searchLeads(args.list_id, args.filters, context?.userId, args.limit, {
       search: args.search,
       cursor: args.cursor,
       listIds: args.list_ids,
@@ -4299,7 +4421,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getLeadDetails(args.list_id, args.lead_id, context?.userId);
+    return await leadsImpl.getLeadDetails(args.list_id, args.lead_id, context?.userId);
   }
 });
 
@@ -4328,7 +4450,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getLeadsNeedingFollowup(args.list_id, context?.userId, {
+    return await leadsImpl.getLeadsNeedingFollowup(args.list_id, context?.userId, {
       limit: args.limit,
       scanLimit: args.scan_limit,
     });
@@ -4361,7 +4483,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.updateLead(args.list_id, args.lead_id, args.updates, context?.userId);
+    return await leadsImpl.updateLead(args.list_id, args.lead_id, args.updates, context?.userId);
   }
 });
 
@@ -4401,7 +4523,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.setLeadContactStatus(
+    return await leadsImpl.setLeadContactStatus(
       args.list_id,
       args.lead_ids,
       args.contact_status,
@@ -4434,7 +4556,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.deleteLeads(args.list_id, args.lead_ids, context?.userId);
+    return await leadsImpl.deleteLeads(args.list_id, args.lead_ids, context?.userId);
   }
 });
 
@@ -4481,7 +4603,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.deleteLeadsByFilter(args.list_id, args.filters, context?.userId, args.confirm);
+    return await leadsImpl.deleteLeadsByFilter(args.list_id, args.filters, context?.userId, args.confirm);
   }
 });
 
@@ -4545,7 +4667,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.updateLeadList(args.list_id, {
+    return await leadsImpl.updateLeadList(args.list_id, {
       name: args.name,
       description: args.description,
       icpsOnly: args.icps_only,
@@ -4575,7 +4697,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.deleteLeadList(args.list_id, context?.userId);
+    return await leadsImpl.deleteLeadList(args.list_id, context?.userId);
   }
 });
 
@@ -4616,7 +4738,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.updateLeadStatus(
+    return await leadsImpl.updateLeadStatus(
       args.list_id, args.lead_id, args.status, context?.userId,
       args.deal_value, args.deal_currency, args.notes
     );
@@ -4640,7 +4762,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getLeadListStatuses(args.list_id, context?.userId);
+    return await leadsImpl.getLeadListStatuses(args.list_id, context?.userId);
   }
 });
 
@@ -4675,7 +4797,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.configureLeadStatuses(args.list_id, args.statuses, context?.userId);
+    return await leadsImpl.configureLeadStatuses(args.list_id, args.statuses, context?.userId);
   }
 });
 
@@ -4704,7 +4826,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getLeadEngagements(args.list_id, args.lead_id, context?.userId, args.limit);
+    return await leadsImpl.getLeadEngagements(args.list_id, args.lead_id, context?.userId, args.limit);
   }
 });
 
@@ -4742,7 +4864,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.addLeadEngagement(
+    return await leadsImpl.addLeadEngagement(
       args.list_id, args.lead_id, args.event_type,
       context?.userId, args.event_data, args.event_date
     );
@@ -4770,7 +4892,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.sendEmailToLead(args.list_id, args.lead_id, context?.userId);
+    return await leadsImpl.sendEmailToLead(args.list_id, args.lead_id, context?.userId);
   }
 });
 
@@ -4820,7 +4942,7 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     const userId = context?.userId;
     if (!userId) throw new Error('Missing user context');
-    return await agentModeService.sendEmailFromConfiguredSender(userId, {
+    return await miscImpl.sendEmailFromConfiguredSender(userId, {
       to: args.to,
       subject: args.subject,
       html: args.html,
@@ -4857,7 +4979,7 @@ If asked to try something in "the test account", choose by test_account. If none
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listConnectedAccounts(context?.userId, args.platform);
+    return await socialAccountsImpl.listConnectedAccounts(context?.userId, args.platform);
   }
 });
 
@@ -4950,7 +5072,7 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     // ENG-827: the context carries `assertPublishStillAuthorized`, which the handler
     // runs immediately before the post becomes real — see postOnConnectedAccount.
-    return await agentModeService.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context);
+    return await linkedinImpl.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context);
   }
 });
 
@@ -5018,7 +5140,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listTaskTemplates();
+    return await tasksImpl.listTaskTemplates();
   }
 });
 
@@ -5064,7 +5186,7 @@ emmaToolRegistry.register({
     if (typeof parameters === 'string') {
       try { parameters = JSON.parse(args.parameters_json); } catch (e) { }
     }
-    return await agentModeService.createTaskFromTemplate(
+    return await tasksImpl.createTaskFromTemplate(
       args.template_id,
       parameters,
       context?.userId,
@@ -5117,7 +5239,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createTaskFromPrompt(
+    return await tasksImpl.createTaskFromPrompt(
       args.task_name,
       args.prompt,
       args.category,
@@ -5161,7 +5283,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createImageTaskFromPrompt(
+    return await tasksImpl.createImageTaskFromPrompt(
       args.task_name,
       args.prompt,
       args.category,
@@ -5202,7 +5324,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createRevision(
+    return await tasksImpl.createRevision(
       args.task_id,
       args.execution_id,
       args.revision_prompt,
@@ -5229,7 +5351,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getTaskSubscriberMetrics(args.task_id, context?.userId);
+    return await socialAccountsImpl.getTaskSubscriberMetrics(args.task_id, context?.userId);
   }
 });
 
@@ -5254,7 +5376,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getTaskSubscriberEngagementEvents(args.task_id, args.email_subject, context?.userId);
+    return await socialAccountsImpl.getTaskSubscriberEngagementEvents(args.task_id, args.email_subject, context?.userId);
   }
 });
 
@@ -5286,11 +5408,18 @@ emmaToolRegistry.register({
     // selected model. (`args.llmModel` was never populated — the schema doesn't
     // expose it and the registry doesn't merge context into args.)
     // ENG-1858: meter the vision call to the calling user instead of "system".
-    return await agentModeService.describeImage(undefined, args.image_url, args.prompt, {
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): calls
+    // emma/impl/mediaVideo.ts directly, not agentModeService.describeImage —
+    // that class method still exists (routes/emmaApi.ts and several
+    // dedicated tests call it directly), but `callLLM`/`getVisionModel` are
+    // both `public` on AgentModeService, so this tool can bind them straight
+    // off the singleton without going through the class's own delegating
+    // wrapper.
+    return await mediaVideoImpl.describeImage(undefined, args.image_url, args.prompt, {
       userId: context?.userId || context?.agentUserId,
       sessionId: context?.sessionId,
       feature: 'describe_image',
-    });
+    }, agentModeService.callLLM.bind(agentModeService), agentModeService.getVisionModel.bind(agentModeService));
   }
 });
 
@@ -5332,7 +5461,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.describeVideo(args.video_file_url, args.prompt, {
+    return await videoImpl.describeVideo(args.video_file_url, args.prompt, {
       return_transcript: args.return_transcript,
       return_scenes: args.return_scenes,
       start_time: args.start_time,
@@ -5366,7 +5495,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.removeC2PAFromImage(args.image_url, args.filename, context?.userId);
+    return await mediaVideoImpl.removeC2PAFromImage(args.image_url, args.filename, context?.userId);
   }
 });
 
@@ -5407,7 +5536,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.removeImageBackground(args.image_url, args.filename, context?.userId, {
+    return await mediaVideoImpl.removeImageBackground(args.image_url, args.filename, context?.userId, {
       tolerance: args.tolerance,
       surfaceColor: args.surface_color
     });
@@ -5486,7 +5615,14 @@ emmaToolRegistry.register({
     // generateImage — so a provider timeout produced zero deliverables. generateImage
     // now resolves the admin default itself and only suppresses the fallback for a
     // genuinely LLM-specified model.
-    return await agentModeService.generateImage(
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): calls
+    // emma/impl/mediaVideo.ts directly, not agentModeService.generateImage —
+    // that class method still exists (routes/emmaApi.ts and several
+    // dedicated tests call it directly), but `callLLM`/`getVisionModel` are
+    // both `public` on AgentModeService, so this tool can bind them straight
+    // off the singleton without going through the class's own delegating
+    // wrapper.
+    return await mediaVideoImpl.generateImage(
       args.prompt,
       args.filename,
       args.size || '1024x1024',
@@ -5499,7 +5635,9 @@ emmaToolRegistry.register({
       args.confirm,
       args.category,
       args.metrics_verified,
-      args.placement
+      args.placement,
+      agentModeService.callLLM.bind(agentModeService),
+      agentModeService.getVisionModel.bind(agentModeService),
     );
   }
 });
@@ -5608,8 +5746,8 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     // If the LLM didn't specify a model, fall back to the admin-configured video API default
-    const videoModel = args.videoModel || await agentModeService.getVideoApiDefaultModel();
-    return await agentModeService.generateVideo(
+    const videoModel = args.videoModel || await videoImpl.getVideoApiDefaultModel();
+    return await mediaVideoImpl.generateVideo(
       args.prompt,
       args.filename,
       context?.userId,
@@ -5698,7 +5836,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.composeVideo(
+    return await mediaVideoImpl.composeVideo(
       args.clip_urls,
       args.filename,
       context?.userId,
@@ -5749,7 +5887,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.muxVideoWithAudio(
+    return await mediaVideoImpl.muxVideoWithAudio(
       args.video_url,
       args.audio_url,
       args.filename,
@@ -5793,7 +5931,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.generateVoiceover(
+    return await mediaVideoImpl.generateVoiceover(
       args.script,
       args.filename,
       context?.userId,
@@ -5818,7 +5956,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (_args: any, context?: any) => {
-    return await agentModeService.listVideoCharacters(context?.userId);
+    return await mediaVideoImpl.listVideoCharacters(context?.userId);
   }
 });
 
@@ -5839,7 +5977,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, _context?: any) => {
-    return await agentModeService.getVideoCharacter(args.character_id);
+    return await mediaVideoImpl.getVideoCharacter(args.character_id);
   }
 });
 
@@ -5872,7 +6010,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createVideoCharacter(context?.userId, {
+    return await mediaVideoImpl.createVideoCharacter(context?.userId, {
       name: args.name,
       description: args.description,
       referenceImageUrl: args.reference_image_url,
@@ -5899,7 +6037,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.deleteVideoCharacter(context?.userId, args.character_id);
+    return await mediaVideoImpl.deleteVideoCharacter(context?.userId, args.character_id);
   }
 });
 
@@ -5936,7 +6074,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.youSearchWeb(args.query, args.max_results || 10, args.freshness, args.include_domains, context?.userId);
+    return await searchResearchImpl.youSearchWeb(args.query, args.max_results || 10, args.freshness, args.include_domains, context?.userId);
   }
 });
 
@@ -5967,7 +6105,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.youSearchNews(args.query, args.max_results || 10, args.freshness, context?.userId);
+    return await searchResearchImpl.youSearchNews(args.query, args.max_results || 10, args.freshness, context?.userId);
   }
 });
 
@@ -5993,7 +6131,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.googleSearchWeb(args.query, args.max_results || 10, context?.userId);
+    return await searchResearchImpl.googleSearchWeb(args.query, args.max_results || 10, context?.userId);
   }
 });
 
@@ -6019,7 +6157,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.searchKnowledgeBase(args.query, args.max_results || 5, context?.userId);
+    return await knowledgeBaseImpl.searchKnowledgeBase(args.query, args.max_results || 5, context?.userId);
   }
 });
 
@@ -6082,7 +6220,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     if (args.source === 'discovery') {
-      return await agentModeService.searchForeplayDiscovery(
+      return await knowledgeBaseImpl.searchForeplayDiscovery(
         args.query,
         {
           maxResults: args.max_results || 10,
@@ -6097,7 +6235,7 @@ emmaToolRegistry.register({
         context?.userId
       );
     }
-    return await agentModeService.searchForeplayAds(args.query, args.max_results || 5, context?.userId);
+    return await knowledgeBaseImpl.searchForeplayAds(args.query, args.max_results || 5, context?.userId);
   }
 });
 
@@ -6135,7 +6273,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listKnowledgeBaseFiles(context?.userId, {
+    return await knowledgeBaseImpl.listKnowledgeBaseFiles(context?.userId, {
       modified_after: args?.modified_after,
       modified_before: args?.modified_before,
       limit: args?.limit,
@@ -6176,7 +6314,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.readKnowledgeBaseFiles(args.files, context?.userId);
+    return await knowledgeBaseImpl.readKnowledgeBaseFiles(args.files, context?.userId);
   }
 });
 
@@ -6201,7 +6339,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.materializeKnowledgeBaseAsset(args.kb_identifier, args.file_name, context?.userId);
+    return await knowledgeBaseImpl.materializeKnowledgeBaseAsset(args.kb_identifier, args.file_name, context?.userId);
   }
 });
 
@@ -6234,7 +6372,7 @@ emmaToolRegistry.register({
     if (!context?.userId || !context?.sessionId) {
       throw new Error("Missing user or session context");
     }
-    return await agentModeService.createKnowledgeBase(
+    return await knowledgeBaseImpl.createKnowledgeBase(
       args.name,
       args.content,
       args.knowledgeBaseType || 'private',
@@ -6277,7 +6415,7 @@ emmaToolRegistry.register({
     if (!context?.userId || !context?.sessionId) {
       throw new Error("Missing user or session context");
     }
-    return await agentModeService.updateKnowledgeBaseFile(
+    return await knowledgeBaseImpl.updateKnowledgeBaseFile(
       args.taskId,
       args.fileName,
       args.content,
@@ -6326,7 +6464,7 @@ emmaToolRegistry.register({
     if (!context?.userId || !context?.sessionId) {
       throw new Error("Missing user or session context");
     }
-    return await agentModeService.attachKnowledgeBaseFiles(
+    return await knowledgeBaseImpl.attachKnowledgeBaseFiles(
       args.taskId,
       args.files,
       context.userId,
@@ -6367,7 +6505,7 @@ emmaToolRegistry.register({
     if (!context?.userId) {
       throw new Error("Missing user context");
     }
-    return await agentModeService.writeClickUpDoc(
+    return await knowledgeBaseImpl.writeClickUpDoc(
       args.workspace_id,
       args.name,
       args.content,
@@ -6475,7 +6613,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    const result = await agentModeService.readFileContent(args.file_url);
+    const result = await miscImpl.readFileContent(args.file_url);
     if (result.success === false) {
       return {
         content: [
@@ -6521,11 +6659,11 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     // If extractDesignTokens is true, use CSS extraction
     if (args.extractDesignTokens) {
-      return await agentModeService.extractCSSFromURL(args, context?.userId);
+      return await htmlToolsImpl.extractCSSFromURL(args, context?.userId);
     }
 
     // Default: read raw HTML
-    const result = await agentModeService.readFileContent(args.url);
+    const result = await miscImpl.readFileContent(args.url);
     if (result.success === false) {
       return {
         content: [
@@ -6609,7 +6747,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.performDataAnalysis(args.file_urls, args.analysis_instruction, context?.userId);
+    return await searchResearchImpl.performDataAnalysis(args.file_urls, args.analysis_instruction, context?.userId);
   }
 });
 
@@ -6646,7 +6784,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     const documentType = args.document_type === 'email' ? 'email' : 'document';
-    return await agentModeService.createHtmlFile(args.title, args.content_draft, args.format_requirements || '', context?.userId, context?.sessionId, documentType);
+    return await htmlCreationImpl.createHtmlFile(args.title, args.content_draft, args.format_requirements || '', context?.userId, context?.sessionId, documentType);
   }
 });
 
@@ -6688,7 +6826,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createHtmlTemplate(
+    return await htmlCreationImpl.createHtmlTemplate(
       args.html_source,
       args.template_id,
       args.template_name,
@@ -6771,7 +6909,7 @@ emmaToolRegistry.register({
     },
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.convertToPdf(args.source_url, args.output_filename, context?.userId, {
+    return await htmlToolsImpl.convertToPdf(args.source_url, args.output_filename, context?.userId, {
       orientation: args.orientation,
       format: args.format,
     });
@@ -6833,7 +6971,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createWorkPlan(args.title, args.steps, context?.sessionId, args.autocomplete, context?.isUnattendedRun);
+    return await workPlansImpl.createWorkPlan(args.title, args.steps, context?.sessionId, args.autocomplete, context?.isUnattendedRun);
   }
 });
 
@@ -6866,11 +7004,11 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.applyPredefinedWorkPlan(args.planTitle, context?.sessionId, context?.userId, {
+    return await workPlansImpl.applyPredefinedWorkPlan(args.planTitle, context?.sessionId, context?.userId, {
       force: args.force === true,
       confirmedDeclinedPlan: args.confirmedDeclinedPlan === true,
       isUnattendedRun: context?.isUnattendedRun,
-    });
+    }, agentModeService);
   }
 });
 
@@ -6908,7 +7046,7 @@ emmaToolRegistry.register({
     // completion-recommendation extension's own internal call into
     // agentModeService.recommendPredefinedWorkPlan, never by the model
     // through this input schema.
-    return await agentModeService.recommendPredefinedWorkPlan(
+    return await workPlansImpl.recommendPredefinedWorkPlan(
       args.planId,
       args.reason,
       context?.sessionId,
@@ -6974,7 +7112,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.modifyWorkPlan(args.steps, args.removeStepCounts || [], context?.sessionId, args.autocomplete, context?.isUnattendedRun);
+    return await workPlansImpl.modifyWorkPlan(args.steps, args.removeStepCounts || [], context?.sessionId, args.autocomplete, context?.isUnattendedRun, agentModeService.callLLM.bind(agentModeService));
   }
 });
 
@@ -7014,7 +7152,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.setWorkPlanStatus(args.updates, context?.sessionId);
+    return await workPlansImpl.setWorkPlanStatus(args.updates, context?.sessionId);
   }
 });
 
@@ -7046,7 +7184,7 @@ emmaToolRegistry.register({
     if (!context?.userId || !context?.sessionId) {
       throw new Error("Missing user or session context");
     }
-    return await agentModeService.sendForReview(
+    return await workPlansImpl.sendForReview(
       args.subject,
       context.sessionId,
       context.userId,
@@ -9681,7 +9819,13 @@ Response keys:
   execute: async (args: any, context: any) => {
     if (!context?.userId) throw new Error('Authentication required');
     const limit = Math.min(args.limit ?? 20, 500);
-    return agentModeService.importLeadsFromSearch(context.userId, {
+    // ENG-2103 (F2 design-decision-list follow-up, Pattern A): calls
+    // emma/impl/leads.ts directly, not agentModeService.importLeadsFromSearch —
+    // that class method still exists (routes/crm.ts and a dedicated test call
+    // it directly), but `callLLM` is `public` on AgentModeService, so this
+    // tool can bind it straight off the singleton, same treatment as
+    // create_html_from_template.
+    return leadsImpl.importLeadsFromSearch(agentModeService.callLLM.bind(agentModeService), context.userId, {
       listId: args.list_id,
       keywords: args.keywords,
       search_url: args.search_url,
@@ -9849,7 +9993,7 @@ ACTION MATRIX:
     },
   },
   execute: async (args: any, context: any) => {
-    return await agentModeService.handleCallGoogleAdsApi(context?.userId || context?.agentUserId, args, {
+    return await adsCrmApisImpl.handleCallGoogleAdsApi(context?.userId || context?.agentUserId, args, {
       sessionId: context?.sessionId,
       ...(args.client_id ? { clientScope: { clientId: args.client_id, toolName: 'call_google_ads_api' } } : {}),
     });
@@ -9892,7 +10036,7 @@ GAQL EXAMPLES:
     },
   },
   execute: async (args: any, context: any) => {
-    return await agentModeService.handleCallGoogleAdsReportingApi(context?.userId || context?.agentUserId, args, {
+    return await adsCrmApisImpl.handleCallGoogleAdsReportingApi(context?.userId || context?.agentUserId, args, {
       ...(args.client_id ? { clientScope: { clientId: args.client_id, toolName: 'call_google_ads_reporting_api' } } : {}),
     });
   },
@@ -10054,7 +10198,7 @@ TYPICAL WORKFLOW:
   execute: async (args: any, context?: any) => {
     const userId = context?.userId;
     if (!userId) return { success: false, error: 'Authentication required: no user context.' };
-    return agentModeService.handleHubspotApi(userId, args);
+    return adsCrmApisImpl.handleHubspotApi(userId, args);
   },
 });
 
@@ -10101,7 +10245,7 @@ ENTITY_TYPE + ACTION MATRIX:
   execute: async (args: any, context?: any) => {
     const userId = context?.userId;
     if (!userId) return { success: false, error: 'Authentication required: no user context.' };
-    return agentModeService.handleAttioApi(userId, args);
+    return adsCrmApisImpl.handleAttioApi(userId, args);
   },
 });
 
@@ -10124,7 +10268,7 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
     const fileId = (args.url_or_id as string).match(/\/d\/([a-zA-Z0-9_-]+)/)?.[1] ?? args.url_or_id.trim();
-    return agentModeService.readGoogleFileById(fileId, context.userId);
+    return googleDriveImpl.readGoogleFileById(fileId, context.userId);
   },
 });
 
@@ -10173,15 +10317,15 @@ emmaToolRegistry.register({
     if (!context?.userId) return { success: false, message: 'Authentication required' };
     if (args.action === 'search') {
       if (!args.query) return { success: false, message: 'query is required for action=search' };
-      return agentModeService.searchGoogleDrive(args.query, context.userId, args.type);
+      return googleDriveImpl.searchGoogleDrive(args.query, context.userId, args.type);
     }
     if (args.action === 'list') {
       if (!args.folder_url_or_id) return { success: false, message: 'folder_url_or_id is required for action=list' };
-      return agentModeService.listGoogleDriveFolder(args.folder_url_or_id, context.userId);
+      return googleDriveImpl.listGoogleDriveFolder(args.folder_url_or_id, context.userId);
     }
     if (args.action === 'create_folder') {
       if (!args.name) return { success: false, message: 'name is required for action=create_folder' };
-      return agentModeService.createGoogleDriveFolder(args.name, context.userId, args.parent_folder_id);
+      return googleDriveImpl.createGoogleDriveFolder(args.name, context.userId, args.parent_folder_id);
     }
     return { success: false, message: `Unknown action: ${args.action}` };
   },
@@ -10251,7 +10395,7 @@ emmaToolRegistry.register({
     const style = args.plain === true ? 'plain' : 'styled';
     const so = args.style_options;
     const styleOptions = so ? { primaryColor: so.primary_color, fontFamily: so.font_family, fontSize: so.font_size, lineHeight: so.line_height, compact: so.compact } : undefined;
-    return agentModeService.createGoogleDoc(args.title, args.content, context.userId, args.folder_id, args.share_with_emails, style, styleOptions);
+    return googleDocsSheetsImpl.createGoogleDoc(args.title, args.content, context.userId, args.folder_id, args.share_with_emails, style, styleOptions);
   },
 });
 
@@ -10297,7 +10441,7 @@ emmaToolRegistry.register({
     const style = args.plain === true ? 'plain' : (args.plain === false || args.style_options) ? 'styled' : 'plain';
     const so = args.style_options;
     const styleOptions = so ? { primaryColor: so.primary_color, fontFamily: so.font_family, fontSize: so.font_size, lineHeight: so.line_height, compact: so.compact } : undefined;
-    return agentModeService.updateGoogleDoc(args.url_or_id, args.content, context.userId, style, styleOptions);
+    return googleDocsSheetsImpl.updateGoogleDoc(args.url_or_id, args.content, context.userId, style, styleOptions);
   },
 });
 
@@ -10333,7 +10477,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
-    return agentModeService.createGoogleSheet(args.title, args.data, context.userId, args.folder_id, args.share_with_emails);
+    return googleDocsSheetsImpl.createGoogleSheet(args.title, args.data, context.userId, args.folder_id, args.share_with_emails);
   },
 });
 
@@ -10364,7 +10508,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
-    return agentModeService.updateGoogleSheet(args.url_or_id, args.range, args.data, context.userId);
+    return googleDocsSheetsImpl.updateGoogleSheet(args.url_or_id, args.range, args.data, context.userId);
   },
 });
 
