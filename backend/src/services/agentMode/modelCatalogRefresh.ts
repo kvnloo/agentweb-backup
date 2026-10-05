@@ -137,18 +137,18 @@ export async function refreshModelCatalog(options: {
     if (Object.keys(patch).length) registryChanges[id] = { ...registryChanges[id], ...patch };
     next[id] = { ...config, ...patch };
   }
+  // Every existing price is a human decision (see withDerivedCache usage and inline
+  // confidence/promo commentary in llmPricing.ts) — a live quote never silently
+  // overwrites it, for any upstream. Only report the drift for human review; only
+  // brand-new additions (above) get priced directly from the quote.
   const quotes = new Map(parseOpenRouter(catalog).map(m => [upstream(m.id), m.price]));
+  const additionIds = new Set(additions.map(m => m.id));
   for (const id of Object.keys(registry)) {
+    if (additionIds.has(id)) continue;
     const quote = quotes.get(upstream(id));
-    // Existing OpenAI logical IDs use Azure BYOK list prices (llmPricing.ts).
-    if (!quote) continue;
-    if (!id.startsWith('openrouter/') || upstream(id).startsWith('openai/')) {
-      if (prices[id] && (prices[id].inPerM !== quote.inPerM || prices[id].outPerM !== quote.outPerM))
-        reports.push(`${id}: retained native/BYOK billing rates; marketplace quote not applied`);
-      continue;
-    }
-    const price = { ...prices[id], ...quote }; // absent cache quotes preserve explicit overrides
-    if (JSON.stringify(price) !== JSON.stringify(prices[id])) pricingChanges[id] = price;
+    if (!quote || !prices[id]) continue;
+    if (prices[id].inPerM !== quote.inPerM || prices[id].outPerM !== quote.outPerM)
+      reports.push(`${id}: live quote ($${quote.inPerM}/$${quote.outPerM} in/out) diverges from curated price ($${prices[id].inPerM}/$${prices[id].outPerM}); not applied`);
   }
   const nextPrices = { ...prices, ...pricingChanges };
   const candidates = Object.entries(next).filter(([, m]) => !m.isLive && !m.internalOnly)
