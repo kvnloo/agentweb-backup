@@ -131,13 +131,11 @@ export async function resolveMetaToolkitAdAccount(
   return normalizeAdAccountId(cfg?.ad_account_id || usable[0].account_id);
 }
 
+// Fail closed: if the manifest cannot be read, let the error propagate so the call is
+// refused (and not metered) rather than executing without the resolved account binding.
 function toolAcceptsAccountId(name: string): boolean {
-  try {
-    const def = getMetaToolkitManifest().find((d: any) => d.name === name);
-    return !!def?.inputSchema?.properties?.account_id;
-  } catch {
-    return false;
-  }
+  const def = getMetaToolkitManifest().find((d: any) => d.name === name);
+  return !!def?.inputSchema?.properties?.account_id;
 }
 
 /**
