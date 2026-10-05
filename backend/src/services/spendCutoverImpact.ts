@@ -92,3 +92,57 @@ export function classifyCutoverImpact(inputs: readonly CutoverAccountInput[]): C
     accounts,
   };
 }
+
+/** Spend recorded against one account id, split the way the cutover cares about. */
+export interface SubjectSpend {
+  llm: number;
+  vendor: number;
+}
+
+export interface PooledSubject extends SubjectSpend {
+  /** The account whose cap this spend counts against. */
+  billingUserId: string;
+  /** Other recorded ids folded into this account, with what each contributed. */
+  pooledFrom: Array<{ id: string } & SubjectSpend>;
+}
+
+/**
+ * Re-key spend by the account the enforcement gate actually checks.
+ *
+ * The gate resolves an org member onto the org's billing root
+ * (`resolveBillingUserId`) and never looks at the member's own id, but spend is
+ * recorded under whatever `billingUserId` the recorder was handed — and until
+ * ENG-2286 that was often the MEMBER, so a member's vendor spend sat outside the
+ * owner's pool. Summing by the recorded id therefore models a gate that does not
+ * exist: it measured a Free org member against the $5 Free cap when the gate
+ * measures them against their Starter owner's $80 pool (2026-10-05: three
+ * "newly paused" accounts, all of them this artifact).
+ *
+ * Pure over already-resolved inputs: `ownerOf` maps a recorded id to the owner the
+ * gate would use. An id missing from it, or mapped to itself, is its own subject.
+ * An owner with no spend of its own still appears, built from its members. The
+ * inputs are not mutated.
+ */
+export function poolSpendByOwner(
+  perSubject: ReadonlyMap<string, SubjectSpend>,
+  ownerOf: ReadonlyMap<string, string>,
+): Map<string, PooledSubject> {
+  const pooled = new Map<string, PooledSubject>();
+  const slot = (id: string): PooledSubject => {
+    let p = pooled.get(id);
+    if (!p) {
+      p = { billingUserId: id, llm: 0, vendor: 0, pooledFrom: [] };
+      pooled.set(id, p);
+    }
+    return p;
+  };
+
+  for (const [id, spend] of perSubject) {
+    const owner = ownerOf.get(id) ?? id;
+    const target = slot(owner);
+    target.llm += spend.llm;
+    target.vendor += spend.vendor;
+    if (owner !== id) target.pooledFrom.push({ id, llm: spend.llm, vendor: spend.vendor });
+  }
+  return pooled;
+}

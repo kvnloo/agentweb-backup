@@ -42,17 +42,20 @@ jest.mock('../services/chatbotService');
 jest.mock('../services/settingsService');
 jest.mock('../utils/secretsManager');
 
-import { AgentModeService } from '../services/agentModeService';
+// ENG-2103 (F2 design-decision-list follow-up, Pattern A): normalizeImageForVision
+// moved from a `private static` method on AgentModeService to a plain export
+// of emma/impl/mediaVideo.ts (exclusive to describeImage, which moved there
+// too).
+import * as mediaVideoImpl from '../emma/impl/mediaVideo';
 
 const sharp = require('sharp') as jest.Mock;
 const fakeBuffer = (size: number) => Buffer.alloc(size, 0x42);
 
-// Private static helper; access it via a typed alias.
 const normalize = (
   buffer: Buffer,
   contentType: string
 ): Promise<{ buffer: Buffer; contentType: string; undecodable?: boolean; detectedFormat?: string }> =>
-  (AgentModeService as any).normalizeImageForVision(buffer, contentType);
+  mediaVideoImpl.normalizeImageForVision(buffer, contentType);
 
 describe('normalizeImageForVision', () => {
   beforeEach(() => {

@@ -43,7 +43,18 @@ jest.mock('crypto', () => ({
       arr[i] = Math.floor(Math.random() * 256);
     }
     return arr;
-  })
+  }),
+  // Pipeline defect fix (pre-existing, unrelated to ENG-2103 F2): this
+  // whole-module crypto mock predates controllers/agentModeController.ts's
+  // scheduled-run lease work, whose module-scope `require('uuid').v4()`
+  // (SCHEDULED_RUN_INSTANCE_ID) now sits on this test's own
+  // agentModeService.ts import chain. `uuid`'s rng.js calls
+  // `crypto.randomFillSync` directly — missing from this mock, it threw
+  // `TypeError: (0, crypto_1.randomFillSync) is not a function` and failed
+  // this entire suite to load, on `origin/main`, independent of this round's
+  // changes (confirmed via `git stash`). A deterministic passthrough is
+  // sufficient: nothing in this suite asserts on the generated UUID's value.
+  randomFillSync: jest.fn((buf) => buf)
 }));
 
 // Mock settingsService

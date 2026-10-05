@@ -1,4 +1,9 @@
 import { AgentModeService } from '../services/agentModeService';
+// ENG-2103 (F2): updateHtmlFileCss's body now lives in emma/impl/htmlUpdate.ts
+// and calls fetchFileContent/uploadUpdatedFile there directly (via a
+// same-module self-import, not `this.<method>`), so the spies below target
+// that module instead of the class singleton.
+import * as htmlUpdateImpl from '../emma/impl/htmlUpdate';
 
 // Mock AWS SDK
 jest.mock('aws-sdk', () => ({
@@ -23,6 +28,10 @@ jest.mock('aws-sdk', () => ({
 }));
 
 jest.mock('axios', () => ({ get: jest.fn() }));
+// ENG-2103 F2 full-suite checkpoint: spread the REAL crypto module rather than
+// a bare { createHash } stub — see readFileContent.test.ts's comment on this
+// same pattern for why (agentModeController.ts's uuid.v4() call needs
+// crypto.randomFillSync at module load).
 jest.mock('crypto', () => ({ ...jest.requireActual('crypto'), createHash: jest.fn() }));
 jest.mock('../utils/s3Utils', () => ({
   uploadFileToS3WithPath: jest.fn().mockResolvedValue({
@@ -81,8 +90,8 @@ describe('updateHtmlFile CSS-selector operations', () => {
     const mockHash = { update: jest.fn().mockReturnThis(), digest: jest.fn().mockReturnValue('mock-hash-123') };
     require('crypto').createHash.mockReturnValue(mockHash);
 
-    jest.spyOn(svc as any, 'fetchFileContent').mockResolvedValue(SAMPLE_HTML);
-    jest.spyOn(svc as any, 'uploadUpdatedFile').mockResolvedValue({
+    jest.spyOn(htmlUpdateImpl, 'fetchFileContent').mockResolvedValue(SAMPLE_HTML);
+    jest.spyOn(htmlUpdateImpl, 'uploadUpdatedFile').mockResolvedValue({
       url: 'https://s3.amazonaws.com/bucket/file_v2.html'
     });
   });
@@ -354,7 +363,7 @@ describe('updateHtmlFile CSS-selector operations', () => {
       );
       expect(result.success).toBe(true);
       expect(result.s3_url).toBe('https://s3.amazonaws.com/bucket/file_v2.html');
-      expect((svc as any).uploadUpdatedFile).toHaveBeenCalledTimes(1);
+      expect(htmlUpdateImpl.uploadUpdatedFile).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -362,7 +371,7 @@ describe('updateHtmlFile CSS-selector operations', () => {
 
   describe('error handling', () => {
     it('handles fetchFileContent error gracefully', async () => {
-      jest.spyOn(svc as any, 'fetchFileContent').mockRejectedValue(new Error('Network timeout'));
+      jest.spyOn(htmlUpdateImpl, 'fetchFileContent').mockRejectedValue(new Error('Network timeout'));
       const result = await (svc as any).updateHtmlFile(
         'https://s3.amazonaws.com/bucket/file.html', 'css',
         [{ action: 'remove', selector: 'h1' }], 'u1', 's1'
