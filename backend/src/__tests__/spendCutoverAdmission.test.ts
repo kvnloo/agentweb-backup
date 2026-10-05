@@ -166,11 +166,13 @@ describe("ENG-1250 §9.6 enforcement cutover — admission chain", () => {
     expect(res.model.modelSelection).toBe("honored");
   });
 
-  it("FLIPPED with no persisted projection: fails open and admits on legacy (no flip-day surprise pause)", async () => {
+  it("FLIPPED with no persisted projection: counts $0 and admits (no flip-day surprise pause, no legacy fallback)", async () => {
     process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
     getProjectionMock.mockResolvedValue(null);
+    const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
     const res = await admit({ legacyRawMicroUsd: LLM_ONLY, ledgerSettledMicroUsd: null });
-    expect(res.basis).toBe("legacy");
+    logSpy.mockRestore();
+    expect(res.basis).toBe("spend_ledger");
     expect(res.mode.usageMode).toBe("full_choice");
     expect(res.model.effectiveModel).toBe(PREMIUM);
   });
