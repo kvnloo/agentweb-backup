@@ -1,0 +1,171 @@
+/**
+ * ENG-2283 — External-agent auth + per-call metering for Meta Toolkit calls (ENG-2268 child 3).
+ *
+ * The call path an external agent (e.g. Claude) uses to invoke the ENG-2282 manifest:
+ *   1. authenticate with an EXISTING account-scoped credential (aw_ agent API key or MCP
+ *      OAuth access token, the same two mechanisms the MCP transport accepts),
+ *   2. resolve the caller's connected Meta ad account (own or org-shared, same visibility
+ *      Emma uses) and refuse a foreign account or a revoked/expired connection,
+ *   3. execute through executeMetaToolkitCall (all ENG-2046 write guards stay in the path),
+ *   4. emit exactly ONE usage event per successful call via recordMcpToolUse.
+ *
+ * Storage: reuses agent API keys, MCP OAuth tokens, connected accounts and MCP usage events
+ * only. No new table, key or persistence model (data-plane gate respected).
+ */
+import { agentApiKeyService } from '../services/agentApiKeyService';
+import { mcpOAuthService } from './oauth/oauthService';
+import {
+  getAccountsByUserIdIncludingOrgShared,
+  type ConnectedAccount,
+} from '../services/connectedAccountsDb';
+import { isMetaAdAccount } from '../services/metaTokenRefresh';
+import { recordMcpToolUse, type McpAuthMethod } from '../services/mcpUsageEventsService';
+import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } from './metaToolkitManifest';
+
+export class MetaToolkitAuthError extends Error {
+  readonly status: 401 | 403;
+  constructor(message: string, status: 401 | 403) {
+    super(message);
+    this.name = 'MetaToolkitAuthError';
+    this.status = status;
+  }
+}
+
+export interface MetaToolkitCaller {
+  userId: string;
+  authMethod: McpAuthMethod;
+  apiKeyId?: string;
+  clientId?: string;
+}
+
+export interface MetaToolkitGatewayDeps {
+  validateApiKey: (raw: string) => Promise<{ userId: string; keyId: string; expiresAt?: string } | null>;
+  validateOAuthToken: (raw: string) => Promise<{ userId: string; clientId: string } | null>;
+  listAccounts: (userId: string) => Promise<ConnectedAccount[]>;
+  execute: typeof executeMetaToolkitCall;
+  recordUsage: typeof recordMcpToolUse;
+  now: () => number;
+}
+
+const defaultDeps: MetaToolkitGatewayDeps = {
+  validateApiKey: (raw) => agentApiKeyService.validateKey(raw),
+  validateOAuthToken: (raw) => mcpOAuthService.validateAccessToken(raw),
+  listAccounts: getAccountsByUserIdIncludingOrgShared,
+  execute: executeMetaToolkitCall,
+  recordUsage: recordMcpToolUse,
+  now: () => Date.now(),
+};
+
+function bearerToken(authorization: string | undefined | null): string | null {
+  if (!authorization) return null;
+  const match = authorization.match(/^Bearer\s+(\S+)\s*$/i);
+  return match ? match[1] : null;
+}
+
+/** Authenticate an external caller. Only account-scoped credentials; the internal static token is refused. */
+export async function authenticateMetaToolkitCaller(
+  authorization: string | undefined | null,
+  deps: MetaToolkitGatewayDeps = defaultDeps,
+): Promise<MetaToolkitCaller> {
+  const token = bearerToken(authorization);
+  if (!token) throw new MetaToolkitAuthError('Missing access token.', 401);
+
+  if (token.startsWith('aw_')) {
+    const key = await deps.validateApiKey(token);
+    if (!key?.userId) throw new MetaToolkitAuthError('Invalid or revoked API key.', 401);
+    if (key.expiresAt && Date.parse(key.expiresAt) <= deps.now()) {
+      throw new MetaToolkitAuthError('API key has expired.', 401);
+    }
+    return { userId: key.userId, authMethod: 'api_key', apiKeyId: key.keyId };
+  }
+
+  const oauth = await deps.validateOAuthToken(token);
+  if (!oauth?.userId) throw new MetaToolkitAuthError('Invalid access token.', 401);
+  return { userId: oauth.userId, authMethod: 'oauth', clientId: oauth.clientId };
+}
+
+function normalizeAdAccountId(id: unknown): string {
+  return String(id ?? '').trim().replace(/^act_/, '');
+}
+
+function connectionIsUsable(account: ConnectedAccount, now: number): boolean {
+  const config: any = account.config;
+  if (config?.ads_scope_revoked_at) return false;
+  const expiresAt = config?.token_expires_at;
+  return !(typeof expiresAt === 'number' && expiresAt < now);
+}
+
+/**
+ * Resolve the Meta ad account this call runs against. A requested account must be one the
+ * caller can see; without a request, exactly one usable connection must exist.
+ */
+export async function resolveMetaToolkitAdAccount(
+  userId: string,
+  requestedAccountId: unknown,
+  deps: MetaToolkitGatewayDeps = defaultDeps,
+): Promise<string> {
+  const metaAccounts = (await deps.listAccounts(userId)).filter(isMetaAdAccount);
+  const requested = normalizeAdAccountId(requestedAccountId);
+  const now = deps.now();
+
+  if (requested) {
+    const match = metaAccounts.find((a) => {
+      const cfg: any = a.config;
+      return normalizeAdAccountId(cfg?.ad_account_id) === requested || normalizeAdAccountId(a.account_id) === requested;
+    });
+    if (!match) throw new MetaToolkitAuthError('That Meta ad account is not connected to this account.', 403);
+    if (!connectionIsUsable(match, now)) {
+      throw new MetaToolkitAuthError('The Meta connection for this ad account was revoked or expired. Reconnect Meta.', 403);
+    }
+    return requested;
+  }
+
+  const usable = metaAccounts.filter((a) => connectionIsUsable(a, now));
+  if (usable.length === 0) {
+    throw new MetaToolkitAuthError('No usable Meta ad account is connected. Connect or reconnect Meta.', 403);
+  }
+  if (usable.length > 1) {
+    throw new MetaToolkitRefusal('Multiple Meta ad accounts are connected; pass account_id.');
+  }
+  const cfg: any = usable[0].config;
+  return normalizeAdAccountId(cfg?.ad_account_id || usable[0].account_id);
+}
+
+function toolAcceptsAccountId(name: string): boolean {
+  try {
+    const def = getMetaToolkitManifest().find((d: any) => d.name === name);
+    return !!def?.inputSchema?.properties?.account_id;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Full external call: authenticate → resolve account → execute → meter once on success.
+ * A refused or failed call is not metered.
+ */
+export async function handleMetaToolkitCall(
+  request: { authorization?: string | null; toolName: string; args?: any; sessionId?: string; userAgent?: string },
+  deps: MetaToolkitGatewayDeps = defaultDeps,
+) {
+  const caller = await authenticateMetaToolkitCaller(request.authorization, deps);
+  const args = { ...(request.args ?? {}) };
+  const accountId = await resolveMetaToolkitAdAccount(caller.userId, args.account_id, deps);
+  if (toolAcceptsAccountId(request.toolName)) args.account_id = accountId;
+
+  const result = await deps.execute(request.toolName, args, {
+    userId: caller.userId,
+    sessionId: request.sessionId,
+  });
+
+  await deps.recordUsage({
+    userId: caller.userId,
+    toolName: request.toolName,
+    authMethod: caller.authMethod,
+    apiKeyId: caller.apiKeyId,
+    clientId: caller.clientId,
+    sessionId: request.sessionId,
+    userAgent: request.userAgent,
+  });
+  return result;
+}
