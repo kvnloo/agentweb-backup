@@ -108,7 +108,12 @@ describe('youSearchWeb freshness + includeDomains threading (ENG-383)', () => {
     });
 
     it('threads tool args through to youSearchWeb', async () => {
-      const spy = jest.spyOn(require('../services/agentModeService').agentModeService, 'youSearchWeb')
+      // ENG-2103 (F2): you_search_web's handler body now lives in
+      // emma/impl/searchResearch.ts and emma/tools.ts calls it directly
+      // instead of through agentModeService (which still exists as a
+      // one-line delegating wrapper, but is no longer what the tool's
+      // execute() calls) — spy on the impl module's real export instead.
+      const spy = jest.spyOn(require('../emma/impl/searchResearch'), 'youSearchWeb')
         .mockResolvedValue({ success: true });
 
       await emmaToolRegistry.execute(
