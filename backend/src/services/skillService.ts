@@ -371,8 +371,12 @@ export class SkillService {
 
       const skill = this.normalizeSkill(result.Item);
 
-      // Write to target table, converting toolNames back to DynamoDB Set
-      const skillItem: any = { ...skill };
+      // Write to target table, converting toolNames back to DynamoDB Set.
+      // ENG-1390: stamp a fresh updatedAt instead of copying the source's. The
+      // review transitions guard on `updatedAt = :expected`; a sync that kept the
+      // source timestamp could land a value equal to what a concurrent transition
+      // read, letting that stale transition overwrite the synced row.
+      const skillItem: any = { ...skill, updatedAt: new Date().toISOString() };
       if (skill.toolNames && skill.toolNames.length > 0) {
         skillItem.toolNames = dynamodb.createSet(skill.toolNames);
       } else {

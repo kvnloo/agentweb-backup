@@ -483,6 +483,18 @@ describe('SkillService', () => {
     });
   });
 
+  describe('syncSkill advances the target revision (ENG-1390)', () => {
+    it('stamps a fresh updatedAt instead of copying the source row', async () => {
+      mockPromise
+        .mockResolvedValueOnce({ Item: { skillId: 's1', name: 'n', updatedAt: '2020-01-01T00:00:00.000Z' } })
+        .mockResolvedValueOnce({});
+      await skillService.syncSkill('s1', 'prod-to-dev');
+      const item = mockPut.mock.calls[mockPut.mock.calls.length - 1][0].Item;
+      expect(item.updatedAt).toBe(mockTimestamp);
+      expect(item.updatedAt).not.toBe('2020-01-01T00:00:00.000Z');
+    });
+  });
+
   describe('withdrawFromReview (ENG-932)', () => {
     const pendingSkill = {
       skillId: 'skill-1',
