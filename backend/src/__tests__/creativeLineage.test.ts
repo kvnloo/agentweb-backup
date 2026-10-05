@@ -62,6 +62,11 @@ class FakeLineageTable implements CreativeLineageDb {
       if (!item) throw conditionFailed();
     } else if (condition === 'attribute_exists(creativeId) AND userId = :userId') {
       if (!item || item.userId !== values[':userId']) throw conditionFailed();
+    } else if (
+      condition === 'attribute_exists(creativeId) AND userId = :userId AND NOT contains(googleAdResourceNames, :adName)'
+    ) {
+      if (!item || item.userId !== values[':userId']) throw conditionFailed();
+      if (setValues(item.googleAdResourceNames).includes(String(values[':adName']))) throw conditionFailed();
     } else {
       throw new Error(`fake: unsupported condition ${condition}`);
     }

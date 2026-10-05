@@ -773,13 +773,15 @@ export async function stampGoogleAdCreated(
   const assets = [...new Set((input.assetResourceNames ?? []).filter((a) => typeof a === 'string' && a))];
   if (!ctx || !input.userId || !input.adResourceName || assets.length === 0) return [];
   const done = new Set<string>();
+  // GSI reads are eventually consistent: keep retrying while ANY asset is still unmatched.
+  const resolvedAssets = new Set<string>();
   try {
     return await withLookupRetry(ctx, input.userId, async () => {
       const stamped: string[] = [];
-      let found = 0;
       for (const assetResourceName of assets) {
+        if (resolvedAssets.has(assetResourceName)) continue;
         const records = await findUserCreativesContaining(ctx, input.userId, 'googleAssetResourceNames', assetResourceName);
-        found += records.length;
+        if (records.length > 0) resolvedAssets.add(assetResourceName);
         for (const record of records) {
           if (done.has(record.creativeId)) continue;
           if ((record.googleAdLinks ?? []).some((l) => l.adResourceName === input.adResourceName)) {
@@ -795,9 +797,12 @@ export async function stampGoogleAdCreated(
               Key: { creativeId: record.creativeId },
               UpdateExpression:
                 'ADD googleAdResourceNames :adSet SET googleAdLinks = list_append(if_not_exists(googleAdLinks, :empty), :link), updatedAt = :now',
-              ConditionExpression: 'attribute_exists(creativeId) AND userId = :userId',
+              // Reject a duplicate link atomically (concurrent stamps may both read pre-link state).
+              ConditionExpression:
+                'attribute_exists(creativeId) AND userId = :userId AND NOT contains(googleAdResourceNames, :adName)',
               ExpressionAttributeValues: {
                 ':adSet': ctx.db.stringSet([input.adResourceName]),
+                ':adName': input.adResourceName,
                 ':empty': [],
                 ':link': [link],
                 ':now': linkedAt,
@@ -807,11 +812,18 @@ export async function stampGoogleAdCreated(
             done.add(record.creativeId);
             stamped.push(record.creativeId);
           } catch (err) {
-            if (!isConditionFailure(err)) warn(`google ad stamp for ${record.creativeId} failed (non-fatal)`, err);
+            if (isConditionFailure(err)) {
+              // Record came from a user-scoped lookup, so the failure is the duplicate-link guard:
+              // the ad is already linked on this creative.
+              done.add(record.creativeId);
+              stamped.push(record.creativeId);
+            } else {
+              warn(`google ad stamp for ${record.creativeId} failed (non-fatal)`, err);
+            }
           }
         }
       }
-      return { result: stamped, retry: found === 0 };
+      return { result: stamped, retry: resolvedAssets.size < assets.length };
     }, concatIds);
   } catch (err) {
     warn(`google ad stamp failed (non-fatal)`, err);
