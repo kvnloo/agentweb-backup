@@ -21,15 +21,22 @@ import {
 import { isMetaAdAccount } from '../services/metaTokenRefresh';
 import { recordMcpToolUse, type McpAuthMethod } from '../services/mcpUsageEventsService';
 import { executeMetaToolkitCall, getMetaToolkitManifest, MetaToolkitRefusal } from './metaToolkitManifest';
+import { RateLimiter } from '../middleware/rateLimiter';
 
 export class MetaToolkitAuthError extends Error {
-  readonly status: 401 | 403;
-  constructor(message: string, status: 401 | 403) {
+  readonly status: 401 | 403 | 429;
+  readonly retryAfterSeconds?: number;
+  constructor(message: string, status: 401 | 403 | 429, retryAfterSeconds?: number) {
     super(message);
     this.name = 'MetaToolkitAuthError';
     this.status = status;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
+
+/** OAuth callers get the same 60/min ceiling as the MCP server; API keys use their own rateLimitPerMin. */
+export const META_TOOLKIT_OAUTH_MAX_PER_MINUTE = 60;
+const credentialRateLimiter = new RateLimiter();
 
 export interface MetaToolkitCaller {
   userId: string;
@@ -39,12 +46,25 @@ export interface MetaToolkitCaller {
 }
 
 export interface MetaToolkitGatewayDeps {
-  validateApiKey: (raw: string) => Promise<{ userId: string; keyId: string; expiresAt?: string } | null>;
+  validateApiKey: (raw: string) => Promise<{ userId: string; keyId: string; expiresAt?: string; rateLimitPerMin?: number } | null>;
   validateOAuthToken: (raw: string) => Promise<{ userId: string; clientId: string } | null>;
   listAccounts: (userId: string) => Promise<ConnectedAccount[]>;
   execute: typeof executeMetaToolkitCall;
   recordUsage: typeof recordMcpToolUse;
   now: () => number;
+  rateLimiter?: Pick<RateLimiter, 'check'>;
+}
+
+/** Per-credential ceiling, so one key/token cannot exceed its limit by spreading calls across IPs. */
+function enforceCredentialLimit(deps: MetaToolkitGatewayDeps, key: string, limit: number) {
+  const result = (deps.rateLimiter ?? credentialRateLimiter).check(`meta-toolkit:${key}`, limit);
+  if (!result.allowed) {
+    throw new MetaToolkitAuthError(
+      'Rate limit exceeded for this credential. Try again shortly.',
+      429,
+      Math.max(1, Math.ceil(result.resetInMs / 1000)),
+    );
+  }
 }
 
 const defaultDeps: MetaToolkitGatewayDeps = {
@@ -76,11 +96,13 @@ export async function authenticateMetaToolkitCaller(
     if (key.expiresAt && Date.parse(key.expiresAt) <= deps.now()) {
       throw new MetaToolkitAuthError('API key has expired.', 401);
     }
+    enforceCredentialLimit(deps, `key:${key.keyId}`, key.rateLimitPerMin ?? META_TOOLKIT_OAUTH_MAX_PER_MINUTE);
     return { userId: key.userId, authMethod: 'api_key', apiKeyId: key.keyId };
   }
 
   const oauth = await deps.validateOAuthToken(token);
   if (!oauth?.userId) throw new MetaToolkitAuthError('Invalid access token.', 401);
+  enforceCredentialLimit(deps, `oauth:${oauth.userId}`, META_TOOLKIT_OAUTH_MAX_PER_MINUTE);
   return { userId: oauth.userId, authMethod: 'oauth', clientId: oauth.clientId };
 }
 
