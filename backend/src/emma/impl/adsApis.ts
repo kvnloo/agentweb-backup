@@ -426,6 +426,19 @@ export type LaunchAudienceCampaignDeps = {
     options?: { adSetId?: string; fields?: string | string[] },
   ) => Promise<any>;
   createMetaAdsAdSet: (userId: string, args: any) => Promise<any>;
+  /**
+   * ENG-2277 (silently dropped by an earlier main-sync, restored here):
+   * the ad-set reuse-match comparison must normalize the REQUESTED budget
+   * the same currency-aware way createMetaAdsAdSet itself does before
+   * writing — a naive ×100 ("cents") assumption defeats reuse for every
+   * zero-decimal currency (TWD, JPY, KRW, ...), where Meta's minor unit
+   * equals its major unit.
+   */
+  normalizeMetaMoneyParams: (
+    accountId: string,
+    accessToken: string,
+    params: any,
+  ) => Promise<{ params: any; currency: string | undefined; confirmation: string }>;
 };
 
 /** `resolveOrCreateSeedAudience`'s own injected-dependency bag — a strict subset of `LaunchAudienceCampaignDeps`. */
@@ -2954,7 +2967,12 @@ export async function executeAudienceCampaignLaunch(
     });
     const campaignHasBudget = !!(campaign?.daily_budget || campaign?.lifetime_budget);
 
-    const toCentsForComparison = (val: number | undefined) => val !== undefined ? Math.round(val * 100) : undefined;
+    const credentials = await deps.getMetaCredentials(userId, args.account_id);
+    const money = await deps.normalizeMetaMoneyParams(credentials.accountId, credentials.accessToken, {
+      ...args.ad_set_params,
+      daily_budget: campaignHasBudget ? undefined : args.ad_set_params?.daily_budget,
+      lifetime_budget: campaignHasBudget ? undefined : args.ad_set_params?.lifetime_budget,
+    });
     const resolvedBidStrategy = args.ad_set_params?.bid_strategy || 'LOWEST_COST_WITHOUT_CAP';
     const resolvedDestinationType = args.ad_set_params?.destination_type === undefined &&
       META_WEBSITE_OPTIMIZATION_GOALS.includes(args.ad_set_params?.optimization_goal)
@@ -2962,9 +2980,9 @@ export async function executeAudienceCampaignLaunch(
       : args.ad_set_params?.destination_type;
     const normalizedRequestedAdSetParams: Record<string, any> = {
       ...args.ad_set_params,
-      daily_budget: campaignHasBudget ? undefined : toCentsForComparison(args.ad_set_params?.daily_budget),
-      lifetime_budget: campaignHasBudget ? undefined : toCentsForComparison(args.ad_set_params?.lifetime_budget),
-      bid_amount: toCentsForComparison(args.ad_set_params?.bid_amount),
+      daily_budget: money.params.daily_budget,
+      lifetime_budget: money.params.lifetime_budget,
+      bid_amount: money.params.bid_amount,
       bid_strategy: resolvedBidStrategy,
       destination_type: resolvedDestinationType,
     };

@@ -15737,6 +15737,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       resolveHubSpotService: this.resolveHubSpotService.bind(this),
       listMetaAdsAdSets: this.listMetaAdsAdSets.bind(this),
       createMetaAdsAdSet: this.createMetaAdsAdSet.bind(this),
+      normalizeMetaMoneyParams: this.normalizeMetaMoneyParams.bind(this),
     });
   }
 
@@ -15752,6 +15753,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       resolveHubSpotService: this.resolveHubSpotService.bind(this),
       listMetaAdsAdSets: this.listMetaAdsAdSets.bind(this),
       createMetaAdsAdSet: this.createMetaAdsAdSet.bind(this),
+      normalizeMetaMoneyParams: this.normalizeMetaMoneyParams.bind(this),
     });
   }
 
@@ -15775,6 +15777,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       resolveHubSpotService: this.resolveHubSpotService.bind(this),
       listMetaAdsAdSets: this.listMetaAdsAdSets.bind(this),
       createMetaAdsAdSet: this.createMetaAdsAdSet.bind(this),
+      normalizeMetaMoneyParams: this.normalizeMetaMoneyParams.bind(this),
     });
   }
 
