@@ -129,7 +129,7 @@ import {
   appendApprovalDeckItem,
   finalizeApprovalDeck,
   findApprovalDeckAnswerForDigest,
-  describeMetaWriteParamDrift,
+  describeMetaWriteParamDrift, formatMetaWriteParamDriftMessage,
   findAnsweredDeckItemByKind,
   reconstructApprovalDeckFromHistory,
   applyDeckAnswers,
@@ -22715,8 +22715,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params,
         });
         if (drifted) {
-          summary += ` CHANGED SINCE APPROVAL: ${drifted.join(', ')} differ from the version you approved, ` +
-            `so that approval does not cover this write and nothing was sent to Meta.`;
+          summary += formatMetaWriteParamDriftMessage(drifted);
         }
       }
       if (budgetAnomaly?.changes) {

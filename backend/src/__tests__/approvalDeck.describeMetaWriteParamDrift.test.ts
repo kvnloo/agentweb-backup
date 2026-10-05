@@ -32,4 +32,17 @@ describe('describeMetaWriteParamDrift (ENG-1748)', () => {
     expect(describeMetaWriteParamDrift({ ...deck('approve'), status: 'awaiting' }, { ...dispatch, params: {} })).toBeNull();
     expect(describeMetaWriteParamDrift(undefined, { ...dispatch, params: {} })).toBeNull();
   });
+
+  it('checks every approved same-target item, not just the first', () => {
+    const two: any = {
+      deckId: 'd2', status: 'answered',
+      items: [
+        { itemId: 'a', kind: 'meta_write', question: 'q', metaWriteDispatch: { ...dispatch, params: { ...dispatch.params, daily_budget: 1 } } },
+        { itemId: 'b', kind: 'meta_write', question: 'q', metaWriteDispatch: dispatch },
+      ],
+      answers: [{ itemId: 'a', verdict: 'approve', answeredBy: 'user' }, { itemId: 'b', verdict: 'approve', answeredBy: 'user' }],
+    };
+    expect(describeMetaWriteParamDrift(two, { ...dispatch })).toBeNull();
+    expect(describeMetaWriteParamDrift(two, { ...dispatch, params: { ...dispatch.params, status: 'PAUSED' } })).toEqual(['status']);
+  });
 });

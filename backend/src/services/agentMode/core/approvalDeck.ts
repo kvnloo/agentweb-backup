@@ -457,7 +457,7 @@ export function describeMetaWriteParamDrift(
 ): string[] | null {
   if (!deck || deck.status !== 'answered' || !deck.answers) return null;
   const same = (a: unknown, b: unknown) => (a ?? undefined) === (b ?? undefined);
-  const approved = deck.items.find((item) => {
+  const approvedItems = deck.items.filter((item) => {
     const d = item.metaWriteDispatch;
     if (!d) return false;
     const answer = deck.answers!.find((candidate) => candidate.itemId === item.itemId);
@@ -466,20 +466,34 @@ export function describeMetaWriteParamDrift(
       same(d.account_id, call.account_id) && same(d.campaign_id, call.campaign_id) &&
       same(d.ad_set_id, call.ad_set_id) && same(d.ad_id, call.ad_id);
   });
-  if (!approved) return null;
+  if (!approvedItems.length) return null;
   const ignored = new Set(['confirm', 'tracking_override_token']);
   const asRecord = (v: unknown): Record<string, unknown> =>
     v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
-  const before = asRecord(approved.metaWriteDispatch!.params);
   const after = asRecord(call.params);
   const stable = (v: unknown): string => JSON.stringify(v, (_k, val) =>
     val && typeof val === 'object' && !Array.isArray(val)
       ? Object.fromEntries(Object.keys(val).sort().map((k) => [k, (val as any)[k]]))
       : val) ?? 'undefined';
-  const changed = [...new Set([...Object.keys(before), ...Object.keys(after)])]
-    .filter((key) => !ignored.has(key) && stable(before[key]) !== stable(after[key]))
-    .sort();
-  return changed.length ? changed : null;
+  // Compare against EVERY approved same-target item: if any matches on all
+  // compared params there is no drift to report; otherwise report the item
+  // with the fewest differing fields (closest approved version).
+  let best: string[] | null = null;
+  for (const item of approvedItems) {
+    const before = asRecord(item.metaWriteDispatch!.params);
+    const changed = [...new Set([...Object.keys(before), ...Object.keys(after)])]
+      .filter((key) => !ignored.has(key) && stable(before[key]) !== stable(after[key]))
+      .sort();
+    if (!changed.length) return null;
+    if (!best || changed.length < best.length) best = changed;
+  }
+  return best;
+}
+
+/** ENG-1748: user-facing drift sentence appended to a halted Meta write summary. */
+export function formatMetaWriteParamDriftMessage(drifted: string[]): string {
+  return ` CHANGED SINCE APPROVAL: ${drifted.join(', ')} differ from the version you approved, ` +
+    `so that approval does not cover this write and nothing was sent to Meta.`;
 }
 
 /** The shape of a persisted chat message this module cares about — deliberately
