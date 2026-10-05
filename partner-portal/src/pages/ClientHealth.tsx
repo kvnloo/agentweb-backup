@@ -67,6 +67,19 @@ interface AdsLayerHealth {
   active_campaigns: number;
   campaigns_complete?: boolean;
   campaigns?: Array<{ id: string; name: string; status: string; objective: string }>;
+  meta_connection_health?: MetaConnectionHealth;
+}
+
+interface MetaConnectionHealth {
+  permissions: 'granted' | 'declined' | 'unknown';
+  declined_permissions?: string[];
+  permissions_error?: string;
+  page_access: 'available' | 'missing' | 'unknown';
+  page_count?: number;
+  page_error?: string;
+  selected_event: 'recent' | 'missing' | 'unknown';
+  reconnect_required: boolean;
+  reconnect_instructions?: string;
 }
 
 interface LanderLayerHealth {
@@ -158,6 +171,32 @@ function StatusIcon({ ok }: { ok: boolean }) {
     <CancelIcon sx={{ fontSize: 16, color: 'error.main' }} />
   );
 }
+
+function healthChipColor(
+  state: 'available' | 'granted' | 'recent' | 'missing' | 'declined' | 'unknown',
+): 'success' | 'error' | 'warning' {
+  if (state === 'available' || state === 'granted' || state === 'recent') return 'success';
+  if (state === 'missing' || state === 'declined') return 'error';
+  return 'warning';
+}
+
+function permissionLabel(health: MetaConnectionHealth): string {
+  if (health.permissions === 'declined') return `Declined: ${(health.declined_permissions || []).join(', ')}`;
+  if (health.permissions === 'unknown') return health.permissions_error ? 'Unknown: read failed' : 'Unknown';
+  return 'Granted';
+}
+
+function pageAccessLabel(health: MetaConnectionHealth): string {
+  if (health.page_access === 'available') return health.page_count === undefined ? 'Available' : `${health.page_count} Page${health.page_count === 1 ? '' : 's'}`;
+  if (health.page_access === 'missing') return 'Missing';
+  return health.page_error ? 'Unknown: read failed' : 'Unknown';
+}
+
+const EVENT_HEALTH_LABEL: Record<MetaConnectionHealth['selected_event'], string> = {
+  recent: 'Recent',
+  missing: 'Missing',
+  unknown: 'Unknown',
+};
 
 // ------------------------------------------------------------------
 // Component
@@ -424,6 +463,49 @@ export default function ClientHealth() {
                       {campaignCountLabel(detail.ads_layer)}
                     </Typography>
                   </Box>
+                  {detail.ads_layer.meta_connection_health && (
+                    <Box sx={{ borderTop: 1, borderColor: 'divider', pt: 1, mt: 1 }}>
+                      <Typography variant="caption" fontWeight={700} color="text.secondary" sx={{ textTransform: 'uppercase' }}>
+                        Meta connection health
+                      </Typography>
+                      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mt: 0.75, gap: 1 }}>
+                        <Typography variant="body2" color="text.secondary">Page access</Typography>
+                        <Tooltip title={detail.ads_layer.meta_connection_health.page_error || ''}>
+                          <Chip
+                            label={pageAccessLabel(detail.ads_layer.meta_connection_health)}
+                            color={healthChipColor(detail.ads_layer.meta_connection_health.page_access)}
+                            size="small"
+                            variant="outlined"
+                          />
+                        </Tooltip>
+                      </Box>
+                      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mt: 0.75, gap: 1 }}>
+                        <Typography variant="body2" color="text.secondary">Permissions</Typography>
+                        <Tooltip title={detail.ads_layer.meta_connection_health.permissions_error || ''}>
+                          <Chip
+                            label={permissionLabel(detail.ads_layer.meta_connection_health)}
+                            color={healthChipColor(detail.ads_layer.meta_connection_health.permissions)}
+                            size="small"
+                            variant="outlined"
+                          />
+                        </Tooltip>
+                      </Box>
+                      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mt: 0.75, gap: 1 }}>
+                        <Typography variant="body2" color="text.secondary">Selected event</Typography>
+                        <Chip
+                          label={EVENT_HEALTH_LABEL[detail.ads_layer.meta_connection_health.selected_event]}
+                          color={healthChipColor(detail.ads_layer.meta_connection_health.selected_event)}
+                          size="small"
+                          variant="outlined"
+                        />
+                      </Box>
+                      {detail.ads_layer.meta_connection_health.reconnect_required && (
+                        <Alert severity="warning" sx={{ mt: 1 }}>
+                          {detail.ads_layer.meta_connection_health.reconnect_instructions}
+                        </Alert>
+                      )}
+                    </Box>
+                  )}
                   {detail.ads_layer.campaigns && detail.ads_layer.campaigns.length > 0 && (
                     <Box sx={{ borderTop: 1, borderColor: 'divider', pt: 1, mt: 1 }}>
                       <Typography variant="caption" fontWeight={700} color="text.secondary" sx={{ textTransform: 'uppercase' }}>
