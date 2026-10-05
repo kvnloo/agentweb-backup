@@ -132,6 +132,7 @@ describe('emma/impl/adsApis.ts self-import makes internal calls spy-observable',
       resolveHubSpotService: jest.fn(),
       listMetaAdsAdSets: jest.fn().mockResolvedValue({ success: true, adSets: [] }),
       createMetaAdsAdSet: jest.fn().mockResolvedValue({ success: true, adSet: { id: 'adset-1', name: 'Ad Set' } }),
+      normalizeMetaMoneyParams: jest.fn().mockResolvedValue({ params: {}, currency: 'USD', confirmation: '' }),
     };
 
     const result = await adsApisImpl.executeAudienceCampaignLaunch(

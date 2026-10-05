@@ -56,6 +56,13 @@ beforeEach(() => {
   // fixtures per test) keeps every existing assertion exercising exactly
   // what it always did.
   jest.spyOn(service as any, 'claimMetaWriteManifestGrant').mockResolvedValue({ granted: true, digest: 'stub-digest' });
+  // ENG-2277/2278/2279/2280: checkMetaBudgetChange is a separate, newer gate
+  // that also runs on every CAMPAIGN/AD_SET UPDATE carrying a budget field —
+  // several tests below vary daily_budget purely as an arbitrary
+  // distinguishing value to prove override-token binding, not to exercise
+  // budget-anomaly detection. Out of scope here, same reasoning as the
+  // manifest-grant stub above.
+  jest.spyOn(service as any, 'checkMetaBudgetChange').mockResolvedValue(undefined);
 });
 
 describe('callMetaMarketingApi — ENG-941 gate wiring', () => {
