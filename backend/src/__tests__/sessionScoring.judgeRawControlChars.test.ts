@@ -99,6 +99,15 @@ describe('raw control characters inside JSON string literals', () => {
     expect(result.reason).toBe('said "no"\nthen left');
   });
 
+  it('treats a backslash followed by a raw newline as a literal backslash plus a repaired newline', async () => {
+    mockCallLLM.mockResolvedValue(llmWith('{"score": 4, "reason": "C:\\\nnext"}'));
+
+    const result = await scoreSessionWithJudge(messages, messages.length, judge);
+
+    expect(result.score).toBe(4);
+    expect(result.reason).toBe('C:\\\nnext');
+  });
+
   it('still rejects genuinely malformed JSON instead of guessing', async () => {
     mockCallLLM.mockResolvedValue(llmWith('{"score": 3, "reason": "unterminated'));
 

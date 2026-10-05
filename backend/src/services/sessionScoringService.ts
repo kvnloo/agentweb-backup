@@ -1567,23 +1567,31 @@ function extractJsonObject(raw: string): string {
 function escapeControlCharsInJsonStrings(json: string): string {
   let out = "";
   let inString = false;
-  let escaped = false;
-  for (const ch of json) {
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (ch === "\\") {
-        escaped = true;
-      } else if (ch === '"') {
-        inString = false;
-      } else if (ch.charCodeAt(0) < 0x20) {
-        out += ch === "\n" ? "\\n" : ch === "\r" ? "\\r" : ch === "\t" ? "\\t" : `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`;
-        continue;
-      }
-    } else if (ch === '"') {
-      inString = true;
+  for (let i = 0; i < json.length; i++) {
+    const ch = json[i];
+    if (!inString) {
+      if (ch === '"') inString = true;
+      out += ch;
+      continue;
     }
-    out += ch;
+    if (ch === "\\") {
+      const next = json[i + 1];
+      if (next === undefined || next.charCodeAt(0) < 0x20) {
+        out += "\\\\";
+      } else {
+        out += ch + next;
+        i++;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = false;
+      out += ch;
+    } else if (ch.charCodeAt(0) < 0x20) {
+      out += ch === "\n" ? "\\n" : ch === "\r" ? "\\r" : ch === "\t" ? "\\t" : `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`;
+    } else {
+      out += ch;
+    }
   }
   return out;
 }
