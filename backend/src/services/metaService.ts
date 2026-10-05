@@ -282,6 +282,15 @@ export interface MetaPixelListResult {
   pagesFetched: number;
 }
 
+export interface MetaOAuthConnectionHealth {
+  pageCount: number;
+  pageIds: string[];
+  pagesError?: string;
+  grantedPermissions: string[];
+  declinedRequiredPermissions: string[];
+  permissionsError?: string;
+}
+
 /**
  * Parse `X-Business-Use-Case-Usage` off a real Marketing API response. The
  * header is a JSON object keyed by ad account id, each value an array with one
@@ -1001,6 +1010,84 @@ export class MetaService {
       this.handleError(error);
       return []; // Unreachable
     }
+  }
+
+  /**
+   * OAuth-time health check for the two Meta grants that most often look
+   * "connected" while being unusable:
+   *   - /me/accounts: Pages selected in the consent dialog.
+   *   - /me/permissions: required permissions the user explicitly declined.
+   *
+   * Unlike getPages(), this keeps pagination/read errors distinct from a true
+   * zero-Page result so a transient Graph problem never gets persisted as
+   * "confirmed no Pages".
+   */
+  public async checkOAuthConnectionHealth(
+    accessToken: string,
+    requiredPermissions: readonly string[],
+  ): Promise<MetaOAuthConnectionHealth> {
+    const apiVersion = process.env.META_API_VERSION || 'v25.0';
+    const required = new Set(requiredPermissions.map(p => String(p).trim()).filter(Boolean));
+    const result: MetaOAuthConnectionHealth = {
+      pageCount: 0,
+      pageIds: [],
+      grantedPermissions: [],
+      declinedRequiredPermissions: [],
+    };
+
+    try {
+      let after: string | undefined;
+      const seen = new Set<string>();
+      for (let page = 0; page < META_LIST_MAX_PAGES; page++) {
+        const qs = new URLSearchParams({
+          fields: 'id,name,access_token,category,tasks',
+          limit: String(META_LIST_PAGE_SIZE),
+          access_token: accessToken,
+          ...(after ? { after } : {}),
+        });
+        const res = await fetch(`https://graph.facebook.com/${apiVersion}/me/accounts?${qs.toString()}`);
+        const body: any = await res.json();
+        if (body?.error) throw new Error(body.error.message || 'Meta returned an error reading Pages');
+        if (!Array.isArray(body?.data)) throw new Error('Meta returned an unexpected Page list shape');
+        for (const raw of body.data) {
+          const id = raw?.id;
+          if (typeof id === 'string' && id.trim()) seen.add(id.trim());
+        }
+        const next = body?.paging?.cursors?.after;
+        if (!body?.paging?.next || typeof next !== 'string' || !next.trim()) break;
+        after = next.trim();
+        if (page === META_LIST_MAX_PAGES - 1) {
+          throw new Error(`Page list exceeded ${META_LIST_MAX_PAGES} pages; treating health as unknown`);
+        }
+      }
+      result.pageIds = [...seen];
+      result.pageCount = result.pageIds.length;
+    } catch (error: any) {
+      result.pagesError = error?.message || String(error);
+    }
+
+    try {
+      const res = await fetch(
+        `https://graph.facebook.com/${apiVersion}/me/permissions?access_token=${encodeURIComponent(accessToken)}`
+      );
+      const body: any = await res.json();
+      if (body?.error) throw new Error(body.error.message || 'Meta returned an error reading permissions');
+      if (!Array.isArray(body?.data)) throw new Error('Meta returned an unexpected permissions shape');
+      const granted = new Set<string>();
+      const declined = new Set<string>();
+      for (const item of body.data) {
+        const permission = typeof item?.permission === 'string' ? item.permission.trim() : '';
+        if (!permission) continue;
+        if (item?.status === 'granted') granted.add(permission);
+        if (item?.status === 'declined' && required.has(permission)) declined.add(permission);
+      }
+      result.grantedPermissions = [...granted];
+      result.declinedRequiredPermissions = [...declined];
+    } catch (error: any) {
+      result.permissionsError = error?.message || String(error);
+    }
+
+    return result;
   }
 
   /**

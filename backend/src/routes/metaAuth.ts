@@ -14,6 +14,8 @@ import { MetaAdAccount, MetaInstagramAccount } from '../types/meta';
 import { getJwtSecret } from '../config/jwt';
 
 const router = express.Router();
+const META_PRECONNECT_INSTRUCTIONS =
+    'Click Edit access, select all current and future Pages, approve all permissions.';
 
 // Token sessions are stored in DynamoDB (AW-OAuthSessions) with a 10-minute TTL
 // to survive across multiple backend instances behind the load balancer.
@@ -35,25 +37,41 @@ function verifyState(state: string): { userId: string; flow?: MetaFlowType } {
     }
 }
 
-function buildOAuthUrl(params: { authorizationUrl: string; clientId: string; redirectUri: string; scopes: string[]; state: string }): string {
+interface MetaOAuthTokenSession {
+    userId: string;
+    access_token: string;
+    expires_in?: number;
+    scopes: string[];
+    granted_scopes?: string[];
+    declined_required_permissions?: string[];
+    meta_oauth_health_error?: string;
+    has_meta_pages?: boolean;
+    meta_page_ids?: string[];
+    meta_page_count?: number;
+    meta_page_health_error?: string;
+    flow: MetaFlowType;
+}
+
+function buildOAuthUrl(params: { authorizationUrl: string; clientId: string; redirectUri: string; scopes: string[]; state: string; authType?: string }): string {
     const searchParams = new URLSearchParams({
         client_id: params.clientId,
         redirect_uri: params.redirectUri,
         state: params.state,
         scope: params.scopes.join(','),
-        response_type: 'code'
+        response_type: 'code',
+        ...(params.authType ? { auth_type: params.authType } : {})
     });
     return `${params.authorizationUrl}?${searchParams.toString()}`;
 }
 
-async function storeTokenSession(userId: string, tokens: { access_token: string; expires_in?: number; scopes: string[]; granted_scopes?: string[]; has_meta_pages?: boolean; meta_page_ids?: string[]; flow: MetaFlowType }): Promise<string> {
+async function storeTokenSession(userId: string, tokens: Omit<MetaOAuthTokenSession, 'userId'>): Promise<string> {
     const sessionId = crypto.randomBytes(32).toString('hex');
     await oauthSessionDb.save({ sessionId, userId, ...tokens });
     return sessionId;
 }
 
-async function retrieveTokenSession(sessionId: string, userId: string) {
-    const session = await oauthSessionDb.get(sessionId, userId);
+async function retrieveTokenSession(sessionId: string, userId: string): Promise<MetaOAuthTokenSession | null> {
+    const session = await oauthSessionDb.get(sessionId, userId) as MetaOAuthTokenSession | null;
     if (!session) {
         console.warn(`[TokenSession] Session ${sessionId.substring(0, 8)}... not found or userId mismatch`);
         return null;
@@ -119,11 +137,19 @@ router.get('/init', authenticateToken, async (req: any, res) => {
             clientId: clientId,
             redirectUri,
             scopes: flowCfg.scopes,
-            state
+            state,
+            // Meta does not re-prompt for declined permissions during an ordinary reconnect.
+            // `rerequest` is the documented path that lets a customer approve previously
+            // declined Pages/permissions instead of receiving another token with the same gap.
+            authType: flow === 'marketing' ? 'rerequest' : undefined
         });
 
         console.log(`[Meta Init] flow=${flow}, scopes=${flowCfg.scopes.join(',')}`);
-        res.json({ success: true, url });
+        res.json({
+            success: true,
+            url,
+            ...(flow === 'marketing' ? { preconnectInstructions: META_PRECONNECT_INSTRUCTIONS } : {}),
+        });
 
     } catch (error) {
         console.error('[Meta Init] Error:', error);
@@ -257,6 +283,8 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
         // the grant records an unverified claim (ENG-629 / OPS-79). Best-effort:
         // a failure here must never block connecting the account.
         let granted_scopes: string[] | undefined;
+        let declined_required_permissions: string[] | undefined;
+        let meta_oauth_health_error: string | undefined;
         try {
             granted_scopes = await metaService.getGrantedScopes(access_token);
             console.log(
@@ -274,14 +302,26 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
         // "we could not ask" is never read as "confirmed zero Pages".
         let has_meta_pages: boolean | undefined;
         let meta_page_ids: string[] | undefined;
+        let meta_page_count: number | undefined;
+        let meta_page_health_error: string | undefined;
         if (flow === 'marketing') {
             try {
-                const pages = await metaService.getPages(access_token);
-                has_meta_pages = pages.length > 0;
-                meta_page_ids = pages.map(p => p.id);
-                console.log(`[Meta Finalize] has_meta_pages: ${has_meta_pages} (${pages.length} Page(s))`);
+                const health = await metaService.checkOAuthConnectionHealth(access_token, flowCfg.scopes);
+                granted_scopes = health.grantedPermissions.length > 0 ? health.grantedPermissions : granted_scopes;
+                declined_required_permissions = health.declinedRequiredPermissions;
+                meta_oauth_health_error = health.permissionsError;
+                if (health.pagesError) {
+                    meta_page_health_error = health.pagesError;
+                    console.warn(`[Meta Finalize] Could not determine Page access: ${health.pagesError}`);
+                } else {
+                    has_meta_pages = health.pageCount > 0;
+                    meta_page_count = health.pageCount;
+                    meta_page_ids = health.pageIds;
+                    console.log(`[Meta Finalize] has_meta_pages: ${has_meta_pages} (${health.pageCount} Page(s))`);
+                }
             } catch (err: any) {
                 console.warn(`[Meta Finalize] Could not determine Page access: ${err?.message ?? err}`);
+                meta_page_health_error = err?.message ?? String(err);
             }
         }
 
@@ -290,8 +330,12 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
             expires_in,
             scopes: flowCfg.scopes,
             ...(granted_scopes ? { granted_scopes } : {}),
+            ...(declined_required_permissions ? { declined_required_permissions } : {}),
+            ...(meta_oauth_health_error ? { meta_oauth_health_error } : {}),
             ...(has_meta_pages !== undefined ? { has_meta_pages } : {}),
             ...(meta_page_ids ? { meta_page_ids } : {}),
+            ...(meta_page_count !== undefined ? { meta_page_count } : {}),
+            ...(meta_page_health_error ? { meta_page_health_error } : {}),
             flow
         });
 
@@ -324,6 +368,10 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
                 // "Choose Pages" step before the user finishes connecting,
                 // instead of only discovering this later at ad-creative time.
                 hasMetaPages: has_meta_pages,
+                metaPageCount: meta_page_count,
+                declinedRequiredPermissions: declined_required_permissions,
+                metaOAuthHealthError: meta_oauth_health_error || meta_page_health_error,
+                preconnectInstructions: META_PRECONNECT_INSTRUCTIONS,
                 tokenSessionId
             });
         }
@@ -439,11 +487,15 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
                     // Omitted (not []) when undetermined, so "we could not ask" never
                     // masquerades as "nothing was granted" (ENG-629).
                     ...(session.granted_scopes ? { granted_scopes: session.granted_scopes } : {}),
+                    ...(session.declined_required_permissions ? { declined_required_permissions: session.declined_required_permissions } : {}),
+                    ...(session.meta_oauth_health_error ? { meta_oauth_health_error: session.meta_oauth_health_error } : {}),
                     // Authoritative Page-access signal, read back by getMetaPagesAccessState.
                     // Falls back to the previously recorded value on an undetermined
                     // probe so a transient failure can't revert a confirmed value
                     // back to unknown (ENG-2232).
                     ...(has_meta_pages !== undefined ? { has_meta_pages } : {}),
+                    ...(session.meta_page_count !== undefined ? { meta_page_count: session.meta_page_count } : {}),
+                    ...(session.meta_page_health_error ? { meta_page_health_error: session.meta_page_health_error } : {}),
                     // Names the specific Page this account's existing ads use, when the
                     // reason has_meta_pages is false is a wrong-Page mismatch rather than
                     // zero Pages — read back by getMetaAdsNoPagesMessage (ENG-2232).

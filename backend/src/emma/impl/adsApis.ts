@@ -1992,6 +1992,24 @@ export async function callMetaMarketingApi(
     }
   }
 
+  // ENG-2274: direct AD writes can bypass AD_CREATIVE CREATE entirely by
+  // referencing an existing creative, copying an ad, or swapping a creative
+  // onto an ad. A connection with confirmed zero accessible Pages cannot
+  // safely create/copy/update ads either, so hard-stop before the write path.
+  if (entity_type === 'AD' && ['CREATE', 'UPDATE', 'COPY_AD'].includes(action)) {
+    const { connection: adGateConnection } = await deps.getMetaCredentials(userId, account_id);
+    const { getMetaPagesAccessState, getMetaAdsNoPagesMessage } = await import('../../utils/metaAdsScope');
+    if (getMetaPagesAccessState(adGateConnection?.config) === 'missing') {
+      const pageMessage = getMetaAdsNoPagesMessage(adGateConnection?.config);
+      return {
+        success: false,
+        message: pageMessage,
+        error: `META_PAGE_ACCESS_MISSING: ${pageMessage}`,
+        hint: 'Reconnect Meta and select the Page on the "Choose Pages" step, or get "Create ads" (Advertiser) access on the Page, then retry.'
+      } as any;
+    }
+  }
+
   // Target-confirmation guardrail for mutating actions (publish/change/delete).
   // ENG-1635/1644 gap 5: `params.confirm` used to be read here into a
   // `confirmed` boolean that could independently satisfy the halt below —
