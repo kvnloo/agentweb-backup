@@ -56,6 +56,18 @@ export function writeCatalogPlan(plan: Awaited<ReturnType<typeof refreshModelCat
     pin = pin.replace(/version: '\d{4}-\d{2}-\d{2}',/, `version: '${plan.date}',`)
       .replace(/fingerprint: '[a-f0-9]+',[^\n]*/, `fingerprint: '${fingerprint}', // Catalog refresh price-book pin.`);
   }
+  // Every addition is priced from a live quote, never a derived guess, so it belongs
+  // in the convention allowlist regardless of whether its rate happens to diverge
+  // today. Register it here, at add time — not by sniffing the registry's
+  // human-editable `description` field later, which the draft-PR review step
+  // explicitly tells reviewers to rewrite (ENG-2293).
+  if (plan.additions.length) {
+    pin = pin.replace(/(const explicitCacheOverrides = new Set\(\[)([^\]]*)(\]\))/, (_match, pre, body, post) => {
+      const existing = [...(body as string).matchAll(/'([^']*)'/g)].map(m => m[1]);
+      const merged = [...new Set([...existing, ...plan.additions])];
+      return `${pre}${merged.map(id => `'${id}'`).join(', ')}${post}`;
+    });
+  }
   // Prepare every edit before writing; failed upstream requests leave the worktree untouched.
   fs.writeFileSync(registryPath, registry);
   fs.writeFileSync(pricePath, pricing);
