@@ -85,7 +85,8 @@ export async function runWorkPlanLifecycleProbe(callTool: CallTool, opts: ProbeO
   if (matches.length !== 1) return fail('list', `expected exactly one fixture plan, found ${matches.length}`);
   const plan = matches[0];
   const owner = plan.userId ?? plan.ownerId ?? plan.createdBy;
-  if (owner !== undefined && owner !== opts.verifierUserId) {
+  if (owner !== opts.verifierUserId) {
+    // Fail closed: a missing owner is not proof of ownership.
     return fail('list', 'fixture plan is not owned by the verifier account');
   }
   evidence.planId = plan.id;
@@ -124,13 +125,18 @@ export async function runWorkPlanLifecycleProbe(callTool: CallTool, opts: ProbeO
   const answered = decode(await callTool('emma_answer_work_plan_input', {
     session_id: opts.sessionId, request_id: pending.requestId, values: fixture.answers,
   }));
-  if (answered?.success === false) return fail('answer', `answer refused: ${answered?.message ?? 'unknown'}`);
+  if (typeof answered === 'string' || !answered || typeof answered !== 'object') {
+    return fail('answer', `answer returned a non-object response: ${String(answered).slice(0, 200)}`);
+  }
+  if (answered.success === false || answered.error !== undefined || answered.code !== undefined) {
+    return fail('answer', `answer refused: ${answered.message ?? answered.error ?? answered.code ?? 'unknown'}`);
+  }
   evidence.steps.push({ step: 'answer', ok: true });
 
-  // 5. read back — the request must no longer be awaiting.
+  // 5. read back — positive evidence: the same request must now be answered.
   const after = decode(await callTool('emma_get_session', { session_id: opts.sessionId }));
-  if (after?.pendingWorkPlanInput?.status === 'awaiting' && after.pendingWorkPlanInput.requestId === pending.requestId) {
-    return fail('readback', 'input request still awaiting after answer');
+  if (!(after?.pendingWorkPlanInput?.requestId === pending.requestId && after.pendingWorkPlanInput.status === 'answered')) {
+    return fail('readback', 'input request is not recorded as answered after answer');
   }
   evidence.steps.push({ step: 'readback', ok: true });
   return { ...evidence, ok: true };

@@ -84,6 +84,27 @@ describe('ENG-2060 work-plan lifecycle probe', () => {
     expect(ev.failedStep).toBe('readback');
   });
 
+  it('fails readback when the session has no answered record (positive evidence required)', async () => {
+    const { callTool } = fakeTools({ emma_get_session: [{ userId: VERIFIER }, awaiting, { userId: VERIFIER }] });
+    const ev = await runWorkPlanLifecycleProbe(callTool, base);
+    expect(ev.failedStep).toBe('readback');
+  });
+
+  it('fails answer on a string or error-shaped response', async () => {
+    for (const resp of ['boom', { error: 'x' }, { code: 'E' }]) {
+      const { callTool } = fakeTools({ emma_answer_work_plan_input: [resp] });
+      const ev = await runWorkPlanLifecycleProbe(callTool, base);
+      expect(ev.failedStep).toBe('answer');
+    }
+  });
+
+  it('refuses to launch a fixture plan with no ownership signal', async () => {
+    const { callTool, calls } = fakeTools({ list_predefined_work_plans: [[{ id: 'fx-1', title: DEFAULT_FIXTURE.planTitle }]] });
+    const ev = await runWorkPlanLifecycleProbe(callTool, base);
+    expect(ev.failedStep).toBe('list');
+    expect(calls.map((c) => c[0])).not.toContain('emma_launch_work_plan');
+  });
+
   it('rejects a non-fixture title before any call', async () => {
     const { callTool } = fakeTools();
     await expect(runWorkPlanLifecycleProbe(callTool, { ...base, fixture: { planTitle: 'Customer plan', answers: {} } }))
