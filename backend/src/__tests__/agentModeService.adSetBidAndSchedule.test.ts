@@ -73,6 +73,11 @@ import { userDb } from '../services/db';
  * Real-world cost: Open Future Forum spent $1,000 for 2 sign-ups because ads
  * ran at inefficient times (2026-07-29 sync, fathom 765808581).
  */
+// Lifetime-budget ad sets must run at least 24h (createMetaAdsAdSet's own
+// enforcement, below) — a fixed calendar date expires as wall-clock time
+// closes in on it. Computed relative to "now" so this suite never time-bombs.
+const FUTURE_END_TIME = new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString();
+
 const mockUser = {
   id: 'user123',
   connected_accounts: [
@@ -215,7 +220,7 @@ describe('ENG-838/ENG-842 — ad set bid strategy and dayparting must not silent
         ...baseAdSetParams,
         daily_budget: undefined,
         lifetime_budget: 500, // dummy — irrelevant under CBO, stripped before send
-        end_time: '2026-10-01T00:00:00+0000',
+        end_time: FUTURE_END_TIME,
         adset_schedule: [{ start_minute: 540, end_minute: 1020, days: [1, 2, 3, 4, 5] }]
       });
 
@@ -237,7 +242,7 @@ describe('ENG-838/ENG-842 — ad set bid strategy and dayparting must not silent
       const result = await service.createMetaAdsAdSet('user123', {
         ...baseAdSetParams,
         daily_budget: undefined,
-        end_time: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+        end_time: FUTURE_END_TIME,
         adset_schedule: [{ start_minute: 540, end_minute: 1020, days: [1, 2, 3, 4, 5] }]
       });
 

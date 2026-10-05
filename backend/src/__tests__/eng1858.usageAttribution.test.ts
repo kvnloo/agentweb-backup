@@ -53,6 +53,7 @@ import { asMutationId } from '../loops/core/types';
 import { cronJobRegistry } from '../utils/cronJobRegistry';
 import { restyleContent, generateBlogContent } from '../controllers/blog';
 import { withRunFunding, type RunFunding } from '../services/funding/runFunding';
+import * as workPlansImpl from '../emma/impl/workPlans';
 
 const mockResolveBilling = resolveBillingUserId as jest.MockedFunction<typeof resolveBillingUserId>;
 const mockMeter = meterUserUsage as jest.MockedFunction<typeof meterUserUsage>;
@@ -479,16 +480,23 @@ describe('ENG-1816 F1: attribution leaks fixed via the ambient RunFunding store'
     });
   });
 
-  it('wasStepRemovalUserAuthorized (agentModeService.ts) carries the run owner and never forwards billingUserId', async () => {
+  it('wasStepRemovalUserAuthorized (emma/impl/workPlans.ts) carries the run owner and never forwards billingUserId', async () => {
+    // ENG-2103 (F2 Pattern A): this helper moved from a private
+    // AgentModeService method to a module export of emma/impl/workPlans.ts,
+    // with `callLLM` now injected rather than reached via `this.callLLM`.
+    // Retargeted from `(agentModeService as any).wasStepRemovalUserAuthorized(...)`
+    // to call the module export directly, passing the same `callLLM` spy used
+    // by the rest of this describe block so the assertion still observes the
+    // real, unchanged call — not a mock that stopped being real.
     jest.spyOn(chatbotDb, 'getMostRecentRealUserMessage').mockResolvedValue({
       content: 'skip that step',
     } as any);
     callLLM.mockResolvedValue(llmReply('yes'));
 
     const authorized = await withRunFunding(funding(), () =>
-      (agentModeService as any).wasStepRemovalUserAuthorized(SESSION, [
+      workPlansImpl.wasStepRemovalUserAuthorized(SESSION, [
         { fn: 'publish_post', stepTitle: 'Publish' },
-      ]),
+      ], callLLM as any),
     );
 
     expect(authorized).toBe(true);
