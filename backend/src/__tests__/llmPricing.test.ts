@@ -245,6 +245,9 @@ describe('llmPricing', () => {
       for (const [model, price] of Object.entries(MODEL_PRICING)) {
         if (price.outPerM === 0) continue; // embeddings have no cache convention
         if (explicitCacheOverrides.has(model)) continue;
+        // Auto-added models (modelCatalogRefresh.ts) are priced straight from a live
+        // OpenRouter quote, never a derived guess — the convention doesn't apply to them.
+        if (LLM_MODEL_REGISTRY[model]?.description?.startsWith('Auto-added from OpenRouter')) continue;
         expect(price.cacheReadPerM).toBeCloseTo(price.inPerM * 0.1, 10);
         expect(price.cacheWritePerM).toBeCloseTo(price.inPerM * 1.25, 10);
         expect(model).toBeTruthy();

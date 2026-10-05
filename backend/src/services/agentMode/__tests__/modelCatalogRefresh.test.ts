@@ -50,12 +50,21 @@ describe('catalog critical invariants', () => {
     expect(additions.map(m => m.id)).toEqual(['openrouter/x-ai/grok-4.8']);
     expect(additions[0].price).toEqual({ inPerM: 1, outPerM: 3 });
     expect(discoverNewModels({ data: [{ ...row, pricing: { prompt: '0.00000029', completion: '0.000003' } }] })[0].price.inPerM).toBe(0.29);
+    // A fixed local registry, not the live LLM_MODEL_REGISTRY — these assertions pin
+    // exact qualityScore/qualityScoreSource matching behavior, which the live import
+    // drifts whenever the catalog refresh itself updates a real score (ENG-2293).
+    const scoreRegistry = {
+      [grok[0]]: { client: null, supportsTemperature: true, provider: 'xai' as const, qualityScore: 10,
+        qualityScoreSource: 'Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Grok 4.6, high' },
+      [grok[1]]: { client: null, supportsTemperature: true, provider: 'xai' as const, qualityScore: 20,
+        qualityScoreSource: 'Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Grok 4.7, xhigh' },
+    };
     const valid = { slug: 'grok-4.6', model_creator: { slug: 'x-ai' }, evaluations: { artificial_analysis_intelligence_index: 45 } };
-    const scores = refreshScores(LLM_MODEL_REGISTRY, { data: [null, valid, { ...valid, evaluations: { artificial_analysis_intelligence_index: '99' } }] }, '2026-09-24');
+    const scores = refreshScores(scoreRegistry, { data: [null, valid, { ...valid, evaluations: { artificial_analysis_intelligence_index: '99' } }] }, '2026-09-24');
     expect(scores.changes[grok[0]].qualityScore).toBe(45);
     expect(scores.changes[grok[1]]).toBeUndefined();
-    expect(refreshScores(LLM_MODEL_REGISTRY, { data: [{ ...valid, slug: 'grok-4-6-high', name: 'Grok 4.6 (high)' }] }, '2026-09-24').changes[grok[0]].qualityScore).toBe(45);
-    expect(refreshScores(LLM_MODEL_REGISTRY, { data: [valid, valid] }, '2026-09-24').changes).toEqual({});
+    expect(refreshScores(scoreRegistry, { data: [{ ...valid, slug: 'grok-4-6-high', name: 'Grok 4.6 (high)' }] }, '2026-09-24').changes[grok[0]].qualityScore).toBe(45);
+    expect(refreshScores(scoreRegistry, { data: [valid, valid] }, '2026-09-24').changes).toEqual({});
   });
   it('patches only requested members and is idempotent', () => {
     const source = "export const X = { /* preserve */ 'a': 1, 'b': 2 };";
