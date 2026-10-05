@@ -118,4 +118,15 @@ describe('ENG-2295 Meta Toolkit MCP endpoint', () => {
     res = await rpc({ id: 11, method: 'tools/list' }).expect(400);
     expect(res.body.error.code).toBe(-32600);
   });
+
+  it('protocol negotiation, id validation, array arguments and GET follow the MCP spec', async () => {
+    let res = await rpc({ jsonrpc: '2.0', id: 12, method: 'initialize', params: { protocolVersion: '2099-01-01' } }).expect(200);
+    expect(res.body.result.protocolVersion).toBe('2025-06-18');
+    res = await rpc({ jsonrpc: '2.0', id: null, method: 'initialize', params: {} }).expect(400);
+    expect(res.body).toMatchObject({ id: null, error: { code: -32600 } });
+    res = await rpc({ jsonrpc: '2.0', id: 13, method: 'tools/call', params: { name: 'meta_get_insights', arguments: [1] } }, 'Bearer x').expect(200);
+    expect(res.body.error.code).toBe(-32602);
+    expect(mockHandle).not.toHaveBeenCalled();
+    await request(app).get('/api/meta-toolkit/mcp').expect(405);
+  });
 });

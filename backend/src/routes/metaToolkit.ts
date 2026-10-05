@@ -74,6 +74,11 @@ router.post('/tools/:name/call', async (req: Request, res: Response) => {
  * not re-implemented here. No session state, no storage.
  */
 export const META_TOOLKIT_MCP_PROTOCOL_VERSION = '2025-06-18';
+const META_TOOLKIT_MCP_SUPPORTED_VERSIONS = new Set(['2025-06-18', '2025-03-26']);
+
+function isValidRpcId(id: unknown) {
+  return typeof id === 'string' || (typeof id === 'number' && Number.isInteger(id));
+}
 
 function rpcResult(res: Response, id: unknown, result: unknown) {
   return res.json({ jsonrpc: '2.0', id: id ?? null, result });
@@ -88,12 +93,21 @@ function toolResultContent(result: unknown) {
   return [{ type: 'text', text }];
 }
 
+// No SSE stream is offered; MCP Streamable HTTP requires 405 for GET in that case.
+router.get('/mcp', (_req: Request, res: Response) => {
+  res.setHeader('Allow', 'POST');
+  return res.status(405).json({ error: 'Method Not Allowed' });
+});
+
 router.post('/mcp', async (req: Request, res: Response) => {
   const msg = req.body;
   if (!msg || typeof msg !== 'object' || Array.isArray(msg) || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') {
     return rpcError(res, msg?.id, -32600, 'Invalid Request', 400);
   }
   const { id, method } = msg;
+  if (id !== undefined && !isValidRpcId(id)) {
+    return rpcError(res, null, -32600, 'Invalid Request: id must be a string or integer', 400);
+  }
   const params = msg.params && typeof msg.params === 'object' ? msg.params : {};
 
   // Notifications (no id) never get a response body.
@@ -106,7 +120,9 @@ router.post('/mcp', async (req: Request, res: Response) => {
       case 'initialize':
         return rpcResult(res, id, {
           protocolVersion:
-            typeof params.protocolVersion === 'string' ? params.protocolVersion : META_TOOLKIT_MCP_PROTOCOL_VERSION,
+            typeof params.protocolVersion === 'string' && META_TOOLKIT_MCP_SUPPORTED_VERSIONS.has(params.protocolVersion)
+              ? params.protocolVersion
+              : META_TOOLKIT_MCP_PROTOCOL_VERSION,
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: 'agentweb-meta-toolkit', version: '1.0.0' },
         });
@@ -118,6 +134,12 @@ router.post('/mcp', async (req: Request, res: Response) => {
       case 'tools/call': {
         if (typeof params.name !== 'string' || !params.name) {
           return rpcError(res, id, -32602, 'Invalid params: tools/call requires a tool name.');
+        }
+        if (
+          params.arguments !== undefined &&
+          (params.arguments === null || typeof params.arguments !== 'object' || Array.isArray(params.arguments))
+        ) {
+          return rpcError(res, id, -32602, 'Invalid params: tools/call arguments must be an object.');
         }
         try {
           const result = await handleMetaToolkitCall({
