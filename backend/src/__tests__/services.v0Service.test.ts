@@ -2764,6 +2764,61 @@ describe("v0Service - iterateLandingPage", () => {
     mockChatsGetById.mockReset();
   });
 
+  it("ENG-1728: the pre-send base version is persisted BEFORE v0 is called", async () => {
+    // If the process dies between v0 accepting the message and pendingIteration being
+    // stored, the retry would read the POST-edit version as its base, the guard would skip
+    // the already-sent message, and the retry would wait for a version no send will create.
+    // Writing the base first closes that window.
+    mockGet.mockReturnValue(iterRecord());
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } })
+      .mockResolvedValue({ latestVersion: { id: "v_new", status: "completed" } });
+    mockChatsSendMessage.mockResolvedValueOnce({});
+
+    await iterateLandingPage("page-1", "user-1", "Add testimonials");
+
+    const pendingWrite = mockUpdate.mock.calls.findIndex(
+      (c: any) => c[0].ExpressionAttributeValues?.[":p"]?.baseVersionId === "v_base"
+    );
+    expect(pendingWrite).toBeGreaterThanOrEqual(0);
+    expect(mockUpdate.mock.calls[pendingWrite][0].ExpressionAttributeValues[":p"].unsent).toBe(true);
+    expect(mockUpdate.mock.invocationCallOrder[pendingWrite]).toBeLessThan(
+      mockChatsSendMessage.mock.invocationCallOrder[0]
+    );
+    // After v0 accepts, the marker is cleared but the ORIGINAL base is kept.
+    const sentWrite = mockUpdate.mock.calls.find(
+      (c: any) => c[0].ExpressionAttributeValues?.[":p"] && !c[0].ExpressionAttributeValues[":p"].unsent
+    );
+    expect(sentWrite[0].ExpressionAttributeValues[":p"].baseVersionId).toBe("v_base");
+    mockChatsGetById.mockReset();
+  });
+
+  it("ENG-1728: a retry whose base was recorded but whose send never happened still sends (no wait for a version nobody will create)", async () => {
+    // Crash between the pre-send pendingIteration write and the v0 call: the record says
+    // this edit is pending, v0 is still at the recorded base, and the guard has no record
+    // of a send. The retry must send rather than wait out V0_GENERATION_TIMEOUT.
+    mockGet.mockReturnValue(
+      iterRecord({
+        pendingIteration: {
+          baseVersionId: "v_base",
+          messageHash: hashV0Prompt("Add testimonials"),
+          startedAt: new Date().toISOString(),
+          unsent: true,
+        },
+      })
+    );
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } })
+      .mockResolvedValue({ latestVersion: { id: "v_new", status: "completed" } });
+    mockChatsSendMessage.mockResolvedValueOnce({});
+
+    const result = await iterateLandingPage("page-1", "user-1", "Add testimonials");
+
+    expect(mockChatsSendMessage).toHaveBeenCalledTimes(1);
+    expect(result.iterations).toBe(1);
+    mockChatsGetById.mockReset();
+  });
+
   it("a failed iteration leaves the page's status alone — the live page must not be marked failed", async () => {
     mockGet.mockReturnValue(iterRecord({ status: "deployed" }));
     mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } });
