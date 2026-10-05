@@ -788,6 +788,21 @@ createTestAccount().then(async () => {
         console.error('[DomainReachability] Failed to initialize:', error);
       }
 
+      // ENG-2156: warn oncall at 80%/95% of the OpenRouter key's own monthly limit, before
+      // the cap starts 402'ing every Agent Mode call. Read-only; hourly from boot.
+      try {
+        const { runOpenRouterKeyBudgetCheck, KEY_BUDGET_INTERVAL_MS } =
+          await import('./cron/openRouterKeyBudgetCron');
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('OpenRouterKeyBudget', runOpenRouterKeyBudgetCheck())
+            .catch(e => console.error('[OpenRouterKeyBudget] Error:', e));
+        }, KEY_BUDGET_INTERVAL_MS);
+        console.log('[OpenRouterKeyBudget] Initialized — hourly');
+      } catch (error) {
+        console.error('[OpenRouterKeyBudget] Failed to initialize:', error);
+      }
+
 
       // ENG-1967: one bounded due-record page per tick. Registry drains in-flight work at shutdown.
       const { runAdsLearningEvaluation } = await import('./cron/adsLearningCron');
