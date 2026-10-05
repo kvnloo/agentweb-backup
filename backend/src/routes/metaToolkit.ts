@@ -14,6 +14,10 @@ import {
   MetaToolkitAuthError,
 } from '../mcp/metaToolkitGateway';
 import { getMetaToolkitManifest, MetaToolkitRefusal } from '../mcp/metaToolkitManifest';
+import { rateLimiter } from '../middleware/rateLimiter';
+
+/** Per-IP request ceiling, applied before bearer auth so unauthenticated floods are throttled too. */
+export const META_TOOLKIT_MAX_PER_MINUTE = 60;
 
 export function sendMetaToolkitError(res: Response, error: unknown) {
   if (error instanceof MetaToolkitAuthError) {
@@ -27,6 +31,15 @@ export function sendMetaToolkitError(res: Response, error: unknown) {
 }
 
 const router = Router();
+
+router.use((req: Request, res: Response, next) => {
+  const result = rateLimiter.check(`meta-toolkit:${req.ip ?? 'unknown'}`, META_TOOLKIT_MAX_PER_MINUTE);
+  if (!result.allowed) {
+    res.setHeader('Retry-After', String(Math.ceil(result.resetInMs / 1000)));
+    return res.status(429).json({ error: 'Too many Meta Toolkit requests. Try again shortly.' });
+  }
+  return next();
+});
 
 router.get('/tools', async (req: Request, res: Response) => {
   try {
