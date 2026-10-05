@@ -260,6 +260,7 @@ import { buildSandboxFetchHtml } from '../../services/sandboxTrackingPreflight';
 import { assertMetaAccountAllowed } from '../../services/metaTestAccountGuard';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from '../../services/metaAudienceCampaignTokenStore';
 import { getJwtSecret } from '../../config/jwt';
+import { metaWriteRateShaper } from '../../services/agentMode/metaWriteRateShaper';
 import { describeMetaWriteParamDrift, formatMetaWriteParamDriftMessage } from '../../services/agentMode/core/approvalDeck';
 
 /** Local copy of `AgentModeService`'s private `MetaApiResult` type — never exported there. */
@@ -3017,6 +3018,14 @@ export async function executeAudienceCampaignLaunch(
     if (existingAdSet) {
       adSet = { id: existingAdSet.id, name: existingAdSet.name };
     } else {
+      // ENG-2268 (D3 follow-up from ENG-2281): the launch_* tools build their ad set
+      // outside callMetaMarketingApi, so they never passed the ENG-2280 burst shaper.
+      // Score this write on the same shared per-account shaper; a burst refusal sends
+      // nothing to Meta and surfaces as a step failure (preview token is released).
+      const shape = metaWriteRateShaper.shapeWrite(String(args.account_id || 'unknown'), 'AD_SET', 'CREATE', undefined, args.ad_set_params);
+      if (shape.kind === 'throttled') {
+        rethrowStepFailure({ message: shape.message, code: 429 }, 'Meta write rate-shaped.');
+      }
       const adSetResult = await deps.createMetaAdsAdSet(userId, {
         ...args.ad_set_params,
         account_id: args.account_id,
