@@ -1559,6 +1559,46 @@ function extractJsonObject(raw: string): string {
   return raw.slice(start, end + 1);
 }
 
+/**
+ * Models sometimes emit a raw newline or tab inside a JSON string (typically a multi-line
+ * "reason"), which strict JSON.parse rejects. Escape only those control characters, and only
+ * inside string literals, then parse strictly again. Anything still malformed still throws.
+ */
+function escapeControlCharsInJsonStrings(json: string): string {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (const ch of json) {
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      } else if (ch.charCodeAt(0) < 0x20) {
+        out += ch === "\n" ? "\\n" : ch === "\r" ? "\\r" : ch === "\t" ? "\\t" : `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`;
+        continue;
+      }
+    } else if (ch === '"') {
+      inString = true;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+function parseJudgeJson(raw: string): any {
+  const candidate = extractJsonObject(raw);
+  try {
+    return JSON.parse(candidate);
+  } catch (error) {
+    const repaired = escapeControlCharsInJsonStrings(candidate);
+    if (repaired === candidate) throw error;
+    return JSON.parse(repaired);
+  }
+}
+
 function parseDimensions(raw: any): ScoringResult["dimensions"] | undefined {
   const d = raw?.dimensions;
   if (!d || typeof d !== "object") return undefined;
@@ -1669,7 +1709,7 @@ export async function scoreSession(
 
   const raw = res.choices?.[0]?.message?.content ?? "{}";
   // ENG-2216: Bedrock doesn't always honor response_format: json_object strictly.
-  const parsed = JSON.parse(extractJsonObject(raw));
+  const parsed = parseJudgeJson(raw);
   // ENG-1669: a missing/non-numeric "score" field used to flow straight through
   // Math.round/Math.max/Math.min as NaN — no code path checked for it — and the
   // resulting NaN only surfaced when DynamoDB's SDK rejected it at the point of
@@ -1817,7 +1857,7 @@ export async function scoreSessionWithJudge(
 
   const raw = res.choices?.[0]?.message?.content ?? "{}";
   // ENG-2216: Bedrock doesn't always honor response_format: json_object strictly.
-  const parsed = JSON.parse(extractJsonObject(raw));
+  const parsed = parseJudgeJson(raw);
   // ENG-1669: see scoreSession's identical guard — a missing/non-numeric
   // "score" here previously reached chatbotDb.updateSessionJudgeScore as NaN
   // and failed opaquely inside the DynamoDB SDK instead of at the source.
