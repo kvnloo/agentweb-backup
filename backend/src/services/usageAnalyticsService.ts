@@ -4,6 +4,8 @@
  */
 
 import { usageRecordDb, UsageRecordRow, isVendorEntry } from "./usageRecordDb";
+import { listSpendEventsBounded } from "./spendEventDb";
+import { isLlmSpendEvent, LLM_SPEND_LEDGER_STARTED_ON } from "./spendLedgerDualWrite";
 import { userDb, orgDb, User } from "./db";
 import type { OrgRole } from "./orgAuthz";
 import { getAccountById } from "./connectedAccountsDb";
@@ -723,12 +725,12 @@ export interface OrgUsageRollup {
   selectedRole: OrgRole | null;
   /** Total real burn across all members (shadow table). */
   grossBurnUsd: number;
-  /** Amount charged to the org quota = the OWNER's monthly counter. */
+  /** Amount charged to the org's cap: the OWNER's LLM spend from the ledger (archived counter history for months before the ledger). */
   countedUsd: number;
   countedSource: "current" | "history" | "none";
   /** Burn not charged to quota: burn-only features + usage predating per-call tracking. */
   unchargedUsd: number;
-  /** counted / gross * 100 (0 when gross is 0). Can exceed 100 when the counter runs ahead. */
+  /** counted / gross * 100 (0 when gross is 0). Can exceed 100 when the ledger runs ahead of the usage records. */
   coveragePct: number;
   /** Per-member burn, sorted by burn desc. */
   members: OrgRollupMember[];
@@ -772,15 +774,46 @@ function aggregateBurn(rows: UsageRecordRow[]): {
   return { costMicroUsd, callCount, totalTokens, byModel: models };
 }
 
-/** The dollar amount charged to a user's quota counter for a month (current or history). */
-function counterForMonth(
-  user: User | null,
-  month: string
-): { costUsd: number; source: "current" | "history" | "none" } {
-  if (user?.tokenUsage?.month === month) {
-    return { costUsd: user.tokenUsage.totalCost || 0, source: "current" };
+/**
+ * A month's ledger read is bounded so the admin modal can never page through an
+ * unbounded range, and it FAILS rather than report a truncated total (a truncated
+ * aggregate is a wrong aggregate).
+ */
+const ROLLUP_LEDGER_MAX_EVENTS = 50_000;
+
+/**
+ * The LLM dollars charged to the org's cap for a month: the OWNER's spend ledger.
+ *
+ * This used to read the owner's legacy `AW-Users.tokenUsage` counter. ENG-1250 AC7
+ * retires that counter and the cap now enforces on the ledger, so the number that
+ * "counted against the cap" is read from where it is now produced. It stays LLM-only
+ * (token + per-generation units) because this rollup's gross burn is LLM-only, so
+ * both sides of the coverage ratio measure the same thing.
+ *
+ * Months up to and including the one the LLM ledger started in (2026-09) are not fully
+ * covered by it, so they keep reading the archived counter history: frozen, complete
+ * pre-retirement data, and exactly what this modal showed for them before.
+ */
+async function countedForMonth(
+  owner: User,
+  month: string,
+  start: string,
+  end: string,
+): Promise<{ costUsd: number; source: "current" | "history" | "none" }> {
+  const fullyCoveredByLedger = month > LLM_SPEND_LEDGER_STARTED_ON.slice(0, 7);
+  if (fullyCoveredByLedger) {
+    const read = await listSpendEventsBounded(owner.userId, start, end, ROLLUP_LEDGER_MAX_EVENTS);
+    if (read.exceeded) {
+      throw new Error(
+        `ledger for ${owner.userId} ${month} has more than ${ROLLUP_LEDGER_MAX_EVENTS} events; refusing to report a truncated total`,
+      );
+    }
+    const llm = read.events.filter((e) => e.lifecycle === "settled" && isLlmSpendEvent(e));
+    if (llm.length > 0) {
+      return { costUsd: llm.reduce((sum, e) => sum + Math.max(0, e.costMicroUsd || 0), 0) / 1_000_000, source: "current" };
+    }
   }
-  const hist = (user?.tokenUsageHistory || []).find((h) => h.month === month);
+  const hist = (owner.tokenUsageHistory || []).find((h) => h.month === month);
   if (hist) return { costUsd: hist.totalCost || 0, source: "history" };
   return { costUsd: 0, source: "none" };
 }
@@ -843,7 +876,7 @@ export async function getUserOrgUsageRollup(
   const orgAgg = aggregateBurn(perMember.flatMap((pm) => pm.rows));
   const grossBurnUsd = orgAgg.costMicroUsd / 1_000_000;
 
-  const counted = counterForMonth(ownerUser, month);
+  const counted = await countedForMonth(ownerUser, month, start, end);
   const unchargedUsd = Math.max(0, grossBurnUsd - counted.costUsd);
   const coveragePct = grossBurnUsd > 0 ? (counted.costUsd / grossBurnUsd) * 100 : 0;
 
