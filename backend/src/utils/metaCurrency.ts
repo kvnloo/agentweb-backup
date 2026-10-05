@@ -17,6 +17,16 @@ const SYMBOLS: Record<string, string> = {
   AUD: 'A$', CAD: 'C$',
 };
 
+const KNOWN_CURRENCIES: ReadonlySet<string> = (() => {
+  const intl = Intl as unknown as { supportedValuesOf?: (key: string) => string[] };
+  const fromIntl = typeof intl.supportedValuesOf === 'function' ? intl.supportedValuesOf('currency') : [];
+  return new Set([...fromIntl, ...META_ZERO_DECIMAL, ...Object.keys(SYMBOLS)]);
+})();
+
+function isKnownCurrency(code: string): boolean {
+  return KNOWN_CURRENCIES.has(code);
+}
+
 export interface MetaCurrencyInfo {
   code: string;
   offset: 1 | 100;
@@ -27,6 +37,7 @@ export interface MetaCurrencyInfo {
 export function resolveMetaCurrency(code: string | null | undefined): MetaCurrencyInfo {
   const normalized = String(code ?? '').trim().toUpperCase();
   if (!/^[A-Z]{3}$/.test(normalized)) return { code: 'UNKNOWN', offset: 100, assumed: true };
+  if (!isKnownCurrency(normalized)) return { code: normalized, offset: 100, assumed: true };
   return { code: normalized, offset: META_ZERO_DECIMAL.has(normalized) ? 1 : 100, assumed: false };
 }
 

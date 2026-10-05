@@ -25,6 +25,8 @@ describe('metaCurrency (ENG-2046 A1)', () => {
     expect(resolveMetaCurrency(' krw ')).toEqual({ code: 'KRW', offset: 1, assumed: false });
     expect(resolveMetaCurrency(undefined)).toEqual({ code: 'UNKNOWN', offset: 100, assumed: true });
     expect(resolveMetaCurrency('dollars').assumed).toBe(true);
+    expect(resolveMetaCurrency('zzz')).toEqual({ code: 'ZZZ', offset: 100, assumed: true });
+    expect(resolveMetaCurrency('usd').assumed).toBe(false);
     expect(describeMetaMoney(3000, null)).toContain('assuming 2 decimals');
   });
 
