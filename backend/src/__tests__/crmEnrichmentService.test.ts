@@ -152,6 +152,32 @@ describe('CrmEnrichmentService', () => {
     mockCrmDb.updateEnrichmentJobStatus.mockResolvedValue(undefined);
   });
 
+  describe('lifecycle presence filtering (ENG-2155)', () => {
+    const leads = [
+      createLead({ leadId: 'absent' }),
+      createLead({ leadId: 'null', lifecycle: null }),
+      createLead({ leadId: 'empty', lifecycle: '' }),
+      createLead({ leadId: 'whitespace', lifecycle: '  ' }),
+      createLead({ leadId: 'inbox', lifecycle: 'inbox' }),
+      createLead({ leadId: 'custom', customFields: { lifecycle: 'customer' } }),
+    ];
+
+    it.each([['is_empty', 0], ['is_not_empty', 6]])(
+      '%s uses semantic lifecycle presence regardless of storage',
+      async (operator, expected) => {
+        mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1' } as any);
+        mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads } as any);
+        const result = await (service as any).loadAndFilterLeads({
+          listId: 'list1', userId: 'user1', instruction: '',
+          outputFields: ['company_size'], sources: ['web_search'],
+          filters: [{ field: 'lifecycle', operator }],
+        });
+        expect(result.filteredTotal).toBe(expected);
+        expect(result.leadsToProcess).toHaveLength(expected);
+      },
+    );
+  });
+
   // ─── FAIL CASES ───────────────────────────────────────────────────────────
 
   describe('preview - fail cases', () => {

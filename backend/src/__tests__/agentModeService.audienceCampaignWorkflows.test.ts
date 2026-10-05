@@ -57,6 +57,7 @@ jest.mock('../utils/ssrfGuard', () => ({
 }));
 
 import axios from 'axios';
+import { metaService } from '../services/metaService';
 import { AgentModeService } from '../services/agentModeService';
 import { toolResultError } from '../utils/toolResultError';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
@@ -70,6 +71,7 @@ import { classifyToolFailureType } from '../utils/toolFailureType';
  * metaLaunchGateWiring.test.ts.
  */
 beforeEach(() => {
+  jest.spyOn(metaService, 'getAdAccountCurrency').mockResolvedValue('USD');
   jest
     .spyOn(AgentModeService.prototype as any, 'getMetaCredentials')
     .mockResolvedValue({ accountId: 'act-test', accessToken: 'tok-test' });
@@ -1127,7 +1129,8 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // mismatch and always created a duplicate. Uses a string here (matching
     // real Meta's response shape) rather than a number, specifically to
     // regression-lock the numeric-coercion fix.
-    it('reuses an existing ad set when the requested budget (dollars) matches Meta\'s stored value (cents, returned as a string)', async () => {
+    it.each([['USD', 10, '1000'], ['TWD', 300, '300']])('reuses matching %s budgets after account-currency normalization', async (currency, major, minor) => {
+      jest.spyOn(metaService, 'getAdAccountCurrency').mockResolvedValue(currency as string);
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
       jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'reuse', audience: { id: 'aud_seed_10', name: 'RankAI Warm List' }, created: false,
@@ -1141,14 +1144,14 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
             custom_audiences: [{ id: 'aud_seed_10' }], geo_locations: { countries: ['US'] },
             targeting_automation: { advantage_audience: 0 },
           },
-          daily_budget: '1000', // $10.00 stored as cents by Meta, returned as a string
+          daily_budget: minor, // Meta returns minor units as a string
           bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
         }],
       } as any);
       const createAdSetSpy = jest.spyOn(agentModeService, 'createMetaAdsAdSet');
 
       const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm({
-        ...baseArgs(), ad_set_params: { ...baseArgs().ad_set_params, daily_budget: 10 }, // $10.00, dollars
+        ...baseArgs(), ad_set_params: { ...baseArgs().ad_set_params, daily_budget: major }, // Agent input is in major units
       }));
 
       expect(createAdSetSpy).not.toHaveBeenCalled();

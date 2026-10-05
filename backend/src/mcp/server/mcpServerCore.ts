@@ -21,6 +21,7 @@ import {
   recordMcpFirstToolUse,
   recordMcpToolUse,
 } from '../../services/mcpUsageEventsService';
+import { cronJobRegistry } from '../../utils/cronJobRegistry';
 
 // Import API-wrapping tools (replaces direct tools.ts and portalTools.ts)
 import './apiTools';
@@ -89,6 +90,8 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
    */
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
+
+    return cronJobRegistry.track('mcpToolCall', (async () => {
 
     // Extract context fields from args (injected by internal MCP clients)
     const { userId, sessionId, llmModel, ...toolArgs } = (args || {}) as any;
@@ -175,6 +178,7 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
         isError: true,
       };
     }
+    })());
   });
 
   return server;

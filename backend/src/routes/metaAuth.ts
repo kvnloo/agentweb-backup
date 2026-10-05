@@ -7,7 +7,7 @@ import { getMetaCredentials, getInstagramCredentials } from '../utils/secretsMan
 import { getMetaFlowConfig, INTEGRATION_CONFIG, MetaFlowType } from '../config/integrations';
 import { metaService } from '../services/metaService';
 import { instagramService } from '../services/instagramService';
-import { createAccount } from '../services/connectedAccountsDb';
+import { createAccount, getAccountById } from '../services/connectedAccountsDb';
 import { redactAccountSecrets, redactAccountsSecrets } from '../utils/accountSecretRedaction';
 import { oauthSessionDb } from '../services/db';
 import { MetaAdAccount, MetaInstagramAccount } from '../types/meta';
@@ -46,7 +46,7 @@ function buildOAuthUrl(params: { authorizationUrl: string; clientId: string; red
     return `${params.authorizationUrl}?${searchParams.toString()}`;
 }
 
-async function storeTokenSession(userId: string, tokens: { access_token: string; expires_in?: number; scopes: string[]; granted_scopes?: string[]; flow: MetaFlowType }): Promise<string> {
+async function storeTokenSession(userId: string, tokens: { access_token: string; expires_in?: number; scopes: string[]; granted_scopes?: string[]; has_meta_pages?: boolean; meta_page_ids?: string[]; flow: MetaFlowType }): Promise<string> {
     const sessionId = crypto.randomBytes(32).toString('hex');
     await oauthSessionDb.save({ sessionId, userId, ...tokens });
     return sessionId;
@@ -266,11 +266,32 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
             console.warn(`[Meta Finalize] Could not determine granted scopes: ${err?.message ?? err}`);
         }
 
+        // ENG-2232: Page access is a second, independent Meta grant that
+        // granted_scopes says nothing about — a token can hold ads_read with
+        // zero accessible Pages, and every AD_CREATIVE needs a page_id. Probed
+        // once here, at connect/reconnect time, same pattern as granted_scopes
+        // above: best-effort, and `undefined` (never `false`) on failure so
+        // "we could not ask" is never read as "confirmed zero Pages".
+        let has_meta_pages: boolean | undefined;
+        let meta_page_ids: string[] | undefined;
+        if (flow === 'marketing') {
+            try {
+                const pages = await metaService.getPages(access_token);
+                has_meta_pages = pages.length > 0;
+                meta_page_ids = pages.map(p => p.id);
+                console.log(`[Meta Finalize] has_meta_pages: ${has_meta_pages} (${pages.length} Page(s))`);
+            } catch (err: any) {
+                console.warn(`[Meta Finalize] Could not determine Page access: ${err?.message ?? err}`);
+            }
+        }
+
         const tokenSessionId = await storeTokenSession(userId, {
             access_token,
             expires_in,
             scopes: flowCfg.scopes,
             ...(granted_scopes ? { granted_scopes } : {}),
+            ...(has_meta_pages !== undefined ? { has_meta_pages } : {}),
+            ...(meta_page_ids ? { meta_page_ids } : {}),
             flow
         });
 
@@ -299,6 +320,10 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
                 flow,
                 adAccounts: adAccounts.length > 0 ? adAccounts : undefined,
                 adAccountsError: adAccountsError || undefined,
+                // ENG-2232: lets the frontend show a blocking warning on the
+                // "Choose Pages" step before the user finishes connecting,
+                // instead of only discovering this later at ad-creative time.
+                hasMetaPages: has_meta_pages,
                 tokenSessionId
             });
         }
@@ -352,6 +377,53 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
 
         const connectedAccounts = [];
         for (const adAccount of adAccounts) {
+            // ENG-2232: createAccount replaces `config` wholesale on reconnect
+            // (unlike top-level fields such as sharedWithOrg, which survive via
+            // spread). A transient Page-probe failure on this reconnect would
+            // otherwise silently erase a previously confirmed has_meta_pages:false
+            // back to 'unknown'. Fall back to the existing account's recorded
+            // value whenever this session's probe came back undetermined.
+            //
+            // Includes the legacy 'facebook' platform value alongside 'meta'
+            // (code review follow-up) — getMetaCredentials elsewhere in this
+            // codebase treats them as the same account for backward
+            // compatibility with connections made before the platform name was
+            // standardized; a lookup scoped to 'meta' alone would silently miss
+            // the recorded value on any account still stored under the old name,
+            // for precisely the users reconnecting because their ads are failing.
+            const existingAccount = await getAccountById(adAccount.account_id, userId, ['meta', 'facebook'] as any);
+            const existingConfig = existingAccount?.config as Record<string, any> | undefined;
+            let has_meta_pages = session.has_meta_pages !== undefined
+                ? session.has_meta_pages
+                : existingConfig?.has_meta_pages;
+            // Same fallback discipline as has_meta_pages above — read back by
+            // getAccessiblePageIds, which a gate uses to check one SPECIFIC
+            // page_id (e.g. an AD_CREATIVE CREATE call's target) rather than
+            // only the aggregate boolean (ENG-2232).
+            const accessible_page_ids: string[] | undefined = session.meta_page_ids !== undefined
+                ? session.meta_page_ids
+                : existingConfig?.accessible_page_ids;
+
+            // ENG-2232: "this login can see at least one Page" isn't the same as
+            // "this specific ad account's existing ads run under one of them" —
+            // cross-check against what the account's own creatives actually use.
+            // `getExistingAdPageIds` is itself best-effort (never throws, returns
+            // [] on failure), so this only ever tightens a positive answer, never
+            // loosens a negative one.
+            let existing_ads_page_id: string | undefined;
+            if (has_meta_pages === true && session.meta_page_ids) {
+                const existingPageIds = await metaService.getExistingAdPageIds(
+                    adAccount.account_id,
+                    session.access_token
+                );
+                const accessiblePageIds = new Set(session.meta_page_ids);
+                const uncovered = existingPageIds.filter(id => !accessiblePageIds.has(id));
+                if (existingPageIds.length > 0 && uncovered.length === existingPageIds.length) {
+                    has_meta_pages = false;
+                    existing_ads_page_id = existingPageIds[0];
+                }
+            }
+
             const account = await createAccount(userId, 'meta', {
                 account_id: adAccount.account_id,
                 account_name: adAccount.name,
@@ -367,6 +439,18 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
                     // Omitted (not []) when undetermined, so "we could not ask" never
                     // masquerades as "nothing was granted" (ENG-629).
                     ...(session.granted_scopes ? { granted_scopes: session.granted_scopes } : {}),
+                    // Authoritative Page-access signal, read back by getMetaPagesAccessState.
+                    // Falls back to the previously recorded value on an undetermined
+                    // probe so a transient failure can't revert a confirmed value
+                    // back to unknown (ENG-2232).
+                    ...(has_meta_pages !== undefined ? { has_meta_pages } : {}),
+                    // Names the specific Page this account's existing ads use, when the
+                    // reason has_meta_pages is false is a wrong-Page mismatch rather than
+                    // zero Pages — read back by getMetaAdsNoPagesMessage (ENG-2232).
+                    ...(existing_ads_page_id ? { existing_ads_page_id } : {}),
+                    // The actual accessible Page ids, read back by getAccessiblePageIds
+                    // for the AD_CREATIVE CREATE page_id gate (ENG-2232).
+                    ...(accessible_page_ids !== undefined ? { accessible_page_ids } : {}),
                 }
             });
             connectedAccounts.push(account);
@@ -374,7 +458,22 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
             await safeAutoResolve('Meta Connect Ad Accounts', userId, 'meta', adAccount.account_id);
         }
 
-        res.json({ success: true, connectedAccounts: redactAccountsSecrets(connectedAccounts) });
+        // ENG-2232: names which of the just-connected accounts have no accessible
+        // Facebook Page, so the UI can warn right now instead of leaving the user
+        // with a plain "Connected!" toast that reads as "you're all set" — Page
+        // access is a second, independent Meta grant that won't be revisited until
+        // the twice-daily reconciler or a future chat session's PAGE LIST call.
+        // Computed from the unredacted list (only reads has_meta_pages/account_name,
+        // nothing secret) before ENG-2258's redaction is applied to the response.
+        const accountsMissingPages = connectedAccounts
+            .filter(acc => (acc.config as Record<string, any> | undefined)?.has_meta_pages === false)
+            .map(acc => acc.account_name);
+
+        res.json({
+            success: true,
+            connectedAccounts: redactAccountsSecrets(connectedAccounts),
+            ...(accountsMissingPages.length > 0 ? { accountsMissingPages } : {}),
+        });
 
     } catch (error: any) {
         console.error('[Meta Connect Ad Accounts] Error:', error);

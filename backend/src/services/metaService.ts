@@ -10,29 +10,57 @@ import { INTEGRATION_CONFIG } from '../config/integrations';
 import { getMetaCredentials } from '../utils/secretsManager';
 import { buildUtmSpec, readUtmKeys, utmQueryString, mergeUtmIntoQueryString, utmKeysInQueryString } from '../utils/adUtm';
 
+// Meta offsets differ from ISO defaults (notably TWD, HUF and IDR).
+// https://developers.facebook.com/docs/marketing-api/currencies/
+// Keep an explicit allow-list: a new/unknown currency must never imply offset 100.
+const META_CURRENCY_OFFSETS = new Map<string, number>([
+  ...'TWD JPY KRW CLP COP CRC HUF ISK IDR PYG VND'.split(' ').map(code => [code, 1] as [string, number]),
+  ...('AED ARS AUD BDT BOB BRL CAD CHF CNY CZK DKK DZD EGP EUR GBP GTQ HKD HNL ' +
+    'ILS INR KES LKR MOP MXN MYR NGN NIO NOK NZD PEN PHP PKR PLN QAR RON SAR SEK SGD THB TRY UAH USD UYU ZAR')
+    .split(' ').map(code => [code, 100] as [string, number]),
+]);
+
+/** One conversion for agent major-unit inputs and Meta minor-unit read-backs. */
+export function normalizeMetaMoney(value: unknown, currency: unknown, unit: 'major' | 'minor' = 'major') {
+  const offset = typeof currency === 'string' ? META_CURRENCY_OFFSETS.get(currency) : undefined;
+  if (offset === undefined) {
+    throw new Error(`Unsupported or missing Meta ad account currency ${JSON.stringify(currency)}; money write rejected.`);
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new Error('Meta money amounts must be finite, non-negative numbers in the ad account currency.');
+  }
+  const scaled = unit === 'major' ? value * offset : value;
+  const minorUnits = Math.round(scaled);
+  if (!Number.isSafeInteger(minorUnits) || (scaled > 0 && minorUnits === 0) || Math.abs(scaled - minorUnits) > 1e-7) {
+    throw new Error(`Meta money amount ${value} cannot be represented in ${currency} minor units.`);
+  }
+  const formatted = new Intl.NumberFormat('en-US', {
+    style: 'currency', currency: currency as string, minimumFractionDigits: 2, maximumFractionDigits: 2,
+  }).format(minorUnits / offset);
+  return { minorUnits, description: `${minorUnits} (= ${formatted})` };
+}
+
 export interface MetaAdsCampaignParams {
   name: string;
   objective: string;
   status?: string;
   special_ad_categories?: string[];
-  // Lifetime hard-stop spend cap for the campaign, in the ad account currency's MINOR units
-  // (cents) — e.g. 300000 = $3,000. Kept in minor units to match Meta's own field and the
-  // long-standing CAMPAIGN UPDATE pass-through, which already applies this value verbatim;
-  // converting only here would silently reinterpret every existing caller's number by 100x.
+  // SDK-layer money fields are already normalized to Meta minor units by the agent.
+  daily_budget?: number;
   spend_cap?: number;
 }
 
 export interface MetaAdsAdSetParams {
   name: string;
   campaign_id: string;
-  daily_budget?: number; // Budget in CENTS (e.g., 100 = $1.00). Caller must convert.
-  lifetime_budget?: number; // Budget in CENTS (e.g., 5000 = $50.00). Caller must convert.
+  daily_budget?: number; // Budget in Meta minor units. Caller must normalize by account currency.
+  lifetime_budget?: number; // Budget in Meta minor units. Caller must normalize by account currency.
   start_time?: string;
   end_time?: string;
   billing_event: string;
   optimization_goal: string;
   bid_strategy?: string;
-  bid_amount?: number; // Bid in CENTS (e.g., 50 = $0.50). Caller must convert.
+  bid_amount?: number; // Bid in Meta minor units. Caller must normalize by account currency.
   targeting: any;
   status?: string;
   promoted_object?: any;
@@ -492,21 +520,13 @@ export class MetaService {
     MetaService.assertNoUnappliedCampaignCreateParams(params);
   }
 
-  /**
-   * `spend_cap` is a whole number of minor currency units, so anything else is a caller
-   * mistake we should catch rather than forward: a fraction (1000.5), a negative, a NaN from
-   * a bad parse, or a string. Meta would reject most of these, but as an opaque "Invalid
-   * parameter" — and on CREATE that rejection arrives AFTER the campaign question is settled,
-   * where a clear pre-flight message costs nothing. 0 is rejected here too, matching Meta,
-   * which refuses it explicitly ("Spend Cap Can't Be Zero", subcode 1885099): removing a cap
-   * is a different operation, not a cap of nothing.
-   */
+  /** Validate the agent's major-unit spend cap before account-aware normalization. */
   public static assertValidSpendCap(value: unknown): void {
     if (value === undefined || value === null) return;
-    if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
       throw new Error(
-        `Campaign "spend_cap" must be a positive whole number of cents (e.g. 300000 = $3,000) — got ${JSON.stringify(value)}. ` +
-        `It is NOT in dollars: multiply the amount the user asked for by 100. ` +
+        `Campaign "spend_cap" must be a positive amount in the ad account currency (e.g. 3000 = $3,000 USD) — got ${JSON.stringify(value)}. ` +
+        `Supply major units; the server converts using the ad account currency. ` +
         `To remove an existing cap, do not send 0 — Meta rejects that.`
       );
     }
@@ -558,9 +578,9 @@ export class MetaService {
       `Campaign CREATE does not support param(s): ${unapplied.join(', ')} — they would NOT be applied ` +
       `to the campaign, so this create was rejected instead of silently ignoring them. ` +
       `Supported CAMPAIGN CREATE params: ${MetaService.CAMPAIGN_CREATE_APPLIED_PARAMS.join(', ')}. ` +
-      `Campaign-level budget: set advantage_campaign_budget=true plus budget_amount (in dollars) — ` +
+      `Campaign-level budget: set advantage_campaign_budget=true plus budget_amount (in account currency major units) — ` +
       `do NOT pass daily_budget/lifetime_budget here. ` +
-      `Hard spend cap: spend_cap (in cents, e.g. 300000 = $3,000). ` +
+      `Hard spend cap: spend_cap (in account currency major units, e.g. 3000 = $3,000 USD). ` +
       `Scheduling (start_time/stop_time) comes from the campaign's AD SETS — Meta accepts those ` +
       `on a campaign create and then ignores them, so set them on AD_SET CREATE. ` +
       `Ad-set fields (bid_strategy, bid_amount, targeting, ` +
@@ -831,6 +851,17 @@ export class MetaService {
     }
   }
 
+  /** Read and validate the selected account currency before converting money. */
+  public async getAdAccountCurrency(adAccountId: string, accessToken: string): Promise<string> {
+    this.initApi(accessToken);
+    const account = new AdAccount(`act_${adAccountId.replace(/^act_/, '')}`);
+    const result = await MetaService.withReadDeadline<any>(() => account.get(['currency']), 'ad account currency');
+    const currency: unknown = (result?._data ?? result)?.currency;
+    // Validate network data before any write; no cached/default currency guesses.
+    normalizeMetaMoney(0, currency);
+    return currency as string;
+  }
+
   /**
    * Get ad accounts accessible by the user using Facebook SDK
    * @param accessToken - Meta OAuth access token
@@ -914,11 +945,43 @@ export class MetaService {
       this.initApi(accessToken);
       const user = new User('me');
       const fields = ['id', 'name', 'access_token', 'category', 'tasks'];
+      const params: Record<string, any> = { limit: META_LIST_PAGE_SIZE };
 
-      // Fetch pages (accounts edge on User)
-      const pagesPath = await user.getAccounts(fields);
+      // Fetch pages (accounts edge on User). Drains pagination (ENG-2232 code
+      // review follow-up) — this result no longer only feeds an informational
+      // count, it backs the AD_CREATIVE CREATE page_id gate and the wrong-Page
+      // cross-check (ENG-2232), both exact-membership checks against the
+      // returned set. Before those existed, only taking the first batch was
+      // harmless — has_meta_pages is a presence check, unaffected by
+      // truncation. Now, an account with more accessible Pages than fit in one
+      // batch would have a REAL Page silently missing from this list, and the
+      // gate would wrongly block a legitimate creative, or the cross-check
+      // would wrongly flag a healthy account as broken.
+      const cursor = await MetaService.withReadDeadline(
+        () => user.getAccounts(fields, params),
+        'page list',
+      );
+      const { items, truncated } = await this.drainCursor(cursor, META_LIST_MAX_PAGES);
+      if (truncated) {
+        // ENG-2232 code review follow-up: draining pagination closed the
+        // "page 1 only" gap, but `drainCursor` can ALSO report truncated:true
+        // for a transient page-N fetch failure mid-walk (by design — see its
+        // own "a page-N failure must not throw away pages 1..N-1" comment) or
+        // for hitting the META_LIST_MAX_PAGES bound. Either way, this result
+        // backs exact-membership, absence-sensitive checks (the AD_CREATIVE
+        // CREATE page_id gate, the wrong-Page cross-check) where an
+        // incomplete list read as complete reproduces the exact bug class
+        // this fix exists for, just one layer deeper. Throwing — rather than
+        // returning the partial list — means every real caller's EXISTING
+        // best-effort try/catch (all five already treat a getPages() failure
+        // as "could not determine", never as a confirmed negative) handles
+        // this correctly for free, with no caller-side changes needed.
+        const message = `Page list pagination stopped early after ${items.length} item(s); treating as undetermined rather than risking an incomplete list being read as complete`;
+        this.log(`getPages: ${message}`, { itemsSoFar: items.length });
+        throw new Error(message);
+      }
 
-      const pages = pagesPath.map((page: any) => ({
+      const pages = items.map((page: any) => ({
         id: page.id || page._data?.id,
         name: page.name || page._data?.name,
         access_token: page.access_token || page._data?.access_token,
@@ -1347,7 +1410,8 @@ export class MetaService {
   }
 
   /**
-   * Create a new campaign
+   * Create a new campaign. Money fields use Meta minor units, except the legacy
+   * budget_amount convenience input. Agent-input validation happens before normalization.
    */
   public async createCampaign(adAccountId: string, accessToken: string, params: MetaAdsCampaignParams) {
     try {
@@ -1365,16 +1429,16 @@ export class MetaService {
         is_adset_budget_sharing_enabled: false, // Required by some accounts when CBO is off
       };
 
-      // Handle Advantage Campaign Budget (CBO)
-      if ((params as any).advantage_campaign_budget && (params as any).budget_amount) {
-        finalParams.daily_budget = Math.round((params as any).budget_amount * 100);
+      // Agent calls supply normalized daily_budget. Direct SDK-wrapper callers may
+      // still supply budget_amount in major units; use the same currency normalizer.
+      if (params.daily_budget !== undefined) {
+        finalParams.daily_budget = params.daily_budget;
+      } else if ((params as any).advantage_campaign_budget && (params as any).budget_amount !== undefined) {
+        const currency = await this.getAdAccountCurrency(adAccountId, accessToken);
+        finalParams.daily_budget = normalizeMetaMoney((params as any).budget_amount, currency).minorUnits;
       }
 
-      // Campaign hard-stop spend cap, in minor units (cents), forwarded verbatim — the same
-      // way CAMPAIGN UPDATE has always sent it. This allow-list used to omit spend_cap
-      // entirely, so a create that asked for a cap produced an UNCAPPED campaign and still
-      // reported success (ENG-1018). The caller verifies the applied value with a read-back;
-      // this only guarantees the request reaches Meta.
+      // Already normalized by the agent, just like the ad-set SDK write fields.
       if (params.spend_cap !== undefined && params.spend_cap !== null) {
         finalParams.spend_cap = params.spend_cap;
       }
@@ -1534,8 +1598,8 @@ export class MetaService {
       if (params.targeting !== undefined) adSetParams[AdSet.Fields.targeting] = params.targeting;
       if (params.status !== undefined) adSetParams[AdSet.Fields.status] = params.status;
       
-      // Monetary values: Expected in CENTS (integer). Caller (agentModeService.createMetaAdsAdSet)
-      // converts dollars to cents via Math.round(val * 100) before passing to this method.
+      // Monetary values: Expected in Meta minor units (integer). Caller (agentModeService.createMetaAdsAdSet)
+      // normalizes major units using the ad account currency before passing to this method.
       if (params.daily_budget !== undefined) adSetParams[AdSet.Fields.daily_budget] = params.daily_budget;
       if (params.lifetime_budget !== undefined) adSetParams[AdSet.Fields.lifetime_budget] = params.lifetime_budget;
       if (params.bid_strategy !== undefined) adSetParams[AdSet.Fields.bid_strategy] = params.bid_strategy;
@@ -1712,6 +1776,33 @@ export class MetaService {
     } catch (error) {
       // handleError always throws — see listAds.
       return this.handleError(error, 'listAdCreatives') as never;
+    }
+  }
+
+  /**
+   * Facebook Page IDs this account's existing ad creatives were built against,
+   * sampled from the most recent page of creatives. Best-effort: returns []
+   * on any failure rather than throwing, same discipline as `getPages`'
+   * granular-scopes fallback — a failed sample must read as "couldn't tell",
+   * never as "no existing ads".
+   *
+   * Lets a caller distinguish "this connection has zero accessible Pages"
+   * from the subtler "it has Pages, but not the one this account's ads
+   * actually run under" (ENG-2232) — a token can hold access to an unrelated
+   * Page while the account's real ads keep failing.
+   */
+  public async getExistingAdPageIds(adAccountId: string, accessToken: string): Promise<string[]> {
+    try {
+      const { creatives } = await this.listAdCreatives(adAccountId, accessToken, { maxPages: 1 });
+      const pageIds = new Set<string>();
+      for (const creative of creatives) {
+        const pageId = creative?.object_story_spec?.page_id;
+        if (typeof pageId === 'string' && pageId) pageIds.add(pageId);
+      }
+      return [...pageIds];
+    } catch (error: any) {
+      console.warn(`[MetaService] getExistingAdPageIds failed for account ${adAccountId}: ${error?.message || error}`);
+      return [];
     }
   }
 

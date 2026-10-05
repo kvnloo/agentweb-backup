@@ -237,3 +237,18 @@ describe('ENG-806: AW-Settings model getters resolve legacy aliases', () => {
     });
   });
 });
+
+// ENG-2178: a schedule pinned the bare pre-OpenRouter id "gpt-4o-mini" and was
+// silently rerouted by the policy resolver. The same model is still served
+// through OpenRouter, so the legacy id must resolve to it.
+describe('ENG-2178: bare gpt-4o-mini resolves to the served OpenRouter id', () => {
+  it('normalizes gpt-4o-mini to a registered model', () => {
+    const service = new AgentModeService();
+    const registry = (service as unknown as { llmModels: Record<string, unknown> }).llmModels;
+
+    expect(registry['gpt-4o-mini']).toBeUndefined();
+    const resolved = service.normalizeModelId('gpt-4o-mini');
+    expect(resolved).toBe('openrouter/openai/gpt-4o-mini');
+    expect(registry[resolved as string]).toBeDefined();
+  });
+});
