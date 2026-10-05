@@ -22,7 +22,6 @@ import { resolveBillingUserId, toCustomerTokenUsage } from '../services/tokenUsa
 import { readBilledLedgerRows } from '../services/llmUsageLedgerReader';
 import { listLlmChargeEvents } from '../services/llmChargeAuditDb';
 import { reconcileItemizedUsage } from '../services/usageItemization';
-import { resolveUsageCostReconciliation } from '../services/usageCostReconciliationResolver';
 
 const router = express.Router();
 
@@ -316,20 +315,6 @@ router.get('/usage/itemized', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Error getting itemized usage:', error);
     return res.status(500).json({ error: 'Failed to get itemized usage' });
-  }
-});
-
-// ENG-1247: explain the admission rail and its shadow ledger without changing
-// counters, credits, thresholds, or ledger rows. The report is resolved for the
-// pooled billing subject, so an org member sees the same reason as the gate.
-router.get('/usage/reconciliation', authenticateToken, async (req, res) => {
-  try {
-    const userId = (req as any).user?.userId;
-    if (!userId) return res.status(401).json({ error: 'Not authenticated' });
-    return res.json(await resolveUsageCostReconciliation(userId));
-  } catch (error) {
-    console.error('Error reconciling usage cost gate:', error);
-    return res.status(500).json({ error: 'Failed to reconcile usage cost gate' });
   }
 });
 
