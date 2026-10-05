@@ -7,6 +7,15 @@ import { validateWelcomeMessage } from "../utils/welcomeMessageValidation";
 import { OpeningAction, validateOpeningAction } from "../utils/openingActionValidation";
 import { changedEvalSkillFields, recordSkillChange } from "../loops/eval/evalChangeMarkers";
 
+/** ENG-1390: message for a lost read→write race on a skill row; routes map it to 409. */
+export const SKILL_CONFLICT_MESSAGE = 'Skill was changed by someone else — refresh and try again';
+
+/** Rethrow a DynamoDB conditional-check failure as the distinct conflict error. */
+function rethrowConflict(error: any): never {
+  if (error?.code === 'ConditionalCheckFailedException') throw new Error(SKILL_CONFLICT_MESSAGE);
+  throw error;
+}
+
 // Load environment variables
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -512,9 +521,14 @@ export class SkillService {
     if (skill.ownerId !== ownerId) throw new Error('Not authorized');
     if (skill.visibility !== 'private') throw new Error('Only private skills can be submitted for review');
 
+    const expectedUpdatedAt = skill.updatedAt;
     skill.visibility = 'pending_review';
     skill.reviewFeedback = undefined;
-    await this.updateSkill(skill);
+    try {
+      skill.updatedAt = await this.updateSkill(skill, expectedUpdatedAt);
+    } catch (error: any) {
+      rethrowConflict(error);
+    }
     return skill;
   }
 
@@ -523,9 +537,14 @@ export class SkillService {
     if (!skill) throw new Error('Skill not found');
     if (skill.visibility !== 'pending_review') throw new Error('Skill is not pending review');
 
+    const expectedUpdatedAt = skill.updatedAt;
     skill.visibility = 'public';
     skill.isPublished = true;
-    await this.putSkill(skill, undefined, 'approve');
+    try {
+      skill.updatedAt = await this.putSkill(skill, expectedUpdatedAt, 'approve');
+    } catch (error: any) {
+      rethrowConflict(error);
+    }
     return skill;
   }
 
@@ -534,9 +553,14 @@ export class SkillService {
     if (!skill) throw new Error('Skill not found');
     if (skill.visibility !== 'pending_review') throw new Error('Skill is not pending review');
 
+    const expectedUpdatedAt = skill.updatedAt;
     skill.visibility = 'private';
     skill.reviewFeedback = feedback;
-    await this.updateSkill(skill);
+    try {
+      skill.updatedAt = await this.updateSkill(skill, expectedUpdatedAt);
+    } catch (error: any) {
+      rethrowConflict(error);
+    }
     return skill;
   }
 
@@ -561,27 +585,48 @@ export class SkillService {
       // clobber whichever one lost the race.
       skill.updatedAt = await this.updateSkill(skill, expectedUpdatedAt);
     } catch (error: any) {
-      if (error?.code === 'ConditionalCheckFailedException') {
-        throw new Error('Skill was changed by someone else — refresh and try again');
-      }
-      throw error;
+      rethrowConflict(error);
     }
     return skill;
   }
 
-  async deleteSkill(skillId: string): Promise<void> {
+  /**
+   * ENG-1390: `expected` (optional) carries the ownerId/visibility the caller
+   * authorized against; the delete is then conditional on the row still having
+   * them, so a concurrent ownership/visibility change fails with
+   * SKILL_CONFLICT_MESSAGE instead of being silently deleted through.
+   */
+  async deleteSkill(skillId: string, expected?: { ownerId?: string; visibility?: string }): Promise<void> {
     const params: AWS.DynamoDB.DocumentClient.DeleteItemInput = {
       TableName: this.tableName,
       Key: { skillId },
       ReturnValues: 'ALL_OLD',
     };
+    if (expected) {
+      const conds: string[] = [];
+      const names: Record<string, string> = {};
+      const values: Record<string, any> = {};
+      for (const key of ['ownerId', 'visibility'] as const) {
+        if (expected[key] !== undefined) {
+          conds.push(`#${key} = :${key}`);
+          names[`#${key}`] = key;
+          values[`:${key}`] = expected[key];
+        }
+      }
+      if (conds.length) {
+        params.ConditionExpression = conds.join(' AND ');
+        params.ExpressionAttributeNames = names;
+        params.ExpressionAttributeValues = values;
+      }
+    }
 
     try {
       const result = await dynamodb.delete(params).promise();
       this.invalidatePublishedSkillsCache();
       // Only a row that existed changes agent behaviour when it goes.
       if (result?.Attributes) void recordSkillChange(skillId, 'delete', {});
-    } catch (error) {
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') throw new Error(SKILL_CONFLICT_MESSAGE);
       console.error(`Error deleting skill ${skillId}:`, error);
       throw error;
     }
