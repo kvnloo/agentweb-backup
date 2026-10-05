@@ -212,7 +212,7 @@ import { publishWithResolvedBlogPublisher } from './blogPublishers';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
 import { declaredPlacementField } from './agentMode/generateImagePlacement';
 import { isNonConsumableRequiredFunctionCall } from './agentMode/workPlanRequiredCallsPolicy';
-import { recordGeneratedCreative, stampMetaAdCreated, stampMetaAdCreativeChanged, stampMetaCreativeCreated, stampMetaImageUpload, stampMetaPublish } from './creativeLineage';
+import { recordGeneratedCreative, stampMetaAdCreated, stampMetaAdCreativeChanged, stampMetaCreativeCreated, stampMetaImageUpload, stampMetaPublish, stampGoogleAssetUpload, stampGoogleAdCreated } from './creativeLineage';
 import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
@@ -42923,6 +42923,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             // moment its campaign is enabled.
             status: args.status || 'PAUSED',
           });
+          // ENG-2235: fire-and-forget lineage stamp (inert unless CREATIVE_LINEAGE_ENABLED).
+          if (ad?.resourceName && Array.isArray(args.image_asset_resource_names)) {
+            void stampGoogleAdCreated({ userId, customerId: String(customer_id), adResourceName: ad.resourceName, assetResourceNames: args.image_asset_resource_names });
+          }
           return { success: true, adResourceName: ad.resourceName, ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
         }
         if (action === 'UPDATE') {
@@ -42969,6 +42973,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           name: args.name,
           data: args.data,
         });
+        // ENG-2235: only a URL upload can resolve to a generated creative.
+        if (resourceName && typeof args.data === 'string' && args.data.startsWith('https://')) {
+          void stampGoogleAssetUpload({ userId, imageUrl: args.data, assetResourceName: resourceName });
+        }
         return { success: true, assetResourceName: resourceName };
       }
 
