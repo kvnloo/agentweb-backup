@@ -434,6 +434,68 @@ export function findApprovalDeckAnswerForDigest(
   return { granted: true, item, answer };
 }
 
+/**
+ * ENG-1748: name WHICH fields drifted when a Meta write's digest has no grant
+ * but the same target (entity/action/account/ids) WAS approved in the answered
+ * deck with different params. Purely explanatory — the grant decision stays
+ * findApprovalDeckAnswerForDigest's digest match; this never grants anything.
+ * Returns the sorted top-level param keys whose values differ (gate-only flags
+ * `confirm`/`tracking_override_token` ignored), or null when there is no
+ * approved same-target item to compare against or nothing differs.
+ */
+export function describeMetaWriteParamDrift(
+  deck: PendingApprovalDeck | null | undefined,
+  call: {
+    entity_type: string;
+    action: string;
+    account_id?: string;
+    campaign_id?: string;
+    ad_set_id?: string;
+    ad_id?: string;
+    params: unknown;
+  },
+): string[] | null {
+  if (!deck || deck.status !== 'answered' || !deck.answers) return null;
+  const same = (a: unknown, b: unknown) => (a ?? undefined) === (b ?? undefined);
+  const approvedItems = deck.items.filter((item) => {
+    const d = item.metaWriteDispatch;
+    if (!d) return false;
+    const answer = deck.answers!.find((candidate) => candidate.itemId === item.itemId);
+    if (!answer || answer.verdict !== 'approve') return false;
+    return d.entity_type === call.entity_type && d.action === call.action &&
+      same(d.account_id, call.account_id) && same(d.campaign_id, call.campaign_id) &&
+      same(d.ad_set_id, call.ad_set_id) && same(d.ad_id, call.ad_id);
+  });
+  if (!approvedItems.length) return null;
+  const ignored = new Set(['confirm', 'tracking_override_token']);
+  const asRecord = (v: unknown): Record<string, unknown> =>
+    v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+  const after = asRecord(call.params);
+  const stable = (v: unknown): string => JSON.stringify(v, (_k, val) =>
+    val && typeof val === 'object' && !Array.isArray(val)
+      ? Object.fromEntries(Object.keys(val).sort().map((k) => [k, (val as any)[k]]))
+      : val) ?? 'undefined';
+  // Compare against EVERY approved same-target item: if any matches on all
+  // compared params there is no drift to report; otherwise report the item
+  // with the fewest differing fields (closest approved version).
+  let best: string[] | null = null;
+  for (const item of approvedItems) {
+    const before = asRecord(item.metaWriteDispatch!.params);
+    const changed = [...new Set([...Object.keys(before), ...Object.keys(after)])]
+      .filter((key) => !ignored.has(key) && stable(before[key]) !== stable(after[key]))
+      .sort();
+    if (!changed.length) return null;
+    if (!best || changed.length < best.length) best = changed;
+  }
+  return best;
+}
+
+/** ENG-1748: user-facing drift sentence appended to a halted Meta write summary. */
+export function formatMetaWriteParamDriftMessage(drifted: string[]): string {
+  return ` CHANGED SINCE APPROVAL: ${drifted.join(', ')} differ from the version you approved, ` +
+    `so that approval does not cover this write and nothing was sent to Meta.`;
+}
+
 /** The shape of a persisted chat message this module cares about — deliberately
  *  minimal so this stays a pure function of already-fetched data (the file
  *  header's "no I/O" rule); the caller (e.g. resolveCampaignObjectiveGate)
