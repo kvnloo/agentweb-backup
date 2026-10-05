@@ -67,4 +67,109 @@ router.post('/tools/:name/call', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * ENG-2295 — stateless MCP (JSON-RPC 2.0) surface so an MCP client such as Claude can add the
+ * toolkit as a remote server (`claude mcp add --transport http <base>/api/meta-toolkit/mcp`).
+ * Same gateway as the REST routes above: auth, account resolution, write guards and metering are
+ * not re-implemented here. No session state, no storage.
+ */
+export const META_TOOLKIT_MCP_PROTOCOL_VERSION = '2025-06-18';
+const META_TOOLKIT_MCP_SUPPORTED_VERSIONS = new Set(['2025-06-18', '2025-03-26']);
+
+function isValidRpcId(id: unknown) {
+  return typeof id === 'string' || (typeof id === 'number' && Number.isInteger(id));
+}
+
+function rpcResult(res: Response, id: unknown, result: unknown) {
+  return res.json({ jsonrpc: '2.0', id: id ?? null, result });
+}
+
+function rpcError(res: Response, id: unknown, code: number, message: string, httpStatus = 200) {
+  return res.status(httpStatus).json({ jsonrpc: '2.0', id: id ?? null, error: { code, message } });
+}
+
+function toolResultContent(result: unknown) {
+  const text = typeof result === 'string' ? result : JSON.stringify(result ?? null);
+  return [{ type: 'text', text }];
+}
+
+// No SSE stream is offered; MCP Streamable HTTP requires 405 for GET in that case.
+router.get('/mcp', (_req: Request, res: Response) => {
+  res.setHeader('Allow', 'POST');
+  return res.status(405).json({ error: 'Method Not Allowed' });
+});
+
+router.post('/mcp', async (req: Request, res: Response) => {
+  const msg = req.body;
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg) || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') {
+    return rpcError(res, msg?.id, -32600, 'Invalid Request', 400);
+  }
+  const { id, method } = msg;
+  if (id !== undefined && !isValidRpcId(id)) {
+    return rpcError(res, null, -32600, 'Invalid Request: id must be a string or integer', 400);
+  }
+  const params = msg.params && typeof msg.params === 'object' ? msg.params : {};
+
+  // Notifications (no id) never get a response body.
+  if (method.startsWith('notifications/') || id === undefined) {
+    return res.status(202).end();
+  }
+
+  try {
+    switch (method) {
+      case 'initialize':
+        return rpcResult(res, id, {
+          protocolVersion:
+            typeof params.protocolVersion === 'string' && META_TOOLKIT_MCP_SUPPORTED_VERSIONS.has(params.protocolVersion)
+              ? params.protocolVersion
+              : META_TOOLKIT_MCP_PROTOCOL_VERSION,
+          capabilities: { tools: { listChanged: false } },
+          serverInfo: { name: 'agentweb-meta-toolkit', version: '1.0.0' },
+        });
+      case 'ping':
+        return rpcResult(res, id, {});
+      case 'tools/list':
+        await authenticateMetaToolkitCaller(req.headers.authorization);
+        return rpcResult(res, id, { tools: getMetaToolkitManifest() });
+      case 'tools/call': {
+        if (typeof params.name !== 'string' || !params.name) {
+          return rpcError(res, id, -32602, 'Invalid params: tools/call requires a tool name.');
+        }
+        if (
+          params.arguments !== undefined &&
+          (params.arguments === null || typeof params.arguments !== 'object' || Array.isArray(params.arguments))
+        ) {
+          return rpcError(res, id, -32602, 'Invalid params: tools/call arguments must be an object.');
+        }
+        try {
+          const result = await handleMetaToolkitCall({
+            authorization: req.headers.authorization,
+            toolName: params.name,
+            args: params.arguments && typeof params.arguments === 'object' ? params.arguments : {},
+            sessionId: req.get('mcp-session-id') ?? undefined,
+            userAgent: req.get('user-agent') ?? undefined,
+          });
+          return rpcResult(res, id, { content: toolResultContent(result), isError: false });
+        } catch (error) {
+          // A refusal is a tool-level failure the model should see, not a transport error.
+          if (error instanceof MetaToolkitRefusal) {
+            return rpcResult(res, id, { content: toolResultContent(error.message), isError: true });
+          }
+          throw error;
+        }
+      }
+      default:
+        return rpcError(res, id, -32601, `Method not found: ${method}`);
+    }
+  } catch (error) {
+    if (error instanceof MetaToolkitAuthError) {
+      if (error.retryAfterSeconds) res.setHeader('Retry-After', String(error.retryAfterSeconds));
+      if (error.status === 401) res.setHeader('WWW-Authenticate', 'Bearer');
+      return rpcError(res, id, -32001, error.message, error.status);
+    }
+    console.error('[meta-toolkit] MCP call failed:', error instanceof Error ? error.message : error);
+    return rpcError(res, id, -32603, 'Meta Toolkit call failed.');
+  }
+});
+
 export default router;
