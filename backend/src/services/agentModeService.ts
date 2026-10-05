@@ -9592,6 +9592,8 @@ export class AgentModeService {
         ? `Save the drafts, report plainly that nothing was published and why, and tell the owner they can turn "Require approval before publishing" OFF for this schedule to let the next run post.`
         : reason === 'revoked'
         ? `Save the drafts, and report plainly that nothing was published and why — publish authorization for this schedule was revoked. Do NOT tell the owner to turn "Require approval before publishing" OFF — that is a different, unrelated setting. They (or an admin) would need to re-authorize this schedule for a future run to publish.`
+        : reason === 'not_granted'
+        ? `Save the drafts, and report plainly that nothing was published and why. Do NOT tell the owner to turn "Require approval before publishing" OFF — that setting is not why this was blocked and toggling it will not change anything. The owner can grant this themselves: open this schedule, confirm the publish tool (e.g. ${toolName}) is selected under Required Actions and saved, then use the "Publish without my review" control (Standing publish authorization) so future runs can post unattended.`
         : `Save the drafts, and report plainly that nothing was published and why. Do NOT tell the owner to turn "Require approval before publishing" OFF — that setting is not why this was blocked and toggling it will not change anything.`;
     return {
       success: false as const,
