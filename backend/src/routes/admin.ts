@@ -210,8 +210,6 @@ const ADMIN_USER_LIST_FIELDS = [
   "tokenUsageHistory",
   "tokenAllowanceBonus",
   "llmUsageCredits",
-  "extraCostUsage",
-  "extraCostUsageHistory",
   "googleDriveFolders",
   "introductionEmailSent",
   "utmSource",

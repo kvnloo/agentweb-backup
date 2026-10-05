@@ -16,6 +16,7 @@ import {
   handleSubscriptionScheduleEnded,
   reconcileAllStripeUsers,
   findBasePlanItem,
+  getSubscriptionPeriodEndIso,
 } from '../services/stripeService';
 
 const CUSTOMER_FRONTEND_URL =
@@ -333,9 +334,15 @@ async function sendStripeEventToCrm(event: any): Promise<void> {
     }
 
     const status = (obj.status as string | undefined) || undefined;
-    const currentPeriodEnd = typeof obj.current_period_end === 'number'
-      ? new Date(obj.current_period_end * 1000).toISOString()
-      : undefined;
+    // Basil moved current_period_end onto subscription items (ENG-405).
+    // Use the base-plan item, not items.data[0] (a seat add-on may sort
+    // first), keeping the legacy root-field fallback — mirrors routes/crm.ts.
+    const basePlanItem = obj?.items?.data?.length ? findBasePlanItem(obj) : undefined;
+    const currentPeriodEnd = getSubscriptionPeriodEndIso(
+      basePlanItem
+        ? { items: { data: [basePlanItem] }, current_period_end: obj.current_period_end }
+        : obj
+    );
 
     const { onStripeSubscriptionEvent } = await import('../services/crmSignalHooks');
     await onStripeSubscriptionEvent({

@@ -45,6 +45,12 @@ jest.mock('../services/settingsService');
 jest.mock('../utils/secretsManager');
 
 import { AgentModeService } from '../services/agentModeService';
+// ENG-2103 (F2 design-decision-list follow-up, Pattern A): resolveDescribeImageTimeoutMs
+// moved from a `static` method on AgentModeService to a plain export of
+// emma/impl/mediaVideo.ts (which describeImage — and, through it, this
+// service's describeImage delegating wrapper — now calls internally via a
+// same-module self-import, so a spy on this module export is still observed).
+import * as mediaVideoImpl from '../emma/impl/mediaVideo';
 
 describe('describeImage — vision call timeout (ENG-294)', () => {
   let service: AgentModeService;
@@ -141,7 +147,7 @@ describe('describeImage — vision call timeout (ENG-294)', () => {
       ['float junk', '1.2.3'],
     ])('falls back to the default bound for %s (%p) — call stays bounded', (_label, value) => {
       process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS = value;
-      const resolved = AgentModeService.resolveDescribeImageTimeoutMs();
+      const resolved = mediaVideoImpl.resolveDescribeImageTimeoutMs();
       // A positive result means callVisionLLMWithTimeout takes the bounded Promise.race
       // branch rather than the disabled passthrough — the hung-call bug cannot recur.
       expect(resolved).toBe(DEFAULT_MS);
@@ -150,17 +156,17 @@ describe('describeImage — vision call timeout (ENG-294)', () => {
 
     it('uses the default when the override is unset', () => {
       delete process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS;
-      expect(AgentModeService.resolveDescribeImageTimeoutMs()).toBe(DEFAULT_MS);
+      expect(mediaVideoImpl.resolveDescribeImageTimeoutMs()).toBe(DEFAULT_MS);
     });
 
     it('honors a clean positive integer override', () => {
       process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS = '1234';
-      expect(AgentModeService.resolveDescribeImageTimeoutMs()).toBe(1234);
+      expect(mediaVideoImpl.resolveDescribeImageTimeoutMs()).toBe(1234);
     });
 
     it('treats a clean explicit 0 as the disable escape hatch', () => {
       process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS = '0';
-      expect(AgentModeService.resolveDescribeImageTimeoutMs()).toBe(0);
+      expect(mediaVideoImpl.resolveDescribeImageTimeoutMs()).toBe(0);
     });
   });
 
@@ -168,8 +174,15 @@ describe('describeImage — vision call timeout (ENG-294)', () => {
     // Regression guard for the fail-open bug: with a garbage override the primary
     // must still time out (default bound). We shrink
     // the default via a spy so the test stays fast while proving the bounded branch runs.
+    // ENG-2103 (F2): spies on the emma/impl/mediaVideo.ts module export, NOT
+    // AgentModeService — describeImage's real timeout path now lives there.
+    // This only works because callVisionLLMWithTimeout reaches
+    // resolveDescribeImageTimeoutMs through a same-module self-import
+    // (`self.resolveDescribeImageTimeoutMs()`), not a local function
+    // reference — otherwise this spy would silently stop being observed
+    // (the exact cluster-10 sibling-function-spy failure mode).
     process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS = 'not-a-number';
-    jest.spyOn(AgentModeService, 'resolveDescribeImageTimeoutMs').mockReturnValue(50);
+    jest.spyOn(mediaVideoImpl, 'resolveDescribeImageTimeoutMs').mockReturnValue(50);
 
     const callLLMSpy = jest
       .spyOn(service, 'callLLM')

@@ -78,6 +78,7 @@ import adsThresholdsRoutes from "./routes/adsThresholds";
 import outcomeLedgerRoutes from "./routes/outcomeLedger";
 import crmWebhookRoutes from "./routes/crmWebhook";
 import mcpServersRoutes, { mcpOAuthPublicRouter } from "./routes/mcpServers";
+import metaToolkitRoutes from "./routes/metaToolkit";
 import skillRoutes from "./routes/skillRoutes";
 import userSkillRoutes from "./routes/userSkillRoutes";
 import userWorkPlanRoutes from "./routes/userWorkPlanRoutes";
@@ -474,6 +475,9 @@ app.use("/api/oauth", connectedAccountsRoutes);
 // Public OAuth redirect callback for outbound MCP server connections (no auth —
 // the browser is redirected here by the OAuth provider with no JWT).
 app.use("/api/mcp-oauth", mcpOAuthPublicRouter);
+// ENG-2288: external-agent Meta Toolkit. Auth is the gateway's own bearer check
+// (aw_ agent API key or MCP OAuth token), not the portal JWT.
+app.use("/api/meta-toolkit", metaToolkitRoutes);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
 app.use("/api/admin/lead-magnets", authenticateToken, isAdmin, leadMagnetAdminRoutes);
 app.use("/api/admin/fathom-onboarding", authenticateToken, isAdmin, fathomOnboardingAdminRoutes);

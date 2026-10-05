@@ -43,7 +43,14 @@ jest.mock('crypto', () => ({
       arr[i] = Math.floor(Math.random() * 256);
     }
     return arr;
-  })
+  }),
+  // Pipeline defect fix (pre-existing, unrelated to ENG-2103 F2): see the
+  // identical fix and explanation in createHtmlFromTemplate.test.ts — this
+  // whole-module crypto mock predates controllers/agentModeController.ts's
+  // scheduled-run lease work, whose module-scope require('uuid').v4() now
+  // sits on this test's own agentModeService.ts import chain and needs
+  // crypto.randomFillSync. A deterministic passthrough is sufficient.
+  randomFillSync: jest.fn((buf) => buf)
 }));
 
 // Mock settingsService

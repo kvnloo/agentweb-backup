@@ -41,6 +41,21 @@ jest.mock('../services/db', () => ({
 
 import { AgentModeService } from '../services/agentModeService';
 import { crmDb, userDb, orgDb } from '../services/db';
+// ENG-2103 (F2 design-decision-list follow-up, Pattern A): updateEmailDraftForLead's
+// body now lives in emma/impl/leads.ts, which calls readBrandGuidelines/
+// readMarketStrategy directly (they are already fully decoupled, plain
+// exported functions in emma/impl/brandMarketStrategy.ts) rather than via
+// `this.readBrandGuidelines`/`this.readMarketStrategy` — so the spies below
+// target the module's real exports instead of the class methods. TypeScript
+// compiles leads.ts's named imports of these functions to property access on
+// this same module object at each call site, so jest.spyOn here still
+// intercepts them correctly (same mechanism this series' `jest.spyOn(<impl
+// module>, '<fn>')` retargets have relied on throughout). `getSenderForLead`
+// is NOT retargeted — it stays injected as `this.getSenderForLead.bind(this)`
+// from the class wrapper (see leads.ts's own header comment on why it wasn't
+// promoted to a shared module this round), so spying on the class method is
+// still correct and unchanged.
+import * as brandMarketStrategyImpl from '../emma/impl/brandMarketStrategy';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
@@ -60,9 +75,14 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
     jest.clearAllMocks();
 
     agentModeService = new AgentModeService();
-    // Use jest.spyOn to properly mock private methods
-    mockReadBrandGuidelines = jest.spyOn(agentModeService as any, 'readBrandGuidelines') as jest.Mock;
-    mockReadMarketStrategy = jest.spyOn(agentModeService as any, 'readMarketStrategy') as jest.Mock;
+    // ENG-2103 (F2 follow-up): readBrandGuidelines/readMarketStrategy are now
+    // called directly from emma/impl/brandMarketStrategy.ts by the moved
+    // updateEmailDraftForLead body, not via `this.` — spy on the module's
+    // real exports (see the import comment above), not the class methods.
+    mockReadBrandGuidelines = jest.spyOn(brandMarketStrategyImpl, 'readBrandGuidelines') as jest.Mock;
+    mockReadMarketStrategy = jest.spyOn(brandMarketStrategyImpl, 'readMarketStrategy') as jest.Mock;
+    // getSenderForLead is still injected via `this.getSenderForLead.bind(this)`
+    // from the class wrapper — the class-method spy is still correct here.
     mockGetSenderForLead = jest.spyOn(agentModeService as any, 'getSenderForLead') as jest.Mock;
     jest.spyOn(agentModeService, 'getReportGenerationDefaultModel').mockResolvedValue('gpt-5.5');
 
