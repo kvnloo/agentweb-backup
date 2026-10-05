@@ -129,6 +129,7 @@ import {
   appendApprovalDeckItem,
   finalizeApprovalDeck,
   findApprovalDeckAnswerForDigest,
+  describeMetaWriteParamDrift, formatMetaWriteParamDriftMessage,
   findAnsweredDeckItemByKind,
   reconstructApprovalDeckFromHistory,
   applyDeckAnswers,
@@ -22704,6 +22705,18 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           // Same reason as the validation branch above: `error` is what the model actually reads.
           error: `ACCOUNT_SCOPE_REFUSED: ${refusal}`,
         } as any;
+      }
+      // ENG-1748: if this exact target was approved with different params, name the
+      // drifted fields so the user sees what changed. Explanatory only — the
+      // grant decision above is unchanged and nothing executes here.
+      if (!budgetReconfirmation && !manifestGranted && sessionId) {
+        const driftSession = await chatbotDb.getChatSession(sessionId);
+        const drifted = describeMetaWriteParamDrift(driftSession?.pendingApprovalDeck, {
+          entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params,
+        });
+        if (drifted) {
+          summary += formatMetaWriteParamDriftMessage(drifted);
+        }
       }
       if (budgetAnomaly?.changes) {
         summary += ` Budget review (${budgetAnomaly.severity}): ` + budgetAnomaly.changes.map(change =>
