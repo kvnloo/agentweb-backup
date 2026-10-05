@@ -20,7 +20,7 @@ const reply = (status) => ({ status, json: async () => ({}) });
 test("classifyPair", () => {
   assert.equal(classifyPair(200, 409), "conflict");
   assert.equal(classifyPair(400, 200), "precondition");
-  assert.equal(classifyPair(200, 200), "double_write");
+  assert.equal(classifyPair(200, 200), "inconclusive");
   assert.equal(classifyPair(200, 500), "server_error");
 });
 
@@ -32,15 +32,22 @@ test("passes on a 409 and cleans up its fixture", async () => {
   assert.ok(calls.filter((c) => c === "DELETE /api/user-skills/s1").length >= 2);
 });
 
-test("fails on a double write", async () => {
+test("two 2xx is inconclusive, not a pass", async () => {
   const { fetchImpl } = mk({ route: () => reply(200) });
-  await assert.rejects(run({ fetchImpl, password: "x", attempts: 3, log: () => {} }), /double_write/);
+  await assert.rejects(run({ fetchImpl, password: "x", attempts: 3, log: () => {} }), /no 409 observed/);
+});
+
+test("fails when fixture cleanup cannot delete", async () => {
+  let deletes = 0;
+  const { fetchImpl } = mk({ route: (m) => m === "DELETE" ? reply(++deletes === 1 ? 409 : 500) : reply(200) });
+  await assert.rejects(run({ fetchImpl, password: "x", attempts: 3, log: () => {} }), /cleanup failed/);
 });
 
 test("fails closed when fixture is not QA-owned and touches nothing else", async () => {
   const { fetchImpl, calls } = mk({ owner: "someone-else", route: () => reply(200) });
   await assert.rejects(run({ fetchImpl, password: "x", attempts: 1, log: () => {} }), /fail closed/);
   assert.ok(!calls.some((c) => c.includes("submit-for-review")));
+  assert.ok(!calls.some((c) => c.startsWith("DELETE")), "must not delete an unowned skill");
 });
 
 test("requires a password", async () => {

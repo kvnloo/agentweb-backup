@@ -23,7 +23,9 @@ const FIXTURE_PREFIX = "[qa-fixture] ENG-2302 conflict probe";
 export function classifyPair(a, b) {
   const ok = [a, b].filter((s) => s >= 200 && s < 300).length;
   if ([a, b].some((s) => s >= 500)) return "server_error";
-  if (ok !== 1) return ok === 0 ? "no_winner" : "double_write";
+  // Two 2xx is inconclusive, not a double write: submit may finish before DELETE
+  // reads the row, and the owner may legitimately delete a pending_review skill.
+  if (ok !== 1) return ok === 0 ? "no_winner" : "inconclusive";
   const loser = a >= 200 && a < 300 ? b : a;
   if (loser === 409) return "conflict";
   if (loser >= 400 && loser < 500) return "precondition";
@@ -50,13 +52,14 @@ export async function run({ fetchImpl = fetch, password = process.env.QA_USER_PA
   const qaUserId = login.json.user?.userId;
   if (login.json.user?.email !== EMAIL || !qaUserId) throw new Error("login did not return the QA user");
 
-  const results = { conflict: 0, precondition: 0, attempts: 0 };
+  const results = { conflict: 0, precondition: 0, inconclusive: 0, attempts: 0 };
   const created = [];
   const fixture = async () => {
     const r = await call("POST", "/api/user-skills", token, { name: `${FIXTURE_PREFIX} ${Date.now()}`, description: "Verifier-owned fixture; safe to delete." });
     if (r.status !== 201 || !r.json?.skillId) throw new Error(`fixture create failed: ${r.status}`);
-    created.push(r.json.skillId);
+    // Ownership check BEFORE scheduling cleanup: never DELETE a skill we do not own.
     if (r.json.ownerId !== qaUserId) throw new Error("fail closed: fixture owner is not the QA user");
+    created.push(r.json.skillId);
     return r.json.skillId;
   };
 
@@ -75,10 +78,16 @@ export async function run({ fetchImpl = fetch, password = process.env.QA_USER_PA
       results[verdict]++;
     }
   } finally {
+    const leaked = [];
     for (const id of created) {
-      const r = await call("DELETE", `/api/user-skills/${id}`, token);
-      if (![200, 404].includes(r.status)) log(`cleanup warning: ${id} → ${r.status}`);
+      let r;
+      for (let t = 0; t < 3; t++) {
+        r = await call("DELETE", `/api/user-skills/${id}`, token);
+        if ([200, 204, 404].includes(r.status)) break;
+      }
+      if (![200, 204, 404].includes(r.status)) { leaked.push(`${id}:${r.status}`); log(`cleanup failed: ${id} → ${r.status}`); }
     }
+    if (leaked.length) throw new Error(`FAIL: fixture cleanup failed (${leaked.join(", ")})`);
   }
   if (results.conflict === 0) throw new Error(`no 409 observed in ${results.attempts} races (no double-write or 5xx either)`);
   log(`PASS: ${JSON.stringify(results)}`);
