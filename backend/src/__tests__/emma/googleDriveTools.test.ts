@@ -53,17 +53,28 @@ const mockUpdateGoogleDoc = jest.fn();
 const mockCreateGoogleSheet = jest.fn();
 const mockUpdateGoogleSheet = jest.fn();
 
+// ENG-2103 (F2): read_google_doc/google_drive's execute() bodies now call
+// emma/impl/googleDrive.ts directly (extracted from AgentModeService) instead
+// of agentModeService.<method> — mock that module instead for those four.
+// create_google_doc/update_google_doc/create_google_sheet/update_google_sheet
+// were extracted the same way to emma/impl/googleDocsSheets.ts — mock that
+// module instead of agentModeService for those four too.
+jest.mock('../../emma/impl/googleDrive', () => ({
+  readGoogleFileById: (...a: any[]) => mockReadGoogleFileById(...a),
+  listGoogleDriveFolder: (...a: any[]) => mockListGoogleDriveFolder(...a),
+  searchGoogleDrive: (...a: any[]) => mockSearchGoogleDrive(...a),
+  createGoogleDriveFolder: (...a: any[]) => mockCreateGoogleDriveFolder(...a),
+}));
+
+jest.mock('../../emma/impl/googleDocsSheets', () => ({
+  createGoogleDoc: (...a: any[]) => mockCreateGoogleDoc(...a),
+  updateGoogleDoc: (...a: any[]) => mockUpdateGoogleDoc(...a),
+  createGoogleSheet: (...a: any[]) => mockCreateGoogleSheet(...a),
+  updateGoogleSheet: (...a: any[]) => mockUpdateGoogleSheet(...a),
+}));
+
 jest.mock('../../services/agentModeService', () => ({
-  agentModeService: {
-    readGoogleFileById: (...a: any[]) => mockReadGoogleFileById(...a),
-    listGoogleDriveFolder: (...a: any[]) => mockListGoogleDriveFolder(...a),
-    searchGoogleDrive: (...a: any[]) => mockSearchGoogleDrive(...a),
-    createGoogleDriveFolder: (...a: any[]) => mockCreateGoogleDriveFolder(...a),
-    createGoogleDoc: (...a: any[]) => mockCreateGoogleDoc(...a),
-    updateGoogleDoc: (...a: any[]) => mockUpdateGoogleDoc(...a),
-    createGoogleSheet: (...a: any[]) => mockCreateGoogleSheet(...a),
-    updateGoogleSheet: (...a: any[]) => mockUpdateGoogleSheet(...a),
-  },
+  agentModeService: {},
 }));
 
 jest.mock('../../services/db', () => ({

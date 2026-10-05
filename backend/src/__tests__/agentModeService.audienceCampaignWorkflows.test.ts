@@ -62,6 +62,10 @@ import { AgentModeService } from '../services/agentModeService';
 import { toolResultError } from '../utils/toolResultError';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { classifyToolFailureType } from '../utils/toolFailureType';
+// ENG-2103 (F2 follow-up): resolveOrCreateSeedAudience/getCampaignForAdSetReuseCheck
+// moved to emma/impl/adsApis.ts as real exports — every jest.spyOn below that
+// used to target the class instance now targets this module instead.
+import * as adsApisImpl from '../emma/impl/adsApis';
 
 /*
  * ENG-941: the launch tracking gate resolves Meta credentials before it runs, and this
@@ -100,16 +104,26 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     jest.spyOn(agentModeService, 'listMetaAdsAdSets').mockResolvedValue({ success: true, adSets: [] } as any);
     // Default: campaign has no CBO (Advantage Campaign Budget), so requested
     // budgets aren't stripped for comparison purposes — the common case.
-    jest.spyOn(agentModeService, 'getCampaignForAdSetReuseCheck').mockResolvedValue({});
+    jest.spyOn(adsApisImpl, 'getCampaignForAdSetReuseCheck').mockResolvedValue({});
   });
 
   const ACCOUNT_ID = '922903076601160';
   const USER_ID = 'user123';
 
-  // Access the private helper the same way other suites in this repo test
-  // private AgentModeService methods (e.g. buildMarketingContext).
+  // resolveOrCreateSeedAudience moved to emma/impl/adsApis.ts (ENG-2103 F2
+  // follow-up) and now takes an explicit `deps` parameter
+  // (manageMetaCustomAudiences, resolveHubSpotService) instead of an implicit
+  // `this`. Routing this helper's deps through the real (spy-observable)
+  // agentModeService instance methods keeps every existing
+  // jest.spyOn(agentModeService, 'manageMetaCustomAudiences')/
+  // jest.spyOn(agentModeService as any, 'resolveHubSpotService') call in this
+  // file's tests below working exactly as before — those spies were never on
+  // resolveOrCreateSeedAudience itself, only on its dependencies.
   const callResolveOrCreateSeedAudience = (...args: any[]) =>
-    (agentModeService as any).resolveOrCreateSeedAudience(...args);
+    adsApisImpl.resolveOrCreateSeedAudience(...(args as [any, any, any, any, any]), {
+      manageMetaCustomAudiences: (...a: any[]) => (agentModeService as any).manageMetaCustomAudiences(...a),
+      resolveHubSpotService: (...a: any[]) => (agentModeService as any).resolveHubSpotService(...a),
+    });
 
   describe('resolveOrCreateSeedAudience', () => {
     it('plans to CREATE when no existing audience matches the name (dry run)', async () => {
@@ -804,7 +818,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // internally consistent with the args.
     it('rejects a self-computed plain-hash token that was never actually issued by a preview call', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      const resolveSpy = jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValue({
+      const resolveSpy = jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValue({
         plannedAction: 'create', audience: undefined, created: false, sourceSummary: 'CSV upload (...)', failures: [],
       });
       const args = baseArgs();
@@ -826,12 +840,16 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       });
 
       expect(result.awaitingUserConfirmation).toBe(true);
-      expect(resolveSpy).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), expect.anything(), { dryRun: false });
+      // ENG-2103 (F2 follow-up): trailing expect.anything() covers
+      // resolveOrCreateSeedAudience's new `deps` argument — without it, the
+      // 6-arg real call would never match this 5-arg pattern regardless of
+      // dryRun, making the assertion trivially (and wrongly) pass.
+      expect(resolveSpy).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), expect.anything(), { dryRun: false }, expect.anything());
     });
 
     it('returns a preview (awaitingUserConfirmation) without executing anything when confirm is not set', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      const resolveSpy = jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      const resolveSpy = jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'create', audience: undefined, created: false, sourceSummary: 'CSV upload (...)', failures: [],
       });
       const createAdSetSpy = jest.spyOn(agentModeService, 'createMetaAdsAdSet');
@@ -840,7 +858,11 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
 
       expect(result.success).toBe(true);
       expect(result.awaitingUserConfirmation).toBe(true);
-      expect(resolveSpy).toHaveBeenCalledWith(USER_ID, ACCOUNT_ID, 'RankAI Warm List', { type: 'csv', csvUrl: 'https://s3.example.com/audience.csv' }, { dryRun: true });
+      // ENG-2103 (F2 follow-up): resolveOrCreateSeedAudience now also receives a
+      // trailing `deps` object (manageMetaCustomAudiences, resolveHubSpotService) —
+      // expect.anything() covers it without re-asserting its exact shape, which
+      // is covered by the resolveOrCreateSeedAudience describe block above.
+      expect(resolveSpy).toHaveBeenCalledWith(USER_ID, ACCOUNT_ID, 'RankAI Warm List', { type: 'csv', csvUrl: 'https://s3.example.com/audience.csv' }, { dryRun: true }, expect.anything());
       expect(createAdSetSpy).not.toHaveBeenCalled();
     });
 
@@ -854,7 +876,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // discloses the risk up front instead.
     it('warns in the preview that a daily/lifetime budget may be silently stripped if the campaign uses CBO', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'create', audience: undefined, created: false, sourceSummary: 'CSV upload (...)', failures: [],
       });
 
@@ -868,7 +890,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
 
     it('does not add the CBO budget caveat when no budget is provided in ad_set_params', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'create', audience: undefined, created: false, sourceSummary: 'CSV upload (...)', failures: [],
       });
 
@@ -879,7 +901,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
 
     it('executes end-to-end and returns a completion ledger when confirm=true (targeted, no lookalike)', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'create',
         audience: { id: 'aud_seed_1', name: 'RankAI Warm List' },
         created: true,
@@ -924,7 +946,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // launchAudienceCampaign's own catch, not just createMetaAdsAdSet's own.
     it('ENG-1300: a coded ad-set-creation failure classifies as auth/config end-to-end', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'create',
         audience: { id: 'aud_seed_1', name: 'RankAI Warm List' },
         created: true,
@@ -955,7 +977,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // the lookalike fix) closes this the same way.
     it('reuses an existing same-named ad set targeting the same audience instead of creating a duplicate', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'reuse', audience: { id: 'aud_seed_6', name: 'RankAI Warm List' }, created: false,
         sourceSummary: 'CSV upload (...)', failures: [],
       });
@@ -1001,7 +1023,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // keys than we sent.
     it('reuses an existing ad set even when Meta echoes back extra injected targeting defaults we never sent', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'reuse', audience: { id: 'aud_seed_meta_defaults', name: 'RankAI Warm List' }, created: false,
         sourceSummary: 'CSV upload (...)', failures: [],
       });
@@ -1030,7 +1052,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
 
     it('creates a new ad set (does not reuse) when a same-named one exists but targets a different audience', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'reuse', audience: { id: 'aud_seed_7', name: 'RankAI Warm List' }, created: false,
         sourceSummary: 'CSV upload (...)', failures: [],
       });
@@ -1060,7 +1082,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // the OLD delivery configuration.
     it('creates a new ad set (does not reuse) when a same-named/same-audience one exists with a different budget', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'reuse', audience: { id: 'aud_seed_8', name: 'RankAI Warm List' }, created: false,
         sourceSummary: 'CSV upload (...)', failures: [],
       });
@@ -1092,7 +1114,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // destination, or promoted object.
     it('creates a new ad set (does not reuse) when a same-named/otherwise-matching one exists with a different promoted_object', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'reuse', audience: { id: 'aud_seed_9', name: 'RankAI Warm List' }, created: false,
         sourceSummary: 'CSV upload (...)', failures: [],
       });
@@ -1132,7 +1154,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     it.each([['USD', 10, '1000'], ['TWD', 300, '300']])('reuses matching %s budgets after account-currency normalization', async (currency, major, minor) => {
       jest.spyOn(metaService, 'getAdAccountCurrency').mockResolvedValue(currency as string);
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'reuse', audience: { id: 'aud_seed_10', name: 'RankAI Warm List' }, created: false,
         sourceSummary: 'CSV upload (...)', failures: [],
       });
@@ -1166,11 +1188,11 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // about CBO, not just blindly cents-convert whatever was requested.
     it('reuses an existing ad set with no budget when the campaign has CBO, even though a budget was requested', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'reuse', audience: { id: 'aud_seed_11', name: 'RankAI Warm List' }, created: false,
         sourceSummary: 'CSV upload (...)', failures: [],
       });
-      jest.spyOn(agentModeService, 'getCampaignForAdSetReuseCheck').mockResolvedValueOnce({ daily_budget: 5000 }); // campaign has CBO
+      jest.spyOn(adsApisImpl, 'getCampaignForAdSetReuseCheck').mockResolvedValueOnce({ daily_budget: 5000 }); // campaign has CBO
       jest.spyOn(agentModeService, 'listMetaAdsAdSets').mockResolvedValueOnce({
         success: true,
         adSets: [{
@@ -1201,7 +1223,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // start_time.
     it('reuses an existing ACTIVE ad set regardless of its auto-filled start_time, when none was explicitly requested', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'reuse', audience: { id: 'aud_seed_12', name: 'RankAI Warm List' }, created: false,
         sourceSummary: 'CSV upload (...)', failures: [],
       });
@@ -1233,7 +1255,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       // false = the atomic claim failed, i.e. this exact token was already claimed
       // (by a prior real call, or a concurrent one that won the race).
       (claimPreviewToken as jest.Mock).mockResolvedValueOnce(false);
-      const resolveSpy = jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      const resolveSpy = jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'create', audience: undefined, created: false, sourceSummary: 'CSV upload (...)', failures: [],
       });
       const createAdSetSpy = jest.spyOn(agentModeService, 'createMetaAdsAdSet');
@@ -1242,12 +1264,16 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
 
       expect(result.awaitingUserConfirmation).toBe(true);
       expect(createAdSetSpy).not.toHaveBeenCalled();
-      expect(resolveSpy).toHaveBeenCalledWith(USER_ID, ACCOUNT_ID, 'RankAI Warm List', { type: 'csv', csvUrl: 'https://s3.example.com/audience.csv' }, { dryRun: true });
+      // ENG-2103 (F2 follow-up): resolveOrCreateSeedAudience now also receives a
+      // trailing `deps` object (manageMetaCustomAudiences, resolveHubSpotService) —
+      // expect.anything() covers it without re-asserting its exact shape, which
+      // is covered by the resolveOrCreateSeedAudience describe block above.
+      expect(resolveSpy).toHaveBeenCalledWith(USER_ID, ACCOUNT_ID, 'RankAI Warm List', { type: 'csv', csvUrl: 'https://s3.example.com/audience.csv' }, { dryRun: true }, expect.anything());
     });
 
     it('creates a Lookalike Audience and attaches it (not the seed) when use_lookalike=true', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'create', audience: { id: 'aud_seed_2', name: 'RankAI Warm List' }, created: true,
         sourceSummary: 'CSV upload (...)', failures: [],
       });
@@ -1286,7 +1312,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // (same pattern as the seed audience) prevents the duplicate.
     it('reuses an existing same-named Lookalike Audience instead of creating a duplicate on retry', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'reuse', audience: { id: 'aud_seed_3', name: 'RankAI Warm List' }, created: false,
         sourceSummary: 'CSV upload (...)', failures: [],
       });
@@ -1324,7 +1350,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // existing audience's actual spec must also match.
     it('creates a new Lookalike Audience (does not reuse) when a same-named one exists with a different ratio/country', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'reuse', audience: { id: 'aud_seed_4', name: 'RankAI Warm List' }, created: false,
         sourceSummary: 'CSV upload (...)', failures: [],
       });
@@ -1361,7 +1387,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // campaign targets the old seed population entirely.
     it('creates a new Lookalike Audience (does not reuse) when a same-named/same-spec one exists from a different seed audience', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'reuse', audience: { id: 'aud_seed_5', name: 'RankAI Warm List' }, created: false,
         sourceSummary: 'CSV upload (...)', failures: [],
       });
@@ -1394,7 +1420,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
 
     it('rejects use_lookalike=true without lookalike_ratio/lookalike_country before calling anything', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      const resolveSpy = jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience');
+      const resolveSpy = jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience');
 
       const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, {
         ...baseArgs(), confirm: true, use_lookalike: true,
@@ -1407,7 +1433,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
 
     it('rejects a retargeting launch missing exclude_audience_id (defensive check) before calling anything', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      const resolveSpy = jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience');
+      const resolveSpy = jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience');
 
       const result = await agentModeService.launchRetargetingCampaign(USER_ID, { ...baseArgs(), confirm: true });
 
@@ -1418,7 +1444,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
 
     it('sets targeting.excluded_custom_audiences for a confirmed retargeting launch', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'reuse', audience: { id: 'aud_warm_1', name: 'Retargeting Warm List' }, created: false,
         sourceSummary: 'CSV upload (...)', failures: [],
       });
@@ -1439,7 +1465,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
 
     it('fails the whole launch (no ad set created) when seed audience resolution throws', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockRejectedValueOnce(
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockRejectedValueOnce(
         new Error('Payload is empty — no user rows to upload.')
       );
       const createAdSetSpy = jest.spyOn(agentModeService, 'createMetaAdsAdSet');
@@ -1482,7 +1508,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // duplicating them.
     it('still reports success and releases the token when markPreviewTokenSucceeded exhausts its retries after a successful launch', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'reuse', audience: { id: 'aud_seed_marksucceed', name: 'RankAI Warm List' }, created: false,
         sourceSummary: 'CSV upload (...)', failures: [],
       });
@@ -1501,7 +1527,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
 
     it('fails the whole launch when ad set creation fails', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'create', audience: { id: 'aud_seed_3', name: 'RankAI Warm List' }, created: true,
         sourceSummary: 'CSV upload (...)', failures: [],
       });
@@ -1517,7 +1543,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
 
     it('rejects an account outside the allowlist before calling any Meta API', async () => {
       process.env.META_TEST_ACCOUNT_ALLOWLIST = 'some-other-account';
-      const resolveSpy = jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience');
+      const resolveSpy = jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience');
 
       const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, baseArgs());
 
@@ -1528,7 +1554,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
 
     it('proceeds normally when the account is in the allowlist', async () => {
       process.env.META_TEST_ACCOUNT_ALLOWLIST = ACCOUNT_ID;
-      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'create', audience: undefined, created: false, sourceSummary: 'CSV upload (...)', failures: [],
       });
 
