@@ -11,6 +11,12 @@ jest.mock('@slack/web-api', () => ({
 }));
 
 import { AgentModeService } from '../services/agentModeService';
+// ENG-2103 (F2): the self-consistency cache moved from an AgentModeService
+// instance field to module-level singleton state in emma/impl/searchResearch.ts
+// (production is unaffected — agentModeService is already a single singleton —
+// but this suite constructs a fresh `new AgentModeService()` per test expecting
+// a clean cache each time, so it must reset the module's cache itself now).
+import { __resetDataAnalysisConsistencyCacheForTests } from '../emma/impl/searchResearch';
 
 jest.mock('axios', () => ({
   get: jest.fn(),
@@ -55,6 +61,7 @@ describe('AgentModeService.performDataAnalysis', () => {
     delete process.env.DATA_ANALYSIS_FILE_SIZE;
     mockedGetSecret.mockResolvedValue('test-gemini-key');
     service = new AgentModeService();
+    __resetDataAnalysisConsistencyCacheForTests();
   });
 
   test('returns error when analysis instruction is missing', async () => {

@@ -1,3 +1,4 @@
+/// <reference path="../types/nspell.d.ts" />
 /**
  * Deterministic creative CONTENT checks (ENG-2193, ENG-2128 B): OCR text-area ratio and
  * legibility, a dictionary spell check on OCR'd text and any supplied ad copy, brand-colour

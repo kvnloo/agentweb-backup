@@ -119,7 +119,7 @@ load_state() {
 
 remote() {
   ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      -o LogLevel=ERROR -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" "$@"
+      -o LogLevel=ERROR -o IdentitiesOnly=yes -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" "$@"
 }
 
 cleanup_failed_launch() {
@@ -390,7 +390,7 @@ EOF
   for i in $(seq 1 60); do
     if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
            -o ConnectTimeout=5 -o LogLevel=ERROR \
-           -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" "true" 2>/dev/null; then
+           -o IdentitiesOnly=yes -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" "true" 2>/dev/null; then
       break
     fi
     if [[ $i -eq 60 ]]; then
@@ -476,7 +476,7 @@ VITE_DEBUG=true' > /home/ec2-user/agentweb/customer-portal/.env.local"
     log "Writing cloud-dev CLAUDE.md..."
     remote "mkdir -p /home/ec2-user/.claude"
     scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR -i "$KEY_FILE" \
+        -o LogLevel=ERROR -o IdentitiesOnly=yes -i "$KEY_FILE" \
         "$SCRIPT_DIR/cloud-dev-claude.md" "$SSH_USER@$PUBLIC_IP:/home/ec2-user/.claude/CLAUDE.md"
     remote "sed -i 's|PUBLIC_IP|$PUBLIC_IP|g' /home/ec2-user/.claude/CLAUDE.md"
 
@@ -701,13 +701,13 @@ _do_sync() {
       --exclude 'builds' \
       --exclude '*.zip' \
       --exclude '*.pem' \
-      -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i $KEY_FILE" \
+      -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o IdentitiesOnly=yes -i $KEY_FILE" \
       "$src_path" "$SSH_USER@$PUBLIC_IP:/home/ec2-user/agentweb/$target/"
   done
 
   # Also sync .dockerignore from repo root
   rsync -az \
-    -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i $KEY_FILE" \
+    -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o IdentitiesOnly=yes -i $KEY_FILE" \
     "$REPO_ROOT/.dockerignore" "$SSH_USER@$PUBLIC_IP:/home/ec2-user/agentweb/.dockerignore"
 }
 
@@ -749,7 +749,7 @@ _do_sync_dev() {
       --exclude 'builds' \
       --exclude '*.zip' \
       --exclude '*.pem' \
-      -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i $KEY_FILE" \
+      -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o IdentitiesOnly=yes -i $KEY_FILE" \
       "$src_path" "$SSH_USER@$PUBLIC_IP:/home/ec2-user/agentweb/$target/"
   done
 
@@ -757,14 +757,14 @@ _do_sync_dev() {
   if [[ "$service" == "all" ]]; then
     log "Syncing repo-root .git/ directory..."
     rsync -az \
-      -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i $KEY_FILE" \
+      -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o IdentitiesOnly=yes -i $KEY_FILE" \
       "$REPO_ROOT/.git/" "$SSH_USER@$PUBLIC_IP:/home/ec2-user/agentweb/.git/"
 
     log "Syncing repo-root files..."
     for f in CLAUDE.md .gitignore; do
       if [[ -f "$REPO_ROOT/$f" ]]; then
         rsync -az \
-          -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i $KEY_FILE" \
+          -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o IdentitiesOnly=yes -i $KEY_FILE" \
           "$REPO_ROOT/$f" "$SSH_USER@$PUBLIC_IP:/home/ec2-user/agentweb/$f"
       fi
     done
@@ -772,7 +772,7 @@ _do_sync_dev() {
     # Sync .claude/ directory if it exists
     if [[ -d "$REPO_ROOT/.claude" ]]; then
       rsync -az \
-        -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i $KEY_FILE" \
+        -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o IdentitiesOnly=yes -i $KEY_FILE" \
         "$REPO_ROOT/.claude/" "$SSH_USER@$PUBLIC_IP:/home/ec2-user/agentweb/.claude/"
     fi
   fi
@@ -952,10 +952,10 @@ cmd_ssh() {
   if is_dev_mode; then
     # -A enables SSH agent forwarding for git push/pull on the instance
     exec ssh -A -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-         -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP"
+         -o IdentitiesOnly=yes -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP"
   else
     exec ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-         -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP"
+         -o IdentitiesOnly=yes -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP"
   fi
 }
 
@@ -976,12 +976,12 @@ cmd_claude() {
   if [[ -n "$message" ]]; then
     # Run Claude Code with a prompt (non-interactive, streams output back)
     ssh -A -t -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" \
+        -o LogLevel=ERROR -o IdentitiesOnly=yes -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" \
         "source ~/.bashrc && cd /home/ec2-user/agentweb && claude --model us.anthropic.claude-sonnet-4-6 --permission-mode auto -p $(printf '%q' "$message")"
   else
     # Interactive Claude Code session
     ssh -A -t -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" \
+        -o LogLevel=ERROR -o IdentitiesOnly=yes -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" \
         "source ~/.bashrc && cd /home/ec2-user/agentweb && claude"
   fi
 }

@@ -25,19 +25,84 @@ import { isPublishCapableTool } from '../utils/schedulePublishAuthorization';
  * Any of the three satisfies this. Doing none of them does not.
  */
 
+// Shared across both mocks below so the drift guard observes the forwarded
+// hook regardless of which module actually owns a given tool's handler body.
+const mockCalls: any[] = [];
+
 jest.mock('../services/agentModeService', () => {
-  const calls: any[] = [];
   const handler: ProxyHandler<any> = {
     get: (_t, prop) => {
-      if (prop === '__calls') return calls;
+      if (prop === '__calls') return mockCalls;
       return (...args: any[]) => {
-        calls.push({ method: String(prop), args });
+        mockCalls.push({ method: String(prop), args });
         return Promise.resolve({ success: true });
       };
     },
   };
   return { agentModeService: new Proxy({}, handler), AgentModeService: jest.fn() };
 });
+
+// ENG-2103 (F2): publish_blog_article's handler body now lives in
+// emma/impl/blog.ts and emma/tools.ts calls it directly instead of through
+// agentModeService — mock it the same call-recording way (a plain object, not
+// a Proxy, so `import * as blogImpl` in emma/tools.ts doesn't get flattened
+// to an empty object by TS's esModuleInterop wildcard-import helper) so this
+// registry-wide drift guard keeps observing the forwarded hook after the
+// extraction.
+jest.mock('../emma/impl/blog', () => ({
+  createBlogArticle: jest.fn((...args: any[]) => {
+    mockCalls.push({ method: 'createBlogArticle', args });
+    return Promise.resolve({ success: true });
+  }),
+  publishBlogArticle: jest.fn((...args: any[]) => {
+    mockCalls.push({ method: 'publishBlogArticle', args });
+    return Promise.resolve({ success: true });
+  }),
+  repairBlogArticle: jest.fn((...args: any[]) => {
+    mockCalls.push({ method: 'repairBlogArticle', args });
+    return Promise.resolve({ success: true });
+  }),
+}));
+
+// ENG-2103 (F2): post_on_connected_account's handler body now lives in
+// emma/impl/linkedin.ts and emma/tools.ts calls it directly instead of
+// through agentModeService — mock it the same call-recording way as
+// emma/impl/blog above (a plain object, not a Proxy, so `import * as
+// linkedinImpl` in emma/tools.ts doesn't get flattened to an empty object by
+// TS's esModuleInterop wildcard-import helper) so this registry-wide drift
+// guard keeps observing the forwarded hook after the extraction.
+// linkedin_manage_post is the cluster's other publish-capable tool, but it
+// still calls `agentModeService.linkedinManagePost` directly (kept on the
+// class, unmoved — see emma/impl/linkedin.ts's module header), so the
+// Proxy mock above already observes it; nothing else from this module needs
+// mocking here.
+jest.mock('../emma/impl/linkedin', () => ({
+  postOnConnectedAccount: jest.fn((...args: any[]) => {
+    mockCalls.push({ method: 'postOnConnectedAccount', args });
+    return Promise.resolve({ success: true });
+  }),
+}));
+
+// ENG-2103 (F2): twitter_manage_post's handler body now lives in
+// emma/impl/twitter.ts and emma/tools.ts calls it directly instead of
+// through agentModeService — mock it the same call-recording way as
+// emma/impl/blog/linkedin above (a plain object, not a Proxy, so `import *
+// as twitterImpl` in emma/tools.ts doesn't get flattened to an empty object
+// by TS's esModuleInterop wildcard-import helper) so this registry-wide
+// drift guard keeps observing the forwarded hook after the extraction.
+// twitter_outreach is not publish-capable (see
+// utils/schedulePublishAuthorization.ts), so this drift guard never calls
+// it, but it is mocked too for symmetry with the module's full export shape.
+jest.mock('../emma/impl/twitter', () => ({
+  twitterManagePost: jest.fn((...args: any[]) => {
+    mockCalls.push({ method: 'twitterManagePost', args });
+    return Promise.resolve({ success: true });
+  }),
+  twitterOutreach: jest.fn((...args: any[]) => {
+    mockCalls.push({ method: 'twitterOutreach', args });
+    return Promise.resolve({ success: true });
+  }),
+}));
 
 const SENTINEL = jest.fn(async () => null);
 

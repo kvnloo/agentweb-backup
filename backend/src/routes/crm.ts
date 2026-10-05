@@ -909,7 +909,7 @@ router.get('/leads/:leadId/enrichment', async (req: Request, res: Response) => {
           // so this route doesn't eagerly pull in stripeService's heavier
           // transitive import graph (e.g. waitlistDb's AWS.config.update at
           // module load) for requests that never hit this branch.
-          const { findBasePlanItem } = await import('../services/stripeService');
+          const { findBasePlanItem, getSubscriptionPeriodEndIso } = await import('../services/stripeService');
           const basePlanItem = sub?.items?.data ? findBasePlanItem(sub) : undefined;
           const priceId = basePlanItem?.price?.id;
           const price = basePlanItem?.price;
@@ -918,10 +918,8 @@ router.get('/leads/:leadId/enrichment', async (req: Request, res: Response) => {
                 ? Math.round(price.unit_amount / 12)
                 : price.unit_amount)
             : 0;
-          const cpe = (sub as any).current_period_end;
-          const currentPeriodEnd = cpe
-            ? new Date(typeof cpe === 'number' ? cpe * 1000 : cpe).toISOString()
-            : null;
+          // Basil moved current_period_end onto subscription items (ENG-405).
+          const currentPeriodEnd = getSubscriptionPeriodEndIso(basePlanItem ? { items: { data: [basePlanItem] }, current_period_end: (sub as any).current_period_end } : sub) ?? null;
           return {
             id: sub.id,
             status: sub.status,

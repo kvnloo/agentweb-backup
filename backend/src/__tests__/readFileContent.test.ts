@@ -69,6 +69,12 @@ jest.mock('../utils/s3Utils', () => ({
 }));
 
 // Mock crypto
+// ENG-2103 F2 full-suite checkpoint: spread the REAL crypto module rather than
+// a bare { createHash } stub — agentModeController.ts (transitively required
+// via agentModeService.ts -> approvalInboxExecution.ts) calls uuid's v4() at
+// module load, which needs crypto.randomFillSync. A createHash-only mock left
+// that undefined, breaking module load for ANY test file that mocks crypto
+// this way, regardless of whether it ever touches uuid itself.
 jest.mock('crypto', () => ({
   ...jest.requireActual('crypto'),
   createHash: jest.fn()
