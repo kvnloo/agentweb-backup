@@ -456,7 +456,6 @@ async function fetchUserAndSubscriptionData(
   try {
     const allUsers = await userDb.scanWithFilter("attribute_exists(userId)", {});
 
-    const currentMonth = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}`;
 
     let totalUsers = allUsers.length;
     let newUsers = 0;
@@ -488,10 +487,11 @@ async function fetchUserAndSubscriptionData(
         churnedUsers++;
       }
 
-      // Prefer lastActiveAt (set on session creation, non-delegated) over token usage for active user count.
-      // lastActiveAt is more accurate — it reflects real user interactions regardless of token consumption.
-      // Fall back to tokenUsage for users who were active before lastActiveAt was introduced.
-      const lastActive = user.lastActiveAt || (user.tokenUsage?.month === currentMonth && user.tokenUsage?.totalTokens > 0 ? new Date().toISOString() : null);
+      // lastActiveAt (set on session creation, non-delegated) reflects real user interactions
+      // regardless of token consumption. It used to fall back to the legacy tokenUsage counter
+      // for users active before lastActiveAt existed; ENG-1250 AC7 retires the counter, and
+      // verified 2026-10-05 that none of the 24 users with counter activity lacks lastActiveAt.
+      const lastActive = user.lastActiveAt || null;
       if (lastActive && new Date(lastActive) >= periodStart) {
         activeUsers++;
       }

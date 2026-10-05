@@ -4,8 +4,12 @@
  * Extends the ENG-353 admin cost surface rather than standing up a second
  * dashboard (AC7): the spend numbers come from the same `AW-UsageRecords`
  * ledger `getCostAggregation` reads, and this adds the per-account economics
- * around them — tier, usage state, the credit ledger, and a reconciliation
- * against the counter the cap actually enforces on.
+ * around them — tier, usage state and the credit ledger.
+ *
+ * (AC2 originally also reconciled the ledger against the legacy `AW-Users.tokenUsage`
+ * counter. ENG-1250 AC7 retires that counter and the cap now enforces on the ledger
+ * itself, so there is nothing left to reconcile against; the counter fields and the
+ * `ledger_counter_drift` alert were removed.)
  *
  * ## All-in cost (AC3)
  *
@@ -90,11 +94,6 @@ export interface UnitEconomicsRow {
   /** LLM spend minus the migration offset — what the cap counts. */
   policyCostUsd: number;
   percentUsed: number | null;
-
-  /** AC2 — reconciliation against the counter, surfaced rather than hidden. */
-  counterCostUsd: number | null;
-  ledgerVsCounterDeltaUsd: number | null;
-  reconciled: boolean;
 }
 
 export interface UnitEconomicsFilters {
@@ -125,17 +124,8 @@ export interface UnitEconomicsReport {
   }>;
   /** AC5 — aggregate and threshold-based; never one issue per heavy account. */
   alerts: Array<{ kind: string; count: number; detail: string }>;
-  /** AC2 — every account whose ledger and counter disagree beyond the tolerance. */
-  unreconciled: Array<{ billingUserId: string; email: string | null; deltaUsd: number }>;
   vendorCoverageNote: string;
 }
-
-/**
- * A cent. The ledger sums many micro-USD rows while the counter is written as a
- * float, so exact equality would flag rounding as a discrepancy and make AC2's
- * signal useless.
- */
-const RECONCILE_TOLERANCE_USD = 0.01;
 
 function round(n: number, dp = 4): number {
   const f = 10 ** dp;
@@ -200,15 +190,6 @@ export async function buildUnitEconomicsReport(
         ? round((policyCostUsd / effectiveThresholdUsd) * 100, 2)
         : null;
 
-    // The counter is only comparable when it describes the SAME month; after a
-    // lazy reset it holds the current month and says nothing about a past one.
-    const counter = user?.tokenUsage;
-    const counterCostUsd =
-      counter && counter.month === month && typeof counter.totalCost === 'number'
-        ? counter.totalCost
-        : null;
-    const delta = counterCostUsd === null ? null : round(llmCostUsd - counterCostUsd);
-
     out.push({
       billingUserId,
       email: user?.email ?? null,
@@ -231,9 +212,6 @@ export async function buildUnitEconomicsReport(
       effectiveThresholdUsd: effectiveThresholdUsd === null ? null : round(effectiveThresholdUsd),
       policyCostUsd: round(policyCostUsd),
       percentUsed,
-      counterCostUsd: counterCostUsd === null ? null : round(counterCostUsd),
-      ledgerVsCounterDeltaUsd: delta,
-      reconciled: delta === null ? true : Math.abs(delta) <= RECONCILE_TOLERANCE_USD,
       _models: agg.models,
     } as UnitEconomicsRow & { _models: Set<string> });
   }
@@ -274,9 +252,6 @@ export async function buildUnitEconomicsReport(
     .sort((a, b) => b.llmCostUsd - a.llmCostUsd);
 
   const uncapped = filtered.filter((r) => r.includedThresholdUsd === null);
-  const unreconciled = filtered
-    .filter((r) => !r.reconciled)
-    .map((r) => ({ billingUserId: r.billingUserId, email: r.email, deltaUsd: r.ledgerVsCounterDeltaUsd! }));
 
   const alerts: UnitEconomicsReport['alerts'] = [];
   const over = filtered.filter((r) => r.percentUsed !== null && r.percentUsed >= 100).length;
@@ -288,10 +263,6 @@ export async function buildUnitEconomicsReport(
       detail: `${uncapped.length} spending account(s) on a tier with no cost policy: ${[...new Set(uncapped.map((r) => r.tier))].join(', ')}`,
     });
   }
-  if (unreconciled.length > 0) {
-    alerts.push({ kind: 'ledger_counter_drift', count: unreconciled.length, detail: `${unreconciled.length} account(s) where the ledger and the enforced counter disagree by more than $${RECONCILE_TOLERANCE_USD}` });
-  }
-
   return {
     month,
     start,
@@ -299,7 +270,6 @@ export async function buildUnitEconomicsReport(
     rows: filtered,
     byTier,
     alerts,
-    unreconciled,
     vendorCoverageNote:
       'vendorCostUsd is complete: every paid vendor (v0, X, You.com, Google CSE, Apollo, enrich.so, Remotion, ElevenLabs, 2captcha, Placid) writes to AW-UsageRecords. allInCostUsd = LLM + vendor is therefore actual all-in cost. Per-account infrastructure is $0 (shared overhead is not per-account attributable). The remaining AC3 item is the COGS target comparison, which needs the authoritative $7/$73/$180 numbers (ENG-1688).',
   };

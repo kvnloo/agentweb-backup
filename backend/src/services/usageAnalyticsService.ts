@@ -47,16 +47,6 @@ export interface UserUsageByModelDay {
   };
 }
 
-export interface UsageComparison {
-  userId: string;
-  month: string;
-  /** Totals from the new shadow table (AW-UsageRecords). */
-  shadow: { totalTokens: number; costUsd: number; callCount: number };
-  /** Totals from the legacy AW-Users.tokenUsage monthly counter. */
-  legacy: { totalTokens: number; costUsd: number; source: "current" | "history" | "none" };
-  delta: { totalTokens: number; costUsd: number };
-}
-
 function toRow(item: UsageRecordRow): ModelDayUsageRow {
   const costMicroUsd = item.costMicroUsd || 0;
   return {
@@ -120,64 +110,6 @@ export async function getUserUsageByModelDay(
   totals.costUsd = totals.costMicroUsd / 1_000_000;
 
   return { userId, start, end, rows, totals };
-}
-
-/**
- * Compare the shadow table's monthly totals against the legacy
- * AW-Users.tokenUsage monthly counter, for one user and one YYYY-MM month.
- */
-export async function getUsageComparison(
-  userId: string,
-  month: string
-): Promise<UsageComparison> {
-  if (!MONTH_RE.test(month)) {
-    throw new Error("month must be YYYY-MM");
-  }
-
-  const items = await usageRecordDb.queryByUserDateRange(userId, `${month}-01`, `${month}-31`);
-  const shadow = items.reduce(
-    (acc, item) => {
-      acc.totalTokens += item.totalTokens || 0;
-      acc.costMicroUsd += item.costMicroUsd || 0;
-      acc.callCount += item.callCount || 0;
-      return acc;
-    },
-    { totalTokens: 0, costMicroUsd: 0, callCount: 0 }
-  );
-
-  // Legacy counter: current month lives on tokenUsage; past months in history.
-  let legacy: UsageComparison["legacy"] = { totalTokens: 0, costUsd: 0, source: "none" };
-  const user = await userDb.getUserById(userId);
-  if (user?.tokenUsage?.month === month) {
-    legacy = {
-      totalTokens: user.tokenUsage.totalTokens || 0,
-      costUsd: user.tokenUsage.totalCost || 0,
-      source: "current",
-    };
-  } else {
-    const hist = (user?.tokenUsageHistory || []).find(
-      (h: { month: string; totalTokens: number; totalCost: number }) => h.month === month
-    );
-    if (hist) {
-      legacy = {
-        totalTokens: hist.totalTokens || 0,
-        costUsd: hist.totalCost || 0,
-        source: "history",
-      };
-    }
-  }
-
-  const shadowCostUsd = shadow.costMicroUsd / 1_000_000;
-  return {
-    userId,
-    month,
-    shadow: { totalTokens: shadow.totalTokens, costUsd: shadowCostUsd, callCount: shadow.callCount },
-    legacy,
-    delta: {
-      totalTokens: shadow.totalTokens - legacy.totalTokens,
-      costUsd: shadowCostUsd - legacy.costUsd,
-    },
-  };
 }
 
 // ── ENG-366: cross-user cost aggregation (backend slice of ENG-353) ──────────
