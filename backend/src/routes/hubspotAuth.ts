@@ -14,7 +14,6 @@ const router = express.Router();
 
 const STATE_EXPIRATION = '15m';
 const TOKEN_SESSION_TTL_MS = OAUTH_FLOW_SESSION_TTL_MS;
-const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 type HubSpotAccountType = 'crm' | 'marketing';
@@ -57,15 +56,6 @@ interface TokenSession extends LocalOAuthFlowSession {
   userId: string;
   expires: number;
 }
-
-const tokenSessions = new Map<string, TokenSession>();
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of tokenSessions.entries()) {
-    if (now > session.expires) tokenSessions.delete(id);
-  }
-}, SESSION_CLEANUP_INTERVAL_MS).unref();
 
 // GET /init
 router.get('/init', authenticateToken, async (req: any, res) => {
@@ -169,7 +159,7 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
         : [];
     const missingScopes = requestedScopes.filter(s => !grantedScopes.includes(s));
 
-    const tokenSessionId = await storeOAuthFlowSession('hubspot', tokenSessions, {
+    const tokenSessionId = await storeOAuthFlowSession('hubspot', {
       userId,
       tokens: { access_token, refresh_token, expires_in },
       hubInfo: { hub_id, hub_domain, user },
@@ -197,7 +187,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
   }
 
   try {
-    const session = await consumeOAuthFlowSession('hubspot', tokenSessions, tokenSessionId, userId);
+    const session = await consumeOAuthFlowSession<TokenSession>('hubspot', tokenSessionId, userId);
     if (!session) {
       return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
     }
