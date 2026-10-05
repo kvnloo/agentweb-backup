@@ -36,13 +36,17 @@
  * has already been removed (or the list changed for any other reason) is a
  * no-op, not a clobber.
  *
- * Dry-run (default): reads the row, prints the diff, writes nothing.
- *   NODE_ENV=development npx ts-node src/scripts/eng2276-remove-stray-icp-persona.ts
- * Apply:
- *   NODE_ENV=development npx ts-node src/scripts/eng2276-remove-stray-icp-persona.ts --apply
+ * Table prefix follows NODE_ENV like every other script here, but there is no
+ * dev copy of this row to rehearse against — demo@gloco.ai does not exist in
+ * Dev-AW-Users (verified), so a NODE_ENV=development run is a guaranteed
+ * no-op, not a dry-run of the real logic. Both commands below must target
+ * production; the dry-run is still safe because it only reads and prints —
+ * it performs no write regardless of environment.
  *
- * Table prefix follows NODE_ENV like every other script here. Run against Dev
- * first; NODE_ENV=production targets the real prod row this ticket is about.
+ * Dry-run (default): reads the row, prints the diff, writes nothing.
+ *   NODE_ENV=production npx ts-node src/scripts/eng2276-remove-stray-icp-persona.ts
+ * Apply:
+ *   NODE_ENV=production npx ts-node src/scripts/eng2276-remove-stray-icp-persona.ts --apply
  */
 import { DynamoDB } from 'aws-sdk';
 
