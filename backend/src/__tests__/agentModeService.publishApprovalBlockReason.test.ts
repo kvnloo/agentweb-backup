@@ -45,6 +45,31 @@ describe('AgentModeService.publishApprovalBlock — accurate withhold reason (EN
     expect(result.error).toContain('post_on_connected_account');
   });
 
+  /**
+   * ENG-2265 — before this, the never-granted branch told the model to have the
+   * owner "flag it via report_product_issues" with no real unblocking action, even
+   * though the customer-portal ScheduleFormPanel already ships a self-service
+   * "Publish without my review" control (gated on saving a publish tool under
+   * Required Actions first — see ScheduleFormPanel.tsx). Starved of a real answer,
+   * the model in prod session 87e55259 invented a nonexistent control name
+   * ("Autorizar publicación automática / Autopublish"). Pin the real control name
+   * and the prerequisite step so a future edit can't silently drop them again.
+   */
+  it('never-granted: names the REAL self-service control (ENG-2265) — not an invented one', () => {
+    const result = block('post_on_connected_account', 'not_granted');
+    expect(result.error).toContain('Publish without my review');
+    expect(result.error).toContain('Required Actions');
+    expect(result.error).not.toContain('Autorizar publicación automática');
+    expect(result.error).not.toContain('Autopublish');
+  });
+
+  it('revoked and unverifiable do NOT get the never-granted self-service instruction (ENG-2265 scope check)', () => {
+    const revokedResult = block('post_on_connected_account', 'revoked');
+    const unverifiableResult = block('post_on_connected_account', 'unverifiable');
+    expect(revokedResult.error).not.toContain('Publish without my review');
+    expect(unverifiableResult.error).not.toContain('Publish without my review');
+  });
+
   it('revoked: does NOT claim the owner turned on "Require approval before publishing", nor confuse it with never-granted', () => {
     const result = block('post_on_connected_account', 'revoked');
     expect(result.success).toBe(false);
