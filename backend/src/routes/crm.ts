@@ -2206,7 +2206,7 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
     const result = await crmDb.batchCreateLeads(listId, normalizedLeads);
 
     // Auto-enroll new leads into any sequences watching this list (fire-and-forget)
-    if (result.newCount > 0) {
+    if (result.newCount > 0 && !suppressLeadSideEffects(list)) {
       void autoEnrollListIntoSequences(userId, listId);
     }
 
@@ -3233,7 +3233,7 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
     // Batch create leads
     const results = await crmDb.batchCreateLeads(listId, leads);
 
-    if (results.newCount > 0) {
+    if (results.newCount > 0 && !suppressLeadSideEffects(list)) {
       void autoEnrollListIntoSequences(userId, listId);
     }
 
