@@ -474,6 +474,30 @@ describe('describeMetaAdsCapability', () => {
     ).toEqual({ ads_capable: false, capability_warning: META_ADS_RECONSENT_MESSAGE });
   });
 
+  it('reports declined required OAuth permissions as incapable even when an ads scope is present', () => {
+    const result = describeMetaAdsCapability(
+      adAccount({
+        granted_scopes: ['ads_read'],
+        declined_required_permissions: ['pages_read_engagement'],
+      })
+    );
+    expect(result.ads_capable).toBe(false);
+    expect(result.capability_warning).toContain('pages_read_engagement');
+    expect(result.capability_warning).toContain('Edit access');
+  });
+
+  it('reports an OAuth health read failure as not healthy rather than capable', () => {
+    const result = describeMetaAdsCapability(
+      adAccount({
+        granted_scopes: ['ads_read'],
+        meta_oauth_health_error: 'Meta permissions endpoint timed out',
+      })
+    );
+    expect(result.ads_capable).toBe(false);
+    expect(result.capability_warning).toContain('could not be fully verified');
+    expect(result.capability_warning).toContain('Meta permissions endpoint timed out');
+  });
+
   it('tolerates a null/undefined account without throwing', () => {
     expect(describeMetaAdsCapability(null)).toEqual({});
     expect(describeMetaAdsCapability(undefined)).toEqual({});

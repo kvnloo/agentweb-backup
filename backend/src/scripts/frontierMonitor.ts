@@ -25,7 +25,7 @@ async function main() {
   const target = path.resolve(__dirname, '../../..', 'docs/openrouter-byok-coverage.md');
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(target, markdown);
-  const report = [ '# Frontier monitor', '', ...detection.alerts, '', ...detection.reports, '', markdown ].join('\n');
+  const report = [ '# Frontier monitor', '', ...detection.alerts, '', ...detection.reports, ...plan.reports, '', markdown ].join('\n');
   if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, report);
   if (process.argv.includes('--write')) writeCatalogPlan(plan);
   // Opt-in side effect: ordinary local runs cannot post alerts accidentally.

@@ -8,10 +8,12 @@ import request from "supertest";
 import express from "express";
 
 jest.mock("../services/skillService", () => ({
+  SKILL_CONFLICT_MESSAGE: "Skill was changed by someone else — refresh and try again",
   skillService: {
     getSkill: jest.fn(),
     deleteSkill: jest.fn(),
     withdrawFromReview: jest.fn(),
+    submitForReview: jest.fn(),
   },
 }));
 
@@ -105,7 +107,7 @@ describe("DELETE /:skillId — owner can delete regardless of visibility (ENG-93
       const res = await request(buildApp(OWNER_ID)).delete("/api/user-skills/skill-1");
 
       expect(res.status).toBe(200);
-      expect(skillService.deleteSkill).toHaveBeenCalledWith("skill-1");
+      expect(skillService.deleteSkill).toHaveBeenCalledWith("skill-1", expect.objectContaining({ ownerId: OWNER_ID }));
     }
   );
 
@@ -140,5 +142,30 @@ describe("DELETE /:skillId — owner can delete regardless of visibility (ENG-93
     skillService.getSkill.mockResolvedValue(null);
     const res = await request(buildApp(OWNER_ID)).delete("/api/user-skills/skill-1");
     expect(res.status).toBe(404);
+  });
+});
+
+describe("ENG-1390: conditional-write conflicts surface as 409", () => {
+  const CONFLICT = "Skill was changed by someone else — refresh and try again";
+
+  it("DELETE passes the authorized ownerId/visibility as the delete condition", async () => {
+    skillService.getSkill.mockResolvedValue({ skillId: "skill-1", ownerId: OWNER_ID, visibility: "private" });
+    skillService.deleteSkill.mockResolvedValue(undefined);
+    const res = await request(buildApp(OWNER_ID)).delete("/api/user-skills/skill-1");
+    expect(res.status).toBe(200);
+    expect(skillService.deleteSkill).toHaveBeenCalledWith("skill-1", { ownerId: OWNER_ID, visibility: "private" });
+  });
+
+  it("DELETE 409s when the skill changed between authorization and delete", async () => {
+    skillService.getSkill.mockResolvedValue({ skillId: "skill-1", ownerId: OWNER_ID, visibility: "private" });
+    skillService.deleteSkill.mockRejectedValue(new Error(CONFLICT));
+    const res = await request(buildApp(OWNER_ID)).delete("/api/user-skills/skill-1");
+    expect(res.status).toBe(409);
+  });
+
+  it("submit-for-review 409s on a concurrent change", async () => {
+    skillService.submitForReview.mockRejectedValue(new Error(CONFLICT));
+    const res = await request(buildApp(OWNER_ID)).post("/api/user-skills/skill-1/submit-for-review");
+    expect(res.status).toBe(409);
   });
 });

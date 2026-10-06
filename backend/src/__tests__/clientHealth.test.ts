@@ -267,6 +267,43 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.health.status_reasons).not.toContain('No active ad campaigns');
   });
 
+  it('surfaces Meta Page, declined-permission, and selected-event health for the dashboard', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user',
+      email: 'client@example.com',
+      displayName: 'Client User',
+      adAccount: '',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      {
+        platform: 'meta',
+        config: {
+          account_type: 'ad_account',
+          ad_account_id: '333333',
+          access_token: 'tok',
+          granted_scopes: ['ads_read'],
+          declined_required_permissions: ['pages_read_engagement'],
+          has_meta_pages: false,
+          meta_page_count: 0,
+        },
+      },
+    ]);
+    mockedMetaFetch.mockResolvedValueOnce({ data: [] });
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.health.ads_layer.meta_connection_health).toEqual({
+      permissions: 'declined',
+      declined_permissions: ['pages_read_engagement'],
+      page_access: 'missing',
+      page_count: 0,
+      selected_event: 'unknown',
+      reconnect_required: true,
+      reconnect_instructions: 'Click Edit access, select all current and future Pages, approve all permissions.',
+    });
+  });
+
 
   // SUCCESS test: Full health assessment for a client with connected accounts
   it('should return full health assessment for a connected client', async () => {

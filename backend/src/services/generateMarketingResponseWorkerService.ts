@@ -71,6 +71,25 @@ export interface GenerateMarketingResponseResult {
   pendingApprovalDeck?: PendingApprovalDeck;
 }
 
+/**
+ * ENG-2294: the dev-mode worker must load ts-node in transpile-only mode, matching the parent
+ * process (`ts-node --transpile-only src/server.ts`). Full type-checking at require-time made
+ * every dev/preview brand-build worker exit 1 on any type error (e.g. untyped `nspell`).
+ * The deployed (dist) branch is unchanged.
+ */
+export function resolveWorkerLaunch(dir: string, isLocalDevelopment: boolean): { workerScript: string; execArgv: string[] } {
+  if (isLocalDevelopment) {
+    return {
+      workerScript: path.join(dir, '../workers/generateMarketingResponseWorker.ts'),
+      execArgv: ['-r', 'ts-node/register/transpile-only', '--max-old-space-size=4096']
+    };
+  }
+  return {
+    workerScript: path.join(dir, '../workers/generateMarketingResponseWorker.js'),
+    execArgv: ['--max-old-space-size=4096']
+  };
+}
+
 export class GenerateMarketingResponseWorkerService {
   private worker: ChildProcess | null = null;
   private pendingRequests: Map<string, { resolve: Function; reject: Function; onProgress?: Function; timeout: NodeJS.Timeout }> = new Map();
@@ -103,13 +122,7 @@ export class GenerateMarketingResponseWorkerService {
     const isDeployedEnvironment = __dirname.includes('/dist/') || __dirname.includes('\\dist\\');
     const isLocalDevelopment = process.env.NODE_ENV === 'development' && !isDeployedEnvironment;
 
-    if (isLocalDevelopment) {
-      workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.ts');
-      execArgv = ['-r', 'ts-node/register', '--max-old-space-size=4096'];
-    } else {
-      workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.js');
-      execArgv = ['--max-old-space-size=4096'];
-    }
+    ({ workerScript, execArgv } = resolveWorkerLaunch(__dirname, isLocalDevelopment));
 
     // Fork a new process with increased memory limit (4GB) to prevent OOM errors
     this.worker = fork(workerScript, [], {

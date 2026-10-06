@@ -1,5 +1,5 @@
 import express from "express";
-import { skillService } from "../services/skillService";
+import { skillService, SKILL_CONFLICT_MESSAGE } from "../services/skillService";
 import { userDb, orgDb } from "../services/db";
 import { can } from "../services/orgAuthz";
 import {
@@ -156,9 +156,10 @@ router.delete("/:skillId", async (req, res) => {
       }
     }
 
-    await skillService.deleteSkill(skillId);
+    await skillService.deleteSkill(skillId, { ownerId: skill.ownerId, visibility: skill.visibility });
     res.json({ message: "Skill deleted successfully" });
-  } catch (error) {
+  } catch (error: any) {
+    if (error?.message === SKILL_CONFLICT_MESSAGE) return res.status(409).json({ message: error.message });
     console.error("Error deleting user skill:", error);
     res.status(500).json({ message: "Failed to delete skill" });
   }
@@ -177,6 +178,7 @@ router.post("/:skillId/submit-for-review", async (req, res) => {
     if (error.message === 'Skill not found') return res.status(404).json({ message: error.message });
     if (error.message === 'Not authorized') return res.status(403).json({ message: error.message });
     if (error.message === 'Only private skills can be submitted for review') return res.status(400).json({ message: error.message });
+    if (error.message === SKILL_CONFLICT_MESSAGE) return res.status(409).json({ message: error.message });
     console.error("Error submitting skill for review:", error);
     res.status(500).json({ message: "Failed to submit skill for review" });
   }
@@ -196,7 +198,7 @@ router.post("/:skillId/withdraw-review", async (req, res) => {
     if (error.message === 'Skill not found') return res.status(404).json({ message: error.message });
     if (error.message === 'Not authorized') return res.status(403).json({ message: error.message });
     if (error.message === 'Skill is not pending review') return res.status(400).json({ message: error.message });
-    if (error.message === 'Skill was changed by someone else — refresh and try again') return res.status(409).json({ message: error.message });
+    if (error.message === SKILL_CONFLICT_MESSAGE) return res.status(409).json({ message: error.message });
     console.error("Error withdrawing skill from review:", error);
     res.status(500).json({ message: "Failed to withdraw skill from review" });
   }
