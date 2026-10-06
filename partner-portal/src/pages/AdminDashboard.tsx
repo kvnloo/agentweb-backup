@@ -291,6 +291,8 @@ interface User {
   productDomain?: string; // Product site domain for feature usage tracking
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   subscriptionType?: string; // Subscription type for customer portal users
+  /** Settled spend this month from the spend ledger (ENG-1250 AC7); absent if the lookup failed. */
+  spendThisMonthUsd?: number;
   tokenUsage?: {
     month: string;
     totalTokens: number;
@@ -905,7 +907,6 @@ export default function AdminDashboard() {
   const [currentSubscriptionType, setCurrentSubscriptionType] = useState<string>("");
   const [subscriptionTypeEditLoading, setSubscriptionTypeEditLoading] = useState(false);
   const [availableSubscriptionTypes, setAvailableSubscriptionTypes] = useState<string[]>([]);
-  const [subscriptionTypeAllowanceMap, setSubscriptionTypeAllowanceMap] = useState<Record<string, number | null>>({});
   const [subscriptionTypeCostAllowanceMap, setSubscriptionTypeCostAllowanceMap] = useState<Record<string, number | null>>({});
   // Per-user LLM cost breakdown modal (burn, from the shadow-usage table)
   const [costBreakdownUser, setCostBreakdownUser] = useState<User | null>(null);
@@ -1060,15 +1061,12 @@ export default function AdminDashboard() {
         ? types.map((t: any) => t.name)
         : ['Basic'];
       setAvailableSubscriptionTypes(typeNames);
-      const allowanceMap: Record<string, number | null> = {};
       const costAllowanceMap: Record<string, number | null> = {};
       types.forEach((t: any) => {
-        allowanceMap[t.name] = t.monthlyTokenAllowance ?? null;
         costAllowanceMap[t.name] = t.llmUsagePolicy?.hardCostThresholdMicroUsd != null
           ? t.llmUsagePolicy.hardCostThresholdMicroUsd / 1_000_000
           : (t.monthlyCostAllowance ?? null);
       });
-      setSubscriptionTypeAllowanceMap(allowanceMap);
       setSubscriptionTypeCostAllowanceMap(costAllowanceMap);
     } catch (error) {
       console.error('Error loading subscription types:', error);
@@ -1812,8 +1810,7 @@ export default function AdminDashboard() {
       case "isActive":
         return user.isActive === false ? 0 : 1;
       case "tokenUsage":
-        return user.tokenUsage?.month === new Date().toISOString().slice(0, 7)
-          ? (user.tokenUsage?.totalTokens || 0) : 0;
+        return user.spendThisMonthUsd ?? 0;
       default:
         return (user as unknown as Record<string, unknown>)[property] ?? "";
     }
@@ -1842,11 +1839,9 @@ export default function AdminDashboard() {
       if (userFilterPaid === "paid" && user.subscription_status !== "active") return false;
       if (userFilterPaid === "unpaid" && user.subscription_status === "active") return false;
       if (userFilterPaid === "bounced" && !(user.stripe_customer_id && !user.subscription_status && !user.subscription_amount)) return false;
-      // Has-usage filter — match the display logic: current-month tokens only
+      // Has-usage filter — match the display logic: settled spend this month (ledger)
       if (userFilterHasUsage) {
-        const currentMonth = new Date().toISOString().slice(0, 7);
-        const used = user.tokenUsage?.month === currentMonth ? (user.tokenUsage?.totalTokens || 0) : 0;
-        if (used <= 0) return false;
+        if ((user.spendThisMonthUsd ?? 0) <= 0) return false;
       }
       return true;
     });
@@ -4514,7 +4509,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                     <UserSortLabel property="lastLoginTime" label="Last Active" />
                   </TableCell>
                   <TableCell>
-                    <UserSortLabel property={"tokenUsage" as keyof User} label="Usage" />
+                    <UserSortLabel property={"tokenUsage" as keyof User} label="Spend (mo)" />
                   </TableCell>
                   <TableCell>Intro Email</TableCell>
                   <TableCell sx={{ width: 100 }}>Actions</TableCell>
@@ -4553,8 +4548,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                       if (diffD < 7) return `${diffD}d ago`;
                       return format(d, "MMM d");
                     })() : "Never";
-                    const used = user.tokenUsage?.month === new Date().toISOString().slice(0, 7)
-                      ? (user.tokenUsage?.totalTokens || 0) : 0;
+                    const spendUsd = user.spendThisMonthUsd;
 
                     return (
                       <React.Fragment key={user.userId}>
@@ -4665,7 +4659,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                         </TableCell>
                         <TableCell>
                           <Typography variant="body2" sx={{ fontVariantNumeric: "tabular-nums" }}>
-                            {used > 0 ? used.toLocaleString() : "—"}
+                            {spendUsd != null && spendUsd > 0 ? `$${spendUsd.toFixed(2)}` : "—"}
                           </Typography>
                         </TableCell>
                         <TableCell>
@@ -5017,20 +5011,10 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                 </Grid>
                                 {/* Usage + actions row */}
                                 <Grid item xs={6}>
-                                  <Typography variant="caption" color="text.secondary">Token Usage</Typography>
-                                  <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
-                                    {user.roles?.includes("customer") ? (() => {
-                                      const baseAllowance = subscriptionTypeAllowanceMap[user.subscriptionType || "Basic"] ?? null;
-                                      const bonus = user.tokenAllowanceBonus || 0;
-                                      const effectiveAllowance = baseAllowance != null ? baseAllowance + bonus : null;
-                                      return (
-                                        <Typography variant="body2">
-                                          {used.toLocaleString()} / {effectiveAllowance != null ? effectiveAllowance.toLocaleString() : "∞"}
-                                          {bonus > 0 && <Typography component="span" variant="caption" color="text.secondary"> (+{bonus.toLocaleString()} bonus)</Typography>}
-                                        </Typography>
-                                      );
-                                    })() : <Typography variant="body2" color="text.disabled">—</Typography>}
-                                  </Box>
+                                  <Typography variant="caption" color="text.secondary">Token usage (archived)</Typography>
+                                  <Typography variant="body2" color="text.disabled" sx={{ mt: 0.5 }}>
+                                    Live token counting is retired — spend is metered in dollars (see LLM Cost).
+                                  </Typography>
                                   {user.roles?.includes("customer") && user.tokenUsageHistory && user.tokenUsageHistory.length > 0 && (
                                     <Box sx={{ mt: 0.5 }}>
                                       <Typography variant="caption" color="text.secondary">History: </Typography>
@@ -5046,12 +5030,12 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                 <Grid item xs={6}>
                                   <HelpCaption
                                     label="LLM Cost"
-                                    help="Dollars deducted from this user's monthly cost cap so far this month, vs the cap (∞ = no cap). This is the counted/deducted figure — open the breakdown for gross burn per model, including platform-absorbed cost."
+                                    help="Settled spend this month from the spend ledger (all vendors), vs the cap (∞ = no cap). This is the figure the cap is enforced on — open the breakdown for gross burn per model, including platform-absorbed cost."
                                   />
                                   <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
                                     {user.roles?.includes("customer") ? (() => {
                                       const currentMonth = new Date().toISOString().slice(0, 7);
-                                      const costUsed = user.tokenUsage?.month === currentMonth ? (user.tokenUsage?.totalCost ?? 0) : 0;
+                                      const costUsed = user.spendThisMonthUsd ?? 0;
                                       const costAllowance = subscriptionTypeCostAllowanceMap[user.subscriptionType || "Basic"] ?? null;
                                       const credits = user.llmUsageCredits?.month === currentMonth
                                         ? ((user.llmUsageCredits.totalPurchasedMicroUsd || 0) + (user.llmUsageCredits.totalAdminGrantedMicroUsd || 0)) / 1_000_000

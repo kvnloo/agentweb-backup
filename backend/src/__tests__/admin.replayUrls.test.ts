@@ -221,16 +221,12 @@ describe('GET /api/admin/users - replay URLs', () => {
       chatSessionCount: 9,
       subscription_status: 'active',
       current_period_end: '2026-07-01',
-      tokenUsage: {
-        month: '2026-06',
-        totalTokens: 123,
-        totalCost: 1.23,
-        resetDate: '2026-07-01',
-      },
       googleDriveFolders: [{ folderId: 'folder-1', name: 'Customer assets' }],
       slackChannels: ['C123'],
       secretNames: ['OPENAI_API_KEY'],
     });
+    // The retired legacy counter is no longer part of the roster payload (ENG-1250 AC7).
+    expect(res.body[0].tokenUsage).toBeUndefined();
     expect(res.body[0].secrets).toBeUndefined();
     expect(res.body[0].chatSessions).toBeUndefined();
     expect(res.body[0].onboardingEvents).toBeUndefined();
@@ -276,6 +272,25 @@ describe('GET /api/admin/users - self-activity signal from the ledger (ENG-1271,
     const res = await request(app).get('/api/admin/users').expect(200);
 
     expect(byId(res.body, 'spender').selfActivity.staffOperatedSuspect).toBe(false);
+  });
+
+  it('reports each account\'s settled spend this month in dollars, 0 when it has no row', async () => {
+    mockBatch.mockResolvedValue(new Map([['spender', { settledMicroUsd: 12_345_000 }]]));
+
+    const res = await request(app).get('/api/admin/users').expect(200);
+
+    expect(byId(res.body, 'spender').spendThisMonthUsd).toBeCloseTo(12.345, 6);
+    expect(byId(res.body, 'quiet').spendThisMonthUsd).toBe(0);
+  });
+
+  it('omits spendThisMonthUsd (rather than showing a false $0) when the ledger lookup failed', async () => {
+    mockBatch.mockRejectedValue(new Error('ProvisionedThroughputExceeded'));
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await request(app).get('/api/admin/users').expect(200);
+
+    expect(byId(res.body, 'spender')).not.toHaveProperty('spendThisMonthUsd');
+    errSpy.mockRestore();
   });
 
   it('a failed ledger lookup still returns the roster (signal left unset) and logs it', async () => {
