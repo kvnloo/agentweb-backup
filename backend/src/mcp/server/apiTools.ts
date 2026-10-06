@@ -2010,6 +2010,30 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
+  name: 'set_landing_page_lead_list',
+  definition: {
+    name: 'set_landing_page_lead_list',
+    description: 'Attach, change, or clear the CRM lead list on an existing landing page (including imported externally-deployed pages) without regenerating it. Pass lead_list_id=null to clear. Enables public submissions on the list and syncs the page capture route where the page has a repo.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' },
+        lead_list_id: { type: ['string', 'null'], description: 'Lead list ID to associate, or null to clear' }
+      },
+      required: ['page_id', 'lead_list_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const leadListId = typeof args.lead_list_id === 'string' && args.lead_list_id.trim() ? args.lead_list_id.trim() : null;
+    const data = await mcpFetch({
+      method: 'PATCH', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/lead-list`, context: ctx(context),
+      body: { leadListId }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
   name: 'edit_landing_page_file',
   definition: {
     name: 'edit_landing_page_file',

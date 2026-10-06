@@ -8089,6 +8089,7 @@ const bridgedToolNames = [
   'publish_landing_page_changes',
   'revert_landing_page_publish',
   'update_landing_page_context',
+  'set_landing_page_lead_list',
   'enable_session_tracking',
   'resolve_skill',
   // Self account status (no-arg; wraps /api/auth/me for the CALLER's own account).
