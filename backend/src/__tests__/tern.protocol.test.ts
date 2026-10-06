@@ -3,6 +3,7 @@ import {
   encodeTspJson,
   encodeTspMessage,
   parseTspJson,
+  splitTspMessage,
   splitUtf8,
   TspStreamReader,
 } from '../tern/protocol';
