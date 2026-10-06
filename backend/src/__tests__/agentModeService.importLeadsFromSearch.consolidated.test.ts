@@ -26,13 +26,20 @@ const mockProbeSearchCapability = jest.fn().mockResolvedValue('ok');
 const mockFilterByCompanySize = jest.fn(
   async (...args: any[]) => ({ items: args[0], excludedUnverifiable: 0 }),
 );
+const mockClearStatusCache = jest.fn();
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     searchPeople: (...args: any[]) => mockSearchPeople(...args),
     resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
     probeSearchCapability: (...args: any[]) => mockProbeSearchCapability(...args),
     filterByCompanySize: (...args: any[]) => mockFilterByCompanySize(...args),
+    clearStatusCache: (...args: any[]) => mockClearStatusCache(...args),
   },
+}));
+
+const mockRecordUnipileAccountHealth = jest.fn();
+jest.mock('../services/linkedInConnectionHealth', () => ({
+  recordUnipileAccountHealth: (...args: any[]) => mockRecordUnipileAccountHealth(...args),
 }));
 
 const mockGetProfile = jest.fn();
@@ -727,6 +734,8 @@ describe('AgentModeService.importLeadsFromSearch — top-up loop', () => {
     mockGetLeadListById.mockReset();
     mockDeleteLead.mockReset();
     mockSetLeadListSearchCursor.mockReset();
+    mockClearStatusCache.mockReset();
+    mockRecordUnipileAccountHealth.mockReset();
     service = new AgentModeService();
     mockResolveAccountId.mockResolvedValue('test-account-id');
     mockGetLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1', leadCount: 0 });
@@ -799,6 +808,44 @@ describe('AgentModeService.importLeadsFromSearch — top-up loop', () => {
     expect(result.imported).toBe(4);
     expect(result.success).toBe(true);
     expect(result.searchError).toContain('Unipile boom');
+    // A plain, unstructured error says nothing about session liveness — must
+    // not be treated as a proven disconnect.
+    expect(mockClearStatusCache).not.toHaveBeenCalled();
+    expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
+  });
+
+  it('corrects the probe cache and records account health on a proven-dead session (ENG-2205)', async () => {
+    const disconnectedError: any = new Error('Session expired');
+    disconnectedError.structuredError = { code: 'errors/disconnected_account', status: 401, classification: 'AUTH_ERROR' };
+    mockSearchPeople
+      .mockResolvedValueOnce({ items: [makeItem(1), makeItem(2)], cursor: 'c2' })
+      .mockRejectedValueOnce(disconnectedError);
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(2, 0, 'p1'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 10 });
+
+    expect(result.searchError).toContain('Session expired');
+    expect(mockClearStatusCache).toHaveBeenCalledWith('test-account-id');
+    expect(mockRecordUnipileAccountHealth).toHaveBeenCalledWith({
+      accountId: 'test-account-id',
+      ownerUserId: 'user-1',
+      state: 'disconnected',
+    });
+  });
+
+  it('does not correct the probe cache on a transient/indeterminate search failure', async () => {
+    const timeoutError: any = new Error('LinkedIn connectivity check timed out');
+    timeoutError.structuredError = { classification: 'TIMEOUT_ERROR', isTimeout: true };
+    mockSearchPeople
+      .mockResolvedValueOnce({ items: [makeItem(1), makeItem(2)], cursor: 'c2' })
+      .mockRejectedValueOnce(timeoutError);
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(2, 0, 'p1'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 10 });
+
+    expect(result.searchError).toContain('LinkedIn connectivity check timed out');
+    expect(mockClearStatusCache).not.toHaveBeenCalled();
+    expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
   });
 
   it('trim on first page resumes from null cursor', async () => {
