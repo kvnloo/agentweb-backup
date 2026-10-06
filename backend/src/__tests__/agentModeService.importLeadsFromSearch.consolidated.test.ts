@@ -27,15 +27,22 @@ const mockFilterByCompanySize = jest.fn(
   async (...args: any[]) => ({ items: args[0], excludedUnverifiable: 0 }),
 );
 const mockClearStatusCache = jest.fn();
-jest.mock('../services/linkedInOutreachService', () => ({
-  linkedInOutreachService: {
-    searchPeople: (...args: any[]) => mockSearchPeople(...args),
-    resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
-    probeSearchCapability: (...args: any[]) => mockProbeSearchCapability(...args),
-    filterByCompanySize: (...args: any[]) => mockFilterByCompanySize(...args),
-    clearStatusCache: (...args: any[]) => mockClearStatusCache(...args),
-  },
-}));
+jest.mock('../services/linkedInOutreachService', () => {
+  // isProvenDisconnectError is a pure, dependency-free predicate — use the REAL
+  // implementation here rather than re-stubbing its logic, so these tests catch
+  // a regression in the actual 403-exclusion behavior, not just a copy of it.
+  const actual = jest.requireActual('../services/linkedInOutreachService');
+  return {
+    isProvenDisconnectError: actual.isProvenDisconnectError,
+    linkedInOutreachService: {
+      searchPeople: (...args: any[]) => mockSearchPeople(...args),
+      resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
+      probeSearchCapability: (...args: any[]) => mockProbeSearchCapability(...args),
+      filterByCompanySize: (...args: any[]) => mockFilterByCompanySize(...args),
+      clearStatusCache: (...args: any[]) => mockClearStatusCache(...args),
+    },
+  };
+});
 
 const mockRecordUnipileAccountHealth = jest.fn();
 jest.mock('../services/linkedInConnectionHealth', () => ({
@@ -844,6 +851,25 @@ describe('AgentModeService.importLeadsFromSearch — top-up loop', () => {
     const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 10 });
 
     expect(result.searchError).toContain('LinkedIn connectivity check timed out');
+    expect(mockClearStatusCache).not.toHaveBeenCalled();
+    expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
+  });
+
+  it('does not treat a bare 403 (permission/plan restriction) as a proven disconnect', async () => {
+    // handleError classifies both 401 and 403 as AUTH_ERROR, but a 403 means the
+    // session is alive and just not allowed to do that specific thing — only
+    // errors/disconnected_account or a real 401 prove the session is dead
+    // (isProvenDisconnectError deliberately excludes a bare 403).
+    const forbiddenError: any = new Error('Forbidden');
+    forbiddenError.structuredError = { status: 403, classification: 'AUTH_ERROR' };
+    mockSearchPeople
+      .mockResolvedValueOnce({ items: [makeItem(1), makeItem(2)], cursor: 'c2' })
+      .mockRejectedValueOnce(forbiddenError);
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(2, 0, 'p1'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 10 });
+
+    expect(result.searchError).toContain('Forbidden');
     expect(mockClearStatusCache).not.toHaveBeenCalled();
     expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
   });
