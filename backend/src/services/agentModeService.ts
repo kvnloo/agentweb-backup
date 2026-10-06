@@ -55,6 +55,7 @@ import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
 import {
   normalizeOpenRouterResponseMetadata,
   normalizeOpenRouterErrorMetadata,
+  resolveServedChainModel,
 } from './agentMode/openRouterMetadata';
 import {
   assertOpenRouterToolsSupported,
@@ -2782,6 +2783,12 @@ export class AgentModeService {
       ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
     });
     // Fire-and-forget usage metering; it must never break an LLM call.
+    // ENG-1345: when OpenRouter served one of `fallbackModels`, meter the model
+    // that actually answered, not the primary we asked for first.
+    const meteredModel = resolveServedChainModel(
+      (res as any)?.model,
+      paramChain.map(m => ({ modelId: m.modelId, upstreamModel: m.upstreamModel })),
+    ) ?? model;
     // ENG-1816 F1: routed through recordLlmUsage, which decides funding ABOVE this
     // fire-and-forget funnel — see funding/recordLlmUsage.ts for why. Branch on
     // RunFunding.route, never on usage.is_byok below: that flag also fires for
@@ -2795,7 +2802,7 @@ export class AgentModeService {
           userId: usageContext?.userId,
           billingUserId: usageContext?.billingUserId,
           sessionId: usageContext?.sessionId,
-          model,
+          model: meteredModel,
           provider: providerLabel,
           feature: usageContext?.feature || 'agent_task',
           eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
