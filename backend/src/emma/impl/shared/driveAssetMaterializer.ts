@@ -121,8 +121,8 @@ export async function resolveNamedDriveFile(params: {
   if (files.length > 1) {
     const folderIdSet = new Set(tree.folderIds);
     const candidates = files.map((file) => {
-      const parents = Array.isArray(file?.parents)
-        ? file.parents.filter((parent: unknown): parent is string => typeof parent === 'string')
+      const parents: string[] = Array.isArray(file?.parents)
+        ? (file.parents as unknown[]).filter((parent): parent is string => typeof parent === 'string')
         : [];
       const parentId = parents.find((parent) => folderIdSet.has(parent)) ?? parents[0];
       const location = parentId === folderId
