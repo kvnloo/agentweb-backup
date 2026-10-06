@@ -3308,6 +3308,19 @@ Returns one diagnosis per connected Meta ad account, each with: outcome ('determ
   }
 });
 
+// ENG-1994: the /api/lead-volume-monitor route accepts only YYYY-MM-DD. Models routinely send a
+// full ISO-8601 datetime for a schema field described as a date, which the route rejected as
+// invalid_args. Truncate a well-formed datetime to its date; anything else passes through
+// untouched so the route still fails closed with a 400 instead of being silently coerced.
+const LEAD_VOLUME_DATE_PATTERN = '^\\d{4}-\\d{2}-\\d{2}(T[0-9:.]+(Z|[+-]\\d{2}:?\\d{2})?)?$';
+const ISO_DATETIME_RE = /^(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$/;
+export function normalizeLeadVolumeDate(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const str = String(value).trim();
+  const m = ISO_DATETIME_RE.exec(str);
+  return m ? m[1] : str;
+}
+
 mcpToolRegistry.register({
   name: 'monitor_lead_volume',
   definition: {
@@ -3332,11 +3345,13 @@ Returns one report per connected Meta ad account for the client.
         },
         since: {
           type: 'string',
-          description: 'Optional window start, YYYY-MM-DD. Defaults to 60 days before `until`.'
+          pattern: LEAD_VOLUME_DATE_PATTERN,
+          description: 'Optional window start, YYYY-MM-DD (a full ISO-8601 datetime is truncated to its date). Must not be after `until`; the since..until window must not exceed 366 days. Defaults to 60 days before `until`.'
         },
         until: {
           type: 'string',
-          description: 'Optional window end, YYYY-MM-DD. Defaults to today.'
+          pattern: LEAD_VOLUME_DATE_PATTERN,
+          description: 'Optional window end, YYYY-MM-DD (a full ISO-8601 datetime is truncated to its date). Defaults to today.'
         }
       },
       required: ['client_name_or_email']
@@ -3344,8 +3359,10 @@ Returns one report per connected Meta ad account for the client.
   },
   execute: async (args: any, context: any) => {
     const query = new URLSearchParams();
-    if (args.since) query.set('since', args.since);
-    if (args.until) query.set('until', args.until);
+    const since = normalizeLeadVolumeDate(args.since);
+    const until = normalizeLeadVolumeDate(args.until);
+    if (since) query.set('since', since);
+    if (until) query.set('until', until);
     const qs = query.toString();
     const data = await mcpFetch({
       method: 'GET',
