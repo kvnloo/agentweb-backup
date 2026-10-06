@@ -127,7 +127,7 @@ export class AgentWebClient {
       const dataLines = block
         .split(/\r?\n/)
         .filter(line => line.startsWith('data:'))
-        .map(line => line.slice(5).replace(/^\\s+/, ''));
+        .map(line => line.slice(5).replace(/^\s+/, ''));
 
       if (dataLines.length === 0) return;
 
