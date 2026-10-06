@@ -1684,19 +1684,38 @@ export class LinkedInOutreachService {
     //    (Previously this returned the FIRST own account with no liveness check,
     //    so a dead first account failed the whole lookup even when the user had a
     //    second, working account. Mirrors resolveAccountIdForEnrichment.)
+    //
+    // Uses the tri-state probeAccountSession, not the binary isAccountConnected
+    // (ENG-2205). isAccountConnected collapses "proven dead" and "probe couldn't
+    // tell" into the same `false` — fine for a caller that just moves on to
+    // another candidate, but this loop can run out of candidates, and when it
+    // does the two cases mean opposite things: "proven dead" means genuinely
+    // fall through to the next pool; "couldn't tell" (a Unipile-side 5xx/timeout,
+    // not a dead session) must not. A 4-day Unipile outage returned 502s for
+    // EVERY account — owned and site-wide — which isAccountConnected read as
+    // "no account configured", telling every affected user to reconnect a
+    // LinkedIn account that was never the problem. Mirrors the mandatory
+    // outreach preflight in agentModeService.ts: block only on a proven-dead
+    // session, fall through to the real call on 'unknown'.
+    let ownUnknown: string | null = null;
     try {
       const { getAccountsByUserId } = await import('./connectedAccountsDb');
       const accounts = await getAccountsByUserId(userId);
       const userAccounts = (accounts as any[]).filter((a) => a.platform === 'unipile' && a.account_id);
       for (const account of userAccounts) {
-        if (await this.isAccountConnected(account.account_id)) {
+        const state = await this.probeAccountSession(account.account_id);
+        if (state === 'connected') {
           return { accountId: account.account_id, usedSharedAccount: false };
         }
-        this.log(`User account ${account.account_id} is disconnected — trying next own account`);
+        if (state === 'unknown' && !ownUnknown) {
+          ownUnknown = account.account_id;
+        }
+        this.log(`User account ${account.account_id} is ${state} — trying next own account`);
       }
     } catch { /* ignore */ }
 
     // 2. Site-wide accounts — verify each one is still connected before returning
+    let sharedUnknown: string | null = null;
     try {
       const { settingsService } = await import('./settingsService');
       const setting = await settingsService.getSetting('site-wide-unipile-accounts');
@@ -1706,13 +1725,24 @@ export class LinkedInOutreachService {
         // Shuffle so load is distributed across accounts
         const shuffled = enabled.sort(() => Math.random() - 0.5);
         for (const account of shuffled) {
-          if (await this.isAccountConnected(account.account_id)) {
+          const state = await this.probeAccountSession(account.account_id);
+          if (state === 'connected') {
             return { accountId: account.account_id, usedSharedAccount: true };
           }
-          this.log(`Site-wide account ${account.account_id} (${account.account_name}) is disconnected — skipping`);
+          if (state === 'unknown' && !sharedUnknown) {
+            sharedUnknown = account.account_id;
+          }
+          this.log(`Site-wide account ${account.account_id} (${account.account_name}) is ${state} — skipping`);
         }
       }
     } catch { /* ignore parse errors or settings fetch failures */ }
+
+    // 3. Nothing came back definitively connected. Prefer an unverifiable own
+    //    account over an unverifiable shared one — still the user's own account
+    //    first — rather than returning null and blaming a missing connection
+    //    that was never the actual fault.
+    if (ownUnknown) return { accountId: ownUnknown, usedSharedAccount: false };
+    if (sharedUnknown) return { accountId: sharedUnknown, usedSharedAccount: true };
 
     return { accountId: null, usedSharedAccount: false };
   }
