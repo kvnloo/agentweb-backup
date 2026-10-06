@@ -110,6 +110,30 @@ function validatedEventTimeSeconds(capturedAtMs: unknown): number | undefined {
 
 
 /**
+ * ENG-2320: turn an `updateLead` payload that carries the WHOLE merged customFields map into one
+ * that carries only the keys this write adds or changes, flagged for per-key atomic writes.
+ *
+ * A full-map `SET customFields = :map` overwrites every key a concurrent request stored since the
+ * snapshot `existingCustomFields` was read (12 concurrent multi-step / double submits kept 1 of
+ * 12). A key is picked when it is absent from the snapshot or its value differs by JSON
+ * comparison, the same comparison the merges use to decide `changed`, so an unchanged value (and a
+ * `source` restored from the stored row) is never rewritten: a stale snapshot cannot revert a key
+ * this write does not own. Updates without customFields pass through untouched.
+ */
+function toKeyMergeUpdate(updates: any, existingCustomFields: Record<string, any>): any {
+  if (!updates.customFields) return updates;
+  const { customFields: mergedMap, ...rest } = updates;
+  const patch = Object.fromEntries(
+    Object.entries(mergedMap).filter(
+      ([k, v]) =>
+        !Object.prototype.hasOwnProperty.call(existingCustomFields, k) ||
+        JSON.stringify(existingCustomFields[k]) !== JSON.stringify(v),
+    ),
+  );
+  return { ...rest, customFields: patch, customFieldsKeyMerge: true };
+}
+
+/**
  * Fire-and-forget: enroll a single lead into any sequences that have
  * autoEnrollListIds containing this list. Mirrors the authenticated CRM path
  * (routes/crm.ts) so leads captured via the public forward-lead webhook also
@@ -863,29 +887,10 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       }
 
       if (changed || matchQualityBackfilled) {
-        // ENG-2320: write customFields PER KEY, not as the merged map. `updates.customFields`
-        // stays the full merged map because `lead` below (what the response cascade renders) is
-        // built from it; what reaches DynamoDB is only the keys this submission actually adds or
-        // changes, each as its own atomic document-path SET. Writing the whole map overwrote
-        // every key a concurrent repeat submission had just stored (12 concurrent multi-step /
-        // double submits kept 1-2 keys of 12). The keys picked are exactly the ones whose value
-        // differs by the same JSON comparison that decided `changed` above, and an unchanged
-        // `source` (restored from the stored row) is never among them.
-        const { customFields: mergedMap, ...rest } = updates;
-        const keyPatch: Record<string, any> | undefined = mergedMap
-          ? Object.fromEntries(
-              Object.entries(mergedMap).filter(
-                ([k, v]) =>
-                  !Object.prototype.hasOwnProperty.call(existingCustomFields, k) ||
-                  JSON.stringify(existingCustomFields[k]) !== JSON.stringify(v),
-              ),
-            )
-          : undefined;
-        await crmDb.updateLead(
-          leadList.listId,
-          existingLead.leadId,
-          keyPatch ? { ...rest, customFields: keyPatch, customFieldsKeyMerge: true } : rest,
-        );
+        // ENG-2320: customFields goes to DynamoDB PER KEY (see toKeyMergeUpdate). `updates` keeps
+        // the full merged map because `lead` below (what the response cascade renders) is built
+        // from it.
+        await crmDb.updateLead(leadList.listId, existingLead.leadId, toKeyMergeUpdate(updates, existingCustomFields));
         // Only a user-visible change makes this an "update". See the ENG-926 §B note above:
         // isUpdated drives sequence enrolment, CRM sync and owner alerts, so a silent
         // metadata backfill deliberately does not set it.
@@ -1062,7 +1067,8 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           }
 
           if (adoptedChanged) {
-            await crmDb.updateLead(leadList.listId, lead.leadId, adoptedUpdates);
+            // ENG-2320: per key, like the email branch (only the keys this adopt adds or changes).
+            await crmDb.updateLead(leadList.listId, lead.leadId, toKeyMergeUpdate(adoptedUpdates, adoptedExistingCustom));
             lead = { ...lead, ...adoptedUpdates };
             // A real, user-visible change — same meaning the email branch gives isUpdated.
             isUpdated = true;
@@ -1181,12 +1187,16 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         if (!sent) return;
 
         try {
+          // ENG-2320: write ONLY the two keys this marker owns, per key. It runs seconds after
+          // the merge, from an in-memory snapshot; spreading that snapshot back as the whole map
+          // overwrote every key a concurrent submission stored in the meantime (it could undo
+          // the merge's own per-key writes).
           await crmDb.updateLead(leadList.listId, lead.leadId, {
             customFields: {
-              ...roadmapCustomFields,
               roadmapEmailSentAt: new Date().toISOString(),
               roadmapEmailStage: Number(roadmapCustomFields.stage),
             },
+            customFieldsKeyMerge: true,
           });
         } catch (markError) {
           console.error('[roadmapDelivery] sent but failed to mark lead:', markError);
