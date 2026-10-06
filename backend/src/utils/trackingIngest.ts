@@ -1,5 +1,5 @@
 import { classifyTraffic, type TrafficClassification } from './trafficSource';
-import { resolveSessionIdentity, type SessionIdentity } from './sessionList';
+import { resolveIngestSessionIdentity, type SessionIdentity } from './sessionList';
 import { isPlausibleListId } from './trackingConfig';
 
 /**
@@ -77,10 +77,11 @@ export function parseIngestBody(body: unknown, nowMs: number): IngestParseResult
   const event = typeof b.event === 'string' ? b.event : '';
   if (!(INGEST_EVENTS as readonly string[]).includes(event)) return fail('invalid_event', 'unknown event');
 
-  // Identity goes through the SAME parser forward-lead uses, so the 48h / +5min window on
-  // sessionStartMs (which becomes the leadId's time prefix) is one rule, not two.
-  const identity = resolveSessionIdentity({ sessionId: b.sessionId, sessionStartMs: b.sessionStartMs }, nowMs);
-  if (!identity) return fail('invalid_session', 'sessionId and a recent sessionStartMs are required');
+  // Same parser and 48h / +5min window as forward-lead, EXCEPT that a well-formed sessionStartMs outside it
+  // is replaced by a stable server-derived one instead of rejected (ENG-2324: a skewed device clock must not
+  // cost the session every event). Only a missing / malformed sessionId or sessionStartMs is still a 400.
+  const identity = resolveIngestSessionIdentity({ sessionId: b.sessionId, sessionStartMs: b.sessionStartMs, clientNowMs: int(b.clientNowMs, 0, Number.MAX_SAFE_INTEGER) }, nowMs);
+  if (!identity) return fail('invalid_session', 'sessionId and an integer sessionStartMs are required');
 
   let customName: string | undefined;
   if (event === 'custom') {

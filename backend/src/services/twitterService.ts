@@ -922,6 +922,26 @@ export class TwitterService {
     }, { operation: 'get_bookmarks', units: arrayLen });
   }
 
+  /**
+   * Retrieve recent posts liked by a user (GET /2/users/:id/liked_tweets) (ENG-979).
+   * Defaults to the connected account itself; pass a handle to read another user's likes.
+   * Requires the `like.read` scope, already requested by the X connect flow.
+   */
+  async getLikedTweets(ownerUserId: string, accountId: string, handle?: string, maxResults?: number): Promise<any[]> {
+    const target = handle?.trim();
+    return this.withRetryOn401(ownerUserId, accountId, async (client) => {
+      const userId = target
+        ? await this.resolveHandleToUserId(client, target)
+        : await this.getMyTwitterUserId(ownerUserId, accountId);
+      const res: any = await client.v2.userLikedTweets(userId, {
+        max_results: this.clampMaxResults(maxResults, 10, 10),
+        'tweet.fields': ['public_metrics', 'created_at', 'author_id', 'conversation_id'],
+      });
+      const rows = res?.data?.data ?? res?.data;
+      return Array.isArray(rows) ? rows : [];
+    }, { operation: 'get_liked_tweets', requiredScope: 'like.read', units: arrayLen, extraUserReads: target ? 1 : 0 });
+  }
+
   // ─── X Lists (read) ────────────────────────────────────────────────────────────
   // The X List read endpoints (owned_lists / list members / list tweets) require the
   // `list.read` OAuth scope. Accounts connected before that scope was added to the

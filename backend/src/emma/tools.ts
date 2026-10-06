@@ -1264,6 +1264,7 @@ Actions:
 - get_dm_conversation: Get DM history with a specific user. Requires handle.
 - bookmark: Bookmark a tweet. Requires tweet_id.
 - get_bookmarks: Retrieve the authenticated user's bookmarked tweets.
+- get_liked_tweets: Get recent posts liked by the connected account (or another user if handle is provided). Optional max_results (default 10, max 100). Use with list_replies/search to find liked posts not yet replied to.
 - list_owned_lists: List the connected account's own X Lists (id + name). Use this to resolve an X List name (e.g. "Engagement 101") to a list id.
 - get_list_members: List the members of an X List (returns member handles). Requires x_list_id, or pass list_name to resolve an owned list by name.
 - get_list_tweets: Get recent tweets posted in an X List (each with author handle, text, and tweet id). Requires x_list_id, or pass list_name to resolve an owned list by name. Optional max_results (default 10, max 100).
@@ -1282,7 +1283,7 @@ For CRM logging of sent DMs, optionally pass list_id, lead_id and lead_email.`,
             'get_profile', 'follow', 'unfollow', 'list_followers', 'list_following',
             'search_tweets', 'get_user_tweets',
             'send_dm', 'list_dms', 'get_dm_conversation',
-            'bookmark', 'get_bookmarks',
+            'bookmark', 'get_bookmarks', 'get_liked_tweets',
             'list_owned_lists', 'get_list_members', 'get_list_tweets',
             'block', 'unblock', 'mute', 'unmute',
           ],
@@ -8088,6 +8089,7 @@ const bridgedToolNames = [
   'publish_landing_page_changes',
   'revert_landing_page_publish',
   'update_landing_page_context',
+  'enable_session_tracking',
   'resolve_skill',
   // Self account status (no-arg; wraps /api/auth/me for the CALLER's own account).
   // Bridged so the in-app loop can resolve the handler; also added to
@@ -8106,6 +8108,8 @@ const adminToolNames = [
   'list_skills',
   'manage_skill',
   'get_chat_history',
+  'get_session_transcript',
+  'get_user_by_id',
   'list_all_clients',
   'assess_client_health',
   'monitor_lead_volume',
