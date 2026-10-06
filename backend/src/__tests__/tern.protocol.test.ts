@@ -19,6 +19,28 @@ describe('Tern protocol transport', () => {
     expect(splitUtf8('🙂🙂', 4)).toEqual(['🙂', '🙂']);
   });
 
+  it('preserves raw key bytes around TSP events', () => {
+    const reader = new TspStreamReader();
+    const event = encodeTspJson('e', {
+      ev: 'select',
+      sf: 'agentweb-emma',
+      id: 'session-picker',
+      item: 's2',
+    });
+    const parts = reader.pushParts(`abc${event}\x1b[B`);
+    expect(parts[0]).toEqual({ type: 'raw', data: 'abc' });
+    expect(parts[1]?.type).toBe('message');
+    expect(parts[2]).toEqual({ type: 'raw', data: '\x1b[B' });
+  });
+
+  it('holds a split TSP prefix instead of leaking it as keyboard input', () => {
+    const reader = new TspStreamReader();
+    expect(reader.pushParts('x\x1b_ts')).toEqual([{ type: 'raw', data: 'x' }]);
+    const rest = reader.pushParts('p;e;{"ev":"focus","sf":"agentweb-emma","id":"composer"}\x1b\\');
+    expect(rest).toHaveLength(1);
+    expect(rest[0]?.type).toBe('message');
+  });
+
   it('reassembles chunked TSP messages across arbitrary PTY reads', () => {
     const encoded = encodeTspJson(
       'e',
