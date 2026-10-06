@@ -788,7 +788,7 @@ export function renderApprovalDeck(
           ? 'Add your comment or question…'
           : 'Optional correction or reason…',
         prompt: '›',
-        sendable: selectedVerdict === 'comment',
+        sendable: true,
       },
     });
   }
