@@ -1,5 +1,8 @@
 import {
+  approvalDeckAllAnswered,
+  approvalDeckIsAwaiting,
   filterSessions,
+  renderApprovalDeck,
   renderEmmaDock,
   renderEmmaMain,
   renderSessionPicker,
@@ -113,6 +116,113 @@ describe('Tern Emma renderer', () => {
     expect(items.find(item => item.id === 's1').badges).toContainEqual(expect.objectContaining({ text: 'current' }));
     expect(items.find(item => item.id === 's2').badges).toContainEqual(expect.objectContaining({ text: 'scheduled' }));
     expect(flatten(layer).find(node => node.id === 'session-preview.title')?.p?.text).toBe('Scheduled report');
+  });
+
+
+  it('renders a deck-of-one question with recommendation and delegation', () => {
+    const deck = {
+      deckId: 'deck-q1',
+      status: 'awaiting' as const,
+      createdAt: '2026-10-06T00:00:00Z',
+      items: [{
+        itemId: 'objective',
+        kind: 'meta_objective',
+        question: 'Which campaign objective should we use?',
+        allowEmmaDecide: true,
+        immutable: true,
+        options: [
+          {
+            id: 'leads',
+            label: 'Leads',
+            consequence: 'Optimize for lead submissions.',
+            recommended: true,
+            why: 'Matches the stated conversion goal.',
+          },
+          {
+            id: 'traffic',
+            label: 'Traffic',
+            consequence: 'Optimize for landing-page visits.',
+          },
+        ],
+      }],
+    };
+
+    expect(approvalDeckIsAwaiting(deck)).toBe(true);
+    const layer = renderApprovalDeck(deck, {
+      itemIndex: 0,
+      selectedVerdict: 'leads',
+      answers: [],
+    });
+    const picker = flatten(layer).find(node => node.id === 'approval-picker');
+    expect(picker?.p).toMatchObject({
+      title: 'Review 1 of 1',
+      selected: 'leads',
+      message: 'This choice may be irreversible.',
+    });
+    const items = picker?.p?.items as any[];
+    expect(items.find(item => item.id === 'leads').badges)
+      .toContainEqual(expect.objectContaining({ text: 'recommended' }));
+    const actions = picker?.p?.actions as any[];
+    expect(actions).toContainEqual(expect.objectContaining({ id: 'delegate' }));
+  });
+
+  it('renders Meta write approvals as fixed approve/reject choices', () => {
+    const deck = {
+      deckId: 'deck-write',
+      status: 'awaiting' as const,
+      createdAt: '2026-10-06T00:00:00Z',
+      items: [{
+        itemId: 'write-1',
+        kind: 'meta_write',
+        question: 'Create the reviewed ad set?',
+        metaWriteManifestDigest: 'digest-1',
+      }],
+    };
+    const state = { itemIndex: 0, selectedVerdict: 'approve', answers: [] };
+    const picker = flatten(renderApprovalDeck(deck, state))
+      .find(node => node.id === 'approval-picker');
+    expect((picker?.p?.items as any[]).map(item => item.id)).toEqual(['approve', 'reject']);
+    expect((picker?.p?.actions as any[]).some(action => action.id === 'delegate')).toBe(false);
+  });
+
+  it('requires one answer per deck item before submission is enabled', () => {
+    const deck = {
+      deckId: 'deck-2',
+      status: 'awaiting' as const,
+      createdAt: '2026-10-06T00:00:00Z',
+      items: [
+        {
+          itemId: 'q1',
+          kind: 'plan_choice',
+          question: 'One?',
+          options: [
+            { id: 'a', label: 'A', recommended: true },
+            { id: 'b', label: 'B' },
+          ],
+        },
+        {
+          itemId: 'q2',
+          kind: 'plan_choice',
+          question: 'Two?',
+          options: [
+            { id: 'c', label: 'C', recommended: true },
+            { id: 'd', label: 'D' },
+          ],
+        },
+      ],
+    };
+
+    expect(approvalDeckAllAnswered(deck, {
+      itemIndex: 0,
+      answers: [{ itemId: 'q1', verdict: 'a' }],
+    })).toBe(false);
+    expect(approvalDeckAllAnswered(deck, {
+      itemIndex: 1,
+      answers: [
+        { itemId: 'q1', verdict: 'a' },
+        { itemId: 'q2', verdict: 'c' },
+      ],
+    })).toBe(true);
   });
 
   it('makes the composer unsendable while Emma is running', () => {
