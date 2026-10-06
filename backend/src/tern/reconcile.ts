@@ -94,7 +94,7 @@ function rising(sequence: readonly number[]): number[] {
   });
 
   const result: number[] = [];
-  let current = tails[tails.length - 1];
+  let current: number | undefined = tails[tails.length - 1];
   while (current !== undefined) {
     result.push(current);
     current = previous[current];
