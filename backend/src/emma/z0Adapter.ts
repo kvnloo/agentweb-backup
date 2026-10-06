@@ -32,6 +32,7 @@ import {
   type Z0BridgeMode,
   type Z0BridgeRequestV1,
   type Z0BridgeResponseV1,
+  type Z0BridgeRiskClass,
 } from './z0BridgeProtocol';
 
 export type Z0AgentWebMode = 'off' | 'shadow' | 'active';
@@ -63,6 +64,11 @@ export interface Z0RouteOptions {
   sessionId: string;
   config?: Z0AgentWebConfig;
   fetchImpl?: Z0FetchLike;
+  /**
+   * Trusted AgentWeb policy classification. Deliberately not part of
+   * Z0RouteArgs/tool input, so prompt text cannot downgrade mutation risk.
+   */
+  riskClass?: Z0BridgeRiskClass;
 }
 
 const DEFAULT_BASE_URL = 'http://127.0.0.1:11501';
@@ -154,6 +160,7 @@ function buildBridgeRequest(params: {
   allowRemote: boolean;
   freeOnly: boolean;
   experimental: boolean;
+  riskClass: Z0BridgeRiskClass;
   payload: Record<string, unknown>;
 }): Z0BridgeRequestV1 {
   const request: Z0BridgeRequestV1 = {
@@ -168,7 +175,7 @@ function buildBridgeRequest(params: {
       allow_remote: params.allowRemote,
       free_only: params.freeOnly,
       experimental: params.experimental,
-      risk_class: params.kind === 'decide' ? 'read' : 'generate',
+      risk_class: params.riskClass,
       approval_state: 'not_required',
     },
     payload: params.payload,
@@ -340,6 +347,7 @@ export async function runZ0Route(args: Z0RouteArgs, options: Z0RouteOptions) {
   const traceId = agentWebTraceId(parentAgent, args);
   const bridgeMode: Z0BridgeMode = config.mode === 'active' ? 'active' : 'shadow';
   const bridgeKind: Z0BridgeKind = bridgeMode === 'shadow' ? 'plan' : 'dispatch';
+  const riskClass: Z0BridgeRiskClass = options.riskClass ?? 'generate';
   const routePayload: Record<string, unknown> = {
     function: args.function,
     task: args.task,
@@ -362,6 +370,7 @@ export async function runZ0Route(args: Z0RouteArgs, options: Z0RouteOptions) {
       allowRemote: args.allow_remote === true,
       freeOnly: true,
       experimental: args.experimental === true,
+      riskClass,
       payload: routePayload,
     });
   } catch (error) {
@@ -573,6 +582,7 @@ export async function runZ0ChoiceExperiment(
       allowRemote: true,
       freeOnly: false,
       experimental: true,
+      riskClass: 'read',
       payload: {
         function: 'experimental_choice',
         decision_id: args.decision_id,
@@ -772,6 +782,7 @@ export async function runZ0NoulExperiment(
       allowRemote: true,
       freeOnly: false,
       experimental: true,
+      riskClass: 'read',
       payload: {
         function: 'experimental_noul',
         decision_id: args.decision_id,
