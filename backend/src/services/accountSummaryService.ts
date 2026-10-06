@@ -4,6 +4,7 @@ import { emailEventsDb } from './emailEventsDb';
 import { agentModeService } from './agentModeService';
 import { getAccountsByUserId } from './connectedAccountsDb';
 import { summarizeSessionIfNeeded } from './sessionSummaryService';
+import { excludeSessionLists } from '../utils/sessionList';
 
 const TIME_RANGE_DAYS: Record<string, number> = {
   '1d': 1,
@@ -238,7 +239,7 @@ async function getSessionSummaries(sessions: ChatSession[]): Promise<SessionSumm
 
 async function getLeadsAdded(userId: string, startDate: Date): Promise<number> {
   try {
-    const leadLists = await crmDb.getLeadListsByUserId(userId);
+    const leadLists = excludeSessionLists(await crmDb.getLeadListsByUserId(userId)); // ENG-2311: session rows are not leads
     if (!leadLists || leadLists.length === 0) return 0;
 
     let totalNew = 0;

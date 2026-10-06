@@ -16,6 +16,8 @@
 
 import { crmDb } from './db';
 import { phoneDigits, isDedupablePhone } from '../utils/smokeTestLead';
+import { isSessionList } from '../utils/sessionList';
+import type { LeadListType } from '../utils/leadSchema';
 
 export interface DedupedContact {
   /**
@@ -48,8 +50,9 @@ const DEFAULT_MAX_RAW_LEADS = 50_000;
 
 export interface DedupQuery {
   userId: string;
-  /** Optional: restrict to a specific listType (e.g. "sales"). */
-  listType?: 'sales' | 'customers';
+  /** Optional: restrict to a specific listType (e.g. "sales"). When omitted, session lists
+   *  are still excluded (ENG-2311) — pass "session" to read them deliberately. */
+  listType?: LeadListType;
   /** Optional: restrict to a specific list id subset. */
   listIds?: string[];
   /** Optional: max number of deduped rows to return (after sort). */
@@ -134,6 +137,12 @@ export async function dedupContactsForUser(query: DedupQuery): Promise<DedupResu
   let filteredLists = Array.isArray(allLists) ? allLists : [];
   if (query.listType) {
     filteredLists = filteredLists.filter((l: any) => (l.listType ?? 'sales') === query.listType);
+  } else {
+    // ENG-2311: "all lists" means all lists of PEOPLE. A session list holds one synthetic-email
+    // row per visit (thousands per list) — folding those into the Inbox would bury every real
+    // contact. Unset listType still counts as 'sales' above, so results for sales/customers
+    // lists are unchanged.
+    filteredLists = filteredLists.filter((l: any) => !isSessionList(l));
   }
   if (query.listIds && query.listIds.length > 0) {
     const allowed = new Set(query.listIds);

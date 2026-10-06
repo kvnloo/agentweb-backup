@@ -8,7 +8,7 @@ import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
 import { parsePendingKinds } from '../utils/metaConversionPending';
-import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, extractDomainFromEmail, defaultStatusConfigFor, isValidLeadLifecycle, LeadImportRowOutcome } from "../utils/leadSchema";
+import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, extractDomainFromEmail, defaultStatusConfigFor, isValidLeadLifecycle, LeadImportRowOutcome, type LeadListType } from "../utils/leadSchema";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
@@ -5324,7 +5324,7 @@ export const crmDb = {
     autoDraftInstruction?: string,
     autoSendEnabled?: boolean,
     statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>,
-    listType?: 'sales' | 'customers',
+    listType?: LeadListType,
     isSystemManaged?: boolean,
     // Idempotent-create support (ENG-524): pass a caller-chosen deterministic ID
     // (instead of the usual random one) to get a race-safe "create if absent" —
@@ -5568,7 +5568,7 @@ export const crmDb = {
        *  `{ qualifiedStatus: null }` turns QualifiedLead off for this list; omitting the
        *  field entirely leaves the relay matching by name, as it did before. */
       conversionMapping?: { qualifiedStatus?: string | null } | null;
-      listType?: 'sales' | 'customers';
+      listType?: LeadListType;
       syncConfig?: {
         platform: 'hubspot' | 'attio';
         accountId: string;
@@ -6390,6 +6390,11 @@ export const crmDb = {
     // fails with `leadAlreadyExists` instead of spawning a duplicate lead.
     leadId?: string;
     failIfExists?: boolean;
+    /** ENG-2311: set by a caller that has ALREADY loaded the list and found it to be a session
+     *  list (utils/sessionList.ts). Skips the attribution.first_touch event-log write — one
+     *  synthetic-contact timeline entry per visit. Never derive it from request input.
+     *  (Slack lead notifications are gated separately, in orgLeadNotificationService.) */
+    suppressSideEffects?: boolean;
   }) {
     try {
       const leadId = leadData.leadId?.trim() || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -6587,7 +6592,7 @@ export const crmDb = {
       // Attribution event — fire once per Lead when any attribution signal is
       // captured. Dedupe via sourceRecordId (`attribution:lead:{leadId}`) so
       // retries on the same lead create a single row.
-      if (leadData.firstTouch) {
+      if (leadData.firstTouch && !leadData.suppressSideEffects) {
         const contactId = emailValue || `nocontact:${leadId}`;
         try {
           await contactEventsDb.logEvent({
@@ -8119,6 +8124,7 @@ export const crmDb = {
                 previousStatus,
                 statusConfig: (list as any).statusConfig,
                 conversionMapping: (list as any).conversionMapping,
+                listType: (list as any).listType,
                 // On a retry of an owed conversion the lead's CURRENT status may no longer
                 // be the one that earned it, so the recorded kind wins — same reasoning as
                 // the queued payload's kind. `undefined` means "use the live transition".

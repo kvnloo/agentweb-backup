@@ -519,7 +519,9 @@ export async function readFileContent(fileUrl: string): Promise<any> {
     const urlPath = new URL(normalizedFileUrl).pathname;
     const extension = urlPath.split('.').pop()?.toLowerCase() || '';
 
-    if (IMAGE_EXTENSIONS.has(extension)) {
+    // SVG is XML text as well as an image (ENG-1468): read_file_content returns its
+    // source (labels, dimensions, metadata); describe_image still owns visual analysis.
+    if (IMAGE_EXTENSIONS.has(extension) && extension !== 'svg') {
       return {
         success: false,
         message: `This is an image file (.${extension}). Use the describe_image tool to analyze its visual content instead.`,
@@ -653,7 +655,7 @@ export async function readFileContent(fileUrl: string): Promise<any> {
           error: docxError instanceof Error ? docxError.message : 'Word document parsing failed'
         };
       }
-    } else if (['txt', 'md', 'csv', 'json', 'xml', 'html', 'htm', 'js', 'css', 'log', 'yml', 'yaml'].includes(extension)) {
+    } else if (['txt', 'md', 'csv', 'json', 'xml', 'svg', 'html', 'htm', 'js', 'css', 'log', 'yml', 'yaml'].includes(extension)) {
       // Handle text-based files
       try {
         extractedContent = buffer.toString('utf-8');

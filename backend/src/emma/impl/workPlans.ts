@@ -255,6 +255,35 @@ import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
 
 /**
+ * ENG-1816 F2 follow-up: a production session reported "No work plan found in
+ * this session" on `set_work_plan_status` immediately after an earlier step on
+ * the SAME session had completed successfully. Direct reproduction (same
+ * sequence, real backend, real DynamoDB reads in between) could not trigger it
+ * -- the create -> complete-step-1 -> complete-step-2 round trip is reliable
+ * every time it was tried. Since the failure couldn't be caught live, this logs
+ * the exact shape of the miss (session missing entirely vs. present with no
+ * workPlan vs. present with a workPlan that calledFunctions disagrees with)
+ * so the next real occurrence leaves forensic evidence instead of just the
+ * user-facing message. Remove once the real cause is found and fixed, or once
+ * this has run long enough with zero hits to downgrade the finding.
+ */
+function logMissingWorkPlanForDiagnosis(
+  caller: 'setWorkPlanStatus' | 'modifyWorkPlan',
+  sessionId: string,
+  session: { workPlan?: unknown; calledFunctions?: Record<string, number>; createdAt?: string; updatedAt?: string } | null,
+): void {
+  const calledFunctionNames = session?.calledFunctions ? Object.keys(session.calledFunctions) : [];
+  console.warn(
+    `AgentMode: ${caller} found no work plan for session ${sessionId} (ENG-1816 diagnostic). ` +
+    `sessionExists=${!!session} ` +
+    `sessionCreatedAt=${session?.createdAt ?? 'n/a'} sessionUpdatedAt=${session?.updatedAt ?? 'n/a'} ` +
+    // If create_work_plan shows up here despite workPlan being absent, the plan
+    // was created and then lost -- a very different bug than "never created".
+    `calledFunctionsSeenOnSession=[${calledFunctionNames.join(', ')}]`
+  );
+}
+
+/**
  * The minimal slice of `AgentModeService` that `applyPredefinedWorkPlan`
  * needs to validate a predefined template's `defaultModel` — see the module
  * header comment (cross-dependency #1) for why this is a passed-in parameter
@@ -886,6 +915,7 @@ async function setWorkPlanStatusAttempt(
   // for the analogous timed-out-run read).
   const session = await chatbotDb.getChatSession(sessionId, true);
   if (!session || !session.workPlan) {
+    logMissingWorkPlanForDiagnosis('setWorkPlanStatus', sessionId, session);
     return {
       success: false,
       message: 'No work plan found in this session. Create one first using create_work_plan.'
@@ -1723,6 +1753,7 @@ export async function modifyWorkPlan(
     // call, could be missed.
     const session = await chatbotDb.getChatSession(sessionId, true);
     if (!session || !session.workPlan) {
+      logMissingWorkPlanForDiagnosis('modifyWorkPlan', sessionId, session);
       return {
         success: false,
         message: 'No work plan found in this session. Create one first using create_work_plan.'
