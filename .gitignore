@@ -27,6 +27,7 @@ node_modules/
 # Testing
 /coverage
 backend/coverage/
+/e2e/.e2e/
 
 # Debug logs
 npm-debug.log*
