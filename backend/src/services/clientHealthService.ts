@@ -15,6 +15,7 @@ import { getThresholdsForAccount } from './adsThresholdsDb';
 import { resolveThresholds } from './adsThresholds';
 import { captureFatigueRecommendations } from './adsRecommendationCapture';
 import { isEvaluationUser } from './evaluationPolicy';
+import { getProjectionsBatch } from './spendProjectionDb';
 
 // 'onboarding' = activation incomplete (no ad account ever connected). ENG-2133: that is not a
 // churn/at-risk signal, so it never shares a status with a connection that broke.
@@ -260,7 +261,12 @@ interface ClientSummary {
   has_crm: boolean;
   last_activity: string | null;
   signup_time: string | null;
-  token_usage_current?: { month: string; totalTokens: number; totalCost: number } | null;
+  /**
+   * This month's settled spend for the account, from the spend ledger (ENG-1250 AC7). Replaces
+   * `token_usage_current`, which read the retired legacy counter. null when the account has no
+   * settled spend this month, or when the ledger lookup failed (logged).
+   */
+  spend_current?: { month: string; totalCost: number } | null;
   token_usage_history?: Array<{ month: string; totalTokens: number; totalCost: number }>;
   subscription_type: string | null;
   stripe_customer_id: string | null;
@@ -933,6 +939,20 @@ export async function listAllClients(callerUserId: string, callerIsAdmin?: boole
     const landingPageSignalCache: LandingPageSignalCache = new Map();
     const nowMs = Date.now();
 
+    // This month's settled spend per account, from the ledger in one batched read (it replaces
+    // the retired legacy counter). Secondary to the health signals, so a failed read must not
+    // fail the whole sweep: log it and leave spend_current null rather than invent a figure.
+    // Keyed by each client's own id, not their billing owner, to keep the old per-account meaning: pooled
+    // usage was charged to the owner's counter only, so a member's own was null. The owner's row carries
+    // the pooled total.
+    const spendMonth = new Date().toISOString().slice(0, 7);
+    let spendByUser = new Map<string, { settledMicroUsd: number }>();
+    try {
+      spendByUser = await getProjectionsBatch(allUsers.map((u: any) => u.userId), spendMonth);
+    } catch (error) {
+      console.error('[clientHealth] ledger spend lookup failed; spend_current left null:', error);
+    }
+
     const clients: ClientSummary[] = await Promise.all(
       allUsers.map(async (user: any) => {
         const [accounts, landingPageSignals] = await Promise.all([
@@ -970,8 +990,8 @@ export async function listAllClients(callerUserId: string, callerIsAdmin?: boole
           has_crm: hasCrm,
           last_activity: user.lastLoginTime || null,
           signup_time: user.createdAt || null,
-          token_usage_current: user.tokenUsage
-            ? { month: user.tokenUsage.month, totalTokens: user.tokenUsage.totalTokens, totalCost: user.tokenUsage.totalCost }
+          spend_current: spendByUser.has(user.userId)
+            ? { month: spendMonth, totalCost: spendByUser.get(user.userId)!.settledMicroUsd / 1_000_000 }
             : null,
           token_usage_history: user.tokenUsageHistory || [],
           ...buildPaymentInfo(user),
