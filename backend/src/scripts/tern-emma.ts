@@ -1082,29 +1082,38 @@ async function main(): Promise<void> {
     render();
 
     try {
-      const complete = await client.streamMessage(
-        session.sessionId,
-        text,
-        (event: EmmaStreamEvent) => {
-          if (event.type !== 'tool_start' || typeof event.name !== 'string') return;
-          runningTools = [
-            ...runningTools,
-            {
-              id: String(++toolCounter),
-              name: event.name,
-              startedAt: Date.now(),
-            },
-          ];
-          render();
-        },
-      );
-
-      if (complete.session) {
-        session = complete.session;
+      const usesAgentMode = session.sessionType === 'scheduled' || session.portalType === 'agent';
+      if (usesAgentMode) {
+        // Scheduled-tab sessions are attended Agent Mode turns in the real
+        // customer portal (ENG-2072). Preserve that route instead of sending
+        // them through the customer-chat SSE controller.
+        session = await client.sendAgentModeMessage(session, text);
+        errorText = undefined;
       } else {
-        session = await client.getSession(session.sessionId);
+        const complete = await client.streamMessage(
+          session.sessionId,
+          text,
+          (event: EmmaStreamEvent) => {
+            if (event.type !== 'tool_start' || typeof event.name !== 'string') return;
+            runningTools = [
+              ...runningTools,
+              {
+                id: String(++toolCounter),
+                name: event.name,
+                startedAt: Date.now(),
+              },
+            ];
+            render();
+          },
+        );
+
+        if (complete.session) {
+          session = complete.session;
+        } else {
+          session = await client.getSession(session.sessionId);
+        }
+        errorText = complete.error ? 'Last turn failed' : undefined;
       }
-      errorText = complete.error ? 'Last turn failed' : undefined;
       maybeOpenApprovalDeck();
     } catch (error) {
       errorText = error instanceof Error ? error.message : String(error);
