@@ -19,6 +19,14 @@ describe('Tern protocol transport', () => {
     expect(splitUtf8('🙂🙂', 4)).toEqual(['🙂', '🙂']);
   });
 
+  it('never starts a continuation chunk with a parameter-shaped segment', () => {
+    const pieces = splitUtf8('xxxxfoo=bar;zz', 4);
+    expect(pieces.join('')).toBe('xxxxfoo=bar;zz');
+    for (const piece of pieces.slice(1)) {
+      expect(piece).not.toMatch(/^[A-Za-z0-9_-]+=[!-:<>-~]*;/);
+    }
+  });
+
   it('preserves raw key bytes around TSP events', () => {
     const reader = new TspStreamReader();
     const event = encodeTspJson('e', {
