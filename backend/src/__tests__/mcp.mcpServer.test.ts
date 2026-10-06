@@ -280,7 +280,8 @@ describe('MCP Server', () => {
         .send({ jsonrpc: '2.0', method: 'initialize', params: { capabilities: {} }, id: 20 });
       await new Promise((resolve) => setTimeout(resolve, 10));
 
-      const transport = (StreamableHTTPServerTransport as unknown as jest.Mock).mock.results.at(-1)?.value;
+      const transportMock = StreamableHTTPServerTransport as unknown as jest.Mock;
+      const transport = transportMock.mock.results[transportMock.mock.results.length - 1]?.value;
       let releaseDispatch!: () => void;
       const dispatchGate = new Promise<void>((resolve) => { releaseDispatch = resolve; });
       transport.handleRequest.mockImplementationOnce(async (_req: any, res: any) => {
@@ -292,7 +293,8 @@ describe('MCP Server', () => {
         .post('/mcp')
         .set('Authorization', `Bearer ${TEST_TOKEN}`)
         .set('mcp-session-id', 'test-session-id')
-        .send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'test_tool', arguments: {} }, id: 21 });
+        .send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'test_tool', arguments: {} }, id: 21 })
+        .then((response) => response);
 
       await new Promise((resolve) => setTimeout(resolve, 10));
       expect(cronJobRegistry.snapshot().mcpHttpToolCall).toBe(1);
@@ -329,7 +331,8 @@ describe('MCP Server', () => {
         .post('/mcp')
         .set('Authorization', `Bearer ${TEST_TOKEN}`)
         .set('mcp-session-id', 'remote-session')
-        .send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'test_tool', arguments: {} }, id: 22 });
+        .send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'test_tool', arguments: {} }, id: 22 })
+        .then((response) => response);
 
       await new Promise((resolve) => setTimeout(resolve, 10));
       expect(cronJobRegistry.snapshot().mcpHttpToolCall).toBe(1);
