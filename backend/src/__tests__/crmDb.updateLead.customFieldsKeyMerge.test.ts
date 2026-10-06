@@ -94,12 +94,15 @@ describe('crmDb.updateLead — customFieldsKeyMerge', () => {
     expect(fake.lead(L, 'lead_1').customFields).toEqual({ keep: 'me', ...cf });
   });
 
-  it('a prototype-ish key is stored as data, not interpreted', async () => {
-    const cf = JSON.parse('{"__proto__":{"x":1},"constructor":"c"}');
+  it('drops a `__proto__` key like the whole-map write did, and stores `constructor` as plain data', async () => {
+    const cf = JSON.parse('{"__proto__":{"x":1},"constructor":"c","ok":1}');
     await crmDb.updateLead(L, 'lead_1', { customFields: cf, customFieldsKeyMerge: true });
+    const [main] = leadUpdates();
+    expect(Object.values(main.ExpressionAttributeNames)).not.toContain('__proto__');
     const stored = fake.lead(L, 'lead_1').customFields;
-    expect(Object.prototype.hasOwnProperty.call(stored, '__proto__')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(stored, '__proto__')).toBe(false);
     expect(stored.constructor).toBe('c');
+    expect(stored.ok).toBe(1);
     expect(({} as any).x).toBeUndefined();
   });
 

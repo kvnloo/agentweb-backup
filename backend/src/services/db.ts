@@ -7824,8 +7824,12 @@ export const crmDb = {
         );
         if (updates.customFieldsKeyMerge) {
           // undefined cannot be marshalled and an empty string cannot be an attribute-name
-          // placeholder value; mergeSessionLeadEvent drops both for the same reasons.
-          const entries = Object.entries(safeCustomFields).filter(([k, v]) => k !== '' && v !== undefined);
+          // placeholder value (the whole-map write 500'd on one: "Empty attribute name"), so
+          // both are dropped, as mergeSessionLeadEvent does. `__proto__` is dropped to keep
+          // what the whole-map write did by accident: the SDK marshaller assigns map keys, so
+          // that key never reached storage. A placeholder WOULD store it, and the SDK then
+          // mis-reads the row back (prototype override + a stray `M` key on customFields).
+          const entries = Object.entries(safeCustomFields).filter(([k, v]) => k !== '' && k !== '__proto__' && v !== undefined);
           for (let i = 0; i < entries.length; i += CUSTOM_KEY_CHUNK) customKeyChunks.push(entries.slice(i, i + CUSTOM_KEY_CHUNK));
           if (customKeyChunks.length > 0) {
             // Every key AND value through a generated placeholder: a caller-chosen key can be

@@ -70,6 +70,8 @@ export const PAYLOADS: Record<string, Payload> = {
     },
     headers: MQ_HEADERS,
   },
+  // an OWN `__proto__` key (what JSON.parse of a hostile body produces); the whole-map write dropped it
+  protoKey: { body: JSON.parse('{"customFields":{"__proto__":{"x":1},"constructor":"c","ok":1}}') },
   manyKeys: { body: { customFields: many(120, 'k') } },
   passthroughOverCap: { body: many(60, 'flat') },
 };

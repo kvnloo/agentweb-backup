@@ -29,6 +29,21 @@ const RESERVED = new Set([
 
 const vex = (message: string) => Object.assign(new Error(`ValidationException: ${message}`), { code: 'ValidationException' });
 const clone = <T>(v: T): T => (v === undefined ? v : JSON.parse(JSON.stringify(v)));
+/**
+ * What the aws-sdk DocumentClient marshaller does to a VALUE on its way out: it builds each map
+ * with `map[key] = ...`, so an own `__proto__` key becomes a prototype assignment and never
+ * reaches DynamoDB (verified against dynamodb-local). A `__proto__` in an attribute NAME placeholder
+ * is not marshalled at all and is stored, which is why updateLead's per-key mode filters it.
+ */
+const marshal = (v: any): any => {
+  if (Array.isArray(v)) return v.map(marshal);
+  if (v && typeof v === 'object') {
+    const out: any = {};
+    for (const k of Object.keys(v)) if (k !== '__proto__') out[k] = marshal(v[k]);
+    return out;
+  }
+  return v;
+};
 
 type Op = { target: string[]; kind: 'set' | 'remove' | 'add'; rhs?: string };
 
@@ -102,7 +117,7 @@ export class LeadTableFake {
       if (!(raw in values)) throw vex(`An expression attribute value used in expression is not defined; attribute value: ${raw}`);
       if (values[raw] === undefined) throw vex(`ExpressionAttributeValues contains an undefined value for ${raw}`);
       usedV.add(raw);
-      return clone(values[raw]);
+      return clone(marshal(values[raw]));
     }
     const fn = raw.match(/^(if_not_exists|list_append)\((.*)\)$/s);
     if (fn) {

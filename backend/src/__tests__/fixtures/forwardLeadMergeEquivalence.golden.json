@@ -1256,6 +1256,61 @@
   },
   "status": 200
  },
+ "bare x protoKey @ normal": {
+  "event": "lead.updated",
+  "leadCount": 1,
+  "leads": [
+   {
+    "createdAt": "2020-01-01T00:00:00.000Z",
+    "customFields": {
+     "constructor": "c",
+     "ok": 1,
+     "source": "api"
+    },
+    "email": "ann@example.com",
+    "leadId": "lead_1",
+    "listId": "L0",
+    "updatedAt": "<NOW>"
+   }
+  ],
+  "listFieldNames": [
+   "__proto__",
+   "a",
+   "constructor",
+   "ok",
+   "source"
+  ],
+  "listHasFieldNamesAttr": true,
+  "sideEffects": {
+   "crmSync": [
+    {
+     "crm": "hubspot",
+     "event": "updated",
+     "leadCustomFieldKeys": [
+      "__proto__",
+      "constructor",
+      "ok",
+      "source"
+     ],
+     "leadDigest": "d7f83e1e4b0121df"
+    },
+    {
+     "crm": "attio",
+     "event": "updated",
+     "leadCustomFieldKeys": [
+      "__proto__",
+      "constructor",
+      "ok",
+      "source"
+     ],
+     "leadDigest": "d7f83e1e4b0121df"
+    }
+   ],
+   "enrol": 1,
+   "ownerNotifyHook": 1
+  },
+  "status": 200
+ },
  "bare x manyKeys @ normal": {
   "event": "lead.updated",
   "leadCount": 1,
@@ -4017,6 +4072,108 @@
   },
   "status": 200
  },
+ "full x protoKey @ normal": {
+  "event": "lead.updated",
+  "leadCount": 1,
+  "leads": [
+   {
+    "company": "Acme",
+    "createdAt": "2020-01-01T00:00:00.000Z",
+    "customFields": {
+     "a": 1,
+     "blank": "",
+     "constructor": "c",
+     "flag": false,
+     "forwardedAt": "2020-01-01T00:00:00.000Z",
+     "list": [
+      1,
+      2
+     ],
+     "nested": {
+      "x": 1,
+      "y": 2
+     },
+     "nul": null,
+     "ok": 1,
+     "source": "hero-form",
+     "zero": 0
+    },
+    "dealValue": 5000,
+    "domain": "example.com",
+    "email": "ann@example.com",
+    "firstName": "Ann",
+    "isICP": 1,
+    "lastName": "Lee",
+    "leadId": "lead_1",
+    "lifecycle": "inbox",
+    "linkedin": "https://www.linkedin.com/in/ann",
+    "listId": "L0",
+    "nameCompanyKey": "ann|lee|acme",
+    "notes": "n",
+    "phone": "555",
+    "selectedSenderId": "s1",
+    "status": "qualified",
+    "title": "CTO",
+    "updatedAt": "<NOW>"
+   }
+  ],
+  "listFieldNames": [
+   "__proto__",
+   "a",
+   "constructor",
+   "forwardedAt",
+   "list",
+   "nested",
+   "ok",
+   "source"
+  ],
+  "listHasFieldNamesAttr": true,
+  "sideEffects": {
+   "crmSync": [
+    {
+     "crm": "hubspot",
+     "event": "updated",
+     "leadCustomFieldKeys": [
+      "source",
+      "forwardedAt",
+      "a",
+      "nested",
+      "blank",
+      "zero",
+      "flag",
+      "nul",
+      "list",
+      "__proto__",
+      "constructor",
+      "ok"
+     ],
+     "leadDigest": "4bceae7778774ff8"
+    },
+    {
+     "crm": "attio",
+     "event": "updated",
+     "leadCustomFieldKeys": [
+      "source",
+      "forwardedAt",
+      "a",
+      "nested",
+      "blank",
+      "zero",
+      "flag",
+      "nul",
+      "list",
+      "__proto__",
+      "constructor",
+      "ok"
+     ],
+     "leadDigest": "4bceae7778774ff8"
+    }
+   ],
+   "enrol": 1,
+   "ownerNotifyHook": 1
+  },
+  "status": 200
+ },
  "full x manyKeys @ normal": {
   "event": "lead.updated",
   "leadCount": 1,
@@ -6463,6 +6620,87 @@
   },
   "status": 200
  },
+ "attributed x protoKey @ normal": {
+  "event": "lead.updated",
+  "leadCount": 1,
+  "leads": [
+   {
+    "clickIds": {
+     "gclid": "OLD"
+    },
+    "clientIp": "198.51.100.1",
+    "clientUserAgent": "UA-old",
+    "createdAt": "2020-01-01T00:00:00.000Z",
+    "customFields": {
+     "constructor": "c",
+     "ok": 1,
+     "source": "lp"
+    },
+    "email": "ann@example.com",
+    "firstName": "Ann",
+    "firstTouch": {
+     "clickIds": {
+      "gclid": "OLD"
+     },
+     "timestamp": "2020-01-01T00:00:00.000Z",
+     "utm": {
+      "medium": "email",
+      "source": "old"
+     }
+    },
+    "lastTouch": {
+     "timestamp": "2020-01-01T00:00:00.000Z",
+     "utm": {
+      "medium": "email",
+      "source": "old"
+     }
+    },
+    "leadId": "lead_1",
+    "listId": "L0",
+    "metaFbp": "fb.old",
+    "updatedAt": "<NOW>",
+    "utmMedium": "email",
+    "utmSource": "old"
+   }
+  ],
+  "listFieldNames": [
+   "__proto__",
+   "a",
+   "constructor",
+   "ok",
+   "source"
+  ],
+  "listHasFieldNamesAttr": true,
+  "sideEffects": {
+   "crmSync": [
+    {
+     "crm": "hubspot",
+     "event": "updated",
+     "leadCustomFieldKeys": [
+      "source",
+      "__proto__",
+      "constructor",
+      "ok"
+     ],
+     "leadDigest": "dd7375d87e80341b"
+    },
+    {
+     "crm": "attio",
+     "event": "updated",
+     "leadCustomFieldKeys": [
+      "source",
+      "__proto__",
+      "constructor",
+      "ok"
+     ],
+     "leadDigest": "dd7375d87e80341b"
+    }
+   ],
+   "enrol": 1,
+   "ownerNotifyHook": 1
+  },
+  "status": 200
+ },
  "attributed x manyKeys @ normal": {
   "event": "lead.updated",
   "leadCount": 1,
@@ -8558,6 +8796,70 @@
   },
   "status": 200
  },
+ "firstTouchOnly x protoKey @ normal": {
+  "event": "lead.updated",
+  "leadCount": 1,
+  "leads": [
+   {
+    "createdAt": "2020-01-01T00:00:00.000Z",
+    "customFields": {
+     "a": "1",
+     "constructor": "c",
+     "ok": 1,
+     "source": "lp"
+    },
+    "email": "ann@example.com",
+    "firstTouch": {
+     "timestamp": "2020-01-01T00:00:00.000Z",
+     "utm": {
+      "source": "seed"
+     }
+    },
+    "leadId": "lead_1",
+    "listId": "L0",
+    "updatedAt": "<NOW>"
+   }
+  ],
+  "listFieldNames": [
+   "__proto__",
+   "a",
+   "constructor",
+   "ok",
+   "source"
+  ],
+  "listHasFieldNamesAttr": true,
+  "sideEffects": {
+   "crmSync": [
+    {
+     "crm": "hubspot",
+     "event": "updated",
+     "leadCustomFieldKeys": [
+      "source",
+      "a",
+      "__proto__",
+      "constructor",
+      "ok"
+     ],
+     "leadDigest": "ee2e58790854f643"
+    },
+    {
+     "crm": "attio",
+     "event": "updated",
+     "leadCustomFieldKeys": [
+      "source",
+      "a",
+      "__proto__",
+      "constructor",
+      "ok"
+     ],
+     "leadDigest": "ee2e58790854f643"
+    }
+   ],
+   "enrol": 1,
+   "ownerNotifyHook": 1
+  },
+  "status": 200
+ },
  "firstTouchOnly x manyKeys @ normal": {
   "event": "lead.updated",
   "leadCount": 1,
@@ -10563,6 +10865,62 @@
       "nested"
      ],
      "leadDigest": "1c4b761768360718"
+    }
+   ],
+   "enrol": 1,
+   "ownerNotifyHook": 1
+  },
+  "status": 200
+ },
+ "legacyEmptyGsi x protoKey @ normal": {
+  "event": "lead.updated",
+  "leadCount": 1,
+  "leads": [
+   {
+    "createdAt": "2020-01-01T00:00:00.000Z",
+    "customFields": {
+     "constructor": "c",
+     "ok": 1,
+     "source": "lp"
+    },
+    "email": "ann@example.com",
+    "firstName": "Bob",
+    "leadId": "lead_1",
+    "listId": "L0",
+    "updatedAt": "<NOW>"
+   }
+  ],
+  "listFieldNames": [
+   "__proto__",
+   "a",
+   "constructor",
+   "ok",
+   "source"
+  ],
+  "listHasFieldNamesAttr": true,
+  "sideEffects": {
+   "crmSync": [
+    {
+     "crm": "hubspot",
+     "event": "updated",
+     "leadCustomFieldKeys": [
+      "source",
+      "__proto__",
+      "constructor",
+      "ok"
+     ],
+     "leadDigest": "b38a3dd3b9b12c61"
+    },
+    {
+     "crm": "attio",
+     "event": "updated",
+     "leadCustomFieldKeys": [
+      "source",
+      "__proto__",
+      "constructor",
+      "ok"
+     ],
+     "leadDigest": "b38a3dd3b9b12c61"
     }
    ],
    "enrol": 1,
@@ -12738,6 +13096,68 @@
   },
   "status": 200
  },
+ "noSource x protoKey @ normal": {
+  "event": "lead.updated",
+  "leadCount": 1,
+  "leads": [
+   {
+    "createdAt": "2020-01-01T00:00:00.000Z",
+    "customFields": {
+     "a": 1,
+     "b": 2,
+     "constructor": "c",
+     "ok": 1,
+     "source": "api"
+    },
+    "email": "ann@example.com",
+    "leadId": "lead_1",
+    "listId": "L0",
+    "updatedAt": "<NOW>"
+   }
+  ],
+  "listFieldNames": [
+   "__proto__",
+   "a",
+   "b",
+   "constructor",
+   "ok",
+   "source"
+  ],
+  "listHasFieldNamesAttr": true,
+  "sideEffects": {
+   "crmSync": [
+    {
+     "crm": "hubspot",
+     "event": "updated",
+     "leadCustomFieldKeys": [
+      "a",
+      "b",
+      "__proto__",
+      "constructor",
+      "ok",
+      "source"
+     ],
+     "leadDigest": "036cc0492dc41ed6"
+    },
+    {
+     "crm": "attio",
+     "event": "updated",
+     "leadCustomFieldKeys": [
+      "a",
+      "b",
+      "__proto__",
+      "constructor",
+      "ok",
+      "source"
+     ],
+     "leadDigest": "036cc0492dc41ed6"
+    }
+   ],
+   "enrol": 1,
+   "ownerNotifyHook": 1
+  },
+  "status": 200
+ },
  "noSource x manyKeys @ normal": {
   "event": "lead.updated",
   "leadCount": 1,
@@ -14736,6 +15156,62 @@
       "nested"
      ],
      "leadDigest": "3b6f7239d2046a59"
+    }
+   ],
+   "enrol": 1,
+   "ownerNotifyHook": 1
+  },
+  "status": 200
+ },
+ "noAttribution x protoKey @ normal": {
+  "event": "lead.updated",
+  "leadCount": 1,
+  "leads": [
+   {
+    "createdAt": "2020-01-01T00:00:00.000Z",
+    "customFields": {
+     "constructor": "c",
+     "ok": 1,
+     "source": "lp"
+    },
+    "email": "ann@example.com",
+    "firstName": "Ann",
+    "leadId": "lead_1",
+    "listId": "L0",
+    "updatedAt": "<NOW>"
+   }
+  ],
+  "listFieldNames": [
+   "__proto__",
+   "a",
+   "constructor",
+   "ok",
+   "source"
+  ],
+  "listHasFieldNamesAttr": true,
+  "sideEffects": {
+   "crmSync": [
+    {
+     "crm": "hubspot",
+     "event": "updated",
+     "leadCustomFieldKeys": [
+      "source",
+      "__proto__",
+      "constructor",
+      "ok"
+     ],
+     "leadDigest": "2a9826207c686c58"
+    },
+    {
+     "crm": "attio",
+     "event": "updated",
+     "leadCustomFieldKeys": [
+      "source",
+      "__proto__",
+      "constructor",
+      "ok"
+     ],
+     "leadDigest": "2a9826207c686c58"
     }
    ],
    "enrol": 1,
