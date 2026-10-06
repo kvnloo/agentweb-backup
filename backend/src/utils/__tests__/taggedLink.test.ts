@@ -139,6 +139,29 @@ describe('buildTaggedLink: validation', () => {
     expect(codeOf(() => buildTaggedLink(input(over)))).toBe(code);
   });
 
+  it('coerces finite numbers for campaign/content/postId (JSON and CSV send numbers)', () => {
+    expect(buildTaggedLink(input({ content: 'ep3 teaser', postId: 1009 as unknown as string })).params.utm_content).toBe('tt-ep3-teaser-1009');
+    expect(buildTaggedLink(input({ campaign: 2026 as unknown as string })).params.utm_campaign).toBe('2026');
+    expect(buildTaggedLink(input({ content: 3 as unknown as string, postId: 0 as unknown as string })).params.utm_content).toBe('tt-3-0');
+    expect(buildTaggedLink(input({ content: null as unknown as string, postId: undefined })).params.utm_content).toBe('tt');
+  });
+
+  it.each([
+    ['campaign', { campaign: {} }], ['campaign', { campaign: true }], ['campaign', { campaign: ['a'] }],
+    ['content', { content: {} }], ['content', { content: NaN }], ['content', { content: Infinity }],
+    ['postId', { postId: [1009] }], ['postId', { postId: false }], ['postId', { postId: {} }],
+  ])('a non-string/non-number %s is a named error, never a silent drop', (field, over) => {
+    let err: unknown;
+    try { buildTaggedLink(input(over as unknown as Partial<TaggedLinkInput>)); } catch (e) { err = e; }
+    expect(err).toBeInstanceOf(TaggedLinkError);
+    expect((err as TaggedLinkError).code).toBe('invalid_field');
+    expect((err as TaggedLinkError).message).toContain(field);
+  });
+
+  it.each([['x'], [5], [{}], [[1]], [['a'.repeat(254)]], [Array(21).fill('a.com')]])('allowedHosts of bad shape %j is a TaggedLinkError', (bad) => {
+    expect(codeOf(() => buildTaggedLink(input({ allowedHosts: bad as unknown as string[] })))).toBe('invalid_allowed_hosts');
+  });
+
   it('allow-list accepts exact and wildcard hosts', () => {
     expect(codeOf(() => buildTaggedLink(input({ allowedHosts: ['go.dramabreak.ai'] })))).toBeUndefined();
     expect(codeOf(() => buildTaggedLink(input({ allowedHosts: ['*.dramabreak.ai'] })))).toBeUndefined();
@@ -217,6 +240,23 @@ describe('buildTaggedLinks (bulk / CSV rows)', () => {
   it('treats blank CSV cells as absent so defaults apply', () => {
     const [r] = buildTaggedLinks([{ platform: 'tiktok', campaign: '', baseUrl: '  ' }], { baseUrl: BASE, campaign: 'launch' });
     expect(r).toMatchObject({ ok: true });
+  });
+
+  it('a row-level allowedHosts of bad shape is that row\'s error, not a crash', () => {
+    const results = buildTaggedLinks([{ platform: 'tiktok', campaign: 'a', allowedHosts: 'x' as unknown as string[] }, { platform: 'tiktok' }], { baseUrl: BASE, campaign: 'c' });
+    expect(results[0]).toMatchObject({ ok: false, error: { code: 'invalid_allowed_hosts' } });
+    expect(results[1]).toMatchObject({ ok: true });
+  });
+
+  it('an unexpected non-TaggedLinkError becomes a generic row error and is logged, never thrown', () => {
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const boom = { platform: 'tiktok', get campaign(): string { throw new Error('secret internal detail'); } };
+    const results = buildTaggedLinks([boom, { platform: 'x' }], { baseUrl: BASE, campaign: 'c' });
+    expect(results[0]).toEqual({ index: 0, ok: false, error: { code: 'invalid_row', message: 'row could not be processed' } });
+    expect(JSON.stringify(results[0])).not.toContain('secret');
+    expect(results[1]).toMatchObject({ ok: true });
+    expect(spy).toHaveBeenCalled();
+    spy.mockRestore();
   });
 
   it('non-object rows are per-row errors', () => {

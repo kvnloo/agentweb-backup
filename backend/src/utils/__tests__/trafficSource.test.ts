@@ -183,15 +183,28 @@ describe('classifyTraffic: intentional differences from V1', () => {
     ['"no_ads" is not paid (V1: paid)', { landingUrl: lp('utm_source=facebook&utm_medium=no_ads') }, { trafficType: 'organic' }],
     ['cpv is paid', { landingUrl: lp('utm_source=youtube&utm_medium=cpv') }, { trafficType: 'paid', paidSignal: 'utm_medium:cpv' }],
     ['retargeting is paid', { landingUrl: lp('utm_source=facebook&utm_medium=retargeting') }, { trafficType: 'paid' }],
+
+    // fbclid is a WEAK paid signal: Facebook/Instagram append it to organic outbound clicks too.
+    ['fbclid + utm_medium=bio is organic Instagram (our own tagged link)', { landingUrl: lp('utm_source=instagram&utm_medium=bio&utm_campaign=x&fbclid=AAA'), referrer: 'https://l.instagram.com/' }, { trafficType: 'organic', channel: 'Instagram', channelGroup: 'Organic Social', paidSignal: null }],
+    ['fbclid + referrer l.facebook.com + medium=post is organic Facebook', { landingUrl: lp('utm_medium=post&fbclid=AAA'), referrer: 'https://l.facebook.com/' }, { trafficType: 'organic', channel: 'Facebook', channelGroup: 'Organic Social' }],
+    ['fbclid + ad_id is paid (strong wins)', { landingUrl: lp('utm_source=instagram&fbclid=AAA&ad_id=1') }, { trafficType: 'paid', paidSignal: 'click_id:ad_id' }],
+    ['fbclid + utm_medium=paid is paid', { landingUrl: lp('utm_source=instagram&utm_medium=paid&fbclid=AAA') }, { trafficType: 'paid', paidSignal: 'utm_medium:paid' }],
+    ['fbclid + medium=bio + ad_id is paid (strong wins over organic medium)', { landingUrl: lp('utm_source=instagram&utm_medium=bio&fbclid=AAA&ad_id=1') }, { trafficType: 'paid', paidSignal: 'click_id:ad_id' }],
+    ['fbclid alone (untagged) is paid, as in V1', { landingUrl: lp('fbclid=AAA') }, { trafficType: 'paid', channelGroup: 'Paid', paidSignal: 'click_id:fbclid' }],
+    ['fbclid + a non-organic custom medium is paid', { landingUrl: lp('utm_source=instagram&utm_medium=social&fbclid=AAA') }, { trafficType: 'paid' }],
+    ['fbclid + structured organic medium is organic', { utm: { source: 'instagram', medium: 'Story' }, clickIds: { fbclid: 'AAA' } }, { trafficType: 'organic', channel: 'Instagram' }],
+
+    // hostOf: a path-only landing URL has no host (was a bogus host via https:///path)
+    ['path-only landingUrl has no host, so a same-named referrer is not "internal"', { landingUrl: '/guilty-before-the-mic-v2?x=1', referrer: 'https://guilty-before-the-mic-v2/' }, { channel: 'guilty-before-the-mic-v2', referrerHost: 'guilty-before-the-mic-v2' }],
   ];
 
   it.each(cases)('%s', (_name, input, expected) => {
     expect(run(input)).toMatchObject(expected);
   });
 
-  it('keeps the known V1 limitation: fbclid alone is paid even on organic Facebook/Instagram clicks', () => {
-    // Facebook appends fbclid to ALL outbound clicks, organic included. Pinned (not "fixed") because
-    // fbclid-only paid and organic cannot be told apart; see PR notes. ad_id/utm_medium are the reliable signals.
+  it('keeps the known V1 limitation: UNTAGGED fbclid alone is paid even on organic Facebook/Instagram clicks', () => {
+    // Facebook appends fbclid to ALL outbound clicks, organic included, so an untagged fbclid-only
+    // visit cannot be separated from a paid one. Pinned (not "fixed"); tagged organic links are handled above.
     expect(run({ landingUrl: lp('fbclid=IwAR1'), userAgent: UA.instagram })).toMatchObject({ trafficType: 'paid', channel: 'Instagram', channelGroup: 'Paid' });
   });
 });
