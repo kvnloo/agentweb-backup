@@ -945,7 +945,13 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           // drop it exactly as the existing-lead stamp above does.
           mergedCustomFields = incomingCustomFields;
           leadData.customFields = mergedCustomFields;
-          await mergeIntoExistingLead(createErr.existingLead);
+          // The carried row came off the eventually-consistent email-index GSI, so it can be
+          // OLDER than what the race winner is still writing — and the merge below writes the
+          // whole customFields map, so merging into the snapshot would drop keys the winner
+          // added after the projection. Re-read by primary key, consistently (one GetItem, race
+          // path only); fall back to the carried row only if that read comes back empty.
+          const fresh = await crmDb.getLeadById(leadList.listId, createErr.existingLead.leadId, { consistentRead: true });
+          await mergeIntoExistingLead(fresh || createErr.existingLead);
         } else if (!createErr?.leadAlreadyExists) {
           throw createErr;
         } else {
