@@ -8024,6 +8024,9 @@ export async function reconcileStaleScheduledRuns(now: number = Date.now()): Pro
 // can access, decides whether the schedule's prompt could be improved for future runs.
 // This is just another message to Emma — if it decides to improve the prompt, it calls
 // the same manage_scheduled_chat tool a user would, which records a revision automatically.
+// ENG-2234: hard cap on the prompt size self-improve may produce or keep rewriting.
+export const SELF_IMPROVE_MAX_PROMPT_CHARS = 8000;
+
 export async function runScheduleSelfImprovement(params: {
   schedule: any;
   sessionId: string;
@@ -8031,6 +8034,15 @@ export async function runScheduleSelfImprovement(params: {
   llmModel: string;
 }): Promise<void> {
   const { schedule, sessionId, userId, llmModel } = params;
+
+  // ENG-2234: a prompt that has already grown to the cap is not rewritten again —
+  // every reflection turn costs a full Emma turn and, unchecked, grows the prompt
+  // (one customer's schedule ballooned until runs ran out of budget).
+  const currentLength = typeof schedule?.startingMessage === 'string' ? schedule.startingMessage.length : 0;
+  if (currentLength >= SELF_IMPROVE_MAX_PROMPT_CHARS) {
+    console.log(`AgentMode: Skipping self-improve for schedule ${schedule?.scheduleId}: prompt is ${currentLength} chars (cap ${SELF_IMPROVE_MAX_PROMPT_CHARS}).`);
+    return;
+  }
 
   const reflectionPrompt = [
     'This was an automated scheduled run. Now reflect on it to help FUTURE runs of this same schedule do better.',
@@ -8040,6 +8052,7 @@ export async function runScheduleSelfImprovement(params: {
     `Then decide whether this schedule's instruction prompt (its starting_message) should be improved so future runs produce better results. If — and only if — you find a clear improvement, update it now by calling the manage_scheduled_chat tool with action "update" and schedule_id "${schedule.scheduleId}", passing the full improved starting_message.`,
     '',
     'Rules for any improved prompt: keep the same overall goal and any {{variables}} exactly as they are; only refine the wording/instructions to make future runs more reliable. Do not invent new variables. If the current prompt is already good, make no change and simply explain why.',
+    `The improved prompt must stay under ${SELF_IMPROVE_MAX_PROMPT_CHARS} characters (the current prompt is ${currentLength}). Prefer tightening or replacing instructions over appending new ones; never append run logs or history to the prompt.`,
   ].join('\n');
 
   // ENG-2204: this reflection turn is only ever reached from runScheduledChat
