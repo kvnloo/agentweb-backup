@@ -390,6 +390,8 @@ async function main(): Promise<void> {
   let pickerKeyBuffer = '';
   let escapeFlush: NodeJS.Timeout | undefined;
   const undoStack: Array<{ text: string; cursor: number }> = [];
+  const pickerUndoStack: Array<{ text: string; cursor: number }> = [];
+  const approvalUndoStack: Array<{ text: string; cursor: number }> = [];
 
   const render = (dockOnly = false) => {
     const dock = renderEmmaDock({
@@ -517,6 +519,8 @@ async function main(): Promise<void> {
 
   const closePicker = () => {
     pickerState = undefined;
+    pickerUndoStack.length = 0;
+    approvalUndoStack.length = 0;
     pickerKeyBuffer = '';
     clearTimeout(escapeFlush);
     escapeFlush = undefined;
@@ -551,6 +555,7 @@ async function main(): Promise<void> {
     const deck = session.pendingApprovalDeck;
     if (approvalDeckIsAwaiting(deck)) dismissedDecks.add(deck.deckId);
     approvalState = undefined;
+    approvalUndoStack.length = 0;
     pickerKeyBuffer = '';
     clearTimeout(escapeFlush);
     escapeFlush = undefined;
@@ -618,6 +623,7 @@ async function main(): Promise<void> {
       const sorted = filterSessions(sessions, '');
       const selected = Math.max(0, sorted.findIndex(item => item.sessionId === session.sessionId));
       pickerState = { sessions, query: '', cursor: 0, selected };
+      pickerUndoStack.length = 0;
       pickerKeyBuffer = '';
       errorText = undefined;
       render();
@@ -627,8 +633,12 @@ async function main(): Promise<void> {
     }
   };
 
-  const updatePickerQuery = (next: string, nextCursor: number) => {
+  const updatePickerQuery = (next: string, nextCursor: number, recordUndo = true) => {
     if (!pickerState) return;
+    if (recordUndo && next !== pickerState.query) {
+      pickerUndoStack.push({ text: pickerState.query, cursor: pickerState.cursor });
+      if (pickerUndoStack.length > 100) pickerUndoStack.shift();
+    }
     pickerState.query = next;
     pickerState.cursor = Math.max(0, Math.min(nextCursor, next.length));
     pickerState.selected = 0;
@@ -704,6 +714,7 @@ async function main(): Promise<void> {
     if (!deck || !approvalState) return;
     approvalState.itemIndex = Math.max(0, Math.min(deck.items.length - 1, approvalState.itemIndex + delta));
     approvalState.selectedVerdict = undefined;
+    approvalUndoStack.length = 0;
     syncApprovalSelection();
     render();
   };
@@ -851,6 +862,13 @@ async function main(): Promise<void> {
       void createNewSession();
       return;
     }
+    if (key.ctrl && key.name === 'z') {
+      const previous = pickerUndoStack.pop();
+      if (previous && pickerState) {
+        updatePickerQuery(previous.text, previous.cursor, false);
+      }
+      return;
+    }
 
     switch (key.name) {
       case 'escape':
@@ -981,8 +999,6 @@ async function main(): Promise<void> {
     return { from, to, text, cursor: nextCursor, len };
   };
 
-  const approvalUndoStack: Array<{ text: string; cursor: number }> = [];
-
   const applyEdit = (event: Record<string, unknown>) => {
     const edit = parseTextEdit(event);
     if (!edit) return;
@@ -1112,6 +1128,12 @@ async function main(): Promise<void> {
         applyEdit(event);
         break;
       case 'undo': {
+        if (event.id === 'session-picker' && pickerState) {
+          const previous = pickerUndoStack.pop();
+          if (!previous) break;
+          updatePickerQuery(previous.text, previous.cursor, false);
+          break;
+        }
         if (event.id === 'approval-note' && approvalState) {
           const previous = approvalUndoStack.pop();
           if (!previous) break;
