@@ -129,8 +129,11 @@ export function encodeTspMessage(
   const pieces = splitUtf8(body, limit);
   let out = '';
   for (let i = 0; i < pieces.length; i++) {
+    // TSP carries caller parameters only on the first chunk. Continuations
+    // carry c=<id> (+ m=1 when more follows), exactly like the official SDK.
+    const original = i === 0 ? base : '';
     const more = i < pieces.length - 1 ? ';m=1' : '';
-    out += frame(verb, `${base};c=${chunkId}${more}`, pieces[i]);
+    out += frame(verb, `${original};c=${chunkId}${more}`, pieces[i]);
   }
   return out;
 }
