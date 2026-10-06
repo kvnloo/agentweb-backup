@@ -53,6 +53,14 @@ export class AgentWebClient {
     return Array.isArray(response.data) ? response.data as EmmaSessionLike[] : [];
   }
 
+  async listScheduledSessions(limit = 20): Promise<EmmaSessionLike[]> {
+    const response = await this.http.get('/api/agent-mode/sessions', {
+      params: { sessionType: 'scheduled', limit },
+    });
+    const sessions = response.data?.sessions;
+    return Array.isArray(sessions) ? sessions as EmmaSessionLike[] : [];
+  }
+
   async getSession(sessionId: string): Promise<EmmaSessionLike> {
     const response = await this.http.get(
       `/api/chatbot/sessions/${encodeURIComponent(sessionId)}`,
