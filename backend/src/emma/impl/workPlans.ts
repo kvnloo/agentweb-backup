@@ -457,7 +457,32 @@ export async function applyPredefinedWorkPlan(
       ?? candidates.find((p) => p.title && normalizeWorkPlanTitleForMatch(p.title) === needle);
 
     if (!predefinedPlan) {
-      return { success: false, message: `Work plan template "${planTitleOrId}" not found` };
+      // ENG-1993: a bare "not found" left the model nothing to recover with, so it
+      // re-tried the same unresolvable name (7/9 failures in one reliability run).
+      // Return the closest accessible templates by stable planId and point at
+      // list_predefined_work_plans. Never auto-launch a guess: the ENG-1794/1814
+      // wrong-template incidents came from exactly that kind of silent fallback.
+      const needleTokens = needle.split(' ').filter((t) => t.length > 2);
+      const suggestions = candidates
+        .filter((p) => p.title && p.planId)
+        .map((p) => {
+          const title = normalizeWorkPlanTitleForMatch(p.title);
+          const score = needleTokens.filter((t) => title.includes(t)).length;
+          return { planId: p.planId as string, title: p.title as string, score };
+        })
+        .filter((s) => s.score > 0)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 5)
+        .map(({ planId, title }) => ({ planId, title }));
+      const hint = suggestions.length > 0
+        ? ` Closest accessible templates: ${suggestions.map((s) => `"${s.title}" (planId ${s.planId})`).join(', ')}. Confirm with the user which one they meant, then call launch_predefined_work_plan with that planId.`
+        : ' Call list_predefined_work_plans to see the templates available to this user, then retry with an exact planId.';
+      return {
+        success: false,
+        errorType: 'not_found',
+        message: `Work plan template "${planTitleOrId}" not found.${hint} Do not retry with the same name.`,
+        suggestions,
+      };
     }
     if (predefinedPlan.visibility === 'private' && (!userId || userId.startsWith('anon_'))) {
       return { success: false, message: 'Not authorized to use this private work plan' };
