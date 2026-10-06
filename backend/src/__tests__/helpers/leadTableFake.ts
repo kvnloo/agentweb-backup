@@ -217,6 +217,17 @@ export class LeadTableFake {
         const items = [...self.leads.values()].filter((l) => l.listId === v[':listId'] && typeof l.email === 'string' && l.email === v[':email']);
         return { Items: clone(items) };
       }),
+      put: wrap(async (p) => {
+        const t = self.table(p.TableName);
+        const store = t === 'leads' ? self.leads : self.lists;
+        const key = t === 'leads' ? self.leadKey(p.Item.listId, p.Item.leadId) : p.Item.listId;
+        const usedN = new Set<string>();
+        if (!self.checkCondition(p.ConditionExpression, store.get(key), p.ExpressionAttributeNames ?? {}, usedN)) {
+          throw Object.assign(new Error('The conditional request failed'), { code: 'ConditionalCheckFailedException' });
+        }
+        store.set(key, clone(marshal(p.Item)));
+        return {};
+      }),
       update: wrap(async (p) => {
         const t = self.table(p.TableName);
         const names = p.ExpressionAttributeNames ?? {};

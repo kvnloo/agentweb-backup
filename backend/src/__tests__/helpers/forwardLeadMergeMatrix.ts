@@ -3,6 +3,7 @@
  * throwaway dynamodb-local diff harness. Data only: no jest globals, so a plain node script can
  * import it.
  */
+import { phoneLeadId } from '../../utils/smokeTestLead';
 
 export const OLD = '2020-01-01T00:00:00.000Z';
 export const BROWSER_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)';
@@ -29,6 +30,9 @@ export const EXISTING: Record<string, any> = {
   },
   firstTouchOnly: { ...base, customFields: { source: 'lp', a: '1' }, firstTouch: { timestamp: OLD, utm: { source: 'seed' } } },
   legacyEmptyGsi: { ...base, firstName: 'Bob', linkedin: '', nameCompanyKey: '', customFields: { source: 'lp' } },
+  // denormalised attribution stored as empty strings (a CSV-import shape): an `if_not_exists`
+  // backfill would keep them, the snapshot check overwrites them — see the PR on why that stays
+  emptyDenorm: { ...base, firstName: 'Ann', customFields: { source: 'lp' }, utmSource: '', utmMedium: '' },
   noSource: { ...base, customFields: { a: 1, b: 2 } },
   noAttribution: { ...base, firstName: 'Ann', customFields: { source: 'lp' } },
 };
@@ -72,6 +76,8 @@ export const PAYLOADS: Record<string, Payload> = {
   },
   // an OWN `__proto__` key (what JSON.parse of a hostile body produces); the whole-map write dropped it
   protoKey: { body: JSON.parse('{"customFields":{"__proto__":{"x":1},"constructor":"c","ok":1}}') },
+  // the AI-readiness funnel: a valid `stage` makes the route mark the lead after sending the roadmap
+  roadmap: { body: { source: 'ai-readiness-popup', firstName: 'Rae', customFields: { stage: 3, q: 'x' } } },
   manyKeys: { body: { customFields: many(120, 'k') } },
   passthroughOverCap: { body: many(60, 'flat') },
 };
@@ -92,9 +98,55 @@ export const norm = (v: any): any => {
   return v;
 };
 
+// ── phone-only adopt branch (a synthetic smoke-test number: deterministic leadId, no email) ──
+export const PHONE = '4155550142';
+export const ADOPT_EXISTING: Record<string, any> = {
+  adoptBare: { listId: 'L0', leadId: phoneLeadId(PHONE), phone: PHONE, createdAt: OLD, updatedAt: OLD },
+  adoptFull: {
+    listId: 'L0', leadId: phoneLeadId(PHONE), phone: PHONE, firstName: 'Pat', company: 'Acme', createdAt: OLD, updatedAt: OLD,
+    customFields: { source: 'phone-lp', forwardedAt: OLD, a: 1, nested: { x: 1, y: 2 }, zero: 0 },
+  },
+};
+export const ADOPT_PAYLOADS: Record<string, Payload> = {
+  adoptEmpty: { body: {} },
+  adoptNewKey: { body: { customFields: { q1: 'yes' } } },
+  adoptChanged: { body: { customFields: { a: 2 } } },
+  adoptSameAfterNormalize: { body: { customFields: { a: '1' } } },
+  adoptSource: { body: { source: 'step2', customFields: { q2: 'x' } } },
+  adoptNames: { body: { firstName: 'Pat2', lastName: 'Q', company: 'Acme2' } },
+  adoptSpecialKeys: { body: { customFields: { domain: 'd', system: 's', name: 'n', 'a.b': 1 } } },
+  adoptEmptyValues: { body: { customFields: { a: '', b: null, c: 'v' } } },
+};
+
 export const CASES: Array<[string, string, string]> = [];
 for (const e of Object.keys(EXISTING)) for (const p of Object.keys(PAYLOADS)) CASES.push([e, p, 'normal']);
 // list-shape variants: the fieldNames sync must behave the same when the list row is bare or drifted
 for (const l of ['noFieldNames', 'drifted']) {
   for (const e of ['full', 'bare']) for (const p of ['emailOnly', 'newKey', 'names', 'attribution']) CASES.push([e, p, l]);
 }
+for (const e of Object.keys(ADOPT_EXISTING)) for (const p of Object.keys(ADOPT_PAYLOADS)) CASES.push([e, p, 'normal']);
+
+/**
+ * The reduced set committed to the repo as the permanent regression net: together these cases
+ * exercise every merge rule (precedence, source / forwardedAt, attribution matrix, match-quality,
+ * fieldNames incl. drift, GSI self-heal, bootstrap, chunking, special keys (chunking is covered by the crmDb unit test), roadmap marker, adopt
+ * branch). The FULL matrix (CASES) is the one-off migration proof recorded on the PR.
+ */
+export const REDUCED_KEYS = [
+  'full x emailOnly @ normal', 'full x sameValues @ normal', 'full x newKey @ normal', 'full x changedValue @ normal',
+  'full x namedSource @ normal', 'full x sourceInCustomFields @ normal', 'full x names @ normal',
+  'full x namesEqualAfterTrim @ normal', 'full x flatPassthrough @ normal', 'full x nestedKeyOrder @ normal',
+  'full x falsyValues @ normal', 'full x specialKeys @ normal', 'full x callerForwardedAt @ normal',
+  'full x protoKey @ normal', 'full x roadmap @ normal',
+  'bare x newKey @ normal', 'bare x emailOnly @ normal', 'bare x roadmap @ normal', 'noSource x newKey @ normal',
+  'attributed x attribution @ normal', 'attributed x lastTouchSeparate @ normal', 'attributed x matchQuality @ normal',
+  'attributed x everything @ normal', 'firstTouchOnly x attribution @ normal', 'firstTouchOnly x matchQuality @ normal',
+  'firstTouchOnly x matchQualityDeclared @ normal', 'noAttribution x attribution @ normal',
+  'noAttribution x promotedFromCustomFields @ normal', 'noAttribution x flatUtm @ normal',
+  'noAttribution x attributionOnly @ normal', 'emptyDenorm x attribution @ normal', 'legacyEmptyGsi x names @ normal',
+  'full x newKey @ drifted', 'full x names @ noFieldNames', 'bare x emailOnly @ noFieldNames',
+  'adoptBare x adoptNewKey @ normal', 'adoptBare x adoptEmpty @ normal', 'adoptFull x adoptEmpty @ normal',
+  'adoptFull x adoptNewKey @ normal', 'adoptFull x adoptChanged @ normal', 'adoptFull x adoptSameAfterNormalize @ normal',
+  'adoptFull x adoptSource @ normal', 'adoptFull x adoptNames @ normal', 'adoptFull x adoptSpecialKeys @ normal',
+  'adoptFull x adoptEmptyValues @ normal',
+];
