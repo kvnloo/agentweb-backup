@@ -1941,7 +1941,7 @@ describe('LinkedInOutreachService', () => {
       mockGetAccountsByUserId.mockResolvedValue([
         { platform: 'unipile', account_id: 'user-acct-123' },
       ]);
-      const liveSpy = jest.spyOn(linkedInOutreachService, 'isAccountConnected').mockResolvedValue(true);
+      const liveSpy = jest.spyOn(linkedInOutreachService, 'probeAccountSession').mockResolvedValue('connected');
 
       const result = await linkedInOutreachService.resolveAccountId('user-1');
 
@@ -1955,8 +1955,8 @@ describe('LinkedInOutreachService', () => {
         { platform: 'unipile', account_id: 'own-live' },
       ]);
       const liveSpy = jest
-        .spyOn(linkedInOutreachService, 'isAccountConnected')
-        .mockImplementation(async (id: string) => id === 'own-live');
+        .spyOn(linkedInOutreachService, 'probeAccountSession')
+        .mockImplementation(async (id: string) => (id === 'own-live' ? 'connected' : 'disconnected'));
 
       const result = await linkedInOutreachService.resolveAccountId('user-1');
 
@@ -1975,8 +1975,8 @@ describe('LinkedInOutreachService', () => {
         settingValue: JSON.stringify([{ account_id: 'site-live', enabled: true }]),
       });
       const liveSpy = jest
-        .spyOn(linkedInOutreachService, 'isAccountConnected')
-        .mockImplementation(async (id: string) => id === 'site-live');
+        .spyOn(linkedInOutreachService, 'probeAccountSession')
+        .mockImplementation(async (id: string) => (id === 'site-live' ? 'connected' : 'disconnected'));
 
       const result = await linkedInOutreachService.resolveAccountId('user-1');
 
@@ -1989,12 +1989,61 @@ describe('LinkedInOutreachService', () => {
         { platform: 'unipile', account_id: 'own-dead-1' },
       ]);
       mockGetSetting.mockResolvedValue(null);
-      const liveSpy = jest.spyOn(linkedInOutreachService, 'isAccountConnected').mockResolvedValue(false);
+      const liveSpy = jest.spyOn(linkedInOutreachService, 'probeAccountSession').mockResolvedValue('disconnected');
 
       const result = await linkedInOutreachService.resolveAccountId('user-1');
 
       expect(result).toBeNull();
       liveSpy.mockRestore();
+    });
+
+    it('returns an indeterminate site-wide account rather than null when Unipile itself is erroring (ENG-2205)', async () => {
+      // A platform-wide Unipile outage (502s from Unipile, not from us) makes every
+      // probe come back 'unknown' rather than a proven 'disconnected'. The pool must
+      // not collapse that into "no account configured" — it must hand back an
+      // account and let the real call surface the actual transient error.
+      mockGetAccountsByUserId.mockResolvedValue([]);
+      mockGetSetting.mockResolvedValue({
+        settingValue: JSON.stringify([{ account_id: 'site-unverifiable', enabled: true }]),
+      });
+      const probeSpy = jest.spyOn(linkedInOutreachService, 'probeAccountSession').mockResolvedValue('unknown');
+
+      const result = await linkedInOutreachService.resolveAccountId('user-1');
+
+      expect(result).toBe('site-unverifiable');
+      probeSpy.mockRestore();
+    });
+
+    it('prefers an indeterminate OWN account over an indeterminate site-wide account', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'own-unverifiable' },
+      ]);
+      mockGetSetting.mockResolvedValue({
+        settingValue: JSON.stringify([{ account_id: 'site-unverifiable', enabled: true }]),
+      });
+      const probeSpy = jest.spyOn(linkedInOutreachService, 'probeAccountSession').mockResolvedValue('unknown');
+
+      const result = await linkedInOutreachService.resolveAccountId('user-1');
+
+      expect(result).toBe('own-unverifiable');
+      probeSpy.mockRestore();
+    });
+
+    it('still prefers a proven-connected site-wide account over an indeterminate own account', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'own-unverifiable' },
+      ]);
+      mockGetSetting.mockResolvedValue({
+        settingValue: JSON.stringify([{ account_id: 'site-live', enabled: true }]),
+      });
+      const probeSpy = jest
+        .spyOn(linkedInOutreachService, 'probeAccountSession')
+        .mockImplementation(async (id: string) => (id === 'site-live' ? 'connected' : 'unknown'));
+
+      const result = await linkedInOutreachService.resolveAccountId('user-1');
+
+      expect(result).toBe('site-live');
+      probeSpy.mockRestore();
     });
 
     it('returns site-wide account_id when user has no account but site-wide accounts are configured', async () => {
@@ -2060,7 +2109,7 @@ describe('LinkedInOutreachService', () => {
       mockGetAccountsByUserId.mockResolvedValue([
         { platform: 'unipile', account_id: 'user-acct-123' },
       ]);
-      const liveSpy = jest.spyOn(linkedInOutreachService, 'isAccountConnected').mockResolvedValue(true);
+      const liveSpy = jest.spyOn(linkedInOutreachService, 'probeAccountSession').mockResolvedValue('connected');
 
       const result = await linkedInOutreachService.resolveAccountIdWithSource('user-1');
 
@@ -2076,13 +2125,26 @@ describe('LinkedInOutreachService', () => {
         settingValue: JSON.stringify([{ account_id: 'site-live', enabled: true }]),
       });
       const liveSpy = jest
-        .spyOn(linkedInOutreachService, 'isAccountConnected')
-        .mockImplementation(async (id: string) => id === 'site-live');
+        .spyOn(linkedInOutreachService, 'probeAccountSession')
+        .mockImplementation(async (id: string) => (id === 'site-live' ? 'connected' : 'disconnected'));
 
       const result = await linkedInOutreachService.resolveAccountIdWithSource('user-1');
 
       expect(result).toEqual({ accountId: 'site-live', usedSharedAccount: true });
       liveSpy.mockRestore();
+    });
+
+    it('reports usedSharedAccount: true for an indeterminate site-wide account when nothing is provably connected (ENG-2205)', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([]);
+      mockGetSetting.mockResolvedValue({
+        settingValue: JSON.stringify([{ account_id: 'site-unverifiable', enabled: true }]),
+      });
+      const probeSpy = jest.spyOn(linkedInOutreachService, 'probeAccountSession').mockResolvedValue('unknown');
+
+      const result = await linkedInOutreachService.resolveAccountIdWithSource('user-1');
+
+      expect(result).toEqual({ accountId: 'site-unverifiable', usedSharedAccount: true });
+      probeSpy.mockRestore();
     });
 
     it('reports usedSharedAccount: false when nothing can be resolved', async () => {
