@@ -73,6 +73,7 @@ export function assertMemoryContentWithinLimit(content: string, field = 'content
     + `identically. Shorten it to the essential fact, or split it into multiple memories of `
     + `at most ${MEMORY_CONTENT_MAX_CHARS} characters each, then save again. `
     + `Suggested split point: character ${split} (first part ends "...${tail}"); save the first `
-    + `${split} characters, then the remaining ${length - split} as a second memory.`,
+    + `${split} characters, then split the remaining ${length - split} into further memories of at most `
+    + `${MEMORY_CONTENT_MAX_CHARS} characters each.`,
   );
 }
