@@ -10,7 +10,9 @@
  *      dropping loses telemetry, never a lead (lead saves go through forward-lead, which has no limiter here);
  *   3. strict body parsing (utils/trackingIngest): allow-listed event, bounded fields, valid session identity;
  *   4. the list is resolved server-side from `listId` and must be a session list with public access ON
- *      (listType is set-once and server-owned: a body can never opt a list in);
+ *      (listType is set-once and server-owned: a body can never opt a list in). The row comes from a
+ *      <=20s in-process cache (ENG-2325, utils/ingestListCache): a disabled list / shrunk allowedOrigins
+ *      is honoured at once by the instance that took the change and by the others within one TTL;
  *   5. a browser's Origin must be in the list's trackingConfig.allowedOrigins (empty list = no browsers).
  *      A request WITHOUT an Origin header (a server, curl) is not a browser cross-site request and is
  *      allowed through steps 1-4 only; it can write nothing a browser could not, to a list whose id it knows.
@@ -19,8 +21,7 @@
  */
 import express, { NextFunction, Request, Response } from 'express';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
-import { crmDb } from '../services/db';
-import { ingestTrackerEvent } from '../services/trackerIngestService';
+import { getIngestList, ingestTrackerEvent } from '../services/trackerIngestService';
 import { isSessionList } from '../utils/sessionList';
 import { parseIngestBody } from '../utils/trackingIngest';
 import { isOriginAllowed, isPlausibleListId } from '../utils/trackingConfig';
@@ -112,26 +113,26 @@ export function createTrackIngestRouter(opts: { rateLimiter?: express.RequestHan
       }
       const { value } = parsed;
 
-      const list = await crmDb.getLeadListById(value.listId);
+      const list = await getIngestList(value.listId);
       if (!list) {
         res.status(404).json({ success: false, code: 'list_not_found' });
         return;
       }
       // Both conditions from the row the DATABASE returned. Same message for both: whether a list
       // is a session list is not something an anonymous caller needs to learn.
-      if (!isSessionList(list) || (list as any).publicAccessEnabled !== true) {
+      if (!isSessionList(list) || list.publicAccessEnabled !== true) {
         res.status(403).json({ success: false, code: 'tracking_not_enabled' });
         return;
       }
       const origin = req.headers.origin;
-      if (origin !== undefined && (typeof origin !== 'string' || !isOriginAllowed((list as any).trackingConfig, origin))) {
+      if (origin !== undefined && (typeof origin !== 'string' || !isOriginAllowed(list.trackingConfig, origin))) {
         res.status(403).json({ success: false, code: 'origin_not_allowed' });
         return;
       }
 
       const xff = req.headers['x-forwarded-for']?.toString().split(',')[0]?.trim();
       await ingestTrackerEvent({
-        list: list as Record<string, any>,
+        list,
         parsed: value,
         userAgent: String(req.headers['user-agent'] ?? '').slice(0, 512),
         visitorIp: xff || req.ip || '',

@@ -6,6 +6,7 @@ import request from 'supertest';
 import express from 'express';
 import { crmDb } from '../../services/db';
 import { createTrackIngestRouter, createIngestRateLimiter, createIngestIpRateLimiter, trackBodyParser } from '../trackIngest';
+import { ingestListCache } from '../../utils/ingestListCache';
 import { sessionLeadId } from '../../utils/sessionList';
 
 jest.mock('../../services/db', () => ({
@@ -40,6 +41,7 @@ const post = (app: express.Express, body: unknown, headers: Record<string, strin
 describe('POST /api/track/event: segment routing (ENG-2316)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    ingestListCache.clear(); // ENG-2325: the ingest caches the list row; every test starts cold
     (crmDb.createLead as jest.Mock).mockImplementation(async (_l: string, d: any) => ({ ...d }));
     (crmDb.getLeadListById as jest.Mock).mockImplementation(async (id: string) => id === LIST_ID
       ? sessionList({ trackingConfig: { allowedOrigins: [ORIGIN], routing: [{ id: 'organic', match: { trafficType: 'organic' }, childListId: 'list_child_org1' }] } })
@@ -68,6 +70,7 @@ describe('POST /api/track/event: segment routing (ENG-2316)', () => {
 describe('POST /api/track/event', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    ingestListCache.clear(); // ENG-2325: the ingest caches the list row; every test starts cold
     (crmDb.getLeadListById as jest.Mock).mockResolvedValue(sessionList());
     (crmDb.createLead as jest.Mock).mockImplementation(async (_l: string, d: any) => ({ ...d }));
     (crmDb.mergeSessionLeadEvent as jest.Mock).mockResolvedValue({ exists: true, changed: true, guardApplied: true });
@@ -299,5 +302,83 @@ describe('POST /api/track/event', () => {
     const res = await post(makeApp(), event());
     expect(res.status).toBe(500);
     expect(JSON.stringify(res.body)).not.toMatch(/AW-Leads|Provisioned/);
+  });
+});
+
+describe('POST /api/track/event: list-read cache (ENG-2325)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    ingestListCache.clear();
+    (crmDb.getLeadListById as jest.Mock).mockResolvedValue(sessionList());
+    (crmDb.createLead as jest.Mock).mockImplementation(async (_l: string, d: any) => ({ ...d }));
+    (crmDb.mergeSessionLeadEvent as jest.Mock).mockResolvedValue({ exists: true, changed: true, guardApplied: true });
+  });
+
+  it('N events for one list = ONE list read (a consistent one); the events themselves all land', async () => {
+    const app = makeApp();
+    for (let i = 0; i < 40; i++) expect((await post(app, event({ eventCount: i + 1 }))).status).toBe(204);
+    expect(crmDb.getLeadListById).toHaveBeenCalledTimes(1);
+    expect(crmDb.getLeadListById).toHaveBeenCalledWith(LIST_ID, { consistentRead: true });
+    expect((crmDb.createLead as jest.Mock).mock.calls.length + (crmDb.mergeSessionLeadEvent as jest.Mock).mock.calls.length).toBe(40);
+  });
+
+  it('SECURITY: the gates are evaluated against the cached row on EVERY request (a cached allowed origin does not admit another)', async () => {
+    const app = makeApp();
+    expect((await post(app, event())).status).toBe(204);
+    expect((await post(app, event(), { Origin: 'https://evil.test' })).status).toBe(403);
+    expect((await post(app, event(), { Origin: 'https://evil.test' })).body.code).toBe('origin_not_allowed');
+    expect((await post(app, event())).status).toBe(204);
+    expect(crmDb.getLeadListById).toHaveBeenCalledTimes(1);
+  });
+
+  it('a list that is DISABLED stops accepting once the entry is invalidated (this process) ...', async () => {
+    const app = makeApp();
+    expect((await post(app, event())).status).toBe(204);
+    (crmDb.getLeadListById as jest.Mock).mockResolvedValue(sessionList({ publicAccessEnabled: false }));
+    expect((await post(app, event())).status).toBe(204); // other instance's view: still cached, within the TTL
+    ingestListCache.invalidate(LIST_ID);                  // what crmDb.updateLeadList does on the instance that took the change
+    const res = await post(app, event());
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe('tracking_not_enabled');
+  });
+
+  it('... and a shrunk allowedOrigins stops admitting the removed origin the same way', async () => {
+    const app = makeApp();
+    expect((await post(app, event())).status).toBe(204);
+    (crmDb.getLeadListById as jest.Mock).mockResolvedValue(sessionList({ trackingConfig: { allowedOrigins: ['https://other.example.com'] } }));
+    ingestListCache.invalidate(LIST_ID);
+    expect((await post(app, event())).status).toBe(403);
+  });
+
+  it('... and within one TTL on an instance that was NOT told (clock past the TTL, no invalidate)', async () => {
+    const real = Date.now;
+    let t = real();
+    jest.spyOn(Date, 'now').mockImplementation(() => t);
+    try {
+      const app = makeApp();
+      expect((await post(app, event({ sessionStartMs: t - 5000 }))).status).toBe(204);
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(sessionList({ publicAccessEnabled: false }));
+      t += 19_000;
+      expect((await post(app, event({ sessionStartMs: t - 5000 }))).status).toBe(204);
+      t += 2_000;
+      expect((await post(app, event({ sessionStartMs: t - 5000 }))).status).toBe(403);
+    } finally { jest.restoreAllMocks(); }
+  });
+
+  it('a non-session list and a list that does not exist are still refused (and the unknown id is negatively cached, bounded)', async () => {
+    (crmDb.getLeadListById as jest.Mock).mockResolvedValue(sessionList({ listType: undefined }));
+    expect((await post(makeApp(), event())).status).toBe(403);
+    ingestListCache.clear();
+    (crmDb.getLeadListById as jest.Mock).mockResolvedValue(null);
+    for (let i = 0; i < 5; i++) expect((await post(makeApp(), event())).status).toBe(404);
+    expect(crmDb.getLeadListById).toHaveBeenCalledTimes(2);
+  });
+
+  it('a database failure is not cached: the next event retries and succeeds', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    (crmDb.getLeadListById as jest.Mock).mockRejectedValueOnce(new Error('throttled'));
+    const app = makeApp();
+    expect((await post(app, event())).status).toBe(500);
+    expect((await post(app, event())).status).toBe(204);
   });
 });

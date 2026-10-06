@@ -34,6 +34,14 @@ export const SESSION_LIST_SEQUENCE_ERROR =
   'Session lists hold per-visitor session telemetry and cannot be bound to or enrolled in a sequence.';
 
 /**
+ * Shown wherever a landing page's lead capture would be bound to a session list (ENG-2323). A page's
+ * form writes real contacts; into a session list they would become visit rows that are suppressed
+ * (no sequences / sync / alerts) and excluded from the Inbox and every contact aggregate.
+ */
+export const SESSION_LIST_LEAD_CAPTURE_ERROR =
+  'Session lists hold website-visit telemetry and cannot be a landing page\'s lead list. Choose a regular lead list.';
+
+/**
  * Drops session lists from a list-of-lists before a cross-list AGGREGATE (lead counts,
  * attribution coverage, "recent leads" rankers, the Inbox). One synthetic-email row per
  * visit would otherwise swamp every total and eat shared scan caps. Lists with an unset or
