@@ -92,4 +92,16 @@ describe('ENG-1212 AC4 — /usage must not ship internal dollars', () => {
     expect(original.costUsed).toBe(214.37);
     expect(original.costAllowance).toBe(350);
   });
+  // ENG-1250 AC7: token volume is no longer measured. The customer portal's token line renders only
+  // when `typeof used === "number"`, so a 0 here would print a false "0 tokens used this month".
+  it('omits `used` when no token limit applies, so the portal hides the token line (not a false 0)', () => {
+    const projected = toCustomerTokenUsage(status({ used: 0, allowance: null, effectiveAllowance: null, percentUsed: 0 }));
+
+    expect(projected).not.toHaveProperty('used');
+    expect(JSON.stringify(projected)).not.toContain('"used"');
+  });
+
+  it('still reports `used` when a token limit exists', () => {
+    expect(toCustomerTokenUsage(status()).used).toBe(90_000);
+  });
 });

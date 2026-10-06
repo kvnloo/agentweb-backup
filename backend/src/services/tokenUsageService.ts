@@ -52,7 +52,13 @@ export interface TokenUsageStatus {
  * `costUsed` and `costAllowance` are dropped. `hasCostAllowance` replaces the
  * only thing the client ever did with the latter — a null check.
  */
-export type CustomerTokenUsageStatus = Omit<TokenUsageStatus, 'costUsed' | 'costAllowance'> & {
+export type CustomerTokenUsageStatus = Omit<TokenUsageStatus, 'costUsed' | 'costAllowance' | 'used'> & {
+  /**
+   * Token volume used this month. ABSENT when no token limit applies (ENG-1250 AC7: token volume is no
+   * longer measured), so the portal's `typeof used === "number"` check hides its token meter instead of
+   * rendering a false "0 tokens used this month".
+   */
+  used?: number;
   /**
    * Whether a dollar ceiling exists at all, without saying what it is.
    *
@@ -92,9 +98,10 @@ export type CustomerTokenUsageStatus = Omit<TokenUsageStatus, 'costUsed' | 'cost
  * emailService and the policy services keep the figures they need.
  */
 export function toCustomerTokenUsage(status: TokenUsageStatus): CustomerTokenUsageStatus {
-  const { costUsed: _costUsed, costAllowance, ...customerSafe } = status;
+  const { costUsed: _costUsed, costAllowance, used, ...customerSafe } = status;
   return {
     ...customerSafe,
+    ...(status.effectiveAllowance === null ? {} : { used }),
     hasCostAllowance: costAllowance != null,
     usageBlock: buildUsageBlockCopy({ month: status.month }),
   };
