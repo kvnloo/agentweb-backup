@@ -876,6 +876,9 @@ export async function listAllClients(callerUserId: string, callerIsAdmin?: boole
     // This month's settled spend per account, from the ledger in one batched read (it replaces
     // the retired legacy counter). Secondary to the health signals, so a failed read must not
     // fail the whole sweep: log it and leave spend_current null rather than invent a figure.
+    // Keyed by each client's own id, not their billing owner, to keep the old per-account meaning: pooled
+    // usage was charged to the owner's counter only, so a member's own was null. The owner's row carries
+    // the pooled total.
     const spendMonth = new Date().toISOString().slice(0, 7);
     let spendByUser = new Map<string, { settledMicroUsd: number }>();
     try {

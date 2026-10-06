@@ -797,6 +797,9 @@ router.get("/users", async (req, res) => {
     // from the spend ledger in one batched read, not the retired legacy counter. It is a
     // secondary signal, so a failed read must not take the whole roster down: log it and
     // treat usage as unknown (staffOperatedSuspect false) rather than silently inventing it.
+    // Keyed by each ACCOUNT's own id, deliberately not its billing owner: the counter this replaces was
+    // per-account, and pooled usage was charged to the owner's counter only, so a member's own was always
+    // empty. Resolving to the owner would flag every member of an org because the owner spent.
     let spendingThisMonth = new Map<string, { settledMicroUsd: number }>();
     try {
       spendingThisMonth = await getProjectionsBatch(
