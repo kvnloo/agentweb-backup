@@ -69,6 +69,11 @@ jest.mock('aws-sdk', () => {
         mockDynamoWrites.push(params);
         return { promise: async () => ({}) };
       },
+      // ENG-2321: an email lead is now created in a transaction; the lead row is its Put.
+      transactWrite: (params: any) => {
+        for (const t of params.TransactItems) if (t.Put) mockDynamoWrites.push(t.Put);
+        return { promise: async () => ({}) };
+      },
       update: () => ({ promise: async () => ({}) }),
       delete: () => ({ promise: async () => ({}) }),
       scan: () => ({ promise: async () => ({ Items: [] }) }),
