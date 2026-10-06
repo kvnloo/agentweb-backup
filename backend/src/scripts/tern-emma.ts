@@ -8,9 +8,14 @@ import {
   TspStreamReader,
 } from '../tern/protocol';
 import {
+  ApprovalDeckInboundAnswer,
+  ApprovalDeckUiState,
   EmmaMessage,
   EmmaSessionLike,
+  approvalDeckAllAnswered,
+  approvalDeckIsAwaiting,
   filterSessions,
+  renderApprovalDeck,
   renderEmmaDock,
   renderEmmaMain,
   renderEmptyLayer,
@@ -331,6 +336,8 @@ async function main(): Promise<void> {
   let errorText: string | undefined;
   let rendered = false;
   let pickerState: SessionPickerState | undefined;
+  let approvalState: ApprovalDeckUiState | undefined;
+  const dismissedDecks = new Set<string>();
   let pickerKeyBuffer = '';
   let escapeFlush: NodeJS.Timeout | undefined;
   const undoStack: Array<{ text: string; cursor: number }> = [];
@@ -345,9 +352,11 @@ async function main(): Promise<void> {
     });
     const layer = pickerState
       ? renderSessionPicker(pickerState, session.sessionId)
-      : renderEmptyLayer();
+      : approvalState && approvalDeckIsAwaiting(session.pendingApprovalDeck)
+        ? renderApprovalDeck(session.pendingApprovalDeck, approvalState)
+        : renderEmptyLayer();
 
-    const focusComposer = !pickerState ? [['focus', 'composer']] : [];
+    const focusComposer = !pickerState && !approvalState ? [['focus', 'composer']] : [];
 
     if (!rendered) {
       const mainNode = renderEmmaMain(session, runningTools);
@@ -361,7 +370,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    if (dockOnly && !pickerState) {
+    if (dockOnly && !pickerState && !approvalState) {
       frames.request([
         ['del', 'dock'],
         nodeAdd(dock),
@@ -390,6 +399,28 @@ async function main(): Promise<void> {
     render();
   };
 
+  const maybeOpenApprovalDeck = () => {
+    const deck = session.pendingApprovalDeck;
+    if (!approvalDeckIsAwaiting(deck) || dismissedDecks.has(deck.deckId)) {
+      approvalState = undefined;
+      return;
+    }
+    if (approvalState && session.pendingApprovalDeck?.deckId === deck.deckId) return;
+    approvalState = { itemIndex: 0, answers: [] };
+    pickerState = undefined;
+    pickerKeyBuffer = '';
+  };
+
+  const closeApprovalDeck = () => {
+    const deck = session.pendingApprovalDeck;
+    if (approvalDeckIsAwaiting(deck)) dismissedDecks.add(deck.deckId);
+    approvalState = undefined;
+    pickerKeyBuffer = '';
+    clearTimeout(escapeFlush);
+    escapeFlush = undefined;
+    render();
+  };
+
   const visiblePickerSessions = (): EmmaSessionLike[] =>
     pickerState ? filterSessions(pickerState.sessions, pickerState.query) : [];
 
@@ -408,7 +439,10 @@ async function main(): Promise<void> {
       cursor = 0;
       errorText = undefined;
       undoStack.length = 0;
-      closePicker();
+      pickerState = undefined;
+      approvalState = undefined;
+      maybeOpenApprovalDeck();
+      render();
     } catch (error) {
       errorText = error instanceof Error ? error.message : String(error);
       render();
@@ -423,7 +457,9 @@ async function main(): Promise<void> {
       cursor = 0;
       errorText = undefined;
       undoStack.length = 0;
-      closePicker();
+      pickerState = undefined;
+      approvalState = undefined;
+      render();
     } catch (error) {
       errorText = error instanceof Error ? error.message : String(error);
       render();
@@ -437,6 +473,7 @@ async function main(): Promise<void> {
 
   const openSessionPicker = async () => {
     if (running) return;
+    approvalState = undefined;
     try {
       const sessions = await client.listEmmaSessions(50);
       if (!sessions.some(item => item.sessionId === session.sessionId)) sessions.unshift(session);
@@ -461,7 +498,152 @@ async function main(): Promise<void> {
     render();
   };
 
+  const currentApprovalDeck = () =>
+    approvalDeckIsAwaiting(session.pendingApprovalDeck) ? session.pendingApprovalDeck : undefined;
+
+  const approvalChoices = () => {
+    const deck = currentApprovalDeck();
+    const item = deck?.items[approvalState?.itemIndex ?? -1];
+    if (!item) return [];
+    if (item.metaWriteManifestDigest) {
+      return [
+        { id: 'approve', label: 'Approve' },
+        { id: 'reject', label: 'Reject' },
+      ];
+    }
+    return item.options ?? [];
+  };
+
+  const syncApprovalSelection = () => {
+    const deck = currentApprovalDeck();
+    if (!deck || !approvalState) return;
+    const item = deck.items[approvalState.itemIndex];
+    if (!item) return;
+    const existing = approvalState.answers.find(answer => answer.itemId === item.itemId);
+    const choices = approvalChoices();
+    approvalState.selectedVerdict =
+      existing?.verdict
+      || choices.find((choice: any) => choice.recommended)?.id
+      || choices[0]?.id;
+  };
+
+  const recordApprovalChoice = (delegated = false): boolean => {
+    const deck = currentApprovalDeck();
+    if (!deck || !approvalState) return false;
+    const item = deck.items[approvalState.itemIndex];
+    if (!item) return false;
+
+    let answer: ApprovalDeckInboundAnswer;
+    if (delegated) {
+      if (!item.allowEmmaDecide || item.metaWriteManifestDigest) return false;
+      answer = { itemId: item.itemId, verdict: '', delegated: true };
+    } else {
+      const verdict = approvalState.selectedVerdict;
+      if (!verdict) return false;
+      answer = { itemId: item.itemId, verdict };
+    }
+
+    approvalState.answers = [
+      ...approvalState.answers.filter(existing => existing.itemId !== item.itemId),
+      answer,
+    ];
+    return true;
+  };
+
+  const moveApproval = (delta: number) => {
+    const deck = currentApprovalDeck();
+    if (!deck || !approvalState) return;
+    approvalState.itemIndex = Math.max(0, Math.min(deck.items.length - 1, approvalState.itemIndex + delta));
+    approvalState.selectedVerdict = undefined;
+    syncApprovalSelection();
+    render();
+  };
+
+  const submitApprovalDeck = async () => {
+    const deck = currentApprovalDeck();
+    if (!deck || !approvalState || running || !approvalDeckAllAnswered(deck, approvalState)) return;
+    running = true;
+    errorText = undefined;
+    const answers = [...approvalState.answers];
+    approvalState = undefined;
+    render();
+
+    try {
+      session = await client.submitApprovalDeck(session, deck.deckId, answers);
+      dismissedDecks.delete(deck.deckId);
+      maybeOpenApprovalDeck();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : String(error);
+      try {
+        session = await client.getSession(session.sessionId);
+      } catch {
+        // Keep the existing session and surface the error in the status line.
+      }
+      if (approvalDeckIsAwaiting(session.pendingApprovalDeck)) {
+        approvalState = { itemIndex: 0, answers };
+        syncApprovalSelection();
+      }
+    } finally {
+      running = false;
+      render();
+    }
+  };
+
+  const chooseApprovalAndAdvance = (delegated = false) => {
+    const deck = currentApprovalDeck();
+    if (!deck || !approvalState || !recordApprovalChoice(delegated)) return;
+    if (approvalState.itemIndex < deck.items.length - 1) {
+      moveApproval(1);
+    } else {
+      render();
+    }
+  };
+
   const handlePickerKey = (key: PickerKey) => {
+    if (approvalState) {
+      const choices = approvalChoices();
+      const current = approvalState.selectedVerdict;
+      let selectedIndex = Math.max(0, choices.findIndex((choice: any) => choice.id === current));
+
+      if (key.ctrl && key.name === 'c') {
+        closeAndExit(130);
+        return;
+      }
+      if (key.ctrl && key.name === 'enter') {
+        void submitApprovalDeck();
+        return;
+      }
+      if (key.name === 'escape') {
+        closeApprovalDeck();
+        return;
+      }
+      if (key.name === 'left') {
+        moveApproval(-1);
+        return;
+      }
+      if (key.name === 'right') {
+        const deck = currentApprovalDeck();
+        if (deck && approvalState.itemIndex < deck.items.length - 1) moveApproval(1);
+        return;
+      }
+      if (key.name === 'up' || key.name === 'down') {
+        selectedIndex += key.name === 'up' ? -1 : 1;
+        selectedIndex = Math.max(0, Math.min(choices.length - 1, selectedIndex));
+        approvalState.selectedVerdict = choices[selectedIndex]?.id;
+        render();
+        return;
+      }
+      if (key.name === 'enter') {
+        chooseApprovalAndAdvance(false);
+        return;
+      }
+      if (!key.ctrl && key.name === 'd') {
+        chooseApprovalAndAdvance(true);
+        return;
+      }
+      return;
+    }
+
     if (!pickerState) {
       if (key.ctrl && key.name === 'c') closeAndExit(130);
       return;
@@ -575,7 +757,7 @@ async function main(): Promise<void> {
   };
 
   rawHandler = raw => {
-    if (!pickerState) {
+    if (!pickerState && !approvalState) {
       if (raw.includes('\x03')) closeAndExit(130);
       return;
     }
@@ -698,6 +880,7 @@ async function main(): Promise<void> {
         session = await client.getSession(session.sessionId);
       }
       errorText = complete.error ? 'Last turn failed' : undefined;
+      maybeOpenApprovalDeck();
     } catch (error) {
       errorText = error instanceof Error ? error.message : String(error);
       try {
@@ -736,6 +919,12 @@ async function main(): Promise<void> {
         break;
       case 'select':
       case 'activate': {
+        if (event.id === 'approval-picker' && typeof event.item === 'string' && approvalState) {
+          approvalState.selectedVerdict = event.item;
+          if (event.ev === 'activate') chooseApprovalAndAdvance(false);
+          else render();
+          break;
+        }
         if (event.id !== 'session-picker' || typeof event.item !== 'string' || !pickerState) break;
         const visible = visiblePickerSessions();
         const index = visible.findIndex(item => item.sessionId === event.item);
@@ -748,6 +937,15 @@ async function main(): Promise<void> {
       case 'action': {
         if (event.act === 'sessions' && event.id === 'status.sessions') {
           void openSessionPicker();
+          break;
+        }
+        if (event.id === 'approval-picker' && approvalState) {
+          if (event.act === 'choose') chooseApprovalAndAdvance(false);
+          else if (event.act === 'delegate') chooseApprovalAndAdvance(true);
+          else if (event.act === 'prev') moveApproval(-1);
+          else if (event.act === 'next') moveApproval(1);
+          else if (event.act === 'submit') void submitApprovalDeck();
+          else if (event.act === 'close' || event.act === 'cancel') closeApprovalDeck();
           break;
         }
         if (event.id !== 'session-picker') break;
@@ -764,7 +962,7 @@ async function main(): Promise<void> {
       case 'error':
         if (typeof event.msg === 'string') {
           errorText = event.msg;
-          render(pickerState === undefined);
+          render(pickerState === undefined && approvalState === undefined);
         }
         break;
       default:
@@ -772,6 +970,8 @@ async function main(): Promise<void> {
     }
   };
 
+  maybeOpenApprovalDeck();
+  if (approvalState) syncApprovalSelection();
   render();
 }
 
