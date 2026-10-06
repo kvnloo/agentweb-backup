@@ -30,9 +30,11 @@ export async function upsertSessionLead(input: {
   /** The merged custom fields (same object as leadData.customFields). */
   customFields: Record<string, any>;
   callerSuppliedSource: boolean;
+  /** Extra keys to guard with the journey counter (see buildSessionMergePlan). Omitted by forward-lead. */
+  journeyKeys?: readonly string[];
   touch?: any;
 }): Promise<{ lead: any; isNew: boolean; isUpdated: boolean; leadId: string }> {
-  const { listId, identity, leadData, customFields, callerSuppliedSource, touch } = input;
+  const { listId, identity, leadData, customFields, callerSuppliedSource, journeyKeys, touch } = input;
 
   // The monotonic journey guard compares numerically (a string never compares <= a number in
   // DynamoDB), so a counter an LP sent as "5" is stored as 5. Mutates in place on purpose:
@@ -58,7 +60,7 @@ export async function upsertSessionLead(input: {
       if (!createErr?.leadAlreadyExists) throw createErr;
 
       const plan = buildSessionMergePlan({
-        leadData, incomingCustomFields: customFields, callerSuppliedSource, touch,
+        leadData, incomingCustomFields: customFields, callerSuppliedSource, touch, journeyKeys,
       });
       const merged = await crmDb.mergeSessionLeadEvent(listId, leadId, plan);
       // Row vanished between the failed create and the merge (owner deleted it): loop once
