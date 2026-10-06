@@ -558,6 +558,15 @@ describe('apiTools', () => {
       expect(mockMcpFetch.mock.calls[0][0].body).toEqual({ htmlPath: 'public/offer.html' });
     });
 
+    it('stops BEFORE the route when publish consent was withdrawn mid-run (unattended schedule), like its sibling', async () => {
+      const assertPublishStillAuthorized = jest.fn(async () => ({ error: 'Publishing was withdrawn for this schedule' }));
+      // the handler itself (the registry attaches its own hook in front of it; see sessionTracking.consentGate.test.ts)
+      const res: any = await mcpToolRegistry.getTool('enable_session_tracking')!.execute({ page_id: 'p1' }, { ...context, assertPublishStillAuthorized });
+      expect(assertPublishStillAuthorized).toHaveBeenCalled();
+      expect(mockMcpFetch).not.toHaveBeenCalled();
+      expect(JSON.stringify(res)).toContain('withdrawn');
+    });
+
     it('propagates a refusal from the route (e.g. the page already has a tracker)', async () => {
       mockMcpFetch.mockRejectedValue(new Error('API error (409): This page already carries its own tracker'));
       await expect(mcpToolRegistry.execute('enable_session_tracking', { page_id: 'p1' }, context)).rejects.toThrow('already carries its own tracker');

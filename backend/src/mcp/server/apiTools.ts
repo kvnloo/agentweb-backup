@@ -1996,6 +1996,10 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
+    // ENG-827: this commits to a customer's live repo, so it honours the same last-moment consent re-check
+    // as publish_landing_page_changes (an unattended schedule whose consent was withdrawn mid-run stops here).
+    const withdrawn = await publishWithdrawnMidFlight(context);
+    if (withdrawn) return jsonResult({ success: false, message: withdrawn.error });
     const data = await mcpFetch({
       method: 'POST', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/session-tracking`, context: ctx(context),
       body: { ...(args.html_path ? { htmlPath: args.html_path } : {}) }
