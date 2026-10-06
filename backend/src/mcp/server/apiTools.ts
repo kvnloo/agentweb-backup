@@ -12,6 +12,7 @@ import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContent
 
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
+import './adminLookupTools';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 
