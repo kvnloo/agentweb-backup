@@ -23,6 +23,7 @@ export interface RecordReliabilityEventInput {
 export interface ReliabilityEventSink {
   record(input: RecordReliabilityEventInput): ReliabilityEvent | null;
   drain(): ReliabilityEvent[];
+  snapshot(): ReliabilityEvent[];
   size(): number;
   clear(): void;
 }
@@ -54,6 +55,12 @@ class MemoryReliabilityEventSink implements ReliabilityEventSink {
     return copy;
   }
 
+  snapshot(): ReliabilityEvent[] {
+    // Return detached records so a read-only proposal consumer cannot mutate
+    // the sink's canonical evidence through object references.
+    return this.buffer.map((event) => ({ ...event }));
+  }
+
   size(): number {
     return this.buffer.length;
   }
@@ -66,6 +73,7 @@ class MemoryReliabilityEventSink implements ReliabilityEventSink {
 const OFF_SINK: ReliabilityEventSink = {
   record: () => null,
   drain: () => [],
+  snapshot: () => [],
   size: () => 0,
   clear: () => undefined,
 };
@@ -89,4 +97,14 @@ export function recordReliabilityEventSafe(input: RecordReliabilityEventInput): 
     console.warn('[H-LEARN] reliability sink failed (non-fatal):', err);
     return null;
   }
+}
+
+
+/**
+ * H-LEARN-2a: read-only proposal view over the current bounded event buffer.
+ * No event is consumed and no durable state is written.
+ */
+export async function getReliabilityLessonProposals(userId: string, now: Date = new Date()) {
+  const { proposeReliabilityLessons } = await import('./reliabilityLearning');
+  return proposeReliabilityLessons(getReliabilityEventSink().snapshot(), userId, now);
 }
