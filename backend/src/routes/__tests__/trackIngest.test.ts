@@ -37,6 +37,34 @@ const post = (app: express.Express, body: unknown, headers: Record<string, strin
   request(app).post('/api/track/event').set('User-Agent', CHROME).set('Origin', ORIGIN).set(headers)
     .set('Content-Type', 'text/plain;charset=UTF-8').send(typeof body === 'string' ? body : JSON.stringify(body));
 
+describe('POST /api/track/event: segment routing (ENG-2316)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (crmDb.createLead as jest.Mock).mockImplementation(async (_l: string, d: any) => ({ ...d }));
+    (crmDb.getLeadListById as jest.Mock).mockImplementation(async (id: string) => id === LIST_ID
+      ? sessionList({ trackingConfig: { allowedOrigins: [ORIGIN], routing: [{ id: 'organic', match: { trafficType: 'organic' }, childListId: 'list_child_org1' }] } })
+      : { listId: id, userId: 'u1', listType: 'session' });
+  });
+
+  it('an organic session is copied to the child through the public route; the response is still 204', async () => {
+    const res = await post(makeApp(), event());
+    expect(res.status).toBe(204);
+    expect((crmDb.createLead as jest.Mock).mock.calls.map((c) => c[0]).sort()).toEqual(['list_child_org1', LIST_ID].sort());
+  });
+
+  it('a paid session is not', async () => {
+    const res = await post(makeApp(), event({ landingUrl: 'https://go.example.com/p?utm_medium=paid&fbclid=Z' }));
+    expect(res.status).toBe(204);
+    expect((crmDb.createLead as jest.Mock).mock.calls.map((c) => c[0])).toEqual([LIST_ID]);
+  });
+
+  it('a failing child never turns the response into an error', async () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    (crmDb.createLead as jest.Mock).mockImplementation(async (l: string, d: any) => { if (l === 'list_child_org1') throw new Error('boom'); return { ...d }; });
+    expect((await post(makeApp(), event())).status).toBe(204);
+  });
+});
+
 describe('POST /api/track/event', () => {
   beforeEach(() => {
     jest.clearAllMocks();
