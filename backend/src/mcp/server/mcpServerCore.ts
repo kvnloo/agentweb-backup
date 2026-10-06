@@ -31,6 +31,9 @@ import './evaluationTools';
 import './workflowTools';
 // ENG-1004: tranche 2 (landing pages). Same additive contract.
 import './landingWorkflowTools';
+// ENG-983: progressive disclosure — tools/list returns the workflow layer plus
+// emma_search_tools; the granular catalogue stays callable and discoverable.
+import { getListedToolDefinitions } from './toolDiscovery';
 
 export interface McpSessionContext {
   agentUserId?: string;
@@ -82,8 +85,7 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
    * Tool descriptions guide proper usage.
    */
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const allTools = mcpToolRegistry.getToolDefinitions();
-    return { tools: allTools };
+    return { tools: getListedToolDefinitions() };
   });
   /**
    * Handler for tool execution.
