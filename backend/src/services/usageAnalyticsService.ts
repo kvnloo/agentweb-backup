@@ -809,9 +809,12 @@ async function countedForMonth(
       );
     }
     const llm = read.events.filter((e) => e.lifecycle === "settled" && isLlmSpendEvent(e));
-    if (llm.length > 0) {
-      return { costUsd: llm.reduce((sum, e) => sum + Math.max(0, e.costMicroUsd || 0), 0) / 1_000_000, source: "current" };
-    }
+    // The ledger is authoritative for these months, so no settled events means $0, not "fall back
+    // to the archived counter" (which can hold charges the ledger never saw if dual-write was off).
+    return {
+      costUsd: llm.reduce((sum, e) => sum + Math.max(0, e.costMicroUsd || 0), 0) / 1_000_000,
+      source: "current",
+    };
   }
   const hist = (owner.tokenUsageHistory || []).find((h) => h.month === month);
   if (hist) return { costUsd: hist.totalCost || 0, source: "history" };

@@ -239,7 +239,7 @@ describe('getUserOrgUsageRollup', () => {
     expect(r.grossBurnUsd).toBe(0);
     expect(r.coveragePct).toBe(0);
     expect(r.unchargedUsd).toBe(0);
-    expect(r.countedSource).toBe('none'); // no ledger events and no archived history
+    expect(r.countedSource).toBe('current'); // ledger-covered month, no settled events -> $0
   });
 
   it('orphaned orgId (org not found) falls back to solo rollup', async () => {
@@ -313,14 +313,26 @@ describe('getUserOrgUsageRollup', () => {
     await expect(getUserOrgUsageRollup('solo', '2026-10')).rejects.toThrow(/truncated total/);
   });
 
-  it('a covered month with no ledger events and no archived history reads as none', async () => {
+  it('a covered month with no ledger events reads as $0 from the ledger', async () => {
     mockGetUser.mockResolvedValue(user({ userId: 'solo' }));
     mockQuery.mockResolvedValue([row({ userId: 'solo', costMicroUsd: 1_000_000 })]);
 
     const r = await getUserOrgUsageRollup('solo', '2026-10');
 
     expect(r.countedUsd).toBe(0);
-    expect(r.countedSource).toBe('none');
+    expect(r.countedSource).toBe('current');
+  });
+
+  it('a covered month with no ledger events IGNORES archived counter history (ledger is authoritative)', async () => {
+    mockGetUser.mockResolvedValue(
+      user({ userId: 'solo', tokenUsageHistory: [{ month: '2026-10', totalTokens: 5, totalCost: 7.5 }] } as any),
+    );
+    mockQuery.mockResolvedValue([row({ userId: 'solo', costMicroUsd: 1_000_000 })]);
+
+    const r = await getUserOrgUsageRollup('solo', '2026-10');
+
+    expect(r.countedUsd).toBe(0); // not the $7.50 the counter archived
+    expect(r.countedSource).toBe('current');
   });
 });
 
