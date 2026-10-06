@@ -26,7 +26,16 @@
 import { createHash } from 'crypto';
 import { crmDb } from './db';
 
-export const SESSION_EMAIL_RE = /^s-(.+)@sessions\.go\.dramabreak\.ai$/i;
+/**
+ * Synthetic-email domain the LP session writer uses for the dramabreak tenant.
+ * NOTE: other tenants' session lists use a different domain; generalising this
+ * (per-list/tenant domain) is deliberately deferred to S5 — do not widen it here.
+ */
+export const SESSION_EMAIL_DOMAIN = 'sessions.go.dramabreak.ai';
+export const SESSION_EMAIL_RE = new RegExp(
+  `^s-(.+)@${SESSION_EMAIL_DOMAIN.replace(/\./g, '\\.')}$`,
+  'i',
+);
 export const SESSION_SOURCE = 'lp-session';
 /** Max rows deleted by one apply call; the caller must re-preview to continue. */
 export const MAX_DELETES_PER_APPLY = 500;
@@ -88,14 +97,17 @@ function toMs(v: unknown): number | undefined {
 /**
  * Session identity of a row, or null. customFields.sessionId wins; the synthetic email
  * `s-<id>@sessions.go.dramabreak.ai` is the fallback. If both exist and disagree the
- * row is ambiguous and is reported as a conflict (never touched). A row whose declared
- * `source` is something other than lp-session is also never treated as a session row.
+ * row is ambiguous and is reported as a conflict (never touched). A row without
+ * customFields.source === 'lp-session' is never treated as a session row.
  */
 export function sessionIdentity(
   row: any,
 ): { sessionId: string } | { conflict: true } | null {
-  const src = row?.source ?? row?.customFields?.source;
-  if (!isBlank(src) && src !== SESSION_SOURCE) return null;
+  // Destructive grouping needs a POSITIVE marker: the LP writer sets
+  // customFields.source = 'lp-session'. A blank source is not enough, and a top-level
+  // source that says anything else also disqualifies the row.
+  if (row?.customFields?.source !== SESSION_SOURCE) return null;
+  if (!isBlank(row?.source) && row.source !== SESSION_SOURCE) return null;
   const cfId = row?.customFields?.sessionId;
   const fromField = typeof cfId === 'string' && cfId.trim() ? cfId.trim() : undefined;
   const m = typeof row?.email === 'string' ? SESSION_EMAIL_RE.exec(row.email.trim()) : null;

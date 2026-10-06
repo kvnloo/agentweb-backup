@@ -80,7 +80,7 @@ function row(leadId: string, sid: string | null, cf: Record<string, any>, extra:
     source: 'lp-session',
     createdAt: `2026-10-01T00:00:00.${leadId.replace(/\D/g, '').padStart(3, '0').slice(-3)}Z`,
     updatedAt: `2026-10-01T00:00:01.${leadId.replace(/\D/g, '').padStart(3, '0').slice(-3)}Z`,
-    customFields: { ...(sid ? { sessionId: sid } : {}), ...cf },
+    customFields: { ...(sid ? { sessionId: sid, source: 'lp-session' } : {}), ...cf },
     ...extra,
   };
 }
@@ -152,11 +152,28 @@ describe('merge rules', () => {
 
 describe('sessionIdentity', () => {
   it('uses customFields.sessionId, falls back to synthetic email, flags conflicts, ignores others', () => {
-    expect(sessionIdentity({ customFields: { sessionId: 'a' } })).toEqual({ sessionId: 'a' });
-    expect(sessionIdentity({ email: 'S-xyz@sessions.go.dramabreak.ai' })).toEqual({ sessionId: 'xyz' });
-    expect(sessionIdentity({ email: 's-a@sessions.go.dramabreak.ai', customFields: { sessionId: 'b' } })).toEqual({ conflict: true });
-    expect(sessionIdentity({ email: 'a@b.com', customFields: {} })).toBeNull();
-    expect(sessionIdentity({ source: 'manual', customFields: { sessionId: 'a' } })).toBeNull();
+    const M = { source: 'lp-session' };
+    expect(sessionIdentity({ customFields: { sessionId: 'a', ...M } })).toEqual({ sessionId: 'a' });
+    expect(sessionIdentity({ email: 'S-xyz@sessions.go.dramabreak.ai', customFields: M })).toEqual({ sessionId: 'xyz' });
+    expect(sessionIdentity({ email: 's-a@sessions.go.dramabreak.ai', customFields: { sessionId: 'b', ...M } })).toEqual({ conflict: true });
+    expect(sessionIdentity({ email: 'a@b.com', customFields: M })).toBeNull();
+    expect(sessionIdentity({ source: 'manual', customFields: { sessionId: 'a', ...M } })).toBeNull();
+  });
+  it('requires the positive customFields.source marker: blank/other source is never a session row', () => {
+    expect(sessionIdentity({ email: 's-a@sessions.go.dramabreak.ai', customFields: {} })).toBeNull();
+    expect(sessionIdentity({ email: 's-a@sessions.go.dramabreak.ai', customFields: { source: '' } })).toBeNull();
+    expect(sessionIdentity({ customFields: { sessionId: 'a', source: 'import' } })).toBeNull();
+  });
+  it('preview leaves a marker-less duplicate pair alone and counts it as without identity', async () => {
+    const a = row('l040', 'M1', { eventCount: '1' });
+    const b = row('l041', 'M1', { eventCount: '2' });
+    delete (a.customFields as any).source;
+    delete (b.customFields as any).source;
+    store.rows[LIST].l040 = a;
+    store.rows[LIST].l041 = b;
+    const plan = await previewDedupe(LIST);
+    expect(plan.groups.find((g) => g.sessionId === 'M1')).toBeUndefined();
+    expect(plan.counts.rowsWithoutIdentity).toBe(4);
   });
 });
 
