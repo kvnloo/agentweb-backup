@@ -6,6 +6,14 @@
  * an ambiguous response: the same operation identity must be reconciled.
  */
 import { createHash } from 'crypto';
+import { z0BridgeCapabilitySupported } from './z0BridgeCapabilities';
+import {
+  ensureZ0SidecarReady,
+  normalizeZ0SidecarBaseUrl,
+  parseZ0DeploymentMode,
+  withZ0SidecarRedirectGuard,
+  type Z0DeploymentMode,
+} from './z0SidecarDeployment';
 import {
   acquireZ0BridgeAdmission,
   noteZ0BridgeTransportFailure,
@@ -33,6 +41,7 @@ export interface Z0AgentWebConfig {
   baseUrl: string;
   timeoutMs: number;
   backpressureMode?: Z0BridgeBackpressureMode;
+  deploymentMode?: Z0DeploymentMode;
 }
 
 export interface Z0RouteArgs {
@@ -75,6 +84,7 @@ export function readZ0AgentWebConfig(env: NodeJS.ProcessEnv = process.env): Z0Ag
         ? timeoutRaw
         : DEFAULT_TIMEOUT_MS,
     backpressureMode: readZ0BridgeBackpressureMode(env),
+    deploymentMode: parseZ0DeploymentMode(env.Z0INT_AGENTWEB_DEPLOYMENT),
   };
 }
 
@@ -231,7 +241,12 @@ async function maybeAcquireBridgeAdmission(params: {
   freeOnly: boolean;
   serializedBody: string;
 }): Promise<
-  | { admitted: true; token: Z0BridgeAdmissionToken | null }
+  | {
+      admitted: true;
+      token: Z0BridgeAdmissionToken | null;
+      baseUrl: string;
+      fetchImpl: Z0FetchLike;
+    }
   | {
       admitted: false;
       reason: string;
@@ -239,20 +254,59 @@ async function maybeAcquireBridgeAdmission(params: {
       message: string;
     }
 > {
-  if ((params.config.backpressureMode ?? 'off') !== 'enforce') {
-    return { admitted: true, token: null };
+  let baseUrl = params.config.baseUrl;
+  let fetchImpl = params.fetchImpl;
+  if (params.config.deploymentMode === 'sidecar') {
+    try {
+      // First-use startup is shared across concurrent callers; success is cached.
+      // Validate before any GET/POST, even when backpressure is disabled.
+      baseUrl = normalizeZ0SidecarBaseUrl(baseUrl);
+      fetchImpl = withZ0SidecarRedirectGuard(fetchImpl);
+      const startup = await ensureZ0SidecarReady({
+        baseUrl,
+        fetchImpl,
+        timeoutMs: params.config.timeoutMs,
+      });
+      if (!z0BridgeCapabilitySupported(startup.capabilities, {
+        mode: params.bridgeMode,
+        kind: params.bridgeKind,
+        capability: params.capability,
+        freeOnly: params.freeOnly,
+      })) {
+        return {
+          admitted: false,
+          reason: 'capability_unsupported',
+          retryAfterMs: 0,
+          message: 'z0 sidecar does not advertise the requested capability',
+        };
+      }
+    } catch {
+      // No execution was attempted. Do not echo configured URLs or peer errors,
+      // which can contain credentials. This does not reconcile earlier attempts.
+      return {
+        admitted: false,
+        reason: 'sidecar_unavailable',
+        retryAfterMs: 0,
+        message: 'z0 sidecar startup failed; incumbent AgentWeb remains available',
+      };
+    }
   }
 
-  return acquireZ0BridgeAdmission({
-    baseUrl: params.config.baseUrl,
+  if ((params.config.backpressureMode ?? 'off') !== 'enforce') {
+    return { admitted: true, token: null, baseUrl, fetchImpl };
+  }
+
+  const admission = await acquireZ0BridgeAdmission({
+    baseUrl,
     mode: params.bridgeMode,
     kind: params.bridgeKind,
     capability: params.capability,
     freeOnly: params.freeOnly,
     requestBytes: Buffer.byteLength(params.serializedBody, 'utf8'),
-    fetchImpl: params.fetchImpl,
+    fetchImpl,
     timeoutMs: params.config.timeoutMs,
   });
+  return admission.admitted ? { ...admission, baseUrl, fetchImpl } : admission;
 }
 
 function backpressureDeniedExtra(retryAfterMs: number) {
@@ -344,7 +398,7 @@ export async function runZ0Route(args: Z0RouteArgs, options: Z0RouteOptions) {
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
 
   try {
-    const response = await fetchImpl(`${config.baseUrl}${endpoint}`, {
+    const response = await admission.fetchImpl(`${admission.baseUrl}${endpoint}`, {
       method: 'POST',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body: serializedBody,
@@ -560,7 +614,7 @@ export async function runZ0ChoiceExperiment(
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
 
   try {
-    const response = await fetchImpl(`${config.baseUrl}/v1/experimental/choice`, {
+    const response = await admission.fetchImpl(`${admission.baseUrl}/v1/experimental/choice`, {
       method: 'POST',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body: serializedBody,
@@ -758,7 +812,7 @@ export async function runZ0NoulExperiment(
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
 
   try {
-    const response = await fetchImpl(`${config.baseUrl}/v1/experimental/noul`, {
+    const response = await admission.fetchImpl(`${admission.baseUrl}/v1/experimental/noul`, {
       method: 'POST',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body: serializedBody,

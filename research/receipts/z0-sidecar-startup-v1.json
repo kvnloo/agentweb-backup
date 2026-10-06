@@ -1,0 +1,40 @@
+{
+  "schema": "agentweb.sidecar.startup.validation.v1",
+  "date": "2026-10-06",
+  "base_sha": "a45cbc3f184c680d72378143bb8e31a75ee5d2c9",
+  "sidecar_groundwork_sha": "a1bc653d9315a50af07b45ee691a04af9ad6fbbd",
+  "changed_blobs": {
+    "backend/src/emma/z0Adapter.ts": "4223a09aa4bd0d490db73ae09b8a1acec6177345",
+    "backend/src/emma/z0SidecarDeployment.ts": "4bc43edd05689c0ae71581e23b904f11eeabe5d2",
+    "backend/scripts/test-z0-sidecar-startup.cjs": "07f5fa71696ee0e911e8615f13f4b55c9d8a38d9"
+  },
+  "preserved_test_blob": "7c7614c448936f6e2438ba22fab15433adc3b748",
+  "tests": {
+    "before": {
+      "passed": 6,
+      "failed": 17
+    },
+    "after": {
+      "passed": 23,
+      "failed": 0,
+      "skipped": 0,
+      "cancelled": 0
+    }
+  },
+  "focused_typecheck": {
+    "before_exit": 2,
+    "after_exit": 0,
+    "baseline_error": "TS18046 at z0SidecarDeployment.ts:129"
+  },
+  "runtime": {
+    "node": "22.16.0",
+    "typescript": "5.8.3",
+    "ts_node": "10.9.2",
+    "node_types": "25.1.0"
+  },
+  "full_backend_build": "not_run",
+  "original_jest_suite": "not_run",
+  "real_z0_e2e": "not_run",
+  "tern_dogfood": "not_run",
+  "live_activation": false
+}
