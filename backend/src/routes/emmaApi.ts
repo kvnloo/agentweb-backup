@@ -457,7 +457,13 @@ router.post('/meta-ads/insights', async (req: Request, res: Response) => {
 
 router.post('/meta-ads/metrics', async (req: Request, res: Response) => {
   try {
-    const parsed = getMetaAdsMetricsArgsSchema.safeParse(req.body);
+    // Direct HTTP clients historically sent numeric IDs; keep accepting them here
+    // while the tool-gateway contract stays string-only.
+    const requestBody = Array.isArray(req.body?.campaign_ids)
+      ? { ...req.body, campaign_ids: req.body.campaign_ids.map((id: unknown) =>
+        (typeof id === 'number' ? String(id) : id)) }
+      : req.body;
+    const parsed = getMetaAdsMetricsArgsSchema.safeParse(requestBody);
     if (!parsed.success) return res.json({ success: false,
       message: 'campaign_ids is required and must contain at least one campaign ID.', error: 'Invalid campaign_ids' });
     const svc = await getAgentModeService();
