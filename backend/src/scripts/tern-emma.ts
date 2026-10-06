@@ -10,9 +10,13 @@ import {
 import {
   EmmaMessage,
   EmmaSessionLike,
+  filterSessions,
   renderEmmaDock,
   renderEmmaMain,
+  renderEmptyLayer,
+  renderSessionPicker,
   RunningTool,
+  SessionPickerState,
   TspNode,
 } from '../tern/renderEmma';
 
@@ -27,6 +31,12 @@ interface HelloReply {
   features?: string[];
   apc?: number;
   credits?: number;
+}
+
+interface PickerKey {
+  name: string;
+  text?: string;
+  ctrl?: boolean;
 }
 
 function argValue(name: string): string | undefined {
@@ -77,7 +87,7 @@ class FrameSender {
 
   private flush(): void {
     // Intentionally use one credit even when Tern grants more. It makes full-root
-    // replacement deterministic and coalesces rapid editor updates for this P0.
+    // replacement deterministic and coalesces rapid editor/picker updates for P0.
     if (this.inFlight !== null || !this.pending) return;
     const ops = this.pending;
     this.pending = null;
@@ -87,6 +97,110 @@ class FrameSender {
       encodeTspJson('f', { sf: SURFACE_ID, s, ops }, undefined, this.apcLimit),
     );
   }
+}
+
+function decodePickerKey(buffer: string): { key?: PickerKey; used: number; needMore?: boolean } {
+  if (!buffer) return { used: 0, needMore: true };
+
+  if (buffer.startsWith('\x1b[200~')) {
+    const end = buffer.indexOf('\x1b[201~', 6);
+    if (end < 0) return { used: 0, needMore: true };
+    return {
+      key: { name: 'paste', text: buffer.slice(6, end) },
+      used: end + 6,
+    };
+  }
+
+  const first = buffer[0];
+  if (first !== '\x1b') {
+    const code = first.codePointAt(0);
+    if (code === undefined) return { used: 1 };
+    const char = String.fromCodePoint(code);
+    const used = char.length;
+
+    if (char === '\r' || char === '\n') return { key: { name: 'enter' }, used };
+    if (char === '\t') return { key: { name: 'tab' }, used };
+    if (char === '\x7f' || char === '\b') return { key: { name: 'backspace' }, used };
+    if (char === '\x03') return { key: { name: 'c', ctrl: true }, used };
+    if (code >= 1 && code <= 26) {
+      return { key: { name: String.fromCharCode(code + 96), ctrl: true }, used };
+    }
+    if (code < 32) return { used };
+    return { key: { name: char.toLowerCase(), text: char }, used };
+  }
+
+  if (buffer.length === 1) return { used: 0, needMore: true };
+
+  const simple: Record<string, string> = {
+    '\x1b[A': 'up',
+    '\x1b[B': 'down',
+    '\x1b[C': 'right',
+    '\x1b[D': 'left',
+    '\x1b[H': 'home',
+    '\x1b[F': 'end',
+    '\x1b[3~': 'delete',
+    '\x1b[5~': 'page_up',
+    '\x1b[6~': 'page_down',
+  };
+  for (const [sequence, name] of Object.entries(simple)) {
+    if (buffer.startsWith(sequence)) return { key: { name }, used: sequence.length };
+    if (sequence.startsWith(buffer)) return { used: 0, needMore: true };
+  }
+
+  const csi = /^\x1b\[([0-9:;]*)([A-Za-z~])/.exec(buffer);
+  if (csi) {
+    const [sequence, params, final] = csi;
+    if (final === 'u') {
+      const pieces = params.split(';');
+      const code = Number((pieces[0] || '').split(':')[0]);
+      const modifier = Number((pieces[1] || '1').split(':')[0]);
+      const bits = Math.max(0, modifier - 1);
+      const ctrl = (bits & 4) !== 0;
+      const named: Record<number, string> = {
+        13: 'enter',
+        9: 'tab',
+        27: 'escape',
+        127: 'backspace',
+        57417: 'left',
+        57418: 'right',
+        57419: 'up',
+        57420: 'down',
+        57421: 'page_up',
+        57422: 'page_down',
+        57423: 'home',
+        57424: 'end',
+        57426: 'delete',
+      };
+      const name = named[code];
+      if (name) return { key: { name, ctrl }, used: sequence.length };
+      if (Number.isInteger(code) && code >= 32 && code <= 0x10ffff) {
+        const text = String.fromCodePoint(code);
+        return { key: { name: text.toLowerCase(), text: ctrl ? undefined : text, ctrl }, used: sequence.length };
+      }
+      return { used: sequence.length };
+    }
+
+    const arrowName: Record<string, string> = {
+      A: 'up',
+      B: 'down',
+      C: 'right',
+      D: 'left',
+      H: 'home',
+      F: 'end',
+    };
+    if (arrowName[final]) return { key: { name: arrowName[final] }, used: sequence.length };
+    if (final === '~') {
+      const n = Number(params.split(';')[0]);
+      const name = n === 3 ? 'delete' : n === 5 ? 'page_up' : n === 6 ? 'page_down' : undefined;
+      return { ...(name ? { key: { name } } : {}), used: sequence.length };
+    }
+    return { used: sequence.length };
+  }
+
+  // A lone ESC is ambiguous with an escape-sequence prefix; the caller flushes it
+  // after a short deadline. Unknown completed ESC sequences are consumed.
+  if (buffer.startsWith('\x1b')) return { used: 1, key: { name: 'escape' } };
+  return { used: 1 };
 }
 
 async function main(): Promise<void> {
@@ -119,6 +233,7 @@ async function main(): Promise<void> {
   const reader = new TspStreamReader();
   let helloResolve: ((hello: HelloReply) => void) | undefined;
   let eventHandler: ((event: Record<string, unknown>) => void) | undefined;
+  let rawHandler: ((raw: string) => void) | undefined;
   let shuttingDown = false;
   let surfaceOpened = false;
 
@@ -139,12 +254,13 @@ async function main(): Promise<void> {
   process.on('SIGHUP', () => closeAndExit(129));
 
   process.stdin.on('data', (chunk: string) => {
-    if (chunk.includes('\x03')) {
-      closeAndExit(130);
-      return;
-    }
+    for (const part of reader.pushParts(chunk)) {
+      if (part.type === 'raw') {
+        rawHandler?.(part.data);
+        continue;
+      }
 
-    for (const raw of reader.push(chunk)) {
+      const raw = part.message;
       const value = parseTspJson(raw);
       if (!value) continue;
       if (raw.verb === 'r' && isHello(value)) {
@@ -176,7 +292,7 @@ async function main(): Promise<void> {
     throw error;
   });
 
-  const requiredKinds = ['col', 'card', 'md', 'editor', 'status', 'seg', 'tool'];
+  const requiredKinds = ['col', 'card', 'md', 'editor', 'status', 'seg', 'tool', 'picker', 'kv', 'section'];
   const missingKinds = requiredKinds.filter(kind => !hello.kinds.includes(kind));
   if (missingKinds.length > 0) {
     process.stdin.setRawMode?.(false);
@@ -220,6 +336,9 @@ async function main(): Promise<void> {
   let toolCounter = 0;
   let errorText: string | undefined;
   let rendered = false;
+  let pickerState: SessionPickerState | undefined;
+  let pickerKeyBuffer = '';
+  let escapeFlush: NodeJS.Timeout | undefined;
   const undoStack: Array<{ text: string; cursor: number }> = [];
 
   const render = (dockOnly = false) => {
@@ -230,23 +349,29 @@ async function main(): Promise<void> {
       session,
       error: errorText,
     });
+    const layer = pickerState
+      ? renderSessionPicker(pickerState, session.sessionId)
+      : renderEmptyLayer();
+
+    const focusComposer = !pickerState ? [['focus', 'composer']] : [];
 
     if (!rendered) {
       const mainNode = renderEmmaMain(session, runningTools);
       frames.request([
         nodeAdd(mainNode),
         nodeAdd(dock),
-        ['focus', 'composer'],
+        nodeAdd(layer),
+        ...focusComposer,
       ]);
       rendered = true;
       return;
     }
 
-    if (dockOnly) {
+    if (dockOnly && !pickerState) {
       frames.request([
         ['del', 'dock'],
         nodeAdd(dock),
-        ['focus', 'composer'],
+        ...focusComposer,
       ]);
       return;
     }
@@ -257,11 +382,246 @@ async function main(): Promise<void> {
       nodeAdd(mainNode),
       ['del', 'dock'],
       nodeAdd(dock),
-      ['focus', 'composer'],
+      ['del', 'layer'],
+      nodeAdd(layer),
+      ...focusComposer,
     ]);
   };
 
+  const closePicker = () => {
+    pickerState = undefined;
+    pickerKeyBuffer = '';
+    clearTimeout(escapeFlush);
+    escapeFlush = undefined;
+    render();
+  };
+
+  const visiblePickerSessions = (): EmmaSessionLike[] =>
+    pickerState ? filterSessions(pickerState.sessions, pickerState.query) : [];
+
+  const clampPickerSelection = () => {
+    if (!pickerState) return;
+    const visible = visiblePickerSessions();
+    pickerState.selected = Math.max(0, Math.min(pickerState.selected, Math.max(0, visible.length - 1)));
+  };
+
+  const switchSession = async (sessionId: string) => {
+    if (running) return;
+    try {
+      const next = await client.getSession(sessionId);
+      session = next;
+      composer = '';
+      cursor = 0;
+      errorText = undefined;
+      undoStack.length = 0;
+      closePicker();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : String(error);
+      render();
+    }
+  };
+
+  const createNewSession = async () => {
+    if (running) return;
+    try {
+      session = await client.createSession();
+      composer = '';
+      cursor = 0;
+      errorText = undefined;
+      undoStack.length = 0;
+      closePicker();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : String(error);
+      render();
+    }
+  };
+
+  const resumeSelectedSession = () => {
+    const selected = visiblePickerSessions()[pickerState?.selected ?? -1];
+    if (selected) void switchSession(selected.sessionId);
+  };
+
+  const openSessionPicker = async () => {
+    if (running) return;
+    try {
+      const sessions = await client.listEmmaSessions(50);
+      if (!sessions.some(item => item.sessionId === session.sessionId)) sessions.unshift(session);
+      const sorted = filterSessions(sessions, '');
+      const selected = Math.max(0, sorted.findIndex(item => item.sessionId === session.sessionId));
+      pickerState = { sessions, query: '', cursor: 0, selected };
+      pickerKeyBuffer = '';
+      errorText = undefined;
+      render();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : String(error);
+      render(true);
+    }
+  };
+
+  const updatePickerQuery = (next: string, nextCursor: number) => {
+    if (!pickerState) return;
+    pickerState.query = next;
+    pickerState.cursor = Math.max(0, Math.min(nextCursor, next.length));
+    pickerState.selected = 0;
+    clampPickerSelection();
+    render();
+  };
+
+  const handlePickerKey = (key: PickerKey) => {
+    if (!pickerState) {
+      if (key.ctrl && key.name === 'c') closeAndExit(130);
+      return;
+    }
+
+    if (key.ctrl && key.name === 'c') {
+      closeAndExit(130);
+      return;
+    }
+    if (key.ctrl && key.name === 'n') {
+      void createNewSession();
+      return;
+    }
+
+    switch (key.name) {
+      case 'escape':
+        closePicker();
+        return;
+      case 'enter':
+        resumeSelectedSession();
+        return;
+      case 'up':
+        pickerState.selected--;
+        clampPickerSelection();
+        render();
+        return;
+      case 'down':
+        pickerState.selected++;
+        clampPickerSelection();
+        render();
+        return;
+      case 'page_up':
+        pickerState.selected -= 8;
+        clampPickerSelection();
+        render();
+        return;
+      case 'page_down':
+        pickerState.selected += 8;
+        clampPickerSelection();
+        render();
+        return;
+      case 'left':
+        pickerState.cursor = Math.max(0, pickerState.cursor - 1);
+        render();
+        return;
+      case 'right':
+        pickerState.cursor = Math.min(pickerState.query.length, pickerState.cursor + 1);
+        render();
+        return;
+      case 'home':
+        pickerState.cursor = 0;
+        render();
+        return;
+      case 'end':
+        pickerState.cursor = pickerState.query.length;
+        render();
+        return;
+      case 'backspace':
+        if (pickerState.cursor > 0) {
+          const at = pickerState.cursor;
+          updatePickerQuery(
+            pickerState.query.slice(0, at - 1) + pickerState.query.slice(at),
+            at - 1,
+          );
+        }
+        return;
+      case 'delete':
+        if (pickerState.cursor < pickerState.query.length) {
+          const at = pickerState.cursor;
+          updatePickerQuery(
+            pickerState.query.slice(0, at) + pickerState.query.slice(at + 1),
+            at,
+          );
+        }
+        return;
+      case 'paste':
+        if (key.text) {
+          const at = pickerState.cursor;
+          updatePickerQuery(
+            pickerState.query.slice(0, at) + key.text + pickerState.query.slice(at),
+            at + key.text.length,
+          );
+        }
+        return;
+      default:
+        if (key.text) {
+          const at = pickerState.cursor;
+          updatePickerQuery(
+            pickerState.query.slice(0, at) + key.text + pickerState.query.slice(at),
+            at + key.text.length,
+          );
+        }
+    }
+  };
+
+  const drainPickerKeys = (finalEscape = false) => {
+    for (;;) {
+      if (!pickerKeyBuffer) return;
+      if (finalEscape && pickerKeyBuffer === '\x1b') {
+        pickerKeyBuffer = '';
+        handlePickerKey({ name: 'escape' });
+        return;
+      }
+
+      const decoded = decodePickerKey(pickerKeyBuffer);
+      if (decoded.needMore && decoded.used === 0) return;
+      if (decoded.used <= 0) return;
+      pickerKeyBuffer = pickerKeyBuffer.slice(decoded.used);
+      if (decoded.key) handlePickerKey(decoded.key);
+    }
+  };
+
+  rawHandler = raw => {
+    if (!pickerState) {
+      if (raw.includes('\x03')) closeAndExit(130);
+      return;
+    }
+
+    pickerKeyBuffer += raw;
+    clearTimeout(escapeFlush);
+    escapeFlush = undefined;
+    drainPickerKeys();
+
+    if (pickerKeyBuffer === '\x1b') {
+      escapeFlush = setTimeout(() => {
+        escapeFlush = undefined;
+        drainPickerKeys(true);
+      }, 30);
+    }
+  };
+
   const applyEdit = (event: Record<string, unknown>) => {
+    if (event.id === 'session-picker' && pickerState) {
+      const from = event.from;
+      const to = event.to;
+      const text = event.text;
+      const nextCursor = event.cursor;
+      if (
+        typeof from === 'number'
+        && typeof to === 'number'
+        && typeof text === 'string'
+        && typeof nextCursor === 'number'
+        && from >= 0
+        && to >= from
+        && to <= pickerState.query.length
+      ) {
+        updatePickerQuery(
+          pickerState.query.slice(0, from) + text + pickerState.query.slice(to),
+          nextCursor,
+        );
+      }
+      return;
+    }
+
     if (event.id !== 'composer') return;
     const from = event.from;
     const to = event.to;
@@ -288,6 +648,19 @@ async function main(): Promise<void> {
   const sendPrompt = async (prompt: string) => {
     const text = prompt.trim();
     if (!text || running) return;
+
+    if (text === '/resume' || text === '/sessions') {
+      composer = '';
+      cursor = 0;
+      void openSessionPicker();
+      return;
+    }
+    if (text === '/new') {
+      composer = '';
+      cursor = 0;
+      void createNewSession();
+      return;
+    }
 
     running = true;
     errorText = undefined;
@@ -367,6 +740,28 @@ async function main(): Promise<void> {
           void sendPrompt(event.text);
         }
         break;
+      case 'select':
+      case 'activate': {
+        if (event.id !== 'session-picker' || typeof event.item !== 'string' || !pickerState) break;
+        const visible = visiblePickerSessions();
+        const index = visible.findIndex(item => item.sessionId === event.item);
+        if (index < 0) break;
+        pickerState.selected = index;
+        if (event.ev === 'activate') resumeSelectedSession();
+        else render();
+        break;
+      }
+      case 'action': {
+        if (event.act === 'sessions' && event.id === 'status.sessions') {
+          void openSessionPicker();
+          break;
+        }
+        if (event.id !== 'session-picker') break;
+        if (event.act === 'resume') resumeSelectedSession();
+        else if (event.act === 'new') void createNewSession();
+        else if (event.act === 'close' || event.act === 'cancel') closePicker();
+        break;
+      }
       case 'gone':
         // Tern may drop retained inline nodes after scrollback compaction. A full
         // re-render is safe because AgentWeb remains the source of truth.
@@ -375,7 +770,7 @@ async function main(): Promise<void> {
       case 'error':
         if (typeof event.msg === 'string') {
           errorText = event.msg;
-          render(true);
+          render(pickerState === undefined);
         }
         break;
       default:
