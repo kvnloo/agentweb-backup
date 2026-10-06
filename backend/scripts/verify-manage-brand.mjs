@@ -44,6 +44,10 @@ export async function run({
   const token = login.json.token;
 
   const before = await read(token);
+  // A restore can only reproduce fields that exist; refuse to mutate a sparse
+  // snapshot rather than report PASS after storing defaults it never had.
+  const missing = FIELDS.filter((f) => before.brandData[f] === undefined || before.brandData[f] === null);
+  if (missing.length) throw new Error(`refusing to mutate: QA brand missing ${missing.join(", ")} (seed them first)`);
   const stamp = `[qa-probe ENG-2095 ${Date.now()}]`;
   const marker = {
     brandName: `${stamp} brand`,
@@ -61,14 +65,15 @@ export async function run({
     if (!same(after.brandData.founders, before.brandData.founders)) failures.push("founders not preserved");
     if (!same(after.attachments, before.attachments)) failures.push("attachments not preserved");
   } finally {
-    const restore = Object.fromEntries(FIELDS.map((f) => [f, before.brandData[f] ?? (f === "keyMessages" ? [] : "")]));
+    const restore = Object.fromEntries(FIELDS.map((f) => [f, before.brandData[f]]));
     let restored = false;
     try {
       const r = await call("POST", "/api/brand/guidelines", token, restore);
       if (r.status >= 200 && r.status < 300) {
         const back = await read(token);
-        restored = FIELDS.every((f) => same(back.brandData[f], restore[f]));
-      }
+        restored = FIELDS.every((f) => same(back.brandData[f], before.brandData[f]));
+        if (!restored) log("restore error: read-back differs from snapshot");
+      } else log(`restore error: POST returned ${r.status}`);
     } catch (e) { log(`restore error: ${e?.message ?? e}`); }
     if (!restored) failures.push("restore failed: QA brand guidelines left modified");
   }
