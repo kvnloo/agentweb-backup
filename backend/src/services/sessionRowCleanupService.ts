@@ -130,10 +130,8 @@ export function sortKeeperFirst<T extends { createdAt?: string; leadId: string }
 const BUNDLE_EVENTS = ['journey', 'eventCount'] as const;
 const BUNDLE_CLICKS = ['clickLog', 'clickCount', 'showsClicked'] as const;
 const MAX_NUMERIC_KEYS = ['dwellSec', 'activeSec', 'videoWatchSec', 'maxScrollPct'] as const;
-/** `<event>_at` (snake) or `fooAt` (camel) timestamp fields. */
+/** `<event>_at` (snake) or `fooAt` (camel) timestamp fields (incl. capiLastSentAt). */
 const TIMESTAMP_KEY_RE = /(_at|At)$/;
-/** A timestamp that records the LAST occurrence (lastSeenAt, last_event_at, …). */
-const LAST_KEY_RE = /(^|_)(last|latest)|[a-z](Last|Latest)/;
 /** Top-level attribution: keeper wins, missing values filled from donors. */
 const TOP_LEVEL_FILL_RE = /^(firstTouch|lastTouch|clickIds|utm.*)$/i;
 
@@ -155,9 +153,11 @@ export interface MergeResult {
  *    bundle is taken from ONE row so a journey is never stitched to a foreign count.
  *  - dwellSec/activeSec/videoWatchSec/maxScrollPct: numeric max (engagement only grows;
  *    values are strings, compared numerically so "9" < "10").
- *  - `<event>_at` / `*At` timestamps: earliest (first-occurrence semantics), except keys
- *    that are clearly "last…", which take the latest. forwardedAt: earliest.
- *  - every other key: keeper wins, filled from donors (in keeper order) only if missing.
+ *  - `<event>_at` / `*At` timestamps: LATEST (each event overwrites its timestamp, so the
+ *    latest is what a non-raced row holds). forwardedAt: EARLIEST (first forward is kept).
+ *  - every other scalar key (lastEvent, furthestStage, lastEp, lastClick*, capi status,
+ *    channel, …): from the row with the highest eventCount (tie: latest updatedAt, then
+ *    keeper order), blanks filled from the other rows in that same order.
  *  - top-level firstTouch/lastTouch/clickIds/utm*: keeper wins, filled when missing.
  */
 export function mergeSessionRows(rowsKeeperFirst: any[]): MergeResult {
@@ -171,11 +171,14 @@ export function mergeSessionRows(rowsKeeperFirst: any[]): MergeResult {
   const allKeys = new Set<string>();
   cfs.forEach((cf) => Object.keys(cf).forEach((k) => allKeys.add(k)));
 
-  // Rank rows for a cumulative bundle: biggest primary count first, then secondary,
-  // then keeper order (stable sort).
+  // Rank rows: biggest primary count first, then secondary count, then the most
+  // recently updated row, then keeper order (stable). The live writer OVERWRITES scalar
+  // fields on every event (last write wins), so the row that saw the most events holds
+  // the state a non-raced row would hold; ranking by it keeps lastEvent / furthestStage /
+  // lastEp / lastClick* consistent with the journey they belong to.
   const rank = (primary: string, secondary?: string) =>
-    cfs
-      .map((cf, i) => ({ cf, i }))
+    rowsKeeperFirst
+      .map((r, i) => ({ cf: cfs[i], i, upd: toMs(r?.updatedAt) ?? 0 }))
       .sort((a, b) => {
         const pa = toNum(a.cf[primary]) ?? 0;
         const pb = toNum(b.cf[primary]) ?? 0;
@@ -185,6 +188,7 @@ export function mergeSessionRows(rowsKeeperFirst: any[]): MergeResult {
           const sb = toNum(b.cf[secondary]) ?? 0;
           if (sa !== sb) return sb - sa;
         }
+        if (a.upd !== b.upd) return b.upd - a.upd;
         return a.i - b.i;
       })
       .map((x) => x.cf);
@@ -209,9 +213,11 @@ export function mergeSessionRows(rowsKeeperFirst: any[]): MergeResult {
           best = cf[key];
         }
       }
-      value = best !== undefined ? best : cfs.find((cf) => !isBlank(cf[key]))?.[key];
+      value = best !== undefined ? best : fromRank(eventRank, key);
     } else if (key === 'forwardedAt' || TIMESTAMP_KEY_RE.test(key)) {
-      const wantLatest = key !== 'forwardedAt' && LAST_KEY_RE.test(key);
+      // Each event overwrites `<event>_at` with its server time, so the latest wins;
+      // forwardedAt is the one exception (forward-lead preserves the FIRST value).
+      const wantLatest = key !== 'forwardedAt';
       let best: any;
       let bestT = wantLatest ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY;
       for (const cf of cfs) {
@@ -222,9 +228,9 @@ export function mergeSessionRows(rowsKeeperFirst: any[]): MergeResult {
           best = cf[key];
         }
       }
-      value = best !== undefined ? best : cfs.find((cf) => !isBlank(cf[key]))?.[key];
+      value = best !== undefined ? best : fromRank(eventRank, key);
     } else {
-      value = cfs.find((cf) => !isBlank(cf[key]))?.[key];
+      value = fromRank(eventRank, key);
     }
     if (value !== undefined) merged[key] = value;
   }

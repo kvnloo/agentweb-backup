@@ -134,19 +134,52 @@ describe('merge rules', () => {
     expect(merged.maxScrollPct).toBe('100');
     expect(merged.activeSec).toBe('7'); // non-numeric keeper value ignored
   });
-  it('<event>_at earliest wins; last_* latest wins; forwardedAt earliest', () => {
-    expect(merged.lp_view_at).toBe('2026-10-01T00:00:00.100Z');
+  it('*_at / *At timestamps: LATEST wins (each event overwrites); forwardedAt: EARLIEST', () => {
+    expect(merged.lp_view_at).toBe('2026-10-01T00:00:00.200Z');
     expect(merged.last_seen_at).toBe('2026-10-01T00:00:09.000Z');
     expect(merged.forwardedAt).toBe('2026-10-01T00:00:00.100Z');
   });
-  it('other fields: keeper wins, blanks and absent keys are filled', () => {
-    expect(merged.utm).toBe('k');
+  it('other scalars come from the highest-eventCount row, blanks/absent filled from the rest', () => {
+    expect(merged.utm).toBe('z'); // donor has eventCount 2 > keeper 1
     expect(merged.channel).toBe('meta');
     expect(merged.extra).toBe('e');
   });
+  it('capiLastSentAt follows the generic timestamp rule (latest)', () => {
+    const r = mergeSessionRows([
+      row('l001', 'S9', { eventCount: '1', capiLastSentAt: '2026-10-01T00:00:01.000Z' }),
+      row('l002', 'S9', { eventCount: '2', capiLastSentAt: '2026-10-01T00:00:07.000Z' }),
+    ]);
+    expect(r.merged.capiLastSentAt).toBe('2026-10-01T00:00:07.000Z');
+  });
+  it('lastEvent / furthestStage / lastEp / page_exit_at come from the same row as the max-eventCount journey', () => {
+    const early = row('l001', 'S9', { eventCount: '1', journey: 'lp_view', lastEvent: 'lp_view', furthestStage: 'view', lastEp: '1', lastClickShow: 'a', page_exit_at: '2026-10-01T00:00:02.000Z' });
+    const rich = row('l002', 'S9', { eventCount: '4', journey: 'lp_view>play_start>ep>exit', lastEvent: 'page_exit', furthestStage: 'play', lastEp: '3', lastClickShow: 'b', page_exit_at: '2026-10-01T00:00:40.000Z' });
+    const m = mergeSessionRows([early, rich]).merged;
+    expect([m.journey, m.lastEvent, m.furthestStage, m.lastEp, m.lastClickShow, m.page_exit_at]).toEqual(['lp_view>play_start>ep>exit', 'page_exit', 'play', '3', 'b', '2026-10-01T00:00:40.000Z']);
+  });
+  it('tie on eventCount: latest updatedAt row wins the scalar, then keeper order', () => {
+    const a = row('l001', 'S9', { eventCount: '2', lastEvent: 'A' });
+    const b = row('l002', 'S9', { eventCount: '2', lastEvent: 'B' });
+    b.updatedAt = '2026-10-01T00:00:09.000Z';
+    a.updatedAt = '2026-10-01T00:00:01.000Z';
+    expect(mergeSessionRows([a, b]).merged.lastEvent).toBe('B');
+    b.updatedAt = a.updatedAt;
+    expect(mergeSessionRows([a, b]).merged.lastEvent).toBe('A');
+  });
+  it('e7c97874-style pair: lp_view+dwellSec 652+page_exit_at vs play_start_at+longer journey', () => {
+    const A = row('l001', 'e7c97874', { eventCount: '2', journey: 'lp_view>page_exit', lp_view_at: '2026-10-01T00:00:00.100Z', dwellSec: '652', lastEvent: 'page_exit', page_exit_at: '2026-10-01T00:10:52.000Z' });
+    const B = row('l002', 'e7c97874', { eventCount: '3', journey: 'lp_view>play_start>page_exit', play_start_at: '2026-10-01T00:00:05.000Z', lp_view_at: '2026-10-01T00:00:00.110Z', lastEvent: 'play_start' });
+    const m = mergeSessionRows([A, B]).merged;
+    expect(m.dwellSec).toBe('652');
+    expect(m.journey).toBe('lp_view>play_start>page_exit');
+    expect(m.play_start_at).toBe('2026-10-01T00:00:05.000Z');
+    expect(m.page_exit_at).toBe('2026-10-01T00:10:52.000Z'); // only A has it; paired with max dwell
+    expect(m.lp_view_at).toBe('2026-10-01T00:00:00.110Z');
+    expect(m.lastEvent).toBe('play_start'); // from the max-eventCount row, consistent with journey
+  });
   it('top-level attribution is filled when the keeper lacks it, never overwritten', () => {
     expect(topLevelWrites).toEqual({ firstTouch: { src: 'ad' }, utm_source: 'fb' });
-    expect(writes.utm).toBeUndefined(); // keeper value unchanged => not written
+    expect(writes.eventCount).toBe('2');
   });
 });
 
@@ -242,7 +275,7 @@ describe('apply', () => {
     expect(Object.keys(store.rows[LIST]).sort()).toEqual(['l001', 'l010', 'l020', 'l030', 'l031']);
     expect(store.lists[LIST].leadCount).toBe(5);
     const k = store.rows[LIST].l001.customFields;
-    expect(k).toMatchObject({ journey: 'lp_view>play_start', eventCount: '2', dwellSec: '10', clickCount: '1', trafficType: 'paid', forwardedAt: '2026-10-01T00:00:00.100Z', lp_view_at: '2026-10-01T00:00:00.100Z', play_start_at: '2026-10-01T00:00:05.000Z' });
+    expect(k).toMatchObject({ journey: 'lp_view>play_start', eventCount: '2', dwellSec: '10', clickCount: '1', trafficType: 'paid', forwardedAt: '2026-10-01T00:00:00.100Z', lp_view_at: '2026-10-01T00:00:00.200Z', play_start_at: '2026-10-01T00:00:05.000Z' });
     expect(store.rows[LIST].l010.customFields.journey).toBe('a>b>c');
     expect(res.backup.map((b) => b.leadId).sort()).toEqual(['l002', 'l011', 'l012']);
     expect(res.backup.find((b) => b.leadId === 'l002')!.item).toEqual(donorBefore);
