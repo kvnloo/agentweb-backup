@@ -271,6 +271,12 @@ export const CHANNELS: readonly ChannelDef[] = [
   },
 ];
 
+/** In-app UA regexes, compiled once (V1 order = CHANNELS order). */
+const IN_APP_UA_MATCHERS: ReadonlyArray<{ def: ChannelDef; re: RegExp }> = CHANNELS.filter((c) => c.inAppUserAgent).map((def) => ({
+  def,
+  re: new RegExp(def.inAppUserAgent as string, 'i'),
+}));
+
 const CHANNEL_BY_KEY: ReadonlyMap<string, ChannelDef> = new Map(CHANNELS.map((c) => [c.key, c]));
 
 /** JSON-safe view of the taxonomy for GET /api/tracking/channels and the future portal. */
@@ -382,13 +388,19 @@ function readQuery(raw: unknown): Map<string, string> {
   return out;
 }
 
-/** Host of an absolute-ish URL, www-stripped and lowercased; '' when there is none. */
+/**
+ * Host of an absolute-ish URL, www-stripped and lowercased; '' when there is none. A path-only or
+ * relative value ('/guilty?x=1') has no host: `https:///guilty` would otherwise parse to host 'guilty'.
+ */
 function hostOf(raw: unknown): string {
   if (typeof raw !== 'string' || !raw) return '';
   const s = raw.trim().slice(0, MAX_INPUT_LEN);
   if (!s) return '';
+  const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(s);
+  const looksLikeHost = /^[a-z0-9-]+(\.[a-z0-9-]+)+(:\d+)?([/?#]|$)/i.test(s) || /^[a-z0-9-]+(:\d+)?$/i.test(s);
+  if (!hasScheme && !looksLikeHost) return '';
   try {
-    const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : `https://${s}`);
+    const u = new URL(hasScheme ? s : `https://${s}`);
     return u.hostname.replace(/^www\./, '').replace(/\.$/, '').toLowerCase();
   } catch {
     return '';
@@ -630,9 +642,13 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
   }
 
   // 2. Paid vs organic (independent of channel).
+  // STRONG signals: any click/ad id except fbclid, or a paid utm_medium token.
+  // fbclid is WEAK: Facebook/Instagram append it to every outbound click, organic included, so it
+  // proves nothing on a link we tagged ourselves. It counts as paid only when the link does not
+  // declare an organic utm_medium. Untagged fbclid-only stays paid (V1); it cannot be separated.
   let paidSignal: string | null = null;
   for (const key of PAID_PARAM_KEYS) {
-    if (clickIds.has(key)) {
+    if (key !== 'fbclid' && clickIds.has(key)) {
       paidSignal = `click_id:${key}`;
       break;
     }
@@ -640,6 +656,9 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
   if (!paidSignal) {
     const tok = paidMediumToken(utm.utm_medium);
     if (tok) paidSignal = `utm_medium:${tok}`;
+  }
+  if (!paidSignal && clickIds.has('fbclid') && !(ORGANIC_MEDIUMS as readonly string[]).includes(utm.utm_medium.toLowerCase())) {
+    paidSignal = 'click_id:fbclid';
   }
   const paid = paidSignal !== null;
 
@@ -664,7 +683,7 @@ export function classifyTraffic(input: ClassifyTrafficInput = {}): TrafficClassi
 
   if (!def && typeof safe.userAgent === 'string') {
     const ua = safe.userAgent.slice(0, MAX_INPUT_LEN);
-    def = CHANNELS.find((c) => c.inAppUserAgent && new RegExp(c.inAppUserAgent, 'i').test(ua));
+    def = IN_APP_UA_MATCHERS.find((m) => m.re.test(ua))?.def;
     if (def) matchedBy = 'user_agent';
   }
 
