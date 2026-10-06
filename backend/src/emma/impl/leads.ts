@@ -2995,7 +2995,7 @@ export async function importLeadsFromSearch(
     return { success: false, error: 'At least one search filter is required: keywords, search_url, cursor, or a structured filter (title, company, location, industry, school)' };
   }
 
-  const { linkedInOutreachService } = await import('../../services/linkedInOutreachService');
+  const { linkedInOutreachService, isProvenDisconnectError } = await import('../../services/linkedInOutreachService');
 
   // Access check (ENG-1049): this function creates leads (batchCreateLeads
   // below), and is called directly by the import_leads_from_search Emma tool
@@ -3125,9 +3125,10 @@ export async function importLeadsFromSearch(
       // 'unknown' for the full 10-minute window and gets handed to the next
       // caller (same user's retry, or another user sharing the site-wide pool)
       // instead of the pool correctly skipping it. Mirrors the identical reactive
-      // handler in emma/impl/linkedin.ts.
-      const structuredError = (e as any)?.structuredError;
-      if (structuredError?.code === 'errors/disconnected_account' || structuredError?.classification === 'AUTH_ERROR') {
+      // handler in emma/impl/linkedin.ts. Uses the shared isProvenDisconnectError
+      // predicate (not a hand-rolled AUTH_ERROR check) specifically because it
+      // excludes a bare 403 — a permission/plan restriction, not a dead session.
+      if (isProvenDisconnectError(e)) {
         linkedInOutreachService.clearStatusCache(accountId);
         const { recordUnipileAccountHealth } = await import('../../services/linkedInConnectionHealth');
         await recordUnipileAccountHealth({ accountId, ownerUserId: userId, state: 'disconnected' });
