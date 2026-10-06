@@ -28,19 +28,9 @@ const router = express.Router();
 
 router.use(authenticateToken);
 
-const MAX_ALLOWED_HOSTS = 20;
-
 router.get('/channels', (_req: Request, res: Response): void => {
   res.json({ ...getTrafficTaxonomy(), taggedLinkPresets: listTaggedLinkPresets(), maxBulkRows: MAX_BULK_ROWS });
 });
-
-function readAllowedHosts(value: unknown): string[] | undefined {
-  if (value === undefined) return undefined;
-  if (!Array.isArray(value) || value.length > MAX_ALLOWED_HOSTS || value.some((h) => typeof h !== 'string' || h.length > 253)) {
-    throw new TaggedLinkError('invalid_base_url', `allowedHosts must be an array of up to ${MAX_ALLOWED_HOSTS} hostnames`);
-  }
-  return value as string[];
-}
 
 router.post('/tagged-links', (req: Request, res: Response): void => {
   const body = req.body;
@@ -49,16 +39,16 @@ router.post('/tagged-links', (req: Request, res: Response): void => {
     return;
   }
   try {
-    const allowedHosts = readAllowedHosts(body.allowedHosts);
+    // allowedHosts is shape-checked inside buildTaggedLink (per row in bulk), so a bad value is a 400/row error.
+    const allowedHosts = body.allowedHosts;
     if (body.rows !== undefined) {
       const defaults = body.defaults && typeof body.defaults === 'object' && !Array.isArray(body.defaults) ? body.defaults : {};
-      const results = buildTaggedLinks(body.rows, { ...(defaults as Partial<TaggedLinkInput>), ...(allowedHosts ? { allowedHosts } : {}) });
+      const results = buildTaggedLinks(body.rows, { ...(defaults as Partial<TaggedLinkInput>), ...(allowedHosts !== undefined ? { allowedHosts } : {}) });
       const failed = results.filter((r) => !r.ok).length;
       res.json({ results, summary: { total: results.length, ok: results.length - failed, failed } });
       return;
     }
-    const { allowedHosts: _ignored, ...input } = body;
-    res.json({ link: buildTaggedLink({ ...(input as TaggedLinkInput), ...(allowedHosts ? { allowedHosts } : {}) }) });
+    res.json({ link: buildTaggedLink(body as TaggedLinkInput) });
   } catch (err) {
     if (err instanceof TaggedLinkError) {
       res.status(400).json({ code: err.code, message: err.message });
