@@ -2510,7 +2510,9 @@ describe("v0Service - deployLandingPage", () => {
           .filter((content) => content.includes("RootLayout"))
           .pop();
       mockAxiosGet.mockImplementation((url: string, ...rest: any[]) =>
-        url.includes("/contents/app/layout.tsx")
+        url.includes("/git/trees/")
+          ? Promise.resolve({ data: { truncated: false, tree: [{ path: "app/layout.tsx", type: "blob", size: 100 }] } })
+          : url.includes("/contents/app/layout.tsx")
           ? Promise.resolve({ data: { type: "file", encoding: "base64", content: Buffer.from(latestLayout() ?? "").toString("base64") } })
           : happyGet(url, ...rest));
 
