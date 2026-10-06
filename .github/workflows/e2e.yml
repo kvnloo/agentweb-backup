@@ -1,0 +1,123 @@
+name: E2E upstream signal
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'partner-portal/**'
+      - 'e2e/**'
+      - '.github/workflows/e2e.yml'
+
+# Additive incubation lane for tester-army/e2e. AgentWeb's incumbent suites
+# remain unchanged; this signal is intentionally advisory until its value and
+# flake rate are measured. PR-authored code receives no application/model/AWS
+# secrets and checkout credentials are not persisted.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  partner-portal:
+    name: tester-army/e2e · partner portal (advisory)
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout PR head
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Node.js
+        id: setup_node
+        continue-on-error: true
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22.22.3'
+          cache: npm
+          cache-dependency-path: partner-portal/package-lock.json
+
+      - name: Install Partner Portal
+        id: install_app
+        continue-on-error: true
+        run: npm ci --prefix partner-portal --no-audit --no-fund
+
+      # Exact direct versions match current tester-army/e2e main. This isolated
+      # incubating package intentionally does not mutate AgentWeb's app lockfiles.
+      - name: Install TesterArmy runner
+        id: install_e2e
+        continue-on-error: true
+        run: npm install --prefix e2e --no-package-lock --ignore-scripts --no-audit --no-fund
+
+      - name: Install Chromium
+        id: browser
+        continue-on-error: true
+        working-directory: e2e
+        run: npm exec -- e2e-web install chromium --with-deps
+
+      - name: Run upstream E2E smoke
+        id: upstream_e2e
+        continue-on-error: true
+        working-directory: e2e
+        env:
+          E2E_TELEMETRY_DISABLED: '1'
+        run: npm run test:ci
+
+      - name: Upload E2E report
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tester-army-e2e-report
+          path: |
+            e2e/.e2e/report.json
+            e2e/.e2e/junit.xml
+          if-no-files-found: warn
+
+      - name: Upload E2E artifacts
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tester-army-e2e-artifacts
+          path: e2e/.e2e/artifacts
+          if-no-files-found: warn
+          retention-days: 7
+
+      # Keep the incubation lane non-blocking without hiding its actual stage
+      # result: every stage is surfaced in the job summary and failures warn.
+      - name: Surface advisory result
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CHECKOUT: ${{ steps.checkout.outcome }}
+          SETUP_NODE: ${{ steps.setup_node.outcome }}
+          INSTALL_APP: ${{ steps.install_app.outcome }}
+          INSTALL_E2E: ${{ steps.install_e2e.outcome }}
+          BROWSER: ${{ steps.browser.outcome }}
+          E2E: ${{ steps.upstream_e2e.outcome }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## tester-army/e2e advisory signal"
+            echo
+            echo "| Stage | Outcome |"
+            echo "| --- | --- |"
+            echo "| checkout | ${CHECKOUT} |"
+            echo "| node | ${SETUP_NODE} |"
+            echo "| app install | ${INSTALL_APP} |"
+            echo "| e2e install | ${INSTALL_E2E} |"
+            echo "| chromium | ${BROWSER} |"
+            echo "| e2e | ${E2E} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ "${CHECKOUT}" != success || "${SETUP_NODE}" != success || "${INSTALL_APP}" != success || "${INSTALL_E2E}" != success || "${BROWSER}" != success || "${E2E}" != success ]]; then
+            echo "::warning title=tester-army/e2e advisory signal::The additive E2E lane did not pass. See the job summary and uploaded evidence; this lane is non-blocking while it incubates."
+          fi
