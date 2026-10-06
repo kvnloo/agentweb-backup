@@ -8162,6 +8162,71 @@ export const crmDb = {
     }
   },
 
+  /**
+   * Guarded hard-delete for the admin session-row cleanup (ENG-2314). Differs from
+   * `deleteLead` in the three ways a repair tool needs:
+   *  - the delete is conditional (row must exist, and `updatedAt` must still equal
+   *    what the plan read), so a row that was modified after the plan is skipped
+   *    instead of silently destroyed;
+   *  - it returns the row exactly as it was at delete time (ReturnValues ALL_OLD),
+   *    which is the restore backup;
+   *  - `leadCount` is decremented ONLY when this call actually removed a row. The
+   *    unconditional `deleteLead` decrements even when the row was already gone, so
+   *    two overlapping cleanups would drive leadCount below the true row count.
+   * `deleteLead` itself is unchanged.
+   */
+  async deleteLeadGuarded(
+    listId: string,
+    leadId: string,
+    expectedUpdatedAt: string | undefined,
+  ): Promise<
+    | { status: 'deleted'; item: any; leadCountDecremented: boolean; leadCountError?: string }
+    | { status: 'not_found' }
+    | { status: 'changed' }
+  > {
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    // `updatedAt` is not a reserved word but is escaped anyway: every attribute name in
+    // an expression goes through a placeholder in this module (see setLeadFields).
+    const params: any = {
+      TableName: tableName,
+      Key: { listId, leadId },
+      ReturnValues: 'ALL_OLD',
+      ExpressionAttributeNames: { '#u': 'updatedAt' },
+      ConditionExpression:
+        expectedUpdatedAt === undefined
+          ? 'attribute_exists(leadId) AND attribute_not_exists(#u)'
+          : 'attribute_exists(leadId) AND #u = :u',
+    };
+    if (expectedUpdatedAt !== undefined) {
+      params.ExpressionAttributeValues = { ':u': expectedUpdatedAt };
+    }
+    let old: any;
+    try {
+      const res = await dynamodb.delete(params).promise();
+      old = res.Attributes;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') {
+        const current = await this.getLeadById(listId, leadId, { consistentRead: true });
+        return current ? { status: 'changed' } : { status: 'not_found' };
+      }
+      handleDynamoDbError(error, 'deleteLeadGuarded');
+      throw error;
+    }
+    try {
+      await this.incrementLeadCount(listId, -1);
+      return { status: 'deleted', item: old, leadCountDecremented: true };
+    } catch (error: any) {
+      // The row is gone and cannot be un-deleted here; surface the drift to the caller
+      // (it lands in the per-group result) instead of throwing and losing the backup.
+      return {
+        status: 'deleted',
+        item: old,
+        leadCountDecremented: false,
+        leadCountError: error?.message ?? String(error),
+      };
+    }
+  },
+
   async batchCreateLeads(listId: string, leads: Array<{
     email?: string;
     firstName?: string;
