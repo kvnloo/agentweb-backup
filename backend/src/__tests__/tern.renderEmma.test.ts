@@ -7,7 +7,9 @@ import {
 } from '../tern/renderEmma';
 
 function flatten(node: TspNode): TspNode[] {
-  return [node, ...(node.c ?? []).flatMap(flatten)];
+  const out = [node];
+  for (const child of node.c ?? []) out.push(...flatten(child));
+  return out;
 }
 
 describe('Tern Emma renderer', () => {
