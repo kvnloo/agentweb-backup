@@ -487,6 +487,23 @@ export function deriveBlockedByCost(status: {
  * For org members, usage is recorded on the org owner's account.
  * Performs lazy monthly reset if the stored month differs from current.
  */
+/**
+ * ENG-1250 AC7 / ENG-2286 stage 3: the legacy per-user counter (`AW-Users.tokenUsage`, plus the
+ * `AW-LlmChargeEvents` audit rows written with it) is no longer maintained. Admission, the usage views,
+ * the admin surfaces and itemization all read the spend ledger now, and `recordUsage` writes every call
+ * to it independently of this function. Set to `true` to resume the legacy writes (rollback).
+ */
+export const LEGACY_COUNTER_WRITES_ENV = "AW_LEGACY_TOKEN_COUNTER_WRITES";
+
+export function isLegacyCounterWriteEnabled(): boolean {
+  return process.env[LEGACY_COUNTER_WRITES_ENV] === "true";
+}
+
+/**
+ * Charge a call to the legacy monthly counter. A NO-OP unless `AW_LEGACY_TOKEN_COUNTER_WRITES=true`; the
+ * ledger, not this counter, is the record of spend. Retained (not deleted) for one rollback window and
+ * removed in stage 4.
+ */
 export async function incrementUserTokenUsage(
   userId: string,
   tokens: number,
@@ -522,6 +539,7 @@ export async function incrementUserTokenUsage(
   }
 ): Promise<void> {
   if (tokens <= 0 && cost <= 0) return;
+  if (!isLegacyCounterWriteEnabled()) return;
 
   const currentMonth = getCurrentMonth();
 

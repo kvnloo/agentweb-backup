@@ -750,6 +750,10 @@ async function countedForMonth(
   }
   const hist = (owner.tokenUsageHistory || []).find((h) => h.month === month);
   if (hist) return { costUsd: hist.totalCost || 0, source: "history" };
+  // A month is archived into tokenUsageHistory only by the first counter write of the NEXT month. The
+  // counter writes have stopped (ENG-1250 AC7), so an account with no activity in between still holds
+  // that month as its current, frozen counter: use it rather than report nothing.
+  if (owner.tokenUsage?.month === month) return { costUsd: owner.tokenUsage.totalCost || 0, source: "history" };
   return { costUsd: 0, source: "none" };
 }
 
