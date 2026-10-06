@@ -78,6 +78,7 @@ import * as socialAccountsImpl from './impl/socialAccounts';
 // without going through the class's own delegating wrapper (same treatment
 // as create_html_from_template).
 import * as linkedinImpl from './impl/linkedin';
+import { excludeSessionLists } from '../utils/sessionList';
 import * as twitterImpl from './impl/twitter';
 // ENG-2103 (F2): Meta/LinkedIn ads APIs tool cluster. Only
 // callLinkedInMarketingApi/callLinkedInAdsInsightsApi are repointed directly
@@ -4093,8 +4094,8 @@ emmaToolRegistry.register({
         },
         list_type: {
           type: 'string',
-          enum: ['sales', 'customers'],
-          description: 'Type of the list. "sales" lists use sales pipeline stages (new, contacted, qualified, etc.). "customers" lists use customer lifecycle stages (onboarding, active, at_risk, churned). Determines default status configuration.'
+          enum: ['sales', 'customers', 'session'],
+          description: 'Type of the list. "sales" lists use sales pipeline stages (new, contacted, qualified, etc.). "customers" lists use customer lifecycle stages (onboarding, active, at_risk, churned). "session" lists hold one row per landing-page visitor session (telemetry, not contacts): no deal stages, and no CRM sync, sequence enrolment, drafts or alerts fire for their rows. Determines default status configuration.'
         }
       },
       required: ['name']
@@ -4351,7 +4352,7 @@ emmaToolRegistry.register({
     // AskCrmLead shape so askCrm doesn't have to know about the underlying
     // storage layout.
     const loadLeadsForUser = async (uid: string, opts: { limit: number }): Promise<AskCrmLead[]> => {
-      const lists = (await crmDb.getLeadListsForUser(uid)) || [];
+      const lists = excludeSessionLists(await crmDb.getLeadListsForUser(uid)); // ENG-2311: session rows would eat the load cap
       const out: AskCrmLead[] = [];
       for (const list of lists as any[]) {
         if (out.length >= opts.limit) break;
@@ -4659,8 +4660,8 @@ emmaToolRegistry.register({
         },
         list_type: {
           type: 'string',
-          enum: ['sales', 'customers'],
-          description: 'Set the list type. Can only be set once — once defined, it cannot be changed. "sales" lists track prospects through a sales pipeline; "customers" lists track existing customers through lifecycle stages.'
+          enum: ['sales', 'customers', 'session'],
+          description: 'Set the list type. Can only be set once — once defined, it cannot be changed. "sales" lists track prospects through a sales pipeline; "customers" lists track existing customers through lifecycle stages; "session" lists hold per-visitor landing-page session rows (telemetry, not contacts).'
         }
       },
       required: ['list_id']
@@ -5385,7 +5386,7 @@ emmaToolRegistry.register({
   name: "describe_image",
   definition: {
     name: "describe_image",
-    description: 'Analyze and describe an image from a URL. Use this when the user mentions an image, asks to "read" an image, or when you need to understand visual content (jpg, jpeg, png, gif, webp, svg, etc.). Always prefer this over read_file_content for image files.',
+    description: 'Analyze and describe an image from a URL. Use this when the user mentions an image, asks to "read" an image, or when you need to understand visual content (jpg, jpeg, png, gif, webp, svg, etc.). Always prefer this over read_file_content for image files; for SVG, use read_file_content only when the user wants its source markup, text labels, or dimensions.',
     inputSchema: {
       type: "object",
       properties: {
@@ -6600,7 +6601,7 @@ emmaToolRegistry.register({
   name: "read_file_content",
   definition: {
     name: "read_file_content",
-    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, Excel/XLSX spreadsheets, Word documents (docx, doc), and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp, svg) — use describe_image instead. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead.',
+    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, Excel/XLSX spreadsheets, Word documents (docx, doc), and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp) — use describe_image instead. For SVG source markup, text labels, or dimensions, use this tool; use describe_image for visual analysis of SVGs. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead.',
     inputSchema: {
       type: "object",
       properties: {
@@ -9383,7 +9384,7 @@ emmaToolRegistry.register({
     // Scan caller's lists and collect candidates. Ranking by heatScore desc.
     let lists: any[] = [];
     try {
-      lists = (await crmDb.getLeadListsForUser(userId)) || [];
+      lists = excludeSessionLists(await crmDb.getLeadListsForUser(userId)); // ENG-2311: session rows would eat the scan cap
     } catch (err: any) {
       return { error: err?.message || 'Failed to load lead lists' };
     }

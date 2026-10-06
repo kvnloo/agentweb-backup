@@ -555,7 +555,7 @@ import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './
 import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
-import type { LeadImportRowOutcome } from '../utils/leadSchema';
+import type { LeadImportRowOutcome, LeadListType } from '../utils/leadSchema';
 import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor } from '../utils/leadSchema';
 import { matchLifecyclePresenceFilter } from '../utils/lifecycleFilterSemantics';
 
@@ -9885,7 +9885,7 @@ export class AgentModeService {
     return leadsImpl.getLeadLists(userId);
   }
 
-  public async createLeadList(name: string, description: string, userId: string, listType?: 'sales' | 'customers'): Promise<any> {
+  public async createLeadList(name: string, description: string, userId: string, listType?: LeadListType): Promise<any> {
     return leadsImpl.createLeadList(name, description, userId, listType);
   }
 
@@ -9961,7 +9961,7 @@ export class AgentModeService {
     autoDraftEnabled?: boolean;
     autoDraftInstruction?: string;
     statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
-    listType?: 'sales' | 'customers';
+    listType?: LeadListType;
   }, userId: string): Promise<any> {
     return leadsImpl.updateLeadList(listId, updates, userId);
   }
