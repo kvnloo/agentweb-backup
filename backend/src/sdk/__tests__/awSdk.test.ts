@@ -49,6 +49,10 @@ describe('aw.js: identity and counters', () => {
       expect(b).not.toHaveProperty(k);
     }
     expect(Number.isSafeInteger(b.sessionStartMs)).toBe(true);
+    // ENG-2324: the device clock at send time rides every event (the server's sticky "clock is ahead" signal)
+    expect(Number.isSafeInteger(b.clientNowMs)).toBe(true);
+    expect(b.clientNowMs - b.sessionStartMs).toBeGreaterThanOrEqual(0); // same (page) clock as the minted start
+    expect(b.clientNowMs - b.sessionStartMs).toBeLessThan(60_000);
   });
 
   it('uses the SAME sessionStartMs and sessionId on every event, with a non-decreasing numeric eventCount', () => {

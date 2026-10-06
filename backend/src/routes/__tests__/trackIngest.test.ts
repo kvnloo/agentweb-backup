@@ -10,7 +10,7 @@ import { ingestListCache } from '../../utils/ingestListCache';
 import { sessionLeadId } from '../../utils/sessionList';
 
 jest.mock('../../services/db', () => ({
-  crmDb: { getLeadListById: jest.fn(), createLead: jest.fn(), mergeSessionLeadEvent: jest.fn() },
+  crmDb: { getLeadListById: jest.fn(), getLeadById: jest.fn(), createLead: jest.fn(), mergeSessionLeadEvent: jest.fn() },
 }));
 
 const LIST_ID = 'list_1790938330308_abc';
@@ -96,6 +96,27 @@ describe('POST /api/track/event', () => {
       sessionId: SID, sessionStartMs: b.sessionStartMs, source: 'tracker-sdk', page: 'Guilty v2',
       channel: 'Instagram', trafficType: 'organic', lp_view_at: expect.any(String), eventCount: 1,
     });
+  });
+
+  it.each([['+3d', 3 * 24 * 3600_000], ['-3d', -3 * 24 * 3600_000], ['+10min', 10 * 60_000]])(
+    'ENG-2324: a device clock %s off is accepted (204) and every event of the session targets ONE row id, time-prefixed within the last 24h', async (_l, skew) => {
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(null);
+      const app = makeApp();
+      const start = Date.now() + skew;
+      for (const ev of ['lp_view', 'play_start', 'click', 'page_exit']) {
+        expect((await post(app, event({ event: ev, sessionStartMs: start }))).status).toBe(204);
+      }
+      const ids = new Set((crmDb.createLead as jest.Mock).mock.calls.map(([, d]) => d.leadId));
+      expect(ids.size).toBe(1);
+      const prefix = Number([...ids][0].split('_')[1]);
+      expect(prefix).toBeLessThanOrEqual(Date.now());
+      expect(prefix).toBeGreaterThan(Date.now() - 24 * 3600_000);
+      expect((crmDb.createLead as jest.Mock).mock.calls[0][1].customFields.sessionStartMs).toBe(prefix);
+    });
+
+  it('ENG-2324: an in-window event never pays the extra substitute probe read', async () => {
+    await post(makeApp(), event());
+    expect(crmDb.getLeadById).not.toHaveBeenCalled();
   });
 
   it('a later event for the same session takes the atomic merge, not a second row', async () => {
@@ -187,7 +208,7 @@ describe('POST /api/track/event', () => {
     it.each([
       ['unknown event', { event: 'purchase' }],
       ['bad session id', { sessionId: 'x' }],
-      ['stale sessionStartMs', { sessionStartMs: Date.now() - 72 * 3600_000 }],
+      ['non-numeric sessionStartMs', { sessionStartMs: 'soon' }],
       ['missing listId', { listId: undefined }],
       ['custom without name', { event: 'custom' }],
     ])('rejects %s', async (_l, over) => {

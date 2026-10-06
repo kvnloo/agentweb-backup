@@ -231,9 +231,20 @@ async function handleHubSpotEvent(
 
     if (!lead) {
       // New contact in HubSpot — create it in our list
-      await crmDb.createLead(listId, leadFields);
-      console.log(`[CrmWebhook/HubSpot] Created lead for ${email} in list ${listId}`);
-    } else {
+      try {
+        await crmDb.createLead(listId, leadFields);
+        console.log(`[CrmWebhook/HubSpot] Created lead for ${email} in list ${listId}`);
+      } catch (createErr: any) {
+        // The lookups above said "absent" but createLead's own pre-check found the address — a
+        // concurrent delivery/import created it in between. Throwing here escapes the loop and
+        // abandons every remaining objectId in this delivery (HubSpot already has its 200), so
+        // adopt the row we lost to and fall through to the update path instead.
+        if (!createErr?.duplicateEmail || !createErr.existingLead) throw createErr;
+        lead = createErr.existingLead as Record<string, any>;
+        console.log(`[CrmWebhook/HubSpot] Lead for ${email} already existed in list ${listId} (lost create race) — updating ${lead.leadId}`);
+      }
+    }
+    if (lead) {
       // Merge custom fields with existing ones
       const mergedCustomFields = Object.keys(customFieldUpdates).length > 0
         ? mergeCustomFields(
