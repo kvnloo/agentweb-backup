@@ -113,7 +113,7 @@ function decodePickerKey(buffer: string): { key?: PickerKey; used: number; needM
 
   const first = buffer[0];
   if (first !== '\x1b') {
-    const code = first.codePointAt(0);
+    const code = buffer.codePointAt(0);
     if (code === undefined) return { used: 1 };
     const char = String.fromCodePoint(code);
     const used = char.length;
@@ -148,6 +148,9 @@ function decodePickerKey(buffer: string): { key?: PickerKey; used: number; needM
   }
 
   const csi = /^\x1b\[([0-9:;]*)([A-Za-z~])/.exec(buffer);
+  if (!csi && buffer.startsWith('\x1b[') && buffer.length < 64) {
+    return { used: 0, needMore: true };
+  }
   if (csi) {
     const [sequence, params, final] = csi;
     if (final === 'u') {
@@ -298,15 +301,6 @@ async function main(): Promise<void> {
     process.stdin.setRawMode?.(false);
     process.stdin.pause();
     throw new Error(`Tern is missing required TSP kinds: ${missingKinds.join(', ')}`);
-  }
-
-  const requiredFeatures = ['edit', 'send'];
-  const helloFeatures = hello.features ?? [];
-  const missingFeatures = requiredFeatures.filter(feature => !helloFeatures.includes(feature));
-  if (missingFeatures.length > 0) {
-    process.stdin.setRawMode?.(false);
-    process.stdin.pause();
-    throw new Error(`Tern is missing required TSP features: ${missingFeatures.join(', ')}`);
   }
 
   const apcLimit = typeof hello.apc === 'number'
