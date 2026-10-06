@@ -165,6 +165,25 @@ function diffChildren(oldNode: TspNode, nextNode: TspNode, ops: TspOp[]): void {
   }
 }
 
+function forgetNode(node: TspNode, forgotten: ReadonlySet<string>): TspNode | null {
+  if (forgotten.has(node.id)) return null;
+  if (!node.c?.length) return node;
+
+  let changed = false;
+  const children: TspNode[] = [];
+  for (const child of node.c) {
+    const kept = forgetNode(child, forgotten);
+    if (!kept) {
+      changed = true;
+      continue;
+    }
+    if (kept !== child) changed = true;
+    children.push(kept);
+  }
+
+  return changed ? { ...node, c: children } : node;
+}
+
 export class TspSurfaceReconciler {
   private roots = new Map<string, TspNode>();
 
@@ -200,6 +219,17 @@ export class TspSurfaceReconciler {
 
   commit(nextRoots: readonly TspNode[]): void {
     this.roots = new Map(nextRoots.map(node => [node.id, node] as const));
+  }
+
+  forget(ids: readonly string[]): void {
+    if (!ids.length) return;
+    const forgotten = new Set(ids);
+    const next = new Map<string, TspNode>();
+    for (const [id, root] of this.roots) {
+      const kept = forgetNode(root, forgotten);
+      if (kept) next.set(id, kept);
+    }
+    this.roots = next;
   }
 
   reset(): void {
