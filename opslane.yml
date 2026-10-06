@@ -1,0 +1,49 @@
+dockerfile: test-env/Dockerfile.backend
+port: 3001
+health_path: /health
+services:
+  - dynamodb
+  - llm
+env:
+  NODE_ENV: development
+  JWT_SECRET: local-test-jwt-secret-0123456789abcdef
+  AWS_REGION: us-west-2
+  # The app's AWS SDK v2 has no endpoint setting: this preload points its DynamoDB clients at the
+  # dynamodb service (DYNAMODB_ENDPOINT, set by the recipe) without changing the app.
+  NODE_OPTIONS: --require /opslane/aws-local.cjs --require /opslane/llm-twin.cjs
+  FRONTEND_URL: http://localhost:5173
+  CUSTOMER_FRONTEND_URL: http://localhost:5174
+  BACKEND_URL: http://localhost:3001
+  GOOGLE_CLIENT_ID: placeholder.apps.googleusercontent.com
+  GOOGLE_CLIENT_SECRET: placeholder
+  MCP_ACCESS_TOKEN: local-mcp-access-token-0123456789
+  CONNECT_TOKEN_ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+migrate: node dist/scripts/create-tables.js
+auth:
+  # Signs in over the API; the session is a bearer token (headers), which hunts' signed-in http calls send.
+  session_command: node /opslane/session.cjs
+seed: node /opslane/seed.cjs
+verify_setup:
+  instructions: |
+    The backend API runs on port 3001 (Express). Data lives in DynamoDB tables prefixed `Dev-`
+    (NODE_ENV=development), e.g. Dev-AW-Users, created empty by the migrate step.
+    A customer account exists (verify@agentweb.local / OpslaneVerify123!). Signed-in calls: use http with
+    sign_in: true, which sends its JWT as `Authorization: Bearer <token>`; don't sign in yourself.
+    Other outside services (Bedrock, Stripe, Slack, Meta, AWS Secrets Manager) are NOT reachable: their
+    keys are placeholders, so features that call them fail. Model calls are the exception (below).
+    There is no Postgres: check state through the API (and the logs), not SQL.
+    Email addresses: the app treats test domains as unreachable (example.com/.net/.org/.edu and any
+    .test, .example, .invalid or .localhost domain): such leads are skipped as "no email". Seed and
+    create leads with addresses on verify.opslane.com (e.g. lead-1@verify.opslane.com). No email is
+    ever sent: the sending providers have placeholder keys.
+    Model calls: the app's calls to OpenRouter, OpenAI and Gemini go to the LLM twin (twin: "llm";
+    .opslane/llm-twin.cjs sends them there). Most of AgentWeb's calls are OpenRouter chat completions,
+    which arrive as POST /api/v1/chat/completions (the spam check sends model
+    anthropic/claude-sonnet-4.6). Script the twin's answers or faults (slow, streamed, 5xx, dropped) to
+    drive a flow, and read its recorded calls to check what the app sent the model.
+    Send requests from outside the app with the http tool: anything run inside the app container
+    (container_exec) dies with it when the app is stopped or sent SIGTERM.
+    MCP (POST /mcp, Streamable HTTP): send initialize first, then put the mcp-session-id response
+    header on every later request of that session (without it the app answers 404). Authenticate with
+    an aw_ API key, or Bearer MCP_ACCESS_TOKEN for internal loopback calls.
+    Sign-in is rate limited to 10 attempts per 15 minutes per process: use sign_in rather than logging in.
