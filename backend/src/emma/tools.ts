@@ -4235,6 +4235,10 @@ emmaToolRegistry.register({
         cursor: {
           type: 'string',
           description: 'Pagination cursor returned as next_cursor from a previous call. Pass this to retrieve the next page of results.'
+        },
+        include_all_fields: {
+          type: 'boolean',
+          description: 'If true, each lead also includes notes, linkedin, customFields, enrichmentMetadata, createdAt and updatedAt. Use for exports (e.g. CSV) instead of calling get_lead_details per lead.'
         }
       },
       required: ['list_id']
@@ -4242,6 +4246,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await leadsImpl.getLeads(args.list_id, context?.userId, {
+      includeAllFields: args.include_all_fields === true,
       search: args.search,
       status: args.status,
       icpOnly: args.icp_only,
