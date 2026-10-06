@@ -10158,6 +10158,52 @@ export const crmDb = {
   },
 
   /**
+   * ENG-2326: sets top-level attributes ONLY where the row holds nothing for them: the attribute
+   * is absent, '' or NULL. One UpdateItem PER KEY, each with its own ConditionExpression, so a key a
+   * concurrent writer has just populated is kept (that key's write is skipped) without blocking the
+   * other keys.
+   *
+   * Why not setLeadFields({ topLevel, ifNotExists: true }): `if_not_exists(#k, :v)` leaves an existing
+   * attribute alone even when its value is '' or NULL, so a "fill the blanks" caller could never fill a
+   * blank. And why not an unconditional SET: it would overwrite a value written between the caller's read
+   * and this write. The condition is evaluated by DynamoDB against the stored item, so there is no
+   * read-then-write window.
+   *
+   * `attribute_exists(leadId)` keeps a row that was deleted in the meantime from being resurrected as a
+   * bare item. A skipped write (value present, or row gone) is NOT an error; the caller re-reads to see
+   * what the row holds. Every attribute name and value goes through a placeholder. Blank VALUES are never
+   * written (this method only fills). The primary-key attributes are refused.
+   */
+  async setLeadTopLevelIfBlank(
+    listId: string,
+    leadId: string,
+    fields: Record<string, any>,
+  ): Promise<{ written: string[]; kept: string[] }> {
+    const written: string[] = [];
+    const kept: string[] = [];
+    for (const [k, v] of Object.entries(fields)) {
+      if (v === undefined || v === null || v === '' || k === 'listId' || k === 'leadId' || !k) continue;
+      try {
+        await dynamodb.update({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          Key: { listId, leadId },
+          UpdateExpression: 'SET #k = :v, #u = :ts',
+          ConditionExpression:
+            'attribute_exists(#pk) AND (attribute_not_exists(#k) OR #k = :empty OR attribute_type(#k, :nullType))',
+          ExpressionAttributeNames: { '#k': k, '#u': 'updatedAt', '#pk': 'leadId' },
+          ExpressionAttributeValues: { ':v': v, ':ts': new Date().toISOString(), ':empty': '', ':nullType': 'NULL' },
+        }).promise();
+        written.push(k);
+      } catch (err: any) {
+        if (err.code === 'ConditionalCheckFailedException') { kept.push(k); continue; }
+        handleDynamoDbError(err, 'setLeadTopLevelIfBlank');
+        throw err;
+      }
+    }
+    return { written, kept };
+  },
+
+  /**
    * Atomic targeted write for bulk enrichment background jobs.
    *
    * Writes top-level scalar fields, enrichmentMetadata sub-keys, and

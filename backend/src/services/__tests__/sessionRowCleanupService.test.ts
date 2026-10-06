@@ -10,7 +10,9 @@ const store: { lists: Record<string, any>; rows: Record<string, Record<string, a
   lists: {},
   rows: {},
 };
-const calls = { setLeadFields: [] as any[], deleteLeadGuarded: [] as any[] };
+const calls = { setLeadFields: [] as any[], setLeadTopLevelIfBlank: [] as any[], deleteLeadGuarded: [] as any[] };
+/** Runs just before the keeper's top-level conditional write: lets a test play the concurrent writer. */
+let beforeTopLevelWrite: ((listId: string, leadId: string) => void) | null = null;
 let failSetFieldsFor: string | null = null;
 let skipWrites = false;
 
@@ -45,6 +47,23 @@ jest.mock('../db', () => ({
         if (!o.ifNotExists || r[k] === undefined) r[k] = v;
       }
       r.updatedAt = '2099-01-01T00:00:00.000Z';
+    }),
+    // Honours the real contract (db.setLeadTopLevelIfBlank): per key, write only if the row exists and the
+    // attribute is absent, '' or null; otherwise keep what is there. Never writes a blank value.
+    setLeadTopLevelIfBlank: jest.fn(async (listId: string, leadId: string, fields: Record<string, any>) => {
+      calls.setLeadTopLevelIfBlank.push({ listId, leadId, fields });
+      if (failSetFieldsFor === leadId) throw new Error('boom');
+      beforeTopLevelWrite?.(listId, leadId);
+      const written: string[] = [];
+      const kept: string[] = [];
+      if (skipWrites) return { written, kept };
+      const r = store.rows[listId]?.[leadId];
+      for (const [k, v] of Object.entries(fields)) {
+        if (v === undefined || v === null || v === '') continue;
+        if (r && (r[k] === undefined || r[k] === null || r[k] === '')) { r[k] = v; written.push(k); } else kept.push(k);
+      }
+      if (r && written.length) r.updatedAt = '2099-01-01T00:00:00.000Z';
+      return { written, kept };
     }),
     deleteLeadGuarded: jest.fn(async (listId: string, leadId: string, expectedUpdatedAt?: string) => {
       calls.deleteLeadGuarded.push({ listId, leadId });
@@ -112,7 +131,9 @@ function defaultSeed() {
 
 beforeEach(() => {
   calls.setLeadFields.length = 0;
+  calls.setLeadTopLevelIfBlank.length = 0;
   calls.deleteLeadGuarded.length = 0;
+  beforeTopLevelWrite = null;
   failSetFieldsFor = null;
   skipWrites = false;
   defaultSeed();
@@ -426,5 +447,80 @@ describe('explicit-ID mode', () => {
     expect(res.backup.map((b) => b.item.customFields.note).sort()).toEqual(['real lead', 'real lead 2']);
     expect(store.lists[LIST].leadCount).toBe(6);
     expect(store.rows[LIST].l001).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ENG-2326: a keeper whose top-level attribution attribute is BLANK
+// ---------------------------------------------------------------------------
+describe('apply: keeper with a blank top-level attribution field (ENG-2326)', () => {
+  const FT = { src: 'ad', ts: 1 };
+  async function applyFor(keeperExtra: Record<string, any>) {
+    seed(LIST, [
+      row('k001', 'SB', { eventCount: '1', journey: 'a' }, keeperExtra),
+      row('k002', 'SB', { eventCount: '2', journey: 'a>b' }, { firstTouch: FT, utm_source: 'fb', lastTouch: { src: 'last' } }),
+    ]);
+    const plan = await previewDedupe(LIST, CLK);
+    const res = await applyDedupe({ listId: LIST, planHash: plan.planHash, expectedRowsToDelete: plan.counts.rowsToDelete, confirm: true }, quiet);
+    return { plan, res };
+  }
+
+  it.each([
+    ["''", { firstTouch: '', utm_source: '', lastTouch: '' }],
+    ['null', { firstTouch: null, utm_source: null, lastTouch: null }],
+    ['absent', {}],
+    ['a mix', { firstTouch: '', utm_source: null }],
+  ])('keeper blank as %s: the donor value is written, verification passes, the donor is deleted', async (_n, extra) => {
+    const { plan, res } = await applyFor(extra);
+    expect(Object.keys(plan.groups[0].topLevelWrites).sort()).toEqual(['firstTouch', 'lastTouch', 'utm_source']);
+    expect(res.groups[0]).toMatchObject({ status: 'merged_and_deleted', keeperWritten: true, deletedLeadIds: ['k002'] });
+    const k = store.rows[LIST].k001;
+    expect(k.firstTouch).toEqual(FT);
+    expect(k.utm_source).toBe('fb');
+    expect(k.lastTouch).toEqual({ src: 'last' });
+    expect(Object.keys(store.rows[LIST])).toEqual(['k001']);
+    expect(store.lists[LIST].leadCount).toBe(1);
+    expect(calls.setLeadTopLevelIfBlank).toHaveLength(1);
+    expect(calls.setLeadFields.every((c) => c.o.topLevel === undefined)).toBe(true); // the old if_not_exists path is gone
+  });
+
+  it('a NON-blank keeper value is never planned and never overwritten', async () => {
+    const { plan, res } = await applyFor({ firstTouch: { src: 'keeper' }, utm_source: 'keeper-src', lastTouch: '' });
+    expect(Object.keys(plan.groups[0].topLevelWrites)).toEqual(['lastTouch']);
+    expect(res.groups[0].status).toBe('merged_and_deleted');
+    expect(store.rows[LIST].k001.firstTouch).toEqual({ src: 'keeper' });
+    expect(store.rows[LIST].k001.utm_source).toBe('keeper-src');
+    expect(store.rows[LIST].k001.lastTouch).toEqual({ src: 'last' });
+  });
+
+  it('a concurrent writer that populates the blank AFTER the plan was read is NOT overwritten (the write is conditional), and nothing is lost', async () => {
+    beforeTopLevelWrite = (listId, leadId) => { store.rows[listId][leadId].firstTouch = { src: 'concurrent' }; };
+    const { res } = await applyFor({ firstTouch: '' });
+    expect(store.rows[LIST].k001.firstTouch).toEqual({ src: 'concurrent' });
+    expect(store.rows[LIST].k001.utm_source).toBe('fb'); // the other keys still filled
+    expect(res.groups[0].status).toBe('merged_and_deleted');
+  });
+
+  it('is idempotent: a second preview plans nothing and apply does nothing', async () => {
+    await applyFor({ firstTouch: '' });
+    const plan2 = await previewDedupe(LIST, CLK);
+    expect(plan2.counts.rowsToDelete).toBe(0);
+    calls.setLeadTopLevelIfBlank.length = 0;
+    const res2 = await applyDedupe({ listId: LIST, planHash: plan2.planHash, expectedRowsToDelete: 0, confirm: true }, quiet);
+    expect(res2.deletedCount).toBe(0);
+    expect(calls.setLeadTopLevelIfBlank).toHaveLength(0);
+    expect(store.rows[LIST].k001.firstTouch).toEqual(FT);
+  });
+
+  it('if the write did not take effect, verification fails and NO donor is deleted (fail-safe preserved; top-level keys only)', async () => {
+    // identical customFields: the ONLY planned write is the top-level one, so only its verification can catch it
+    seed(LIST, [row('k001', 'SB', { eventCount: '1' }, { firstTouch: '' }), row('k002', 'SB', { eventCount: '1' }, { firstTouch: FT })]);
+    const plan = await previewDedupe(LIST, CLK);
+    skipWrites = true;
+    const res = await applyDedupe({ listId: LIST, planHash: plan.planHash, expectedRowsToDelete: 1, confirm: true }, quiet);
+    expect(res.groups[0].status).toBe('error');
+    expect(res.groups[0].error).toMatch(/keeper verification failed/);
+    expect(Object.keys(store.rows[LIST]).sort()).toEqual(['k001', 'k002']);
+    expect(calls.deleteLeadGuarded).toHaveLength(0);
   });
 });
