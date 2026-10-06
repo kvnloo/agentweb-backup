@@ -60,6 +60,16 @@ export interface EmmaSessionLike {
   updatedAt?: string;
   messages?: EmmaMessage[];
   pendingApprovalDeck?: EmmaPendingApprovalDeck;
+  workPlan?: {
+    title: string;
+    steps: Array<{
+      stepCount: number;
+      title: string;
+      description?: string;
+      status: 'pending' | 'completed' | 'skipped';
+      notes?: string;
+    }>;
+  };
 }
 
 export interface RunningTool {
@@ -215,6 +225,41 @@ export function renderEmmaMain(
   };
 }
 
+export function renderWorkPlanChecklist(session: EmmaSessionLike): TspNode | null {
+  const plan = session.workPlan;
+  if (!plan || !Array.isArray(plan.steps) || plan.steps.length === 0) return null;
+
+  const firstPending = plan.steps.findIndex(step => step.status === 'pending');
+  const done = plan.steps.filter(step => step.status === 'completed' || step.status === 'skipped').length;
+
+  return {
+    id: 'work-plan',
+    k: 'checklist',
+    p: {
+      mode: 'hud',
+      note: `${done}/${plan.steps.length} · ${plan.title}`,
+      phases: [{
+        id: 'work-plan',
+        title: plan.title,
+        items: plan.steps.map((step, index) => ({
+          id: `step-${step.stepCount}`,
+          text: step.title,
+          status:
+            step.status === 'completed'
+              ? 'done'
+              : step.status === 'skipped'
+                ? 'dropped'
+                : index === firstPending
+                  ? 'active'
+                  : 'pending',
+          ...(step.notes ? { note: step.notes } : {}),
+        })),
+        collapsed: done === plan.steps.length,
+      }],
+    },
+  };
+}
+
 export function renderEmmaDock(options: {
   text: string;
   cursor: number;
@@ -237,11 +282,14 @@ export function renderEmmaDock(options: {
     );
   }
 
+  const workPlan = renderWorkPlanChecklist(session);
+
   return {
     id: 'dock',
     k: 'col',
     p: { gap: 'xs' },
     c: [
+      ...(workPlan ? [workPlan] : []),
       {
         id: 'composer',
         k: 'editor',
