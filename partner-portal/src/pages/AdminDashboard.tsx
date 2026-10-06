@@ -4659,7 +4659,7 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                         </TableCell>
                         <TableCell>
                           <Typography variant="body2" sx={{ fontVariantNumeric: "tabular-nums" }}>
-                            {spendUsd != null && spendUsd > 0 ? `$${spendUsd.toFixed(2)}` : "—"}
+                            {spendUsd != null ? `$${spendUsd.toFixed(2)}` : "—"}
                           </Typography>
                         </TableCell>
                         <TableCell>
@@ -5030,19 +5030,19 @@ const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
                                 <Grid item xs={6}>
                                   <HelpCaption
                                     label="LLM Cost"
-                                    help="Settled spend this month from the spend ledger (all vendors), vs the cap (∞ = no cap). This is the figure the cap is enforced on — open the breakdown for gross burn per model, including platform-absorbed cost."
+                                    help="Settled spend this month from the spend ledger, vs the cap (∞ = no cap). Accounts on ledger enforcement (every tier at present) are capped on this figure; a rollback to the legacy basis would count LLM spend only. A dash means the ledger lookup failed. Open the breakdown for gross burn per model, including platform-absorbed cost."
                                   />
                                   <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
                                     {user.roles?.includes("customer") ? (() => {
                                       const currentMonth = new Date().toISOString().slice(0, 7);
-                                      const costUsed = user.spendThisMonthUsd ?? 0;
+                                      const costUsed = user.spendThisMonthUsd;
                                       const costAllowance = subscriptionTypeCostAllowanceMap[user.subscriptionType || "Basic"] ?? null;
                                       const credits = user.llmUsageCredits?.month === currentMonth
                                         ? ((user.llmUsageCredits.totalPurchasedMicroUsd || 0) + (user.llmUsageCredits.totalAdminGrantedMicroUsd || 0)) / 1_000_000
                                         : 0;
                                       return (
                                         <Typography variant="body2">
-                                          ${costUsed.toFixed(2)} / {costAllowance != null ? `$${(costAllowance + credits).toFixed(2)}` : "∞"}
+                                          {costUsed != null ? `$${costUsed.toFixed(2)}` : "—"} / {costAllowance != null ? `$${(costAllowance + credits).toFixed(2)}` : "∞"}
                                           {credits > 0 && <Typography component="span" variant="caption" color="text.secondary"> (+${credits.toFixed(2)} credits)</Typography>}
                                           <Typography component="span" variant="caption" color="text.secondary"> deducted</Typography>
                                         </Typography>
