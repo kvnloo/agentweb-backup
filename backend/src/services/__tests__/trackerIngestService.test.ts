@@ -5,6 +5,7 @@
 import { crmDb } from '../db';
 import { ingestTrackerEvent } from '../trackerIngestService';
 import { parseIngestBody } from '../../utils/trackingIngest';
+import { ingestListCache } from '../../utils/ingestListCache';
 import { sessionLeadId } from '../../utils/sessionList';
 
 jest.mock('../db', () => ({
@@ -34,6 +35,7 @@ const writtenTo = () => (crmDb.createLead as jest.Mock).mock.calls.map((c) => c[
 
 beforeEach(() => {
   jest.clearAllMocks();
+  ingestListCache.clear();
   jest.spyOn(console, 'warn').mockImplementation(() => undefined);
   (crmDb.getLeadListById as jest.Mock).mockImplementation(async (id: string) => ({ list_child_org1: child('list_child_org1'), list_child_paid: child('list_child_paid') } as any)[id] ?? null);
   (crmDb.createLead as jest.Mock).mockImplementation(async (_l: string, d: any) => ({ ...d }));
@@ -136,5 +138,34 @@ describe('child failure isolation', () => {
       return { ...d };
     });
     await expect(ingest(IG)).rejects.toThrow('parent write failed');
+  });
+});
+
+describe('ENG-2325: routing-child lookups use the list cache', () => {
+  it('N events for a session routed to a child read the child list ONCE, not once per event', async () => {
+    for (let i = 0; i < 20; i++) await ingest(IG);
+    expect((crmDb.getLeadListById as jest.Mock).mock.calls.filter((c) => c[0] === 'list_child_org1')).toHaveLength(1);
+    expect(writtenTo()).toHaveLength(40); // every event still written to the parent and the child
+  });
+
+  it('the child checks still run against the cached row: a child owned by someone else is refused every time', async () => {
+    (crmDb.getLeadListById as jest.Mock).mockImplementation(async (id: string) => child(id, { userId: 'someone-else' }));
+    const r1 = await ingest(IG); const r2 = await ingest(IG);
+    expect(r1.childFailures).toEqual(['list_child_org1']);
+    expect(r2.childFailures).toEqual(['list_child_org1']);
+    expect(writtenTo()).toEqual(['list_parent_001', 'list_parent_001']);
+  });
+
+  it('a child that stops being a session list is refused once the entry is invalidated', async () => {
+    await ingest(IG);
+    (crmDb.getLeadListById as jest.Mock).mockImplementation(async (id: string) => child(id, { listType: undefined }));
+    ingestListCache.invalidate('list_child_org1');
+    expect((await ingest(IG)).childFailures).toEqual(['list_child_org1']);
+  });
+
+  it('createLead is handed the owner (parent and child), so it does not re-read the list on every event', async () => {
+    await ingest(IG);
+    const byList = Object.fromEntries((crmDb.createLead as jest.Mock).mock.calls.map(([l, d]) => [l, d.userId]));
+    expect(byList).toEqual({ list_parent_001: 'u1', list_child_org1: 'u1' });
   });
 });

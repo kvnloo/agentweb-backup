@@ -451,6 +451,12 @@ async function _twitterOutreachImpl(userId: string, args: any): Promise<any> {
         return { success: true, data: result };
       }
 
+      case 'get-liked-tweets': {
+        const target = handle || recipient_handle;
+        const result = await twitterService.getLikedTweets(ownerUserId, account_id, target, max_results);
+        return { success: true, data: result };
+      }
+
       case 'list-owned-lists': {
         const result = await twitterService.getOwnedLists(ownerUserId, account_id);
         return { success: true, data: result };
@@ -505,7 +511,7 @@ async function _twitterOutreachImpl(userId: string, args: any): Promise<any> {
           'get-profile', 'follow', 'unfollow', 'list-followers', 'list-following',
           'search-tweets', 'get-user-tweets',
           'send-dm', 'list-dms', 'get-dm-conversation',
-          'bookmark', 'get-bookmarks',
+          'bookmark', 'get-bookmarks', 'get-liked-tweets',
           'list-owned-lists', 'get-list-members', 'get-list-tweets',
           'block', 'unblock', 'mute', 'unmute',
         ];
