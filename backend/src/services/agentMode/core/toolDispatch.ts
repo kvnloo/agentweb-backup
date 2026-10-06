@@ -770,7 +770,11 @@ export async function executePreparedTools(
         continue;
       }
 
-      if (loopBreakerActive && !isReadOnlyToolName(toolCall.function.name)) {
+      // ask_user_question passes the ask_ read classifier but halts the run for a question deck.
+      if (loopBreakerActive && (
+        toolCall.function.name === 'ask_user_question'
+        || !isReadOnlyToolName(toolCall.function.name)
+      )) {
         const errorMsg = `Tool "${toolCall.function.name}" was not run: the same request has repeated several times, so only read-only or verification tools may run this turn. Do not retry it; use a read-only tool or answer the user directly.`;
         appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg, deniedBy: 'loop_breaker' }));
         continue;
