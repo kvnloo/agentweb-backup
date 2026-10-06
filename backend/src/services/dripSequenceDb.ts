@@ -401,16 +401,32 @@ function claimKey(sequenceId: string, identity: string): string {
 /**
  * A TransactWriteItems that fails because ONE of its condition checks did not hold
  * surfaces as `TransactionCanceledException` with `CancellationReasons[i].Code ===
- * 'ConditionalCheckFailed'`. Mirrors `llmUsageCreditService.ts`'s own helper of the
- * same name for the identical AWS error shape.
+ * 'ConditionalCheckFailed'` — a genuine duplicate: some other write already holds this
+ * exact claim, so the condition itself was evaluated and failed.
  */
-function isTransactionalConditionalFailure(error: any): boolean {
+function isGenuineConditionalFailure(error: any): boolean {
+  if (error?.code !== 'TransactionCanceledException') return false;
+  const reasons = error?.CancellationReasons || [];
+  return reasons.some((r: any) => r?.Code === 'ConditionalCheckFailed');
+}
+
+/**
+ * `TransactionConflictException` (and the `TransactionConflict` cancellation reason) is
+ * a DIFFERENT AWS error shape from a conditional failure: it means another transaction
+ * was concurrently touching the same item and this one couldn't proceed — AWS's own
+ * guidance is to retry, not to treat it as a resolved outcome. The condition was never
+ * actually evaluated, so there's no evidence the other party's write committed either.
+ *
+ * Treating this the same as a genuine conditional failure (an earlier version of this
+ * helper did, mirroring `llmUsageCreditService.ts`'s own `isTransactionalConditionalFailure`
+ * — the same conflation exists there) would silently drop a lead from a sequence with
+ * zero signal anything went wrong: indistinguishable in logs from a correct dedup skip.
+ */
+function isTransientTransactionConflict(error: any): boolean {
   if (error?.code === 'TransactionConflictException') return true;
   if (error?.code !== 'TransactionCanceledException') return false;
   const reasons = error?.CancellationReasons || [];
-  return reasons.some(
-    (r: any) => r?.Code === 'ConditionalCheckFailed' || r?.Code === 'TransactionConflict',
-  );
+  return reasons.some((r: any) => r?.Code === 'TransactionConflict');
 }
 
 /**
@@ -431,6 +447,13 @@ function isTransactionalConditionalFailure(error: any): boolean {
  * Returns `null` if a candidate was already claimed — by a concurrent request, or by an
  * enrollment this same transaction raced against — which callers must treat exactly like
  * `getExistingEnrollment` finding a row: already enrolled, skip.
+ *
+ * A transient `TransactionConflictException`/`TransactionConflict` is retried (bounded,
+ * short backoff) rather than treated as a resolved duplicate — see
+ * `isTransientTransactionConflict`'s own doc comment for why conflating the two would be
+ * a silent, undetectable lead-drop. If every retry is itself a transient conflict, this
+ * throws rather than guessing at the outcome — the caller's own retry/error handling
+ * takes over from there, same as any other unexpected write failure.
  */
 async function enrollLead(input: CreateEnrollmentInput): Promise<SequenceEnrollment | null> {
   const ts = now();
@@ -460,19 +483,28 @@ async function enrollLead(input: CreateEnrollmentInput): Promise<SequenceEnrollm
     },
   }));
 
-  try {
-    await dynamodb.transactWrite({
-      TransactItems: [
-        ...claimItems,
-        { Put: { TableName: ENROLLMENTS_TABLE, Item: enrollment } },
-      ],
-    }).promise();
-  } catch (error: any) {
-    if (isTransactionalConditionalFailure(error)) return null;
-    throw error;
+  const MAX_CONFLICT_RETRIES = 3;
+  for (let attempt = 0; attempt <= MAX_CONFLICT_RETRIES; attempt++) {
+    try {
+      await dynamodb.transactWrite({
+        TransactItems: [
+          ...claimItems,
+          { Put: { TableName: ENROLLMENTS_TABLE, Item: enrollment } },
+        ],
+      }).promise();
+      return enrollment;
+    } catch (error: any) {
+      if (isGenuineConditionalFailure(error)) return null;
+      if (isTransientTransactionConflict(error) && attempt < MAX_CONFLICT_RETRIES) {
+        await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+        continue;
+      }
+      throw error;
+    }
   }
-
-  return enrollment;
+  // Unreachable — the loop above always returns or throws — but TypeScript can't see
+  // that the for-loop's last iteration always hits one of the three branches above.
+  throw new Error('enrollLead: exhausted retries without resolving');
 }
 
 /** Bulk-enroll multiple leads; skips leads already enrolled (active or completed/converted).

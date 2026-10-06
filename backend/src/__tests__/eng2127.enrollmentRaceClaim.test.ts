@@ -8,10 +8,12 @@
  * this table's own (strongly consistent) primary key in the same transaction as the
  * real enrollment write, so only one of two racing callers can ever win.
  *
- * These tests simulate the actual DynamoDB conditional-put semantics inside the mock
- * (a shared "claimed keys" set that a second conditional put against an already-present
- * key fails against) specifically so the concurrency case is a real assertion, not a
- * restatement of the implementation.
+ * These tests pin the control-flow correctness (a conditional put against an
+ * already-present key resolves to null, not a second write) using a mocked
+ * transactWrite — they are not a genuine interleaving test, since nothing here awaits
+ * between two "concurrent" calls at the mock layer. The actual proof that this holds
+ * under real, simultaneous requests is a live test against a running preview backend +
+ * real DynamoDB (recorded in chod-brain's pr-3264 node), not these unit tests alone.
  */
 
 const mockQuery = jest.fn();
@@ -102,14 +104,38 @@ describe('enrollLead: the claim transaction itself', () => {
     expect(result).toBeNull();
   });
 
-  it('returns null on a TransactionConflictException too', async () => {
-    const err: any = new Error('conflict');
-    err.code = 'TransactionConflictException';
-    mockTransactWrite.mockReturnValue({ promise: () => Promise.reject(err) });
+  /**
+   * A TransactionConflictException is NOT the same as a ConditionalCheckFailed — AWS's
+   * own guidance is that it means another transaction was concurrently touching the
+   * same item and this one couldn't proceed, not that the condition was evaluated and
+   * lost. Treating it the same as a genuine duplicate (an earlier version of this code
+   * did) would silently drop a lead with zero signal anything went wrong. It must be
+   * retried, not resolved to null.
+   */
+  it('retries on a transient TransactionConflictException rather than treating it as a duplicate', async () => {
+    const conflict: any = new Error('conflict');
+    conflict.code = 'TransactionConflictException';
+    let attempts = 0;
+    mockTransactWrite.mockImplementation(() => ({
+      promise: () => {
+        attempts++;
+        if (attempts === 1) return Promise.reject(conflict);
+        return Promise.resolve({});
+      },
+    }));
 
     const result = await dripSequenceDb.enrollLead(input as any);
 
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(attempts).toBe(2);
+  });
+
+  it('throws, rather than silently returning null, if the conflict never resolves', async () => {
+    const conflict: any = new Error('conflict');
+    conflict.code = 'TransactionConflictException';
+    mockTransactWrite.mockReturnValue({ promise: () => Promise.reject(conflict) });
+
+    await expect(dripSequenceDb.enrollLead(input as any)).rejects.toThrow('conflict');
   });
 
   it('rethrows an unrelated error rather than silently treating it as "already enrolled"', async () => {
@@ -131,10 +157,16 @@ describe('bulkEnroll: treats a lost race the same as the pre-check finding a row
 
 describe('the actual bug: two concurrent callers racing past the same eventually-consistent pre-check', () => {
   it('only one of two simultaneous enrollLead calls for the same lead+sequence wins', async () => {
-    // Simulates real DynamoDB: a conditional put against an already-present key fails.
-    // Both callers' GSI pre-check already returned "nothing" (mockQuery above) — this
-    // is exactly the race window ENG-2127 describes. Without the claim transaction,
-    // both would reach the old unconditional `put` and both would succeed.
+    // This pins the CONTROL-FLOW correctness (a conditional put against an
+    // already-present key resolves to null, not a second enrollment) — it is not a
+    // genuine interleaving test, since the mock's transactWrite has no await before its
+    // first branch, so these two calls do not actually race at the OS/event-loop level.
+    // The real proof of atomicity under genuine concurrency is the live test (recorded
+    // in chod-brain's pr-3264 node): 5 truly concurrent HTTP requests against a running
+    // preview backend + real DynamoDB, exactly 1 won. Both callers' GSI pre-check
+    // already returned "nothing" (mockQuery above) — this is exactly the race window
+    // ENG-2127 describes. Without the claim transaction, both would reach the old
+    // unconditional `put` and both would succeed.
     const claimed = new Set<string>();
     mockTransactWrite.mockImplementation((params: any) => ({
       promise: async () => {
