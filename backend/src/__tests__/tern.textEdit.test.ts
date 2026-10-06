@@ -28,15 +28,29 @@ describe('Tern native text edit resolver', () => {
   it('never slices through a surrogate pair', () => {
     const text = 'a🙂b';
     expect(resolveNativeTextEdit(text, {
-      // Both offsets point into the surrogate pair. The resolver widens them.
+      // This range starts inside the emoji; the resolver widens to the whole pair.
       from: 2,
-      to: 2,
+      to: 3,
       text: 'X',
-      cursor: 3,
+      cursor: 2,
       len: text.length,
     })).toEqual({
-      text: 'aX🙂b',
-      cursor: 3,
+      text: 'aXb',
+      cursor: 2,
+      changed: true,
+    });
+  });
+
+  it('clamps a resulting caret off a surrogate boundary', () => {
+    expect(resolveNativeTextEdit('ab', {
+      from: 1,
+      to: 1,
+      text: '🙂',
+      cursor: 2,
+      len: 2,
+    })).toEqual({
+      text: 'a🙂b',
+      cursor: 1,
       changed: true,
     });
   });
