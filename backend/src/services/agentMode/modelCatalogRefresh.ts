@@ -26,6 +26,11 @@ function rate(value: unknown): number | undefined {
 }
 export interface CatalogCandidate { id: string; config: LLMModelConfig; price: ModelPrice }
 
+/** A new addition priced more than 3x off its family's existing average gets a loud
+ * review-time warning (ENG-2293 follow-up) — e.g. a transient OpenRouter promo/glitch
+ * quote, not a hard gate. */
+const PRICE_OUTLIER_RATIO = 3;
+
 /** OpenRouter prices are per token. Only supported text/tool product lines enter this catalog.
  * Source: https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties
  */
@@ -132,6 +137,21 @@ export async function refreshModelCatalog(options: {
   const pricingChanges: Record<string, ModelPrice> = {};
   for (const model of additions) { next[model.id] = model.config; registryChanges[model.id] = model.config; pricingChanges[model.id] = model.price; }
   const { changes, reports } = refreshScores(next, aa, date);
+  // Flag a wildly mispriced addition loudly — never block on it. A hard gate here
+  // would recreate the exact deadlock ENG-2293 fixed (one bad quote blocking every
+  // future model forever); a report a reviewer can't miss is the safer trade-off.
+  for (const model of additions) {
+    const siblingPrices = Object.entries(registry)
+      .filter(([id, config]) => (config.family ?? inferFamily(id)) === model.config.family && prices[id])
+      .map(([id]) => blendedPrice(prices[id]));
+    if (!siblingPrices.length) continue;
+    const siblingAvg = siblingPrices.reduce((a, b) => a + b, 0) / siblingPrices.length;
+    const addedPrice = blendedPrice(model.price);
+    const ratio = siblingAvg > 0 ? addedPrice / siblingAvg : Infinity;
+    if (ratio > PRICE_OUTLIER_RATIO || ratio < 1 / PRICE_OUTLIER_RATIO) {
+      reports.push(`⚠️ PRICE OUTLIER: ${model.id} blended $${addedPrice.toFixed(3)}/M is ${ratio.toFixed(1)}x its "${model.config.family}" family average ($${siblingAvg.toFixed(3)}/M) — verify before merging.`);
+    }
+  }
   for (const [id, config] of Object.entries(next)) {
     const patch = { ...(!config.family ? { family: inferFamily(id) } : {}), ...changes[id] };
     if (Object.keys(patch).length) registryChanges[id] = { ...registryChanges[id], ...patch };
