@@ -1669,7 +1669,7 @@ export async function getMetaAdsMetrics(
 
     // Build filtering parameter for API calls
     const filteringParam = campaignFilterIds.length > 0
-      ? `&filtering=[{"field":"campaign.id","operator":"IN","value":["${campaignFilterIds.join('","')}"]}]`
+      ? `&filtering=${encodeURIComponent(JSON.stringify([{ field: 'campaign.id', operator: 'IN', value: campaignFilterIds }]))}`
       : '';
 
 
