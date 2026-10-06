@@ -306,7 +306,7 @@ async function main(): Promise<void> {
     throw error;
   });
 
-  const requiredKinds = ['col', 'card', 'md', 'editor', 'status', 'seg', 'tool', 'picker', 'kv', 'section', 'checklist', 'progress'];
+  const requiredKinds = ['col', 'card', 'md', 'editor', 'status', 'seg', 'tool', 'picker', 'kv', 'section', 'checklist', 'progress', 'table'];
   const missingKinds = requiredKinds.filter(kind => !hello.kinds.includes(kind));
   if (missingKinds.length > 0) {
     process.stdin.setRawMode?.(false);
