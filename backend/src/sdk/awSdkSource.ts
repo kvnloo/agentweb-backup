@@ -168,8 +168,10 @@ export const AW_SDK_SOURCE: string = String.raw`/* AgentWeb tracker v1. One sess
     }
 
     function baseBody(ev) {
+      // clientNowMs: the device clock NOW, so the server can tell a clock that is ahead (its startMs is rejected as
+      // future until the clock catches up, which would move the session to a new row mid-session) from a normal one.
       var b = {
-        listId: listId, event: ev, sessionId: st.id, sessionStartMs: st.startMs, visitorId: vid, visitNo: st.visitNo,
+        listId: listId, event: ev, sessionId: st.id, sessionStartMs: st.startMs, clientNowMs: Date.now(), visitorId: vid, visitNo: st.visitNo,
         eventCount: st.count, landingUrl: st.landing, referrer: st.ref,
         firstTouchLanding: ft.url, firstTouchReferrer: ft.ref
       };

@@ -529,6 +529,50 @@ describe('apiTools', () => {
     });
   });
 
+  describe('enable_session_tracking (ENG-2327)', () => {
+    it('is registered, requires only page_id, and carries a description Emma can act on', () => {
+      expect(mcpToolRegistry.getToolNames()).toContain('enable_session_tracking');
+      const def = mcpToolRegistry.getToolDefinitions().find((d: any) => d.name === 'enable_session_tracking') as any;
+      expect(def).toBeDefined();
+      expect(def.inputSchema.required).toEqual(['page_id']);
+      expect(Object.keys(def.inputSchema.properties).sort()).toEqual(['html_path', 'page_id']);
+      expect(def.description).toMatch(/session tracking/i);
+      expect(def.description).toMatch(/safe to call again/i);
+      // The override that would double-count a bespoke tracker is deliberately NOT exposed to the model.
+      expect(JSON.stringify(def.inputSchema)).not.toMatch(/override/i);
+    });
+
+    it('POSTs to the session-tracking route and returns its JSON', async () => {
+      mockMcpFetch.mockResolvedValue({ success: true, listId: 'list_1', installed: true, alreadyInstalled: false });
+      await mcpToolRegistry.execute('enable_session_tracking', { page_id: 'page 1/../x' }, context);
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+        method: 'POST',
+        path: '/api/landing-pages/v0/generated/page%201%2F..%2Fx/session-tracking',
+        body: {},
+      }));
+    });
+
+    it('forwards html_path as htmlPath, and nothing else', async () => {
+      mockMcpFetch.mockResolvedValue({ success: true });
+      await mcpToolRegistry.execute('enable_session_tracking', { page_id: 'p1', html_path: 'public/offer.html', overrideExistingTracker: true }, context);
+      expect(mockMcpFetch.mock.calls[0][0].body).toEqual({ htmlPath: 'public/offer.html' });
+    });
+
+    it('stops BEFORE the route when publish consent was withdrawn mid-run (unattended schedule), like its sibling', async () => {
+      const assertPublishStillAuthorized = jest.fn(async () => ({ error: 'Publishing was withdrawn for this schedule' }));
+      // the handler itself (the registry attaches its own hook in front of it; see sessionTracking.consentGate.test.ts)
+      const res: any = await mcpToolRegistry.getTool('enable_session_tracking')!.execute({ page_id: 'p1' }, { ...context, assertPublishStillAuthorized });
+      expect(assertPublishStillAuthorized).toHaveBeenCalled();
+      expect(mockMcpFetch).not.toHaveBeenCalled();
+      expect(JSON.stringify(res)).toContain('withdrawn');
+    });
+
+    it('propagates a refusal from the route (e.g. the page already has a tracker)', async () => {
+      mockMcpFetch.mockRejectedValue(new Error('API error (409): This page already carries its own tracker'));
+      await expect(mcpToolRegistry.execute('enable_session_tracking', { page_id: 'p1' }, context)).rejects.toThrow('already carries its own tracker');
+    });
+  });
+
   describe('manage_gtm_items - add_phase', () => {
     it('should call POST /api/gtm-plan/:id/phases', async () => {
       mockMcpFetch.mockResolvedValue({ phaseId: 'phase-1' });

@@ -101,8 +101,10 @@ describe('forward-lead — lost duplicate-email race', () => {
     const [listId, leadId, updates] = (crmDb.updateLead as jest.Mock).mock.calls[0];
     expect([listId, leadId]).toEqual(['list_123', 'lead_winner']);
     expect(updates.lastName).toBe('Lee');
-    expect(updates.customFields).toMatchObject({ q1: 'old', q2: 'new', source: 'lp-b' });
-    expect(updates.customFields.forwardedAt).toBe('2020-01-01T00:00:00.000Z');
+    // ENG-2320: customFields reaches updateLead as a per-key PATCH (only what this submission
+    // adds/changes), so the carried row's q1 and forwardedAt are never rewritten at all.
+    expect(updates.customFieldsKeyMerge).toBe(true);
+    expect(updates.customFields).toEqual({ q2: 'new', source: 'lp-b' });
     expect(leadListAlertService.notifyLeadListOwnerIfConfigured).not.toHaveBeenCalledWith(
       expect.anything(), expect.anything(), 'api.lead_failed', expect.anything(), expect.anything(),
     );
@@ -123,7 +125,8 @@ describe('forward-lead — lost duplicate-email race', () => {
 
     expect(res.status).toBe(200);
     expect(crmDb.getLeadById).toHaveBeenCalledWith('list_123', 'lead_winner', { consistentRead: true });
-    expect((crmDb.updateLead as jest.Mock).mock.calls[0][2].customFields).toMatchObject({ q1: 'old', q2: 'new', winnerLate: 'kept' });
+    // ENG-2320: the winner's late key is not in the patch because it is never written, so it survives.
+    expect((crmDb.updateLead as jest.Mock).mock.calls[0][2].customFields).toEqual({ q2: 'new' });
   });
 
   it('falls back to the carried row when the consistent read returns nothing', async () => {
@@ -131,7 +134,7 @@ describe('forward-lead — lost duplicate-email race', () => {
     const res = await request(app).post('/api/webhooks/forward-lead').send({ listId: 'list_123', email: 'race@example.com', q2: 'new' });
     await flush();
     expect(res.status).toBe(200);
-    expect((crmDb.updateLead as jest.Mock).mock.calls[0][2].customFields).toMatchObject({ q1: 'old', q2: 'new' });
+    expect((crmDb.updateLead as jest.Mock).mock.calls[0][2].customFields).toEqual({ q2: 'new' });
   });
 
   it('a repeat that carries nothing new is a 200 unchanged with no write', async () => {
@@ -164,7 +167,8 @@ describe('forward-lead — lost duplicate-email race', () => {
     await flush();
     expect(merged.status).toBe(200);
     expect(crmDb.createLead).not.toHaveBeenCalled();
-    expect((crmDb.updateLead as jest.Mock).mock.calls[0][2].customFields.forwardedAt).toBe('2020-01-01T00:00:00.000Z');
+    // forwardedAt is never rewritten: it is absent from the per-key patch (ENG-2320)
+    expect((crmDb.updateLead as jest.Mock).mock.calls[0][2].customFields).toEqual({ q2: 'new' });
   });
 });
 

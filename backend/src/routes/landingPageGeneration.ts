@@ -54,6 +54,7 @@ import {
 import { injectGtmIntoLayout, verifyGtmInjection } from "../utils/gtmInjection";
 import { injectGoogleAdsIntoLayout, verifyGoogleAdsInjection } from "../utils/googleAdsInjection";
 import { injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjection";
+import { SessionTrackingError, disableSessionTrackingForPage, enableSessionTrackingForPage } from "../services/sessionTrackingService";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
 import { isSessionList, SESSION_LIST_LEAD_CAPTURE_ERROR } from "../utils/sessionList";
@@ -3020,6 +3021,78 @@ router.post("/generated/:id/meta-pixel", editRateLimiter, async (req, res: Respo
     console.error("[LP GENERATION] Error injecting Meta Pixel:", error);
     const httpStatus = error?.httpStatus ?? 500;
     res.status(httpStatus).json({ error: error.response?.data?.message || error.message || "Failed to inject Meta Pixel" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST|DELETE /generated/:id/session-tracking  (ENG-2327)
+// Create-or-reuse the page's session list, commit the AgentWeb SDK tag into the page's own repo,
+// and record sessionTrackingListId on the page. Idempotent. DELETE removes the tag and keeps the list.
+// ---------------------------------------------------------------------------
+function sendSessionTrackingError(res: Response, error: any, label: string) {
+  if (error instanceof SessionTrackingError) {
+    return res.status(error.httpStatus).json({ error: error.message, code: error.code });
+  }
+  const ghStatus = error?.response?.status;
+  console.error(`[LP GENERATION] Error ${label} (HTTP ${ghStatus}):`, error?.response?.data?.message || error?.message);
+  if (error?.code === "ECONNABORTED" || error?.code === "ETIMEDOUT") {
+    return res.status(504).json({ error: "GitHub API timed out. Try again in a moment." });
+  }
+  return res.status(500).json({ error: `Failed ${label}: ${error?.response?.data?.message || error?.message || "unknown error"}` });
+}
+
+router.post("/generated/:id/session-tracking", editRateLimiter, async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+
+    const body = req.body ?? {};
+    const { overrideExistingTracker, htmlPath } = body as { overrideExistingTracker?: unknown; htmlPath?: unknown };
+    if (overrideExistingTracker !== undefined && typeof overrideExistingTracker !== "boolean") {
+      return res.status(400).json({ error: "overrideExistingTracker must be a boolean" });
+    }
+    if (htmlPath !== undefined && typeof htmlPath !== "string") {
+      return res.status(400).json({ error: "htmlPath must be a string" });
+    }
+
+    const result = await enableSessionTrackingForPage(auth.page, {
+      overrideExistingTracker: overrideExistingTracker === true,
+      ...(htmlPath !== undefined ? { htmlPath } : {}),
+    });
+    res.json({
+      success: true,
+      ...result,
+      message: result.alreadyInstalled
+        ? "Session tracking was already installed on this page."
+        : "Session tracking added. Your site will redeploy shortly.",
+    });
+  } catch (error: any) {
+    sendSessionTrackingError(res, error, "enabling session tracking");
+  }
+});
+
+router.delete("/generated/:id/session-tracking", editRateLimiter, async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+
+    const htmlPath = typeof req.query.htmlPath === "string" ? req.query.htmlPath : undefined;
+    const result = await disableSessionTrackingForPage(auth.page, { htmlPath });
+    res.json({
+      success: true,
+      ...result,
+      message: result.alreadyRemoved
+        ? "Session tracking was not installed on this page."
+        : "Session tracking removed. The session list and its history were kept.",
+    });
+  } catch (error: any) {
+    sendSessionTrackingError(res, error, "disabling session tracking");
   }
 });
 

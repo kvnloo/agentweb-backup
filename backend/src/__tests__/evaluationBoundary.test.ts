@@ -23,7 +23,7 @@ const DENIED: Array<[string, string]> = [
   ['connect_account', 'connectors'], ['install_mcp_server', 'connectors'], ['configure_mcp_server', 'connectors'],
   ['send_email', 'sends'], ['notify_session', 'sends'], ['slack_send_message', 'sends'], ['enqueue_human_eval', 'sends'], ['email', 'sends'],
   ['linkedin_outreach', 'social'], ['twitter_manage_post', 'social'], ['post_on_connected_account', 'social'], ['google_calendar_create_event', 'social'],
-  ['publish_landing_page_changes', 'publish'], ['deploy_landing_page', 'publish'], ['configure_landing_page_subdomain', 'publish'], ['enable_lead_list_public_access', 'publish'],
+  ['publish_landing_page_changes', 'publish'], ['deploy_landing_page', 'publish'], ['configure_landing_page_subdomain', 'publish'], ['enable_lead_list_public_access', 'publish'], ['enable_session_tracking', 'publish'],
   ['call_google_ads_api', 'third_party_writes'], ['call_hubspot_api', 'third_party_writes'], ['enrich_leads_execute', 'third_party_writes'], ['google_drive_search', 'third_party_writes'],
   ['playwright_browser_navigate', 'browser'], ['browser_run_code', 'browser'], ['save_browser_cookies', 'browser'], ['open_site_signin', 'browser'], ['solve_captcha', 'browser'],
   ['coding_agent', 'automation'], ['manage_scheduled_chat', 'automation'], ['create_schedule_from_template', 'automation'],
