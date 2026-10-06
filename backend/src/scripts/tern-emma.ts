@@ -7,6 +7,7 @@ import {
   TSP_DEFAULT_APC_LIMIT,
   TspStreamReader,
 } from '../tern/protocol';
+import { resolveNativeTextEdit } from '../tern/textEdit';
 import {
   AgentRunSummaryLike,
   ApprovalDeckInboundAnswer,
@@ -968,75 +969,53 @@ async function main(): Promise<void> {
     }
   };
 
-  const applyEdit = (event: Record<string, unknown>) => {
-    if (event.id === 'approval-note' && approvalState) {
-      const from = event.from;
-      const to = event.to;
-      const text = event.text;
-      const nextCursor = event.cursor;
-      if (
-        typeof from === 'number'
-        && typeof to === 'number'
-        && typeof text === 'string'
-        && typeof nextCursor === 'number'
-        && from >= 0
-        && to >= from
-        && to <= approvalState.freeText.length
-      ) {
-        approvalState.freeText =
-          approvalState.freeText.slice(0, from)
-          + text
-          + approvalState.freeText.slice(to);
-        approvalState.freeTextCursor = Math.max(
-          0,
-          Math.min(nextCursor, approvalState.freeText.length),
-        );
-        render();
-      }
-      return;
-    }
-
-    if (event.id === 'session-picker' && pickerState) {
-      const from = event.from;
-      const to = event.to;
-      const text = event.text;
-      const nextCursor = event.cursor;
-      if (
-        typeof from === 'number'
-        && typeof to === 'number'
-        && typeof text === 'string'
-        && typeof nextCursor === 'number'
-        && from >= 0
-        && to >= from
-        && to <= pickerState.query.length
-      ) {
-        updatePickerQuery(
-          pickerState.query.slice(0, from) + text + pickerState.query.slice(to),
-          nextCursor,
-        );
-      }
-      return;
-    }
-
-    if (event.id !== 'composer') return;
-    const from = event.from;
-    const to = event.to;
-    const text = event.text;
-    const nextCursor = event.cursor;
+  const parseTextEdit = (event: Record<string, unknown>) => {
+    const { from, to, text, cursor: nextCursor, len } = event;
     if (
       typeof from !== 'number'
       || typeof to !== 'number'
       || typeof text !== 'string'
       || typeof nextCursor !== 'number'
-      || from < 0
-      || to < from
-      || to > composer.length
-    ) return;
+      || typeof len !== 'number'
+    ) return null;
+    return { from, to, text, cursor: nextCursor, len };
+  };
+
+  const approvalUndoStack: Array<{ text: string; cursor: number }> = [];
+
+  const applyEdit = (event: Record<string, unknown>) => {
+    const edit = parseTextEdit(event);
+    if (!edit) return;
+
+    if (event.id === 'approval-note' && approvalState) {
+      const resolved = resolveNativeTextEdit(approvalState.freeText, edit);
+      if (!resolved) return;
+      approvalUndoStack.push({
+        text: approvalState.freeText,
+        cursor: approvalState.freeTextCursor,
+      });
+      if (approvalUndoStack.length > 100) approvalUndoStack.shift();
+      approvalState.freeText = resolved.text;
+      approvalState.freeTextCursor = resolved.cursor;
+      render();
+      return;
+    }
+
+    if (event.id === 'session-picker' && pickerState) {
+      const resolved = resolveNativeTextEdit(pickerState.query, edit);
+      if (!resolved) return;
+      updatePickerQuery(resolved.text, resolved.cursor);
+      return;
+    }
+
+    if (event.id !== 'composer') return;
+    const resolved = resolveNativeTextEdit(composer, edit);
+    if (!resolved) return;
 
     undoStack.push({ text: composer, cursor });
     if (undoStack.length > 100) undoStack.shift();
-    composer = composer.slice(0, from) + text + composer.slice(to);
-    cursor = Math.max(0, Math.min(nextCursor, composer.length));
+    composer = resolved.text;
+    cursor = resolved.cursor;
     errorText = undefined;
     render(true);
   };
@@ -1133,6 +1112,14 @@ async function main(): Promise<void> {
         applyEdit(event);
         break;
       case 'undo': {
+        if (event.id === 'approval-note' && approvalState) {
+          const previous = approvalUndoStack.pop();
+          if (!previous) break;
+          approvalState.freeText = previous.text;
+          approvalState.freeTextCursor = previous.cursor;
+          render();
+          break;
+        }
         if (event.id !== 'composer') break;
         const previous = undoStack.pop();
         if (!previous) break;
