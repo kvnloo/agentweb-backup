@@ -77,6 +77,8 @@ describe('forward-lead — lost duplicate-email race', () => {
     (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
     (crmDb.createLead as jest.Mock).mockResolvedValue({ leadId: 'lead_1', listId: 'list_123', email: 'race@example.com' });
     (crmDb.updateLead as jest.Mock).mockResolvedValue(undefined);
+    // default: the consistent re-read agrees with the carried snapshot
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue(null);
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user_123', connected_accounts: [] });
   });
 
@@ -106,6 +108,30 @@ describe('forward-lead — lost duplicate-email race', () => {
     );
     // a repeat submission notifies like any other repeat
     expect(dispatchLeadCreated).toHaveBeenCalledWith('list_123', 'lead_winner', expect.any(Object));
+  });
+
+  it('merges into the CONSISTENT re-read of the winner, so keys it wrote after the GSI snapshot survive', async () => {
+    (crmDb.createLead as jest.Mock).mockRejectedValue(dupErr(existing));
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+      ...existing, customFields: { ...existing.customFields, winnerLate: 'kept' },
+    });
+
+    const res = await request(app).post('/api/webhooks/forward-lead').send({
+      listId: 'list_123', email: 'race@example.com', q2: 'new',
+    });
+    await flush();
+
+    expect(res.status).toBe(200);
+    expect(crmDb.getLeadById).toHaveBeenCalledWith('list_123', 'lead_winner', { consistentRead: true });
+    expect((crmDb.updateLead as jest.Mock).mock.calls[0][2].customFields).toMatchObject({ q1: 'old', q2: 'new', winnerLate: 'kept' });
+  });
+
+  it('falls back to the carried row when the consistent read returns nothing', async () => {
+    (crmDb.createLead as jest.Mock).mockRejectedValue(dupErr(existing));
+    const res = await request(app).post('/api/webhooks/forward-lead').send({ listId: 'list_123', email: 'race@example.com', q2: 'new' });
+    await flush();
+    expect(res.status).toBe(200);
+    expect((crmDb.updateLead as jest.Mock).mock.calls[0][2].customFields).toMatchObject({ q1: 'old', q2: 'new' });
   });
 
   it('a repeat that carries nothing new is a 200 unchanged with no write', async () => {
