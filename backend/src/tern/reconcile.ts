@@ -59,6 +59,22 @@ function jsonEqual(a: unknown, b: unknown): boolean {
   return true;
 }
 
+function normalizeNode(node: TspNode): TspNode {
+  const rawProps = node.p ?? {};
+  const props: Record<string, unknown> = {};
+  for (const key of Object.keys(rawProps)) {
+    if (rawProps[key] !== undefined) props[key] = rawProps[key];
+  }
+
+  const children = node.c?.map(normalizeNode);
+  return {
+    id: node.id,
+    k: node.k,
+    ...(Object.keys(props).length ? { p: props } : {}),
+    ...(children?.length ? { c: children } : {}),
+  };
+}
+
 /** Indices of one longest strictly increasing subsequence. */
 function rising(sequence: readonly number[]): number[] {
   const tails: number[] = [];
@@ -191,7 +207,8 @@ export class TspSurfaceReconciler {
 
   diff(nextRoots: readonly TspNode[]): TspOp[] {
     const ops: TspOp[] = [];
-    const next = new Map(nextRoots.map(node => [node.id, node] as const));
+    const normalizedRoots = nextRoots.map(normalizeNode);
+    const next = new Map(normalizedRoots.map(node => [node.id, node] as const));
 
     for (const [id] of this.roots) {
       if (!next.has(id)) ops.push(['del', id]);
@@ -199,10 +216,10 @@ export class TspSurfaceReconciler {
 
     // Surface regions are stable and ordered by the caller. If a new root is
     // introduced, add it in that order using the following root as the anchor.
-    for (let i = nextRoots.length - 1; i >= 0; i--) {
-      const node = nextRoots[i]!;
+    for (let i = normalizedRoots.length - 1; i >= 0; i--) {
+      const node = normalizedRoots[i]!;
       const oldNode = this.roots.get(node.id);
-      const nextSibling = nextRoots[i + 1]?.id ?? null;
+      const nextSibling = normalizedRoots[i + 1]?.id ?? null;
 
       if (!oldNode) {
         ops.push(['add', node.id, this.surfaceId, nextSibling, node]);
@@ -218,7 +235,8 @@ export class TspSurfaceReconciler {
   }
 
   commit(nextRoots: readonly TspNode[]): void {
-    this.roots = new Map(nextRoots.map(node => [node.id, node] as const));
+    const normalizedRoots = nextRoots.map(normalizeNode);
+    this.roots = new Map(normalizedRoots.map(node => [node.id, node] as const));
   }
 
   forget(ids: readonly string[]): void {
