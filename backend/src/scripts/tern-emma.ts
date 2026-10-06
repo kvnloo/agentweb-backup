@@ -533,6 +533,8 @@ async function main(): Promise<void> {
       selectedVerdict:
         firstChoices.find((choice: any) => choice.recommended)?.id
         || firstChoices[0]?.id,
+      freeText: '',
+      freeTextCursor: 0,
     };
     pickerState = undefined;
     pickerKeyBuffer = '';
@@ -654,6 +656,8 @@ async function main(): Promise<void> {
       existing?.verdict
       || choices.find((choice: any) => choice.recommended)?.id
       || choices[0]?.id;
+    approvalState.freeText = existing?.freeText ?? '';
+    approvalState.freeTextCursor = approvalState.freeText.length;
   };
 
   const recordApprovalChoice = (delegated = false): boolean => {
@@ -669,7 +673,16 @@ async function main(): Promise<void> {
     } else {
       const verdict = approvalState.selectedVerdict;
       if (!verdict) return false;
-      answer = { itemId: item.itemId, verdict };
+      const freeText = approvalState.freeText.trim();
+
+      if (verdict === 'comment') {
+        if (!freeText) return false;
+        answer = { itemId: item.itemId, verdict, freeText };
+      } else if (verdict === 'reject' && item.allowFreeText === true && freeText) {
+        answer = { itemId: item.itemId, verdict, freeText };
+      } else {
+        answer = { itemId: item.itemId, verdict };
+      }
     }
 
     approvalState.answers = [
@@ -709,7 +722,12 @@ async function main(): Promise<void> {
         // Keep the existing session and surface the error in the status line.
       }
       if (approvalDeckIsAwaiting(session.pendingApprovalDeck)) {
-        approvalState = { itemIndex: 0, answers };
+        approvalState = {
+          itemIndex: 0,
+          answers,
+          freeText: '',
+          freeTextCursor: 0,
+        };
         syncApprovalSelection();
       }
     } finally {
@@ -945,6 +963,33 @@ async function main(): Promise<void> {
   };
 
   const applyEdit = (event: Record<string, unknown>) => {
+    if (event.id === 'approval-note' && approvalState) {
+      const from = event.from;
+      const to = event.to;
+      const text = event.text;
+      const nextCursor = event.cursor;
+      if (
+        typeof from === 'number'
+        && typeof to === 'number'
+        && typeof text === 'string'
+        && typeof nextCursor === 'number'
+        && from >= 0
+        && to >= from
+        && to <= approvalState.freeText.length
+      ) {
+        approvalState.freeText =
+          approvalState.freeText.slice(0, from)
+          + text
+          + approvalState.freeText.slice(to);
+        approvalState.freeTextCursor = Math.max(
+          0,
+          Math.min(nextCursor, approvalState.freeText.length),
+        );
+        render();
+      }
+      return;
+    }
+
     if (event.id === 'session-picker' && pickerState) {
       const from = event.from;
       const to = event.to;
@@ -1091,6 +1136,12 @@ async function main(): Promise<void> {
         break;
       }
       case 'send':
+        if (event.id === 'approval-note' && approvalState && typeof event.text === 'string') {
+          approvalState.freeText = event.text;
+          approvalState.freeTextCursor = event.text.length;
+          chooseApprovalAndAdvance(false);
+          break;
+        }
         if (event.id === 'composer' && typeof event.text === 'string') {
           void sendPrompt(event.text);
         }
