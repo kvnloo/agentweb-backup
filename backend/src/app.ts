@@ -124,6 +124,7 @@ import loopEventsRoutes from "./routes/loopEvents";
 import humanEvalRoutes from "./routes/humanEval";
 import trackingRoutes from "./routes/tracking";
 import trackIngestRoutes, { trackBodyParser } from "./routes/trackIngest";
+import sdkRouter from "./routes/trackSdk";
 import { registerAiEvalFunnelForProduction } from "./loops/instances/ai-eval-funnel";
 import { registerAiReadinessFunnel } from "./loops/instances/ai-readiness-funnel";
 import { checkFinalizeGuardMisconfiguration, registerAgentModeLoop } from "./loops/instances/agent-mode";
@@ -310,9 +311,10 @@ app.use((req, res, next) => {
   // Check if this is a public endpoint that needs open CORS
   if (req.path.match(/^\/api\/tasks\/[^\/]+\/subscribers\/join$/) ||
       req.path.startsWith('/api/lead-magnet/') ||
-      // ENG-2315: the tracker ingest is called from visitors' browsers on any customer
+      // ENG-2315: the tracker SDK and its ingest are called from visitors' browsers on any customer
       // domain. Origins are enforced per list inside the route (trackingConfig.allowedOrigins), not here.
       req.path === '/api/track/event' ||
+      req.path.startsWith('/sdk/v1/') ||
       req.path.startsWith('/batch-review/')) {
     // Allow all origins for public endpoints
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -523,8 +525,9 @@ app.use("/api/human-eval", humanEvalRoutes);
 // ENG-2313: traffic-source taxonomy + tagged-link generator. Pure, no persistence; the router
 // applies authenticateToken itself (user auth, not admin).
 app.use("/api/tracking", trackingRoutes);
-// ENG-2315: public (unauthenticated) tracker ingest. Distinct prefix from /api/tracking above, which is user-auth.
+// ENG-2315: public (unauthenticated) tracker ingest + SDK. Distinct prefix from /api/tracking above, which is user-auth.
 app.use("/api/track", trackIngestRoutes);
+app.use("/sdk/v1", sdkRouter);
 
 // Register closed-loop instances with production impls. The route handlers
 // look up loop manifests from LOOP_REGISTRY; the cron in server.ts invokes
