@@ -9,6 +9,8 @@ import type Stripe from 'stripe';
 export const CUSTOM_SUBSCRIPTION_LINK_SOURCE = 'custom_subscription_link';
 /** Upper bound for a single custom link charge, in USD. */
 export const MAX_CUSTOM_LINK_AMOUNT_USD = 50_000;
+/** Stripe's minimum USD charge amount. */
+export const MIN_CUSTOM_LINK_AMOUNT_USD = 0.5;
 /** Stripe product names allow more, but keep invoice/receipt lines readable. */
 export const MAX_CUSTOM_LINK_LABEL_LENGTH = 120;
 
@@ -46,6 +48,9 @@ export function toUnitAmountCents(amountUsd: number): number {
     throw new CustomSubscriptionLinkError('amountUsd must be a finite number');
   }
   if (amountUsd <= 0) throw new CustomSubscriptionLinkError('amountUsd must be greater than 0');
+  if (amountUsd < MIN_CUSTOM_LINK_AMOUNT_USD) {
+    throw new CustomSubscriptionLinkError(`amountUsd must be at least ${MIN_CUSTOM_LINK_AMOUNT_USD}`);
+  }
   if (amountUsd > MAX_CUSTOM_LINK_AMOUNT_USD) {
     throw new CustomSubscriptionLinkError(`amountUsd exceeds max ${MAX_CUSTOM_LINK_AMOUNT_USD}`);
   }
@@ -78,7 +83,9 @@ export function buildCustomSubscriptionLinkCheckoutParams(
   const unitAmount = toUnitAmountCents(input.amountUsd);
 
   const isOneTime = input.frequency === 'one_time';
-  const recurring = isOneTime ? undefined : RECURRING[input.frequency as Exclude<CustomLinkFrequency, 'one_time'>];
+  const recurring = isOneTime || !Object.prototype.hasOwnProperty.call(RECURRING, input.frequency)
+    ? undefined
+    : RECURRING[input.frequency as Exclude<CustomLinkFrequency, 'one_time'>];
   if (!isOneTime && !recurring) {
     throw new CustomSubscriptionLinkError(`unsupported frequency: ${String(input.frequency)}`);
   }

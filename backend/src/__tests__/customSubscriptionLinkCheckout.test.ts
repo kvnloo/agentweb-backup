@@ -41,11 +41,11 @@ describe('buildCustomSubscriptionLinkCheckoutParams (ENG-2304)', () => {
   it('converts to integer cents', () => {
     const p = buildCustomSubscriptionLinkCheckoutParams({ ...base, amountUsd: 19.99 });
     expect(p.line_items![0].price_data!.unit_amount).toBe(1999);
-    const q = buildCustomSubscriptionLinkCheckoutParams({ ...base, amountUsd: 0.1 + 0.2 - 0.00000000000000004 });
+    const q = buildCustomSubscriptionLinkCheckoutParams({ ...base, amountUsd: 1.1 + 2.2 });
     expect(Number.isInteger(q.line_items![0].price_data!.unit_amount)).toBe(true);
   });
 
-  it.each([0, -5, NaN, Infinity, 1.005, 12.345, MAX_CUSTOM_LINK_AMOUNT_USD + 0.01])('rejects amount %p', (amountUsd) => {
+  it.each([0, -5, 0.01, 0.49, NaN, Infinity, 1.005, 12.345, MAX_CUSTOM_LINK_AMOUNT_USD + 0.01])('rejects amount %p', (amountUsd) => {
     expect(() => buildCustomSubscriptionLinkCheckoutParams({ ...base, amountUsd })).toThrow(CustomSubscriptionLinkError);
   });
 
@@ -90,5 +90,8 @@ describe('buildCustomSubscriptionLinkCheckoutParams (ENG-2304)', () => {
     expect(() => buildCustomSubscriptionLinkCheckoutParams({ ...base, orgId: '' })).toThrow(CustomSubscriptionLinkError);
     expect(() => buildCustomSubscriptionLinkCheckoutParams({ ...base, createdBy: ' ' })).toThrow(CustomSubscriptionLinkError);
     expect(() => buildCustomSubscriptionLinkCheckoutParams({ ...base, frequency: 'daily' as any })).toThrow(CustomSubscriptionLinkError);
+    for (const frequency of ['__proto__', 'constructor', 'toString']) {
+      expect(() => buildCustomSubscriptionLinkCheckoutParams({ ...base, frequency: frequency as any })).toThrow(CustomSubscriptionLinkError);
+    }
   });
 });
