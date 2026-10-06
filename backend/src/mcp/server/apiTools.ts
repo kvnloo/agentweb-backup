@@ -2841,7 +2841,9 @@ The two underlying fields are also returned, and they are NOT interchangeable:
 - llmModel: the model *selected* in the picker. A client-side selection only — the session may never have run on it (it can name a model outside the registry, or a live voice model that cannot generate text at all).
 - generationModels: the models that actually generated the assistant turns, derived from the transcript. Null when no message recorded one.
 
-TOKEN vs COST — they are not on the same basis. totalTokens EXCLUDES prompt-cache tokens, but totalCost/estimated_cost BILLS them. cacheTokens ({creation, read}, null when none) reports what was cached. A cache-heavy scheduled run can show 371 totalTokens against $2.94 of real spend, so a cost-per-token or "cheap because few tokens" claim computed from totalTokens alone is wrong by orders of magnitude. When reporting spend, use totalCost directly; when reporting volume, add cacheTokens to totalTokens and say you did.
+TOKEN vs COST — they are not on the same basis. totalTokens EXCLUDES prompt-cache tokens, but totalCost/estimated_cost BILLS them. cacheTokens ({creation, read}, null when none) reports what was cached. A cache-heavy scheduled run can show 371 totalTokens against $2.94 of real spend, so a cost-per-token or "cheap because few tokens" claim computed from totalTokens alone is wrong by orders of magnitude. When reporting spend, use totalCost directly for lifetime spend; when reporting volume, add cacheTokens to totalTokens and say you did.
+
+IN-WINDOW COST — sessions match the range on last activity, so a long-lived session carries its LIFETIME totalCost into a daily window. inWindowCost is the spend from assistant turns timestamped inside [start_time, end_time); use it for "spend in this period" (e.g. true 24h burn) and totalCost for lifetime. inWindowCost is null when no assistant turn recorded a timestamp — then the in-window share is unknown; say so rather than using totalCost as the period's spend.
 
 PER-MODEL COST — use costByModel, never attributedModels. attributedModels says WHICH models ran; it does not say how the money split. costByModel ({model: usd}, null when no turn recorded cost) is the actual per-turn allocation, so a session that ran two models contributes correctly to each rather than being double-counted or dropped. unattributedCost is the residual, on the same micro-USD basis as costByModel and totalCost: sum(costByModel) + unattributedCost reconciles to totalCost, exactly whenever there is spend left to attribute. It is null when the residual is not positive — in that case the per-model buckets already account for the whole session and may exceed totalCost by a few micro-dollars of per-turn rounding, which is noise, not missing money. Never treat a null as licence to rescale the buckets. It covers both spend on turns that recorded no model AND cost that never lands on a turn at all (tool/image spend counts toward totalCost but belongs to no model). When it is non-null the per-model split does NOT account for all of this session's cost — report it as its own line rather than folding it into a model, or your model percentages will not sum to the total.
 
@@ -2891,6 +2893,8 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
 
     // Format response — return all metadata shown in the admin Chat History tab, but exclude raw messages
     const sessions = (data as any)?.sessions || [];
+    const windowStartMs = Date.parse(args.start_time);
+    const windowEndMs = Date.parse(args.end_time);
     const formattedSessions = sessions.map((session: any) => {
       const messages: any[] = session.messages || [];
 
@@ -2926,10 +2930,22 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       // Greptile P1 (ENG-1313): the denominator for unlabelledAssistantTurns, so
       // "partial" can be quantified (N of M) rather than just flagged.
       let assistantTurnCount = 0;
+      // ENG-972: the range filter matches on last activity, so a long-lived
+      // session enters the window carrying its lifetime totalCost. Sum only the
+      // spend from assistant turns timestamped inside [start_time, end_time).
+      let inWindowCostMicro = 0;
+      let timestampedAssistantTurns = 0;
       for (const msg of messages) {
         if (msg?.role !== 'assistant') continue;
         assistantTurnCount++;
         const turnCost = msg?.usage?.estimated_cost || 0;
+        const turnMs = msg?.timestamp ? Date.parse(msg.timestamp) : NaN;
+        if (!Number.isNaN(turnMs)) {
+          timestampedAssistantTurns++;
+          if (turnMs >= windowStartMs && turnMs < windowEndMs && turnCost) {
+            inWindowCostMicro += Math.round(turnCost * 1e6);
+          }
+        }
         if (typeof msg?.llm === 'string' && msg.llm) {
           generationModels.add(msg.llm);
           if (turnCost) {
@@ -3059,6 +3075,9 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
         // Same micro-USD basis as costByModel/unattributedCost below, so the three
         // reconcile exactly rather than each being rounded independently.
         totalCost: session.totalCost != null ? Math.round(Number(session.totalCost) * 1e6) / 1e6 : null,
+        // ENG-972: spend from assistant turns inside the requested window only.
+        // Null when no assistant turn carries a timestamp (unknown, not zero).
+        inWindowCost: timestampedAssistantTurns > 0 ? inWindowCostMicro / 1e6 : null,
         satisfactionScore: session.satisfactionScore || null,
         judgeScores: session.judgeScores || null,
         // ENG-929: under sync=true, why this session does or does not have a
