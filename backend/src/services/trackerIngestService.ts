@@ -65,7 +65,10 @@ export async function ingestTrackerEvent(input: {
   // resolveClientIdentity drops IP and UA together when the caller is not a browser (see its doc comment).
   const identity = resolveClientIdentity(userAgent, visitorIp);
 
-  const write = (listId: string): Promise<unknown> => {
+  // `ownerUserId` is handed to createLead so it does not re-read the list row just to learn its owner: that read
+  // happens BEFORE the conditional put, i.e. on EVERY event (the put then fails for all but a session's first),
+  // and would put the per-event list read straight back. The owner comes from the same cached row the gates used.
+  const write = (listId: string, ownerUserId: unknown): Promise<unknown> => {
     // One object per target: the upsert normalises the counter in place.
     const customFields = { ...built.customFields, forwardedAt: nowIso };
     return upsertSessionLead({
@@ -73,6 +76,7 @@ export async function ingestTrackerEvent(input: {
       identity: parsed.identity,
       leadData: {
         firstName: '', lastName: '', phone: '', company: '', title: '', notes: '', linkedin: '',
+        ...(typeof ownerUserId === 'string' && ownerUserId ? { userId: ownerUserId } : {}),
         ...(identity.clientIp ? { clientIp: identity.clientIp } : {}),
         ...(identity.clientUserAgent ? { clientUserAgent: identity.clientUserAgent } : {}),
         customFields,
@@ -91,13 +95,13 @@ export async function ingestTrackerEvent(input: {
       if (!child || !isSessionList(child) || child.userId !== list.userId) {
         throw new Error('child list missing, not a session list, or owned by someone else');
       }
-      await write(childId);
+      await write(childId, child.userId);
     } catch (err: any) {
       childFailures.push(childId);
       console.warn(`[trackerIngest] child write failed list=${list.listId} child=${childId}: ${err?.message ?? err}`);
     }
   };
 
-  await Promise.all([write(list.listId), ...childListIds.map(writeChild)]);
+  await Promise.all([write(list.listId, list.userId), ...childListIds.map(writeChild)]);
   return { classification, childListIds, childFailures };
 }

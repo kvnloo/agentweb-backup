@@ -162,4 +162,10 @@ describe('ENG-2325: routing-child lookups use the list cache', () => {
     ingestListCache.invalidate('list_child_org1');
     expect((await ingest(IG)).childFailures).toEqual(['list_child_org1']);
   });
+
+  it('createLead is handed the owner (parent and child), so it does not re-read the list on every event', async () => {
+    await ingest(IG);
+    const byList = Object.fromEntries((crmDb.createLead as jest.Mock).mock.calls.map(([l, d]) => [l, d.userId]));
+    expect(byList).toEqual({ list_parent_001: 'u1', list_child_org1: 'u1' });
+  });
 });
