@@ -812,6 +812,42 @@ describe('CRM Routes', () => {
       expect(call.firstTouch).toBeUndefined();
       expect(call.lastTouch).toBeUndefined();
     });
+
+    // ENG-2322: createLead's duplicate-email pre-check throws a typed error. For the owner's own
+    // create that is a conflict (409 + the existing leadId), not a 500 server failure.
+    const postCreate = async () => {
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads' && r.route?.methods?.post
+      );
+      await handler!.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+    };
+
+    it('returns 409 with the existing leadId and the unchanged message on a duplicate email', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', name: 'L', userId: 'test-user-id' });
+      const message = 'Lead with email "dup@example.com" already exists in this list';
+      (crmDb.createLead as jest.Mock).mockRejectedValue(
+        Object.assign(new Error(message), { duplicateEmail: true, existingLead: { leadId: 'lead_existing', email: 'dup@example.com' } }),
+      );
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { email: 'dup@example.com' };
+
+      await postCreate();
+
+      expect(mockResponse.status).toHaveBeenCalledWith(409);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message, duplicate: true, leadId: 'lead_existing' });
+    });
+
+    it('still returns 500 for a non-duplicate createLead failure', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', name: 'L', userId: 'test-user-id' });
+      (crmDb.createLead as jest.Mock).mockRejectedValue(new Error('dynamo down'));
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { email: 'x@example.com' };
+
+      await postCreate();
+
+      expect(mockResponse.status).toHaveBeenCalledWith(500);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'dynamo down' });
+    });
   });
 
   describe('PUT /api/crm/lists/:listId/leads/:leadId', () => {
