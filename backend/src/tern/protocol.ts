@@ -140,23 +140,47 @@ export function splitTspMessage(sequence: string): TspRawMessage | null {
  * discarded; the native editor owns text input once the hello handshake opts
  * into edit/send events.
  */
+export type TspInputPart =
+  | { type: 'raw'; data: string }
+  | { type: 'message'; message: TspRawMessage };
+
+function partialPrefixSuffix(text: string, prefix: string): number {
+  const max = Math.min(prefix.length - 1, text.length);
+  for (let length = max; length > 0; length--) {
+    if (text.endsWith(prefix.slice(0, length))) return length;
+  }
+  return 0;
+}
+
 export class TspStreamReader {
   private buffer = '';
   private chunks = new Map<string, string>();
 
-  push(chunk: string): TspRawMessage[] {
+  pushParts(chunk: string): TspInputPart[] {
     this.buffer += chunk;
-    const messages: TspRawMessage[] = [];
+    const parts: TspInputPart[] = [];
+
+    const emitRaw = (data: string) => {
+      if (!data) return;
+      const previous = parts.at(-1);
+      if (previous?.type === 'raw') previous.data += data;
+      else parts.push({ type: 'raw', data });
+    };
 
     for (;;) {
       const start = this.buffer.indexOf(TSP_PREFIX);
       if (start === -1) {
-        // Keep a possible partial ESC-prefix, discard ordinary keyboard bytes.
-        const esc = this.buffer.lastIndexOf('\x1b');
-        this.buffer = esc >= 0 ? this.buffer.slice(esc) : '';
+        const hold = partialPrefixSuffix(this.buffer, TSP_PREFIX);
+        const rawEnd = this.buffer.length - hold;
+        emitRaw(this.buffer.slice(0, rawEnd));
+        this.buffer = this.buffer.slice(rawEnd);
         break;
       }
-      if (start > 0) this.buffer = this.buffer.slice(start);
+
+      if (start > 0) {
+        emitRaw(this.buffer.slice(0, start));
+        this.buffer = this.buffer.slice(start);
+      }
 
       const end = this.buffer.indexOf(ST, TSP_PREFIX.length);
       if (end === -1) break;
@@ -177,10 +201,16 @@ export class TspStreamReader {
         raw.body = joined;
       }
 
-      messages.push(raw);
+      parts.push({ type: 'message', message: raw });
     }
 
-    return messages;
+    return parts;
+  }
+
+  push(chunk: string): TspRawMessage[] {
+    return this.pushParts(chunk)
+      .filter((part): part is Extract<TspInputPart, { type: 'message' }> => part.type === 'message')
+      .map(part => part.message);
   }
 }
 
