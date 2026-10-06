@@ -27,6 +27,10 @@ const mockFilterByCompanySize = jest.fn(
   async (...args: any[]) => ({ items: args[0], excludedUnverifiable: 0 }),
 );
 const mockClearStatusCache = jest.fn();
+// Defaults to false (own account) so every pre-existing test below — none of
+// which care about site-wide-pool attribution — keeps working unmodified.
+// Only the reactive-handler tests override it to exercise usedSharedAccount: true.
+const mockUsedSharedAccount = jest.fn().mockReturnValue(false);
 jest.mock('../services/linkedInOutreachService', () => {
   // isProvenDisconnectError is a pure, dependency-free predicate — use the REAL
   // implementation here rather than re-stubbing its logic, so these tests catch
@@ -37,6 +41,14 @@ jest.mock('../services/linkedInOutreachService', () => {
     linkedInOutreachService: {
       searchPeople: (...args: any[]) => mockSearchPeople(...args),
       resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
+      // importLeadsFromSearch calls resolveAccountIdWithSource (needs
+      // usedSharedAccount for the reactive handler's ownerUserId attribution);
+      // synthesized from the same mockResolveAccountId so every existing test
+      // setup (`mockResolveAccountId.mockResolvedValue(...)`) keeps working.
+      resolveAccountIdWithSource: async (...args: any[]) => ({
+        accountId: await mockResolveAccountId(...args),
+        usedSharedAccount: mockUsedSharedAccount(),
+      }),
       probeSearchCapability: (...args: any[]) => mockProbeSearchCapability(...args),
       filterByCompanySize: (...args: any[]) => mockFilterByCompanySize(...args),
       clearStatusCache: (...args: any[]) => mockClearStatusCache(...args),
@@ -743,6 +755,7 @@ describe('AgentModeService.importLeadsFromSearch — top-up loop', () => {
     mockSetLeadListSearchCursor.mockReset();
     mockClearStatusCache.mockReset();
     mockRecordUnipileAccountHealth.mockReset();
+    mockUsedSharedAccount.mockReset().mockReturnValue(false);
     service = new AgentModeService();
     mockResolveAccountId.mockResolvedValue('test-account-id');
     mockGetLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1', leadCount: 0 });
@@ -836,6 +849,30 @@ describe('AgentModeService.importLeadsFromSearch — top-up loop', () => {
     expect(mockRecordUnipileAccountHealth).toHaveBeenCalledWith({
       accountId: 'test-account-id',
       ownerUserId: 'user-1',
+      state: 'disconnected',
+    });
+  });
+
+  it('omits ownerUserId for a proven-dead SITE-WIDE pool account (ENG-2205)', async () => {
+    // recordUnipileAccountHealth can only resolve a real owner by looking up
+    // ownerUserId's OWN/org-shared accounts — it can never find the ownerless
+    // global site-wide pool account under an unrelated caller's userId. Passing
+    // userId there would silently no-op instead of reaching the dedicated
+    // ownerless/oncall alert branch, so this must stay undefined for that case.
+    mockUsedSharedAccount.mockReturnValue(true);
+    const disconnectedError: any = new Error('Session expired');
+    disconnectedError.structuredError = { code: 'errors/disconnected_account', status: 401, classification: 'AUTH_ERROR' };
+    mockSearchPeople
+      .mockResolvedValueOnce({ items: [makeItem(1), makeItem(2)], cursor: 'c2' })
+      .mockRejectedValueOnce(disconnectedError);
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(2, 0, 'p1'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 10 });
+
+    expect(result.searchError).toContain('Session expired');
+    expect(mockRecordUnipileAccountHealth).toHaveBeenCalledWith({
+      accountId: 'test-account-id',
+      ownerUserId: undefined,
       state: 'disconnected',
     });
   });
