@@ -343,6 +343,9 @@ async function main(): Promise<void> {
   let rendered = false;
   let pickerState: SessionPickerState | undefined;
   let approvalState: ApprovalDeckUiState | undefined;
+  let runState: { runs: AgentRunSummaryLike[]; selected: number } | undefined;
+  let runFrames: FrameSender | undefined;
+  let runsSurfaceOpened = false;
   const dismissedDecks = new Set<string>();
   let pickerKeyBuffer = '';
   let escapeFlush: NodeJS.Timeout | undefined;
@@ -397,6 +400,83 @@ async function main(): Promise<void> {
     ]);
   };
 
+  const renderRuns = () => {
+    if (!runState || !runFrames) return;
+    const root = renderAgentRunsScreen(runState.runs, runState.selected);
+    runFrames.request([
+      ['del', 'run-picker'],
+      nodeAdd(root, RUNS_SURFACE_ID),
+    ]);
+  };
+
+  const closeAgentRuns = () => {
+    runState = undefined;
+    runFrames = undefined;
+    pickerKeyBuffer = '';
+    clearTimeout(escapeFlush);
+    escapeFlush = undefined;
+    if (runsSurfaceOpened) {
+      process.stdout.write(
+        encodeTspJson('x', { id: RUNS_SURFACE_ID, keep: false }, undefined, apcLimit),
+      );
+      runsSurfaceOpened = false;
+    }
+  };
+
+  const refreshAgentRuns = async () => {
+    if (!runState) return;
+    try {
+      const runs = await client.getAgentRuns(session.sessionId, 3);
+      runState.runs = runs;
+      runState.selected = Math.max(0, Math.min(runState.selected, Math.max(0, runs.length - 1)));
+      renderRuns();
+    } catch (error: any) {
+      const status = error?.response?.status;
+      closeAgentRuns();
+      errorText = status === 401 || status === 403
+        ? 'AgentRun Inspector requires admin access'
+        : error instanceof Error
+          ? error.message
+          : String(error);
+      render(true);
+    }
+  };
+
+  const openAgentRuns = async () => {
+    if (running) return;
+    try {
+      const runs = await client.getAgentRuns(session.sessionId, 3);
+      runState = { runs, selected: 0 };
+      pickerState = undefined;
+      approvalState = undefined;
+      pickerKeyBuffer = '';
+      runFrames = new FrameSender(RUNS_SURFACE_ID, apcLimit);
+      process.stdout.write(
+        encodeTspJson(
+          'o',
+          {
+            id: RUNS_SURFACE_ID,
+            mode: 'screen',
+            title: 'AgentRun Inspector',
+            role: 'agentweb.runs',
+          },
+          undefined,
+          apcLimit,
+        ),
+      );
+      runsSurfaceOpened = true;
+      runFrames.request([nodeAdd(renderAgentRunsScreen(runs, 0), RUNS_SURFACE_ID)]);
+    } catch (error: any) {
+      const status = error?.response?.status;
+      errorText = status === 401 || status === 403
+        ? 'AgentRun Inspector requires admin access'
+        : error instanceof Error
+          ? error.message
+          : String(error);
+      render(true);
+    }
+  };
+
   const closePicker = () => {
     pickerState = undefined;
     pickerKeyBuffer = '';
@@ -449,6 +529,7 @@ async function main(): Promise<void> {
   const switchSession = async (sessionId: string) => {
     if (running) return;
     try {
+      closeAgentRuns();
       const next = await client.getSession(sessionId);
       session = next;
       composer = '';
@@ -468,6 +549,7 @@ async function main(): Promise<void> {
   const createNewSession = async () => {
     if (running) return;
     try {
+      closeAgentRuns();
       session = await client.createSession();
       composer = '';
       cursor = 0;
@@ -615,7 +697,47 @@ async function main(): Promise<void> {
     }
   };
 
+  const handleRunKey = (key: PickerKey): boolean => {
+    if (!runState) return false;
+
+    if (key.ctrl && key.name === 'c') {
+      closeAndExit(130);
+      return true;
+    }
+    if (key.name === 'escape') {
+      closeAgentRuns();
+      return true;
+    }
+    if (!key.ctrl && key.name === 'r') {
+      void refreshAgentRuns();
+      return true;
+    }
+    if (key.name === 'up') {
+      runState.selected = Math.max(0, runState.selected - 1);
+      renderRuns();
+      return true;
+    }
+    if (key.name === 'down') {
+      runState.selected = Math.min(Math.max(0, runState.runs.length - 1), runState.selected + 1);
+      renderRuns();
+      return true;
+    }
+    if (key.name === 'home') {
+      runState.selected = 0;
+      renderRuns();
+      return true;
+    }
+    if (key.name === 'end') {
+      runState.selected = Math.max(0, runState.runs.length - 1);
+      renderRuns();
+      return true;
+    }
+    return true;
+  };
+
   const handlePickerKey = (key: PickerKey) => {
+    if (runState && handleRunKey(key)) return;
+
     if (approvalState) {
       const choices = approvalChoices();
       const current = approvalState.selectedVerdict;
@@ -773,7 +895,7 @@ async function main(): Promise<void> {
   };
 
   rawHandler = raw => {
-    if (!pickerState && !approvalState) {
+    if (!pickerState && !approvalState && !runState) {
       if (raw.includes('\x03')) closeAndExit(130);
       return;
     }
@@ -841,6 +963,12 @@ async function main(): Promise<void> {
     const text = prompt.trim();
     if (!text || running) return;
 
+    if (text === '/runs') {
+      composer = '';
+      cursor = 0;
+      void openAgentRuns();
+      return;
+    }
     if (text === '/resume' || text === '/sessions') {
       composer = '';
       cursor = 0;
@@ -914,7 +1042,10 @@ async function main(): Promise<void> {
   eventHandler = event => {
     switch (event.ev) {
       case 'ack':
-        if (typeof event.s === 'number') frames.ack(event.s);
+        if (typeof event.s === 'number') {
+          if (event.sf === RUNS_SURFACE_ID) runFrames?.ack(event.s);
+          else frames.ack(event.s);
+        }
         break;
       case 'edit':
         applyEdit(event);
@@ -935,6 +1066,14 @@ async function main(): Promise<void> {
         break;
       case 'select':
       case 'activate': {
+        if (event.id === 'run-picker' && typeof event.item === 'string' && runState) {
+          const index = runState.runs.findIndex(run => run.runId === event.item);
+          if (index >= 0) {
+            runState.selected = index;
+            renderRuns();
+          }
+          break;
+        }
         if (event.id === 'approval-picker' && typeof event.item === 'string' && approvalState) {
           approvalState.selectedVerdict = event.item;
           if (event.ev === 'activate') chooseApprovalAndAdvance(false);
@@ -951,6 +1090,15 @@ async function main(): Promise<void> {
         break;
       }
       case 'action': {
+        if (event.act === 'runs' && event.id === 'status.runs') {
+          void openAgentRuns();
+          break;
+        }
+        if (event.id === 'run-picker' && runState) {
+          if (event.act === 'refresh') void refreshAgentRuns();
+          else if (event.act === 'close' || event.act === 'cancel') closeAgentRuns();
+          break;
+        }
         if (event.act === 'sessions' && event.id === 'status.sessions') {
           void openSessionPicker();
           break;
@@ -978,7 +1126,11 @@ async function main(): Promise<void> {
       case 'error':
         if (typeof event.msg === 'string') {
           errorText = event.msg;
-          render(pickerState === undefined && approvalState === undefined);
+          if (event.sf === RUNS_SURFACE_ID) {
+            closeAgentRuns();
+          } else {
+            render(pickerState === undefined && approvalState === undefined);
+          }
         }
         break;
       default:
