@@ -6,6 +6,8 @@ import path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig } from "../utils/secretsManager";
 import { resolveLandingPageGa4 } from "../utils/landingPageGa4";
 import { injectGtmIntoLayoutFiles } from "../utils/gtmInjection";
+import { injectUtmDecorationIntoLayoutFiles, type LanderUtmLayers } from "../utils/landerUtmDecoration";
+import { getCustomerUtmDefault, getLanderUtmOverride } from "./landerUtmStore";
 import { isAutoSessionTrackingEnabled } from "../utils/sessionTrackingInjection";
 import { injectPixelIntoLayoutFiles, injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjection";
 import { injectGoogleAdsIntoLayoutFiles, injectGoogleAdsIntoLayout, verifyGoogleAdsInjection } from "../utils/googleAdsInjection";
@@ -3605,6 +3607,7 @@ export async function deployLandingPage(
       metaPixelId,
       metaAdAccountId,
       record.googleAdsConversionId,
+      await loadLanderUtmLayers(id, userId),
     );
     // Reflect the tracking signals on the in-memory record so every downstream return
     // (deployed or build-failed) carries them consistently with what we persisted.
@@ -5332,6 +5335,25 @@ export function injectLeadCaptureAttribution(
 }
 
 /**
+ * ENG-726: read the two stored UTM layers fresh at push time. Read failures degrade
+ * to "no layer" so a storage hiccup never fails generation (the lander simply ships
+ * undecorated, which is today's behavior).
+ */
+async function loadLanderUtmLayers(pageId: string, userId: string): Promise<LanderUtmLayers> {
+  const [override, customerDefault] = await Promise.all([
+    getLanderUtmOverride(pageId, userId).catch((err: any) => {
+      console.warn(`[V0 SERVICE] UTM override read failed for ${pageId}: ${err?.message}`);
+      return null;
+    }),
+    getCustomerUtmDefault(userId).catch((err: any) => {
+      console.warn(`[V0 SERVICE] UTM default read failed for ${userId}: ${err?.message}`);
+      return null;
+    }),
+  ]);
+  return { override, customerDefault };
+}
+
+/**
  * Create a GitHub repo under the AgentWebPro org and push all files via the Contents API.
  */
 async function createGitHubRepoAndPush(
@@ -5367,6 +5389,12 @@ async function createGitHubRepoAndPush(
    * When absent, NOTHING is injected — no fallback tag on a customer page.
    */
   googleAdsConversionId?: string,
+  /**
+   * ENG-726: the stored UTM layers (per-lander override + customer default). When
+   * either is configured, an outbound-link decoration script resolved by the shared
+   * ENG-723 resolver is injected into the root layout. Neither set: nothing injected.
+   */
+  utmLayers: LanderUtmLayers = {},
 ): Promise<{ githubRepoUrl: string; repoFullName: string; commitSha: string; gtmInjected: boolean; pixelInjected: boolean; googleAdsInjected: boolean }> {
   const { token, org } = await getGitHubOrgToken();
   const headers = {
@@ -5521,6 +5549,15 @@ async function createGitHubRepoAndPush(
   // measurable from the first deploy — no manual "Add GTM" step. Absent a container id,
   // nothing is injected and the caller records a "no tracking installed" signal.
   const gtmInjected = injectGtmIntoLayoutFiles(finalFiles, gtmContainerId);
+  // ENG-726: decorate outbound links with the resolved UTMs. A malformed stored
+  // config must not fail generation — log and ship undecorated, as before this slice.
+  try {
+    if (injectUtmDecorationIntoLayoutFiles(finalFiles, utmLayers)) {
+      console.log(`[V0 SERVICE] Injected UTM outbound-link decoration into app/layout.tsx`);
+    }
+  } catch (err: any) {
+    console.error(`[V0 SERVICE] UTM decoration skipped (invalid stored UTM config): ${err?.message}`);
+  }
   console.log(
     gtmInjected
       ? `[V0 SERVICE] Injected GTM container ${gtmContainerId} into app/layout.tsx`
