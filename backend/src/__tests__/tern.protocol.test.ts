@@ -41,6 +41,32 @@ describe('Tern protocol transport', () => {
     expect(parts[2]).toEqual({ type: 'raw', data: '\x1b[B' });
   });
 
+  it('accepts OSC-877 TSP terminated by BEL (ConPTY path)', () => {
+    const reader = new TspStreamReader();
+    const parts = reader.pushParts(
+      '\x1b]877;tsp;e;{"ev":"focus","sf":"agentweb-emma","id":"composer"}\x07',
+    );
+    expect(parts).toHaveLength(1);
+    expect(parts[0]?.type).toBe('message');
+    if (parts[0]?.type === 'message') {
+      expect(parseTspJson(parts[0].message)).toMatchObject({
+        ev: 'focus',
+        sf: 'agentweb-emma',
+        id: 'composer',
+      });
+    }
+  });
+
+  it('holds a split OSC-877 prefix instead of leaking it as keyboard input', () => {
+    const reader = new TspStreamReader();
+    expect(reader.pushParts('x\x1b]877;ts')).toEqual([{ type: 'raw', data: 'x' }]);
+    const rest = reader.pushParts(
+      'p;e;{"ev":"focus","sf":"agentweb-emma","id":"composer"}\x07',
+    );
+    expect(rest).toHaveLength(1);
+    expect(rest[0]?.type).toBe('message');
+  });
+
   it('holds a split TSP prefix instead of leaking it as keyboard input', () => {
     const reader = new TspStreamReader();
     expect(reader.pushParts('x\x1b_ts')).toEqual([{ type: 'raw', data: 'x' }]);
