@@ -57,7 +57,8 @@ function usage(message?: string): never {
   if (message) process.stderr.write(`${message}\n\n`);
   process.stderr.write(
     'Usage: AGENTWEB_TOKEN=<token> npm run tern:emma -- [--session <id> | --new]\n' +
-    '       Optional: AGENTWEB_API_URL=http://localhost:3001\n',
+    '       Optional: AGENTWEB_API_URL=http://localhost:3001\n' +
+    '                 AGENTWEB_RUNS_SECRET=<read-only secret> or AGENTWEB_ADMIN_TOKEN=<admin JWT> for /runs\n',
   );
   process.exit(1);
 }
@@ -222,7 +223,12 @@ async function main(): Promise<void> {
   if (!token) usage('AGENTWEB_TOKEN is required.');
 
   const baseUrl = process.env.AGENTWEB_API_URL || 'http://localhost:3001';
-  const client = new AgentWebClient({ baseUrl, token });
+  const client = new AgentWebClient({
+    baseUrl,
+    token,
+    runsToken: process.env.AGENTWEB_ADMIN_TOKEN,
+    runsSecret: process.env.AGENTWEB_RUNS_SECRET,
+  });
   const requestedSession = argValue('--session');
   const forceNew = process.argv.includes('--new');
 
