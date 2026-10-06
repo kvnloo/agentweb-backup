@@ -45,6 +45,16 @@ export function sdkScriptUrl(): string {
   return `${base}/sdk/v1/aw.js`;
 }
 
+/**
+ * The flag for automatic enablement at generation. Default OFF; `true` or `1` turns it on. Lives here
+ * (a dependency-free module) so the generation path can check it synchronously, with no import and no
+ * await, and flag-off generation is therefore byte-for-byte the code path it was before ENG-2327.
+ */
+export function isAutoSessionTrackingEnabled(): boolean {
+  const v = String(process.env.AUTO_SESSION_TRACKING ?? '').trim().toLowerCase();
+  return v === 'true' || v === '1';
+}
+
 const LIST_ID_RE = /^[A-Za-z0-9_-]{6,80}$/;
 // The src goes into source code we commit: nothing that could close the attribute or the JSX expression.
 const SDK_URL_RE = /^https?:\/\/[A-Za-z0-9.:\-]+(\/[A-Za-z0-9._\-/]*)?$/;

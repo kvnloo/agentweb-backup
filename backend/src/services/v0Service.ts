@@ -6,6 +6,7 @@ import path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig } from "../utils/secretsManager";
 import { resolveLandingPageGa4 } from "../utils/landingPageGa4";
 import { injectGtmIntoLayoutFiles } from "../utils/gtmInjection";
+import { isAutoSessionTrackingEnabled } from "../utils/sessionTrackingInjection";
 import { injectPixelIntoLayoutFiles, injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjection";
 import { injectGoogleAdsIntoLayoutFiles, injectGoogleAdsIntoLayout, verifyGoogleAdsInjection } from "../utils/googleAdsInjection";
 import { metaService } from "./metaService";
@@ -2815,6 +2816,20 @@ async function addPageToExistingRepo(
       })
       .promise();
 
+    // ENG-2327: the session tag lives in the shared root layout, so a sub-page of a tracked site inherits the
+    // site's list with no repo work. Flag-gated and never throws (see the same call in deployLandingPage).
+    if (isAutoSessionTrackingEnabled()) {
+      try {
+        const tracking = await import("./sessionTrackingService").then((m) => m.autoEnableSessionTracking(deployedSubPage, existingPage));
+        if (tracking) {
+          deployedSubPage.sessionTrackingListId = tracking.listId;
+          deployedSubPage.sessionTrackingInstalled = tracking.installed;
+        }
+      } catch (trackingErr: any) {
+        console.warn(`[V0 SERVICE] Session tracking inheritance could not run (generation unaffected): ${trackingErr?.message}`);
+      }
+    }
+
     void enqueueLandingPageHumanEval(deployedSubPage, async () => allFiles);
     // Dynamic import: landingPageSmokeTest.ts imports FROM this module (GeneratedLandingPage,
     // updateLandingPageSmokeTestResult), so a static import here would be circular.
@@ -3736,6 +3751,23 @@ export async function deployLandingPage(
       updatedAt: now,
     };
 
+    // ENG-2327: automatic session tracking (flag AUTO_SESSION_TRACKING, default OFF). It runs AFTER the
+    // GTM / Meta / Google Ads injection and the deploy because the list's allowed origins are the page's
+    // own domains, which only exist now; the tag therefore goes in as one extra commit (one extra Vercel
+    // build). It never throws and never fails generation: a failure is logged and recorded on the page.
+    // The flag is read synchronously first, so with it OFF (the default) nothing below is even imported.
+    // Dynamic import: sessionTrackingService imports FROM this module, so a static import would be circular.
+    if (isAutoSessionTrackingEnabled()) {
+      try {
+        const tracking = await import("./sessionTrackingService").then((m) => m.autoEnableSessionTracking(deployedRecord));
+        if (tracking) {
+          deployedRecord.sessionTrackingListId = tracking.listId;
+          deployedRecord.sessionTrackingInstalled = tracking.installed;
+        }
+      } catch (trackingErr: any) {
+        console.warn(`[V0 SERVICE] Session tracking auto-enable could not run (generation unaffected): ${trackingErr?.message}`);
+      }
+    }
 
     const deployedZip = zipBuffer;
     void enqueueLandingPageHumanEval(deployedRecord, () => unzipBuffer(deployedZip));

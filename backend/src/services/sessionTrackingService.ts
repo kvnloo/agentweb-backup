@@ -38,6 +38,7 @@ import {
   extractInstalledListId,
   injectSessionTrackingIntoHtml,
   injectSessionTrackingIntoLayout,
+  isAutoSessionTrackingEnabled,
   sdkScriptUrl,
   verifySessionTrackingInjection,
   type SessionTrackingTarget,
@@ -125,16 +126,12 @@ export interface SessionTrackingResult {
   allowedOrigins: string[];
 }
 
+export { isAutoSessionTrackingEnabled };
+
 const GITHUB_TIMEOUT_MS = 30_000;
 const MAX_CAS_ATTEMPTS = 3;
 const LAYOUT_PATHS = ['app/layout.tsx', 'src/app/layout.tsx'];
 const HTML_PATH_RE = /^public\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*\.html$/;
-
-/** The flag for automatic enablement at generation. Default OFF; `true` or `1` turns it on. */
-export function isAutoSessionTrackingEnabled(): boolean {
-  const v = String(process.env.AUTO_SESSION_TRACKING ?? '').trim().toLowerCase();
-  return v === 'true' || v === '1';
-}
 
 /** Serialises enablement per repo inside one process: sibling pages share the layout they all edit. */
 const repoLocks = new Map<string, Promise<unknown>>();
