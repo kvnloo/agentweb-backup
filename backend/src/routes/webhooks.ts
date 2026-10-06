@@ -34,6 +34,7 @@ import { handleHardBounceRecipients } from '../services/emailDeliverabilityServi
 // module-private state. Extracted so the CRM → Meta conversion relay throttles against the
 // same counters instead of a second set that drifts out of step with this one.
 import { shouldAttemptCapiSend, isCapiAccountPaused, recordCapiUsage } from '../services/capiSendBudget';
+import { suppressLeadSideEffects } from '../utils/sessionList';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -496,6 +497,10 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
   try {
 
+    // ENG-2311: read from the list row the DATABASE returned, never from the body. One
+    // decision, made once, consumed by every side-effect gate below.
+    const suppressSideEffects = suppressLeadSideEffects(leadList);
+
     // Extract lead data from request body
     const {
       email,
@@ -883,9 +888,11 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       try {
         lead = await crmDb.createLead(
           leadList.listId,
-          deterministicLeadId
-            ? { ...leadData, leadId: deterministicLeadId, failIfExists: true }
-            : leadData
+          {
+            ...(deterministicLeadId ? { ...leadData, leadId: deterministicLeadId, failIfExists: true } : leadData),
+            // Only added when true, so every non-session list passes byte-identical input.
+            ...(suppressSideEffects ? { suppressSideEffects: true } : {}),
+          }
         );
         isNew = true;
       } catch (createErr: any) {
@@ -999,7 +1006,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // numbers at random, so collisions are routine by construction and every colliding
     // resubmission notified a real human about a fake lead. The gate's own comment claims
     // it skips "the whole cascade"; this is the part that escaped it.
-    if (!isNew && !isSmokeTestLead(lead) && !isSmokeTestLead(leadData)) {
+    if (!suppressSideEffects && !isNew && !isSmokeTestLead(lead) && !isSmokeTestLead(leadData)) {
       const submission = { submissionId: crypto.randomUUID(), submittedAt: new Date().toISOString() };
       void import('../services/orgLeadNotificationService')
         .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, submission))
@@ -1041,7 +1048,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // synthetic lead — CAPI's correctness is already covered by unit tests (metaService.capi
     // .test.ts) and doesn't depend on v0-authored code, so there's nothing extra to verify
     // live here, only real-ad-account conversion data to needlessly pollute.
-    if (pixelId && metaAccountId && eventId && !isSmokeTestLead(leadData) && shouldAttemptCapiSend(leadList.listId) && !isCapiAccountPaused(metaAccountId)) {
+    if (!suppressSideEffects && pixelId && metaAccountId && eventId && !isSmokeTestLead(leadData) && shouldAttemptCapiSend(leadList.listId) && !isCapiAccountPaused(metaAccountId)) {
       void (async () => {
         try {
           const owner = await userDb.getUserById(leadList.userId);
@@ -1085,7 +1092,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // only on `isNew`: popup partials / AI Eval pretriggers can create the lead
     // before the final roadmap submit arrives with a valid stage.
     const roadmapCustomFields = lead.customFields || mergedCustomFields || {};
-    if (!roadmapCustomFields.roadmapEmailSentAt) {
+    if (!suppressSideEffects && !roadmapCustomFields.roadmapEmailSentAt) {
       void (async () => {
         const sent = await sendRoadmapDeliveryEmail({
           to: lead.email,
@@ -1127,7 +1134,11 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // lead; the lead row itself is still created/returned normally above so the smoke
       // test's CRM-landing check still works.
       console.log(`[webhooks] Synthetic smoke-test lead (${lead.email || lead.phone || lead.leadId}) — skipping CRM sync/sequence enrollment/auto-draft/auto-send/owner-notify side effects`);
-    } else if (isNew || isUpdated) {
+    } else if ((isNew || isUpdated) && !suppressSideEffects) {
+      // ENG-2311: a session list is skipped here (HubSpot/Attio sync, sequence enrolment,
+      // auto-draft/auto-send, owner alert) — see utils/sessionList.ts. The lead row itself
+      // is still created/updated and the response is unchanged.
+      //
       // Real-time push to any connected external CRM (HubSpot / Attio). The
       // authenticated UI create/update routes do this inline; inbound capture
       // (landing pages, lead-forward webhooks) did not, so form leads only ever

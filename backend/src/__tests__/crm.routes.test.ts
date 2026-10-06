@@ -2923,7 +2923,41 @@ describe('CRM Routes', () => {
       }
 
       expect(mockResponse.status).toHaveBeenCalledWith(400);
-      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'listType must be "sales" or "customers"' });
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'listType must be "sales", "customers" or "session"' });
+    });
+
+    // ENG-2311: 'session' is a valid set-once type; the contract is the vocabulary + set-once.
+    it('should accept "session" when listType is not yet set', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.updateLeadList as jest.Mock).mockResolvedValue({ ...mockList, listType: 'session' });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { listType: 'session' };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.updateLeadList).toHaveBeenCalledWith('list1', { listType: 'session' });
+    });
+
+    it.each(['session', 'sales', 'customers'])('set-once: refuses to change a list already typed "%s"', async (existing) => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id', listType: existing };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { listType: existing === 'session' ? 'sales' : 'session' };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'listType is already set and cannot be changed' });
+      expect(crmDb.updateLeadList).not.toHaveBeenCalled();
     });
   });
 
