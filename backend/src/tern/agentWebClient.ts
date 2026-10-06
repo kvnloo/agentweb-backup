@@ -1,5 +1,9 @@
 import axios, { AxiosInstance } from 'axios';
-import type { ApprovalDeckInboundAnswer, EmmaSessionLike } from './renderEmma';
+import type {
+  AgentRunSummaryLike,
+  ApprovalDeckInboundAnswer,
+  EmmaSessionLike,
+} from './renderEmma';
 
 export type EmmaStreamEvent =
   | { type: 'tool_start'; name: string }
@@ -53,6 +57,14 @@ export class AgentWebClient {
       { params: { portal: 'customer' } },
     );
     return response.data as EmmaSessionLike;
+  }
+
+  async getAgentRuns(sessionId: string, limit = 3): Promise<AgentRunSummaryLike[]> {
+    const response = await this.http.get('/api/admin/agent-runs', {
+      params: { sessionId, limit },
+    });
+    const runs = response.data?.runs;
+    return Array.isArray(runs) ? runs as AgentRunSummaryLike[] : [];
   }
 
   async submitApprovalDeck(
