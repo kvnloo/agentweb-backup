@@ -285,11 +285,21 @@ export interface DedupePlan {
     rowsWithoutIdentity: number;
     rowsWithConflictingIdentity: number;
     sessions: number;
+    /** Duplicated sessions found, eligible or not. */
     duplicatedSessions: number;
+    /** Duplicated sessions skipped because a row was updated within minIdleMinutes. */
+    groupsSkippedActive: number;
+    /** Rows to delete in ELIGIBLE (idle) groups only. */
     rowsToDelete: number;
     groupsWithKeeperWrites: number;
   };
+  minIdleMinutes: number;
+  /** Rows updated at/after this instant count as live. Informational, not hashed. */
+  idleCutoff: string;
+  /** Eligible (idle) groups: the only ones apply will touch. */
   groups: GroupPlan[];
+  /** Possibly-live groups: reported, never mutated, excluded from rowsToDelete/planHash. */
+  skippedActive: Array<{ sessionId: string; leadIds: string[]; newestUpdatedAt?: string }>;
   planHash: string;
 }
 
@@ -326,8 +336,8 @@ const groupFingerprint = (g: GroupPlan) =>
     t: g.topLevelWrites,
   });
 
-const hashGroups = (listId: string, mode: string, groups: GroupPlan[]) =>
-  sha256(stableStringify({ listId, mode, groups: groups.map(groupFingerprint) }));
+const hashGroups = (listId: string, mode: string, groups: GroupPlan[], extra: Record<string, unknown> = {}) =>
+  sha256(stableStringify({ listId, mode, ...extra, groups: groups.map(groupFingerprint) }));
 
 async function requireList(listId: string): Promise<any> {
   const list = await crmDb.getLeadListById(listId);
@@ -356,12 +366,38 @@ async function scanAllRows(listId: string, pageSize: number): Promise<any[]> {
 // Dedupe: preview / apply
 // ---------------------------------------------------------------------------
 
+export const DEFAULT_MIN_IDLE_MINUTES = 30;
+export const MIN_IDLE_MINUTES_RANGE = { min: 5, max: 1440 } as const;
+
 export interface CleanupOptions {
   /** Query page size; tests force small pages to exercise LastEvaluatedKey. */
   pageSize?: number;
+  /**
+   * Idle guard: a duplicate group is only eligible when EVERY row's updatedAt is older
+   * than this many minutes. Until the live LP writer is atomic (S2), a live session is
+   * still written by a read-modify-write that overwrites the whole customFields map from
+   * a stale read, which could clobber merged keeper values.
+   */
+  minIdleMinutes?: number;
+  /** Injectable clock (epoch ms) for tests. */
+  now?: () => number;
+}
+
+export function resolveMinIdleMinutes(v: unknown): number {
+  if (v === undefined || v === null) return DEFAULT_MIN_IDLE_MINUTES;
+  if (!Number.isInteger(v) || (v as number) < MIN_IDLE_MINUTES_RANGE.min || (v as number) > MIN_IDLE_MINUTES_RANGE.max) {
+    throw new SessionCleanupError(
+      400,
+      'invalid_min_idle_minutes',
+      `minIdleMinutes must be an integer between ${MIN_IDLE_MINUTES_RANGE.min} and ${MIN_IDLE_MINUTES_RANGE.max}`,
+    );
+  }
+  return v as number;
 }
 
 export async function previewDedupe(listId: string, opts: CleanupOptions = {}): Promise<DedupePlan> {
+  const minIdleMinutes = resolveMinIdleMinutes(opts.minIdleMinutes);
+  const cutoffMs = (opts.now ?? Date.now)() - minIdleMinutes * 60_000;
   const list = await requireList(listId);
   const rows = await scanAllRows(listId, opts.pageSize ?? DEFAULT_PAGE_SIZE);
   const bySession = new Map<string, any[]>();
@@ -380,8 +416,19 @@ export async function previewDedupe(listId: string, opts: CleanupOptions = {}): 
     }
   }
   const groups: GroupPlan[] = [];
+  const skippedActive: DedupePlan['skippedActive'] = [];
   for (const [sessionId, group] of [...bySession.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
-    if (group.length > 1) groups.push(buildGroupPlan(sessionId, group));
+    if (group.length < 2) continue;
+    // Strictly older than the cutoff is idle; exactly at the cutoff, or an
+    // unparseable/missing updatedAt, is treated as possibly live (fail safe).
+    const times = group.map((r) => toMs(r.updatedAt));
+    const idle = times.every((t) => t !== undefined && t < cutoffMs);
+    if (!idle) {
+      const newest = group.map((r) => r.updatedAt).filter(Boolean).sort().pop();
+      skippedActive.push({ sessionId, leadIds: group.map((r) => r.leadId).sort(), newestUpdatedAt: newest });
+      continue;
+    }
+    groups.push(buildGroupPlan(sessionId, group));
   }
   const rowsToDelete = groups.reduce((n, g) => n + g.remove.length, 0);
   return {
@@ -394,14 +441,21 @@ export async function previewDedupe(listId: string, opts: CleanupOptions = {}): 
       rowsWithoutIdentity: withoutIdentity,
       rowsWithConflictingIdentity: conflicts,
       sessions: bySession.size,
-      duplicatedSessions: groups.length,
+      duplicatedSessions: groups.length + skippedActive.length,
+      groupsSkippedActive: skippedActive.length,
       rowsToDelete,
       groupsWithKeeperWrites: groups.filter(
         (g) => Object.keys(g.customFieldsWrites).length + Object.keys(g.topLevelWrites).length > 0,
       ).length,
     },
+    minIdleMinutes,
+    idleCutoff: new Date(cutoffMs).toISOString(),
     groups,
-    planHash: hashGroups(listId, 'dedupe', groups),
+    skippedActive,
+    // Hash covers ELIGIBLE groups + the idle setting only. A live group's updatedAt keeps
+    // moving, so hashing it would make the plan unstable run-to-run; a group that turns
+    // idle between preview and apply DOES change the hash, forcing a fresh review.
+    planHash: hashGroups(listId, 'dedupe', groups, { minIdleMinutes }),
   };
 }
 
@@ -414,7 +468,7 @@ export interface DeletedRowBackup {
 export interface GroupResult {
   sessionId: string;
   keeperLeadId: string;
-  status: 'merged_and_deleted' | 'deleted' | 'partial' | 'skipped_changed' | 'error';
+  status: 'merged_and_deleted' | 'deleted' | 'partial' | 'skipped_changed' | 'skipped_active' | 'error';
   keeperWritten: boolean;
   deletedLeadIds: string[];
   notDeleted: { leadId: string; reason: string }[];
@@ -475,7 +529,16 @@ export async function applyDedupe(
   const plan = await previewDedupe(req.listId, opts);
   assertConfirmed(req, { planHash: plan.planHash, rowsToDelete: plan.counts.rowsToDelete });
 
-  const results: GroupResult[] = [];
+  const results: GroupResult[] = plan.skippedActive.map((a) => ({
+    sessionId: a.sessionId,
+    keeperLeadId: '',
+    status: 'skipped_active' as const,
+    keeperWritten: false,
+    deletedLeadIds: [],
+    notDeleted: [],
+    leadCountDriftRows: [],
+    error: `a row was updated within the last ${plan.minIdleMinutes} minutes (newest ${a.newestUpdatedAt ?? 'unknown'})`,
+  }));
   const backup: DeletedRowBackup[] = [];
   let deleted = 0;
   let remaining = 0;

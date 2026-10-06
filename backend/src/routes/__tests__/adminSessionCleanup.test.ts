@@ -88,6 +88,24 @@ describe('apply request contract', () => {
   });
 });
 
+describe('minIdleMinutes passthrough', () => {
+  it('forwards minIdleMinutes to preview and apply (service validates the range)', async () => {
+    (svc.previewDedupe as jest.Mock).mockResolvedValue({ mode: 'dedupe', counts: { rowsToDelete: 0 }, planHash: 'p', groups: [] });
+    (svc.applyDedupe as jest.Mock).mockResolvedValue({ mode: 'dedupe', planHash: 'h', deletedCount: 0, continuationRequired: false, groups: [{ status: 'skipped_active', deletedLeadIds: [] }], backup: [] });
+    await request(app).post('/api/admin/session-cleanup/preview').send({ listId: 'L', minIdleMinutes: 90 });
+    expect(svc.previewDedupe).toHaveBeenCalledWith('L', { minIdleMinutes: 90 });
+    await request(app).post('/api/admin/session-cleanup/apply').send({ ...ok, minIdleMinutes: 90 });
+    expect(svc.applyDedupe).toHaveBeenCalledWith(expect.objectContaining({ listId: 'L' }), { minIdleMinutes: 90 });
+    expect(recordAdminAudit).toHaveBeenLastCalledWith(expect.objectContaining({ groupErrors: 0, groupsSkippedActive: 1 }));
+  });
+  it('maps an invalid value to 400', async () => {
+    (svc.previewDedupe as jest.Mock).mockRejectedValue(new svc.SessionCleanupError(400, 'invalid_min_idle_minutes', 'bad'));
+    const res = await request(app).post('/api/admin/session-cleanup/preview').send({ listId: 'L', minIdleMinutes: 1 });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('invalid_min_idle_minutes');
+  });
+});
+
 describe('preview', () => {
   it('audits and returns the plan', async () => {
     (svc.previewDedupe as jest.Mock).mockResolvedValue({ mode: 'dedupe', counts: { rowsToDelete: 3 }, planHash: 'p', groups: [] });

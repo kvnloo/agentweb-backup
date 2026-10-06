@@ -70,7 +70,10 @@ import {
 
 const LIST = 'list-A';
 const OTHER = 'list-B';
-const quiet = { log: () => undefined };
+const NOW = Date.parse('2026-10-05T00:00:00.000Z');
+/** Fixed clock: every seeded row (2026-10-01) is idle by default. */
+const CLK = { now: () => NOW };
+const quiet = { log: () => undefined, ...CLK };
 
 function row(leadId: string, sid: string | null, cf: Record<string, any>, extra: Record<string, any> = {}) {
   return {
@@ -204,7 +207,7 @@ describe('sessionIdentity', () => {
     delete (b.customFields as any).source;
     store.rows[LIST].l040 = a;
     store.rows[LIST].l041 = b;
-    const plan = await previewDedupe(LIST);
+    const plan = await previewDedupe(LIST, CLK);
     expect(plan.groups.find((g) => g.sessionId === 'M1')).toBeUndefined();
     expect(plan.counts.rowsWithoutIdentity).toBe(4);
   });
@@ -212,7 +215,7 @@ describe('sessionIdentity', () => {
 
 describe('preview', () => {
   it('groups across pages, picks earliest keeper, writes nothing', async () => {
-    const plan = await previewDedupe(LIST, { pageSize: 2 });
+    const plan = await previewDedupe(LIST, { ...CLK, pageSize: 2 });
     expect(plan.counts).toMatchObject({ rowsScanned: 8, sessions: 3, duplicatedSessions: 2, rowsToDelete: 3, rowsWithoutIdentity: 2 });
     const s1 = plan.groups.find((g) => g.sessionId === 'S1')!;
     expect(s1.keeper.leadId).toBe('l001');
@@ -222,14 +225,14 @@ describe('preview', () => {
     expect(calls.deleteLeadGuarded).toHaveLength(0);
   });
   it('planHash is deterministic and changes when a row changes', async () => {
-    const a = await previewDedupe(LIST);
-    const b = await previewDedupe(LIST, { pageSize: 3 });
+    const a = await previewDedupe(LIST, CLK);
+    const b = await previewDedupe(LIST, { ...CLK, pageSize: 3 });
     expect(a.planHash).toBe(b.planHash);
     store.rows[LIST].l002.customFields.dwellSec = '99';
-    expect((await previewDedupe(LIST)).planHash).not.toBe(a.planHash);
+    expect((await previewDedupe(LIST, CLK)).planHash).not.toBe(a.planHash);
   });
   it('per-list scoping: other list is never read into this plan', async () => {
-    const plan = await previewDedupe(LIST);
+    const plan = await previewDedupe(LIST, CLK);
     expect(plan.groups.flatMap((g) => g.remove.map((r) => r.leadId))).not.toContain('o001');
     expect(plan.counts.rowsScanned).toBe(8);
   });
@@ -240,7 +243,7 @@ describe('preview', () => {
 
 describe('apply', () => {
   async function planAndReq() {
-    const plan = await previewDedupe(LIST);
+    const plan = await previewDedupe(LIST, CLK);
     return { plan, req: { listId: LIST, planHash: plan.planHash, expectedRowsToDelete: plan.counts.rowsToDelete, confirm: true } };
   }
 
@@ -335,8 +338,67 @@ describe('apply', () => {
     expect(res.deletedCount).toBe(1);
     expect(res.continuationRequired).toBe(true);
     expect(res.remainingRowsToDelete).toBe(2);
-    const plan2 = await previewDedupe(LIST);
+    const plan2 = await previewDedupe(LIST, CLK);
     expect(plan2.counts.rowsToDelete).toBe(2);
+  });
+});
+
+describe('idle guard (minIdleMinutes)', () => {
+  const touch = (leadId: string, iso: string) => { store.rows[LIST][leadId].updatedAt = iso; };
+
+  it('active group is reported skipped_active, excluded from rowsToDelete/hash, and never mutated', async () => {
+    const idleHash = (await previewDedupe(LIST, CLK)).planHash;
+    touch('l002', new Date(NOW - 60_000).toISOString()); // S1 donor updated 1 minute ago
+    const plan = await previewDedupe(LIST, CLK);
+    expect(plan.counts).toMatchObject({ duplicatedSessions: 2, groupsSkippedActive: 1, rowsToDelete: 2 });
+    expect(plan.skippedActive.map((a) => a.sessionId)).toEqual(['S1']);
+    expect(plan.groups.map((g) => g.sessionId)).toEqual(['S2']);
+    expect(plan.planHash).not.toBe(idleHash);
+    // Further churn of the live row must not make the plan unstable.
+    touch('l002', new Date(NOW - 30_000).toISOString());
+    expect((await previewDedupe(LIST, CLK)).planHash).toBe(plan.planHash);
+    const res = await applyDedupe({ listId: LIST, planHash: plan.planHash, expectedRowsToDelete: 2, confirm: true }, quiet);
+    expect(res.deletedCount).toBe(2);
+    expect(res.groups.find((g) => g.sessionId === 'S1')!.status).toBe('skipped_active');
+    expect(store.rows[LIST].l001.customFields.journey).toBe('lp_view'); // keeper unmerged
+    expect(store.rows[LIST].l002).toBeDefined();
+    expect(calls.setLeadFields.every((c) => c.leadId !== 'l001')).toBe(true);
+  });
+
+  it('boundary: updatedAt exactly at the cutoff is active, 1 ms older is eligible', async () => {
+    const cutoff = NOW - 30 * 60_000;
+    for (const id of ['l001', 'l002']) touch(id, new Date(cutoff).toISOString());
+    expect((await previewDedupe(LIST, CLK)).skippedActive.map((a) => a.sessionId)).toEqual(['S1']);
+    for (const id of ['l001', 'l002']) touch(id, new Date(cutoff - 1).toISOString());
+    const plan = await previewDedupe(LIST, CLK);
+    expect(plan.counts.groupsSkippedActive).toBe(0);
+    expect(plan.groups.map((g) => g.sessionId)).toEqual(['S1', 'S2']);
+  });
+
+  it('a single recent row makes the whole group ineligible; missing updatedAt fails safe', async () => {
+    touch('l011', new Date(NOW - 1000).toISOString());
+    expect((await previewDedupe(LIST, CLK)).skippedActive.map((a) => a.sessionId)).toEqual(['S2']);
+    touch('l011', '2026-10-01T00:00:01.011Z');
+    delete store.rows[LIST].l002.updatedAt;
+    expect((await previewDedupe(LIST, CLK)).skippedActive.map((a) => a.sessionId)).toEqual(['S1']);
+  });
+
+  it('minIdleMinutes is validated (5..1440, integer), default 30, and part of the hash', async () => {
+    for (const bad of [4, 1441, 5.5, '30', 0, -1]) {
+      await expect(previewDedupe(LIST, { ...CLK, minIdleMinutes: bad as any })).rejects.toMatchObject({ status: 400, code: 'invalid_min_idle_minutes' });
+    }
+    const a = await previewDedupe(LIST, CLK);
+    expect(a.minIdleMinutes).toBe(30);
+    const b = await previewDedupe(LIST, { ...CLK, minIdleMinutes: 60 });
+    expect(b.planHash).not.toBe(a.planHash);
+    await expect(applyDedupe({ listId: LIST, planHash: a.planHash, expectedRowsToDelete: 3, confirm: true }, { ...quiet, minIdleMinutes: 60 })).rejects.toMatchObject({ code: 'plan_mismatch' });
+  });
+
+  it('a group that turns idle between preview and apply changes the hash and is refused', async () => {
+    touch('l002', new Date(NOW - 60_000).toISOString());
+    const plan = await previewDedupe(LIST, CLK);
+    const later = { ...quiet, now: () => NOW + 60 * 60_000 };
+    await expect(applyDedupe({ listId: LIST, planHash: plan.planHash, expectedRowsToDelete: plan.counts.rowsToDelete, confirm: true }, later)).rejects.toMatchObject({ status: 409 });
   });
 });
 

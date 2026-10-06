@@ -6,7 +6,8 @@
  * (non-delegated) admin. Nothing here is reachable by list owners: the REST delete
  * routes in crm.ts are deliberately untouched.
  *
- *   POST /preview  { listId }                         read-only dedupe/merge plan
+ *   POST /preview  { listId [, minIdleMinutes 5..1440, default 30] }  read-only dedupe/merge plan
+ *                  (groups with any row updated within minIdleMinutes are skipped_active)
  *   POST /preview  { listId, leadIds[] }              read-only explicit-delete plan
  *   POST /apply    { listId, planHash, expectedRowsToDelete, confirm: true [, leadIds[]] }
  *
@@ -46,7 +47,7 @@ router.post('/preview', async (req: Request, res: Response) => {
   try {
     const plan = explicit
       ? await previewExplicitDelete(listId, req.body.leadIds)
-      : await previewDedupe(listId);
+      : await previewDedupe(listId, { minIdleMinutes: req.body?.minIdleMinutes });
     recordAdminAudit({
       actorUserId: actor.userId,
       actorEmail: actor.email,
@@ -81,7 +82,7 @@ router.post('/apply', async (req: Request, res: Response) => {
   try {
     const result = explicit
       ? await applyExplicitDelete({ ...request, leadIds: req.body.leadIds })
-      : await applyDedupe(request);
+      : await applyDedupe(request, { minIdleMinutes: req.body?.minIdleMinutes });
     recordAdminAudit({
       actorUserId: actor.userId,
       actorEmail: actor.email,
@@ -92,7 +93,8 @@ router.post('/apply', async (req: Request, res: Response) => {
       expectedRowsToDelete,
       deletedCount: result.deletedCount,
       deletedLeadIds: result.groups.flatMap((g) => g.deletedLeadIds),
-      groupErrors: result.groups.filter((g) => g.status !== 'merged_and_deleted' && g.status !== 'deleted').length,
+      groupErrors: result.groups.filter((g) => !['merged_and_deleted', 'deleted', 'skipped_active'].includes(g.status)).length,
+      groupsSkippedActive: result.groups.filter((g) => g.status === 'skipped_active').length,
       continuationRequired: result.continuationRequired,
     });
     return res.json(result);
