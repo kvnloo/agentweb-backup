@@ -47,3 +47,30 @@ export function normalizeOpenRouterErrorMetadata(error: any): OpenRouterMetadata
     is_byok: typeof metadata?.is_byok === 'boolean' ? metadata.is_byok : undefined,
   };
 }
+
+/**
+ * ENG-1345: map OpenRouter's served `model` back to the logical model id in
+ * the requested chain (primary followed by `fallbackModels`), so metering
+ * attributes a served fallback to the fallback rather than the primary.
+ *
+ * Returns undefined when the response names no model or a model outside the
+ * chain; callers keep the primary in that case, so primary-path metering is
+ * unchanged. OpenRouter may answer with a dated variant
+ * (`vendor/model-20260901`), which matches its chain entry by prefix; the
+ * longest matching upstream id wins so `x-pro` never resolves to `x`.
+ */
+export function resolveServedChainModel(
+  servedModel: unknown,
+  chain: ReadonlyArray<{ modelId: string; upstreamModel: string }>,
+): string | undefined {
+  if (typeof servedModel !== 'string' || !servedModel) return undefined;
+  const served = servedModel.toLowerCase();
+  let best: { modelId: string; len: number } | undefined;
+  for (const { modelId, upstreamModel } of chain) {
+    const up = upstreamModel.toLowerCase();
+    if (served === up || served.startsWith(`${up}-`) || served.startsWith(`${up}:`)) {
+      if (!best || up.length > best.len) best = { modelId, len: up.length };
+    }
+  }
+  return best?.modelId;
+}
