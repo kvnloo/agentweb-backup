@@ -154,6 +154,8 @@ describe('Tern Emma renderer', () => {
       itemIndex: 0,
       selectedVerdict: 'leads',
       answers: [],
+      freeText: '',
+      freeTextCursor: 0,
     });
     const picker = flatten(layer).find(node => node.id === 'approval-picker');
     expect(picker?.p).toMatchObject({
@@ -180,10 +182,16 @@ describe('Tern Emma renderer', () => {
         metaWriteManifestDigest: 'digest-1',
       }],
     };
-    const state = { itemIndex: 0, selectedVerdict: 'approve', answers: [] };
+    const state = {
+      itemIndex: 0,
+      selectedVerdict: 'approve',
+      answers: [],
+      freeText: '',
+      freeTextCursor: 0,
+    };
     const picker = flatten(renderApprovalDeck(deck, state))
       .find(node => node.id === 'approval-picker');
-    expect((picker?.p?.items as any[]).map(item => item.id)).toEqual(['approve', 'reject']);
+    expect((picker?.p?.items as any[]).map(item => item.id)).toEqual(['approve', 'reject', 'comment']);
     expect((picker?.p?.actions as any[]).some(action => action.id === 'delegate')).toBe(false);
   });
 
@@ -217,6 +225,8 @@ describe('Tern Emma renderer', () => {
     expect(approvalDeckAllAnswered(deck, {
       itemIndex: 0,
       answers: [{ itemId: 'q1', verdict: 'a' }],
+      freeText: '',
+      freeTextCursor: 0,
     })).toBe(false);
     expect(approvalDeckAllAnswered(deck, {
       itemIndex: 1,
@@ -224,6 +234,8 @@ describe('Tern Emma renderer', () => {
         { itemId: 'q1', verdict: 'a' },
         { itemId: 'q2', verdict: 'c' },
       ],
+      freeText: '',
+      freeTextCursor: 0,
     })).toBe(true);
   });
 
@@ -306,6 +318,49 @@ describe('Tern Emma renderer', () => {
     expect(flatten(screen).some(node => node.id === 'run-preview.flags')).toBe(true);
     expect(flatten(screen).some(node => node.id === 'run-preview.decisions' && node.k === 'table')).toBe(true);
     expect(flatten(screen).some(node => node.id === 'run-preview.outcomes' && node.k === 'table')).toBe(true);
+  });
+
+  it('renders universal comment and reject-correction free text', () => {
+    const deck = {
+      deckId: 'deck-comment',
+      status: 'awaiting' as const,
+      createdAt: '2026-10-06T00:00:00Z',
+      items: [{
+        itemId: 'write-1',
+        kind: 'meta_write',
+        question: 'Apply this change?',
+        allowFreeText: true,
+        metaWriteManifestDigest: 'digest-1',
+      }],
+    };
+
+    const comment = renderApprovalDeck(deck, {
+      itemIndex: 0,
+      selectedVerdict: 'comment',
+      answers: [],
+      freeText: '',
+      freeTextCursor: 0,
+    });
+    const commentPicker = flatten(comment).find(node => node.id === 'approval-picker');
+    expect(commentPicker?.p?.focus).toBe('preview');
+    expect(flatten(comment).find(node => node.id === 'approval-note')).toMatchObject({
+      k: 'input',
+      p: { sendable: true },
+    });
+    expect((commentPicker?.p?.actions as any[])
+      .find(action => action.id === 'choose')?.disabled).toBe('Add a comment first');
+
+    const reject = renderApprovalDeck(deck, {
+      itemIndex: 0,
+      selectedVerdict: 'reject',
+      answers: [],
+      freeText: 'Use a lower budget.',
+      freeTextCursor: 19,
+    });
+    expect(flatten(reject).find(node => node.id === 'approval-note')).toMatchObject({
+      k: 'input',
+      p: { text: 'Use a lower budget.', sendable: false },
+    });
   });
 
   it('maps AgentWeb work-plan steps into a native checklist HUD', () => {
