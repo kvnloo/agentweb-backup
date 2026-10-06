@@ -25,6 +25,8 @@
  * customer-wide number hides as a small dip.
  */
 
+import { excludeSessionLists } from '../utils/sessionList';
+
 const TAG = '[Attribution Coverage]';
 
 /** One page of leads per round trip. Matches the reconciliation sweep's page size. */
@@ -189,7 +191,8 @@ export async function computeClickIdCoverageForUser(
 ): Promise<ClickIdCoverageResult> {
   const { crmDb } = await import('./db');
   return computeClickIdCoverage(userId, windowDays, {
-    getLeadLists: (id) => crmDb.getLeadListsByUserId(id),
+    // ENG-2311: per-visit session rows are not leads; they would swamp the coverage totals.
+    getLeadLists: async (id) => excludeSessionLists(await crmDb.getLeadListsByUserId(id)),
     getLeads: (listId, limit, startKey) => crmDb.getLeadsByListId(listId, limit, startKey),
   });
 }

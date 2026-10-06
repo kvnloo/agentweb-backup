@@ -26,6 +26,11 @@ function rate(value: unknown): number | undefined {
 }
 export interface CatalogCandidate { id: string; config: LLMModelConfig; price: ModelPrice }
 
+/** A new addition priced more than 3x off its CLOSEST existing family sibling gets a
+ * loud review-time warning (ENG-2293 follow-up) — e.g. a transient OpenRouter
+ * promo/glitch quote, not a hard gate. */
+const PRICE_OUTLIER_RATIO = 3;
+
 /** OpenRouter prices are per token. Only supported text/tool product lines enter this catalog.
  * Source: https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties
  */
@@ -132,6 +137,34 @@ export async function refreshModelCatalog(options: {
   const pricingChanges: Record<string, ModelPrice> = {};
   for (const model of additions) { next[model.id] = model.config; registryChanges[model.id] = model.config; pricingChanges[model.id] = model.price; }
   const { changes, reports } = refreshScores(next, aa, date);
+  // Flag a wildly mispriced addition loudly — never block on it. A hard gate here
+  // would recreate the exact deadlock ENG-2293 fixed (one bad quote blocking every
+  // future model forever); a report a reviewer can't miss is the safer trade-off.
+  // Symmetric ratio distance between two non-negative prices. Both zero is a
+  // match (free addition into a free family); exactly one zero is an extreme
+  // mismatch, never Infinity-by-default on an unrelated zero baseline.
+  const priceRatio = (a: number, b: number): number =>
+    a > 0 && b > 0 ? Math.max(a / b, b / a) : a === 0 && b === 0 ? 1 : Infinity;
+  for (const model of additions) {
+    const siblingPrices = Object.entries(registry)
+      .filter(([id, config]) => (config.family ?? inferFamily(id)) === model.config.family && prices[id])
+      .map(([id]) => blendedPrice(prices[id]));
+    if (!siblingPrices.length) continue;
+    const addedPrice = blendedPrice(model.price);
+    // Compare against the CLOSEST existing sibling, not the family average — a
+    // family can legitimately span several price tiers under one family name
+    // (verified: gpt-sol's two real, correctly-priced members alone span 2.8x),
+    // so a plain average is already near the outlier cutoff before any new
+    // addition even arrives, and would false-flag a normal new tier member.
+    let nearest = siblingPrices[0], bestRatio = priceRatio(addedPrice, nearest);
+    for (const p of siblingPrices.slice(1)) {
+      const r = priceRatio(addedPrice, p);
+      if (r < bestRatio) { bestRatio = r; nearest = p; }
+    }
+    if (bestRatio > PRICE_OUTLIER_RATIO) {
+      reports.push(`⚠️ PRICE OUTLIER: ${model.id} blended $${addedPrice.toFixed(3)}/M is ${bestRatio.toFixed(1)}x its closest "${model.config.family}" family sibling ($${nearest.toFixed(3)}/M) — verify before merging.`);
+    }
+  }
   for (const [id, config] of Object.entries(next)) {
     const patch = { ...(!config.family ? { family: inferFamily(id) } : {}), ...changes[id] };
     if (Object.keys(patch).length) registryChanges[id] = { ...registryChanges[id], ...patch };

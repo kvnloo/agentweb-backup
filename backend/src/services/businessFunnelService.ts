@@ -5,6 +5,7 @@ import { getAccountByPlatform } from "./connectedAccountsDb";
 import { getProspectMeetingMetrics, ProspectMeetingMetrics } from "./prospectMeetingService";
 import { getSmartLeadMetrics, SmartLeadMetrics } from "./smartleadService";
 import { getUnipileOutreachMetrics, UnipileOutreachMetrics } from "./unipileOutreachService";
+import { excludeSessionLists } from '../utils/sessionList';
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -411,7 +412,7 @@ interface LeadData {
 
 async function fetchLeadCount(periodStart: Date): Promise<LeadData> {
   try {
-    const leadLists = await crmDb.getLeadListsByUserId(FOUNDER_USER_ID);
+    const leadLists = excludeSessionLists(await crmDb.getLeadListsByUserId(FOUNDER_USER_ID)); // ENG-2311: session rows are not leads
     let total = 0;
     let thisMonth = 0;
 

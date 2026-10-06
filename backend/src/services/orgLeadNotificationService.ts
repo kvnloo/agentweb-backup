@@ -1,6 +1,7 @@
 import { attributionValues, fieldKey, humanizeField, resolveNotificationNames, slackAttributionUrl, submittedPacific } from './leadNotificationAttribution';
 import { createHash } from 'crypto';
 import { isSmokeTestLead } from '../utils/smokeTestLead';
+import { suppressLeadSideEffects } from '../utils/sessionList';
 import { WebClient, ChatPostMessageArguments } from '@slack/web-api';
 import { crmDb, orgDb, userDb } from './db';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from './asyncJobQueue';
@@ -64,6 +65,10 @@ function configOf(value: unknown): LeadNotificationsConfig | undefined {
 async function routingContext(listId: string, expectedOrgId?: string) {
   const list = await crmDb.getLeadListById(listId);
   if (!list || list.listId !== listId || !string(list.userId)) return;
+  // ENG-2311: a session list's rows are per-visit telemetry. This is the one chokepoint for
+  // every Slack lead notification (db.createLead / batch import / webhook resubmission /
+  // queue recovery), so gating here covers them all without a read the others would not do.
+  if (suppressLeadSideEffects(list)) return;
   const owner = await userDb.getUserById(list.userId);
   if (!owner || owner.userId !== list.userId || !string(owner.orgId) ||
       (expectedOrgId && owner.orgId !== expectedOrgId)) return;
