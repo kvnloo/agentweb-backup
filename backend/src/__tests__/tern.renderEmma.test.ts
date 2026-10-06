@@ -2,6 +2,7 @@ import {
   approvalDeckAllAnswered,
   approvalDeckIsAwaiting,
   filterSessions,
+  renderAgentRunsScreen,
   renderApprovalDeck,
   renderEmmaDock,
   renderEmmaMain,
@@ -224,6 +225,87 @@ describe('Tern Emma renderer', () => {
         { itemId: 'q2', verdict: 'c' },
       ],
     })).toBe(true);
+  });
+
+  it('renders coding-agent acceptance and preview URL inside the tool card', () => {
+    const main = renderEmmaMain({
+      sessionId: 's1',
+      messages: [{
+        role: 'assistant',
+        content: 'Updated the page.',
+        metadata: {
+          toolCalls: [{
+            id: 'coding-1',
+            name: 'coding_agent',
+            result: {
+              success: true,
+              previewUrl: 'https://preview.example',
+              branch: 'draft/agentweb-preview',
+              acceptanceStatus: 'passed',
+              acceptance: {
+                summary: 'Acceptance passed (2/2 checks).',
+                checks: [
+                  { id: 'a', label: 'Page loads', status: 'passed' },
+                  { id: 'b', label: 'No console errors', status: 'passed' },
+                ],
+              },
+            },
+          }],
+        },
+      }],
+    });
+
+    const tool = flatten(main).find(node => node.id === 'msg.0.tool.coding-1');
+    expect(tool?.c?.some(node => node.k === 'checklist')).toBe(true);
+    const open = tool?.c?.find(node => node.p?.href === 'https://preview.example');
+    expect(open?.p).toMatchObject({
+      href: 'https://preview.example',
+      actions: { click: 'open' },
+    });
+  });
+
+  it('renders AgentRun traces as a full-screen picker with flags and tables', () => {
+    const screen = renderAgentRunsScreen([{
+      runId: 'run-1',
+      sessionId: 's1',
+      llmModel: 'gpt-test',
+      status: 'completed',
+      toolCalls: 3,
+      failedToolCalls: 1,
+      durationMs: 2500,
+      outcomeVerdict: 'degraded',
+      flags: [{
+        code: 'failed_tool_calls',
+        severity: 'critical',
+        message: 'One call failed.',
+      }],
+      decisions: [{
+        ts: '2026-10-06T00:00:00Z',
+        iteration: 1,
+        toolNames: ['coding_agent'],
+        decisionExplanation: 'Edit the landing page.',
+      }],
+      outcomes: [{
+        ts: '2026-10-06T00:00:01Z',
+        eventType: 'agent_mode.tool_failed',
+        toolName: 'coding_agent',
+        durationMs: 1200,
+        errorMessage: 'Acceptance failed.',
+      }],
+      chat: {
+        title: 'Landing page edit',
+        customerPortalUrl: 'https://app.example/agent-mode/s1',
+      },
+    }], 0);
+
+    expect(screen).toMatchObject({
+      id: 'run-picker',
+      k: 'picker',
+      p: { size: 'screen', selected: 'run-1' },
+    });
+    expect(flatten(screen).some(node => node.id === 'run-preview.flags')).toBe(true);
+    expect(flatten(screen).some(node => node.id === 'run-preview.decisions' && node.k === 'table')).toBe(true);
+    expect(flatten(screen).some(node => node.id === 'run-preview.outcomes' && node.k === 'table')).toBe(true);
   });
 
   it('maps AgentWeb work-plan steps into a native checklist HUD', () => {
