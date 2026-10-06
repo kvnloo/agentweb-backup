@@ -714,6 +714,10 @@ describe("checkTokenUsage - cost tracking (observe-only by default)", () => {
 });
 
 describe("incrementUserTokenUsage", () => {
+  // The legacy writer is off by default (ENG-1250 AC7); these suites exercise it for the rollback window.
+  beforeEach(() => { process.env.AW_LEGACY_TOKEN_COUNTER_WRITES = "true"; });
+  afterEach(() => { delete process.env.AW_LEGACY_TOKEN_COUNTER_WRITES; });
+
   it("initializes usage for new month (lazy reset)", async () => {
     mockGetUserById.mockResolvedValue({
       userId: "u1",
@@ -1044,6 +1048,10 @@ describe("checkTokenUsage - org member uses owner quota", () => {
 });
 
 describe("incrementUserTokenUsage - org member increments owner counter", () => {
+  // The legacy writer is off by default (ENG-1250 AC7); these suites exercise it for the rollback window.
+  beforeEach(() => { process.env.AW_LEGACY_TOKEN_COUNTER_WRITES = "true"; });
+  afterEach(() => { delete process.env.AW_LEGACY_TOKEN_COUNTER_WRITES; });
+
   it("increments org owner's usage when called for org member", async () => {
     // ENG-1215: keyed by id rather than a positional mockResolvedValueOnce
     // chain. `resolveBillingUserId` now verifies the org owner resolves before
@@ -1283,6 +1291,10 @@ describe("deriveBlockedByCost - respects the enforced dimension (ENG-1116)", () 
 // to the same counter alongside agent mode and Emma.
 
 describe("incrementUserTokenUsage - concurrent month rollover (ENG-1134)", () => {
+  // The legacy writer is off by default (ENG-1250 AC7); these suites exercise it for the rollback window.
+  beforeEach(() => { process.env.AW_LEGACY_TOKEN_COUNTER_WRITES = "true"; });
+  afterEach(() => { delete process.env.AW_LEGACY_TOKEN_COUNTER_WRITES; });
+
   it("does not lose a charge when another writer resets the month first", async () => {
     const staleUser = {
       userId: "u1",
@@ -1397,5 +1409,46 @@ describe("incrementUserTokenUsage - concurrent month rollover (ENG-1134)", () =>
     await incrementUserTokenUsage("u1", 500, 5);
 
     expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe("incrementUserTokenUsage - legacy counter writes are OFF by default (ENG-1250 AC7 stage 3)", () => {
+  beforeEach(() => {
+    delete process.env.AW_LEGACY_TOKEN_COUNTER_WRITES;
+    mockApplyMonthlyChargeAtomic.mockClear();
+    mockRecordLlmChargeEvent.mockClear();
+    mockGetUserById.mockReset();
+  });
+  afterEach(() => { delete process.env.AW_LEGACY_TOKEN_COUNTER_WRITES; });
+
+  it("writes nothing and reads nothing by default: no counter update, no audit row, no user lookup", async () => {
+    await incrementUserTokenUsage("u1", 1000, 0.5);
+
+    expect(mockApplyMonthlyChargeAtomic).not.toHaveBeenCalled();
+    expect(mockRecordLlmChargeEvent).not.toHaveBeenCalled();
+    expect(mockGetUserById).not.toHaveBeenCalled();
+  });
+
+  it("only the exact value 'true' re-enables it (rollback), nothing truthy-ish", async () => {
+    // A resolvable user, so an unguarded writer WOULD reach the atomic apply (otherwise this proves nothing).
+    const user = { userId: "u1", email: "a@b.com", tokenUsage: { month: currentMonth(), totalTokens: 1, totalCost: 0, resetDate: "2026-11-01T00:00:00.000Z" } };
+    mockGetUserById.mockResolvedValue(user);
+    (userDb as any).getUserByIdConsistent?.mockResolvedValue?.(user);
+    for (const v of ["", "1", "TRUE", "yes", "false"]) {
+      process.env.AW_LEGACY_TOKEN_COUNTER_WRITES = v;
+      await incrementUserTokenUsage("u1", 1000, 0.5);
+    }
+    expect(mockApplyMonthlyChargeAtomic).not.toHaveBeenCalled();
+  });
+
+  it("resumes the legacy writes when AW_LEGACY_TOKEN_COUNTER_WRITES=true (the rollback path works)", async () => {
+    process.env.AW_LEGACY_TOKEN_COUNTER_WRITES = "true";
+    mockGetUserById.mockResolvedValue({ userId: "u1", email: "a@b.com", tokenUsage: { month: currentMonth(), totalTokens: 1, totalCost: 0, resetDate: "2026-11-01T00:00:00.000Z" } });
+    (userDb as any).getUserByIdConsistent?.mockResolvedValue?.({ userId: "u1", email: "a@b.com", tokenUsage: { month: currentMonth(), totalTokens: 1, totalCost: 0, resetDate: "2026-11-01T00:00:00.000Z" } });
+
+    await incrementUserTokenUsage("u1", 1000, 0.5);
+
+    expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalled();
   });
 });

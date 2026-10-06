@@ -313,6 +313,31 @@ describe('getUserOrgUsageRollup', () => {
     await expect(getUserOrgUsageRollup('solo', '2026-10')).rejects.toThrow(/truncated total/);
   });
 
+  it('September not yet archived into history still reads from the frozen current counter', async () => {
+    mockGetUser.mockResolvedValue(
+      user({ userId: 'solo', tokenUsage: { month: '2026-09', totalTokens: 10, totalCost: 4.25, resetDate: '2026-10-01' } } as any),
+    );
+    mockQuery.mockResolvedValue([row({ userId: 'solo', costMicroUsd: 1_000_000 })]);
+
+    const r = await getUserOrgUsageRollup('solo', '2026-09');
+
+    expect(r.countedUsd).toBeCloseTo(4.25, 6);
+    expect(r.countedSource).toBe('history');
+  });
+
+  it('archived history wins over the frozen counter when both exist for the month', async () => {
+    mockGetUser.mockResolvedValue(
+      user({
+        userId: 'solo',
+        tokenUsage: { month: '2026-09', totalTokens: 10, totalCost: 4.25, resetDate: '2026-10-01' },
+        tokenUsageHistory: [{ month: '2026-09', totalTokens: 10, totalCost: 6, }],
+      } as any),
+    );
+    mockQuery.mockResolvedValue([row({ userId: 'solo', costMicroUsd: 1_000_000 })]);
+
+    expect((await getUserOrgUsageRollup('solo', '2026-09')).countedUsd).toBeCloseTo(6, 6);
+  });
+
   it('a covered month with no ledger events reads as $0 from the ledger', async () => {
     mockGetUser.mockResolvedValue(user({ userId: 'solo' }));
     mockQuery.mockResolvedValue([row({ userId: 'solo', costMicroUsd: 1_000_000 })]);
