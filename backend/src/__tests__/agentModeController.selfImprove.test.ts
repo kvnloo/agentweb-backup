@@ -114,6 +114,7 @@ import {
   agentModeController,
   runScheduledChat,
   runScheduleSelfImprovement,
+  SELF_IMPROVE_MAX_PROMPT_CHARS,
   SCHEDULE_PROMPT_REVISION_LIMIT,
 } from '../controllers/agentModeController';
 import { SCHEDULE_ITEM_BUDGET_BYTES, PROMPT_REVISIONS_BUDGET_BYTES, estimateDynamoItemBytes } from '../utils/dynamoItemBudget';
@@ -171,6 +172,29 @@ describe('runScheduleSelfImprovement', () => {
     expect(sentMessage).toContain('manage_scheduled_chat');
     expect(sentMessage).toContain('sched-1');
     expect(sentMessage).toContain('{{variables}}');
+  });
+
+  // ENG-2234: a prompt already at the cap is not rewritten again (runaway cost).
+  it('skips the reflection turn when the prompt is at or over the size cap', async () => {
+    await runScheduleSelfImprovement({
+      schedule: { ...baseSchedule, startingMessage: 'x'.repeat(SELF_IMPROVE_MAX_PROMPT_CHARS) },
+      sessionId: 'sess-1',
+      userId: 'user-1',
+      llmModel: 'gpt-5-chat-2',
+    });
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+  });
+
+  it('tells Emma the size cap when the prompt is under it', async () => {
+    await runScheduleSelfImprovement({
+      schedule: { ...baseSchedule, startingMessage: 'x'.repeat(SELF_IMPROVE_MAX_PROMPT_CHARS - 1) },
+      sessionId: 'sess-1',
+      userId: 'user-1',
+      llmModel: 'gpt-5-chat-2',
+    });
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+    const sentMessage = mockWorker.runInWorker.mock.calls[0][0].messageContent as string;
+    expect(sentMessage).toContain(`under ${SELF_IMPROVE_MAX_PROMPT_CHARS} characters`);
   });
 
   // ENG-2204: this reflection turn is only ever reached from runScheduledChat,
