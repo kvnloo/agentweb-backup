@@ -16,6 +16,7 @@
 
 import { crmDb } from './db';
 import { phoneDigits, isDedupablePhone } from '../utils/smokeTestLead';
+import type { LeadListType } from '../utils/leadSchema';
 
 export interface DedupedContact {
   /**
@@ -48,8 +49,9 @@ const DEFAULT_MAX_RAW_LEADS = 50_000;
 
 export interface DedupQuery {
   userId: string;
-  /** Optional: restrict to a specific listType (e.g. "sales"). */
-  listType?: 'sales' | 'customers';
+  /** Optional: restrict to a specific listType (e.g. "sales"). When omitted, session lists
+   *  are still excluded (ENG-2311) — pass "session" to read them deliberately. */
+  listType?: LeadListType;
   /** Optional: restrict to a specific list id subset. */
   listIds?: string[];
   /** Optional: max number of deduped rows to return (after sort). */

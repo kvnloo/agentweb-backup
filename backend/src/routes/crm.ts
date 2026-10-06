@@ -23,7 +23,7 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
-import { isValidLeadLifecycle, LEAD_LIFECYCLES } from '../utils/leadSchema';
+import { isValidLeadLifecycle, LEAD_LIFECYCLES, isLeadListType, type LeadListType } from '../utils/leadSchema';
 import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValidation';
 import { syncContact, SyncInput } from '../services/contactSyncService';
@@ -1019,7 +1019,8 @@ router.get('/lists', async (req: Request, res: Response) => {
  *       Powers the /crm Inbox tab — replaces client-side per-list fetch+dedup
  *       which was 30-90s on 5000+ lead accounts.
  * @access Private
- * @query listType? "sales" | "customers" — restrict to a list type (default: all)
+ * @query listType? "sales" | "customers" | "session" — restrict to a list type (default: all EXCEPT
+ *        session lists, whose per-visit rows are telemetry, not contacts — ask for them explicitly)
  * @query listIds? comma-separated listIds to restrict to a subset
  * @query limit? max deduped rows to return (default: all)
  * @query sort? "heat" | "recent" (default: heat)
@@ -1035,8 +1036,8 @@ router.get('/contacts', async (req: Request, res: Response) => {
 
     const { listType, listIds, limit, sort, cursor } = req.query as Record<string, string | undefined>;
 
-    if (listType !== undefined && listType !== 'sales' && listType !== 'customers') {
-      return res.status(400).json({ message: 'listType must be "sales" or "customers"' });
+    if (listType !== undefined && !isLeadListType(listType)) {
+      return res.status(400).json({ message: 'listType must be "sales", "customers" or "session"' });
     }
 
     if (sort !== undefined && sort !== 'heat' && sort !== 'recent') {
@@ -1080,7 +1081,7 @@ router.get('/contacts', async (req: Request, res: Response) => {
       userIdsToDedup.map((uid) =>
         dedupContactsForUser({
           userId: uid,
-          listType: listType as 'sales' | 'customers' | undefined,
+          listType: listType as LeadListType | undefined,
           listIds: uid === userId ? parsedListIds : undefined,
           limit: parsedLimit,
           sort: sort as 'heat' | 'recent' | undefined,
@@ -1163,8 +1164,8 @@ router.post('/lists', async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'List name is required' });
     }
 
-    if (listType !== undefined && listType !== 'sales' && listType !== 'customers') {
-      return res.status(400).json({ message: 'listType must be "sales" or "customers"' });
+    if (listType !== undefined && !isLeadListType(listType)) {
+      return res.status(400).json({ message: 'listType must be "sales", "customers" or "session"' });
     }
 
     let normalizedAlertEvents: string[] | undefined;
@@ -1461,7 +1462,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       engagedOnly?: boolean;
       statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
       conversionMapping?: { qualifiedStatus?: string | null } | null;
-      listType?: 'sales' | 'customers';
+      listType?: LeadListType;
     } = {};
     if (name !== undefined) {
       if (typeof name !== 'string' || name.trim().length === 0) {
@@ -1635,8 +1636,8 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     }
 
     if (listType !== undefined) {
-      if (listType !== 'sales' && listType !== 'customers') {
-        return res.status(400).json({ message: 'listType must be "sales" or "customers"' });
+      if (!isLeadListType(listType)) {
+        return res.status(400).json({ message: 'listType must be "sales", "customers" or "session"' });
       }
       if (list.listType) {
         return res.status(400).json({ message: 'listType is already set and cannot be changed' });

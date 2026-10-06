@@ -195,8 +195,8 @@
  * same treatment as `create_html_from_template`/`import_leads_from_search`);
  * `getSenderForLead` is bound off the singleton the same way.
  */
-import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor } from '../../utils/leadSchema';
-import type { LeadImportRowOutcome } from '../../utils/leadSchema';
+import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor, isLeadListType } from '../../utils/leadSchema';
+import type { LeadImportRowOutcome, LeadListType } from '../../utils/leadSchema';
 import { providerLabel } from '../../services/crmSenderTypes';
 import { mergeCustomFields } from '../../utils/customFieldsGuard';
 import { recoverLeadFromWrongList } from '../../services/agentMode/leadRecovery';
@@ -261,8 +261,13 @@ export async function getLeadLists(userId: string): Promise<any> {
     }
   }
 
-export async function createLeadList(name: string, description: string, userId: string, listType?: 'sales' | 'customers'): Promise<any> {
+export async function createLeadList(name: string, description: string, userId: string, listType?: LeadListType): Promise<any> {
     try {
+      // listType is set-once, so a typo persisted here could never be corrected. The tool
+      // schema's enum is advisory to the model, not enforced on direct callers.
+      if (listType !== undefined && !isLeadListType(listType)) {
+        return { success: false, message: 'Invalid list type', error: 'listType must be "sales", "customers" or "session"' };
+      }
       const { crmDb } = await import('../../services/db');
       const list = await crmDb.createLeadList(userId, name, description, undefined, undefined, undefined, undefined, undefined, undefined, listType);
 
@@ -1792,7 +1797,7 @@ export async function updateLeadList(listId: string, updates: {
     autoDraftEnabled?: boolean;
     autoDraftInstruction?: string;
     statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
-    listType?: 'sales' | 'customers';
+    listType?: LeadListType;
   }, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
@@ -1823,6 +1828,9 @@ export async function updateLeadList(listId: string, updates: {
       if (updates.autoDraftInstruction !== undefined) filteredUpdates.autoDraftInstruction = updates.autoDraftInstruction;
       if (updates.statusConfig !== undefined) filteredUpdates.statusConfig = updates.statusConfig;
       if (updates.listType !== undefined) {
+        if (!isLeadListType(updates.listType)) {
+          return { success: false, message: 'Invalid list type', error: 'listType must be "sales", "customers" or "session"' };
+        }
         if (list.listType) {
           return { success: false, message: 'List type already set', error: 'listType is already set and cannot be changed' };
         }
