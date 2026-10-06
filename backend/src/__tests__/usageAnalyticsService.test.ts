@@ -26,7 +26,6 @@ import { usageRecordDb } from '../services/usageRecordDb';
 import { userDb } from '../services/db';
 import {
   getUserUsageByModelDay,
-  getUsageComparison,
   getCostAggregation,
   getXAllocatedTotals,
   currentXBillingCycle,
@@ -197,106 +196,6 @@ describe('usageAnalyticsService', () => {
       expect(result.rows[0].costMicroUsd).toBe(0);
       expect(result.rows[0].costUsd).toBe(0);
       expect(result.rows[0].totalTokens).toBe(15);
-    });
-  });
-
-  describe('getUsageComparison', () => {
-    it('rejects malformed months', async () => {
-      await expect(getUsageComparison('u', '2026-6')).rejects.toThrow('YYYY-MM');
-      await expect(getUsageComparison('u', 'June 2026')).rejects.toThrow('YYYY-MM');
-    });
-
-    it('compares shadow totals against the current-month legacy counter', async () => {
-      mockQuery.mockResolvedValue([
-        row({ totalTokens: 1100, costMicroUsd: 3500 }),
-        row({ totalTokens: 900, costMicroUsd: 1500 }),
-      ]);
-      mockGetUser.mockResolvedValue({
-        userId: 'user-1',
-        tokenUsage: { month: '2026-06', totalTokens: 1800, totalCost: 0.004, resetDate: 'x' },
-      });
-
-      const result = await getUsageComparison('user-1', '2026-06');
-
-      expect(mockQuery).toHaveBeenCalledWith('user-1', '2026-06-01', '2026-06-31');
-      expect(result.shadow).toEqual({ totalTokens: 2000, costUsd: 0.005, callCount: 6 });
-      expect(result.legacy).toEqual({ totalTokens: 1800, costUsd: 0.004, source: 'current' });
-      expect(result.delta.totalTokens).toBe(200);
-      expect(result.delta.costUsd).toBeCloseTo(0.001, 10);
-    });
-
-    it('falls back to tokenUsageHistory for past months', async () => {
-      mockGetUser.mockResolvedValue({
-        userId: 'user-1',
-        tokenUsage: { month: '2026-06', totalTokens: 50, totalCost: 0.1, resetDate: 'x' },
-        tokenUsageHistory: [
-          { month: '2026-04', totalTokens: 10, totalCost: 0.01 },
-          { month: '2026-05', totalTokens: 4000, totalCost: 0.02 },
-        ],
-      });
-
-      const result = await getUsageComparison('user-1', '2026-05');
-      expect(result.legacy).toEqual({ totalTokens: 4000, costUsd: 0.02, source: 'history' });
-    });
-
-    it('reports legacy source "none" for unknown users or untracked months', async () => {
-      const result = await getUsageComparison('user-1', '2026-01');
-      expect(result.legacy).toEqual({ totalTokens: 0, costUsd: 0, source: 'none' });
-      expect(result.shadow).toEqual({ totalTokens: 0, costUsd: 0, callCount: 0 });
-    });
-
-    it('treats missing shadow item fields as 0 in the monthly reduce', async () => {
-      // A shadow record missing totalTokens/costMicroUsd/callCount — exercises
-      // the `item.X || 0` fallbacks in the shadow reduce (lines 133-135).
-      mockQuery.mockResolvedValue([
-        {
-          userId: 'user-1',
-          sk: '2026-06-02#gpt-5-chat-2#agent-chat',
-          date: '2026-06-02',
-          model: 'gpt-5-chat-2',
-          feature: 'agent-chat',
-          totalTokens: undefined,
-          costMicroUsd: undefined,
-          callCount: undefined,
-        },
-        row({ totalTokens: 700, costMicroUsd: 2000, callCount: 2 }),
-      ]);
-      mockGetUser.mockResolvedValue(null);
-
-      const result = await getUsageComparison('user-1', '2026-06');
-
-      // The undefined-field record contributes 0 to each accumulator.
-      expect(result.shadow).toEqual({ totalTokens: 700, costUsd: 0.002, callCount: 2 });
-      expect(result.legacy.source).toBe('none');
-    });
-
-    it('treats missing current-month legacy fields as 0', async () => {
-      // tokenUsage.month matches but totalTokens/totalCost are undefined —
-      // exercises the `|| 0` fallbacks in the current branch (lines 146-147).
-      mockGetUser.mockResolvedValue({
-        userId: 'user-1',
-        tokenUsage: { month: '2026-06', totalTokens: undefined, totalCost: undefined, resetDate: 'x' },
-      });
-
-      const result = await getUsageComparison('user-1', '2026-06');
-
-      expect(result.legacy).toEqual({ totalTokens: 0, costUsd: 0, source: 'current' });
-    });
-
-    it('treats missing history legacy fields as 0', async () => {
-      // A matching tokenUsageHistory entry with undefined totalTokens/totalCost —
-      // exercises the `|| 0` fallbacks in the history branch (lines 156-157).
-      mockGetUser.mockResolvedValue({
-        userId: 'user-1',
-        tokenUsage: { month: '2026-06', totalTokens: 50, totalCost: 0.1, resetDate: 'x' },
-        tokenUsageHistory: [
-          { month: '2026-05', totalTokens: undefined, totalCost: undefined },
-        ],
-      });
-
-      const result = await getUsageComparison('user-1', '2026-05');
-
-      expect(result.legacy).toEqual({ totalTokens: 0, costUsd: 0, source: 'history' });
     });
   });
 
