@@ -982,7 +982,7 @@ export function renderAgentRunsScreen(
     }
   }
 
-  return {
+  const picker: TspNode = {
     id: 'run-picker',
     k: 'picker',
     p: {
@@ -1011,5 +1011,11 @@ export function renderAgentRunsScreen(
       state: 'ready',
     },
     c: preview,
+  };
+
+  return {
+    id: 'main',
+    k: 'col',
+    c: [picker],
   };
 }
