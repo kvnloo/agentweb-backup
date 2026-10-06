@@ -9,7 +9,7 @@ jest.mock('../mcp/server/httpClient', () => ({
 
 import { mcpToolRegistry } from '../mcp/server/registry';
 import { mcpFetch } from '../mcp/server/httpClient';
-import { TRANSCRIPT_MESSAGE_CHAR_CAP } from '../mcp/server/adminLookupTools';
+import { TRANSCRIPT_MESSAGE_CHAR_CAP, TRANSCRIPT_PAGE_SIZE_MAX } from '../mcp/server/adminLookupTools';
 import { ADMIN_SKILL_TOOL_NAMES } from '../services/agentModeService';
 import { CROSS_ACCOUNT_USER_DATA_TOOLS } from '../services/scheduledReportAccess';
 
@@ -46,6 +46,18 @@ describe('ENG-481 admin lookup tools', () => {
       expect(out).toMatchObject({ found: true, userId: 'u1', messageCount: 2 });
       expect(out.messages[0]).toMatchObject({ role: 'user', content: 'hello', timestamp: 't1' });
       expect(out.messages[1]).toMatchObject({ role: 'assistant', content: 'hi', model: 'claude-x' });
+    });
+
+    it('bounds the total payload with offset pagination', async () => {
+      const n = TRANSCRIPT_PAGE_SIZE_MAX + 5;
+      const msgs = Array.from({ length: n }, (_, i) => ({ role: 'user', content: `m${i}` }));
+      mockFetch.mockResolvedValue({ sessions: [{ sessionId: 's', messages: msgs }] });
+      const p1 = parse(await mcpToolRegistry.execute('get_session_transcript', { session_id: 's', limit: 1000 }, context));
+      expect(p1).toMatchObject({ messageCount: n, returned: TRANSCRIPT_PAGE_SIZE_MAX, hasMore: true, nextOffset: TRANSCRIPT_PAGE_SIZE_MAX });
+      const p2 = parse(await mcpToolRegistry.execute('get_session_transcript', { session_id: 's', offset: p1.nextOffset }, context));
+      expect(p2).toMatchObject({ returned: 5, hasMore: false });
+      expect(p2.nextOffset).toBeUndefined();
+      expect(p2.messages[0].content).toBe(`m${TRANSCRIPT_PAGE_SIZE_MAX}`);
     });
 
     it('truncates oversized messages and flags them', async () => {

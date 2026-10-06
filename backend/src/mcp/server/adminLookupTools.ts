@@ -16,6 +16,8 @@ import { ctx, jsonResult } from './toolHelpers';
 
 /** Per-message content cap so one huge tool payload can't blow the context. */
 export const TRANSCRIPT_MESSAGE_CHAR_CAP = 4000;
+/** Max messages returned per call; callers page with offset/nextOffset. */
+export const TRANSCRIPT_PAGE_SIZE_MAX = 50;
 
 const toText = (content: unknown): string => {
   if (typeof content === 'string') return content;
@@ -33,11 +35,13 @@ mcpToolRegistry.register({
   name: 'get_session_transcript',
   definition: {
     name: 'get_session_transcript',
-    description: `Get the message-level transcript of ONE chat session by session_id. Admin-only, read-only. Use with get_chat_history (which returns session ids and metadata but no messages) when an audit or activity report needs what was actually said. Each message's content is truncated to ${TRANSCRIPT_MESSAGE_CHAR_CAP} chars (truncated=true marks it). Returns found=false when the session does not exist or has no user messages.`,
+    description: `Get the message-level transcript of ONE chat session by session_id. Admin-only, read-only. Use with get_chat_history (which returns session ids and metadata but no messages) when an audit or activity report needs what was actually said. Each message's content is truncated to ${TRANSCRIPT_MESSAGE_CHAR_CAP} chars (truncated=true marks it). Returns at most ${TRANSCRIPT_PAGE_SIZE_MAX} messages per call; when hasMore=true call again with offset=nextOffset. Returns found=false when the session does not exist or has no user messages.`,
     inputSchema: {
       type: 'object',
       properties: {
         session_id: { type: 'string', description: 'The chat session id (e.g. from get_chat_history).' },
+        offset: { type: 'number', description: 'Index of the first message to return (default 0).' },
+        limit: { type: 'number', description: `Messages to return (default and max ${TRANSCRIPT_PAGE_SIZE_MAX}).` },
       },
       required: ['session_id'],
     },
@@ -52,7 +56,14 @@ mcpToolRegistry.register({
     });
     const session = (data?.sessions || [])[0];
     if (!session) return jsonResult({ sessionId, found: false });
-    const messages = (session.messages || []).map((m: any) => {
+    const all: any[] = session.messages || [];
+    const offset = Math.max(0, Math.floor(Number(args?.offset) || 0));
+    const reqLimit = Math.floor(Number(args?.limit) || TRANSCRIPT_PAGE_SIZE_MAX);
+    const limit = Math.min(TRANSCRIPT_PAGE_SIZE_MAX, Math.max(1, reqLimit));
+    const page = all.slice(offset, offset + limit);
+    const nextOffset = offset + page.length;
+    const hasMore = nextOffset < all.length;
+    const messages = page.map((m: any) => {
       const text = toText(m?.content);
       const truncated = text.length > TRANSCRIPT_MESSAGE_CHAR_CAP;
       return {
@@ -70,7 +81,11 @@ mcpToolRegistry.register({
       title: session.title ?? null,
       createdAt: session.createdAt ?? null,
       updatedAt: session.updatedAt ?? null,
-      messageCount: messages.length,
+      messageCount: all.length,
+      offset,
+      returned: messages.length,
+      hasMore,
+      ...(hasMore ? { nextOffset } : {}),
       messages,
     });
   },
