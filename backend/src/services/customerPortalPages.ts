@@ -121,6 +121,12 @@ export const CUSTOMER_PORTAL_PAGES: CustomerPortalPage[] = [
     label: 'Social Posts',
     description: 'View and track social media posts and engagement metrics'
   },
+  {
+    // ENG-2317: the tagged-link builder (customer-portal src/pages/TaggedLinks.tsx, /tracking/links).
+    path: '/tracking/links',
+    label: 'Tagged Links',
+    description: 'Build tracking links per platform and post'
+  },
 ];
 
 /**

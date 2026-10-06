@@ -926,6 +926,8 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
             ...(deterministicLeadId ? { ...leadData, leadId: deterministicLeadId, failIfExists: true } : leadData),
             // Only added when true, so every non-session list passes byte-identical input.
             ...(suppressSideEffects ? { suppressSideEffects: true } : {}),
+            // ENG-2321: an email lead on an ordinary list takes the exactly-once create (db.createLead).
+            ...(normalizedEmail && !isSessionList(leadList) ? { emailUniqueCreate: true } : {}),
           }
         );
         isNew = true;
