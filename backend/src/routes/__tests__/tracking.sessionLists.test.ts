@@ -14,7 +14,7 @@ jest.mock('../../middleware/auth', () => ({
   },
 }));
 jest.mock('../../services/db', () => ({
-  crmDb: { createLeadList: jest.fn(), getLeadListById: jest.fn(), updateLeadList: jest.fn() },
+  crmDb: { createLeadList: jest.fn(), getLeadListById: jest.fn(), updateLeadList: jest.fn(), getLeadListsByUserId: jest.fn() },
 }));
 jest.mock('../../services/crmAccessControl', () => ({
   canDestructiveCrmList: jest.fn(),
@@ -126,5 +126,88 @@ describe('PUT /api/tracking/session-lists/:listId/config', () => {
   ])('400 on %s, nothing written', async (_l, body) => {
     expect((await put(LIST.listId, body)).status).toBe(400);
     expect(crmDb.updateLeadList).not.toHaveBeenCalled();
+  });
+});
+
+describe('PUT /api/tracking/session-lists/:listId/config: routing (ENG-2316)', () => {
+  const CHILD = { listId: 'list_child_0001', userId: 'user-1', listType: 'session', trackingConfig: { allowedOrigins: [] } };
+  const rule = (over: Record<string, any> = {}) => ({ id: 'organic', match: { trafficType: 'organic' }, childListId: CHILD.listId, ...over });
+  const lists: Record<string, any> = {};
+
+  beforeEach(() => {
+    for (const k of Object.keys(lists)) delete lists[k];
+    Object.assign(lists, { [LIST.listId]: LIST, [CHILD.listId]: CHILD });
+    (crmDb.getLeadListById as jest.Mock).mockImplementation(async (id: string) => lists[id] ?? null);
+    (crmDb.getLeadListsByUserId as jest.Mock).mockResolvedValue([LIST, CHILD]);
+  });
+
+  it('saves a valid rule set next to the existing origins and label', async () => {
+    const res = await put(LIST.listId, { routing: [rule()] });
+    expect(res.status).toBe(200);
+    expect((crmDb.updateLeadList as jest.Mock).mock.calls[0][1].trackingConfig).toEqual({
+      allowedOrigins: ['https://a.example.com'], pageLabel: 'Old', routing: [rule()],
+    });
+  });
+
+  it('routing: null / [] clears the rules and keeps everything else', async () => {
+    lists[LIST.listId] = { ...LIST, trackingConfig: { ...LIST.trackingConfig, routing: [rule()] } };
+    for (const routing of [null, []]) {
+      (crmDb.updateLeadList as jest.Mock).mockClear();
+      expect((await put(LIST.listId, { routing })).status).toBe(200);
+      expect((crmDb.updateLeadList as jest.Mock).mock.calls[0][1].trackingConfig).toEqual({ allowedOrigins: ['https://a.example.com'], pageLabel: 'Old' });
+    }
+  });
+
+  it('an update that does not mention routing leaves stored rules untouched', async () => {
+    lists[LIST.listId] = { ...LIST, trackingConfig: { ...LIST.trackingConfig, routing: [rule()] } };
+    await put(LIST.listId, { pageLabel: 'New' });
+    expect((crmDb.updateLeadList as jest.Mock).mock.calls[0][1].trackingConfig.routing).toEqual([rule()]);
+  });
+
+  it.each([
+    ['a rule with no condition', () => [rule({ match: {} })], 'invalid_rule'],
+    ['6 rules', () => Array.from({ length: 6 }, (_, i) => rule({ id: `r${i}`, childListId: `list_child_${i}0000` })), 'too_many_rules'],
+    ['a self loop', () => [rule({ childListId: LIST.listId })], 'routing_self'],
+    ['a child that does not exist', () => [rule({ childListId: 'list_missing_01' })], 'routing_child_not_found'],
+  ])('400 %s, nothing written', async (_l, mk, code) => {
+    const res = await put(LIST.listId, { routing: mk() });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe(code);
+    expect(crmDb.updateLeadList).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a non-session child', { listType: 'sales' }, 'routing_child_not_session'],
+    ['a child owned by someone else', { userId: 'someone-else' }, 'routing_child_other_owner'],
+    ['a child that already has routing (chain)', { trackingConfig: { allowedOrigins: [], routing: [{ id: 'x', match: { trafficType: 'paid' }, childListId: 'list_zzz_00001' }] } }, 'routing_chain'],
+  ])('400 for %s', async (_l, over, code) => {
+    lists[CHILD.listId] = { ...CHILD, ...over };
+    const res = await put(LIST.listId, { routing: [rule()] });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe(code);
+    expect(crmDb.updateLeadList).not.toHaveBeenCalled();
+  });
+
+  it('400 when THIS list is already some other list\'s routing target (no chains, other direction)', async () => {
+    const other = { listId: 'list_other_0001', userId: 'user-1', listType: 'session', trackingConfig: { allowedOrigins: [], routing: [rule({ childListId: LIST.listId })] } };
+    (crmDb.getLeadListsByUserId as jest.Mock).mockResolvedValue([LIST, CHILD, other]);
+    const res = await put(LIST.listId, { routing: [rule()] });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('routing_is_child');
+    expect(crmDb.updateLeadList).not.toHaveBeenCalled();
+  });
+
+  it('403 when the caller can edit the parent but not a child (they could otherwise fill a list they cannot touch)', async () => {
+    (canDestructiveCrmList as jest.Mock).mockImplementation(async (_u: string, l: any) => l.listId !== CHILD.listId);
+    const res = await put(LIST.listId, { routing: [rule()] });
+    expect(res.status).toBe(403);
+    expect(res.body.childListId).toBe(CHILD.listId);
+    expect(crmDb.updateLeadList).not.toHaveBeenCalled();
+  });
+
+  it('clearing routing needs no child reads and no child permission', async () => {
+    (canDestructiveCrmList as jest.Mock).mockImplementation(async (_u: string, l: any) => l.listId !== CHILD.listId);
+    expect((await put(LIST.listId, { routing: [] })).status).toBe(200);
+    expect(crmDb.getLeadListsByUserId).not.toHaveBeenCalled();
   });
 });

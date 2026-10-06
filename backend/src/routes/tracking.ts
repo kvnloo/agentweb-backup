@@ -11,7 +11,7 @@
  * ENG-2315 adds the owner-facing "enable tracking" API on the same router:
  *
  *   POST /api/tracking/session-lists                     create a session list + its tracker config, return the embed tag
- *   PUT  /api/tracking/session-lists/:listId/config      update allowedOrigins / pageLabel of a session list
+ *   PUT  /api/tracking/session-lists/:listId/config      update allowedOrigins / pageLabel / routing (ENG-2316) of a session list
  *
  * Auth is the ordinary user JWT (authenticateToken), applied inside this router so a future mount
  * cannot forget it. Deliberately NOT admin-only: the portal user is the one building their links.
@@ -25,6 +25,8 @@ import { isSessionList } from '../utils/sessionList';
 import {
   normalizeAllowedOrigins,
   normalizePageLabel,
+  normalizeRouting,
+  validateRoutingTargets,
   TrackingConfigError,
   type TrackingConfig,
 } from '../utils/trackingConfig';
@@ -164,7 +166,7 @@ router.put('/session-lists/:listId/config', async (req: Request, res: Response):
 
     const body = req.body;
     if (!isPlainObject(body)) throw new TrackingConfigError('invalid_body', 'JSON object body required');
-    rejectUnknownKeys(body, ['allowedOrigins', 'pageLabel']);
+    rejectUnknownKeys(body, ['allowedOrigins', 'pageLabel', 'routing']);
     if (Object.keys(body).length === 0) throw new TrackingConfigError('empty_update', 'nothing to update');
 
     const current: Partial<TrackingConfig> = (list as any).trackingConfig && typeof (list as any).trackingConfig === 'object' ? (list as any).trackingConfig : {};
@@ -175,6 +177,37 @@ router.put('/session-lists/:listId/config', async (req: Request, res: Response):
     if (body.pageLabel !== undefined) {
       const label = normalizePageLabel(body.pageLabel);
       if (label) next.pageLabel = label; else delete next.pageLabel;
+    }
+
+    if (body.routing !== undefined) {
+      // null / [] clears routing. A non-empty array is validated shape-first, then against the lists it names.
+      const rules = body.routing === null ? [] : normalizeRouting(body.routing);
+      if (rules.length > 0) {
+        const children = new Map<string, Record<string, any> | null>();
+        const getChild = async (id: string) => {
+          if (!children.has(id)) children.set(id, ((await crmDb.getLeadListById(id)) as Record<string, any> | null | undefined) ?? null);
+          return children.get(id);
+        };
+        await validateRoutingTargets(list as { listId: string; userId: string }, rules, getChild);
+        // Copying sessions into a list is writing to it: the caller must be able to edit every child too,
+        // not merely the parent (otherwise a parent-editor could fill a list they cannot touch).
+        for (const rule of rules) {
+          if (!(await canDestructiveCrmList(userId, children.get(rule.childListId) as Record<string, any>))) {
+            res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE, code: 'routing_child_forbidden', childListId: rule.childListId });
+            return;
+          }
+        }
+        // No chains, other direction: this list must not already be a CHILD of another list's routing.
+        // Read via the existing userId-index (children share the owner). Eventually consistent, and the
+        // ingest only ever fans out ONE level from the list the event was posted to, so a race here
+        // can mis-configure but can never loop.
+        const owned = await crmDb.getLeadListsByUserId(list.userId);
+        const parent = owned.find((l: any) => l.listId !== list.listId && Array.isArray(l.trackingConfig?.routing) && l.trackingConfig.routing.some((r: any) => r?.childListId === list.listId));
+        if (parent) throw new TrackingConfigError('routing_is_child', `this list is already a routing target of list ${parent.listId} (chains are not allowed)`);
+        next.routing = rules;
+      } else {
+        delete next.routing;
+      }
     }
 
     const updated = await crmDb.updateLeadList(list.listId, { trackingConfig: next });
