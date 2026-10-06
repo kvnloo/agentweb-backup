@@ -142,7 +142,13 @@ function toItem(lead: AskCrmLead, heatScore: number, lifecycle: LifecycleStage):
   };
 }
 
-/** Compute heat + lifecycle for one lead, preferring stored values when present. */
+/**
+ * Compute heat + lifecycle for one lead.
+ *
+ * Stored lifecycle is a compatibility fallback. Positive live signals may
+ * advance it, but partial/negative snapshots must never silently downgrade a
+ * stronger stored state.
+ */
 function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: LifecycleStage } {
   const heat = typeof lead.heatScore === 'number'
     ? lead.heatScore
@@ -159,7 +165,33 @@ function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: L
         now
       );
 
-  const lifecycle = lead.lifecycle ?? computeLifecycle(
+  const nowMs = now.getTime();
+  const ageDays = (value: string | null | undefined): number | null => {
+    if (!value) return null;
+    const parsed = Date.parse(value);
+    if (Number.isNaN(parsed) || parsed > nowMs) return null;
+    return (nowMs - parsed) / (24 * 60 * 60 * 1000);
+  };
+  const subscriptionIsDefinitive =
+    lead.subscriptionState === 'active' ||
+    lead.subscriptionState === 'trialing' ||
+    lead.subscriptionState === 'past_due' ||
+    lead.subscriptionState === 'canceled';
+  const hasCurrentOpenDeal =
+    Array.isArray(lead.openDealStages) &&
+    lead.openDealStages.some((stage) => !['won', 'lost'].includes(String(stage).toLowerCase()));
+  const provesSignup =
+    lead.hasUserRecord === true &&
+    (lead.lifecycle === 'unknown' || lead.lifecycle === 'inbox');
+  const provesChurn = (ageDays(lead.lastActivityAt) ?? 0) > 60;
+  const provesRisk =
+    (lead.lifecycle === 'paying' || lead.lifecycle === 'at_risk') &&
+    (
+      (typeof lead.healthScore === 'number' && lead.healthScore < 40) ||
+      (ageDays(lead.lastUsageAt) ?? 0) > 30
+    );
+
+  const computedLifecycle = computeLifecycle(
     {
       email: lead.email ?? undefined,
       phone: lead.phone ?? undefined,
@@ -168,10 +200,21 @@ function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: L
       lastActivityAt: lead.lastActivityAt ?? undefined,
       lastUsageAt: lead.lastUsageAt ?? undefined,
       healthScore: lead.healthScore ?? undefined,
+      currentLifecycle: lead.lifecycle ?? undefined,
       openDealStages: lead.openDealStages ?? undefined,
     } as LifecycleSignals,
     now
   );
+
+  const lifecycle =
+    !lead.lifecycle ||
+    subscriptionIsDefinitive ||
+    hasCurrentOpenDeal ||
+    provesSignup ||
+    provesChurn ||
+    provesRisk
+      ? computedLifecycle
+      : lead.lifecycle;
 
   return { heat, lifecycle };
 }

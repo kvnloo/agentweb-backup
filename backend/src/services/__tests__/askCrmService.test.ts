@@ -194,3 +194,34 @@ describe('askCrm — respects load limit', () => {
     expect(loadLeadsForUser).toHaveBeenCalledWith('u1', { limit: 42 });
   });
 });
+
+
+describe('askCrm — ENG-2155 live lifecycle precedence', () => {
+  it('lets an authorized active subscription advance stale inbox to paying', async () => {
+    const result = await askCrm('show paying customers', 'u1', makeDeps([
+      lead({ lifecycle: 'inbox', subscriptionState: 'active', hasUserRecord: true }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('paying');
+  });
+
+  it('lets positive open-deal evidence advance stale inbox to in_deal', async () => {
+    const result = await askCrm('which deals are closing', 'u1', makeDeps([
+      lead({ lifecycle: 'inbox', openDealStages: ['Negotiation'] }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('in_deal');
+  });
+
+  it('does not treat closed-only deal stages as authoritative evidence for a downgrade', async () => {
+    const result = await askCrm('which deals are closing', 'u1', makeDeps([
+      lead({ lifecycle: 'in_deal', openDealStages: ['Won'] }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('in_deal');
+  });
+
+  it('uses stored lifecycle when no positive/terminal live signal can replace it', async () => {
+    const result = await askCrm('show paying customers', 'u1', makeDeps([
+      lead({ lifecycle: 'paying', openDealStages: [] }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('paying');
+  });
+});
