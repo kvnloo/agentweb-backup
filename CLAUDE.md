@@ -846,6 +846,14 @@ For manual testing on test/staging environments:
 - **Subscription:** Basic (default for DIY users)
 - **Purpose:** Test features available to users with Basic subscription
 
+### Verifier-owned skill fixture (ENG-2302)
+- `qa-user@agentweb.pro` owns throwaway `[qa-fixture] ENG-2302 conflict probe` user skills.
+- `QA_USER_PASSWORD=... node backend/scripts/verify-skill-conflict.mjs` (optional `VERIFY_BASE_URL`)
+  creates a fixture, races submit-for-review vs delete, asserts one 2xx + one 409 (never a
+  double write or 5xx), and deletes every fixture it created. It fails closed if the fixture
+  is not owned by the QA user and never touches customer skills. Offline test:
+  `node --test backend/scripts/verify-skill-conflict.test.mjs`.
+
 ## Cloud Test Environment
 
 Ephemeral EC2 test environments for manual testing. See `docs/cloud-test-env.md` for full setup, usage commands, and architecture.
