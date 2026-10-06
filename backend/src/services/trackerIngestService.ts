@@ -1,0 +1,95 @@
+import { upsertSessionLead } from './sessionUpsertService';
+import { buildSessionRow, type ParsedIngest } from '../utils/trackingIngest';
+import { resolveClientIdentity } from '../utils/clientIdentity';
+import { SESSION_JOURNEY_KEYS, isSessionList } from '../utils/sessionList';
+import { matchRoutingRules } from '../utils/trackingConfig';
+import { crmDb } from './db';
+
+/**
+ * "Latest state" fields written by one event, guarded by the same eventCount as the journey: with
+ * concurrent beacons an older event must not make lastEvent / furthestStage / the last click go backwards.
+ * (Engagement scalars — dwellSec etc. — stay last-write-wins; they only come from page_exit, which is
+ * cumulative, so a stale one is overwritten by the next.)
+ */
+export const INGEST_GUARDED_KEYS: readonly string[] = [
+  ...SESSION_JOURNEY_KEYS, 'lastEvent', 'furthestStage', 'lastCustomName', 'lastCustomProps', 'lastClickLabel', 'lastClickSection', 'lastClickUrl',
+];
+
+/**
+ * ENG-2315 / ENG-2316: writes one tracker event into its session list and, when the list has
+ * routing rules, into every matching child session list.
+ *
+ * PARENT: always upserted and authoritative — it keeps every session, so its totals never change
+ * because of routing, and a parent failure fails the request. The upsert is the same exactly-once
+ * implementation forward-lead uses, so concurrent / duplicate / out-of-order deliveries of one
+ * session's events collapse onto one row.
+ *
+ * CHILDREN: the SAME sessionId/sessionStartMs, so each child has its own deterministic leadId
+ * (the hash includes the list id) and the same exactly-once guarantees. They run concurrently with
+ * the parent and are isolated: a child failure is logged and NEVER fails the request or the parent.
+ * Self-healing: the journey is cumulative and every event upserts again, so a child that missed one
+ * event converges on the next. The limit: scalar fields only an earlier event carried (e.g. a
+ * `lp_view_at` the child missed) stay missing on that child.
+ *
+ * Children are re-read and re-checked here (still a session list, same owner as the parent) rather
+ * than trusting the stored rule: the config was valid when saved, but this is the write path.
+ *
+ * Writes ROWS ONLY. Session lists are telemetry: no lead side effects, no alerts, no CAPI
+ * (createLead is told suppressSideEffects by the upsert).
+ */
+export async function ingestTrackerEvent(input: {
+  list: Record<string, any>;
+  parsed: ParsedIngest;
+  userAgent: string;
+  /** The visitor's address as the route resolved it (first X-Forwarded-For hop), or ''. */
+  visitorIp: string;
+}): Promise<{
+  classification: ReturnType<typeof buildSessionRow>['classification'];
+  childListIds: string[];
+  childFailures: string[];
+}> {
+  const { list, parsed, userAgent, visitorIp } = input;
+  const nowIso = new Date().toISOString();
+  const pageLabel = typeof list.trackingConfig?.pageLabel === 'string' ? list.trackingConfig.pageLabel : undefined;
+  const built = buildSessionRow(parsed, { userAgent, pageLabel, nowIso });
+  const { classification } = built;
+
+  // resolveClientIdentity drops IP and UA together when the caller is not a browser (see its doc comment).
+  const identity = resolveClientIdentity(userAgent, visitorIp);
+
+  const write = (listId: string): Promise<unknown> => {
+    // One object per target: the upsert normalises the counter in place.
+    const customFields = { ...built.customFields, forwardedAt: nowIso };
+    return upsertSessionLead({
+      listId,
+      identity: parsed.identity,
+      leadData: {
+        firstName: '', lastName: '', phone: '', company: '', title: '', notes: '', linkedin: '',
+        ...(identity.clientIp ? { clientIp: identity.clientIp } : {}),
+        ...(identity.clientUserAgent ? { clientUserAgent: identity.clientUserAgent } : {}),
+        customFields,
+      },
+      customFields,
+      callerSuppliedSource: true,
+      journeyKeys: INGEST_GUARDED_KEYS,
+    });
+  };
+
+  const childListIds = matchRoutingRules(list.trackingConfig?.routing, classification).filter((id) => id !== list.listId);
+  const childFailures: string[] = [];
+  const writeChild = async (childId: string): Promise<void> => {
+    try {
+      const child = await crmDb.getLeadListById(childId);
+      if (!child || !isSessionList(child) || child.userId !== list.userId) {
+        throw new Error('child list missing, not a session list, or owned by someone else');
+      }
+      await write(childId);
+    } catch (err: any) {
+      childFailures.push(childId);
+      console.warn(`[trackerIngest] child write failed list=${list.listId} child=${childId}: ${err?.message ?? err}`);
+    }
+  };
+
+  await Promise.all([write(list.listId), ...childListIds.map(writeChild)]);
+  return { classification, childListIds, childFailures };
+}

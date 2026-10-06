@@ -34,7 +34,8 @@ import { handleHardBounceRecipients } from '../services/emailDeliverabilityServi
 // module-private state. Extracted so the CRM → Meta conversion relay throttles against the
 // same counters instead of a second set that drifts out of step with this one.
 import { shouldAttemptCapiSend, isCapiAccountPaused, recordCapiUsage } from '../services/capiSendBudget';
-import { suppressLeadSideEffects } from '../utils/sessionList';
+import { suppressLeadSideEffects, isSessionList, resolveSessionIdentity } from '../utils/sessionList';
+import { upsertSessionLead } from '../services/sessionUpsertService';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -658,6 +659,11 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // (`clientIp`/`clientUserAgent` are deliberately NOT handled — see the destructure.)
       'visitorIp', 'visitorUserAgent',
       'allowAnonymousLead',
+      // ENG-2312. The session's start time, consumed below as part of the session identity
+      // (it becomes the leadId's time prefix). Absent from this set it would be written into
+      // customFields as junk on every event. `sessionId` is deliberately NOT added: LPs
+      // already post it (flat or in customFields) and read it back out of customFields.
+      'sessionStartMs',
     ]);
     const PASSTHROUGH_MAX_KEYS = 50;
     const PASSTHROUGH_MAX_VALUE_LENGTH = 1000;
@@ -726,7 +732,16 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // so two submissions of the same number collapse onto one row without needing a second
     // GSI. A phone-only lead that later submits WITH an email becomes its own row, which is
     // the same thing that already happens for two different emails.
-    const existingLead = normalizedEmail
+    //
+    // ENG-2312: a SESSION list with a valid session identity skips this lookup entirely.
+    // email-index is an eventually-consistent GSI, so events 3–128 ms apart for one session
+    // all missed each other here and each created its own row. Such a request instead targets
+    // one deterministic (listId, leadId) item and lets a conditional put decide (see the
+    // sessionIdentity branch below). Gated on the list row the DB returned, never on the body:
+    // the body only supplies the identity to use, and an invalid or missing identity falls back
+    // to exactly the behaviour below, so LPs that do not send sessionStartMs yet are unchanged.
+    const sessionIdentity = isSessionList(leadList) ? resolveSessionIdentity(req.body) : null;
+    const existingLead = normalizedEmail && !sessionIdentity
       ? await crmDb.getLeadByEmail(leadList.listId, normalizedEmail.toLowerCase())
       : null;
 
@@ -734,14 +749,24 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     const mergedCustomFields: Record<string, any> = existingLead
       ? incomingCustomFields
       : { ...incomingCustomFields, forwardedAt: new Date().toISOString() };
-
     leadData.customFields = mergedCustomFields;
 
     let lead: any;
     let isNew = false;
     let isUpdated = false;
 
-    if (existingLead) {
+    if (sessionIdentity) {
+      // ENG-2312. Exactly-once create + atomic merge for one (list, session): the shared
+      // implementation (also used by the tracker ingest) lives in sessionUpsertService.
+      ({ lead, isNew, isUpdated } = await upsertSessionLead({
+        listId: leadList.listId,
+        identity: sessionIdentity,
+        leadData,
+        customFields: mergedCustomFields,
+        callerSuppliedSource,
+        touch,
+      }));
+    } else if (existingLead) {
       // Merge new data into existing lead (only overwrite with non-empty values)
       const normalize = (value: any): string => {
         if (value === null || value === undefined) return '';

@@ -43,6 +43,7 @@ import {
   formatChange,
   getMetricColor,
 } from '../../utils/revenueMetrics';
+import { CHART_SERIES } from './chartPalette';
 
 Chart.register(...registerables);
 
@@ -133,7 +134,7 @@ function MrrTrendChart({ snapshots }: { snapshots: RevenueSnapshot[] }) {
           {
             label: 'Total MRR',
             data: snapshots.map((s) => s.mrr / 100),
-            borderColor: '#1976d2',
+            borderColor: CHART_SERIES.blue,
             backgroundColor: 'rgba(25, 118, 210, 0.1)',
             fill: true,
             tension: 0.4,
@@ -141,7 +142,7 @@ function MrrTrendChart({ snapshots }: { snapshots: RevenueSnapshot[] }) {
           {
             label: 'New MRR',
             data: snapshots.map((s) => s.newMrr / 100),
-            borderColor: '#4caf50',
+            borderColor: CHART_SERIES.green,
             backgroundColor: 'rgba(76, 175, 80, 0.1)',
             fill: false,
             tension: 0.4,
@@ -149,7 +150,7 @@ function MrrTrendChart({ snapshots }: { snapshots: RevenueSnapshot[] }) {
           {
             label: 'Expansion MRR',
             data: snapshots.map((s) => s.expansionMrr / 100),
-            borderColor: '#ff9800',
+            borderColor: CHART_SERIES.orange,
             backgroundColor: 'rgba(255, 152, 0, 0.1)',
             fill: false,
             tension: 0.4,
@@ -157,7 +158,7 @@ function MrrTrendChart({ snapshots }: { snapshots: RevenueSnapshot[] }) {
           {
             label: 'Churned MRR',
             data: snapshots.map((s) => -(s.churnedMrr / 100)),
-            borderColor: '#f44336',
+            borderColor: CHART_SERIES.red,
             backgroundColor: 'rgba(244, 67, 54, 0.1)',
             fill: false,
             tension: 0.4,
