@@ -746,7 +746,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       : null;
 
     // Only stamp forwardedAt for new leads; for existing leads, preserve the original timestamp
-    const mergedCustomFields: Record<string, any> = existingLead
+    let mergedCustomFields: Record<string, any> = existingLead
       ? incomingCustomFields
       : { ...incomingCustomFields, forwardedAt: new Date().toISOString() };
     leadData.customFields = mergedCustomFields;
@@ -755,18 +755,12 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     let isNew = false;
     let isUpdated = false;
 
-    if (sessionIdentity) {
-      // ENG-2312. Exactly-once create + atomic merge for one (list, session): the shared
-      // implementation (also used by the tracker ingest) lives in sessionUpsertService.
-      ({ lead, isNew, isUpdated } = await upsertSessionLead({
-        listId: leadList.listId,
-        identity: sessionIdentity,
-        leadData,
-        customFields: mergedCustomFields,
-        callerSuppliedSource,
-        touch,
-      }));
-    } else if (existingLead) {
+    // The one merge routine for an EXISTING lead. Two entry points reach it: the
+    // getLeadByEmail hit at the top of this handler, and a createLead that lost a race to a
+    // concurrent submission of the same email (the adopt in the create branch below). Sharing
+    // it keeps both on identical merge / attribution / isUpdated semantics. Assigns the
+    // enclosing `lead` and `isUpdated`.
+    const mergeIntoExistingLead = async (existingLead: any): Promise<void> => {
       // Merge new data into existing lead (only overwrite with non-empty values)
       const normalize = (value: any): string => {
         if (value === null || value === undefined) return '';
@@ -877,6 +871,21 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       }
 
       lead = { ...existingLead, ...updates };
+    };
+
+    if (sessionIdentity) {
+      // ENG-2312. Exactly-once create + atomic merge for one (list, session): the shared
+      // implementation (also used by the tracker ingest) lives in sessionUpsertService.
+      ({ lead, isNew, isUpdated } = await upsertSessionLead({
+        listId: leadList.listId,
+        identity: sessionIdentity,
+        leadData,
+        customFields: mergedCustomFields,
+        callerSuppliedSource,
+        touch,
+      }));
+    } else if (existingLead) {
+      await mergeIntoExistingLead(existingLead);
     } else {
       // Create a new lead.
       // ENG-2082: with no email there is nothing to query on beforehand, so a phone-only
@@ -926,95 +935,109 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         // report it as a duplicate. isNew stays false, so none of the new-lead side effects
         // (sequence enrolment, auto-draft/auto-send, owner notify, CAPI) fire a second time
         // for one person — which is the whole reason the number is keyed deterministically.
-        if (!createErr?.leadAlreadyExists) throw createErr;
-        // Consistent read: the conditional write just told us this exact key exists, so an
-        // eventually-consistent miss here would be a lie, not an answer.
-        lead = await crmDb.getLeadById(leadList.listId, deterministicLeadId, { consistentRead: true });
-        if (!lead) {
-          // Still nothing — the winner's row was deleted between its write and this read, or
-          // the read failed in a way that returned empty. Do NOT throw: throwing reaches the
-          // handler's catch and returns 500 to the lander for a submission that was, from
-          // the visitor's point of view, accepted. Degrade to the id we know, the same way
-          // linkedInInviteCrmMirror does on this identical race.
-          console.warn(
-            `[webhooks] ENG-2082: adopted lead ${deterministicLeadId} not readable after a ` +
-              `losing conditional create in ${leadList.listId} — reporting the duplicate anyway.`
-          );
-          lead = { leadId: deterministicLeadId, listId: leadList.listId, ...leadData };
-        }
+        if (createErr?.duplicateEmail && createErr.existingLead) {
+          // The email twin of the case below: getLeadByEmail (eventually-consistent GSI) missed
+          // above, but createLead's own pre-check found a row a concurrent submission wrote in
+          // between. That is a REPEAT submission of an existing lead, not a failure — throwing
+          // here returned 500 plus an api.lead_failed owner alert and dropped the visitor's
+          // data. Adopt the carried row through the same merge an existing lead gets from the
+          // start. forwardedAt was minted for a create; an existing lead keeps its original, so
+          // drop it exactly as the existing-lead stamp above does.
+          mergedCustomFields = incomingCustomFields;
+          leadData.customFields = mergedCustomFields;
+          await mergeIntoExistingLead(createErr.existingLead);
+        } else if (!createErr?.leadAlreadyExists) {
+          throw createErr;
+        } else {
+          // Consistent read: the conditional write just told us this exact key exists, so an
+          // eventually-consistent miss here would be a lie, not an answer.
+          lead = await crmDb.getLeadById(leadList.listId, deterministicLeadId, { consistentRead: true });
+          if (!lead) {
+            // Still nothing — the winner's row was deleted between its write and this read, or
+            // the read failed in a way that returned empty. Do NOT throw: throwing reaches the
+            // handler's catch and returns 500 to the lander for a submission that was, from
+            // the visitor's point of view, accepted. Degrade to the id we know, the same way
+            // linkedInInviteCrmMirror does on this identical race.
+            console.warn(
+              `[webhooks] ENG-2082: adopted lead ${deterministicLeadId} not readable after a ` +
+                `losing conditional create in ${leadList.listId} — reporting the duplicate anyway.`
+            );
+            lead = { leadId: deterministicLeadId, listId: leadList.listId, ...leadData };
+          }
 
-        // ENG-2082 follow-up: this path is not only the concurrent race. A deterministic id
-        // plus failIfExists means EVERY repeat submission from the same number lands here,
-        // forever. Without a merge the second submission returns success and silently drops
-        // whatever it carried — the exact failure this file documents for flat custom fields
-        // ("a 201 and a visible lead row with the data gone"), reproduced for a multi-step
-        // phone-only lander whose step 2 posts the qualification answers.
-        //
-        // Mirrors the existingLead branch's rules deliberately rather than sharing them:
-        // that branch is the well-trodden email path and is not worth destabilising here.
-        const normalizeAdopted = (value: any): string =>
-          value === null || value === undefined ? '' : String(value).trim();
-        const adoptedUpdates: any = {};
-        let adoptedChanged = false;
+          // ENG-2082 follow-up: this path is not only the concurrent race. A deterministic id
+          // plus failIfExists means EVERY repeat submission from the same number lands here,
+          // forever. Without a merge the second submission returns success and silently drops
+          // whatever it carried — the exact failure this file documents for flat custom fields
+          // ("a 201 and a visible lead row with the data gone"), reproduced for a multi-step
+          // phone-only lander whose step 2 posts the qualification answers.
+          //
+          // Mirrors the existingLead branch's rules deliberately rather than sharing them:
+          // that branch is the well-trodden email path and is not worth destabilising here.
+          const normalizeAdopted = (value: any): string =>
+            value === null || value === undefined ? '' : String(value).trim();
+          const adoptedUpdates: any = {};
+          let adoptedChanged = false;
 
-        for (const field of ['firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'] as const) {
-          const newValue = normalizeAdopted(leadData[field]);
-          if (newValue && normalizeAdopted(lead[field]) !== newValue) {
-            adoptedUpdates[field] = newValue;
+          for (const field of ['firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'] as const) {
+            const newValue = normalizeAdopted(leadData[field]);
+            if (newValue && normalizeAdopted(lead[field]) !== newValue) {
+              adoptedUpdates[field] = newValue;
+              adoptedChanged = true;
+            }
+          }
+
+          const adoptedExistingCustom = lead.customFields || {};
+          const adoptedIncomingCustom = leadData.customFields || {};
+          const adoptedMergedCustom: Record<string, any> = { ...adoptedExistingCustom };
+          let customChanged = false;
+          // Stamped by this handler rather than sent by the visitor: `forwardedAt` is minted
+          // fresh on every submission because this branch builds leadData as if creating, and
+          // `source` defaults to 'api' when the caller sends none (see the destructure above).
+          // Neither is visitor data, and letting either mark a resubmission as a real update
+          // would drive CRM sync and owner alerts off a duplicate that carried nothing new.
+          // They are still merged through — they just do not, alone, constitute a change.
+          const SYSTEM_CUSTOM_KEYS = new Set(['forwardedAt', 'source']);
+          for (const [key, value] of Object.entries(adoptedIncomingCustom)) {
+            if (value === undefined || value === null || value === '') continue;
+            if (normalizeAdopted(adoptedExistingCustom[key]) !== normalizeAdopted(value)) {
+              adoptedMergedCustom[key] = value;
+              if (!SYSTEM_CUSTOM_KEYS.has(key)) customChanged = true;
+            }
+          }
+          if (customChanged) {
+            // Put the STORED system values back before writing. `forwardedAt` is minted fresh
+            // on this branch (existingLead is null, so line ~700 stamps a new one), and the
+            // merged object would otherwise carry it — overwriting the lead's real capture
+            // time whenever anything else changed. That contradicts the invariant stated at
+            // the stamp site ("for existing leads, preserve the original timestamp") and is
+            // customer-visible: forwardedAt is what the owner alert renders as the received
+            // time. The email branch avoids this by omitting the key entirely; this branch
+            // cannot, so it restores it.
+            // forwardedAt unconditionally: it is minted by THIS handler on every submission
+            // (existingLead is null on this branch), so the merged copy is never the
+            // visitor's data and the stored capture time must win. `source` is handled by
+            // provenance just below, exactly as the email branch now does — a caller-supplied
+            // source wins, a defaulted one never overwrites.
+            if ('forwardedAt' in adoptedExistingCustom) {
+              adoptedMergedCustom.forwardedAt = adoptedExistingCustom.forwardedAt;
+            }
+            // Restore `source` ONLY when this submission did not name one. A caller-supplied
+            // source is real data and must win (that is the multi-step case); a defaulted one
+            // must never overwrite what is already stored.
+            if (!callerSuppliedSource && 'source' in adoptedExistingCustom) {
+              adoptedMergedCustom.source = adoptedExistingCustom.source;
+            }
+            adoptedUpdates.customFields = adoptedMergedCustom;
             adoptedChanged = true;
           }
-        }
 
-        const adoptedExistingCustom = lead.customFields || {};
-        const adoptedIncomingCustom = leadData.customFields || {};
-        const adoptedMergedCustom: Record<string, any> = { ...adoptedExistingCustom };
-        let customChanged = false;
-        // Stamped by this handler rather than sent by the visitor: `forwardedAt` is minted
-        // fresh on every submission because this branch builds leadData as if creating, and
-        // `source` defaults to 'api' when the caller sends none (see the destructure above).
-        // Neither is visitor data, and letting either mark a resubmission as a real update
-        // would drive CRM sync and owner alerts off a duplicate that carried nothing new.
-        // They are still merged through — they just do not, alone, constitute a change.
-        const SYSTEM_CUSTOM_KEYS = new Set(['forwardedAt', 'source']);
-        for (const [key, value] of Object.entries(adoptedIncomingCustom)) {
-          if (value === undefined || value === null || value === '') continue;
-          if (normalizeAdopted(adoptedExistingCustom[key]) !== normalizeAdopted(value)) {
-            adoptedMergedCustom[key] = value;
-            if (!SYSTEM_CUSTOM_KEYS.has(key)) customChanged = true;
+          if (adoptedChanged) {
+            await crmDb.updateLead(leadList.listId, lead.leadId, adoptedUpdates);
+            lead = { ...lead, ...adoptedUpdates };
+            // A real, user-visible change — same meaning the email branch gives isUpdated.
+            isUpdated = true;
           }
-        }
-        if (customChanged) {
-          // Put the STORED system values back before writing. `forwardedAt` is minted fresh
-          // on this branch (existingLead is null, so line ~700 stamps a new one), and the
-          // merged object would otherwise carry it — overwriting the lead's real capture
-          // time whenever anything else changed. That contradicts the invariant stated at
-          // the stamp site ("for existing leads, preserve the original timestamp") and is
-          // customer-visible: forwardedAt is what the owner alert renders as the received
-          // time. The email branch avoids this by omitting the key entirely; this branch
-          // cannot, so it restores it.
-          // forwardedAt unconditionally: it is minted by THIS handler on every submission
-          // (existingLead is null on this branch), so the merged copy is never the
-          // visitor's data and the stored capture time must win. `source` is handled by
-          // provenance just below, exactly as the email branch now does — a caller-supplied
-          // source wins, a defaulted one never overwrites.
-          if ('forwardedAt' in adoptedExistingCustom) {
-            adoptedMergedCustom.forwardedAt = adoptedExistingCustom.forwardedAt;
-          }
-          // Restore `source` ONLY when this submission did not name one. A caller-supplied
-          // source is real data and must win (that is the multi-step case); a defaulted one
-          // must never overwrite what is already stored.
-          if (!callerSuppliedSource && 'source' in adoptedExistingCustom) {
-            adoptedMergedCustom.source = adoptedExistingCustom.source;
-          }
-          adoptedUpdates.customFields = adoptedMergedCustom;
-          adoptedChanged = true;
-        }
-
-        if (adoptedChanged) {
-          await crmDb.updateLead(leadList.listId, lead.leadId, adoptedUpdates);
-          lead = { ...lead, ...adoptedUpdates };
-          // A real, user-visible change — same meaning the email branch gives isUpdated.
-          isUpdated = true;
         }
       }
     }
