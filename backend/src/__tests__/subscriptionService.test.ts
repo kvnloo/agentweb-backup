@@ -816,12 +816,15 @@ describe('subscriptionService', () => {
     expect(tools).toContain('generate_image');
   });
 
-  it('resolveSkillsToToolNames scopes the catalog passed to getUnassociatedToolNames to only the reachable skillIds (ENG-2299)', async () => {
+  it('resolveSkillsToToolNames passes the FULL published catalog to getUnassociatedToolNames, not just the caller\'s own reachable skillIds (ENG-2299)', async () => {
     // getPublishedSkills() (mocked above) returns the FULL multi-tenant catalog:
-    // skill-1 and skill-2. This caller's own skillIds only reach skill-1 —
-    // skill-2 belongs to a tier/org this caller cannot install, so it must not
-    // be passed to getUnassociatedToolNames and silently claim generate_video
-    // out of this caller's __other_skills__ catch-all.
+    // skill-1 and skill-2. Even though this caller's own skillIds only reach
+    // skill-1, skill-2 must still be passed through — a published skill always
+    // claims its tool out of the shared __other_skills__ catch-all regardless of
+    // which tier is asking, exactly like getUnassociatedTools' own isPublished
+    // check (ENG-1237). Pre-filtering the catalog to the caller's own skillIds
+    // before this call is what let a tier-excluded skill's tool leak back into
+    // every tier's catch-all (the bug this test guards against).
     const { agentModeService } = require('../services/agentModeService');
     const seenSkillIds: string[][] = [];
     const spy = jest
@@ -833,7 +836,7 @@ describe('subscriptionService', () => {
 
     await resolveSkillsToToolNames(['skill-1', '__other_skills__']);
 
-    expect(seenSkillIds).toEqual([['skill-1']]);
+    expect(seenSkillIds).toEqual([['skill-1', 'skill-2']]);
     spy.mockRestore();
   });
 

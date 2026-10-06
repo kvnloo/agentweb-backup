@@ -1010,14 +1010,14 @@ describe('AgentModeService - Skills', () => {
     });
 
     // ENG-2299: a published skill belonging to a subscription tier this user can
-    // never install must not be able to "steal" its tool out of the shared
-    // __other_skills__ catch-all. getPublishedSkills() is a single global,
-    // multi-tenant catalog — whether some OTHER org's tier is entitled to a
-    // skill that happens to list this tool has nothing to do with whether THIS
-    // session can reach the tool, yet unscoped resolution let it flip the
-    // tool's availability anyway, matching the ENG-1237 unpublished-skill case
-    // just above but for cross-tier reachability instead of publish state.
-    it('should NOT treat a tool as associated when only a subscription-unreachable published skill claims it', () => {
+    // never install must STILL claim its tool out of the shared __other_skills__
+    // catch-all — exactly like any other published skill (ENG-1237's isPublished
+    // check is the only axis that un-claims a tool). The caller's own tier
+    // entitlement governs whether THEY can install that skill directly, not
+    // whether its tool leaks into every other tier's catch-all; scoping the
+    // catalog by the caller's own allowedSkillIds before computing "claimed"
+    // tools would bypass that tier gate instead of fixing it.
+    it('should still treat a tool as associated when only a subscription-unreachable published skill claims it', () => {
       const publishedSkills = [
         { skillId: 'reachable-skill', name: 'Reachable', toolNames: ['tool_mine'], isPublished: true },
         { skillId: 'other-tier-skill', name: 'Other Tier Skill', toolNames: ['tool_other_tier'], isPublished: true },
@@ -1034,13 +1034,13 @@ describe('AgentModeService - Skills', () => {
 
       const result = (agentModeService as any).buildSkillContext([], userAllowedSkillIds, publishedSkills, ['__other_skills__']);
 
-      // tool_mine is reachable via 'reachable-skill' (even if not installed), so it
+      // tool_mine is claimed by 'reachable-skill' (even if not installed), so it
       // must stay out of the catch-all.
       expect(result.allowedToolNames.has('tool_mine')).toBe(false);
-      // tool_other_tier is only claimed by a skill this subscriber can never
-      // install — it must fall into the __other_skills__ catch-all instead of
-      // vanishing entirely.
-      expect(result.allowedToolNames.has('tool_other_tier')).toBe(true);
+      // tool_other_tier is claimed by a published skill this subscriber's tier
+      // cannot install — it must stay claimed (hidden) rather than falling
+      // through to this tier's __other_skills__ catch-all.
+      expect(result.allowedToolNames.has('tool_other_tier')).toBe(false);
     });
   });
 
@@ -1246,6 +1246,47 @@ describe('AgentModeService - Skills', () => {
       const result = (agentModeService as any).buildAvailableSkillsMessage(publishedSkills, []);
 
       expect(result).toBe('');
+    });
+
+    // ENG-2299: every call above omits userAllowedSkillIds, so it defaults to
+    // ['*'] and the non-wildcard filter branch (`allowedSet.has(...)`) never
+    // runs. Covers both branches directly, mirroring buildSkillContext's
+    // corrected ENG-2299 test: a tier-excluded skill is hidden from the
+    // directly-listed entries, but its tool still stays claimed (hidden) out of
+    // __other_skills__ rather than falling through to this tier's catch-all.
+    it('wildcard userAllowedSkillIds lists every published skill', () => {
+      const publishedSkills = [
+        { skillId: 'reachable-skill', name: 'Reachable', description: 'Desc', toolNames: ['tool_mine'], isPublished: true },
+        { skillId: 'other-tier-skill', name: 'Other Tier Skill', description: 'Desc', toolNames: ['tool_other_tier'], isPublished: true },
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue([] as any);
+
+      const result = (agentModeService as any).buildAvailableSkillsMessage(publishedSkills, [], ['*']);
+
+      expect(result).toContain('reachable-skill- Reachable');
+      expect(result).toContain('other-tier-skill- Other Tier Skill');
+    });
+
+    it('non-wildcard userAllowedSkillIds hides a tier-excluded skill from the list but keeps its tool out of __other_skills__', () => {
+      const publishedSkills = [
+        { skillId: 'reachable-skill', name: 'Reachable', description: 'Desc', toolNames: ['tool_mine'], isPublished: true },
+        { skillId: 'other-tier-skill', name: 'Other Tier Skill', description: 'Desc', toolNames: ['tool_other_tier'], isPublished: true },
+      ];
+      const mockTools = [
+        { name: 'tool_mine', definition: { function: { description: 'desc' } } },
+        { name: 'tool_other_tier', definition: { function: { description: 'desc' } } },
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const userAllowedSkillIds = ['reachable-skill', '__other_skills__'];
+      const result = (agentModeService as any).buildAvailableSkillsMessage(publishedSkills, [], userAllowedSkillIds);
+
+      // Listed directly: only the reachable skill.
+      expect(result).toContain('reachable-skill- Reachable');
+      expect(result).not.toContain('other-tier-skill- Other Tier Skill');
+      // __other_skills__ catch-all: tool_other_tier stays claimed by the
+      // tier-excluded skill, so it must not surface here either.
+      expect(result).not.toContain('tool_other_tier');
     });
   });
 
