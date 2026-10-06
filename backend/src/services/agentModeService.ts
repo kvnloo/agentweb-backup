@@ -9906,6 +9906,7 @@ export class AgentModeService {
     status?: string;
     limit?: number;
     cursor?: string;
+    includeAllFields?: boolean;
   } = {}): Promise<any> {
     return leadsImpl.getLeads(listId, userId, options);
   }
