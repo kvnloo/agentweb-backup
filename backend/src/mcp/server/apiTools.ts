@@ -3313,7 +3313,7 @@ Returns one diagnosis per connected Meta ad account, each with: outcome ('determ
 // invalid_args. Truncate a well-formed datetime to its date; anything else passes through
 // untouched so the route still fails closed with a 400 instead of being silently coerced.
 const LEAD_VOLUME_DATE_PATTERN = '^\\d{4}-\\d{2}-\\d{2}(T[0-9:.]+(Z|[+-]\\d{2}:?\\d{2})?)?$';
-const ISO_DATETIME_RE = /^(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$/;
+const ISO_DATETIME_RE = /^(\d{4}-\d{2}-\d{2})T([01]\d|2[0-3]):[0-5]\d(:[0-5]\d(\.\d+)?)?(Z|[+-]([01]\d|2[0-3]):?[0-5]\d)?$/;
 export function normalizeLeadVolumeDate(value: unknown): string | undefined {
   if (value === undefined || value === null || value === '') return undefined;
   const str = String(value).trim();
