@@ -383,4 +383,78 @@ describe("spendEnforcementBasis", () => {
       warn.mockRestore();
     });
   });
+  // ENG-1250 AC7: the legacy counter is retiring, so it must not be read unless a legacy path is
+  // actually taken. Passing a function makes that observable.
+  describe("lazy legacy counter (never read on the live ledger path)", () => {
+    const base = { billingUserId: ACCT, billingMonth: MONTH };
+
+    it("is NOT invoked when the ledger basis is used", async () => {
+      process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+      process.env[SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV] = "*";
+      getProjectionMock.mockResolvedValue(projection(5_000_000));
+      const legacy = jest.fn().mockResolvedValue(999);
+
+      const res = await resolveEnforcementCostBasisMicroUsd({ ...base, legacyRawCostUsedMicroUsd: legacy });
+
+      expect(res).toMatchObject({ basis: "spend_ledger", rawCostUsedMicroUsd: 5_000_000 });
+      expect(legacy).not.toHaveBeenCalled();
+    });
+
+    it("is NOT invoked when the projection is missing or the read fails (counts $0 / fails open)", async () => {
+      process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+      process.env[SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV] = "*";
+      const legacy = jest.fn().mockResolvedValue(999);
+      jest.spyOn(console, "log").mockImplementation(() => {});
+      jest.spyOn(console, "error").mockImplementation(() => {});
+
+      getProjectionMock.mockResolvedValueOnce(null);
+      expect((await resolveEnforcementCostBasisMicroUsd({ ...base, legacyRawCostUsedMicroUsd: legacy })).rawCostUsedMicroUsd).toBe(0);
+      getProjectionMock.mockRejectedValueOnce(new Error("boom"));
+      expect((await resolveEnforcementCostBasisMicroUsd({ ...base, legacyRawCostUsedMicroUsd: legacy })).rawCostUsedMicroUsd).toBe(0);
+
+      expect(legacy).not.toHaveBeenCalled();
+      jest.restoreAllMocks();
+    });
+
+    it("IS invoked (and its value used) when enforcement is off for the subject", async () => {
+      const legacy = jest.fn().mockResolvedValue(7_000_000);
+
+      const res = await resolveEnforcementCostBasisMicroUsd({ ...base, legacyRawCostUsedMicroUsd: legacy });
+
+      expect(res).toMatchObject({ basis: "legacy", rawCostUsedMicroUsd: 7_000_000 });
+      expect(legacy).toHaveBeenCalledTimes(1);
+    });
+
+    it("IS invoked on the opt-in legacy fallback for a missing projection and a failed read", async () => {
+      process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+      process.env[SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV] = "*";
+      process.env[SPEND_LEDGER_LEGACY_FALLBACK_ENV] = "true";
+      jest.spyOn(console, "log").mockImplementation(() => {});
+      jest.spyOn(console, "error").mockImplementation(() => {});
+      const legacy = jest.fn().mockResolvedValue(3_000_000);
+
+      getProjectionMock.mockResolvedValueOnce(null);
+      expect((await resolveEnforcementCostBasisMicroUsd({ ...base, legacyRawCostUsedMicroUsd: legacy })).rawCostUsedMicroUsd).toBe(3_000_000);
+      getProjectionMock.mockRejectedValueOnce(new Error("boom"));
+      expect((await resolveEnforcementCostBasisMicroUsd({ ...base, legacyRawCostUsedMicroUsd: legacy })).rawCostUsedMicroUsd).toBe(3_000_000);
+
+      expect(legacy).toHaveBeenCalledTimes(2);
+      jest.restoreAllMocks();
+    });
+
+    it("IS invoked on the staleness fallback", async () => {
+      process.env[SPEND_LEDGER_ENFORCEMENT_ENV] = "true";
+      process.env[SPEND_LEDGER_ENFORCEMENT_ACCOUNTS_ENV] = "*";
+      process.env[SPEND_PROJECTION_MAX_STALENESS_MIN_ENV] = "5";
+      jest.spyOn(console, "warn").mockImplementation(() => {});
+      getProjectionMock.mockResolvedValue(projection(218_240_000, "2020-01-01T00:00:00.000Z"));
+      const legacy = jest.fn().mockResolvedValue(4_000_000);
+
+      const res = await resolveEnforcementCostBasisMicroUsd({ ...base, legacyRawCostUsedMicroUsd: legacy });
+
+      expect(res).toMatchObject({ basis: "legacy", stale: true, rawCostUsedMicroUsd: 4_000_000 });
+      expect(legacy).toHaveBeenCalledTimes(1);
+      jest.restoreAllMocks();
+    });
+  });
 });
