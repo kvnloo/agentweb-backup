@@ -478,6 +478,17 @@ export function renderEmmaDock(options: {
               aria: 'Open Emma sessions',
             },
           },
+          {
+            id: 'status.runs',
+            k: 'seg',
+            p: {
+              spans: [{ t: 'Runs', s: 'muted' }],
+              side: 'right',
+              priority: 4,
+              actions: { click: 'runs' },
+              aria: 'Open AgentRun inspector',
+            },
+          },
         ],
       },
     ],
