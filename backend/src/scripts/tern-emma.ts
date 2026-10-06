@@ -356,7 +356,7 @@ async function main(): Promise<void> {
   const credits = typeof hello.credits === 'number' && hello.credits > 0
     ? Math.floor(hello.credits)
     : 2;
-  const frames = new FrameSender(SURFACE_ID, apcLimit, credits);
+  let frames = new FrameSender(SURFACE_ID, apcLimit, credits);
 
   process.stdout.write(
     encodeTspJson(
@@ -1206,11 +1206,49 @@ async function main(): Promise<void> {
         else if (event.act === 'close' || event.act === 'cancel') closePicker();
         break;
       }
-      case 'gone':
-        // Tern may drop retained inline nodes after scrollback compaction. A full
-        // re-render is safe because AgentWeb remains the source of truth.
-        render();
+      case 'gone': {
+        const ids = Array.isArray(event.ids)
+          ? event.ids.filter((id): id is string => typeof id === 'string')
+          : [];
+
+        if (ids.includes(RUNS_SURFACE_ID)) {
+          // Tern dropped the screen surface itself (for example after the user
+          // dismissed it externally). Do not send an x for something already gone.
+          runState = undefined;
+          runFrames = undefined;
+          runsSurfaceOpened = false;
+          pickerKeyBuffer = '';
+          break;
+        }
+
+        if (ids.includes(SURFACE_ID)) {
+          // Tern no longer has the inline surface. Re-open from canonical AgentWeb
+          // state with a fresh frame sequence, matching the SDK's gone recovery.
+          frames = new FrameSender(SURFACE_ID, apcLimit, credits);
+          rendered = false;
+          process.stdout.write(
+            encodeTspJson(
+              'o',
+              {
+                id: SURFACE_ID,
+                mode: 'inline',
+                title: session.title || 'Emma',
+                role: 'agentweb.emma',
+              },
+              undefined,
+              apcLimit,
+            ),
+          );
+          render();
+          break;
+        }
+
+        // Node-level eviction: replay only the affected surface from canonical
+        // application state. Our renderer sends complete region replacements.
+        if (event.sf === RUNS_SURFACE_ID) renderRuns();
+        else render();
         break;
+      }
       case 'error':
         if (typeof event.msg === 'string') {
           errorText = event.msg;
