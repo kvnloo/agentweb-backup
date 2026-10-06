@@ -21,6 +21,7 @@ import {
 } from "@mui/material";
 import { useAuth } from "../../contexts/AuthContext";
 import { buildApiUrl } from "../../config";
+import { COST_SERIES_PALETTE } from './chartPalette';
 
 interface Counters {
   inputTokens: number;
@@ -177,7 +178,7 @@ export default function CostDashboardTab() {
 
   const dailySeries = seriesByDate(data?.series ?? []);
   const maxDailySpend = Math.max(...dailySeries.map((row) => row.total), 0);
-  const colors = ["#155EEF", "#7F56D9", "#039855", "#DC6803", "#D92D20", "#667085"];
+  const colors = COST_SERIES_PALETTE;
 
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
