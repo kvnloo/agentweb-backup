@@ -168,6 +168,7 @@ import {
 } from './shared/googleDriveErrors';
 import { pdfPageRender } from './shared/pdfTextRender';
 import * as googleDriveImpl from './googleDrive';
+import { materializeResolvedDriveAsset, resolveNamedDriveFile } from './shared/driveAssetMaterializer';
 
 /**
  * Validate a model-supplied Drive date filter, returning the `YYYY-MM-DD` day it names.
@@ -2464,134 +2465,32 @@ function driveNameSearchIncompleteMessage(fileName: string, rootName: string, fa
 async function readGoogleDriveSharedFile(kbIdentifier: string, fileName: string, userId: string): Promise<any> {
   const folderId = kbIdentifier.replace('gdrive:', '');
 
-  // Verify the folder belongs to this user
+  // Authorization stays ahead of service-account client creation.
   const folders = await getUserGoogleDriveFolders(userId);
-  if (!folders.some(f => f.folderId === folderId)) {
+  const folderMeta = folders.find(f => f.folderId === folderId);
+  if (!folderMeta) {
     return { success: false, message: 'Not authorized to access this Google Drive folder' };
   }
 
-  const folderMeta = folders.find(f => f.folderId === folderId);
-  const rootName = folderMeta?.name || folderId;
-
   try {
     const drive = await getGoogleDriveClient();
+    const resolved = await resolveNamedDriveFile({
+      drive,
+      folders,
+      kbIdentifier,
+      fileName,
+      fields: 'files(id, name, mimeType, size, modifiedTime, parents, shortcutDetails)',
+      deps: {
+        getFolderTree: getGoogleDriveFolderTreeIds,
+        queryFiles: queryDriveFilesAcrossFolders,
+        escapeQueryValue: escapeDriveQueryValue,
+        incompleteMessage: driveNameSearchIncompleteMessage,
+        serviceAccountEmail: getGoogleDriveServiceAccountEmail(),
+      },
+    });
+    if (!resolved.ok) return resolved.result;
 
-    // Find the file by name anywhere in the registered folder's tree (ENG-1624:
-    // not just its direct children).
-    const { folderIds, restricted, rootRestricted, truncated: folderScanTruncated, throttled: folderScanThrottled, transientFailure: folderScanTransient, boundedStop: folderScanBounded, folderNames } = await getGoogleDriveFolderTreeIds(drive, folderId);
-    // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
-    // lets an ambiguous name (same filename in two sub-folders) be detected and
-    // reported instead of one candidate being picked arbitrarily.
-    const { files: filesMap, capped: nameQueryCapped, failed: nameQueryFailed } =
-      await queryDriveFilesAcrossFolders(
-        drive,
-        folderIds,
-        `name = '${escapeDriveQueryValue(fileName)}' and trashed = false`,
-        'files(id, name, mimeType, size, modifiedTime, parents, shortcutDetails)',
-        2
-      );
-    const files = Array.from(filesMap.values());
-
-    if (files.length === 0) {
-      /*
-       * "Searched and absent" versus "could not search" — the whole point of this branch.
-       *
-       * queryDriveFilesAcrossFolders swallows a request failure and reports it as
-       * `failed`/`capped` rather than throwing (throwing would discard rows it had already
-       * merged). Destructuring only `files` therefore turned a timeout or 5xx on the name
-       * query into a confident `File "X" not found in Google Drive folder "Y"` — a definitive
-       * absence claim from a read that errored. Before the helper caught the error the
-       * rejection reached the outer try and said the read failed, which was correct.
-       *
-       * Checked before the folder-scan signals below because it is the stronger fact: the
-       * name query is what would have found the file, so if IT did not complete, nothing here
-       * knows whether the file is there.
-       */
-      /*
-       * `rootRestricted` is checked BEFORE the incomplete-search branch, and the order is the
-       * point.
-       *
-       * Drive answers 403 for a permission denial AND for `userRateLimitExceeded`. The walk
-       * now separates the two (`isDriveThrottle`), so `rootRestricted` means a real access
-       * decision — but an unreadable root still very often makes the name query fail too, so
-       * both flags are set at once. Ranking the search failure first replaced the one remedy the user can act on —
-       * share the folder with the service account — with "retry the read", which cannot work
-       * while the folder stays unshared. Same "remedy that cannot work" shape as ENG-1636.
-       *
-       * The incomplete-search caveat is not lost: it is appended, so the message carries the
-       * actionable cause AND the fact that absence was never confirmed.
-       */
-      /*
-       * A quota answer is not a shape answer, and it outranks everything below.
-       *
-       * A throttled walk sets `truncated`, and the only branch that consumed it said "the
-       * folder tree is large enough that the scan stopped" — so a rate-limited user was told
-       * their folder was too big and invited to narrow a search that would throttle just the
-       * same. Every other branch here describes the folder; this one describes Drive.
-       */
-      if (folderScanThrottled) {
-        return {
-          success: false,
-          message: `File "${fileName}" was not found, but Google Drive rate-limited the scan of `
-            + `folder "${rootName}", so the search did not finish. This is a temporary quota answer, `
-            + `NOT a permissions or size problem — nothing needs to be shared and narrowing will not `
-            + `help. Wait a minute and try again. Do NOT report the file as absent.`,
-        };
-      }
-      if (rootRestricted) {
-        return {
-          success: false,
-          message: `File "${fileName}" not found — the Google Drive folder "${rootName}" itself could not be accessed. Share it with ${getGoogleDriveServiceAccountEmail()} to allow access.`
-            + (nameQueryFailed || nameQueryCapped ? ' The file search did not complete either, so this is not a confirmed absence.' : '')
-        };
-      }
-      if (nameQueryFailed || nameQueryCapped) {
-        return {
-          success: false,
-          message: driveNameSearchIncompleteMessage(fileName, rootName, nameQueryFailed)
-        };
-      }
-      if (restricted.length > 0) {
-        const names = restricted.map(r => `"${r.name}"`).join(', ');
-        return {
-          success: false,
-          message: `File "${fileName}" not found in Google Drive folder "${rootName}". Sub-folder(s) ${names} could not be accessed — share them with ${getGoogleDriveServiceAccountEmail()} to allow access.`
-        };
-      }
-      if (folderScanTruncated) {
-        return {
-          success: false,
-          message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder scan did not cover the whole tree, so this is not a confirmed absence. `
-            // Deterministic bound checked FIRST: the causes are not exclusive, and a walk that
-            // hit both will hit the bound again next time, so a retry cannot help.
-            + (folderScanTransient && !folderScanBounded
-              ? `A sub-folder read failed part-way, so retrying may well complete the scan.`
-              : `It stopped at a fixed folder-count or time bound, so a tree this size will stop in the same place every time. Do NOT retry this same call — narrow to a specific sub-folder, or ask the user for a direct Google Drive link.`)
-        };
-      }
-      return { success: false, message: `File "${fileName}" not found in Google Drive folder "${rootName}"` };
-    }
-
-    if (files.length > 1) {
-      // A Drive file can have more than one parent — index [0] may be a
-      // folder outside the tree that was actually searched, which would
-      // point someone at the wrong place. Prefer whichever parent is
-      // actually in `folderIds`; only fall back to [0] when none of the
-      // file's parents resolve within the searched tree (shouldn't happen
-      // in practice, since the file matched a query scoped to folderIds).
-      const folderIdSet = new Set(folderIds);
-      const candidates = files.map(f => {
-        const parentId = (f.parents || []).find((p: string) => folderIdSet.has(p)) ?? (f.parents || [])[0];
-        const location = parentId === folderId ? rootName : (folderNames.get(parentId) || parentId || 'an unresolved sub-folder');
-        return `"${f.name}" in "${location}"`;
-      }).join(', ');
-      return {
-        success: false,
-        message: `Multiple files named "${fileName}" found in Google Drive folder "${rootName}": ${candidates}. Use a more specific file name, or move the duplicates so names are unique.`
-      };
-    }
-
-    const matchedFile = files[0];
+    const matchedFile = resolved.file;
     let file = matchedFile;
     if (matchedFile.mimeType === 'application/vnd.google-apps.shortcut') {
       const targetId = matchedFile.shortcutDetails?.targetId;
@@ -2626,7 +2525,7 @@ async function readGoogleDriveSharedFile(kbIdentifier: string, fileName: string,
       message: `Successfully read Google Drive file "${fileName}"`,
       kb_identifier: kbIdentifier,
       file_name: fileName,
-      name: folderMeta?.name || folderId,
+      name: folderMeta.name || folderId,
       content: truncated,
       size: file.size ? parseInt(file.size, 10) : contentStr.length,
       type: 'google-drive',
@@ -2634,10 +2533,6 @@ async function readGoogleDriveSharedFile(kbIdentifier: string, fileName: string,
     };
   } catch (error) {
     console.error('AgentMode: Error reading Google Drive file:', error);
-    // ENG-1300: carry the real numeric HTTP status through so a clean
-    // 401/403/404 classifies as auth/not_found instead of the generic
-    // Error/bug fallback once toolResultError rebuilds an Error from the
-    // message alone.
     const code = (error as any)?.code || (error as any)?.status;
     return {
       success: false,
@@ -2671,7 +2566,6 @@ export async function materializeKnowledgeBaseAsset(
   if (!kbIdentifier || !fileName) {
     return { success: false, message: 'kb_identifier and file_name are required' };
   }
-
   if (!kbIdentifier.startsWith('gdrive:')) {
     return {
       success: false,
@@ -2684,169 +2578,35 @@ export async function materializeKnowledgeBaseAsset(
   if (!folders.some(f => f.folderId === folderId)) {
     return { success: false, message: 'Not authorized to access this Google Drive folder' };
   }
-  const rootName = folders.find(f => f.folderId === folderId)?.name || folderId;
 
   try {
     const drive = await getGoogleDriveClient();
-
-    // Search the whole folder tree rooted at the registered folder (ENG-1624),
-    // not just its direct children.
-    const { folderIds, restricted, rootRestricted, truncated, throttled: folderScanThrottled, transientFailure: folderScanTransient, boundedStop: folderScanBounded, folderNames } = await getGoogleDriveFolderTreeIds(drive, folderId);
-    // pageSizePerBatch of 2 (not 1): a single match is the common case, but this
-    // lets an ambiguous name (same filename in two sub-folders) be detected and
-    // reported instead of one candidate being materialized arbitrarily.
-    const { files: filesMap, capped: nameQueryCapped, failed: nameQueryFailed } =
-      await queryDriveFilesAcrossFolders(
-        drive,
-        folderIds,
-        `name = '${escapeDriveQueryValue(fileName)}' and trashed = false`,
-        'files(id, name, mimeType, size, parents)',
-        2
-      );
-    const files = Array.from(filesMap.values());
-
-    if (files.length === 0) {
-      // Same distinction readGoogleDriveSharedFile draws, for the same reason: the helper
-      // reports a failed request as `failed`/`capped` instead of throwing, so ignoring both
-      // flags turned an errored search into a definitive "not found". Shared wording too, so
-      // the transient/deterministic split cannot drift between the two call sites.
-      /*
-       * `rootRestricted` is checked BEFORE the incomplete-search branch, and the order is the
-       * point.
-       *
-       * Drive answers 403 for a permission denial AND for `userRateLimitExceeded`. The walk
-       * now separates the two (`isDriveThrottle`), so `rootRestricted` means a real access
-       * decision — but an unreadable root still very often makes the name query fail too, so
-       * both flags are set at once. Ranking the search failure first replaced the one remedy the user can act on —
-       * share the folder with the service account — with "retry the read", which cannot work
-       * while the folder stays unshared. Same "remedy that cannot work" shape as ENG-1636.
-       *
-       * The incomplete-search caveat is not lost: it is appended, so the message carries the
-       * actionable cause AND the fact that absence was never confirmed.
-       */
-      /*
-       * A quota answer is not a shape answer, and it outranks everything below.
-       *
-       * A throttled walk sets `truncated`, and the only branch that consumed it said "the
-       * folder tree is large enough that the scan stopped" — so a rate-limited user was told
-       * their folder was too big and invited to narrow a search that would throttle just the
-       * same. Every other branch here describes the folder; this one describes Drive.
-       */
-      if (folderScanThrottled) {
-        return {
-          success: false,
-          message: `File "${fileName}" was not found, but Google Drive rate-limited the scan of `
-            + `folder "${rootName}", so the search did not finish. This is a temporary quota answer, `
-            + `NOT a permissions or size problem — nothing needs to be shared and narrowing will not `
-            + `help. Wait a minute and try again. Do NOT report the file as absent.`,
-        };
-      }
-      if (rootRestricted) {
-        return {
-          success: false,
-          message: `File "${fileName}" not found — the Google Drive folder "${rootName}" itself could not be accessed. Share it with ${getGoogleDriveServiceAccountEmail()} to allow access.`
-            + (nameQueryFailed || nameQueryCapped ? ' The file search did not complete either, so this is not a confirmed absence.' : '')
-        };
-      }
-      if (nameQueryFailed || nameQueryCapped) {
-        return {
-          success: false,
-          message: driveNameSearchIncompleteMessage(fileName, rootName, nameQueryFailed)
-        };
-      }
-      if (restricted.length > 0) {
-        const names = restricted.map(r => `"${r.name}"`).join(', ');
-        return {
-          success: false,
-          message: `File "${fileName}" not found in Google Drive folder. Sub-folder(s) ${names} could not be accessed — share them with ${getGoogleDriveServiceAccountEmail()} to allow access.`
-        };
-      }
-      if (truncated) {
-        return {
-          success: false,
-          message: `File "${fileName}" not found in Google Drive folder "${rootName}" — but the folder scan did not cover the whole tree, so this is not a confirmed absence. `
-            // Deterministic bound checked FIRST: the causes are not exclusive, and a walk that
-            // hit both will hit the bound again next time, so a retry cannot help.
-            + (folderScanTransient && !folderScanBounded
-              ? `A sub-folder read failed part-way, so retrying may well complete the scan.`
-              : `It stopped at a fixed folder-count or time bound, so a tree this size will stop in the same place every time. Do NOT retry this same call — narrow to a specific sub-folder, or ask the user for a direct Google Drive link.`)
-        };
-      }
-      return { success: false, message: `File "${fileName}" not found in Google Drive folder` };
-    }
-
-    if (files.length > 1) {
-      // A Drive file can have more than one parent — index [0] may be a
-      // folder outside the tree that was actually searched, which would
-      // point someone at the wrong place. Prefer whichever parent is
-      // actually in `folderIds`; only fall back to [0] when none of the
-      // file's parents resolve within the searched tree (shouldn't happen
-      // in practice, since the file matched a query scoped to folderIds).
-      const folderIdSet = new Set(folderIds);
-      const candidates = files.map(f => {
-        const parentId = (f.parents || []).find((p: string) => folderIdSet.has(p)) ?? (f.parents || [])[0];
-        const location = parentId === folderId ? rootName : (folderNames.get(parentId) || parentId || 'an unresolved sub-folder');
-        return `"${f.name}" in "${location}"`;
-      }).join(', ');
-      return {
-        success: false,
-        message: `Multiple files named "${fileName}" found in Google Drive folder "${rootName}": ${candidates}. Use a more specific file name, or move the duplicates so names are unique.`
-      };
-    }
-
-    const file = files[0];
-    const mimeType = file.mimeType || '';
-    if (!mimeType.startsWith('image/') && !mimeType.startsWith('video/')) {
-      return {
-        success: false,
-        message: `"${fileName}" is a ${mimeType || 'unknown type'} file. materialize_knowledge_base_asset only handles images/videos — use read_knowledge_base_files for text/document content.`
-      };
-    }
-
-    const size = file.size ? parseInt(file.size, 10) : 0;
-    if (size > MATERIALIZE_ASSET_MAX_BYTES) {
-      return {
-        success: false,
-        message: `"${fileName}" is ${Math.round(size / (1024 * 1024))}MB, over the ${MATERIALIZE_ASSET_MAX_BYTES / (1024 * 1024)}MB limit for asset materialization`
-      };
-    }
-
-    const mediaResponse = await drive.files.get(
-      { fileId: file.id!, alt: 'media', supportsAllDrives: true },
-      { responseType: 'arraybuffer' }
-    );
-    const buffer = Buffer.from(mediaResponse.data as any);
-
-    // Drive's reported `size` can be missing/stale (e.g. 0 during virus-scan) —
-    // re-check the actual downloaded bytes so an oversized file can't slip
-    // through on bad metadata and get uploaded/reported with a wrong size.
-    if (buffer.length > MATERIALIZE_ASSET_MAX_BYTES) {
-      return {
-        success: false,
-        message: `"${fileName}" is ${Math.round(buffer.length / (1024 * 1024))}MB, over the ${MATERIALIZE_ASSET_MAX_BYTES / (1024 * 1024)}MB limit for asset materialization`
-      };
-    }
+    const resolved = await resolveNamedDriveFile({
+      drive,
+      folders,
+      kbIdentifier,
+      fileName,
+      fields: 'files(id, name, mimeType, size, parents)',
+      deps: {
+        getFolderTree: getGoogleDriveFolderTreeIds,
+        queryFiles: queryDriveFilesAcrossFolders,
+        escapeQueryValue: escapeDriveQueryValue,
+        incompleteMessage: driveNameSearchIncompleteMessage,
+        serviceAccountEmail: getGoogleDriveServiceAccountEmail(),
+      },
+    });
+    if (!resolved.ok) return resolved.result;
 
     const { uploadFileToS3 } = await import('../../utils/s3Utils');
-    const uploadResult = await uploadFileToS3(buffer, file.name || fileName, userId, mimeType);
-
-    if (!uploadResult.success || !uploadResult.url) {
-      return {
-        success: false,
-        message: uploadResult.error || 'Failed to upload asset to S3',
-        error: uploadResult.error || 's3_upload_failed'
-      };
-    }
-
-    return {
-      success: true,
-      message: `Materialized "${fileName}" from Google Drive as a hosted asset.`,
-      url: uploadResult.url,
-      file_name: file.name || fileName,
-      mime_type: mimeType,
-      size,
-      kb_identifier: kbIdentifier
-    };
+    return await materializeResolvedDriveAsset({
+      drive,
+      file: resolved.file,
+      fileName,
+      userId,
+      kbIdentifier,
+      maxBytes: MATERIALIZE_ASSET_MAX_BYTES,
+      uploadFile: uploadFileToS3,
+    });
   } catch (error: any) {
     console.error('AgentMode: Error materializing knowledge base asset:', error);
     const code = driveErrorCode(error);
