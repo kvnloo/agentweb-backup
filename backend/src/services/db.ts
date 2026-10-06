@@ -6425,7 +6425,14 @@ export const crmDb = {
       if (!leadData.skipEmailDuplicateCheck && leadData.email && leadData.email.trim()) {
         const existingLead = await this.getLeadByEmail(listId, leadData.email.trim().toLowerCase());
         if (existingLead) {
-          throw new Error(`Lead with email "${leadData.email}" already exists in this list`);
+          // Typed so a caller that races a concurrent submission of the same email can ADOPT the
+          // row it lost to instead of surfacing a failure. The message is unchanged on purpose:
+          // callers and tests that match the text keep working. Carries the row the pre-check
+          // already read, so an adopting caller needs no second (eventually-consistent) lookup.
+          const duplicateErr: any = new Error(`Lead with email "${leadData.email}" already exists in this list`);
+          duplicateErr.duplicateEmail = true;
+          duplicateErr.existingLead = existingLead;
+          throw duplicateErr;
         }
       }
 
