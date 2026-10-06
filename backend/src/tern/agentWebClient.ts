@@ -28,7 +28,7 @@ export class AgentWebClient {
         Authorization: `Bearer ${options.token}`,
         Accept: 'application/json',
       },
-      timeout: 120_000,
+      timeout: 0,
     });
   }
 
