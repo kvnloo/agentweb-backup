@@ -16,6 +16,11 @@ import {
   type Z0BridgeBackpressureMode,
 } from './z0BridgeBackpressure';
 import {
+  ensureZ0SidecarReady,
+  parseZ0DeploymentMode,
+  type Z0DeploymentMode,
+} from './z0SidecarDeployment';
+import {
   Z0_BRIDGE_SCHEMA_V1,
   bridgeFailureDisposition,
   validateZ0BridgeRequestV1,
@@ -33,6 +38,7 @@ export interface Z0AgentWebConfig {
   baseUrl: string;
   timeoutMs: number;
   backpressureMode?: Z0BridgeBackpressureMode;
+  deploymentMode?: Z0DeploymentMode;
 }
 
 export interface Z0RouteArgs {
@@ -75,6 +81,7 @@ export function readZ0AgentWebConfig(env: NodeJS.ProcessEnv = process.env): Z0Ag
         ? timeoutRaw
         : DEFAULT_TIMEOUT_MS,
     backpressureMode: readZ0BridgeBackpressureMode(env),
+    deploymentMode: parseZ0DeploymentMode(env.Z0INT_AGENTWEB_DEPLOYMENT),
   };
 }
 
@@ -239,6 +246,25 @@ async function maybeAcquireBridgeAdmission(params: {
       message: string;
     }
 > {
+  if ((params.config.deploymentMode ?? 'off') === 'sidecar') {
+    try {
+      await ensureZ0SidecarReady({
+        baseUrl: params.config.baseUrl,
+        fetchImpl: params.fetchImpl,
+        timeoutMs: Math.min(params.config.timeoutMs, 5000),
+      });
+    } catch (error) {
+      return {
+        admitted: false,
+        reason: 'sidecar_unavailable',
+        retryAfterMs: 0,
+        message: `z0 sidecar startup failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      };
+    }
+  }
+
   if ((params.config.backpressureMode ?? 'off') !== 'enforce') {
     return { admitted: true, token: null };
   }
