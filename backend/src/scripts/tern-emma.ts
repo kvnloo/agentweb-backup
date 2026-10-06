@@ -7,6 +7,7 @@ import {
   TSP_DEFAULT_APC_LIMIT,
   TspStreamReader,
 } from '../tern/protocol';
+import { TspSurfaceReconciler } from '../tern/reconcile';
 import { resolveNativeTextEdit } from '../tern/textEdit';
 import {
   AgentRunSummaryLike,
@@ -90,14 +91,10 @@ function isHello(value: Record<string, unknown>): value is Record<string, unknow
     && value.kinds.every(item => typeof item === 'string');
 }
 
-function nodeAdd(node: TspNode, surfaceId = SURFACE_ID): [string, string, string, null, TspNode] {
-  return ['add', node.id, surfaceId, null, node];
-}
-
 class FrameSender {
   private sequence = 0;
   private acked = 0;
-  private pending: unknown[][] | null = null;
+  private pending: { ops: unknown[][]; onSent?: () => void } | null = null;
 
   constructor(
     private readonly surfaceId: string,
@@ -105,10 +102,16 @@ class FrameSender {
     private readonly credits: number,
   ) {}
 
-  request(ops: unknown[][]): void {
-    // While blocked, keep only the newest full-state frame. Our callers render
-    // complete region replacements, so older queued frames are superseded.
-    this.pending = ops;
+  request(ops: unknown[][], onSent?: () => void): void {
+    // While blocked, keep only the newest state transition. The reconciler
+    // computes each pending batch from the last state actually sent.
+    this.pending = { ops, onSent };
+    if (ops.length === 0) {
+      const pending = this.pending;
+      this.pending = null;
+      pending.onSent?.();
+      return;
+    }
     this.pump();
   }
 
@@ -124,12 +127,13 @@ class FrameSender {
 
   private pump(): void {
     if (this.blocked || !this.pending) return;
-    const ops = this.pending;
+    const pending = this.pending;
     this.pending = null;
     const s = ++this.sequence;
     process.stdout.write(
-      encodeTspJson('f', { sf: this.surfaceId, s, ops }, undefined, this.apcLimit),
+      encodeTspJson('f', { sf: this.surfaceId, s, ops: pending.ops }, undefined, this.apcLimit),
     );
+    pending.onSent?.();
   }
 }
 
@@ -360,6 +364,8 @@ async function main(): Promise<void> {
     ? Math.floor(hello.credits)
     : 2;
   let frames = new FrameSender(SURFACE_ID, apcLimit, credits);
+  let reconciler = new TspSurfaceReconciler(SURFACE_ID);
+  let surfaceFocus: string | null | undefined;
 
   process.stdout.write(
     encodeTspJson(
@@ -382,11 +388,11 @@ async function main(): Promise<void> {
   let runningTools: RunningTool[] = [];
   let toolCounter = 0;
   let errorText: string | undefined;
-  let rendered = false;
   let pickerState: SessionPickerState | undefined;
   let approvalState: ApprovalDeckUiState | undefined;
   let runState: { runs: AgentRunSummaryLike[]; selected: number } | undefined;
   let runFrames: FrameSender | undefined;
+  let runReconciler: TspSurfaceReconciler | undefined;
   const dismissedDecks = new Set<string>();
   let pickerKeyBuffer = '';
   let escapeFlush: NodeJS.Timeout | undefined;
@@ -394,7 +400,8 @@ async function main(): Promise<void> {
   const pickerUndoStack: Array<{ text: string; cursor: number }> = [];
   const approvalUndoStack: Array<{ text: string; cursor: number }> = [];
 
-  const render = (dockOnly = false) => {
+  const render = (_dockOnly = false) => {
+    const mainNode = renderEmmaMain(session, runningTools);
     const dock = renderEmmaDock({
       text: composer,
       cursor,
@@ -408,53 +415,40 @@ async function main(): Promise<void> {
         ? renderApprovalDeck(session.pendingApprovalDeck, approvalState)
         : renderEmptyLayer();
 
-    const focusComposer = !pickerState && !approvalState ? [['focus', 'composer']] : [];
+    const roots = [mainNode, dock, layer];
+    const ops = reconciler.diff(roots) as unknown[][];
 
-    if (!rendered) {
-      const mainNode = renderEmmaMain(session, runningTools);
-      frames.request([
-        nodeAdd(mainNode),
-        nodeAdd(dock),
-        nodeAdd(layer),
-        ...focusComposer,
-      ]);
-      rendered = true;
-      return;
+    let desiredFocus: string | null = null;
+    if (!pickerState && !approvalState) {
+      desiredFocus = 'composer';
+    } else if (approvalState && approvalDeckIsAwaiting(session.pendingApprovalDeck)) {
+      const item = session.pendingApprovalDeck.items[approvalState.itemIndex];
+      const needsText = approvalState.selectedVerdict === 'comment'
+        || (approvalState.selectedVerdict === 'reject' && item?.allowFreeText === true);
+      if (needsText) desiredFocus = 'approval-note';
     }
 
-    if (dockOnly && !pickerState && !approvalState) {
-      frames.request([
-        ['del', 'dock'],
-        nodeAdd(dock),
-        ...focusComposer,
-      ]);
-      return;
+    if (desiredFocus !== surfaceFocus) {
+      ops.push(['focus', desiredFocus]);
     }
 
-    const mainNode = renderEmmaMain(session, runningTools);
-    frames.request([
-      ['del', 'main'],
-      nodeAdd(mainNode),
-      ['del', 'dock'],
-      nodeAdd(dock),
-      ['del', 'layer'],
-      nodeAdd(layer),
-      ...focusComposer,
-    ]);
+    frames.request(ops, () => {
+      reconciler.commit(roots);
+      surfaceFocus = desiredFocus;
+    });
   };
 
   const renderRuns = () => {
-    if (!runState || !runFrames) return;
-    const root = renderAgentRunsScreen(runState.runs, runState.selected);
-    runFrames.request([
-      ['del', 'run-picker'],
-      nodeAdd(root, RUNS_SURFACE_ID),
-    ]);
+    if (!runState || !runFrames || !runReconciler) return;
+    const roots = [renderAgentRunsScreen(runState.runs, runState.selected)];
+    const ops = runReconciler.diff(roots) as unknown[][];
+    runFrames.request(ops, () => runReconciler?.commit(roots));
   };
 
   const closeAgentRuns = () => {
     runState = undefined;
     runFrames = undefined;
+    runReconciler = undefined;
     pickerKeyBuffer = '';
     clearTimeout(escapeFlush);
     escapeFlush = undefined;
@@ -492,6 +486,7 @@ async function main(): Promise<void> {
       runState = { runs, selected: 0 };
       pickerKeyBuffer = '';
       runFrames = new FrameSender(RUNS_SURFACE_ID, apcLimit, credits);
+      runReconciler = new TspSurfaceReconciler(RUNS_SURFACE_ID);
       process.stdout.write(
         encodeTspJson(
           'o',
@@ -506,7 +501,7 @@ async function main(): Promise<void> {
         ),
       );
       runsSurfaceOpened = true;
-      runFrames.request([nodeAdd(renderAgentRunsScreen(runs, 0), RUNS_SURFACE_ID)]);
+      renderRuns();
     } catch (error: any) {
       const status = error?.response?.status;
       errorText = status === 401 || status === 403
@@ -1234,6 +1229,7 @@ async function main(): Promise<void> {
           // dismissed it externally). Do not send an x for something already gone.
           runState = undefined;
           runFrames = undefined;
+          runReconciler = undefined;
           runsSurfaceOpened = false;
           pickerKeyBuffer = '';
           break;
@@ -1243,7 +1239,8 @@ async function main(): Promise<void> {
           // Tern no longer has the inline surface. Re-open from canonical AgentWeb
           // state with a fresh frame sequence, matching the SDK's gone recovery.
           frames = new FrameSender(SURFACE_ID, apcLimit, credits);
-          rendered = false;
+          reconciler = new TspSurfaceReconciler(SURFACE_ID);
+          surfaceFocus = undefined;
           process.stdout.write(
             encodeTspJson(
               'o',
@@ -1263,8 +1260,13 @@ async function main(): Promise<void> {
 
         // Node-level eviction: replay only the affected surface from canonical
         // application state. Our renderer sends complete region replacements.
-        if (event.sf === RUNS_SURFACE_ID) renderRuns();
-        else render();
+        if (event.sf === RUNS_SURFACE_ID) {
+          runReconciler?.forget(ids);
+          renderRuns();
+        } else {
+          reconciler.forget(ids);
+          render();
+        }
         break;
       }
       case 'error':
