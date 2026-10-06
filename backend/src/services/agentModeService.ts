@@ -6687,7 +6687,13 @@ export class AgentModeService {
 
     // Add virtual other_skills if allowed, there are unassociated tools, AND it's not already installed
     if (!associatedSet.has(OTHER_SKILLS_VIRTUAL_ID) && (isWildcard || allowedSet.has(OTHER_SKILLS_VIRTUAL_ID))) {
-      const unassociatedTools = this.getUnassociatedTools(publishedSkills);
+      // ENG-2299: scope to subscription-reachable skills only — see buildSkillContext's
+      // matching comment for why an unreachable tier's skill must not steal a tool out
+      // of this user's __other_skills__ catch-all.
+      const reachablePublishedSkills = isWildcard
+        ? publishedSkills
+        : publishedSkills.filter(s => allowedSet.has(s.skillId));
+      const unassociatedTools = this.getUnassociatedTools(reachablePublishedSkills);
 
       if (unassociatedTools.length > 0) {
         const otherToolsDescription = unassociatedTools
@@ -7239,7 +7245,17 @@ export class AgentModeService {
 
     // Handle virtual other_skills (gated by subscription)
     if (sessionAssociatedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID) && (isWildcard || allowedSkillSet.has(OTHER_SKILLS_VIRTUAL_ID))) {
-      const unassociatedTools = this.getUnassociatedTools(publishedSkills);
+      // ENG-2299: `publishedSkills` is the full, shared, multi-tenant catalog —
+      // it also contains skills from subscription tiers this user can never
+      // install. A skill this user cannot reach must not be able to claim a
+      // tool out of the shared __other_skills__ catch-all on their behalf, or
+      // tool availability silently varies with other orgs'/tiers' published
+      // skills instead of this session's own entitlements (same class of bug
+      // ENG-1237 fixed for unpublished skills, here for unreachable ones).
+      const reachablePublishedSkills = isWildcard
+        ? publishedSkills
+        : publishedSkills.filter(s => allowedSkillSet.has(s.skillId));
+      const unassociatedTools = this.getUnassociatedTools(reachablePublishedSkills);
       unassociatedTools.forEach(t => allowedToolNames.add(t.name));
     }
 
