@@ -30,6 +30,7 @@ import {
   creativeDirReadyPatch,
   creativeDirStartPatch,
   CreativeDirResult,
+  CreativeDirStatusFields,
   sanitizeCreativeDirResult,
 } from "./creativeDirStatusService";
 import {
@@ -274,15 +275,39 @@ export async function triggerCreativeDirForUser(
 }
 
 /**
+ * Guards the non-running -> `running` transition with a DynamoDB
+ * ConditionExpression (ENG-2308) — same race as the icp/competitor axes: a
+ * plain read-then-write here lets two concurrent callers both observe a
+ * non-running status and both win, launching two fully parallel LLM calls.
+ */
+const CREATIVE_DIR_START_CLAIM_CONDITION = {
+  expression:
+    "attribute_not_exists(#creativeDirStatus) OR #creativeDirStatus <> :creativeDirRunning",
+  names: { "#creativeDirStatus": "creativeDirStatus" },
+  values: { ":creativeDirRunning": "running" },
+};
+
+/**
  * Synchronous entry point for routes — flips status to `running` and
- * launches background work. Returns once the start patch has been
- * persisted so the route can return the running snapshot.
+ * launches background work. Returns the persisted start patch, or `null`
+ * if a concurrent caller already claimed this run (ENG-2308) — callers
+ * must NOT launch a second background generation in that case.
  */
 export async function startCreativeDirForUser(
   userId: string,
   deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
-): Promise<void> {
-  await userDb.updateUser(userId, creativeDirStartPatch() as any);
+): Promise<CreativeDirStatusFields | null> {
+  const patch = creativeDirStartPatch();
+  try {
+    await userDb.updateUser(userId, patch as any, {
+      condition: CREATIVE_DIR_START_CLAIM_CONDITION,
+    });
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") {
+      return null;
+    }
+    throw err;
+  }
   // Eager DAG sub-task 2: orchestrator owns step ordering for opted-in
   // users; cheap no-op gated inside the orchestrator for everyone else.
   // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -295,7 +320,8 @@ export async function startCreativeDirForUser(
     | null;
   if (isEagerPipelineActiveFor(current)) {
     void reconcileForUser(userId);
-    return;
+    return patch;
   }
   void triggerCreativeDirForUser(userId, deps);
+  return patch;
 }

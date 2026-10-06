@@ -1242,6 +1242,25 @@ export async function triggerAdImageGenerationForUser(
 }
 
 /**
+ * Guards the non-running -> `running` claim with a DynamoDB
+ * ConditionExpression (ENG-2308) — same race as the icp/competitor/
+ * creative-dir/ad-copy axes: two concurrent claims (the legacy route and
+ * the eager-orchestrator's `runAdImage`, or two overlapping `/ad-image/start`
+ * calls) can each mint a nonce and launch a real Gemini generation before
+ * either one's completion-time ownership check (`axisOwnershipCondition`,
+ * ENG-792) ever runs — that check only stops a stale run from PUBLISHING
+ * over a newer one, it does not stop a stale run from being launched at all.
+ * Making the claim itself atomic closes that gap instead of leaving it to a
+ * best-effort early read in the worker.
+ */
+const AD_IMAGE_START_CLAIM_CONDITION = {
+  expression:
+    "attribute_not_exists(#adImageStatus) OR #adImageStatus <> :adImageRunning",
+  names: { "#adImageStatus": "adImageStatus" },
+  values: { ":adImageRunning": "running" },
+};
+
+/**
  * Claim the ad-image axis for a NEW run: mint the run's identity, publish it,
  * and hand it back so the caller can pass it to the worker it is about to
  * launch.
@@ -1251,12 +1270,25 @@ export async function triggerAdImageGenerationForUser(
  * ITSELF — it adopts whichever run the record names at read time, so two
  * overlapping starts both adopt the later nonce, both pass the conditional
  * terminal write, and each can overwrite the other's result (Greptile).
+ *
+ * Returns `null` when a concurrent caller already claimed a run that is
+ * still `running` (ENG-2308) — callers must NOT launch a second worker in
+ * that case.
  */
 export async function claimAdImageRun(
   userId: string,
-): Promise<AdImageRunIdentity> {
+): Promise<AdImageRunIdentity | null> {
   const startPatch = adImageStartPatch();
-  await userDb.updateUser(userId, startPatch as any);
+  try {
+    await userDb.updateUser(userId, startPatch as any, {
+      condition: AD_IMAGE_START_CLAIM_CONDITION,
+    });
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") {
+      return null;
+    }
+    throw err;
+  }
   return {
     runId: startPatch.adImageRunId,
     startedAt: startPatch.adImageStartedAt,
@@ -1265,7 +1297,9 @@ export async function claimAdImageRun(
 
 /**
  * Synchronous entry point for routes — flips status to `running` and
- * launches background work.
+ * launches background work. Returns the claimed run identity, or `null` if
+ * a concurrent caller already claimed this run (ENG-2308) — callers must
+ * NOT launch a second background worker in that case.
  */
 export async function startAdImageGenerationForUser(
   userId: string,
@@ -1276,8 +1310,9 @@ export async function startAdImageGenerationForUser(
     // because this function is the thing that mints it.
     verifyLogoUrl?: (logoUrl: string) => Promise<boolean>;
   } = {}
-): Promise<void> {
+): Promise<AdImageRunIdentity | null> {
   const run = await claimAdImageRun(userId);
+  if (!run) return null;
   // Eager DAG sub-task 2: orchestrator owns step ordering for opted-in
   // users; cheap no-op gated inside the orchestrator for everyone else.
   // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -1290,7 +1325,8 @@ export async function startAdImageGenerationForUser(
     | null;
   if (isEagerPipelineActiveFor(current)) {
     void reconcileForUser(userId);
-    return;
+    return run;
   }
   void triggerAdImageGenerationForUser(userId, { ...deps, run });
+  return run;
 }

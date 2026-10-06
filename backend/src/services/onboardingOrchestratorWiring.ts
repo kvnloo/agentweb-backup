@@ -162,6 +162,15 @@ async function runAdImage(userId: string): Promise<unknown> {
   // whatever the record names when it reads — two overlapping eager starts
   // would then share one nonce and could overwrite each other (Greptile).
   const run = await claimAdImageRun(userId);
+  if (!run) {
+    // Lost the claim (ENG-2308) — a concurrent caller (the legacy route, or
+    // another reconcile pass) already owns a `running` run for this axis.
+    // This invocation contributed nothing, which is not a failure of ITS
+    // run — return whatever is currently persisted rather than launching a
+    // second worker or throwing.
+    const current = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
+    return current?.adImageResult ?? null;
+  }
   await triggerAdImageGenerationForUser(userId, { run });
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
   // Covers all three ad-image gates: missing logo, unfetchable logo, and

@@ -34,6 +34,7 @@ import {
   adCopyReadyPatch,
   adCopyStartPatch,
   AdCopyResult,
+  AdCopyStatusFields,
   AdCopyVariant,
 } from "./adCopyStatusService";
 import {
@@ -442,14 +443,39 @@ export async function triggerAdCopyForUser(
 }
 
 /**
+ * Guards the non-running -> `running` transition with a DynamoDB
+ * ConditionExpression (ENG-2308) — same race as the icp/competitor axes: a
+ * plain read-then-write here lets two concurrent callers both observe a
+ * non-running status and both win, launching two fully parallel LLM calls.
+ */
+const AD_COPY_START_CLAIM_CONDITION = {
+  expression:
+    "attribute_not_exists(#adCopyStatus) OR #adCopyStatus <> :adCopyRunning",
+  names: { "#adCopyStatus": "adCopyStatus" },
+  values: { ":adCopyRunning": "running" },
+};
+
+/**
  * Synchronous entry point for routes — flips status to `running` and
- * launches background work.
+ * launches background work. Returns the persisted start patch, or `null`
+ * if a concurrent caller already claimed this run (ENG-2308) — callers
+ * must NOT launch a second background generation in that case.
  */
 export async function startAdCopyForUser(
   userId: string,
   deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
-): Promise<void> {
-  await userDb.updateUser(userId, adCopyStartPatch() as any);
+): Promise<AdCopyStatusFields | null> {
+  const patch = adCopyStartPatch();
+  try {
+    await userDb.updateUser(userId, patch as any, {
+      condition: AD_COPY_START_CLAIM_CONDITION,
+    });
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") {
+      return null;
+    }
+    throw err;
+  }
   // Eager DAG sub-task 2: orchestrator owns step ordering for opted-in
   // users; cheap no-op gated inside the orchestrator for everyone else.
   // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -462,7 +488,8 @@ export async function startAdCopyForUser(
     | null;
   if (isEagerPipelineActiveFor(current)) {
     void reconcileForUser(userId);
-    return;
+    return patch;
   }
   void triggerAdCopyForUser(userId, deps);
+  return patch;
 }

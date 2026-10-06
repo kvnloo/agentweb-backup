@@ -331,9 +331,11 @@ router.post("/creative-dir/start", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    // startCreativeDirForUser applies creativeDirStartPatch synchronously and
-    // launches the background LLM call (fire-and-forget). The route returns
-    // the running snapshot immediately so the UI can poll /creative-dir/status.
+    // startCreativeDirForUser claims the non-running -> running transition
+    // with a DynamoDB ConditionExpression (ENG-2308) and launches the
+    // background LLM call (fire-and-forget) — or no-ops (returns null) if a
+    // concurrent caller already claimed it. Either way we re-read below, so
+    // the route returns the current snapshot regardless of which branch won.
     await startCreativeDirForUser(userId);
     const user = await userDb.getUserById(userId);
     const fallback = creativeDirStartPatch();
@@ -423,11 +425,12 @@ router.post("/ad-image/start", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    // startAdImageGenerationForUser applies adImageStartPatch synchronously
-    // and launches the background Brick 8 / Step 5 image-generation loop
-    // (Gemini Pro, 3 variants in parallel, per-variant timeout). The route
-    // returns the running snapshot immediately so the UI can poll
-    // /ad-image/status. The orchestrator gates on creativeDirStatus ===
+    // startAdImageGenerationForUser claims the run with a DynamoDB
+    // ConditionExpression (ENG-2308) and launches the background Brick 8 /
+    // Step 5 image-generation loop (Gemini Pro, 3 variants in parallel,
+    // per-variant timeout) — or no-ops (returns null) if a concurrent caller
+    // already claimed it, so we don't burn a second Gemini run. Either way
+    // we re-read below. The orchestrator gates on creativeDirStatus ===
     // 'ready' — if creative direction hasn't completed, it patches with
     // adImageFailedPatch and the UI surfaces the gating reason.
     await startAdImageGenerationForUser(userId);
@@ -512,11 +515,13 @@ router.post("/ad-copy/start", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    // startAdCopyForUser applies adCopyStartPatch synchronously and launches
-    // the background per-image LLM loop. The orchestrator gates on
-    // adImageStatus === 'ready' — until the image step ships, it will fail
-    // immediately. The route returns the running snapshot regardless so the
-    // UI can poll /ad-copy/status.
+    // startAdCopyForUser claims the non-running -> running transition with a
+    // DynamoDB ConditionExpression (ENG-2308) and launches the background
+    // per-image LLM loop — or no-ops (returns null) if a concurrent caller
+    // already claimed it. Either way we re-read below. The orchestrator
+    // gates on adImageStatus === 'ready' — until the image step ships, it
+    // will fail immediately. The route returns the running snapshot
+    // regardless so the UI can poll /ad-copy/status.
     await startAdCopyForUser(userId);
     const user = await userDb.getUserById(userId);
     const fallback = adCopyStartPatch();
