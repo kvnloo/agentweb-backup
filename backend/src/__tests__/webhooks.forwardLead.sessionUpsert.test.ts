@@ -106,7 +106,7 @@ describe('forward-lead session upsert (ENG-2312)', () => {
     expect(crmDb.getLeadByEmail).not.toHaveBeenCalled();
     const [listId, leadId, plan] = (crmDb.mergeSessionLeadEvent as jest.Mock).mock.calls[0];
     expect([listId, leadId]).toEqual(['L1', expectedId]);
-    expect(plan.monotonic).toMatchObject({ counterKey: 'eventCount', counter: 3 });
+    expect(plan.monotonic).toEqual([expect.objectContaining({ counterKey: 'eventCount', counter: 3 })]);
     expect(plan.customFields).toMatchObject({ dwellSec: 9, sessionId: SID });
     expect(JSON.stringify(plan)).not.toContain('forwardedAt');
   });
@@ -122,6 +122,16 @@ describe('forward-lead session upsert (ENG-2312)', () => {
   it('a counter sent as a numeric string is stored/compared as a number', async () => {
     await post(body({ customFields: { sessionId: SID, eventCount: '4' } }));
     expect(created().customFields.eventCount).toBe(4);
+  });
+
+  it('a clickCount sent as a numeric string is coerced too (CLICKS group guard)', async () => {
+    (crmDb.createLead as jest.Mock).mockRejectedValue(leadAlreadyExists());
+    await post(body({ customFields: { sessionId: SID, eventCount: '4', clickCount: '2', clickLog: ['a'] } }));
+    const [, , plan] = (crmDb.mergeSessionLeadEvent as jest.Mock).mock.calls[0];
+    expect(plan.monotonic).toEqual([
+      expect.objectContaining({ counterKey: 'eventCount', counter: 4 }),
+      expect.objectContaining({ counterKey: 'clickCount', counter: 2 }),
+    ]);
   });
 
   it('row deleted between the failed create and the merge: retries the create once', async () => {

@@ -122,6 +122,65 @@ describe('crmDb.mergeSessionLeadEvent', () => {
     expect(r).toMatchObject({ exists: true, guardApplied: false });
   });
 
+  it('two groups: each is its OWN conditional UpdateItem on its OWN counter; one stale group does not block the other', async () => {
+    updateSpy
+      .mockResolvedValueOnce({ Attributes: { customFields: {} } })     // scalars
+      .mockRejectedValueOnce(ccf('ConditionalCheckFailedException'))   // PROGRESS stale
+      .mockResolvedValueOnce({});                                      // CLICKS applied
+    const r = await crmDb.mergeSessionLeadEvent('list1', 'lead_1_abc', {
+      customFields: { name: 'n' },
+      monotonic: [
+        { counterKey: 'eventCount', counter: 2, fields: { eventCount: 2, lastEvent: 'play_start' } },
+        { counterKey: 'clickCount', counter: 1, fields: { clickCount: 1, system: 'reserved', 'a.b': 1 } },
+      ],
+    });
+    expect(updateSpy).toHaveBeenCalledTimes(3);
+    const [, progress, clicks] = updateSpy.mock.calls.map((c) => c[0]);
+    for (const g of [progress, clicks]) {
+      assertWellFormed(g);
+      expect(g.ConditionExpression).toBe(
+        'attribute_exists(#lid) AND (attribute_not_exists(#cf.#ctr) OR NOT attribute_type(#cf.#ctr, :numType) OR #cf.#ctr <= :ctr)');
+      expect(g.ExpressionAttributeValues).toMatchObject({ ':numType': 'N' });
+    }
+    expect(progress.ExpressionAttributeNames['#ctr']).toBe('eventCount');
+    expect(progress.ExpressionAttributeValues[':ctr']).toBe(2);
+    expect(clicks.ExpressionAttributeNames['#ctr']).toBe('clickCount');
+    expect(clicks.ExpressionAttributeValues[':ctr']).toBe(1);
+    expect(Object.values(clicks.ExpressionAttributeNames)).toEqual(expect.arrayContaining(['system', 'a.b']));
+    // a group's UpdateItem never carries another group's (or the scalars') fields
+    expect(JSON.stringify(progress)).not.toMatch(/clickCount|system|"name"/);
+    expect(JSON.stringify(clicks)).not.toMatch(/lastEvent|eventCount/);
+    expect(r).toMatchObject({ exists: true, guardApplied: true }); // any group applied
+  });
+
+  it('guardApplied is true when the FIRST group applied and a later one was stale', async () => {
+    updateSpy.mockResolvedValueOnce({ Attributes: {} }).mockResolvedValueOnce({}).mockRejectedValueOnce(ccf('ConditionalCheckFailedException'));
+    const r = await crmDb.mergeSessionLeadEvent('l', 'x', { monotonic: [
+      { counterKey: 'eventCount', counter: 2, fields: { eventCount: 2 } },
+      { counterKey: 'clickCount', counter: 1, fields: { clickCount: 1 } },
+    ] });
+    expect(r.guardApplied).toBe(true);
+  });
+
+  it('all groups stale => guardApplied false; no throw', async () => {
+    updateSpy.mockResolvedValueOnce({ Attributes: {} }).mockRejectedValue(ccf('ConditionalCheckFailedException'));
+    const r = await crmDb.mergeSessionLeadEvent('l', 'x', { monotonic: [
+      { counterKey: 'eventCount', counter: 1, fields: { eventCount: 1 } },
+      { counterKey: 'clickCount', counter: 1, fields: { clickCount: 1 } },
+    ] });
+    expect(updateSpy).toHaveBeenCalledTimes(3);
+    expect(r).toMatchObject({ exists: true, guardApplied: false, changed: false });
+  });
+
+  it('changed is detected from a later applied group (pre-image differs only in CLICKS)', async () => {
+    updateSpy.mockResolvedValueOnce({ Attributes: { customFields: { eventCount: 2, clickCount: 0 } } }).mockResolvedValue({});
+    const r = await crmDb.mergeSessionLeadEvent('l', 'x', { monotonic: [
+      { counterKey: 'eventCount', counter: 2, fields: { eventCount: 2 } },
+      { counterKey: 'clickCount', counter: 1, fields: { clickCount: 1 } },
+    ] });
+    expect(r.changed).toBe(true);
+  });
+
   it('row deleted meanwhile: exists=false and the journey write is not attempted', async () => {
     updateSpy.mockRejectedValueOnce(ccf('ConditionalCheckFailedException'));
     const r = await crmDb.mergeSessionLeadEvent('list1', 'lead_1_abc', {

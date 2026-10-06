@@ -28,6 +28,9 @@ dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 // Get table prefix based on NODE_ENV (defaults to empty string for production)
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
+/** One counter-guarded group of customFields for crmDb.mergeSessionLeadEvent. */
+type MonotonicPlan = { counterKey: string; counter: number; fields: Record<string, any> };
+
 // An 'in_progress' claimLeadStepOnce claim older than this is treated as
 // abandoned (its release write never landed) and becomes reclaimable — see
 // claimLeadStepOnce for the full reasoning (Greptile P1 on #2291, round 17).
@@ -9986,13 +9989,15 @@ export const crmDb = {
    *
    *   1. LAST-WRITE-WINS scalars: one document-path SET per key, `customFields.#k = :v`. Keys
    *      this event does not carry are never touched (key-union across events).
-   *   2. GUARDED group (`monotonic`): the cumulative journey. Each event carries the whole
-   *      journey so far, so an out-of-order OLDER event must not overwrite a newer one. It is
-   *      applied only if the stored counter is absent / not a number / <= the incoming one,
+   *   2. GUARDED groups (`monotonic`, one group or several): the cumulative journey / latest
+   *      state. An out-of-order OLDER event must not overwrite a newer one. Each group is
+   *      applied only if ITS stored counter is absent / not a number / <= the incoming one,
    *      as a ConditionExpression on the SAME UpdateItem that writes the group — the compare
    *      and the write are one atomic operation. A failed guard means "stale", not an error.
-   *      Scalars are a separate UpdateItem on purpose: a condition fails the whole item, and a
-   *      stale journey must not discard the event's other (newer) fields.
+   *      Scalars and every group are separate UpdateItems on purpose: a condition fails the
+   *      whole item, and a stale group must not discard the event's other (newer) fields —
+   *      including another group's (a click event overtaken by a later non-click one is stale
+   *      for the progress group but still the newest click data).
    *
    * Why not reuse setLeadFields: it first issues a bootstrap UpdateItem (a row created by
    * createLead always has a customFields map, so that round trip is waste), returns void
@@ -10016,8 +10021,8 @@ export const crmDb = {
       topLevelIfNotExists?: Record<string, any>;
       /** customFields keys, last-write-wins, one document-path SET each. */
       customFields?: Record<string, any>;
-      /** Cumulative group guarded by a numeric counter that must not go backwards. */
-      monotonic?: { counterKey: string; counter: number; fields: Record<string, any> };
+      /** Cumulative group(s), each guarded by its own numeric counter that must not go backwards. */
+      monotonic?: MonotonicPlan | MonotonicPlan[];
     },
   ): Promise<{ exists: boolean; changed: boolean; guardApplied: boolean | null }> {
     const tableName = `${TABLE_PREFIX}AW-Leads`;
@@ -10039,7 +10044,9 @@ export const crmDb = {
       console.warn(`[mergeSessionLeadEvent] ${listId}/${leadId}: ${scalars.length} customFields keys, merging first ${MAX_KEYS}`);
       scalars = scalars.slice(0, MAX_KEYS);
     }
-    const guarded = plan.monotonic ? clean(plan.monotonic.fields).slice(0, CHUNK_SIZE) : [];
+    const groups = (plan.monotonic ? (Array.isArray(plan.monotonic) ? plan.monotonic : [plan.monotonic]) : [])
+      .map((g) => ({ ...g, entries: clean(g.fields).slice(0, CHUNK_SIZE) }))
+      .filter((g) => g.entries.length > 0);
     const ts = new Date().toISOString();
 
     const run = async (params: any, label: string): Promise<any> => {
@@ -10099,14 +10106,15 @@ export const crmDb = {
       }
     }
 
-    // ── 2. guarded cumulative group
+    // ── 2. guarded cumulative groups, one conditional UpdateItem each
     let guardApplied: boolean | null = null;
-    if (plan.monotonic && guarded.length > 0) {
-      const { counterKey, counter } = plan.monotonic;
+    const appliedGroups: Array<Array<[string, any]>> = [];
+    for (const { counterKey, counter, entries } of groups) {
       const names: Record<string, string> = { '#lid': 'leadId', '#ua': 'updatedAt', '#cf': 'customFields', '#ctr': counterKey };
       const values: Record<string, any> = { ':ts': ts, ':ctr': counter, ':numType': 'N' };
       const sets: string[] = ['#ua = :ts'];
-      guarded.forEach(([k, v], i) => { names[`#g${i}`] = k; values[`:g${i}`] = v; sets.push(`#cf.#g${i} = :g${i}`); });
+      entries.forEach(([k, v], i) => { names[`#g${i}`] = k; values[`:g${i}`] = v; sets.push(`#cf.#g${i} = :g${i}`); });
+      let applied: boolean;
       try {
         await run({
           TableName: tableName, Key: key,
@@ -10120,11 +10128,14 @@ export const crmDb = {
           ExpressionAttributeNames: names,
           ExpressionAttributeValues: values,
         }, 'journey');
-        guardApplied = true;
+        applied = true;
       } catch (err: any) {
         if (err.code !== 'ConditionalCheckFailedException') throw err;
-        guardApplied = false; // stale event: a newer journey is already stored — correct, not an error
+        applied = false; // stale event: a newer value of this group is already stored — correct, not an error
       }
+      if (applied) appliedGroups.push(entries);
+      // true if ANY group applied; false only if every group was stale.
+      guardApplied = (guardApplied ?? false) || applied;
     }
 
     // ── change detection from the atomic pre-image (no extra read)
@@ -10132,7 +10143,7 @@ export const crmDb = {
     const oldCf = (before?.customFields && typeof before.customFields === 'object') ? before.customFields : {};
     let changed = false;
     for (const [k, v] of scalars) if (differs(oldCf[k], v)) { changed = true; break; }
-    if (!changed && guardApplied) for (const [k, v] of guarded) if (differs(oldCf[k], v)) { changed = true; break; }
+    if (!changed) for (const entries of appliedGroups) for (const [k, v] of entries) if (differs(oldCf[k], v)) { changed = true; break; }
     if (!changed) for (const [k, v] of topLevel) if (differs(before?.[k], v)) { changed = true; break; }
     return { exists: true, changed, guardApplied };
   },

@@ -98,14 +98,28 @@ describe('buildSessionMergePlan', () => {
     forwardedAt: '2026-01-01T00:00:00.000Z', source: 'api', domain: 'x.com', system: 'y',
   };
 
-  it('journey keys go under the eventCount guard; everything else is last-write-wins', () => {
-    const p = buildSessionMergePlan({ ...base, incomingCustomFields: cf });
-    expect(p.monotonic).toEqual({
-      counterKey: 'eventCount', counter: 7,
-      fields: { journey: 'a>b', eventCount: 7, clickLog: ['x'], clickCount: 1, showsClicked: ['s1'] },
+  it('default plan: PROGRESS under the eventCount guard, CLICKS under the clickCount guard; everything else last-write-wins', () => {
+    const p = buildSessionMergePlan({
+      ...base, incomingCustomFields: { ...cf, furthestStage: 'play_start', lastEvent: 'play_start', lastEp: 2, lastClickLabel: 'L', lastClickShow: 's', lastClickSection: 'h', lastClickUrl: 'u' },
     });
+    expect(p.monotonic).toEqual([
+      { counterKey: 'eventCount', counter: 7, fields: { journey: 'a>b', eventCount: 7, furthestStage: 'play_start', lastEvent: 'play_start', lastEp: 2 } },
+      { counterKey: 'clickCount', counter: 1,
+        fields: { clickLog: ['x'], clickCount: 1, showsClicked: ['s1'], lastClickLabel: 'L', lastClickShow: 's', lastClickSection: 'h', lastClickUrl: 'u' } },
+    ]);
     expect(Object.keys(p.customFields).sort()).toEqual(
       ['activeSec', 'channel', 'domain', 'dwellSec', 'maxScrollPct', 'system', 'videoWatchSec']);
+  });
+
+  it('a non-click event yields only the PROGRESS group (no empty CLICKS group)', () => {
+    const p = buildSessionMergePlan({ ...base, incomingCustomFields: { eventCount: 4, lastEvent: 'page_exit', dwellSec: 3 } });
+    expect(p.monotonic).toEqual([{ counterKey: 'eventCount', counter: 4, fields: { eventCount: 4, lastEvent: 'page_exit' } }]);
+  });
+
+  it('journeyKeys override (tracker ingest): ONE eventCount group, single-object shape, unchanged', () => {
+    const p = buildSessionMergePlan({ ...base, journeyKeys: ['journey', 'eventCount', 'clickLog', 'lastEvent'], incomingCustomFields: cf });
+    expect(p.monotonic).toEqual({ counterKey: 'eventCount', counter: 7, fields: { journey: 'a>b', eventCount: 7, clickLog: ['x'] } });
+    expect(p.customFields).toMatchObject({ clickCount: 1, showsClicked: ['s1'] });
   });
 
   it('never writes forwardedAt; writes source only if the caller named one', () => {
@@ -117,12 +131,20 @@ describe('buildSessionMergePlan', () => {
     }
   });
 
-  it('no usable numeric counter => no guard, journey keys degrade to last-write-wins (not dropped)', () => {
+  it('no usable numeric counter => that group is unguarded, its keys degrade to last-write-wins (not dropped)', () => {
     for (const ec of [undefined, 'x', NaN, null]) {
       const p = buildSessionMergePlan({ ...base, incomingCustomFields: { ...cf, eventCount: ec } });
-      expect(p.monotonic).toBeUndefined();
-      expect(p.customFields).toMatchObject({ journey: 'a>b', clickLog: ['x'] });
+      // PROGRESS has no counter; CLICKS (clickCount 1) is still guarded on its own counter
+      expect(p.monotonic).toEqual([{ counterKey: 'clickCount', counter: 1, fields: { clickLog: ['x'], clickCount: 1, showsClicked: ['s1'] } }]);
+      expect(p.customFields).toMatchObject({ journey: 'a>b' });
     }
+    for (const cc of [undefined, 'x', NaN, null]) {
+      const p = buildSessionMergePlan({ ...base, incomingCustomFields: { ...cf, clickCount: cc } });
+      expect(p.monotonic).toEqual([expect.objectContaining({ counterKey: 'eventCount', counter: 7 })]);
+      expect(p.customFields).toMatchObject({ clickLog: ['x'], showsClicked: ['s1'] });
+    }
+    const none = buildSessionMergePlan({ ...base, incomingCustomFields: { ...cf, eventCount: undefined, clickCount: undefined } });
+    expect(none.monotonic).toBeUndefined();
   });
 
   it('standard fields: non-empty only; attribution: lastTouch LWW, firstTouch/utm/clickIds/ids write-once', () => {
