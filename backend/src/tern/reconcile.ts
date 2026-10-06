@@ -104,7 +104,7 @@ function rising(sequence: readonly number[]): number[] {
 
 function diffNode(oldNode: TspNode, nextNode: TspNode, ops: TspOp[]): void {
   if (oldNode.k !== nextNode.k) {
-    throw new Error(\`TSP node kind changed without parent context: \${oldNode.id}\`);
+    throw new Error(`TSP node kind changed without parent context: ${oldNode.id}`);
   }
 
   const beforeProps = oldNode.p ?? {};
