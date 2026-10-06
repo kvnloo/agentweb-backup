@@ -24,6 +24,33 @@ export interface EmmaMessage {
   };
 }
 
+export interface EmmaApprovalOption {
+  id: string;
+  label: string;
+  consequence?: string;
+  recommended?: boolean;
+  why?: string;
+}
+
+export interface EmmaApprovalDeckItem {
+  itemId: string;
+  kind: string;
+  question: string;
+  options?: EmmaApprovalOption[];
+  allowFreeText?: boolean;
+  allowEmmaDecide?: boolean;
+  immutable?: boolean;
+  metaWriteManifestDigest?: string;
+}
+
+export interface EmmaPendingApprovalDeck {
+  deckId: string;
+  items: EmmaApprovalDeckItem[];
+  status: 'building' | 'awaiting' | 'answered';
+  createdAt: string;
+  finalizedAt?: string;
+}
+
 export interface EmmaSessionLike {
   sessionId: string;
   title?: string;
@@ -32,6 +59,7 @@ export interface EmmaSessionLike {
   createdAt?: string;
   updatedAt?: string;
   messages?: EmmaMessage[];
+  pendingApprovalDeck?: EmmaPendingApprovalDeck;
 }
 
 export interface RunningTool {
@@ -45,6 +73,19 @@ export interface SessionPickerState {
   query: string;
   cursor: number;
   selected: number;
+}
+
+export interface ApprovalDeckInboundAnswer {
+  itemId: string;
+  verdict: string;
+  freeText?: string;
+  delegated?: boolean;
+}
+
+export interface ApprovalDeckUiState {
+  itemIndex: number;
+  selectedVerdict?: string;
+  answers: ApprovalDeckInboundAnswer[];
 }
 
 function toolLabel(name: string): string {
@@ -394,4 +435,160 @@ export function renderSessionPicker(
 
 export function renderEmptyLayer(): TspNode {
   return { id: 'layer', k: 'col' };
+}
+
+
+function approvalChoices(item: EmmaApprovalDeckItem): Array<{
+  id: string;
+  label: string;
+  detail?: string;
+  recommended?: boolean;
+}> {
+  if (item.metaWriteManifestDigest) {
+    return [
+      { id: 'approve', label: 'Approve', detail: 'Apply this exact reviewed change.' },
+      { id: 'reject', label: 'Reject', detail: 'Do not apply this change.' },
+    ];
+  }
+
+  return (item.options ?? []).map(option => ({
+    id: option.id,
+    label: option.label,
+    ...(option.consequence ? { detail: option.consequence } : {}),
+    ...(option.recommended ? { recommended: true } : {}),
+  }));
+}
+
+export function approvalDeckIsAwaiting(
+  deck: EmmaPendingApprovalDeck | null | undefined,
+): deck is EmmaPendingApprovalDeck {
+  return !!deck && deck.status === 'awaiting' && Array.isArray(deck.items) && deck.items.length > 0;
+}
+
+export function approvalDeckAllAnswered(
+  deck: EmmaPendingApprovalDeck,
+  state: ApprovalDeckUiState,
+): boolean {
+  return deck.items.every(item => state.answers.some(answer => answer.itemId === item.itemId));
+}
+
+export function renderApprovalDeck(
+  deck: EmmaPendingApprovalDeck,
+  state: ApprovalDeckUiState,
+): TspNode {
+  const itemIndex = Math.max(0, Math.min(state.itemIndex, deck.items.length - 1));
+  const item = deck.items[itemIndex];
+  const choices = approvalChoices(item);
+  const existing = state.answers.find(answer => answer.itemId === item.itemId);
+  const selectedVerdict =
+    state.selectedVerdict
+    ?? existing?.verdict
+    ?? choices.find(choice => choice.recommended)?.id
+    ?? choices[0]?.id
+    ?? null;
+
+  const items = choices.map(choice => ({
+    id: choice.id,
+    label: choice.label,
+    ...(choice.detail ? { detail: choice.detail } : {}),
+    ...(choice.recommended
+      ? { badges: [{ text: 'recommended', tone: 'accent' }] }
+      : {}),
+  }));
+
+  const selectedChoice = choices.find(choice => choice.id === selectedVerdict);
+  const answeredCount = deck.items.filter(deckItem =>
+    state.answers.some(answer => answer.itemId === deckItem.itemId),
+  ).length;
+
+  const preview: TspNode[] = [
+    {
+      id: 'approval-preview.question',
+      k: 'md',
+      p: { text: item.question },
+    },
+    {
+      id: 'approval-preview.progress',
+      k: 'progress',
+      p: {
+        value: deck.items.length ? answeredCount / deck.items.length : 0,
+        label: `${answeredCount}/${deck.items.length} reviewed`,
+      },
+    },
+  ];
+
+  if (selectedChoice?.detail) {
+    preview.push({
+      id: 'approval-preview.detail',
+      k: 'section',
+      p: { head: selectedChoice.recommended ? 'Recommended' : 'What this means' },
+      c: [{
+        id: 'approval-preview.detail.body',
+        k: 'md',
+        p: { text: selectedChoice.detail },
+      }],
+    });
+  }
+
+  const option = item.options?.find(candidate => candidate.id === selectedVerdict);
+  if (option?.why) {
+    preview.push({
+      id: 'approval-preview.why',
+      k: 'section',
+      p: { head: 'Why Emma recommends this' },
+      c: [{
+        id: 'approval-preview.why.body',
+        k: 'md',
+        p: { text: option.why },
+      }],
+    });
+  }
+
+  const actions: Array<Record<string, unknown>> = [];
+  if (itemIndex > 0) actions.push({ id: 'prev', label: 'Previous', keys: ['left'] });
+  actions.push({
+    id: 'choose',
+    label: existing ? 'Update choice' : 'Choose',
+    keys: ['enter'],
+    primary: true,
+  });
+  if (item.allowEmmaDecide && !item.metaWriteManifestDigest) {
+    actions.push({ id: 'delegate', label: 'Let Emma decide', keys: ['d'] });
+  }
+
+  const allAnswered = approvalDeckAllAnswered(deck, state);
+  if (itemIndex < deck.items.length - 1) {
+    actions.push({ id: 'next', label: 'Next', keys: ['right'] });
+  } else if (allAnswered) {
+    actions.push({ id: 'submit', label: 'Submit review', keys: ['ctrl', 'enter'], primary: true });
+  }
+  actions.push({ id: 'close', label: 'Close', keys: ['esc'], end: true });
+
+  return {
+    id: 'layer',
+    k: 'col',
+    c: [{
+      id: 'approval-picker',
+      k: 'picker',
+      p: {
+        title: `Review ${itemIndex + 1} of ${deck.items.length}`,
+        subtitle: item.kind.replace(/_/g, ' '),
+        icon: item.metaWriteManifestDigest ? 'shield-check' : 'help-circle',
+        noun: item.metaWriteManifestDigest ? 'decisions' : 'options',
+        size: 'lg',
+        layout: 'cards',
+        preview: 'side',
+        query: null,
+        items,
+        order: items.map(choice => choice.id),
+        selected: selectedVerdict,
+        total: choices.length,
+        empty: 'No choices available',
+        actions,
+        state: 'ready',
+        message: item.immutable ? 'This choice may be irreversible.' : undefined,
+      },
+      c: preview,
+    }],
+  };
 }
