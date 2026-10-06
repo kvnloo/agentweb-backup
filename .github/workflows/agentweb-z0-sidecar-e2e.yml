@@ -1,0 +1,149 @@
+name: AgentWeb z0 Sidecar E2E
+
+on:
+  pull_request:
+    branches:
+      - lab/z0-backpressure-circuit-v1
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sidecar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout AgentWeb exact head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Checkout z0intelligence sidecar branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kvnloo/z0intelligence
+          ref: lab/agentweb-sidecar-deployment-v1
+          path: deps/z0intelligence
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Record exact heads
+        run: |
+          python - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          roots = {
+              "agentweb": ".",
+              "z0intelligence": "deps/z0intelligence",
+          }
+          heads = {
+              name: subprocess.check_output(
+                  ["git", "-C", path, "rev-parse", "HEAD"], text=True
+              ).strip()
+              for name, path in roots.items()
+          }
+          Path("/tmp/z0-sidecar-heads.json").write_text(
+              json.dumps(heads, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(heads, indent=2))
+          PY
+
+      - name: Install narrow dependencies
+        run: |
+          cd backend && npm ci
+          cd ..
+          python -m pip install pytest==8.4.2 typesafe-sdk==0.7.2
+
+      - name: Run sidecar contract suites
+        run: |
+          cd backend
+          node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit \
+            src/__tests__/experiments.z0SidecarDeployment.test.ts \
+            src/__tests__/experiments.z0SidecarRoutingGate.test.ts \
+            src/__tests__/experiments.z0BridgeBackpressure.test.ts \
+            src/__tests__/experiments.z0BridgeCapabilities.test.ts \
+            src/__tests__/experiments.z0Integration.test.ts
+          cd ..
+          PYTHONPATH="$GITHUB_WORKSPACE/deps/z0intelligence/src" python -m pytest -q \
+            deps/z0intelligence/tests/test_agentweb_sidecar_profile.py \
+            deps/z0intelligence/tests/test_agentweb_bridge_overload.py \
+            deps/z0intelligence/tests/test_agentweb_bridge_capabilities.py
+
+      - name: Start real z0 sidecar on loopback
+        env:
+          PYTHONPATH: ${{ github.workspace }}/deps/z0intelligence/src
+          Z0INT_HOME: /tmp/z0int-sidecar-home
+        run: |
+          mkdir -p "$Z0INT_HOME"
+          python -m z0int.intelligence_service --bind 127.0.0.1 --port 11501 > /tmp/z0int-sidecar.log 2>&1 &
+          echo $! > /tmp/z0int-sidecar.pid
+          python - <<'PY'
+          import time, urllib.request
+          url = "http://127.0.0.1:11501/healthz"
+          last = None
+          for _ in range(40):
+              try:
+                  with urllib.request.urlopen(url, timeout=1) as response:
+                      if response.status == 200:
+                          raise SystemExit(0)
+              except Exception as exc:
+                  last = exc
+                  time.sleep(.25)
+          raise SystemExit(f"z0 sidecar did not become healthy: {last}")
+          PY
+
+      - name: Run exact-head sidecar startup study
+        working-directory: backend
+        env:
+          Z0INT_SERVICE_URL: http://127.0.0.1:11501
+        run: |
+          npx ts-node src/scripts/run-z0-sidecar-study.ts /tmp/z0-sidecar-study.json
+          cat /tmp/z0-sidecar-study.json
+
+      - name: Verify loopback-only startup evidence
+        run: |
+          python - <<'PY'
+          import json
+          result = json.load(open("/tmp/z0-sidecar-study.json"))
+          assert result["schema"] == "z0eval.agentweb_sidecar_startup_e2e.v1"
+          assert result["base_url"] == "http://127.0.0.1:11501"
+          assert result["cached_same_object"] is True
+          assert "agentweb.z0.bridge.v1" in result["bridge_protocol_versions"]
+          assert result["public_wildcard_supported"] is False
+          assert result["graceful_drain_supported"] is True
+          assert result["credentials_required"] is False
+          assert result["queue_policy"] == "reject_excess"
+          assert result["overload_execution"] == "not_started"
+          assert result["overload_execution_header"] == "X-Z0-Execution"
+          PY
+
+      - name: Stop z0 sidecar
+        if: always()
+        run: |
+          if test -f /tmp/z0int-sidecar.pid; then
+            kill "$(cat /tmp/z0int-sidecar.pid)" || true
+          fi
+          cat /tmp/z0int-sidecar.log || true
+
+      - name: Upload sidecar evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentweb-z0-sidecar-e2e
+          path: |
+            /tmp/z0-sidecar-heads.json
+            /tmp/z0-sidecar-study.json
+            /tmp/z0int-sidecar.log
