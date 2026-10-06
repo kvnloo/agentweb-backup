@@ -1885,7 +1885,7 @@ export async function processHubspotWebhookJob(payload: HubspotJobPayload): Prom
               // row (a concurrent create won). Throwing would abandon every remaining list and
               // contact in this job; adopt the row and apply the event as an update below.
               if (!createErr?.duplicateEmail || !createErr.existingLead) throw createErr;
-              lead = createErr.existingLead;
+              lead = createErr.existingLead as Record<string, any>;
               if (lead.email) delete fields.email;
               console.log(`[HubSpot Webhook] Lead for ${email} already existed in list ${list.listId} (lost create race) — updating ${lead.leadId}`);
             }

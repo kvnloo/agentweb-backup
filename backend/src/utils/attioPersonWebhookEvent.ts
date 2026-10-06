@@ -200,7 +200,7 @@ export async function applyAttioPersonEvent(
       // concurrent create won in between. Adopt that row and apply this event as an update
       // instead of failing the event (which marks the whole sync run failed).
       if (!createErr?.duplicateEmail || !createErr.existingLead) throw createErr;
-      lead = createErr.existingLead;
+      lead = createErr.existingLead as Record<string, any>;
       console.log(`[AttioWebhook] Lead for recordId=${recordId} already existed in list ${listId} (lost create race) — updating ${lead.leadId}`);
     }
   }
