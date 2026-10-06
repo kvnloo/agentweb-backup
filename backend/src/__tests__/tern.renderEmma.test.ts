@@ -311,7 +311,11 @@ describe('Tern Emma renderer', () => {
     }], 0);
 
     expect(screen).toMatchObject({
-      id: 'run-picker',
+      id: 'main',
+      k: 'col',
+    });
+    const runPicker = flatten(screen).find(node => node.id === 'run-picker');
+    expect(runPicker).toMatchObject({
       k: 'picker',
       p: { size: 'screen', selected: 'run-1' },
     });
@@ -359,7 +363,7 @@ describe('Tern Emma renderer', () => {
     });
     expect(flatten(reject).find(node => node.id === 'approval-note')).toMatchObject({
       k: 'input',
-      p: { text: 'Use a lower budget.', sendable: false },
+      p: { text: 'Use a lower budget.', sendable: true },
     });
   });
 
