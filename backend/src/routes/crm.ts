@@ -23,6 +23,7 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { suppressLeadSideEffects } from '../utils/sessionList';
 import { isValidLeadLifecycle, LEAD_LIFECYCLES, isLeadListType, type LeadListType } from '../utils/leadSchema';
 import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValidation';
@@ -2124,9 +2125,12 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
       leadData.syncMetadata = { ...(leadData.syncMetadata || {}), syncStatus: 'sync_pending' };
     }
 
-    const lead = await crmDb.createLead(listId, leadData);
+    // ENG-2311: session lists are telemetry — no CRM push, sequence enrolment or paid
+    // email validation for their rows. Flag only added when true (other lists unchanged).
+    const suppressSideEffects = suppressLeadSideEffects(list);
+    const lead = await crmDb.createLead(listId, suppressSideEffects ? { ...leadData, suppressSideEffects: true } : leadData);
 
-    void Promise.allSettled([
+    if (!suppressSideEffects) void Promise.allSettled([
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'hubspot', 'created'),
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'attio', 'created'),
       autoEnrollLeadInSequences(userId, listId, (lead as any).leadId, {
@@ -2860,7 +2864,8 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
 
     const updatedLead = await crmDb.updateLead(listId, leadId, updateData);
 
-    void Promise.allSettled([
+    // ENG-2311: no CRM push for a session-list row (see utils/sessionList.ts).
+    if (!suppressLeadSideEffects(list)) void Promise.allSettled([
       externalCrmSyncService.autoSyncLead(userId, listId, updatedLead, 'hubspot', 'updated'),
       externalCrmSyncService.autoSyncLead(userId, listId, updatedLead, 'attio', 'updated'),
     ]);

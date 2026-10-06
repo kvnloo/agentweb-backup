@@ -6390,6 +6390,11 @@ export const crmDb = {
     // fails with `leadAlreadyExists` instead of spawning a duplicate lead.
     leadId?: string;
     failIfExists?: boolean;
+    /** ENG-2311: set by a caller that has ALREADY loaded the list and found it to be a session
+     *  list (utils/sessionList.ts). Skips the attribution.first_touch event-log write — one
+     *  synthetic-contact timeline entry per visit. Never derive it from request input.
+     *  (Slack lead notifications are gated separately, in orgLeadNotificationService.) */
+    suppressSideEffects?: boolean;
   }) {
     try {
       const leadId = leadData.leadId?.trim() || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -6587,7 +6592,7 @@ export const crmDb = {
       // Attribution event — fire once per Lead when any attribution signal is
       // captured. Dedupe via sourceRecordId (`attribution:lead:{leadId}`) so
       // retries on the same lead create a single row.
-      if (leadData.firstTouch) {
+      if (leadData.firstTouch && !leadData.suppressSideEffects) {
         const contactId = emailValue || `nocontact:${leadId}`;
         try {
           await contactEventsDb.logEvent({
