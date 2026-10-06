@@ -22,9 +22,14 @@ teardown. To point the exact same suite at an already-running Atem/test
 environment, set `E2E_PARTNER_URL`.
 
 CI is an **advisory parallel signal** while this lane incubates. It follows the
-upstream CI guidance: compatible Node, Chromium + system dependencies, JUnit
-and JSON reports, failure artifacts, one-failure cutoff, no telemetry, no
-model credentials.
+upstream v0.17 CI guidance: compatible Node, Chromium + system dependencies,
+JUnit and JSON reports, failure artifacts, one-failure cutoff, no telemetry,
+and no model credentials.
+
+The package pins the currently published compatible pair:
+`e2e@0.17.0` + `@e2e-dev/web@0.12.0`. Upstream `main` is already
+developing the next unreleased versions, so this lane does not depend on those
+until they are published and validated.
 
 ## Provenance
 

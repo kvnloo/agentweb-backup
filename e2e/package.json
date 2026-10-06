@@ -7,8 +7,8 @@
     "test:ci": "e2e run --reporter list,junit --max-failures 1"
   },
   "devDependencies": {
-    "@e2e-dev/web": "0.13.0",
-    "e2e": "0.18.0"
+    "@e2e-dev/web": "0.12.0",
+    "e2e": "0.17.0"
   },
   "engines": {
     "node": "^22.22.3 || >=24.8.0"

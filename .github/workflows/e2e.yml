@@ -49,8 +49,8 @@ jobs:
         continue-on-error: true
         run: npm ci --prefix partner-portal --no-audit --no-fund
 
-      # Exact direct versions match current tester-army/e2e main. This isolated
-      # incubating package intentionally does not mutate AgentWeb's app lockfiles.
+      # Pin the latest published compatible pair. tester-army/e2e main may be
+      # ahead of npm while the next release is being prepared.
       - name: Install TesterArmy runner
         id: install_e2e
         continue-on-error: true
