@@ -26,14 +26,18 @@ export interface AgentWebClientOptions {
 
 export class AgentWebClient {
   private readonly http: AxiosInstance;
+  private readonly baseUrl: string;
+  private readonly token: string;
   private readonly runsToken?: string;
   private readonly runsSecret?: string;
 
   constructor(options: AgentWebClientOptions) {
+    this.baseUrl = options.baseUrl.replace(/\/$/, '');
+    this.token = options.token;
     this.runsToken = options.runsToken;
     this.runsSecret = options.runsSecret;
     this.http = axios.create({
-      baseURL: options.baseUrl.replace(/\/$/, ''),
+      baseURL: this.baseUrl,
       headers: {
         Authorization: `Bearer ${options.token}`,
         Accept: 'application/json',
@@ -66,13 +70,20 @@ export class AgentWebClient {
   }
 
   async getAgentRuns(sessionId: string, limit = 3): Promise<AgentRunSummaryLike[]> {
-    const headers: Record<string, string> = {};
-    if (this.runsSecret) headers['x-aw-agent-runs-secret'] = this.runsSecret;
-    else if (this.runsToken) headers.Authorization = `Bearer ${this.runsToken}`;
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (this.runsSecret) {
+      // Secret-authenticated requests intentionally do NOT carry the normal
+      // Emma bearer token; the backend's narrow gate treats the secret as the
+      // complete credential for this single read-only route.
+      headers['x-aw-agent-runs-secret'] = this.runsSecret;
+    } else {
+      headers.Authorization = `Bearer ${this.runsToken ?? this.token}`;
+    }
 
-    const response = await this.http.get('/api/admin/agent-runs', {
+    const response = await axios.get(`${this.baseUrl}/api/admin/agent-runs`, {
       params: { sessionId, limit },
-      ...(Object.keys(headers).length ? { headers } : {}),
+      headers,
+      timeout: 0,
     });
     const runs = response.data?.runs;
     return Array.isArray(runs) ? runs as AgentRunSummaryLike[] : [];
