@@ -592,7 +592,10 @@ export async function applyDedupe(
       //    name; top-level fill uses ifNotExists so it can never overwrite.
       if (Object.keys(group.topLevelWrites).length > 0) {
         await crmDb.setLeadFields(req.listId, group.keeper.leadId, {
-          topLevel: group.topLevelWrites,
+          // setLeadFields types topLevel as Record<string,string>, but values are passed
+          // straight to the DocumentClient, so objects (firstTouch/clickIds) persist as
+          // Maps, not strings (verified against dynamodb-local).
+          topLevel: group.topLevelWrites as Record<string, string>,
           ifNotExists: true,
         });
       }
