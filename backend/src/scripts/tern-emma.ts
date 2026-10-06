@@ -184,6 +184,15 @@ async function main(): Promise<void> {
     throw new Error(`Tern is missing required TSP kinds: ${missingKinds.join(', ')}`);
   }
 
+  const requiredFeatures = ['edit', 'send'];
+  const helloFeatures = hello.features ?? [];
+  const missingFeatures = requiredFeatures.filter(feature => !helloFeatures.includes(feature));
+  if (missingFeatures.length > 0) {
+    process.stdin.setRawMode?.(false);
+    process.stdin.pause();
+    throw new Error(`Tern is missing required TSP features: ${missingFeatures.join(', ')}`);
+  }
+
   const apcLimit = typeof hello.apc === 'number'
     ? hello.apc
     : TSP_DEFAULT_APC_LIMIT;
