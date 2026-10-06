@@ -870,15 +870,21 @@ describe("POST /api/onboarding/icp/regenerate-one", () => {
     expect(regenerateSingleIcpForUser).not.toHaveBeenCalled();
   });
 
-  // ENG-2308 review follow-up: this write was unconditional, the exact same
-  // race /icp/start had — two concurrent regenerate-one clicks (same card
-  // double-clicked, or one card while another is still running) would both
-  // win, both launch a real LLM call, and race on which completion lands
-  // last. Guarded with the identical ConditionExpression /icp/start uses.
-  it("claims the running transition with the same ConditionExpression /icp/start uses", async () => {
+  // ENG-255 / ENG-2308 review: a follow-up briefly guarded this write with
+  // the same global icpStatus ConditionExpression /icp/start uses, on the
+  // theory that it was "the exact same race". It wasn't — regenerate-one's
+  // concurrency unit is the PERSONA, not the user, and two different cards
+  // regenerating at once is a real, tested, intentional flow (the FE fires
+  // regenerate-one per card independently; see
+  // BrandReview.test.tsx's "ENG-255: concurrent regenerations do not clear
+  // each other's spinners"). Guarding on the global flag silently dropped
+  // the second card's request. Caught in review before merge; this test
+  // locks the regression in so it can't come back the same way.
+  it("ENG-255: fires even while icpStatus is already running from a different card's in-flight regeneration", async () => {
     userDb.getUserById.mockResolvedValue({
       userId: "user-1",
-      icpStatus: "ready",
+      icpStatus: "running",
+      icpStartedAt: "2026-04-24T12:00:00.000Z",
       icpResult: goodPersonas,
     });
     userDb.updateUser.mockResolvedValue({});
@@ -888,37 +894,10 @@ describe("POST /api/onboarding/icp/regenerate-one", () => {
       .send({ icpId: "icp-1" });
 
     expect(res.status).toBe(200);
-    const options = userDb.updateUser.mock.calls[0][2];
-    expect(options?.condition?.expression).toBe(
-      "attribute_not_exists(#icpStatus) OR #icpStatus <> :icpRunning OR #icpStartedAt <= :icpStaleBefore",
-    );
     expect(regenerateSingleIcpForUser).toHaveBeenCalledTimes(1);
-  });
-
-  it("returns the in-flight snapshot and does not regenerate when it loses the claim race", async () => {
-    userDb.getUserById.mockResolvedValue({
-      userId: "user-1",
-      icpStatus: "running",
-      icpStartedAt: "2026-04-24T12:00:00.000Z",
-      icpResult: goodPersonas,
-    });
-    const conditionalFailure = Object.assign(
-      new Error("The conditional request failed"),
-      { code: "ConditionalCheckFailedException" },
-    );
-    // Once, not persistent: a persistent rejection here would leak into
-    // every later test in this file that calls userDb.updateUser (jest's
-    // clearAllMocks in beforeEach clears call history, not implementations).
-    userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
-
-    const res = await request(app)
-      .post("/api/onboarding/icp/regenerate-one")
-      .send({ icpId: "icp-1" });
-
-    expect(res.status).toBe(200);
-    expect(res.body.status.icpStatus).toBe("running");
-    expect(res.body.status.inFlight).toBe(true);
-    expect(regenerateSingleIcpForUser).not.toHaveBeenCalled();
+    expect(regenerateSingleIcpForUser).toHaveBeenCalledWith("user-1", 1);
+    // Plain unconditional write — no ConditionExpression option at all.
+    expect(userDb.updateUser.mock.calls[0][2]).toBeUndefined();
   });
 });
 
