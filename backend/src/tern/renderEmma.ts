@@ -824,7 +824,7 @@ export function renderApprovalDeck(
       p: {
         title: `Review ${itemIndex + 1} of ${deck.items.length}`,
         subtitle: item.kind.replace(/_/g, ' '),
-        icon: item.metaWriteManifestDigest ? 'shield-check' : 'help-circle',
+        icon: item.metaWriteManifestDigest ? 'shield' : 'question',
         noun: item.metaWriteManifestDigest ? 'decisions' : 'options',
         size: 'lg',
         layout: 'cards',
