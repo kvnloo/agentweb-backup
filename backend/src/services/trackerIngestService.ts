@@ -1,7 +1,7 @@
 import { upsertSessionLead } from './sessionUpsertService';
 import { buildSessionRow, type ParsedIngest } from '../utils/trackingIngest';
 import { resolveClientIdentity } from '../utils/clientIdentity';
-import { SESSION_JOURNEY_KEYS, isSessionList } from '../utils/sessionList';
+import { SESSION_JOURNEY_KEYS, isSessionList, sessionLeadId } from '../utils/sessionList';
 import { matchRoutingRules } from '../utils/trackingConfig';
 import { crmDb } from './db';
 
@@ -57,12 +57,21 @@ export async function ingestTrackerEvent(input: {
   // resolveClientIdentity drops IP and UA together when the caller is not a browser (see its doc comment).
   const identity = resolveClientIdentity(userAgent, visitorIp);
 
-  const write = (listId: string): Promise<unknown> => {
+  const write = async (listId: string): Promise<unknown> => {
+    // ENG-2324: a substituted start (device clock unusable) advances once a day, at the session's own phase,
+    // and a session that outlived the device start's window lives under the old one. If the session already
+    // has a row under one of the candidate starts, keep writing THERE: exact-key consistent reads, only for
+    // substituted sessions, so a normal event pays nothing extra.
+    let sessionIdentity = parsed.identity;
+    for (const startMs of parsed.identity.probeStartsMs ?? []) {
+      const candidate = { sessionId: sessionIdentity.sessionId, sessionStartMs: startMs };
+      if (await crmDb.getLeadById(listId, sessionLeadId(listId, candidate), { consistentRead: true })) { sessionIdentity = candidate; break; }
+    }
     // One object per target: the upsert normalises the counter in place.
-    const customFields = { ...built.customFields, forwardedAt: nowIso };
+    const customFields = { ...built.customFields, sessionStartMs: sessionIdentity.sessionStartMs, forwardedAt: nowIso };
     return upsertSessionLead({
       listId,
-      identity: parsed.identity,
+      identity: sessionIdentity,
       leadData: {
         firstName: '', lastName: '', phone: '', company: '', title: '', notes: '', linkedin: '',
         ...(identity.clientIp ? { clientIp: identity.clientIp } : {}),

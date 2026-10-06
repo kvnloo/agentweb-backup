@@ -5,10 +5,10 @@
 import { crmDb } from '../db';
 import { ingestTrackerEvent } from '../trackerIngestService';
 import { parseIngestBody } from '../../utils/trackingIngest';
-import { sessionLeadId } from '../../utils/sessionList';
+import { sessionLeadId, SESSION_START_GENERATION_MS } from '../../utils/sessionList';
 
 jest.mock('../db', () => ({
-  crmDb: { getLeadListById: jest.fn(), createLead: jest.fn(), mergeSessionLeadEvent: jest.fn() },
+  crmDb: { getLeadListById: jest.fn(), getLeadById: jest.fn(), createLead: jest.fn(), mergeSessionLeadEvent: jest.fn() },
 }));
 
 const NOW = Date.now();
@@ -136,5 +136,51 @@ describe('child failure isolation', () => {
       return { ...d };
     });
     await expect(ingest(IG)).rejects.toThrow('parent write failed');
+  });
+});
+
+describe('ENG-2324: substituted session start', () => {
+  const skewed = () => parsed(IG, { sessionStartMs: NOW + 3 * 24 * 3600_000 });
+  const run = () => ingestTrackerEvent({ list: parent(ROUTING), parsed: skewed(), userAgent: CHROME, visitorIp: '' });
+
+  it('first event: no row under the previous generation -> creates under the current one, on every target', async () => {
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue(null);
+    await run();
+    const cur = skewed().identity;
+    for (const [listId, d] of (crmDb.createLead as jest.Mock).mock.calls) {
+      expect(d.leadId).toBe(sessionLeadId(listId, { sessionId: SID, sessionStartMs: cur.sessionStartMs }));
+      expect(d.customFields.sessionStartMs).toBe(cur.sessionStartMs);
+    }
+    // the probe is an exact-key CONSISTENT read of the previous generation's id, per target
+    expect((crmDb.getLeadById as jest.Mock).mock.calls).toContainEqual(
+      ['list_parent_001', sessionLeadId('list_parent_001', { sessionId: SID, sessionStartMs: cur.probeStartsMs![0] }), { consistentRead: true }]);
+  });
+
+  it('the session already has its row under the previous generation -> keeps writing THERE (no second row after the daily advance)', async () => {
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue({ leadId: 'exists' });
+    (crmDb.createLead as jest.Mock).mockRejectedValue(Object.assign(new Error('exists'), { leadAlreadyExists: true }));
+    await run();
+    const prevStart = skewed().identity.probeStartsMs![0];
+    expect(prevStart).toBe(skewed().identity.sessionStartMs - SESSION_START_GENERATION_MS);
+    // the stored sessionStartMs follows the row actually written, not the current generation
+    const planned = JSON.stringify((crmDb.mergeSessionLeadEvent as jest.Mock).mock.calls.map((c) => c[2]));
+    expect(planned).toContain(`"sessionStartMs":${prevStart}`);
+    expect(planned).not.toContain(`"sessionStartMs":${skewed().identity.sessionStartMs}`);
+    for (const [listId, leadId] of (crmDb.mergeSessionLeadEvent as jest.Mock).mock.calls.map((c) => [c[0], c[1]])) {
+      expect(leadId).toBe(sessionLeadId(listId, { sessionId: SID, sessionStartMs: prevStart }));
+    }
+  });
+
+  it('a normal in-window session never reads the probe', async () => {
+    await ingest(IG);
+    expect(crmDb.getLeadById).not.toHaveBeenCalled();
+  });
+
+  it('a probe failure fails the parent (500 upstream) and is isolated for a child, like any write', async () => {
+    (crmDb.getLeadById as jest.Mock).mockImplementation(async (l: string) => { if (l === 'list_child_paid') throw new Error('throttled'); return null; });
+    const r = await ingestTrackerEvent({ list: parent(ROUTING), parsed: parsed(PAID, { sessionStartMs: NOW + 3 * 24 * 3600_000 }), userAgent: CHROME, visitorIp: '' });
+    expect(r.childFailures).toEqual(['list_child_paid']);
+    (crmDb.getLeadById as jest.Mock).mockRejectedValue(new Error('throttled'));
+    await expect(run()).rejects.toThrow('throttled');
   });
 });
