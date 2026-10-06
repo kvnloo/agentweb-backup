@@ -1,5 +1,5 @@
 import axios, { AxiosInstance } from 'axios';
-import type { EmmaSessionLike } from './renderEmma';
+import type { ApprovalDeckInboundAnswer, EmmaSessionLike } from './renderEmma';
 
 export type EmmaStreamEvent =
   | { type: 'tool_start'; name: string }
@@ -53,6 +53,32 @@ export class AgentWebClient {
       { params: { portal: 'customer' } },
     );
     return response.data as EmmaSessionLike;
+  }
+
+  async submitApprovalDeck(
+    session: EmmaSessionLike,
+    deckId: string,
+    answers: ApprovalDeckInboundAnswer[],
+  ): Promise<EmmaSessionLike> {
+    const delegated = answers.length > 0 && answers.every(answer => answer.delegated === true);
+    const approved = answers.filter(answer => answer.verdict === 'approve').length;
+    const rejected = answers.filter(answer => answer.verdict === 'reject').length;
+    const label = delegated
+      ? 'Let Emma decide'
+      : `Reviewed ${answers.length} item${answers.length === 1 ? '' : 's'}${approved || rejected ? ` — ${approved} approved, ${rejected} rejected` : ''}`;
+
+    await this.http.post('/api/agent-mode/generate', {
+      sessionId: session.sessionId,
+      userMessage: label,
+      llmModel: session.llmModel,
+      attachments: [],
+      deckAnswer: {
+        deckId,
+        answers,
+      },
+    });
+
+    return this.getSession(session.sessionId);
   }
 
   async streamMessage(
