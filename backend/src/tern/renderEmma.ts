@@ -56,6 +56,8 @@ export interface EmmaSessionLike {
   title?: string;
   llmModel?: string;
   sessionType?: string;
+  pageIdentifier?: string;
+  previewText?: string;
   createdAt?: string;
   updatedAt?: string;
   messages?: EmmaMessage[];
@@ -499,7 +501,9 @@ export function renderEmmaDock(options: {
 
 function firstUserMessage(session: EmmaSessionLike): string {
   const message = (session.messages ?? []).find(item => item.role === 'user' && item.content?.trim());
-  return message?.content?.replace(/\s+/g, ' ').trim() ?? '';
+  return message?.content?.replace(/\s+/g, ' ').trim()
+    || session.previewText?.replace(/\s+/g, ' ').trim()
+    || '';
 }
 
 function sessionLabel(session: EmmaSessionLike): string {
@@ -539,6 +543,7 @@ export function filterSessions(
       session.title,
       session.llmModel,
       session.sessionType,
+      session.pageIdentifier,
       firstUserMessage(session),
     ].filter(Boolean).join(' ').toLowerCase();
     return tokens.every(token => text.includes(token));
