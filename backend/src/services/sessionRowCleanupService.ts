@@ -589,15 +589,14 @@ export async function applyDedupe(
       );
 
       // 3. Atomic per-key writes to the keeper. setLeadFields escapes every attribute
-      //    name; top-level fill uses ifNotExists so it can never overwrite.
+      //    name. The top-level fill uses a per-key CONDITIONAL write that replaces the attribute
+      //    only when it is absent, '' or NULL: the plan fills a keeper's BLANK attribute, which
+      //    if_not_exists would leave in place (verification below would then fail, no donor would
+      //    be deleted and every preview would repeat the plan), and an unconditional SET could
+      //    overwrite a value a concurrent writer put there after the fingerprint read. Values are
+      //    passed straight to the DocumentClient, so objects (firstTouch/clickIds) persist as Maps.
       if (Object.keys(group.topLevelWrites).length > 0) {
-        await crmDb.setLeadFields(req.listId, group.keeper.leadId, {
-          // setLeadFields types topLevel as Record<string,string>, but values are passed
-          // straight to the DocumentClient, so objects (firstTouch/clickIds) persist as
-          // Maps, not strings (verified against dynamodb-local).
-          topLevel: group.topLevelWrites as Record<string, string>,
-          ifNotExists: true,
-        });
+        await crmDb.setLeadTopLevelIfBlank(req.listId, group.keeper.leadId, group.topLevelWrites);
       }
       if (Object.keys(group.customFieldsWrites).length > 0) {
         await crmDb.setLeadFields(req.listId, group.keeper.leadId, {
