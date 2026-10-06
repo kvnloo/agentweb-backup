@@ -9,6 +9,7 @@ import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
 import { parsePendingKinds } from '../utils/metaConversionPending';
 import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, extractDomainFromEmail, defaultStatusConfigFor, isValidLeadLifecycle, LeadImportRowOutcome, type LeadListType } from "../utils/leadSchema";
+import type { TrackingConfig } from "../utils/trackingConfig";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
@@ -5333,7 +5334,11 @@ export const crmDb = {
     // auto-created default list at once) can't create duplicates. A caller
     // that loses the race gets a ConditionalCheckFailedException and should
     // fetch the winner's record via getLeadListById instead.
-    explicitListId?: string
+    explicitListId?: string,
+    // ENG-2315: attributes that must be present from the FIRST write (a tracker list that exists
+    // without its config would be momentarily public-but-unconfigured, or configured-but-private,
+    // and a second write can fail between the two). Narrow on purpose: not a generic spread.
+    initialAttributes?: { publicAccessEnabled?: boolean; displayFields?: string[]; trackingConfig?: TrackingConfig }
   ) {
     try {
       const listId = explicitListId ?? `list_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -5365,6 +5370,9 @@ export const crmDb = {
           statusConfig: statusConfig || defaultStatusConfigFor(listType),
           ...(listType ? { listType } : {}),
           ...(isSystemManaged ? { isSystemManaged: true } : {}),
+          ...(initialAttributes?.publicAccessEnabled !== undefined ? { publicAccessEnabled: initialAttributes.publicAccessEnabled } : {}),
+          ...(initialAttributes?.displayFields ? { displayFields: initialAttributes.displayFields } : {}),
+          ...(initialAttributes?.trackingConfig ? { trackingConfig: initialAttributes.trackingConfig } : {}),
         },
       };
 
@@ -5569,6 +5577,8 @@ export const crmDb = {
        *  field entirely leaves the relay matching by name, as it did before. */
       conversionMapping?: { qualifiedStatus?: string | null } | null;
       listType?: LeadListType;
+      /** ENG-2315: tracker config of a session list (allowed origins, page label, ENG-2316 routing). */
+      trackingConfig?: TrackingConfig;
       syncConfig?: {
         platform: 'hubspot' | 'attio';
         accountId: string;
@@ -5721,6 +5731,12 @@ export const crmDb = {
         expressionAttributeNames['#listType'] = 'listType';
         updateExpressions.push('#listType = :listType');
         expressionAttributeValues[':listType'] = updates.listType;
+      }
+
+      if (updates.trackingConfig !== undefined) {
+        expressionAttributeNames['#trackingConfig'] = 'trackingConfig';
+        updateExpressions.push('#trackingConfig = :trackingConfig');
+        expressionAttributeValues[':trackingConfig'] = updates.trackingConfig;
       }
 
       if (updates.syncConfig !== undefined) {

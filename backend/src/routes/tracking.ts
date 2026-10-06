@@ -8,12 +8,26 @@
  * Pure and non-persisting: both handlers only call utils/trafficSource.ts and utils/taggedLink.ts.
  * No DynamoDB, no outbound requests, nothing stored — a link is a string we hand back.
  *
+ * ENG-2315 adds the owner-facing "enable tracking" API on the same router:
+ *
+ *   POST /api/tracking/session-lists                     create a session list + its tracker config, return the embed tag
+ *   PUT  /api/tracking/session-lists/:listId/config      update allowedOrigins / pageLabel of a session list
+ *
  * Auth is the ordinary user JWT (authenticateToken), applied inside this router so a future mount
  * cannot forget it. Deliberately NOT admin-only: the portal user is the one building their links.
  * The taxonomy is not tenant data, so no org/ownership scoping applies.
  */
 import express, { Request, Response } from 'express';
-import { authenticateToken } from '../middleware/auth';
+import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
+import { crmDb } from '../services/db';
+import { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } from '../services/crmAccessControl';
+import { isSessionList } from '../utils/sessionList';
+import {
+  normalizeAllowedOrigins,
+  normalizePageLabel,
+  TrackingConfigError,
+  type TrackingConfig,
+} from '../utils/trackingConfig';
 import { getTrafficTaxonomy } from '../utils/trafficSource';
 import {
   buildTaggedLink,
@@ -56,6 +70,117 @@ router.post('/tagged-links', (req: Request, res: Response): void => {
     }
     console.error('tracking tagged-links error:', (err as Error)?.message ?? err);
     res.status(500).json({ message: 'Failed to build tagged link' });
+  }
+});
+
+// ─── ENG-2315: enable tracking ──────────────────────────────────────────────────────────
+
+/** Columns a session list shows by default (customFields keys written by the ingest). */
+export const SESSION_LIST_DISPLAY_FIELDS = [
+  'channel', 'trafficType', 'channelGroup', 'sourceDetail', 'dwellSec', 'lastEvent', 'furthestStage', 'visitNo',
+];
+
+export function buildEmbedSnippet(listId: string): string {
+  const base = (process.env.BACKEND_URL || 'https://api.agentweb.pro').replace(/\/+$/, '');
+  return `<script src="${base}/sdk/v1/aw.js" data-aw-list="${listId}" async></script>`;
+}
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+
+/** Unknown keys are a 400, not ignored: a typo like "allowedOrigin" must not silently leave the list deny-all. */
+function rejectUnknownKeys(body: Record<string, unknown>, allowed: string[]): void {
+  for (const k of Object.keys(body)) {
+    if (!allowed.includes(k)) throw new TrackingConfigError('unknown_field', `unknown field "${k}"`);
+  }
+}
+
+function sendConfigError(res: Response, err: unknown, label: string): void {
+  if (err instanceof TrackingConfigError) {
+    res.status(400).json({ code: err.code, message: err.message });
+    return;
+  }
+  console.error(`${label}:`, (err as Error)?.message ?? err);
+  res.status(500).json({ message: 'Failed to update tracking configuration' });
+}
+
+router.post('/session-lists', async (req: Request, res: Response): Promise<void> => {
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  if (!userId) {
+    res.status(401).json({ message: 'Unauthorized' });
+    return;
+  }
+  try {
+    const body = req.body;
+    if (!isPlainObject(body)) throw new TrackingConfigError('invalid_body', 'JSON object body required');
+    rejectUnknownKeys(body, ['name', 'allowedOrigins', 'pageLabel']);
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    if (!name || name.length > 100) throw new TrackingConfigError('invalid_name', 'name is required (at most 100 characters)');
+    const allowedOrigins = normalizeAllowedOrigins(body.allowedOrigins);
+    // A session list with no origin allows no browser at all; creating one that way is never what was meant.
+    if (allowedOrigins.length === 0) throw new TrackingConfigError('origins_required', 'at least one allowed origin is required');
+    const pageLabel = normalizePageLabel(body.pageLabel);
+
+    const trackingConfig: TrackingConfig = { allowedOrigins, ...(pageLabel ? { pageLabel } : {}) };
+    const list = await crmDb.createLeadList(
+      userId, name, '',
+      [],              // alertEvents: a session row is telemetry, never an owner alert
+      null, false, undefined, undefined, undefined,
+      'session',
+      true,            // isSystemManaged
+      undefined,
+      // publicAccessEnabled from the first write: the SDK posts anonymously, and ingest refuses a list without it.
+      { publicAccessEnabled: true, displayFields: SESSION_LIST_DISPLAY_FIELDS, trackingConfig },
+    );
+    res.status(201).json({ list, trackingConfig, embedSnippet: buildEmbedSnippet(list.listId) });
+  } catch (err) {
+    sendConfigError(res, err, 'tracking create session list error');
+  }
+});
+
+router.put('/session-lists/:listId/config', async (req: Request, res: Response): Promise<void> => {
+  const userId = (req as AuthenticatedRequest).user?.userId;
+  if (!userId) {
+    res.status(401).json({ message: 'Unauthorized' });
+    return;
+  }
+  try {
+    const list = await crmDb.getLeadListById(req.params.listId);
+    if (!list) {
+      res.status(404).json({ message: 'Lead list not found' });
+      return;
+    }
+    // canDestructiveCrmList = list owner, org owner or a listed CRM editor, regardless of the org's
+    // crm sharing toggle: exactly the gate PUT /api/crm/lists/:listId uses for list settings. This
+    // config decides which sites may write rows into the list, so it is edit-level (canAccessCrmList
+    // is read-level and would let any org viewer widen the allow-list).
+    if (!(await canDestructiveCrmList(userId, list))) {
+      res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
+      return;
+    }
+    if (!isSessionList(list)) {
+      res.status(400).json({ code: 'not_session_list', message: 'Tracking can only be configured on a session list' });
+      return;
+    }
+
+    const body = req.body;
+    if (!isPlainObject(body)) throw new TrackingConfigError('invalid_body', 'JSON object body required');
+    rejectUnknownKeys(body, ['allowedOrigins', 'pageLabel']);
+    if (Object.keys(body).length === 0) throw new TrackingConfigError('empty_update', 'nothing to update');
+
+    const current: Partial<TrackingConfig> = (list as any).trackingConfig && typeof (list as any).trackingConfig === 'object' ? (list as any).trackingConfig : {};
+    const next: TrackingConfig = {
+      ...current,
+      allowedOrigins: body.allowedOrigins !== undefined ? normalizeAllowedOrigins(body.allowedOrigins) : (Array.isArray(current.allowedOrigins) ? current.allowedOrigins : []),
+    };
+    if (body.pageLabel !== undefined) {
+      const label = normalizePageLabel(body.pageLabel);
+      if (label) next.pageLabel = label; else delete next.pageLabel;
+    }
+
+    const updated = await crmDb.updateLeadList(list.listId, { trackingConfig: next });
+    res.json({ trackingConfig: (updated as any)?.trackingConfig ?? next, embedSnippet: buildEmbedSnippet(list.listId) });
+  } catch (err) {
+    sendConfigError(res, err, 'tracking update config error');
   }
 });
 

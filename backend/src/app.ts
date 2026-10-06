@@ -124,6 +124,8 @@ import onboardingVariantsRoutes from "./routes/onboardingVariants";
 import loopEventsRoutes from "./routes/loopEvents";
 import humanEvalRoutes from "./routes/humanEval";
 import trackingRoutes from "./routes/tracking";
+import trackIngestRoutes, { trackBodyParser } from "./routes/trackIngest";
+import sdkRouter from "./routes/trackSdk";
 import { registerAiEvalFunnelForProduction } from "./loops/instances/ai-eval-funnel";
 import { registerAiReadinessFunnel } from "./loops/instances/ai-readiness-funnel";
 import { checkFinalizeGuardMisconfiguration, registerAgentModeLoop } from "./loops/instances/agent-mode";
@@ -310,6 +312,10 @@ app.use((req, res, next) => {
   // Check if this is a public endpoint that needs open CORS
   if (req.path.match(/^\/api\/tasks\/[^\/]+\/subscribers\/join$/) ||
       req.path.startsWith('/api/lead-magnet/') ||
+      // ENG-2315: the tracker SDK and its ingest are called from visitors' browsers on any customer
+      // domain. Origins are enforced per list inside the route (trackingConfig.allowedOrigins), not here.
+      req.path === '/api/track/event' ||
+      req.path.startsWith('/sdk/v1/') ||
       req.path.startsWith('/batch-review/')) {
     // Allow all origins for public endpoints
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -353,6 +359,9 @@ app.use("/api/webhooks/whatsapp", express.raw({ type: "application/json" }));
 // no raw Buffer (auth is a plain shared header, not an HMAC over the body), so
 // force JSON parsing regardless of the declared content-type instead.
 app.use("/api/webhooks/unipile", express.json({ type: () => true, limit: "1mb" }));
+// ENG-2315: public tracker ingest. Its own 16kb parser must run before the global 50mb one below
+// (body-parser skips a request whose body is already parsed).
+app.use("/api/track/event", ...trackBodyParser);
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());
@@ -519,6 +528,9 @@ app.use("/api/human-eval", humanEvalRoutes);
 // ENG-2313: traffic-source taxonomy + tagged-link generator. Pure, no persistence; the router
 // applies authenticateToken itself (user auth, not admin).
 app.use("/api/tracking", trackingRoutes);
+// ENG-2315: public (unauthenticated) tracker ingest + SDK. Distinct prefix from /api/tracking above, which is user-auth.
+app.use("/api/track", trackIngestRoutes);
+app.use("/sdk/v1", sdkRouter);
 
 // Register closed-loop instances with production impls. The route handlers
 // look up loop manifests from LOOP_REGISTRY; the cron in server.ts invokes

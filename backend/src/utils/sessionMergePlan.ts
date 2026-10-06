@@ -21,6 +21,10 @@ export function buildSessionMergePlan(input: {
   leadData: Record<string, any>;
   incomingCustomFields: Record<string, any>;
   callerSuppliedSource: boolean;
+  /** The guarded group. Defaults to SESSION_JOURNEY_KEYS (forward-lead); the tracker ingest widens it
+   *  with its own "latest state" keys (lastEvent, furthestStage, ...) so an out-of-order older event
+   *  cannot regress them either. */
+  journeyKeys?: readonly string[];
   touch?: { utm?: { source?: string; medium?: string }; clickIds?: unknown } & Record<string, any> | null;
 }): {
   topLevel: Record<string, any>;
@@ -29,6 +33,7 @@ export function buildSessionMergePlan(input: {
   monotonic?: { counterKey: string; counter: number; fields: Record<string, any> };
 } {
   const { leadData, incomingCustomFields, callerSuppliedSource, touch } = input;
+  const journeyKeys = input.journeyKeys ?? SESSION_JOURNEY_KEYS;
 
   const topLevel: Record<string, any> = {};
   // Non-empty only, like the existing merge paths. `linkedin` and `email` are deliberately not
@@ -58,7 +63,7 @@ export function buildSessionMergePlan(input: {
     if (v === undefined) continue;
     if (k === 'forwardedAt') continue;
     if (k === 'source' && !callerSuppliedSource) continue;
-    if (SESSION_JOURNEY_KEYS.includes(k)) journey[k] = v;
+    if (journeyKeys.includes(k)) journey[k] = v;
     else customFields[k] = v;
   }
 
