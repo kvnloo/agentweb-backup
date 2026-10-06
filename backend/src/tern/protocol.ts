@@ -7,8 +7,11 @@
  * business logic to OMP.
  */
 const APC = '\x1b_';
+const OSC = '\x1b]';
+const BEL = '\x07';
 const ST = '\x1b\\';
 export const TSP_PREFIX = `${APC}tsp;`;
+export const TSP_OSC_PREFIX = `${OSC}877;tsp;`;
 export const TSP_VERSION = 1;
 export const TSP_DEFAULT_APC_LIMIT = 65_536;
 
@@ -153,8 +156,21 @@ export function encodeHelloQuery(app = 'agentweb-emma'): string {
 const PARAM_PATTERN = /^[A-Za-z0-9_-]+=[\x21-\x3a\x3c-\x7e]*$/;
 
 export function splitTspMessage(sequence: string): TspRawMessage | null {
-  if (!sequence.startsWith(TSP_PREFIX) || !sequence.endsWith(ST)) return null;
-  const inner = sequence.slice(TSP_PREFIX.length, -ST.length);
+  const prefix = sequence.startsWith(TSP_PREFIX)
+    ? TSP_PREFIX
+    : sequence.startsWith(TSP_OSC_PREFIX)
+      ? TSP_OSC_PREFIX
+      : null;
+  if (!prefix) return null;
+
+  const terminator = sequence.endsWith(ST)
+    ? ST
+    : sequence.endsWith(BEL)
+      ? BEL
+      : null;
+  if (!terminator) return null;
+
+  const inner = sequence.slice(prefix.length, -terminator.length);
   let semi = inner.indexOf(';');
   if (semi <= 0) {
     return semi === -1 && inner.length > 0
@@ -196,6 +212,22 @@ function partialPrefixSuffix(text: string, prefix: string): number {
   return 0;
 }
 
+function tspPrefixAt(text: string): { at: number; prefix: string } | null {
+  const apc = text.indexOf(TSP_PREFIX);
+  const osc = text.indexOf(TSP_OSC_PREFIX);
+  if (apc < 0 && osc < 0) return null;
+  if (apc >= 0 && (osc < 0 || apc <= osc)) return { at: apc, prefix: TSP_PREFIX };
+  return { at: osc, prefix: TSP_OSC_PREFIX };
+}
+
+function terminatorAt(text: string, from: number): { at: number; length: number } | null {
+  const st = text.indexOf(ST, from);
+  const bel = text.indexOf(BEL, from);
+  if (st < 0 && bel < 0) return null;
+  if (st >= 0 && (bel < 0 || st <= bel)) return { at: st, length: ST.length };
+  return { at: bel, length: BEL.length };
+}
+
 export class TspStreamReader {
   private buffer = '';
   private chunks = new Map<string, string>();
@@ -212,25 +244,28 @@ export class TspStreamReader {
     };
 
     for (;;) {
-      const start = this.buffer.indexOf(TSP_PREFIX);
-      if (start === -1) {
-        const hold = partialPrefixSuffix(this.buffer, TSP_PREFIX);
+      const found = tspPrefixAt(this.buffer);
+      if (!found) {
+        const hold = Math.max(
+          partialPrefixSuffix(this.buffer, TSP_PREFIX),
+          partialPrefixSuffix(this.buffer, TSP_OSC_PREFIX),
+        );
         const rawEnd = this.buffer.length - hold;
         emitRaw(this.buffer.slice(0, rawEnd));
         this.buffer = this.buffer.slice(rawEnd);
         break;
       }
 
-      if (start > 0) {
-        emitRaw(this.buffer.slice(0, start));
-        this.buffer = this.buffer.slice(start);
+      if (found.at > 0) {
+        emitRaw(this.buffer.slice(0, found.at));
+        this.buffer = this.buffer.slice(found.at);
       }
 
-      const end = this.buffer.indexOf(ST, TSP_PREFIX.length);
-      if (end === -1) break;
+      const end = terminatorAt(this.buffer, found.prefix.length);
+      if (!end) break;
 
-      const sequence = this.buffer.slice(0, end + ST.length);
-      this.buffer = this.buffer.slice(end + ST.length);
+      const sequence = this.buffer.slice(0, end.at + end.length);
+      this.buffer = this.buffer.slice(end.at + end.length);
       const raw = splitTspMessage(sequence);
       if (!raw) continue;
 
