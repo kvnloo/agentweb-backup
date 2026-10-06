@@ -555,8 +555,8 @@ function buildSEOPipeline(
 
   // 4. Active
   const activeSources = userData.status === "ok"
-    ? [safeSource("Token Usage (current month)", userData.data.activeUsers)]
-    : [errorSource("Token Usage", "Failed to fetch usage data")];
+    ? [safeSource("Active Users (last activity in period)", userData.data.activeUsers)]
+    : [errorSource("Active Users", "Failed to fetch user data")];
   stages.push(makeStage("Active", userData.data.activeUsers, userData.previousData.activeUsers, userData.data.newUsers, activeSources));
 
   // 5. Paid
