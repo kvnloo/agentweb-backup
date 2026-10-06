@@ -80,12 +80,16 @@ export async function run({ fetchImpl = fetch, password = process.env.QA_USER_PA
   } finally {
     const leaked = [];
     for (const id of created) {
-      let r;
+      let status = "no-response";
       for (let t = 0; t < 3; t++) {
-        r = await call("DELETE", `/api/user-skills/${id}`, token);
-        if ([200, 204, 404].includes(r.status)) break;
+        try {
+          status = (await call("DELETE", `/api/user-skills/${id}`, token)).status;
+        } catch (e) {
+          status = `error(${e?.message ?? e})`;
+        }
+        if ([200, 204, 404].includes(status)) break;
       }
-      if (![200, 204, 404].includes(r.status)) { leaked.push(`${id}:${r.status}`); log(`cleanup failed: ${id} → ${r.status}`); }
+      if (![200, 204, 404].includes(status)) { leaked.push(`${id}:${status}`); log(`cleanup failed: ${id} → ${status}`); }
     }
     if (leaked.length) throw new Error(`FAIL: fixture cleanup failed (${leaked.join(", ")})`);
   }

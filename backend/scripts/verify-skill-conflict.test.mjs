@@ -53,3 +53,17 @@ test("fails closed when fixture is not QA-owned and touches nothing else", async
 test("requires a password", async () => {
   await assert.rejects(run({ fetchImpl: async () => { throw new Error("no"); }, password: "", log: () => {} }), /PASSWORD/);
 });
+
+test("a rejected cleanup DELETE is retried and later fixtures are still cleaned", async () => {
+  let deletes = 0;
+  const { fetchImpl, calls } = mk({ route: (m, p) => {
+    if (m !== "DELETE") return reply(200);
+    deletes++;
+    if (deletes === 1) return reply(409); // in-race delete -> conflict
+    if (deletes === 2) throw new Error("network reset");
+    return reply(204);
+  } });
+  const r = await run({ fetchImpl, password: "x", attempts: 3, log: () => {} });
+  assert.equal(r.conflict, 1);
+  assert.ok(calls.filter((c) => c === "DELETE /api/user-skills/s1").length >= 3);
+});
