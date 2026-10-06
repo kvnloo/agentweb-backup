@@ -44,7 +44,7 @@ function usage(message?: string): never {
   process.exit(1);
 }
 
-function isHello(value: Record<string, unknown>): value is unknown & HelloReply {
+function isHello(value: Record<string, unknown>): value is Record<string, unknown> & HelloReply {
   return value.r === 'hello'
     && typeof value.v === 'number'
     && typeof value.term === 'string'
