@@ -357,14 +357,16 @@ describe('ENG-982: responses are high-signal', () => {
   beforeEach(() => jest.clearAllMocks());
 
   it('emma_get_account_status returns named fields, not the raw /me payload', async () => {
-    mockMcpFetch.mockResolvedValueOnce({
-      email: 'a@b.com',
-      subscriptionType: 'Starter',
-      hasBrandGuidelines: true,
-      tokenUsage: { totalTokens: 10 },
-      passwordHash: 'SHOULD NOT LEAK',
-      sessionVersion: 3,
-    });
+    mockMcpFetch
+      .mockResolvedValueOnce({
+        email: 'a@b.com',
+        subscriptionType: 'Starter',
+        hasBrandGuidelines: true,
+        tokenUsage: { totalTokens: 999 }, // the raw legacy counter must NOT be what is reported
+        passwordHash: 'SHOULD NOT LEAK',
+        sessionVersion: 3,
+      })
+      .mockResolvedValueOnce({ totalTokens: 10 }); // /api/subscription/usage
 
     const res: any = await tool('emma_get_account_status').execute({}, CALLER);
     const body = JSON.parse(res.content[0].text);
@@ -377,6 +379,21 @@ describe('ENG-982: responses are high-signal', () => {
     });
     // Passing the raw record through would hand internal fields to any caller.
     expect(res.content[0].text).not.toContain('passwordHash');
+  });
+
+  it('emma_get_account_status still reports the account when the usage lookup fails', async () => {
+    mockMcpFetch
+      .mockResolvedValueOnce({ email: 'a@b.com', subscriptionType: 'Starter', hasBrandGuidelines: true })
+      .mockRejectedValueOnce(new Error('usage down'));
+
+    const res: any = await tool('emma_get_account_status').execute({}, CALLER);
+
+    expect(JSON.parse(res.content[0].text)).toEqual({
+      email: 'a@b.com',
+      plan: 'Starter',
+      is_onboarded: true,
+      usage: null,
+    });
   });
 
   it('emma_find_leads reports how many matched instead of making the agent count', async () => {
