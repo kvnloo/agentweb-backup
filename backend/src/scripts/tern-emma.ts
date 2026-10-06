@@ -30,6 +30,24 @@ import {
 const SURFACE_ID = 'agentweb-emma';
 const RUNS_SURFACE_ID = 'agentweb-runs';
 const DA1 = '\x1b[c';
+const PASTE_ON = '\x1b[?2004h';
+const PASTE_OFF = '\x1b[?2004l';
+const KITTY_PUSH = '\x1b[>1u';
+const KITTY_POP = '\x1b[<u';
+
+let terminalModesArmed = false;
+
+function armTerminalModes(): void {
+  if (terminalModesArmed) return;
+  process.stdout.write(PASTE_ON + KITTY_PUSH);
+  terminalModesArmed = true;
+}
+
+function restoreTerminalModes(): void {
+  if (!terminalModesArmed) return;
+  process.stdout.write(KITTY_POP + PASTE_OFF);
+  terminalModesArmed = false;
+}
 
 interface HelloReply {
   r: 'hello';
@@ -271,6 +289,7 @@ async function main(): Promise<void> {
         encodeTspJson('x', { id: SURFACE_ID, keep: false }),
       );
     }
+    restoreTerminalModes();
     process.stdin.setRawMode?.(false);
     process.stdin.pause();
     process.exit(code);
@@ -325,6 +344,8 @@ async function main(): Promise<void> {
     process.stdin.pause();
     throw new Error(`Tern is missing required TSP kinds: ${missingKinds.join(', ')}`);
   }
+
+  armTerminalModes();
 
   const apcLimit = typeof hello.apc === 'number'
     ? hello.apc
@@ -1155,6 +1176,7 @@ async function main(): Promise<void> {
 
 main().catch(error => {
   try {
+    restoreTerminalModes();
     process.stdin.setRawMode?.(false);
     process.stdin.pause();
   } catch {
