@@ -12,7 +12,7 @@ on:
 # suites remain on Atem under ENG-1463; this signal is intentionally advisory
 # until its value/flakiness are measured. No app/model/AWS secrets are exposed.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -39,36 +39,19 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22.22.3'
+          cache: npm
+          cache-dependency-path: |
+            e2e/package-lock.json
+            partner-portal/package-lock.json
 
-      # One-shot bootstrap: resolve the exact runner graph without running package scripts.
-      # This step is removed once e2e/package-lock.json is committed.
-      - name: Resolve E2E lockfile
-        id: resolve_lock
+      - name: Install app and E2E runner
+        id: install
         continue-on-error: true
-        run: npm install --prefix e2e --ignore-scripts --no-audit --no-fund
-
-      - name: Commit E2E lockfile
-        if: ${{ steps.resolve_lock.outcome == 'success' }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          HEAD_REF: ${{ github.head_ref }}
         shell: bash
         run: |
           set -euo pipefail
-          if git ls-files --error-unmatch e2e/package-lock.json >/dev/null 2>&1; then
-            exit 0
-          fi
-          content="$(base64 -w0 e2e/package-lock.json)"
-          gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/e2e/package-lock.json" \
-            --field message='test(e2e): lock tester-army runner dependencies' \
-            --field content="${content}" \
-            --field branch="${HEAD_REF}" >/dev/null
-
-      - name: Install Partner Portal
-        id: install
-        continue-on-error: true
-        run: npm ci --prefix partner-portal
+          npm ci --prefix partner-portal
+          npm ci --prefix e2e --ignore-scripts
 
       - name: Install Chromium
         id: browser
@@ -102,7 +85,7 @@ jobs:
         with:
           name: tester-army-e2e-artifacts
           path: e2e/.e2e/artifacts
-          if-no-files-found: warn
+          if-no-files-found: ignore
           retention-days: 7
 
       - name: Surface advisory result
