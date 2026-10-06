@@ -3117,6 +3117,21 @@ export async function importLeadsFromSearch(
       });
     } catch (e: any) {
       searchError = e?.message ? String(e.message) : String(e);
+      // ENG-2205: resolveAccountId can now hand back an account whose probe was
+      // merely indeterminate (not proven dead — see linkedInOutreachService's
+      // probeAccountSession), so a real failure here is the backstop that proves
+      // it either way. On a proven-dead session, correct the probe cache and
+      // record the health event — otherwise this account stays cached as
+      // 'unknown' for the full 10-minute window and gets handed to the next
+      // caller (same user's retry, or another user sharing the site-wide pool)
+      // instead of the pool correctly skipping it. Mirrors the identical reactive
+      // handler in emma/impl/linkedin.ts.
+      const structuredError = (e as any)?.structuredError;
+      if (structuredError?.code === 'errors/disconnected_account' || structuredError?.classification === 'AUTH_ERROR') {
+        linkedInOutreachService.clearStatusCache(accountId);
+        const { recordUnipileAccountHealth } = await import('../../services/linkedInConnectionHealth');
+        await recordUnipileAccountHealth({ accountId, ownerUserId: userId, state: 'disconnected' });
+      }
       break;
     }
 
