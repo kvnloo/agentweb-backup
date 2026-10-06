@@ -37,7 +37,6 @@ import {
   sanitizeICPPersonas,
 } from "../services/icpStatusService";
 import {
-  icpStartClaimCondition,
   regenerateSingleIcpForUser,
   startIcpDiscoveryForUser,
 } from "../services/onboardingIcpService";
@@ -857,26 +856,30 @@ router.post("/icp/regenerate-one", authenticateToken, async (req, res) => {
     // ~20s and the FE polls `/icp/status` rather than holding this request
     // open.
     //
-    // Claims the transition with the same ConditionExpression /icp/start
-    // uses (ENG-2308 review follow-up) — this write was unconditional,
-    // the exact same race: two concurrent regenerate-one clicks (same
-    // card double-clicked, or one card while another is still running)
-    // would both win, both launch a real LLM call, and race on which
-    // completion lands last.
-    const patch = icpStartPatch();
-    try {
-      await userDb.updateUser(userId, patch, {
-        condition: icpStartClaimCondition(),
-      });
-    } catch (err: any) {
-      if (err?.code === "ConditionalCheckFailedException") {
-        // Lost the race — another regenerate-one (or /icp/start) already
-        // claimed this run. Do NOT launch a second parallel LLM call.
-        const current = await userDb.getUserById(userId);
-        return res.json({ status: icpSnapshot(current || {}) });
-      }
-      throw err;
-    }
+    // Deliberately UNCONDITIONAL, unlike /icp/start's claim (ENG-2308) — a
+    // review follow-up briefly guarded this write with the same global
+    // icpStatus ConditionExpression, which seemed like the same race but
+    // wasn't: icpStatus is a single per-user flag shared by every
+    // regenerate-one call, while the actual concurrency unit here is the
+    // PERSONA. ENG-255's whole premise is two different cards regenerating
+    // at once — the FE fires regenerate-one per card independently
+    // (`BrandReview.tsx`'s `regeneratingIds` is a Set, with a dedicated test
+    // "ENG-255: concurrent regenerations do not clear each other's
+    // spinners" that clicks two different cards back-to-back and expects
+    // both to actually be in flight) — and `regenerateSingleIcpForUser`'s
+    // completion path already explicitly tolerates this (re-reads the
+    // CURRENT list and splices by persona id, and persists even when
+    // `icpStatus` is no longer `running` because another card's
+    // regeneration already claimed the `ready` transition first). Guarding
+    // this write on the global flag would have silently dropped the second
+    // card's regeneration request — confirmed in review before it shipped,
+    // caught by exercising the actual two-cards-at-once path, not by the
+    // single-card tests this commit added. Closing the real remaining gap
+    // here (two rapid clicks on the SAME card) needs a per-persona claim,
+    // not a per-user one — left as a follow-up rather than rushed in, since
+    // the FE already disables a card's own regenerate control once it shows
+    // a spinner, which already covers the common case.
+    await userDb.updateUser(userId, icpStartPatch());
     void regenerateSingleIcpForUser(userId, idx).catch((err: unknown) => {
       console.error("[icp] regenerate-one failed", { userId, idx, err });
     });
@@ -887,7 +890,7 @@ router.post("/icp/regenerate-one", authenticateToken, async (req, res) => {
     // observed during the 2026-04-27 baseline rerun. With this change,
     // the FE always sees status='running' immediately after the POST
     // and keeps polling until the trigger persists fresh ICPs.
-    return res.json({ status: icpSnapshot(patch) });
+    return res.json({ status: icpSnapshot(icpStartPatch()) });
   } catch (err) {
     console.error("[icp] regenerate-one failed", err);
     return res.status(500).json({ message: "Failed to regenerate icp" });

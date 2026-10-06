@@ -955,12 +955,18 @@ export async function triggerIcpDiscoveryForUser(
  * so a claim becomes possible at precisely the moment the FE is told the
  * run has timed out and offers a retry.
  *
- * Exported so `/icp/regenerate-one` (onboardingSteps.ts) can guard its own
- * running-transition write with the identical condition — it flips the
- * same `icpStatus` field and was found, during ENG-2308 review, to have
- * the exact same unconditional-write race this function closes.
+ * NOT reusable for `/icp/regenerate-one`, even though that route flips the
+ * same `icpStatus` field: this condition treats `icpStatus` as a one-slot
+ * lock, but regenerate-one's actual concurrency unit is the PERSONA, not
+ * the user. Two different cards regenerating at once is a real, tested,
+ * intentional flow (ENG-255) — a prior version of this comment claimed
+ * regenerate-one had "the exact same race" and reused this condition
+ * there; that broke two-cards-at-once (the second card's claim lost the
+ * race and its regeneration silently never ran) and was reverted after
+ * review caught it before merge. See the comment on `/icp/regenerate-one`
+ * for the full reasoning.
  */
-export function icpStartClaimCondition(now: Date = new Date()) {
+function icpStartClaimCondition(now: Date = new Date()) {
   const staleBefore = new Date(now.getTime() - ICP_TIMEOUT_MS).toISOString();
   return {
     expression:
