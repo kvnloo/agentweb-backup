@@ -1,6 +1,7 @@
 import {
   encodeHelloQuery,
   encodeTspJson,
+  encodeTspMessage,
   parseTspJson,
   splitUtf8,
   TspStreamReader,
@@ -73,6 +74,33 @@ describe('Tern protocol transport', () => {
     const rest = reader.pushParts('p;e;{"ev":"focus","sf":"agentweb-emma","id":"composer"}\x1b\\');
     expect(rest).toHaveLength(1);
     expect(rest[0]?.type).toBe('message');
+  });
+
+  it('puts caller parameters only on the first chunk', () => {
+    const encoded = encodeTspMessage(
+      'b',
+      'abcdefghijklmnop',
+      { id: 'blob-1', mime: 'text/plain' },
+      4,
+    );
+    const frames = encoded
+      .split('\x1b\\')
+      .filter(Boolean)
+      .map(part => splitTspMessage(part + '\x1b\\'))
+      .filter((part): part is NonNullable<typeof part> => part !== null);
+
+    expect(frames.length).toBeGreaterThan(1);
+    expect(frames[0].params).toMatchObject({
+      id: 'blob-1',
+      mime: 'text/plain',
+      c: expect.any(String),
+      m: '1',
+    });
+    for (const continuation of frames.slice(1)) {
+      expect(continuation.params.id).toBeUndefined();
+      expect(continuation.params.mime).toBeUndefined();
+      expect(continuation.params.c).toBe(frames[0].params.c);
+    }
   });
 
   it('reassembles chunked TSP messages across arbitrary PTY reads', () => {
