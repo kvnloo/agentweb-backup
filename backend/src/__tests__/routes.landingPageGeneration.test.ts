@@ -195,6 +195,7 @@ jest.mock("../services/metaAccountCredentials", () => ({
 }));
 
 import landingPageGenerationRouter, { _resetRateLimitState } from "../routes/landingPageGeneration";
+import { SESSION_LIST_LEAD_CAPTURE_ERROR } from "../utils/sessionList";
 
 const app = express();
 app.use(express.json());
@@ -1965,6 +1966,54 @@ describe("DELETE /api/landing-pages/v0/generated/:id", () => {
 // =============================================================================
 // Rate Limiting
 // =============================================================================
+// ENG-2323: a session (telemetry) list is never a page's lead list.
+describe("ENG-2323: generate / duplicate refuse a session lead list", () => {
+  it("generate: explicit lead_list_id naming a session list → 400, no generation, no side effects", async () => {
+    mockGetUserById.mockResolvedValue({ userId: "test-user-id" });
+    mockGetLeadListById.mockResolvedValue({ listId: "sess-1", listType: "session", publicAccessEnabled: true });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a pricing page", lead_list_id: "sess-1" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe(SESSION_LIST_LEAD_CAPTURE_ERROR);
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+    expect(mockUpdateLeadList).not.toHaveBeenCalled();
+    expect(mockCreateLeadList).not.toHaveBeenCalled();
+  });
+
+  it("generate: an explicit sales list is unaffected", async () => {
+    mockGetUserById.mockResolvedValue({ userId: "test-user-id" });
+    mockGetLeadListById.mockResolvedValue({ listId: "list-1", listType: "sales", publicAccessEnabled: true });
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a pricing page", lead_list_id: "list-1" });
+
+    expect(res.status).toBe(201);
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("list-1");
+  });
+
+  it("duplicate: an original bound to a session list is not carried over → 400, no generation", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1", userId: "test-user-id", name: "Original", prompt: "Build a page",
+      status: "deployed", iterations: 0, leadListId: "sess-1",
+    });
+    mockGetLeadListById.mockResolvedValue({ listId: "sess-1", listType: "session", publicAccessEnabled: true });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe(SESSION_LIST_LEAD_CAPTURE_ERROR);
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+    expect(mockUpdateLeadList).not.toHaveBeenCalled();
+  });
+});
+
 describe("POST /api/landing-pages/v0/generated/:id/duplicate", () => {
   it("FAIL (ENG-1238): an externally-imported record is rejected before any generation", async () => {
     mockGetLandingPageById.mockResolvedValueOnce({
