@@ -1008,6 +1008,40 @@ describe('AgentModeService - Skills', () => {
       // install_skills is always included (infrastructure but needed)
       expect(result.allowedToolNames.has('install_skills')).toBe(true);
     });
+
+    // ENG-2299: a published skill belonging to a subscription tier this user can
+    // never install must not be able to "steal" its tool out of the shared
+    // __other_skills__ catch-all. getPublishedSkills() is a single global,
+    // multi-tenant catalog — whether some OTHER org's tier is entitled to a
+    // skill that happens to list this tool has nothing to do with whether THIS
+    // session can reach the tool, yet unscoped resolution let it flip the
+    // tool's availability anyway, matching the ENG-1237 unpublished-skill case
+    // just above but for cross-tier reachability instead of publish state.
+    it('should NOT treat a tool as associated when only a subscription-unreachable published skill claims it', () => {
+      const publishedSkills = [
+        { skillId: 'reachable-skill', name: 'Reachable', toolNames: ['tool_mine'], isPublished: true },
+        { skillId: 'other-tier-skill', name: 'Other Tier Skill', toolNames: ['tool_other_tier'], isPublished: true },
+      ];
+      const mockTools = [
+        { name: 'tool_mine', definition: {} },
+        { name: 'tool_other_tier', definition: {} },
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      // This subscriber's tier allows 'reachable-skill' and __other_skills__, but
+      // NOT 'other-tier-skill' — they can never install it to reach tool_other_tier.
+      const userAllowedSkillIds = ['reachable-skill', '__other_skills__'];
+
+      const result = (agentModeService as any).buildSkillContext([], userAllowedSkillIds, publishedSkills, ['__other_skills__']);
+
+      // tool_mine is reachable via 'reachable-skill' (even if not installed), so it
+      // must stay out of the catch-all.
+      expect(result.allowedToolNames.has('tool_mine')).toBe(false);
+      // tool_other_tier is only claimed by a skill this subscriber can never
+      // install — it must fall into the __other_skills__ catch-all instead of
+      // vanishing entirely.
+      expect(result.allowedToolNames.has('tool_other_tier')).toBe(true);
+    });
   });
 
   describe('getUnassociatedTools', () => {

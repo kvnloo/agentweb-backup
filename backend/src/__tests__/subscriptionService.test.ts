@@ -816,6 +816,27 @@ describe('subscriptionService', () => {
     expect(tools).toContain('generate_image');
   });
 
+  it('resolveSkillsToToolNames scopes the catalog passed to getUnassociatedToolNames to only the reachable skillIds (ENG-2299)', async () => {
+    // getPublishedSkills() (mocked above) returns the FULL multi-tenant catalog:
+    // skill-1 and skill-2. This caller's own skillIds only reach skill-1 —
+    // skill-2 belongs to a tier/org this caller cannot install, so it must not
+    // be passed to getUnassociatedToolNames and silently claim generate_video
+    // out of this caller's __other_skills__ catch-all.
+    const { agentModeService } = require('../services/agentModeService');
+    const seenSkillIds: string[][] = [];
+    const spy = jest
+      .spyOn(agentModeService, 'getUnassociatedToolNames')
+      .mockImplementation((skills: any) => {
+        seenSkillIds.push(skills.map((s: any) => s.skillId));
+        return ['generate_image'];
+      });
+
+    await resolveSkillsToToolNames(['skill-1', '__other_skills__']);
+
+    expect(seenSkillIds).toEqual([['skill-1']]);
+    spy.mockRestore();
+  });
+
   // ---- getAllowedFunctionCalls bridge tests ----
 
   it('getAllowedFunctionCalls bridges through skills: returns tool names from allowed skills', async () => {
