@@ -56,7 +56,7 @@ describe('ENG-1994 monitor_lead_volume schema/handler parity', () => {
     expect(path).toBe(`/api/lead-volume-monitor/a%40example.com?since=${expected}&until=${expected}`);
   });
 
-  it.each(['not-a-date', '2026/09/01', '2026-9-1'])('passes malformed %p through so the route still 400s', async bad => {
+  it.each(['not-a-date', '2026/09/01', '2026-9-1', '2025-02-31T12:00:00Z'])('passes malformed %p through so the route still 400s', async bad => {
     const path = await pathFor({ since: bad });
     expect(new URLSearchParams(path.split('?')[1]).get('since')).toBe(bad);
   });

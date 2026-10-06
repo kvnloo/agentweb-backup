@@ -3318,7 +3318,13 @@ export function normalizeLeadVolumeDate(value: unknown): string | undefined {
   if (value === undefined || value === null || value === '') return undefined;
   const str = String(value).trim();
   const m = ISO_DATETIME_RE.exec(str);
-  return m ? m[1] : str;
+  if (!m) return str;
+  // Only truncate a real calendar date; otherwise pass the raw value through so the route's
+  // YYYY-MM-DD check rejects it with a 400 instead of forwarding e.g. 2025-02-31.
+  const [y, mo, d] = m[1].split('-').map(Number);
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  const real = dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+  return real ? m[1] : str;
 }
 
 mcpToolRegistry.register({
