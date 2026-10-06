@@ -406,7 +406,17 @@ async function main(): Promise<void> {
       return;
     }
     if (approvalState && session.pendingApprovalDeck?.deckId === deck.deckId) return;
-    approvalState = { itemIndex: 0, answers: [] };
+    const firstItem = deck.items[0];
+    const firstChoices = firstItem?.metaWriteManifestDigest
+      ? [{ id: 'approve' }, { id: 'reject' }]
+      : firstItem?.options ?? [];
+    approvalState = {
+      itemIndex: 0,
+      answers: [],
+      selectedVerdict:
+        firstChoices.find((choice: any) => choice.recommended)?.id
+        || firstChoices[0]?.id,
+    };
     pickerState = undefined;
     pickerKeyBuffer = '';
   };
