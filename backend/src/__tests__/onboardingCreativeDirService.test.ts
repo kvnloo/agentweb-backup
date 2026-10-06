@@ -417,12 +417,58 @@ describe("onboardingCreativeDirService", () => {
       userDb.updateUser.mockResolvedValue({});
       userDb.getUserById.mockResolvedValue(null);
 
-      await startCreativeDirForUser("user-1");
+      const result = await startCreativeDirForUser("user-1");
 
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
       const startPatch = userDb.updateUser.mock.calls[0][1];
       expect(startPatch.creativeDirStatus).toBe("running");
       expect(startPatch.creativeDirStartedAt).toBeTruthy();
+      expect(result).toBe(startPatch);
+    });
+
+    // ENG-2308: same unconditional-write race as icp/competitor — two
+    // concurrent callers could each observe a non-running status and both
+    // launch a real LLM call. Guard the claim with a ConditionExpression.
+    it("claims the running transition with a ConditionExpression guarding against a concurrent in-flight run", async () => {
+      userDb.updateUser.mockResolvedValue({});
+      userDb.getUserById.mockResolvedValue(null);
+
+      await startCreativeDirForUser("user-1");
+
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toBe(
+        "attribute_not_exists(#creativeDirStatus) OR #creativeDirStatus <> :creativeDirRunning",
+      );
+      expect(options?.condition?.names).toEqual({
+        "#creativeDirStatus": "creativeDirStatus",
+      });
+      expect(options?.condition?.values).toEqual({
+        ":creativeDirRunning": "running",
+      });
+    });
+
+    it("returns null and launches no background work when it loses the race to a concurrent caller", async () => {
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValue(conditionalFailure);
+
+      const result = await startCreativeDirForUser("user-1");
+
+      expect(result).toBeNull();
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      expect(userDb.getUserById).not.toHaveBeenCalled();
+    });
+
+    it("re-throws a non-conditional DynamoDB error", async () => {
+      userDb.updateUser.mockRejectedValue(
+        Object.assign(new Error("boom"), {
+          code: "ProvisionedThroughputExceededException",
+        }),
+      );
+
+      await expect(startCreativeDirForUser("user-1")).rejects.toThrow("boom");
     });
   });
 });

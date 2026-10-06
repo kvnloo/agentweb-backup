@@ -666,6 +666,43 @@ describe("reconcileForUser", () => {
   });
 });
 
+describe("runAdImage — lost start-claim race (ENG-2308)", () => {
+  it("skips the worker and returns the current adImageResult without throwing when claimAdImageRun loses the race", async () => {
+    await jest.isolateModulesAsync(async () => {
+      const triggerAdImage = jest.fn();
+      const claimAdImageRunMock = jest.fn(async () => null);
+
+      jest.doMock("../services/db", () => ({
+        userDb: {
+          getUserById: jest.fn().mockResolvedValue({
+            userId: "u1",
+            adImageStatus: "running",
+            // Owned by whichever concurrent caller actually won the claim.
+            adImageResult: { variants: [{ id: "v1", imageUrl: "https://x/1.png", prompt: "p" }] },
+          }),
+          updateUser: jest.fn().mockResolvedValue(undefined),
+        },
+      }));
+      jest.doMock("../services/onboardingAdImageService", () => ({
+        claimAdImageRun: claimAdImageRunMock,
+        triggerAdImageGenerationForUser: triggerAdImage,
+      }));
+
+      const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
+      const result = await PRODUCTION_DAG.adImage.runner({ userId: "u1" });
+
+      expect(claimAdImageRunMock).toHaveBeenCalledWith("u1");
+      // Must NOT launch a second worker when the claim is already owned
+      // elsewhere — that is exactly the duplicate-Gemini-call bug ENG-2308
+      // closes for this axis.
+      expect(triggerAdImage).not.toHaveBeenCalled();
+      expect(result).toEqual({
+        variants: [{ id: "v1", imageUrl: "https://x/1.png", prompt: "p" }],
+      });
+    });
+  });
+});
+
 describe("PRODUCTION_DAG", () => {
   it("declares the same topology as DEFAULT_DAG (sub-task 1)", () => {
     const {
