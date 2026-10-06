@@ -41,6 +41,7 @@ export type TwitterOperation =
   | "get_tweet_metrics"
   | "get_list_tweets"
   | "get_user_tweets"
+  | "get_liked_tweets"
   // ── User reads ──
   | "get_profile"
   | "get_retweeters"
@@ -105,6 +106,7 @@ const RATE_CARD: Record<TwitterOperation, RateCard> = {
   get_tweet_metrics: POST_READ,
   get_list_tweets: POST_READ,
   get_user_tweets: POST_READ,
+  get_liked_tweets: POST_READ,
   // User reads
   get_profile: USER_READ,
   get_retweeters: USER_READ,
