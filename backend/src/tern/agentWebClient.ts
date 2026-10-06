@@ -20,12 +20,18 @@ export type EmmaStreamEvent =
 export interface AgentWebClientOptions {
   baseUrl: string;
   token: string;
+  runsToken?: string;
+  runsSecret?: string;
 }
 
 export class AgentWebClient {
   private readonly http: AxiosInstance;
+  private readonly runsToken?: string;
+  private readonly runsSecret?: string;
 
   constructor(options: AgentWebClientOptions) {
+    this.runsToken = options.runsToken;
+    this.runsSecret = options.runsSecret;
     this.http = axios.create({
       baseURL: options.baseUrl.replace(/\/$/, ''),
       headers: {
@@ -60,8 +66,13 @@ export class AgentWebClient {
   }
 
   async getAgentRuns(sessionId: string, limit = 3): Promise<AgentRunSummaryLike[]> {
+    const headers: Record<string, string> = {};
+    if (this.runsSecret) headers['x-aw-agent-runs-secret'] = this.runsSecret;
+    else if (this.runsToken) headers.Authorization = `Bearer ${this.runsToken}`;
+
     const response = await this.http.get('/api/admin/agent-runs', {
       params: { sessionId, limit },
+      ...(Object.keys(headers).length ? { headers } : {}),
     });
     const runs = response.data?.runs;
     return Array.isArray(runs) ? runs as AgentRunSummaryLike[] : [];
