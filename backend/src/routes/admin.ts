@@ -26,8 +26,9 @@ import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
 import { deriveSelfActivity } from "../utils/selfActivity";
+import { getProjectionsBatch } from "../services/spendProjectionDb";
 import { generateSecurePassword, getInitialPasswordExpiry } from "../utils/secureRandom";
-import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance, resolveBillingUserId } from "../services/tokenUsageService";
+import { grantTokenBonus, resolveBillingUserId } from "../services/tokenUsageService";
 import { grantMonthlyLlmUsageCredit } from "../services/llmUsageCreditService";
 import { getRevenueMetrics } from "../services/revenueService";
 import { detectMrrCollectionGaps } from "../services/mrrCollectionGapService";
@@ -228,7 +229,7 @@ const ADMIN_USER_LIST_FIELDS = [
   "orgRole",
 ] as const;
 
-const compactAdminUserForList = (user: any): Record<string, any> => {
+const compactAdminUserForList = (user: any, hasUsageThisMonth = false): Record<string, any> => {
   const compact: Record<string, any> = {};
   for (const field of ADMIN_USER_LIST_FIELDS) {
     if (user[field] !== undefined) {
@@ -237,7 +238,7 @@ const compactAdminUserForList = (user: any): Record<string, any> => {
   }
   compact.secretNames = user.secrets ? Object.keys(user.secrets) : [];
   // ENG-1271: per-account customer self-activity vs staff-operated signal.
-  compact.selfActivity = deriveSelfActivity(user);
+  compact.selfActivity = deriveSelfActivity(user, hasUsageThisMonth);
   return compact;
 };
 
@@ -792,7 +793,22 @@ router.get("/users", async (req, res) => {
     // The partner-portal roster is where Access Portal lives; sandbox (eval_)
     // accounts must stay reachable here even though every fleet sweep excludes them.
     const users = await userDb.getAllUsers(hideBotLike, { includeSandbox: true });
-    const sanitized = users.map(compactAdminUserForList);
+    // ENG-1271 / ENG-1250 AC7: "has spend this month" for the self-activity signal comes
+    // from the spend ledger in one batched read, not the retired legacy counter. It is a
+    // secondary signal, so a failed read must not take the whole roster down: log it and
+    // treat usage as unknown (staffOperatedSuspect false) rather than silently inventing it.
+    let spendingThisMonth = new Map<string, { settledMicroUsd: number }>();
+    try {
+      spendingThisMonth = await getProjectionsBatch(
+        users.map((u: any) => u.userId),
+        new Date().toISOString().slice(0, 7),
+      );
+    } catch (error) {
+      console.error("[admin/users] spend lookup for the self-activity signal failed; leaving it unset:", error);
+    }
+    const sanitized = users.map((u: any) =>
+      compactAdminUserForList(u, (spendingThisMonth.get(u.userId)?.settledMicroUsd ?? 0) > 0),
+    );
 
     // Batch-fetch org name + owner + analytics-sharing flag for users in an org.
     // Also capture the owner's subscription tier so org members can inherit it
@@ -5430,19 +5446,6 @@ router.post("/users/:userId/send-intro-email", async (req, res) => {
   } catch (error) {
     console.error("Error sending team introduction email:", error);
     res.status(500).json({ message: "Error sending team introduction email" });
-  }
-});
-
-// Get token usage for a specific user
-router.get("/users/:userId/token-usage", async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const usage = await getUserTokenUsage(userId);
-    const { allowance, bonus, effectiveAllowance } = await getUserTokenAllowance(userId);
-    res.json({ ...usage, allowance, effectiveAllowance });
-  } catch (error) {
-    console.error("Error getting user token usage:", error);
-    res.status(500).json({ message: "Error getting token usage" });
   }
 });
 
