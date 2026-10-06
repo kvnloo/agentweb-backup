@@ -43,6 +43,8 @@ export const MAX_POST_ID_LENGTH = 32;
 export const MAX_UTM_CONTENT_LENGTH = 100;
 export const MAX_AGENCY_NAME_LENGTH = 32;
 export const MAX_EXTRA_PARAMS = 5;
+export const MAX_ALLOWED_HOSTS = 20;
+export const MAX_HOSTNAME_LENGTH = 253;
 export const MAX_EXTRA_VALUE_LENGTH = 100;
 /** Rows per bulk call. The route enforces the same number at the envelope. */
 export const MAX_BULK_ROWS = 200;
@@ -56,6 +58,9 @@ export type TaggedLinkErrorCode =
   | 'unknown_platform'
   | 'invalid_agency_name'
   | 'invalid_campaign'
+  | 'invalid_field'
+  | 'invalid_allowed_hosts'
+  | 'invalid_row'
   | 'invalid_medium'
   | 'field_too_long'
   | 'invalid_extra'
@@ -133,7 +138,7 @@ export function slugify(input: unknown): string {
   if (typeof input !== 'string') return '';
   return input
     .normalize('NFKD')
-    .replace(/[̀-ͯ]/g, '')
+    .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
@@ -154,7 +159,35 @@ function hostAllowed(host: string, allowed: readonly string[]): boolean {
   });
 }
 
-function parseBaseUrl(baseUrl: unknown, allowedHosts?: readonly string[]): URL {
+/** A caller (JSON body, CSV row) can put anything here; reject a bad shape instead of crashing in .some(). */
+function validateAllowedHosts(value: unknown): readonly string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (
+    !Array.isArray(value) ||
+    value.length > MAX_ALLOWED_HOSTS ||
+    value.some((h) => typeof h !== 'string' || h.length > MAX_HOSTNAME_LENGTH)
+  ) {
+    throw new TaggedLinkError(
+      'invalid_allowed_hosts',
+      `allowedHosts must be an array of up to ${MAX_ALLOWED_HOSTS} hostnames (strings, <= ${MAX_HOSTNAME_LENGTH} characters)`,
+    );
+  }
+  return value as string[];
+}
+
+/**
+ * Text field from JSON/CSV: strings pass, finite numbers are stringified (a postId of 1009 is
+ * normal), absent is ''. Anything else is an error naming the field, never a silent drop.
+ */
+function textField(label: string, value: unknown): string {
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  throw new TaggedLinkError('invalid_field', `${label} must be a string or number`);
+}
+
+function parseBaseUrl(baseUrl: unknown, allowedHostsRaw?: unknown): URL {
+  const allowedHosts = validateAllowedHosts(allowedHostsRaw);
   if (typeof baseUrl !== 'string' || !baseUrl.trim()) {
     throw new TaggedLinkError('invalid_base_url', 'baseUrl is required');
   }
@@ -217,7 +250,7 @@ function resolvePreset(platformIn: unknown): { def: ChannelDef & { link: NonNull
 }
 
 function cappedSlug(label: string, value: unknown, max: number): string {
-  const s = slugify(value);
+  const s = slugify(textField(label, value));
   if (s.length > max) throw new TaggedLinkError('field_too_long', `${label} exceeds ${max} characters after slugging`);
   return s;
 }
@@ -334,7 +367,9 @@ export function buildTaggedLinks(
       return { index, ok: true, link: buildTaggedLink(merged as unknown as TaggedLinkInput) };
     } catch (err) {
       if (err instanceof TaggedLinkError) return { index, ok: false, error: { code: err.code, message: err.message } };
-      throw err;
+      // Never let one malformed row 500 the whole batch; keep the real error in the log only.
+      console.error('buildTaggedLinks: unexpected error on row', index, (err as Error)?.message ?? err);
+      return { index, ok: false, error: { code: 'invalid_row', message: 'row could not be processed' } };
     }
   });
 }
