@@ -207,7 +207,6 @@ const ADMIN_USER_LIST_FIELDS = [
   "productDomain",
   "cmsType",
   "subscriptionType",
-  "tokenUsage",
   "tokenUsageHistory",
   "tokenAllowanceBonus",
   "llmUsageCredits",
@@ -229,7 +228,7 @@ const ADMIN_USER_LIST_FIELDS = [
   "orgRole",
 ] as const;
 
-const compactAdminUserForList = (user: any, hasUsageThisMonth = false): Record<string, any> => {
+const compactAdminUserForList = (user: any, hasUsageThisMonth = false, spendThisMonthUsd?: number): Record<string, any> => {
   const compact: Record<string, any> = {};
   for (const field of ADMIN_USER_LIST_FIELDS) {
     if (user[field] !== undefined) {
@@ -239,6 +238,8 @@ const compactAdminUserForList = (user: any, hasUsageThisMonth = false): Record<s
   compact.secretNames = user.secrets ? Object.keys(user.secrets) : [];
   // ENG-1271: per-account customer self-activity vs staff-operated signal.
   compact.selfActivity = deriveSelfActivity(user, hasUsageThisMonth);
+  // Settled spend this month from the ledger (ENG-1250 AC7); omitted when the lookup failed so the UI shows "—", not a false $0.
+  if (spendThisMonthUsd !== undefined) compact.spendThisMonthUsd = spendThisMonthUsd;
   return compact;
 };
 
@@ -800,7 +801,7 @@ router.get("/users", async (req, res) => {
     // Keyed by each ACCOUNT's own id, deliberately not its billing owner: the counter this replaces was
     // per-account, and pooled usage was charged to the owner's counter only, so a member's own was always
     // empty. Resolving to the owner would flag every member of an org because the owner spent.
-    let spendingThisMonth = new Map<string, { settledMicroUsd: number }>();
+    let spendingThisMonth: Map<string, { settledMicroUsd: number }> | null = null;
     try {
       spendingThisMonth = await getProjectionsBatch(
         users.map((u: any) => u.userId),
@@ -809,9 +810,14 @@ router.get("/users", async (req, res) => {
     } catch (error) {
       console.error("[admin/users] spend lookup for the self-activity signal failed; leaving it unset:", error);
     }
-    const sanitized = users.map((u: any) =>
-      compactAdminUserForList(u, (spendingThisMonth.get(u.userId)?.settledMicroUsd ?? 0) > 0),
-    );
+    const sanitized = users.map((u: any) => {
+      const settledMicroUsd = spendingThisMonth ? (spendingThisMonth.get(u.userId)?.settledMicroUsd ?? 0) : undefined;
+      return compactAdminUserForList(
+        u,
+        (settledMicroUsd ?? 0) > 0,
+        settledMicroUsd === undefined ? undefined : settledMicroUsd / 1_000_000,
+      );
+    });
 
     // Batch-fetch org name + owner + analytics-sharing flag for users in an org.
     // Also capture the owner's subscription tier so org members can inherit it
