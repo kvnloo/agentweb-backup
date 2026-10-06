@@ -34,8 +34,8 @@ import { handleHardBounceRecipients } from '../services/emailDeliverabilityServi
 // module-private state. Extracted so the CRM → Meta conversion relay throttles against the
 // same counters instead of a second set that drifts out of step with this one.
 import { shouldAttemptCapiSend, isCapiAccountPaused, recordCapiUsage } from '../services/capiSendBudget';
-import { suppressLeadSideEffects, isSessionList, resolveSessionIdentity, sessionLeadId, SESSION_JOURNEY_COUNTER_KEY } from '../utils/sessionList';
-import { buildSessionMergePlan } from '../utils/sessionMergePlan';
+import { suppressLeadSideEffects, isSessionList, resolveSessionIdentity } from '../utils/sessionList';
+import { upsertSessionLead } from '../services/sessionUpsertService';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -749,13 +749,6 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     const mergedCustomFields: Record<string, any> = existingLead
       ? incomingCustomFields
       : { ...incomingCustomFields, forwardedAt: new Date().toISOString() };
-    // The monotonic journey guard compares numerically (a string never compares <= a number in
-    // DynamoDB), so a counter an LP sent as "5" is stored as 5. Session path only.
-    if (sessionIdentity) {
-      const ctr = mergedCustomFields[SESSION_JOURNEY_COUNTER_KEY];
-      if (typeof ctr === 'string' && /^\d{1,15}$/.test(ctr)) mergedCustomFields[SESSION_JOURNEY_COUNTER_KEY] = Number(ctr);
-    }
-
     leadData.customFields = mergedCustomFields;
 
     let lead: any;
@@ -763,44 +756,16 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     let isUpdated = false;
 
     if (sessionIdentity) {
-      // ENG-2312. Exactly-once create + atomic merge for one (list, session).
-      //
-      // CREATE: a conditional put on a deterministic leadId (`attribute_not_exists(leadId)`,
-      // via failIfExists). N concurrent events for one session all target the same primary
-      // key, so DynamoDB — not a GSI read — picks exactly one creator. Only the creator runs
-      // createLead's create-time work (leadCount ADD, fieldNames); a loser throws
-      // leadAlreadyExists BEFORE any of it, so the count cannot double. skipEmailDuplicateCheck
-      // drops createLead's own email-index pre-check: it is the eventually-consistent read this
-      // path exists to avoid, and it throws a plain Error that would turn a lost race into a 500.
-      //
-      // MERGE (loser, or any later event): per-key atomic SETs, no read-modify-write — see
-      // crmDb.mergeSessionLeadEvent for the guarantees.
-      const sessionLeadIdValue = sessionLeadId(leadList.listId, sessionIdentity);
-      for (let attempt = 0; attempt < 2 && !lead; attempt++) {
-        try {
-          lead = await crmDb.createLead(leadList.listId, {
-            ...leadData,
-            leadId: sessionLeadIdValue,
-            failIfExists: true,
-            skipEmailDuplicateCheck: true,
-            suppressSideEffects: true,
-          });
-          isNew = true;
-        } catch (createErr: any) {
-          if (!createErr?.leadAlreadyExists) throw createErr;
-
-          const plan = buildSessionMergePlan({
-            leadData, incomingCustomFields: mergedCustomFields, callerSuppliedSource, touch,
-          });
-          const merged = await crmDb.mergeSessionLeadEvent(leadList.listId, sessionLeadIdValue, plan);
-          // Row vanished between the failed create and the merge (owner deleted it): loop once
-          // and the conditional create now succeeds. Without the retry that event is dropped.
-          if (!merged.exists) continue;
-          isUpdated = merged.changed;
-          lead = { ...leadData, leadId: sessionLeadIdValue, listId: leadList.listId };
-        }
-      }
-      if (!lead) throw new Error(`Failed to upsert session lead ${sessionLeadIdValue}`);
+      // ENG-2312. Exactly-once create + atomic merge for one (list, session): the shared
+      // implementation (also used by the tracker ingest) lives in sessionUpsertService.
+      ({ lead, isNew, isUpdated } = await upsertSessionLead({
+        listId: leadList.listId,
+        identity: sessionIdentity,
+        leadData,
+        customFields: mergedCustomFields,
+        callerSuppliedSource,
+        touch,
+      }));
     } else if (existingLead) {
       // Merge new data into existing lead (only overwrite with non-empty values)
       const normalize = (value: any): string => {
