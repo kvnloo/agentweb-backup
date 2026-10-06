@@ -105,6 +105,47 @@ function makeInput(
 }
 
 describe('executePreparedTools', () => {
+  // ENG-1337: the loop-breaker is a hard execution-layer deny, not just prose.
+  describe('while loopBreakerActive', () => {
+    const run = async (name: string, active = true) => {
+      const executed: string[] = [];
+      const ports = makePorts({
+        executePreparedAgentTool: async (i: any) => { executed.push(i.toolName); return { success: true }; },
+      } as any);
+      const input = makeInput([toolCall('c1', name, '{}')], ports, { loopBreakerActive: active });
+      await executePreparedTools(input);
+      return { executed, input };
+    };
+
+    it.each(['send_email', 'create_lead', 'update_crm_contact', 'delete_campaign', 'publish_social_post'])(
+      'denies write/publish/send tool %s before it reaches the gateway',
+      async (name) => {
+        const { executed, input } = await run(name);
+        expect(executed).toEqual([]);
+        expect(String(input.toolCallsLedger[0]?.error ?? '')).toMatch(/only read-only or verification tools/);
+        expect(JSON.stringify(input.messages)).toContain('loop_breaker');
+      },
+    );
+
+    it.each(['read_brand_guidelines', 'read_market_strategy', 'get_google_ads_report', 'list_leads', 'web_search'])(
+      'still executes read-only/verification tool %s',
+      async (name) => {
+        const { executed } = await run(name);
+        expect(executed).toEqual([name]);
+      },
+    );
+
+    it('still denies install_skills (ENG-763 regression)', async () => {
+      const { executed } = await run('install_skills');
+      expect(executed).toEqual([]);
+    });
+
+    it('does not deny writes when the loop-breaker is inactive', async () => {
+      const { executed } = await run('send_email', false);
+      expect(executed).toEqual(['send_email']);
+    });
+  });
+
   /*
    * Observed live (delegated session a1a6345a, Phoenix): this gate refused
    * `audit_ad_utm_coverage`, the `install_skills` fallback was refused by subscription, and the
