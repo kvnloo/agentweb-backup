@@ -1,6 +1,7 @@
 import { LLM_MODEL_REGISTRY } from '../llmModelRegistry';
 import { deriveDominanceLegacyIds, inferFamily, scheduleBackupModels } from '../modelSupersession';
 import { discoverNewModels, refreshModelCatalog, refreshScores } from '../modelCatalogRefresh';
+import { MODEL_PRICING } from '../../../utils/llmPricing';
 import { patchObject, mergeSetLiteral } from '../../../scripts/refreshModelCatalog';
 
 const grok = ['openrouter/x-ai/grok-4.6', 'openrouter/x-ai/grok-4.7'];
@@ -82,6 +83,42 @@ describe('catalog critical invariants', () => {
     // Re-running on the already-merged output must not duplicate entries.
     const twice = mergeSetLiteral(merged, 'explicitCacheOverrides', ['openrouter/new/model-x']);
     expect(twice).toBe(merged);
+  });
+  it('flags a wildly mispriced addition as a loud warning, never a blocking failure (ENG-2293 follow-up)', async () => {
+    const outlierRow = { ...row, id: 'x-ai/grok-4.9', pricing: { prompt: '0.0001', completion: '0.0003' } }; // $100/$300 per M — absurd vs grok's real ~$2-6 range
+    const request = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ data: [outlierRow] }) });
+    const plan = await refreshModelCatalog({ fetch: request, aaApiKey: '', additionIds: ['openrouter/x-ai/grok-4.9'] });
+    expect(plan.additions).toContain('openrouter/x-ai/grok-4.9');
+    expect(plan.reports.some(r => r.includes('PRICE OUTLIER') && r.includes('openrouter/x-ai/grok-4.9'))).toBe(true);
+  });
+  it('does not flag an addition priced in line with its family', async () => {
+    const normalRow = { ...row, id: 'x-ai/grok-4.9', pricing: { prompt: '0.000002', completion: '0.000006' } }; // in grok's real range
+    const request = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ data: [normalRow] }) });
+    const plan = await refreshModelCatalog({ fetch: request, aaApiKey: '', additionIds: ['openrouter/x-ai/grok-4.9'] });
+    expect(plan.additions).toContain('openrouter/x-ai/grok-4.9');
+    expect(plan.reports.some(r => r.includes('PRICE OUTLIER'))).toBe(false);
+  });
+  it('does not flag a free addition matching a free family as an outlier (ratio must not force Infinity at a zero baseline)', async () => {
+    const zeroPrices = { ...MODEL_PRICING, [grok[0]]: { inPerM: 0, outPerM: 0 }, [grok[1]]: { inPerM: 0, outPerM: 0 } };
+    const freeRow = { ...row, id: 'x-ai/grok-4.95', pricing: { prompt: '0', completion: '0' } };
+    const request = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ data: [freeRow] }) });
+    const plan = await refreshModelCatalog({ fetch: request, aaApiKey: '', prices: zeroPrices, additionIds: ['openrouter/x-ai/grok-4.95'] });
+    expect(plan.additions).toContain('openrouter/x-ai/grok-4.95');
+    expect(plan.reports.some(r => r.includes('PRICE OUTLIER'))).toBe(false);
+  });
+  it('compares a new addition against its closest family tier, not a skewed average (ENG-2293 second review pass)', async () => {
+    // Real risk found on review: a family can legitimately span tiers under one
+    // name — gpt-sol's two correctly-priced members alone already span 2.8x. A
+    // flat average baseline would false-flag a brand new, normal tier member;
+    // comparing against the closest sibling must not.
+    const tieredPrices = { ...MODEL_PRICING, [grok[0]]: { inPerM: 12, outPerM: 12 }, [grok[1]]: { inPerM: 4, outPerM: 4 } };
+    const newRow = { ...row, id: 'x-ai/grok-4.95', pricing: { prompt: '0.000002', completion: '0.000002' } }; // blended $2/M
+    const request = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ data: [newRow] }) });
+    const plan = await refreshModelCatalog({ fetch: request, aaApiKey: '', prices: tieredPrices, additionIds: ['openrouter/x-ai/grok-4.95'] });
+    expect(plan.additions).toContain('openrouter/x-ai/grok-4.95');
+    // Family average is (12+4)/2=8 — $2/M is 4x off that (would false-flag).
+    // Closest sibling is $4/M — $2/M is only 2x off that — correctly not flagged.
+    expect(plan.reports.some(r => r.includes('PRICE OUTLIER'))).toBe(false);
   });
   it('patches only requested members and is idempotent', () => {
     const source = "export const X = { /* preserve */ 'a': 1, 'b': 2 };";
