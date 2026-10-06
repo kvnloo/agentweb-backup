@@ -22,6 +22,7 @@ const mockFollowers = jest.fn();
 const mockFollowing = jest.fn();
 const mockBookmark = jest.fn();
 const mockBookmarks = jest.fn();
+const mockUserLikedTweets = jest.fn();
 const mockListDmEventsWithParticipant = jest.fn();
 const mockReply = jest.fn();
 const mockTweetThread = jest.fn();
@@ -61,6 +62,7 @@ jest.mock('twitter-api-v2', () => ({
         following: (...a: any[]) => mockFollowing(...a),
         bookmark: (...a: any[]) => mockBookmark(...a),
         bookmarks: (...a: any[]) => mockBookmarks(...a),
+        userLikedTweets: (...a: any[]) => mockUserLikedTweets(...a),
         listDmEventsWithParticipant: (...a: any[]) => mockListDmEventsWithParticipant(...a),
         reply: (...a: any[]) => mockReply(...a),
         tweetThread: (...a: any[]) => mockTweetThread(...a),
@@ -1202,5 +1204,34 @@ describe('TwitterService — pre-write scope guard', () => {
     const res = await twitterService.postTweet(OWNER, ACCOUNT_ID, 'empty-scopes');
     expect(mockTweet).toHaveBeenCalled();
     expect(res.id).toBe('111');
+  });
+});
+
+// ─── getLikedTweets (ENG-979) ─────────────────────────────────────────────────
+
+describe('TwitterService.getLikedTweets', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockUserLikedTweets.mockReset();
+    mockUserLikedTweets.mockResolvedValue({ data: { data: [{ id: 'lk1', text: 'liked', author_id: 'a1' }] } });
+  });
+
+  it('defaults to the connected account own user id (no handle lookup)', async () => {
+    const res = await twitterService.getLikedTweets(OWNER, ACCOUNT_ID);
+    expect(mockUserLikedTweets).toHaveBeenCalledWith('12345', expect.objectContaining({ max_results: 10 }));
+    expect(res).toHaveLength(1);
+    expect(res[0].id).toBe('lk1');
+  });
+
+  it('resolves a handle when provided and clamps max_results to 100', async () => {
+    mockUserByUsername.mockResolvedValue({ data: { id: '999' } });
+    await twitterService.getLikedTweets(OWNER, ACCOUNT_ID, '@someone', 500);
+    expect(mockUserByUsername).toHaveBeenCalledWith('someone');
+    expect(mockUserLikedTweets).toHaveBeenCalledWith('999', expect.objectContaining({ max_results: 100 }));
+  });
+
+  it('returns empty array when X returns no data', async () => {
+    mockUserLikedTweets.mockResolvedValue({ data: {} });
+    expect(await twitterService.getLikedTweets(OWNER, ACCOUNT_ID)).toEqual([]);
   });
 });

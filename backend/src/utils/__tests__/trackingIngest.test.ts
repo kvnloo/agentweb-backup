@@ -26,13 +26,33 @@ describe('parseIngestBody: rejection', () => {
     ['unknown event', base({ event: 'purchase' }), 'invalid_event'],
     ['event wrong type', base({ event: ['lp_view'] }), 'invalid_event'],
     ['bad sessionId', base({ sessionId: 'short' }), 'invalid_session'],
-    ['sessionStartMs too old', base({ sessionStartMs: NOW - 49 * 3600_000 }), 'invalid_session'],
-    ['sessionStartMs in the future', base({ sessionStartMs: NOW + 10 * 60_000 }), 'invalid_session'],
+    ['sessionStartMs missing', base({ sessionStartMs: undefined }), 'invalid_session'],
+    ['sessionStartMs fractional', base({ sessionStartMs: NOW - 5000.5 }), 'invalid_session'],
+    ['sessionStartMs Infinity-sized', base({ sessionStartMs: 1e300 }), 'invalid_session'],
     ['sessionStartMs not a number', base({ sessionStartMs: 'soon' }), 'invalid_session'],
     ['custom without name', base({ event: 'custom' }), 'invalid_name'],
     ['custom name not a slug', base({ event: 'custom', name: 'has space' }), 'invalid_name'],
     ['custom name too long', base({ event: 'custom', name: 'a'.repeat(33) }), 'invalid_name'],
   ])('%s -> %s', (_l, b, code) => expect(parse(b)).toMatchObject({ ok: false, code }));
+});
+
+describe('parseIngestBody: ENG-2324 device clock', () => {
+  it('a start outside the window is accepted with a substitute; an in-window one is untouched', () => {
+    const v = ok(base({ sessionStartMs: NOW - 5 * 24 * 3600_000 }));
+    expect(v.identity.sessionStartMs).toBeGreaterThan(NOW - 24 * 3600_000);
+    expect(v.identity.sessionStartMs).toBeLessThanOrEqual(NOW);
+    expect(ok(base()).identity).toEqual({ sessionId: 'abcd1234-ef56-7890', sessionStartMs: NOW - 5000 });
+  });
+
+  it('clientNowMs >5min ahead of the server makes even an in-window start substituted (and a missing / garbage one is ignored)', () => {
+    expect(ok(base({ clientNowMs: NOW + 10 * 60_000 })).identity.sessionStartMs).not.toBe(NOW - 5000);
+    expect(ok(base({ clientNowMs: String(NOW + 10 * 60_000) })).identity.sessionStartMs).not.toBe(NOW - 5000);
+    for (const v of [NOW, NOW + 60_000, 'x', {}, null, -5]) expect(ok(base({ clientNowMs: v })).identity.sessionStartMs).toBe(NOW - 5000);
+  });
+
+  it('clientNowMs is never stored on the row', () => {
+    expect(JSON.stringify(ok(base({ clientNowMs: NOW }))).includes('clientNowMs')).toBe(false);
+  });
 });
 
 describe('parseIngestBody: bounded fields', () => {
