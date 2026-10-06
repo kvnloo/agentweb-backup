@@ -195,6 +195,7 @@
  * same treatment as `create_html_from_template`/`import_leads_from_search`);
  * `getSenderForLead` is bound off the singleton the same way.
  */
+import { suppressLeadSideEffects } from '../../utils/sessionList';
 import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor, isLeadListType } from '../../utils/leadSchema';
 import type { LeadImportRowOutcome, LeadListType } from '../../utils/leadSchema';
 import { providerLabel } from '../../services/crmSenderTypes';
@@ -1443,7 +1444,8 @@ export async function updateLead(listId: string, leadId: string, updates: Record
 
       await crmDb.updateLead(listId, leadId, dbUpdates);
 
-      void (async () => {
+      // ENG-2311: no CRM push for a session-list row (list already loaded above).
+      if (!suppressLeadSideEffects(list)) void (async () => {
         try {
           const { externalCrmSyncService } = await import('../../services/externalCrmSyncService');
           await Promise.allSettled([
