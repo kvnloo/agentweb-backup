@@ -1412,6 +1412,52 @@ describe('apiTools', () => {
       expect(session.attributionBasis).toBe('partial-transcript');
     });
 
+    // ENG-972: the query filters on last activity, so a long-lived session
+    // enters the window carrying its lifetime cost. inWindowCost separates the
+    // spend from turns inside [start_time, end_time) from carried history.
+    it('should report in-window cost separately from lifetime totalCost', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-long-lived',
+          userId: 'user-13',
+          title: 'Long-lived deck',
+          createdAt: '2026-07-02T00:00:00Z',
+          updatedAt: '2026-08-08T01:00:00Z',
+          totalCost: 47.5,
+          messages: [
+            { role: 'user', content: 'start', timestamp: '2026-07-02T00:00:00Z' },
+            { role: 'assistant', content: 'old', timestamp: '2026-07-02T00:01:00Z', usage: { estimated_cost: 45.0 } },
+            { role: 'assistant', content: 'new', timestamp: '2026-08-08T00:30:00Z', usage: { estimated_cost: 2.25 } },
+            { role: 'assistant', content: 'edge', timestamp: '2026-08-09T00:00:00Z', usage: { estimated_cost: 0.25 } },
+          ],
+        }, {
+          sessionId: 'sess-no-timestamps',
+          userId: 'user-14',
+          title: 'No timestamps',
+          createdAt: '2026-08-08T00:00:00Z',
+          updatedAt: '2026-08-08T01:00:00Z',
+          totalCost: 1.0,
+          messages: [
+            { role: 'assistant', content: 'x', usage: { estimated_cost: 1.0 } },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-08-08T00:00:00Z',
+        end_time: '2026-08-09T00:00:00Z',
+      }, context);
+
+      const [longLived, untimed] = JSON.parse((result as any).content[0].text).sessions;
+
+      expect(longLived.totalCost).toBe(47.5);
+      // Only the 00:30 turn is inside the half-open window.
+      expect(longLived.inWindowCost).toBe(2.25);
+      // No turn carries a timestamp, so the in-window share is unknown, not zero.
+      expect(untimed.inWindowCost).toBeNull();
+    });
+
     // Greptile 4/5 follow-up: an unlabelled turn carrying no cost left
     // unattributedCost null, so a partial transcript still claimed 'transcript'.
     // Real shape — prod session 8fb98376 has 2 unlabelled turns and a ~$0 delta.
