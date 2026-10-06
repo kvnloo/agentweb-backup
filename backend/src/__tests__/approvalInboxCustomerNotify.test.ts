@@ -7,7 +7,7 @@ jest.mock('../services/emailService', () => ({
 }));
 
 jest.mock('../services/db', () => ({
-  userDb: { getUserById: jest.fn() },
+  userDb: { getUserById: jest.fn(), getUserByEmail: jest.fn() },
 }));
 
 jest.mock('../services/approvalInboxService', () => ({
@@ -242,5 +242,43 @@ describe('autoResolveCredentialDecisionOnReconnect', () => {
     await expect(autoResolveCredentialDecisionOnReconnect('cust-1', 'meta', 'act_123')).resolves.toBeUndefined();
     expect(mockExecuteResolvedDecision).toHaveBeenCalledTimes(1);
     expect(mockExecuteResolvedDecision).toHaveBeenCalledWith({ decisionId: 'succeeding', status: 'approved' });
+  });
+});
+
+describe('ENG-2301: resolveCustomerEmail for email-shaped customerId', () => {
+  const mockGetUserByEmail = (userDb as any).getUserByEmail as jest.Mock;
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetUserById.mockResolvedValue(null);
+    mockGetUserByEmail.mockResolvedValue(null);
+    mockSendEmail.mockResolvedValue(undefined);
+  });
+
+  it('pending: email-shaped customerId with no user row emails the customer and does not alert oncall', async () => {
+    await notifyCustomerOfPendingCredentialDecision({ ...baseDecision, customerId: 'juan@usehaven.ai' });
+    expect(mockSendEmail).toHaveBeenCalledTimes(1);
+    expect(mockSendEmail.mock.calls[0][0]).toBe('juan@usehaven.ai');
+    expect(mockSendOncallAlert).not.toHaveBeenCalled();
+  });
+
+  it('expired: email-shaped customerId with no user row emails the customer and does not alert oncall', async () => {
+    await notifyCustomerOfExpiredCredentialDecision({ ...baseDecision, customerId: 'juan@usehaven.ai' });
+    expect(mockSendEmail.mock.calls[0][0]).toBe('juan@usehaven.ai');
+    expect(mockSendOncallAlert).not.toHaveBeenCalled();
+  });
+
+  it('prefers the user-by-email record when one exists', async () => {
+    mockGetUserByEmail.mockResolvedValue({ email: 'juan@usehaven.ai' });
+    await notifyCustomerOfPendingCredentialDecision({ ...baseDecision, customerId: 'Juan@UseHaven.ai' });
+    expect(mockGetUserByEmail).toHaveBeenCalledWith('juan@usehaven.ai');
+    expect(mockSendEmail.mock.calls[0][0]).toBe('juan@usehaven.ai');
+  });
+
+  it('opaque customerId with no user still fires the oncall alert (both paths)', async () => {
+    await notifyCustomerOfPendingCredentialDecision({ ...baseDecision, customerId: 'cust-missing' });
+    await notifyCustomerOfExpiredCredentialDecision({ ...baseDecision, customerId: 'cust-missing' });
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(mockSendOncallAlert).toHaveBeenCalledTimes(2);
+    expect(mockGetUserByEmail).not.toHaveBeenCalled();
   });
 });
