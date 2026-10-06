@@ -43,6 +43,39 @@ describe('AgentWeb Tern HTTP client', () => {
     });
   });
 
+  it('continues attended scheduled sessions through Agent Mode then rehydrates', async () => {
+    mockInstancePost.mockResolvedValueOnce({ data: { success: true } });
+    mockInstanceGet.mockResolvedValueOnce({
+      data: {
+        sessionId: 'sched-1',
+        sessionType: 'scheduled',
+        portalType: 'agent',
+        messages: [{ role: 'assistant', content: 'Done' }],
+      },
+    });
+
+    const client = new AgentWebClient({
+      baseUrl: 'https://api.example',
+      token: 'emma-token',
+    });
+
+    const session = {
+      sessionId: 'sched-1',
+      sessionType: 'scheduled',
+      portalType: 'agent',
+      llmModel: 'gpt-test',
+    };
+    await client.sendAgentModeMessage(session, 'Continue this schedule');
+
+    expect(mockInstancePost).toHaveBeenCalledWith('/api/agent-mode/generate', {
+      sessionId: 'sched-1',
+      userMessage: 'Continue this schedule',
+      llmModel: 'gpt-test',
+      attachments: [],
+    });
+    expect(mockInstanceGet).toHaveBeenCalledWith('/api/chatbot/sessions/sched-1');
+  });
+
   it('sends only the narrow read-only secret for AgentRun lookup', async () => {
     (mockedAxios.get as jest.Mock).mockResolvedValueOnce({
       data: { runs: [] },
