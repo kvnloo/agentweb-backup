@@ -8124,6 +8124,7 @@ export const crmDb = {
                 previousStatus,
                 statusConfig: (list as any).statusConfig,
                 conversionMapping: (list as any).conversionMapping,
+                listType: (list as any).listType,
                 // On a retry of an owed conversion the lead's CURRENT status may no longer
                 // be the one that earned it, so the recorded kind wins — same reasoning as
                 // the queued payload's kind. `undefined` means "use the live transition".
