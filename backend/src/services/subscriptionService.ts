@@ -660,20 +660,19 @@ export async function resolveSkillsToToolNames(
 
     const publishedSkills = await skillService.getPublishedSkills();
     const toolNames = new Set<string>();
-    // ENG-2299: `publishedSkills` is the full, shared, multi-tenant catalog — it
-    // also contains skills from subscription tiers/orgs this caller's `skillIds`
-    // never grants. A skill this caller cannot reach must not be able to claim a
-    // tool out of their __other_skills__ catch-all, or tool availability silently
-    // varies with unrelated orgs'/tiers' published skills (same class of bug
-    // ENG-1237 fixed for unpublished skills, here for unreachable ones).
-    const reachableSkillIds = new Set(skillIds);
-    const reachablePublishedSkills = publishedSkills.filter((s) => reachableSkillIds.has(s.skillId));
 
     for (const skillId of skillIds) {
       if (skillId === "__other_skills__") {
-        // Get tools not associated with any published skill this caller can reach
+        // ENG-2299 (reverted): pass the FULL published-skills catalog, not just
+        // this caller's own reachable `skillIds`. getUnassociatedToolNames already
+        // scopes "claimed" by publish/visibility state (isPublished, ENG-1237) —
+        // that's the only axis that should remove a tool from the catch-all.
+        // Filtering by the caller's own skillIds first was the wrong axis: a tool
+        // exclusively owned by a tier this caller can't install would then read as
+        // "unclaimed" and get handed back via __other_skills__ anyway, bypassing
+        // the tier gate this function exists to enforce.
         const { agentModeService } = await import("./agentModeService");
-        const unassociatedTools = agentModeService.getUnassociatedToolNames(reachablePublishedSkills);
+        const unassociatedTools = agentModeService.getUnassociatedToolNames(publishedSkills);
         unassociatedTools.forEach((name: string) => toolNames.add(name));
       } else {
         const skill = publishedSkills.find((s) => s.skillId === skillId);
