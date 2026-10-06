@@ -1,6 +1,8 @@
 import {
+  filterSessions,
   renderEmmaDock,
   renderEmmaMain,
+  renderSessionPicker,
   TspNode,
 } from '../tern/renderEmma';
 
@@ -51,6 +53,64 @@ describe('Tern Emma renderer', () => {
       k: 'tool',
       p: { name: 'search_web', status: 'running', age: 100 },
     });
+  });
+
+  it('filters session picker rows across title, prompt, model and type', () => {
+    const sessions = [
+      {
+        sessionId: 's-old',
+        title: 'Weekly report',
+        llmModel: 'gemini-test',
+        sessionType: 'scheduled',
+        updatedAt: '2026-10-01T00:00:00Z',
+        messages: [{ role: 'user', content: 'Summarize paid ads' }],
+      },
+      {
+        sessionId: 's-new',
+        title: 'Lead search',
+        llmModel: 'gpt-test',
+        sessionType: 'regular',
+        updatedAt: '2026-10-05T00:00:00Z',
+        messages: [{ role: 'user', content: 'Find dental leads' }],
+      },
+    ];
+
+    expect(filterSessions(sessions, '').map(s => s.sessionId)).toEqual(['s-new', 's-old']);
+    expect(filterSessions(sessions, 'dental').map(s => s.sessionId)).toEqual(['s-new']);
+    expect(filterSessions(sessions, 'scheduled gemini').map(s => s.sessionId)).toEqual(['s-old']);
+  });
+
+  it('renders a native picker with current/scheduled badges and preview', () => {
+    const layer = renderSessionPicker({
+      sessions: [
+        {
+          sessionId: 's1',
+          title: 'Current chat',
+          llmModel: 'gpt-test',
+          sessionType: 'regular',
+          updatedAt: '2026-10-05T00:00:00Z',
+          messages: [{ role: 'user', content: 'hello' }],
+        },
+        {
+          sessionId: 's2',
+          title: 'Scheduled report',
+          llmModel: 'gemini-test',
+          sessionType: 'scheduled',
+          updatedAt: '2026-10-04T00:00:00Z',
+          messages: [{ role: 'user', content: 'run report' }],
+        },
+      ],
+      query: '',
+      cursor: 0,
+      selected: 1,
+    }, 's1');
+
+    const picker = flatten(layer).find(node => node.id === 'session-picker');
+    expect(picker?.k).toBe('picker');
+    const items = picker?.p?.items as any[];
+    expect(items.find(item => item.id === 's1').badges).toContainEqual(expect.objectContaining({ text: 'current' }));
+    expect(items.find(item => item.id === 's2').badges).toContainEqual(expect.objectContaining({ text: 'scheduled' }));
+    expect(flatten(layer).find(node => node.id === 'session-preview.title')?.p?.text).toBe('Scheduled report');
   });
 
   it('makes the composer unsendable while Emma is running', () => {
