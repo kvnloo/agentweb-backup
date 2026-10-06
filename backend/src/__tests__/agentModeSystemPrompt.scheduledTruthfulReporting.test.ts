@@ -78,6 +78,25 @@ describe('getScheduledSessionOverride — truthful execution reporting (ENG-803)
       }
     });
 
+    /**
+     * Follow-up to ENG-2265 — the hard fabrication ban above (claiming a LinkedIn/
+     * X/API/credential gate) wasn't what recurred in live testing; a SOFTER drift
+     * did: "the platform enforces an unattended publishing safety lock", immediately
+     * followed by a disclaimer that it's AgentWeb's own setting, not a LinkedIn
+     * token or API quota issue. That sentence never claims a third-party gate, so it
+     * didn't violate the existing rule — but "platform" is an overloaded word in a
+     * product that also talks about connected social platforms, so a customer
+     * skimming the first clause alone can still misread it as LinkedIn/X blocking
+     * them. Banning the bare word (not just the "platform gate" phrase) closes that
+     * softer drift without touching the hard-fabrication rule it layers onto.
+     */
+    it('forbids the bare word "platform" when describing the setting, not just "platform gate"', () => {
+      for (const variant of [scheduled, approvalRequired]) {
+        expect(variant).toContain('Do not use the word "platform" at all when describing this setting');
+        expect(variant).toContain('Say "AgentWeb" or name the setting directly');
+      }
+    });
+
     it('ties the title and summary to real tool outcomes, banning the reported "queued" title', () => {
       expect(scheduled).toContain('Derive your title and summary from actual tool-call outcomes');
       expect(scheduled).toContain('"queued"');
