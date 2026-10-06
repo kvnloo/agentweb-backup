@@ -824,6 +824,7 @@ export function renderApprovalDeck(
         size: 'lg',
         layout: 'cards',
         preview: 'side',
+        focus: needsText ? 'preview' : 'list',
         query: null,
         items,
         order: items.map(choice => choice.id),
