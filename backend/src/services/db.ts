@@ -18,7 +18,7 @@ import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { isEvaluationUser } from "./evaluationPolicy";
-import { emailLeadIds, isEmailUniqueCreateEnabled, type EmailLeadIds } from '../utils/emailLeadId';
+import { emailLeadIds, isEmailUniqueCreateEnabled, emailTxAllowed, tripEmailTxBreaker, type EmailLeadIds } from '../utils/emailLeadId';
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
 import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
@@ -6693,7 +6693,9 @@ export const crmDb = {
    *
    * TransactionConflict (an in-flight racer holds one of the keys) is retried a few times: the
    * retry then fails on a real condition and adopts. If retries run out with no row visible, it
-   * degrades to the plain conditional put (still exact within one bucket) rather than a 500.
+   * degrades to the plain conditional put (still exact within one bucket) rather than a 500. An
+   * AccessDeniedException (role lacks the transaction permissions) does the same and opens a
+   * circuit breaker (emailLeadId.ts) so later creates skip the doomed transaction for a while.
    */
   async putEmailKeyedLead(params: any, ids: EmailLeadIds): Promise<void> {
     const table = params.TableName;
@@ -6713,7 +6715,7 @@ export const crmDb = {
       }
       if (err) throw err;
     };
-    const MAX_ATTEMPTS = 5;
+    const MAX_ATTEMPTS = emailTxAllowed() ? 5 : 0;
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       try {
         await dynamodb.transactWrite({
@@ -6725,6 +6727,12 @@ export const crmDb = {
         }).promise();
         return;
       } catch (err: any) {
+        if (err?.code === 'AccessDeniedException') {
+          // The role may lack TransactWriteItems / ConditionCheck on this table. Never fail the capture for it:
+          // trip the breaker and fall through to the conditional put below (exact within one bucket).
+          tripEmailTxBreaker(err);
+          break;
+        }
         if (err?.code !== 'TransactionCanceledException' && err?.code !== 'TransactionConflictException') throw err;
         await adoptOrThrow(null);
         // Nothing visible: an in-flight transaction holds a key (or its row was just deleted). Back off, retry.

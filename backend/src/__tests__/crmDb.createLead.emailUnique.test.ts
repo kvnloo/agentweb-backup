@@ -11,6 +11,7 @@ const ops: string[] = [];
 let conflictsToInject = 0;
 const txCalls: any[] = [];
 let txError: any = null;
+let txAlways: any = null;
 const tick = () => new Promise<void>((r) => setImmediate(r));
 const k = (listId: string, leadId: string) => `${listId}|${leadId}`;
 const condFail = (): any => Object.assign(new Error('The conditional request failed'), { code: 'ConditionalCheckFailedException' });
@@ -45,6 +46,7 @@ jest.mock('aws-sdk', () => ({
           await tick();
           ops.push('transactWrite');
           txCalls.push(p);
+          if (txAlways) throw txAlways;
           if (txError) { const e = txError; txError = null; throw e; }
           if (conflictsToInject > 0) { conflictsToInject--; throw canceled(p.TransactItems.map(() => 'TransactionConflict')); }
           const reasons = p.TransactItems.map((t: any) => {
@@ -67,7 +69,7 @@ jest.mock('aws-sdk', () => ({
 }));
 
 import { crmDb } from '../services/db';
-import { emailLeadClock } from '../utils/emailLeadId';
+import { emailLeadClock, emailTxBreaker } from '../utils/emailLeadId';
 
 const W = 5000;
 const T0 = 1_700_000_000_000 - (1_700_000_000_000 % W); // a bucket start
@@ -79,7 +81,7 @@ const leadRows = () => [...rows.values()];
 describe('crmDb.createLead — emailUniqueCreate', () => {
   const realNow = emailLeadClock.now;
   beforeEach(() => {
-    rows.clear(); ops.length = 0; txCalls.length = 0; txError = null; conflictsToInject = 0;
+    rows.clear(); ops.length = 0; txCalls.length = 0; txError = null; txAlways = null; emailTxBreaker.openUntil = 0; conflictsToInject = 0;
     delete process.env.LEAD_EMAIL_UNIQUE_CREATE; delete process.env.LEAD_EMAIL_UNIQUE_BUCKET_MS;
     clockAt(T0 + 100);
   });
@@ -198,11 +200,69 @@ describe('crmDb.createLead — emailUniqueCreate', () => {
       expect(ops[ops.length - 1]).toMatch(/^put:lead_\d{13}_/);
     });
 
-    it('a non-transaction error (e.g. throttling/IAM) is not swallowed', async () => {
+    it('a non-transaction error (e.g. throttling) is not swallowed', async () => {
       jest.spyOn(console, 'error').mockImplementation(() => undefined);
-      txError = Object.assign(new Error('AccessDeniedException'), { code: 'AccessDeniedException' });
+      txError = Object.assign(new Error('throttled'), { code: 'ProvisionedThroughputExceededException' });
       await expect(create('e@x.com')).rejects.toBeDefined();
       expect(leadRows().filter((r) => r.email === 'e@x.com')).toHaveLength(0);
+    });
+  });
+
+  describe('ENG-2321 degraded mode: role lacks transaction permissions (AccessDeniedException)', () => {
+    const denied = () => Object.assign(new Error('not authorized to perform: dynamodb:ConditionCheckItem'), { code: 'AccessDeniedException' });
+    let errSpy: jest.SpyInstance;
+    beforeEach(() => { txAlways = denied(); errSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined); });
+    afterEach(() => errSpy.mockRestore());
+
+    it('still creates the lead exactly once via the conditional put on the SAME bucketed id; no throw; logs the greppable tag', async () => {
+      const lead = await create('h@x.com');
+      expect(leadRows()).toHaveLength(1);
+      expect(lead.leadId).toMatch(/^lead_\d{13}_[0-9a-f]{12}$/);
+      expect(ops.filter((o) => o === 'transactWrite')).toHaveLength(1);
+      expect(ops[ops.length - 1]).toBe(`put:${lead.leadId}`);
+      expect(errSpy.mock.calls.filter((c) => String(c[0]).includes('[ENG-2321] ConditionCheck denied on AW-Leads - degraded to conditional put'))).toHaveLength(1);
+    });
+
+    it('circuit breaker: a second create inside the interval does not retry the transaction; after it, it does', async () => {
+      await create('h@x.com');
+      await create('i@x.com');
+      expect(txCalls).toHaveLength(1);
+      expect(leadRows()).toHaveLength(2);
+      expect(errSpy.mock.calls.filter((c) => String(c[0]).includes('[ENG-2321]'))).toHaveLength(1); // logged once per interval
+      clockAt(T0 + 100 + 10 * 60 * 1000 + 1);
+      await create('j@x.com');
+      expect(txCalls).toHaveLength(2);
+      expect(errSpy.mock.calls.filter((c) => String(c[0]).includes('[ENG-2321]'))).toHaveLength(2);
+    });
+
+    it('breaker interval is env-tunable', async () => {
+      process.env.LEAD_EMAIL_UNIQUE_TX_BACKOFF_MS = '2000';
+      await create('h@x.com');
+      clockAt(T0 + 100 + 2001);
+      await create('i@x.com');
+      expect(txCalls).toHaveLength(2);
+      delete process.env.LEAD_EMAIL_UNIQUE_TX_BACKOFF_MS;
+    });
+
+    it('12 same-bucket racers in degraded mode -> one row; losers adopt through the typed duplicate', async () => {
+      const res = await settle(Array.from({ length: 12 }, () => create('Dup@Example.com')));
+      expect(leadRows()).toHaveLength(1);
+      const losers = res.filter((r: any) => !r.ok) as any[];
+      expect(losers).toHaveLength(11);
+      for (const l of losers) expect(l.e).toMatchObject({ duplicateEmail: true, existingLead: { leadId: leadRows()[0].leadId } });
+    });
+
+    it('a cross-bucket pair is NOT serialised in degraded mode (documented: the boundary gap reopens)', async () => {
+      clockAt(T0 + W - 1); await create('k@x.com');
+      clockAt(T0 + W); await create('k@x.com');
+      expect(leadRows()).toHaveLength(2);
+    });
+
+    it('only AccessDeniedException degrades: other errors (e.g. ValidationException) still surface', async () => {
+      txAlways = Object.assign(new Error('bad'), { code: 'ValidationException' });
+      await expect(create('l@x.com')).rejects.toBeDefined();
+      expect(leadRows()).toHaveLength(0);
+      expect(emailTxBreaker.openUntil).toBe(0);
     });
   });
 

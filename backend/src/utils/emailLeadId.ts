@@ -41,7 +41,10 @@ export function emailLeadBucketMs(): number {
 function emailKeyHash(listId: string, emailLower: string): string {
   // Keyed so the id never carries a plain, offline-guessable hash of the address. The id is
   // short-lived (it only has to agree between racers seconds apart), so rotating the secret is
-  // harmless. JWT_SECRET is asserted at boot; the unkeyed fallback only serves unconfigured test envs.
+  // harmless. JWT_SECRET is asserted at boot (server.ts:50 -> config/jwt.ts assertJwtSecretAtBoot); the unkeyed
+  // fallback only serves unconfigured test envs. If two instances ever disagreed on it their ids would
+  // differ, racers on different instances would not collide, and dedupe would silently degrade to the
+  // pre-check (the pre-ENG-2321 behaviour): benign, and unrealistic since JWT verification needs one shared secret.
   const secret = process.env.JWT_SECRET || 'email-lead-id';
   return crypto.createHmac('sha256', secret).update(`${listId}:${emailLower}`).digest('hex').slice(0, 12);
 }
@@ -64,4 +67,34 @@ export function emailLeadIds(listId: string, emailLower: string, nowMs: number =
     prevLeadId: `lead_${bucket - width}_${hash}`,
     nextLeadId: `lead_${bucket + width}_${hash}`,
   };
+}
+
+const DEFAULT_TX_BACKOFF_MS = 10 * 60 * 1000;
+
+/**
+ * Circuit breaker for the adjacency transaction. If the app role lacks permission for
+ * TransactWriteItems / ConditionCheck on AW-Leads, every attempt would fail the same way, so after the
+ * first AccessDeniedException the create degrades to a plain conditional put on the same bucketed id
+ * (exact within one bucket; the boundary gap reopens) for LEAD_EMAIL_UNIQUE_TX_BACKOFF_MS (default 10 min,
+ * accepted 1 s - 1 h), then tries the transaction again.
+ */
+export const emailTxBreaker = { openUntil: 0 };
+
+function txBackoffMs(): number {
+  const n = Number(process.env.LEAD_EMAIL_UNIQUE_TX_BACKOFF_MS);
+  return Number.isInteger(n) && n >= 1000 && n <= 3600000 ? n : DEFAULT_TX_BACKOFF_MS;
+}
+
+export function emailTxAllowed(): boolean {
+  return emailLeadClock.now() >= emailTxBreaker.openUntil;
+}
+
+/** Opens the breaker and logs once (the breaker only opens when closed, so once per interval). */
+export function tripEmailTxBreaker(err: unknown): void {
+  emailTxBreaker.openUntil = emailLeadClock.now() + txBackoffMs();
+  console.error(
+    `[ENG-2321] ConditionCheck denied on AW-Leads - degraded to conditional put for ${txBackoffMs()}ms ` +
+      `(grant dynamodb:ConditionCheckItem + TransactWriteItems to restore boundary protection):`,
+    (err as { message?: string })?.message,
+  );
 }
