@@ -819,7 +819,7 @@ describe('CRM Routes', () => {
       const handler = router.stack.find((r: any) =>
         r.route?.path === '/lists/:listId/leads' && r.route?.methods?.post
       );
-      await handler!.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      await handler!.route!.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
     };
 
     it('returns 409 with the existing leadId and the unchanged message on a duplicate email', async () => {
