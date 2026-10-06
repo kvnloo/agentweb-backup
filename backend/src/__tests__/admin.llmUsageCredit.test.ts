@@ -16,8 +16,6 @@ jest.mock('../services/db', () => ({
 jest.mock('../services/tokenUsageService', () => ({
   resolveBillingUserId: jest.fn(),
   grantTokenBonus: jest.fn(),
-  getUserTokenUsage: jest.fn(),
-  getUserTokenAllowance: jest.fn(),
 }));
 jest.mock('../services/llmUsageCreditService', () => ({
   grantMonthlyLlmUsageCredit: jest.fn(),
