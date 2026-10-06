@@ -29,7 +29,9 @@ jest.mock("../services/onboardingIcpService", () => {
     startIcpDiscoveryForUser: jest.fn(async (userId: string) => {
       const { userDb } = require("../services/db");
       const { icpStartPatch } = require("../services/icpStatusService");
-      await userDb.updateUser(userId, icpStartPatch());
+      const patch = icpStartPatch();
+      await userDb.updateUser(userId, patch);
+      return patch;
     }),
     // ENG-255: /icp/regenerate-one must regenerate ONE persona, not the set.
     regenerateSingleIcpForUser: jest.fn(async (userId: string) => {
@@ -47,7 +49,9 @@ jest.mock("../services/onboardingCompetitorService", () => {
     startCompetitorStrategyForUser: jest.fn(async (userId: string) => {
       const { userDb } = require("../services/db");
       const { competitorStartPatch } = require("../services/competitorStatusService");
-      await userDb.updateUser(userId, competitorStartPatch());
+      const patch = competitorStartPatch();
+      await userDb.updateUser(userId, patch);
+      return patch;
     }),
   };
 });
@@ -731,6 +735,38 @@ describe("/icp/start and /competitor/start delegate to onboarding services", () 
     expect(res.status).toBe(200);
     expect(startCompetitorStrategyForUser).toHaveBeenCalledTimes(1);
     expect(startCompetitorStrategyForUser).toHaveBeenCalledWith("user-1");
+  });
+
+  // ENG-2308: when the service loses the atomic start-claim race (a
+  // concurrent caller already flipped the axis to `running`), it returns
+  // `null` rather than a patch. The route must surface the current
+  // in-flight snapshot instead of pretending it just started a fresh run.
+  it("/icp/start surfaces the in-flight snapshot (not an error) when the service loses the start-claim race", async () => {
+    const { startIcpDiscoveryForUser } = require("../services/onboardingIcpService");
+    (startIcpDiscoveryForUser as jest.Mock).mockResolvedValueOnce(null);
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      icpStatus: "running",
+      icpStartedAt: "2026-04-24T12:00:00.000Z",
+    });
+    const res = await request(app).post("/api/onboarding/icp/start");
+    expect(res.status).toBe(200);
+    expect(res.body.status.icpStatus).toBe("running");
+    expect(res.body.status.inFlight).toBe(true);
+  });
+
+  it("/competitor/start surfaces the in-flight snapshot (not an error) when the service loses the start-claim race", async () => {
+    const { startCompetitorStrategyForUser } = require("../services/onboardingCompetitorService");
+    (startCompetitorStrategyForUser as jest.Mock).mockResolvedValueOnce(null);
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      competitorStatus: "running",
+      competitorStartedAt: "2026-04-24T12:00:00.000Z",
+    });
+    const res = await request(app).post("/api/onboarding/competitor/start");
+    expect(res.status).toBe(200);
+    expect(res.body.status.competitorStatus).toBe("running");
+    expect(res.body.status.inFlight).toBe(true);
   });
 });
 

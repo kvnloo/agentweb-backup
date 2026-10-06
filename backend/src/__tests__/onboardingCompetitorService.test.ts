@@ -564,12 +564,63 @@ describe("onboardingCompetitorService", () => {
       userDb.updateUser.mockResolvedValue({});
       userDb.getUserById.mockResolvedValue(null); // background returns silently
 
-      await startCompetitorStrategyForUser("user-1");
+      const result = await startCompetitorStrategyForUser("user-1");
 
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
       const startPatch = userDb.updateUser.mock.calls[0][1];
       expect(startPatch.competitorStatus).toBe("running");
       expect(startPatch.competitorStartedAt).toBeTruthy();
+      expect(result).toBe(startPatch);
+    });
+
+    // ENG-2308: this function has two callers that can race each other — the
+    // `/competitor/start` route AND the icp-ready cascade kickoff in
+    // onboardingIcpService.ts. Without an atomic claim, a manual retry
+    // landing while the cascade is already mid-flight launches a second,
+    // fully parallel per-ICP LLM loop (confirmed live during ENG-2276
+    // production testing).
+    it("claims the running transition with a ConditionExpression guarding against a concurrent in-flight run", async () => {
+      userDb.updateUser.mockResolvedValue({});
+      userDb.getUserById.mockResolvedValue(null);
+
+      await startCompetitorStrategyForUser("user-1");
+
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toBe(
+        "attribute_not_exists(#competitorStatus) OR #competitorStatus <> :competitorRunning",
+      );
+      expect(options?.condition?.names).toEqual({
+        "#competitorStatus": "competitorStatus",
+      });
+      expect(options?.condition?.values).toEqual({
+        ":competitorRunning": "running",
+      });
+    });
+
+    it("returns null and launches no background work when it loses the race to a concurrent caller", async () => {
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValue(conditionalFailure);
+
+      const result = await startCompetitorStrategyForUser("user-1");
+
+      expect(result).toBeNull();
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      expect(userDb.getUserById).not.toHaveBeenCalled();
+    });
+
+    it("re-throws a non-conditional DynamoDB error", async () => {
+      userDb.updateUser.mockRejectedValue(
+        Object.assign(new Error("boom"), {
+          code: "ProvisionedThroughputExceededException",
+        }),
+      );
+
+      await expect(startCompetitorStrategyForUser("user-1")).rejects.toThrow(
+        "boom",
+      );
     });
   });
 

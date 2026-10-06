@@ -643,12 +643,59 @@ describe("onboardingIcpService", () => {
       // Make the background trigger find no user so it terminates fast.
       userDb.getUserById.mockResolvedValue(null);
 
-      await startIcpDiscoveryForUser("user-1");
+      const result = await startIcpDiscoveryForUser("user-1");
 
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
       const startPatch = userDb.updateUser.mock.calls[0][1];
       expect(startPatch.icpStatus).toBe("running");
       expect(startPatch.icpStartedAt).toBeTruthy();
+      expect(result).toBe(startPatch);
+    });
+
+    // ENG-2308: OutreachIcpPick's 8s watchdog re-fires /icp/start whenever
+    // generation is still running past that window — which real generation
+    // routinely is. Without an atomic claim, a concurrent call that reads a
+    // stale non-running status launches a second, fully parallel LLM
+    // generation that races the first to decide which personas persist.
+    it("claims the running transition with a ConditionExpression guarding against a concurrent in-flight run", async () => {
+      userDb.updateUser.mockResolvedValue({});
+      userDb.getUserById.mockResolvedValue(null);
+
+      await startIcpDiscoveryForUser("user-1");
+
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toBe(
+        "attribute_not_exists(#icpStatus) OR #icpStatus <> :icpRunning",
+      );
+      expect(options?.condition?.names).toEqual({ "#icpStatus": "icpStatus" });
+      expect(options?.condition?.values).toEqual({ ":icpRunning": "running" });
+    });
+
+    it("returns null and launches no background work when it loses the race to a concurrent caller", async () => {
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValue(conditionalFailure);
+
+      const result = await startIcpDiscoveryForUser("user-1");
+
+      expect(result).toBeNull();
+      // Only the failed claim attempt — no background-trigger reads/writes,
+      // and in particular no second generateJsonRobust call could have been
+      // reached from here.
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      expect(userDb.getUserById).not.toHaveBeenCalled();
+    });
+
+    it("re-throws a non-conditional DynamoDB error", async () => {
+      userDb.updateUser.mockRejectedValue(
+        Object.assign(new Error("boom"), {
+          code: "ProvisionedThroughputExceededException",
+        }),
+      );
+
+      await expect(startIcpDiscoveryForUser("user-1")).rejects.toThrow("boom");
     });
   });
 
