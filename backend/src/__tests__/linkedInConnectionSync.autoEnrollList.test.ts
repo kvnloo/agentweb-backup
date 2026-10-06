@@ -233,4 +233,41 @@ describe('enrollNewConnections serves LinkedIn-only leads', () => {
     expect(enrolled).toBe(0);
     expect(mockDripDb.enrollLead).not.toHaveBeenCalled();
   });
+
+  /**
+   * ENG-2127: this call site used to pass only `leadEmail`, not `identityCandidates` —
+   * the one identity its own pre-check (two tests up) already looks across, left out of
+   * the write that now atomically claims every candidate. A write under just the
+   * primary identity left the claim transaction protecting only one of the (up to) three
+   * identities the pre-check guards against.
+   */
+  it('passes every identity candidate through to enrollLead, not just the primary one', async () => {
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [{ ...LI_ONLY_LEAD, email: 'john@acme.io' }], lastEvaluatedKey: null, hasMore: false,
+    } as any);
+
+    await enrollNewConnections([NEW_CONNECTION]);
+
+    expect(mockDripDb.enrollLead).toHaveBeenCalledWith(
+      expect.objectContaining({
+        identityCandidates: expect.arrayContaining([
+          'https://www.linkedin.com/in/john-prospect/',
+          'john@acme.io',
+        ]),
+      }),
+    );
+  });
+
+  /** enrollLead now returns null when a concurrent caller already claimed this lead —
+   * must not be counted as a successful enrollment. */
+  it('does not count a lost race (null from enrollLead) as enrolled', async () => {
+    mockCrmDb.getLeadsByListId.mockResolvedValue(
+      { items: [LI_ONLY_LEAD], lastEvaluatedKey: null, hasMore: false } as any,
+    );
+    mockDripDb.enrollLead.mockResolvedValueOnce(null);
+
+    const enrolled = await enrollNewConnections([NEW_CONNECTION]);
+
+    expect(enrolled).toBe(0);
+  });
 });

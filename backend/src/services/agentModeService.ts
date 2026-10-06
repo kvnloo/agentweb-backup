@@ -4683,6 +4683,7 @@ export class AgentModeService {
           isUnattendedRun,
           adminSkillToolNames: ADMIN_SKILL_TOOL_NAMES,
           excludeTools,
+          loopBreakerActive,
           publishedSkillsCount: publishedSkills.length,
           sessionAssociatedSkillIdsCount: sessionAssociatedSkillIds.length,
           allowedToolNames,

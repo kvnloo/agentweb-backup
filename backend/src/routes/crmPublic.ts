@@ -198,7 +198,19 @@ router.post('/leads/:listId', async (req: Request, res: Response) => {
     // ENG-2311: no HubSpot/Attio push for a session list (leadData is whitelisted above, so
     // the flag below is server-set, never body-controlled).
     const suppressSideEffects = suppressLeadSideEffects(list);
-    const lead = await crmDb.createLead(listId, (suppressSideEffects ? { ...leadData, suppressSideEffects: true } : leadData) as any);
+    let lead: any;
+    try {
+      lead = await crmDb.createLead(listId, (suppressSideEffects ? { ...leadData, suppressSideEffects: true } : leadData) as any);
+    } catch (createErr: any) {
+      if (!createErr?.duplicateEmail) throw createErr;
+      // The email is already on this list (a repeat submission, or a concurrent one that won
+      // the race). That is a visitor re-submitting a form, not a server fault: the generic
+      // catch below turned it into a 500 for EVERY repeat. Report success without merging and
+      // without echoing the existing leadId — this endpoint is unauthenticated, so letting a
+      // caller overwrite an existing lead's fields (or learn its id) by guessing its email
+      // would be a data-poisoning / enumeration vector the create-only contract never had.
+      return res.status(200).json({ success: true, duplicate: true });
+    }
 
     // Real-time push to any connected external CRM (HubSpot / Attio). Without
     // this, public-form leads only reached HubSpot on a manual push. Uses the

@@ -25,7 +25,12 @@ const READ_ONLY_TOOL_EXACT = new Set(['account_summary', 'you_search_web', 'web_
 // McpToolHandler in mcp/server/registry.ts) when EVERY possible call is
 // side-effect-free, and this consults it. Checked last, after the free name
 // checks — cheaper and requires no registry state for the common case.
+// Tools whose name leads with a read verb but which mutate state. Checked first so
+// the verb-prefix heuristic can't launder a write: load_browser_cookies injects
+// cookies into the live browser context via addCookies (ENG-1337 review).
+const MUTATING_DESPITE_READ_VERB = new Set(['load_browser_cookies']);
 export function isReadOnlyToolName(name: string): boolean {
+  if (MUTATING_DESPITE_READ_VERB.has(name)) return false;
   if (READ_ONLY_TOOL_EXACT.has(name) || READ_ONLY_TOOL.test(name)) return true;
   return emmaToolRegistry.getTool(name)?.readOnly === true;
 }
