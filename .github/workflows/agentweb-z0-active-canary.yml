@@ -1,0 +1,52 @@
+name: AgentWeb z0 Active Canary
+
+on:
+  pull_request:
+    branches:
+      - lab/z0-sidecar-startup-v1
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact canary head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Build backend
+        working-directory: backend
+        run: npm run build
+
+      - name: Run active-canary contract suites
+        working-directory: backend
+        run: |
+          node --max-old-space-size=4096 node_modules/.bin/jest --runInBand --forceExit \
+            src/__tests__/experiments.z0ActiveCanary.test.ts \
+            src/__tests__/experiments.z0Integration.test.ts \
+            src/__tests__/experiments.z0SidecarDeployment.test.ts \
+            src/__tests__/experiments.z0BridgeBackpressure.test.ts \
+            src/__tests__/experiments.z0BridgeCapabilities.test.ts \
+            src/__tests__/experiments.z0BridgeProtocol.test.ts
+
+      - name: Re-run model-free sidecar startup regression
+        working-directory: backend
+        run: node --test scripts/test-z0-sidecar-startup.cjs
