@@ -4,6 +4,7 @@ import { resolveClientIdentity } from '../utils/clientIdentity';
 import { SESSION_JOURNEY_KEYS, isSessionList } from '../utils/sessionList';
 import { matchRoutingRules } from '../utils/trackingConfig';
 import { crmDb } from './db';
+import { ingestListCache } from '../utils/ingestListCache';
 
 /**
  * "Latest state" fields written by one event, guarded by the same eventCount as the journey: with
@@ -14,6 +15,13 @@ import { crmDb } from './db';
 export const INGEST_GUARDED_KEYS: readonly string[] = [
   ...SESSION_JOURNEY_KEYS, 'lastEvent', 'furthestStage', 'lastCustomName', 'lastCustomProps', 'lastClickLabel', 'lastClickSection', 'lastClickUrl',
 ];
+
+/**
+ * ENG-2325: the list row the ingest evaluates its gates against, from the short-lived in-process cache
+ * (utils/ingestListCache: staleness, invalidation and bounds are documented there). The ONLY ingest
+ * reader of a list row; loads with a consistent read so a read after this process's own write is fresh.
+ */
+export const getIngestList = (listId: string) => ingestListCache.get(listId, (id) => crmDb.getLeadListById(id, { consistentRead: true }));
 
 /**
  * ENG-2315 / ENG-2316: writes one tracker event into its session list and, when the list has
@@ -79,7 +87,7 @@ export async function ingestTrackerEvent(input: {
   const childFailures: string[] = [];
   const writeChild = async (childId: string): Promise<void> => {
     try {
-      const child = await crmDb.getLeadListById(childId);
+      const child = await getIngestList(childId);
       if (!child || !isSessionList(child) || child.userId !== list.userId) {
         throw new Error('child list missing, not a session list, or owned by someone else');
       }
