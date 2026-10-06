@@ -954,8 +954,13 @@ export async function triggerIcpDiscoveryForUser(
  * race. The threshold matches `icpSnapshot`'s own `timedOut` flag exactly,
  * so a claim becomes possible at precisely the moment the FE is told the
  * run has timed out and offers a retry.
+ *
+ * Exported so `/icp/regenerate-one` (onboardingSteps.ts) can guard its own
+ * running-transition write with the identical condition — it flips the
+ * same `icpStatus` field and was found, during ENG-2308 review, to have
+ * the exact same unconditional-write race this function closes.
  */
-function icpStartClaimCondition(now: Date = new Date()) {
+export function icpStartClaimCondition(now: Date = new Date()) {
   const staleBefore = new Date(now.getTime() - ICP_TIMEOUT_MS).toISOString();
   return {
     expression:
