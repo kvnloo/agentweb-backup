@@ -72,6 +72,61 @@ export interface EmmaSessionLike {
   };
 }
 
+export interface AgentRunFlagLike {
+  code: string;
+  severity: 'info' | 'warning' | 'critical';
+  message: string;
+  evidence?: string;
+}
+
+export interface AgentRunDecisionLike {
+  ts: string;
+  iteration?: number;
+  toolNames: string[];
+  decisionExplanation?: string;
+  toolPolicySummary?: string;
+  argsRepairedCount?: number;
+  schemaErrorCount?: number;
+}
+
+export interface AgentRunOutcomeLike {
+  ts: string;
+  eventType: string;
+  iteration?: number;
+  toolName?: string;
+  durationMs?: number;
+  errorClass?: string;
+  errorMessage?: string;
+  failureType?: string;
+}
+
+export interface AgentRunSummaryLike {
+  runId: string;
+  sessionId?: string;
+  llmModel?: string;
+  sessionType?: string;
+  startedAt?: string;
+  completedAt?: string;
+  status: 'running' | 'completed' | 'failed' | 'unknown';
+  toolCalls: number;
+  failedToolCalls: number;
+  deferredToolCalls?: number;
+  durationMs?: number;
+  outcomeVerdict?: 'ok' | 'degraded' | 'failed';
+  outcomeReasons?: string;
+  flags: AgentRunFlagLike[];
+  decisions: AgentRunDecisionLike[];
+  outcomes: AgentRunOutcomeLike[];
+  chat?: {
+    title?: string;
+    firstUserMessage?: string;
+    lastUserMessage?: string;
+    lastAssistantMessage?: string;
+    messageCount?: number;
+    customerPortalUrl?: string;
+  };
+}
+
 export interface RunningTool {
   id: string;
   name: string;
@@ -98,6 +153,101 @@ export interface ApprovalDeckUiState {
   answers: ApprovalDeckInboundAnswer[];
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function codingPreviewBody(tool: EmmaToolCall): TspNode[] {
+  if (tool.name !== 'coding_agent' && tool.name !== 'get_landing_page_preview_url') return [];
+  const result = asRecord(tool.result);
+  if (!result) return [];
+
+  const previewUrl =
+    typeof result.previewUrl === 'string'
+      ? result.previewUrl
+      : typeof result.url === 'string'
+        ? result.url
+        : undefined;
+  const branch = typeof result.branch === 'string' ? result.branch : undefined;
+  const buildStatus = typeof result.buildStatus === 'string' ? result.buildStatus : undefined;
+  const acceptanceStatus = typeof result.acceptanceStatus === 'string' ? result.acceptanceStatus : undefined;
+  const acceptance = asRecord(result.acceptance);
+  const acceptanceSummary = typeof acceptance?.summary === 'string' ? acceptance.summary : undefined;
+  const checks = Array.isArray(acceptance?.checks) ? acceptance.checks : [];
+
+  const children: TspNode[] = [];
+  const facts: Array<{ k: string; v: string }> = [];
+  if (branch) facts.push({ k: 'Branch', v: branch });
+  if (buildStatus) facts.push({ k: 'Build', v: buildStatus });
+  if (acceptanceStatus) facts.push({ k: 'Acceptance', v: acceptanceStatus });
+  if (facts.length) {
+    children.push({
+      id: 'coding-preview.facts',
+      k: 'kv',
+      p: { items: facts },
+    });
+  }
+
+  if (acceptanceSummary) {
+    children.push({
+      id: 'coding-preview.summary',
+      k: 'text',
+      p: {
+        text: acceptanceSummary,
+        tone: acceptanceStatus === 'failed' ? 'error' : acceptanceStatus === 'passed' ? 'success' : 'muted',
+      },
+    });
+  }
+
+  if (checks.length) {
+    children.push({
+      id: 'coding-preview.checks',
+      k: 'checklist',
+      p: {
+        mode: 'full',
+        phases: [{
+          id: 'acceptance',
+          title: 'Acceptance checks',
+          items: checks.map((raw, index) => {
+            const check = asRecord(raw) ?? {};
+            const status = typeof check.status === 'string' ? check.status : 'pending';
+            return {
+              id: typeof check.id === 'string' ? check.id : `check-${index + 1}`,
+              text: typeof check.label === 'string' ? check.label : `Check ${index + 1}`,
+              status:
+                status === 'passed'
+                  ? 'done'
+                  : status === 'failed'
+                    ? 'blocked'
+                    : status === 'running'
+                      ? 'active'
+                      : 'pending',
+              ...(typeof check.message === 'string' ? { note: check.message } : {}),
+            };
+          }),
+        }],
+      },
+    });
+  }
+
+  if (previewUrl) {
+    children.push({
+      id: 'coding-preview.open',
+      k: 'text',
+      p: {
+        spans: [{ t: 'Open preview', s: 'link', href: previewUrl }],
+        href: previewUrl,
+        actions: { click: 'open', menu: ['open', 'copy'] },
+        aria: 'Open landing-page preview',
+      },
+    });
+  }
+
+  return children;
+}
+
 function toolLabel(name: string): string {
   return name
     .replace(/^mcp__/, '')
@@ -122,9 +272,22 @@ function compact(value: unknown, max = 1200): string | undefined {
 }
 
 function persistedToolNode(tool: EmmaToolCall, id: string): TspNode {
-  const result = tool.result as { success?: boolean } | undefined;
+  const result = asRecord(tool.result);
   const failed = tool.error !== undefined || result?.success === false;
-  const body = compact(failed ? tool.error ?? tool.result : undefined);
+  const codingBody = codingPreviewBody(tool);
+  const errorBody = compact(failed ? tool.error ?? tool.result : undefined);
+  const children: TspNode[] = codingBody.map((child, index) => ({
+    ...child,
+    id: `${id}.rich.${index}`,
+  }));
+
+  if (errorBody) {
+    children.push({
+      id: `${id}.detail`,
+      k: 'code',
+      p: { text: errorBody, lang: 'json', wrap: true },
+    });
+  }
 
   return {
     id,
@@ -135,15 +298,7 @@ function persistedToolNode(tool: EmmaToolCall, id: string): TspNode {
       status: failed ? 'error' : 'done',
       ...(typeof tool.duration === 'number' ? { took: tool.duration } : {}),
     },
-    ...(body
-      ? {
-          c: [{
-            id: `${id}.detail`,
-            k: 'code',
-            p: { text: body, lang: 'json', wrap: true },
-          }],
-        }
-      : {}),
+    ...(children.length ? { c: children } : {}),
   };
 }
 
@@ -638,5 +793,174 @@ export function renderApprovalDeck(
       },
       c: preview,
     }],
+  };
+}
+
+
+function formatRunDuration(ms?: number): string {
+  if (ms == null) return '—';
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
+}
+
+function runLabel(run: AgentRunSummaryLike): string {
+  return run.chat?.title
+    || run.chat?.firstUserMessage
+    || run.chat?.lastUserMessage
+    || run.runId;
+}
+
+export function renderAgentRunsScreen(
+  runs: readonly AgentRunSummaryLike[],
+  selectedIndex: number,
+): TspNode {
+  const safeIndex = Math.max(0, Math.min(selectedIndex, Math.max(0, runs.length - 1)));
+  const selected = runs[safeIndex];
+  const items = runs.map(run => ({
+    id: run.runId,
+    label: runLabel(run),
+    detail: run.llmModel || run.sessionType || run.runId,
+    dot:
+      run.status === 'failed'
+        ? 'error'
+        : run.status === 'running'
+          ? 'pending'
+          : run.flags?.length
+            ? 'warning'
+            : 'success',
+    facts: {
+      tools: run.toolCalls,
+      failed: run.failedToolCalls,
+      duration: formatRunDuration(run.durationMs),
+    },
+    badges: [
+      { text: run.status, tone: run.status === 'failed' ? 'error' : run.status === 'running' ? 'pending' : 'success' },
+      ...(run.outcomeVerdict && run.outcomeVerdict !== 'ok'
+        ? [{ text: run.outcomeVerdict, tone: run.outcomeVerdict === 'failed' ? 'error' : 'warning' }]
+        : []),
+    ],
+  }));
+
+  const preview: TspNode[] = [];
+  if (selected) {
+    preview.push({
+      id: 'run-preview.summary',
+      k: 'kv',
+      p: {
+        items: [
+          { k: 'Run', v: selected.runId },
+          { k: 'Status', v: selected.status },
+          { k: 'Model', v: selected.llmModel || '—' },
+          { k: 'Duration', v: formatRunDuration(selected.durationMs) },
+          { k: 'Tools', v: `${selected.toolCalls} total / ${selected.failedToolCalls} failed` },
+          { k: 'Verdict', v: selected.outcomeVerdict || '—' },
+        ],
+      },
+    });
+
+    if (selected.chat?.customerPortalUrl) {
+      preview.push({
+        id: 'run-preview.chat',
+        k: 'text',
+        p: {
+          spans: [{ t: 'Open chat', s: 'link', href: selected.chat.customerPortalUrl }],
+          href: selected.chat.customerPortalUrl,
+          actions: { click: 'open', menu: ['open', 'copy'] },
+        },
+      });
+    }
+
+    if (selected.flags?.length) {
+      preview.push({
+        id: 'run-preview.flags',
+        k: 'section',
+        p: { head: 'Flags' },
+        c: selected.flags.map((flag, index) => ({
+          id: `run-preview.flag.${index}`,
+          k: 'text',
+          p: {
+            text: `${flag.code}: ${flag.message}${flag.evidence ? ` (${flag.evidence})` : ''}`,
+            tone: flag.severity === 'critical' ? 'error' : flag.severity === 'warning' ? 'warning' : 'info',
+          },
+        })),
+      });
+    }
+
+    if (selected.decisions?.length) {
+      preview.push({
+        id: 'run-preview.decisions',
+        k: 'table',
+        p: {
+          cols: [
+            { id: 'iter', head: 'Iter', priority: 3 },
+            { id: 'tools', head: 'Tools', priority: 3, grow: 1 },
+            { id: 'why', head: 'Decision', priority: 1, grow: 2 },
+          ],
+          rows: selected.decisions.slice(-8).map((decision, index) => ({
+            id: `decision-${index}`,
+            cells: {
+              iter: String(decision.iteration ?? index + 1),
+              tools: decision.toolNames.join(', ') || '—',
+              why: decision.decisionExplanation || decision.toolPolicySummary || '—',
+            },
+          })),
+        },
+      });
+    }
+
+    if (selected.outcomes?.length) {
+      preview.push({
+        id: 'run-preview.outcomes',
+        k: 'table',
+        p: {
+          cols: [
+            { id: 'tool', head: 'Tool', priority: 3, grow: 1 },
+            { id: 'event', head: 'Event', priority: 2 },
+            { id: 'time', head: 'Time', priority: 1 },
+          ],
+          rows: selected.outcomes.slice(-12).map((outcome, index) => ({
+            id: `outcome-${index}`,
+            cells: {
+              tool: outcome.toolName || '—',
+              event: outcome.errorMessage
+                ? `${outcome.eventType}: ${outcome.errorMessage}`
+                : outcome.eventType,
+              time: formatRunDuration(outcome.durationMs),
+            },
+          })),
+        },
+      });
+    }
+  }
+
+  return {
+    id: 'run-picker',
+    k: 'picker',
+    p: {
+      title: 'AgentRun Inspector',
+      subtitle: 'Read-only current-session traces',
+      icon: 'activity',
+      noun: 'runs',
+      size: 'screen',
+      layout: 'cards',
+      preview: 'side',
+      query: null,
+      columns: [
+        { id: 'tools', format: 'num' },
+        { id: 'failed', format: 'num' },
+        { id: 'duration', format: 'dim' },
+      ],
+      items,
+      order: items.map(item => item.id),
+      selected: selected?.runId ?? null,
+      total: runs.length,
+      empty: 'No AgentRun traces found for this session',
+      actions: [
+        { id: 'refresh', label: 'Refresh', keys: ['r'] },
+        { id: 'close', label: 'Close', keys: ['esc'], end: true },
+      ],
+      state: 'ready',
+    },
+    c: preview,
   };
 }
