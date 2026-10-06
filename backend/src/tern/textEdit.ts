@@ -54,11 +54,13 @@ export function resolveNativeTextEdit(
   const next = current.slice(0, from) + insert + current.slice(to);
 
   const expectedLength = size - (to - from) + insert.length;
-  const cursor = clampOffset(edit.cursor, expectedLength);
+  let cursor = clampOffset(edit.cursor, expectedLength);
+  cursor = Math.min(cursor, next.length);
+  if (splitsSurrogatePair(next, cursor)) cursor--;
 
   return {
     text: next,
     cursor,
-    changed: next !== current,
+    changed: from !== to || insert !== '',
   };
 }
