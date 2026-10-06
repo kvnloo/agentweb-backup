@@ -1,6 +1,7 @@
 import { LLM_MODEL_REGISTRY } from '../llmModelRegistry';
 import { deriveDominanceLegacyIds, inferFamily, scheduleBackupModels } from '../modelSupersession';
 import { discoverNewModels, refreshModelCatalog, refreshScores } from '../modelCatalogRefresh';
+import { MODEL_PRICING } from '../../../utils/llmPricing';
 import { patchObject, mergeSetLiteral } from '../../../scripts/refreshModelCatalog';
 
 const grok = ['openrouter/x-ai/grok-4.6', 'openrouter/x-ai/grok-4.7'];
@@ -95,6 +96,14 @@ describe('catalog critical invariants', () => {
     const request = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ data: [normalRow] }) });
     const plan = await refreshModelCatalog({ fetch: request, aaApiKey: '', additionIds: ['openrouter/x-ai/grok-4.9'] });
     expect(plan.additions).toContain('openrouter/x-ai/grok-4.9');
+    expect(plan.reports.some(r => r.includes('PRICE OUTLIER'))).toBe(false);
+  });
+  it('does not flag a free addition matching a free family as an outlier (ratio must not force Infinity at a zero baseline)', async () => {
+    const zeroPrices = { ...MODEL_PRICING, [grok[0]]: { inPerM: 0, outPerM: 0 }, [grok[1]]: { inPerM: 0, outPerM: 0 } };
+    const freeRow = { ...row, id: 'x-ai/grok-4.95', pricing: { prompt: '0', completion: '0' } };
+    const request = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ data: [freeRow] }) });
+    const plan = await refreshModelCatalog({ fetch: request, aaApiKey: '', prices: zeroPrices, additionIds: ['openrouter/x-ai/grok-4.95'] });
+    expect(plan.additions).toContain('openrouter/x-ai/grok-4.95');
     expect(plan.reports.some(r => r.includes('PRICE OUTLIER'))).toBe(false);
   });
   it('patches only requested members and is idempotent', () => {

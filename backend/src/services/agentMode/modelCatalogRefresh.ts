@@ -147,7 +147,9 @@ export async function refreshModelCatalog(options: {
     if (!siblingPrices.length) continue;
     const siblingAvg = siblingPrices.reduce((a, b) => a + b, 0) / siblingPrices.length;
     const addedPrice = blendedPrice(model.price);
-    const ratio = siblingAvg > 0 ? addedPrice / siblingAvg : Infinity;
+    // siblingAvg === 0 (a free-priced family) must not force Infinity when the
+    // addition is also free — that's a correct match, not an outlier.
+    const ratio = siblingAvg > 0 ? addedPrice / siblingAvg : addedPrice > 0 ? Infinity : 1;
     if (ratio > PRICE_OUTLIER_RATIO || ratio < 1 / PRICE_OUTLIER_RATIO) {
       reports.push(`⚠️ PRICE OUTLIER: ${model.id} blended $${addedPrice.toFixed(3)}/M is ${ratio.toFixed(1)}x its "${model.config.family}" family average ($${siblingAvg.toFixed(3)}/M) — verify before merging.`);
     }
