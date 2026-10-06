@@ -839,7 +839,7 @@ export function renderApprovalDeck(
         empty: 'No choices available',
         actions,
         state: 'ready',
-        message: item.immutable ? 'This choice may be irreversible.' : undefined,
+        ...(item.immutable ? { message: 'This choice may be irreversible.' } : {}),
       },
       c: preview,
     }],
