@@ -73,6 +73,13 @@ instructions narrow and operational.
   version of this doctrine for cross-repo consistency; this paragraph is the
   authoritative in-repo copy — if they ever disagree, this one wins here.)
 
+## dev.md notes
+
+- Never edit `dev.md` directly; the `dev.md fragment guard` check fails the PR.
+  Write `dev/pending/<eng-id>-<slug>.md` (first line
+  `## ENG-<n>: <title> (YYYY-MM-DD)`); a post-merge workflow consolidates
+  fragments into `dev.md` newest first (ENG-809, `dev/pending/README.md`).
+
 ## Business execution
 
 - For OPS, GROW, Sales, Marketing, and CS work, invoke Emma directly wherever
