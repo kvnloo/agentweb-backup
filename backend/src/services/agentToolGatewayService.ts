@@ -674,6 +674,7 @@ export const EXTERNAL_SEND_TOOLS = new Set([
 export const EXTERNAL_PUBLISH_TOOLS = new Set([
   'publish_blog_article',
   'publish_landing_page_changes',
+  'enable_session_tracking', // ENG-2327: commits to a customer's live repo
 ]);
 
 const SESSION_STATE_TOOLS = new Set([
