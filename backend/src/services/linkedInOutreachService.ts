@@ -1808,7 +1808,13 @@ export class LinkedInOutreachService {
       return accountId;
     };
 
-    // 1. User's own accounts — try all, first live one wins
+    // 1. User's own accounts — try all, first live one wins. Uses the tri-state
+    //    probeAccountSession, not the binary isAccountConnected (ENG-2205): an
+    //    indeterminate probe (Unipile-side 5xx/timeout, not a dead session) must
+    //    not be discarded the same way a proven-dead one is, or a Unipile outage
+    //    collapses enrichment's whole account pool to null exactly like it did
+    //    for resolveAccountIdWithSource.
+    let ownUnknown: string | null = null;
     try {
       const { getAccountsByUserId } = await import('./connectedAccountsDb');
       const accounts = await getAccountsByUserId(userId);
@@ -1816,13 +1822,18 @@ export class LinkedInOutreachService {
       for (const account of userAccounts) {
         if (!account.account_id) continue;
         if (skip && skipAccountIds!.has(account.account_id)) continue;
-        if (await this.isAccountConnected(account.account_id)) {
+        const state = await this.probeAccountSession(account.account_id);
+        if (state === 'connected') {
           return setCache(account.account_id);
+        }
+        if (state === 'unknown' && !ownUnknown) {
+          ownUnknown = account.account_id;
         }
       }
     } catch { /* ignore */ }
 
     // 2. Site-wide accounts (last resort) — verify connectivity before returning
+    let sharedUnknown: string | null = null;
     try {
       const { settingsService } = await import('./settingsService');
       const setting = await settingsService.getSetting('site-wide-unipile-accounts');
@@ -1832,13 +1843,22 @@ export class LinkedInOutreachService {
         const shuffled = enabled.sort(() => Math.random() - 0.5);
         for (const account of shuffled) {
           if (skip && skipAccountIds!.has(account.account_id)) continue;
-          if (await this.isAccountConnected(account.account_id)) {
+          const state = await this.probeAccountSession(account.account_id);
+          if (state === 'connected') {
             return setCache(account.account_id);
           }
-          this.log(`Site-wide account ${account.account_id} (${account.account_name}) is disconnected — skipping`);
+          if (state === 'unknown' && !sharedUnknown) {
+            sharedUnknown = account.account_id;
+          }
+          this.log(`Site-wide account ${account.account_id} (${account.account_name}) is ${state} — skipping`);
         }
       }
     } catch { /* ignore */ }
+
+    // 3. Nothing came back definitively connected — prefer an unverifiable own
+    //    account over an unverifiable shared one rather than returning null.
+    if (ownUnknown) return setCache(ownUnknown);
+    if (sharedUnknown) return setCache(sharedUnknown);
 
     return null;
   }
