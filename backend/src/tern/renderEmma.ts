@@ -150,6 +150,8 @@ export interface ApprovalDeckInboundAnswer {
 export interface ApprovalDeckUiState {
   itemIndex: number;
   selectedVerdict?: string;
+  freeText: string;
+  freeTextCursor: number;
   answers: ApprovalDeckInboundAnswer[];
 }
 
@@ -658,19 +660,29 @@ function approvalChoices(item: EmmaApprovalDeckItem): Array<{
   detail?: string;
   recommended?: boolean;
 }> {
+  const comment = {
+    id: 'comment',
+    label: 'Comment',
+    detail: 'Leave feedback or ask a question without approving or executing this item.',
+  };
+
   if (item.metaWriteManifestDigest) {
     return [
       { id: 'approve', label: 'Approve', detail: 'Apply this exact reviewed change.' },
       { id: 'reject', label: 'Reject', detail: 'Do not apply this change.' },
+      comment,
     ];
   }
 
-  return (item.options ?? []).map(option => ({
-    id: option.id,
-    label: option.label,
-    ...(option.consequence ? { detail: option.consequence } : {}),
-    ...(option.recommended ? { recommended: true } : {}),
-  }));
+  return [
+    ...(item.options ?? []).map(option => ({
+      id: option.id,
+      label: option.label,
+      ...(option.consequence ? { detail: option.consequence } : {}),
+      ...(option.recommended ? { recommended: true } : {}),
+    })),
+    comment,
+  ];
 }
 
 export function approvalDeckIsAwaiting(
@@ -758,13 +770,33 @@ export function renderApprovalDeck(
     });
   }
 
+  const needsText = selectedVerdict === 'comment'
+    || (selectedVerdict === 'reject' && item.allowFreeText === true);
+  if (needsText) {
+    preview.push({
+      id: 'approval-note',
+      k: 'input',
+      p: {
+        text: state.freeText,
+        cursor: Math.max(0, Math.min(state.freeTextCursor, state.freeText.length)),
+        placeholder: selectedVerdict === 'comment'
+          ? 'Add your comment or question…'
+          : 'Optional correction or reason…',
+        prompt: '›',
+        sendable: selectedVerdict === 'comment',
+      },
+    });
+  }
+
   const actions: Array<Record<string, unknown>> = [];
   if (itemIndex > 0) actions.push({ id: 'prev', label: 'Previous', keys: ['left'] });
+  const commentMissingText = selectedVerdict === 'comment' && state.freeText.trim() === '';
   actions.push({
     id: 'choose',
     label: existing ? 'Update choice' : 'Choose',
     keys: ['enter'],
     primary: true,
+    ...(commentMissingText ? { disabled: 'Add a comment first' } : {}),
   });
   if (item.allowEmmaDecide && !item.metaWriteManifestDigest) {
     actions.push({ id: 'delegate', label: 'Let Emma decide', keys: ['d'] });
