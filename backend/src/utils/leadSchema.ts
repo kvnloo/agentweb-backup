@@ -154,6 +154,19 @@ const DEFAULT_CUSTOMER_STATUS_CONFIG: readonly LeadStatusConfigEntry[] = [
 ];
 
 /**
+ * ENG-2311: a `session` list holds one row per landing-page visitor SESSION (engagement
+ * telemetry written by custom LPs through forward-lead), not a person or a deal. Nothing
+ * downstream may treat those rows as pipeline: there are no deal stages to move through, and
+ * a won/lost/qualified-typed status on one would be read by the Meta conversion relay as a
+ * real conversion. So the config is a single non-terminal entry. It is non-empty on purpose —
+ * an empty config makes mapStatusToMetaEvent fall back to the SALES defaults (which contain
+ * `won`), and sequences.ts treats "no statuses" as a 400 for any status filter.
+ */
+const DEFAULT_SESSION_STATUS_CONFIG: readonly LeadStatusConfigEntry[] = [
+  { value: 'new', label: 'New', color: 'gray', type: 'active' },
+];
+
+/**
  * A FRESH array of fresh objects every call — one of the two consumers writes the result
  * straight into DynamoDB and the other hands it to a caller, so a shared reference here
  * would be a mutation waiting to happen.
@@ -161,8 +174,21 @@ const DEFAULT_CUSTOMER_STATUS_CONFIG: readonly LeadStatusConfigEntry[] = [
 export function defaultStatusConfigFor(listType?: string | null): LeadStatusConfigEntry[] {
   const source = listType === 'customers'
     ? DEFAULT_CUSTOMER_STATUS_CONFIG
-    : DEFAULT_PROSPECT_STATUS_CONFIG;
+    : listType === 'session'
+      ? DEFAULT_SESSION_STATUS_CONFIG
+      : DEFAULT_PROSPECT_STATUS_CONFIG;
   return source.map((s) => ({ ...s }));
+}
+
+/**
+ * The ONLY accepted `listType` values. `listType` is set-once (see crm.ts / emma leads.ts),
+ * so a value accepted here can never be corrected later — keep this the single source of
+ * truth rather than re-spelling the union at each validation site.
+ */
+export const LEAD_LIST_TYPES = ['sales', 'customers', 'session'] as const;
+export type LeadListType = (typeof LEAD_LIST_TYPES)[number];
+export function isLeadListType(value: unknown): value is LeadListType {
+  return typeof value === 'string' && (LEAD_LIST_TYPES as readonly string[]).includes(value);
 }
 
 export const LEAD_ROLES = [

@@ -14,6 +14,7 @@ import {
   UpdateSequenceInput,
 } from '../services/dripSequenceDb';
 import { crmDb } from '../services/db';
+import { isSessionList, SESSION_LIST_SEQUENCE_ERROR } from '../utils/sessionList';
 import { resolveSenderForSend } from '../services/crmSenderService';
 import { CrmSender } from '../services/crmSenderTypes';
 import { sendAsSender } from '../services/sendAsSender';
@@ -183,6 +184,15 @@ router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response
   const authReq = req as AuthenticatedRequest;
   const { name, description, campaignType, enrollmentTrigger, enrollmentCondition, exitConditions, autoEnrollListIds, steps, status } = req.body;
   try {
+    // ENG-2311: auto-enrolment is driven solely by autoEnrollListIds, so refusing a session
+    // list HERE (the only writer besides by-list enrol, guarded below) keeps every enrol path
+    // — crm.ts, webhooks.ts, imports — from ever seeing a sequence bound to one.
+    if (Array.isArray(autoEnrollListIds)) {
+      for (const lid of autoEnrollListIds) {
+        const bound = typeof lid === 'string' && lid ? await crmDb.getLeadListById(lid).catch(() => null) : null;
+        if (isSessionList(bound)) return res.status(400).json({ error: SESSION_LIST_SEQUENCE_ERROR });
+      }
+    }
     const input: UpdateSequenceInput = {
       name,
       description,
@@ -291,10 +301,15 @@ router.post(
       // Deduped: one authorization per distinct listId, not per lead.
       const listIds = Array.from(new Set(leads.map((l: any) => String(l.listId ?? ''))));
       const listAuth = new Map<string, boolean>();
+      const sessionListIdsInRequest: string[] = [];
       for (const lid of listIds) {
         if (!lid) { listAuth.set(lid, false); continue; }
         const list = await crmDb.getLeadListById(lid).catch(() => null);
         listAuth.set(lid, !!list && await crmDb.canOrgMemberAccessList(authReq.user!.userId, list));
+        if (isSessionList(list)) sessionListIdsInRequest.push(lid);
+      }
+      if (sessionListIdsInRequest.length > 0) {
+        return res.status(400).json({ error: SESSION_LIST_SEQUENCE_ERROR });
       }
       const unauthorized = listIds.filter((lid) => !listAuth.get(lid));
       if (unauthorized.length > 0) {
@@ -400,6 +415,8 @@ router.post(
       if (!(await crmDb.canOrgMemberAccessList(authReq.user!.userId, list))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
+      // ENG-2311: a session list's rows are per-visit telemetry, never enrolled in sequences.
+      if (isSessionList(list)) return res.status(400).json({ error: SESSION_LIST_SEQUENCE_ERROR });
 
       // The historical request field `lifecycle` also carried lead status values.
       // Keep that compatibility for current or still-materialized legacy statuses, while

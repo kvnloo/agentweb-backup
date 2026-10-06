@@ -1,6 +1,7 @@
 import { crmDb, userDb, orgDb } from './db';
 import { emailService } from './emailService';
 import { sendLeadNotification } from './slackService';
+import { suppressLeadSideEffects } from '../utils/sessionList';
 import {
   bootstrapMessagingChannels,
   getMessagingChannel,
@@ -264,6 +265,11 @@ export const leadListAlertService = {
     createdAt: string,
     emailDomain?: string
   ) {
+    // ENG-2311: no owner email/Slack per visitor session. Every caller passes the list it
+    // already holds, so this costs nothing and covers forward-lead, the engagement route and
+    // Calendly alike.
+    if (suppressLeadSideEffects(list)) return;
+
     const normalizedEventType = normalizeEventType(eventType);
     const alertEvents = getAlertEvents(list);
 
