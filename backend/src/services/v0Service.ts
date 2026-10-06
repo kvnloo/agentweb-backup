@@ -663,6 +663,18 @@ export interface GeneratedLandingPage {
    */
   googleAdsTrackingInstalled?: boolean;
   /**
+   * ENG-2327: the `listType:'session'` list the AgentWeb SDK tag on this page writes visitor
+   * sessions into. Site-level in effect, like gtmContainerId: the tag lives in the shared root
+   * layout, so every page of one repo carries the same id (kept in sync across siblings).
+   * Written ONLY by sessionTrackingService; set once the list exists, even if the tag commit
+   * failed, so a retry reuses the list instead of creating a second one.
+   */
+  sessionTrackingListId?: string;
+  /** True once the SDK tag is committed to the repo's main branch (false/absent = not installed). */
+  sessionTrackingInstalled?: boolean;
+  /** Last enablement failure, for the portal/Emma to surface; cleared by the next success. */
+  sessionTrackingError?: string;
+  /**
    * Per-page (not site-level) — whether the generated form component was confirmed,
    * via the validation-retry check, to actually call fbq('track','Lead') on submit. v0 authors
    * the form freeform, so unlike layout-level injection this can only be checked, not guaranteed.
@@ -3723,6 +3735,7 @@ export async function deployLandingPage(
       githubRepoUrl,
       updatedAt: now,
     };
+
 
     const deployedZip = zipBuffer;
     void enqueueLandingPageHumanEval(deployedRecord, () => unzipBuffer(deployedZip));
@@ -7075,6 +7088,75 @@ export async function updateLandingPageMetaTrackingInstalled(
       ExpressionAttributeValues: {
         ":t": metaTrackingInstalled,
         ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
+}
+
+/**
+ * ENG-2327: record the session-tracking list on a page. DATA-PLANE: writes the new persisted
+ * attributes sessionTrackingListId / sessionTrackingInstalled / sessionTrackingError.
+ *
+ * Conditional: it only claims the page when no list is recorded yet (or the recorded one is the
+ * `replacing` id the caller found dead), so two concurrent enables can never leave a page pointing
+ * at a list the other one then orphans. Returns false when another caller already holds the claim.
+ */
+export async function claimLandingPageSessionTrackingList(
+  id: string,
+  listId: string,
+  replacing?: string,
+): Promise<boolean> {
+  try {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression:
+          "SET sessionTrackingListId = :l, sessionTrackingInstalled = :f, updatedAt = :now REMOVE sessionTrackingError",
+        ConditionExpression: replacing
+          ? "attribute_exists(id) AND (attribute_not_exists(sessionTrackingListId) OR sessionTrackingListId = :replacing)"
+          : "attribute_exists(id) AND attribute_not_exists(sessionTrackingListId)",
+        ExpressionAttributeValues: {
+          ":l": listId,
+          ":f": false,
+          ":now": new Date().toISOString(),
+          ...(replacing ? { ":replacing": replacing } : {}),
+        },
+      })
+      .promise();
+    return true;
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * ENG-2327: set the session-tracking install state on a page (and the list id, when given).
+ * Mirrors updateLandingPageMetaTrackingInstalled; split out because the tag lives in the SHARED
+ * root layout, so callers loop it across the siblings sharing that repo. `error` records the last
+ * failure on the page (cleared when absent), the same "fail loud" signal the other injectors keep.
+ */
+export async function updateLandingPageSessionTracking(
+  id: string,
+  state: { installed: boolean; listId?: string; error?: string },
+): Promise<void> {
+  const error = state.error ? state.error.slice(0, 500) : undefined;
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      ConditionExpression: "attribute_exists(id)", // never upsert a ghost record for a page deleted meanwhile
+      UpdateExpression:
+        "SET sessionTrackingInstalled = :i, updatedAt = :now" +
+        (state.listId ? ", sessionTrackingListId = :l" : "") +
+        (error ? ", sessionTrackingError = :e" : "") +
+        (error ? "" : " REMOVE sessionTrackingError"),
+      ExpressionAttributeValues: {
+        ":i": state.installed,
+        ":now": new Date().toISOString(),
+        ...(state.listId ? { ":l": state.listId } : {}),
+        ...(error ? { ":e": error } : {}),
       },
     })
     .promise();

@@ -28,7 +28,7 @@ describe('POST /api/tracking/session-lists', () => {
     process.env.BACKEND_URL = 'https://api.example.test/';
     mockCreateLeadList.mockImplementation(async (userId: string, name: string) => ({ listId: 'list_abc123', userId, name }));
   });
-  afterAll(() => { process.env.BACKEND_URL = prevBackend; });
+  afterAll(() => { if (prevBackend === undefined) delete process.env.BACKEND_URL; else process.env.BACKEND_URL = prevBackend; });
 
   it('creates a system-managed public session list with the exact createLeadList arguments', async () => {
     const res = await request(app)
