@@ -89,7 +89,7 @@ export class LeadTableFake {
   private getPath(item: any, path: string[]): any {
     let cur = item;
     for (const seg of path) {
-      if (cur === null || typeof cur !== 'object' || Array.isArray(cur)) return undefined;
+      if (cur === null || typeof cur !== 'object' || Array.isArray(cur) || !Object.prototype.hasOwnProperty.call(cur, seg)) return undefined;
       cur = cur[seg];
     }
     return cur;
@@ -156,17 +156,19 @@ export class LeadTableFake {
       const leaf = op.target[op.target.length - 1];
       let parent: any = item;
       for (const seg of parentPath) {
-        parent = parent?.[seg];
+        parent = parent && Object.prototype.hasOwnProperty.call(parent, seg) ? parent[seg] : undefined;
       }
       if (parentPath.length > 0 && (parent === undefined || parent === null || typeof parent !== 'object' || Array.isArray(parent))) {
         throw vex('The document path provided in the update expression is invalid for update');
       }
       if (op.kind === 'remove') { delete parent[leaf]; continue; }
+      // defineProperty, not assignment: a map key named `__proto__` is DATA in DynamoDB.
+      const put = (v: any) => Object.defineProperty(parent, leaf, { value: v, enumerable: true, writable: true, configurable: true });
       if (op.kind === 'add') {
-        parent[leaf] = (typeof parent[leaf] === 'number' ? parent[leaf] : 0) + this.evalOperand(op.rhs!, before, names, values, usedN, usedV);
+        put((typeof parent[leaf] === 'number' ? parent[leaf] : 0) + this.evalOperand(op.rhs!, before, names, values, usedN, usedV));
         continue;
       }
-      parent[leaf] = this.evalOperand(op.rhs!, before, names, values, usedN, usedV);
+      put(this.evalOperand(op.rhs!, before, names, values, usedN, usedV));
     }
   }
 
@@ -204,8 +206,16 @@ export class LeadTableFake {
         const t = self.table(p.TableName);
         const names = p.ExpressionAttributeNames ?? {};
         const values = p.ExpressionAttributeValues ?? {};
-        const usedN = new Set<string>();
-        const usedV = new Set<string>();
+        // Placeholders are "used" syntactically, like DynamoDB counts them: the default operand
+        // of an if_not_exists that does not fire is still used.
+        const text = `${p.UpdateExpression ?? ''} ${p.ConditionExpression ?? ''}`;
+        const usedN = new Set<string>(text.match(/#[A-Za-z0-9_]+/g) ?? []);
+        const usedV = new Set<string>(text.match(/:[A-Za-z0-9_]+/g) ?? []);
+        for (const n of usedN) if (!(n in names)) throw vex(`An expression attribute name used in the document path is not defined; attribute name: ${n}`);
+        for (const v of usedV) {
+          if (!(v in values)) throw vex(`An expression attribute value used in expression is not defined; attribute value: ${v}`);
+          if (values[v] === undefined) throw vex(`ExpressionAttributeValues contains an undefined value for ${v}`);
+        }
         self.updates.push(clone(p));
         const key = t === 'leads' ? self.leadKey(p.Key.listId, p.Key.leadId) : p.Key.listId;
         const store = t === 'leads' ? self.leads : self.lists;
