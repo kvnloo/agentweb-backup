@@ -7441,6 +7441,19 @@ export const crmDb = {
     linkedin?: string;
     companyLinkedin?: string;
     customFields?: Record<string, any>;
+    /**
+     * ENG-2320, opt-in. Treat `customFields` as a PATCH instead of the whole map: each key is
+     * written with its own document-path SET (`customFields.#k = :v`), so keys this call does
+     * not carry are never touched and two concurrent writers cannot overwrite each other's keys
+     * (the default full-map `SET customFields = :customFields` loses every key but the last
+     * writer's). The caller passes only the keys it means to write.
+     *
+     * Also switches the list `fieldNames` sync from read-modify-write-the-whole-array to an
+     * atomic append of the truly-new names (`mergeFieldNames`), for the same reason. Every
+     * other updateLead behaviour (GSI self-heal, nameCompanyKey, domain, status relay, ...) is
+     * unchanged. Omitted/false => byte-identical to before for every existing caller.
+     */
+    customFieldsKeyMerge?: boolean;
     selectedSenderId?: string | null;
     emailDraftFormat?: 'text' | 'html';
     emailDraft?: {
@@ -7798,12 +7811,37 @@ export const crmDb = {
         }
       }
 
+      // ENG-2320 (customFieldsKeyMerge): keys beyond the first chunk are written by follow-up
+      // UpdateItems after the main one (see below). A hostile/oversized body must not become an
+      // over-long UpdateExpression (4KB cap) -> ValidationException -> 500, so the keys are
+      // chunked, never truncated: the full-map write this replaces stored all of them.
+      const CUSTOM_KEY_CHUNK = 50;
+      let customKeyChunks: Array<Array<[string, any]>> = [];
       if (updates.customFields !== undefined) {
-        setExpressions.push('customFields = :customFields');
-        expressionAttributeValues[':customFields'] = sanitizeCustomFields(
+        const safeCustomFields = sanitizeCustomFields(
           updates.customFields,
           { source: 'db.updateLead', listId, leadId },
         );
+        if (updates.customFieldsKeyMerge) {
+          // undefined cannot be marshalled and an empty string cannot be an attribute-name
+          // placeholder value; mergeSessionLeadEvent drops both for the same reasons.
+          const entries = Object.entries(safeCustomFields).filter(([k, v]) => k !== '' && v !== undefined);
+          for (let i = 0; i < entries.length; i += CUSTOM_KEY_CHUNK) customKeyChunks.push(entries.slice(i, i + CUSTOM_KEY_CHUNK));
+          if (customKeyChunks.length > 0) {
+            // Every key AND value through a generated placeholder: a caller-chosen key can be
+            // `domain`/`system`/`name` (reserved words) or hold `.`, `-`, a space. Mocked-
+            // DocumentClient tests cannot see that ValidationException; see setLeadFields.
+            expressionAttributeNames['#cfMap'] = 'customFields';
+            customKeyChunks[0].forEach(([k, v], i) => {
+              expressionAttributeNames[`#cfk${i}`] = k;
+              expressionAttributeValues[`:cfv${i}`] = v;
+              setExpressions.push(`#cfMap.#cfk${i} = :cfv${i}`);
+            });
+          }
+        } else {
+          setExpressions.push('customFields = :customFields');
+          expressionAttributeValues[':customFields'] = safeCustomFields;
+        }
       }
 
       if (updates.enrichmentMetadata !== undefined) {
@@ -8076,11 +8114,44 @@ export const crmDb = {
         params.ExpressionAttributeNames = expressionAttributeNames;
       }
 
-      const result = await dynamodb.update(params).promise();
+      // A document-path SET fails when the parent map is absent (a row imported without
+      // customFields): create the map once and retry. if_not_exists never clobbers a map a
+      // concurrent writer just created.
+      const updateCustomKeyAware = async (p: any) => {
+        try {
+          return await dynamodb.update(p).promise();
+        } catch (err: any) {
+          if (!(updates.customFieldsKeyMerge && err?.code === 'ValidationException' && /document path/i.test(String(err.message)))) throw err;
+          await dynamodb.update({
+            TableName: p.TableName, Key: p.Key,
+            UpdateExpression: 'SET #cfMap = if_not_exists(#cfMap, :emptyMap)',
+            ExpressionAttributeNames: { '#cfMap': 'customFields', '#lid': 'leadId' },
+            ExpressionAttributeValues: { ':emptyMap': {} },
+            ConditionExpression: 'attribute_exists(#lid)',
+          }).promise();
+          return await dynamodb.update(p).promise();
+        }
+      };
+      const result = await updateCustomKeyAware(params);
+      for (const chunk of customKeyChunks.slice(1)) {
+        const names: Record<string, string> = { '#cfMap': 'customFields' };
+        const values: Record<string, any> = {};
+        const sets = chunk.map(([k, v], i) => {
+          names[`#cfk${i}`] = k;
+          values[`:cfv${i}`] = v;
+          return `#cfMap.#cfk${i} = :cfv${i}`;
+        });
+        await updateCustomKeyAware({
+          TableName: params.TableName, Key: params.Key,
+          UpdateExpression: `SET ${sets.join(', ')}`,
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: values,
+        });
+      }
 
       // Extract field names from updates
       const fieldNames: string[] = [];
-      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements', 'system', 'metaConversionsSent', 'suppressConversionRelay'];
+      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'customFieldsKeyMerge', 'isICP', 'isEngaged', 'engagements', 'system', 'metaConversionsSent', 'suppressConversionRelay'];
 
       // Top level fields
       Object.keys(updates).forEach(key => {
@@ -8088,10 +8159,18 @@ export const crmDb = {
           fieldNames.push(key);
         }
       });
-      // customFields explicitly
+      // customFields explicitly. In key-merge mode the caller passes only the keys it writes,
+      // while the full-map write this replaces contributed EVERY key of the merged map (so a
+      // list whose fieldNames had drifted behind its leads was healed by any merge): add the
+      // lead's stored keys back in so the set of names offered to the list is identical.
       if (updates.customFields) {
-        Object.keys(updates.customFields).forEach(key => {
-          if (updates.customFields![key] && String(updates.customFields![key]).trim()) {
+        const storedCf = updates.customFieldsKeyMerge ? existingLeadForGuard?.customFields : undefined;
+        const nameSource: Record<string, any> = {
+          ...(storedCf && typeof storedCf === 'object' && !Array.isArray(storedCf) ? storedCf : {}),
+          ...updates.customFields,
+        };
+        Object.keys(nameSource).forEach(key => {
+          if (nameSource[key] && String(nameSource[key]).trim()) {
             fieldNames.push(key);
           }
         });
@@ -8101,8 +8180,28 @@ export const crmDb = {
       if (fieldNames.length > 0 && !updates.skipFieldNamesUpdate) {
         const list = await this.getLeadListById(listId);
         const existingFieldNames = (list?.fieldNames as string[]) || [];
-        const allFieldNames = [...existingFieldNames, ...fieldNames];
-        await this.updateFieldNames(listId, allFieldNames);
+        if (updates.customFieldsKeyMerge) {
+          // ENG-2320: the read-modify-write below overwrites the whole array, so two concurrent
+          // merges lose each other's names. Append only the truly-new ones atomically instead
+          // (getLeadListById dedupes + sorts on read, so storage order is not observable).
+          // Still ONE write to the list per merge, as before, so its updatedAt moves exactly as
+          // it did: an unchanged name set just bumps updatedAt.
+          const known = new Set(existingFieldNames);
+          const trulyNew = Array.from(new Set(fieldNames)).filter((n) => !known.has(n));
+          if (trulyNew.length > 0) {
+            await this.mergeFieldNames(listId, trulyNew);
+          } else {
+            await dynamodb.update({
+              TableName: `${TABLE_PREFIX}AW-LeadLists`,
+              Key: { listId },
+              UpdateExpression: 'SET updatedAt = :updatedAt',
+              ExpressionAttributeValues: { ':updatedAt': new Date().toISOString() },
+            }).promise();
+          }
+        } else {
+          const allFieldNames = [...existingFieldNames, ...fieldNames];
+          await this.updateFieldNames(listId, allFieldNames);
+        }
       }
 
       // ENG-926 §C: relay a real status TRANSITION to Meta as a conversion.
