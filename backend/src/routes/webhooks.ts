@@ -953,6 +953,8 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
             ...(deterministicLeadId ? { ...leadData, leadId: deterministicLeadId, failIfExists: true } : leadData),
             // Only added when true, so every non-session list passes byte-identical input.
             ...(suppressSideEffects ? { suppressSideEffects: true } : {}),
+            // ENG-2321: an email lead on an ordinary list takes the exactly-once create (db.createLead).
+            ...(normalizedEmail && !isSessionList(leadList) ? { emailUniqueCreate: true } : {}),
           }
         );
         isNew = true;
@@ -1909,9 +1911,19 @@ export async function processHubspotWebhookJob(payload: HubspotJobPayload): Prom
             if (!data.isCreation) continue;
             const newLead: any = { email: email.toLowerCase(), ...fields, syncMetadata: { hubspot_contact_id: objectId } };
             if (Object.keys(customFieldUpdates).length > 0) newLead.customFields = customFieldUpdates;
-            await crmDb.createLead(list.listId, newLead);
-            console.log(`[HubSpot Webhook] Created lead for ${email} in list ${list.listId}`);
-            continue;
+            try {
+              await crmDb.createLead(list.listId, newLead);
+              console.log(`[HubSpot Webhook] Created lead for ${email} in list ${list.listId}`);
+              continue;
+            } catch (createErr: any) {
+              // The lookups above said "absent" but createLead's own email pre-check found the
+              // row (a concurrent create won). Throwing would abandon every remaining list and
+              // contact in this job; adopt the row and apply the event as an update below.
+              if (!createErr?.duplicateEmail || !createErr.existingLead) throw createErr;
+              lead = createErr.existingLead as Record<string, any>;
+              if (lead.email) delete fields.email;
+              console.log(`[HubSpot Webhook] Lead for ${email} already existed in list ${list.listId} (lost create race) — updating ${lead.leadId}`);
+            }
           }
 
           const updates: any = { ...fields };

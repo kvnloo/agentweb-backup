@@ -171,3 +171,50 @@ describe('forward-lead — lost duplicate-email race', () => {
     expect((crmDb.updateLead as jest.Mock).mock.calls[0][2].customFields).toEqual({ q2: 'new' });
   });
 });
+
+describe('forward-lead — ENG-2321 exactly-once create wiring', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.createLead as jest.Mock).mockResolvedValue({ leadId: 'lead_1', listId: 'list_123', email: 'race@example.com' });
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue(null);
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user_123', connected_accounts: [] });
+  });
+  const list = (extra: any = {}) => (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+    listId: 'list_123', userId: 'user_123', name: 'Test List', publicAccessEnabled: true, autoDraftEnabled: false, ...extra,
+  });
+  const createArg = () => (crmDb.createLead as jest.Mock).mock.calls[0][1];
+
+  it('an email lead on an ordinary list asks createLead for the exactly-once create', async () => {
+    list();
+    await request(app).post('/api/webhooks/forward-lead').send({ listId: 'list_123', email: 'race@example.com' });
+    expect(createArg().emailUniqueCreate).toBe(true);
+  });
+
+  it('a phone-only lead does not (its create path is unchanged)', async () => {
+    list();
+    await request(app).post('/api/webhooks/forward-lead').send({ listId: 'list_123', phone: '+14155550142' });
+    expect(crmDb.createLead).toHaveBeenCalled();
+    expect(createArg()).not.toHaveProperty('emailUniqueCreate');
+  });
+
+  it('a session list (no valid identity -> fallback create) does not either', async () => {
+    list({ listType: 'session' });
+    await request(app).post('/api/webhooks/forward-lead').send({ listId: 'list_123', email: 'race@example.com' });
+    expect(createArg()).not.toHaveProperty('emailUniqueCreate');
+  });
+
+  it('a lost race (typed duplicate from the transaction) is a repeat: one create attempt, merge, no new-lead side effects', async () => {
+    list();
+    const winner = { leadId: 'lead_1700000000000_abcdef012345', listId: 'list_123', email: 'race@example.com', customFields: { forwardedAt: '2020-01-01T00:00:00.000Z' } };
+    (crmDb.createLead as jest.Mock).mockRejectedValue(dupErr(winner));
+    (crmDb.getLeadById as jest.Mock).mockResolvedValue(winner);
+    const res = await request(app).post('/api/webhooks/forward-lead').send({ listId: 'list_123', email: 'race@example.com', q: 1 });
+    await flush();
+    expect(res.status).toBe(200);
+    expect(res.body.event).toBe('lead.updated');
+    expect(crmDb.createLead).toHaveBeenCalledTimes(1);
+    expect(crmDb.getLeadById).toHaveBeenCalledWith('list_123', winner.leadId, { consistentRead: true });
+  });
+});
+
