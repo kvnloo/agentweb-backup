@@ -3747,7 +3747,7 @@ emmaToolRegistry.register({
         },
         phase_id: {
           type: 'string',
-          description: 'The unique identifier of the phase to add work items to'
+          description: 'The phase id from read_gtm_plan\'s output (each phase line ends with "(id: ...)"). Not the phase\'s display number ("Phase 1", "Phase 2").'
         },
         work_items: {
           type: 'array',
@@ -3798,11 +3798,11 @@ emmaToolRegistry.register({
         },
         phase_id: {
           type: 'string',
-          description: 'The unique identifier of the phase containing the work item'
+          description: 'The phase id from read_gtm_plan\'s output (each phase line ends with "(id: ...)"). Not the phase\'s display number.'
         },
         work_item_id: {
           type: 'string',
-          description: 'The unique identifier of the work item to update'
+          description: 'The work item id from read_gtm_plan\'s output (each work item line ends with "(id: ...)"). Not its display number within the phase.'
         },
         status: {
           type: 'string',
@@ -3884,7 +3884,7 @@ emmaToolRegistry.register({
         },
         phase_id: {
           type: 'string',
-          description: 'The unique identifier of the phase to update'
+          description: 'The phase id from read_gtm_plan\'s output (each phase line ends with "(id: ...)"). Not the phase\'s display number.'
         },
         title: {
           type: 'string',
@@ -3930,11 +3930,11 @@ emmaToolRegistry.register({
         },
         phase_id: {
           type: 'string',
-          description: 'Optional phase ID. If provided with plan_id, deletes the phase. If provided with work_item_id, targets the work item in this phase.'
+          description: 'Optional phase id, from read_gtm_plan\'s output (each phase line ends with "(id: ...)"), not its display number. If provided with plan_id, deletes the phase. If provided with work_item_id, targets the work item in this phase.'
         },
         work_item_id: {
           type: 'string',
-          description: 'Optional work item ID. Requires phase_id. Deletes the specific work item from the phase.'
+          description: 'Optional work item id, from read_gtm_plan\'s output (each work item line ends with "(id: ...)"), not its display number. Requires phase_id. Deletes the specific work item from the phase.'
         }
       },
       required: ['plan_id']
@@ -5385,7 +5385,7 @@ emmaToolRegistry.register({
   name: "describe_image",
   definition: {
     name: "describe_image",
-    description: 'Analyze and describe an image from a URL. Use this when the user mentions an image, asks to "read" an image, or when you need to understand visual content (jpg, jpeg, png, gif, webp, svg, etc.). Always prefer this over read_file_content for image files.',
+    description: 'Analyze and describe an image from a URL. Use this when the user mentions an image, asks to "read" an image, or when you need to understand visual content (jpg, jpeg, png, gif, webp, svg, etc.). Always prefer this over read_file_content for image files; for SVG, use read_file_content only when the user wants its source markup, text labels, or dimensions.',
     inputSchema: {
       type: "object",
       properties: {
@@ -6600,7 +6600,7 @@ emmaToolRegistry.register({
   name: "read_file_content",
   definition: {
     name: "read_file_content",
-    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, Excel/XLSX spreadsheets, Word documents (docx, doc), and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp, svg) — use describe_image instead. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead.',
+    description: 'Read and extract text content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, Excel/XLSX spreadsheets, Word documents (docx, doc), and other common formats. Do NOT use this for image files (jpg, jpeg, png, gif, webp) — use describe_image instead. For SVG source markup, text labels, or dimensions, use this tool; use describe_image for visual analysis of SVGs. Do NOT use this for video files (mp4, mov, avi, webm, mkv) — use describe_video instead.',
     inputSchema: {
       type: "object",
       properties: {
