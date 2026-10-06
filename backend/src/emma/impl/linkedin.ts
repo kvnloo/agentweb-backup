@@ -409,7 +409,7 @@ function linkedInPublicIdFromUrl(url: string | undefined | null): string | null 
 }
 
 // Post on connected account helper
-export async function postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any): Promise<any> {
+export async function postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean }): Promise<any> {
   console.log('[AgentMode] postOnConnectedAccount called:', {
     userId,
     accountId,
@@ -510,10 +510,21 @@ export async function postOnConnectedAccount(userId: string, accountId: string |
     // decision taken before that work began. Hand the same re-check down so those
     // adapters can run it immediately before their irreversible request; adapters
     // that commit straight away (X) need nothing and ignore it.
-    const result = await adapter.createPost(
-      account, content, mediaUrls, ownerUserId,
-      toolContext?.assertPublishStillAuthorized
-    );
+    // ENG-428: save-as-draft is a LinkedIn-only capability; refuse it elsewhere
+    // rather than silently publishing what the caller asked to keep private.
+    const saveAsDraft = options?.saveAsDraft === true;
+    if (saveAsDraft && account.platform !== 'linkedin') {
+      return { success: false, message: `save_as_draft is only supported for LinkedIn accounts, not ${account.platform}. Nothing was posted.` };
+    }
+    const result = saveAsDraft
+      ? await (adapter as any).createPost(
+        account, content, mediaUrls, ownerUserId,
+        toolContext?.assertPublishStillAuthorized, { draft: true }
+      )
+      : await adapter.createPost(
+        account, content, mediaUrls, ownerUserId,
+        toolContext?.assertPublishStillAuthorized
+      );
 
     // An adapter that abandoned the post on a withdrawn consent reports it as a
     // refusal, not a platform failure — the run was stopped deliberately.
@@ -546,7 +557,8 @@ export async function postOnConnectedAccount(userId: string, accountId: string |
       success: true,
       message: result.message,
       post_id: result.postId,
-      post_url: result.postUrl
+      post_url: result.postUrl,
+      ...(saveAsDraft ? { draft: true } : {})
     };
   } catch (error: any) {
     const message = error?.message?.includes('access token expired')

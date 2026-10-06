@@ -5071,7 +5071,8 @@ emmaToolRegistry.register({
           type: 'array',
           items: { type: 'string' },
           description: 'Optional URLs of images/videos to attach. REQUIRED for YouTube — must be a direct video file URL (e.g. .mp4). The video will be downloaded and uploaded to YouTube.'
-        }
+        },
+        save_as_draft: { type: 'boolean', description: 'LinkedIn only. When true, the post is saved as a LinkedIn draft instead of being published, so the user can review it on LinkedIn before it goes live. Rejected for other platforms.' }
       },
       required: ['content']
     }
@@ -5079,7 +5080,7 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     // ENG-827: the context carries `assertPublishStillAuthorized`, which the handler
     // runs immediately before the post becomes real — see postOnConnectedAccount.
-    return await linkedinImpl.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context);
+    return await linkedinImpl.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context, ...(args.save_as_draft === true ? [{ saveAsDraft: true }] : []));
   }
 });
 
