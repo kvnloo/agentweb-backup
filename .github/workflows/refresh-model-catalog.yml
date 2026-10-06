@@ -82,9 +82,9 @@ jobs:
           if [ -z "$SLACK_MODEL_ALERTS_WEBHOOK" ]; then exit 0; fi
           OP="${{ steps.open_pr.outputs.pull-request-operation }}"
           VERB="opened"; [ "$OP" = "updated" ] && VERB="updated"
-          curl -s -X POST -H 'Content-type: application/json' \
+          curl -sf -X POST -H 'Content-type: application/json' \
             --data "{\"text\":\"Model catalog refresh PR ${VERB}: ${{ steps.open_pr.outputs.pull-request-url }}\"}" \
-            "$SLACK_MODEL_ALERTS_WEBHOOK" || true
+            "$SLACK_MODEL_ALERTS_WEBHOOK" || echo "::warning::Slack notification failed — check SLACK_MODEL_ALERTS_WEBHOOK (rotated/revoked?)"
       - name: Surface incomplete upstream observations
         run: node -e 'if (require("/tmp/model-catalog-plan.json").degraded) { console.error("Upstream observation incomplete; inspect monitor report"); process.exit(1); }'
       - name: Notify Slack on any job failure
@@ -99,6 +99,6 @@ jobs:
           SLACK_MODEL_ALERTS_WEBHOOK: ${{ secrets.SLACK_MODEL_ALERTS_WEBHOOK }}
         run: |
           if [ -z "$SLACK_MODEL_ALERTS_WEBHOOK" ]; then exit 0; fi
-          curl -s -X POST -H 'Content-type: application/json' \
+          curl -sf -X POST -H 'Content-type: application/json' \
             --data "{\"text\":\"Model catalog refresh job FAILED: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
-            "$SLACK_MODEL_ALERTS_WEBHOOK" || true
+            "$SLACK_MODEL_ALERTS_WEBHOOK" || echo "::warning::Slack notification failed — check SLACK_MODEL_ALERTS_WEBHOOK (rotated/revoked?)"
