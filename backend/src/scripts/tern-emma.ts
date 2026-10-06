@@ -8,6 +8,7 @@ import {
   TspStreamReader,
 } from '../tern/protocol';
 import {
+  AgentRunSummaryLike,
   ApprovalDeckInboundAnswer,
   ApprovalDeckUiState,
   EmmaMessage,
@@ -15,6 +16,7 @@ import {
   approvalDeckAllAnswered,
   approvalDeckIsAwaiting,
   filterSessions,
+  renderAgentRunsScreen,
   renderApprovalDeck,
   renderEmmaDock,
   renderEmmaMain,
@@ -26,6 +28,7 @@ import {
 } from '../tern/renderEmma';
 
 const SURFACE_ID = 'agentweb-emma';
+const RUNS_SURFACE_ID = 'agentweb-runs';
 const DA1 = '\x1b[c';
 
 interface HelloReply {
@@ -67,8 +70,8 @@ function isHello(value: Record<string, unknown>): value is Record<string, unknow
     && value.kinds.every(item => typeof item === 'string');
 }
 
-function nodeAdd(node: TspNode): [string, string, string, null, TspNode] {
-  return ['add', node.id, SURFACE_ID, null, node];
+function nodeAdd(node: TspNode, surfaceId = SURFACE_ID): [string, string, string, null, TspNode] {
+  return ['add', node.id, surfaceId, null, node];
 }
 
 class FrameSender {
@@ -76,7 +79,10 @@ class FrameSender {
   private inFlight: number | null = null;
   private pending: unknown[][] | null = null;
 
-  constructor(private readonly apcLimit: number) {}
+  constructor(
+    private readonly surfaceId: string,
+    private readonly apcLimit: number,
+  ) {}
 
   request(ops: unknown[][]): void {
     this.pending = ops;
@@ -99,7 +105,7 @@ class FrameSender {
     const s = ++this.sequence;
     this.inFlight = s;
     process.stdout.write(
-      encodeTspJson('f', { sf: SURFACE_ID, s, ops }, undefined, this.apcLimit),
+      encodeTspJson('f', { sf: this.surfaceId, s, ops }, undefined, this.apcLimit),
     );
   }
 }
@@ -311,7 +317,7 @@ async function main(): Promise<void> {
   const apcLimit = typeof hello.apc === 'number'
     ? hello.apc
     : TSP_DEFAULT_APC_LIMIT;
-  const frames = new FrameSender(apcLimit);
+  const frames = new FrameSender(SURFACE_ID, apcLimit);
 
   process.stdout.write(
     encodeTspJson(
