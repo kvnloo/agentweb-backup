@@ -328,6 +328,53 @@ describe('CRM Webhook Endpoint — POST /api/crm/:provider/:listId/webhook', () 
     expect(crmDb.createLead).not.toHaveBeenCalled();
   });
 
+  // ENG-2322: the lookups said "absent" but createLead's email pre-check found the row (a
+  // concurrent create won). That used to throw out of the loop and abandon the whole delivery.
+  it('adopts the existing lead as an update when createLead loses a duplicate-email race, and still processes the next contact', async () => {
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockResolvedValue(null);
+    (crmDb.createLead as jest.Mock)
+      .mockRejectedValueOnce(Object.assign(
+        new Error('Lead with email "raced@acme.com" already exists in this list'),
+        { duplicateEmail: true, existingLead: { leadId: 'lead-won', email: 'raced@acme.com', firstName: 'Old' } },
+      ))
+      .mockResolvedValueOnce({ leadId: 'lead-second' });
+
+    const res = await request(app)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send([
+        { subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '111', propertyName: 'email', propertyValue: 'raced@acme.com' },
+        { subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '111', propertyName: 'firstname', propertyValue: 'New' },
+        { subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '222', propertyName: 'email', propertyValue: 'second@acme.com' },
+      ]);
+
+    expect(res.status).toBe(200);
+    await new Promise(r => setTimeout(r, 80));
+    expect(crmDb.updateLead).toHaveBeenCalledWith(
+      VALID_LIST_ID, 'lead-won',
+      expect.objectContaining({ firstName: 'New' }),
+    );
+    // The adopted lead already has the address: it is not rewritten.
+    expect((crmDb.updateLead as jest.Mock).mock.calls[0][2].email).toBeUndefined();
+    // The contact behind the race was not abandoned.
+    expect(crmDb.createLead).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not swallow a createLead failure that is not a duplicate-email race', async () => {
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.getLeadByHubSpotContactId as jest.Mock).mockResolvedValue(null);
+    (crmDb.createLead as jest.Mock).mockRejectedValueOnce(new Error('dynamo down'));
+
+    await request(app)
+      .post(`/api/crm/hubspot/${VALID_LIST_ID}/webhook`)
+      .set('x-webhook-secret', VALID_SECRET)
+      .send([{ subscriptionType: 'contact.propertyChange', portalId: 99999, objectId: '111', propertyName: 'email', propertyValue: 'x@acme.com' }]);
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(crmDb.updateLead).not.toHaveBeenCalled();
+  });
+
   // ─── Happy paths ──────────────────────────────────────────────────────────────
 
   it('updates lead standard fields on HubSpot contact.propertyChange', async () => {
