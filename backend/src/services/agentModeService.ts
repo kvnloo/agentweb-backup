@@ -309,7 +309,7 @@ import { stampMetaAdCreated, stampMetaAdCreativeChanged, stampMetaCreativeCreate
 // change) is inside setWorkPlanStatusAttempt, whose real body is now in
 // emma/impl/workPlans.ts — imported there instead, see that module.
 import { CitationRegistry } from '../utils/citations';
-import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
+import { normalizeMetaCampaignIds, getMetaAdsMetricsArgsSchema } from '../utils/metaCampaignIds';
 import { parseTimecodeToSeconds } from '../emma/impl/video';
 import {
   applyOpenRouterCacheBreakpoints,
@@ -8228,10 +8228,8 @@ export class AgentModeService {
         };
 
       case 'get_meta_ads_metrics':
-        const normalizedCampaignIds = normalizeMetaCampaignIds(
-          args.campaign_ids,
-          args.campaign_id,
-        );
+        const parsedMetricsArgs = getMetaAdsMetricsArgsSchema.safeParse(args);
+        const normalizedCampaignIds = parsedMetricsArgs.success ? parsedMetricsArgs.data.campaign_ids : [];
 
         if (normalizedCampaignIds.length === 0) {
           return {
