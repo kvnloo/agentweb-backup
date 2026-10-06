@@ -95,34 +95,37 @@ function nodeAdd(node: TspNode, surfaceId = SURFACE_ID): [string, string, string
 
 class FrameSender {
   private sequence = 0;
-  private inFlight: number | null = null;
+  private acked = 0;
   private pending: unknown[][] | null = null;
 
   constructor(
     private readonly surfaceId: string,
     private readonly apcLimit: number,
+    private readonly credits: number,
   ) {}
 
   request(ops: unknown[][]): void {
+    // While blocked, keep only the newest full-state frame. Our callers render
+    // complete region replacements, so older queued frames are superseded.
     this.pending = ops;
-    this.flush();
+    this.pump();
   }
 
   ack(sequence: number): void {
-    if (this.inFlight !== null && sequence >= this.inFlight) {
-      this.inFlight = null;
-      this.flush();
-    }
+    if (sequence <= this.acked) return;
+    this.acked = Math.min(sequence, this.sequence);
+    this.pump();
   }
 
-  private flush(): void {
-    // Intentionally use one credit even when Tern grants more. It makes full-root
-    // replacement deterministic and coalesces rapid editor/picker updates for P0.
-    if (this.inFlight !== null || !this.pending) return;
+  private get blocked(): boolean {
+    return this.sequence - this.acked >= this.credits;
+  }
+
+  private pump(): void {
+    if (this.blocked || !this.pending) return;
     const ops = this.pending;
     this.pending = null;
     const s = ++this.sequence;
-    this.inFlight = s;
     process.stdout.write(
       encodeTspJson('f', { sf: this.surfaceId, s, ops }, undefined, this.apcLimit),
     );
@@ -350,7 +353,10 @@ async function main(): Promise<void> {
   const apcLimit = typeof hello.apc === 'number'
     ? hello.apc
     : TSP_DEFAULT_APC_LIMIT;
-  const frames = new FrameSender(SURFACE_ID, apcLimit);
+  const credits = typeof hello.credits === 'number' && hello.credits > 0
+    ? Math.floor(hello.credits)
+    : 2;
+  const frames = new FrameSender(SURFACE_ID, apcLimit, credits);
 
   process.stdout.write(
     encodeTspJson(
@@ -481,7 +487,7 @@ async function main(): Promise<void> {
       const runs = await client.getAgentRuns(session.sessionId, 3);
       runState = { runs, selected: 0 };
       pickerKeyBuffer = '';
-      runFrames = new FrameSender(RUNS_SURFACE_ID, apcLimit);
+      runFrames = new FrameSender(RUNS_SURFACE_ID, apcLimit, credits);
       process.stdout.write(
         encodeTspJson(
           'o',
