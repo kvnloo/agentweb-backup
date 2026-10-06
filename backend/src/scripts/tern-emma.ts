@@ -278,6 +278,7 @@ async function main(): Promise<void> {
   let rawHandler: ((raw: string) => void) | undefined;
   let shuttingDown = false;
   let surfaceOpened = false;
+  let runsSurfaceOpened = false;
 
   const closeAndExit = (code: number) => {
     if (shuttingDown) return;
@@ -299,6 +300,7 @@ async function main(): Promise<void> {
     process.exit(code);
   };
 
+  process.on('SIGINT', () => closeAndExit(130));
   process.on('SIGTERM', () => closeAndExit(143));
   process.on('SIGHUP', () => closeAndExit(129));
 
@@ -385,7 +387,6 @@ async function main(): Promise<void> {
   let approvalState: ApprovalDeckUiState | undefined;
   let runState: { runs: AgentRunSummaryLike[]; selected: number } | undefined;
   let runFrames: FrameSender | undefined;
-  let runsSurfaceOpened = false;
   const dismissedDecks = new Set<string>();
   let pickerKeyBuffer = '';
   let escapeFlush: NodeJS.Timeout | undefined;
