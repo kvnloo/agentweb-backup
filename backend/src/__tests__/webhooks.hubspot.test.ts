@@ -352,6 +352,38 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 
+  // ENG-2322: the lookups said "absent" but createLead's own email pre-check found the row (a
+  // concurrent create won). That used to throw out of the list loop and fail the whole job.
+  it('adopts the existing lead as an update when createLead loses a duplicate-email race', async () => {
+    mockGetLeadByEmail.mockResolvedValue(null);
+    mockGetContactById.mockResolvedValue({ email: 'raced@example.com', firstname: 'New' });
+    mockCreateLead.mockRejectedValueOnce(Object.assign(
+      new Error('Lead with email "raced@example.com" already exists in this list'),
+      { duplicateEmail: true, existingLead: { leadId: 'lead-won', email: 'raced@example.com', firstName: 'Old' } },
+    ));
+    const body = [{ subscriptionType: 'contact.creation', portalId: PORTAL_ID, objectId: '777' }];
+    await request(app).post('/api/webhooks/hubspot').send(body);
+
+    await flushPromises();
+    await flushPromises();
+    expect(mockUpdateLead).toHaveBeenCalledWith(LIST_ID, 'lead-won', expect.objectContaining({ firstName: 'New' }));
+    // The adopted lead already has the address: it is not rewritten.
+    expect(mockUpdateLead.mock.calls[0][2].email).toBeUndefined();
+    expect(mockMarkJobFailed).not.toHaveBeenCalled();
+  });
+
+  it('still fails the job for a createLead error that is not a duplicate-email race', async () => {
+    mockGetLeadByEmail.mockResolvedValue(null);
+    mockGetContactById.mockResolvedValue({ email: 'x@example.com' });
+    mockCreateLead.mockRejectedValueOnce(new Error('dynamo down'));
+    const body = [{ subscriptionType: 'contact.creation', portalId: PORTAL_ID, objectId: '778' }];
+    await request(app).post('/api/webhooks/hubspot').send(body);
+
+    await flushPromises();
+    await flushPromises();
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
   it('does NOT create a lead on contact.propertyChange for a contact not in the list', async () => {
     mockGetLeadByEmail.mockResolvedValue(null);
     const body = [{ subscriptionType: 'contact.propertyChange', portalId: PORTAL_ID, objectId: '888', propertyName: 'email', propertyValue: 'stranger@example.com' }];

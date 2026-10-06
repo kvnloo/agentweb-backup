@@ -2143,6 +2143,17 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
 
     res.status(201).json(lead);
   } catch (error: any) {
+    // A same-email lead already in this list is a conflict the user caused, not a server fault:
+    // createLead's pre-check throws a typed error (message unchanged, so the portal toast still
+    // reads the same). 409 + the existing leadId lets a client open/merge the row instead of
+    // treating it as a failure; 5xx would also trip retries and error alerting.
+    if (error?.duplicateEmail) {
+      return res.status(409).json({
+        message: error.message,
+        duplicate: true,
+        ...(error.existingLead?.leadId ? { leadId: error.existingLead.leadId } : {}),
+      });
+    }
     console.error('Error creating lead:', error);
     res.status(500).json({ message: error.message || 'Failed to create lead' });
   }
