@@ -169,7 +169,12 @@ export async function readGTMPlan(planId: string, userId: string): Promise<any> 
 
     if (plan.phases && plan.phases.length > 0) {
       plan.phases.forEach((phase: any, index: number) => {
-        formattedContent += `Phase ${index + 1}: ${phase.title}\n`;
+        // ENG-1816 F2 follow-up: expose the phase's real id (what add_gtm_work_items/
+        // update_gtm_phase/delete_gtm_items actually key off) alongside its display
+        // number. Appended after the title, not between "Phase N:" and the title, so
+        // existing formattedContent.toContain('Phase 1: Phase 1')-style assertions
+        // (which check that exact prefix) keep matching.
+        formattedContent += `Phase ${index + 1}: ${phase.title} (id: ${phase.id})\n`;
         if (phase.description) {
           formattedContent += `  Description: ${phase.description}\n`;
         }
@@ -192,6 +197,11 @@ export async function readGTMPlan(planId: string, userId: string): Promise<any> 
             if (item.completedAt) {
               formattedContent += ` - Completed: ${item.completedAt}`;
             }
+            // Same reasoning as the phase id above: appended last, after every
+            // existing conditional segment, so 'Work Item 1 [pending]'-style
+            // assertions (title immediately followed by the status bracket)
+            // still match.
+            formattedContent += ` (id: ${item.id})`;
             formattedContent += `\n`;
             if (item.description) {
               formattedContent += `       ${item.description}\n`;

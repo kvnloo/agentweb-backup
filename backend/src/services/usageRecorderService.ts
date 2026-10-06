@@ -291,17 +291,22 @@ let lastBillingResolveErrorLogAt = 0;
  * which is exactly the pre-ENG-2286 behaviour — a record is never lost over this.
  */
 async function resolveRecordBillingUserId(supplied: string | undefined, userId: string): Promise<string> {
-  if (supplied) return supplied;
-  if (process.env[SPEND_RECORDER_RESOLVE_ORG_OWNER_ENV] === "false") return userId;
+  // A SUPPLIED id is resolved too, not trusted as the payer. Callers name the owner of a connected
+  // resource (e.g. the X account's owner), which for an org member is the member, not the org's
+  // billing root: honouring it verbatim kept that spend outside the owner's cap. Resolving is
+  // idempotent for an id that is already a billing root (an owner, a solo user, a member holding their
+  // own subscription), so callers that pass a resolved payer are unaffected.
+  const subject = supplied || userId;
+  if (process.env[SPEND_RECORDER_RESOLVE_ORG_OWNER_ENV] === "false") return subject;
   // No AW-Users row to pool from, so there is nothing to resolve.
-  if (!userId || userId === "system" || userId.startsWith("anon_")) return userId;
+  if (!subject || subject === "system" || subject.startsWith("anon_")) return subject;
   // Unit tests that run the recorder over an unmocked data layer must never reach
   // a live DynamoDB (same precedent as llmUsagePolicyResolverService). They keep
   // the old behaviour unless a test installs a resolver explicitly.
-  if (!billingOwnerResolverOverride && process.env.NODE_ENV === "test") return userId;
+  if (!billingOwnerResolverOverride && process.env.NODE_ENV === "test") return subject;
 
   const now = Date.now();
-  const hit = billingOwnerCache.get(userId);
+  const hit = billingOwnerCache.get(subject);
   if (hit && hit.expiresAt > now) return hit.id;
 
   try {
@@ -309,9 +314,9 @@ async function resolveRecordBillingUserId(supplied: string | undefined, userId: 
       billingOwnerResolverOverride ??
       // Lazy-required, not imported: see the note on tokenUsageService above.
       (require("./tokenUsageService") as typeof import("./tokenUsageService")).resolveBillingUserId;
-    const id = await resolve(userId);
+    const id = await resolve(subject);
     if (billingOwnerCache.size >= BILLING_OWNER_CACHE_MAX) billingOwnerCache.clear();
-    billingOwnerCache.set(userId, { id, expiresAt: now + BILLING_OWNER_CACHE_TTL_MS });
+    billingOwnerCache.set(subject, { id, expiresAt: now + BILLING_OWNER_CACHE_TTL_MS });
     return id;
   } catch (error) {
     // Not cached: the next call retries. Logged (throttled) because silently
@@ -323,7 +328,7 @@ async function resolveRecordBillingUserId(supplied: string | undefined, userId: 
         error instanceof Error ? error.message : error,
       );
     }
-    return userId;
+    return subject;
   }
 }
 

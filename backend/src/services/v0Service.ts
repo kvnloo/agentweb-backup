@@ -6961,16 +6961,25 @@ export async function updateLandingPageMetaPixel(
   if (!record) throw new Error("Landing page not found");
 
   if (pixelId) {
+    const sets = ["metaPixelId = :px", "updatedAt = :now"];
+    const values: Record<string, any> = { ":px": pixelId, ":now": new Date().toISOString() };
+    const removes: string[] = [];
+    // Mirrors updateLandingPageGoogleAds's conversionLabel/customerId handling: `undefined`
+    // means the caller didn't mention an account (leave whatever is stored — a standalone
+    // page can carry a pixel with no ad account tied to it), `""` means explicitly clear
+    // it. Previously this always referenced `:acc` even when `accountId` was undefined,
+    // and the SDK silently drops an undefined value from ExpressionAttributeValues — so
+    // DynamoDB rejected the whole update as referencing an undefined placeholder.
+    if (accountId === undefined) { /* not mentioned — leave whatever is stored */ }
+    else if (accountId === "") { removes.push("metaAdAccountId"); }
+    else { sets.push("metaAdAccountId = :acc"); values[":acc"] = accountId; }
+
     await dynamodb
       .update({
         TableName: TABLE_NAME,
         Key: { id },
-        UpdateExpression: "SET metaPixelId = :px, metaAdAccountId = :acc, updatedAt = :now",
-        ExpressionAttributeValues: {
-          ":px": pixelId,
-          ":acc": accountId,
-          ":now": new Date().toISOString(),
-        },
+        UpdateExpression: `SET ${sets.join(", ")}` + (removes.length ? ` REMOVE ${removes.join(", ")}` : ""),
+        ExpressionAttributeValues: values,
       })
       .promise();
   } else {
