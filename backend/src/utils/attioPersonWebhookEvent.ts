@@ -192,9 +192,19 @@ export async function applyAttioPersonEvent(
       syncMetadata: { attio_record_id: recordId },
     };
     if (Object.keys(customFields).length > 0) newLead.customFields = customFields;
-    const created = await crmDb.createLead(listId, newLead);
-    console.log(`[AttioWebhook] Created lead ${created?.leadId ?? '(unknown)'} for recordId=${recordId} in list ${listId}`);
-  } else {
+    try {
+      const created = await crmDb.createLead(listId, newLead);
+      console.log(`[AttioWebhook] Created lead ${created?.leadId ?? '(unknown)'} for recordId=${recordId} in list ${listId}`);
+    } catch (createErr: any) {
+      // The lookups above said "absent" but createLead's own pre-check found the address — a
+      // concurrent create won in between. Adopt that row and apply this event as an update
+      // instead of failing the event (which marks the whole sync run failed).
+      if (!createErr?.duplicateEmail || !createErr.existingLead) throw createErr;
+      lead = createErr.existingLead as Record<string, any>;
+      console.log(`[AttioWebhook] Lead for recordId=${recordId} already existed in list ${listId} (lost create race) — updating ${lead.leadId}`);
+    }
+  }
+  if (lead) {
     const updates: Record<string, any> = { ...leadData };
     // Keep AgentWeb's stored email in sync with an email change made in
     // Attio, and stamp attio_record_id when this lead was only just matched
