@@ -5385,7 +5385,7 @@ emmaToolRegistry.register({
   name: "describe_image",
   definition: {
     name: "describe_image",
-    description: 'Analyze and describe an image from a URL. Use this when the user mentions an image, asks to "read" an image, or when you need to understand visual content (jpg, jpeg, png, gif, webp, svg, etc.). Always prefer this over read_file_content for image files.',
+    description: 'Analyze and describe an image from a URL. Use this when the user mentions an image, asks to "read" an image, or when you need to understand visual content (jpg, jpeg, png, gif, webp, svg, etc.). Always prefer this over read_file_content for image files; for SVG, use read_file_content only when the user wants its source markup, text labels, or dimensions.',
     inputSchema: {
       type: "object",
       properties: {

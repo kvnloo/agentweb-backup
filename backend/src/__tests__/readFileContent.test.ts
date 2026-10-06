@@ -415,6 +415,29 @@ describe('readFileContent', () => {
       expect(result.file_type).toBe('text');
     });
 
+    it('reads SVG source as text instead of rejecting it as an image (ENG-1468)', async () => {
+      const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="40"><text>Logo</text></svg>';
+      const axios = require('axios');
+      axios.get.mockResolvedValue({ data: Buffer.from(svg), headers: { 'content-type': 'image/svg+xml' } });
+
+      const result = await (agentModeService as any).readFileContent('https://example.com/logo.svg');
+
+      expect(result.success).toBe(true);
+      expect(result.content).toBe(svg);
+      expect(result.file_type).toBe('text');
+    });
+
+    it('still rejects raster images and points to describe_image (ENG-1468)', async () => {
+      const axios = require('axios');
+      axios.get.mockClear();
+
+      const result = await (agentModeService as any).readFileContent('https://example.com/photo.png');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('describe_image');
+      expect(axios.get).not.toHaveBeenCalled();
+    });
+
     it('should detect unknown file types', async () => {
       const testContent = 'Some binary content';
       const mockResponse = {
