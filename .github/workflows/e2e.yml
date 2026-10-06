@@ -47,7 +47,17 @@ jobs:
         run: |
           set -euo pipefail
           npm ci --prefix partner-portal
-          npm install --prefix e2e --no-package-lock --ignore-scripts --no-audit --no-fund
+          npm install --prefix e2e --ignore-scripts --no-audit --no-fund
+
+      # Bootstrap only: capture npm's resolved graph so the final lane can use npm ci.
+      - name: Upload bootstrap lockfile
+        if: ${{ steps.install.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-lockfile-bootstrap
+          path: e2e/package-lock.json
+          if-no-files-found: error
 
       - name: Install Chromium
         id: browser
