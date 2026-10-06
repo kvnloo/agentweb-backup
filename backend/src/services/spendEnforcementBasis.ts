@@ -180,12 +180,22 @@ export interface EnforcementCostBasis {
 export async function resolveEnforcementCostBasisMicroUsd(input: {
   billingUserId: string;
   billingMonth: string;
-  legacyRawCostUsedMicroUsd: number;
+  /**
+   * The legacy per-user counter figure. Pass a function: it is invoked ONLY on the paths that fall
+   * back to the legacy basis (enforcement off for this subject, or the opt-in legacy fallback), so
+   * with the ledger live the retiring counter is never read at all (ENG-1250 AC7).
+   */
+  legacyRawCostUsedMicroUsd: number | (() => number | Promise<number>);
   /** Subscription tier, when the caller has it — lets an excluded tier (e.g. Free) stay on legacy under a broad flip. */
   tier?: string | null;
 }): Promise<EnforcementCostBasis> {
+  const legacy = async (): Promise<number> =>
+    typeof input.legacyRawCostUsedMicroUsd === "function"
+      ? input.legacyRawCostUsedMicroUsd()
+      : input.legacyRawCostUsedMicroUsd;
+
   if (!isSpendLedgerEnforcementEnabled(input.billingUserId, input.tier)) {
-    return { rawCostUsedMicroUsd: input.legacyRawCostUsedMicroUsd, basis: "legacy", projectionMissing: false, stale: false };
+    return { rawCostUsedMicroUsd: await legacy(), basis: "legacy", projectionMissing: false, stale: false };
   }
 
   let projection = null;
@@ -199,7 +209,7 @@ export async function resolveEnforcementCostBasisMicroUsd(input: {
           `falling back to legacy basis:`,
         err,
       );
-      return { rawCostUsedMicroUsd: input.legacyRawCostUsedMicroUsd, basis: "legacy", projectionMissing: true, stale: false };
+      return { rawCostUsedMicroUsd: await legacy(), basis: "legacy", projectionMissing: true, stale: false };
     }
     // AC7: no legacy fallback. FAIL OPEN — admit — and say so loudly, because an
     // over-cap account is admitted for as long as this keeps failing.
@@ -221,7 +231,7 @@ export async function resolveEnforcementCostBasisMicroUsd(input: {
         `[spendEnforcementBasis] projection MISSING for ${input.billingUserId} ${input.billingMonth}; ` +
           `falling back to legacy basis (writer/backfill has not covered this subject).`,
       );
-      return { rawCostUsedMicroUsd: input.legacyRawCostUsedMicroUsd, basis: "legacy", projectionMissing: true, stale: false };
+      return { rawCostUsedMicroUsd: await legacy(), basis: "legacy", projectionMissing: true, stale: false };
     }
     // AC7: no row means no settled spend has been recorded for this subject this
     // month — the normal state of a first request in a new month — so it counts $0.
@@ -250,7 +260,7 @@ export async function resolveEnforcementCostBasisMicroUsd(input: {
           `computedAt=${projection.computedAt ?? "(missing)"} age=${Number.isFinite(ageMs) ? Math.round(ageMs / 1000) + "s" : "unknown"} ` +
           `> threshold=${Math.round(thresholdMs / 1000)}s; falling back to legacy basis.`,
       );
-      return { rawCostUsedMicroUsd: input.legacyRawCostUsedMicroUsd, basis: "legacy", projectionMissing: false, stale: true };
+      return { rawCostUsedMicroUsd: await legacy(), basis: "legacy", projectionMissing: false, stale: true };
     }
   }
 
@@ -258,12 +268,10 @@ export async function resolveEnforcementCostBasisMicroUsd(input: {
   // Credits/threshold are applied downstream, identically to the legacy figure.
   const rawCostUsedMicroUsd = Math.max(0, Math.round(projection.settledMicroUsd));
 
-  // One terse observability line so a canary flip can be watched: how much the
-  // basis moved for this subject (the vendor spend the legacy counter never saw).
-  const deltaMicroUsd = rawCostUsedMicroUsd - Math.max(0, Math.round(input.legacyRawCostUsedMicroUsd));
+  // No legacy comparison here any more: the canary that diffed ledger against the legacy counter
+  // served the cutover, and it would force a counter read on every admission (ENG-1250 AC7).
   console.log(
-    `[spendEnforcementBasis] ledger basis for ${input.billingUserId} ${input.billingMonth}: ` +
-      `legacy=${input.legacyRawCostUsedMicroUsd}µ ledger=${rawCostUsedMicroUsd}µ delta=${deltaMicroUsd}µ`,
+    `[spendEnforcementBasis] ledger basis for ${input.billingUserId} ${input.billingMonth}: ledger=${rawCostUsedMicroUsd}µ`,
   );
 
   return { rawCostUsedMicroUsd, basis: "spend_ledger", projectionMissing: false, stale: false };

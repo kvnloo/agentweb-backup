@@ -171,7 +171,6 @@ describe('resolveEffectiveModelForUser — admin-only model entitlement (ENG-120
       billingUserId: OWNER_ID,
       policy: null,
       costUsedMicroUsd: 0,
-      tokenUsed: 1,
       creditsApplied: false,
       mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
     });
