@@ -34,6 +34,7 @@
 import * as crypto from 'crypto';
 import { isSmokeTestLead } from '../utils/smokeTestLead';
 import { defaultStatusConfigFor } from '../utils/leadSchema';
+import { isSessionList } from '../utils/sessionList';
 
 export type LeadStatusType = 'active' | 'won' | 'lost' | 'churned';
 
@@ -401,6 +402,9 @@ export interface RelayContext {
    *  status says now. Absent on the first, inline attempt, where current state is the
    *  transition. See processConversionRelayJob for why this matters. */
   conversionKind?: ConversionKind;
+  /** The list's listType, from the list row the caller already loaded. A session list never
+   *  relays (ENG-2311) — see the guards in dispatchLeadStatusConversion / relayLeadStatusEvent. */
+  listType?: string | null;
 }
 
 export type RelayResult =
@@ -527,6 +531,12 @@ export async function relayLeadStatusEvent(
 
   try {
     if (!leadId) return { skipped: true, reason: 'lead has no leadId', retryable: false };
+
+    // ENG-2311: every send funnels through here (inline, queued job, fallback). Prod session
+    // lists were created untyped with the SALES statusConfig (it has `won`), and retagging
+    // 'session' keeps that config — so a status edit on a session row must still never
+    // reach Meta. settled=true so any pending marker is released rather than swept forever.
+    if (isSessionList({ listType: ctx.listType })) return skip('session list never relays conversions', false, false, true);
 
     // A queued kind is authoritative: the conversion happened when the status changed, and
     // a later edit does not un-happen it. Only fall back to deriving one from current status
@@ -742,6 +752,7 @@ export async function processConversionRelayJob(payload: ConversionRelayJobPaylo
     lead,
     statusConfig: (list as any)?.statusConfig,
     conversionMapping: (list as any)?.conversionMapping,
+    listType: (list as any)?.listType,
     conversionKind: payload.conversionKind,
   });
 
@@ -867,6 +878,8 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<D
 
   const leadId = ctx.lead?.leadId;
   if (!leadId) return 'noop';
+  // ENG-2311: don't even enqueue a job for a session list (see relayLeadStatusEvent).
+  if (isSessionList({ listType: ctx.listType })) return 'noop';
 
   // An explicitly supplied kind is authoritative — it comes either from a queued job or from
   // a `metaConversionPending` marker, and in both cases the lead's CURRENT status may have

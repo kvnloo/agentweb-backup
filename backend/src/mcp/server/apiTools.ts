@@ -1026,7 +1026,7 @@ mcpToolRegistry.register({
         list_id: { type: 'string', description: 'List ID (required for get/update/delete)' },
         name: { type: 'string', description: 'List name (create/update)' },
         description: { type: 'string', description: 'List description (create/update)' },
-        list_type: { type: 'string', description: 'List type (create only)' }
+        list_type: { type: 'string', description: 'List type: sales | customers | session (create only; validated by the API)' }
       },
       required: ['action']
     }
