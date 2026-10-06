@@ -618,8 +618,16 @@ async function main(): Promise<void> {
     if (running) return;
     approvalState = undefined;
     try {
-      const sessions = await client.listEmmaSessions(50);
-      if (!sessions.some(item => item.sessionId === session.sessionId)) sessions.unshift(session);
+      const [emmaSessions, scheduledSessions] = await Promise.all([
+        client.listEmmaSessions(50),
+        client.listScheduledSessions(50),
+      ]);
+      const byId = new Map<string, EmmaSessionLike>();
+      for (const item of [...emmaSessions, ...scheduledSessions]) {
+        if (!byId.has(item.sessionId)) byId.set(item.sessionId, item);
+      }
+      if (!byId.has(session.sessionId)) byId.set(session.sessionId, session);
+      const sessions = [...byId.values()];
       const sorted = filterSessions(sessions, '');
       const selected = Math.max(0, sorted.findIndex(item => item.sessionId === session.sessionId));
       pickerState = { sessions, query: '', cursor: 0, selected };
