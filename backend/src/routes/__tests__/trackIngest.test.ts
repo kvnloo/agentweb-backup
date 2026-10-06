@@ -5,7 +5,7 @@
 import request from 'supertest';
 import express from 'express';
 import { crmDb } from '../../services/db';
-import { createTrackIngestRouter, createIngestRateLimiter, trackBodyParser } from '../trackIngest';
+import { createTrackIngestRouter, createIngestRateLimiter, createIngestIpRateLimiter, trackBodyParser } from '../trackIngest';
 import { sessionLeadId } from '../../utils/sessionList';
 
 jest.mock('../../services/db', () => ({
@@ -17,12 +17,12 @@ const SID = 'abcd1234-ef56-7890';
 const ORIGIN = 'https://go.example.com';
 const CHROME = 'Mozilla/5.0 (Windows NT 10.0) Chrome/120';
 
-function makeApp(limit?: number) {
+function makeApp(limit?: number, ipLimit?: number) {
   const app = express();
   app.set('trust proxy', 2);
   // Same order as app.ts: the 16kb parser first.
   app.use('/api/track/event', ...trackBodyParser);
-  app.use('/api/track', createTrackIngestRouter({ rateLimiter: createIngestRateLimiter({ limit: limit ?? 1000 }) }));
+  app.use('/api/track', createTrackIngestRouter({ rateLimiter: createIngestRateLimiter({ limit: limit ?? 1000 }), ipRateLimiter: createIngestIpRateLimiter({ limit: ipLimit ?? 100000 }) }));
   return app;
 }
 const sessionList = (over: Record<string, any> = {}) => ({
@@ -249,6 +249,18 @@ describe('POST /api/track/event', () => {
       const statuses: number[] = [];
       for (let i = 1; i <= 5; i++) statuses.push((await post(app, event(), forged(i))).status);
       expect(statuses.filter((s) => s === 429).length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('rotating listIds from ONE IP cannot dodge the limit: the IP-wide cap 429s before any list read', async () => {
+      const app = makeApp(1000, 5);
+      const ip = { 'X-Forwarded-For': '198.51.100.9, 198.51.100.9, 10.0.0.9' };
+      const statuses: number[] = [];
+      for (let i = 0; i < 12; i++) statuses.push((await post(app, event({ listId: `list_rotating_${i}` }), ip)).status);
+      expect(statuses.filter((s) => s === 429)).toHaveLength(7);
+      expect(statuses.slice(0, 5).every((s) => s !== 429)).toBe(true);
+      expect(crmDb.getLeadListById).toHaveBeenCalledTimes(5); // the 7 dropped requests cost no database read
+      // another address is unaffected
+      expect((await post(app, event(), { 'X-Forwarded-For': '203.0.113.1, 203.0.113.1, 10.0.0.9' })).status).toBe(204);
     });
 
     it('never touches the lead-save route: the limiter lives only on /api/track/event', async () => {

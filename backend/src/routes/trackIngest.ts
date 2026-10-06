@@ -6,7 +6,7 @@
  * Anonymous and CORS-open by design (a landing page on any customer domain posts here), so the
  * trust model is explicit and layered, cheapest check first:
  *   1. body: <=16kb, parsed by trackBodyParser before the app-wide 50mb parser can see it;
- *   2. per IP+list rate limit that DROPS (429) — this endpoint only ever writes session rows, so
+ *   2. per-IP limiter (all lists) then per IP+list limiter, both DROP (429) — this endpoint only ever writes session rows, so
  *      dropping loses telemetry, never a lead (lead saves go through forward-lead, which has no limiter here);
  *   3. strict body parsing (utils/trackingIngest): allow-listed event, bounded fields, valid session identity;
  *   4. the list is resolved server-side from `listId` and must be a session list with public access ON
@@ -29,6 +29,13 @@ export const MAX_INGEST_BODY = '16kb';
 export const INGEST_RATE_WINDOW_MS = 60_000;
 /** Events per IP per list per minute. A real visitor sends well under 30 a minute; 240 leaves room for a shared office/campus NAT. */
 export const INGEST_RATE_LIMIT = 240;
+/**
+ * Events per IP per minute across ALL lists. The per-list key comes from the body, so on its own a
+ * caller rotating listIds gets a fresh bucket each time and every request costs an unauthenticated
+ * DynamoDB read. 600 = 2.5x the per-list cap: room for a busy shared NAT (an office/campus on one
+ * address across a few lists) while bounding what one address can make us read.
+ */
+export const INGEST_IP_RATE_LIMIT = 600;
 
 export const setCors = (res: Response): void => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -53,6 +60,23 @@ export const trackBodyParser: Array<express.RequestHandler | express.ErrorReques
   },
 ];
 
+const dropped = (_req: Request, res: Response): void => {
+  setCors(res);
+  res.status(429).json({ success: false, code: 'rate_limited' });
+};
+
+/** IP-only limiter, mounted BEFORE the per-list one so a rejected request never creates a per-list key. */
+export function createIngestIpRateLimiter(opts: { limit?: number; windowMs?: number } = {}): express.RequestHandler {
+  return rateLimit({
+    windowMs: opts.windowMs ?? INGEST_RATE_WINDOW_MS,
+    limit: opts.limit ?? INGEST_IP_RATE_LIMIT,
+    standardHeaders: false,
+    legacyHeaders: false,
+    keyGenerator: (req) => ipKeyGenerator(req.ip ?? ''),
+    handler: dropped,
+  });
+}
+
 export function createIngestRateLimiter(opts: { limit?: number; windowMs?: number } = {}): express.RequestHandler {
   return rateLimit({
     windowMs: opts.windowMs ?? INGEST_RATE_WINDOW_MS,
@@ -65,23 +89,21 @@ export function createIngestRateLimiter(opts: { limit?: number; windowMs?: numbe
       const listId = isPlausibleListId(req.body?.listId) ? req.body.listId : '-';
       return `${ipKeyGenerator(req.ip ?? '')}|${listId}`;
     },
-    handler: (_req, res) => {
-      setCors(res);
-      res.status(429).json({ success: false, code: 'rate_limited' });
-    },
+    handler: dropped,
   });
 }
 
-export function createTrackIngestRouter(opts: { rateLimiter?: express.RequestHandler } = {}): express.Router {
+export function createTrackIngestRouter(opts: { rateLimiter?: express.RequestHandler; ipRateLimiter?: express.RequestHandler } = {}): express.Router {
   const router = express.Router();
   const limiter = opts.rateLimiter ?? createIngestRateLimiter();
+  const ipLimiter = opts.ipRateLimiter ?? createIngestIpRateLimiter();
 
   router.options('/event', (_req: Request, res: Response) => {
     setCors(res);
     res.status(204).end();
   });
 
-  router.post('/event', (req, res, next) => { setCors(res); next(); }, limiter, async (req: Request, res: Response) => {
+  router.post('/event', (req, res, next) => { setCors(res); next(); }, ipLimiter, limiter, async (req: Request, res: Response) => {
     try {
       const parsed = parseIngestBody(req.body, Date.now());
       if (!parsed.ok) {
