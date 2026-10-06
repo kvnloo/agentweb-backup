@@ -73,6 +73,7 @@ let mainSha: number;
 let lists: Record<string, any>;
 let listSeq: number;
 let githubUrls: string[];
+let treeTruncated: boolean;
 
 beforeEach(() => {
   jest.resetAllMocks();
@@ -81,12 +82,16 @@ beforeEach(() => {
   lists = {};
   listSeq = 0;
   githubUrls = [];
+  treeTruncated = false;
   delete process.env.AUTO_SESSION_TRACKING;
   mockOrgToken.mockResolvedValue({ token: 'gh-test-token' });
 
   mockAxiosGet.mockImplementation(async (url: string) => {
     githubUrls.push(url);
     if (url.endsWith('/git/ref/heads/main')) return { data: { object: { sha: `sha${mainSha}` } } };
+    if (url.includes('/git/trees/')) {
+      return { data: { truncated: treeTruncated, tree: Object.keys(files).map((path) => ({ path, type: 'blob', size: files[path].length })) } };
+    }
     const m = /\/contents\/([^?]+)\?ref=/.exec(url);
     if (m) {
       const path = decodeURIComponent(m[1]);
@@ -412,6 +417,7 @@ describe('enableSessionTrackingForPage — siblings and races', () => {
     mockAxiosGet.mockImplementation(async (url: string) => {
       githubUrls.push(url);
       if (url.endsWith('/git/ref/heads/main')) { reads++; return { data: { object: { sha: reads === 3 ? 'moved' : `sha${mainSha}` } } }; }
+      if (url.includes('/git/trees/')) return { data: { truncated: false, tree: Object.keys(files).map((path) => ({ path, type: 'blob', size: 1 })) } };
       const m = /\/contents\/([^?]+)\?ref=/.exec(url)!;
       return { data: { type: 'file', encoding: 'base64', content: Buffer.from(files[decodeURIComponent(m[1])]).toString('base64') } };
     });
@@ -525,5 +531,98 @@ describe('autoEnableSessionTracking (generation hook)', () => {
     expect(await autoEnableSessionTracking(page({ id: 'sub1' }), {})).toBeNull();
     expect(mockCommit).not.toHaveBeenCalled();
     expect(mockCreateList).not.toHaveBeenCalled();
+  });
+});
+
+describe('enableSessionTrackingForPage — trackers elsewhere in the repo (DramaBreak shape)', () => {
+  const BESPOKE_PAGE = HTML.replace('</head>', '<script>var s = "aw_sess_" + id; var t = session_start_ms;</script></head>');
+  const BESPOKE_ROUTE = `export async function POST(req) { await fetch(process.env.BACKEND + '/api/webhooks/forward-lead', { body: JSON.stringify({ source: 'lp-session' }) }) }\n`;
+  const expectNothingDone = () => {
+    expect(mockCreateList).not.toHaveBeenCalled();
+    expect(mockClaim).not.toHaveBeenCalled();
+    expect(mockCommit).not.toHaveBeenCalled();
+  };
+
+  it('layout WITHOUT a tracker + static page WITH aw_sess_ + bespoke track route => 409 existing_tracker, no list, no commit', async () => {
+    files = { 'app/layout.tsx': LAYOUT, 'public/offer.html': BESPOKE_PAGE, 'app/api/track/route.ts': BESPOKE_ROUTE };
+    await expect(enableSessionTrackingForPage(page())).rejects.toMatchObject({ code: 'existing_tracker', httpStatus: 409 });
+    expectNothingDone();
+    expect(files['app/layout.tsx']).toBe(LAYOUT);
+  });
+
+  it('a static page with the tracker alone is enough to refuse', async () => {
+    files = { 'app/layout.tsx': LAYOUT, 'public/a/b/offer.html': BESPOKE_PAGE };
+    const err: any = await enableSessionTrackingForPage(page()).catch((e) => e);
+    expect(err.code).toBe('existing_tracker');
+    expect(err.message).toContain('public/a/b/offer.html');
+    expectNothingDone();
+  });
+
+  it('a bespoke track route alone (forward-lead + lp-session) is enough to refuse, wherever it lives under app/api', async () => {
+    files = { 'app/layout.tsx': LAYOUT, 'public/index.html': HTML, 'app/api/v2/collect/route.ts': BESPOKE_ROUTE };
+    await expect(enableSessionTrackingForPage(page())).rejects.toMatchObject({ code: 'existing_tracker' });
+    expectNothingDone();
+  });
+
+  it('the platform\'s own capture route (forward-lead without lp-session) is not a tracker', async () => {
+    files = { 'app/layout.tsx': LAYOUT, 'app/api/capture/route.ts': "fetch('/api/webhooks/forward-lead')" };
+    expect((await enableSessionTrackingForPage(page())).installed).toBe(true);
+  });
+
+  it('POSITIVE: layout + plain public html without a tracker still installs', async () => {
+    files = { 'app/layout.tsx': LAYOUT, 'public/offer.html': HTML, 'public/robots.txt': 'x' };
+    const r = await enableSessionTrackingForPage(page());
+    expect(r).toMatchObject({ installed: true, listCreated: true, path: 'app/layout.tsx' });
+    expect(files['public/offer.html']).toBe(HTML); // other files untouched
+    expect(mockCommit.mock.calls[0][2].map((f: any) => f.path)).toEqual(['app/layout.tsx']);
+  });
+
+  it('an explicit override installs despite a tracker elsewhere', async () => {
+    files = { 'app/layout.tsx': LAYOUT, 'public/offer.html': BESPOKE_PAGE };
+    expect((await enableSessionTrackingForPage(page(), { overrideExistingTracker: true })).installed).toBe(true);
+  });
+
+  it('a truncated tree is refused conservatively (repo_too_large), nothing created', async () => {
+    treeTruncated = true;
+    await expect(enableSessionTrackingForPage(page())).rejects.toMatchObject({ code: 'repo_too_large' });
+    expectNothingDone();
+  });
+
+  it('more than 20 static pages (or routes) is refused conservatively (too_many_files)', async () => {
+    files = { 'app/layout.tsx': LAYOUT };
+    for (let i = 0; i < 21; i++) files[`public/p${i}.html`] = HTML;
+    await expect(enableSessionTrackingForPage(page())).rejects.toMatchObject({ code: 'too_many_files' });
+    expectNothingDone();
+    files = { 'app/layout.tsx': LAYOUT };
+    for (let i = 0; i < 21; i++) files[`app/api/r${i}/route.ts`] = 'export {}';
+    await expect(enableSessionTrackingForPage(page())).rejects.toMatchObject({ code: 'too_many_files' });
+  });
+
+  it('exactly 20 clean pages is fine', async () => {
+    files = { 'app/layout.tsx': LAYOUT };
+    for (let i = 0; i < 20; i++) files[`public/p${i}.html`] = HTML;
+    expect((await enableSessionTrackingForPage(page())).installed).toBe(true);
+  });
+
+  it('a file too big to read is refused, not skipped', async () => {
+    files = { 'app/layout.tsx': LAYOUT, 'public/huge.html': 'x'.repeat(900_001) };
+    await expect(enableSessionTrackingForPage(page())).rejects.toMatchObject({ code: 'too_large' });
+    expectNothingDone();
+  });
+
+  it('an idempotent re-run on an already-tagged page does not re-scan the repo (and never regresses to a refusal)', async () => {
+    const first = await enableSessionTrackingForPage(page());
+    files['public/late.html'] = BESPOKE_PAGE; // a tracker appears later; our tag is already installed
+    githubUrls = [];
+    const again = await enableSessionTrackingForPage(page({ sessionTrackingListId: first.listId }));
+    expect(again.alreadyInstalled).toBe(true);
+    expect(githubUrls.some((u) => u.includes('/git/trees/'))).toBe(false);
+  });
+
+  it('reads only inside the page\'s own repo, at the head sha it probed', async () => {
+    files = { 'app/layout.tsx': LAYOUT, 'public/offer.html': HTML };
+    await enableSessionTrackingForPage(page());
+    const tree = githubUrls.find((u) => u.includes('/git/trees/'))!;
+    expect(tree).toBe('https://api.github.com/repos/AgentWebPro/lp-spring-1234abcd/git/trees/sha0?recursive=1');
   });
 });

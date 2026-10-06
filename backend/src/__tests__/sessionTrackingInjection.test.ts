@@ -155,6 +155,7 @@ describe('injectSessionTrackingIntoLayout', () => {
   it.each([
     ['an SDK tag placed by hand', `<head><script src="https://api.agentweb.pro/sdk/v1/aw.js" data-aw-list="list_old_000001" async></script></head>`, 'data-aw-list'],
     ['the bespoke aw_sess_ tracker', `<head></head><body><script>var k = "aw_sess_" + id;</script></body>`, 'aw_sess_'],
+    ['the bespoke session_start_ms tracker', `<head></head><body><script>var t = session_start_ms;</script></body>`, 'session_start_ms'],
     ['the SDK url alone', `<head><script src="/sdk/v1/aw.js"></script></head>`, '/sdk/v1/aw.js'],
   ])('refuses a layout that already carries %s', (_name, extra, signature) => {
     const layout = V0_LAYOUT.replace('<head>', `<head>${extra}`).replace('<body', `<body data-x="1"`);

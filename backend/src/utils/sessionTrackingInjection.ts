@@ -77,6 +77,7 @@ const BLOCK_CAPTURE_RE: Record<SessionTrackingTarget, RegExp> = {
 const FOREIGN_TRACKER_PATTERNS: Array<[string, RegExp]> = [
   ['data-aw-list', /data-aw-list/],
   ['aw_sess_', /aw_sess_/],
+  ['session_start_ms', /session_start_ms/],
   ['/sdk/v1/aw.js', /\/sdk\/v1\/aw\.js/],
 ];
 
@@ -107,6 +108,16 @@ function stripOurBlocks(content: string, target: SessionTrackingTarget): string 
 export function findExistingTracker(content: string, target: SessionTrackingTarget): string | null {
   const rest = stripOurBlocks(content, target);
   for (const [label, re] of FOREIGN_TRACKER_PATTERNS) if (re.test(rest)) return label;
+  return null;
+}
+
+/**
+ * A bespoke tracking ROUTE (e.g. app/api/track/route.ts) rather than a page: it forwards session rows to
+ * forward-lead tagged `lp-session`. Returns a label for the refusal message, or null.
+ */
+export function findBespokeTrackerRoute(content: string): string | null {
+  if (content.includes('forward-lead') && content.includes('lp-session')) return 'forward-lead + lp-session route';
+  for (const [label, re] of FOREIGN_TRACKER_PATTERNS) if (re.test(content)) return label;
   return null;
 }
 

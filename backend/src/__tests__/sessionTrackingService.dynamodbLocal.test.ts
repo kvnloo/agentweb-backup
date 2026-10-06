@@ -25,6 +25,7 @@ const files = () => gh.commits[gh.head];
 const mockFakeGhAxios = {
   get: jest.fn(async (url: string) => {
     if (url.endsWith('/git/ref/heads/main')) return { data: { object: { sha: gh.head } } };
+    if (url.includes('/git/trees/')) return { data: { truncated: false, tree: Object.keys(files()).map((path) => ({ path, type: 'blob', size: files()[path].length })) } };
     const m = /\/contents\/([^?]+)\?ref=/.exec(url);
     if (m) {
       const f = files()[decodeURIComponent(m[1])];

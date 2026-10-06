@@ -36,6 +36,8 @@ import {
 import {
   SessionTrackingInjectionError,
   extractInstalledListId,
+  findBespokeTrackerRoute,
+  findExistingTracker,
   injectSessionTrackingIntoHtml,
   injectSessionTrackingIntoLayout,
   isAutoSessionTrackingEnabled,
@@ -90,6 +92,8 @@ export type SessionTrackingFailureCode =
   | 'too_large'
   | 'list_mismatch'
   | 'page_gone'
+  | 'repo_too_large'
+  | 'too_many_files'
   | 'verify_failed';
 
 /** A refusal or failure the caller can show verbatim; `httpStatus` is what the route answers with. */
@@ -129,6 +133,9 @@ export interface SessionTrackingResult {
 export { isAutoSessionTrackingEnabled };
 
 const GITHUB_TIMEOUT_MS = 30_000;
+/** Most static pages / API routes we will read to look for a tracker; more than this is refused, not guessed. */
+const MAX_INSPECTED_FILES = 20;
+const MAX_INSPECTED_FILE_BYTES = 900_000;
 const MAX_CAS_ATTEMPTS = 3;
 const LAYOUT_PATHS = ['app/layout.tsx', 'src/app/layout.tsx'];
 const HTML_PATH_RE = /^public\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*\.html$/;
@@ -217,7 +224,7 @@ function assertSafePath(path: string): void {
 async function readRepoFile(repoFullName: string, headers: Record<string, string>, path: string, ref: string): Promise<string | null> {
   try {
     const res = await axios.get<any>(
-      `https://api.github.com/repos/${repoFullName}/contents/${path}?ref=${encodeURIComponent(ref)}`,
+      `https://api.github.com/repos/${repoFullName}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(ref)}`,
       { headers, timeout: GITHUB_TIMEOUT_MS },
     );
     if (Array.isArray(res.data) || res.data?.type === 'dir') return null;
@@ -272,6 +279,60 @@ async function locateTarget(
     'Could not find app/layout.tsx or a public/*.html page in this repository, so there is nowhere to add the tracking tag.',
     422,
   );
+}
+
+
+/**
+ * The located target is not the only file that can carry a tracker. A repo can ship a Next layout AND raw
+ * static pages (public/*.html behind rewrites) that never load that layout, with their own tracker and a
+ * bespoke track route (the DramaBreak shape). Tagging only the layout there would edit the customer's repo
+ * for nothing and double-track nothing it reaches. So, before anything is created, read the whole repo's
+ * tracker-bearing files (bounded) and refuse if ANY carries one. Conservative on every bound: a truncated
+ * tree, too many files or a file too big to read is a refusal with its own code, never a guess.
+ */
+async function assertNoTrackerElsewhere(
+  repoFullName: string,
+  headers: Record<string, string>,
+  sha: string,
+  alreadyChecked: string,
+): Promise<void> {
+  const res = await axios.get<any>(`https://api.github.com/repos/${repoFullName}/git/trees/${encodeURIComponent(sha)}?recursive=1`, {
+    headers, timeout: GITHUB_TIMEOUT_MS,
+  });
+  if (res.data?.truncated || !Array.isArray(res.data?.tree)) {
+    throw new SessionTrackingError('repo_too_large', 'This repository is too large to check for an existing tracker, so nothing was changed.', 422);
+  }
+  const blobs: Array<{ path: string; size?: number }> = res.data.tree.filter((e: any) => e?.type === 'blob' && typeof e.path === 'string');
+  const htmlFiles = blobs.filter((b) => /^public\/.+\.html?$/i.test(b.path));
+  const routeFiles = blobs.filter((b) => /^(?:src\/)?app\/api\/.+\/route\.(?:ts|tsx|js|mjs)$/.test(b.path));
+  if (htmlFiles.length > MAX_INSPECTED_FILES || routeFiles.length > MAX_INSPECTED_FILES) {
+    throw new SessionTrackingError(
+      'too_many_files',
+      `This repository has more than ${MAX_INSPECTED_FILES} static pages or API routes to check for an existing tracker, so nothing was changed.`,
+      422,
+    );
+  }
+  const refuse = (path: string, found: string): never => {
+    throw new SessionTrackingError(
+      'existing_tracker',
+      `This repository already carries its own tracker (found "${found}" in ${path}). Adding the AgentWeb session tag would ` +
+        'count visits twice or tag a layout those pages never load, so nothing was changed. Pass overrideExistingTracker only if you have ' +
+        'confirmed the existing tracker is being removed.',
+      409,
+    );
+  };
+  for (const [files, isRoute] of [[htmlFiles, false], [routeFiles, true]] as const) {
+    for (const f of files) {
+      if (f.path === alreadyChecked) continue;
+      if (typeof f.size === 'number' && f.size > MAX_INSPECTED_FILE_BYTES) {
+        throw new SessionTrackingError('too_large', `${f.path} is too large to check for an existing tracker, so nothing was changed.`, 422);
+      }
+      const content = await readRepoFile(repoFullName, headers, f.path, sha);
+      if (content === null) continue;
+      const found = isRoute ? findBespokeTrackerRoute(content) : findExistingTracker(content, 'html');
+      if (found) refuse(f.path, found);
+    }
+  }
 }
 
 function injectFor(file: RepoFile, listId: string, override: boolean): string {
@@ -402,6 +463,10 @@ export async function enableSessionTrackingForPage(
     const probeSha = await readMainSha(repoFullName, headers);
     const probe = await locateTarget(page, repoFullName, headers, probeSha, opts.htmlPath);
     injectFor(probe, 'list_dry_run_probe', override);
+    // ...and the REST of the repo, unless our own tag is already there (then this is an idempotent re-run).
+    if (!override && extractInstalledListId(probe.content, probe.target) === null) {
+      await assertNoTrackerElsewhere(repoFullName, headers, probeSha, probe.path);
+    }
 
     // (a) the list. Repo truth first (what the live tag points at), then the recorded id, else create.
     const installedId = extractInstalledListId(probe.content, probe.target);
