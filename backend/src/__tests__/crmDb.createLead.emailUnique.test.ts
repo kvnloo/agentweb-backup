@@ -12,6 +12,8 @@ let conflictsToInject = 0;
 const txCalls: any[] = [];
 let txError: any = null;
 let txAlways: any = null;
+let putConflicts = 0;
+let onPutConflict: (() => void) | null = null;
 const tick = () => new Promise<void>((r) => setImmediate(r));
 const k = (listId: string, leadId: string) => `${listId}|${leadId}`;
 const condFail = (): any => Object.assign(new Error('The conditional request failed'), { code: 'ConditionalCheckFailedException' });
@@ -36,6 +38,7 @@ jest.mock('aws-sdk', () => ({
         promise: async () => {
           await tick();
           ops.push(`put:${p.Item.leadId}`);
+          if (putConflicts > 0 && p.ConditionExpression) { putConflicts--; onPutConflict?.(); throw Object.assign(new Error('conflict'), { code: 'TransactionConflictException' }); }
           if (p.ConditionExpression && rows.has(k(p.Item.listId, p.Item.leadId))) throw condFail();
           rows.set(k(p.Item.listId, p.Item.leadId), p.Item);
           return {};
@@ -81,7 +84,7 @@ const leadRows = () => [...rows.values()];
 describe('crmDb.createLead — emailUniqueCreate', () => {
   const realNow = emailLeadClock.now;
   beforeEach(() => {
-    rows.clear(); ops.length = 0; txCalls.length = 0; txError = null; txAlways = null; emailTxBreaker.openUntil = 0; conflictsToInject = 0;
+    rows.clear(); ops.length = 0; txCalls.length = 0; txError = null; txAlways = null; putConflicts = 0; onPutConflict = null; emailTxBreaker.openUntil = 0; conflictsToInject = 0;
     delete process.env.LEAD_EMAIL_UNIQUE_CREATE; delete process.env.LEAD_EMAIL_UNIQUE_BUCKET_MS;
     clockAt(T0 + 100);
   });
@@ -252,10 +255,39 @@ describe('crmDb.createLead — emailUniqueCreate', () => {
       for (const l of losers) expect(l.e).toMatchObject({ duplicateEmail: true, existingLead: { leadId: leadRows()[0].leadId } });
     });
 
-    it('a cross-bucket pair is NOT serialised in degraded mode (documented: the boundary gap reopens)', async () => {
+    it('pre-probe: a cross-bucket pair in degraded mode adopts the neighbouring bucket\'s row (either direction)', async () => {
       clockAt(T0 + W - 1); await create('k@x.com');
-      clockAt(T0 + W); await create('k@x.com');
-      expect(leadRows()).toHaveLength(2);
+      clockAt(T0 + W);
+      await expect(create('k@x.com')).rejects.toMatchObject({ duplicateEmail: true });
+      rows.clear(); emailTxBreaker.openUntil = 0;
+      clockAt(T0 + W); await create('m@x.com');
+      clockAt(T0 + W - 1);
+      await expect(create('m@x.com')).rejects.toMatchObject({ duplicateEmail: true });
+      expect(leadRows()).toHaveLength(1);
+    });
+
+    it('conflict on the fallback put is retried, then the lead is created once (no throw)', async () => {
+      putConflicts = 2;
+      await create('n@x.com');
+      expect(leadRows()).toHaveLength(1);
+      expect(ops.filter((o) => o.startsWith('put:'))).toHaveLength(3);
+    });
+
+    it('conflict on the fallback put, winner becomes visible -> adopts via duplicateEmail', async () => {
+      putConflicts = 1;
+      // the winner holds the SAME bucketed id ours targets:
+      onPutConflict = () => { const mine = ops[ops.length - 1].slice(4); rows.set(k('L1', mine), { listId: 'L1', leadId: mine, email: 'n@x.com' }); };
+      await expect(create('n@x.com')).rejects.toMatchObject({ duplicateEmail: true });
+      expect(leadRows()).toHaveLength(1);
+    });
+
+    it('retries exhausted with nothing adoptable -> legacy random-id create succeeds, no throw, returned leadId is the written one', async () => {
+      putConflicts = 99;
+      const lead = await create('o@x.com');
+      expect(leadRows()).toHaveLength(1);
+      expect(lead.leadId).toBe(leadRows()[0].leadId);
+      expect(lead.leadId).toMatch(/^lead_\d+_[a-z0-9]{1,9}$/);
+      expect(lead.leadId).not.toMatch(/_[0-9a-f]{12}$/);
     });
 
     it('only AccessDeniedException degrades: other errors (e.g. ValidationException) still surface', async () => {

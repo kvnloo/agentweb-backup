@@ -6433,7 +6433,7 @@ export const crmDb = {
         leadData.emailUniqueCreate && !leadData.leadId?.trim() && leadData.email?.trim() && isEmailUniqueCreateEnabled()
           ? emailLeadIds(listId, leadData.email.trim().toLowerCase())
           : null;
-      const leadId = leadData.leadId?.trim() || emailKeyIds?.leadId || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      let leadId = leadData.leadId?.trim() || emailKeyIds?.leadId || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
       // Check for duplicate email if email is provided
       if (!leadData.skipEmailDuplicateCheck && leadData.email && leadData.email.trim()) {
@@ -6600,7 +6600,7 @@ export const crmDb = {
       }
 
       if (emailKeyIds) {
-        await this.putEmailKeyedLead(params, emailKeyIds);
+        leadId = await this.putEmailKeyedLead(params, emailKeyIds);
       } else {
         await dynamodb.put(params).promise();
       }
@@ -6693,11 +6693,14 @@ export const crmDb = {
    *
    * TransactionConflict (an in-flight racer holds one of the keys) is retried a few times: the
    * retry then fails on a real condition and adopts. If retries run out with no row visible, it
-   * degrades to the plain conditional put (still exact within one bucket) rather than a 500. An
-   * AccessDeniedException (role lacks the transaction permissions) does the same and opens a
-   * circuit breaker (emailLeadId.ts) so later creates skip the doomed transaction for a while.
+   * degrades to the non-transactional path rather than a 500. An AccessDeniedException (role lacks the
+   * transaction permissions) does the same and opens a circuit breaker (emailLeadId.ts) so later creates
+   * skip the doomed transaction for a while. That path: consistent probe of prev/current/next ids (adopt),
+   * conditional put (retrying TransactionConflict, adopting once the winner is visible), and as a LAST
+   * RESORT the legacy random-id put. Returns the leadId actually written. TransactionConflict/Canceled
+   * never reach the caller: a duplicate row is recoverable, a dropped lead is not.
    */
-  async putEmailKeyedLead(params: any, ids: EmailLeadIds): Promise<void> {
+  async putEmailKeyedLead(params: any, ids: EmailLeadIds): Promise<string> {
     const table = params.TableName;
     const listId = params.Item.listId;
     const nonexistent = (leadId: string) => ({
@@ -6725,7 +6728,7 @@ export const crmDb = {
             { ConditionCheck: nonexistent(ids.nextLeadId) },
           ],
         }).promise();
-        return;
+        return params.Item.leadId;
       } catch (err: any) {
         if (err?.code === 'AccessDeniedException') {
           // The role may lack TransactWriteItems / ConditionCheck on this table. Never fail the capture for it:
@@ -6739,12 +6742,29 @@ export const crmDb = {
         await new Promise((resolve) => setTimeout(resolve, 10 * 2 ** attempt * (0.5 + Math.random())));
       }
     }
-    try {
-      await dynamodb.put({ ...params, ConditionExpression: 'attribute_not_exists(leadId)' }).promise();
-    } catch (err: any) {
-      if (err?.code === 'ConditionalCheckFailedException') await adoptOrThrow(err);
-      throw err;
+    // Non-transactional path: breaker open, AccessDenied, or transaction retries exhausted. Probe the
+    // adjacent buckets (and this one) with CONSISTENT reads first and adopt a winner if one is visible, which
+    // shrinks the boundary gap the missing ConditionChecks would have closed to the probe-to-put interval.
+    await adoptOrThrow(null);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        await dynamodb.put({ ...params, ConditionExpression: 'attribute_not_exists(leadId)' }).promise();
+        return params.Item.leadId;
+      } catch (err: any) {
+        if (err?.code === 'ConditionalCheckFailedException') {
+          await adoptOrThrow(null);
+          break; // the row vanished between the failed put and the read (deleted): create below
+        }
+        // An in-flight transactWrite from a racer can hold the item: retry, adopting the winner once visible.
+        if (err?.code !== 'TransactionConflictException' && err?.code !== 'TransactionCanceledException') throw err;
+        await adoptOrThrow(null);
+        await new Promise((resolve) => setTimeout(resolve, 10 * 2 ** attempt * (0.5 + Math.random())));
+      }
     }
+    // Last resort: the legacy random-id create. A duplicate row is recoverable (cleanup/merge); a dropped lead is not.
+    params.Item = { ...params.Item, leadId: `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}` };
+    await dynamodb.put({ TableName: table, Item: params.Item }).promise();
+    return params.Item.leadId;
   },
 
   async getLeadsByListId(listId: string, limit?: number, lastEvaluatedKey?: any) {
