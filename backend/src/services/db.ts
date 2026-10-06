@@ -10,6 +10,7 @@ import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPa
 import { parsePendingKinds } from '../utils/metaConversionPending';
 import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, extractDomainFromEmail, defaultStatusConfigFor, isValidLeadLifecycle, LeadImportRowOutcome, type LeadListType } from "../utils/leadSchema";
 import type { TrackingConfig } from "../utils/trackingConfig";
+import { ingestListCache } from "../utils/ingestListCache";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
@@ -5381,6 +5382,7 @@ export const crmDb = {
       };
 
       await dynamodb.put(params).promise();
+      ingestListCache.invalidate(listId);
       return params.Item;
     } catch (error) {
       handleDynamoDbError(error, "createLeadList");
@@ -5533,13 +5535,16 @@ export const crmDb = {
     return [...(ownLists || []), ...memberListArrays.flat().filter(Boolean)];
   },
 
-  async getLeadListById(listId: string) {
+  async getLeadListById(listId: string, opts?: { consistentRead?: boolean }) {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-LeadLists`,
         Key: {
           listId,
         },
+        // ENG-2325: the tracker-ingest cache loads with a consistent read so that a read issued right
+        // after this process wrote the list (and invalidated the cache) cannot re-cache the old row.
+        ...(opts?.consistentRead ? { ConsistentRead: true } : {}),
       };
 
       const result = await dynamodb.get(params).promise();
@@ -5787,6 +5792,8 @@ export const crmDb = {
       };
 
       const result = await dynamodb.update(params).promise();
+      // ENG-2325: the tracker ingest caches these rows (publicAccessEnabled, listType, trackingConfig, owner).
+      ingestListCache.invalidate(listId);
       return result.Attributes;
     } catch (error) {
       handleDynamoDbError(error, "updateLeadList");
@@ -6141,6 +6148,7 @@ export const crmDb = {
         ":ts": new Date().toISOString(),
       },
     }).promise();
+    ingestListCache.invalidate(listId); // ENG-2325: the ingest compares child.userId to the parent's
   },
 
   async deleteLeadList(listId: string) {
@@ -6187,6 +6195,7 @@ export const crmDb = {
       };
 
       await dynamodb.delete(params).promise();
+      ingestListCache.invalidate(listId);
       return { success: true };
     } catch (error) {
       handleDynamoDbError(error, "deleteLeadList");
@@ -10245,6 +10254,52 @@ export const crmDb = {
     if (!changed) for (const entries of appliedGroups) for (const [k, v] of entries) if (differs(oldCf[k], v)) { changed = true; break; }
     if (!changed) for (const [k, v] of topLevel) if (differs(before?.[k], v)) { changed = true; break; }
     return { exists: true, changed, guardApplied };
+  },
+
+  /**
+   * ENG-2326: sets top-level attributes ONLY where the row holds nothing for them: the attribute
+   * is absent, '' or NULL. One UpdateItem PER KEY, each with its own ConditionExpression, so a key a
+   * concurrent writer has just populated is kept (that key's write is skipped) without blocking the
+   * other keys.
+   *
+   * Why not setLeadFields({ topLevel, ifNotExists: true }): `if_not_exists(#k, :v)` leaves an existing
+   * attribute alone even when its value is '' or NULL, so a "fill the blanks" caller could never fill a
+   * blank. And why not an unconditional SET: it would overwrite a value written between the caller's read
+   * and this write. The condition is evaluated by DynamoDB against the stored item, so there is no
+   * read-then-write window.
+   *
+   * `attribute_exists(leadId)` keeps a row that was deleted in the meantime from being resurrected as a
+   * bare item. A skipped write (value present, or row gone) is NOT an error; the caller re-reads to see
+   * what the row holds. Every attribute name and value goes through a placeholder. Blank VALUES are never
+   * written (this method only fills). The primary-key attributes are refused.
+   */
+  async setLeadTopLevelIfBlank(
+    listId: string,
+    leadId: string,
+    fields: Record<string, any>,
+  ): Promise<{ written: string[]; kept: string[] }> {
+    const written: string[] = [];
+    const kept: string[] = [];
+    for (const [k, v] of Object.entries(fields)) {
+      if (v === undefined || v === null || v === '' || k === 'listId' || k === 'leadId' || !k) continue;
+      try {
+        await dynamodb.update({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          Key: { listId, leadId },
+          UpdateExpression: 'SET #k = :v, #u = :ts',
+          ConditionExpression:
+            'attribute_exists(#pk) AND (attribute_not_exists(#k) OR #k = :empty OR attribute_type(#k, :nullType))',
+          ExpressionAttributeNames: { '#k': k, '#u': 'updatedAt', '#pk': 'leadId' },
+          ExpressionAttributeValues: { ':v': v, ':ts': new Date().toISOString(), ':empty': '', ':nullType': 'NULL' },
+        }).promise();
+        written.push(k);
+      } catch (err: any) {
+        if (err.code === 'ConditionalCheckFailedException') { kept.push(k); continue; }
+        handleDynamoDbError(err, 'setLeadTopLevelIfBlank');
+        throw err;
+      }
+    }
+    return { written, kept };
   },
 
   /**
