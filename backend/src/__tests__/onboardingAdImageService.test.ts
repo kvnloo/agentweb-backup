@@ -1779,6 +1779,8 @@ describe("onboardingAdImageService", () => {
     // side of the race — this asserts startAdImageGenerationForUser respects
     // a lost claim by returning null and never invoking the image generator.
     it("returns null and launches no worker when the claim itself loses the race", async () => {
+      // Not on the eager pipeline, so this exercises the claim path.
+      userDb.getUserById.mockResolvedValue({ userId: "u1" });
       const conditionalFailure = Object.assign(
         new Error("The conditional request failed"),
         { code: "ConditionalCheckFailedException" },
@@ -1789,8 +1791,39 @@ describe("onboardingAdImageService", () => {
       const run = await startAdImageGenerationForUser("u1", { imageGen: gen as any });
 
       expect(run).toBeNull();
-      expect(userDb.getUserById).not.toHaveBeenCalled();
       expect(gen.callCount).toBe(0);
+    });
+
+    // ENG-2308 fix-of-a-fix, caught live against the preview with a real
+    // eager-pipeline test account: `runAdImage` claims this SAME axis itself
+    // (with its own identity) once the orchestrator actually fires the step.
+    // If THIS function also claimed before delegating, its throwaway claim
+    // — discarded immediately after — would permanently win the exclusive
+    // claim and starve runAdImage's real claim moments later, so ad-image
+    // generation would never fire for an eager-pipeline user. Must check
+    // eager status and skip claiming entirely in that case, leaving
+    // claimAdImageRun as the sole claimant.
+    it("does not claim the axis itself on the eager pipeline — leaves the claim to runAdImage", async () => {
+      // `isEagerPipelineActiveFor` is cheap/pure and fine to run for real;
+      // `reconcileForUser` is NOT — it would drive the real orchestrator
+      // (brandDna, real triggers, ...) as an unawaited side effect of this
+      // unit test. Stub just that export on the SAME lazily-`require`'d
+      // module instance `onboardingAdImageService.ts` resolves internally.
+      const orchestratorWiring = require("../services/onboardingOrchestratorWiring");
+      const reconcileSpy = jest
+        .spyOn(orchestratorWiring, "reconcileForUser")
+        .mockImplementation(async () => {});
+      try {
+        userDb.getUserById.mockResolvedValue({ userId: "u1", useEagerPipeline: true });
+
+        const run = await startAdImageGenerationForUser("u1");
+
+        expect(run).toBeNull();
+        expect(userDb.updateUser).not.toHaveBeenCalled();
+        expect(reconcileSpy).toHaveBeenCalledWith("u1");
+      } finally {
+        reconcileSpy.mockRestore();
+      }
     });
 
     it("hands its own nonce to the worker, which abandons when a later start has taken the axis (Greptile)", async () => {
