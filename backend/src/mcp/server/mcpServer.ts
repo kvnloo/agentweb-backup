@@ -20,6 +20,7 @@ import {
 import { rehydrateAndServe } from './mcpSessionRehydration';
 import { anonymousUserIdForSession, isAnonymousDiscoveryEnabled, isAnonymouslyPermitted } from "./anonymousTransport";
 import { isCronEnabled } from '../../utils/instanceState';
+import { cronJobRegistry } from '../../utils/cronJobRegistry';
 
 // Rate limiter for MCP requests authenticated via aw_* API keys
 const mcpRateLimiter = new RateLimiter();
@@ -298,12 +299,24 @@ export function setupMcpServer(
     // already-tracked AgentWeb turn are deliberately exempt: runDrain keeps
     // this listener open specifically so those calls can finish.
     const mcpMessages = Array.isArray(req.body) ? req.body : [req.body];
+    const hasToolCall = mcpMessages.some((message: any) => message?.method === 'tools/call');
     if (
-      mcpMessages.some((message: any) => message?.method === 'tools/call') &&
+      hasToolCall &&
       (req as any)._mcpIsInternal !== true &&
       !isCronEnabled()
     ) {
       return res.status(503).json({ message: 'Instance draining — retry on new instance' });
+    }
+
+    // Track from the admission decision onward, before session lookup/rehydration
+    // can await. Otherwise graceful drain can observe zero active MCP work and
+    // close the listener while an admitted call is still resolving its session.
+    let finishAdmittedToolCall: (() => void) | undefined;
+    if (hasToolCall) {
+      const admitted = new Promise<void>((resolve) => {
+        finishAdmittedToolCall = resolve;
+      });
+      void cronJobRegistry.track('mcpHttpToolCall', admitted);
     }
 
     // Log all incoming requests
@@ -510,6 +523,8 @@ export function setupMcpServer(
           id: null
         });
       }
+    } finally {
+      finishAdmittedToolCall?.();
     }
   });
 
