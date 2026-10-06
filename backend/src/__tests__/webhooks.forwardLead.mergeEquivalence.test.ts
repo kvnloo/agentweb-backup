@@ -28,7 +28,7 @@ import * as crypto from 'crypto';
 import request from 'supertest';
 import express from 'express';
 import { LeadTableFake } from './helpers/leadTableFake';
-import { CASES, EMAIL, EXISTING, LISTS, PAYLOADS, Payload, norm } from './helpers/forwardLeadMergeMatrix';
+import { BROWSER_UA, CASES, EMAIL, EXISTING, LISTS, PAYLOADS, Payload, TOUCH, norm } from './helpers/forwardLeadMergeMatrix';
 
 jest.mock('aws-sdk', () => {
   const { LeadTableFake: Fake } = require('./helpers/leadTableFake');
@@ -127,5 +127,61 @@ describe('forward-lead existing-lead merge — sequential equivalence with origi
     const key = `${e} x ${p} @ ${l}`;
     if (writing) { golden[key] = got; return; }
     expect(got).toEqual(golden[key]);
+  });
+});
+
+describe('forward-lead existing-lead merge — concurrent repeat submissions lose no customFields keys (ENG-2320)', () => {
+  const N = 12;
+  const fire = async (extra: (i: number) => Record<string, any> = () => ({})) => {
+    fake.reset();
+    fake.jitterMs = 4;
+    fake.seedList({ ...LISTS.normal, fieldNames: [] });
+    fake.seedLead({ ...EXISTING.bare, customFields: { source: 'lp', seed: 1 } });
+    const res = await Promise.all(
+      Array.from({ length: N }, (_, i) =>
+        request(app).post('/api/webhooks/forward-lead').send({ listId: 'L0', email: EMAIL, source: 'lp', customFields: { [`k_${i}`]: i + 1 }, ...extra(i) }),
+      ),
+    );
+    await settle();
+    return res;
+  };
+
+  it.each([1, 2, 3])('run %i: all 12 distinct keys survive, no 5xx, one row', async () => {
+    const res = await fire();
+    expect(res.map((r) => r.status).filter((s) => s >= 500)).toEqual([]);
+    const rows = fake.leadsIn('L0');
+    expect(rows).toHaveLength(1);
+    const cf = rows[0].customFields;
+    for (let i = 0; i < N; i++) expect(cf[`k_${i}`]).toBe(i + 1);
+    expect(cf.seed).toBe(1);
+    expect(cf.source).toBe('lp');
+    // every key is in the list's field names, and no request lost another's name (values are
+    // i+1: a falsy value is deliberately never offered as a field name)
+    const fn = new Set<string>(fake.list('L0').fieldNames);
+    for (let i = 0; i < N; i++) expect(fn.has(`k_${i}`)).toBe(true);
+    expect(fake.list('L0').leadCount).toBe(1);
+  });
+
+  it('attribution + match-quality under concurrency: firstTouch/utm immutable, lastTouch refreshed, clientIp written once', async () => {
+    fake.reset();
+    fake.jitterMs = 4;
+    fake.seedList({ ...LISTS.normal, fieldNames: [] });
+    fake.seedLead({ ...EXISTING.firstTouchOnly, customFields: { source: 'lp' } });
+    await Promise.all(
+      Array.from({ length: N }, (_, i) =>
+        request(app).post('/api/webhooks/forward-lead')
+          .set('User-Agent', BROWSER_UA).set('X-Forwarded-For', `203.0.113.${10 + i}`)
+          .send({ listId: 'L0', email: EMAIL, customFields: { [`k_${i}`]: i + 1 }, attribution: { ...TOUCH, utm: { source: `s${i}` } }, fbp: `fb.${i}` }),
+      ),
+    );
+    await settle();
+    const row = fake.leadsIn('L0')[0];
+    for (let i = 0; i < N; i++) expect(row.customFields[`k_${i}`]).toBe(i + 1);
+    expect(row.firstTouch.utm.source).toBe('seed'); // immutable
+    expect(row.lastTouch.utm.source).toMatch(/^s\d+$/); // refreshed by SOME request
+    expect(row.clientIp).toMatch(/^203\.0\.113\.\d+$/);
+    // write-once: the stored value is one of the 12 and every later write was an if_not_exists no-op
+    const ipSets = fake.updates.filter((u) => /clientIp/.test(JSON.stringify(u.UpdateExpression)));
+    for (const u of ipSets) expect(u.UpdateExpression).toMatch(/clientIp = if_not_exists\(clientIp, :clientIp\)/);
   });
 });

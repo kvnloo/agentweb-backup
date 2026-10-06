@@ -863,7 +863,29 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       }
 
       if (changed || matchQualityBackfilled) {
-        await crmDb.updateLead(leadList.listId, existingLead.leadId, updates);
+        // ENG-2320: write customFields PER KEY, not as the merged map. `updates.customFields`
+        // stays the full merged map because `lead` below (what the response cascade renders) is
+        // built from it; what reaches DynamoDB is only the keys this submission actually adds or
+        // changes, each as its own atomic document-path SET. Writing the whole map overwrote
+        // every key a concurrent repeat submission had just stored (12 concurrent multi-step /
+        // double submits kept 1-2 keys of 12). The keys picked are exactly the ones whose value
+        // differs by the same JSON comparison that decided `changed` above, and an unchanged
+        // `source` (restored from the stored row) is never among them.
+        const { customFields: mergedMap, ...rest } = updates;
+        const keyPatch: Record<string, any> | undefined = mergedMap
+          ? Object.fromEntries(
+              Object.entries(mergedMap).filter(
+                ([k, v]) =>
+                  !Object.prototype.hasOwnProperty.call(existingCustomFields, k) ||
+                  JSON.stringify(existingCustomFields[k]) !== JSON.stringify(v),
+              ),
+            )
+          : undefined;
+        await crmDb.updateLead(
+          leadList.listId,
+          existingLead.leadId,
+          keyPatch ? { ...rest, customFields: keyPatch, customFieldsKeyMerge: true } : rest,
+        );
         // Only a user-visible change makes this an "update". See the ENG-926 §B note above:
         // isUpdated drives sequence enrolment, CRM sync and owner alerts, so a silent
         // metadata backfill deliberately does not set it.
@@ -946,10 +968,11 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           mergedCustomFields = incomingCustomFields;
           leadData.customFields = mergedCustomFields;
           // The carried row came off the eventually-consistent email-index GSI, so it can be
-          // OLDER than what the race winner is still writing — and the merge below writes the
-          // whole customFields map, so merging into the snapshot would drop keys the winner
-          // added after the projection. Re-read by primary key, consistently (one GetItem, race
-          // path only); fall back to the carried row only if that read comes back empty.
+          // OLDER than what the race winner is still writing. The merge below writes per key
+          // (ENG-2320), so a stale snapshot no longer drops the winner's keys, but it still
+          // decides `changed` and the write-once backfills — so re-read by primary key,
+          // consistently (one GetItem, race path only); fall back to the carried row only if
+          // that read comes back empty.
           const fresh = await crmDb.getLeadById(leadList.listId, createErr.existingLead.leadId, { consistentRead: true });
           await mergeIntoExistingLead(fresh || createErr.existingLead);
         } else if (!createErr?.leadAlreadyExists) {
