@@ -3748,7 +3748,7 @@ emmaToolRegistry.register({
         },
         phase_id: {
           type: 'string',
-          description: 'The unique identifier of the phase to add work items to'
+          description: 'The phase id from read_gtm_plan\'s output (each phase line ends with "(id: ...)"). Not the phase\'s display number ("Phase 1", "Phase 2").'
         },
         work_items: {
           type: 'array',
@@ -3799,11 +3799,11 @@ emmaToolRegistry.register({
         },
         phase_id: {
           type: 'string',
-          description: 'The unique identifier of the phase containing the work item'
+          description: 'The phase id from read_gtm_plan\'s output (each phase line ends with "(id: ...)"). Not the phase\'s display number.'
         },
         work_item_id: {
           type: 'string',
-          description: 'The unique identifier of the work item to update'
+          description: 'The work item id from read_gtm_plan\'s output (each work item line ends with "(id: ...)"). Not its display number within the phase.'
         },
         status: {
           type: 'string',
@@ -3885,7 +3885,7 @@ emmaToolRegistry.register({
         },
         phase_id: {
           type: 'string',
-          description: 'The unique identifier of the phase to update'
+          description: 'The phase id from read_gtm_plan\'s output (each phase line ends with "(id: ...)"). Not the phase\'s display number.'
         },
         title: {
           type: 'string',
@@ -3931,11 +3931,11 @@ emmaToolRegistry.register({
         },
         phase_id: {
           type: 'string',
-          description: 'Optional phase ID. If provided with plan_id, deletes the phase. If provided with work_item_id, targets the work item in this phase.'
+          description: 'Optional phase id, from read_gtm_plan\'s output (each phase line ends with "(id: ...)"), not its display number. If provided with plan_id, deletes the phase. If provided with work_item_id, targets the work item in this phase.'
         },
         work_item_id: {
           type: 'string',
-          description: 'Optional work item ID. Requires phase_id. Deletes the specific work item from the phase.'
+          description: 'Optional work item id, from read_gtm_plan\'s output (each work item line ends with "(id: ...)"), not its display number. Requires phase_id. Deletes the specific work item from the phase.'
         }
       },
       required: ['plan_id']
