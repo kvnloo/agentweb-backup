@@ -27,6 +27,10 @@ export function suppressLeadSideEffects(list: { listType?: unknown } | null | un
   return isSessionList(list);
 }
 
+/** Shown wherever a sequence binding / enrolment names a session list (ENG-2311). */
+export const SESSION_LIST_SEQUENCE_ERROR =
+  'Session lists hold per-visitor session telemetry and cannot be bound to or enrolled in a sequence.';
+
 /**
  * Drops session lists from a list-of-lists before a cross-list AGGREGATE (lead counts,
  * attribution coverage, "recent leads" rankers, the Inbox). One synthetic-email row per
