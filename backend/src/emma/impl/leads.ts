@@ -3019,8 +3019,11 @@ export async function importLeadsFromSearch(
     return { success: false, error: 'Failed to verify list access' };
   }
 
-  // Resolve account: user's own or platform-wide fallback
-  const accountId = await linkedInOutreachService.resolveAccountId(userId);
+  // Resolve account: user's own or platform-wide fallback. Keep usedSharedAccount
+  // (not the flag-discarding resolveAccountId wrapper) — the reactive handler
+  // below needs it to know whether accountId is this user's own account or the
+  // ownerless site-wide pool (see the ownerUserId comment there).
+  const { accountId, usedSharedAccount } = await linkedInOutreachService.resolveAccountIdWithSource(userId);
   if (!accountId) {
     return {
       success: false,
@@ -3131,7 +3134,17 @@ export async function importLeadsFromSearch(
       if (isProvenDisconnectError(e)) {
         linkedInOutreachService.clearStatusCache(accountId);
         const { recordUnipileAccountHealth } = await import('../../services/linkedInConnectionHealth');
-        await recordUnipileAccountHealth({ accountId, ownerUserId: userId, state: 'disconnected' });
+        // ownerUserId must be omitted for the site-wide pool: recordUnipileAccountHealth
+        // resolves an attributed owner only via getAccountsByUserId(ownerUserId) /
+        // getAccountsByUserIdIncludingOrgShared(ownerUserId) — neither of which can ever
+        // find the global fallback pool account under an unrelated customer's userId. A
+        // truthy-but-wrong ownerUserId silently no-ops instead of reaching the dedicated
+        // ownerless/oncall branch that exists specifically for this account class.
+        await recordUnipileAccountHealth({
+          accountId,
+          ownerUserId: usedSharedAccount ? undefined : userId,
+          state: 'disconnected',
+        });
       }
       break;
     }
