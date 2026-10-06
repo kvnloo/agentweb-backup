@@ -57,7 +57,7 @@ import {
   type AdImageGeneratorDep,
 } from "../services/onboardingAdImageService";
 import { evaluateCreativeGates } from "../services/creativeGates";
-import { adImageReadyPatch } from "../services/adImageStatusService";
+import { adImageReadyPatch, AD_IMAGE_TIMEOUT_MS } from "../services/adImageStatusService";
 const { userDb, orgDb } = require("../services/db");
 
 class FakeImageGen {
@@ -1719,18 +1719,22 @@ describe("onboardingAdImageService", () => {
     // nonce and both launch a real Gemini generation before either one's
     // completion-time ownership check (ENG-792) ever runs.
     it("claims the running transition with a ConditionExpression guarding against a concurrent in-flight run", async () => {
+      const before = Date.now();
       await claimAdImageRun("u1");
 
       const options = userDb.updateUser.mock.calls[0][2];
       expect(options?.condition?.expression).toBe(
-        "attribute_not_exists(#adImageStatus) OR #adImageStatus <> :adImageRunning",
+        "attribute_not_exists(#adImageStatus) OR #adImageStatus <> :adImageRunning OR #adImageStartedAt <= :adImageStaleBefore",
       );
       expect(options?.condition?.names).toEqual({
         "#adImageStatus": "adImageStatus",
+        "#adImageStartedAt": "adImageStartedAt",
       });
-      expect(options?.condition?.values).toEqual({
-        ":adImageRunning": "running",
-      });
+      expect(options?.condition?.values?.[":adImageRunning"]).toBe("running");
+      // ENG-2308 fix-of-a-fix: stale-claim escape hatch (see icpStartClaimCondition).
+      const staleBefore = Date.parse(options?.condition?.values?.[":adImageStaleBefore"]);
+      expect(staleBefore).toBeGreaterThanOrEqual(before - AD_IMAGE_TIMEOUT_MS - 1000);
+      expect(staleBefore).toBeLessThanOrEqual(Date.now() - AD_IMAGE_TIMEOUT_MS + 1000);
     });
 
     it("returns null when it loses the race to a concurrent claimant", async () => {

@@ -20,6 +20,7 @@ import {
   triggerCompetitorStrategyForUser,
 } from "../services/onboardingCompetitorService";
 import type { ICPPersona } from "../services/icpStatusService";
+import { COMPETITOR_TIMEOUT_MS } from "../services/competitorStatusService";
 const { userDb } = require("../services/db");
 
 class FakeLlm {
@@ -583,18 +584,24 @@ describe("onboardingCompetitorService", () => {
       userDb.updateUser.mockResolvedValue({});
       userDb.getUserById.mockResolvedValue(null);
 
+      const before = Date.now();
       await startCompetitorStrategyForUser("user-1");
 
       const options = userDb.updateUser.mock.calls[0][2];
       expect(options?.condition?.expression).toBe(
-        "attribute_not_exists(#competitorStatus) OR #competitorStatus <> :competitorRunning",
+        "attribute_not_exists(#competitorStatus) OR #competitorStatus <> :competitorRunning OR #competitorStartedAt <= :competitorStaleBefore",
       );
       expect(options?.condition?.names).toEqual({
         "#competitorStatus": "competitorStatus",
+        "#competitorStartedAt": "competitorStartedAt",
       });
-      expect(options?.condition?.values).toEqual({
-        ":competitorRunning": "running",
-      });
+      expect(options?.condition?.values?.[":competitorRunning"]).toBe("running");
+      // ENG-2308 fix-of-a-fix: stale-claim escape hatch (see icpStartClaimCondition).
+      const staleBefore = Date.parse(
+        options?.condition?.values?.[":competitorStaleBefore"],
+      );
+      expect(staleBefore).toBeGreaterThanOrEqual(before - COMPETITOR_TIMEOUT_MS - 1000);
+      expect(staleBefore).toBeLessThanOrEqual(Date.now() - COMPETITOR_TIMEOUT_MS + 1000);
     });
 
     it("returns null and launches no background work when it loses the race to a concurrent caller", async () => {

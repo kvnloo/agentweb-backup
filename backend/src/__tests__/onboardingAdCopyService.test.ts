@@ -31,6 +31,7 @@ import {
   startAdCopyForUser,
   triggerAdCopyForUser,
 } from "../services/onboardingAdCopyService";
+import { AD_COPY_TIMEOUT_MS } from "../services/adCopyStatusService";
 const { userDb } = require("../services/db");
 
 class FakeLlm {
@@ -721,18 +722,22 @@ describe("onboardingAdCopyService", () => {
       userDb.updateUser.mockResolvedValue({});
       userDb.getUserById.mockResolvedValue(null);
 
+      const before = Date.now();
       await startAdCopyForUser("user-1");
 
       const options = userDb.updateUser.mock.calls[0][2];
       expect(options?.condition?.expression).toBe(
-        "attribute_not_exists(#adCopyStatus) OR #adCopyStatus <> :adCopyRunning",
+        "attribute_not_exists(#adCopyStatus) OR #adCopyStatus <> :adCopyRunning OR #adCopyStartedAt <= :adCopyStaleBefore",
       );
       expect(options?.condition?.names).toEqual({
         "#adCopyStatus": "adCopyStatus",
+        "#adCopyStartedAt": "adCopyStartedAt",
       });
-      expect(options?.condition?.values).toEqual({
-        ":adCopyRunning": "running",
-      });
+      expect(options?.condition?.values?.[":adCopyRunning"]).toBe("running");
+      // ENG-2308 fix-of-a-fix: stale-claim escape hatch (see icpStartClaimCondition).
+      const staleBefore = Date.parse(options?.condition?.values?.[":adCopyStaleBefore"]);
+      expect(staleBefore).toBeGreaterThanOrEqual(before - AD_COPY_TIMEOUT_MS - 1000);
+      expect(staleBefore).toBeLessThanOrEqual(Date.now() - AD_COPY_TIMEOUT_MS + 1000);
     });
 
     it("returns null and launches no background work when it loses the race to a concurrent caller", async () => {

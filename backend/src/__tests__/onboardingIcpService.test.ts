@@ -36,6 +36,7 @@ import {
   startIcpDiscoveryForUser,
   triggerIcpDiscoveryForUser,
 } from "../services/onboardingIcpService";
+import { ICP_TIMEOUT_MS } from "../services/icpStatusService";
 const { taskDb, userDb } = require("../services/db");
 
 class FakeLlm {
@@ -661,14 +662,27 @@ describe("onboardingIcpService", () => {
       userDb.updateUser.mockResolvedValue({});
       userDb.getUserById.mockResolvedValue(null);
 
+      const before = Date.now();
       await startIcpDiscoveryForUser("user-1");
 
       const options = userDb.updateUser.mock.calls[0][2];
       expect(options?.condition?.expression).toBe(
-        "attribute_not_exists(#icpStatus) OR #icpStatus <> :icpRunning",
+        "attribute_not_exists(#icpStatus) OR #icpStatus <> :icpRunning OR #icpStartedAt <= :icpStaleBefore",
       );
-      expect(options?.condition?.names).toEqual({ "#icpStatus": "icpStatus" });
-      expect(options?.condition?.values).toEqual({ ":icpRunning": "running" });
+      expect(options?.condition?.names).toEqual({
+        "#icpStatus": "icpStatus",
+        "#icpStartedAt": "icpStartedAt",
+      });
+      expect(options?.condition?.values?.[":icpRunning"]).toBe("running");
+      // ENG-2308 fix-of-a-fix: the stale-claim escape hatch — without it, a
+      // run genuinely stuck in `running` (lost to a deploy/crash) could
+      // never be retried again, since the exclusive claim would block every
+      // future /icp/start forever. The threshold is "now minus the same
+      // ICP_TIMEOUT_MS the FE's `timedOut` flag already uses", computed
+      // fresh on every call (not a fixed constant).
+      const staleBefore = Date.parse(options?.condition?.values?.[":icpStaleBefore"]);
+      expect(staleBefore).toBeGreaterThanOrEqual(before - ICP_TIMEOUT_MS - 1000);
+      expect(staleBefore).toBeLessThanOrEqual(Date.now() - ICP_TIMEOUT_MS + 1000);
     });
 
     it("returns null and launches no background work when it loses the race to a concurrent caller", async () => {

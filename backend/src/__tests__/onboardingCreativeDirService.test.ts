@@ -18,6 +18,7 @@ import {
   startCreativeDirForUser,
   triggerCreativeDirForUser,
 } from "../services/onboardingCreativeDirService";
+import { CREATIVE_DIR_TIMEOUT_MS } from "../services/creativeDirStatusService";
 const { userDb } = require("../services/db");
 
 class FakeLlm {
@@ -433,18 +434,24 @@ describe("onboardingCreativeDirService", () => {
       userDb.updateUser.mockResolvedValue({});
       userDb.getUserById.mockResolvedValue(null);
 
+      const before = Date.now();
       await startCreativeDirForUser("user-1");
 
       const options = userDb.updateUser.mock.calls[0][2];
       expect(options?.condition?.expression).toBe(
-        "attribute_not_exists(#creativeDirStatus) OR #creativeDirStatus <> :creativeDirRunning",
+        "attribute_not_exists(#creativeDirStatus) OR #creativeDirStatus <> :creativeDirRunning OR #creativeDirStartedAt <= :creativeDirStaleBefore",
       );
       expect(options?.condition?.names).toEqual({
         "#creativeDirStatus": "creativeDirStatus",
+        "#creativeDirStartedAt": "creativeDirStartedAt",
       });
-      expect(options?.condition?.values).toEqual({
-        ":creativeDirRunning": "running",
-      });
+      expect(options?.condition?.values?.[":creativeDirRunning"]).toBe("running");
+      // ENG-2308 fix-of-a-fix: stale-claim escape hatch (see icpStartClaimCondition).
+      const staleBefore = Date.parse(
+        options?.condition?.values?.[":creativeDirStaleBefore"],
+      );
+      expect(staleBefore).toBeGreaterThanOrEqual(before - CREATIVE_DIR_TIMEOUT_MS - 1000);
+      expect(staleBefore).toBeLessThanOrEqual(Date.now() - CREATIVE_DIR_TIMEOUT_MS + 1000);
     });
 
     it("returns null and launches no background work when it loses the race to a concurrent caller", async () => {
