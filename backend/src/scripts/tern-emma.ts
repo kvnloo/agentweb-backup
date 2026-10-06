@@ -260,6 +260,12 @@ async function main(): Promise<void> {
   const closeAndExit = (code: number) => {
     if (shuttingDown) return;
     shuttingDown = true;
+    if (runsSurfaceOpened) {
+      process.stdout.write(
+        encodeTspJson('x', { id: RUNS_SURFACE_ID, keep: false }),
+      );
+      runsSurfaceOpened = false;
+    }
     if (surfaceOpened) {
       process.stdout.write(
         encodeTspJson('x', { id: SURFACE_ID, keep: false }),
@@ -453,8 +459,6 @@ async function main(): Promise<void> {
     try {
       const runs = await client.getAgentRuns(session.sessionId, 3);
       runState = { runs, selected: 0 };
-      pickerState = undefined;
-      approvalState = undefined;
       pickerKeyBuffer = '';
       runFrames = new FrameSender(RUNS_SURFACE_ID, apcLimit);
       process.stdout.write(
