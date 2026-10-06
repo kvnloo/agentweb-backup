@@ -23,7 +23,7 @@ describe('Tern protocol transport', () => {
     const pieces = splitUtf8('xxxxfoo=bar;zz', 4);
     expect(pieces.join('')).toBe('xxxxfoo=bar;zz');
     for (const piece of pieces.slice(1)) {
-      expect(piece).not.toMatch(/^[A-Za-z0-9_-]+=[!-:<>-~]*;/);
+      expect(piece).not.toMatch(/^[A-Za-z0-9_-]+=[\x21-\x3a\x3c-\x7e]*;/);
     }
   });
 
