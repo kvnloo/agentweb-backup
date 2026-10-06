@@ -200,7 +200,7 @@ async function provenOverloadStudy() {
     { ...baseRequest, operation_id: 'overload-op-3' },
     { sessionId: 'overload-session-3', config, fetchImpl },
   );
-  if (recovered.ok !== true || postCount !== 2) {
+  if (recovered.ok !== true || Number(postCount) !== 2) {
     throw new Error(`circuit did not recover after cooldown: ${JSON.stringify(recovered)}`);
   }
 
