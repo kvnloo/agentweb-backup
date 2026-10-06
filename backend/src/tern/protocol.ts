@@ -1,0 +1,197 @@
+/**
+ * Minimal Tern Surface Protocol (TSP) transport for the AgentWeb Emma dogfood CLI.
+ *
+ * Framing/chunking semantics follow the Tern v1 protocol and the production
+ * implementation in can1357/oh-my-pi (packages/tui/src/native/encode.ts).
+ * Kept local and dependency-free so this experiment does not couple AgentWeb
+ * business logic to OMP.
+ */
+const APC = '\x1b_';
+const ST = '\x1b\\';
+export const TSP_PREFIX = `${APC}tsp;`;
+export const TSP_VERSION = 1;
+export const TSP_DEFAULT_APC_LIMIT = 65_536;
+
+export type TspVerb = 'q' | 'o' | 'f' | 'b' | 't' | 'x' | 'r' | 'e';
+export type TspParams = Readonly<Record<string, string | number>>;
+
+export interface TspRawMessage {
+  verb: string;
+  params: Record<string, string>;
+  body: string;
+}
+
+let nextChunkId = 1;
+
+function codePointBytes(text: string, i: number): { bytes: number; units: number } {
+  const c = text.charCodeAt(i);
+  if (c < 0x80) return { bytes: 1, units: 1 };
+  if (c < 0x800) return { bytes: 2, units: 1 };
+  if (c >= 0xd800 && c <= 0xdbff && i + 1 < text.length) {
+    const next = text.charCodeAt(i + 1);
+    if (next >= 0xdc00 && next <= 0xdfff) return { bytes: 4, units: 2 };
+  }
+  return { bytes: 3, units: 1 };
+}
+
+export function splitUtf8(body: string, limit: number): string[] {
+  const max = Math.max(4, Math.trunc(limit));
+  const pieces: string[] = [];
+  let start = 0;
+  let bytes = 0;
+  let i = 0;
+
+  while (i < body.length) {
+    const step = codePointBytes(body, i);
+    if (bytes + step.bytes > max) {
+      pieces.push(body.slice(start, i));
+      start = i;
+      bytes = 0;
+    }
+    bytes += step.bytes;
+    i += step.units;
+  }
+
+  pieces.push(body.slice(start));
+  return pieces;
+}
+
+function encodeParams(params?: TspParams): string {
+  if (!params) return '';
+  let out = '';
+  for (const key in params) out += `;${key}=${params[key]}`;
+  return out;
+}
+
+function frame(verb: TspVerb, params: string, body: string): string {
+  return `${TSP_PREFIX}${verb}${params};${body}${ST}`;
+}
+
+export function encodeTspMessage(
+  verb: TspVerb,
+  body: string,
+  params?: TspParams,
+  limit = TSP_DEFAULT_APC_LIMIT,
+): string {
+  const base = encodeParams(params);
+  if (body.length * 3 <= limit || Buffer.byteLength(body, 'utf8') <= limit) {
+    return frame(verb, base, body);
+  }
+
+  const chunkId = (nextChunkId++).toString(36);
+  const pieces = splitUtf8(body, limit);
+  let out = '';
+  for (let i = 0; i < pieces.length; i++) {
+    const more = i < pieces.length - 1 ? ';m=1' : '';
+    out += frame(verb, `${base};c=${chunkId}${more}`, pieces[i]);
+  }
+  return out;
+}
+
+export function encodeTspJson(
+  verb: TspVerb,
+  value: unknown,
+  params?: TspParams,
+  limit?: number,
+): string {
+  return encodeTspMessage(verb, JSON.stringify(value), params, limit);
+}
+
+export function encodeHelloQuery(app = 'agentweb-emma'): string {
+  return encodeTspJson('q', {
+    q: 'hello',
+    v: [TSP_VERSION],
+    app,
+    features: ['edit', 'undo', 'send'],
+  });
+}
+
+const PARAM_PATTERN = /^[A-Za-z0-9_-]+=[\x21-\x3a\x3c-\x7e]*$/;
+
+export function splitTspMessage(sequence: string): TspRawMessage | null {
+  if (!sequence.startsWith(TSP_PREFIX) || !sequence.endsWith(ST)) return null;
+  const inner = sequence.slice(TSP_PREFIX.length, -ST.length);
+  let semi = inner.indexOf(';');
+  if (semi <= 0) {
+    return semi === -1 && inner.length > 0
+      ? { verb: inner, params: {}, body: '' }
+      : null;
+  }
+
+  const verb = inner.slice(0, semi);
+  const params: Record<string, string> = {};
+  let pos = semi + 1;
+
+  for (;;) {
+    semi = inner.indexOf(';', pos);
+    if (semi === -1) break;
+    const segment = inner.slice(pos, semi);
+    if (!PARAM_PATTERN.test(segment)) break;
+    const eq = segment.indexOf('=');
+    params[segment.slice(0, eq)] = segment.slice(eq + 1);
+    pos = semi + 1;
+  }
+
+  return { verb, params, body: inner.slice(pos) };
+}
+
+/**
+ * Incremental PTY reader. Raw keyboard bytes before a TSP APC are intentionally
+ * discarded; the native editor owns text input once the hello handshake opts
+ * into edit/send events.
+ */
+export class TspStreamReader {
+  private buffer = '';
+  private chunks = new Map<string, string>();
+
+  push(chunk: string): TspRawMessage[] {
+    this.buffer += chunk;
+    const messages: TspRawMessage[] = [];
+
+    for (;;) {
+      const start = this.buffer.indexOf(TSP_PREFIX);
+      if (start === -1) {
+        // Keep a possible partial ESC-prefix, discard ordinary keyboard bytes.
+        const esc = this.buffer.lastIndexOf('\x1b');
+        this.buffer = esc >= 0 ? this.buffer.slice(esc) : '';
+        break;
+      }
+      if (start > 0) this.buffer = this.buffer.slice(start);
+
+      const end = this.buffer.indexOf(ST, TSP_PREFIX.length);
+      if (end === -1) break;
+
+      const sequence = this.buffer.slice(0, end + ST.length);
+      this.buffer = this.buffer.slice(end + ST.length);
+      const raw = splitTspMessage(sequence);
+      if (!raw) continue;
+
+      const chunkId = raw.params.c;
+      if (chunkId !== undefined) {
+        const joined = (this.chunks.get(chunkId) ?? '') + raw.body;
+        if (raw.params.m === '1') {
+          this.chunks.set(chunkId, joined);
+          continue;
+        }
+        this.chunks.delete(chunkId);
+        raw.body = joined;
+      }
+
+      messages.push(raw);
+    }
+
+    return messages;
+  }
+}
+
+export function parseTspJson(raw: TspRawMessage): Record<string, unknown> | null {
+  if (raw.verb !== 'r' && raw.verb !== 'e') return null;
+  try {
+    const parsed: unknown = JSON.parse(raw.body);
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
