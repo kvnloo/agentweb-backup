@@ -162,7 +162,7 @@ export class TspStreamReader {
 
     const emitRaw = (data: string) => {
       if (!data) return;
-      const previous = parts.at(-1);
+      const previous = parts[parts.length - 1];
       if (previous?.type === 'raw') previous.data += data;
       else parts.push({ type: 'raw', data });
     };
