@@ -34,26 +34,70 @@ function codePointBytes(text: string, i: number): { bytes: number; units: number
   return { bytes: 3, units: 1 };
 }
 
+function leadsWithParameterAt(body: string, at: number): boolean {
+  let i = at;
+  if (i >= body.length) return false;
+
+  const keyStart = i;
+  while (i < body.length && /[A-Za-z0-9_-]/.test(body[i])) i++;
+  if (i === keyStart || body[i] !== '=') return false;
+  i++;
+
+  while (i < body.length) {
+    const code = body.charCodeAt(i);
+    if (body[i] === ';') return true;
+    if (code < 0x21 || code > 0x7e) return false;
+    i++;
+  }
+  return false;
+}
+
 export function splitUtf8(body: string, limit: number): string[] {
   const max = Math.max(4, Math.trunc(limit));
   const pieces: string[] = [];
   let start = 0;
-  let bytes = 0;
-  let i = 0;
 
-  while (i < body.length) {
-    const step = codePointBytes(body, i);
-    if (bytes + step.bytes > max) {
-      pieces.push(body.slice(start, i));
-      start = i;
-      bytes = 0;
+  while (start < body.length) {
+    let i = start;
+    let bytes = 0;
+    let safeEnd = start;
+
+    while (i < body.length) {
+      const step = codePointBytes(body, i);
+      if (bytes + step.bytes > max) break;
+      bytes += step.bytes;
+      i += step.units;
+      if (!leadsWithParameterAt(body, i)) safeEnd = i;
     }
-    bytes += step.bytes;
-    i += step.units;
+
+    if (i >= body.length) {
+      pieces.push(body.slice(start));
+      break;
+    }
+
+    let end = safeEnd > start ? safeEnd : i;
+
+    // If every boundary inside the byte budget would make the next chunk look
+    // like another TSP parameter (e.g. "foo=bar;"), walk forward to the first
+    // safe code-point boundary. This mirrors the Tern SDK's chunk_end rule.
+    if (end === i && leadsWithParameterAt(body, end)) {
+      let forward = end;
+      while (forward < body.length && leadsWithParameterAt(body, forward)) {
+        forward += codePointBytes(body, forward).units;
+      }
+      end = forward;
+    }
+
+    if (end <= start) {
+      // Defensive progress guarantee for malformed surrogate input.
+      end = start + codePointBytes(body, start).units;
+    }
+
+    pieces.push(body.slice(start, end));
+    start = end;
   }
 
-  pieces.push(body.slice(start));
-  return pieces;
+  return pieces.length ? pieces : [''];
 }
 
 function encodeParams(params?: TspParams): string {
