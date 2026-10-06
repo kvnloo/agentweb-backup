@@ -97,6 +97,19 @@ export class AgentWebClient {
     return Array.isArray(runs) ? runs as AgentRunSummaryLike[] : [];
   }
 
+  async sendAgentModeMessage(
+    session: EmmaSessionLike,
+    message: string,
+  ): Promise<EmmaSessionLike> {
+    await this.http.post('/api/agent-mode/generate', {
+      sessionId: session.sessionId,
+      userMessage: message,
+      llmModel: session.llmModel,
+      attachments: [],
+    });
+    return this.getSession(session.sessionId);
+  }
+
   async submitApprovalDeck(
     session: EmmaSessionLike,
     deckId: string,
