@@ -1298,8 +1298,9 @@ export async function claimAdImageRun(
 /**
  * Synchronous entry point for routes — flips status to `running` and
  * launches background work. Returns the claimed run identity, or `null` if
- * a concurrent caller already claimed this run (ENG-2308) — callers must
- * NOT launch a second background worker in that case.
+ * a concurrent caller already claimed this run (ENG-2308), OR if the user
+ * is on the eager pipeline (see below) — callers must NOT launch a second
+ * background worker when this returns `null`.
  */
 export async function startAdImageGenerationForUser(
   userId: string,
@@ -1311,10 +1312,22 @@ export async function startAdImageGenerationForUser(
     verifyLogoUrl?: (logoUrl: string) => Promise<boolean>;
   } = {}
 ): Promise<AdImageRunIdentity | null> {
-  const run = await claimAdImageRun(userId);
-  if (!run) return null;
   // Eager DAG sub-task 2: orchestrator owns step ordering for opted-in
   // users; cheap no-op gated inside the orchestrator for everyone else.
+  //
+  // Checked BEFORE claiming (ENG-2308 fix-of-a-fix, caught live): the
+  // orchestrator's `runAdImage` claims this SAME axis itself, with its own
+  // identity, when it actually fires the step — that is the real claim for
+  // an eager-pipeline run. Claiming here too, then discarding the result,
+  // used to be harmless because the old unconditional `claimAdImageRun`
+  // let both claims win (latest nonce wins, by design — see its docstring).
+  // Once the claim became exclusive, this route's throwaway claim always
+  // won first and permanently starved `runAdImage`'s real claim moments
+  // later for every eager-pipeline request, so ad-image generation never
+  // actually fired on that path. Checking eager status first and skipping
+  // the claim entirely leaves `claimAdImageRun` as the SOLE claimant for
+  // eager-pipeline users, exactly like the other four axes' runners (which
+  // never claim at the route level before delegating either).
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const {
     isEagerPipelineActiveFor,
@@ -1325,8 +1338,10 @@ export async function startAdImageGenerationForUser(
     | null;
   if (isEagerPipelineActiveFor(current)) {
     void reconcileForUser(userId);
-    return run;
+    return null;
   }
+  const run = await claimAdImageRun(userId);
+  if (!run) return null;
   void triggerAdImageGenerationForUser(userId, { ...deps, run });
   return run;
 }
