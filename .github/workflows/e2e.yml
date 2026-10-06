@@ -12,7 +12,7 @@ on:
 # suites remain on Atem under ENG-1463; this signal is intentionally advisory
 # until its value/flakiness are measured. No app/model/AWS secrets are exposed.
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -40,24 +40,35 @@ jobs:
         with:
           node-version: '22.22.3'
 
-      - name: Install app and E2E runner
-        id: install
+      # One-shot bootstrap: resolve the exact runner graph without running package scripts.
+      # This step is removed once e2e/package-lock.json is committed.
+      - name: Resolve E2E lockfile
+        id: resolve_lock
         continue-on-error: true
+        run: npm install --prefix e2e --ignore-scripts --no-audit --no-fund
+
+      - name: Commit E2E lockfile
+        if: ${{ steps.resolve_lock.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.head_ref }}
         shell: bash
         run: |
           set -euo pipefail
-          npm ci --prefix partner-portal
-          npm install --prefix e2e --ignore-scripts --no-audit --no-fund
+          if git ls-files --error-unmatch e2e/package-lock.json >/dev/null 2>&1; then
+            exit 0
+          fi
+          content="$(base64 -w0 e2e/package-lock.json)"
+          gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/e2e/package-lock.json" \
+            --field message='test(e2e): lock tester-army runner dependencies' \
+            --field content="${content}" \
+            --field branch="${HEAD_REF}" >/dev/null
 
-      # Bootstrap only: capture npm's resolved graph so the final lane can use npm ci.
-      - name: Upload bootstrap lockfile
-        if: ${{ steps.install.outcome == 'success' }}
+      - name: Install Partner Portal
+        id: install
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: e2e-lockfile-bootstrap
-          path: e2e/package-lock.json
-          if-no-files-found: error
+        run: npm ci --prefix partner-portal
 
       - name: Install Chromium
         id: browser
