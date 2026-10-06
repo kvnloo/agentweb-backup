@@ -8108,6 +8108,8 @@ const adminToolNames = [
   'list_skills',
   'manage_skill',
   'get_chat_history',
+  'get_session_transcript',
+  'get_user_by_id',
   'list_all_clients',
   'assess_client_health',
   'monitor_lead_volume',
