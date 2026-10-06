@@ -44,6 +44,7 @@ import { resolveConfigTarget } from "../services/analyticsConfigResolver";
 import { readAnalyticsConfig, writeAnalyticsConfig } from "../services/analyticsConfigStore";
 import { validateAnalyticsConfig } from "../services/analyticsConfigValidator";
 import { sweepUndeliverableDomains } from "../services/emailDeliverabilityService";
+import { isSessionList } from "../utils/sessionList";
 
 const router = express.Router();
 
@@ -3936,10 +3937,17 @@ router.get("/analytics/crm", async (req, res) => {
       return items;
     };
 
-    const [leadLists, leads] = await Promise.all([
+    const [allLeadLists, allLeads] = await Promise.all([
       scanAll(`${TABLE_PREFIX}AW-LeadLists`),
       scanAll(`${TABLE_PREFIX}AW-Leads`),
     ]);
+
+    // ENG-2311: session lists hold one telemetry row per landing-page visit; counting them
+    // as lists/leads would swamp every platform total. Leads carry no listType, so exclude
+    // by the set of session listIds. Non-session lists pass through unchanged.
+    const sessionListIds = new Set(allLeadLists.filter((l) => isSessionList(l)).map((l) => l.listId));
+    const leadLists = allLeadLists.filter((l) => !sessionListIds.has(l.listId));
+    const leads = sessionListIds.size ? allLeads.filter((l) => !sessionListIds.has(l.listId)) : allLeads;
 
     const totalLists = leadLists.length;
     const totalLeads = leads.length;

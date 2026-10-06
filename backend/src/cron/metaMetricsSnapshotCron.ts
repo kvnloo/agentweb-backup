@@ -13,6 +13,7 @@ import { leadTotals, type MetaAction } from "../utils/metaActionFamilies";
 import { META_GRAPH_TIMEOUT_MS } from "../utils/metaApiFetch";
 import { promoteAttributionFromCustomFields, type AttributionTouch } from "../types/attribution";
 import { isEvaluationUser } from "../services/evaluationPolicy";
+import { excludeSessionLists } from '../utils/sessionList';
 
 /**
  * ENG-993: Every.io's Meta CAPI gap means its Meta-reported conversions read as
@@ -114,7 +115,7 @@ export async function getLeadsByDateForUser(
   bounds?: { from: string; to: string }
 ): Promise<Map<string, any[]>> {
   const byDate = new Map<string, any[]>();
-  const leadLists = await crmDb.getLeadListsByUserId(userId);
+  const leadLists = excludeSessionLists(await crmDb.getLeadListsByUserId(userId)); // ENG-2311: session rows are not leads
   for (const list of leadLists) {
     let lastKey: any = undefined;
     do {
@@ -353,7 +354,7 @@ export async function snapshotMetaMetricsForDate(
   if (leadsByDate) {
     leadsForDate = leadsByDate.get(dateStr) || [];
   } else {
-    const leadLists = await crmDb.getLeadListsByUserId(userId);
+    const leadLists = excludeSessionLists(await crmDb.getLeadListsByUserId(userId)); // ENG-2311: session rows are not leads
     leadsForDate = [];
     for (const list of leadLists) {
       const leads = await getLeadsForListOnDate(list.listId, dateStr);

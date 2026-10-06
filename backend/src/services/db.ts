@@ -8,7 +8,7 @@ import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
 import { parsePendingKinds } from '../utils/metaConversionPending';
-import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, extractDomainFromEmail, defaultStatusConfigFor, isValidLeadLifecycle, LeadImportRowOutcome } from "../utils/leadSchema";
+import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, extractDomainFromEmail, defaultStatusConfigFor, isValidLeadLifecycle, LeadImportRowOutcome, type LeadListType } from "../utils/leadSchema";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
@@ -5324,7 +5324,7 @@ export const crmDb = {
     autoDraftInstruction?: string,
     autoSendEnabled?: boolean,
     statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>,
-    listType?: 'sales' | 'customers',
+    listType?: LeadListType,
     isSystemManaged?: boolean,
     // Idempotent-create support (ENG-524): pass a caller-chosen deterministic ID
     // (instead of the usual random one) to get a race-safe "create if absent" —
@@ -5568,7 +5568,7 @@ export const crmDb = {
        *  `{ qualifiedStatus: null }` turns QualifiedLead off for this list; omitting the
        *  field entirely leaves the relay matching by name, as it did before. */
       conversionMapping?: { qualifiedStatus?: string | null } | null;
-      listType?: 'sales' | 'customers';
+      listType?: LeadListType;
       syncConfig?: {
         platform: 'hubspot' | 'attio';
         accountId: string;
@@ -6390,12 +6390,23 @@ export const crmDb = {
     // fails with `leadAlreadyExists` instead of spawning a duplicate lead.
     leadId?: string;
     failIfExists?: boolean;
+    /** ENG-2311: set by a caller that has ALREADY loaded the list and found it to be a session
+     *  list (utils/sessionList.ts). Skips the attribution.first_touch event-log write — one
+     *  synthetic-contact timeline entry per visit. Never derive it from request input.
+     *  (Slack lead notifications are gated separately, in orgLeadNotificationService.) */
+    suppressSideEffects?: boolean;
+    /** ENG-2312: skip the email-index duplicate pre-check below. For a caller that keys the
+     *  lead on a deterministic leadId + failIfExists, so the conditional put is the dedupe.
+     *  The pre-check reads an eventually-consistent GSI (and throws a plain Error), so for
+     *  such a caller it can only add a false "already exists" or a missed one — never safety.
+     *  Default (omitted) behaviour is unchanged. */
+    skipEmailDuplicateCheck?: boolean;
   }) {
     try {
       const leadId = leadData.leadId?.trim() || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
       // Check for duplicate email if email is provided
-      if (leadData.email && leadData.email.trim()) {
+      if (!leadData.skipEmailDuplicateCheck && leadData.email && leadData.email.trim()) {
         const existingLead = await this.getLeadByEmail(listId, leadData.email.trim().toLowerCase());
         if (existingLead) {
           throw new Error(`Lead with email "${leadData.email}" already exists in this list`);
@@ -6587,7 +6598,7 @@ export const crmDb = {
       // Attribution event — fire once per Lead when any attribution signal is
       // captured. Dedupe via sourceRecordId (`attribution:lead:{leadId}`) so
       // retries on the same lead create a single row.
-      if (leadData.firstTouch) {
+      if (leadData.firstTouch && !leadData.suppressSideEffects) {
         const contactId = emailValue || `nocontact:${leadId}`;
         try {
           await contactEventsDb.logEvent({
@@ -8119,6 +8130,7 @@ export const crmDb = {
                 previousStatus,
                 statusConfig: (list as any).statusConfig,
                 conversionMapping: (list as any).conversionMapping,
+                listType: (list as any).listType,
                 // On a retry of an owed conversion the lead's CURRENT status may no longer
                 // be the one that earned it, so the recorded kind wins — same reasoning as
                 // the queued payload's kind. `undefined` means "use the live transition".
@@ -9875,6 +9887,166 @@ export const crmDb = {
       handleDynamoDbError(err, 'setLeadEmailIfMissing:retry');
       throw err;
     }
+  },
+
+  /**
+   * ENG-2312: atomically merge ONE more event into an existing session-lead row.
+   *
+   * Used for every event of a session after the first (the first is the conditional create in
+   * createLead). Nothing here reads the row before writing, so concurrent events cannot lose
+   * each other's keys the way updateLead's full-map `SET customFields = :customFields` does:
+   *
+   *   1. LAST-WRITE-WINS scalars: one document-path SET per key, `customFields.#k = :v`. Keys
+   *      this event does not carry are never touched (key-union across events).
+   *   2. GUARDED group (`monotonic`): the cumulative journey. Each event carries the whole
+   *      journey so far, so an out-of-order OLDER event must not overwrite a newer one. It is
+   *      applied only if the stored counter is absent / not a number / <= the incoming one,
+   *      as a ConditionExpression on the SAME UpdateItem that writes the group — the compare
+   *      and the write are one atomic operation. A failed guard means "stale", not an error.
+   *      Scalars are a separate UpdateItem on purpose: a condition fails the whole item, and a
+   *      stale journey must not discard the event's other (newer) fields.
+   *
+   * Why not reuse setLeadFields: it first issues a bootstrap UpdateItem (a row created by
+   * createLead always has a customFields map, so that round trip is waste), returns void
+   * (this caller needs the pre-image to report updated-vs-unchanged), cannot carry a guard,
+   * and syncs list.fieldNames per call — create-time list bookkeeping that ONLY the creating
+   * request may do. It does share setLeadFields' rule that every attribute NAME and VALUE
+   * goes through a generated placeholder: `domain`/`system`/`name` are reserved words and a
+   * caller-chosen key can hold any character, and mocked-DocumentClient unit tests cannot see
+   * a syntax ValidationException (this file has shipped that bug before).
+   *
+   * Returns exists=false when the row is gone (deleted between the caller's conditional
+   * create failing and this write); the caller decides whether to re-create.
+   */
+  async mergeSessionLeadEvent(
+    listId: string,
+    leadId: string,
+    plan: {
+      /** Top-level attributes, last-write-wins (non-empty standard fields, lastTouch). */
+      topLevel?: Record<string, any>;
+      /** Top-level attributes written only if absent (firstTouch backfill, metaFbp, clientIp…). */
+      topLevelIfNotExists?: Record<string, any>;
+      /** customFields keys, last-write-wins, one document-path SET each. */
+      customFields?: Record<string, any>;
+      /** Cumulative group guarded by a numeric counter that must not go backwards. */
+      monotonic?: { counterKey: string; counter: number; fields: Record<string, any> };
+    },
+  ): Promise<{ exists: boolean; changed: boolean; guardApplied: boolean | null }> {
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    const key = { listId, leadId };
+    // Hard bound on keys per write. This endpoint is public and customFields is caller-shaped;
+    // DynamoDB caps an UpdateExpression at 4KB, and an unbounded key count would turn a hostile
+    // body into a ValidationException (500) instead of a bounded write. Chunked, not truncated
+    // per call: the first CHUNK_SIZE go in one UpdateItem, the rest in follow-ups, up to MAX_KEYS.
+    const CHUNK_SIZE = 100;
+    const MAX_KEYS = 300;
+    // undefined cannot be marshalled; an empty key cannot be an attribute-name placeholder value.
+    const clean = (o?: Record<string, any>): Array<[string, any]> =>
+      Object.entries(o ?? {}).filter(([k, v]) => k !== '' && v !== undefined);
+
+    const topLevel = clean(plan.topLevel);
+    const topLevelIfNotExists = clean(plan.topLevelIfNotExists);
+    let scalars = clean(plan.customFields);
+    if (scalars.length > MAX_KEYS) {
+      console.warn(`[mergeSessionLeadEvent] ${listId}/${leadId}: ${scalars.length} customFields keys, merging first ${MAX_KEYS}`);
+      scalars = scalars.slice(0, MAX_KEYS);
+    }
+    const guarded = plan.monotonic ? clean(plan.monotonic.fields).slice(0, CHUNK_SIZE) : [];
+    const ts = new Date().toISOString();
+
+    const run = async (params: any, label: string): Promise<any> => {
+      try {
+        return await dynamodb.update(params).promise();
+      } catch (err: any) {
+        if (err.code === 'ConditionalCheckFailedException') throw err; // callers interpret it
+        // customFields map absent (cannot happen for a row createLead wrote; a repaired or
+        // hand-edited row could): bootstrap it and retry exactly once.
+        if (err.code === 'ValidationException' && /document path/i.test(String(err.message))) {
+          await dynamodb.update({
+            TableName: tableName, Key: key,
+            UpdateExpression: 'SET #cf = if_not_exists(#cf, :empty)',
+            ExpressionAttributeNames: { '#cf': 'customFields', '#lid': 'leadId' },
+            ExpressionAttributeValues: { ':empty': {} },
+            ConditionExpression: 'attribute_exists(#lid)',
+          }).promise();
+          return await dynamodb.update(params).promise();
+        }
+        handleDynamoDbError(err, `mergeSessionLeadEvent:${label}`);
+        throw err;
+      }
+    };
+
+    // ── 1. last-write-wins scalars (+ top-level + updatedAt), first chunk returns the pre-image
+    const chunks: Array<Array<[string, any]>> = [];
+    for (let i = 0; i < scalars.length; i += CHUNK_SIZE) chunks.push(scalars.slice(i, i + CHUNK_SIZE));
+    if (chunks.length === 0) chunks.push([]);
+
+    let before: any;
+    for (let c = 0; c < chunks.length; c++) {
+      const names: Record<string, string> = { '#lid': 'leadId', '#ua': 'updatedAt' };
+      const values: Record<string, any> = { ':ts': ts };
+      const sets: string[] = ['#ua = :ts'];
+      if (c === 0) {
+        topLevel.forEach(([k, v], i) => { names[`#t${i}`] = k; values[`:t${i}`] = v; sets.push(`#t${i} = :t${i}`); });
+        topLevelIfNotExists.forEach(([k, v], i) => {
+          names[`#n${i}`] = k; values[`:n${i}`] = v;
+          sets.push(`#n${i} = if_not_exists(#n${i}, :n${i})`);
+        });
+      }
+      if (chunks[c].length > 0) names['#cf'] = 'customFields';
+      chunks[c].forEach(([k, v], i) => { names[`#k${i}`] = k; values[`:v${i}`] = v; sets.push(`#cf.#k${i} = :v${i}`); });
+      try {
+        const res = await run({
+          TableName: tableName, Key: key,
+          UpdateExpression: `SET ${sets.join(', ')}`,
+          ConditionExpression: 'attribute_exists(#lid)',
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: values,
+          ...(c === 0 ? { ReturnValues: 'ALL_OLD' } : {}),
+        }, 'scalars');
+        if (c === 0) before = res?.Attributes;
+      } catch (err: any) {
+        if (err.code === 'ConditionalCheckFailedException') return { exists: false, changed: false, guardApplied: null };
+        throw err;
+      }
+    }
+
+    // ── 2. guarded cumulative group
+    let guardApplied: boolean | null = null;
+    if (plan.monotonic && guarded.length > 0) {
+      const { counterKey, counter } = plan.monotonic;
+      const names: Record<string, string> = { '#lid': 'leadId', '#ua': 'updatedAt', '#cf': 'customFields', '#ctr': counterKey };
+      const values: Record<string, any> = { ':ts': ts, ':ctr': counter, ':numType': 'N' };
+      const sets: string[] = ['#ua = :ts'];
+      guarded.forEach(([k, v], i) => { names[`#g${i}`] = k; values[`:g${i}`] = v; sets.push(`#cf.#g${i} = :g${i}`); });
+      try {
+        await run({
+          TableName: tableName, Key: key,
+          UpdateExpression: `SET ${sets.join(', ')}`,
+          // Written as `<= incoming`, not `<`: a retried/duplicated identical event re-applies
+          // harmlessly, and equal counters mean "same point in the journey".
+          // NOT attribute_type(...,N) keeps a junk (non-numeric) stored counter from freezing
+          // the group forever — a string compares false against a number in DynamoDB.
+          ConditionExpression:
+            'attribute_exists(#lid) AND (attribute_not_exists(#cf.#ctr) OR NOT attribute_type(#cf.#ctr, :numType) OR #cf.#ctr <= :ctr)',
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: values,
+        }, 'journey');
+        guardApplied = true;
+      } catch (err: any) {
+        if (err.code !== 'ConditionalCheckFailedException') throw err;
+        guardApplied = false; // stale event: a newer journey is already stored — correct, not an error
+      }
+    }
+
+    // ── change detection from the atomic pre-image (no extra read)
+    const differs = (a: any, b: any) => JSON.stringify(a) !== JSON.stringify(b);
+    const oldCf = (before?.customFields && typeof before.customFields === 'object') ? before.customFields : {};
+    let changed = false;
+    for (const [k, v] of scalars) if (differs(oldCf[k], v)) { changed = true; break; }
+    if (!changed && guardApplied) for (const [k, v] of guarded) if (differs(oldCf[k], v)) { changed = true; break; }
+    if (!changed) for (const [k, v] of topLevel) if (differs(before?.[k], v)) { changed = true; break; }
+    return { exists: true, changed, guardApplied };
   },
 
   /**

@@ -26,6 +26,7 @@
 
 import { parsePendingKinds } from '../utils/metaConversionPending';
 import { isConversionRelayEnabled, ConversionKind } from './metaConversionRelay';
+import { excludeSessionLists } from '../utils/sessionList';
 
 const TAG = '[CAPI Reconcile]';
 
@@ -92,7 +93,8 @@ export async function reconcilePendingConversionsForUser(user: any): Promise<Rec
 
   let lists: any[];
   try {
-    lists = (await crmDb.getLeadListsByUserId(user.userId)) || [];
+    // ENG-2311: session rows carry no status and must never relay a conversion.
+    lists = excludeSessionLists(await crmDb.getLeadListsByUserId(user.userId));
   } catch (error: any) {
     console.error(`${TAG} could not enumerate lead lists for ${user.userId}: ${error?.message}`);
     return summary;

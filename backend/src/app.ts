@@ -122,6 +122,7 @@ import onboardingEventsRoutes from "./routes/onboardingEvents";
 import onboardingVariantsRoutes from "./routes/onboardingVariants";
 import loopEventsRoutes from "./routes/loopEvents";
 import humanEvalRoutes from "./routes/humanEval";
+import trackingRoutes from "./routes/tracking";
 import { registerAiEvalFunnelForProduction } from "./loops/instances/ai-eval-funnel";
 import { registerAiReadinessFunnel } from "./loops/instances/ai-readiness-funnel";
 import { checkFinalizeGuardMisconfiguration, registerAgentModeLoop } from "./loops/instances/agent-mode";
@@ -512,6 +513,9 @@ app.use("/api/onboarding", onboardingEventsRoutes);
 app.use("/api/onboarding", onboardingVariantsRoutes);
 app.use("/api/loop-events", loopEventsRoutes);
 app.use("/api/human-eval", humanEvalRoutes);
+// ENG-2313: traffic-source taxonomy + tagged-link generator. Pure, no persistence; the router
+// applies authenticateToken itself (user auth, not admin).
+app.use("/api/tracking", trackingRoutes);
 
 // Register closed-loop instances with production impls. The route handlers
 // look up loop manifests from LOOP_REGISTRY; the cron in server.ts invokes

@@ -32,6 +32,8 @@
  * invariant was the right one. Zero-arrival cannot be produced by lag or slop.
  */
 
+import { excludeSessionLists } from '../utils/sessionList';
+
 const TAG = '[CAPI Divergence]';
 
 /** Below this many relayed conversions the comparison says nothing. One conversion that
@@ -406,7 +408,8 @@ export async function buildDivergenceDeps(
   ]);
 
   return {
-    getLeadLists: (userId) => crmDb.getLeadListsByUserId(userId),
+    // ENG-2311: session rows are not CRM conversions; skip their pages entirely.
+    getLeadLists: async (userId) => excludeSessionLists(await crmDb.getLeadListsByUserId(userId)),
     getLeads: (listId, limit, startKey) => crmDb.getLeadsByListId(listId, limit, startKey),
     // The SAME resolver §C sends through, so the pixel read back from is the pixel written
     // to. Reading a different one would compare two unrelated numbers.
