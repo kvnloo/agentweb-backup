@@ -1,6 +1,6 @@
 import { crmDb } from './db';
 import { buildSessionMergePlan } from '../utils/sessionMergePlan';
-import { sessionLeadId, SESSION_JOURNEY_COUNTER_KEY, type SessionIdentity } from '../utils/sessionList';
+import { sessionLeadId, SESSION_GUARD_GROUPS, type SessionIdentity } from '../utils/sessionList';
 
 /**
  * ENG-2312 / ENG-2315: the ONE exactly-once upsert of a landing-page visitor session into a
@@ -30,17 +30,20 @@ export async function upsertSessionLead(input: {
   /** The merged custom fields (same object as leadData.customFields). */
   customFields: Record<string, any>;
   callerSuppliedSource: boolean;
-  /** Extra keys to guard with the journey counter (see buildSessionMergePlan). Omitted by forward-lead. */
+  /** Override: ONE group of keys guarded by eventCount (the tracker ingest). Omitted by forward-lead, which uses SESSION_GUARD_GROUPS. */
   journeyKeys?: readonly string[];
   touch?: any;
 }): Promise<{ lead: any; isNew: boolean; isUpdated: boolean; leadId: string }> {
   const { listId, identity, leadData, customFields, callerSuppliedSource, journeyKeys, touch } = input;
 
-  // The monotonic journey guard compares numerically (a string never compares <= a number in
-  // DynamoDB), so a counter an LP sent as "5" is stored as 5. Mutates in place on purpose:
+  // The monotonic guards compare numerically (a string never compares <= a number in DynamoDB), so
+  // a counter an LP sent as "5" is stored as 5. EVERY group's counter is coerced (eventCount and
+  // clickCount), whichever guard set the caller uses. Mutates in place on purpose:
   // leadData.customFields is this same object, so the created row carries the number too.
-  const ctr = customFields[SESSION_JOURNEY_COUNTER_KEY];
-  if (typeof ctr === 'string' && /^\d{1,15}$/.test(ctr)) customFields[SESSION_JOURNEY_COUNTER_KEY] = Number(ctr);
+  for (const { counterKey } of SESSION_GUARD_GROUPS) {
+    const ctr = customFields[counterKey];
+    if (typeof ctr === 'string' && /^\d{1,15}$/.test(ctr)) customFields[counterKey] = Number(ctr);
+  }
 
   let lead: any;
   let isNew = false;

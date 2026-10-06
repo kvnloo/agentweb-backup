@@ -1,5 +1,5 @@
 import { pruneClickIds } from './leadSchema';
-import { SESSION_JOURNEY_KEYS, SESSION_JOURNEY_COUNTER_KEY } from './sessionList';
+import { SESSION_GUARD_GROUPS, SESSION_JOURNEY_COUNTER_KEY } from './sessionList';
 
 /**
  * ENG-2312: turns one forward-lead event into the write plan db.mergeSessionLeadEvent applies
@@ -8,32 +8,36 @@ import { SESSION_JOURNEY_KEYS, SESSION_JOURNEY_COUNTER_KEY } from './sessionList
  *
  *  - scalar engagement fields (dwellSec, activeSec, maxScrollPct, *_at, channel, ...):
  *    last-write-wins, per key; keys this event omits are never touched;
- *  - the cumulative journey group (SESSION_JOURNEY_KEYS): guarded by `eventCount` so an
- *    out-of-order older event cannot regress it. If this event carries no usable numeric
- *    counter there is nothing to guard on, so its journey keys fall back to last-write-wins
- *    rather than being dropped;
+ *  - the guard groups (SESSION_GUARD_GROUPS: PROGRESS by `eventCount`, CLICKS by `clickCount`),
+ *    each independently guarded so an out-of-order older event cannot regress it. If this event
+ *    carries no usable numeric counter for a group there is nothing to guard on, so that group's
+ *    keys fall back to last-write-wins rather than being dropped;
  *  - `forwardedAt` is NEVER written: it is the stored first-capture time, stamped once by the
  *    creating request (the existing merge paths preserve it the same way);
  *  - `source` is written only if this event NAMED one (callerSuppliedSource) — the handler
  *    defaults it to 'api' otherwise, and that default must not overwrite a real stored value.
  */
+export interface MonotonicGroup { counterKey: string; counter: number; fields: Record<string, any> }
+
 export function buildSessionMergePlan(input: {
   leadData: Record<string, any>;
   incomingCustomFields: Record<string, any>;
   callerSuppliedSource: boolean;
-  /** The guarded group. Defaults to SESSION_JOURNEY_KEYS (forward-lead); the tracker ingest widens it
-   *  with its own "latest state" keys (lastEvent, furthestStage, ...) so an out-of-order older event
-   *  cannot regress them either. */
+  /** Override: ONE group guarded by eventCount (the tracker ingest passes its wider "latest state" set;
+   *  its output shape is the single `monotonic` object it always was). Omitted by forward-lead, which
+   *  gets SESSION_GUARD_GROUPS and an array of independently guarded groups. */
   journeyKeys?: readonly string[];
   touch?: { utm?: { source?: string; medium?: string }; clickIds?: unknown } & Record<string, any> | null;
 }): {
   topLevel: Record<string, any>;
   topLevelIfNotExists: Record<string, any>;
   customFields: Record<string, any>;
-  monotonic?: { counterKey: string; counter: number; fields: Record<string, any> };
+  monotonic?: MonotonicGroup | MonotonicGroup[];
 } {
   const { leadData, incomingCustomFields, callerSuppliedSource, touch } = input;
-  const journeyKeys = input.journeyKeys ?? SESSION_JOURNEY_KEYS;
+  const groups = input.journeyKeys
+    ? [{ counterKey: SESSION_JOURNEY_COUNTER_KEY, fields: input.journeyKeys }]
+    : SESSION_GUARD_GROUPS;
 
   const topLevel: Record<string, any> = {};
   // Non-empty only, like the existing merge paths. `linkedin` and `email` are deliberately not
@@ -57,22 +61,23 @@ export function buildSessionMergePlan(input: {
     if (clickIds) topLevelIfNotExists.clickIds = clickIds;
   }
 
-  const journey: Record<string, any> = {};
+  const grouped: Array<Record<string, any>> = groups.map(() => ({}));
   const customFields: Record<string, any> = {};
   for (const [k, v] of Object.entries(incomingCustomFields)) {
     if (v === undefined) continue;
     if (k === 'forwardedAt') continue;
     if (k === 'source' && !callerSuppliedSource) continue;
-    if (journeyKeys.includes(k)) journey[k] = v;
+    const gi = groups.findIndex((g) => g.fields.includes(k));
+    if (gi >= 0) grouped[gi][k] = v;
     else customFields[k] = v;
   }
 
-  const counter = journey[SESSION_JOURNEY_COUNTER_KEY];
-  if (typeof counter === 'number' && Number.isFinite(counter)) {
-    return {
-      topLevel, topLevelIfNotExists, customFields,
-      monotonic: { counterKey: SESSION_JOURNEY_COUNTER_KEY, counter, fields: journey },
-    };
-  }
-  return { topLevel, topLevelIfNotExists, customFields: { ...customFields, ...journey } };
+  const monotonic: MonotonicGroup[] = [];
+  groups.forEach((g, i) => {
+    const counter = grouped[i][g.counterKey];
+    if (typeof counter === 'number' && Number.isFinite(counter)) monotonic.push({ counterKey: g.counterKey, counter, fields: grouped[i] });
+    else Object.assign(customFields, grouped[i]); // nothing to guard on: last-write-wins, not dropped
+  });
+  if (monotonic.length === 0) return { topLevel, topLevelIfNotExists, customFields };
+  return { topLevel, topLevelIfNotExists, customFields, monotonic: input.journeyKeys ? monotonic[0] : monotonic };
 }
