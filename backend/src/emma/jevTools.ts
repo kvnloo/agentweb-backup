@@ -11,7 +11,8 @@ import {
   type JevQuestion,
   type JudgmentState,
 } from './jevAdapter';
-import { runZ0Route, type Z0RouteArgs } from './z0Adapter';
+import { runZ0CanaryRoute } from './z0ActiveCanary';
+import { type Z0RouteArgs } from './z0Adapter';
 
 const JEV_DECIDE_DESCRIPTION =
   'Run a fast typed semantic judgment over structured state instead of spending a full LLM turn. ' +
@@ -75,7 +76,7 @@ emmaToolRegistry.register({
 
 const Z0_ROUTE_DESCRIPTION =
   'Downstream experiment: ask z0intelligence to plan or execute an evidenced route beneath Emma. ' +
-  'Default is off. Shadow mode performs no physical model call. Active mode preserves z0 trace/receipt authority. ' +
+  'Default is reference/shadow. Active application requires the explicit bounded canary, sidecar startup, backpressure enforcement, and an allowed risk class. ' +
   'This tool never bypasses AgentWeb confirmation or publishing guards; allow_remote defaults false.';
 
 emmaToolRegistry.register({
@@ -115,7 +116,10 @@ emmaToolRegistry.register({
     const sessionId = typeof context?.sessionId === 'string' ? context.sessionId : '';
     return {
       type: 'z0_route',
-      ...(await runZ0Route(args as Z0RouteArgs, { sessionId })),
+      ...(await runZ0CanaryRoute(args as Z0RouteArgs, {
+        sessionId,
+        riskClass: 'generate',
+      })),
     };
   },
 });
