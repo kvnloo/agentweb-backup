@@ -255,6 +255,35 @@ import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
 
 /**
+ * ENG-1816 F2 follow-up: a production session reported "No work plan found in
+ * this session" on `set_work_plan_status` immediately after an earlier step on
+ * the SAME session had completed successfully. Direct reproduction (same
+ * sequence, real backend, real DynamoDB reads in between) could not trigger it
+ * -- the create -> complete-step-1 -> complete-step-2 round trip is reliable
+ * every time it was tried. Since the failure couldn't be caught live, this logs
+ * the exact shape of the miss (session missing entirely vs. present with no
+ * workPlan vs. present with a workPlan that calledFunctions disagrees with)
+ * so the next real occurrence leaves forensic evidence instead of just the
+ * user-facing message. Remove once the real cause is found and fixed, or once
+ * this has run long enough with zero hits to downgrade the finding.
+ */
+function logMissingWorkPlanForDiagnosis(
+  caller: 'setWorkPlanStatus' | 'modifyWorkPlan',
+  sessionId: string,
+  session: { workPlan?: unknown; calledFunctions?: Record<string, number>; createdAt?: string; updatedAt?: string } | null,
+): void {
+  const calledFunctionNames = session?.calledFunctions ? Object.keys(session.calledFunctions) : [];
+  console.warn(
+    `AgentMode: ${caller} found no work plan for session ${sessionId} (ENG-1816 diagnostic). ` +
+    `sessionExists=${!!session} ` +
+    `sessionCreatedAt=${session?.createdAt ?? 'n/a'} sessionUpdatedAt=${session?.updatedAt ?? 'n/a'} ` +
+    // If create_work_plan shows up here despite workPlan being absent, the plan
+    // was created and then lost -- a very different bug than "never created".
+    `calledFunctionsSeenOnSession=[${calledFunctionNames.join(', ')}]`
+  );
+}
+
+/**
  * The minimal slice of `AgentModeService` that `applyPredefinedWorkPlan`
  * needs to validate a predefined template's `defaultModel` — see the module
  * header comment (cross-dependency #1) for why this is a passed-in parameter
@@ -457,7 +486,32 @@ export async function applyPredefinedWorkPlan(
       ?? candidates.find((p) => p.title && normalizeWorkPlanTitleForMatch(p.title) === needle);
 
     if (!predefinedPlan) {
-      return { success: false, message: `Work plan template "${planTitleOrId}" not found` };
+      // ENG-1993: a bare "not found" left the model nothing to recover with, so it
+      // re-tried the same unresolvable name (7/9 failures in one reliability run).
+      // Return the closest accessible templates by stable planId and point at
+      // list_predefined_work_plans. Never auto-launch a guess: the ENG-1794/1814
+      // wrong-template incidents came from exactly that kind of silent fallback.
+      const needleTokens = needle.split(' ').filter((t) => t.length > 2);
+      const suggestions = candidates
+        .filter((p) => p.title && p.planId)
+        .map((p) => {
+          const title = normalizeWorkPlanTitleForMatch(p.title);
+          const score = needleTokens.filter((t) => title.includes(t)).length;
+          return { planId: p.planId as string, title: p.title as string, score };
+        })
+        .filter((s) => s.score > 0)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 5)
+        .map(({ planId, title }) => ({ planId, title }));
+      const hint = suggestions.length > 0
+        ? ` Closest accessible templates: ${suggestions.map((s) => `"${s.title}" (planId ${s.planId})`).join(', ')}. Confirm with the user which one they meant, then call launch_predefined_work_plan with that planId.`
+        : ' Call list_predefined_work_plans to see the templates available to this user, then retry with an exact planId.';
+      return {
+        success: false,
+        errorType: 'not_found',
+        message: `Work plan template "${planTitleOrId}" not found.${hint} Do not retry with the same name.`,
+        suggestions,
+      };
     }
     if (predefinedPlan.visibility === 'private' && (!userId || userId.startsWith('anon_'))) {
       return { success: false, message: 'Not authorized to use this private work plan' };
@@ -861,6 +915,7 @@ async function setWorkPlanStatusAttempt(
   // for the analogous timed-out-run read).
   const session = await chatbotDb.getChatSession(sessionId, true);
   if (!session || !session.workPlan) {
+    logMissingWorkPlanForDiagnosis('setWorkPlanStatus', sessionId, session);
     return {
       success: false,
       message: 'No work plan found in this session. Create one first using create_work_plan.'
@@ -1698,6 +1753,7 @@ export async function modifyWorkPlan(
     // call, could be missed.
     const session = await chatbotDb.getChatSession(sessionId, true);
     if (!session || !session.workPlan) {
+      logMissingWorkPlanForDiagnosis('modifyWorkPlan', sessionId, session);
       return {
         success: false,
         message: 'No work plan found in this session. Create one first using create_work_plan.'

@@ -305,6 +305,30 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
       expect(result.formattedContent).toContain('Work Item 1 [pending]');
       expect(result.formattedContent).toContain('5 day(s)');
     });
+
+    // ENG-1816 F2 follow-up: readGTMPlan's formattedContent never exposed the
+    // phase/work-item's real id, only their 1-based display position, so
+    // add_gtm_work_items/update_gtm_phase/update_gtm_work_item/delete_gtm_items
+    // had nothing valid to target (a guessed phase_id like "1" fails with
+    // "Phase not found"). Asserts the real ids from the DB record (phase-1,
+    // item-1 — distinct from their display numbers) are now present, and that
+    // the pre-existing display-format assertions above still hold unchanged.
+    it('should expose each phase and work item\'s real id alongside its display number', async () => {
+      const mockPromise = jest.fn().mockResolvedValue({
+        Item: mockPlan,
+      });
+      mockGet.mockReturnValue({ promise: mockPromise });
+
+      const result = await (agentModeService as any).readGTMPlan(mockPlanId, mockUserId);
+
+      expect(result.formattedContent).toContain('Phase 1: Phase 1 (id: phase-1)');
+      expect(result.formattedContent).toContain('Work Item 1 [pending]');
+      expect(result.formattedContent).toContain('(id: item-1)');
+      // The work item's id must appear on the same line as its title, after
+      // every other conditional field (duration, dri, completedAt), not
+      // between the title and its status bracket.
+      expect(result.formattedContent).toMatch(/Work Item 1 \[pending\] - 5 day\(s\) \(id: item-1\)/);
+    });
   });
 
   describe('createGTMPlan', () => {
