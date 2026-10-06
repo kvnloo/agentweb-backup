@@ -26,10 +26,10 @@ import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBu
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
 // Get table prefix based on NODE_ENV (defaults to empty string for production)
+const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+
 /** One counter-guarded group of customFields for crmDb.mergeSessionLeadEvent. */
 type MonotonicPlan = { counterKey: string; counter: number; fields: Record<string, any> };
-
-const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
 // An 'in_progress' claimLeadStepOnce claim older than this is treated as
 // abandoned (its release write never landed) and becomes reclaimable — see
