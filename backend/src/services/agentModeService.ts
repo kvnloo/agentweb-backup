@@ -309,7 +309,7 @@ import { stampMetaAdCreated, stampMetaAdCreativeChanged, stampMetaCreativeCreate
 // change) is inside setWorkPlanStatusAttempt, whose real body is now in
 // emma/impl/workPlans.ts — imported there instead, see that module.
 import { CitationRegistry } from '../utils/citations';
-import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
+import { normalizeMetaCampaignIds, getMetaAdsMetricsArgsSchema } from '../utils/metaCampaignIds';
 import { parseTimecodeToSeconds } from '../emma/impl/video';
 import {
   applyOpenRouterCacheBreakpoints,
@@ -593,6 +593,7 @@ import {
   META_GOAL_BID_STRATEGY_MAP,
   META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
+import { resolveOptimisationEvent, pixelReceivedEvent } from './metaOptimisationCoverage';
 
 
 /**
@@ -8227,10 +8228,8 @@ export class AgentModeService {
         };
 
       case 'get_meta_ads_metrics':
-        const normalizedCampaignIds = normalizeMetaCampaignIds(
-          args.campaign_ids,
-          args.campaign_id,
-        );
+        const parsedMetricsArgs = getMetaAdsMetricsArgsSchema.safeParse(args);
+        const normalizedCampaignIds = parsedMetricsArgs.success ? parsedMetricsArgs.data.campaign_ids : [];
 
         if (normalizedCampaignIds.length === 0) {
           return {
@@ -9226,6 +9225,8 @@ export class AgentModeService {
         ? `Save the drafts, report plainly that nothing was published and why, and tell the owner they can turn "Require approval before publishing" OFF for this schedule to let the next run post.`
         : reason === 'revoked'
         ? `Save the drafts, and report plainly that nothing was published and why — publish authorization for this schedule was revoked. Do NOT tell the owner to turn "Require approval before publishing" OFF — that is a different, unrelated setting. They (or an admin) would need to re-authorize this schedule for a future run to publish.`
+        : reason === 'not_granted'
+        ? `Save the drafts, and report plainly that nothing was published and why. Do NOT tell the owner to turn "Require approval before publishing" OFF — that setting is not why this was blocked and toggling it will not change anything. The owner can grant this themselves: open this schedule, confirm the publish tool (e.g. ${toolName}) is selected under Required Actions and saved, then use the "Publish without my review" control (Standing publish authorization) so future runs can post unattended.`
         : `Save the drafts, and report plainly that nothing was published and why. Do NOT tell the owner to turn "Require approval before publishing" OFF — that setting is not why this was blocked and toggling it will not change anything.`;
     return {
       success: false as const,
@@ -12086,6 +12087,10 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const money = await this.normalizeMetaMoneyParams(accountId, accessToken, args);
       const normalizedParams: MetaAdsAdSetParams = { ...money.params, bid_strategy: strategy };
 
+      const optimisationEventWarning = await this.buildMetaOptimisationEventWarning(
+        accessToken,
+        normalizedParams.promoted_object,
+      );
       const adSet = await metaService.createAdSet(accountId, accessToken, normalizedParams);
 
       // ENG-838: surface the bid strategy that actually landed. When the caller
@@ -12104,7 +12109,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         message: `Ad set "${adSet.name}" created successfully${money.confirmation}`,
         adSet: adSet,
         appliedBidStrategy: strategy,
-        bidStrategyWasDefaulted: args.bid_strategy === undefined
+        bidStrategyWasDefaulted: args.bid_strategy === undefined,
+        ...(optimisationEventWarning ? { warning: optimisationEventWarning, optimisationEventWarning } : {})
       };
 
       let readBack: any;
@@ -12175,6 +12181,81 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         code: error?.status ?? error?.response?.status
       };
     }
+  }
+
+  private async buildMetaOptimisationEventWarning(
+    accessToken: string,
+    promotedObject: any,
+  ): Promise<string | undefined> {
+    const pixelId = typeof promotedObject?.pixel_id === 'string' ? promotedObject.pixel_id.trim() : '';
+    if (!pixelId) return undefined;
+    const resolved = resolveOptimisationEvent(promotedObject);
+    if (resolved.kind !== 'resolved') return undefined;
+
+    try {
+      const stats = await metaService.getDatasetEventStats(pixelId, accessToken);
+      const health = this.readLast30DayOptimisationEventHealth(stats?.event_stats, resolved.expectedEventName);
+      if (health === 'recent') return undefined;
+      if (health === 'missing') {
+        return (
+          `Warning: Meta did not report any ${resolved.expectedEventName} events on selected pixel ${pixelId} ` +
+          `in the last 30 days. The ad set was created, but optimization may be learning from little or no ` +
+          `recent signal; verify the pixel event before scaling spend.`
+        );
+      }
+      return (
+        `Warning: Meta pixel event health for ${resolved.expectedEventName} on selected pixel ${pixelId} is unknown ` +
+        `because Meta event_stats did not include an explicit last-30-day count for the selected event. The ad set ` +
+        `was created, but do not treat this as a healthy optimization signal until the event is verified.`
+      );
+    } catch (error: any) {
+      return (
+        `Warning: Meta pixel event health for ${resolved.expectedEventName} on selected pixel ${pixelId} is unknown ` +
+        `because Meta event_stats could not be read (${error?.message || String(error)}). The ad set was created, ` +
+        `but do not treat this as a healthy optimization signal until the event is verified.`
+      );
+    }
+  }
+
+  private readLast30DayOptimisationEventHealth(
+    rawStats: unknown,
+    expectedEventName: string,
+  ): 'recent' | 'missing' | 'unknown' {
+    let rows: any[] = [];
+    if (Array.isArray(rawStats)) {
+      rows = rawStats;
+    } else if (typeof rawStats === 'string' && rawStats.trim()) {
+      const parsed = JSON.parse(rawStats);
+      rows = Array.isArray(parsed) ? parsed : [];
+    } else {
+      return 'unknown';
+    }
+
+    const hasAnyExplicitLast30 = rows.some((row: any) =>
+      Object.keys(row ?? {}).some((key) => /(last[_-]?30|30[_-]?(day|d)|last[_-]?thirty)/i.test(key))
+    );
+    const matchedRows = rows.filter((row: any) => {
+      const name = row?.event || row?.event_name || row?.name;
+      return typeof name === 'string' && pixelReceivedEvent(new Set([name]), expectedEventName);
+    });
+    if (matchedRows.length === 0) return hasAnyExplicitLast30 ? 'missing' : 'unknown';
+
+    let sawExplicitLast30 = false;
+    for (const row of matchedRows) {
+      for (const [key, value] of Object.entries(row ?? {})) {
+        if (!/(last[_-]?30|30[_-]?(day|d)|last[_-]?thirty)/i.test(key)) continue;
+        const numeric = typeof value === 'number'
+          ? value
+          : typeof value === 'string' && value.trim() !== ''
+            ? Number(value)
+            : NaN;
+        if (!Number.isFinite(numeric)) continue;
+        sawExplicitLast30 = true;
+        if (numeric > 0) return 'recent';
+      }
+    }
+
+    return sawExplicitLast30 ? 'missing' : 'unknown';
   }
 
   public async listMetaAdsAdCreatives(userId: string, account_id?: string, adSetId?: string): Promise<any> {

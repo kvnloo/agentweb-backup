@@ -35,6 +35,9 @@ describe('normalizeOpenRouterCatalogEntry (ENG-1689)', () => {
     expect(normalizeOpenRouterCatalogEntry({ ...sonnet, pricing: { prompt: '0.000003' } })).toMatchObject({ ok: false });
     expect(normalizeOpenRouterCatalogEntry({ ...sonnet, pricing: { prompt: '-1', completion: '0.1' } })).toMatchObject({ ok: false });
     expect(normalizeOpenRouterCatalogEntry({ ...sonnet, pricing: { prompt: '0', completion: '0' } })).toMatchObject({ ok: false, reason: 'zero pricing' });
+    expect(normalizeOpenRouterCatalogEntry({ ...sonnet, pricing: { prompt: '0', completion: '0.00001' } })).toMatchObject({ ok: false, reason: 'zero pricing' });
+    expect(normalizeOpenRouterCatalogEntry({ ...sonnet, pricing: { prompt: '0.00001', completion: '0' } })).toMatchObject({ ok: false, reason: 'zero pricing' });
+    expect(normalizeOpenRouterCatalogEntry({ ...sonnet, pricing: { prompt: '0.000003', completion: '0.000015', overrides: [{ min_prompt_tokens: 272000, prompt: '0.000006' }] } })).toMatchObject({ ok: false, reason: 'tiered pricing overrides unsupported' });
     expect(normalizeOpenRouterCatalogEntry({ ...sonnet, id: '../etc' })).toMatchObject({ ok: false, reason: 'invalid id' });
   });
 
