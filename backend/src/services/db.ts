@@ -18,6 +18,7 @@ import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { isEvaluationUser } from "./evaluationPolicy";
+import { emailLeadIds, isEmailUniqueCreateEnabled, type EmailLeadIds } from '../utils/emailLeadId';
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
 import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
@@ -6420,9 +6421,19 @@ export const crmDb = {
      *  such a caller it can only add a false "already exists" or a missed one — never safety.
      *  Default (omitted) behaviour is unchanged. */
     skipEmailDuplicateCheck?: boolean;
+    /** ENG-2321: opt in to the exactly-once email-keyed create (utils/emailLeadId.ts): a time-bucketed
+     *  deterministic leadId written in a transaction that also condition-checks the adjacent buckets,
+     *  so concurrent same-email submissions resolve to ONE row. A loser throws the same typed
+     *  `duplicateEmail` error the pre-check does. Ignored when the caller supplies a leadId, when
+     *  there is no email, or when LEAD_EMAIL_UNIQUE_CREATE=false (random-id path, unchanged). */
+    emailUniqueCreate?: boolean;
   }) {
     try {
-      const leadId = leadData.leadId?.trim() || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const emailKeyIds: EmailLeadIds | null =
+        leadData.emailUniqueCreate && !leadData.leadId?.trim() && leadData.email?.trim() && isEmailUniqueCreateEnabled()
+          ? emailLeadIds(listId, leadData.email.trim().toLowerCase())
+          : null;
+      const leadId = leadData.leadId?.trim() || emailKeyIds?.leadId || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
       // Check for duplicate email if email is provided
       if (!leadData.skipEmailDuplicateCheck && leadData.email && leadData.email.trim()) {
@@ -6588,7 +6599,11 @@ export const crmDb = {
         params.ConditionExpression = 'attribute_not_exists(leadId)';
       }
 
-      await dynamodb.put(params).promise();
+      if (emailKeyIds) {
+        await this.putEmailKeyedLead(params, emailKeyIds);
+      } else {
+        await dynamodb.put(params).promise();
+      }
       // Covers landing-page form capture and every single CRM insert. Never await Slack.
       void import('./orgLeadNotificationService')
         .then(({ dispatchLeadCreated }) => dispatchLeadCreated(listId, leadId))
@@ -6665,6 +6680,62 @@ export const crmDb = {
       }
       handleDynamoDbError(error, "createLead");
       throw error;
+    }
+  },
+
+  /**
+   * ENG-2321: the write half of the exactly-once email-keyed create. ONE transaction: put the
+   * lead under its bucketed id (attribute_not_exists) and condition-check that the previous and
+   * next buckets' ids do not exist. Racers in the same bucket collide on the put; racers on either
+   * side of a bucket boundary each touch the other's key, so DynamoDB serialises them. A loser
+   * throws the typed `duplicateEmail` error carrying the winner's row (consistent GetItem by known
+   * key, never the GSI), which both callers already adopt / treat as a repeat.
+   *
+   * TransactionConflict (an in-flight racer holds one of the keys) is retried a few times: the
+   * retry then fails on a real condition and adopts. If retries run out with no row visible, it
+   * degrades to the plain conditional put (still exact within one bucket) rather than a 500.
+   */
+  async putEmailKeyedLead(params: any, ids: EmailLeadIds): Promise<void> {
+    const table = params.TableName;
+    const listId = params.Item.listId;
+    const nonexistent = (leadId: string) => ({
+      TableName: table, Key: { listId, leadId }, ConditionExpression: 'attribute_not_exists(leadId)',
+    });
+    const adoptOrThrow = async (err: any): Promise<void> => {
+      for (const id of [ids.prevLeadId, ids.leadId, ids.nextLeadId]) {
+        const existing = await this.getLeadById(listId, id, { consistentRead: true });
+        if (existing) {
+          const duplicateErr: any = new Error(`Lead with email "${params.Item.email}" already exists in this list`);
+          duplicateErr.duplicateEmail = true;
+          duplicateErr.existingLead = existing;
+          throw duplicateErr;
+        }
+      }
+      if (err) throw err;
+    };
+    const MAX_ATTEMPTS = 5;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      try {
+        await dynamodb.transactWrite({
+          TransactItems: [
+            { Put: { TableName: table, Item: params.Item, ConditionExpression: 'attribute_not_exists(leadId)' } },
+            { ConditionCheck: nonexistent(ids.prevLeadId) },
+            { ConditionCheck: nonexistent(ids.nextLeadId) },
+          ],
+        }).promise();
+        return;
+      } catch (err: any) {
+        if (err?.code !== 'TransactionCanceledException' && err?.code !== 'TransactionConflictException') throw err;
+        await adoptOrThrow(null);
+        // Nothing visible: an in-flight transaction holds a key (or its row was just deleted). Back off, retry.
+        await new Promise((resolve) => setTimeout(resolve, 10 * 2 ** attempt * (0.5 + Math.random())));
+      }
+    }
+    try {
+      await dynamodb.put({ ...params, ConditionExpression: 'attribute_not_exists(leadId)' }).promise();
+    } catch (err: any) {
+      if (err?.code === 'ConditionalCheckFailedException') await adoptOrThrow(err);
+      throw err;
     }
   },
 
