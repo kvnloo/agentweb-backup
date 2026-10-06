@@ -183,7 +183,6 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
       billingUserId: 'test-user-123',
       policy: null,
       costUsedMicroUsd: 0,
-      tokenUsed: 1,
       creditsApplied: false,
       mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
     });
@@ -259,7 +258,6 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
         optimizedDefaultModel: 'gpt-5-chat-2',
       },
       costUsedMicroUsd: 80_000_000,
-      tokenUsed: 300_000_000,
       creditsApplied: false,
       mode: { usageMode: 'optimized', admissionAllowed: true, reason: 'optimization_threshold_reached' },
     });
@@ -322,7 +320,6 @@ describe('getModelOptions — authoritative model discovery', () => {
         optimizedDefaultModel: 'openrouter/x-ai/grok-4.6',
       },
       costUsedMicroUsd: 80_000_000,
-      tokenUsed: 1,
       creditsApplied: false,
       mode: { usageMode: 'optimized', admissionAllowed: true, reason: 'optimization_threshold_reached' },
     });
@@ -409,7 +406,6 @@ describe('resolveScheduleBackup via updateScheduledChat (ENG-1211)', () => {
         optimizedDefaultModel: 'gemini-3.1-flash-lite',
       },
       costUsedMicroUsd: 0,
-      tokenUsed: 0,
       creditsApplied: false,
       mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'hard_cap_only' },
     } as any);

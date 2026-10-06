@@ -151,7 +151,7 @@ export async function resolveBillingUserId(userId: string): Promise<string> {
   return org.ownerUserId;
 }
 
-function getCurrentMonth(): string {
+export function getCurrentMonth(): string {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
 }
@@ -322,8 +322,11 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
   }
 
   const billingUserId = await resolveBillingUserId(userId);
-  const usage = await getUserTokenUsage(billingUserId);
-  const [{ allowance, bonus, effectiveAllowance, costAllowance, llmUsagePolicy, subscriptionType }, billingUser] = await Promise.all([
+  // ENG-1250 AC7: the gate no longer reads the legacy per-user counter. The month is the clock's,
+  // and spend comes from the ledger (below); the counter is consulted only if the rollback path
+  // falls back to the legacy basis.
+  const month = getCurrentMonth();
+  const [{ bonus, costAllowance, llmUsagePolicy, subscriptionType }, billingUser] = await Promise.all([
     getUserTokenAllowance(billingUserId),
     userDb.getUserById(billingUserId),
   ]);
@@ -354,17 +357,19 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
   const versionedCostPolicyEnforced = !!llmUsagePolicy && llmUsagePolicy.enforcementState !== "observe";
   const enforceCostCap = versionedCostPolicyEnforced || process.env.ENFORCE_COST_CAP === "true";
 
-  const legacyRawCostUsedMicroUsd = Math.max(0, Math.round((usage.totalCost || 0) * 1_000_000));
+  // Lazy: read only if the basis falls back to legacy (rollback path), never on the live ledger path.
+  const legacyRawCostUsedMicroUsd = async (): Promise<number> =>
+    Math.max(0, Math.round(((await getUserTokenUsage(billingUserId)).totalCost || 0) * 1_000_000));
   // ENG-1250 §9.6 enforcement cutover (dark by default): swap the raw spend basis
   // onto the vendor-inclusive spend ledger; the credit/threshold/predicate path
   // below is reused unchanged so the only divergence is vendor inclusion.
   const { rawCostUsedMicroUsd } = await resolveEnforcementCostBasisMicroUsd({
     billingUserId,
-    billingMonth: usage.month,
+    billingMonth: month,
     legacyRawCostUsedMicroUsd,
     tier: subscriptionType,
   });
-  const creditAdjustment = getLlmUsageCreditAdjustment(billingUser?.llmUsageCredits, usage.month);
+  const creditAdjustment = getLlmUsageCreditAdjustment(billingUser?.llmUsageCredits, month);
   const adjustedUsage = llmUsagePolicy
     ? applyLlmUsageCredits({
         rawCostUsedMicroUsd,
@@ -378,52 +383,50 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
   const costUsedMicroUsd = adjustedUsage.policyCostUsedMicroUsd;
   const usageDecision = evaluateLlmUsageMode({
     costUsedMicroUsd,
-    tokenUsed: usage.totalTokens,
     policy: effectiveLlmUsagePolicy,
   });
   const effectiveCostAllowance = versionedCostPolicyEnforced
     ? effectiveLlmUsagePolicy!.hardCostThresholdMicroUsd / 1_000_000
     : costAllowance;
 
-  const tokenPercentUsed = computePercentUsed(usage.totalTokens, effectiveAllowance);
   const policyCostUsed = costUsedMicroUsd / 1_000_000;
   const costPercentUsed = computePercentUsed(policyCostUsed, effectiveCostAllowance);
 
-  // A tier with no configured dollar allowance would become completely ungated the
-  // moment the flag flips — a strictly worse failure than the cap being replaced.
-  // Such tiers keep their token cap until someone prices them. That guard is also
-  // what makes the rollout order-independent: this code can ship to prod, where
-  // every tier is currently unpriced, and change nothing until the allowances land.
+  // A tier with no configured dollar allowance has no cost gate. It used to fall back to its token
+  // cap here; the token counter is retired (ENG-1250 AC7), so such a tier is now uncapped until
+  // someone prices it. Accepted deliberately for the accounts on those tiers.
   const costIsGate = enforceCostCap && effectiveCostAllowance !== null;
 
-  const tokenAllowed = effectiveAllowance === null || tokenPercentUsed < 100;
   const costAllowed = effectiveCostAllowance === null || costPercentUsed < 100;
   // Once a versioned cost policy is enforced, raw token volume is observe-only:
   // admission is governed exclusively by provider/model cost. Legacy rows retain
   // the old token gate until an admin explicitly saves a versioned policy.
+  // ENG-1250 AC7: there is no token-count gate any more — it needed the retiring counter, and
+  // dollars are the unit that actually bounds spend. A tier with neither an enforced policy nor a
+  // cost gate is therefore uncapped, deliberately (25 such accounts were identified and accepted).
   const allowed = versionedCostPolicyEnforced
     ? usageDecision.admissionAllowed
     : costIsGate
       ? costAllowed
-      : tokenAllowed;
+      : true;
 
   // Warn only on the dimension that can actually block. Warning about an
   // observe-only cap is the same stale nag ENG-951 removed from customer surfaces.
-  const tokenWarning =
-    !costIsGate && effectiveAllowance !== null && tokenPercentUsed >= 80 && tokenPercentUsed < 100;
   const costWarning =
     costIsGate && costPercentUsed >= 80 && costPercentUsed < 100;
 
   return {
     allowed,
-    warning: allowed && (tokenWarning || costWarning),
-    used: usage.totalTokens,
-    allowance,
+    warning: allowed && costWarning,
+    // Token volume is no longer measured (see `allowed` above): null allowance reads as "no token
+    // limit" everywhere, which is also what hides the customer usage meter for such tiers.
+    used: 0,
+    allowance: null,
     bonus,
-    effectiveAllowance,
-    percentUsed: effectiveAllowance === null ? 0 : tokenPercentUsed,
-    month: usage.month,
-    costUsed: versionedCostPolicyEnforced ? policyCostUsed : usage.totalCost,
+    effectiveAllowance: null,
+    percentUsed: 0,
+    month,
+    costUsed: policyCostUsed,
     costAllowance: effectiveCostAllowance,
     costPercentUsed: effectiveCostAllowance === null ? 0 : costPercentUsed,
     costEnforced: costIsGate,
