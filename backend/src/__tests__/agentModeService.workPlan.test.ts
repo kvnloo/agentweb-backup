@@ -494,6 +494,43 @@ describe('AgentModeService - Work Plan', () => {
       expect(result.message).toContain('No work plan found');
     });
 
+    // ENG-1816 F2 follow-up: this failure was reported happening on a session
+    // that HAD just created a plan, which direct reproduction could not
+    // reproduce -- so the miss is now logged with enough detail (session
+    // existence, calledFunctions history) for the next real occurrence to be
+    // diagnosable. Asserts the log actually fires and actually distinguishes
+    // "create_work_plan was called but the plan is gone anyway" from
+    // "never created" -- the one signal that would prove this is real data
+    // loss rather than the model never having created a plan in the first place.
+    it('ENG-1816: logs diagnostic detail, including prior calledFunctions, when no work plan is found', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        messages: [],
+        calledFunctions: { create_work_plan: 1 },
+        createdAt: '2026-10-01T00:00:00.000Z',
+        updatedAt: '2026-10-01T00:05:00.000Z',
+        // No workPlan, despite create_work_plan showing up above.
+      };
+
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).modifyWorkPlan(
+        [{ stepCount: 1, title: 'Step 1' }],
+        [],
+        mockSessionId
+      );
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('modifyWorkPlan found no work plan for session ' + mockSessionId)
+      );
+      const [[loggedLine]] = warnSpy.mock.calls;
+      expect(loggedLine).toContain('sessionExists=true');
+      expect(loggedLine).toContain('calledFunctionsSeenOnSession=[create_work_plan]');
+      warnSpy.mockRestore();
+    });
+
     it('ENG-2058: forces autocomplete true on a scheduled session even when the model requests false', async () => {
       const freshWorkPlan = JSON.parse(JSON.stringify({ ...existingWorkPlan, autocomplete: false }));
 
@@ -703,6 +740,29 @@ describe('AgentModeService - Work Plan', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('No work plan found');
+    });
+
+    // ENG-1816 F2 follow-up: same diagnostic as modifyWorkPlan's own version
+    // of this failure -- see that test for the full rationale. Covers the
+    // "session itself is missing entirely" shape here, distinct from the
+    // "session exists, calledFunctions shows a plan was created, but
+    // workPlan is gone" shape the modifyWorkPlan test covers.
+    it('ENG-1816: logs diagnostic detail when the session itself cannot be found', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(null);
+
+      await (agentModeService as any).setWorkPlanStatus(
+        [{ stepCount: 1, status: 'completed' }],
+        mockSessionId
+      );
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('setWorkPlanStatus found no work plan for session ' + mockSessionId)
+      );
+      const [[loggedLine]] = warnSpy.mock.calls;
+      expect(loggedLine).toContain('sessionExists=false');
+      expect(loggedLine).toContain('calledFunctionsSeenOnSession=[]');
+      warnSpy.mockRestore();
     });
 
     it('should update multiple steps at once', async () => {
