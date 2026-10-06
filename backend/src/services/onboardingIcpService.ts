@@ -34,6 +34,7 @@ import {
   icpReadyPatch,
   icpStartPatch,
   ICPPersona,
+  ICPStatusFields,
   ICP_PERSONA_FIELD_NAMES,
   ensurePersonaIds,
   MAX_ICP_PERSONAS,
@@ -930,15 +931,47 @@ export async function triggerIcpDiscoveryForUser(
 }
 
 /**
+ * Guards the non-running -> `running` transition with a DynamoDB
+ * ConditionExpression (ENG-2308) — a plain read-then-write here lets two
+ * concurrent `/icp/start` calls both observe a non-running status and both
+ * win, launching two fully parallel LLM generations that race to decide
+ * which personas persist. This is not a rare interleaving: `OutreachIcpPick`'s
+ * watchdog (`ICP_AUTO_RETRY_MS` = 8s) re-fires `/icp/start` whenever
+ * generation is still running past that window, which real ICP generation
+ * routinely exceeds. `userDb.updateUser` already supports conditional
+ * writes for exactly this class of race (see designSystemBuild.ts's
+ * `START_CLAIM_CONDITION`, ENG-328); this uses the same primitive to make
+ * the claim atomic instead of trusting a prior read.
+ */
+const ICP_START_CLAIM_CONDITION = {
+  expression: "attribute_not_exists(#icpStatus) OR #icpStatus <> :icpRunning",
+  names: { "#icpStatus": "icpStatus" },
+  values: { ":icpRunning": "running" },
+};
+
+/**
  * Synchronous entry point for routes — flips status to `running` and
- * launches background work. Returns once the start patch has been
- * persisted so the route can return the running snapshot.
+ * launches background work. Returns the persisted start patch once it has
+ * landed so the route can return the running snapshot, or `null` if a
+ * concurrent call already claimed this run (ENG-2308) — callers must NOT
+ * launch a second background generation in that case.
  */
 export async function startIcpDiscoveryForUser(
   userId: string,
   deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {},
-): Promise<void> {
-  await userDb.updateUser(userId, icpStartPatch() as any);
+): Promise<ICPStatusFields | null> {
+  const patch = icpStartPatch();
+  try {
+    await userDb.updateUser(userId, patch as any, {
+      condition: ICP_START_CLAIM_CONDITION,
+    });
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") {
+      // Lost the race — another concurrent /icp/start already claimed it.
+      return null;
+    }
+    throw err;
+  }
   // Eager DAG sub-task 2: kick the orchestrator. No-op for users not on
   // `useEagerPipeline`; for opted-in users the orchestrator drives the
   // ICP runner (which delegates to triggerIcpDiscoveryForUser), so we
@@ -955,9 +988,10 @@ export async function startIcpDiscoveryForUser(
     | null;
   if (isEagerPipelineActiveFor(current)) {
     void reconcileForUser(userId);
-    return;
+    return patch;
   }
   // Intentionally not awaited — the route returns immediately.
   // Errors inside triggerIcpDiscoveryForUser are caught + persisted there.
   void triggerIcpDiscoveryForUser(userId, deps);
+  return patch;
 }

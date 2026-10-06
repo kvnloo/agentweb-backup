@@ -30,6 +30,7 @@ import {
   competitorStartPatch,
   CompetitorPerICP,
   CompetitorResult,
+  CompetitorStatusFields,
   MAX_COMPETITOR_ICPS,
   sanitizeCompetitorResult,
 } from "./competitorStatusService";
@@ -537,8 +538,29 @@ export async function triggerCompetitorStrategyForUser(
 }
 
 /**
+ * Guards the non-running -> `running` transition with a DynamoDB
+ * ConditionExpression (ENG-2308) — same race as `onboardingIcpService`'s
+ * `ICP_START_CLAIM_CONDITION`: a plain read-then-write here lets two
+ * concurrent callers both observe a non-running status and both win,
+ * launching two fully parallel per-ICP LLM loops. This function has two
+ * callers that can race each other — the `/competitor/start` route AND the
+ * `icpResult`-ready cascade kickoff in `onboardingIcpService.ts` — so even
+ * without a frontend double-fire, a manual retry landing while the cascade
+ * is already mid-flight hits the same bug (confirmed live during ENG-2276
+ * production testing).
+ */
+const COMPETITOR_START_CLAIM_CONDITION = {
+  expression:
+    "attribute_not_exists(#competitorStatus) OR #competitorStatus <> :competitorRunning",
+  names: { "#competitorStatus": "competitorStatus" },
+  values: { ":competitorRunning": "running" },
+};
+
+/**
  * Synchronous entry point for routes. Flips status to `running` and
- * launches background work.
+ * launches background work. Returns the persisted start patch, or `null`
+ * if a concurrent caller already claimed this run (ENG-2308) — callers
+ * must NOT launch a second background generation in that case.
  */
 export async function startCompetitorStrategyForUser(
   userId: string,
@@ -546,8 +568,19 @@ export async function startCompetitorStrategyForUser(
     llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
     webSearchFn?: WebSearchFn;
   } = {},
-): Promise<void> {
-  await userDb.updateUser(userId, competitorStartPatch() as any);
+): Promise<CompetitorStatusFields | null> {
+  const patch = competitorStartPatch();
+  try {
+    await userDb.updateUser(userId, patch as any, {
+      condition: COMPETITOR_START_CLAIM_CONDITION,
+    });
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") {
+      // Lost the race — another concurrent start already claimed it.
+      return null;
+    }
+    throw err;
+  }
   // Eager DAG sub-task 2: orchestrator owns step ordering for opted-in
   // users; cheap no-op gated inside the orchestrator for everyone else.
   // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -560,7 +593,8 @@ export async function startCompetitorStrategyForUser(
     | null;
   if (isEagerPipelineActiveFor(current)) {
     void reconcileForUser(userId);
-    return;
+    return patch;
   }
   void triggerCompetitorStrategyForUser(userId, deps);
+  return patch;
 }

@@ -123,17 +123,25 @@ router.post("/icp/start", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    // startIcpDiscoveryForUser applies icpStartPatch synchronously and
-    // launches the background LLM call (fire-and-forget). Return the
-    // running snapshot directly from the patch we just persisted — do
-    // NOT read the user back via getUserById here. UserIdIndex is
-    // eventually consistent, and a stale GSI read can return the
-    // pre-update row (icpStatus='ready' + previous icpResult), which
-    // tells the FE to stop polling. Source of truth for the response
+    // startIcpDiscoveryForUser claims the non-running -> running transition
+    // with a DynamoDB ConditionExpression and launches the background LLM
+    // call (fire-and-forget). Return the running snapshot directly from the
+    // patch we just persisted — do NOT read the user back via getUserById
+    // here. UserIdIndex is eventually consistent, and a stale GSI read can
+    // return the pre-update row (icpStatus='ready' + previous icpResult),
+    // which tells the FE to stop polling. Source of truth for the response
     // is what we just wrote, not what the GSI happens to surface in
     // the next 100-1000ms.
-    await startIcpDiscoveryForUser(userId);
-    return res.json({ status: icpSnapshot(icpStartPatch()) });
+    const patch = await startIcpDiscoveryForUser(userId);
+    if (!patch) {
+      // Lost the race (ENG-2308) — a concurrent /icp/start already claimed
+      // this run (e.g. OutreachIcpPick's watchdog re-firing while the first
+      // call's generation is still in flight). Do NOT launch a second
+      // parallel LLM call; return the in-flight snapshot instead.
+      const existing = await userDb.getUserById(userId);
+      return res.json({ status: icpSnapshot(existing || {}) });
+    }
+    return res.json({ status: icpSnapshot(patch) });
   } catch (err) {
     console.error("[icp] start failed", err);
     return res.status(500).json({ message: "Failed to start icp" });
@@ -231,14 +239,22 @@ router.post("/competitor/start", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    // startCompetitorStrategyForUser applies competitorStartPatch synchronously
-    // and launches the background per-ICP LLM loop (fire-and-forget). The
-    // route returns the running snapshot immediately so the UI can poll
-    // /competitor/status.
-    await startCompetitorStrategyForUser(userId);
+    // startCompetitorStrategyForUser claims the non-running -> running
+    // transition with a DynamoDB ConditionExpression and launches the
+    // background per-ICP LLM loop (fire-and-forget). The route returns the
+    // running snapshot immediately so the UI can poll /competitor/status.
+    const patch = await startCompetitorStrategyForUser(userId);
+    if (!patch) {
+      // Lost the race (ENG-2308) — a concurrent caller (the route itself,
+      // or the icp-ready cascade kickoff) already claimed this run. Do NOT
+      // launch a second parallel per-ICP LLM loop; return the in-flight
+      // snapshot instead.
+      const existing = await userDb.getUserById(userId);
+      const fallback = competitorStartPatch();
+      return res.json({ status: competitorSnapshot(existing || fallback) });
+    }
     const user = await userDb.getUserById(userId);
-    const fallback = competitorStartPatch();
-    return res.json({ status: competitorSnapshot(user || fallback) });
+    return res.json({ status: competitorSnapshot(user || patch) });
   } catch (err) {
     console.error("[competitor] start failed", err);
     return res.status(500).json({ message: "Failed to start competitor" });
