@@ -49,6 +49,7 @@ jest.mock('../utils/secretsManager', () => ({
 }));
 
 import router from '../routes/landingPageGeneration';
+import { SESSION_LIST_LEAD_CAPTURE_ERROR } from '../utils/sessionList';
 const app: Application = express();
 app.use(express.json());
 app.use('/api/landing-pages/v0', router);
@@ -297,5 +298,50 @@ describe('PATCH /generated/:id/lead-list — captureRouteSkipped warning (ENG-44
 
     expect(res.status).toBe(200);
     expect(res.body.captureSyncWarning).toBeUndefined();
+  });
+});
+
+/**
+ * ENG-2323: a `session` list is website-visit telemetry. A page's form writes real contacts; bound to
+ * a session list they would become suppressed visit rows excluded from the Inbox and every contact
+ * aggregate. The UI no longer offers it; the server has to refuse it too.
+ */
+describe('PATCH /generated/:id/lead-list — session lists are refused (ENG-2323)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetLandingPageById.mockResolvedValue(ownedPage);
+    mockGetUserById.mockResolvedValue({ userId: 'u1' });
+    mockUpdateLeadList.mockResolvedValue(undefined);
+    mockUpdateLeadListRecord.mockResolvedValue(undefined);
+  });
+
+  it('400 with the shared message, and nothing is bound, enabled or synced', async () => {
+    mockGetLeadListById.mockResolvedValue({ listId: 's1', userId: 'u1', listType: 'session', publicAccessEnabled: true });
+    const res = await request(app).patch('/api/landing-pages/v0/generated/p1/lead-list').send({ leadListId: 's1' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe(SESSION_LIST_LEAD_CAPTURE_ERROR);
+    expect(mockUpdateLeadList).not.toHaveBeenCalled();
+    expect(mockUpdateLeadListRecord).not.toHaveBeenCalled();
+    expect(mockSyncLeadCapture).not.toHaveBeenCalled();
+  });
+
+  it('an inaccessible session list still answers 403, not a type-revealing 400', async () => {
+    mockGetLeadListById.mockResolvedValue({ listId: 's1', userId: 'u99', listType: 'session' });
+    mockGetUserById.mockResolvedValueOnce({ userId: 'u1' }).mockResolvedValueOnce({ userId: 'u99' });
+    mockCanEditItem.mockReturnValue(false);
+    const res = await request(app).patch('/api/landing-pages/v0/generated/p1/lead-list').send({ leadListId: 's1' });
+    expect(res.status).toBe(403);
+  });
+
+  it.each([['sales'], ['customers'], [undefined]])('a %s list is still bindable', async (listType) => {
+    mockGetLeadListById.mockResolvedValue({ listId: 'l1', userId: 'u1', listType, publicAccessEnabled: true });
+    const res = await request(app).patch('/api/landing-pages/v0/generated/p1/lead-list').send({ leadListId: 'l1' });
+    expect(res.status).toBe(200);
+    expect(mockUpdateLeadList).toHaveBeenCalledWith('p1', 'u1', 'l1');
+  });
+
+  it('detaching (null) is unaffected', async () => {
+    const res = await request(app).patch('/api/landing-pages/v0/generated/p1/lead-list').send({ leadListId: null });
+    expect(res.status).toBe(200);
   });
 });

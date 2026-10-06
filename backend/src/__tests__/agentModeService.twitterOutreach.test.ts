@@ -51,6 +51,7 @@ const mockListDms = jest.fn();
 const mockGetDmConversation = jest.fn();
 const mockBookmarkTweet = jest.fn();
 const mockGetBookmarks = jest.fn();
+const mockGetLikedTweets = jest.fn();
 const mockGetOwnedLists = jest.fn();
 const mockGetListMembers = jest.fn();
 const mockGetListTweets = jest.fn();
@@ -89,6 +90,7 @@ jest.mock('../services/twitterService', () => ({
     getDmConversation: (...a: any[]) => mockGetDmConversation(...a),
     bookmarkTweet: (...a: any[]) => mockBookmarkTweet(...a),
     getBookmarks: (...a: any[]) => mockGetBookmarks(...a),
+    getLikedTweets: (...a: any[]) => mockGetLikedTweets(...a),
     getOwnedLists: (...a: any[]) => mockGetOwnedLists(...a),
     getListMembers: (...a: any[]) => mockGetListMembers(...a),
     getListTweets: (...a: any[]) => mockGetListTweets(...a),
@@ -433,6 +435,7 @@ describe('AgentModeService.twitterOutreach', () => {
     mockGetDmConversation.mockResolvedValue([{ id: 'dm_ev1', text: 'hello' }]);
     mockBookmarkTweet.mockResolvedValue({ bookmarked: true });
     mockGetBookmarks.mockResolvedValue([{ id: 'bm1', text: 'bookmarked tweet' }]);
+    mockGetLikedTweets.mockResolvedValue([{ id: 'lk1', text: 'liked tweet' }]);
     mockGetOwnedLists.mockResolvedValue([{ id: 'L1', name: 'Engagement 101' }]);
     mockGetListMembers.mockResolvedValue([{ id: 'm1', username: 'member1', name: 'Member One' }]);
     mockGetListTweets.mockResolvedValue([{ id: 'lt1', text: 'list tweet', author_id: 'a1', author_handle: 'author1' }]);
@@ -648,6 +651,18 @@ describe('AgentModeService.twitterOutreach', () => {
     expect(mockGetBookmarks).toHaveBeenCalledWith(OWNER, 'tw1');
     expect(res.success).toBe(true);
     expect(res.data).toHaveLength(1);
+  });
+
+  it('get_liked_tweets defaults to own account (ENG-979)', async () => {
+    const res = await service.twitterOutreach('u', { action: 'get_liked_tweets' });
+    expect(mockGetLikedTweets).toHaveBeenCalledWith(OWNER, 'tw1', undefined, undefined);
+    expect(res.success).toBe(true);
+    expect(res.data[0].id).toBe('lk1');
+  });
+
+  it('get_liked_tweets passes handle and max_results (ENG-979)', async () => {
+    await service.twitterOutreach('u', { action: 'get_liked_tweets', handle: 'bob', max_results: 50 });
+    expect(mockGetLikedTweets).toHaveBeenCalledWith(OWNER, 'tw1', 'bob', 50);
   });
 
   // ── X Lists (read) ──

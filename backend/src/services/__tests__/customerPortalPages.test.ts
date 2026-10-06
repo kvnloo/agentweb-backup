@@ -24,6 +24,17 @@ describe('customerPortalPages', () => {
       expect(pagePaths).toContain('/product');
     });
 
+    // ENG-2317: admins grant pages from this registry (GET /api/subscription/customer-portal-pages feeds
+    // the partner-portal tier editor). Without the entry the tagged-link builder can never be granted.
+    it('should register the Tagged Links page (/tracking/links) so admins can grant it', () => {
+      const page = CUSTOMER_PORTAL_PAGES.find(p => p.path === '/tracking/links');
+
+      expect(page).toBeDefined();
+      expect(page?.label).toBe('Tagged Links');
+      expect(page?.description).toBeTruthy();
+      expect(getPageLabel('/tracking/links')).toBe('Tagged Links');
+    });
+
     it('should have Paid Social page with correct label and description', () => {
       const paidSocialPage = CUSTOMER_PORTAL_PAGES.find(page => page.path === '/paid-social');
       
