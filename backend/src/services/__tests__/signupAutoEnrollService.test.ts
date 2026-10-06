@@ -173,6 +173,25 @@ describe('enrollSignupIntoFoundersList', () => {
     expect(leads).toHaveLength(0);
   });
 
+  // ENG-2322: our getLeadByEmail missed but createLead's own pre-check found the row (a concurrent
+  // enrolment won). The signup IS in the list — report that, not 'error'.
+  it('reports already_in_list (not error) when createLead loses a duplicate-email race', async () => {
+    const { deps, mocks } = makeCrmDbStub({
+      existingLists: [{ listId: 'list_existing', userId: FOUNDERS_USERID, name: FOUNDERS_SIGNUPS_LIST_NAME }],
+    });
+    mocks.createLead.mockRejectedValueOnce(Object.assign(
+      new Error('Lead with email "race@example.com" already exists in this list'),
+      { duplicateEmail: true, existingLead: { listId: 'list_existing', leadId: 'lead_won', email: 'race@example.com' } },
+    ));
+
+    const outcome = await enrollSignupIntoFoundersList(
+      makeSignupCtx({ identity: { email: 'race@example.com' } }),
+      deps
+    );
+
+    expect(outcome).toEqual({ enrolled: false, reason: 'already_in_list', listId: 'list_existing', leadId: 'lead_won' });
+  });
+
   it('skips non-signup events', async () => {
     const { deps, mocks } = makeCrmDbStub();
     const ctx = makeSignupCtx({
