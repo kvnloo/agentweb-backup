@@ -6,6 +6,7 @@ import {
   renderEmmaDock,
   renderEmmaMain,
   renderSessionPicker,
+  renderWorkPlanChecklist,
   TspNode,
 } from '../tern/renderEmma';
 
@@ -223,6 +224,34 @@ describe('Tern Emma renderer', () => {
         { itemId: 'q2', verdict: 'c' },
       ],
     })).toBe(true);
+  });
+
+  it('maps AgentWeb work-plan steps into a native checklist HUD', () => {
+    const checklist = renderWorkPlanChecklist({
+      sessionId: 's1',
+      workPlan: {
+        title: 'Launch campaign',
+        steps: [
+          { stepCount: 1, title: 'Research', status: 'completed' },
+          { stepCount: 2, title: 'Build', status: 'pending', notes: 'Creating assets' },
+          { stepCount: 3, title: 'Publish', status: 'pending' },
+        ],
+      },
+    });
+
+    expect(checklist).toMatchObject({
+      k: 'checklist',
+      p: {
+        mode: 'hud',
+        note: '1/3 · Launch campaign',
+      },
+    });
+    const phases = checklist?.p?.phases as any[];
+    expect(phases[0].items).toEqual([
+      expect.objectContaining({ id: 'step-1', status: 'done' }),
+      expect.objectContaining({ id: 'step-2', status: 'active', note: 'Creating assets' }),
+      expect.objectContaining({ id: 'step-3', status: 'pending' }),
+    ]);
   });
 
   it('makes the composer unsendable while Emma is running', () => {
