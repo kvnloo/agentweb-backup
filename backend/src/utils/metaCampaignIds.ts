@@ -9,8 +9,12 @@ export function normalizeMetaCampaignIds(campaignIds: unknown, legacyCampaignId?
       const parsed = JSON.parse(trimmed);
       ids = Array.isArray(parsed) ? parsed : [trimmed];
     } catch { ids = [trimmed]; }
-  } else if (typeof legacyCampaignId === 'string' && legacyCampaignId.trim()) ids = [legacyCampaignId];
-  return [...new Set(ids.map((id) => String(id).trim()).filter(Boolean))];
+  }
+  const normalized = [...new Set(ids.map((id) => String(id).trim()).filter(Boolean))];
+  if (!normalized.length && typeof legacyCampaignId === 'string' && legacyCampaignId.trim()) {
+    return [legacyCampaignId.trim()];
+  }
+  return normalized;
 }
 
 export function repairMetaAdsMetricsAlias(input: unknown): unknown {
@@ -31,6 +35,8 @@ export type MetaAdsMetricsArgs = Record<string, unknown> & {
   account_id?: string;
 };
 
+const META_ADS_TIMEFRAMES: string[] = ['7d', '14d', '30d', '90d'];
+
 export const getMetaAdsMetricsArgsSchema = z.preprocess(repairMetaAdsMetricsAlias,
 z.record(z.unknown()).superRefine((args, context) => {
   const mismatch = (path: string, expected: string) => context.addIssue({
@@ -38,6 +44,9 @@ z.record(z.unknown()).superRefine((args, context) => {
     message: `Argument "${path}" has the wrong type. Expected ${expected}.`,
   });
   if (args.timeframe != null && typeof args.timeframe !== 'string') mismatch('timeframe', 'string');
+  else if (typeof args.timeframe === 'string' && args.timeframe && !META_ADS_TIMEFRAMES.includes(args.timeframe))
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['timeframe'],
+      message: `Argument "timeframe" must be one of: ${META_ADS_TIMEFRAMES.join(', ')}.` });
   if (args.campaign_ids != null && !Array.isArray(args.campaign_ids) && typeof args.campaign_ids !== 'string')
     mismatch('campaign_ids', 'array or string');
   else if (Array.isArray(args.campaign_ids)) {
@@ -49,9 +58,9 @@ z.record(z.unknown()).superRefine((args, context) => {
   }
   if (args.campaign_id != null && typeof args.campaign_id !== 'string') mismatch('campaign_id', 'string');
   if (args.account_id != null && typeof args.account_id !== 'string') mismatch('account_id', 'string');
-  const hasId = (Array.isArray(args.campaign_ids) && args.campaign_ids.some((id) => typeof id === 'string' && id.trim()))
-    || (typeof args.campaign_ids === 'string' && args.campaign_ids.trim())
-    || (typeof args.campaign_id === 'string' && args.campaign_id.trim());
+  const stringIds = Array.isArray(args.campaign_ids)
+    ? args.campaign_ids.filter((id) => typeof id === 'string') : args.campaign_ids;
+  const hasId = normalizeMetaCampaignIds(stringIds, args.campaign_id).length > 0;
   if (!hasId) context.addIssue({ code: z.ZodIssueCode.custom, path: ['campaign_ids'],
     message: 'Provide at least one campaign id via campaign_ids (array or string) or campaign_id. Use list_meta_ads_campaigns to find campaign IDs.' });
 })).transform(({ campaign_id, ...args }): MetaAdsMetricsArgs => ({ ...args,

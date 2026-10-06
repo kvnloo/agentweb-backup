@@ -1187,6 +1187,17 @@ describe('agentToolGatewayService', () => {
         });
       });
 
+      it('rejects blank-only campaign_ids and falls back to a valid legacy campaign_id', () => {
+        expect(validate({ campaign_ids: '[]' }).status).toBe('invalid');
+        expect(validate({ campaign_ids: '[""]' }).status).toBe('invalid');
+        expect(validate({ campaign_ids: '[""]', campaign_id: '789' }).args).toEqual({ campaign_ids: ['789'] });
+      });
+
+      it('rejects a timeframe outside the published enum', () => {
+        expect(validate({ campaign_ids: ['1'], timeframe: 'yesterday' }).status).toBe('invalid');
+        expect(validate({ campaign_ids: ['1'], timeframe: '30d' }).status).toBe('valid');
+      });
+
       it('normalizes the legacy singular campaign_id at the gateway boundary', () => {
         expect(validate({ campaign_id: '789' }).args).toEqual({
           campaign_ids: ['789'],
