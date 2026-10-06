@@ -36,6 +36,7 @@ import {
   AdCopyResult,
   AdCopyStatusFields,
   AdCopyVariant,
+  AD_COPY_TIMEOUT_MS,
 } from "./adCopyStatusService";
 import {
   extractIcpBrandContext,
@@ -447,13 +448,21 @@ export async function triggerAdCopyForUser(
  * ConditionExpression (ENG-2308) — same race as the icp/competitor axes: a
  * plain read-then-write here lets two concurrent callers both observe a
  * non-running status and both win, launching two fully parallel LLM calls.
+ *
+ * Also allows a fresh claim once the in-flight run has exceeded
+ * `AD_COPY_TIMEOUT_MS` — see `icpStartClaimCondition`'s docstring in
+ * `onboardingIcpService.ts` for why: without this, a run genuinely stuck
+ * in `running` (lost to a deploy/crash) could never be retried again.
  */
-const AD_COPY_START_CLAIM_CONDITION = {
-  expression:
-    "attribute_not_exists(#adCopyStatus) OR #adCopyStatus <> :adCopyRunning",
-  names: { "#adCopyStatus": "adCopyStatus" },
-  values: { ":adCopyRunning": "running" },
-};
+function adCopyStartClaimCondition(now: Date = new Date()) {
+  const staleBefore = new Date(now.getTime() - AD_COPY_TIMEOUT_MS).toISOString();
+  return {
+    expression:
+      "attribute_not_exists(#adCopyStatus) OR #adCopyStatus <> :adCopyRunning OR #adCopyStartedAt <= :adCopyStaleBefore",
+    names: { "#adCopyStatus": "adCopyStatus", "#adCopyStartedAt": "adCopyStartedAt" },
+    values: { ":adCopyRunning": "running", ":adCopyStaleBefore": staleBefore },
+  };
+}
 
 /**
  * Synchronous entry point for routes — flips status to `running` and
@@ -468,7 +477,7 @@ export async function startAdCopyForUser(
   const patch = adCopyStartPatch();
   try {
     await userDb.updateUser(userId, patch as any, {
-      condition: AD_COPY_START_CLAIM_CONDITION,
+      condition: adCopyStartClaimCondition(),
     });
   } catch (err: any) {
     if (err?.code === "ConditionalCheckFailedException") {

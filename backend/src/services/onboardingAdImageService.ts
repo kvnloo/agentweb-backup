@@ -49,6 +49,7 @@ import {
   AdImageResult,
   AdImageStatusFields,
   AdImageVariant,
+  AD_IMAGE_TIMEOUT_MS,
 } from "./adImageStatusService";
 import {
   extractIcpBrandContext,
@@ -1252,13 +1253,27 @@ export async function triggerAdImageGenerationForUser(
  * over a newer one, it does not stop a stale run from being launched at all.
  * Making the claim itself atomic closes that gap instead of leaving it to a
  * best-effort early read in the worker.
+ *
+ * Also allows a fresh claim once the in-flight run has exceeded
+ * `AD_IMAGE_TIMEOUT_MS` — see `icpStartClaimCondition`'s docstring in
+ * `onboardingIcpService.ts` for why: without this, a run genuinely stuck
+ * in `running` (lost to a deploy/crash) could never be retried again. Does
+ * NOT replace `axisOwnershipCondition` — that condition still separately
+ * decides who may publish a TERMINAL state; this one only decides who may
+ * START a new one.
  */
-const AD_IMAGE_START_CLAIM_CONDITION = {
-  expression:
-    "attribute_not_exists(#adImageStatus) OR #adImageStatus <> :adImageRunning",
-  names: { "#adImageStatus": "adImageStatus" },
-  values: { ":adImageRunning": "running" },
-};
+function adImageStartClaimCondition(now: Date = new Date()) {
+  const staleBefore = new Date(now.getTime() - AD_IMAGE_TIMEOUT_MS).toISOString();
+  return {
+    expression:
+      "attribute_not_exists(#adImageStatus) OR #adImageStatus <> :adImageRunning OR #adImageStartedAt <= :adImageStaleBefore",
+    names: {
+      "#adImageStatus": "adImageStatus",
+      "#adImageStartedAt": "adImageStartedAt",
+    },
+    values: { ":adImageRunning": "running", ":adImageStaleBefore": staleBefore },
+  };
+}
 
 /**
  * Claim the ad-image axis for a NEW run: mint the run's identity, publish it,
@@ -1281,7 +1296,7 @@ export async function claimAdImageRun(
   const startPatch = adImageStartPatch();
   try {
     await userDb.updateUser(userId, startPatch as any, {
-      condition: AD_IMAGE_START_CLAIM_CONDITION,
+      condition: adImageStartClaimCondition(),
     });
   } catch (err: any) {
     if (err?.code === "ConditionalCheckFailedException") {

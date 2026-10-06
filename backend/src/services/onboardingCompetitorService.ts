@@ -31,6 +31,7 @@ import {
   CompetitorPerICP,
   CompetitorResult,
   CompetitorStatusFields,
+  COMPETITOR_TIMEOUT_MS,
   MAX_COMPETITOR_ICPS,
   sanitizeCompetitorResult,
 } from "./competitorStatusService";
@@ -540,21 +541,35 @@ export async function triggerCompetitorStrategyForUser(
 /**
  * Guards the non-running -> `running` transition with a DynamoDB
  * ConditionExpression (ENG-2308) — same race as `onboardingIcpService`'s
- * `ICP_START_CLAIM_CONDITION`: a plain read-then-write here lets two
- * concurrent callers both observe a non-running status and both win,
- * launching two fully parallel per-ICP LLM loops. This function has two
- * callers that can race each other — the `/competitor/start` route AND the
- * `icpResult`-ready cascade kickoff in `onboardingIcpService.ts` — so even
- * without a frontend double-fire, a manual retry landing while the cascade
- * is already mid-flight hits the same bug (confirmed live during ENG-2276
- * production testing).
+ * icp claim: a plain read-then-write here lets two concurrent callers both
+ * observe a non-running status and both win, launching two fully parallel
+ * per-ICP LLM loops. This function has two callers that can race each
+ * other — the `/competitor/start` route AND the `icpResult`-ready cascade
+ * kickoff in `onboardingIcpService.ts` — so even without a frontend
+ * double-fire, a manual retry landing while the cascade is already
+ * mid-flight hits the same bug (confirmed live during ENG-2276 production
+ * testing).
+ *
+ * Also allows a fresh claim once the in-flight run has exceeded
+ * `COMPETITOR_TIMEOUT_MS` — see `icpStartClaimCondition`'s docstring in
+ * `onboardingIcpService.ts` for why: without this, a run genuinely stuck
+ * in `running` (lost to a deploy/crash) could never be retried again.
  */
-const COMPETITOR_START_CLAIM_CONDITION = {
-  expression:
-    "attribute_not_exists(#competitorStatus) OR #competitorStatus <> :competitorRunning",
-  names: { "#competitorStatus": "competitorStatus" },
-  values: { ":competitorRunning": "running" },
-};
+function competitorStartClaimCondition(now: Date = new Date()) {
+  const staleBefore = new Date(now.getTime() - COMPETITOR_TIMEOUT_MS).toISOString();
+  return {
+    expression:
+      "attribute_not_exists(#competitorStatus) OR #competitorStatus <> :competitorRunning OR #competitorStartedAt <= :competitorStaleBefore",
+    names: {
+      "#competitorStatus": "competitorStatus",
+      "#competitorStartedAt": "competitorStartedAt",
+    },
+    values: {
+      ":competitorRunning": "running",
+      ":competitorStaleBefore": staleBefore,
+    },
+  };
+}
 
 /**
  * Synchronous entry point for routes. Flips status to `running` and
@@ -572,7 +587,7 @@ export async function startCompetitorStrategyForUser(
   const patch = competitorStartPatch();
   try {
     await userDb.updateUser(userId, patch as any, {
-      condition: COMPETITOR_START_CLAIM_CONDITION,
+      condition: competitorStartClaimCondition(),
     });
   } catch (err: any) {
     if (err?.code === "ConditionalCheckFailedException") {

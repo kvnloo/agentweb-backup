@@ -36,6 +36,7 @@ import {
   ICPPersona,
   ICPStatusFields,
   ICP_PERSONA_FIELD_NAMES,
+  ICP_TIMEOUT_MS,
   ensurePersonaIds,
   MAX_ICP_PERSONAS,
   sanitizeICPPersonas,
@@ -942,12 +943,27 @@ export async function triggerIcpDiscoveryForUser(
  * writes for exactly this class of race (see designSystemBuild.ts's
  * `START_CLAIM_CONDITION`, ENG-328); this uses the same primitive to make
  * the claim atomic instead of trusting a prior read.
+ *
+ * Also allows a fresh claim once the in-flight run has exceeded
+ * `ICP_TIMEOUT_MS` (caught live: without this, a run genuinely stuck in
+ * `running` — background job lost to a deploy/instance recycle/crash —
+ * could never be retried again, since the claim would block every future
+ * `/icp/start` forever. Before this PR the write was unconditional, so a
+ * stuck run was always one retry away from unsticking itself; this clause
+ * keeps that escape hatch while still closing the sub-timeout double-fire
+ * race. The threshold matches `icpSnapshot`'s own `timedOut` flag exactly,
+ * so a claim becomes possible at precisely the moment the FE is told the
+ * run has timed out and offers a retry.
  */
-const ICP_START_CLAIM_CONDITION = {
-  expression: "attribute_not_exists(#icpStatus) OR #icpStatus <> :icpRunning",
-  names: { "#icpStatus": "icpStatus" },
-  values: { ":icpRunning": "running" },
-};
+function icpStartClaimCondition(now: Date = new Date()) {
+  const staleBefore = new Date(now.getTime() - ICP_TIMEOUT_MS).toISOString();
+  return {
+    expression:
+      "attribute_not_exists(#icpStatus) OR #icpStatus <> :icpRunning OR #icpStartedAt <= :icpStaleBefore",
+    names: { "#icpStatus": "icpStatus", "#icpStartedAt": "icpStartedAt" },
+    values: { ":icpRunning": "running", ":icpStaleBefore": staleBefore },
+  };
+}
 
 /**
  * Synchronous entry point for routes — flips status to `running` and
@@ -963,7 +979,7 @@ export async function startIcpDiscoveryForUser(
   const patch = icpStartPatch();
   try {
     await userDb.updateUser(userId, patch as any, {
-      condition: ICP_START_CLAIM_CONDITION,
+      condition: icpStartClaimCondition(),
     });
   } catch (err: any) {
     if (err?.code === "ConditionalCheckFailedException") {
