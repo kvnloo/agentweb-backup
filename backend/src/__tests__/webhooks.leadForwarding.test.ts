@@ -86,6 +86,12 @@ const flushAsyncWork = async () => {
   await new Promise((resolve) => setImmediate(resolve));
 };
 
+// ENG-2320: forward-lead sends customFields to updateLead as a per-key PATCH (customFieldsKeyMerge), so what
+// these tests pin is the RESULT: the stored map with the patch applied, not the call's argument shape.
+const applied = (stored: Record<string, any>, updates: any): Record<string, any> =>
+  updates.customFieldsKeyMerge ? { ...stored, ...updates.customFields } : { ...updates.customFields };
+const STORED = { forwardedAt: '2020-01-01T00:00:00.000Z', source: 'hero-form' };
+
 describe('Lead Forwarding API (List ID Authentication)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -415,9 +421,10 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
 
       expect(crmDb.updateLead).toHaveBeenCalled();
       const [, , updates] = (crmDb.updateLead as jest.Mock).mock.calls[0];
-      expect(updates.customFields.forwardedAt).toBe('2020-01-01T00:00:00.000Z');
-      expect(updates.customFields.source).toBe('qualify-form');
-      expect(updates.customFields.qualified).toBe('yes');
+      const result = applied(STORED, updates);
+      expect(result.forwardedAt).toBe('2020-01-01T00:00:00.000Z');
+      expect(result.source).toBe('qualify-form');
+      expect(result.qualified).toBe('yes');
     });
 
     it('the EMAIL path also keeps a stored source when the submission omits one', async () => {
@@ -434,8 +441,9 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
         .send({ listId: 'list_123', email: 'x@example.com', qualified: 'yes' });
 
       const [, , updates] = (crmDb.updateLead as jest.Mock).mock.calls[0];
-      expect(updates.customFields.qualified).toBe('yes');
-      expect(updates.customFields.source).toBe('hero-form');
+      const result = applied(STORED, updates);
+      expect(result.qualified).toBe('yes');
+      expect(result.source).toBe('hero-form');
     });
 
     it('the EMAIL path still lets a submission that NAMES a source overwrite the stored one', async () => {
@@ -454,8 +462,9 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
         .send({ listId: 'list_123', email: 'x@example.com', source: 'qualify-form', qualified: 'yes' });
 
       const [, , updates] = (crmDb.updateLead as jest.Mock).mock.calls[0];
-      expect(updates.customFields.source).toBe('qualify-form');
-      expect(updates.customFields.forwardedAt).toBe('2020-01-01T00:00:00.000Z');
+      const result = applied(STORED, updates);
+      expect(result.source).toBe('qualify-form');
+      expect(result.forwardedAt).toBe('2020-01-01T00:00:00.000Z');
     });
 
     it('ENG-2082: a repeat submission that omits source must not clobber the stored one', async () => {
@@ -478,9 +487,10 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
         .send({ listId: 'list_123', phone: '4155550142', qualified: 'yes' });
 
       const [, , updates] = (crmDb.updateLead as jest.Mock).mock.calls[0];
-      expect(updates.customFields.qualified).toBe('yes');
-      expect(updates.customFields.forwardedAt).toBe('2020-01-01T00:00:00.000Z');
-      expect(updates.customFields.source).toBe('hero-form');
+      const result = applied(STORED, updates);
+      expect(result.qualified).toBe('yes');
+      expect(result.forwardedAt).toBe('2020-01-01T00:00:00.000Z');
+      expect(result.source).toBe('hero-form');
     });
 
     it('ENG-2082: a repeat phone submission merges its new data instead of discarding it', async () => {
@@ -654,14 +664,18 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       expect(crmDb.updateLead).toHaveBeenLastCalledWith(
         'list_123',
         'lead_existing_eval',
+        // ENG-2320: the delivery marker writes ONLY the two keys it owns, per key, so it can never
+        // clobber keys a concurrent submission just merged. `stage` was written by the merge call.
         expect.objectContaining({
-          customFields: expect.objectContaining({
-            stage: 5,
+          customFieldsKeyMerge: true,
+          customFields: {
             roadmapEmailSentAt: expect.any(String),
             roadmapEmailStage: 5,
-          }),
+          },
         })
       );
+      const mergeCall = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
+      expect(applied(existingLead.customFields, mergeCall).stage).toBe(5);
     });
 
     it('should not resend the roadmap after it has been marked delivered', async () => {

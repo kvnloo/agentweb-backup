@@ -39,6 +39,18 @@ function assertPromptToolsAreDeclared(systemPrompt: string, toolNames: string[])
 }
 
 describe('seed-eng615-leadgen-skills', () => {
+  describe('ENG-970 funding-stage floor', () => {
+    it.each([
+      ['ICP scoring', () => buildIcpScoringSkill()],
+      ['speed-to-lead', () => buildSpeedToLeadSkill()],
+    ])('%s prompt caps below-floor leads at Tier 2 regardless of bonuses', (_n, build) => {
+      const prompt = build().systemPrompt;
+      expect(prompt).toContain('STAGE FLOOR');
+      expect(prompt).toMatch(/can NEVER be 🏆 Tier 1/);
+      expect(prompt).toMatch(/Avoid/);
+    });
+  });
+
   describe('buildIcpScoringSkill (#2)', () => {
     it('creates a valid public analysis skill', () => {
       const skill = buildIcpScoringSkill();
