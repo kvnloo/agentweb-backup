@@ -114,7 +114,28 @@ export function sessionLeadId(listId: string, identity: SessionIdentity): string
 /**
  * The cumulative "journey" group: each event carries the whole journey so far, so an
  * out-of-order older event must not overwrite a newer one. Guarded on `eventCount` (a counter
- * that only grows within a session) — see db.mergeSessionLeadEvent.
+ * that only grows within a session) — see db.mergeSessionLeadEvent. The tracker ingest builds its
+ * single guarded group from this; forward-lead uses SESSION_GUARD_GROUPS below.
  */
 export const SESSION_JOURNEY_KEYS: readonly string[] = ['journey', 'eventCount', 'clickLog', 'clickCount', 'showsClicked'];
 export const SESSION_JOURNEY_COUNTER_KEY = 'eventCount';
+
+/**
+ * A set of customFields keys written together under ONE monotonic counter (see db.mergeSessionLeadEvent).
+ * Each group is its own UpdateItem, so a stale group never discards another group's newer data.
+ */
+export interface SessionGuardGroup { counterKey: string; fields: readonly string[] }
+
+/**
+ * forward-lead's default guard groups (the DramaBreak LPs post flat fields, not the SDK's cumulative ones):
+ *  - PROGRESS, keyed by `eventCount`: the funnel state. furthestStage / lastEvent / lastEp are "latest state",
+ *    so an out-of-order older event must not regress them (funnel analytics read furthestStage).
+ *  - CLICKS, keyed by `clickCount`: ONLY click events carry these. They must NOT share PROGRESS's counter:
+ *    a click event (eventCount N) overtaken by a later non-click event (N+1) would have its whole group
+ *    rejected and the click data lost. clickCount only grows when a click happens, so it orders them.
+ * A group whose counter is absent / non-numeric in the incoming event falls back to last-write-wins.
+ */
+export const SESSION_GUARD_GROUPS: readonly SessionGuardGroup[] = [
+  { counterKey: 'eventCount', fields: ['journey', 'eventCount', 'furthestStage', 'lastEvent', 'lastEp'] },
+  { counterKey: 'clickCount', fields: ['clickLog', 'clickCount', 'showsClicked', 'lastClickLabel', 'lastClickShow', 'lastClickSection', 'lastClickUrl'] },
+];

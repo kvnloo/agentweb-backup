@@ -43,3 +43,10 @@ describe('isWriteToolCall', () => {
     expect(isWriteToolCall(null)).toBe(false);
   });
 });
+
+describe('isReadOnlyToolName read-verb exceptions', () => {
+  it('treats load_browser_cookies as mutating despite its load_ prefix', () => {
+    expect(isReadOnlyToolName('load_browser_cookies')).toBe(false);
+    expect(isWriteToolCall({ name: 'load_browser_cookies' })).toBe(true);
+  });
+});
