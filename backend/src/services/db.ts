@@ -10,6 +10,7 @@ import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPa
 import { parsePendingKinds } from '../utils/metaConversionPending';
 import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, extractDomainFromEmail, defaultStatusConfigFor, isValidLeadLifecycle, LeadImportRowOutcome, type LeadListType } from "../utils/leadSchema";
 import type { TrackingConfig } from "../utils/trackingConfig";
+import { ingestListCache } from "../utils/ingestListCache";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
@@ -18,6 +19,7 @@ import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { isEvaluationUser } from "./evaluationPolicy";
+import { emailLeadIds, isEmailUniqueCreateEnabled, emailTxAllowed, tripEmailTxBreaker, type EmailLeadIds } from '../utils/emailLeadId';
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
 import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
@@ -5380,6 +5382,7 @@ export const crmDb = {
       };
 
       await dynamodb.put(params).promise();
+      ingestListCache.invalidate(listId);
       return params.Item;
     } catch (error) {
       handleDynamoDbError(error, "createLeadList");
@@ -5532,13 +5535,16 @@ export const crmDb = {
     return [...(ownLists || []), ...memberListArrays.flat().filter(Boolean)];
   },
 
-  async getLeadListById(listId: string) {
+  async getLeadListById(listId: string, opts?: { consistentRead?: boolean }) {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-LeadLists`,
         Key: {
           listId,
         },
+        // ENG-2325: the tracker-ingest cache loads with a consistent read so that a read issued right
+        // after this process wrote the list (and invalidated the cache) cannot re-cache the old row.
+        ...(opts?.consistentRead ? { ConsistentRead: true } : {}),
       };
 
       const result = await dynamodb.get(params).promise();
@@ -5786,6 +5792,8 @@ export const crmDb = {
       };
 
       const result = await dynamodb.update(params).promise();
+      // ENG-2325: the tracker ingest caches these rows (publicAccessEnabled, listType, trackingConfig, owner).
+      ingestListCache.invalidate(listId);
       return result.Attributes;
     } catch (error) {
       handleDynamoDbError(error, "updateLeadList");
@@ -6140,6 +6148,7 @@ export const crmDb = {
         ":ts": new Date().toISOString(),
       },
     }).promise();
+    ingestListCache.invalidate(listId); // ENG-2325: the ingest compares child.userId to the parent's
   },
 
   async deleteLeadList(listId: string) {
@@ -6186,6 +6195,7 @@ export const crmDb = {
       };
 
       await dynamodb.delete(params).promise();
+      ingestListCache.invalidate(listId);
       return { success: true };
     } catch (error) {
       handleDynamoDbError(error, "deleteLeadList");
@@ -6420,9 +6430,19 @@ export const crmDb = {
      *  such a caller it can only add a false "already exists" or a missed one — never safety.
      *  Default (omitted) behaviour is unchanged. */
     skipEmailDuplicateCheck?: boolean;
+    /** ENG-2321: opt in to the exactly-once email-keyed create (utils/emailLeadId.ts): a time-bucketed
+     *  deterministic leadId written in a transaction that also condition-checks the adjacent buckets,
+     *  so concurrent same-email submissions resolve to ONE row. A loser throws the same typed
+     *  `duplicateEmail` error the pre-check does. Ignored when the caller supplies a leadId, when
+     *  there is no email, or when LEAD_EMAIL_UNIQUE_CREATE=false (random-id path, unchanged). */
+    emailUniqueCreate?: boolean;
   }) {
     try {
-      const leadId = leadData.leadId?.trim() || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const emailKeyIds: EmailLeadIds | null =
+        leadData.emailUniqueCreate && !leadData.leadId?.trim() && leadData.email?.trim() && isEmailUniqueCreateEnabled()
+          ? emailLeadIds(listId, leadData.email.trim().toLowerCase())
+          : null;
+      let leadId = leadData.leadId?.trim() || emailKeyIds?.leadId || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
       // Check for duplicate email if email is provided
       if (!leadData.skipEmailDuplicateCheck && leadData.email && leadData.email.trim()) {
@@ -6588,7 +6608,11 @@ export const crmDb = {
         params.ConditionExpression = 'attribute_not_exists(leadId)';
       }
 
-      await dynamodb.put(params).promise();
+      if (emailKeyIds) {
+        leadId = await this.putEmailKeyedLead(params, emailKeyIds);
+      } else {
+        await dynamodb.put(params).promise();
+      }
       // Covers landing-page form capture and every single CRM insert. Never await Slack.
       void import('./orgLeadNotificationService')
         .then(({ dispatchLeadCreated }) => dispatchLeadCreated(listId, leadId))
@@ -6666,6 +6690,90 @@ export const crmDb = {
       handleDynamoDbError(error, "createLead");
       throw error;
     }
+  },
+
+  /**
+   * ENG-2321: the write half of the exactly-once email-keyed create. ONE transaction: put the
+   * lead under its bucketed id (attribute_not_exists) and condition-check that the previous and
+   * next buckets' ids do not exist. Racers in the same bucket collide on the put; racers on either
+   * side of a bucket boundary each touch the other's key, so DynamoDB serialises them. A loser
+   * throws the typed `duplicateEmail` error carrying the winner's row (consistent GetItem by known
+   * key, never the GSI), which both callers already adopt / treat as a repeat.
+   *
+   * TransactionConflict (an in-flight racer holds one of the keys) is retried a few times: the
+   * retry then fails on a real condition and adopts. If retries run out with no row visible, it
+   * degrades to the non-transactional path rather than a 500. An AccessDeniedException (role lacks the
+   * transaction permissions) does the same and opens a circuit breaker (emailLeadId.ts) so later creates
+   * skip the doomed transaction for a while. That path: consistent probe of prev/current/next ids (adopt),
+   * conditional put (retrying TransactionConflict, adopting once the winner is visible), and as a LAST
+   * RESORT the legacy random-id put. Returns the leadId actually written. TransactionConflict/Canceled
+   * never reach the caller: a duplicate row is recoverable, a dropped lead is not.
+   */
+  async putEmailKeyedLead(params: any, ids: EmailLeadIds): Promise<string> {
+    const table = params.TableName;
+    const listId = params.Item.listId;
+    const nonexistent = (leadId: string) => ({
+      TableName: table, Key: { listId, leadId }, ConditionExpression: 'attribute_not_exists(leadId)',
+    });
+    const adoptOrThrow = async (err: any): Promise<void> => {
+      for (const id of [ids.prevLeadId, ids.leadId, ids.nextLeadId]) {
+        const existing = await this.getLeadById(listId, id, { consistentRead: true });
+        if (existing) {
+          const duplicateErr: any = new Error(`Lead with email "${params.Item.email}" already exists in this list`);
+          duplicateErr.duplicateEmail = true;
+          duplicateErr.existingLead = existing;
+          throw duplicateErr;
+        }
+      }
+      if (err) throw err;
+    };
+    const MAX_ATTEMPTS = emailTxAllowed() ? 5 : 0;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      try {
+        await dynamodb.transactWrite({
+          TransactItems: [
+            { Put: { TableName: table, Item: params.Item, ConditionExpression: 'attribute_not_exists(leadId)' } },
+            { ConditionCheck: nonexistent(ids.prevLeadId) },
+            { ConditionCheck: nonexistent(ids.nextLeadId) },
+          ],
+        }).promise();
+        return params.Item.leadId;
+      } catch (err: any) {
+        if (err?.code === 'AccessDeniedException') {
+          // The role may lack TransactWriteItems / ConditionCheck on this table. Never fail the capture for it:
+          // trip the breaker and fall through to the conditional put below (exact within one bucket).
+          tripEmailTxBreaker(err);
+          break;
+        }
+        if (err?.code !== 'TransactionCanceledException' && err?.code !== 'TransactionConflictException') throw err;
+        await adoptOrThrow(null);
+        // Nothing visible: an in-flight transaction holds a key (or its row was just deleted). Back off, retry.
+        await new Promise((resolve) => setTimeout(resolve, 10 * 2 ** attempt * (0.5 + Math.random())));
+      }
+    }
+    // Non-transactional path: breaker open, AccessDenied, or transaction retries exhausted. Probe the
+    // adjacent buckets (and this one) with CONSISTENT reads first and adopt a winner if one is visible, which
+    // shrinks the boundary gap the missing ConditionChecks would have closed to the probe-to-put interval.
+    await adoptOrThrow(null);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        await dynamodb.put({ ...params, ConditionExpression: 'attribute_not_exists(leadId)' }).promise();
+        return params.Item.leadId;
+      } catch (err: any) {
+        if (err?.code === 'ConditionalCheckFailedException') {
+          await adoptOrThrow(null);
+          break; // the row vanished between the failed put and the read (deleted): create below
+        }
+        // An in-flight transactWrite from a racer can hold the item: retry, adopting the winner once visible.
+        if (err?.code !== 'TransactionConflictException' && err?.code !== 'TransactionCanceledException') throw err;
+        await adoptOrThrow(null);
+        await new Promise((resolve) => setTimeout(resolve, 10 * 2 ** attempt * (0.5 + Math.random())));
+      }
+    }
+    // Last resort: the legacy random-id create. A duplicate row is recoverable (cleanup/merge); a dropped lead is not.
+    params.Item = { ...params.Item, leadId: `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}` };
+    await dynamodb.put({ TableName: table, Item: params.Item }).promise();
+    return params.Item.leadId;
   },
 
   async getLeadsByListId(listId: string, limit?: number, lastEvaluatedKey?: any) {
@@ -10146,6 +10254,52 @@ export const crmDb = {
     if (!changed) for (const entries of appliedGroups) for (const [k, v] of entries) if (differs(oldCf[k], v)) { changed = true; break; }
     if (!changed) for (const [k, v] of topLevel) if (differs(before?.[k], v)) { changed = true; break; }
     return { exists: true, changed, guardApplied };
+  },
+
+  /**
+   * ENG-2326: sets top-level attributes ONLY where the row holds nothing for them: the attribute
+   * is absent, '' or NULL. One UpdateItem PER KEY, each with its own ConditionExpression, so a key a
+   * concurrent writer has just populated is kept (that key's write is skipped) without blocking the
+   * other keys.
+   *
+   * Why not setLeadFields({ topLevel, ifNotExists: true }): `if_not_exists(#k, :v)` leaves an existing
+   * attribute alone even when its value is '' or NULL, so a "fill the blanks" caller could never fill a
+   * blank. And why not an unconditional SET: it would overwrite a value written between the caller's read
+   * and this write. The condition is evaluated by DynamoDB against the stored item, so there is no
+   * read-then-write window.
+   *
+   * `attribute_exists(leadId)` keeps a row that was deleted in the meantime from being resurrected as a
+   * bare item. A skipped write (value present, or row gone) is NOT an error; the caller re-reads to see
+   * what the row holds. Every attribute name and value goes through a placeholder. Blank VALUES are never
+   * written (this method only fills). The primary-key attributes are refused.
+   */
+  async setLeadTopLevelIfBlank(
+    listId: string,
+    leadId: string,
+    fields: Record<string, any>,
+  ): Promise<{ written: string[]; kept: string[] }> {
+    const written: string[] = [];
+    const kept: string[] = [];
+    for (const [k, v] of Object.entries(fields)) {
+      if (v === undefined || v === null || v === '' || k === 'listId' || k === 'leadId' || !k) continue;
+      try {
+        await dynamodb.update({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          Key: { listId, leadId },
+          UpdateExpression: 'SET #k = :v, #u = :ts',
+          ConditionExpression:
+            'attribute_exists(#pk) AND (attribute_not_exists(#k) OR #k = :empty OR attribute_type(#k, :nullType))',
+          ExpressionAttributeNames: { '#k': k, '#u': 'updatedAt', '#pk': 'leadId' },
+          ExpressionAttributeValues: { ':v': v, ':ts': new Date().toISOString(), ':empty': '', ':nullType': 'NULL' },
+        }).promise();
+        written.push(k);
+      } catch (err: any) {
+        if (err.code === 'ConditionalCheckFailedException') { kept.push(k); continue; }
+        handleDynamoDbError(err, 'setLeadTopLevelIfBlank');
+        throw err;
+      }
+    }
+    return { written, kept };
   },
 
   /**
