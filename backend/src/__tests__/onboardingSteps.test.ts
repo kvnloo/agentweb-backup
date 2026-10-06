@@ -63,7 +63,9 @@ jest.mock("../services/onboardingCreativeDirService", () => {
     startCreativeDirForUser: jest.fn(async (userId: string) => {
       const { userDb } = require("../services/db");
       const { creativeDirStartPatch } = require("../services/creativeDirStatusService");
-      await userDb.updateUser(userId, creativeDirStartPatch());
+      const patch = creativeDirStartPatch();
+      await userDb.updateUser(userId, patch);
+      return patch;
     }),
   };
 });
@@ -75,7 +77,9 @@ jest.mock("../services/onboardingAdCopyService", () => {
     startAdCopyForUser: jest.fn(async (userId: string) => {
       const { userDb } = require("../services/db");
       const { adCopyStartPatch } = require("../services/adCopyStatusService");
-      await userDb.updateUser(userId, adCopyStartPatch());
+      const patch = adCopyStartPatch();
+      await userDb.updateUser(userId, patch);
+      return patch;
     }),
   };
 });
@@ -768,6 +772,62 @@ describe("/icp/start and /competitor/start delegate to onboarding services", () 
     expect(res.body.status.competitorStatus).toBe("running");
     expect(res.body.status.inFlight).toBe(true);
   });
+
+  // ENG-2308 review follow-up: on a win, these three routes used to
+  // unconditionally re-read via getUserById (the eventually-consistent
+  // UserIdIndex GSI) instead of trusting the patch they just wrote — the
+  // exact staleness risk icp/start's own comment already warns about.
+  // They now return the winning patch directly, matching icp/start.
+  it("/competitor/start does not re-read via getUserById on a winning claim", async () => {
+    const { startCompetitorStrategyForUser } = require("../services/onboardingCompetitorService");
+    userDb.getUserById.mockClear();
+    const res = await request(app).post("/api/onboarding/competitor/start");
+    expect(res.status).toBe(200);
+    expect(startCompetitorStrategyForUser).toHaveBeenCalledTimes(1);
+    expect(userDb.getUserById).not.toHaveBeenCalled();
+  });
+
+  it("/creative-dir/start does not re-read via getUserById on a winning claim", async () => {
+    userDb.getUserById.mockClear();
+    const res = await request(app).post("/api/onboarding/creative-dir/start");
+    expect(res.status).toBe(200);
+    expect(userDb.getUserById).not.toHaveBeenCalled();
+  });
+
+  it("/creative-dir/start surfaces the in-flight snapshot (not an error) when the service loses the start-claim race", async () => {
+    const { startCreativeDirForUser } = require("../services/onboardingCreativeDirService");
+    (startCreativeDirForUser as jest.Mock).mockResolvedValueOnce(null);
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      creativeDirStatus: "running",
+      creativeDirStartedAt: "2026-04-24T12:00:00.000Z",
+    });
+    const res = await request(app).post("/api/onboarding/creative-dir/start");
+    expect(res.status).toBe(200);
+    expect(res.body.status.creativeDirStatus).toBe("running");
+    expect(res.body.status.inFlight).toBe(true);
+  });
+
+  it("/ad-copy/start does not re-read via getUserById on a winning claim", async () => {
+    userDb.getUserById.mockClear();
+    const res = await request(app).post("/api/onboarding/ad-copy/start");
+    expect(res.status).toBe(200);
+    expect(userDb.getUserById).not.toHaveBeenCalled();
+  });
+
+  it("/ad-copy/start surfaces the in-flight snapshot (not an error) when the service loses the start-claim race", async () => {
+    const { startAdCopyForUser } = require("../services/onboardingAdCopyService");
+    (startAdCopyForUser as jest.Mock).mockResolvedValueOnce(null);
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      adCopyStatus: "running",
+      adCopyStartedAt: "2026-04-24T12:00:00.000Z",
+    });
+    const res = await request(app).post("/api/onboarding/ad-copy/start");
+    expect(res.status).toBe(200);
+    expect(res.body.status.adCopyStatus).toBe("running");
+    expect(res.body.status.inFlight).toBe(true);
+  });
 });
 
 // ─────────────────────────────── ENG-255 ───────────────────────────────
@@ -807,6 +867,57 @@ describe("POST /api/onboarding/icp/regenerate-one", () => {
       .send({ icpId: "not-an-icp-id" });
 
     expect(res.status).toBe(400);
+    expect(regenerateSingleIcpForUser).not.toHaveBeenCalled();
+  });
+
+  // ENG-2308 review follow-up: this write was unconditional, the exact same
+  // race /icp/start had — two concurrent regenerate-one clicks (same card
+  // double-clicked, or one card while another is still running) would both
+  // win, both launch a real LLM call, and race on which completion lands
+  // last. Guarded with the identical ConditionExpression /icp/start uses.
+  it("claims the running transition with the same ConditionExpression /icp/start uses", async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      icpStatus: "ready",
+      icpResult: goodPersonas,
+    });
+    userDb.updateUser.mockResolvedValue({});
+
+    const res = await request(app)
+      .post("/api/onboarding/icp/regenerate-one")
+      .send({ icpId: "icp-1" });
+
+    expect(res.status).toBe(200);
+    const options = userDb.updateUser.mock.calls[0][2];
+    expect(options?.condition?.expression).toBe(
+      "attribute_not_exists(#icpStatus) OR #icpStatus <> :icpRunning OR #icpStartedAt <= :icpStaleBefore",
+    );
+    expect(regenerateSingleIcpForUser).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns the in-flight snapshot and does not regenerate when it loses the claim race", async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      icpStatus: "running",
+      icpStartedAt: "2026-04-24T12:00:00.000Z",
+      icpResult: goodPersonas,
+    });
+    const conditionalFailure = Object.assign(
+      new Error("The conditional request failed"),
+      { code: "ConditionalCheckFailedException" },
+    );
+    // Once, not persistent: a persistent rejection here would leak into
+    // every later test in this file that calls userDb.updateUser (jest's
+    // clearAllMocks in beforeEach clears call history, not implementations).
+    userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+
+    const res = await request(app)
+      .post("/api/onboarding/icp/regenerate-one")
+      .send({ icpId: "icp-1" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status.icpStatus).toBe("running");
+    expect(res.body.status.inFlight).toBe(true);
     expect(regenerateSingleIcpForUser).not.toHaveBeenCalled();
   });
 });
