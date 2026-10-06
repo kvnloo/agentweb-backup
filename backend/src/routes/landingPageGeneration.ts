@@ -57,6 +57,7 @@ import { injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjec
 import { SessionTrackingError, disableSessionTrackingForPage, enableSessionTrackingForPage } from "../services/sessionTrackingService";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
+import { isSessionList, SESSION_LIST_LEAD_CAPTURE_ERROR } from "../utils/sessionList";
 import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
 import { isExternalLandingPageRecord } from "../services/externalLandingPageCatalog";
 import { verifyLanderLiveMapping } from "../services/landerLiveMappingCheck";
@@ -623,6 +624,10 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       if (!(await crmDb.canOrgMemberAccessList(userId, explicitList))) {
         return res.status(403).json({ error: `lead_list_id "${lead_list_id}" is not accessible to you` });
       }
+      // ENG-2323: a session (telemetry) list is never a page's lead list.
+      if (isSessionList(explicitList)) {
+        return res.status(400).json({ error: SESSION_LIST_LEAD_CAPTURE_ERROR });
+      }
     }
 
     const pageName = name || prompt.slice(0, 60);
@@ -1089,6 +1094,11 @@ router.post("/generated/:id/duplicate", rateLimiter, async (req, res: Response) 
     // otherwise resolve/create the same default list /generate uses. A duplicated page
     // used to start completely unbound — this closes that gap without needing a new
     // request field, consistent with the "no page is ever generated unbound" intent.
+    // ENG-2323: a page bound to a session list before it was refused (or via the API) must not hand
+    // that binding on to the copy. Checked before any generation spend.
+    if (original.leadListId && isSessionList(await crmDb.getLeadListById(original.leadListId))) {
+      return res.status(400).json({ error: SESSION_LIST_LEAD_CAPTURE_ERROR });
+    }
     const leadListId = original.leadListId || (await resolveOrCreateDefaultLeadList(userId, user?.orgId)).id;
 
     // ENG-967: same as /generate — a bound list that isn't publicly submittable makes the
@@ -3236,6 +3246,9 @@ router.patch("/generated/:id/lead-list", async (req, res: Response) => {
         );
         if (!allowed) return res.status(403).json({ error: "Lead list not accessible" });
       }
+      // ENG-2323: a session (telemetry) list is never a page's lead list. After the access checks so
+      // a list the caller cannot see still answers 403/404 rather than revealing its type.
+      if (isSessionList(list)) return res.status(400).json({ error: SESSION_LIST_LEAD_CAPTURE_ERROR });
     }
 
     try {
