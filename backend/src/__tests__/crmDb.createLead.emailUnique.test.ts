@@ -49,7 +49,8 @@ jest.mock('aws-sdk', () => ({
           if (conflictsToInject > 0) { conflictsToInject--; throw canceled(p.TransactItems.map(() => 'TransactionConflict')); }
           const reasons = p.TransactItems.map((t: any) => {
             const kk = t.Put ? k(t.Put.Item.listId, t.Put.Item.leadId) : k(t.ConditionCheck.Key.listId, t.ConditionCheck.Key.leadId);
-            return rows.has(kk) ? 'ConditionalCheckFailed' : 'None';
+            // an unconditioned Put overwrites (DynamoDB semantics); only a stated condition can fail it
+            return rows.has(kk) && (t.ConditionCheck || t.Put.ConditionExpression) ? 'ConditionalCheckFailed' : 'None';
           });
           if (reasons.some((r: string) => r !== 'None')) throw canceled(reasons);
           for (const t of p.TransactItems) if (t.Put) rows.set(k(t.Put.Item.listId, t.Put.Item.leadId), t.Put.Item);
