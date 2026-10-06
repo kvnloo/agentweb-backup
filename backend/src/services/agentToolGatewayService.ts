@@ -4,6 +4,7 @@ import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { getMetaAdsMetricsArgsSchema, repairMetaAdsMetricsAlias } from '../utils/metaCampaignIds';
 import { isFastTripErrorClass } from './agentMode/core/errorRetryability';
 import type { ZodIssue } from 'zod';
+import { suggestMemorySplitPoint } from '../utils/memoryContentLimit';
 
 export type AgentToolEffect =
   | 'read'
@@ -1531,7 +1532,7 @@ function validateJsonSchemaConstraints(name: string, value: unknown, schema: any
       issues.push({
         code: 'invalid_args',
         path: `$.${name}`,
-        message: `Argument "${name}" must be at most ${schema.maxLength} character(s) — received ${received}; remove at least ${received - schema.maxLength}.`,
+        message: `Argument "${name}" must be at most ${schema.maxLength} character(s) — received ${received}; remove at least ${received - schema.maxLength}. Suggested split point: character ${suggestMemorySplitPoint(value, schema.maxLength)} — keep the text before it, and send the rest in further calls of at most ${schema.maxLength} character(s) each if the tool allows (ENG-1199).`,
       });
     }
   }
