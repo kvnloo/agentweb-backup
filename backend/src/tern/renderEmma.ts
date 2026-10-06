@@ -56,6 +56,7 @@ export interface EmmaSessionLike {
   title?: string;
   llmModel?: string;
   sessionType?: string;
+  portalType?: string;
   pageIdentifier?: string;
   previewText?: string;
   createdAt?: string;
