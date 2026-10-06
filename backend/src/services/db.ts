@@ -7816,7 +7816,7 @@ export const crmDb = {
       // over-long UpdateExpression (4KB cap) -> ValidationException -> 500, so the keys are
       // chunked, never truncated: the full-map write this replaces stored all of them.
       const CUSTOM_KEY_CHUNK = 50;
-      let customKeyChunks: Array<Array<[string, any]>> = [];
+      const customKeyChunks: Array<Array<[string, any]>> = [];
       if (updates.customFields !== undefined) {
         const safeCustomFields = sanitizeCustomFields(
           updates.customFields,
