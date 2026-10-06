@@ -9,6 +9,7 @@ import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { requireEmmaTokenBudget } from '../middleware/emmaTokenBudget';
 import { chatbotDb } from '../services/chatbotService';
 import { publishRevalidationForForwardedRun } from '../utils/scheduledPublishConsentGuard';
+import { getMetaAdsMetricsArgsSchema } from '../utils/metaCampaignIds';
 
 const router = Router();
 
@@ -456,12 +457,21 @@ router.post('/meta-ads/insights', async (req: Request, res: Response) => {
 
 router.post('/meta-ads/metrics', async (req: Request, res: Response) => {
   try {
+    // Direct HTTP clients historically sent numeric IDs; keep accepting them here
+    // while the tool-gateway contract stays string-only.
+    const requestBody = Array.isArray(req.body?.campaign_ids)
+      ? { ...req.body, campaign_ids: req.body.campaign_ids.map((id: unknown) =>
+        (typeof id === 'number' ? String(id) : id)) }
+      : req.body;
+    const parsed = getMetaAdsMetricsArgsSchema.safeParse(requestBody);
+    if (!parsed.success) return res.json({ success: false,
+      message: 'campaign_ids is required and must contain at least one campaign ID.', error: 'Invalid campaign_ids' });
     const svc = await getAgentModeService();
     const result = await svc.getMetaAdsMetrics(
-      req.body.timeframe || '7d',
+      parsed.data.timeframe || '7d',
       userId(req),
-      req.body.campaign_ids,
-      req.body.account_id,
+      parsed.data.campaign_ids,
+      parsed.data.account_id,
     );
     res.json(result);
   } catch (err: any) {

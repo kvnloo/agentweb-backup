@@ -15,6 +15,9 @@ jest.mock('aws-sdk', () => ({
 jest.mock('../services/settingsService', () => ({
   settingsService: { getSetting: jest.fn(), getSettings: jest.fn() },
 }));
+// The roster's self-activity signal reads this month's spend from the ledger (ENG-1250 AC7).
+// Mocked so this performance test never reaches a live DynamoDB.
+jest.mock('../services/spendProjectionDb', () => ({ getProjectionsBatch: jest.fn().mockResolvedValue(new Map()) }));
 import { userDb, orgDb } from '../services/db';
 import adminRoutes from '../routes/admin';
 import { settingsService } from '../services/settingsService';

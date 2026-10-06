@@ -260,6 +260,7 @@ import { buildSandboxFetchHtml } from '../../services/sandboxTrackingPreflight';
 import { assertMetaAccountAllowed } from '../../services/metaTestAccountGuard';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from '../../services/metaAudienceCampaignTokenStore';
 import { getJwtSecret } from '../../config/jwt';
+import { metaWriteRateShaper } from '../../services/agentMode/metaWriteRateShaper';
 import { describeMetaWriteParamDrift, formatMetaWriteParamDriftMessage } from '../../services/agentMode/core/approvalDeck';
 
 /** Local copy of `AgentModeService`'s private `MetaApiResult` type — never exported there. */
@@ -1668,7 +1669,7 @@ export async function getMetaAdsMetrics(
 
     // Build filtering parameter for API calls
     const filteringParam = campaignFilterIds.length > 0
-      ? `&filtering=[{"field":"campaign.id","operator":"IN","value":["${campaignFilterIds.join('","')}"]}]`
+      ? `&filtering=${encodeURIComponent(JSON.stringify([{ field: 'campaign.id', operator: 'IN', value: campaignFilterIds }]))}`
       : '';
 
 
@@ -1987,6 +1988,24 @@ export async function callMetaMarketingApi(
         message: pageMessage,
         error: `META_PAGE_ACCESS_MISSING: ${pageMessage}`,
         hint: 'Reconnect Meta and select that Page on the "Choose Pages" step, or get "Create ads" (Advertiser) access on it, then retry.'
+      } as any;
+    }
+  }
+
+  // ENG-2274: direct AD writes can bypass AD_CREATIVE CREATE entirely by
+  // referencing an existing creative, copying an ad, or swapping a creative
+  // onto an ad. A connection with confirmed zero accessible Pages cannot
+  // safely create/copy/update ads either, so hard-stop before the write path.
+  if (entity_type === 'AD' && ['CREATE', 'UPDATE', 'COPY_AD'].includes(action)) {
+    const { connection: adGateConnection } = await deps.getMetaCredentials(userId, account_id);
+    const { getMetaPagesAccessState, getMetaAdsNoPagesMessage } = await import('../../utils/metaAdsScope');
+    if (getMetaPagesAccessState(adGateConnection?.config) === 'missing') {
+      const pageMessage = getMetaAdsNoPagesMessage(adGateConnection?.config);
+      return {
+        success: false,
+        message: pageMessage,
+        error: `META_PAGE_ACCESS_MISSING: ${pageMessage}`,
+        hint: 'Reconnect Meta and select the Page on the "Choose Pages" step, or get "Create ads" (Advertiser) access on the Page, then retry.'
       } as any;
     }
   }
@@ -3017,6 +3036,14 @@ export async function executeAudienceCampaignLaunch(
     if (existingAdSet) {
       adSet = { id: existingAdSet.id, name: existingAdSet.name };
     } else {
+      // ENG-2268 (D3 follow-up from ENG-2281): the launch_* tools build their ad set
+      // outside callMetaMarketingApi, so they never passed the ENG-2280 burst shaper.
+      // Score this write on the same shared per-account shaper; a burst refusal sends
+      // nothing to Meta and surfaces as a step failure (preview token is released).
+      const shape = metaWriteRateShaper.shapeWrite(String(args.account_id || 'unknown'), 'AD_SET', 'CREATE', undefined, args.ad_set_params);
+      if (shape.kind === 'throttled') {
+        rethrowStepFailure({ message: shape.message, code: 429 }, 'Meta write rate-shaped.');
+      }
       const adSetResult = await deps.createMetaAdsAdSet(userId, {
         ...args.ad_set_params,
         account_id: args.account_id,

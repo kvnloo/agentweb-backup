@@ -8,7 +8,7 @@ import {
   syncSkill,
   getSyncStatus,
 } from "../controllers/skillController";
-import { skillService } from "../services/skillService";
+import { skillService, SKILL_CONFLICT_MESSAGE } from "../services/skillService";
 
 const router = express.Router();
 
@@ -37,6 +37,7 @@ router.post("/:skillId/approve", async (req, res) => {
   } catch (error: any) {
     if (error.message === 'Skill not found') return res.status(404).json({ message: error.message });
     if (error.message === 'Skill is not pending review') return res.status(400).json({ message: error.message });
+    if (error.message === SKILL_CONFLICT_MESSAGE) return res.status(409).json({ message: error.message });
     console.error("Error approving skill:", error);
     res.status(500).json({ message: "Failed to approve skill" });
   }
@@ -53,6 +54,7 @@ router.post("/:skillId/reject", async (req, res) => {
   } catch (error: any) {
     if (error.message === 'Skill not found') return res.status(404).json({ message: error.message });
     if (error.message === 'Skill is not pending review') return res.status(400).json({ message: error.message });
+    if (error.message === SKILL_CONFLICT_MESSAGE) return res.status(409).json({ message: error.message });
     console.error("Error rejecting skill:", error);
     res.status(500).json({ message: "Failed to reject skill" });
   }

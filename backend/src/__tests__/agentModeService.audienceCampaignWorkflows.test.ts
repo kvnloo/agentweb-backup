@@ -66,6 +66,7 @@ import { classifyToolFailureType } from '../utils/toolFailureType';
 // moved to emma/impl/adsApis.ts as real exports — every jest.spyOn below that
 // used to target the class instance now targets this module instead.
 import * as adsApisImpl from '../emma/impl/adsApis';
+import { metaWriteRateShaper } from '../services/agentMode/metaWriteRateShaper';
 
 /*
  * ENG-941: the launch tracking gate resolves Meta credentials before it runs, and this
@@ -938,6 +939,42 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       // failed-release retries also made a genuinely completed launch's
       // token replayable after the staleness window.
       expect(markPreviewTokenSucceeded).toHaveBeenCalledWith(USER_ID, expect.any(String));
+    });
+
+    it('ENG-2268: refuses the ad-set write when the shared Meta write shaper is bursting, sending nothing', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'create', audience: { id: 'aud_seed_1', name: 'RankAI Warm List' }, created: true,
+        sourceSummary: 'CSV upload (...)', failures: [], recordsFound: undefined, recordsUsable: undefined,
+      });
+      const shapeSpy = jest.spyOn(metaWriteRateShaper, 'shapeWrite').mockReturnValueOnce({
+        kind: 'throttled', reason: 'burst_limit', retryAfterMs: 30000, message: 'META_RATE_SHAPED: bursting',
+      });
+      const createAdSetSpy = jest.spyOn(agentModeService, 'createMetaAdsAdSet');
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm(baseArgs()));
+
+      expect(shapeSpy).toHaveBeenCalledWith(ACCOUNT_ID, 'AD_SET', 'CREATE', undefined, expect.anything());
+      expect(createAdSetSpy).not.toHaveBeenCalled();
+      expect(result.success).toBe(false);
+      expect(JSON.stringify(result)).toContain('META_RATE_SHAPED');
+    });
+
+    it('ENG-2268: scores the launch ad-set write on the shared shaper when it is sent', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      jest.spyOn(adsApisImpl, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'create', audience: { id: 'aud_seed_1', name: 'RankAI Warm List' }, created: true,
+        sourceSummary: 'CSV upload (...)', failures: [], recordsFound: undefined, recordsUsable: undefined,
+      });
+      const shapeSpy = jest.spyOn(metaWriteRateShaper, 'shapeWrite');
+      jest.spyOn(agentModeService, 'createMetaAdsAdSet').mockResolvedValueOnce({
+        success: true, adSet: { id: 'adset_1', name: 'Targeted Ad Set' },
+      } as any);
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm(baseArgs()));
+
+      expect(result.success).toBe(true);
+      expect(shapeSpy).toHaveBeenCalledWith(ACCOUNT_ID, 'AD_SET', 'CREATE', undefined, expect.anything());
     });
 
     // ENG-1300: createMetaAdsAdSet already returns `code` on failure (fixed

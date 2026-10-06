@@ -151,6 +151,14 @@ export interface MetaAdsScopeConfigLike {
    * Internal to `metaAdsCapabilitySync.ts`'s own write — no gate reads it.
    */
   page_access_probed_at?: unknown;
+  /** Required OAuth permissions that /me/permissions says the user explicitly declined. */
+  declined_required_permissions?: unknown;
+  /** Failure from the /me/permissions health read. Unknown is a warning, not healthy. */
+  meta_oauth_health_error?: unknown;
+  /** Complete /me/accounts count when the OAuth health read succeeded. */
+  meta_page_count?: unknown;
+  /** Failure from the /me/accounts health read. Distinct from confirmed zero Pages. */
+  meta_page_health_error?: unknown;
 }
 
 /**
@@ -191,9 +199,19 @@ export const META_ADS_ASSET_ACCESS_MESSAGE =
  */
 export const META_ADS_NO_PAGES_MESSAGE =
   'Meta Ads access is incomplete for this connection: no Facebook Pages are accessible, and every ad creative ' +
-  'must reference a Page, so ad creation will fail. Reconnect Meta under Settings -> Connected accounts and ' +
-  'select the Page on the "Choose Pages" step, and/or ask whoever manages that Page in Meta Business Settings ' +
-  'to add this person with "Create ads" (Advertiser) access, then run this again. No ads were created.';
+  'must reference a Page, so ad creation will fail. Reconnect Meta under Settings -> Connected accounts, choose ' +
+  'Edit access, select all current and future Pages (or at least the Page you will advertise from), approve all ' +
+  'requested permissions, and/or ask whoever manages that Page in Meta Business Settings to add this person with ' +
+  '"Create ads" (Advertiser) access, then run this again. No ads were created.';
+
+export const buildMetaOAuthDeclinedPermissionsMessage = (permissions: string[]): string =>
+  `Meta Ads access is incomplete for this connection: Meta says the required permission(s) ` +
+  `${permissions.join(', ')} were declined. Reconnect Meta under Settings -> Connected accounts; when Meta opens, ` +
+  `choose Edit access, select all current and future Pages, and approve all requested permissions. No ads were created.`;
+
+export const buildMetaOAuthHealthUnknownMessage = (reason: string): string =>
+  `Meta Ads access could not be fully verified for this connection (${reason}). Reconnect Meta under Settings -> ` +
+  `Connected accounts if this keeps happening, and make sure Edit access includes all current and future Pages and all requested permissions.`;
 
 /**
  * ENG-2232: the subtler sibling of `META_ADS_NO_PAGES_MESSAGE` — this
@@ -333,6 +351,24 @@ export const describeMetaAdsCapability = (
   account: MetaAdsAccountLike | null | undefined
 ): MetaAdsCapabilityAnnotation => {
   if (!isMetaAdAccountRecord(account)) return {};
+
+  const declined = account?.config?.declined_required_permissions;
+  const declinedList = Array.isArray(declined)
+    ? declined.filter((p): p is string => typeof p === 'string' && p.trim().length > 0)
+    : [];
+  if (declinedList.length > 0) {
+    return {
+      ads_capable: false,
+      capability_warning: buildMetaOAuthDeclinedPermissionsMessage(declinedList),
+    };
+  }
+
+  const healthError =
+    (typeof account?.config?.meta_oauth_health_error === 'string' && account.config.meta_oauth_health_error) ||
+    (typeof account?.config?.meta_page_health_error === 'string' && account.config.meta_page_health_error);
+  if (healthError) {
+    return { ads_capable: false, capability_warning: buildMetaOAuthHealthUnknownMessage(healthError) };
+  }
 
   const state = getMetaAdsScopeState(account?.config);
   if (state === 'missing') {

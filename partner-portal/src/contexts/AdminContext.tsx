@@ -57,6 +57,8 @@ interface User {
   productDomain?: string; // Product site domain for feature usage tracking
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   subscriptionType?: string; // Subscription type for customer portal users
+  /** Settled spend this month from the spend ledger (ENG-1250 AC7); absent if the lookup failed. */
+  spendThisMonthUsd?: number;
   tokenUsage?: {
     month: string;
     totalTokens: number;

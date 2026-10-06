@@ -432,6 +432,69 @@ describe('SkillService', () => {
     });
   });
 
+  describe('ENG-1390: conditional review transitions and delete', () => {
+    const base = {
+      skillId: 'skill-1', name: 'S', description: 'D', toolNames: ['tool1'],
+      ownerId: 'owner-1', createdAt: mockTimestamp, updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const conflict = () => Object.assign(new Error('The conditional request failed'), { code: 'ConditionalCheckFailedException' });
+    const CONFLICT = 'Skill was changed by someone else — refresh and try again';
+    const cases: Array<[string, any, () => Promise<any>, string]> = [
+      ['submitForReview', { ...base, visibility: 'private' }, () => skillService.submitForReview('skill-1', 'owner-1'), 'pending_review'],
+      ['approveSkill', { ...base, visibility: 'pending_review' }, () => skillService.approveSkill('skill-1'), 'public'],
+      ['rejectSkill', { ...base, visibility: 'pending_review' }, () => skillService.rejectSkill('skill-1', 'needs work'), 'private'],
+    ];
+
+    it.each(cases)('%s writes conditionally on the read updatedAt and succeeds when nothing races', async (_n, row, call, vis) => {
+      mockPromise.mockResolvedValueOnce({ Item: row }).mockResolvedValueOnce({});
+      const result = await call();
+      expect(result.visibility).toBe(vis);
+      expect(result.updatedAt).toBe(mockTimestamp);
+      expect(mockPut).toHaveBeenCalledWith(expect.objectContaining({
+        ConditionExpression: 'updatedAt = :expectedUpdatedAt',
+        ExpressionAttributeValues: { ':expectedUpdatedAt': base.updatedAt },
+      }));
+    });
+
+    it.each(cases)('%s surfaces a concurrent change as the conflict error', async (_n, row, call) => {
+      mockPromise.mockResolvedValueOnce({ Item: row }).mockRejectedValueOnce(conflict());
+      await expect(call()).rejects.toThrow(CONFLICT);
+    });
+
+    it('deleteSkill without a condition stays unconditional', async () => {
+      mockPromise.mockResolvedValueOnce({});
+      await skillService.deleteSkill('skill-1');
+      expect(mockDelete.mock.calls[0][0].ConditionExpression).toBeUndefined();
+    });
+
+    it('deleteSkill conditions on the expected ownerId and visibility', async () => {
+      mockPromise.mockResolvedValueOnce({});
+      await skillService.deleteSkill('skill-1', { ownerId: 'owner-1', visibility: 'private' });
+      expect(mockDelete).toHaveBeenCalledWith(expect.objectContaining({
+        ConditionExpression: '#ownerId = :ownerId AND #visibility = :visibility',
+        ExpressionAttributeNames: { '#ownerId': 'ownerId', '#visibility': 'visibility' },
+        ExpressionAttributeValues: { ':ownerId': 'owner-1', ':visibility': 'private' },
+      }));
+    });
+
+    it('deleteSkill surfaces a failed condition as the conflict error', async () => {
+      mockPromise.mockRejectedValueOnce(conflict());
+      await expect(skillService.deleteSkill('skill-1', { ownerId: 'owner-1' })).rejects.toThrow(CONFLICT);
+    });
+  });
+
+  describe('syncSkill advances the target revision (ENG-1390)', () => {
+    it('stamps a fresh updatedAt instead of copying the source row', async () => {
+      mockPromise
+        .mockResolvedValueOnce({ Item: { skillId: 's1', name: 'n', updatedAt: '2020-01-01T00:00:00.000Z' } })
+        .mockResolvedValueOnce({});
+      await skillService.syncSkill('s1', 'prod-to-dev');
+      const item = mockPut.mock.calls[mockPut.mock.calls.length - 1][0].Item;
+      expect(item.updatedAt).toBe(mockTimestamp);
+      expect(item.updatedAt).not.toBe('2020-01-01T00:00:00.000Z');
+    });
+  });
+
   describe('withdrawFromReview (ENG-932)', () => {
     const pendingSkill = {
       skillId: 'skill-1',

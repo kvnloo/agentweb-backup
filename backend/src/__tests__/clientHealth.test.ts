@@ -17,6 +17,9 @@ jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: jest.fn(),
 }));
 
+// ENG-1250 AC7: each account's spend this month comes from the ledger in one batched read.
+jest.mock('../services/spendProjectionDb', () => ({ getProjectionsBatch: jest.fn() }));
+
 jest.mock('../services/v0Service', () => ({
   getLandingPagesByOwner: jest.fn().mockResolvedValue([]),
   getLandingPagesByOrg: jest.fn().mockResolvedValue([]),
@@ -39,6 +42,9 @@ jest.mock('../services/metaTokenRefresh', () => ({
 }));
 
 import { assessClientHealth, listAllClients, classifyMetaAdConnection } from '../services/clientHealthService';
+import { getProjectionsBatch } from '../services/spendProjectionDb';
+
+const mockBatch = getProjectionsBatch as jest.Mock;
 import { fetchWithRetryAndPaging as metaFetch } from '../utils/metaApiFetch';
 
 const mockedMetaFetch = jest.mocked(metaFetch);
@@ -265,6 +271,43 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.health.status).not.toBe('blocked');
     expect(result.health.status_reasons.join(' ')).toMatch(/could not be read/i);
     expect(result.health.status_reasons).not.toContain('No active ad campaigns');
+  });
+
+  it('surfaces Meta Page, declined-permission, and selected-event health for the dashboard', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({ userId: 'admin-user', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user',
+      email: 'client@example.com',
+      displayName: 'Client User',
+      adAccount: '',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([
+      {
+        platform: 'meta',
+        config: {
+          account_type: 'ad_account',
+          ad_account_id: '333333',
+          access_token: 'tok',
+          granted_scopes: ['ads_read'],
+          declined_required_permissions: ['pages_read_engagement'],
+          has_meta_pages: false,
+          meta_page_count: 0,
+        },
+      },
+    ]);
+    mockedMetaFetch.mockResolvedValueOnce({ data: [] });
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.health.ads_layer.meta_connection_health).toEqual({
+      permissions: 'declined',
+      declined_permissions: ['pages_read_engagement'],
+      page_access: 'missing',
+      page_count: 0,
+      selected_event: 'unknown',
+      reconnect_required: true,
+      reconnect_instructions: 'Click Edit access, select all current and future Pages, approve all permissions.',
+    });
   });
 
 
@@ -1369,6 +1412,72 @@ describe('Client Health - assessClientHealth', () => {
 describe('Client Health - listAllClients', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockBatch.mockResolvedValue(new Map());
+  });
+
+  describe('spend_current comes from the ledger, not the retired counter (ENG-1250 AC7)', () => {
+    const month = new Date().toISOString().slice(0, 7);
+    const twoClients = () => {
+      (userDb.getAllUsers as jest.Mock).mockResolvedValueOnce([
+        {
+          userId: 'spender',
+          email: 's@example.com',
+          isAdmin: false,
+          // The legacy counter must no longer surface; archived history still does.
+          tokenUsage: { month, totalTokens: 999, totalCost: 999 },
+          tokenUsageHistory: [{ month: '2026-08', totalTokens: 10, totalCost: 1 }],
+        },
+        { userId: 'quiet', email: 'q@example.com', isAdmin: false },
+      ]);
+      (getAccountsByUserId as jest.Mock).mockResolvedValue([]);
+    };
+    const byId = (r: any, id: string) => r.clients.find((c: any) => c.userId === id);
+
+    it('reports the ledger total for an account with settled spend, null for one without', async () => {
+      twoClients();
+      mockBatch.mockResolvedValue(new Map([['spender', { settledMicroUsd: 12_500_000 }]]));
+
+      const result = await listAllClients('admin', true);
+
+      expect(byId(result, 'spender').spend_current).toEqual({ month, totalCost: 12.5 });
+      expect(byId(result, 'quiet').spend_current).toBeNull();
+    });
+
+    it('asks the ledger once, for every client, for the CURRENT month', async () => {
+      twoClients();
+      await listAllClients('admin', true);
+
+      expect(mockBatch).toHaveBeenCalledTimes(1);
+      expect(mockBatch).toHaveBeenCalledWith(['spender', 'quiet'], month);
+    });
+
+    it('no longer exposes the legacy token_usage_current, but keeps the frozen history', async () => {
+      twoClients();
+      mockBatch.mockResolvedValue(new Map([['spender', { settledMicroUsd: 1_000_000 }]]));
+
+      const result = await listAllClients('admin', true);
+      const c = byId(result, 'spender');
+
+      expect(c).not.toHaveProperty('token_usage_current');
+      expect(c.token_usage_history).toEqual([{ month: '2026-08', totalTokens: 10, totalCost: 1 }]);
+    });
+
+    it('a failed ledger lookup still returns the sweep with spend_current null, and logs it', async () => {
+      twoClients();
+      mockBatch.mockRejectedValue(new Error('ProvisionedThroughputExceeded'));
+      const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      const result = await listAllClients('admin', true);
+
+      expect(result.success).toBe(true);
+      expect(result.clients).toHaveLength(2);
+      expect(byId(result, 'spender').spend_current).toBeNull();
+      expect(errSpy).toHaveBeenCalledWith(
+        expect.stringContaining('ledger spend lookup failed'),
+        expect.any(Error),
+      );
+      errSpy.mockRestore();
+    });
   });
 
   // FAIL test 1: Non-admin user should be rejected

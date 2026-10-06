@@ -6,8 +6,6 @@ export const OAUTH_FLOW_SESSION_TTL_MS = 10 * 60 * 1000;
 export interface LocalOAuthFlowSession {
   userId: string;
   expires: number;
-  /** Local shadows must never resurrect a session consumed on another instance. */
-  persisted?: boolean;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -31,35 +29,24 @@ function isValidPayload(value: unknown, provider: PendingOAuthSession['provider'
     isStrings(value.grantedScopes) && isStrings(value.missingScopes);
 }
 
-/** Expand phase: retain the process-local representation alongside the shared row. */
+/** Shared AW-OAuthSessions row is the only store: any instance may finalize or connect. */
 export async function storeOAuthFlowSession<T extends LocalOAuthFlowSession>(
   provider: PendingOAuthSession['provider'],
-  local: Map<string, T>,
   session: T,
 ): Promise<string> {
   const sessionId = crypto.randomBytes(32).toString('hex');
   await oauthSessionDb.save({ sessionId, userId: session.userId, provider, payload: session });
-  local.set(sessionId, { ...session, persisted: true });
   return sessionId;
 }
 
 export async function consumeOAuthFlowSession<T extends LocalOAuthFlowSession>(
   provider: PendingOAuthSession['provider'],
-  local: Map<string, T>,
   sessionId: string,
   userId: string,
 ): Promise<T | null> {
   if (typeof sessionId !== 'string' || !sessionId.trim()) return null;
   // Errors propagate to the route's 500 handler; an outage is not a missing row.
   const stored = await oauthSessionDb.consume(sessionId, userId, provider);
-  if (stored) {
-    local.delete(sessionId);
-    if (!isValidPayload(stored.payload, provider, userId)) return null;
-    return stored.payload as T;
-  }
-  const legacy = local.get(sessionId);
-  if (!legacy || legacy.userId !== userId) return null;
-  local.delete(sessionId);
-  if (legacy.persisted || legacy.expires <= Date.now()) return null;
-  return legacy;
+  if (!stored || !isValidPayload(stored.payload, provider, userId)) return null;
+  return stored.payload as T;
 }
