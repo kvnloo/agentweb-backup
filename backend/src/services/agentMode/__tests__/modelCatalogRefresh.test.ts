@@ -50,6 +50,8 @@ describe('catalog critical invariants', () => {
       { ...row, id: 'x-ai/grok-4.9', pricing: { prompt: '', completion: 'NaN' } }] });
     expect(additions.map(m => m.id)).toEqual(['openrouter/x-ai/grok-4.8']);
     expect(additions[0].price).toEqual({ inPerM: 1, outPerM: 3 });
+    // Unreviewed models must never reach customers on their own (ENG-2293).
+    expect(additions[0].config.adminOnly).toBe(true);
     expect(discoverNewModels({ data: [{ ...row, pricing: { prompt: '0.00000029', completion: '0.000003' } }] })[0].price.inPerM).toBe(0.29);
     // A fixed local registry, not the live LLM_MODEL_REGISTRY — these assertions pin
     // exact qualityScore/qualityScoreSource matching behavior, which the live import

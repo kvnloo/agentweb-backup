@@ -68,6 +68,10 @@ export function parseOpenRouter(payload: unknown): CatalogCandidate[] {
     result.set(id, { id, price, config: {
       client: null, name: typeof row.name === 'string' ? row.name : row.id,
       description: 'Auto-added from OpenRouter; benchmark score shown when available.',
+      // Unreviewed pricing/capabilities must never reach customers on their own:
+      // adminOnly drops the entry from every customer-facing model list and from
+      // the session model switch. A human removes the flag after review.
+      adminOnly: true,
       provider, family: inferFamily(id), supportsTemperature: params.includes('temperature'),
       supportsTools: true, supportsToolChoice: params.includes('tool_choice'),
       // Vision stays opt-in until the describe_image path is verified.

@@ -160,7 +160,7 @@ export function renderPrBody(reports: readonly string[]): string {
     'Include advertised cloud BYOK endpoint coverage; credentials and quota are not verified.',
     'Missing AA credentials preserve existing scores. Inspect the model-catalog-plan artifact for unmatched scores, proposed prices, and supersession.',
     '',
-    'New entries are marked auto-added. Review capabilities and customer-facing descriptions before marking ready. Existing Azure BYOK pricing is preserved.',
+    'New entries are marked auto-added and admin-only: customers cannot see or select them until a human reviews capabilities, pricing and descriptions and removes `adminOnly`. Existing Azure BYOK pricing is preserved.',
     'No database writes or changes to saved model selections. Rollback: revert this PR.',
     'Complexity: extends the existing registry and price book; no new runtime service or storage.',
     '',
