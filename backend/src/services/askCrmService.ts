@@ -172,11 +172,16 @@ function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: L
     if (Number.isNaN(parsed) || parsed > nowMs) return null;
     return (nowMs - parsed) / (24 * 60 * 60 * 1000);
   };
+  // past_due is only a meaningful transition when computeLifecycle's own Rule 2
+  // would actually act on it (isOrWasPaying — see lifecycleService.ts). Treating it
+  // as definitive from a colder stored state (inbox/signed_up) fires this gate for
+  // no effect: computeLifecycle drops the signal and falls through to signed_up,
+  // the same answer a plain "no subscription signal at all" would have produced.
   const subscriptionIsDefinitive =
     lead.subscriptionState === 'active' ||
     lead.subscriptionState === 'trialing' ||
-    lead.subscriptionState === 'past_due' ||
-    lead.subscriptionState === 'canceled';
+    lead.subscriptionState === 'canceled' ||
+    (lead.subscriptionState === 'past_due' && (lead.lifecycle === 'paying' || lead.lifecycle === 'at_risk'));
   const hasCurrentOpenDeal =
     Array.isArray(lead.openDealStages) &&
     lead.openDealStages.some((stage) => !['won', 'lost'].includes(String(stage).toLowerCase()));

@@ -5,12 +5,33 @@
  * matched account is the caller or belongs to the caller's organization.
  * The owner-wide deal query is bounded, so it supplies positive evidence only:
  * absence from that page never erases a stored open-deal signal.
+ *
+ * Known, accepted limitation (not fixed here): this makes `openDealStages`
+ * one-directional — a deal this query SEES as still open can correctly ADD to the
+ * stored stages, but a deal that has since closed (Won/Lost) is dropped from this
+ * computation entirely rather than used to REMOVE a stale stored entry, because
+ * `openDealStages` only stores stage NAME strings with no deal-id linkage — once a
+ * deal closes there is no way to tell which stored stage string it used to
+ * correspond to. A real fix needs either a per-contact deal query (defeats the
+ * "one bounded query" cost design) or a data-model change so a lead's open-deal
+ * signal carries deal ids, not just stage names. Until then, a closed-but-stale
+ * `openDealStages` entry can make `hasCurrentOpenDeal` (askCrmService.ts) keep
+ * firing for a dead deal — `computeLifecycle`'s `in_deal` rule is lower-priority
+ * than the churned/paying/trialing rules, so the blast radius is a stale pipeline
+ * classification, not a false financial/churn answer.
  */
 import type { AskCrmLead } from './askCrmService';
 import { mapSubscriptionState, pickLatestTimestamp } from '../utils/crmBackfill';
 import { excludeSessionLists } from '../utils/sessionList';
 
-const USER_LOOKUP_BUDGET = 500;
+/**
+ * Exported so callers (ask_crm's `load_limit` parameter) can cap how many leads
+ * they ever ask this loader to scan at this same number — scanning more than this
+ * would silently return leads with no live enrichment at all, reintroducing the
+ * exact frozen-forever staleness ENG-2155 exists to fix for whichever leads fall
+ * past the budget, with nothing in the response signalling that it happened.
+ */
+export const USER_LOOKUP_BUDGET = 500;
 const USER_LOOKUP_BATCH = 20;
 const DEAL_LOOKUP_LIMIT = 1000;
 
@@ -131,12 +152,20 @@ async function lookupUsers(
   deps: AskCrmLeadLoaderDeps,
 ): Promise<Map<string, ReturnType<typeof normalizeUser>>> {
   const result = new Map<string, ReturnType<typeof normalizeUser>>();
+  // getUserByEmail resolves to undefined for an ordinary "no matching account" —
+  // this .catch only fires on a genuine failure (DB/network), so logging it is
+  // meaningful, not noise from the common not-found case. One summary line per
+  // batch, not per email: a sustained outage would otherwise flood the log.
+  let failures = 0;
   for (let offset = 0; offset < emails.length; offset += USER_LOOKUP_BATCH) {
     const chunk = emails.slice(offset, offset + USER_LOOKUP_BATCH);
     const users = await Promise.all(
-      chunk.map((email) => deps.getUserByEmail(email).catch(() => null)),
+      chunk.map((email) => deps.getUserByEmail(email).catch(() => { failures++; return null; })),
     );
     chunk.forEach((email, index) => result.set(email, normalizeUser(users[index])));
+  }
+  if (failures > 0) {
+    console.warn(`[askCrmLeadLoader] ${failures}/${emails.length} getUserByEmail lookups failed — those leads fall back to stored signals only`);
   }
   return result;
 }
@@ -168,8 +197,14 @@ export function createAskCrmLeadLoader(deps: AskCrmLeadLoaderDeps) {
     }
 
     const [ownerRaw, dealsRaw] = await Promise.all([
-      deps.getUserById(userId).catch(() => null),
-      deps.getDealsByOwner(userId, { limit: DEAL_LOOKUP_LIMIT }).catch(() => null),
+      deps.getUserById(userId).catch((err) => {
+        console.warn(`[askCrmLeadLoader] getUserById(${userId}) failed — authorization check will reject every candidate account:`, err);
+        return null;
+      }),
+      deps.getDealsByOwner(userId, { limit: DEAL_LOOKUP_LIMIT }).catch((err) => {
+        console.warn(`[askCrmLeadLoader] getDealsByOwner(${userId}) failed — falling back to stored openDealStages only:`, err);
+        return null;
+      }),
     ]);
     const owner = normalizeUser(ownerRaw);
 

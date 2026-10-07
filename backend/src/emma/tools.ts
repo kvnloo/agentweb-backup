@@ -9,7 +9,7 @@ import { metaAdReadPort, googleAdReadPort, linkedInAdReadPort } from '../service
 import { accountMemoryDb, orgMemoryDb, userDb } from '../services/db';
 import { crmDb } from '../services/db';
 import { askCrm } from '../services/askCrmService';
-import { createAskCrmLeadLoader } from '../services/askCrmLeadLoader';
+import { createAskCrmLeadLoader, USER_LOOKUP_BUDGET } from '../services/askCrmLeadLoader';
 import { getAccountSummary } from '../services/accountSummaryService';
 import { dealDb, DealAuthError, DealNotFoundError, DEAL_STAGES, type DealStage } from '../services/dealDb';
 import { contactEventsDb, normalizeContactId } from '../services/contactEventsDb';
@@ -4340,7 +4340,7 @@ emmaToolRegistry.register({
         },
         load_limit: {
           type: 'number',
-          description: 'Max number of leads to scan across the user\'s lists (default 500). Rarely needed — only raise if the user has tons of lists.'
+          description: 'Max number of leads to scan across the user\'s lists (default 500, hard cap 500 — every scanned lead also gets a live account/deal lookup, bounded at this same number, so raising it has no effect).'
         }
       },
       required: ['question']
@@ -4353,7 +4353,10 @@ emmaToolRegistry.register({
     }
 
     const resultLimit = Math.min(Math.max(args.limit ?? 10, 1), 25);
-    const loadLimit = Math.max(args.load_limit ?? 500, 1);
+    // Capped at USER_LOOKUP_BUDGET, not just floored: scanning more leads than the
+    // loader can enrich would silently return some leads live-corrected and others
+    // still frozen on their stored value, with nothing distinguishing which is which.
+    const loadLimit = Math.min(Math.max(args.load_limit ?? 500, 1), USER_LOOKUP_BUDGET);
 
     // Live account/deal enrichment is centralized in a tested loader so its
     // authorization and partial-read semantics cannot drift from ask_crm.
