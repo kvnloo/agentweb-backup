@@ -73,6 +73,29 @@ export interface McpToolHandler {
 
 export { isAnonymousUserId } from '../anonymousToolAccess';
 
+/**
+ * ENG-336 — MCP tool annotations (readOnlyHint / destructiveHint /
+ * openWorldHint) required for ChatGPT app publication. Derived from the
+ * existing `readOnly` flag; anything not declared read-only is labelled a
+ * destructive write (conservative: a client confirms rather than auto-runs).
+ * Every Emma tool reaches third-party services/the web, so openWorldHint
+ * defaults true. Explicit `definition.annotations` hints always win.
+ * Returns a copy; the registered definition is never mutated.
+ */
+export function withToolAnnotations(t: McpToolHandler): any {
+  const readOnly = t.readOnly === true;
+  const explicit = (t.definition && t.definition.annotations) || {};
+  return {
+    ...t.definition,
+    annotations: {
+      readOnlyHint: readOnly,
+      destructiveHint: !readOnly,
+      openWorldHint: true,
+      ...explicit,
+    },
+  };
+}
+
 export class McpToolRegistry {
   private tools: Map<string, McpToolHandler> = new Map();
 
@@ -84,7 +107,7 @@ export class McpToolRegistry {
   getToolDefinitions() {
     return Array.from(this.tools.values())
       .filter(t => !t.internal)
-      .map(t => t.definition);
+      .map(t => withToolAnnotations(t));
   }
 
   /** All tool definitions including internal-only (for Emma's internal registry). */

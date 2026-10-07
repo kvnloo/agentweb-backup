@@ -4235,6 +4235,10 @@ emmaToolRegistry.register({
         cursor: {
           type: 'string',
           description: 'Pagination cursor returned as next_cursor from a previous call. Pass this to retrieve the next page of results.'
+        },
+        include_all_fields: {
+          type: 'boolean',
+          description: 'If true, each lead also includes notes, linkedin, customFields, enrichmentMetadata, createdAt and updatedAt. Use for exports (e.g. CSV) instead of calling get_lead_details per lead.'
         }
       },
       required: ['list_id']
@@ -4242,6 +4246,7 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await leadsImpl.getLeads(args.list_id, context?.userId, {
+      includeAllFields: args.include_all_fields === true,
       search: args.search,
       status: args.status,
       icpOnly: args.icp_only,
@@ -5066,7 +5071,8 @@ emmaToolRegistry.register({
           type: 'array',
           items: { type: 'string' },
           description: 'Optional URLs of images/videos to attach. REQUIRED for YouTube — must be a direct video file URL (e.g. .mp4). The video will be downloaded and uploaded to YouTube.'
-        }
+        },
+        save_as_draft: { type: 'boolean', description: 'LinkedIn only. When true, the post is saved as a LinkedIn draft instead of being published, so the user can review it on LinkedIn before it goes live. Rejected for other platforms.' }
       },
       required: ['content']
     }
@@ -5074,7 +5080,7 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     // ENG-827: the context carries `assertPublishStillAuthorized`, which the handler
     // runs immediately before the post becomes real — see postOnConnectedAccount.
-    return await linkedinImpl.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context);
+    return await linkedinImpl.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context, ...(args.save_as_draft === true ? [{ saveAsDraft: true }] : []));
   }
 });
 
@@ -8089,6 +8095,8 @@ const bridgedToolNames = [
   'publish_landing_page_changes',
   'revert_landing_page_publish',
   'update_landing_page_context',
+  'set_landing_page_lead_list',
+  'enable_session_tracking',
   'resolve_skill',
   // Self account status (no-arg; wraps /api/auth/me for the CALLER's own account).
   // Bridged so the in-app loop can resolve the handler; also added to
@@ -8107,6 +8115,8 @@ const adminToolNames = [
   'list_skills',
   'manage_skill',
   'get_chat_history',
+  'get_session_transcript',
+  'get_user_by_id',
   'list_all_clients',
   'assess_client_health',
   'monitor_lead_volume',
@@ -9878,7 +9888,7 @@ ACTION MATRIX:
               Bidding: pass bidding_strategy for a standard (embedded) strategy, OR bidding_strategy_resource_name to attach a portfolio/shared strategy (from BIDDING_STRATEGY LIST) — never both. Switching to a standard strategy detaches any portfolio strategy.
               LAUNCH GATE: RESUME (or UPDATE with status=ENABLED) enables a campaign — this runs a pre-flight tracking check on the campaign's final URLs. If any URL lacks a detectable GA4/GTM/Google Ads conversion snippet the launch is BLOCKED (result has blocked=true and names the unmeasured URLs). Relay that to the user and help them fix tracking; only pass override_tracking_check=true if they explicitly choose to launch anyway.
               ENG-1944: enabling the CAMPAIGN does NOT enable its ad groups, keywords, or ads — those default to PAUSED on creation and stay that way unless explicitly updated. A successful RESUME/UPDATE(ENABLED) response may include pausedChildEntitiesWarning naming ad groups/keywords/ads still PAUSED underneath — if present, the campaign will deliver ZERO traffic despite showing ENABLED. Do not report a launch as live until you've enabled those too (AD_GROUP/KEYWORD/AD UPDATE with status=ENABLED) and re-checked. Never rely on CAMPAIGN status alone to confirm something is live.
-              ADD_PROXIMITY (campaign_resource_name, radius, address{street_address?, city_name?, postal_code?, province_code?, province_name?, country_code?}; radius_units defaults MILES) — mile/km-radius targeting centered on a real address (Google geocodes it server-side). This is native API support for "within N miles of our store/showroom" requests — do NOT tell the user proximity/radius targeting requires the UI; it does not. Additive to any existing LOCATION (city) criteria — REMOVE_PROXIMITY the old one first if only the radius should apply.
+              ADD_PROXIMITY (campaign_resource_name, radius, and EITHER address{street_address?, city_name?, postal_code?, province_code?, province_name?, country_code?} OR latitude+longitude (decimal degrees); radius_units defaults MILES) — mile/km-radius targeting centered on a real address (Google geocodes it server-side). This is native API support for "within N miles of our store/showroom" requests — do NOT tell the user proximity/radius targeting requires the UI; it does not. Additive to any existing LOCATION (city) criteria — REMOVE_PROXIMITY the old one first if only the radius should apply.
               REMOVE_PROXIMITY (criterion_resource_name) — removes a campaign-level LOCATION or PROXIMITY criterion. Obtain resource names via a raw GAQL query on campaign_criterion (call_google_ads_reporting_api mode="raw").
               TRANSPARENCY GUARDRAIL: if any Google Ads request cannot be fully satisfied via this API — including cases where you genuinely must fall back to a UI-only step (e.g. linking Google Business Profile) — you MUST say so explicitly to the user at deployment: name the gap, what you did instead, and the exact manual step left for them. Never silently substitute a workaround or imply a request is fully done when a manual step remains outstanding.
   CAMPAIGN_CRITERION → ADD (campaign_resource_name, placement_urls? and/or mobile_app_category_resource_names?)
@@ -9943,6 +9953,8 @@ ACTION MATRIX:
         campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE/ADD_PROXIMITY, AD_GROUP LIST, and (as an alternative to ad_group_resource_name) KEYWORD ADD_NEGATIVE.' },
         radius: { type: 'number', description: 'Proximity radius for CAMPAIGN ADD_PROXIMITY, in radius_units (default MILES).' },
         radius_units: { type: 'string', enum: ['MILES', 'KILOMETERS'], description: 'Unit for radius on CAMPAIGN ADD_PROXIMITY. Defaults to MILES.' },
+        latitude: { type: 'number', description: 'CAMPAIGN ADD_PROXIMITY: decimal-degree latitude of the radius center (use with longitude instead of address).' },
+        longitude: { type: 'number', description: 'CAMPAIGN ADD_PROXIMITY: decimal-degree longitude of the radius center (use with latitude instead of address).' },
         address: {
           type: 'object',
           description: 'Address to center the radius on for CAMPAIGN ADD_PROXIMITY (Google geocodes it server-side). At least one field required.',

@@ -17,7 +17,12 @@ export const PUBLISH_TOOLS = new Set<string>([
   "post_on_account",           // MCP alias — posts to a connected social account
   "post_on_connected_account",
   "publish_blog_article",
+  "emma_publish_social_post",
+  "emma_publish_blog_post",
   "publish_landing_page_changes",
+  // ENG-2327: commits the tracking tag to a customer's live repo (=> redeploy), so an unattended
+  // schedule needs the same consent as publish_landing_page_changes.
+  "enable_session_tracking",
 ]);
 
 /**

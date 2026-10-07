@@ -61,7 +61,33 @@ const SESSION_START_FUTURE_MS = 5 * 60 * 1000;
 export interface SessionIdentity {
   sessionId: string;
   sessionStartMs: number;
+  /**
+   * ONLY set by resolveIngestSessionIdentity when it REPLACED the device-supplied start (see there):
+   * the other starts this session may already have a row under, most likely first. The ingest probes
+   * them (exact-key reads) before creating under `sessionStartMs`; nothing else reads this.
+   */
+  probeStartsMs?: number[];
 }
+
+/** The sessionId / sessionStartMs of a body (top level, or inside `customFields`), shape-checked only: no window. */
+function readSessionFields(body: unknown): { sessionId: string; start: number } | null {
+  const b = (body && typeof body === 'object' ? body : {}) as Record<string, any>;
+  const cf = (b.customFields && typeof b.customFields === 'object' ? b.customFields : {}) as Record<string, any>;
+
+  const rawId = b.sessionId !== undefined ? b.sessionId : cf.sessionId;
+  if (typeof rawId !== 'string' || !SESSION_ID_RE.test(rawId)) return null;
+
+  const rawStart = b.sessionStartMs !== undefined ? b.sessionStartMs : cf.sessionStartMs;
+  let start: number;
+  if (typeof rawStart === 'number') start = rawStart;
+  else if (typeof rawStart === 'string' && /^\d{1,16}$/.test(rawStart)) start = Number(rawStart);
+  else return null;
+  if (!Number.isSafeInteger(start)) return null;
+  return { sessionId: rawId, start };
+}
+
+const startInWindow = (start: number, nowMs: number): boolean =>
+  start >= nowMs - SESSION_START_PAST_MS && start <= nowMs + SESSION_START_FUTURE_MS;
 
 /**
  * Pulls the session identity out of a forward-lead body: `sessionId` / `sessionStartMs` at the
@@ -82,21 +108,65 @@ export function resolveSessionIdentity(
   body: unknown,
   nowMs: number = Date.now(),
 ): SessionIdentity | null {
-  const b = (body && typeof body === 'object' ? body : {}) as Record<string, any>;
-  const cf = (b.customFields && typeof b.customFields === 'object' ? b.customFields : {}) as Record<string, any>;
+  const f = readSessionFields(body);
+  if (!f || !startInWindow(f.start, nowMs)) return null;
+  return { sessionId: f.sessionId, sessionStartMs: f.start };
+}
 
-  const rawId = b.sessionId !== undefined ? b.sessionId : cf.sessionId;
-  if (typeof rawId !== 'string' || !SESSION_ID_RE.test(rawId)) return null;
+/** ENG-2324: width of the generations a substituted start is drawn from. <= the 48h window, so every substitute is inside it. */
+export const SESSION_START_GENERATION_MS = 24 * 60 * 60 * 1000;
 
-  const rawStart = b.sessionStartMs !== undefined ? b.sessionStartMs : cf.sessionStartMs;
-  let start: number;
-  if (typeof rawStart === 'number') start = rawStart;
-  else if (typeof rawStart === 'string' && /^\d{1,16}$/.test(rawStart)) start = Number(rawStart);
-  else return null;
-  if (!Number.isSafeInteger(start)) return null;
-  if (start < nowMs - SESSION_START_PAST_MS || start > nowMs + SESSION_START_FUTURE_MS) return null;
+/**
+ * ENG-2324: a stand-in for a device start that is not usable, derived from the sessionId and the
+ * server clock only.
+ *
+ * Generation g(now) = the latest instant <= now of the form k*24h + phase, phase = hash(sessionId)
+ * mod 24h. It is therefore in (now-24h, now]: always inside the window, always a real 13-digit
+ * time, never ahead of the server clock, and no more than a day behind it. It is identical for
+ * every event of the session until `now` passes the session's own phase instant (once a day,
+ * at a point the session id picks, not a shared midnight); after that the generation advances by
+ * 24h. `probeStartsMs` lists where the session may already have its row: the device start when it
+ * had aged out of the window (`agedOutDeviceStart`: the row was created while it was inside) and the
+ * two previous generations (a session of up to 48h).
+ * A caller cannot choose anything the window did not already let it choose: the phase picks a
+ * position inside the last 24h, an in-window sessionStartMs picks one inside the last 48h.
+ */
+export function substituteSessionStart(sessionId: string, nowMs: number, agedOutDeviceStart?: number): SessionIdentity {
+  const phase = parseInt(
+    crypto.createHash('sha256').update(`start:${sessionId.toLowerCase()}`).digest('hex').slice(0, 8), 16,
+  ) % SESSION_START_GENERATION_MS;
+  const sessionStartMs = Math.floor((nowMs - phase) / SESSION_START_GENERATION_MS) * SESSION_START_GENERATION_MS + phase;
+  return {
+    sessionId,
+    sessionStartMs,
+    probeStartsMs: [
+      ...(agedOutDeviceStart !== undefined ? [agedOutDeviceStart] : []),
+      sessionStartMs - SESSION_START_GENERATION_MS,
+      sessionStartMs - 2 * SESSION_START_GENERATION_MS,
+    ],
+  };
+}
 
-  return { sessionId: rawId, sessionStartMs: start };
+/**
+ * ENG-2324: the PUBLIC tracker ingest's identity parser. Same as resolveSessionIdentity when the
+ * start is inside the window; but a well-formed start OUTSIDE it (a device clock that is wrong, a tab
+ * left open for days) is no longer a rejection — that lost every event of the session. It is
+ * replaced by substituteSessionStart. forward-lead keeps the strict resolveSessionIdentity.
+ *
+ * `body.clientNowMs` (the SDK's Date.now() when it built the event; optional) makes the decision
+ * sticky for a device whose clock is AHEAD by more than the 5 minutes: such a start is out of the
+ * window now but enters it as the clock catches up, which would move the session from its
+ * substitute row to a new one mid-session. A device that is ahead is ahead for the whole session,
+ * so it is substituted for the whole session. The value only ever pushes a session onto the
+ * substitute (which is bounded), never off the window rule, so a lying caller gains nothing.
+ */
+export function resolveIngestSessionIdentity(body: unknown, nowMs: number = Date.now()): SessionIdentity | null {
+  const f = readSessionFields(body);
+  if (!f) return null;
+  const clientNow = (body as Record<string, unknown>).clientNowMs;
+  const deviceAhead = typeof clientNow === 'number' && clientNow > nowMs + SESSION_START_FUTURE_MS;
+  if (!deviceAhead && startInWindow(f.start, nowMs)) return { sessionId: f.sessionId, sessionStartMs: f.start };
+  return substituteSessionStart(f.sessionId, nowMs, f.start < nowMs - SESSION_START_PAST_MS ? f.start : undefined);
 }
 
 /**

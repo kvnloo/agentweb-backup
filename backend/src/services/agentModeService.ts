@@ -55,6 +55,7 @@ import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
 import {
   normalizeOpenRouterResponseMetadata,
   normalizeOpenRouterErrorMetadata,
+  resolveServedChainModel,
 } from './agentMode/openRouterMetadata';
 import {
   assertOpenRouterToolsSupported,
@@ -355,7 +356,7 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -2782,6 +2783,12 @@ export class AgentModeService {
       ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
     });
     // Fire-and-forget usage metering; it must never break an LLM call.
+    // ENG-1345: when OpenRouter served one of `fallbackModels`, meter the model
+    // that actually answered, not the primary we asked for first.
+    const meteredModel = resolveServedChainModel(
+      (res as any)?.model,
+      paramChain.map(m => ({ modelId: m.modelId, upstreamModel: m.upstreamModel })),
+    ) ?? model;
     // ENG-1816 F1: routed through recordLlmUsage, which decides funding ABOVE this
     // fire-and-forget funnel — see funding/recordLlmUsage.ts for why. Branch on
     // RunFunding.route, never on usage.is_byok below: that flag also fires for
@@ -2795,7 +2802,7 @@ export class AgentModeService {
           userId: usageContext?.userId,
           billingUserId: usageContext?.billingUserId,
           sessionId: usageContext?.sessionId,
-          model,
+          model: meteredModel,
           provider: providerLabel,
           feature: usageContext?.feature || 'agent_task',
           eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
@@ -9906,6 +9913,7 @@ export class AgentModeService {
     status?: string;
     limit?: number;
     cursor?: string;
+    includeAllFields?: boolean;
   } = {}): Promise<any> {
     return leadsImpl.getLeads(listId, userId, options);
   }
