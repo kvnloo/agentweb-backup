@@ -439,6 +439,18 @@ export async function resolveEffectiveModelForUser(input: {
   ) {
     throw new ModelUnavailableError(input.requestedModel as string, 'not_selectable');
   }
+  // No explicit selection (allowSilentSwap) but the requested/stored model is a live-voice
+  // id: it cannot serve a text chat, so treat it as not selectable. Dropping it from the
+  // supported set makes selectPolicyModel 'correct' it to the default, exactly like an
+  // internalOnly/adminOnly model.
+  if (
+    input.allowSilentSwap
+    && requestedResolution
+    && typeof agentModeService.isLiveModel === 'function'
+    && agentModeService.isLiveModel(requestedResolution.model)
+  ) {
+    supportedModelIds = supportedModelIds.filter((id) => id !== requestedResolution.model);
+  }
   const decision = selectPolicyModel({
     usageMode: usage.mode.usageMode,
     requestedModel: requestedResolution?.model || input.requestedModel,
@@ -458,6 +470,23 @@ export async function resolveEffectiveModelForUser(input: {
     usageMode: usage.mode.usageMode,
     usagePolicyVersion: usage.policy?.version || null,
   };
+}
+
+/**
+ * A request-body llmModel that is not a string (array, number, object...) is still an
+ * explicit selection, but it must never reach the registry lookups, which coerce keys
+ * (['gpt-5.5'] would match 'gpt-5.5' and then blow up later as a 500). Give it a
+ * stable string form so it is refused like any other unserved id. null/undefined/blank
+ * stay "no selection".
+ */
+function normalizeRequestedLlmModel(raw: unknown): string | undefined {
+  if (raw === null || raw === undefined) return undefined;
+  if (typeof raw === 'string') return raw.trim() || undefined;
+  try {
+    return JSON.stringify(raw) ?? String(raw);
+  } catch {
+    return String(typeof raw);
+  }
 }
 
 /** The one 422 body for a ModelUnavailableError (display name from the registry when the id is one). */
@@ -9031,7 +9060,7 @@ export const agentModeController = {
       const user = authReq.user as User;
       const { portalType: requestedPortalType = 'agent', pageIdentifier: requestedPageIdentifier = 'agent-mode', sessionType, idempotencyKey, llmModel: rawRequestedLlmModel } = req.body;
       // A padded id is trimmed; blank counts as NO selection (like '').
-      const requestedLlmModel = typeof rawRequestedLlmModel === 'string' ? rawRequestedLlmModel.trim() : rawRequestedLlmModel;
+      const requestedLlmModel = normalizeRequestedLlmModel(rawRequestedLlmModel);
       const skillId = req.params?.skillId;
       const portalType = skillId ? 'agent' : requestedPortalType;
       let skill;
@@ -9403,7 +9432,7 @@ export const agentModeController = {
       const { sessionId, llmModel: rawLlmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer, deckAnswer, deckCancel, clientId } = req.body;
       let { userMessage } = req.body;
       // A padded id is trimmed; blank counts as NO selection (like '').
-      const llmModel = typeof rawLlmModel === 'string' ? rawLlmModel.trim() : rawLlmModel;
+      const llmModel = normalizeRequestedLlmModel(rawLlmModel);
 
       // If the request contains audio, transcribe it to text first
       if (audioInput?.data && !userMessage) {
@@ -10500,10 +10529,15 @@ export const agentModeController = {
   async getModelOptions(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const [usage, supportedModels] = await Promise.all([
+      const [usage, entitledModels] = await Promise.all([
         getEffectiveLlmUsagePolicy(user.userId),
         agentModeService.getSupportedModels(user.isAdmin === true),
       ]);
+      // Every consumer (chat composer, schedule form, MCP) is a text-chat picker, and an
+      // explicit live-voice pick is refused (422 not_selectable), so never offer one.
+      const supportedModels = typeof agentModeService.isLiveModel === 'function'
+        ? entitledModels.filter((id) => !agentModeService.isLiveModel(id))
+        : entitledModels;
       const optimizedModels = scheduleBackupModels(
         usage.policy?.optimizedModelIds ?? supportedModels, supportedModels,
       );

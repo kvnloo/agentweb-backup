@@ -1,6 +1,6 @@
 ## ENG-903: An explicit model selection runs on that model or not at all (2026-10-07)
 
-Rule: a model the user (or a schedule pin, or the session's stored selection) explicitly chose is either the model that runs, or nothing runs and the caller is told. It is never replaced by the default, never "corrected", and never overwritten in storage. No selection at all still uses the configured default; usage-paused is still the 429; registry legacy aliases (`LEGACY_MODEL_ALIASES`) still map forward; a user-configured backup model is unchanged.
+Rule: a model the user explicitly chose (the request carries it, or a schedule pin) is either the model that runs, or nothing runs and the caller is told. It is never replaced by the default, never "corrected", and never overwritten in storage. No selection at all still uses the configured default; usage-paused is still the 429; registry legacy aliases (`LEGACY_MODEL_ALIASES`) still map forward; a user-configured backup model is unchanged.
 
 **How:** `resolveEffectiveModelForUser` throws `ModelUnavailableError` (`services/agentMode/modelUnavailable.ts`) when an explicit model is not served (`resolveGenerationModel(...).fellBack`, which used to mask the policy's `corrected`) or is not selectable. `allowSilentSwap` is true only when there is NO explicit selection (unpinned schedule, no-selection session creation, unselected shared session).
 

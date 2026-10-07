@@ -1,10 +1,11 @@
 /**
- * FAIL-LOUD selected model. An explicit selection (request llmModel, session-stored
- * llmModel, requestedLlmModel at session creation) must run on exactly that model or
- * not run at all: resolveEffectiveModelForUser throws ModelUnavailableError instead of
+ * FAIL-LOUD selected model. An explicit selection (a model the REQUEST carries: /generate
+ * llmModel, requestedLlmModel at session creation) must run on exactly that model or not
+ * run at all: resolveEffectiveModelForUser throws ModelUnavailableError instead of
  * silently swapping in the default, and the interactive handlers answer 422
  * { error, code:'model_unavailable', requestedModel, reason } with no LLM call, no
- * metering, no session write and the generation lock released.
+ * metering, no session write and the generation lock released. A model merely STORED
+ * on a session is not explicit: it falls back to the default (allowSilentSwap).
  */
 import { Request, Response } from 'express';
 
@@ -51,12 +52,14 @@ jest.mock('../services/agentModeService', () => ({
     getReportsModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
     getCustomerSupportDefaultModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
     // internalOnly ids are registry keys but excluded from the supported set.
-    getSupportedModels: jest.fn(async () => ['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5']),
+    // Like the real getSupportedModels(false): the live-voice id IS in the supported set.
+    getSupportedModels: jest.fn(async () => ['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5', 'live-voice-1']),
     // Mirrors the real behaviour: unknown ids fall back to the default, registry ids pass.
     resolveGenerationModel: jest.fn((model: string) => {
       const registry = new Set(['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5', 'internal-judge-1', 'legacy-old-alias-target', 'live-voice-1']);
+      // Like the real hasOwnProperty lookup, an array key coerces to its string form.
       const normalized = model === 'legacy-old-alias' ? 'legacy-old-alias-target' : model;
-      return registry.has(normalized)
+      return registry.has(String(normalized))
         ? { model: normalized, fellBack: false, requestedModel: model }
         : { model: 'gpt-5-chat-2', fellBack: true, requestedModel: model };
     }),
@@ -315,6 +318,43 @@ describe('POST /generate (fail-loud)', () => {
     expect(res.statusCode).toBe(200);
   });
 
+  it('a STORED live-voice model with NO request llmModel runs on the default in a text chat (never the live id)', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(baseSession('live-voice-1') as any);
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({}), res);
+    expect(res.statusCode).toBe(200);
+    expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: DEFAULT_MODEL }), expect.anything());
+    expect(mockWorker.runInWorker).not.toHaveBeenCalledWith(expect.objectContaining({ llmModel: 'live-voice-1' }), expect.anything());
+  });
+
+  it('resolver: allowSilentSwap + live model is corrected to the default', async () => {
+    const decision = await resolveEffectiveModelForUser({ userId: OWNER, requestedModel: 'live-voice-1', allowSilentSwap: true });
+    expect(decision.effectiveModel).toBe(DEFAULT_MODEL);
+    expect(decision.modelSelection).toBe('corrected');
+  });
+
+  it.each([
+    ['array', ['gpt-5.5']],
+    ['nested array', [['gpt-5.5']]],
+    ['number', 5],
+    ['true', true],
+    ['object', { id: 'gpt-5.5' }],
+  ])('non-string llmModel (%s) is an explicit but unserved selection: 422 model_unavailable, not 500', async (_n, value) => {
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: value }), res);
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toMatchObject({ code: 'model_unavailable' });
+    expect(typeof res.body.requestedModel).toBe('string');
+    assertNothingRan();
+  });
+
+  it('null llmModel is NO selection (stored model falls back, 200)', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(baseSession(UNSERVED) as any);
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: null }), res);
+    expect(res.statusCode).toBe(200);
+  });
+
   it('422 not_selectable for an explicit LIVE voice model, before the user message is persisted', async () => {
     const res = makeRes();
     await agentModeController.generateResponse(generateReq({ llmModel: 'live-voice-1' }), res);
@@ -402,7 +442,7 @@ describe('POST /generate (fail-loud)', () => {
 });
 
 describe('shared generate (anonymous visitors select nothing)', () => {
-  it.each([UNSERVED, INTERNAL_ONLY])('a stored %s owner model falls back to the default, no 422', async (stored) => {
+  it.each([UNSERVED, INTERNAL_ONLY, 'live-voice-1'])('a stored %s owner model falls back to the default, no 422', async (stored) => {
     mockChatbotDb.getChatSession.mockResolvedValue({
       ...baseSession(stored),
       interactiveShareMetadata: { isActive: true, token: 'tok', sharedAt: '2026-07-01T00:00:00Z' },

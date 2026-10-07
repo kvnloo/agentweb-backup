@@ -1,10 +1,11 @@
 /**
- * FAIL-LOUD selected model: an explicit model selection (request `llmModel`,
- * session-stored `llmModel`, `requestedLlmModel` at session creation) must run
- * on exactly that model or not run at all. `resolveEffectiveModelForUser`
- * throws this instead of silently substituting the default; interactive
- * handlers translate it into the 422 body built here. This file is the ONLY
- * producer of the user-facing message text.
+ * FAIL-LOUD selected model: an explicit model selection (a model the REQUEST
+ * carries: `/generate` `llmModel`, `requestedLlmModel` at session creation; or a
+ * schedule pin) must run on exactly that model or not run at all. A model merely
+ * STORED on a session is not explicit and falls back to the default.
+ * `resolveEffectiveModelForUser` throws this instead of silently substituting the
+ * default; interactive handlers translate it into the 422 body built here. This
+ * file is the ONLY producer of the user-facing message text.
  */
 
 export type ModelUnavailableReason = 'not_served' | 'not_selectable';

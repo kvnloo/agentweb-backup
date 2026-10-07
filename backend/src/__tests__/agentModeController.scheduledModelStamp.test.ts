@@ -349,6 +349,28 @@ describe('getModelOptions — authoritative model discovery', () => {
       scheduleBackupModels: ['openrouter/x-ai/grok-4.7'],
     }));
   });
+
+  it('never offers a live-voice model: every consumer is a text-chat picker and an explicit live pick now 422s', async () => {
+    mockAgentModeService.getSupportedModels.mockResolvedValue(['gpt-a', 'live-voice-1', 'gpt-b'] as any);
+    (mockAgentModeService as any).isLiveModel = jest.fn((id: string) => id === 'live-voice-1');
+    mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+      billingUserId: 'test-user-123', policy: null, costUsedMicroUsd: 0, creditsApplied: false,
+      mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
+    });
+    const json = jest.fn();
+    try {
+      await agentModeController.getModelOptions(
+        { user: { userId: 'test-user-123', isAdmin: false } } as any,
+        { json, status: jest.fn(() => ({ json })) } as any,
+      );
+    } finally {
+      delete (mockAgentModeService as any).isLiveModel;
+    }
+    const body = json.mock.calls[0][0];
+    expect(body.allModels).toEqual(['gpt-a', 'gpt-b']);
+    expect(body.selectableModels).toEqual(['gpt-a', 'gpt-b']);
+    expect(body.scheduleBackupModels).not.toContain('live-voice-1');
+  });
 });
 
 /**

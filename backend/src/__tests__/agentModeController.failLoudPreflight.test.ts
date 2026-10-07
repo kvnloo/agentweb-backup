@@ -1,8 +1,10 @@
 /**
- * FAIL-LOUD at the entry points that bypass resolveEffectiveModelForUser and run
- * the SESSION-STORED model through a person's action (conversable, verifiedGenerate):
- * a retired stored model 422s BEFORE any write or worker dispatch. generateSessionResponse
- * itself stays lenient so system-assigned flows (Slack, GTM, ...) keep the fallback.
+ * Entry points that run the SESSION-STORED model (conversable, verifiedGenerate). A model
+ * merely STORED on a session is NOT an explicit selection (only a request-carried model or
+ * a schedule pin is), so a retired / internalOnly / live-voice stored model never 422s:
+ * it falls back to the current default (conversable, verifiedGenerate stores the default
+ * on the session first). generateSessionResponse stays lenient for system-assigned flows
+ * (Slack, GTM, ...).
  */
 import { Request, Response } from 'express';
 
@@ -46,10 +48,12 @@ jest.mock('../services/agentModeService', () => ({
     getReportsModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
     getCustomerSupportDefaultModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
     // internalOnly ids are registry keys but excluded from the supported set.
-    getSupportedModels: jest.fn(async () => ['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5']),
+    // Like the real getSupportedModels(false), the live-voice id IS in the supported set.
+    getSupportedModels: jest.fn(async () => ['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5', 'live-voice-1']),
+    isLiveModel: jest.fn((id: string) => id === 'live-voice-1'),
     // Mirrors the real behaviour: unknown ids fall back to the default, registry ids pass.
     resolveGenerationModel: jest.fn((model: string) => {
-      const registry = new Set(['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5', 'internal-judge-1', 'legacy-old-alias-target']);
+      const registry = new Set(['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5', 'internal-judge-1', 'legacy-old-alias-target', 'live-voice-1']);
       const normalized = model === 'legacy-old-alias' ? 'legacy-old-alias-target' : model;
       return registry.has(normalized)
         ? { model: normalized, fellBack: false, requestedModel: model }
@@ -203,6 +207,19 @@ describe('conversable generate (visitor selects nothing)', () => {
   });
 });
 
+describe('conversable generate: stored live-voice model', () => {
+  it('runs a text chat on the default, never the live id', async () => {
+    const res = makeRes();
+    await agentModeController.generateConversableResponse({
+      params: { shareId: SESSION_ID },
+      body: { userMessage: MESSAGE, attachments: [] },
+      conversableSession: session('live-voice-1'),
+      on: jest.fn(),
+    } as unknown as Request, res);
+    expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: DEFAULT_MODEL }), expect.anything());
+  });
+});
+
 describe('verifiedGenerate (stored model is not a selection)', () => {
   const verifiedReq = () => ({
     user: { userId: OWNER },
@@ -218,6 +235,12 @@ describe('verifiedGenerate (stored model is not a selection)', () => {
     expect(res.statusCode).not.toBe(422);
     expect(res.statusCode).not.toBe(500);
     expect(mockAlert).not.toHaveBeenCalled();
+  });
+
+  it('a stored live-voice model is replaced by the default before the run reads the session', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(session('live-voice-1') as any);
+    await agentModeController.verifiedGenerate(verifiedReq(), makeRes());
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, expect.anything());
   });
 
   it('a stored internalOnly model is replaced by the default before the run reads the session', async () => {
