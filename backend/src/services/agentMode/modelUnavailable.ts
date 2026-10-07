@@ -74,19 +74,10 @@ export interface SharedModelUnavailableBody {
  * owner's stored model must not be disclosed to them, so there is no model id,
  * name or "you selected" wording here.
  */
-// `reason` is deliberately omitted: it would tell an anonymous visitor that the owner's model is internal/admin-only.
-export function buildSharedModelUnavailableBody(_err: ModelUnavailableError): SharedModelUnavailableBody {
+// Takes no argument on purpose: nothing about the error (model id, name, `reason`) may reach an anonymous visitor; `reason` would reveal that the owner's model is internal/admin-only.
+export function buildSharedModelUnavailableBody(): SharedModelUnavailableBody {
   return {
     error: "This shared conversation can't continue right now because its model is no longer available. Ask the person who shared it to choose another model.",
     code: 'model_unavailable',
   };
-}
-
-/**
- * Message for chat channels (Slack, Teams, ...): nobody picked a model in the
- * thread and there is no picker, and the stored id must never be echoed into
- * channel markup (mrkdwn would render <!channel>/<@U..>), so no model id or name.
- */
-export function buildChannelModelUnavailableMessage(): string {
-  return "I can't answer in this thread because the model it was started with is no longer available. Please start a new thread, or switch the model in the AgentWeb app.";
 }

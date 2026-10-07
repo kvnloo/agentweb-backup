@@ -235,7 +235,9 @@ describe('runScheduledChat: pinned unserved model fails loud (WP-G)', () => {
     const result: any = await runScheduledChat({ ...baseSchedule, llmModel: 'internal-judge-1' }, USER, false, 'run-fl-2');
     await flushAsync();
     expect(result.status).toBe('failure');
-    expect(result.actualResponse).toContain('model_unavailable: pinned model "internal-judge-1"');
+    expect(result.actualResponse).toBe(
+      'model_unavailable: pinned model "internal-judge-1" is not selectable — choose a served model for this schedule',
+    );
     expectNothingRan();
   });
 

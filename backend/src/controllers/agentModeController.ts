@@ -457,6 +457,19 @@ function modelUnavailableBody(err: ModelUnavailableError) {
   return buildModelUnavailableBody(err, displayName);
 }
 
+/**
+ * Strict check of a session's STORED model for the entry points where a person
+ * picked it (shared/conversable chat, verified-generate). Pure and synchronous
+ * (no settings reads), so it is cheap to run before any write. System-assigned
+ * flows (Slack, work-plan launch, GTM, ...) deliberately do not call this.
+ */
+function storedModelUnavailable(storedModel: string | null | undefined): ModelUnavailableError | null {
+  if (!storedModel || typeof agentModeService.resolveGenerationModel !== 'function') return null;
+  return agentModeService.resolveGenerationModel(storedModel).fellBack
+    ? new ModelUnavailableError(storedModel, 'not_served')
+    : null;
+}
+
 async function resolveScheduleBackup(input: {
   userId: string;
   requestedBackupModel?: string | null;
@@ -6240,7 +6253,7 @@ export async function runScheduledChat(
         runId: preGeneratedRunId || require('uuid').v4(),
         status: 'failure' as const,
         passed: false,
-        actualResponse: `model_unavailable: pinned model "${pinnedLabel}" is not served — choose a served model for this schedule`,
+        actualResponse: `model_unavailable: pinned model "${pinnedLabel}" is ${modelError.reason === 'not_served' ? 'not served' : 'not selectable'} — choose a served model for this schedule`,
         actualFunctionCalls: [],
         keywordMatches: [],
         keywordMisses: schedule.keywords || [],
@@ -8392,21 +8405,6 @@ export async function generateSessionResponse(
   if (!session) {
     throw new Error('Session not found');
   }
-  // FAIL-LOUD pre-flight, before ANY write or worker dispatch: the model that will
-  // run is the session's stored selection (callers pass `session.llmModel || default`).
-  // If that explicit selection is not served the inner resolveGenerationModel would
-  // silently swap in the default; throw the typed error instead, outside the inner
-  // try/catch that wraps errors. A configured default is never "selected", so a
-  // misconfigured default keeps resolveFallbackModel's safety net.
-  if (
-    session.llmModel
-    && session.llmModel === llmModel
-    && llmModel !== agentModeService.default_model
-    && typeof agentModeService.resolveGenerationModel === 'function'
-    && agentModeService.resolveGenerationModel(llmModel).fellBack
-  ) {
-    throw new ModelUnavailableError(llmModel, 'not_served');
-  }
   // Some server-side callers (notably Slack) resume a persisted delegated
   // session without carrying the HTTP request's delegation flag. Preserve the
   // session's authority when dispatching the turn to the worker.
@@ -9442,6 +9440,15 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
 
+      // A STORED model on an interactive session is treated as a selection even when
+      // it was the auto-assigned default: if it was retired the picker shows it as
+      // 'Unavailable' and one pick fixes the session, so failing loudly here is
+      // recoverable. System-assigned flows (Slack, work-plan launch, GTM, onboarding,
+      // approval inbox) have no picker, so they never reach this check and keep the
+      // resolveFallbackModel safety net. We do NOT exempt `default_model` here: the
+      // stale STORED default is a different id from the current one, so that
+      // exemption would not help; and no persisted "user picked" flag exists.
+      //
       // FAIL-LOUD pre-flight: validate an explicit model BEFORE anything below
       // mutates the session (work-plan input answer, approval-deck answer/cancel
       // each persist state that a 422 would otherwise consume without a turn).
@@ -11037,7 +11044,7 @@ export const agentModeController = {
         if (!isModelUnavailableError(modelError)) throw modelError;
         // The visitor chose nothing, so the body names no model.
         if ((await checkTokenUsage(session.userId)).allowed) {
-          return res.status(422).json(buildSharedModelUnavailableBody(modelError));
+          return res.status(422).json(buildSharedModelUnavailableBody());
         }
       }
 
@@ -11195,7 +11202,7 @@ export const agentModeController = {
         if (!isModelUnavailableError(modelError)) throw modelError;
         // FAIL-LOUD: the owner's stored model is not served; nothing was sent
         // to another model. The visitor chose nothing, so the body names no model.
-        return res.status(422).json(buildSharedModelUnavailableBody(modelError));
+        return res.status(422).json(buildSharedModelUnavailableBody());
       }
       if (!modelPolicyDecision.effectiveModel) {
         // Runtime always exposes this method. The guard preserves older
@@ -14565,6 +14572,12 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
+      // FAIL-LOUD, before any write: a retired stored model is a 422, not a silent swap.
+      const storedModelError = storedModelUnavailable(session.llmModel);
+      if (storedModelError) {
+        return res.status(422).json(buildSharedModelUnavailableBody());
+      }
+
       // Use session's llmModel if available, otherwise use default
       const defaultModel = await agentModeService.getDefaultModel();
       const modelToUse = session.llmModel || defaultModel;
@@ -14604,11 +14617,6 @@ export const agentModeController = {
       const convSessionId = req.params?.shareId;
       if (convSessionId) {
         markProgressComplete(convSessionId);
-      }
-
-      // FAIL-LOUD: the owner's stored model is not served. Anonymous visitor: no model named.
-      if (isModelUnavailableError(error)) {
-        return res.status(422).json(buildSharedModelUnavailableBody(error));
       }
 
       // Handle specific error types (same as generateResponse)
@@ -15340,6 +15348,12 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Access denied to this session' });
       }
 
+      // FAIL-LOUD, before any write: a retired stored model is a 422, not a silent swap.
+      const storedModelError = storedModelUnavailable(session.llmModel);
+      if (storedModelError) {
+        return res.status(422).json(modelUnavailableBody(storedModelError));
+      }
+
       // Track if client disconnected (user navigated away)
       let clientDisconnected = false;
       req.on('close', () => {
@@ -15433,13 +15447,6 @@ export const agentModeController = {
           code: 'PROVIDER_UNAVAILABLE',
           suggestion: 'wait_and_retry',
         });
-      }
-
-      // FAIL-LOUD: the session's stored model is not served — an expected, user-fixable
-      // outcome (422), not a failure worth an oncall alert or a 500. runVerifiedChat's
-      // retry loop rethrows it untouched (not transient / zero-output / session-limit).
-      if (isModelUnavailableError(error)) {
-        return res.status(422).json(modelUnavailableBody(error));
       }
       console.error('AgentMode: Verified generate error:', error);
       const sessionId = req.body?.sessionId;

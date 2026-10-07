@@ -1,9 +1,8 @@
 /**
- * FAIL-LOUD pre-flight inside generateSessionResponse (WP-I): entry points that
- * bypass resolveEffectiveModelForUser (conversable, verifiedGenerate, Slack,
- * GTM, approval-inbox) run the SESSION-STORED model. An explicit stored model
- * that is not served must throw the typed ModelUnavailableError BEFORE any
- * write or worker dispatch — never be silently swapped by the inner layer.
+ * FAIL-LOUD at the entry points that bypass resolveEffectiveModelForUser and run
+ * the SESSION-STORED model through a person's action (conversable, verifiedGenerate):
+ * a retired stored model 422s BEFORE any write or worker dispatch. generateSessionResponse
+ * itself stays lenient so system-assigned flows (Slack, GTM, ...) keep the fallback.
  */
 import { Request, Response } from 'express';
 
@@ -37,11 +36,7 @@ jest.mock('../services/generateMarketingResponseWorkerService', () => ({
   },
 }));
 
-const DEFAULT_MODEL = 'gpt-5-chat-2';
-const SERVED = [DEFAULT_MODEL, 'gemini-3.5-flash', 'gpt-5.5'];
 const UNSERVED = 'retired-model-9';
-const INTERNAL_ONLY = 'internal-judge-1';
-const REGISTRY = new Set([...SERVED, INTERNAL_ONLY, 'legacy-old-alias-target']);
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
@@ -114,11 +109,10 @@ import {
   activeSessionGenerations,
   generateSessionResponse,
 } from '../controllers/agentModeController';
-import { ModelUnavailableError, isModelUnavailableError } from '../services/agentMode/modelUnavailable';
+import { ModelUnavailableError } from '../services/agentMode/modelUnavailable';
 import { isTransientLLMError, isSessionLimitError } from '../utils/agentModeErrors';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { chatbotDb } from '../services/chatbotService';
-import { agentModeService } from '../services/agentModeService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { incrementUserTokenUsage } from '../services/tokenUsageService';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
@@ -176,48 +170,17 @@ beforeEach(() => {
   mockWorker.runInWorker.mockResolvedValue({ content: 'OK', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] } as any);
 });
 
-describe('generateSessionResponse pre-flight', () => {
-  it('throws the typed error for an unserved explicit stored model, intact and with ZERO writes/dispatch', async () => {
+describe('generateSessionResponse (system-assigned flows keep the fallback)', () => {
+  it('does NOT throw for a stale stored model: Slack/GTM/onboarding have no picker, so it runs on the fallback', async () => {
     mockChatbotDb.getChatSession.mockResolvedValue(session(UNSERVED) as any);
-    const err = await generateSessionResponse(SESSION_ID, MESSAGE, OWNER, UNSERVED).catch((e) => e);
-
-    expect(err).toBeInstanceOf(ModelUnavailableError);
-    expect(err).toMatchObject({ code: 'model_unavailable', requestedModel: UNSERVED, reason: 'not_served' });
-    expectZeroWrites();
+    await expect(generateSessionResponse(SESSION_ID, MESSAGE, OWNER, UNSERVED)).resolves.toBeDefined();
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
   });
 
   it('the typed error is neither transient nor session-limit, so runVerifiedChat never retries it', () => {
     const err = new ModelUnavailableError(UNSERVED, 'not_served');
     expect(isTransientLLMError(err)).toBe(false);
     expect(isSessionLimitError(err)).toBe(false);
-  });
-
-  it('does not throw when no model is stored (default path unchanged)', async () => {
-    mockChatbotDb.getChatSession.mockResolvedValue(session() as any);
-    await expect(generateSessionResponse(SESSION_ID, MESSAGE, OWNER, DEFAULT_MODEL)).resolves.toBeDefined();
-    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not throw for a served stored model or a legacy alias', async () => {
-    await expect(generateSessionResponse(SESSION_ID, MESSAGE, OWNER, 'gpt-5.5')).resolves.toBeDefined();
-    mockChatbotDb.getChatSession.mockResolvedValue(session('legacy-old-alias') as any);
-    await expect(generateSessionResponse(SESSION_ID, MESSAGE, OWNER, 'legacy-old-alias')).resolves.toBeDefined();
-  });
-
-  it('never throws "selected" about the configured default, even if it is stored and unserved', async () => {
-    const dm = (agentModeService as any).default_model;
-    (agentModeService as any).default_model = UNSERVED;
-    try {
-      mockChatbotDb.getChatSession.mockResolvedValue(session(UNSERVED) as any);
-      await expect(generateSessionResponse(SESSION_ID, MESSAGE, OWNER, UNSERVED)).resolves.toBeDefined();
-    } finally {
-      (agentModeService as any).default_model = dm;
-    }
-  });
-
-  it('does not throw when the caller passes a different model than the stored one (caller already chose it)', async () => {
-    mockChatbotDb.getChatSession.mockResolvedValue(session(UNSERVED) as any);
-    await expect(generateSessionResponse(SESSION_ID, MESSAGE, OWNER, 'gpt-5.5')).resolves.toBeDefined();
   });
 });
 

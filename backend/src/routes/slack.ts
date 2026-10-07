@@ -37,7 +37,6 @@ import { isSessionLimitError } from "../utils/agentModeErrors";
 import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
 import { getEmmaBotUserId, handleLoopApprovalReaction } from "../services/loopSlackApprovalDispatcher";
 import { agentModeService } from '../services/agentModeService';
-import { buildChannelModelUnavailableMessage, isModelUnavailableError } from '../services/agentMode/modelUnavailable';
 import { handleSessionResponse } from "../services/conversation/sessionResponder";
 import { slackChannelAdapter, renderOutboundForSlack } from "../services/conversation/slackChannelAdapter";
 import type { ConversationRef } from "../services/conversation/channelPort";
@@ -299,14 +298,11 @@ async function handleMappedSlackThreadResponse(params: {
     else await postThreadResponse(channel, threadTs, 'I completed the task but was unable to format a response. Please check the portal for results or try again.');
   } catch (genError) {
     console.error('❌ Error generating thread response:', genError);
-    // FAIL-LOUD: the session's selected model is not served — say so (the one
-    // server-produced channel message, no model id) instead of a generic "Sorry". Single catch, no retry.
-    const modelUnavailableText = isModelUnavailableError(genError) ? buildChannelModelUnavailableMessage() : undefined;
-    await postThreadResponse(channel, threadTs, modelUnavailableText ?? 'Sorry, I encountered an error. Please try again.');
+    await postThreadResponse(channel, threadTs, 'Sorry, I encountered an error. Please try again.');
     try {
       await chatbotDb.addMessageToSession(sessionId, {
         role: 'assistant',
-        content: modelUnavailableText ?? 'Sorry, I encountered an error processing your request. Please try again.',
+        content: 'Sorry, I encountered an error processing your request. Please try again.',
         timestamp: new Date().toISOString(),
         metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
       });
