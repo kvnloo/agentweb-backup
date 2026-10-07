@@ -60,11 +60,14 @@ jest.mock('../services/db', () => ({
     getUserById: jest.fn(async (id: string) => ({ userId: id, email: `${id}@x.test`, isAdmin: false, sessionVersion: 0 })),
   },
 }));
+// runFunding is REAL (so the ambient scope is real); only the settings-backed flag read it lazy-loads is faked.
+jest.mock('../services/funding/fundingFlags', () => ({ getFundingFlags: async () => ({}) }));
 jest.mock('../services/voiceService', () => ({ synthesizeSpeech: jest.fn() }));
 jest.mock('../middleware/serviceAuth', () => ({ requireScheduledChatsServiceSecret: (_q: unknown, _r: unknown, n: () => void) => n() }));
 jest.mock('../services/agentMode/runStore', () => ({ getOwnedRunStatus: jest.fn() }));
 
 import agentModeRoutes from '../routes/agentMode';
+import { currentRunFunding } from '../services/funding/runFunding';
 
 const GOOD_SECRET = 'route-test-secret';
 const bearer = (userId: string) => `Bearer ${jwt.sign({ userId, email: `${userId}@x.test`, isAdmin: false }, GOOD_SECRET)}`;
@@ -113,6 +116,19 @@ describe('POST /compare', () => {
       expect(Object.keys(call[2])).toEqual(expect.not.arrayContaining(['tools', 'webSearch', 'tool_choice', 'fallbackModels']));
     }
     expect(JSON.stringify(out.body)).not.toMatch(/"cost"|"usage"/);
+  });
+
+  it('runs every model call inside the run-funding scope of the session owner (same as /generate)', async () => {
+    const seen: Array<{ route?: string; ownerUserId?: string } | undefined> = [];
+    mockCallLLM.mockImplementation(async (model: string) => {
+      const funding = currentRunFunding();
+      seen.push(funding && { route: funding.route, ownerUserId: funding.ownerUserId });
+      return { choices: [{ message: { content: `from ${model}` } }] };
+    });
+    const out = await request(app).post('/api/agent-mode/compare').set('Authorization', bearer('owner')).send(validBody);
+    expect(out.status).toBe(200);
+    expect(seen).toHaveLength(2);
+    expect(seen).toEqual([{ route: 'agentweb', ownerUserId: 'owner' }, { route: 'agentweb', ownerUserId: 'owner' }]);
   });
 
   it('403 for a non-owner, 404 for a missing session', async () => {

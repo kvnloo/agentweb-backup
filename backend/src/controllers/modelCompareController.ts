@@ -18,6 +18,7 @@ import { checkTokenUsage, resolveBillingUserId } from '../services/tokenUsageSer
 import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
 import { getModelPrice } from '../utils/llmPricing';
 import { isCronEnabled } from '../utils/instanceState';
+import { resolveRunFunding, withRunFunding, type RunFunding } from '../services/funding/runFunding';
 import {
   releaseSessionGeneration,
   resolveEffectiveModelForUser,
@@ -62,6 +63,19 @@ const log = (message: string, fields?: Record<string, unknown>): void => {
 };
 
 function compareDeps(): CompareDeps {
+  // Every LLM entry point resolves run funding once and runs inside withRunFunding (ENG-1816), so
+  // metering and any future customer-funded route see the same scope /generate gives. Today it always
+  // resolves to the AgentWeb route; resolved once per request (memoised per owner) so the parallel
+  // model calls do not each re-read the funding flags.
+  const fundingByOwner = new Map<string, Promise<RunFunding>>();
+  const fundingFor = (ownerUserId: string): Promise<RunFunding> => {
+    let pending = fundingByOwner.get(ownerUserId);
+    if (!pending) {
+      pending = resolveRunFunding({ userId: ownerUserId });
+      fundingByOwner.set(ownerUserId, pending);
+    }
+    return pending;
+  };
   return {
     isAcceptingWork: isCronEnabled,
     isFeatureEnabled: isModelCompareEnabled,
@@ -74,7 +88,10 @@ function compareDeps(): CompareDeps {
     getModelInfo: (model) => agentModeService.getModelCompareInfo(model),
     isPriced: (model) => getModelPrice(model) !== null,
     resolveBillingUserId,
-    callLLM: (model, messages, options) => agentModeService.callLLM(model, messages, options),
+    callLLM: async (model, messages, options) => {
+      const runFunding = await fundingFor(options.usageContext.userId);
+      return withRunFunding(runFunding, () => agentModeService.callLLM(model, messages, options));
+    },
     getSecret: getJwtSecret,
     now: () => Date.now(),
     newId: newCompareId,
