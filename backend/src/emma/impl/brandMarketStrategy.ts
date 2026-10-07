@@ -84,8 +84,8 @@ import {
 import { buildReadyPatch, logCompletionMetric } from '../../services/brandBuildStatusService';
 import {
   brandBuildOwnershipCondition,
-  isBrandBuildSessionSuperseded,
   parseBrandBuildSessionClaim,
+  shouldRefuseBrandBuildSessionWrite,
 } from '../../services/brandBuildSessionMarker';
 
   // Read current user's brand guidelines
@@ -283,7 +283,7 @@ export async function readMarketStrategy(
   }
 
   // Update user's market strategy
-export async function updateMarketStrategy(updateData: any, userId: string, opts: { replace?: boolean } = {}): Promise<any> {
+export async function updateMarketStrategy(updateData: any, userId: string, opts: { replace?: boolean; sessionId?: string } = {}): Promise<any> {
     try {
       const { userDb, orgDb } = await import('../../services/db');
       const { canEditItem } = await import('../../services/orgShareService');
@@ -296,6 +296,10 @@ export async function updateMarketStrategy(updateData: any, userId: string, opts
           error: 'User not found'
         };
       }
+
+      // ENG-2308: refuse / condition writes from a superseded brand-build session.
+      const guard = await guardBrandBuildSession(user, userDb, userId, opts.sessionId);
+      if (guard.refuse) return supersededResult();
 
       // Org members: only the org owner or a listed marketingStrategy editor
       // may update. Solo users are unaffected.
@@ -391,9 +395,10 @@ export async function updateMarketStrategy(updateData: any, userId: string, opts
 
       // Update org-level or personal market strategy
       if (user.orgId) {
+        await guard.assertStillCurrent();
         await orgDb.updateOrg(user.orgId, { marketStrategy: marketStrategyData });
       } else {
-        await userDb.updateUser(userId, { marketStrategy: marketStrategyData });
+        await guard.userWrite({ marketStrategy: marketStrategyData });
       }
 
       // ENG-2103 (F2): lazily required — brandGuidelinesPopulation.ts
@@ -457,6 +462,10 @@ export async function updateMarketStrategy(updateData: any, userId: string, opts
         formattedContent
       };
     } catch (error) {
+      if (error instanceof SupersededBrandBuildWrite) {
+        console.warn('[brandBuild] dropping market-strategy update from a superseded brand-build session: a newer claim took over mid-call');
+        return supersededResult();
+      }
       console.error('AgentMode: Error updating market strategy:', error);
       return {
         success: false,
@@ -473,6 +482,107 @@ class SupersededBrandBuildWrite extends Error {
     super('brand build superseded');
     this.name = 'SupersededBrandBuildWrite';
   }
+}
+
+const SUPERSEDED_MESSAGE =
+  'This brand build was superseded by a newer run, so this update was not applied. Stop now: do not retry, do not change the arguments, and end your turn.';
+
+/**
+ * Result for a refused write. Shaped as a deliberate policy refusal
+ * (`blocked` + `reason`, ENG-1636) so the dispatcher does not count it as a tool
+ * malfunction. The stop instruction is in `error`, not only `message`, because
+ * extractToolResultMessage prefers `error` and that is all the model is shown.
+ */
+function supersededResult() {
+  return {
+    success: false,
+    blocked: true,
+    reason: 'superseded_brand_build',
+    superseded: true,
+    error: SUPERSEDED_MESSAGE,
+    message: SUPERSEDED_MESSAGE,
+  };
+}
+
+interface BrandBuildSessionGuard {
+  /** The session's writes must be refused outright. */
+  refuse: boolean;
+  /** Set when the session belongs to the CURRENT build: its writes carry this claim as a condition. */
+  claim?: string;
+  /** Writes made for the guarded session; throws SupersededBrandBuildWrite if a reclaim lands first. */
+  userWrite: (patch: Record<string, unknown>) => Promise<any>;
+  /** Org-level writes cannot be conditioned on the user's claim, so re-check it consistently just before. */
+  assertStillCurrent: () => Promise<void>;
+}
+
+/**
+ * ENG-2308: decide how a brand-guidelines / market-strategy write from `sessionId`
+ * must behave, BEFORE anything is written. A brand build's Emma session is not
+ * aborted when the build times out, so a superseded ("zombie") session can still
+ * call these tools after a retry reclaimed the build; it must not overwrite the
+ * newer run's data. Only sessions marked as brand-build sessions are affected
+ * (see brandBuildSessionMarker); ordinary chat, REST saves, no session id, and
+ * old brand-build sessions reopened long after keep the original behavior.
+ */
+async function guardBrandBuildSession(
+  user: any,
+  userDb: any,
+  userId: string,
+  sessionId: string | undefined,
+): Promise<BrandBuildSessionGuard> {
+  const currentStartedAt: string | undefined = user?.brandBuildStartedAt;
+  let sessionClaim: string | undefined;
+  if (sessionId && currentStartedAt) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { chatbotDb } = require('../../services/chatbotService');
+      const session = await chatbotDb.getChatSessionRecord(sessionId, true);
+      sessionClaim = parseBrandBuildSessionClaim(session?.pageIdentifier);
+    } catch (lookupErr: any) {
+      // Cannot tell: treat as an ordinary session (original behavior).
+      console.warn('[brandBuild] session lookup failed; treating as a non-brand-build session', {
+        userId,
+        error: lookupErr?.message ?? String(lookupErr),
+      });
+    }
+  }
+
+  const refuse = shouldRefuseBrandBuildSessionWrite(sessionClaim, {
+    startedAt: currentStartedAt,
+    status: user?.brandBuildStatus,
+  });
+  if (refuse) {
+    console.warn('[brandBuild] dropping update from a superseded brand-build session', {
+      userId,
+      sessionId,
+      sessionClaim,
+      currentStartedAt,
+    });
+  }
+  // A marked session whose claim is no longer current but is not refused is an
+  // old session reopened later: ordinary chat, so no claim condition either.
+  const claim = !refuse && sessionClaim && sessionClaim === currentStartedAt ? sessionClaim : undefined;
+
+  return {
+    refuse,
+    claim,
+    userWrite: async (patch) => {
+      if (!claim) return userDb.updateUser(userId, patch as any);
+      try {
+        return await userDb.updateUser(userId, patch as any, {
+          condition: brandBuildOwnershipCondition(claim),
+        });
+      } catch (condErr: any) {
+        if (condErr?.code === 'ConditionalCheckFailedException') throw new SupersededBrandBuildWrite();
+        throw condErr;
+      }
+    },
+    assertStillCurrent: async () => {
+      if (!claim) return;
+      const fresh = user?.email ? await userDb.getUserByEmailConsistent(user.email) : null;
+      if (fresh && fresh.brandBuildStartedAt !== claim) throw new SupersededBrandBuildWrite();
+    },
+  };
 }
 
 export async function updateBrandGuidelines(
@@ -493,61 +603,11 @@ export async function updateBrandGuidelines(
         };
       }
 
-      // ENG-2308: if this call comes from a brand-build Emma session, find the
-      // claim that session belongs to BEFORE writing anything. A brand build's
-      // session is not aborted when the build times out, so a superseded
-      // ("zombie") session can still call this tool after a retry has reclaimed
-      // the build; it must not overwrite the newer run's brand guidelines or
-      // flip its status. Sessions that are not brand-build sessions (ordinary
-      // chat, REST saves, no session id) keep the original behavior, and the
-      // lookup is skipped when the user has never had a brand build.
-      const currentBuildStartedAt: string | undefined = (user as any).brandBuildStartedAt;
-      let sessionClaim: string | undefined;
-      if (opts.sessionId && currentBuildStartedAt) {
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-var-requires
-          const { chatbotDb } = require('../../services/chatbotService');
-          const session = await chatbotDb.getChatSessionRecord(opts.sessionId, true);
-          sessionClaim = parseBrandBuildSessionClaim(session?.pageIdentifier);
-        } catch (lookupErr: any) {
-          // Cannot tell: treat as an ordinary session (original behavior).
-          console.warn('[brandBuild] session lookup failed; treating as a non-brand-build session', {
-            userId,
-            error: lookupErr?.message ?? String(lookupErr),
-          });
-        }
-      }
-      const supersededResult = () => ({
-        success: false,
-        superseded: true,
-        message:
-          'This brand build was superseded by a newer run, so this update was not applied. Stop now and do not retry.',
-        error: 'Superseded brand build',
-      });
-      if (isBrandBuildSessionSuperseded(sessionClaim, currentBuildStartedAt)) {
-        console.warn('[brandBuild] dropping update from a superseded brand-build session', {
-          userId,
-          sessionId: opts.sessionId,
-          sessionClaim,
-          currentBuildStartedAt,
-        });
-        return supersededResult();
-      }
-      // Writes on behalf of a brand-build session also assert, atomically,
-      // that it is still the current claim (a reclaim can land after the check
-      // above). Org-level brand guidelines live on the org record, which has no
-      // claim to condition on, so for org members only the check above applies.
-      const userWrite = async (patch: Record<string, unknown>) => {
-        if (!sessionClaim) return userDb.updateUser(userId, patch as any);
-        try {
-          return await userDb.updateUser(userId, patch as any, {
-            condition: brandBuildOwnershipCondition(sessionClaim),
-          });
-        } catch (condErr: any) {
-          if (condErr?.code === 'ConditionalCheckFailedException') throw new SupersededBrandBuildWrite();
-          throw condErr;
-        }
-      };
+      // ENG-2308: refuse / condition writes from a superseded brand-build session.
+      const guard = await guardBrandBuildSession(user, userDb, userId, opts.sessionId);
+      if (guard.refuse) return supersededResult();
+      const userWrite = guard.userWrite;
+      const sessionClaim = guard.claim;
 
       // Org members: only the org owner or a listed brandGuidelines editor
       // may update. Solo users are unaffected.
@@ -602,6 +662,7 @@ export async function updateBrandGuidelines(
 
         // Update org or user with initial brand guidelines
         if (user.orgId) {
+          await guard.assertStillCurrent();
           await orgDb.updateOrg(user.orgId, { brandGuidelines: initialBrandGuidelines });
         } else {
           await userWrite({ brandGuidelines: initialBrandGuidelines });
@@ -855,6 +916,7 @@ export async function updateBrandGuidelines(
       };
 
       if (user.orgId) {
+        await guard.assertStillCurrent();
         await orgDb.updateOrg(user.orgId, { brandGuidelines: updatedGuidelines });
       } else {
         await userWrite({ brandGuidelines: updatedGuidelines });
@@ -940,13 +1002,7 @@ export async function updateBrandGuidelines(
     } catch (error) {
       if (error instanceof SupersededBrandBuildWrite) {
         console.warn('[brandBuild] dropping update from a superseded brand-build session: a newer claim took over mid-call');
-        return {
-          success: false,
-          superseded: true,
-          message:
-            'This brand build was superseded by a newer run, so this update was not applied. Stop now and do not retry.',
-          error: 'Superseded brand build',
-        };
+        return supersededResult();
       }
       console.error('AgentMode: Error updating brand guidelines:', error);
       return {

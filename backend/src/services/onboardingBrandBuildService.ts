@@ -38,7 +38,7 @@ import { logStepMetric } from "./onboardingMetricsService";
 import {
   brandBuildOwnershipCondition,
   brandBuildSessionPageIdentifier,
-  isBrandBuildSessionSuperseded,
+  isClaimSuperseded,
 } from "./brandBuildSessionMarker";
 
 const BRAND_BUILD_MODEL = "anthropic.claude-sonnet-4-6";
@@ -516,7 +516,7 @@ export async function triggerBrandBuildForUser(
   // would otherwise mirror stale results over the newer run's.
   if (deps.expectedStartedAt) {
     const latest = (await userDb.getUserById(userId)) as any;
-    if (isBrandBuildSessionSuperseded(deps.expectedStartedAt, latest?.brandBuildStartedAt)) {
+    if (isClaimSuperseded(deps.expectedStartedAt, latest?.brandBuildStartedAt)) {
       console.warn("[onboardingBrandBuildService] run superseded while its session ran; skipping post-session writes", {
         userId,
         ours: deps.expectedStartedAt,
