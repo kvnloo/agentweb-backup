@@ -144,13 +144,22 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
 // check send-linkedin-message/-invite, withdraw and accept-invitation already apply.
 const LINKEDIN_STEP_ACCOUNT_ERROR = 'A LinkedIn step references an account that is not connected to your user.';
 
-async function stepsReferenceForeignLinkedInAccount(userId: string, steps: unknown): Promise<boolean> {
+// `alreadyPinned` (PUT only) holds the account ids already stored on the caller's own sequence. Those are not
+// re-validated: a user can legitimately have a sequence whose pinned account was later disconnected, and an
+// unrelated edit must still save. They cannot be abused to send, because the drip worker re-checks the pin at
+// send time. Only a NEW or CHANGED pin has to be an account the caller owns or shares.
+async function stepsReferenceForeignLinkedInAccount(
+  userId: string,
+  steps: unknown,
+  alreadyPinned: ReadonlySet<string> = new Set(),
+): Promise<boolean> {
   if (!Array.isArray(steps)) return false;
   const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
   for (const step of steps) {
     const id = step?.linkedInAccountId;
     if (id === undefined || id === null || id === '') continue; // auto-resolved by the worker
     if (typeof id !== 'string') return true;
+    if (alreadyPinned.has(id)) continue;
     if (!(await resolveLinkedInAccountForWrite(userId, id))) return true;
   }
   return false;
@@ -215,7 +224,16 @@ router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response
         if (isSessionList(bound)) return res.status(400).json({ error: SESSION_LIST_SEQUENCE_ERROR });
       }
     }
-    if (await stepsReferenceForeignLinkedInAccount(authReq.user!.userId, steps)) {
+    // Only trust the stored pins of the CALLER's own sequence (updateSequence rejects anyone else below).
+    const stored = Array.isArray(steps)
+      ? await dripSequenceDb.getSequence(req.params.sequenceId).catch(() => null)
+      : null;
+    const alreadyPinned = new Set<string>(
+      stored && stored.userId === authReq.user!.userId
+        ? (stored.steps ?? []).map((st: any) => st?.linkedInAccountId).filter((v: unknown): v is string => typeof v === 'string' && !!v)
+        : [],
+    );
+    if (await stepsReferenceForeignLinkedInAccount(authReq.user!.userId, steps, alreadyPinned)) {
       return res.status(403).json({ error: LINKEDIN_STEP_ACCOUNT_ERROR });
     }
     const input: UpdateSequenceInput = {
