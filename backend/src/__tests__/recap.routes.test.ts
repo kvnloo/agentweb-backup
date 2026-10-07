@@ -146,6 +146,11 @@ describe('pure helpers', () => {
     expect(parseSince('nope')).toEqual({ ok: false });
     expect(parseSince('2026-10-01T00:00:00Z')).toEqual({ ok: true, since: Date.parse('2026-10-01T00:00:00Z') });
   });
+  it('parseSince rejects impossible calendar dates and timezone-less values', () => {
+    expect(parseSince('2026-02-30T00:00:00Z')).toEqual({ ok: false });
+    expect(parseSince('2026-10-01T00:00:00')).toEqual({ ok: false });
+    expect(parseSince('2026-10-01T00:00:00+05:30')).toEqual({ ok: true, since: Date.parse('2026-10-01T00:00:00+05:30') });
+  });
   it('projectRunResults tolerates non-arrays and undated rows under a since bound', () => {
     expect(projectRunResults(undefined, null)).toEqual([]);
     expect(projectRunResults([{ status: 'success' }], 0)).toEqual([]);

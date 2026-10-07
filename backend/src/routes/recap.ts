@@ -42,6 +42,13 @@ async function requireEntitledCaller(req: Request, res: Response): Promise<Authe
 export function parseSince(raw: unknown): { ok: true; since: number | null } | { ok: false } {
   if (raw === undefined || raw === '') return { ok: true, since: null };
   if (typeof raw !== 'string') return { ok: false };
+  // Require a full ISO date-time with an explicit timezone, and a real calendar date
+  // (Date.parse normalizes 2026-02-30 and treats zone-less values as server-local).
+  const m = /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/.exec(raw);
+  if (!m) return { ok: false };
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const cal = new Date(Date.UTC(y, mo - 1, d));
+  if (cal.getUTCFullYear() !== y || cal.getUTCMonth() !== mo - 1 || cal.getUTCDate() !== d) return { ok: false };
   const ms = Date.parse(raw);
   return Number.isFinite(ms) ? { ok: true, since: ms } : { ok: false };
 }
@@ -106,7 +113,7 @@ router.get('/scheduled-activity', async (req: Request, res: Response) => {
       .filter((s) => s && s.userId === user.userId)
       .map((s) => ({
         scheduleId: s.scheduleId,
-        name: s.name ?? s.title ?? null,
+        name: s.scheduleName ?? s.name ?? s.title ?? null,
         runResults: projectRunResults(s.runResults, parsed.since),
       }))
       .filter((s) => s.runResults.length > 0);
