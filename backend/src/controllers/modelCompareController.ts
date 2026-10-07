@@ -18,6 +18,7 @@ import { checkTokenUsage, resolveBillingUserId } from '../services/tokenUsageSer
 import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
 import { getModelPrice } from '../utils/llmPricing';
 import { resolveOpenRouterUpstreamModelId } from '../utils/openRouterGatewayContract';
+import { LLM_MODEL_REGISTRY } from '../services/agentMode/llmModelRegistry';
 import { isCronEnabled } from '../utils/instanceState';
 import { resolveRunFunding, withRunFunding, type RunFunding } from '../services/funding/runFunding';
 import {
@@ -64,6 +65,23 @@ const log = (message: string, fields?: Record<string, unknown>): void => {
   else console.error(message);
 };
 
+let registeredUpstreamIdsCache: string[] | null = null;
+/** Upstream (OpenRouter) ids of every registered model; unmapped ids are skipped. */
+function registeredUpstreamIds(): string[] {
+  if (!registeredUpstreamIdsCache) {
+    const ids: string[] = [];
+    for (const key of Object.keys(LLM_MODEL_REGISTRY)) {
+      try {
+        ids.push(resolveOpenRouterUpstreamModelId(key));
+      } catch {
+        /* no gateway mapping */
+      }
+    }
+    registeredUpstreamIdsCache = ids;
+  }
+  return registeredUpstreamIdsCache;
+}
+
 function compareDeps(): CompareDeps {
   // Every LLM entry point resolves run funding once and runs inside withRunFunding (ENG-1816), so
   // metering and any future customer-funded route see the same scope /generate gives. Today it always
@@ -92,7 +110,7 @@ function compareDeps(): CompareDeps {
       // Strict (exact or dated snapshot of the same id); fail closed if the id has no gateway
       // mapping (callLLM would already have refused it).
       try {
-        return isSameServedModel(resolveOpenRouterUpstreamModelId(requested), served);
+        return isSameServedModel(resolveOpenRouterUpstreamModelId(requested), served, registeredUpstreamIds());
       } catch {
         return false;
       }

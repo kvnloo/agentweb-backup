@@ -1082,6 +1082,39 @@ describe('only the selected model may answer (served-model verification)', () =>
     expect(isSameServedModel('', 'openai/gpt-5.5')).toBe(false);
   });
 
+  describe('MMDD-suffixed ids are part of the model identity (F3)', () => {
+    const SIBLINGS = [
+      'deepseek/deepseek-v4-pro', 'deepseek/deepseek-v4-pro-0813',
+      'deepseek/deepseek-v4-flash', 'deepseek/deepseek-v4-flash-0731',
+      'qwen/qwen3.8-max', 'qwen/qwen3.8-max-0902',
+    ];
+    it.each([
+      ['deepseek/deepseek-v4-pro-0813', 'deepseek/deepseek-v4-pro-20260813'],
+      ['deepseek/deepseek-v4-flash-0731', 'deepseek/deepseek-v4-flash-20260731'],
+      ['qwen/qwen3.8-max-0902', 'qwen/qwen3.8-max-20260902'],
+      ['qwen/qwen3.8-max-0902', 'qwen/qwen3.8-max-2026-09-02'],
+      ['deepseek/deepseek-v4-pro-0813', 'deepseek/deepseek-v4-pro-0813'],
+    ])('accepts an MMDD id served as its full-date canonical slug: %s -> %s', (id, slug) => {
+      expect(isSameServedModel(id, slug, SIBLINGS)).toBe(true);
+      expect(isSameServedModel(id, slug)).toBe(true);
+    });
+    it.each([
+      ['deepseek/deepseek-v4-pro', 'deepseek/deepseek-v4-pro-20260813'],
+      ['deepseek/deepseek-v4-flash', 'deepseek/deepseek-v4-flash-20260731'],
+      ['qwen/qwen3.8-max', 'qwen/qwen3.8-max-20260902'],
+      ['deepseek/deepseek-v4-pro', 'deepseek/deepseek-v4-pro-0813'],
+      ['deepseek/deepseek-v4-pro-0813', 'deepseek/deepseek-v4-pro-20260423'],
+      ['deepseek/deepseek-v4-pro-0813', 'deepseek/deepseek-v4-pro'],
+      ['deepseek/deepseek-v4-flash-0731', 'deepseek/deepseek-v4-pro-20260731'],
+    ])('rejects the sibling variant: %s must not accept %s', (id, slug) => {
+      expect(isSameServedModel(id, slug, SIBLINGS)).toBe(false);
+    });
+    it('still accepts the base id own canonical snapshot when a MMDD sibling exists', () => {
+      expect(isSameServedModel('deepseek/deepseek-v4-pro', 'deepseek/deepseek-v4-pro-20260423', SIBLINGS)).toBe(true);
+      expect(isSameServedModel('openai/gpt-4o-mini', 'openai/gpt-4o-mini-2024-07-18', SIBLINGS)).toBe(true);
+    });
+  });
+
   it('an unreported served model (no `model` field) is accepted: the gateway always sets it, and a missing field proves nothing either way', async () => {
     const { deps } = makeDeps({ callLLM: jest.fn(async (m: string) => ok(`answer from ${m}`)) as any });
     const out = await run(deps, body());

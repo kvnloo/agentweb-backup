@@ -389,14 +389,46 @@ function extractText(response: unknown): { text: string; finishReason: string | 
  * A longer or different name is a DIFFERENT model (`gpt-5.5-pro`, `gpt-5.5-mini`, `gpt-5`), as is any
  * `:variant` or other vendor. Metering's tolerant prefix matcher is deliberately not used.
  */
-export function isSameServedModel(upstreamModel: string, served: unknown): boolean {
+export function isSameServedModel(
+  upstreamModel: string,
+  served: unknown,
+  /**
+   * Other registered upstream ids. A base id (`deepseek/deepseek-v4-pro`) must not accept the dated slug of a
+   * registered MMDD sibling (`deepseek/deepseek-v4-pro-0813` -> `...-20260813`), which the date-stripping alone
+   * cannot tell apart from the base id's own snapshot.
+   */
+  knownUpstreamIds: Iterable<string> = [],
+): boolean {
   if (typeof served !== 'string' || typeof upstreamModel !== 'string') return false;
   const want = splitServedModel(upstreamModel);
   const got = splitServedModel(served);
-  if (!want || !got || want.vendor !== got.vendor || want.tokens.length !== got.tokens.length) return false;
+  if (!want || !got || want.vendor !== got.vendor) return false;
+
+  const wantMmdd = trailingMmdd(want.tokens);
+  if (wantMmdd) {
+    // A trailing MMDD is part of the model identity: the id itself, or its full-date canonical slug
+    // whose date ends in the same MMDD (`-0813` <-> `-20260813`) over identical base tokens.
+    if (!got.date) return sameTokens(want.tokens, got.tokens);
+    return got.date.slice(4) === wantMmdd && sameTokens(want.tokens.slice(0, -1), got.tokens);
+  }
+  if (!sameTokens(want.tokens, got.tokens)) return false;
+  if (got.date) {
+    for (const known of knownUpstreamIds) {
+      const sibling = typeof known === 'string' ? splitServedModel(known) : null;
+      const m = sibling && sibling.vendor === want.vendor ? trailingMmdd(sibling.tokens) : null;
+      if (sibling && m && !sibling.date && got.date.slice(4) === m && sameTokens(sibling.tokens.slice(0, -1), want.tokens)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function sameTokens(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
   const counts = new Map<string, number>();
-  for (const t of want.tokens) counts.set(t, (counts.get(t) ?? 0) + 1);
-  for (const t of got.tokens) {
+  for (const t of a) counts.set(t, (counts.get(t) ?? 0) + 1);
+  for (const t of b) {
     const n = counts.get(t);
     if (!n) return false;
     counts.set(t, n - 1);
@@ -404,16 +436,28 @@ export function isSameServedModel(upstreamModel: string, served: unknown): boole
   return true;
 }
 
-function splitServedModel(id: string): { vendor: string; tokens: string[] } | null {
+/** Last token as `MMDD` (month 01-12, day 01-31), only when it is not the whole name. */
+function trailingMmdd(tokens: string[]): string | null {
+  const last = tokens[tokens.length - 1];
+  if (tokens.length < 2 || !/^\d{4}$/.test(last)) return null;
+  const month = Number(last.slice(0, 2));
+  const day = Number(last.slice(2));
+  return month >= 1 && month <= 12 && day >= 1 && day <= 31 ? last : null;
+}
+
+function splitServedModel(id: string): { vendor: string; tokens: string[]; date: string | null } | null {
   const trimmed = id.trim().toLowerCase();
   const slash = trimmed.indexOf('/');
   if (slash <= 0) return null;
   const vendor = trimmed.slice(0, slash);
-  const name = trimmed.slice(slash + 1).replace(/-(?:\d{4}-\d{2}-\d{2}|\d{8})$/, '');
+  const rawName = trimmed.slice(slash + 1);
+  const dm = /-(\d{4})-?(\d{2})-?(\d{2})$/.exec(rawName);
+  const dated = dm && /-(?:\d{4}-\d{2}-\d{2}|\d{8})$/.test(rawName) ? dm : null;
+  const name = dated ? rawName.slice(0, dated.index) : rawName;
   if (!name || name.includes(':') || name.includes('/')) return null;
   const tokens = name.split('-');
   if (tokens.some((t) => t.length === 0)) return null;
-  return { vendor, tokens };
+  return { vendor, tokens, date: dated ? `${dated[1]}${dated[2]}${dated[3]}` : null };
 }
 
 function mapCallError(error: unknown): { errorCode: CompareErrorCode; errorClass: string } {
