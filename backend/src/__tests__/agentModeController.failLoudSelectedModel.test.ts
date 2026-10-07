@@ -1,0 +1,471 @@
+/**
+ * FAIL-LOUD selected model. An explicit selection (request llmModel, session-stored
+ * llmModel, requestedLlmModel at session creation) must run on exactly that model or
+ * not run at all: resolveEffectiveModelForUser throws ModelUnavailableError instead of
+ * silently swapping in the default, and the interactive handlers answer 422
+ * { error, code:'model_unavailable', requestedModel, reason } with no LLM call, no
+ * metering, no session write and the generation lock released.
+ */
+import { Request, Response } from 'express';
+
+jest.mock('../services/chatbotService', () => ({
+  chatbotDb: {
+    createChatSession: jest.fn(),
+    getChatSession: jest.fn(),
+    updateSessionLlmModel: jest.fn(),
+    addMessageToSession: jest.fn(),
+    addMessagesToSession: jest.fn(),
+    updateSessionTitle: jest.fn(),
+    getMessagesFromMessagesTable: jest.fn(),
+  },
+  updateTaskExecutionStatus: jest.fn(),
+}));
+
+jest.mock('../services/emailService', () => ({
+  emailService: { sendOncallAlert: jest.fn().mockResolvedValue(undefined) },
+}));
+
+jest.mock('../services/db', () => ({
+  userDb: { getUserById: jest.fn() },
+  scheduleDb: {},
+  taskDb: {},
+}));
+
+jest.mock('../services/generateMarketingResponseWorkerService', () => ({
+  generateMarketingResponseWorkerService: {
+    runInWorker: jest.fn(),
+    cancelSession: jest.fn(),
+  },
+}));
+
+const DEFAULT_MODEL = 'gpt-5-chat-2';
+const SERVED = [DEFAULT_MODEL, 'gemini-3.5-flash', 'gpt-5.5'];
+const UNSERVED = 'retired-model-9';
+const INTERNAL_ONLY = 'internal-judge-1';
+const REGISTRY = new Set([...SERVED, INTERNAL_ONLY, 'legacy-old-alias-target']);
+
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: {
+    default_model: 'gpt-5-chat-2',
+    getDefaultModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
+    getReportsModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
+    getCustomerSupportDefaultModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
+    // internalOnly ids are registry keys but excluded from the supported set.
+    getSupportedModels: jest.fn(async () => ['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5']),
+    // Mirrors the real behaviour: unknown ids fall back to the default, registry ids pass.
+    resolveGenerationModel: jest.fn((model: string) => {
+      const registry = new Set(['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5', 'internal-judge-1', 'legacy-old-alias-target']);
+      const normalized = model === 'legacy-old-alias' ? 'legacy-old-alias-target' : model;
+      return registry.has(normalized)
+        ? { model: normalized, fellBack: false, requestedModel: model }
+        : { model: 'gpt-5-chat-2', fellBack: true, requestedModel: model };
+    }),
+    getModelDisplayName: jest.fn((id: string) => (id === 'gpt-5.5' ? 'GPT-5.5' : undefined)),
+    generateSessionTitle: jest.fn().mockResolvedValue('Test Title'),
+    getMarketingSystemPrompt: jest.fn().mockResolvedValue('System prompt'),
+    generateDiagnosticMessage: jest.fn().mockResolvedValue(null),
+    getSkillsForDisplay: jest.fn().mockResolvedValue([]),
+  },
+  AgentModeService: jest.fn(),
+}));
+
+jest.mock('../services/llmUsagePolicyResolverService', () => ({
+  getEffectiveLlmUsagePolicy: jest.fn(),
+}));
+
+jest.mock('../services/tokenUsageService', () => ({
+  checkTokenUsage: jest.fn(),
+  incrementUserTokenUsage: jest.fn(),
+  deriveBlockedByCost: jest.fn(() => ({ blockedByCost: false })),
+}));
+
+jest.mock('../utils/sseProgress', () => ({
+  progressStore: { delete: jest.fn() },
+  emitProgress: jest.fn(),
+  hasActiveProgress: jest.fn().mockReturnValue(false),
+  requestCancel: jest.fn(),
+  clearCancel: jest.fn(),
+  isCancelled: jest.fn().mockReturnValue(false),
+  registerProgressCallback: jest.fn().mockReturnValue(() => {}),
+  getLatestProgress: jest.fn().mockReturnValue(null),
+  markProgressComplete: jest.fn(),
+}));
+
+jest.mock('../services/workPlanService', () => ({
+  workPlanService: { getWorkPlan: jest.fn().mockResolvedValue(null) },
+}));
+jest.mock('../services/skillService', () => ({
+  skillService: { getInstalledSkills: jest.fn().mockResolvedValue([]) },
+}));
+jest.mock('../services/subscriptionService', () => ({
+  getAllowedSkills: jest.fn().mockResolvedValue([]),
+}));
+jest.mock('../utils/agentModeAlerts', () => ({
+  sendAgentModeOncallAlert: jest.fn().mockResolvedValue(undefined),
+}));
+jest.mock('../utils/agentModeErrors', () => ({
+  isContextLimitError: jest.fn().mockReturnValue(false),
+  isSessionLimitError: jest.fn().mockReturnValue(false),
+  isTransientLLMError: jest.fn().mockReturnValue(false),
+  isWorkerShutdownError: jest.fn().mockReturnValue(false),
+}));
+
+import {
+  agentModeController,
+  activeSessionGenerations,
+  resolveEffectiveModelForUser,
+} from '../controllers/agentModeController';
+import { ModelUnavailableError, buildModelUnavailableBody, isModelUnavailableError } from '../services/agentMode/modelUnavailable';
+import { chatbotDb } from '../services/chatbotService';
+import { agentModeService } from '../services/agentModeService';
+import { userDb } from '../services/db';
+import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
+import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
+import { checkTokenUsage, incrementUserTokenUsage } from '../services/tokenUsageService';
+
+const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
+const mockWorker = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
+const mockPolicy = getEffectiveLlmUsagePolicy as jest.Mock;
+const mockCheckTokenUsage = checkTokenUsage as jest.Mock;
+const mockIncrementUsage = incrementUserTokenUsage as jest.Mock;
+const mockUserDb = userDb as jest.Mocked<typeof userDb>;
+const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
+
+const OWNER = 'user-owner';
+const SESSION_ID = 'session-1';
+const FULL_CHOICE = { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' };
+
+const MESSAGE = 'Please draft the launch email';
+
+const SHARED_MESSAGE = "This shared conversation can't continue right now because its model is no longer available. Ask the person who shared it to choose another model.";
+
+const expectedMessage = (label: string) =>
+  `The model you selected (${label}) isn't available right now, so nothing was sent to a different model. Choose another model and try again.`;
+
+const makeRes = () => {
+  const res: any = { statusCode: 200, body: undefined };
+  res.status = jest.fn((code: number) => { res.statusCode = code; return res; });
+  res.json = jest.fn((payload: any) => { res.body = payload; return res; });
+  return res as Response & { statusCode: number; body: any };
+};
+
+const generateReq = (body: Record<string, unknown>, isAdmin = false) => ({
+  user: { userId: OWNER, isAdmin },
+  body: { sessionId: SESSION_ID, userMessage: MESSAGE, attachments: [], ...body },
+  method: 'POST',
+  path: '/api/agent-mode/generate',
+  ip: '127.0.0.1',
+  socket: { remoteAddress: '127.0.0.1' },
+  on: jest.fn(),
+} as unknown as Request);
+
+const baseSession = (llmModel?: string) => ({
+  sessionId: SESSION_ID,
+  userId: OWNER,
+  sessionType: 'regular',
+  title: 'Chat',
+  messages: [],
+  createdAt: '2026-07-01T00:00:00Z',
+  updatedAt: '2026-07-01T00:00:00Z',
+  portalType: 'agent' as const,
+  pageIdentifier: 'agent-mode',
+  ...(llmModel ? { llmModel } : {}),
+});
+
+const workerResult = { content: 'OK', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] };
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  activeSessionGenerations.clear();
+  mockPolicy.mockResolvedValue({ billingUserId: OWNER, policy: null, costUsedMicroUsd: 0, tokenUsed: 0, mode: FULL_CHOICE });
+  mockCheckTokenUsage.mockResolvedValue({
+    allowed: true, warning: false, used: 0, allowance: null, bonus: 0, effectiveAllowance: null, percentUsed: 0, month: '2026-07',
+  });
+  mockChatbotDb.getChatSession.mockResolvedValue(baseSession('gpt-5.5') as any);
+  (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
+  mockChatbotDb.addMessageToSession.mockResolvedValue(baseSession() as any);
+  mockChatbotDb.addMessagesToSession.mockResolvedValue(undefined as any);
+  mockChatbotDb.updateSessionTitle.mockResolvedValue(undefined as any);
+  mockChatbotDb.updateSessionLlmModel.mockResolvedValue(baseSession('gpt-5.5') as any);
+  mockChatbotDb.createChatSession.mockResolvedValue(baseSession() as any);
+  mockWorker.runInWorker.mockResolvedValue(workerResult as any);
+  mockUserDb.getUserById.mockResolvedValue({ userId: OWNER, isAdmin: false } as any);
+});
+
+describe('resolveEffectiveModelForUser (fail-loud)', () => {
+  it('throws not_served for an unserved explicit id and echoes the requested id', async () => {
+    const err = await resolveEffectiveModelForUser({ userId: OWNER, requestedModel: UNSERVED }).catch((e) => e);
+    expect(err).toBeInstanceOf(ModelUnavailableError);
+    expect(err).toMatchObject({ code: 'model_unavailable', requestedModel: UNSERVED, reason: 'not_served' });
+  });
+
+  it('throws not_selectable for a registry id outside the supported set (internalOnly)', async () => {
+    const err = await resolveEffectiveModelForUser({ userId: OWNER, requestedModel: INTERNAL_ONLY }).catch((e) => e);
+    expect(isModelUnavailableError(err)).toBe(true);
+    expect(err).toMatchObject({ requestedModel: INTERNAL_ONLY, reason: 'not_selectable' });
+  });
+
+  it('defaults (no throw) when no model is requested', async () => {
+    const decision = await resolveEffectiveModelForUser({ userId: OWNER });
+    expect(decision).toMatchObject({ effectiveModel: DEFAULT_MODEL, modelSelection: 'defaulted' });
+  });
+
+  it('returns blocked (no throw) when usage is paused, even for an unserved id', async () => {
+    mockPolicy.mockResolvedValue({
+      billingUserId: OWNER, policy: null, costUsedMicroUsd: 0, tokenUsed: 0,
+      mode: { usageMode: 'paused', admissionAllowed: false, reason: 'hard_threshold_reached' },
+    });
+    const decision = await resolveEffectiveModelForUser({ userId: OWNER, requestedModel: UNSERVED });
+    expect(decision).toMatchObject({ effectiveModel: null, modelSelection: 'blocked' });
+  });
+
+  it('honors a served id and a legacy alias (normalized first)', async () => {
+    await expect(resolveEffectiveModelForUser({ userId: OWNER, requestedModel: 'gpt-5.5' }))
+      .resolves.toMatchObject({ effectiveModel: 'gpt-5.5', modelSelection: 'honored' });
+    (mockAgentModeService.getSupportedModels as jest.Mock).mockResolvedValueOnce([DEFAULT_MODEL, 'legacy-old-alias-target']);
+    await expect(resolveEffectiveModelForUser({ userId: OWNER, requestedModel: 'legacy-old-alias' }))
+      .resolves.toMatchObject({ effectiveModel: 'legacy-old-alias-target', modelSelection: 'honored' });
+  });
+
+  it('drops an unserved user backup instead of throwing', async () => {
+    const decision = await resolveEffectiveModelForUser({
+      userId: OWNER, requestedModel: 'gpt-5.5', backupModel: UNSERVED, backupSource: 'user',
+    });
+    expect(decision).toMatchObject({ effectiveModel: 'gpt-5.5', modelSelection: 'honored', backupModel: null });
+  });
+
+  it('gives admins and non-admins the identical result for an unserved id', async () => {
+    const outcomes: unknown[] = [];
+    for (const isAdmin of [false, true]) {
+      mockUserDb.getUserById.mockResolvedValue({ userId: OWNER, isAdmin } as any);
+      const err = await resolveEffectiveModelForUser({ userId: OWNER, requestedModel: UNSERVED }).catch((e) => e);
+      outcomes.push({ code: err.code, requestedModel: err.requestedModel, reason: err.reason });
+    }
+    expect(outcomes[0]).toEqual(outcomes[1]);
+  });
+
+  it('allowSilentSwap (schedule caller, WP-G) keeps today\'s swap for a registry id outside the supported set', async () => {
+    const decision = await resolveEffectiveModelForUser({ userId: OWNER, requestedModel: INTERNAL_ONLY, allowSilentSwap: true });
+    expect(decision).toMatchObject({ effectiveModel: DEFAULT_MODEL, modelSelection: 'corrected' });
+  });
+});
+
+describe('POST /generate (fail-loud)', () => {
+  const assertNothingRan = () => {
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    expect(mockChatbotDb.addMessageToSession).not.toHaveBeenCalled();
+    expect(mockChatbotDb.addMessagesToSession).not.toHaveBeenCalled();
+    expect(mockIncrementUsage).not.toHaveBeenCalled();
+    expect(activeSessionGenerations.has(SESSION_ID)).toBe(false);
+  };
+
+  it('422s for an unserved request llmModel with the exact body and runs nothing', async () => {
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: UNSERVED }), res);
+
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toEqual({
+      error: expectedMessage(UNSERVED),
+      code: 'model_unavailable',
+      requestedModel: UNSERVED,
+      reason: 'not_served',
+    });
+    assertNothingRan();
+  });
+
+  it('releases the lock: an immediate second request is 422 again, not 409 SESSION_BUSY', async () => {
+    await agentModeController.generateResponse(generateReq({ llmModel: UNSERVED }), makeRes());
+    const second = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: UNSERVED }), second);
+    expect(second.statusCode).toBe(422);
+    expect(second.body.code).toBe('model_unavailable');
+  });
+
+  it('422s when the STORED session model is unserved and the body has no llmModel; stored model untouched', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(baseSession(UNSERVED) as any);
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({}), res);
+
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toMatchObject({ code: 'model_unavailable', requestedModel: UNSERVED, reason: 'not_served' });
+    assertNothingRan();
+  });
+
+  it('422 not_selectable for an internalOnly id', async () => {
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: INTERNAL_ONLY }), res);
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toMatchObject({ reason: 'not_selectable', requestedModel: INTERNAL_ONLY });
+    assertNothingRan();
+  });
+
+  it('admin and non-admin get the identical 422', async () => {
+    const bodies: unknown[] = [];
+    for (const isAdmin of [false, true]) {
+      mockUserDb.getUserById.mockResolvedValue({ userId: OWNER, isAdmin } as any);
+      const res = makeRes();
+      await agentModeController.generateResponse(generateReq({ llmModel: UNSERVED }, isAdmin), res);
+      expect(res.statusCode).toBe(422);
+      bodies.push(res.body);
+    }
+    expect(bodies[0]).toEqual(bodies[1]);
+  });
+
+  it('paused user + unserved model gets the usage_paused 429, not 422/500', async () => {
+    mockCheckTokenUsage.mockResolvedValue({
+      allowed: false, warning: false, used: 1, allowance: 1, bonus: 0, effectiveAllowance: 1, percentUsed: 100,
+      month: '2026-07', usagePolicyVersion: 'v1',
+    });
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: UNSERVED }), res);
+    // Paused mode: resolver returns 'blocked' (policy 429). Full-choice mode with an exhausted
+    // allowance: resolver throws and the plain 429 is returned. Both are 429 usage_paused.
+    expect(res.statusCode).toBe(429);
+    expect(res.body.code).toBe('usage_paused');
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    expect(activeSessionGenerations.has(SESSION_ID)).toBe(false);
+  });
+
+  it('paused (cost hard cap) + unserved model gets usage_paused 429 with a blocked decision', async () => {
+    mockPolicy.mockResolvedValue({
+      billingUserId: OWNER, policy: null, costUsedMicroUsd: 0, tokenUsed: 0,
+      mode: { usageMode: 'paused', admissionAllowed: false, reason: 'hard_threshold_reached' },
+    });
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: UNSERVED }), res);
+    expect(res.statusCode).toBe(429);
+    expect(res.body).toMatchObject({ code: 'usage_paused', modelSelection: 'blocked' });
+  });
+
+  it('runs the resolver pass ONCE per normal turn (pre-flight decision is reused at dispatch)', async () => {
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: 'gpt-5.5' }), res);
+    expect(res.statusCode).toBe(200);
+    expect(mockPolicy).toHaveBeenCalledTimes(1);
+    expect(mockAgentModeService.getDefaultModel).toHaveBeenCalledTimes(1);
+  });
+
+  it('happy path: a served model still runs on exactly that model and is stored', async () => {
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: 'gpt-5.5' }), res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockWorker.runInWorker).toHaveBeenCalledWith(
+      expect.objectContaining({ llmModel: 'gpt-5.5' }),
+      expect.anything(),
+    );
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'gpt-5.5', expect.objectContaining({ modelSelection: 'honored' }));
+    expect(res.body).toMatchObject({ effectiveModel: 'gpt-5.5', modelSelection: 'honored' });
+  });
+});
+
+describe('shared generate (fail-loud)', () => {
+  it('422s when the owner\'s stored model is unserved, with no model named to the anonymous visitor', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue({
+      ...baseSession(UNSERVED),
+      interactiveShareMetadata: { isActive: true, token: 'tok', sharedAt: '2026-07-01T00:00:00Z' },
+    } as any);
+    const req = {
+      params: { shareId: SESSION_ID },
+      query: { conversable: 'tok' },
+      body: { userMessage: MESSAGE, attachments: [] },
+      on: jest.fn(),
+    } as unknown as Request;
+    const res = makeRes();
+    await agentModeController.generateSharedResponse(req, res);
+
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toEqual({
+      error: SHARED_MESSAGE,
+      code: 'model_unavailable',
+    });
+    expect(JSON.stringify(res.body)).not.toContain(UNSERVED);
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    expect(activeSessionGenerations.has(SESSION_ID)).toBe(false);
+  });
+
+  it('a deck answer with an unserved owner model 422s WITHOUT touching deck/session state', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue({
+      ...baseSession(UNSERVED),
+      pendingApprovalDeck: { deckId: 'deck-1' },
+      interactiveShareMetadata: { isActive: true, token: 'tok', sharedAt: '2026-07-01T00:00:00Z' },
+    } as any);
+    (mockAgentModeService as any).submitApprovalDeckAnswers = jest.fn();
+    (mockChatbotDb as any).updateSessionApprovalDeck = jest.fn();
+    const res = makeRes();
+    await agentModeController.generateSharedResponse({
+      params: { shareId: SESSION_ID },
+      query: { conversable: 'tok' },
+      body: { userMessage: MESSAGE, attachments: [], deckAnswer: { deckId: 'deck-1', answers: [] } },
+      on: jest.fn(),
+    } as unknown as Request, res);
+
+    expect(res.statusCode).toBe(422);
+    expect((mockAgentModeService as any).submitApprovalDeckAnswers).not.toHaveBeenCalled();
+    expect((mockChatbotDb as any).updateSessionApprovalDeck).not.toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+  });
+});
+
+describe('createSession (fail-loud)', () => {
+  const createReq = (body: Record<string, unknown>) => ({ user: { userId: OWNER }, body } as unknown as Request);
+
+  it('422s for an unserved requestedLlmModel and creates no session', async () => {
+    const res = makeRes();
+    await agentModeController.createSession(createReq({ portalType: 'agent', llmModel: UNSERVED }), res);
+
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toMatchObject({ code: 'model_unavailable', requestedModel: UNSERVED, reason: 'not_served' });
+    expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+  });
+
+  it('creates normally for a served model and for no model (default)', async () => {
+    const served = makeRes();
+    await agentModeController.createSession(createReq({ portalType: 'agent', llmModel: 'gpt-5.5' }), served);
+    expect(served.statusCode).toBe(201);
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'gpt-5.5', expect.anything());
+
+    mockChatbotDb.updateSessionLlmModel.mockClear();
+    const dflt = makeRes();
+    await agentModeController.createSession(createReq({ portalType: 'agent' }), dflt);
+    expect(dflt.statusCode).toBe(201);
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, expect.anything());
+  });
+
+  it('an explicit llmModel on an emma-sidebar creation is intentionally ignored (admin-configured model stamped, 201)', async () => {
+    const res = makeRes();
+    await agentModeController.createSession(createReq({ portalType: 'emma-sidebar', llmModel: UNSERVED }), res);
+    expect(res.statusCode).toBe(201);
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, undefined);
+  });
+});
+
+describe('buildModelUnavailableBody (single message producer)', () => {
+  it('uses the display name when given, else the raw id', () => {
+    const err = new ModelUnavailableError('gpt-5.5', 'not_selectable');
+    expect(buildModelUnavailableBody(err, 'GPT-5.5').error).toBe(expectedMessage('GPT-5.5'));
+    expect(buildModelUnavailableBody(err).error).toBe(expectedMessage('gpt-5.5'));
+  });
+
+  it('strips control characters and truncates to 120 chars', () => {
+    const hostile = `evil\u0000\n\r\u2028model${'x'.repeat(300)}`;
+    const body = buildModelUnavailableBody(new ModelUnavailableError(hostile, 'not_served'));
+    expect(body.requestedModel).not.toMatch(/[\u0000-\u001f\u2028]/);
+    expect(body.requestedModel.length).toBeLessThanOrEqual(120);
+    expect(body.error).toContain(body.requestedModel);
+    expect(body.error).not.toMatch(/[\u0000-\u001f\u2028]/);
+  });
+
+  it('echoes markup as inert JSON text (never HTML-rendered server side)', () => {
+    const body = buildModelUnavailableBody(new ModelUnavailableError('<img src=x onerror=alert(1)>', 'not_served'));
+    expect(JSON.parse(JSON.stringify(body)).requestedModel).toBe('<img src=x onerror=alert(1)>');
+  });
+
+  it('falls back to a placeholder when nothing printable remains', () => {
+    expect(buildModelUnavailableBody(new ModelUnavailableError('\u0000\u0001', 'not_served')).error).toContain('(unknown model)');
+  });
+});

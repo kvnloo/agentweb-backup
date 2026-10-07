@@ -199,11 +199,16 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
     } as any);
   });
 
-  it('does not stamp an unserved schedule model — records the fallback generation resolves to', async () => {
-    await runScheduledChat({ ...baseSchedule, llmModel: 'claude-sonnet-4-5' } as any, 'test-user-123', false);
+  // FAIL-LOUD (WP-G): this used to assert the silent swap to the fallback. An explicit
+  // pin that is not served now ends the run failed, before any session exists, so
+  // nothing is stamped and nothing runs on a different model.
+  it('does not run an unserved schedule model on the fallback — fails the run, nothing stamped', async () => {
+    const result: any = await runScheduledChat({ ...baseSchedule, llmModel: 'claude-sonnet-4-5' } as any, 'test-user-123', false);
 
-    expect(stampedModel()).toBe(FALLBACK);
-    expect(stampedModel()).not.toBe('claude-sonnet-4-5');
+    expect(result.status).toBe('failure');
+    expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
   });
 
   it('stamps the canonical id for a legacy alias, not the alias', async () => {
@@ -235,7 +240,9 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
     const alert = mockAlert.mock.calls[0][0];
     expect(alert.subject).toContain('unsupported');
     expect(alert.message).toContain('claude-sonnet-4-5');
-    expect(alert.message).toContain(FALLBACK);
+    // FAIL-LOUD (WP-G): the run no longer continues on a fallback model.
+    expect(alert.message).toContain('FAILED');
+    expect(alert.message).not.toContain(FALLBACK);
     // Deduped per (schedule, bad value) so a daily schedule cannot flood oncall.
     expect(alert.dedupeKey).toBe('schedule_model_invalid:sched-1:claude-sonnet-4-5');
   });
