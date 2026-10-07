@@ -164,7 +164,6 @@ describe('leads/CRM cluster delegates to emma/impl/leads.ts (ENG-2103 F2)', () =
 
     // include_all_fields (ENG-425) is always forwarded as a strict boolean; omitted -> false.
     expect(mockLeads.getLeads).toHaveBeenCalledWith('L1', 'u1', {
-      includeAllFields: false,
       search: 'acme', status: 'qualified', icpOnly: true, engagedOnly: false, limit: 10, cursor: 'c1',
       includeAllFields: false, // defaults false when include_all_fields isn't requested
     });
