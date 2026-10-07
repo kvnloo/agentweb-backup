@@ -201,7 +201,7 @@ router.post('/leads/:listId', async (req: Request, res: Response) => {
     let lead: any;
     try {
       // ENG-2321: concurrent same-email posts resolve to one row (an ordinary list; session lists are untouched).
-      lead = await crmDb.createLead(listId, (suppressSideEffects ? { ...leadData, suppressSideEffects: true } : { ...leadData, emailUniqueCreate: true }) as any);
+      lead = await crmDb.createLead(listId, (suppressSideEffects ? { ...leadData, suppressSideEffects: true } : { ...leadData, emailUniqueCreate: true }) as any, 'form_fill');
     } catch (createErr: any) {
       if (!createErr?.duplicateEmail) throw createErr;
       // The email is already on this list (a repeat submission, or a concurrent one that won

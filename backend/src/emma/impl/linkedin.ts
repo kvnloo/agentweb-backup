@@ -233,7 +233,7 @@
  * it still calls `agentModeService.linkedinManagePost` for the unrelated
  * sibling-method-spy reason documented in the FOLLOW-UP section above.
  */
-import { linkedInOutreachService } from '../../services/linkedInOutreachService';
+import { linkedInOutreachService, isProvenDisconnectError } from '../../services/linkedInOutreachService';
 import {
   isAnonymizedIdentifier,
   usablePublicIdentifier,
@@ -246,6 +246,7 @@ import {
   resolveLinkedInAccountForWrite,
   resolveLinkedInAccountFromList,
   setDailyInviteCap,
+  DailyInviteCapNotOwnerError,
   type ResolvedLinkedInAccount,
 } from '../../services/agentMode/linkedInDailyVolumeGate';
 import {
@@ -1203,9 +1204,13 @@ export async function linkedinOutreach(
     // depend on which of the two paths happened to observe the dead session first
     // (ENG-1197).
     const { recordUnipileAccountHealth } = await import('../../services/linkedInConnectionHealth');
+    // ENG-2205: ownerUserId must be omitted for a site-wide pool account — its
+    // owner lookup can never resolve the global fallback pool under an
+    // unrelated caller's userId, so a truthy-but-wrong value here silently
+    // no-ops instead of reaching the dedicated ownerless/oncall alert branch.
     await recordUnipileAccountHealth({
       accountId: account_id,
-      ownerUserId: userId,
+      ownerUserId: usedSharedAccount ? undefined : userId,
       state: 'disconnected',
     });
     return withRouting(linkedInDisconnectedResponse());
@@ -2237,11 +2242,20 @@ export async function linkedinOutreach(
         // for an unattended/scheduled run (there's no one to ask).
         // Writes through the account OWNER's record, not necessarily the
         // caller's — see linkedInDailyVolumeGate.ts's module doc comment.
-        const clampedCap = await setDailyInviteCap(
-          resolvedLinkedInAccount!,
-          account_id,
-          args.daily_invite_cap,
-        );
+        let clampedCap: number;
+        try {
+          clampedCap = await setDailyInviteCap(
+            resolvedLinkedInAccount!,
+            account_id,
+            args.daily_invite_cap,
+            userId,
+          );
+        } catch (err) {
+          if (err instanceof DailyInviteCapNotOwnerError) {
+            return { success: false, error: err.message };
+          }
+          throw err;
+        }
         return {
           success: true,
           data: {
@@ -2268,7 +2282,12 @@ export async function linkedinOutreach(
     }
 
     const structuredError = (error as any).structuredError;
-    if (structuredError?.code === 'errors/disconnected_account' || structuredError?.classification === 'AUTH_ERROR') {
+    // ENG-2205: uses the shared isProvenDisconnectError predicate rather than
+    // this inline check — the inline version (kept here as `structuredError`
+    // for the fallback below) treats any AUTH_ERROR as proof of death, but
+    // handleError classifies a bare 403 as AUTH_ERROR too, and a 403 is a
+    // permission/plan restriction, not a dead session.
+    if (isProvenDisconnectError(error)) {
       // A session can die between the preflight above and this call (or inside the
       // probe's 10-minute cache window), so the reactive path stays as the backstop.
       // Both return the identical response via one helper.
@@ -2277,12 +2296,12 @@ export async function linkedinOutreach(
       // learned a session was dead told the model and nobody else, so an unattended
       // scheduled run discovered the outage, no-opped, and left no trace anything
       // was wrong. Recording it is what gives the owner an alert and lets the next
-      // run skip instead of repeating the discovery. A no-op for shared accounts,
-      // which this user doesn't own.
+      // run skip instead of repeating the discovery. ownerUserId is omitted for a
+      // shared account — see the identical comment on the preflight call above.
       const { recordUnipileAccountHealth } = await import('../../services/linkedInConnectionHealth');
       await recordUnipileAccountHealth({
         accountId: account_id,
-        ownerUserId: userId,
+        ownerUserId: usedSharedAccount ? undefined : userId,
         state: 'disconnected',
       });
       return withRouting(linkedInDisconnectedResponse());

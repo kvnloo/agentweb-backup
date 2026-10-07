@@ -723,6 +723,19 @@ describe('executePreparedTools', () => {
     expect((ports as any).__execOrder).toEqual([]);
   });
 
+  it('preflight-blocks org notification settings writes in a shared (share-link) session', async () => {
+    const ports = makePorts();
+    const input = makeInput(
+      [toolCall('a', 'update_lead_notification_settings', '{"leadTypes":[]}')],
+      ports,
+      { hasAdminAccess: false, isInteractiveShare: true },
+    );
+    await executePreparedTools(input);
+
+    expect(input.toolCallsLedger[0].error).toContain('not available in shared sessions');
+    expect((ports as any).__execOrder).toEqual([]);
+  });
+
   it('records a JSON-parse failure as a preflight error', async () => {
     const ports = makePorts();
     const input = makeInput([toolCall('a', 'read_brand_guidelines', '{not json}')], ports);

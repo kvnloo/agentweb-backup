@@ -120,6 +120,7 @@ import * as miscImpl from './impl/misc';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
+import './leadNotificationTools';
 
 // Register email lookup / find tool (provider-agnostic)
 import './emailLookupTool';

@@ -254,6 +254,11 @@ export function seedSearchCallCountFromHistory(
 }
 
 /** A tool-result outcome from the gateway, normalized into the loop's union shape. */
+/** Org-settings writes a share-link visitor (who runs as the owner) must never reach. */
+export const SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS: ReadonlySet<string> = new Set([
+  'update_lead_notification_settings',
+]);
+
 export interface ToolExecOutcome {
   status: 'success' | 'error';
   result?: any;
@@ -760,6 +765,14 @@ export async function executePreparedTools(
         const errorMsg = isInteractiveShare
           ? `Tool "${toolCall.function.name}" is not available in shared sessions. You can continue to use it in Agent Mode in your own session.`
           : `Tool "${toolCall.function.name}" requires admin access. This session does not have admin privileges.`;
+        appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
+        continue;
+      }
+
+      // A share-link visitor runs under the owner's userId, so owner-only org-settings
+      // writes must be refused here rather than by the tool's own role check.
+      if (isInteractiveShare && SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS.has(toolCall.function.name)) {
+        const errorMsg = `Tool "${toolCall.function.name}" changes organization settings and is not available in shared sessions. The org owner or an admin can change it in Agent Mode in their own session.`;
         appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
         continue;
       }

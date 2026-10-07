@@ -955,7 +955,8 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
             ...(suppressSideEffects ? { suppressSideEffects: true } : {}),
             // ENG-2321: an email lead on an ordinary list takes the exactly-once create (db.createLead).
             ...(normalizedEmail && !isSessionList(leadList) ? { emailUniqueCreate: true } : {}),
-          }
+          },
+          'form_fill'
         );
         isNew = true;
       } catch (createErr: any) {
@@ -1094,7 +1095,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     if (!suppressSideEffects && !isNew && !isSmokeTestLead(lead) && !isSmokeTestLead(leadData)) {
       const submission = { submissionId: crypto.randomUUID(), submittedAt: new Date().toISOString() };
       void import('../services/orgLeadNotificationService')
-        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, submission))
+        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(leadList.listId, lead.leadId, 'form_fill', submission))
         .catch(() => console.warn('[leadNotifications] submission hook failed', { listId: leadList.listId, leadId: lead.leadId }));
     }
 
@@ -1912,7 +1913,7 @@ export async function processHubspotWebhookJob(payload: HubspotJobPayload): Prom
             const newLead: any = { email: email.toLowerCase(), ...fields, syncMetadata: { hubspot_contact_id: objectId } };
             if (Object.keys(customFieldUpdates).length > 0) newLead.customFields = customFieldUpdates;
             try {
-              await crmDb.createLead(list.listId, newLead);
+              await crmDb.createLead(list.listId, newLead, 'integration');
               console.log(`[HubSpot Webhook] Created lead for ${email} in list ${list.listId}`);
               continue;
             } catch (createErr: any) {
