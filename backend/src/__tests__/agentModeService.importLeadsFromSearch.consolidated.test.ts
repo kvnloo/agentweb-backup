@@ -31,13 +31,25 @@ const mockClearStatusCache = jest.fn();
 // which care about site-wide-pool attribution — keeps working unmodified.
 // Only the reactive-handler tests override it to exercise usedSharedAccount: true.
 const mockUsedSharedAccount = jest.fn().mockReturnValue(false);
+// A faithful inline copy of isProvenDisconnectError's logic (pure,
+// dependency-free). jest.requireActual on this module was tried first, but
+// that pulls in linkedInOutreachService.ts's real top-level `import {
+// UnipileClient } from 'unipile-node-sdk'` at load time, which interacted
+// unreliably with another test file's `{virtual: true}` mock of that same
+// package when both ran in the same jest worker — reproducibly ~50% failure
+// rate across runs of the combined suite, 0% in isolation. Inlining avoids
+// loading the real module's import graph at all.
+function isProvenDisconnectErrorMock(error: any): boolean {
+  const structured = error?.structuredError;
+  const code = structured?.code || error?.body?.code || error?.code || '';
+  const status = structured?.status || error?.body?.status || error?.status;
+  const classification = structured?.classification || error?.body?.classification || error?.classification;
+  if (Number(status) === 403 && code !== 'errors/disconnected_account') return false;
+  return code === 'errors/disconnected_account' || classification === 'AUTH_ERROR' || Number(status) === 401;
+}
 jest.mock('../services/linkedInOutreachService', () => {
-  // isProvenDisconnectError is a pure, dependency-free predicate — use the REAL
-  // implementation here rather than re-stubbing its logic, so these tests catch
-  // a regression in the actual 403-exclusion behavior, not just a copy of it.
-  const actual = jest.requireActual('../services/linkedInOutreachService');
   return {
-    isProvenDisconnectError: actual.isProvenDisconnectError,
+    isProvenDisconnectError: isProvenDisconnectErrorMock,
     linkedInOutreachService: {
       searchPeople: (...args: any[]) => mockSearchPeople(...args),
       resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
