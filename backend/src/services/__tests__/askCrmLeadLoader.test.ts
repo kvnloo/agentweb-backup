@@ -114,14 +114,16 @@ describe('ask_crm production lead loader', () => {
 
     it('never loads more than USER_LOOKUP_BUDGET leads, even if a caller asks for more', async () => {
       const page = Array.from({ length: 200 }, (_, i) => stored(`l${i}`, `u${i}@example.com`));
+      const getUserByEmail = jest.fn().mockResolvedValue(null);
       const d = deps({
         getLeadListsForUser: jest.fn().mockResolvedValue(Array.from({ length: 10 }, (_, i) => ({ listId: `list-${i}` }))),
         getLeadsByListId: jest.fn().mockImplementation(async (_id: string, limit: number) => ({ items: page.slice(0, limit) })),
+        getUserByEmail,
       });
       const leads = await createAskCrmLeadLoader(d)('owner', { limit: 100000 });
 
       expect(leads).toHaveLength(500);
-      expect(d.getUserByEmail.mock.calls.length).toBeLessThanOrEqual(500);
+      expect(getUserByEmail.mock.calls.length).toBeLessThanOrEqual(500);
     });
 
     it('falls back to stored signals when a getUserByEmail lookup rejects, and logs once per batch', async () => {
