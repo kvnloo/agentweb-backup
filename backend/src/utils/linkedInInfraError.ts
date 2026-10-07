@@ -1,0 +1,21 @@
+/**
+ * Dependency-free so route/test mocks of linkedInOutreachService can't hide it.
+ *
+ * True when a LinkedIn/Unipile failure is about the INFRASTRUCTURE being unreachable
+ * (credential fetch, gateway/5xx, timeout, transport) rather than a business answer
+ * from LinkedIn. resolveAccountId* can now hand back an account whose liveness was only
+ * indeterminate (ENG-2205), so callers that make the real call must not surface these
+ * raw internal messages as a 500.
+ */
+export const LINKEDIN_UNAVAILABLE_MESSAGE =
+  'LinkedIn is temporarily unavailable. Please try again in a few minutes.';
+
+export function isLinkedInInfraError(error: any): boolean {
+  const msg = String(error?.message ?? '');
+  if (/Failed to fetch Unipile credentials/i.test(msg)) return true;
+  if (/<html|502 Bad Gateway|503 Service|504 Gateway/i.test(msg)) return true;
+  if (/ECONNRESET|ETIMEDOUT|ENOTFOUND|ECONNREFUSED|fetch failed|socket hang up/i.test(msg)) return true;
+  const classification = error?.structuredError?.classification;
+  if (classification === 'TIMEOUT_ERROR' || classification === 'SERVER_ERROR') return true;
+  return error?.isTimeout === true;
+}

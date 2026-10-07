@@ -24,6 +24,7 @@
 
 import { linkedInOutreachService } from "./linkedInOutreachService";
 import { isAnonymizedSearchItem } from "../utils/anonymizedLinkedInLead";
+import { isLinkedInInfraError } from "../utils/linkedInInfraError";
 import { usablePublicIdentifier, usableProfileUrl } from "../utils/linkedInAnonymizedProfile";
 
 /**
@@ -359,6 +360,12 @@ export async function searchProspectsPreview(
   try {
     searchResult = await linkedInOutreachService.searchPeople(accountId, params);
   } catch (err: any) {
+    // Infrastructure failures (credential fetch, gateway/5xx, timeout) must not
+    // leak their raw internal message — the route maps search_unavailable to a
+    // friendly 503 with retry/skip guidance.
+    if (isLinkedInInfraError(err)) {
+      return { ok: false, error: "search_unavailable" };
+    }
     return {
       ok: false,
       error: "unipile_error",

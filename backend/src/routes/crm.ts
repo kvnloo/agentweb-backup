@@ -4989,6 +4989,10 @@ router.post('/lists/:listId/sync-linkedin-connections', async (req: Request, res
     return res.json({ synced: synced.length, syncedAt: new Date().toISOString() });
   } catch (error: any) {
     console.error('Error syncing LinkedIn connections for list:', error);
+    const { isLinkedInInfraError, LINKEDIN_UNAVAILABLE_MESSAGE } = await import('../utils/linkedInInfraError');
+    if (isLinkedInInfraError(error)) {
+      return res.status(503).json({ message: LINKEDIN_UNAVAILABLE_MESSAGE, code: 'linkedin_unavailable' });
+    }
     return res.status(500).json({ message: error.message || 'Failed to sync LinkedIn connections' });
   }
 });
@@ -5073,6 +5077,10 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
     console.error('Error sending LinkedIn message:', error);
     if (error.message?.startsWith('Cannot send message:')) {
       return res.status(400).json({ message: error.message });
+    }
+    const { isLinkedInInfraError, LINKEDIN_UNAVAILABLE_MESSAGE } = await import('../utils/linkedInInfraError');
+    if (isLinkedInInfraError(error)) {
+      return res.status(503).json({ message: LINKEDIN_UNAVAILABLE_MESSAGE, code: 'linkedin_unavailable' });
     }
     return res.status(500).json({ message: error.message || 'Failed to send LinkedIn message' });
   }
