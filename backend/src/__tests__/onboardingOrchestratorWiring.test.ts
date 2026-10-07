@@ -718,6 +718,164 @@ describe("reconcileForUser", () => {
       expect(result).toBeNull();
     });
   });
+
+  // ENG-2308 review follow-up, confirmed by direct reproduction: two
+  // concurrent reconcileForUser() calls for the same user both read
+  // User.steps before either has persisted anything, so both compute the
+  // SAME starting generation and both decide a not-yet-claimed step is
+  // theirs to fire. The per-axis DynamoDB claim correctly lets only one
+  // of them win the real work, but — before this fix — the LOSING pass's
+  // own topo walk still treated the step as "ready" (with whatever
+  // placeholder/null output the lost claim returned) and proceeded to
+  // fire the NEXT step for real using it, a genuine wasted/degraded extra
+  // LLM call. Fixed by collapsing concurrent calls for the same userId
+  // into the one already-in-flight reconcile() pass.
+  it("collapses two concurrent reconcileForUser calls for the same user into a single orchestrator pass", async () => {
+    process.env.EAGER_ONBOARDING_PIPELINE_ENABLED = "true";
+
+    await jest.isolateModulesAsync(async () => {
+      let releaseIcp: (() => void) | undefined;
+      const icpGate = new Promise<void>((resolve) => {
+        releaseIcp = resolve;
+      });
+      // Claim is slow — mirrors a real DynamoDB round-trip — so both
+      // concurrent reconcileForUser() calls are guaranteed to be
+      // in-flight at the same time before either resolves anything.
+      const claimIcpRunMock = jest.fn(async () => {
+        await icpGate;
+        return { icpStatus: "running" };
+      });
+      const triggerIcp = jest.fn(async () => undefined);
+
+      jest.doMock("../services/db", () => ({
+        userDb: {
+          getUserById: jest.fn().mockResolvedValue({ userId: "u-concurrent" }),
+          updateUser: jest.fn().mockResolvedValue(undefined),
+        },
+      }));
+      jest.doMock("../services/onboardingIcpService", () => ({
+        claimIcpRun: claimIcpRunMock,
+        triggerIcpDiscoveryForUser: triggerIcp,
+      }));
+      jest.doMock("../services/onboardingCompetitorService", () => ({
+        claimCompetitorRun: jest.fn(async () => ({})),
+        triggerCompetitorStrategyForUser: jest.fn(async () => undefined),
+      }));
+      jest.doMock("../services/onboardingCreativeDirService", () => ({
+        claimCreativeDirRun: jest.fn(async () => ({})),
+        triggerCreativeDirForUser: jest.fn(async () => undefined),
+      }));
+      jest.doMock("../services/onboardingAdImageService", () => ({
+        claimAdImageRun: jest.fn(async () => ({
+          runId: "adimg_test-run",
+          startedAt: "2026-08-04T00:00:00.000Z",
+        })),
+        triggerAdImageGenerationForUser: jest.fn(async () => undefined),
+      }));
+      jest.doMock("../services/onboardingAdCopyService", () => ({
+        claimAdCopyRun: jest.fn(async () => ({})),
+        triggerAdCopyForUser: jest.fn(async () => undefined),
+      }));
+      jest.doMock("../services/onboardingBrandBuildService", () => ({
+        claimBrandBuildRun: jest.fn(async () => ({})),
+        triggerBrandBuildForUser: jest.fn(async () => undefined),
+      }));
+
+      const {
+        reconcileForUser,
+        _resetOrchestratorForTests,
+      } = require("../services/onboardingOrchestratorWiring");
+      _resetOrchestratorForTests();
+      const {
+        _resetRateLimitState,
+      } = require("../services/onboardingPipelineOrchestrator");
+      _resetRateLimitState();
+
+      // Two callers fire reconcileForUser for the SAME user before
+      // either's icp claim has resolved — exactly the race window
+      // reproduced against the bare orchestrator.
+      const callA = reconcileForUser("u-concurrent");
+      const callB = reconcileForUser("u-concurrent");
+      // Let both calls actually reach the (still-paused) icp claim.
+      await new Promise((r) => setImmediate(r));
+      releaseIcp!();
+
+      const [reportA, reportB] = await Promise.all([callA, callB]);
+
+      // Without the dedup, claimIcpRun/triggerIcp would each be called
+      // twice (once per concurrent reconcile pass) — the exact shape of
+      // the reproduced bug (a real extra LLM call fired from the losing
+      // pass's own topo walk). With the dedup, both callers share the
+      // one in-flight pass.
+      expect(claimIcpRunMock).toHaveBeenCalledTimes(1);
+      expect(triggerIcp).toHaveBeenCalledTimes(1);
+      expect(reportA).toBe(reportB);
+      expect(reportA?.fired.some((f: { step: string }) => f.step === "icp")).toBe(true);
+    });
+  });
+
+  it("does not dedup a SECOND, later-arriving call once the first has already finished", async () => {
+    process.env.EAGER_ONBOARDING_PIPELINE_ENABLED = "true";
+
+    await jest.isolateModulesAsync(async () => {
+      const getUserByIdMock = jest.fn().mockResolvedValue({ userId: "u-sequential" });
+
+      jest.doMock("../services/db", () => ({
+        userDb: {
+          getUserById: getUserByIdMock,
+          updateUser: jest.fn().mockResolvedValue(undefined),
+        },
+      }));
+      jest.doMock("../services/onboardingIcpService", () => ({
+        claimIcpRun: jest.fn(async () => ({})),
+        triggerIcpDiscoveryForUser: jest.fn(async () => undefined),
+      }));
+      jest.doMock("../services/onboardingCompetitorService", () => ({
+        claimCompetitorRun: jest.fn(async () => ({})),
+        triggerCompetitorStrategyForUser: jest.fn(async () => undefined),
+      }));
+      jest.doMock("../services/onboardingCreativeDirService", () => ({
+        claimCreativeDirRun: jest.fn(async () => ({})),
+        triggerCreativeDirForUser: jest.fn(async () => undefined),
+      }));
+      jest.doMock("../services/onboardingAdImageService", () => ({
+        claimAdImageRun: jest.fn(async () => ({
+          runId: "adimg_test-run",
+          startedAt: "2026-08-04T00:00:00.000Z",
+        })),
+        triggerAdImageGenerationForUser: jest.fn(async () => undefined),
+      }));
+      jest.doMock("../services/onboardingAdCopyService", () => ({
+        claimAdCopyRun: jest.fn(async () => ({})),
+        triggerAdCopyForUser: jest.fn(async () => undefined),
+      }));
+      jest.doMock("../services/onboardingBrandBuildService", () => ({
+        claimBrandBuildRun: jest.fn(async () => ({})),
+        triggerBrandBuildForUser: jest.fn(async () => undefined),
+      }));
+
+      const {
+        reconcileForUser,
+        _resetOrchestratorForTests,
+      } = require("../services/onboardingOrchestratorWiring");
+      _resetOrchestratorForTests();
+      const {
+        _resetRateLimitState,
+      } = require("../services/onboardingPipelineOrchestrator");
+      _resetRateLimitState();
+
+      await reconcileForUser("u-sequential");
+      const callsAfterFirst = getUserByIdMock.mock.calls.length;
+      expect(callsAfterFirst).toBeGreaterThan(0);
+
+      await reconcileForUser("u-sequential");
+      // The dedup map must release its entry once a pass finishes — a
+      // genuinely later, sequential call must run its OWN fresh
+      // reconcile() pass (its own getUser read), not reuse a stale
+      // in-flight promise left behind by an earlier, already-settled call.
+      expect(getUserByIdMock.mock.calls.length).toBeGreaterThan(callsAfterFirst);
+    });
+  });
 });
 
 describe("runAdImage — lost start-claim race (ENG-2308)", () => {

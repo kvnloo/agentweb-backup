@@ -337,7 +337,44 @@ function getOrchestrator(): OnboardingPipelineOrchestrator {
  */
 export function _resetOrchestratorForTests(): void {
   _orchestrator = null;
+  _inFlightReconciles.clear();
 }
+
+/**
+ * Per-user in-process dedup for concurrent `reconcileForUser` calls
+ * (ENG-2308 review follow-up, confirmed by direct reproduction — see
+ * PR discussion). `reconcile()` reads `User.steps` ONCE at the top of
+ * its topo walk into a local `workingSteps` copy, then fires every
+ * step that's ready in that single pass. Six different call sites
+ * (every axis's `start*ForUser` on the eager branch, plus the
+ * brand-build route) each fire `reconcileForUser` independently with
+ * no mutual exclusion between THEM — only the per-axis DynamoDB claims
+ * arbitrate who actually runs real work for a given axis.
+ *
+ * That claim only protects the *legacy* status field. It does nothing
+ * for the orchestrator's OWN bookkeeping: if two reconcile() passes
+ * both start before either has persisted anything, both decide to
+ * fire the same step (same starting generation, since both compute
+ * `(prev?.generation ?? 0) + 1` from the same pre-write read), one
+ * loses the per-axis claim and resolves fast with a null/placeholder
+ * output, and that pass's OWN topo walk then treats the step as
+ * "ready" with that null output and proceeds to fire the NEXT step for
+ * real using it — a genuine extra LLM call with degraded context, the
+ * exact class of waste/corruption this ticket exists to eliminate, one
+ * layer up. Reproduced directly against the real orchestrator with two
+ * concurrent `reconcile()` calls for the same user.
+ *
+ * Fix: collapse concurrent calls for the same userId into the ONE
+ * already-in-flight `reconcile()` promise instead of starting a second
+ * walk. That walk will itself fire whatever the second caller wanted
+ * fired (reconcile() always walks the full topo order), so nothing is
+ * lost — only the redundant, racy second pass is. In-process only,
+ * same scoping as `defaultShouldRateLimit`'s in-memory counter above
+ * (its own docstring already defers cross-instance durability to a
+ * follow-up); this does not protect against two different backend
+ * instances reconciling the same user at the same instant.
+ */
+const _inFlightReconciles = new Map<string, Promise<ReconcileReport | null>>();
 
 /**
  * Drive the eager DAG forward for `userId`. Cheap no-op when neither the
@@ -349,16 +386,28 @@ export function _resetOrchestratorForTests(): void {
 export async function reconcileForUser(
   userId: string,
 ): Promise<ReconcileReport | null> {
+  const existing = _inFlightReconciles.get(userId);
+  if (existing) return existing;
+
+  const run = (async () => {
+    try {
+      return await getOrchestrator().reconcile(userId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // eslint-disable-next-line no-console
+      console.error("[onboardingOrchestratorWiring] reconcile failed", {
+        userId,
+        err: msg,
+      });
+      return null;
+    }
+  })();
+
+  _inFlightReconciles.set(userId, run);
   try {
-    return await getOrchestrator().reconcile(userId);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    // eslint-disable-next-line no-console
-    console.error("[onboardingOrchestratorWiring] reconcile failed", {
-      userId,
-      err: msg,
-    });
-    return null;
+    return await run;
+  } finally {
+    _inFlightReconciles.delete(userId);
   }
 }
 
