@@ -1,4 +1,4 @@
-import type { LeadNotificationsConfig } from './orgLeadNotificationService';
+import type { LeadNotificationsConfig, LeadOrigin } from './leadNotificationConfig';
 import { writeWithEvaluationGuard } from './evaluationPersistence';
 import AWS from "aws-sdk";
 import { buildAwsHttpOptions } from "../utils/awsHttpOptions";
@@ -6441,7 +6441,7 @@ export const crmDb = {
      *  `duplicateEmail` error the pre-check does. Ignored when the caller supplies a leadId, when
      *  there is no email, or when LEAD_EMAIL_UNIQUE_CREATE=false (random-id path, unchanged). */
     emailUniqueCreate?: boolean;
-  }) {
+  }, origin?: LeadOrigin) {
     try {
       const emailKeyIds: EmailLeadIds | null =
         leadData.emailUniqueCreate && !leadData.leadId?.trim() && leadData.email?.trim() && isEmailUniqueCreateEnabled()
@@ -6620,7 +6620,7 @@ export const crmDb = {
       }
       // Covers landing-page form capture and every single CRM insert. Never await Slack.
       void import('./orgLeadNotificationService')
-        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(listId, leadId))
+        .then(({ dispatchLeadCreated }) => dispatchLeadCreated(listId, leadId, origin))
         .catch(() => console.warn('[leadNotifications] hook failed', { listId, leadId }));
 
       // Extract field names from lead data
@@ -8509,6 +8509,7 @@ export const crmDb = {
      *  lead-filter UI. */
     system?: Record<string, any>;
   }>, options: {
+    origin?: LeadOrigin;
     /**
      * Wall-clock budget for this import (ENG-1133). When it runs out, the
      * importer stops between units of work and leaves the rows it never reached
@@ -8903,7 +8904,7 @@ export const crmDb = {
       // Notification delivery must never delay or fail the import save.
       if (results.created.length) {
         void import('./orgLeadNotificationService')
-          .then(({ dispatchLeadsCreated }) => dispatchLeadsCreated(listId, results.created.map(row => row.leadId)))
+          .then(({ dispatchLeadsCreated }) => dispatchLeadsCreated(listId, results.created.map(row => row.leadId), options.origin))
           .catch(() => console.warn('[leadNotifications] batch hook failed', { listId }));
       }
 

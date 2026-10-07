@@ -95,15 +95,15 @@ describe('forward-lead — unknown top-level fields reach customFields', () => {
     for (let i = 0; i < 2; i++) {
       const response = await request(app).post('/api/webhooks/forward-lead').send({
         listId: 'list_123', email: existing.email, phone: existing.phone,
-        source: 'unknown-future-lander', landingPagePath: '/never-registered',
+        source: 'unknown-future-lander', landingPagePath: '/never-registered', origin: 'linkedin',
       });
       expect(response.status).toBe(200);
       await flush();
     }
     expect(dispatchLeadCreated).toHaveBeenCalledTimes(2);
     const calls = (dispatchLeadCreated as jest.Mock).mock.calls;
-    expect(calls[0]).toEqual(['list_123', 'lead_repeat', { submissionId: expect.any(String), submittedAt: expect.any(String) }]);
-    expect(calls[0][2].submissionId).not.toBe(calls[1][2].submissionId);
+    expect(calls[0]).toEqual(['list_123', 'lead_repeat', 'form_fill', { submissionId: expect.any(String), submittedAt: expect.any(String) }]);
+    expect(calls[0][3].submissionId).not.toBe(calls[1][3].submissionId);
   });
 
   it('leaves new unknown-LP submissions to the single CRM insert hook', async () => {

@@ -232,7 +232,7 @@ async function handleHubSpotEvent(
     if (!lead) {
       // New contact in HubSpot — create it in our list
       try {
-        await crmDb.createLead(listId, leadFields);
+        await crmDb.createLead(listId, leadFields, 'integration');
         console.log(`[CrmWebhook/HubSpot] Created lead for ${email} in list ${listId}`);
       } catch (createErr: any) {
         // The lookups above said "absent" but createLead's own pre-check found the address — a

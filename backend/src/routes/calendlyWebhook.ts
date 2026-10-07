@@ -443,7 +443,7 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
             },
             leadId: deterministicLeadId,
             failIfExists: true,
-          });
+          }, 'booking');
           eventType = 'created';
         } catch (err: any) {
           if (err?.duplicateEmail && err.existingLead) {
