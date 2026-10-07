@@ -2355,6 +2355,16 @@ export class AgentModeService {
   }
 
   /**
+   * Registry display name for a model id, or undefined when the id is not a
+   * registry key (own-property check, so 'constructor' etc. don't match).
+   * Used only to word the fail-loud model_unavailable message.
+   */
+  getModelDisplayName(modelId: string): string | undefined {
+    if (!modelId || !Object.prototype.hasOwnProperty.call(this.llmModels, modelId)) return undefined;
+    return this.llmModels[modelId].name;
+  }
+
+  /**
    * Would the model picker accept this id for this user? The single source of
    * truth for "can this user pick this model" — internal/live exclusion and the
    * adminOnly gate. `updateSessionLlmModel`

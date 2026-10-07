@@ -17,6 +17,7 @@
  */
 
 import type { ConversationChannelAdapter, ConversationRef, InboundAttachment } from './channelPort';
+import { buildChannelModelUnavailableMessage, isModelUnavailableError } from '../agentMode/modelUnavailable';
 
 export interface SessionResponseParams {
   session: any;
@@ -128,12 +129,16 @@ export async function handleSessionResponse(
       }
     }
 
+    // FAIL-LOUD: the session's selected model is not served — reply with the one
+    // server-produced sentence instead of the generic "Sorry". Same single catch.
+    const modelUnavailableText = isModelUnavailableError(genError) ? buildChannelModelUnavailableMessage() : undefined;
+
     // CodeRabbit, PR #2393: when generation failed *because* the transport is failing,
     // this reply usually fails too. Unguarded, the rejection escaped and skipped the
     // persistence below, so iShare viewers saw an orphaned user message — and the
     // "never throws" contract above would have been a lie for every future transport.
     try {
-      await adapter.postReply(ref, 'Sorry, I encountered an error while processing your request. Please try again.');
+      await adapter.postReply(ref, modelUnavailableText ?? 'Sorry, I encountered an error while processing your request. Please try again.');
     } catch (replyError) {
       console.error('❌ Failed to post the error reply:', replyError);
     }
@@ -142,7 +147,7 @@ export async function handleSessionResponse(
     try {
       await chatbotDb.addMessageToSession(session.sessionId, {
         role: 'assistant',
-        content: 'Sorry, I encountered an error processing your request. Please try again.',
+        content: modelUnavailableText ?? 'Sorry, I encountered an error processing your request. Please try again.',
         timestamp: new Date().toISOString(),
         metadata: { timestamp: new Date().toISOString(), isErrorMessage: true },
       });
