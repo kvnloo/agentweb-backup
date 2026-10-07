@@ -41,6 +41,7 @@ import {
   type StepName,
   type UserSteps,
   DEFAULT_DAG,
+  StepClaimLostError,
 } from "./onboardingPipelineOrchestrator";
 import { userDb } from "./db";
 
@@ -143,15 +144,15 @@ async function runBrandDna(userId: string): Promise<unknown> {
   const startedAtMs = Date.now();
   const claimed = await claimBrandBuildRun(userId);
   if (!claimed) {
-    // Lost the claim to a concurrent caller (e.g. /brand-build/start
-    // itself, mid-flight). Don't run a second Emma session.
-    const current = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
-    return current?.brandGuidelines ?? null;
+    // Lost the claim to a concurrent caller (another instance's pass, or a
+    // legacy route mid-flight). Don't run a second Emma session, and don't
+    // report a result either: the winner records the real outcome.
+    throw new StepClaimLostError("brandDna");
   }
   // expectedStartedAt: this invocation's own claim, so a later reclaim's
-  // zombie FAILURE write can't stomp a terminal state WE or the reclaiming
-  // run have since published (ENG-2308 review follow-up). The ready
-  // transition itself is written by Emma's tool-call hook, out of scope.
+  // zombie failure write, and a zombie Emma session's `ready` flip in the
+  // update_brand_guidelines hook, can't stomp a terminal state WE or the
+  // reclaiming run have since published (ENG-2308 review follow-up).
   await triggerBrandBuildForUser(userId, {
     expectedStartedAt: (claimed as { brandBuildStartedAt?: string }).brandBuildStartedAt,
   });
@@ -166,8 +167,7 @@ async function runIcp(userId: string): Promise<unknown> {
   const startedAtMs = Date.now();
   const claimed = await claimIcpRun(userId);
   if (!claimed) {
-    const current = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
-    return current?.icpResult ?? null;
+    throw new StepClaimLostError("icp");
   }
   // expectedStartedAt: this invocation's own claim, so a later reclaim's
   // zombie completion can't be mistaken for a terminal state WE published
@@ -189,8 +189,7 @@ async function runCompetitor(userId: string): Promise<unknown> {
   const startedAtMs = Date.now();
   const claimed = await claimCompetitorRun(userId);
   if (!claimed) {
-    const current = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
-    return current?.competitorResult ?? null;
+    throw new StepClaimLostError("competitor");
   }
   await triggerCompetitorStrategyForUser(userId, {
     expectedStartedAt: (claimed as { competitorStartedAt?: string }).competitorStartedAt,
@@ -209,8 +208,7 @@ async function runCreativeDir(userId: string): Promise<unknown> {
   const startedAtMs = Date.now();
   const claimed = await claimCreativeDirRun(userId);
   if (!claimed) {
-    const current = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
-    return current?.creativeDirResult ?? null;
+    throw new StepClaimLostError("creativeDir");
   }
   await triggerCreativeDirForUser(userId, {
     expectedStartedAt: (claimed as { creativeDirStartedAt?: string }).creativeDirStartedAt,
@@ -235,13 +233,9 @@ async function runAdImage(userId: string): Promise<unknown> {
   // would then share one nonce and could overwrite each other (Greptile).
   const run = await claimAdImageRun(userId);
   if (!run) {
-    // Lost the claim (ENG-2308) — a concurrent caller (the legacy route, or
-    // another reconcile pass) already owns a `running` run for this axis.
-    // This invocation contributed nothing, which is not a failure of ITS
-    // run — return whatever is currently persisted rather than launching a
-    // second worker or throwing.
-    const current = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
-    return current?.adImageResult ?? null;
+    // Lost the claim (ENG-2308): another run owns a `running` ad-image axis.
+    // Skip rather than report: the winner records the real outcome.
+    throw new StepClaimLostError("adImage");
   }
   await triggerAdImageGenerationForUser(userId, { run });
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
@@ -259,8 +253,7 @@ async function runAdCopy(userId: string): Promise<unknown> {
   const startedAtMs = Date.now();
   const claimed = await claimAdCopyRun(userId);
   if (!claimed) {
-    const current = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
-    return current?.adCopyResult ?? null;
+    throw new StepClaimLostError("adCopy");
   }
   await triggerAdCopyForUser(userId, {
     expectedStartedAt: (claimed as { adCopyStartedAt?: string }).adCopyStartedAt,
