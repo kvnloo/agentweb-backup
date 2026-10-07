@@ -212,9 +212,10 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   //   `true` on each, gated as unproven-in-our-stack — Harsha: "i'm fine to
   //   include open source / open router stuff for all users not just
   //   isadmin". Client construction is the same lazy-loaded OpenRouter path
-  //   already used successfully by gpt-4o-mini above.) This does NOT apply
-  //   to non-OpenRouter adminOnly entries elsewhere in this registry (e.g.
-  //   anthropic.claude-opus-4-6-v1), which are gated for unrelated reasons.
+  //   already used successfully by gpt-4o-mini above.) No model is gated by
+  //   name or family (Opus 4.6 was the last such gate, removed in ENG-2028).
+  //   The only adminOnly entries are those auto-added by modelCatalogRefresh,
+  //   which stay adminOnly until a human reviews them.
   'openrouter/openai/gpt-4o-mini': {"name":"GPT-4o Mini","family":"gpt5-nano","provider":"openai","tier":"ultra_cheap","description":"Legacy lightweight model","client":null,"supportsTemperature":true,"qualityScore":6.7,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gpt-4o-mini (https://artificialanalysis.ai/)"},
   // Workload-specific research agent. It is intentionally callable only from
   // DeepResearchService, not exposed as a general chat-picker model.
@@ -392,7 +393,7 @@ export const LLM_MODEL_REGISTRY: Readonly<Record<string, Readonly<LLMModelConfig
   // "Show more", they're just no longer the default row per tier.
   'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 19, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Claude Sonnet 4.5, Non-reasoning' },
   'anthropic.claude-sonnet-4-6': {"name":"Claude Sonnet 4.6","family":"claude-sonnet","provider":"anthropic","tier":"medium","description":"Previous-generation Sonnet","client":null,"supportsTemperature":true,"supportsVision":true,"legacy":true,"qualityScore":24.7,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-sonnet-4-6 (https://artificialanalysis.ai/)"},
-  'anthropic.claude-opus-4-6-v1': {"name":"Claude Opus 4.6","family":"claude-opus","provider":"anthropic","tier":"pro","description":"Previous-generation Opus","client":null,"supportsTemperature":true,"adminOnly":true,"supportsVision":true,"legacy":true,"qualityScore":26.4,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-opus-4-6 (https://artificialanalysis.ai/)"},
+  'anthropic.claude-opus-4-6-v1': {"name":"Claude Opus 4.6","family":"claude-opus","provider":"anthropic","tier":"pro","description":"Previous-generation Opus","client":null,"supportsTemperature":true,"supportsVision":true,"legacy":true,"qualityScore":26.4,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-opus-4-6 (https://artificialanalysis.ai/)"},
   // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
   // temperature is deprecated for this model
   'anthropic.claude-opus-4-8': {"name":"Claude Opus 4.8","family":"claude-opus","provider":"anthropic","tier":"pro","description":"Previous-generation Opus","client":null,"supportsTemperature":false,"supportsVision":true,"legacy":true,"qualityScore":41.8,"qualityScoreSource":"Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-opus-4-8 (https://artificialanalysis.ai/)"},
