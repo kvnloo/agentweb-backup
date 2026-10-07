@@ -106,6 +106,61 @@ describe('ask_crm production lead loader', () => {
     expect(leads[0].liveOpenDealStages).toEqual(['Proposal']);
   });
 
+  describe('bounds and failure fallbacks', () => {
+    const stored = (id: string, email: string) => ({ leadId: id, listId: 'list-1', email, lifecycle: 'inbox' });
+    let warn: jest.SpyInstance;
+    beforeEach(() => { warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined); });
+    afterEach(() => warn.mockRestore());
+
+    it('never loads more than USER_LOOKUP_BUDGET leads, even if a caller asks for more', async () => {
+      const page = Array.from({ length: 200 }, (_, i) => stored(`l${i}`, `u${i}@example.com`));
+      const d = deps({
+        getLeadListsForUser: jest.fn().mockResolvedValue(Array.from({ length: 10 }, (_, i) => ({ listId: `list-${i}` }))),
+        getLeadsByListId: jest.fn().mockImplementation(async (_id: string, limit: number) => ({ items: page.slice(0, limit) })),
+      });
+      const leads = await createAskCrmLeadLoader(d)('owner', { limit: 100000 });
+
+      expect(leads).toHaveLength(500);
+      expect(d.getUserByEmail.mock.calls.length).toBeLessThanOrEqual(500);
+    });
+
+    it('falls back to stored signals when a getUserByEmail lookup rejects, and logs once per batch', async () => {
+      const d = deps({
+        getLeadsByListId: jest.fn().mockResolvedValue({ items: [stored('l1', 'a@example.com'), stored('l2', 'b@example.com')] }),
+        getUserByEmail: jest.fn().mockRejectedValue(new Error('dynamo down')),
+      });
+      const leads = await createAskCrmLeadLoader(d)('owner', { limit: 10 });
+
+      expect(leads).toHaveLength(2);
+      expect(leads.every((l) => l.lifecycle === 'inbox' && l.subscriptionState == null)).toBe(true);
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
+
+    it('falls back to stored deal stages when getDealsByOwner rejects', async () => {
+      const d = deps({
+        getLeadsByListId: jest.fn().mockResolvedValue({ items: [{ ...stored('l1', 'a@example.com'), openDealStages: ['Proposal'] }] }),
+        getDealsByOwner: jest.fn().mockRejectedValue(new Error('dynamo down')),
+      });
+      const leads = await createAskCrmLeadLoader(d)('owner', { limit: 10 });
+
+      expect(leads[0].openDealStages).toEqual(['Proposal']);
+      expect(leads[0].liveOpenDealStages).toBeNull();
+      expect(warn).toHaveBeenCalled();
+    });
+
+    it('only self-matches when the owner lookup fails, so a same-org member is not enriched', async () => {
+      const d = deps({
+        getLeadsByListId: jest.fn().mockResolvedValue({ items: [stored('l1', 'member@example.com')] }),
+        getUserById: jest.fn().mockRejectedValue(new Error('dynamo down')),
+        getUserByEmail: jest.fn().mockResolvedValue({ userId: 'member', orgId: 'org-1', subscription_status: 'active' }),
+      });
+      const leads = await createAskCrmLeadLoader(d)('owner', { limit: 10 });
+
+      expect(leads[0].subscriptionState == null).toBe(true);
+      expect(leads[0].hasUserRecord == null).toBe(true);
+    });
+  });
+
   it('keeps liveOpenDealStages to the live query only, never the stored stages', async () => {
     const d = deps({
       getLeadsByListId: jest.fn().mockResolvedValue({
