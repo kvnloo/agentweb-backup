@@ -133,9 +133,20 @@ describe('persisted admin defaults hidden by the picker (ENG-2183)', () => {
     expect(await resolveModelForRole(undefined, 'image')).toBe('gemini-3-pro-image-preview');
   });
 
-  it('falls back for an adminOnly model', async () => {
+  it('honours Opus 4.6 stored as the content model: it was the last adminOnly model and is open to everyone now', async () => {
     setting('agent_mode_content_model', 'anthropic.claude-opus-4-6-v1');
-    expect(await resolveModelForRole(undefined, 'content_generation')).toBe('gemini-3.8-flash');
+    expect(await resolveModelForRole(undefined, 'content_generation')).toBe('anthropic.claude-opus-4-6-v1');
+  });
+
+  it('still falls back for a model that IS flagged adminOnly (the mechanism is kept; synthetic entry, none is flagged in the registry)', async () => {
+    const id = '__synthetic-admin-only__';
+    (LLM_MODEL_REGISTRY as Record<string, unknown>)[id] = { ...LLM_MODEL_REGISTRY['anthropic.claude-opus-4-6-v1'], adminOnly: true };
+    try {
+      setting('agent_mode_content_model', id);
+      expect(await resolveModelForRole(undefined, 'content_generation')).toBe('gemini-3.8-flash');
+    } finally {
+      delete (LLM_MODEL_REGISTRY as Record<string, unknown>)[id];
+    }
   });
 
   it('falls back for an internalOnly model', async () => {

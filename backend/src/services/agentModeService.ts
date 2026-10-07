@@ -2021,11 +2021,34 @@ export class AgentModeService {
     return null;
   }
 
+  /** Bad configured-default values already warned about (once per process each). */
+  private warnedUnusableDefaults = new Set<string>();
+
+  /** Selectable by a non-admin through the picker: served, not internalOnly/adminOnly/live. */
+  private isPubliclySelectable(modelId: string): boolean {
+    const config = this.llmModels[modelId];
+    return Boolean(config) && !config.internalOnly && !config.adminOnly && !config.isLive;
+  }
+
   async getDefaultModel(): Promise<string> {
-    return (
-      (await this.resolveConfiguredModel(this.defaultModelSettingName, 'default')) ??
-      this.default_model
-    );
+    const configured = await this.resolveConfiguredModel(this.defaultModelSettingName, 'default');
+    if (!configured) return this.default_model;
+    // The default stands in for every user, so it must be one the picker offers a
+    // non-admin (the same rules getSupportedModels(false) applies). Otherwise the
+    // usage policy rejects it ("system default model is not supported") and a turn
+    // with no stored/request model fails. Fall back to the code constant -- but only
+    // when that constant is itself usable; otherwise keep the existing behaviour.
+    if (!this.isPubliclySelectable(configured) && this.isPubliclySelectable(this.default_model)) {
+      if (!this.warnedUnusableDefaults.has(configured)) {
+        this.warnedUnusableDefaults.add(configured);
+        console.warn(
+          `AgentMode: ${this.defaultModelSettingName} "${configured}" is internal-only, admin-only, or a live-voice model ` +
+            `and cannot serve users; using "${this.default_model}" instead. Fix the AW-Settings row.`
+        );
+      }
+      return this.default_model;
+    }
+    return configured;
   }
 
   async getReportsModel(): Promise<string> {
@@ -2355,9 +2378,24 @@ export class AgentModeService {
   }
 
   /**
+   * Registry display name for a model id, or undefined when the id is not a
+   * registry key (own-property check, so 'constructor' etc. don't match).
+   * Used only to word the fail-loud model_unavailable message.
+   */
+  getModelDisplayName(modelId: string): string | undefined {
+    if (!modelId || !Object.prototype.hasOwnProperty.call(this.llmModels, modelId)) return undefined;
+    return this.llmModels[modelId].name;
+  }
+
+  /** True for a live-voice registry model (never valid for a text chat). Own-property check. */
+  isLiveModel(modelId: string): boolean {
+    return Boolean(modelId && Object.prototype.hasOwnProperty.call(this.llmModels, modelId) && this.llmModels[modelId].isLive);
+  }
+
+  /**
    * Would the model picker accept this id for this user? The single source of
-   * truth for "can this user pick this model" — internal/live exclusion, the
-   * adminOnly gate, and the non-admin Opus restriction. `updateSessionLlmModel`
+   * truth for "can this user pick this model" — internal/live exclusion and the
+   * adminOnly gate. `updateSessionLlmModel`
    * / `updateSharedSessionLlmModel` call this directly (ENG-2293: they used to
    * re-derive a subset inline — just the opus check — which let a non-admin
    * who named an adminOnly auto-added model by id bypass it) so the two cannot
@@ -2367,8 +2405,22 @@ export class AgentModeService {
     const config = this.llmModels[modelId];
     if (!config || config.internalOnly || config.isLive) return false;
     if (config.adminOnly && !isAdmin) return false;
-    if (modelId.includes('opus') && !isAdmin) return false;
     return true;
+  }
+
+  /**
+   * ENG-55: registry facts the model-compare feature needs (display name, lab, live
+   * flag) without exposing the registry. Null for ids that are not registry keys.
+   */
+  getModelCompareInfo(modelId: string): { name: string; provider: string; isLive: boolean; internalOnly: boolean } | null {
+    if (!Object.prototype.hasOwnProperty.call(this.llmModels, modelId)) return null;
+    const config = this.llmModels[modelId];
+    return {
+      name: config.name ?? modelId,
+      provider: config.provider ?? 'other',
+      isLive: config.isLive === true,
+      internalOnly: config.internalOnly === true,
+    };
   }
 
   /**
@@ -2440,7 +2492,7 @@ export class AgentModeService {
   }
 
   async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
-    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || (!this.llmModels[m].adminOnly && !m.includes('opus'))));
+    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || !this.llmModels[m].adminOnly));
   }
   /**
    * Make an LLM call with the specified model and parameters
@@ -17382,7 +17434,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // delegating wrapper — real callers beyond tools.ts: routes/emmaApi.ts's
   // POST /social-post handler, and many direct real-instance calls in
   // agentModeService.socialTools.test.ts.
-  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean }): Promise<any> {
+  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean; inReplyToPostId?: string }): Promise<any> {
     return linkedinImpl.postOnConnectedAccount(userId, accountId, content, mediaUrls, platform, toolContext, options);
   }
 
