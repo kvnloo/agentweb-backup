@@ -81,6 +81,20 @@ export function parseOpenRouter(payload: unknown): CatalogCandidate[] {
   return [...result.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
 
+/**
+ * Registry id -> the Artificial Analysis slug that is actually that model. Needed
+ * only where the two catalogs disagree on which release a bare name means:
+ * OpenRouter's `deepseek/deepseek-v4-pro` is the 0423 release, but AA's
+ * `deepseek-v4-pro` slug now names the newer 0813 release (the 0423 one is
+ * `deepseek-v4-pro-0424`). Without this the daily refresh matched the 0423 entry
+ * to the 0813 row and wrote 0813's score onto it (36 instead of 30). A slug that
+ * is absent from the payload simply reports "unmatched; score unchanged".
+ */
+const AA_SLUG_OVERRIDES: Readonly<Record<string, string>> = {
+  'openrouter/deepseek/deepseek-v4-pro': 'deepseek-v4-pro-0424',
+  'openrouter/deepseek/deepseek-v4-pro-0813': 'deepseek-v4-pro',
+};
+
 /** Exact model-version matching only. Ambiguous effort variants are reported, never guessed.
  * Source: https://artificialanalysis.ai/api-reference
  */
@@ -102,8 +116,10 @@ export function refreshScores(registry: Registry, payload: unknown | undefined, 
     const [provider, model] = upstream(id).split('/');
     if (!model) continue;
     const source = normalize((config.qualityScoreSource ?? '').replace(/\(https?:.*$/, ''));
+    const slugOverride = AA_SLUG_OVERRIDES[id];
     const matches = scores.filter(s => (s.provider === normalize(provider) || s.provider === normalize(config.provider ?? ''))
-      && (normalize(s.slug) === normalize(model) || normalize(s.name) === normalize(model)
+      && (slugOverride ? normalize(s.slug) === normalize(slugOverride)
+        : normalize(s.slug) === normalize(model) || normalize(s.name) === normalize(model)
         // An existing AA source can explicitly identify a benchmark effort variant.
         // Do not pick the highest scoring variant or strip arbitrary effort suffixes.
         || ([s.slug, s.name].some(name => normalize(name).startsWith(normalize(model))

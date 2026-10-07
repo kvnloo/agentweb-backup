@@ -69,6 +69,26 @@ describe('catalog critical invariants', () => {
     expect(refreshScores(scoreRegistry, { data: [{ ...valid, slug: 'grok-4-6-high', name: 'Grok 4.6 (high)' }] }, '2026-09-24').changes[grok[0]].qualityScore).toBe(45);
     expect(refreshScores(scoreRegistry, { data: [valid, valid] }, '2026-09-24').changes).toEqual({});
   });
+  it('matches the 0423 and 0813 DeepSeek V4 Pro entries to their own AA rows, not the bare-name row (ENG-2293)', () => {
+    // AA's bare `deepseek-v4-pro` slug names the 0813 release; OpenRouter's bare
+    // `deepseek-v4-pro` is the 0423 release (AA: `deepseek-v4-pro-0424`). Matching
+    // by bare name wrote 0813's score (36) onto the 0423 entry (true: 30) every run.
+    const old = 'openrouter/deepseek/deepseek-v4-pro', ga = 'openrouter/deepseek/deepseek-v4-pro-0813';
+    const reg = {
+      [old]: { client: null, supportsTemperature: true, provider: 'deepseek' as const, qualityScore: 36, qualityScoreSource: 'stale' },
+      [ga]: { client: null, supportsTemperature: true, provider: 'deepseek' as const },
+    };
+    const aa = (slug: string, score: number) => ({ slug, model_creator: { slug: 'deepseek' }, evaluations: { artificial_analysis_intelligence_index: score } });
+    const { changes } = refreshScores(reg, { data: [aa('deepseek-v4-pro', 36), aa('deepseek-v4-pro-0424', 30)] }, '2026-10-07');
+    expect(changes[old].qualityScore).toBe(30);
+    expect(changes[old].qualityScoreSource).toContain('deepseek-v4-pro-0424');
+    expect(changes[ga].qualityScore).toBe(36);
+    // Idempotent once correct: the next daily run must not flip the old entry back.
+    const settled = { [old]: { ...reg[old], qualityScore: 30 }, [ga]: { ...reg[ga], qualityScore: 36 } };
+    expect(refreshScores(settled, { data: [aa('deepseek-v4-pro', 36), aa('deepseek-v4-pro-0424', 30)] }, '2026-10-07').changes).toEqual({});
+    // A missing slug is a loud "unmatched", never a silent wrong match.
+    expect(refreshScores(settled, { data: [aa('deepseek-v4-pro', 36)] }, '2026-10-07').reports.join()).toContain(`${old}: AA unmatched`);
+  });
   it('merges additions into an override Set regardless of existing quote style, and is idempotent (ENG-2293)', () => {
     const singleQuoted = "const explicitCacheOverrides = new Set(['gpt-4o', 'openrouter/anthropic/claude-fable-5.1']);";
     const merged = mergeSetLiteral(singleQuoted, 'explicitCacheOverrides', ['openrouter/new/model-x']);
