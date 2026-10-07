@@ -17,6 +17,7 @@ jest.mock("../services/db", () => ({
 }));
 
 import {
+  claimBrandBuildRun,
   triggerBrandBuildForUser,
   mapMarketIcpToResult,
   mapMarketCompetitorsToResult,
@@ -29,6 +30,44 @@ beforeEach(() => {
 });
 
 describe("onboardingBrandBuildService", () => {
+  // ENG-2308 follow-up, caught live: the orchestrator's runBrandDna used to
+  // call triggerBrandBuildForUser directly with nothing ever flipping
+  // brandBuildStatus to building first — the real Emma session ran, really
+  // called update_brand_guidelines, but that tool's own "flip to ready if
+  // we were building" hook silently no-op'd, and triggerBrandBuildForUser's
+  // own final check then misreported "Emma finished but did not call
+  // update_brand_guidelines". claimBrandBuildRun is the extracted, reusable
+  // claim both /brand-build/start and runBrandDna now go through.
+  describe("claimBrandBuildRun", () => {
+    it("claims the axis and returns the persisted patch", async () => {
+      userDb.updateUser.mockResolvedValue({});
+      const patch = await claimBrandBuildRun("user-1");
+      expect(patch).not.toBeNull();
+      expect(patch?.brandBuildStatus).toBe("building");
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toContain("brandBuildStatus");
+    });
+
+    it("returns null without throwing when it loses the claim", async () => {
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+      const patch = await claimBrandBuildRun("user-1");
+      expect(patch).toBeNull();
+    });
+
+    it("re-throws a non-conditional DynamoDB error", async () => {
+      userDb.updateUser.mockRejectedValue(
+        Object.assign(new Error("boom"), {
+          code: "ProvisionedThroughputExceededException",
+        }),
+      );
+      await expect(claimBrandBuildRun("user-1")).rejects.toThrow("boom");
+    });
+  });
+
   describe("mapMarketIcpToResult", () => {
     it("maps marketStrategy.icp[] entries into the icpResult persona shape", () => {
       const input = [

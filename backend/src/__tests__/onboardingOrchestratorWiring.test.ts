@@ -75,12 +75,18 @@ describe("reconcileForUser", () => {
         },
       }));
       jest.doMock("../services/onboardingIcpService", () => ({
+        // ENG-2308 follow-up: runIcp claims its own axis before triggering
+        // (same reasoning as adImage's claim below) — the mock must supply
+        // a truthy claim or the runner never reaches triggerIcp at all.
+        claimIcpRun: jest.fn(async () => ({})),
         triggerIcpDiscoveryForUser: triggerIcp,
       }));
       jest.doMock("../services/onboardingCompetitorService", () => ({
+        claimCompetitorRun: jest.fn(async () => ({})),
         triggerCompetitorStrategyForUser: triggerCompetitor,
       }));
       jest.doMock("../services/onboardingCreativeDirService", () => ({
+        claimCreativeDirRun: jest.fn(async () => ({})),
         triggerCreativeDirForUser: triggerCreativeDir,
       }));
       const claimAdImageRunMock = jest.fn(async () => ({
@@ -95,9 +101,11 @@ describe("reconcileForUser", () => {
         triggerAdImageGenerationForUser: triggerAdImage,
       }));
       jest.doMock("../services/onboardingAdCopyService", () => ({
+        claimAdCopyRun: jest.fn(async () => ({})),
         triggerAdCopyForUser: triggerAdCopy,
       }));
       jest.doMock("../services/onboardingBrandBuildService", () => ({
+        claimBrandBuildRun: jest.fn(async () => ({})),
         triggerBrandBuildForUser: triggerBrandBuild,
       }));
 
@@ -171,12 +179,18 @@ describe("reconcileForUser", () => {
         },
       }));
       jest.doMock("../services/onboardingIcpService", () => ({
+        // ENG-2308 follow-up: runIcp claims its own axis before triggering
+        // (same reasoning as adImage's claim below) — the mock must supply
+        // a truthy claim or the runner never reaches triggerIcp at all.
+        claimIcpRun: jest.fn(async () => ({})),
         triggerIcpDiscoveryForUser: triggerIcp,
       }));
       jest.doMock("../services/onboardingCompetitorService", () => ({
+        claimCompetitorRun: jest.fn(async () => ({})),
         triggerCompetitorStrategyForUser: triggerCompetitor,
       }));
       jest.doMock("../services/onboardingCreativeDirService", () => ({
+        claimCreativeDirRun: jest.fn(async () => ({})),
         triggerCreativeDirForUser: triggerCreativeDir,
       }));
       const claimAdImageRunMock = jest.fn(async () => ({
@@ -191,9 +205,11 @@ describe("reconcileForUser", () => {
         triggerAdImageGenerationForUser: triggerAdImage,
       }));
       jest.doMock("../services/onboardingAdCopyService", () => ({
+        claimAdCopyRun: jest.fn(async () => ({})),
         triggerAdCopyForUser: triggerAdCopy,
       }));
       jest.doMock("../services/onboardingBrandBuildService", () => ({
+        claimBrandBuildRun: jest.fn(async () => ({})),
         triggerBrandBuildForUser: triggerBrandBuild,
       }));
 
@@ -295,12 +311,18 @@ describe("reconcileForUser", () => {
         },
       }));
       jest.doMock("../services/onboardingIcpService", () => ({
+        // ENG-2308 follow-up: runIcp claims its own axis before triggering
+        // (same reasoning as adImage's claim below) — the mock must supply
+        // a truthy claim or the runner never reaches triggerIcp at all.
+        claimIcpRun: jest.fn(async () => ({})),
         triggerIcpDiscoveryForUser: triggerIcp,
       }));
       jest.doMock("../services/onboardingCompetitorService", () => ({
+        claimCompetitorRun: jest.fn(async () => ({})),
         triggerCompetitorStrategyForUser: triggerCompetitor,
       }));
       jest.doMock("../services/onboardingCreativeDirService", () => ({
+        claimCreativeDirRun: jest.fn(async () => ({})),
         triggerCreativeDirForUser: triggerCreativeDir,
       }));
       const claimAdImageRunMock = jest.fn(async () => ({
@@ -315,9 +337,11 @@ describe("reconcileForUser", () => {
         triggerAdImageGenerationForUser: triggerAdImage,
       }));
       jest.doMock("../services/onboardingAdCopyService", () => ({
+        claimAdCopyRun: jest.fn(async () => ({})),
         triggerAdCopyForUser: triggerAdCopy,
       }));
       jest.doMock("../services/onboardingBrandBuildService", () => ({
+        claimBrandBuildRun: jest.fn(async () => ({})),
         triggerBrandBuildForUser: triggerBrandBuild,
       }));
 
@@ -393,12 +417,18 @@ describe("reconcileForUser", () => {
         },
       }));
       jest.doMock("../services/onboardingIcpService", () => ({
+        // ENG-2308 follow-up: runIcp claims its own axis before triggering
+        // (same reasoning as adImage's claim below) — the mock must supply
+        // a truthy claim or the runner never reaches triggerIcp at all.
+        claimIcpRun: jest.fn(async () => ({})),
         triggerIcpDiscoveryForUser: triggerIcp,
       }));
       jest.doMock("../services/onboardingCompetitorService", () => ({
+        claimCompetitorRun: jest.fn(async () => ({})),
         triggerCompetitorStrategyForUser: triggerCompetitor,
       }));
       jest.doMock("../services/onboardingCreativeDirService", () => ({
+        claimCreativeDirRun: jest.fn(async () => ({})),
         triggerCreativeDirForUser: triggerCreativeDir,
       }));
       const claimAdImageRunMock = jest.fn(async () => ({
@@ -413,9 +443,11 @@ describe("reconcileForUser", () => {
         triggerAdImageGenerationForUser: triggerAdImage,
       }));
       jest.doMock("../services/onboardingAdCopyService", () => ({
+        claimAdCopyRun: jest.fn(async () => ({})),
         triggerAdCopyForUser: triggerAdCopy,
       }));
       jest.doMock("../services/onboardingBrandBuildService", () => ({
+        claimBrandBuildRun: jest.fn(async () => ({})),
         triggerBrandBuildForUser: triggerBrandBuild,
       }));
 
@@ -498,12 +530,18 @@ describe("reconcileForUser", () => {
         },
       }));
       jest.doMock("../services/onboardingIcpService", () => ({
+        // ENG-2308 follow-up: runIcp claims its own axis before triggering
+        // (same reasoning as adImage's claim below) — the mock must supply
+        // a truthy claim or the runner never reaches triggerIcp at all.
+        claimIcpRun: jest.fn(async () => ({})),
         triggerIcpDiscoveryForUser: triggerIcp,
       }));
       jest.doMock("../services/onboardingCompetitorService", () => ({
+        claimCompetitorRun: jest.fn(async () => ({})),
         triggerCompetitorStrategyForUser: triggerCompetitor,
       }));
       jest.doMock("../services/onboardingCreativeDirService", () => ({
+        claimCreativeDirRun: jest.fn(async () => ({})),
         triggerCreativeDirForUser: triggerCreativeDir,
       }));
       const claimAdImageRunMock = jest.fn(async () => ({
@@ -518,9 +556,11 @@ describe("reconcileForUser", () => {
         triggerAdImageGenerationForUser: triggerAdImage,
       }));
       jest.doMock("../services/onboardingAdCopyService", () => ({
+        claimAdCopyRun: jest.fn(async () => ({})),
         triggerAdCopyForUser: triggerAdCopy,
       }));
       jest.doMock("../services/onboardingBrandBuildService", () => ({
+        claimBrandBuildRun: jest.fn(async () => ({})),
         triggerBrandBuildForUser: triggerBrandBuild,
       }));
 
@@ -572,12 +612,18 @@ describe("reconcileForUser", () => {
         },
       }));
       jest.doMock("../services/onboardingIcpService", () => ({
+        // ENG-2308 follow-up: runIcp claims its own axis before triggering
+        // (same reasoning as adImage's claim below) — the mock must supply
+        // a truthy claim or the runner never reaches triggerIcp at all.
+        claimIcpRun: jest.fn(async () => ({})),
         triggerIcpDiscoveryForUser: triggerIcp,
       }));
       jest.doMock("../services/onboardingCompetitorService", () => ({
+        claimCompetitorRun: jest.fn(async () => ({})),
         triggerCompetitorStrategyForUser: triggerCompetitor,
       }));
       jest.doMock("../services/onboardingCreativeDirService", () => ({
+        claimCreativeDirRun: jest.fn(async () => ({})),
         triggerCreativeDirForUser: triggerCreativeDir,
       }));
       const claimAdImageRunMock = jest.fn(async () => ({
@@ -592,9 +638,11 @@ describe("reconcileForUser", () => {
         triggerAdImageGenerationForUser: triggerAdImage,
       }));
       jest.doMock("../services/onboardingAdCopyService", () => ({
+        claimAdCopyRun: jest.fn(async () => ({})),
         triggerAdCopyForUser: triggerAdCopy,
       }));
       jest.doMock("../services/onboardingBrandBuildService", () => ({
+        claimBrandBuildRun: jest.fn(async () => ({})),
         triggerBrandBuildForUser: triggerBrandBuild,
       }));
 
@@ -627,12 +675,15 @@ describe("reconcileForUser", () => {
         },
       }));
       jest.doMock("../services/onboardingIcpService", () => ({
+        claimIcpRun: jest.fn(async () => ({})),
         triggerIcpDiscoveryForUser: jest.fn(),
       }));
       jest.doMock("../services/onboardingCompetitorService", () => ({
+        claimCompetitorRun: jest.fn(async () => ({})),
         triggerCompetitorStrategyForUser: jest.fn(),
       }));
       jest.doMock("../services/onboardingCreativeDirService", () => ({
+        claimCreativeDirRun: jest.fn(async () => ({})),
         triggerCreativeDirForUser: jest.fn(),
       }));
       const claimAdImageRunMock = jest.fn(async () => ({
@@ -640,12 +691,15 @@ describe("reconcileForUser", () => {
         startedAt: "2026-08-04T00:00:00.000Z",
       }));
       jest.doMock("../services/onboardingAdImageService", () => ({
+        claimAdImageRun: claimAdImageRunMock,
         triggerAdImageGenerationForUser: jest.fn(),
       }));
       jest.doMock("../services/onboardingAdCopyService", () => ({
+        claimAdCopyRun: jest.fn(async () => ({})),
         triggerAdCopyForUser: jest.fn(),
       }));
       jest.doMock("../services/onboardingBrandBuildService", () => ({
+        claimBrandBuildRun: jest.fn(async () => ({})),
         triggerBrandBuildForUser: jest.fn(),
       }));
 
@@ -699,6 +753,164 @@ describe("runAdImage — lost start-claim race (ENG-2308)", () => {
       expect(result).toEqual({
         variants: [{ id: "v1", imageUrl: "https://x/1.png", prompt: "p" }],
       });
+    });
+  });
+});
+
+// ENG-2308 follow-up, caught live against a real preview + real DynamoDB:
+// runBrandDna/runIcp/runCompetitor/runCreativeDir/runAdCopy used to call
+// their trigger function directly, with nothing ever flipping the legacy
+// `<axis>Status` field to its in-flight value first. Each trigger's own
+// completion logic requires that in-flight value as a precondition to
+// persist a result — without it, the trigger ran for real then silently
+// dropped its result, and the orchestrator recorded the step "ready" with
+// a null output anyway, since nothing threw. These tests lock in the fix:
+// each runner now claims its own axis first (same pattern as the
+// pre-existing runAdImage above), and must skip the trigger — not run it a
+// second time — when that claim is already owned elsewhere.
+describe("runBrandDna/runIcp/runCompetitor/runCreativeDir/runAdCopy — claim-before-trigger (ENG-2308)", () => {
+  it("runBrandDna skips triggerBrandBuildForUser and returns the current brandGuidelines when claimBrandBuildRun loses the race", async () => {
+    await jest.isolateModulesAsync(async () => {
+      const triggerBrandBuild = jest.fn();
+      const claimBrandBuildRunMock = jest.fn(async () => null);
+
+      jest.doMock("../services/db", () => ({
+        userDb: {
+          getUserById: jest.fn().mockResolvedValue({
+            userId: "u1",
+            brandBuildStatus: "building",
+            brandGuidelines: { brandData: { brandName: "Owned Elsewhere" } },
+          }),
+          updateUser: jest.fn().mockResolvedValue(undefined),
+        },
+      }));
+      jest.doMock("../services/onboardingBrandBuildService", () => ({
+        claimBrandBuildRun: claimBrandBuildRunMock,
+        triggerBrandBuildForUser: triggerBrandBuild,
+      }));
+
+      const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
+      const result = await PRODUCTION_DAG.brandDna.runner({ userId: "u1" });
+
+      expect(claimBrandBuildRunMock).toHaveBeenCalledWith("u1");
+      expect(triggerBrandBuild).not.toHaveBeenCalled();
+      expect(result).toEqual({ brandData: { brandName: "Owned Elsewhere" } });
+    });
+  });
+
+  it("runIcp skips triggerIcpDiscoveryForUser and returns the current icpResult when claimIcpRun loses the race", async () => {
+    await jest.isolateModulesAsync(async () => {
+      const triggerIcp = jest.fn();
+      const claimIcpRunMock = jest.fn(async () => null);
+
+      jest.doMock("../services/db", () => ({
+        userDb: {
+          getUserById: jest.fn().mockResolvedValue({
+            userId: "u1",
+            icpStatus: "running",
+            icpResult: [{ name: "Owned Elsewhere" }],
+          }),
+          updateUser: jest.fn().mockResolvedValue(undefined),
+        },
+      }));
+      jest.doMock("../services/onboardingIcpService", () => ({
+        claimIcpRun: claimIcpRunMock,
+        triggerIcpDiscoveryForUser: triggerIcp,
+      }));
+
+      const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
+      const result = await PRODUCTION_DAG.icp.runner({ userId: "u1" });
+
+      expect(claimIcpRunMock).toHaveBeenCalledWith("u1");
+      expect(triggerIcp).not.toHaveBeenCalled();
+      expect(result).toEqual([{ name: "Owned Elsewhere" }]);
+    });
+  });
+
+  it("runCompetitor skips triggerCompetitorStrategyForUser and returns the current competitorResult when claimCompetitorRun loses the race", async () => {
+    await jest.isolateModulesAsync(async () => {
+      const triggerCompetitor = jest.fn();
+      const claimCompetitorRunMock = jest.fn(async () => null);
+
+      jest.doMock("../services/db", () => ({
+        userDb: {
+          getUserById: jest.fn().mockResolvedValue({
+            userId: "u1",
+            competitorStatus: "running",
+            competitorResult: { per_icp: [{ icp_id: "Owned Elsewhere" }] },
+          }),
+          updateUser: jest.fn().mockResolvedValue(undefined),
+        },
+      }));
+      jest.doMock("../services/onboardingCompetitorService", () => ({
+        claimCompetitorRun: claimCompetitorRunMock,
+        triggerCompetitorStrategyForUser: triggerCompetitor,
+      }));
+
+      const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
+      const result = await PRODUCTION_DAG.competitor.runner({ userId: "u1" });
+
+      expect(claimCompetitorRunMock).toHaveBeenCalledWith("u1");
+      expect(triggerCompetitor).not.toHaveBeenCalled();
+      expect(result).toEqual({ per_icp: [{ icp_id: "Owned Elsewhere" }] });
+    });
+  });
+
+  it("runCreativeDir skips triggerCreativeDirForUser and returns the current creativeDirResult when claimCreativeDirRun loses the race", async () => {
+    await jest.isolateModulesAsync(async () => {
+      const triggerCreativeDir = jest.fn();
+      const claimCreativeDirRunMock = jest.fn(async () => null);
+
+      jest.doMock("../services/db", () => ({
+        userDb: {
+          getUserById: jest.fn().mockResolvedValue({
+            userId: "u1",
+            creativeDirStatus: "running",
+            creativeDirResult: { concepts: ["Owned Elsewhere"] },
+          }),
+          updateUser: jest.fn().mockResolvedValue(undefined),
+        },
+      }));
+      jest.doMock("../services/onboardingCreativeDirService", () => ({
+        claimCreativeDirRun: claimCreativeDirRunMock,
+        triggerCreativeDirForUser: triggerCreativeDir,
+      }));
+
+      const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
+      const result = await PRODUCTION_DAG.creativeDir.runner({ userId: "u1" });
+
+      expect(claimCreativeDirRunMock).toHaveBeenCalledWith("u1");
+      expect(triggerCreativeDir).not.toHaveBeenCalled();
+      expect(result).toEqual({ concepts: ["Owned Elsewhere"] });
+    });
+  });
+
+  it("runAdCopy skips triggerAdCopyForUser and returns the current adCopyResult when claimAdCopyRun loses the race", async () => {
+    await jest.isolateModulesAsync(async () => {
+      const triggerAdCopy = jest.fn();
+      const claimAdCopyRunMock = jest.fn(async () => null);
+
+      jest.doMock("../services/db", () => ({
+        userDb: {
+          getUserById: jest.fn().mockResolvedValue({
+            userId: "u1",
+            adCopyStatus: "running",
+            adCopyResult: { variants: [{ id: "v1", headline: "Owned Elsewhere" }] },
+          }),
+          updateUser: jest.fn().mockResolvedValue(undefined),
+        },
+      }));
+      jest.doMock("../services/onboardingAdCopyService", () => ({
+        claimAdCopyRun: claimAdCopyRunMock,
+        triggerAdCopyForUser: triggerAdCopy,
+      }));
+
+      const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
+      const result = await PRODUCTION_DAG.adCopy.runner({ userId: "u1" });
+
+      expect(claimAdCopyRunMock).toHaveBeenCalledWith("u1");
+      expect(triggerAdCopy).not.toHaveBeenCalled();
+      expect(result).toEqual({ variants: [{ id: "v1", headline: "Owned Elsewhere" }] });
     });
   });
 });

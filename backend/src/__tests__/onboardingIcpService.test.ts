@@ -28,6 +28,7 @@ jest.mock("../services/onboardingCompetitorService", () => ({
 }));
 
 import {
+  claimIcpRun,
   extractIcpBrandContext,
   generateIcpsForUser,
   ICP_DISCOVERY_SYSTEM_PROMPT,
@@ -634,6 +635,40 @@ describe("onboardingIcpService", () => {
     });
   });
 
+  // ENG-2308 follow-up, caught live: the eager-pipeline orchestrator's
+  // runIcp used to call triggerIcpDiscoveryForUser directly, with nothing
+  // ever flipping icpStatus to running first on a pure orchestrator-driven
+  // cascade — icpReadyPatch requires icpStatus === 'running' to persist a
+  // result, so the trigger ran for real then silently dropped it, and the
+  // orchestrator recorded the step "ready" with a null output anyway.
+  // claimIcpRun is the extracted, reusable claim both startIcpDiscoveryForUser
+  // and the orchestrator's runIcp now go through.
+  describe("claimIcpRun", () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it("claims the axis and returns the persisted patch", async () => {
+      userDb.updateUser.mockResolvedValue({});
+      const patch = await claimIcpRun("user-1");
+      expect(patch).not.toBeNull();
+      expect(patch?.icpStatus).toBe("running");
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toContain("icpStatus");
+    });
+
+    it("returns null without throwing when it loses the claim", async () => {
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+      const patch = await claimIcpRun("user-1");
+      expect(patch).toBeNull();
+    });
+  });
+
   describe("startIcpDiscoveryForUser", () => {
     beforeEach(() => {
       jest.clearAllMocks();
@@ -686,6 +721,8 @@ describe("onboardingIcpService", () => {
     });
 
     it("returns null and launches no background work when it loses the race to a concurrent caller", async () => {
+      // Not on the eager pipeline, so this exercises the claim path.
+      userDb.getUserById.mockResolvedValue({ userId: "user-1" });
       const conditionalFailure = Object.assign(
         new Error("The conditional request failed"),
         { code: "ConditionalCheckFailedException" },
@@ -695,14 +732,48 @@ describe("onboardingIcpService", () => {
       const result = await startIcpDiscoveryForUser("user-1");
 
       expect(result).toBeNull();
-      // Only the failed claim attempt — no background-trigger reads/writes,
-      // and in particular no second generateJsonRobust call could have been
-      // reached from here.
+      // Only the failed claim attempt — no background-trigger writes, and
+      // in particular no second generateJsonRobust call could have been
+      // reached from here. getUserById IS called once (to check eager
+      // status before claiming — ENG-2308 fix-of-a-fix), but that's the
+      // extent of it.
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
-      expect(userDb.getUserById).not.toHaveBeenCalled();
+      expect(userDb.getUserById).toHaveBeenCalledTimes(1);
+    });
+
+    // ENG-2308 fix-of-a-fix, caught live against a real preview + real
+    // eager-pipeline account: runIcp claims this SAME axis itself (with
+    // its own call to claimIcpRun) when the orchestrator actually fires
+    // the step, inside the SAME reconcile pass this function delegates to.
+    // If this function ALSO claimed before checking eager status, its own
+    // claim would always win an instant before handing off, permanently
+    // starving runIcp's claim moments later. Must check eager status and
+    // skip claiming entirely in that case, leaving claimIcpRun as the sole
+    // claimant — exactly like ad-image's existing fix.
+    it("does not claim the axis itself on the eager pipeline — leaves the claim to runIcp", async () => {
+      userDb.getUserById.mockResolvedValue({ userId: "user-1", useEagerPipeline: true });
+      const orchestratorWiring = require("../services/onboardingOrchestratorWiring");
+      const reconcileSpy = jest
+        .spyOn(orchestratorWiring, "reconcileForUser")
+        .mockImplementation(async () => {});
+      try {
+        const result = await startIcpDiscoveryForUser("user-1");
+
+        expect(result).toBeNull();
+        expect(userDb.updateUser).not.toHaveBeenCalled();
+        expect(reconcileSpy).toHaveBeenCalledWith("user-1");
+      } finally {
+        reconcileSpy.mockRestore();
+      }
     });
 
     it("re-throws a non-conditional DynamoDB error", async () => {
+      // jest.clearAllMocks() (beforeEach) does not reset the previous test's
+      // mockResolvedValue — without this, a prior eager-pipeline test's
+      // `useEagerPipeline: true` leaks in, and since the eager check now
+      // runs BEFORE the claim write, this test would short-circuit to the
+      // reconcile branch and never reach updateUser at all.
+      userDb.getUserById.mockResolvedValue({ userId: "user-1" });
       userDb.updateUser.mockRejectedValue(
         Object.assign(new Error("boom"), {
           code: "ProvisionedThroughputExceededException",
@@ -739,7 +810,13 @@ describe("onboardingIcpService", () => {
           userId: "user-1",
           icpStatus: "running",
           icpStartedAt: "2026-04-24T11:59:00.000Z",
-        });
+        })
+        // mirrorIcpsToMarketStrategy's own re-read is a 3rd call. Pin it to
+        // null (no user found -> early return, no extra write) instead of
+        // relying on whatever default a previous test in this file left
+        // behind — jest.clearAllMocks() (beforeEach) does not reset a
+        // previous test's persistent mockResolvedValue default.
+        .mockResolvedValue(null);
       userDb.updateUser.mockResolvedValue({});
 
       const llm = new FakeLlm({ icps: fivePersonas });

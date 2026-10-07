@@ -66,10 +66,14 @@ describe("POST /api/onboarding/brand-build/start", () => {
       .post("/api/onboarding/brand-build/start")
       .send({ companyUrl: "https://example.com" });
     expect(res.status).toBe(200);
-    expect(userDb.updateUser).toHaveBeenCalledWith(
-      "user-1",
+    // The claim write (via claimBrandBuildRun) passes a 3rd ConditionExpression
+    // argument now (ENG-2308), so toHaveBeenCalledWith's exact-arity match on
+    // just 2 args no longer applies — assert on the actual claim call instead.
+    // Call order: [0] the inputPatch-only write (productDomain), [1] the claim.
+    expect(userDb.updateUser.mock.calls[1][1]).toEqual(
       expect.objectContaining({ brandBuildStatus: "building" })
     );
+    expect(userDb.updateUser.mock.calls[1][2]?.condition).toBeTruthy();
     expect(res.body.status.brandBuildStatus).toBe("building");
     expect(res.body.status.inFlight).toBe(true);
   });
@@ -191,10 +195,13 @@ describe("POST /api/onboarding/brand-build/start", () => {
       });
     const res = await request(app).post("/api/onboarding/brand-build/start");
     expect(res.status).toBe(200);
-    expect(userDb.updateUser).toHaveBeenCalledWith(
-      "user-1",
+    // No companyUrl/companyName/goal in the body, so there's no separate
+    // inputPatch write — the claim (3 args, ConditionExpression) is the
+    // only call. Same arity issue as the test above.
+    expect(userDb.updateUser.mock.calls[0][1]).toEqual(
       expect.objectContaining({ brandBuildStatus: "building" })
     );
+    expect(userDb.updateUser.mock.calls[0][2]?.condition).toBeTruthy();
     expect(res.body.status.brandBuildStatus).toBe("building");
     expect(res.body.status.needsUrl).toBeUndefined();
   });

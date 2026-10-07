@@ -13,6 +13,7 @@ jest.mock("../services/db", () => ({
 }));
 
 import {
+  claimCreativeDirRun,
   CREATIVE_DIR_SYSTEM_PROMPT,
   generateCreativeDirectionForUser,
   startCreativeDirForUser,
@@ -409,6 +410,35 @@ describe("onboardingCreativeDirService", () => {
     });
   });
 
+  // ENG-2308 follow-up, caught live: the orchestrator's runCreativeDir used
+  // to call triggerCreativeDirForUser directly with nothing ever flipping
+  // creativeDirStatus to running first — the trigger silently dropped its
+  // result, which then starved adImage downstream. claimCreativeDirRun is
+  // the extracted, reusable claim both startCreativeDirForUser and
+  // runCreativeDir go through.
+  describe("claimCreativeDirRun", () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it("claims the axis and returns the persisted patch", async () => {
+      userDb.updateUser.mockResolvedValue({});
+      const patch = await claimCreativeDirRun("user-1");
+      expect(patch).not.toBeNull();
+      expect(patch?.creativeDirStatus).toBe("running");
+    });
+
+    it("returns null without throwing when it loses the claim", async () => {
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+      const patch = await claimCreativeDirRun("user-1");
+      expect(patch).toBeNull();
+    });
+  });
+
   describe("startCreativeDirForUser", () => {
     beforeEach(() => {
       jest.clearAllMocks();
@@ -455,6 +485,7 @@ describe("onboardingCreativeDirService", () => {
     });
 
     it("returns null and launches no background work when it loses the race to a concurrent caller", async () => {
+      userDb.getUserById.mockResolvedValue({ userId: "user-1" });
       const conditionalFailure = Object.assign(
         new Error("The conditional request failed"),
         { code: "ConditionalCheckFailedException" },
@@ -465,10 +496,39 @@ describe("onboardingCreativeDirService", () => {
 
       expect(result).toBeNull();
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
-      expect(userDb.getUserById).not.toHaveBeenCalled();
+      // getUserById IS called once (to check eager status before claiming
+      // — ENG-2308 fix-of-a-fix).
+      expect(userDb.getUserById).toHaveBeenCalledTimes(1);
+    });
+
+    // ENG-2308 fix-of-a-fix, caught live: runCreativeDir claims this SAME
+    // axis itself when the orchestrator fires the step, inside the SAME
+    // reconcile pass this function delegates to. Must check eager status
+    // and skip claiming entirely in that case.
+    it("does not claim the axis itself on the eager pipeline — leaves the claim to runCreativeDir", async () => {
+      userDb.getUserById.mockResolvedValue({ userId: "user-1", useEagerPipeline: true });
+      const orchestratorWiring = require("../services/onboardingOrchestratorWiring");
+      const reconcileSpy = jest
+        .spyOn(orchestratorWiring, "reconcileForUser")
+        .mockImplementation(async () => {});
+      try {
+        const result = await startCreativeDirForUser("user-1");
+
+        expect(result).toBeNull();
+        expect(userDb.updateUser).not.toHaveBeenCalled();
+        expect(reconcileSpy).toHaveBeenCalledWith("user-1");
+      } finally {
+        reconcileSpy.mockRestore();
+      }
     });
 
     it("re-throws a non-conditional DynamoDB error", async () => {
+      // jest.clearAllMocks() (beforeEach) does not reset the previous test's
+      // mockResolvedValue — without this, a prior eager-pipeline test's
+      // `useEagerPipeline: true` leaks in, and since the eager check now
+      // runs BEFORE the claim write, this test would short-circuit to the
+      // reconcile branch and never reach updateUser at all.
+      userDb.getUserById.mockResolvedValue({ userId: "user-1" });
       userDb.updateUser.mockRejectedValue(
         Object.assign(new Error("boom"), {
           code: "ProvisionedThroughputExceededException",
