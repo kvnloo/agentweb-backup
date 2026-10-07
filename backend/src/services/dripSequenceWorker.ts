@@ -326,6 +326,16 @@ async function sendLinkedInStep(
   }
 
   // Resolve which LinkedIn account to send from
+  if (step.linkedInAccountId) {
+    // ENG-2205: a pinned account must be the sequence owner's own or org-shared one. Checked here
+    // as well as on sequence write because sequences saved before that check may name any account.
+    // A config problem, so it throws (retried once the user fixes the step) rather than skipping.
+    const { resolveLinkedInAccountForWrite } = await import('./agentMode/linkedInDailyVolumeGate');
+    if (!(await resolveLinkedInAccountForWrite(enrollment.userId, step.linkedInAccountId))) {
+      console.error(`[dripWorker] LinkedIn step ${step.stepNumber} for enrollment ${enrollment.enrollmentId}: pinned account is not connected to user ${enrollment.userId}`);
+      throw new Error(`LinkedIn step ${step.stepNumber} references an account that is not connected to user ${enrollment.userId}`);
+    }
+  }
   const accountId = step.linkedInAccountId
     || await linkedInOutreachService.resolveAccountId(enrollment.userId);
 

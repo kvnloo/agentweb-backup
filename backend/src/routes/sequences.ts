@@ -137,6 +137,25 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
   }
 });
 
+// ENG-2205: a step's linkedInAccountId is the Unipile account the drip worker will SEND from.
+// It arrives in the request body, so it must be an account the caller owns or that is shared with
+// their org — otherwise any user could name the site-wide pool account (whose id is disclosed in
+// agent tool responses) or another customer's account and have the worker send from it. Same
+// check send-linkedin-message/-invite, withdraw and accept-invitation already apply.
+const LINKEDIN_STEP_ACCOUNT_ERROR = 'A LinkedIn step references an account that is not connected to your user.';
+
+async function stepsReferenceForeignLinkedInAccount(userId: string, steps: unknown): Promise<boolean> {
+  if (!Array.isArray(steps)) return false;
+  const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+  for (const step of steps) {
+    const id = step?.linkedInAccountId;
+    if (id === undefined || id === null || id === '') continue; // auto-resolved by the worker
+    if (typeof id !== 'string') return true;
+    if (!(await resolveLinkedInAccountForWrite(userId, id))) return true;
+  }
+  return false;
+}
+
 // POST /api/crm/sequences
 router.post('/', authenticateToken, async (req: Request, res: Response) => {
   const authReq = req as AuthenticatedRequest;
@@ -146,6 +165,9 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
   }
 
   try {
+    if (await stepsReferenceForeignLinkedInAccount(authReq.user!.userId, steps)) {
+      return res.status(403).json({ error: LINKEDIN_STEP_ACCOUNT_ERROR });
+    }
     const input: CreateSequenceInput = {
       userId: authReq.user!.userId,
       name: name.trim(),
@@ -192,6 +214,9 @@ router.put('/:sequenceId', authenticateToken, async (req: Request, res: Response
         const bound = typeof lid === 'string' && lid ? await crmDb.getLeadListById(lid).catch(() => null) : null;
         if (isSessionList(bound)) return res.status(400).json({ error: SESSION_LIST_SEQUENCE_ERROR });
       }
+    }
+    if (await stepsReferenceForeignLinkedInAccount(authReq.user!.userId, steps)) {
+      return res.status(403).json({ error: LINKEDIN_STEP_ACCOUNT_ERROR });
     }
     const input: UpdateSequenceInput = {
       name,
