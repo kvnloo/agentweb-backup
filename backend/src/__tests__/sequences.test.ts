@@ -23,6 +23,12 @@ jest.mock('../services/resendService', () => ({
   resendService: { sendEmail: jest.fn() },
 }));
 
+// ENG-2205: LinkedIn step account ids are checked against the caller's own/org-shared accounts.
+const mockResolveLinkedInAccountForWrite = jest.fn();
+jest.mock('../services/agentMode/linkedInDailyVolumeGate', () => ({
+  resolveLinkedInAccountForWrite: (...args: any[]) => mockResolveLinkedInAccountForWrite(...args),
+}));
+
 jest.mock('../services/settingsService', () => ({
   settingsService: { getSetting: jest.fn(), setSetting: jest.fn() },
 }));
@@ -293,6 +299,63 @@ describe('POST / - create sequence', () => {
   it('rejects empty string name', async () => {
     const res = await request(app).post('/').send({ name: '   ' });
     expect(res.status).toBe(400);
+  });
+
+  describe('LinkedIn step account authorization (ENG-2205)', () => {
+    const liStep = (linkedInAccountId?: unknown) => ({
+      stepNumber: 1, name: 'DM', channel: 'linkedin', delayDays: 0, messageText: 'hi',
+      ...(linkedInAccountId !== undefined ? { linkedInAccountId } : {}),
+    });
+    beforeEach(() => {
+      mockResolveLinkedInAccountForWrite.mockReset();
+      (dripSequenceDb.createSequence as jest.Mock).mockClear();
+    });
+
+    it('creates the sequence when the pinned account is the caller\'s own or org-shared', async () => {
+      mockResolveLinkedInAccountForWrite.mockResolvedValue({ ownerUserId: 'user-123' });
+      const res = await request(app).post('/').send({ name: 'Seq', steps: [liStep('my-acct')] });
+      expect(res.status).toBe(201);
+      expect(mockResolveLinkedInAccountForWrite).toHaveBeenCalledWith('user-123', 'my-acct');
+    });
+
+    it('refuses with 403 and stores nothing when a step names an account the caller does not own (e.g. the pool)', async () => {
+      mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+      const res = await request(app).post('/').send({ name: 'Seq', steps: [liStep('pool-or-foreign-acct')] });
+      expect(res.status).toBe(403);
+      expect(dripSequenceDb.createSequence).not.toHaveBeenCalled();
+    });
+
+    it('refuses a non-string account id', async () => {
+      const res = await request(app).post('/').send({ name: 'Seq', steps: [liStep({ $ne: null })] });
+      expect(res.status).toBe(403);
+      expect(dripSequenceDb.createSequence).not.toHaveBeenCalled();
+    });
+
+    it('does not run the check for auto-resolved steps (no pinned account), email steps, or no steps', async () => {
+      for (const body of [
+        { name: 'A', steps: [liStep()] },
+        { name: 'B', steps: [liStep(''), { stepNumber: 2, name: 'Mail', delayDays: 1, subject: 's', bodyHtml: '<p>x</p>' }] },
+        { name: 'C' },
+      ]) {
+        const res = await request(app).post('/').send(body);
+        expect(res.status).toBe(201);
+      }
+      expect(mockResolveLinkedInAccountForWrite).not.toHaveBeenCalled();
+    });
+
+    it('PUT refuses with 403 and does not update when a step names a foreign account', async () => {
+      mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+      (dripSequenceDb.updateSequence as jest.Mock).mockClear();
+      const res = await request(app).put('/seq_1').send({ steps: [liStep('foreign-acct')] });
+      expect(res.status).toBe(403);
+      expect(dripSequenceDb.updateSequence).not.toHaveBeenCalled();
+    });
+
+    it('PUT accepts an owned pinned account', async () => {
+      mockResolveLinkedInAccountForWrite.mockResolvedValue({ ownerUserId: 'user-123' });
+      const res = await request(app).put('/seq_1').send({ steps: [liStep('my-acct')] });
+      expect(res.status).toBe(200);
+    });
   });
 
   it('passes through all optional fields', async () => {

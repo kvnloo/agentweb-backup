@@ -130,6 +130,7 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message', () =
     mockGetLeadListById.mockResolvedValue(OWNED_LIST);
     mockGetLeadById.mockResolvedValue(LEAD_WITH_LINKEDIN);
     mockResolveAccountId.mockResolvedValue('unipile-acct-1');
+    mockResolveLinkedInAccountForWrite.mockResolvedValue({ ownerUserId: 'test-user-id' });
     mockSendMessage.mockResolvedValue({ id: 'chat-abc' });
     mockAddLinkedInMessageEvent.mockResolvedValue(undefined);
   });
