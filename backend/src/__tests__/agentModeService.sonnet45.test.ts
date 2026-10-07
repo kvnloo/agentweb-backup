@@ -97,10 +97,16 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(models).toContain('anthropic.claude-opus-4-6-v1');
     });
 
-    it('the admin catalog and the user catalog are identical: no model is role-gated', async () => {
-      expect(await agentModeService.getSupportedModels(false)).toEqual(await agentModeService.getSupportedModels(true));
-      const gated = Object.entries((agentModeService as any).llmModels).filter(([, m]: [string, any]) => m.adminOnly === true).map(([id]) => id);
-      expect(gated).toEqual([]);
+    it('no model is gated by name: adminOnly is only ever on unreviewed auto-added entries', () => {
+      const entries = Object.entries((agentModeService as any).llmModels) as [string, any][];
+      const gated = entries.filter(([, m]) => m.adminOnly === true);
+      for (const [id, m] of gated) {
+        expect({ id, description: String(m.description).startsWith('Auto-added') }).toEqual({ id, description: true });
+      }
+      expect(entries.find(([id]) => id === 'anthropic.claude-opus-4-6-v1')?.[1].adminOnly).not.toBe(true);
+      for (const [id, m] of entries.filter(([id]) => id.includes('opus'))) {
+        expect({ id, adminOnly: m.adminOnly === true }).toEqual({ id, adminOnly: false });
+      }
     });
 
     it('should include Claude Opus 4.8 in the supported models for admins', async () => {
