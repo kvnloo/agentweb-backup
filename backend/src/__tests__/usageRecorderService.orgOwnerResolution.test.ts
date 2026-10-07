@@ -11,7 +11,8 @@
  * properties that matter:
  *   - the owner is resolved when the caller names none, and the ACTING user is
  *     still recorded as the actor;
- *   - an explicit `billingUserId` always wins;
+ *   - an explicit `billingUserId` is resolved too (the X account owner of a member's connected
+ *     account IS the member), and an explicit id that is already a billing root is unchanged;
  *   - it is resolved ONCE, so the aggregate, the spend event and the legacy
  *     fallback can never split one call across two owners;
  *   - it can never lose a record (resolver failure → old behaviour, never a throw);
@@ -101,12 +102,30 @@ describe('recorder resolves the org billing owner (ENG-2286)', () => {
       expect(event.actingUserId).toBe(MEMBER); // who did it is preserved
     });
 
-    it("an explicit billingUserId always wins and the resolver is not consulted", async () => {
+    it("an explicit billingUserId that is already a billing root is unchanged (resolution is idempotent)", async () => {
       await recordVendorUsage(vendor({ billingUserId: 'explicit-9' }));
 
       const [increment, event] = mockTxn.mock.calls[0];
       expect(increment.billingUserId).toBe('explicit-9');
       expect(event.billingUserId).toBe('explicit-9');
+    });
+
+    it("an explicit billingUserId that is an org MEMBER resolves to the owner (the X-account case, 2026-10-05 leak)", async () => {
+      // twitterService passes billingUserId = the connected X account's owner, which is the member.
+      await recordVendorUsage(vendor({ userId: 'someone-else', billingUserId: MEMBER }));
+
+      const [increment, event] = mockTxn.mock.calls[0];
+      expect(increment.billingUserId).toBe(OWNER);
+      expect(event.billingUserId).toBe(OWNER);
+      expect(resolver).toHaveBeenCalledWith(MEMBER);
+    });
+
+    it("an explicit 'system' or anon payer is never resolved", async () => {
+      await recordVendorUsage(vendor({ billingUserId: 'system' }));
+      await recordVendorUsage(vendor({ billingUserId: 'anon_x1' }));
+
+      expect(mockTxn.mock.calls[0][1].billingUserId).toBe('system');
+      expect(mockTxn.mock.calls[1][1].billingUserId).toBe('anon_x1');
       expect(resolver).not.toHaveBeenCalled();
     });
 
@@ -153,11 +172,12 @@ describe('recorder resolves the org billing owner (ENG-2286)', () => {
       expect(event.actingUserId).toBe(MEMBER);
     });
 
-    it("keeps an explicit billingUserId", async () => {
+    it("keeps an explicit billingUserId that is already a billing root, and resolves a member's to the owner", async () => {
       await recordUsage(llm({ billingUserId: 'explicit-9' }));
+      await recordUsage(llm({ billingUserId: MEMBER }));
 
       expect(mockTxn.mock.calls[0][0].billingUserId).toBe('explicit-9');
-      expect(resolver).not.toHaveBeenCalled();
+      expect(mockTxn.mock.calls[1][0].billingUserId).toBe(OWNER);
     });
   });
 

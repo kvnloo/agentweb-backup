@@ -4,11 +4,17 @@
  * Distinguishes "the customer is using the product" from "AgentWeb staff are
  * operating it through a delegated admin session". The only persisted
  * customer-only signal is `AW-Users.lastActiveAt`, which chatbotService writes
- * exclusively for non-delegated chat sessions. Token usage is recorded for
- * both kinds of session, so tokens this month with no recent self-activity is
- * the Haven/Every shape: heavy usage, customer absent.
+ * exclusively for non-delegated chat sessions. Spend is recorded for both kinds
+ * of session, so spend this month with no recent self-activity is the
+ * Haven/Every shape: heavy usage, customer absent.
  *
- * Deliberately NOT a historical or mixed-ratio rate: token records carry no
+ * "Spend this month" comes from the spend ledger (the account's settled spend in
+ * AW-SpendProjection), supplied by the caller. It used to be read off the legacy
+ * `AW-Users.tokenUsage` counter, which ENG-1250 AC7 retires. It is slightly broader
+ * than the old token check: vendor spend counts too, which is the better evidence of
+ * an account being operated while its owner is absent.
+ *
+ * Deliberately NOT a historical or mixed-ratio rate: usage records carry no
  * session lineage, and adding one is a data-plane change (ENG-1501).
  */
 
@@ -26,13 +32,12 @@ export interface SelfActivitySignal {
 
 interface SelfActivityInput {
   lastActiveAt?: string | null;
-  tokenUsage?: { month?: string; totalTokens?: number } | null;
 }
-
-const currentMonth = (now: Date): string => now.toISOString().slice(0, 7);
 
 export function deriveSelfActivity(
   user: SelfActivityInput,
+  /** Whether the account has settled spend recorded this month (see the module doc). */
+  hasUsageThisMonth: boolean,
   now: Date = new Date(),
 ): SelfActivitySignal {
   const parsed = user.lastActiveAt ? new Date(user.lastActiveAt) : null;
@@ -41,13 +46,6 @@ export function deriveSelfActivity(
   // A future timestamp (clock skew / bad write) is not evidence of activity.
   const selfActiveRecently =
     valid && ageMs >= 0 && ageMs <= SELF_ACTIVITY_WINDOW_DAYS * 24 * 60 * 60 * 1000;
-
-  const usage = user.tokenUsage;
-  const hasUsageThisMonth =
-    !!usage &&
-    usage.month === currentMonth(now) &&
-    typeof usage.totalTokens === "number" &&
-    usage.totalTokens > 0;
 
   return {
     selfActiveRecently,

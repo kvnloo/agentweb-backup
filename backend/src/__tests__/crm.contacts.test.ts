@@ -111,6 +111,15 @@ describe('GET /api/crm/contacts', () => {
     expect(mockRes.status).toHaveBeenCalledWith(400);
   });
 
+  // ENG-2311: session rows are only ever returned when asked for explicitly.
+  it('accepts listType=session and passes it to the service (the only way to read session rows)', async () => {
+    asMock(dedupContactsForUser).mockResolvedValue({ contacts: [], total: 0, rawCount: 0, listsCount: 0 });
+    mockReq.query = { listType: 'session' };
+    await handler!(mockReq, mockRes);
+    expect(mockRes.status).not.toHaveBeenCalledWith(400);
+    expect(dedupContactsForUser).toHaveBeenCalledWith(expect.objectContaining({ listType: 'session' }));
+  });
+
   it('returns 400 when sort is invalid', async () => {
     mockReq.query = { sort: 'abc' };
     await handler!(mockReq, mockRes);

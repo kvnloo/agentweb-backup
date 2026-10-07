@@ -23,6 +23,27 @@ import { executeResolvedDecision } from './approvalInboxExecution';
  * "notify twice for the same decision" a non-issue.
  */
 
+const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * ENG-2301: single recipient resolver for both notify paths. Some decisions
+ * carry an email as customerId (e.g. juan@usehaven.ai); the old id-only
+ * lookup missed those and fired a false "no resolvable email" oncall alert.
+ * Order: explicit customerEmail -> user-by-id -> user-by-email (when the id
+ * is email-shaped) -> the email-shaped customerId itself.
+ */
+export async function resolveCustomerEmail(decision: ApprovalDecision): Promise<string | undefined> {
+  if (decision.customerEmail) return decision.customerEmail;
+  const customerId = decision.customerId;
+  if (!customerId) return undefined;
+  const byId = await userDb.getUserById(customerId).catch(() => null);
+  if ((byId as any)?.email) return (byId as any).email;
+  const trimmed = customerId.trim();
+  if (!EMAIL_SHAPE.test(trimmed)) return undefined;
+  const byEmail = await userDb.getUserByEmail(trimmed.toLowerCase()).catch(() => null);
+  return (byEmail as any)?.email || trimmed;
+}
+
 async function alertNoResolvableCustomer(decision: ApprovalDecision): Promise<void> {
   await emailService.sendOncallAlert(
     `Approval inbox: no resolvable email for customer ${decision.customerId}`,
@@ -37,8 +58,7 @@ export async function notifyCustomerOfPendingCredentialDecision(decision: Approv
   if (decision.gateType !== 'customer_credential') return;
   if (!decision.customerId || !decision.customerActionUrl) return;
 
-  const user = await userDb.getUserById(decision.customerId);
-  const customerEmail = decision.customerEmail || (user as any)?.email;
+  const customerEmail = await resolveCustomerEmail(decision);
 
   if (!customerEmail) {
     await alertNoResolvableCustomer(decision);
@@ -77,8 +97,7 @@ export async function notifyCustomerOfExpiredCredentialDecision(decision: Approv
   if (decision.gateType !== 'customer_credential') return;
   if (!decision.customerId) return;
 
-  const user = await userDb.getUserById(decision.customerId);
-  const customerEmail = decision.customerEmail || (user as any)?.email;
+  const customerEmail = await resolveCustomerEmail(decision);
 
   if (!customerEmail) {
     await alertNoResolvableCustomer(decision);

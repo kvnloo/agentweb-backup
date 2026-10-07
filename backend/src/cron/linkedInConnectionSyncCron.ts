@@ -357,13 +357,20 @@ export async function enrollNewConnections(newConnections: UnipileConnection[]):
               }
               if (existing) continue;
 
-              await dripSequenceDb.enrollLead({
+              // ENG-2127: the pre-check above already probes every identity candidate;
+              // pass the same set through so the claim-transaction inside enrollLead
+              // protects all of them too, not just this one. A null return means a
+              // concurrent enroller already claimed one of them — same as the pre-check
+              // finding a row.
+              const result = await dripSequenceDb.enrollLead({
                 sequenceId: seq.sequenceId,
                 userId: seq.userId,
                 listId: list.listId,
                 leadId: lead.leadId,
                 leadEmail: identity,
+                identityCandidates: enrollmentIdentityCandidates(lead),
               });
+              if (!result) continue;
               enrolled++;
               console.log(`${TAG} Enrolled lead ${identity} into sequence ${seq.sequenceId} (LinkedIn connected)`);
             }

@@ -84,6 +84,7 @@ import userSkillRoutes from "./routes/userSkillRoutes";
 import userWorkPlanRoutes from "./routes/userWorkPlanRoutes";
 import adminWorkPlanRoutes from "./routes/adminWorkPlanRoutes";
 import adminLandingPagesRoutes from "./routes/adminLandingPages";
+import adminSessionCleanupRoutes from "./routes/adminSessionCleanup";
 import adminOrgDiagnosticsRoutes from "./routes/adminOrgDiagnostics";
 import adminTrackingMonitorRoutes from "./routes/adminTrackingMonitor";
 import adminRenewalIntegrationHealthRoutes from "./routes/adminRenewalIntegrationHealth";
@@ -102,6 +103,7 @@ import onboardingLoopAdminRoutes from "./routes/onboardingLoopAdmin";
 import agentRunsRoutes from "./routes/agentRuns";
 import socialPostsRoutes from "./routes/socialPosts";
 import landingPagesRoutes from "./routes/landingPages";
+import landerUtmRoutes from "./routes/landerUtm";
 import htmlTemplatesRoutes from "./routes/htmlTemplates";
 import landingPageGenerationRoutes from "./routes/landingPageGeneration";
 import domainRoutes from "./routes/domains";
@@ -113,6 +115,7 @@ import leadVolumeMonitorRoutes from "./routes/leadVolumeMonitor";
 import l2DiagnoseRoutes from "./routes/l2Diagnose";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import orgRoutes from "./routes/org";
+import sourceAccessRoutes from "./routes/sourceAccess";
 import orgMemoryRoutes from "./routes/orgMemory";
 import orgModelRolesRoutes from './routes/orgModelRoles';
 import orgShareSettingsRoutes from "./routes/orgShareSettings";
@@ -122,6 +125,9 @@ import onboardingEventsRoutes from "./routes/onboardingEvents";
 import onboardingVariantsRoutes from "./routes/onboardingVariants";
 import loopEventsRoutes from "./routes/loopEvents";
 import humanEvalRoutes from "./routes/humanEval";
+import trackingRoutes from "./routes/tracking";
+import trackIngestRoutes, { trackBodyParser } from "./routes/trackIngest";
+import sdkRouter from "./routes/trackSdk";
 import { registerAiEvalFunnelForProduction } from "./loops/instances/ai-eval-funnel";
 import { registerAiReadinessFunnel } from "./loops/instances/ai-readiness-funnel";
 import { checkFinalizeGuardMisconfiguration, registerAgentModeLoop } from "./loops/instances/agent-mode";
@@ -308,6 +314,10 @@ app.use((req, res, next) => {
   // Check if this is a public endpoint that needs open CORS
   if (req.path.match(/^\/api\/tasks\/[^\/]+\/subscribers\/join$/) ||
       req.path.startsWith('/api/lead-magnet/') ||
+      // ENG-2315: the tracker SDK and its ingest are called from visitors' browsers on any customer
+      // domain. Origins are enforced per list inside the route (trackingConfig.allowedOrigins), not here.
+      req.path === '/api/track/event' ||
+      req.path.startsWith('/sdk/v1/') ||
       req.path.startsWith('/batch-review/')) {
     // Allow all origins for public endpoints
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -351,6 +361,9 @@ app.use("/api/webhooks/whatsapp", express.raw({ type: "application/json" }));
 // no raw Buffer (auth is a plain shared header, not an HMAC over the body), so
 // force JSON parsing regardless of the declared content-type instead.
 app.use("/api/webhooks/unipile", express.json({ type: () => true, limit: "1mb" }));
+// ENG-2315: public tracker ingest. Its own 16kb parser must run before the global 50mb one below
+// (body-parser skips a request whose body is already parsed).
+app.use("/api/track/event", ...trackBodyParser);
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());
@@ -407,6 +420,7 @@ app.use("/api/stripe", stripeRoutes);
 app.use("/api/brand", brandRoutes);
 app.use("/api/landing-pages/v0", landingPageGenerationRoutes);
 app.use("/api/landing-pages", landingPagesRoutes);
+app.use("/api/lander-utm", landerUtmRoutes);
 app.use("/api/html-templates", authenticateToken, htmlTemplatesRoutes);
 app.use("/api/domains", domainRoutes);
 app.use("/api/market-strategy", marketStrategyRoutes);
@@ -493,6 +507,8 @@ app.use("/api/user-skills", authenticateToken, userSkillRoutes);
 app.use("/api/user-work-plans", authenticateToken, userWorkPlanRoutes);
 app.use("/api/admin/work-plans", authenticateToken, isAdmin, adminWorkPlanRoutes);
 app.use("/api/admin/landing-pages", authenticateToken, isAdmin, adminLandingPagesRoutes);
+// ENG-2314 — dry-run-first merge/delete of LP session rows. Same admin double-gate as above.
+app.use("/api/admin/session-cleanup", authenticateToken, isAdmin, adminSessionCleanupRoutes);
 app.use("/api/admin/org-diagnostics", authenticateToken, isAdmin, adminOrgDiagnosticsRoutes);
 app.use("/api/admin/tracking-monitor", authenticateToken, isAdmin, adminTrackingMonitorRoutes);
 app.use("/api/admin/renewal-integration-health", authenticateToken, isAdmin, adminRenewalIntegrationHealthRoutes);
@@ -512,6 +528,12 @@ app.use("/api/onboarding", onboardingEventsRoutes);
 app.use("/api/onboarding", onboardingVariantsRoutes);
 app.use("/api/loop-events", loopEventsRoutes);
 app.use("/api/human-eval", humanEvalRoutes);
+// ENG-2313: traffic-source taxonomy + tagged-link generator. Pure, no persistence; the router
+// applies authenticateToken itself (user auth, not admin).
+app.use("/api/tracking", trackingRoutes);
+// ENG-2315: public (unauthenticated) tracker ingest + SDK. Distinct prefix from /api/tracking above, which is user-auth.
+app.use("/api/track", trackIngestRoutes);
+app.use("/sdk/v1", sdkRouter);
 
 // Register closed-loop instances with production impls. The route handlers
 // look up loop manifests from LOOP_REGISTRY; the cron in server.ts invokes
@@ -556,6 +578,7 @@ app.use("/batch-review", batchReviewPublicRouter);
 app.use("/api/image-reports", imageReportsRoutes);
 app.use("/api/lead-magnet", leadMagnetRoutes);
 app.use("/api/org", orgRoutes);
+app.use("/api/source-access", sourceAccessRoutes);
 app.use("/api/org", orgMemoryRoutes);
 app.use("/api/orgs/me/model-roles", authenticateToken, orgModelRolesRoutes);
 app.use("/api/orgs/me/share-settings", authenticateToken, orgShareSettingsRoutes);

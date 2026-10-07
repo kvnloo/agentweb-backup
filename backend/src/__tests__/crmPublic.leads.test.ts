@@ -117,6 +117,28 @@ describe('POST /leads/:listId — public lead creation', () => {
     expect(res.body).toHaveProperty('leadId');
   });
 
+  test('ENG-2321: asks createLead for the exactly-once email-keyed create', async () => {
+    await request(server).post('/leads/list_abc123').send(validBody);
+    expect((crmDb.createLead as jest.Mock).mock.calls[0][1].emailUniqueCreate).toBe(true);
+  });
+
+  test('a duplicate email (repeat or lost race) is a 200 duplicate, never a 500, and leaks no leadId', async () => {
+    (crmDb.createLead as jest.Mock).mockRejectedValue(
+      Object.assign(new Error('Lead with email "test@example.com" already exists in this list'), {
+        duplicateEmail: true, existingLead: { leadId: 'lead_existing' },
+      }),
+    );
+    const res = await request(server).post('/leads/list_abc123').send(validBody);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true, duplicate: true });
+  });
+
+  test('a non-duplicate createLead failure still returns 500', async () => {
+    (crmDb.createLead as jest.Mock).mockRejectedValue(new Error('boom'));
+    const res = await request(server).post('/leads/list_abc123').send(validBody);
+    expect(res.status).toBe(500);
+  });
+
   test('strips unknown dangerous fields before creating lead', async () => {
     const res = await request(server).post('/leads/list_abc123').send({
       ...validBody,

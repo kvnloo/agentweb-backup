@@ -34,6 +34,7 @@ jest.mock('../services/metaService', () => {
     metaService: {
       createCampaign: jest.fn(),
       createAdCreative: jest.fn(),
+      createAd: jest.fn(),
     },
   };
 });
@@ -290,6 +291,51 @@ describe('AgentModeService — Meta AD_CREATIVE CREATE page_id gate (ENG-2232)',
     });
 
     const result = await callCreativeApi({ page_id: '1010991085424542' });
+
+    expect(result.error ?? '').not.toContain('META_PAGE_ACCESS_MISSING');
+  });
+});
+
+describe('AgentModeService — Meta AD write Page-access gate (ENG-2274)', () => {
+  let service: AgentModeService;
+
+  beforeEach(() => {
+    service = new AgentModeService();
+    jest.clearAllMocks();
+    mockIsTokenValid.mockResolvedValue(true);
+    (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad_1', name: 'Test Ad' });
+    jest.spyOn(service as any, 'claimMetaWriteManifestGrant').mockResolvedValue({ granted: true, digest: 'stub-digest' });
+  });
+
+  it('blocks direct AD CREATE when the connection has confirmed zero accessible Pages', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      id: 'user1',
+      connected_accounts: [metaAccount({ has_meta_pages: false })],
+    });
+
+    const result = await (service as any).callMetaMarketingApi(
+      'user1', 'AD', 'CREATE', AD_ACCOUNT_ID, 'camp_1', 'adset_1', undefined,
+      { name: 'Test Ad', creative_id: 'creative_1', status: 'PAUSED', confirm: true },
+      SESSION_ID,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.message).toBe(META_ADS_NO_PAGES_MESSAGE);
+    expect(result.error).toContain('META_PAGE_ACCESS_MISSING');
+    expect(metaService.createAd).not.toHaveBeenCalled();
+  });
+
+  it('does not block direct AD CREATE when Page access is unknown on a legacy record', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      id: 'user1',
+      connected_accounts: [metaAccount({})],
+    });
+
+    const result = await (service as any).callMetaMarketingApi(
+      'user1', 'AD', 'CREATE', AD_ACCOUNT_ID, 'camp_1', 'adset_1', undefined,
+      { name: 'Test Ad', creative_id: 'creative_1', status: 'PAUSED', confirm: true },
+      SESSION_ID,
+    );
 
     expect(result.error ?? '').not.toContain('META_PAGE_ACCESS_MISSING');
   });

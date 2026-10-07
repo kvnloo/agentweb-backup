@@ -65,6 +65,8 @@ export const EMMA_ROUTE_BUDGET: Record<string, EmmaRouteBudget> = {
   'POST /social-posts': 'metered',
   'POST /linkedin-outreach': 'metered',
   'POST /post-on-account': 'metered',
+  'POST /create-blog-article': 'metered',
+  'POST /publish-blog-article': 'metered',
   'GET /connected-account-posts': 'exempt',
   'GET /connected-account-metrics': 'exempt',
   'POST /linkedin-comment': 'metered',

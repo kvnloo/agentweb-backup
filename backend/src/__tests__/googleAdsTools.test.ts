@@ -292,6 +292,26 @@ describe('handleCallGoogleAdsApi', () => {
     expect(result.error).toMatch(/radius|address/i);
   });
 
+  it('passes lat/long center through for ADD_PROXIMITY without address (ENG-486)', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890', entity_type: 'CAMPAIGN', action: 'ADD_PROXIMITY',
+      campaign_resource_name: 'customers/123/campaigns/1', radius: 30, latitude: 47.6588, longitude: -117.426,
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.addProximityCriterion).toHaveBeenCalledWith('user-123', '1234567890', 'customers/123/campaigns/1',
+      expect.objectContaining({ radius: 30, geoPoint: { latitude: 47.6588, longitude: -117.426 } }));
+  });
+
+  it('rejects ADD_PROXIMITY with only one coordinate (ENG-486)', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890', entity_type: 'CAMPAIGN', action: 'ADD_PROXIMITY',
+      campaign_resource_name: 'customers/123/campaigns/1', radius: 30, latitude: 47.6,
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/latitude and longitude/);
+    expect(googleAdsService.addProximityCriterion).not.toHaveBeenCalled();
+  });
+
   it('handles CAMPAIGN REMOVE_PROXIMITY action (ENG-487)', async () => {
     const result = await service.handleCallGoogleAdsApi('user-123', {
       customer_id: '1234567890',

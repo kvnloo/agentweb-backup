@@ -23,7 +23,8 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
-import { isValidLeadLifecycle, LEAD_LIFECYCLES } from '../utils/leadSchema';
+import { suppressLeadSideEffects } from '../utils/sessionList';
+import { isValidLeadLifecycle, LEAD_LIFECYCLES, isLeadListType, type LeadListType } from '../utils/leadSchema';
 import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValidation';
 import { syncContact, SyncInput } from '../services/contactSyncService';
@@ -1019,7 +1020,8 @@ router.get('/lists', async (req: Request, res: Response) => {
  *       Powers the /crm Inbox tab — replaces client-side per-list fetch+dedup
  *       which was 30-90s on 5000+ lead accounts.
  * @access Private
- * @query listType? "sales" | "customers" — restrict to a list type (default: all)
+ * @query listType? "sales" | "customers" | "session" — restrict to a list type (default: all EXCEPT
+ *        session lists, whose per-visit rows are telemetry, not contacts — ask for them explicitly)
  * @query listIds? comma-separated listIds to restrict to a subset
  * @query limit? max deduped rows to return (default: all)
  * @query sort? "heat" | "recent" (default: heat)
@@ -1035,8 +1037,8 @@ router.get('/contacts', async (req: Request, res: Response) => {
 
     const { listType, listIds, limit, sort, cursor } = req.query as Record<string, string | undefined>;
 
-    if (listType !== undefined && listType !== 'sales' && listType !== 'customers') {
-      return res.status(400).json({ message: 'listType must be "sales" or "customers"' });
+    if (listType !== undefined && !isLeadListType(listType)) {
+      return res.status(400).json({ message: 'listType must be "sales", "customers" or "session"' });
     }
 
     if (sort !== undefined && sort !== 'heat' && sort !== 'recent') {
@@ -1080,7 +1082,7 @@ router.get('/contacts', async (req: Request, res: Response) => {
       userIdsToDedup.map((uid) =>
         dedupContactsForUser({
           userId: uid,
-          listType: listType as 'sales' | 'customers' | undefined,
+          listType: listType as LeadListType | undefined,
           listIds: uid === userId ? parsedListIds : undefined,
           limit: parsedLimit,
           sort: sort as 'heat' | 'recent' | undefined,
@@ -1163,8 +1165,8 @@ router.post('/lists', async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'List name is required' });
     }
 
-    if (listType !== undefined && listType !== 'sales' && listType !== 'customers') {
-      return res.status(400).json({ message: 'listType must be "sales" or "customers"' });
+    if (listType !== undefined && !isLeadListType(listType)) {
+      return res.status(400).json({ message: 'listType must be "sales", "customers" or "session"' });
     }
 
     let normalizedAlertEvents: string[] | undefined;
@@ -1461,7 +1463,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       engagedOnly?: boolean;
       statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
       conversionMapping?: { qualifiedStatus?: string | null } | null;
-      listType?: 'sales' | 'customers';
+      listType?: LeadListType;
     } = {};
     if (name !== undefined) {
       if (typeof name !== 'string' || name.trim().length === 0) {
@@ -1635,8 +1637,8 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     }
 
     if (listType !== undefined) {
-      if (listType !== 'sales' && listType !== 'customers') {
-        return res.status(400).json({ message: 'listType must be "sales" or "customers"' });
+      if (!isLeadListType(listType)) {
+        return res.status(400).json({ message: 'listType must be "sales", "customers" or "session"' });
       }
       if (list.listType) {
         return res.status(400).json({ message: 'listType is already set and cannot be changed' });
@@ -2123,9 +2125,12 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
       leadData.syncMetadata = { ...(leadData.syncMetadata || {}), syncStatus: 'sync_pending' };
     }
 
-    const lead = await crmDb.createLead(listId, leadData);
+    // ENG-2311: session lists are telemetry — no CRM push, sequence enrolment or paid
+    // email validation for their rows. Flag only added when true (other lists unchanged).
+    const suppressSideEffects = suppressLeadSideEffects(list);
+    const lead = await crmDb.createLead(listId, suppressSideEffects ? { ...leadData, suppressSideEffects: true } : leadData);
 
-    void Promise.allSettled([
+    if (!suppressSideEffects) void Promise.allSettled([
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'hubspot', 'created'),
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'attio', 'created'),
       autoEnrollLeadInSequences(userId, listId, (lead as any).leadId, {
@@ -2138,6 +2143,17 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
 
     res.status(201).json(lead);
   } catch (error: any) {
+    // A same-email lead already in this list is a conflict the user caused, not a server fault:
+    // createLead's pre-check throws a typed error (message unchanged, so the portal toast still
+    // reads the same). 409 + the existing leadId lets a client open/merge the row instead of
+    // treating it as a failure; 5xx would also trip retries and error alerting.
+    if (error?.duplicateEmail) {
+      return res.status(409).json({
+        message: error.message,
+        duplicate: true,
+        ...(error.existingLead?.leadId ? { leadId: error.existingLead.leadId } : {}),
+      });
+    }
     console.error('Error creating lead:', error);
     res.status(500).json({ message: error.message || 'Failed to create lead' });
   }
@@ -2201,7 +2217,7 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
     const result = await crmDb.batchCreateLeads(listId, normalizedLeads);
 
     // Auto-enroll new leads into any sequences watching this list (fire-and-forget)
-    if (result.newCount > 0) {
+    if (result.newCount > 0 && !suppressLeadSideEffects(list)) {
       void autoEnrollListIntoSequences(userId, listId);
     }
 
@@ -2859,7 +2875,8 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
 
     const updatedLead = await crmDb.updateLead(listId, leadId, updateData);
 
-    void Promise.allSettled([
+    // ENG-2311: no CRM push for a session-list row (see utils/sessionList.ts).
+    if (!suppressLeadSideEffects(list)) void Promise.allSettled([
       externalCrmSyncService.autoSyncLead(userId, listId, updatedLead, 'hubspot', 'updated'),
       externalCrmSyncService.autoSyncLead(userId, listId, updatedLead, 'attio', 'updated'),
     ]);
@@ -3227,7 +3244,7 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
     // Batch create leads
     const results = await crmDb.batchCreateLeads(listId, leads);
 
-    if (results.newCount > 0) {
+    if (results.newCount > 0 && !suppressLeadSideEffects(list)) {
       void autoEnrollListIntoSequences(userId, listId);
     }
 

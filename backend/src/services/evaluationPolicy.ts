@@ -42,7 +42,7 @@ export const SANDBOX_TOOL_CLASSES: Record<string, ToolMatcher> = {
   publish: anyOf(
     prefix('publish_'),
     exact('deploy_landing_page', 'configure_landing_page_subdomain', 'enable_lead_list_public_access',
-      'revert_landing_page_publish', 'share_landing_page_with_org'),
+      'revert_landing_page_publish', 'share_landing_page_with_org', 'enable_session_tracking'),
   ),
   third_party_writes: anyOf(
     exact('call_google_ads_api', 'call_google_ads_reporting_api', 'call_hubspot_api', 'call_attio_api',

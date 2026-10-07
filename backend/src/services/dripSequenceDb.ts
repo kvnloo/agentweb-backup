@@ -381,7 +381,81 @@ async function deleteSequence(sequenceId: string, userId: string): Promise<void>
 
 // ─── Enrollments ─────────────────────────────────────────────────────────────
 
-async function enrollLead(input: CreateEnrollmentInput): Promise<SequenceEnrollment> {
+/** Every identity this write could collide under — same set `getExistingEnrollment`
+ * callers probe, computed once so the claim-transaction below and a caller's own
+ * pre-check can never silently diverge. */
+function allEnrollmentCandidates(input: CreateEnrollmentInput): string[] {
+  return Array.from(new Set([input.leadEmail, ...(input.identityCandidates ?? [])])).filter(Boolean);
+}
+
+/** `claim#<sequenceId>#<identity>` — never collides with a real `generateEnrollmentId()`
+ * value (always `enr_...`). Deliberately carries none of this table's GSI key
+ * attributes (leadEmail; sequenceId+status; userId+nextSendAt) and never sets status to
+ * 'active', so it is invisible to every existing query AND to getAllDueEnrollments'
+ * scan — confirmed against every read path against ENROLLMENTS_TABLE before relying on
+ * it. The only way to ever see one is a `get` by this exact key, which nothing does. */
+function claimKey(sequenceId: string, identity: string): string {
+  return `claim#${sequenceId}#${identity}`;
+}
+
+/**
+ * A TransactWriteItems that fails because ONE of its condition checks did not hold
+ * surfaces as `TransactionCanceledException` with `CancellationReasons[i].Code ===
+ * 'ConditionalCheckFailed'` — a genuine duplicate: some other write already holds this
+ * exact claim, so the condition itself was evaluated and failed.
+ */
+function isGenuineConditionalFailure(error: any): boolean {
+  if (error?.code !== 'TransactionCanceledException') return false;
+  const reasons = error?.CancellationReasons || [];
+  return reasons.some((r: any) => r?.Code === 'ConditionalCheckFailed');
+}
+
+/**
+ * `TransactionConflictException` (and the `TransactionConflict` cancellation reason) is
+ * a DIFFERENT AWS error shape from a conditional failure: it means another transaction
+ * was concurrently touching the same item and this one couldn't proceed — AWS's own
+ * guidance is to retry, not to treat it as a resolved outcome. The condition was never
+ * actually evaluated, so there's no evidence the other party's write committed either.
+ *
+ * Treating this the same as a genuine conditional failure (an earlier version of this
+ * helper did, mirroring `llmUsageCreditService.ts`'s own `isTransactionalConditionalFailure`
+ * — the same conflation exists there) would silently drop a lead from a sequence with
+ * zero signal anything went wrong: indistinguishable in logs from a correct dedup skip.
+ */
+function isTransientTransactionConflict(error: any): boolean {
+  if (error?.code === 'TransactionConflictException') return true;
+  if (error?.code !== 'TransactionCanceledException') return false;
+  const reasons = error?.CancellationReasons || [];
+  return reasons.some((r: any) => r?.Code === 'TransactionConflict');
+}
+
+/**
+ * Writes the enrollment, atomically claiming every identity candidate first.
+ *
+ * TODO (ENG-2127) this replaced: enrollment keys were random IDs and the only duplicate
+ * check was a query against the eventually-consistent `leadEmail-index`, so two
+ * concurrent callers (or the same caller a moment after its own prior write) could both
+ * pass the check and both write — the whole sequence delivered twice. A
+ * TransactWriteItems that conditionally claims each candidate identity against THIS
+ * TABLE'S OWN PRIMARY KEY (strongly consistent, no GSI lag) in the same transaction as
+ * the real enrollment write closes that window: either every claim and the enrollment
+ * land together, or none of them do. No table, key, or index changed — the existing
+ * `leadEmail-index` pre-check callers already do stays as the cheap fast path (and is
+ * still what finds enrollments written before this fix existed, which carry no claim);
+ * this transaction is the backstop for the race specifically, not a replacement for it.
+ *
+ * Returns `null` if a candidate was already claimed — by a concurrent request, or by an
+ * enrollment this same transaction raced against — which callers must treat exactly like
+ * `getExistingEnrollment` finding a row: already enrolled, skip.
+ *
+ * A transient `TransactionConflictException`/`TransactionConflict` is retried (bounded,
+ * short backoff) rather than treated as a resolved duplicate — see
+ * `isTransientTransactionConflict`'s own doc comment for why conflating the two would be
+ * a silent, undetectable lead-drop. If every retry is itself a transient conflict, this
+ * throws rather than guessing at the outcome — the caller's own retry/error handling
+ * takes over from there, same as any other unexpected write failure.
+ */
+async function enrollLead(input: CreateEnrollmentInput): Promise<SequenceEnrollment | null> {
   const ts = now();
   const enrollment: SequenceEnrollment = {
     enrollmentId: generateEnrollmentId(),
@@ -396,20 +470,49 @@ async function enrollLead(input: CreateEnrollmentInput): Promise<SequenceEnrollm
     enrolledAt: ts,
   };
 
-  await dynamodb.put({
-    TableName: ENROLLMENTS_TABLE,
-    Item: enrollment,
-  }).promise();
+  const candidates = allEnrollmentCandidates(input);
+  const claimItems = candidates.map((identity) => ({
+    Put: {
+      TableName: ENROLLMENTS_TABLE,
+      Item: {
+        enrollmentId: claimKey(input.sequenceId, identity),
+        claimedEnrollmentId: enrollment.enrollmentId,
+        createdAt: ts,
+      },
+      ConditionExpression: 'attribute_not_exists(enrollmentId)',
+    },
+  }));
 
-  return enrollment;
+  const MAX_CONFLICT_RETRIES = 3;
+  for (let attempt = 0; attempt <= MAX_CONFLICT_RETRIES; attempt++) {
+    try {
+      await dynamodb.transactWrite({
+        TransactItems: [
+          ...claimItems,
+          { Put: { TableName: ENROLLMENTS_TABLE, Item: enrollment } },
+        ],
+      }).promise();
+      return enrollment;
+    } catch (error: any) {
+      if (isGenuineConditionalFailure(error)) return null;
+      if (isTransientTransactionConflict(error) && attempt < MAX_CONFLICT_RETRIES) {
+        await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+        continue;
+      }
+      throw error;
+    }
+  }
+  // Unreachable — the loop above always returns or throws — but TypeScript can't see
+  // that the for-loop's last iteration always hits one of the three branches above.
+  throw new Error('enrollLead: exhausted retries without resolving');
 }
 
 /** Bulk-enroll multiple leads; skips leads already enrolled (active or completed/converted).
- * TODO: enforce cross-request uniqueness with an approved data-plane design.
- * Enrollment keys are random IDs; leadEmail-index is eventually consistent, so a
- * process-local mutex or conditional put on enrollmentId cannot guarantee uniqueness
- * across workers (or even immediately after a prior write). Do not change keys or add
- * persisted lock records without the separate data-plane approval.
+ * ENG-2127: the GSI pre-check below is the cheap fast path (and still what finds
+ * enrollments written before the claim-transaction existed), but `enrollLead` itself now
+ * closes the race between this check and its own write — see that function's doc
+ * comment. A `null` return means a candidate was already claimed; treat it exactly like
+ * the pre-check finding a row.
  */
 async function bulkEnroll(
   inputs: CreateEnrollmentInput[],
@@ -420,9 +523,8 @@ async function bulkEnroll(
   for (const input of inputs) {
     // Check every identity the lead could already be stored under, not just the one we
     // would write today — the identity moves when the lead's data changes, and a miss
-    // here re-delivers the whole sequence. Deduped, and `leadEmail` is always included.
-    const candidates = Array.from(new Set([input.leadEmail, ...(input.identityCandidates ?? [])]))
-      .filter(Boolean);
+    // here re-delivers the whole sequence.
+    const candidates = allEnrollmentCandidates(input);
     let existing: SequenceEnrollment | null = null;
     for (const identity of candidates) {
       existing = await getExistingEnrollment(input.sequenceId, identity);
@@ -432,7 +534,11 @@ async function bulkEnroll(
       skipped++;
       continue;
     }
-    await enrollLead(input);
+    const result = await enrollLead(input);
+    if (!result) {
+      skipped++;
+      continue;
+    }
     enrolled++;
   }
 

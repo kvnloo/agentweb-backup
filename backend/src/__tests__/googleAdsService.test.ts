@@ -705,6 +705,44 @@ describe('addProximityCriterion / removeCampaignCriterion (ENG-487)', () => {
     expect(body.operations[0].create.proximity.address).toEqual({ postalCode: '99201' });
   });
 
+  it('creates a PROXIMITY criterion centered on lat/long in micro-degrees (ENG-486)', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/campaignCriteria/1~3' }] } });
+    await service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
+      radius: 25, radiusUnits: 'KILOMETERS', address: {},
+      geoPoint: { latitude: 47.4668, longitude: -122.2668 },
+    });
+    const create = mockAxiosPost.mock.calls[0][1].operations[0].create;
+    expect(create.proximity).toEqual({
+      radius: 25, radiusUnits: 'KILOMETERS',
+      geoPoint: { latitudeInMicroDegrees: 47466800, longitudeInMicroDegrees: -122266800 },
+    });
+  });
+
+  it('rejects out-of-range coordinates before any API call (ENG-486)', async () => {
+    await expect(service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
+      radius: 25, address: {}, geoPoint: { latitude: 120, longitude: 0 },
+    })).rejects.toThrow('latitude');
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, null, NaN, Infinity, 0, -1])('rejects invalid radius %s before credential lookup (ENG-486)', async (radius) => {
+    const credentials = jest.spyOn(service as any, 'getAccountCredentials');
+    await expect(service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
+      radius: radius as number, address: { postalCode: '99201' },
+    })).rejects.toThrow('radius must be a positive finite number');
+    expect(credentials).not.toHaveBeenCalled();
+    credentials.mockRestore();
+  });
+
+  it('rejects a missing center before credential lookup (ENG-486)', async () => {
+    const credentials = jest.spyOn(service as any, 'getAccountCredentials');
+    await expect(service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
+      radius: 25, address: {},
+    })).rejects.toThrow('at least one address field');
+    expect(credentials).not.toHaveBeenCalled();
+    credentials.mockRestore();
+  });
+
   it('rejects an address with no fields set', async () => {
     await expect(service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
       radius: 25,

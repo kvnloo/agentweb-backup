@@ -90,11 +90,27 @@ describe("brandBuildStatusService", () => {
       expect(patch!.brandBuildDurationMs).toBe(60_000);
     });
 
-    it("still ignores a ready/absent build even with includeFailed set", () => {
+    it("still ignores an already-ready build even with includeFailed set", () => {
       expect(
         buildReadyPatch({ brandBuildStatus: "ready" }, now, { includeFailed: true })
       ).toBeNull();
-      expect(buildReadyPatch({}, now, { includeFailed: true })).toBeNull();
+    });
+
+    // ENG-2276 follow-up: the outreach "I don't have a website yet" skip path
+    // never calls /brand-build/start, so brandBuildStatus is absent (not
+    // "failed") when the user later submits a brand description through the
+    // manual-fallback modal. Confirmed live: without this, the save silently
+    // succeeded but brandBuildStatus never left `undefined`, so /icp/start
+    // never fired and the user stayed frozen despite doing what the UI asked.
+    it("flips an absent (never-started) build to ready when includeFailed is set", () => {
+      const patch = buildReadyPatch({}, now, { includeFailed: true });
+      expect(patch).not.toBeNull();
+      expect(patch!.brandBuildStatus).toBe("ready");
+      expect(patch!.brandBuildError).toBeUndefined();
+    });
+
+    it("still ignores an absent build when includeFailed is NOT set (Emma's internal hook)", () => {
+      expect(buildReadyPatch({}, now)).toBeNull();
     });
   });
 

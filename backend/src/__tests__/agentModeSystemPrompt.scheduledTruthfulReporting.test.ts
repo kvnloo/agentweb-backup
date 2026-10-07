@@ -78,6 +78,25 @@ describe('getScheduledSessionOverride — truthful execution reporting (ENG-803)
       }
     });
 
+    /**
+     * Follow-up to ENG-2265 — the hard fabrication ban above (claiming a LinkedIn/
+     * X/API/credential gate) wasn't what recurred in live testing; a SOFTER drift
+     * did: "the platform enforces an unattended publishing safety lock", immediately
+     * followed by a disclaimer that it's AgentWeb's own setting, not a LinkedIn
+     * token or API quota issue. That sentence never claims a third-party gate, so it
+     * didn't violate the existing rule — but "platform" is an overloaded word in a
+     * product that also talks about connected social platforms, so a customer
+     * skimming the first clause alone can still misread it as LinkedIn/X blocking
+     * them. Banning the bare word (not just the "platform gate" phrase) closes that
+     * softer drift without touching the hard-fabrication rule it layers onto.
+     */
+    it('forbids the bare word "platform" when describing the setting, not just "platform gate"', () => {
+      for (const variant of [scheduled, approvalRequired]) {
+        expect(variant).toContain('Do not use the word "platform" at all when describing this setting');
+        expect(variant).toContain('Say "AgentWeb" or name the setting directly');
+      }
+    });
+
     it('ties the title and summary to real tool outcomes, banning the reported "queued" title', () => {
       expect(scheduled).toContain('Derive your title and summary from actual tool-call outcomes');
       expect(scheduled).toContain('"queued"');
@@ -289,6 +308,27 @@ describe('getScheduledSessionOverride — accurate withhold reason (ENG-1245)', 
     // Explicitly steers away from the wrong fix, the same way the genuine-hold
     // branch already steers away from "Full autonomy".
     expect(neverGranted).toMatch(/Require approval before publishing.*(is already off|not what|will not change|does not (govern|change))/i);
+  });
+
+  /**
+   * ENG-2265 — before this, the never-granted branch only told the model to have
+   * the owner "flag it via report_product_issues", with no real unblocking path,
+   * even though customer-portal's ScheduleFormPanel already ships a self-service
+   * "Publish without my review" control (under a "Standing publish authorization"
+   * section, gated on saving a publish tool under Required Actions first). Starved
+   * of a real answer, the model in prod session 87e55259 invented a nonexistent
+   * control name ("Autorizar publicación automática / Autopublish") when the owner
+   * pushed back. Pin the real control name and prerequisite step.
+   */
+  it('the never-granted branch names the REAL self-service control (ENG-2265) — not an invented one', () => {
+    expect(neverGranted).toContain('Publish without my review');
+    expect(neverGranted).toContain('Required Actions');
+    expect(neverGranted).not.toContain('Autorizar publicación automática');
+    expect(neverGranted).not.toContain('Autopublish');
+  });
+
+  it('the revoked branch does NOT get the never-granted self-service instruction (ENG-2265 scope check)', () => {
+    expect(revoked).not.toContain('Publish without my review');
   });
 
   it('the never-granted branch ends on its OWN accurate terminal marker, not the genuine-hold one', () => {

@@ -716,19 +716,24 @@ export async function handleCallGoogleAdsApi(userId: string, args: {
         };
       }
       if (action === 'ADD_PROXIMITY') {
-        if (!args.campaign_resource_name || args.radius === undefined || !args.address) {
-          return { success: false, error: 'campaign_resource_name, radius, and address are required for ADD_PROXIMITY' };
+        const hasGeo = args.latitude !== undefined || args.longitude !== undefined;
+        if (!args.campaign_resource_name || args.radius === undefined || (!args.address && !hasGeo)) {
+          return { success: false, error: 'campaign_resource_name, radius, and address (or latitude+longitude) are required for ADD_PROXIMITY' };
+        }
+        if (hasGeo && (typeof args.latitude !== 'number' || typeof args.longitude !== 'number')) {
+          return { success: false, error: 'ADD_PROXIMITY needs both latitude and longitude as numbers when centering on coordinates' };
         }
         const criterion = await googleAdsService.addProximityCriterion(userId, customer_id, args.campaign_resource_name, {
           radius: args.radius,
           radiusUnits: args.radius_units,
+          ...(hasGeo ? { geoPoint: { latitude: args.latitude, longitude: args.longitude } } : {}),
           address: {
-            streetAddress: args.address.street_address,
-            cityName: args.address.city_name,
-            postalCode: args.address.postal_code,
-            provinceCode: args.address.province_code,
-            provinceName: args.address.province_name,
-            countryCode: args.address.country_code,
+            streetAddress: args.address?.street_address,
+            cityName: args.address?.city_name,
+            postalCode: args.address?.postal_code,
+            provinceCode: args.address?.province_code,
+            provinceName: args.address?.province_name,
+            countryCode: args.address?.country_code,
           },
         });
         return { success: true, criterionResourceName: criterion.resourceName };

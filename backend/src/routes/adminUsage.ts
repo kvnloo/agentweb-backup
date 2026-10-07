@@ -16,7 +16,6 @@ import { isAdmin } from "../middleware/admin";
 import { AuthRequest } from "../types/express";
 import {
   getUserUsageByModelDay,
-  getUsageComparison,
   getCostAggregation,
   getUserOrgUsageRollup,
   getXAllocatedTotals,
@@ -259,33 +258,6 @@ router.get(
       console.error("[adminUsage] by-model-day failed:", error);
       return res.status(500).json({
         message: "Failed to load usage",
-        error: error instanceof Error ? error.message : "Unknown error",
-      });
-    }
-  }
-);
-
-router.get(
-  "/users/:userId/usage/comparison",
-  authenticateToken,
-  isAdmin,
-  async (req: AuthRequest, res: Response) => {
-    try {
-      const { userId } = req.params as { userId: string };
-      const month = String(req.query.month || "");
-
-      if (!MONTH_RE.test(month)) {
-        return res
-          .status(400)
-          .json({ message: "month query param is required (YYYY-MM)" });
-      }
-
-      const result = await getUsageComparison(userId, month);
-      return res.json(result);
-    } catch (error) {
-      console.error("[adminUsage] comparison failed:", error);
-      return res.status(500).json({
-        message: "Failed to load usage comparison",
         error: error instanceof Error ? error.message : "Unknown error",
       });
     }

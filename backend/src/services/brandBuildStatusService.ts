@@ -111,9 +111,21 @@ export function buildReadyPatch(
   // brand by hand after an unscrapable-site failure, the write completes the
   // build (failed → ready) and they're no longer gated on the buildingBrand
   // screen. Emma's internal ready-hook keeps the default (building-only).
+  //
+  // `undefined` (no build ever attempted) is included alongside `failed`
+  // under the same `includeFailed` opt-in (ENG-2276 follow-up): the outreach
+  // "I don't have a website yet" skip path never calls `/brand-build/start`
+  // at all, so `brandBuildStatus` is absent rather than `failed` — without
+  // this, a user who explicitly types a brand description through the
+  // manual-fallback modal gets a 201 with no error, but the build silently
+  // never completes and `/icp/start` never fires. Confirmed live: the save
+  // succeeded, `brandBuildStatus` stayed unset, and the user was frozen on
+  // "Emma is still figuring out…" indefinitely despite doing everything the
+  // UI asked. `ready` itself is deliberately excluded — an already-complete
+  // build must stay a no-op here regardless of `includeFailed`.
   const canComplete =
     status === "building" ||
-    (status === "failed" && opts.includeFailed === true);
+    ((status === "failed" || status === undefined) && opts.includeFailed === true);
   if (!canComplete) {
     return null;
   }

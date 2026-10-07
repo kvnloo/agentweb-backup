@@ -2431,6 +2431,106 @@ describe("v0Service - deployLandingPage", () => {
     expect(pushedTrackingSignal()).toBe(true);
     expect(pushedMetaTrackingSignal()).toBe(true);
   });
+
+  // ---------------------------------------------------------------------------
+  // ENG-2327: automatic session tracking at generation (flag AUTO_SESSION_TRACKING, default OFF).
+  // The service's own behaviour is pinned in sessionTrackingService.test.ts; these pin the WIRING:
+  // flag off = nothing extra happens, and a failing enablement can never fail generation.
+  // ---------------------------------------------------------------------------
+  describe("ENG-2327 AUTO_SESSION_TRACKING wiring", () => {
+    const prevFlag = process.env.AUTO_SESSION_TRACKING;
+    afterEach(() => {
+      if (prevFlag === undefined) delete process.env.AUTO_SESSION_TRACKING; else process.env.AUTO_SESSION_TRACKING = prevFlag;
+    });
+
+    function queuePage() {
+      mockGet.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Item: { id: "page-1", userId: "user-1", name: "Tracked Page", prompt: "Build it", status: "draft", v0ChatId: "chat_1", iterations: 0 },
+          }),
+      });
+    }
+    const sessionTrackingWrites = () =>
+      mockUpdate.mock.calls.filter((c) => /sessionTracking/.test(String(c[0]?.UpdateExpression)));
+    const contentsReads = () =>
+      mockAxiosGet.mock.calls.filter((c) => typeof c[0] === "string" && c[0].includes("/contents/"));
+
+    it("flag unset (default OFF): generation does no session-tracking work at all", async () => {
+      delete process.env.AUTO_SESSION_TRACKING;
+      queuePage();
+      mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+      mockChatsDownloadVersion.mockResolvedValueOnce(await createV0ZipWithLayout());
+      wireHappyPathDeploy();
+
+      const result = await deployLandingPage("page-1", "user-1");
+
+      expect(result.status).toBe("deployed");
+      expect(result.sessionTrackingListId).toBeUndefined();
+      expect(contentsReads()).toHaveLength(0);
+      expect(sessionTrackingWrites()).toHaveLength(0);
+      expect(mockPut.mock.calls.some((c) => c[0]?.Item?.listType === "session")).toBe(false);
+    });
+
+    it("flag ON but enablement throws (GitHub read fails): the page still deploys and the error is recorded on it", async () => {
+      process.env.AUTO_SESSION_TRACKING = "true";
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+      queuePage();
+      mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+      mockChatsDownloadVersion.mockResolvedValueOnce(await createV0ZipWithLayout());
+      wireHappyPathDeploy();
+      const happyGet = mockAxiosGet.getMockImplementation()!;
+      mockAxiosGet.mockImplementation((url: string, ...rest: any[]) =>
+        url.includes("/contents/") ? Promise.reject(Object.assign(new Error("github down"), { response: { status: 500 } })) : happyGet(url, ...rest));
+
+      const result = await deployLandingPage("page-1", "user-1");
+
+      expect(result.status).toBe("deployed");
+      expect(result.sessionTrackingListId).toBeUndefined();
+      const recorded = sessionTrackingWrites().find((c) => c[0].ExpressionAttributeValues?.[":e"]);
+      expect(recorded?.[0].ExpressionAttributeValues[":e"]).toContain("github down");
+      expect(recorded?.[0].ExpressionAttributeValues[":i"]).toBe(false);
+      // and no half state: no list was created for a repo that could not be read
+      expect(mockPut.mock.calls.some((c) => c[0]?.Item?.listType === "session")).toBe(false);
+      errSpy.mockRestore();
+    });
+
+    it("flag ON, happy path: creates the list, commits the tag after the initial push, and returns the ids on the record", async () => {
+      process.env.AUTO_SESSION_TRACKING = "1";
+      queuePage();
+      mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+      mockChatsDownloadVersion.mockResolvedValueOnce(await createV0ZipWithLayout());
+      wireHappyPathDeploy();
+      const happyGet = mockAxiosGet.getMockImplementation()!;
+      // The repo serves back the latest layout blob that was pushed (initial push, then ours).
+      const latestLayout = () =>
+        mockAxiosPost.mock.calls
+          .filter((c) => typeof c[0] === "string" && c[0].includes("/git/blobs"))
+          .map((c) => Buffer.from(c[1].content, "base64").toString("utf8"))
+          .filter((content) => content.includes("RootLayout"))
+          .pop();
+      mockAxiosGet.mockImplementation((url: string, ...rest: any[]) =>
+        url.includes("/git/trees/")
+          ? Promise.resolve({ data: { truncated: false, tree: [{ path: "app/layout.tsx", type: "blob", size: 100 }] } })
+          : url.includes("/contents/app/layout.tsx")
+          ? Promise.resolve({ data: { type: "file", encoding: "base64", content: Buffer.from(latestLayout() ?? "").toString("base64") } })
+          : happyGet(url, ...rest));
+
+      const result = await deployLandingPage("page-1", "user-1");
+
+      expect(result.status).toBe("deployed");
+      const session = mockPut.mock.calls.map((c) => c[0]?.Item).find((i) => i?.listType === "session");
+      expect(session).toBeDefined();
+      expect(session.name).toBe("LP Sessions - Tracked Page");
+      expect(session.userId).toBe("user-1");
+      expect(session.trackingConfig.allowedOrigins.length).toBeGreaterThan(0);
+      expect(result.sessionTrackingListId).toBe(session.listId);
+      expect(result.sessionTrackingInstalled).toBe(true);
+      expect(latestLayout()).toContain(`data-aw-list="${session.listId}"`);
+      // the GTM/pixel/ads blocks of the initial push are untouched by the second commit
+      expect(latestLayout()).toContain("RootLayout");
+    });
+  });
 });
 
 // =============================================================================
@@ -2761,6 +2861,61 @@ describe("v0Service - iterateLandingPage", () => {
     await iterateLandingPage("page-1", "user-1", "Edit B: make the hero blue");
 
     expect(mockChatsSendMessage).toHaveBeenCalledTimes(2);
+    mockChatsGetById.mockReset();
+  });
+
+  it("ENG-1728: the pre-send base version is persisted BEFORE v0 is called", async () => {
+    // If the process dies between v0 accepting the message and pendingIteration being
+    // stored, the retry would read the POST-edit version as its base, the guard would skip
+    // the already-sent message, and the retry would wait for a version no send will create.
+    // Writing the base first closes that window.
+    mockGet.mockReturnValue(iterRecord());
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } })
+      .mockResolvedValue({ latestVersion: { id: "v_new", status: "completed" } });
+    mockChatsSendMessage.mockResolvedValueOnce({});
+
+    await iterateLandingPage("page-1", "user-1", "Add testimonials");
+
+    const pendingWrite = mockUpdate.mock.calls.findIndex(
+      (c: any) => c[0].ExpressionAttributeValues?.[":p"]?.baseVersionId === "v_base"
+    );
+    expect(pendingWrite).toBeGreaterThanOrEqual(0);
+    expect(mockUpdate.mock.calls[pendingWrite][0].ExpressionAttributeValues[":p"].unsent).toBe(true);
+    expect(mockUpdate.mock.invocationCallOrder[pendingWrite]).toBeLessThan(
+      mockChatsSendMessage.mock.invocationCallOrder[0]
+    );
+    // After v0 accepts, the marker is cleared but the ORIGINAL base is kept.
+    const sentWrite = mockUpdate.mock.calls.find(
+      (c: any) => c[0].ExpressionAttributeValues?.[":p"] && !c[0].ExpressionAttributeValues[":p"].unsent
+    );
+    expect(sentWrite[0].ExpressionAttributeValues[":p"].baseVersionId).toBe("v_base");
+    mockChatsGetById.mockReset();
+  });
+
+  it("ENG-1728: a retry whose base was recorded but whose send never happened still sends (no wait for a version nobody will create)", async () => {
+    // Crash between the pre-send pendingIteration write and the v0 call: the record says
+    // this edit is pending, v0 is still at the recorded base, and the guard has no record
+    // of a send. The retry must send rather than wait out V0_GENERATION_TIMEOUT.
+    mockGet.mockReturnValue(
+      iterRecord({
+        pendingIteration: {
+          baseVersionId: "v_base",
+          messageHash: hashV0Prompt("Add testimonials"),
+          startedAt: new Date().toISOString(),
+          unsent: true,
+        },
+      })
+    );
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } })
+      .mockResolvedValue({ latestVersion: { id: "v_new", status: "completed" } });
+    mockChatsSendMessage.mockResolvedValueOnce({});
+
+    const result = await iterateLandingPage("page-1", "user-1", "Add testimonials");
+
+    expect(mockChatsSendMessage).toHaveBeenCalledTimes(1);
+    expect(result.iterations).toBe(1);
     mockChatsGetById.mockReset();
   });
 

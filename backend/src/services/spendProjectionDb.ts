@@ -150,6 +150,50 @@ export async function getProjection(
   return (result.Item as PersistedProjection) ?? null;
 }
 
+/**
+ * Read one month's projection rows for many subjects at once (BatchGetItem, 100 keys
+ * per call). Returns a map keyed by billingUserId; a subject with no row is simply
+ * absent, which means no settled spend has been recorded for it that month.
+ *
+ * For admin surfaces that list many accounts and need "did this one spend this
+ * month" or its settled total without N round trips (ENG-1250 AC7, which retires the
+ * legacy per-user counter those surfaces used to read).
+ *
+ * Unprocessed keys (throttling) are retried a bounded number of times; if any still
+ * remain it THROWS rather than return a partial map, because an absent key means
+ * "no spend" and a silently dropped one would read as exactly that.
+ */
+export async function getProjectionsBatch(
+  billingUserIds: readonly string[],
+  billingMonth: string,
+  maxRetries = 4,
+): Promise<Map<string, PersistedProjection>> {
+  const out = new Map<string, PersistedProjection>();
+  if (!MONTH.test(billingMonth)) throw new Error(`bad billing month: ${JSON.stringify(billingMonth)}`);
+  const ids = [...new Set(billingUserIds.filter((id) => id !== ""))];
+
+  for (let i = 0; i < ids.length; i += 100) {
+    let pending: AWS.DynamoDB.DocumentClient.KeyList | undefined = ids
+      .slice(i, i + 100)
+      .map((billingUserId) => ({ billingUserId, billingMonth }));
+
+    for (let attempt = 0; pending && pending.length > 0; attempt++) {
+      if (attempt > maxRetries) {
+        throw new Error(`getProjectionsBatch: ${pending.length} key(s) still unprocessed after ${maxRetries} retries`);
+      }
+      const result: AWS.DynamoDB.DocumentClient.BatchGetItemOutput = await db()
+        .batchGet({ RequestItems: { [SPEND_PROJECTION_TABLE]: { Keys: pending } } })
+        .promise();
+      for (const item of (result.Responses?.[SPEND_PROJECTION_TABLE] ?? []) as PersistedProjection[]) {
+        out.set(item.billingUserId, item);
+      }
+      pending = result.UnprocessedKeys?.[SPEND_PROJECTION_TABLE]?.Keys;
+      if (pending && pending.length > 0) await new Promise((r) => setTimeout(r, 50 * 2 ** attempt));
+    }
+  }
+  return out;
+}
+
 // ── Event-driven writer (ENG-1250 §3b, the missing production writer) ─────────
 //
 // §3b shipped this table plus `putProjection`, but nothing called it in

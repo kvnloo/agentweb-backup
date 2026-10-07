@@ -8,7 +8,8 @@ import { Router, Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { requireEmmaTokenBudget } from '../middleware/emmaTokenBudget';
 import { chatbotDb } from '../services/chatbotService';
-import { publishRevalidationForForwardedRun } from '../utils/scheduledPublishConsentGuard';
+import { publishRevalidationForForwardedRun, publishWithdrawnMidFlight, SCHEDULED_SESSION_HEADER } from '../utils/scheduledPublishConsentGuard';
+import { getMetaAdsMetricsArgsSchema } from '../utils/metaCampaignIds';
 
 const router = Router();
 
@@ -338,11 +339,54 @@ router.post('/post-on-account', async (req: Request, res: Response) => {
     const toolContext = buildScheduledPublishContext(req);
     const result = await svc.postOnConnectedAccount(
       userId(req), req.body.account_id, req.body.content, req.body.media_urls || [],
-      undefined, toolContext
+      undefined, toolContext, req.body.save_as_draft === true ? { saveAsDraft: true } : undefined
     );
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
+  }
+});
+
+// ENG-1005: authenticated, metered counterparts of the internal blog tools.
+// Keep the existing service behavior and carry scheduled consent to the CMS write.
+router.post('/create-blog-article', async (req: Request, res: Response) => {
+  try {
+    const args = req.body;
+    if (![args.title_draft, args.content_draft].every(value => typeof value === 'string' && value.trim())) {
+      return res.status(400).json({ message: 'title_draft and content_draft are required.' });
+    }
+    const svc = await getAgentModeService();
+    const result = await svc.createBlogArticle(
+      args.title_draft, args.content_draft, args.length || 'medium',
+      args.researchContext || '', args.requirements || '',
+      userId(req), req.header(SCHEDULED_SESSION_HEADER) || '',
+      args.style || 'default', args.deep_research === true
+    );
+    return res.json(result);
+  } catch (err: any) {
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+router.post('/publish-blog-article', async (req: Request, res: Response) => {
+  try {
+    const args = req.body;
+    if (![args.title, args.description, args.hero_image_url, args.blog_html_url].every(value => typeof value === 'string' && value.trim())) {
+      return res.status(400).json({ message: 'title, description, hero_image_url, and blog_html_url are required.' });
+    }
+    const status = args.status ?? 'draft';
+    if (status !== 'draft' && status !== 'published') return res.status(400).json({ message: 'status must be draft or published.' });
+    const publishContext = status === 'published' ? publishRevalidationForForwardedRun(req, 'publish_blog_article') : undefined;
+    const withdrawn = await publishWithdrawnMidFlight(publishContext);
+    if (withdrawn) return res.json(withdrawn);
+    const svc = await getAgentModeService();
+    return res.json(await svc.publishBlogArticle(
+      args.title, args.description, args.hero_image_url, args.blog_html_url,
+      userId(req), req.header(SCHEDULED_SESSION_HEADER) || '',
+      status, args.author, args.categories, publishContext?.assertPublishStillAuthorized
+    ));
+  } catch (err: any) {
+    return res.status(500).json({ message: err.message });
   }
 });
 
@@ -456,12 +500,21 @@ router.post('/meta-ads/insights', async (req: Request, res: Response) => {
 
 router.post('/meta-ads/metrics', async (req: Request, res: Response) => {
   try {
+    // Direct HTTP clients historically sent numeric IDs; keep accepting them here
+    // while the tool-gateway contract stays string-only.
+    const requestBody = Array.isArray(req.body?.campaign_ids)
+      ? { ...req.body, campaign_ids: req.body.campaign_ids.map((id: unknown) =>
+        (typeof id === 'number' ? String(id) : id)) }
+      : req.body;
+    const parsed = getMetaAdsMetricsArgsSchema.safeParse(requestBody);
+    if (!parsed.success) return res.json({ success: false,
+      message: 'campaign_ids is required and must contain at least one campaign ID.', error: 'Invalid campaign_ids' });
     const svc = await getAgentModeService();
     const result = await svc.getMetaAdsMetrics(
-      req.body.timeframe || '7d',
+      parsed.data.timeframe || '7d',
       userId(req),
-      req.body.campaign_ids,
-      req.body.account_id,
+      parsed.data.campaign_ids,
+      parsed.data.account_id,
     );
     res.json(result);
   } catch (err: any) {

@@ -195,8 +195,9 @@
  * same treatment as `create_html_from_template`/`import_leads_from_search`);
  * `getSenderForLead` is bound off the singleton the same way.
  */
-import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor } from '../../utils/leadSchema';
-import type { LeadImportRowOutcome } from '../../utils/leadSchema';
+import { suppressLeadSideEffects } from '../../utils/sessionList';
+import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution, defaultStatusConfigFor, isLeadListType } from '../../utils/leadSchema';
+import type { LeadImportRowOutcome, LeadListType } from '../../utils/leadSchema';
 import { providerLabel } from '../../services/crmSenderTypes';
 import { mergeCustomFields } from '../../utils/customFieldsGuard';
 import { recoverLeadFromWrongList } from '../../services/agentMode/leadRecovery';
@@ -261,8 +262,13 @@ export async function getLeadLists(userId: string): Promise<any> {
     }
   }
 
-export async function createLeadList(name: string, description: string, userId: string, listType?: 'sales' | 'customers'): Promise<any> {
+export async function createLeadList(name: string, description: string, userId: string, listType?: LeadListType): Promise<any> {
     try {
+      // listType is set-once, so a typo persisted here could never be corrected. The tool
+      // schema's enum is advisory to the model, not enforced on direct callers.
+      if (listType !== undefined && !isLeadListType(listType)) {
+        return { success: false, message: 'Invalid list type', error: 'listType must be "sales", "customers" or "session"' };
+      }
       const { crmDb } = await import('../../services/db');
       const list = await crmDb.createLeadList(userId, name, description, undefined, undefined, undefined, undefined, undefined, undefined, listType);
 
@@ -527,6 +533,10 @@ export async function getLeads(listId: string, userId: string, options: {
     status?: string;
     limit?: number;
     cursor?: string;
+    // ENG-425: export callers (CSV) need the full row; without this they fan
+    // out one get_lead_details call per lead. Off by default so the model's
+    // compact browse rows (and token budget) are unchanged.
+    includeAllFields?: boolean;
   } = {}): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
@@ -616,6 +626,27 @@ export async function getLeads(listId: string, userId: string, options: {
 
       const nextCursor = cursor ? Buffer.from(JSON.stringify(cursor)).toString('base64') : undefined;
 
+      // ENG-425: full export fields. Same card-revenue boundary as
+      // getLeadDetails (ENG-1388) — org-shared lists must not leak Enigma
+      // card revenue to a non-allowlisted caller through the bulk path.
+      let fullFieldProjector: ((lead: any) => Record<string, any>) | null = null;
+      if (options.includeAllFields) {
+        const { sanitizeEnrichmentMetadataForResponse, stripCardRevenueKeys, shouldHideCardRevenueForViewer } = await import('../../utils/enrichmentMetadataPresentation');
+        const hide = shouldHideCardRevenueForViewer(userId);
+        fullFieldProjector = (lead: any) => {
+          const meta = sanitizeEnrichmentMetadataForResponse(lead.enrichmentMetadata as Record<string, any> | undefined);
+          return {
+            listId: lead.listId || listId,
+            notes: lead.notes || '',
+            linkedin: lead.linkedin || '',
+            customFields: hide ? (stripCardRevenueKeys(lead.customFields) ?? {}) : (lead.customFields || {}),
+            ...(meta ? { enrichmentMetadata: hide ? stripCardRevenueKeys(meta) : meta } : {}),
+            createdAt: lead.createdAt || null,
+            updatedAt: lead.updatedAt || null,
+          };
+        };
+      }
+
       return {
         success: true,
         // ENG-1207: same contract as searchLeads — a truncated page must not be
@@ -645,6 +676,7 @@ export async function getLeads(listId: string, userId: string, options: {
           // the detail path. Spread last so it can only add keys, never shadow
           // an existing one; absent attribution adds nothing at all.
           ...projectLeadAttribution(lead),
+          ...(fullFieldProjector ? fullFieldProjector(lead) : {}),
         })),
         matchCount: matchingLeads.length,
         listName: list.name,
@@ -1438,7 +1470,8 @@ export async function updateLead(listId: string, leadId: string, updates: Record
 
       await crmDb.updateLead(listId, leadId, dbUpdates);
 
-      void (async () => {
+      // ENG-2311: no CRM push for a session-list row (list already loaded above).
+      if (!suppressLeadSideEffects(list)) void (async () => {
         try {
           const { externalCrmSyncService } = await import('../../services/externalCrmSyncService');
           await Promise.allSettled([
@@ -1792,7 +1825,7 @@ export async function updateLeadList(listId: string, updates: {
     autoDraftEnabled?: boolean;
     autoDraftInstruction?: string;
     statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
-    listType?: 'sales' | 'customers';
+    listType?: LeadListType;
   }, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
@@ -1823,6 +1856,9 @@ export async function updateLeadList(listId: string, updates: {
       if (updates.autoDraftInstruction !== undefined) filteredUpdates.autoDraftInstruction = updates.autoDraftInstruction;
       if (updates.statusConfig !== undefined) filteredUpdates.statusConfig = updates.statusConfig;
       if (updates.listType !== undefined) {
+        if (!isLeadListType(updates.listType)) {
+          return { success: false, message: 'Invalid list type', error: 'listType must be "sales", "customers" or "session"' };
+        }
         if (list.listType) {
           return { success: false, message: 'List type already set', error: 'listType is already set and cannot be changed' };
         }
@@ -2985,7 +3021,7 @@ export async function importLeadsFromSearch(
     return { success: false, error: 'At least one search filter is required: keywords, search_url, cursor, or a structured filter (title, company, location, industry, school)' };
   }
 
-  const { linkedInOutreachService } = await import('../../services/linkedInOutreachService');
+  const { linkedInOutreachService, isProvenDisconnectError } = await import('../../services/linkedInOutreachService');
 
   // Access check (ENG-1049): this function creates leads (batchCreateLeads
   // below), and is called directly by the import_leads_from_search Emma tool
@@ -3009,8 +3045,11 @@ export async function importLeadsFromSearch(
     return { success: false, error: 'Failed to verify list access' };
   }
 
-  // Resolve account: user's own or platform-wide fallback
-  const accountId = await linkedInOutreachService.resolveAccountId(userId);
+  // Resolve account: user's own or platform-wide fallback. Keep usedSharedAccount
+  // (not the flag-discarding resolveAccountId wrapper) — the reactive handler
+  // below needs it to know whether accountId is this user's own account or the
+  // ownerless site-wide pool (see the ownerUserId comment there).
+  const { accountId, usedSharedAccount } = await linkedInOutreachService.resolveAccountIdWithSource(userId);
   if (!accountId) {
     return {
       success: false,
@@ -3107,6 +3146,32 @@ export async function importLeadsFromSearch(
       });
     } catch (e: any) {
       searchError = e?.message ? String(e.message) : String(e);
+      // ENG-2205: resolveAccountId can now hand back an account whose probe was
+      // merely indeterminate (not proven dead — see linkedInOutreachService's
+      // probeAccountSession), so a real failure here is the backstop that proves
+      // it either way. On a proven-dead session, correct the probe cache and
+      // record the health event — otherwise this account stays cached as
+      // 'unknown' for the full 10-minute window and gets handed to the next
+      // caller (same user's retry, or another user sharing the site-wide pool)
+      // instead of the pool correctly skipping it. Mirrors the identical reactive
+      // handler in emma/impl/linkedin.ts. Uses the shared isProvenDisconnectError
+      // predicate (not a hand-rolled AUTH_ERROR check) specifically because it
+      // excludes a bare 403 — a permission/plan restriction, not a dead session.
+      if (isProvenDisconnectError(e)) {
+        linkedInOutreachService.clearStatusCache(accountId);
+        const { recordUnipileAccountHealth } = await import('../../services/linkedInConnectionHealth');
+        // ownerUserId must be omitted for the site-wide pool: recordUnipileAccountHealth
+        // resolves an attributed owner only via getAccountsByUserId(ownerUserId) /
+        // getAccountsByUserIdIncludingOrgShared(ownerUserId) — neither of which can ever
+        // find the global fallback pool account under an unrelated customer's userId. A
+        // truthy-but-wrong ownerUserId silently no-ops instead of reaching the dedicated
+        // ownerless/oncall branch that exists specifically for this account class.
+        await recordUnipileAccountHealth({
+          accountId,
+          ownerUserId: usedSharedAccount ? undefined : userId,
+          state: 'disconnected',
+        });
+      }
       break;
     }
 
