@@ -28,6 +28,14 @@ import { v4 as uuidv4 } from 'uuid';
 // socialEngagementExecutor.ts's INSTANCE_ID, used for log correlation only.
 const INSTANCE_ID = uuidv4();
 
+/** A LinkedIn step pins an account the sequence owner no longer owns or shares. */
+export class PinnedLinkedInAccountNotConnectedError extends Error {
+  constructor(stepNumber: number, userId: string) {
+    super(`LinkedIn step ${stepNumber} references an account that is not connected to user ${userId}`);
+    this.name = 'PinnedLinkedInAccountNotConnectedError';
+  }
+}
+
 export async function processDueEnrollments(): Promise<{
   processed: number;
   sent: number;
@@ -73,6 +81,12 @@ export async function processDueEnrollments(): Promise<{
         const retryAt = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
         await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, retryAt).catch(() => {});
         console.log(`[dripWorker] Snoozed enrollment ${enrollment.enrollmentId} until ${retryAt} (not yet connected)`);
+      } else if (err instanceof PinnedLinkedInAccountNotConnectedError) {
+        // A config problem the owner has to fix (re-pick or reconnect the account). Retrying every 5-minute
+        // tick cannot succeed and only burns claims and log noise, so back off like the not-connected case.
+        const retryAt = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
+        await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, retryAt).catch(() => {});
+        console.log(`[dripWorker] Snoozed enrollment ${enrollment.enrollmentId} until ${retryAt} (pinned LinkedIn account not connected)`);
       } else if (err instanceof SenderDailyLimitExceededError) {
         // ENG-265: the sender's daily counter resets at UTC midnight — releasing
         // the claim here would just re-fail on the very next 5-minute tick until
@@ -333,7 +347,7 @@ async function sendLinkedInStep(
     const { resolveLinkedInAccountForWrite } = await import('./agentMode/linkedInDailyVolumeGate');
     if (!(await resolveLinkedInAccountForWrite(enrollment.userId, step.linkedInAccountId))) {
       console.error(`[dripWorker] LinkedIn step ${step.stepNumber} for enrollment ${enrollment.enrollmentId}: pinned account is not connected to user ${enrollment.userId}`);
-      throw new Error(`LinkedIn step ${step.stepNumber} references an account that is not connected to user ${enrollment.userId}`);
+      throw new PinnedLinkedInAccountNotConnectedError(step.stepNumber, enrollment.userId);
     }
   }
   const accountId = step.linkedInAccountId

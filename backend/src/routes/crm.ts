@@ -25,6 +25,9 @@ import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { suppressLeadSideEffects } from '../utils/sessionList';
 import { isLinkedInInfraError, LINKEDIN_UNAVAILABLE_MESSAGE } from '../utils/linkedInInfraError';
+
+const LINKEDIN_ACCOUNT_NOT_YOURS_MESSAGE =
+  'That LinkedIn account is not connected to your user. Send from one of your own connected LinkedIn accounts (Settings → Connected Accounts).';
 import { isValidLeadLifecycle, LEAD_LIFECYCLES, isLeadListType, type LeadListType } from '../utils/leadSchema';
 import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValidation';
@@ -5045,7 +5048,7 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
     if (requestedAccountId && typeof requestedAccountId === 'string') {
       const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
       if (!(await resolveLinkedInAccountForWrite(userId, accountId))) {
-        return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+        return res.status(403).json({ message: LINKEDIN_ACCOUNT_NOT_YOURS_MESSAGE, code: 'linkedin_account_not_connected' });
       }
     }
 
@@ -5065,20 +5068,26 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
 
     await linkedInOutreachService.sendMessage(accountId, leadLinkedIn, true, message.trim());
 
-    // Record the engagement
-    const { emailEventsDb } = await import('../services/emailEventsDb');
-    const emailDomain = `linkedin-${listId}`;
-    const leadLinkedInKey = leadLinkedIn.toLowerCase();
-    await emailEventsDb.addLinkedInMessageEvent({
-      eventId: `linkedin_sent_${Date.now()}_${leadId}`,
-      emailDomain,
-      leadEmail: leadLinkedInKey,
-      eventType: 'linkedin.message.sent',
-      text: message.trim(),
-      timestamp: new Date().toISOString(),
-      senderId: accountId,
-      messageProviderId: '',
-    });
+    // Record the engagement. The message is ALREADY sent at this point, so a failure here must not be
+    // reported as a failed send: the user would retry and message the lead twice.
+    try {
+      const { emailEventsDb } = await import('../services/emailEventsDb');
+      const emailDomain = `linkedin-${listId}`;
+      const leadLinkedInKey = leadLinkedIn.toLowerCase();
+      await emailEventsDb.addLinkedInMessageEvent({
+        eventId: `linkedin_sent_${Date.now()}_${leadId}`,
+        emailDomain,
+        leadEmail: leadLinkedInKey,
+        eventType: 'linkedin.message.sent',
+        text: message.trim(),
+        timestamp: new Date().toISOString(),
+        senderId: accountId,
+        messageProviderId: '',
+      });
+    } catch (recordErr) {
+      console.error('LinkedIn message was sent but its engagement could not be recorded (non-fatal):', recordErr);
+      return res.json({ success: true, engagementRecorded: false });
+    }
 
     return res.json({ success: true });
   } catch (error: any) {
@@ -5141,7 +5150,7 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     if (requestedAccountId && typeof requestedAccountId === 'string') {
       const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
       if (!(await resolveLinkedInAccountForWrite(userId, accountId))) {
-        return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+        return res.status(403).json({ message: LINKEDIN_ACCOUNT_NOT_YOURS_MESSAGE, code: 'linkedin_account_not_connected' });
       }
     }
 

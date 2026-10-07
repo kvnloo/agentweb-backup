@@ -24,6 +24,9 @@ export function isLinkedInInfraError(error: any): boolean {
     if (typeof code === 'string' && (TRANSPORT_CODE.test(code) || code.startsWith('UND_ERR_'))) return true;
   }
   const classification = error?.structuredError?.classification;
-  if (classification === 'TIMEOUT_ERROR' || classification === 'SERVER_ERROR') return true;
+  if (classification === 'TIMEOUT_ERROR') return true;
+  // Only gateway-style 5xx mean "Unipile is unreachable". A plain 500 can be request-specific
+  // (retrying will never help), so it keeps its normal error handling.
+  if (classification === 'SERVER_ERROR') return [502, 503, 504].includes(Number(error?.structuredError?.status));
   return error?.isTimeout === true;
 }
