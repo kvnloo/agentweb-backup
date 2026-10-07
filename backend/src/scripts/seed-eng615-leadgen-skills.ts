@@ -149,6 +149,12 @@ org's criteria.
 - 🥈 Tier 2 — right shape but below threshold, or a secondary role.
 - ❌ Exclude — out of ICP (B2C, students, .edu, free-mail with no company,
   agencies/freelancers) unless the org's strategy says otherwise.
+- STAGE FLOOR (applies before any bonus): if the org's strategy sets a
+  funding-stage or revenue floor (e.g. Series A+ / >=$1M ARR) or marks a
+  segment as Avoid (e.g. pre-seed), a lead known to be below that floor or in
+  an Avoid segment can NEVER be 🏆 Tier 1 — vertical, title, and intent
+  bonuses cannot lift it. Cap it at 🥈 Tier 2 (or ❌ Exclude if the strategy
+  says Avoid) and state the floor in its "why this score" line.
 
 ---
 
@@ -250,6 +256,12 @@ THAT org — never assumed here.
 ## STEP 4 — SCORE & ROUTE (against THIS org's ICP)
 - Score FIT + INTENT against STEP 1's ICP: 🏆 Tier 1 / 🥈 Tier 2 / ❌ Exclude.
   Use \`get_hot_leads\` to cross-check already-surfaced hot leads.
+- STAGE FLOOR (applies before any bonus): if the org's strategy sets a
+  funding-stage or revenue floor (e.g. Series A+ / >=$1M ARR) or marks a
+  segment as Avoid (e.g. pre-seed), a lead known to be below that floor or in
+  an Avoid segment can NEVER be 🏆 Tier 1 — vertical, title, and intent
+  bonuses cannot lift it. Cap it at 🥈 Tier 2 (or ❌ Exclude if the strategy
+  says Avoid) and state the floor in its "why this score" line.
 - Route: Tier 1 → immediate personalized first-touch; Tier 2 → first-touch if
   the send cap still has room; Exclude → log and stop.
 

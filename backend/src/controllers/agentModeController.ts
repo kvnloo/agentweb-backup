@@ -39,7 +39,7 @@ import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/fi
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { resolveRunFunding } from '../services/funding/runFunding';
-import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
+import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
@@ -10174,6 +10174,16 @@ export const agentModeController = {
           return;
         }
 
+        if (isProviderNoEndpointsError(error)) {
+          res.status(503).json({
+            error: 'Model provider unavailable',
+            message: 'The selected model has no available provider right now. Please try again, or pick a different model from the selector above.',
+            code: 'PROVIDER_UNAVAILABLE',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
         if (isContextLimitError(error)) {
           const user = req.user as User;
           const sessionId = req.body?.sessionId;
@@ -11336,6 +11346,16 @@ export const agentModeController = {
             error: 'Server is restarting',
             message: 'The server is restarting. Please try again in a moment.',
             code: 'SERVER_RESTARTING',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
+        if (isProviderNoEndpointsError(error)) {
+          res.status(503).json({
+            error: 'Model provider unavailable',
+            message: 'The selected model has no available provider right now. Please try again, or pick a different model from the selector above.',
+            code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
           });
           return;
@@ -13436,6 +13456,13 @@ export const agentModeController = {
     try {
       const user = req.user as User;
       if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
+      // ENG-1805: a test run admitted after shutdown drain starts fails at worker
+      // dispatch ("Worker is draining") and is recorded as a failed run with no retry.
+      // Refuse before creating a session or run record; the caller retries on the
+      // replacement instance (same contract as A-019 for interactive turns).
+      if (!isCronEnabled()) {
+        return res.status(503).json({ error: 'Instance draining — retry on new instance' });
+      }
       const { scheduleId } = req.params;
 
       // Verify schedule exists and belongs to user
@@ -14438,6 +14465,16 @@ export const agentModeController = {
           return;
         }
 
+        if (isProviderNoEndpointsError(error)) {
+          res.status(503).json({
+            error: 'Model provider unavailable',
+            message: 'The selected model has no available provider right now. Please try again, or pick a different model from the selector above.',
+            code: 'PROVIDER_UNAVAILABLE',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
         if (error.message.includes('Generation timed out')) {
           res.status(504).json({
             error: 'Generation timed out',
@@ -15185,6 +15222,21 @@ export const agentModeController = {
           code: 'SESSION_BUSY',
         });
       }
+
+      // ENG-2293: same handled outcome as the other three generate-response
+      // chains (generateResponse, generateSharedResponse,
+      // generateConversableResponse) — this one calls an LLM via
+      // runVerifiedChat too, and was missed when those three were fixed, so
+      // it still fell through to the generic 500 + oncall alert below.
+      if (isProviderNoEndpointsError(error)) {
+        return res.status(503).json({
+          error: 'Model provider unavailable',
+          message: 'The selected model has no available provider right now. Please try again, or pick a different model from the selector above.',
+          code: 'PROVIDER_UNAVAILABLE',
+          suggestion: 'wait_and_retry',
+        });
+      }
+
       console.error('AgentMode: Verified generate error:', error);
       const sessionId = req.body?.sessionId;
       const user = req.user as User;
@@ -15242,9 +15294,15 @@ export const agentModeController = {
       }
       const canonicalModel = resolution.model;
 
-      // Block non-admins from using opus models
-      if (canonicalModel.includes('opus') && !user.isAdmin) {
-        return res.status(403).json({ error: 'Opus models are not available for your account' });
+      // ENG-2293: the allow-list check above accepts ANY registered model,
+      // including adminOnly auto-added entries the picker UI already hides —
+      // this was the only other gate, and it only ever checked for "opus", so
+      // a non-admin who named one of those ids directly still got a 200 and
+      // ran their session on it. isModelSelectableBy is the single source of
+      // truth for "can this user pick this model" (adminOnly + opus + the
+      // internal/live exclusions); use it instead of re-deriving a subset here.
+      if (!agentModeService.isModelSelectableBy(canonicalModel, !!user.isAdmin)) {
+        return res.status(403).json({ error: 'This model is not available for your account' });
       }
 
       // Get the session to verify ownership
@@ -15291,9 +15349,11 @@ export const agentModeController = {
       }
       const canonicalModel = resolution.model;
 
-      // Shared sessions are non-admin; block opus models
-      if (canonicalModel.includes('opus')) {
-        return res.status(403).json({ error: 'Opus models are not available for shared sessions' });
+      // ENG-2293: same gate as updateSessionLlmModel, same reasoning — shared
+      // viewers are always non-admin, so this also now blocks adminOnly
+      // auto-added models, not just opus.
+      if (!agentModeService.isModelSelectableBy(canonicalModel, false)) {
+        return res.status(403).json({ error: 'This model is not available for shared sessions' });
       }
 
       // Get the session to verify the conversable token

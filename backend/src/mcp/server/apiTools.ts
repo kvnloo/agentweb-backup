@@ -12,6 +12,7 @@ import { findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContent
 
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
+import './adminLookupTools';
 import type { AgentRunStatus } from '../../services/agentMode/runStore';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 
@@ -1976,6 +1977,57 @@ mcpToolRegistry.register({
     const data = await mcpFetch({
       method: 'PATCH', path: `/api/landing-pages/v0/generated/${args.page_id}/context`, context: ctx(context),
       body: { context: args.context }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'enable_session_tracking',
+  definition: {
+    name: 'enable_session_tracking',
+    description: 'Turn on organic and paid visitor SESSION tracking for a landing page: creates (or reuses) a session list named "LP Sessions - {page name}" and adds the AgentWeb tracking tag to the page\'s own repo in one commit (the site redeploys in about a minute). Safe to call again: it never duplicates the tag or the list. Use it for a deployed landing page that has no session tracking yet, or after the page gains a new domain (re-running adds the new address to the list). Returns listId, embedSnippet, installed and alreadyInstalled. If the page already has its own tracker the tool refuses with an explanation instead of double-counting visits; report that to the user rather than retrying.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID (from list_landing_pages or get_landing_page)' },
+        html_path: { type: 'string', description: 'Only for a static-HTML page whose file is not public/<slug>.html or public/index.html: the file to tag, e.g. "public/offer.html"' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    // ENG-827: this commits to a customer's live repo, so it honours the same last-moment consent re-check
+    // as publish_landing_page_changes (an unattended schedule whose consent was withdrawn mid-run stops here).
+    const withdrawn = await publishWithdrawnMidFlight(context);
+    if (withdrawn) return jsonResult({ success: false, message: withdrawn.error });
+    const data = await mcpFetch({
+      method: 'POST', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/session-tracking`, context: ctx(context),
+      body: { ...(args.html_path ? { htmlPath: args.html_path } : {}) }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'set_landing_page_lead_list',
+  definition: {
+    name: 'set_landing_page_lead_list',
+    description: 'Attach, change, or clear the CRM lead list on an existing landing page (including imported externally-deployed pages) without regenerating it. Pass lead_list_id=null to clear. Enables public submissions on the list and syncs the page capture route where the page has a repo.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' },
+        lead_list_id: { type: ['string', 'null'], description: 'Lead list ID to associate, or null to clear' }
+      },
+      required: ['page_id', 'lead_list_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const leadListId = typeof args.lead_list_id === 'string' && args.lead_list_id.trim() ? args.lead_list_id.trim() : null;
+    const data = await mcpFetch({
+      method: 'PATCH', path: `/api/landing-pages/v0/generated/${encodeURIComponent(args.page_id)}/lead-list`, context: ctx(context),
+      body: { leadListId }
     });
     return jsonResult(data);
   }

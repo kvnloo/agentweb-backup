@@ -22,6 +22,7 @@ import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { crmDb } from '../services/db';
 import { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } from '../services/crmAccessControl';
 import { isSessionList } from '../utils/sessionList';
+import { buildEmbedSnippet, createTrackerSessionList, SESSION_LIST_DISPLAY_FIELDS } from '../services/sessionTrackingService';
 import {
   normalizeAllowedOrigins,
   normalizePageLabel,
@@ -77,15 +78,8 @@ router.post('/tagged-links', (req: Request, res: Response): void => {
 
 // ─── ENG-2315: enable tracking ──────────────────────────────────────────────────────────
 
-/** Columns a session list shows by default (customFields keys written by the ingest). */
-export const SESSION_LIST_DISPLAY_FIELDS = [
-  'channel', 'trafficType', 'channelGroup', 'sourceDetail', 'dwellSec', 'lastEvent', 'furthestStage', 'visitNo',
-];
-
-export function buildEmbedSnippet(listId: string): string {
-  const base = (process.env.BACKEND_URL || 'https://api.agentweb.pro').replace(/\/+$/, '');
-  return `<script src="${base}/sdk/v1/aw.js" data-aw-list="${listId}" async></script>`;
-}
+// Extracted to services/sessionTrackingService.ts (ENG-2327) so landing pages share it; re-exported unchanged.
+export { SESSION_LIST_DISPLAY_FIELDS, buildEmbedSnippet };
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
@@ -123,16 +117,7 @@ router.post('/session-lists', async (req: Request, res: Response): Promise<void>
     const pageLabel = normalizePageLabel(body.pageLabel);
 
     const trackingConfig: TrackingConfig = { allowedOrigins, ...(pageLabel ? { pageLabel } : {}) };
-    const list = await crmDb.createLeadList(
-      userId, name, '',
-      [],              // alertEvents: a session row is telemetry, never an owner alert
-      null, false, undefined, undefined, undefined,
-      'session',
-      true,            // isSystemManaged
-      undefined,
-      // publicAccessEnabled from the first write: the SDK posts anonymously, and ingest refuses a list without it.
-      { publicAccessEnabled: true, displayFields: SESSION_LIST_DISPLAY_FIELDS, trackingConfig },
-    );
+    const list = await createTrackerSessionList(userId, name, trackingConfig);
     res.status(201).json({ list, trackingConfig, embedSnippet: buildEmbedSnippet(list.listId) });
   } catch (err) {
     sendConfigError(res, err, 'tracking create session list error');

@@ -6,6 +6,9 @@ import path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig } from "../utils/secretsManager";
 import { resolveLandingPageGa4 } from "../utils/landingPageGa4";
 import { injectGtmIntoLayoutFiles } from "../utils/gtmInjection";
+import { injectUtmDecorationIntoLayoutFiles, type LanderUtmLayers } from "../utils/landerUtmDecoration";
+import { getCustomerUtmDefault, getLanderUtmOverride } from "./landerUtmStore";
+import { isAutoSessionTrackingEnabled } from "../utils/sessionTrackingInjection";
 import { injectPixelIntoLayoutFiles, injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjection";
 import { injectGoogleAdsIntoLayoutFiles, injectGoogleAdsIntoLayout, verifyGoogleAdsInjection } from "../utils/googleAdsInjection";
 import { metaService } from "./metaService";
@@ -662,6 +665,18 @@ export interface GeneratedLandingPage {
    * exists to refuse a launch over.
    */
   googleAdsTrackingInstalled?: boolean;
+  /**
+   * ENG-2327: the `listType:'session'` list the AgentWeb SDK tag on this page writes visitor
+   * sessions into. Site-level in effect, like gtmContainerId: the tag lives in the shared root
+   * layout, so every page of one repo carries the same id (kept in sync across siblings).
+   * Written ONLY by sessionTrackingService; set once the list exists, even if the tag commit
+   * failed, so a retry reuses the list instead of creating a second one.
+   */
+  sessionTrackingListId?: string;
+  /** True once the SDK tag is committed to the repo's main branch (false/absent = not installed). */
+  sessionTrackingInstalled?: boolean;
+  /** Last enablement failure, for the portal/Emma to surface; cleared by the next success. */
+  sessionTrackingError?: string;
   /**
    * Per-page (not site-level) — whether the generated form component was confirmed,
    * via the validation-retry check, to actually call fbq('track','Lead') on submit. v0 authors
@@ -2803,6 +2818,20 @@ async function addPageToExistingRepo(
       })
       .promise();
 
+    // ENG-2327: the session tag lives in the shared root layout, so a sub-page of a tracked site inherits the
+    // site's list with no repo work. Flag-gated and never throws (see the same call in deployLandingPage).
+    if (isAutoSessionTrackingEnabled()) {
+      try {
+        const tracking = await import("./sessionTrackingService").then((m) => m.autoEnableSessionTracking(deployedSubPage, existingPage));
+        if (tracking) {
+          deployedSubPage.sessionTrackingListId = tracking.listId;
+          deployedSubPage.sessionTrackingInstalled = tracking.installed;
+        }
+      } catch (trackingErr: any) {
+        console.warn(`[V0 SERVICE] Session tracking inheritance could not run (generation unaffected): ${trackingErr?.message}`);
+      }
+    }
+
     void enqueueLandingPageHumanEval(deployedSubPage, async () => allFiles);
     // Dynamic import: landingPageSmokeTest.ts imports FROM this module (GeneratedLandingPage,
     // updateLandingPageSmokeTestResult), so a static import here would be circular.
@@ -3578,6 +3607,7 @@ export async function deployLandingPage(
       metaPixelId,
       metaAdAccountId,
       record.googleAdsConversionId,
+      await loadLanderUtmLayers(id, userId),
     );
     // Reflect the tracking signals on the in-memory record so every downstream return
     // (deployed or build-failed) carries them consistently with what we persisted.
@@ -3723,6 +3753,24 @@ export async function deployLandingPage(
       githubRepoUrl,
       updatedAt: now,
     };
+
+    // ENG-2327: automatic session tracking (flag AUTO_SESSION_TRACKING, default OFF). It runs AFTER the
+    // GTM / Meta / Google Ads injection and the deploy because the list's allowed origins are the page's
+    // own domains, which only exist now; the tag therefore goes in as one extra commit (one extra Vercel
+    // build). It never throws and never fails generation: a failure is logged and recorded on the page.
+    // The flag is read synchronously first, so with it OFF (the default) nothing below is even imported.
+    // Dynamic import: sessionTrackingService imports FROM this module, so a static import would be circular.
+    if (isAutoSessionTrackingEnabled()) {
+      try {
+        const tracking = await import("./sessionTrackingService").then((m) => m.autoEnableSessionTracking(deployedRecord));
+        if (tracking) {
+          deployedRecord.sessionTrackingListId = tracking.listId;
+          deployedRecord.sessionTrackingInstalled = tracking.installed;
+        }
+      } catch (trackingErr: any) {
+        console.warn(`[V0 SERVICE] Session tracking auto-enable could not run (generation unaffected): ${trackingErr?.message}`);
+      }
+    }
 
     const deployedZip = zipBuffer;
     void enqueueLandingPageHumanEval(deployedRecord, () => unzipBuffer(deployedZip));
@@ -5287,6 +5335,25 @@ export function injectLeadCaptureAttribution(
 }
 
 /**
+ * ENG-726: read the two stored UTM layers fresh at push time. Read failures degrade
+ * to "no layer" so a storage hiccup never fails generation (the lander simply ships
+ * undecorated, which is today's behavior).
+ */
+async function loadLanderUtmLayers(pageId: string, userId: string): Promise<LanderUtmLayers> {
+  const [override, customerDefault] = await Promise.all([
+    getLanderUtmOverride(pageId, userId).catch((err: any) => {
+      console.warn(`[V0 SERVICE] UTM override read failed for ${pageId}: ${err?.message}`);
+      return null;
+    }),
+    getCustomerUtmDefault(userId).catch((err: any) => {
+      console.warn(`[V0 SERVICE] UTM default read failed for ${userId}: ${err?.message}`);
+      return null;
+    }),
+  ]);
+  return { override, customerDefault };
+}
+
+/**
  * Create a GitHub repo under the AgentWebPro org and push all files via the Contents API.
  */
 async function createGitHubRepoAndPush(
@@ -5322,6 +5389,12 @@ async function createGitHubRepoAndPush(
    * When absent, NOTHING is injected — no fallback tag on a customer page.
    */
   googleAdsConversionId?: string,
+  /**
+   * ENG-726: the stored UTM layers (per-lander override + customer default). When
+   * either is configured, an outbound-link decoration script resolved by the shared
+   * ENG-723 resolver is injected into the root layout. Neither set: nothing injected.
+   */
+  utmLayers: LanderUtmLayers = {},
 ): Promise<{ githubRepoUrl: string; repoFullName: string; commitSha: string; gtmInjected: boolean; pixelInjected: boolean; googleAdsInjected: boolean }> {
   const { token, org } = await getGitHubOrgToken();
   const headers = {
@@ -5476,6 +5549,15 @@ async function createGitHubRepoAndPush(
   // measurable from the first deploy — no manual "Add GTM" step. Absent a container id,
   // nothing is injected and the caller records a "no tracking installed" signal.
   const gtmInjected = injectGtmIntoLayoutFiles(finalFiles, gtmContainerId);
+  // ENG-726: decorate outbound links with the resolved UTMs. A malformed stored
+  // config must not fail generation — log and ship undecorated, as before this slice.
+  try {
+    if (injectUtmDecorationIntoLayoutFiles(finalFiles, utmLayers)) {
+      console.log(`[V0 SERVICE] Injected UTM outbound-link decoration into app/layout.tsx`);
+    }
+  } catch (err: any) {
+    console.error(`[V0 SERVICE] UTM decoration skipped (invalid stored UTM config): ${err?.message}`);
+  }
   console.log(
     gtmInjected
       ? `[V0 SERVICE] Injected GTM container ${gtmContainerId} into app/layout.tsx`
@@ -7075,6 +7157,75 @@ export async function updateLandingPageMetaTrackingInstalled(
       ExpressionAttributeValues: {
         ":t": metaTrackingInstalled,
         ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
+}
+
+/**
+ * ENG-2327: record the session-tracking list on a page. DATA-PLANE: writes the new persisted
+ * attributes sessionTrackingListId / sessionTrackingInstalled / sessionTrackingError.
+ *
+ * Conditional: it only claims the page when no list is recorded yet (or the recorded one is the
+ * `replacing` id the caller found dead), so two concurrent enables can never leave a page pointing
+ * at a list the other one then orphans. Returns false when another caller already holds the claim.
+ */
+export async function claimLandingPageSessionTrackingList(
+  id: string,
+  listId: string,
+  replacing?: string,
+): Promise<boolean> {
+  try {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression:
+          "SET sessionTrackingListId = :l, sessionTrackingInstalled = :f, updatedAt = :now REMOVE sessionTrackingError",
+        ConditionExpression: replacing
+          ? "attribute_exists(id) AND (attribute_not_exists(sessionTrackingListId) OR sessionTrackingListId = :replacing)"
+          : "attribute_exists(id) AND attribute_not_exists(sessionTrackingListId)",
+        ExpressionAttributeValues: {
+          ":l": listId,
+          ":f": false,
+          ":now": new Date().toISOString(),
+          ...(replacing ? { ":replacing": replacing } : {}),
+        },
+      })
+      .promise();
+    return true;
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * ENG-2327: set the session-tracking install state on a page (and the list id, when given).
+ * Mirrors updateLandingPageMetaTrackingInstalled; split out because the tag lives in the SHARED
+ * root layout, so callers loop it across the siblings sharing that repo. `error` records the last
+ * failure on the page (cleared when absent), the same "fail loud" signal the other injectors keep.
+ */
+export async function updateLandingPageSessionTracking(
+  id: string,
+  state: { installed: boolean; listId?: string; error?: string },
+): Promise<void> {
+  const error = state.error ? state.error.slice(0, 500) : undefined;
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      ConditionExpression: "attribute_exists(id)", // never upsert a ghost record for a page deleted meanwhile
+      UpdateExpression:
+        "SET sessionTrackingInstalled = :i, updatedAt = :now" +
+        (state.listId ? ", sessionTrackingListId = :l" : "") +
+        (error ? ", sessionTrackingError = :e" : "") +
+        (error ? "" : " REMOVE sessionTrackingError"),
+      ExpressionAttributeValues: {
+        ":i": state.installed,
+        ":now": new Date().toISOString(),
+        ...(state.listId ? { ":l": state.listId } : {}),
+        ...(error ? { ":e": error } : {}),
       },
     })
     .promise();

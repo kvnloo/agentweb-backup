@@ -1247,17 +1247,46 @@ export class GoogleAdsService {
       provinceName?: string;
       countryCode?: string;
     };
+    /** Alternative center: decimal-degree coordinates (ENG-486). Takes precedence over address. */
+    geoPoint?: { latitude: number; longitude: number };
   }): Promise<{ resourceName: string }> {
-    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    if (!Number.isFinite(params.radius) || params.radius <= 0) {
+      throw new Error('addProximityCriterion radius must be a positive finite number');
+    }
+    if (params.geoPoint) {
+      const { latitude, longitude } = params.geoPoint;
+      if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || Math.abs(latitude) > 90 || Math.abs(longitude) > 180) {
+        throw new Error('addProximityCriterion geo_point requires latitude in [-90,90] and longitude in [-180,180]');
+      }
+    }
     const address: Record<string, any> = {};
-    if (params.address.streetAddress) address.streetAddress = params.address.streetAddress;
-    if (params.address.cityName) address.cityName = params.address.cityName;
-    if (params.address.postalCode) address.postalCode = params.address.postalCode;
-    if (params.address.provinceCode) address.provinceCode = params.address.provinceCode;
-    if (params.address.provinceName) address.provinceName = params.address.provinceName;
-    if (params.address.countryCode) address.countryCode = params.address.countryCode;
-    if (Object.keys(address).length === 0) {
-      throw new Error('addProximityCriterion requires at least one address field (street_address, city_name, postal_code, province_code, province_name, country_code)');
+    if (!params.geoPoint) {
+      if (params.address?.streetAddress) address.streetAddress = params.address.streetAddress;
+      if (params.address?.cityName) address.cityName = params.address.cityName;
+      if (params.address?.postalCode) address.postalCode = params.address.postalCode;
+      if (params.address?.provinceCode) address.provinceCode = params.address.provinceCode;
+      if (params.address?.provinceName) address.provinceName = params.address.provinceName;
+      if (params.address?.countryCode) address.countryCode = params.address.countryCode;
+      if (Object.keys(address).length === 0) {
+        throw new Error('addProximityCriterion requires at least one address field (street_address, city_name, postal_code, province_code, province_name, country_code)');
+      }
+    }
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    if (params.geoPoint) {
+      const data = await this.mutate(customerId, accessToken, 'campaignCriteria', [{
+        create: {
+          campaign: campaignResourceName,
+          proximity: {
+            radius: params.radius,
+            radiusUnits: params.radiusUnits || 'MILES',
+            geoPoint: {
+              latitudeInMicroDegrees: Math.round(params.geoPoint.latitude * 1e6),
+              longitudeInMicroDegrees: Math.round(params.geoPoint.longitude * 1e6),
+            },
+          },
+        },
+      }], loginCustomerId);
+      return { resourceName: data.results[0].resourceName };
     }
     const data = await this.mutate(customerId, accessToken, 'campaignCriteria', [{
       create: {

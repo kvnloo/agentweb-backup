@@ -213,6 +213,29 @@ describe("searchProspectsPreview", () => {
     }
   });
 
+  it("returns unipile_error (not an uncaught throw) when searchPeople rejects (ENG-2205)", async () => {
+    // handleError in linkedInOutreachService.ts always throws (Promise<never>) —
+    // it never resolves with { error: '...' }. This is the real shape a Unipile
+    // outage or credential failure takes; the mocked-resolved-value test above
+    // only covers a shape searchPeople never actually produces in production.
+    linkedInOutreachService.resolveAccountId.mockResolvedValue("acct-1");
+    getAccountsByUserId.mockResolvedValue([]);
+    linkedInOutreachService.searchPeople.mockRejectedValue(
+      new Error("Failed to fetch Unipile credentials from Secrets Manager"),
+    );
+
+    const r = await searchProspectsPreview("user-1", {
+      icp: "Founders",
+      specifications: "B2B SaaS",
+    });
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toBe("unipile_error");
+      expect(r.message).toContain("Failed to fetch Unipile credentials");
+    }
+  });
+
   it("returns mapped items + linkedinConnected=true when user has unipile account", async () => {
     linkedInOutreachService.resolveAccountId.mockResolvedValue("acct-1");
     getAccountsByUserId.mockResolvedValue([

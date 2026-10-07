@@ -55,6 +55,7 @@ import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
 import {
   normalizeOpenRouterResponseMetadata,
   normalizeOpenRouterErrorMetadata,
+  resolveServedChainModel,
 } from './agentMode/openRouterMetadata';
 import {
   assertOpenRouterToolsSupported,
@@ -355,7 +356,7 @@ const SKILL_NO_SUBSTITUTION =
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+export const ADMIN_SKILL_TOOL_NAMES = ['evaluation_workspace', 'inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'read_linear_issues', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'get_session_transcript', 'get_user_by_id', 'list_all_clients', 'assess_client_health', 'monitor_lead_volume', 'check_account_tracking_health', 'diagnose_leads_at_zero', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -2354,10 +2355,13 @@ export class AgentModeService {
   }
 
   /**
-   * Would the model picker accept this id for this user? Mirrors the two gates
-   * `agentModeController.updateSessionLlmModel` applies, in the same order: the
-   * supported-model allow-list, then the non-admin Opus restriction. Kept next
-   * to the registry it reads so the two cannot drift.
+   * Would the model picker accept this id for this user? The single source of
+   * truth for "can this user pick this model" — internal/live exclusion, the
+   * adminOnly gate, and the non-admin Opus restriction. `updateSessionLlmModel`
+   * / `updateSharedSessionLlmModel` call this directly (ENG-2293: they used to
+   * re-derive a subset inline — just the opus check — which let a non-admin
+   * who named an adminOnly auto-added model by id bypass it) so the two cannot
+   * drift again.
    */
   isModelSelectableBy(modelId: string, isAdmin: boolean): boolean {
     const config = this.llmModels[modelId];
@@ -2782,6 +2786,12 @@ export class AgentModeService {
       ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
     });
     // Fire-and-forget usage metering; it must never break an LLM call.
+    // ENG-1345: when OpenRouter served one of `fallbackModels`, meter the model
+    // that actually answered, not the primary we asked for first.
+    const meteredModel = resolveServedChainModel(
+      (res as any)?.model,
+      paramChain.map(m => ({ modelId: m.modelId, upstreamModel: m.upstreamModel })),
+    ) ?? model;
     // ENG-1816 F1: routed through recordLlmUsage, which decides funding ABOVE this
     // fire-and-forget funnel — see funding/recordLlmUsage.ts for why. Branch on
     // RunFunding.route, never on usage.is_byok below: that flag also fires for
@@ -2795,7 +2805,7 @@ export class AgentModeService {
           userId: usageContext?.userId,
           billingUserId: usageContext?.billingUserId,
           sessionId: usageContext?.sessionId,
-          model,
+          model: meteredModel,
           provider: providerLabel,
           feature: usageContext?.feature || 'agent_task',
           eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
@@ -6391,6 +6401,10 @@ export class AgentModeService {
     'save_org_memory',
     'delete_org_memory',
 
+    // Org notification preferences use the same org-settings authorization.
+    'get_lead_notification_settings',
+    'update_lead_notification_settings',
+
     // Scheduled Chat Management
     'list_scheduled_chats',
     'manage_scheduled_chat',
@@ -9906,6 +9920,7 @@ export class AgentModeService {
     status?: string;
     limit?: number;
     cursor?: string;
+    includeAllFields?: boolean;
   } = {}): Promise<any> {
     return leadsImpl.getLeads(listId, userId, options);
   }
@@ -12480,7 +12495,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const withBudget = (r: any) => {
         if (!budgetFields) return r;
         const { budget_message, error, ...rest } = budgetFields;
-        const out: any = { ...r, ...rest, message: `${r.message} — ${budget_message}` };
+        const out: any = {
+          ...r, ...rest,
+          success: r.success && rest.budget_verification === 'CONFIRMED',
+          message: rest.budget_verification === 'CONFIRMED' ? `${r.message} — ${budget_message}` : budget_message,
+        };
         if (error && !r.error) out.error = error;
         else if (error) out.budget_error = error;
         return out;
@@ -12578,8 +12597,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         (v: number) => normalizeMetaMoney(v, money.currency, 'minor').description
       );
       return {
-        success: true,
-        message: `Ad set updated successfully${money.confirmation} — ${budget_message}`,
+        success: verdict.budget_verification === 'CONFIRMED',
+        message: verdict.budget_verification === 'CONFIRMED'
+          ? `Ad set updated successfully${money.confirmation} — ${budget_message}` : budget_message,
         ...verdict,
       };
     } catch (error: any) {
@@ -17362,8 +17382,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // delegating wrapper — real callers beyond tools.ts: routes/emmaApi.ts's
   // POST /social-post handler, and many direct real-instance calls in
   // agentModeService.socialTools.test.ts.
-  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any): Promise<any> {
-    return linkedinImpl.postOnConnectedAccount(userId, accountId, content, mediaUrls, platform, toolContext);
+  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean }): Promise<any> {
+    return linkedinImpl.postOnConnectedAccount(userId, accountId, content, mediaUrls, platform, toolContext, options);
   }
 
   /**

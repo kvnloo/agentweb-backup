@@ -188,7 +188,46 @@ describe('applyAttioPersonEvent', () => {
       phone: '+15551234567',
       title: 'Engineer',
       syncMetadata: { attio_record_id: 'rec-1' },
+    }), 'integration');
+  });
+
+  // ENG-2322: both lookups said "absent" but createLead's own email pre-check found the row (a
+  // concurrent create won). That used to throw out of the handler and fail the whole event.
+  it('adopts the existing lead as an UPDATE when createLead loses a duplicate-email race', async () => {
+    const svc = makeSvc({
+      email_addresses: [{ email_address: 'Raced@Example.com' }],
+      name: [{ first_name: 'Ada', last_name: 'Lovelace' }],
+    });
+    mockGetLeadByEmail.mockResolvedValue(null);
+    mockCreateLead.mockRejectedValueOnce(Object.assign(
+      new Error('Lead with email "raced@example.com" already exists in this list'),
+      { duplicateEmail: true, existingLead: { leadId: 'lead-won', email: 'raced@example.com', syncMetadata: { other: 1 } } },
+    ));
+
+    await expect(applyAttioPersonEvent('list-1', baseConfig, svc as any, {
+      event_type: 'record.created',
+      id: { record_id: 'rec-1' },
+    })).resolves.toBe(true);
+
+    expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-won', expect.objectContaining({
+      firstName: 'Ada',
+      lastName: 'Lovelace',
+      syncMetadata: { other: 1, attio_record_id: 'rec-1' },
     }));
+    // The address already matches the row, so it is not rewritten.
+    expect(mockUpdateLead.mock.calls[0][2].email).toBeUndefined();
+  });
+
+  it('still rethrows a createLead failure that is not a duplicate-email race', async () => {
+    const svc = makeSvc({ email_addresses: [{ email_address: 'new@example.com' }] });
+    mockGetLeadByEmail.mockResolvedValue(null);
+    mockCreateLead.mockRejectedValueOnce(new Error('dynamo down'));
+
+    await expect(applyAttioPersonEvent('list-1', baseConfig, svc as any, {
+      event_type: 'record.created',
+      id: { record_id: 'rec-1' },
+    })).rejects.toThrow('dynamo down');
+    expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 
   // Live-caught gap (ENG-1380): the webhook handler used to hardcode a
@@ -217,7 +256,7 @@ describe('applyAttioPersonEvent', () => {
     expect(mockCreateLead).toHaveBeenCalledWith('list-1', expect.objectContaining({
       email: 'new@example.com',
       company: 'Acme Corp',
-    }));
+    }), 'integration');
   });
 
   it('does NOT sync linkedin via webhook — the default mapping marks it push-only, same as manual pull respects', async () => {
@@ -307,7 +346,7 @@ describe('applyAttioPersonEvent', () => {
 
     expect(mockCreateLead).toHaveBeenCalledWith('list-1', expect.objectContaining({
       customFields: { favoriteColor: 'blue' },
-    }));
+    }), 'integration');
   });
 
   it('merges enabled custom fields into an existing lead\'s customFields on update, rather than overwriting them', async () => {

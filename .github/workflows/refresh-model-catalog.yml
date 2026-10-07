@@ -29,6 +29,7 @@ jobs:
         env:
           ARTIFICIAL_ANALYSIS_API_KEY: ${{ secrets.ARTIFICIAL_ANALYSIS_API_KEY }}
           SLACK_MODEL_ALERTS_WEBHOOK: ${{ secrets.SLACK_MODEL_ALERTS_WEBHOOK }}
+          PR_BODY_PATH: /tmp/model-catalog-pr-body.md
         run: npx ts-node --transpile-only src/scripts/frontierMonitor.ts --write --notify > /tmp/model-catalog-plan.json
       - name: Refresh capability evidence for added models
         working-directory: backend
@@ -56,15 +57,7 @@ jobs:
           draft: true
           title: 'Refresh frontier models and OpenRouter BYOK coverage'
           commit-message: 'chore: refresh model catalog from OpenRouter and Artificial Analysis'
-          body: |
-            Daily frontier detection using OpenRouter release dates and the Artificial Analysis top 10.
-            Auto-add validated text/tool models in tracked families or top-N models from tracked providers.
-            Include advertised cloud BYOK endpoint coverage; credentials and quota are not verified.
-            Missing AA credentials preserve existing scores. Inspect the model-catalog-plan artifact for unmatched scores, proposed prices, and supersession.
-
-            New entries are marked auto-added. Review capabilities and customer-facing descriptions before marking ready. Existing Azure BYOK pricing is preserved.
-            No database writes or changes to saved model selections. Rollback: revert this PR.
-            Complexity: extends the existing registry and price book; no new runtime service or storage.
+          body-path: /tmp/model-catalog-pr-body.md
           add-paths: |
             backend/src/services/agentMode/llmModelRegistry.ts
             backend/src/utils/llmPricing.ts
