@@ -86,19 +86,27 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(models).toContain('anthropic.claude-sonnet-4-6');
     });
 
-    it('should include Claude Opus 4.6 in the supported models for admins', async () => {
-      const models = await agentModeService.getSupportedModels(true);
+    // Every user and admin selects from the same catalog: Opus 4.6 was the last adminOnly model.
+    it.each([true, false])('includes Claude Opus 4.6 in the supported models (isAdmin=%s)', async (isAdmin) => {
+      const models = await agentModeService.getSupportedModels(isAdmin);
       expect(models).toContain('anthropic.claude-opus-4-6-v1');
     });
 
-    it('should NOT include Claude Opus 4.6 in the supported models for non-admins', async () => {
-      const models = await agentModeService.getSupportedModels(false);
-      expect(models).not.toContain('anthropic.claude-opus-4-6-v1');
+    it('includes Claude Opus 4.6 by default (no admin flag)', async () => {
+      const models = await agentModeService.getSupportedModels();
+      expect(models).toContain('anthropic.claude-opus-4-6-v1');
     });
 
-    it('should NOT include Claude Opus 4.6 by default (non-admin)', async () => {
-      const models = await agentModeService.getSupportedModels();
-      expect(models).not.toContain('anthropic.claude-opus-4-6-v1');
+    it('no model is gated by name: adminOnly is only ever on unreviewed auto-added entries', () => {
+      const entries = Object.entries((agentModeService as any).llmModels) as [string, any][];
+      const gated = entries.filter(([, m]) => m.adminOnly === true);
+      for (const [id, m] of gated) {
+        expect({ id, description: String(m.description).startsWith('Auto-added') }).toEqual({ id, description: true });
+      }
+      expect(entries.find(([id]) => id === 'anthropic.claude-opus-4-6-v1')?.[1].adminOnly).not.toBe(true);
+      for (const [id, m] of entries.filter(([id]) => id.includes('opus'))) {
+        expect({ id, adminOnly: m.adminOnly === true }).toEqual({ id, adminOnly: false });
+      }
     });
 
     it('should include Claude Opus 4.8 in the supported models for admins', async () => {
@@ -371,9 +379,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
      * 2026-08-19 — every OpenRouter entry opened to everyone. Harsha: "i'm
      * fine to include open source / open router stuff for all users not
      * just isadmin." Was `adminOnly: true` on each (gated as
-     * unproven-in-our-stack); removed. Does NOT touch adminOnly gates
-     * elsewhere in the registry that exist for unrelated reasons (e.g.
-     * anthropic.claude-opus-4-6-v1, still Bedrock-Claude-tier-gated).
+     * unproven-in-our-stack); removed. Opus 4.6 (formerly kept adminOnly as
+     * "Bedrock-Claude-tier-gated") was opened afterwards: every user and admin
+     * selects from one catalog.
      */
     describe('2026-08-19 — OpenRouter models opened to everyone (no longer adminOnly)', () => {
       const OPENROUTER_IDS = [
@@ -401,8 +409,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(models).toContain(id);
       });
 
-      it('does NOT touch an adminOnly gate that exists for a non-OpenRouter reason', () => {
-        expect((agentModeService as any).llmModels['anthropic.claude-opus-4-6-v1'].adminOnly).toBe(true);
+      it('Opus 4.6, the last adminOnly model, is open to everyone too', () => {
+        expect((agentModeService as any).llmModels['anthropic.claude-opus-4-6-v1'].adminOnly).toBeUndefined();
       });
     });
 
@@ -1041,13 +1049,15 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gemini-3.5-flash'].maxTools).toBe(128);
     });
 
-    it('should return only anthropic non-opus models from getReportsModelOptions for non-admins', async () => {
+    // ENG-2028: flipped. The name-based Opus exclusion is gone; only the registry
+    // adminOnly flag filters, so non-admins now get the Opus anthropic models too.
+    it('should return only anthropic models (including opus) from getReportsModelOptions for non-admins', async () => {
       const reportsModels = await agentModeService.getReportsModelOptions(false);
       expect(reportsModels.length).toBeGreaterThan(0);
       reportsModels.forEach(model => {
         expect(model).toMatch(/^anthropic\./);
-        expect(model).not.toContain('opus');
       });
+      expect(reportsModels).toContain('anthropic.claude-opus-5');
     });
 
     it('should include opus in getReportsModelOptions for admins', async () => {
@@ -1055,9 +1065,10 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(reportsModels).toContain('anthropic.claude-opus-4-6-v1');
     });
 
-    it('should NOT include opus in getReportsModelOptions by default (non-admin)', async () => {
+    // ENG-2028: flipped (Opus 4.6 is no longer adminOnly; no name-based deny).
+    it('should include opus in getReportsModelOptions by default (non-admin)', async () => {
       const reportsModels = await agentModeService.getReportsModelOptions();
-      expect(reportsModels).not.toContain('anthropic.claude-opus-4-6-v1');
+      expect(reportsModels).toContain('anthropic.claude-opus-4-6-v1');
     });
 
     it('should return only anthropic models from getReportsModelOptions', async () => {
