@@ -2,9 +2,10 @@
  * ENG-2282 — Meta Toolkit v1 manifest for external agents (ENG-2268 child 2).
  *
  * Exposes ONLY the v1 Meta tools defined in docs/integrations/meta-toolkit-product.md §4
- * (ENG-2281) as MCP-compatible tool definitions. It is a pure filter over the Emma tool
- * registry. It never re-implements a handler, so a call goes through the same
- * `registry.execute` → `agentModeService.callMetaMarketingApi` path that Emma uses,
+ * (ENG-2281) as MCP-compatible tool definitions. It is a pure filter over the Meta-only
+ * registry in emma/metaTools, which holds the same handler objects Emma registers, so the
+ * full Emma registry is never imported. It never re-implements a handler, so a call goes
+ * through the same `registry.execute` → `agentModeService.callMetaMarketingApi` path that Emma uses,
  * and every ENG-2046-family write guard (approval deck, money normalization, anomaly
  * gate, rate shaper, tracking pre-flight) stays in the path. There is no bypass.
  *
@@ -12,7 +13,7 @@
  * they are refused at call time. A caller that ignores the schema still cannot reach an
  * excluded action.
  */
-import { emmaToolRegistry } from '../emma/registry';
+import { metaToolRegistry } from '../emma/metaTools';
 import type { McpToolRegistry } from './server/registry';
 
 export const META_TOOLKIT_V1_TOOL_NAMES = [
@@ -65,7 +66,7 @@ function narrowDefinition(definition: any): any {
  * Fails loudly when a v1 tool is missing from the registry. A silently shorter
  * manifest would read as a product change.
  */
-export function getMetaToolkitManifest(registry: McpToolRegistry = emmaToolRegistry) {
+export function getMetaToolkitManifest(registry: McpToolRegistry = metaToolRegistry) {
   return META_TOOLKIT_V1_TOOL_NAMES.map((name) => {
     const tool = registry.getTool(name);
     if (!tool) throw new Error(`Meta Toolkit manifest: tool ${name} is not registered`);
@@ -103,7 +104,7 @@ export async function executeMetaToolkitCall(
   name: string,
   args: any,
   context: { userId: string; sessionId?: string; [k: string]: unknown },
-  registry: McpToolRegistry = emmaToolRegistry,
+  registry: McpToolRegistry = metaToolRegistry,
 ) {
   if (!context?.userId) throw new MetaToolkitRefusal('Meta Toolkit calls require an authenticated user.');
   assertMetaToolkitV1Call(name, args);

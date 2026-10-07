@@ -25,7 +25,9 @@ import { extractJson } from './util/extractJson';
 const JUDGE_TIMEOUT_MS = 12000;
 const MATCH_CONFIDENCE_THRESHOLD = 75; // bias to NEW: only stack on a confident match
 export const MAX_CANDIDATES = 30;
-const MAX_TEXT_CHARS = 600; // keep the prompt cheap
+// ENG-1335: the substantive ask often sits past a preamble ("REPEAT REQUEST — …", evidence
+// tables), so 600 chars routinely cut it off. Still bounded: 30 candidates × 1200 ≈ 9k tokens.
+const MAX_TEXT_CHARS = 1200;
 
 export type DedupItemType = 'feature_request' | 'bug';
 
@@ -56,6 +58,14 @@ function buildPrompt(input: DedupInput, candidates: DedupCandidate[]): { system:
     `and a numbered list of EXISTING open posts. Decide whether the NEW one is the SAME underlying ` +
     `${input.type === 'bug' ? 'bug' : 'feature/capability'} as one of the existing ones — different wording is fine, ` +
     `but it must be genuinely the same request, not merely the same general area. ` +
+    // ENG-1335: compare the SUBSTANTIVE ASK, not the title. The same request reworded across
+    // filings ("mark awaiting-reply sessions neutral" vs "add a neutral awaiting-user-input
+    // scoring state") shares almost no title tokens; matching on titles filed it six times.
+    `Judge by the substantive ask — the concrete behavior or change being requested, as stated in the description — ` +
+    `not by title wording: two posts can share no distinctive title words and still be the same request. ` +
+    `A post that covers the new one's ask as part of a broader request IS a match. ` +
+    `Conversely, two requests that touch the same component but ask for a DIFFERENT change are NOT a match ` +
+    `(e.g. "don't penalize a session where the user never replied" vs "resolve the conflict between the publish-approval gate and the judge rubric" are different asks). ` +
     `If it clearly matches one, return that candidate's NUMBER. If it is a different request, or you are unsure, return null. ` +
     `Respond with ONLY JSON: {"matchedIndex": <number or null>, "confidence": <0-100>, "reason": "<short>"}.`;
   const list = candidates

@@ -1,3 +1,59 @@
+## ENG-2342: adSetBidAndSchedule test reads metaTools.ts after tools split (2026-10-07)
+
+Test-only path fix: the AD_SET CREATE contract moved from emma/tools.ts to emma/metaTools.ts.
+
+## OPS: nginx request-timing access log for per-route p99 alarm (2026-10-07)
+
+- `backend/.platform/nginx/conf.d/access_log_timing.conf` defines `main_timing` = EB default `main` + `rt=$request_time urt=$upstream_response_time`.
+- `conf.d/elasticbeanstalk/access_log_timing.conf` writes it to a separate `/var/log/nginx/access_timing.log`. EB's nginx.conf already has a server-level `access_log access.log main`, so reusing access.log would double-log. access.log is unchanged.
+- `.ebextensions/07-nginx-timing-log.config` appends the file to the CloudWatch agent (log group `/aws/elasticbeanstalk/<env>/var/log/nginx/access_timing.log`).
+- Follow-up after deploy: per-route p99 alarm excluding `/api/agent-mode/*` and `/mcp`, then retire the interim 60s `prod3-p99-latency` threshold.
+
+## ENG-728: Report corrupt preview overrides as errors (2026-10-07)
+
+Production verification found that the UTM preview has no production caller yet, and source inspection reproduced a separate AC5 defect: malformed nonempty overrides were reported as skipped before validation. Validate overrides inside the per-lander error boundary before protecting valid overrides. Invalid values now produce error rows without reading deployed links. No storage, deployment, or apply boundary changes.
+
+Scoped regression evidence: the existing preview Jest file went from 3 failed / 9 passed to 12 passed with a 768 MB heap. CodeRabbit local light review completed with zero findings. This narrow fix does not complete ENG-728: a read-only deployment adapter/invocation surface and production per-lander evidence remain outstanding.
+
+## ENG-428: Preserve REST draft intent (2026-10-07)
+
+Production artifact verification confirmed `/api/emma/post-on-account` dropped `save_as_draft`, and its service wrapper dropped the implementation's options argument. Forward the existing draft option across both boundaries so LinkedIn drafts remain drafts and other platforms reach the existing explicit refusal instead of publication. Ordinary posts retain the published default. Focused route regression: RED 1 failure/1 pass, GREEN 2/2. No provider writes, schema changes or paid model calls. Original deployed service/adapter tests also exercised DRAFT behavior using mocked HTTP clients. Production closure awaits deployment of this forwarding correction and exact-artifact replay.
+
+## ENG-2334: MCP tool annotation policy + publication CI gate (2026-10-07)
+
+Typed per-tool read/write policy (`mcp/server/toolAnnotationPolicy.ts`) covering all 95 public MCP tools; unclassified tools fail closed. CI gate in `mcp.publicToolInventory.test.ts` asserts annotations match policy, get_chat_history is not read-only, mutating tools are never read-only, and no banned schema fields or description phrases exist. No copy changes.
+
+## ENG-809: dev.md notes become fragments, because append collides exactly like prepend (2026-10-06)
+
+Every PR used to prepend to dev.md line 1, so any two open PRs conflicted, and a conflicted PR cannot
+schedule a workflow run (ENG-757 blind window). Appending would not help: two EOF additions touch the
+same hunk. Notes now go in `dev/pending/<eng-id>-<slug>.md`; `dev-md-consolidate.sh` folds them in
+newest first after merge and refuses to delete any fragment whose lines are not verifiably in the new
+dev.md. The guard runs from the base ref so a PR cannot weaken the check judging it, and the
+consolidation branch is exempt only when it solely edits dev.md and removes fragments.
+
+## ENG-428: LinkedIn save-as-draft via post_on_connected_account (2026-10-06)
+
+`post_on_connected_account` gains `save_as_draft` (LinkedIn only; other platforms refused, nothing posted). Draft posts use `lifecycleState: DRAFT`, skip the published-posts cache, and return no feed URL.
+
+## ENG-427: list_knowledge_base_files returns signed URL for private KBs (2026-10-06)
+
+getTasksWithKnowledgeBase now keeps the `knowledgeBase` signed URL in its projection, so the KB listing no longer returns url:null for private/org knowledge-base.txt files.
+
+## ENG-336: MCP tools/list emits readOnly/destructive/openWorld annotations (2026-10-06)
+
+Slice 1 of ChatGPT app compliance: `McpToolRegistry.getToolDefinitions()` now attaches MCP `annotations` derived from `readOnly` (undeclared = destructive write), explicit per-tool annotations win, jest gate in `registry.toolAnnotations.test.ts`.
+
+## ENG-1005: Publish, plan, and schedule workflow tools (2026-10-06)
+
+- Add four externally listed MCP workflows: `emma_publish_social_post`, `emma_publish_blog_post`, `emma_create_gtm_plan`, and `emma_schedule_recurring_work`.
+- Publishing defaults to local draft previews; only boolean `publish: true` permits publication. Social calls without an account return connected accounts. Granular publish tools remain internal-only (already enforced in this checkout).
+- Blog creation/publication had no matching REST adapters; add authenticated, quota-metered adapters around the existing service methods, carrying scheduled consent through to the CMS write. Successful publishers lacking a URL are reported explicitly without suggesting a duplicate publish.
+- GTM orchestration uses the actual route contracts (title, whole-plan responses, one work item per request). Schedules need no template; missing prompt variables are named before creation.
+- Complexity: four thin workflows, two required REST adapters, no dependencies or persistence changes. Rollback: remove the new workflow imports/list entries and adapters.
+- TDD: initial ENG-1005 run was 32 failed / 3 passed before implementation. Verification is scoped Jest only; no servers, browsers, full-repo typecheck, commit, or push.
+- Final verification: 311 tests in 13 suites passed (including 47 ENG-1005 tests), plus 3 static quota-classification tests. CodeRabbit's completion-credit finding was reproduced and fixed; its remaining title-normalization suggestion does not apply because the phase route stores titles verbatim.
+
 ## ENG-1907: sandbox mode phase 1 — the `eval_` principal becomes a real portal account (2026-09-12)
 
 ENG-1870 shipped a separate mini-product for evaluations (server-rendered `/evaluation` page, a
