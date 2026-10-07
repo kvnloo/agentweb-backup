@@ -721,7 +721,7 @@ router.post("/crm-sync/:source/start", async (req, res) => {
 
     const syncStartedAt = new Date().toISOString();
     const results = leads.length > 0
-      ? await crmDb.batchCreateLeads(parsed.listId, leads)
+      ? await crmDb.batchCreateLeads(parsed.listId, leads, { origin: 'integration' })
       : { successCount: 0, newCount: 0, mergedCount: 0, errorCount: 0, errors: [] as string[], anonymizedSkipped: 0 };
 
     let updatedLastSyncAt: string | null = parsed.lastSyncAt || null;
