@@ -35,6 +35,10 @@ import {
   logCompletionMetric,
 } from "./brandBuildStatusService";
 import { logStepMetric } from "./onboardingMetricsService";
+import {
+  brandBuildOwnershipCondition,
+  brandBuildSessionPageIdentifier,
+} from "./brandBuildSessionMarker";
 
 const BRAND_BUILD_MODEL = "anthropic.claude-sonnet-4-6";
 
@@ -78,7 +82,10 @@ export interface BrandBuildDeps {
    * Override for Emma's chat-session creator. Defaults to the real
    * `chatbotService.createChatSession`. Tests inject a fake.
    */
-  createChatSession?: (userId: string) => Promise<{ sessionId: string }>;
+  createChatSession?: (
+    userId: string,
+    opts?: { pageIdentifier?: string },
+  ) => Promise<{ sessionId: string }>;
   /**
    * Override for Emma's response generator. Defaults to the real
    * `agentModeController.generateSessionResponse`. Tests inject a fake
@@ -110,70 +117,11 @@ export interface BrandBuildDeps {
    * ownership-token pattern applied to icp/competitor/creativeDir/adCopy.
    * Optional for backward compatibility with direct callers/tests that
    * bypass the claim; only callers that hold a fresh claim should pass it.
-   * The `ready` transition is written by the `update_brand_guidelines`
-   * hook, which judges ownership from the session's own `createdAt` (see
-   * `sessionMayCompleteBrandBuild`).
+   * The Emma session is created with a `pageIdentifier` naming this claim, so
+   * the `update_brand_guidelines` hook can tell a superseded session from the
+   * current one (see `brandBuildSessionPageIdentifier`).
    */
   expectedStartedAt?: string;
-}
-
-/**
- * Restate "the `building` record is still the one THIS run claimed" as a
- * DynamoDB condition (ENG-2308 review follow-up, confirmed by direct
- * reproduction — see onboardingIcpService's `icpOwnershipCondition` for
- * the full reasoning, identical here).
- */
-function brandBuildOwnershipCondition(expectedStartedAt: string) {
-  return {
-    expression: "#brandBuildStartedAt = :brandBuildOwnerStartedAt",
-    names: { "#brandBuildStartedAt": "brandBuildStartedAt" },
-    values: { ":brandBuildOwnerStartedAt": expectedStartedAt },
-  };
-}
-
-/**
- * Whether an `update_brand_guidelines` call from chat session `sessionId` may
- * complete the CURRENT brand build (ENG-2308 review follow-up).
- *
- * `withTimeout` does not abort the Emma session, so a build that timed out and
- * was retried leaves a live "zombie" session that can still call the tool
- * later. The hook only checked `brandBuildStatus === "building"`, which is true
- * for the RECLAIMING run's `building`, so the zombie flipped the newer run to
- * `ready` early and the newer run's own flip was then dropped.
- *
- * Ownership is derived from data that already exists, so it needs no new
- * persisted field and works across processes (the agent loop runs in a forked
- * worker, so an in-process session registry cannot see the build): a brand
- * build creates its session AFTER it claims the axis, so a session belongs to
- * the current claim only if it was created at or after `brandBuildStartedAt`.
- * A zombie from an older claim was created before the reclaiming claim started.
- *
- * `toleranceMs` absorbs clock skew between instances. A zombie is always at
- * least a full stale window (or a user-driven retry) older than the claim that
- * superseded it, far more than the tolerance.
- */
-export const BRAND_BUILD_SESSION_SKEW_TOLERANCE_MS = 5_000;
-
-export function sessionMayCompleteBrandBuild(
-  sessionCreatedAt: string | undefined,
-  brandBuildStartedAt: string | undefined,
-  toleranceMs: number = BRAND_BUILD_SESSION_SKEW_TOLERANCE_MS,
-): boolean {
-  const created = sessionCreatedAt ? Date.parse(sessionCreatedAt) : NaN;
-  const started = brandBuildStartedAt ? Date.parse(brandBuildStartedAt) : NaN;
-  // Cannot prove the session predates the claim: keep the pre-existing
-  // behavior (allow) rather than strand a real build in `building`.
-  if (!Number.isFinite(created) || !Number.isFinite(started)) return true;
-  return created >= started - toleranceMs;
-}
-
-/**
- * DynamoDB condition for the `building -> ready` flip: the build must still be
- * the claim the ownership rule above was judged against. Exported for the
- * `update_brand_guidelines` hook.
- */
-export function brandBuildReadyOwnershipCondition(observedStartedAt: string) {
-  return brandBuildOwnershipCondition(observedStartedAt);
 }
 
 function buildBrandPrompt(input: {
@@ -336,7 +284,10 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
  * never trigger this path.
  */
 function defaultDeps(): {
-  createChatSession: (userId: string) => Promise<{ sessionId: string }>;
+  createChatSession: (
+    userId: string,
+    opts?: { pageIdentifier?: string },
+  ) => Promise<{ sessionId: string }>;
   generateSessionResponse: (
     sessionId: string,
     userMessage: string,
@@ -351,12 +302,12 @@ function defaultDeps(): {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { cronJobRegistry } = require("../utils/cronJobRegistry");
   return {
-    createChatSession: async (userId: string) => {
+    createChatSession: async (userId: string, opts?: { pageIdentifier?: string }) => {
       const session = await chatbotDb.createChatSession(
         userId,
         undefined,
         "agent",
-        "agent-mode",
+        opts?.pageIdentifier ?? "agent-mode",
         undefined,
         undefined,
         undefined,
@@ -510,7 +461,16 @@ export async function triggerBrandBuildForUser(
 
   let sessionId: string;
   try {
-    const session = await createChatSession(userId);
+    // The session names the claim it serves so the update_brand_guidelines
+    // hook can tell it from a later run's session (see
+    // brandBuildSessionPageIdentifier). Without a claim (direct callers) it
+    // keeps the default identifier.
+    const session = await createChatSession(
+      userId,
+      deps.expectedStartedAt
+        ? { pageIdentifier: brandBuildSessionPageIdentifier(deps.expectedStartedAt) }
+        : undefined,
+    );
     sessionId = session.sessionId;
   } catch (e: any) {
     await persistFailure(
