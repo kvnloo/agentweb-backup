@@ -1,7 +1,7 @@
 /** Daily read-only discovery; --write prepares code for the existing draft-PR workflow. */
 import * as fs from 'fs';
 import * as path from 'path';
-import { byokCoverage, detectFrontier, fetchJson, renderCoverage } from '../services/agentMode/frontierMonitor';
+import { byokCoverage, detectFrontier, fetchJson, renderCoverage, renderPrBody } from '../services/agentMode/frontierMonitor';
 import { LLM_MODEL_REGISTRY, LLMModelConfig } from '../services/agentMode/llmModelRegistry';
 import { refreshModelCatalog } from '../services/agentMode/modelCatalogRefresh';
 import { writeCatalogPlan } from './refreshModelCatalog';
@@ -28,6 +28,7 @@ async function main() {
   const report = [ '# Frontier monitor', '', ...detection.alerts, '', ...detection.reports, ...plan.reports, '', markdown ].join('\n');
   if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, report);
   if (process.argv.includes('--write')) writeCatalogPlan(plan);
+  if (process.env.PR_BODY_PATH) fs.writeFileSync(process.env.PR_BODY_PATH, renderPrBody([...detection.reports, ...plan.reports]));
   // Opt-in side effect: ordinary local runs cannot post alerts accidentally.
   let notificationFailed = false;
   if (process.argv.includes('--notify') && process.env.SLACK_MODEL_ALERTS_WEBHOOK && detection.alerts.length) {
