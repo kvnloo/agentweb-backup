@@ -252,7 +252,7 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
     const res = makeRes();
     await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { accountId: 'someone-elses-acct' } } as any, res as any);
     expect(res.status).toHaveBeenCalledWith(403);
-    expect(res.json).toHaveBeenCalledWith({ message: 'That LinkedIn account is not connected to your user.' });
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'linkedin_account_not_connected', message: expect.stringContaining('not connected to your user') }));
     expect(mockSendInvitation).not.toHaveBeenCalled();
   });
 

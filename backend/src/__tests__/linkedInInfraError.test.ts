@@ -5,7 +5,9 @@ describe('isLinkedInInfraError (ENG-2205)', () => {
     ['credential fetch failure', new Error('Failed to fetch Unipile credentials from Secrets Manager')],
     ['gateway html body (the real outage shape)', new Error('<html><head><title>502 Bad Gateway</title></head></html>')],
     ['transport error', new Error('connect ECONNRESET 1.2.3.4:443')],
-    ['SERVER_ERROR classification', Object.assign(new Error('x'), { structuredError: { classification: 'SERVER_ERROR' } })],
+    ['SERVER_ERROR with a gateway status (502)', Object.assign(new Error('x'), { structuredError: { classification: 'SERVER_ERROR', status: 502 } })],
+    ['SERVER_ERROR with a gateway status (503)', Object.assign(new Error('x'), { structuredError: { classification: 'SERVER_ERROR', status: 503 } })],
+    ['SERVER_ERROR with a gateway status (504)', Object.assign(new Error('x'), { structuredError: { classification: 'SERVER_ERROR', status: 504 } })],
     ['TIMEOUT_ERROR classification', Object.assign(new Error('x'), { structuredError: { classification: 'TIMEOUT_ERROR' } })],
     ['isTimeout flag', Object.assign(new Error('x'), { isTimeout: true })],
     ['DNS failure (EAI_AGAIN)', new Error('getaddrinfo EAI_AGAIN api.unipile.com')],
@@ -23,6 +25,8 @@ describe('isLinkedInInfraError (ENG-2205)', () => {
     ['auth error', Object.assign(new Error('Disconnected account'), { structuredError: { classification: 'AUTH_ERROR' } })],
     ['a message that merely contains "terminated"', new Error('Account terminated by LinkedIn')],
     ['numeric status code (not a transport code)', Object.assign(new Error('x'), { code: 404 })],
+    ['a plain 500 (can be request-specific; retrying will not help)', Object.assign(new Error('Internal error'), { structuredError: { classification: 'SERVER_ERROR', status: 500 } })],
+    ['SERVER_ERROR with no status', Object.assign(new Error('x'), { structuredError: { classification: 'SERVER_ERROR' } })],
     ['undefined', undefined],
   ])('does NOT treat %s as infrastructure', (_l, err) => expect(isLinkedInInfraError(err)).toBe(false));
 

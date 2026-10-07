@@ -133,6 +133,7 @@ beforeEach(() => {
   mockLi.sendMessage.mockResolvedValue(undefined as any);
   mockResolveLinkedInAccountForWrite.mockReset();
   mockResolveLinkedInAccountForWrite.mockResolvedValue({ ownerUserId: 'user-1' });
+  mockDb.snoozeEnrollment.mockResolvedValue(undefined as any);
 });
 
 describe('the LinkedIn send path uses the canonical URL the predicate validated', () => {
@@ -267,12 +268,24 @@ describe('a pinned LinkedIn account must belong to the sequence owner (ENG-2205)
     expect(mockLi.sendMessage).toHaveBeenCalledWith('owned-acct', expect.any(String), true, expect.any(String));
   });
 
-  it('refuses to send, and throws so the config problem is retried once fixed, when the pinned account is not theirs', async () => {
+  it('refuses to send, and SNOOZES (not retry every tick) when the pinned account is not theirs', async () => {
     mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
     mockDb.getSequence.mockResolvedValue(pinned('pool-or-foreign-acct') as any);
     const stats = await processDueEnrollments();
     expect(mockLi.sendMessage).not.toHaveBeenCalled();
     expect(stats.errors).toBe(1);
+    expect(mockDb.snoozeEnrollment).toHaveBeenCalledTimes(1);
+    const retryAt = new Date(mockDb.snoozeEnrollment.mock.calls[0][1]).getTime();
+    expect(retryAt - Date.now()).toBeGreaterThan(5 * 60 * 60 * 1000); // ~6h, not the next 5-minute tick
+    expect(mockDb.releaseEnrollmentClaim).not.toHaveBeenCalled();
+  });
+
+  it('a transient failure of the ownership LOOKUP itself is not treated as "not connected" (keeps the normal retry)', async () => {
+    mockResolveLinkedInAccountForWrite.mockRejectedValue(new Error('DynamoDB throttled'));
+    mockDb.getSequence.mockResolvedValue(pinned('owned-acct') as any);
+    await processDueEnrollments();
+    expect(mockLi.sendMessage).not.toHaveBeenCalled();
+    expect(mockDb.snoozeEnrollment).not.toHaveBeenCalled();
     expect(mockDb.releaseEnrollmentClaim).toHaveBeenCalled();
   });
 

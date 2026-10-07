@@ -1471,7 +1471,9 @@ describe('CrmEnrichmentService', () => {
           sources: ['linkedin', 'existing_data'],
         });
 
-        expect(result.warnings).toContain('No LinkedIn (Unipile) account connected — linkedin source skipped');
+        // An account EXISTS but could not be verified: say so, rather than claiming nothing is connected.
+        expect(result.warnings).toContain('LinkedIn (Unipile) is temporarily unreachable — linkedin source skipped');
+        expect(result.warnings).not.toContain('No LinkedIn (Unipile) account connected — linkedin source skipped');
         expect(mockAgentModeService.linkedinOutreach).not.toHaveBeenCalled();
       } finally {
         linkedInOutreachService.probeAccountSession.mockResolvedValue('connected');

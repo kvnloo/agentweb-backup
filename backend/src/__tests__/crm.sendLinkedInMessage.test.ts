@@ -300,7 +300,7 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message', () =
     await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { message: 'Hello!', accountId: 'someone-elses-acct' } } as any, res as any);
     expect(mockResolveLinkedInAccountForWrite).toHaveBeenCalledWith('test-user-id', 'someone-elses-acct');
     expect(res.status).toHaveBeenCalledWith(403);
-    expect(res.json).toHaveBeenCalledWith({ message: 'That LinkedIn account is not connected to your user.' });
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'linkedin_account_not_connected', message: expect.stringContaining('not connected to your user') }));
     expect(mockSendMessage).not.toHaveBeenCalled();
     expect(mockAddLinkedInMessageEvent).not.toHaveBeenCalled();
   });
@@ -312,6 +312,17 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message', () =
     expect(mockSendMessage).toHaveBeenCalledWith('my-default-acct', 'https://www.linkedin.com/in/john-doe', true, 'Hello!');
     expect(mockResolveAccountId).not.toHaveBeenCalled();
     expect(res.status).not.toHaveBeenCalled();
+  });
+
+  // The message is already out when the engagement is recorded; reporting a failed send would make the user
+  // retry and message the lead twice.
+  it('still reports success (and does not invite a retry) when the engagement write fails AFTER a successful send', async () => {
+    mockAddLinkedInMessageEvent.mockRejectedValue(new Error('read ECONNRESET'));
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { message: 'Hello!' } } as any, res as any);
+    expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    expect(res.status).not.toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith({ success: true, engagementRecorded: false });
   });
 
   it('sends message and records engagement on happy path', async () => {
