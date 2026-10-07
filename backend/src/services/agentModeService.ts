@@ -2356,8 +2356,8 @@ export class AgentModeService {
 
   /**
    * Would the model picker accept this id for this user? The single source of
-   * truth for "can this user pick this model" — internal/live exclusion, the
-   * adminOnly gate, and the non-admin Opus restriction. `updateSessionLlmModel`
+   * truth for "can this user pick this model" — internal/live exclusion and the
+   * adminOnly gate. `updateSessionLlmModel`
    * / `updateSharedSessionLlmModel` call this directly (ENG-2293: they used to
    * re-derive a subset inline — just the opus check — which let a non-admin
    * who named an adminOnly auto-added model by id bypass it) so the two cannot
@@ -2367,8 +2367,22 @@ export class AgentModeService {
     const config = this.llmModels[modelId];
     if (!config || config.internalOnly || config.isLive) return false;
     if (config.adminOnly && !isAdmin) return false;
-    if (modelId.includes('opus') && !isAdmin) return false;
     return true;
+  }
+
+  /**
+   * ENG-55: registry facts the model-compare feature needs (display name, lab, live
+   * flag) without exposing the registry. Null for ids that are not registry keys.
+   */
+  getModelCompareInfo(modelId: string): { name: string; provider: string; isLive: boolean; internalOnly: boolean } | null {
+    if (!Object.prototype.hasOwnProperty.call(this.llmModels, modelId)) return null;
+    const config = this.llmModels[modelId];
+    return {
+      name: config.name ?? modelId,
+      provider: config.provider ?? 'other',
+      isLive: config.isLive === true,
+      internalOnly: config.internalOnly === true,
+    };
   }
 
   /**
@@ -2440,7 +2454,7 @@ export class AgentModeService {
   }
 
   async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
-    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || (!this.llmModels[m].adminOnly && !m.includes('opus'))));
+    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.') && (isAdmin || !this.llmModels[m].adminOnly));
   }
   /**
    * Make an LLM call with the specified model and parameters
