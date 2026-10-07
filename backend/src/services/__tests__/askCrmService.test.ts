@@ -224,4 +224,66 @@ describe('askCrm — ENG-2155 live lifecycle precedence', () => {
     ]));
     expect(result.items[0].lifecycle).toBe('paying');
   });
+
+  // specific_contact is lifecycle-agnostic (text match only), unlike the
+  // paying_customers/at_risk/deals_closing intents above, which filter the result
+  // list BY the derived lifecycle — so a test whose derived outcome isn't in that
+  // intent's own target set would see result.items come back empty rather than
+  // actually exercising deriveScores. Querying by name keeps every case below
+  // observable regardless of what lifecycle it resolves to.
+  it('lets a confirmed account record advance stale inbox to signed_up', async () => {
+    const result = await askCrm('is Signupcase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Signupcase', company: 'Acme', lifecycle: 'inbox', hasUserRecord: true }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('signed_up');
+  });
+
+  it('lets 60+ days of inactivity advance stale paying to churned', async () => {
+    const result = await askCrm('is Churncase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Churncase', company: 'Acme', lifecycle: 'paying', lastActivityAt: '2026-01-01T00:00:00Z' }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('churned');
+  });
+
+  it('lets a low health score move a stored paying customer to at_risk', async () => {
+    const result = await askCrm('is Healthcase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Healthcase', company: 'Acme', lifecycle: 'paying', healthScore: 20 }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('at_risk');
+  });
+
+  it('lets 30+ days of no usage move a stored paying customer to at_risk', async () => {
+    const result = await askCrm('is Usagecase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Usagecase', company: 'Acme', lifecycle: 'paying', lastUsageAt: '2026-03-01T00:00:00Z' }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('at_risk');
+  });
+
+  it('does not downgrade stored paying from a healthy score and recent usage alone', async () => {
+    const result = await askCrm('is Healthycase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Healthycase', company: 'Acme', lifecycle: 'paying', healthScore: 90, lastUsageAt: '2026-04-13T00:00:00Z' }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('paying');
+  });
+
+  it('does not let past_due downgrade a stored signed_up lead to inbox', async () => {
+    const result = await askCrm('is Pastduecase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Pastduecase', company: 'Acme', lifecycle: 'signed_up', subscriptionState: 'past_due' }),
+    ]));
+    // Before the fix, subscriptionIsDefinitive treated ANY past_due as definitive,
+    // so the gate trusted computeLifecycle here — which (Rule 2 only applies from
+    // paying/at_risk, so past_due is a no-op, and hasUserRecord is unset) falls
+    // through to the Rule 7 email-visibility floor and returns 'inbox'. That is a
+    // real downgrade of a stronger stored state, the exact failure class this
+    // gate exists to prevent. provesSignup can't rescue this case either —
+    // its own condition requires lifecycle to already be 'unknown'/'inbox'.
+    expect(result.items[0].lifecycle).toBe('signed_up');
+  });
+
+  it('does treat past_due as definitive from an already-paying stored state', async () => {
+    const result = await askCrm('is Atriskcase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Atriskcase', company: 'Acme', lifecycle: 'paying', subscriptionState: 'past_due' }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('at_risk');
+  });
 });
