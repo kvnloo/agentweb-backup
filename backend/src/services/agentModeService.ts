@@ -42,6 +42,7 @@ import {
 } from './agentMode/metaImageSwapCheck';
 import { readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
+import { runCrmFreshnessShadow } from '../utils/crmFreshnessGuard';
 import {
   evaluateTurnTimeBudget,
   buildTurnTimeBudgetNudge,
@@ -5211,6 +5212,13 @@ export class AgentModeService {
             }
           }
         }
+      }
+
+      // ENG-2263 (log-only): a `[verified: <CRM tool>]` tag that no CRM call this turn can back —
+      // a carried-over number dressed as fresh. Measures how often it happens, per model, before
+      // anyone decides to enforce. Never edits `content`; kill switch AGENT_CRM_FRESHNESS_GUARD=off.
+      if (content && !wasCancelled && !mockMode) {
+        runCrmFreshnessShadow({ finalText: content, toolCalls, sessionId, model: llmModel });
       }
 
       // ENG-1207 AC3: a run must not finish silently on an unread page.
