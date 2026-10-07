@@ -199,11 +199,11 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
           expect(info.tier).toBe('ultra_premium');
         });
 
-        it('reports the AA Intelligence Index v4.3.2 quality score (58, #1)', async () => {
+        it('reports the current Artificial Analysis quality score (#1)', async () => {
           const models = await agentModeService.getSupportedModelsWithMetadata(false);
           const info = models.find((m) => m.id === OPUS_5_5)!;
-          expect(info.qualityScore).toBe(58);
-          expect(info.qualityScoreSource).toBe('Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Claude Opus 5.5, Adaptive Reasoning, Max Effort');
+          expect(info.qualityScore).toBe(57.6);
+          expect(info.qualityScoreSource).toBe('Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-opus-5-5 (https://artificialanalysis.ai/)');
         });
 
         it('Opus 5.5 supersedes Opus 5: same cost band, higher quality, so dominance flags Opus 5 legacy', async () => {
@@ -258,7 +258,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       it('AC #6 — leaves the live voice model untouched', () => {
         const live = (agentModeService as any).llmModels['gemini-3.1-flash-live-preview'];
-        expect(live).toEqual({ client: null, supportsTemperature: false, isLive: true });
+        // 2026-10-07: the catalog refresh added an explicit `family` to every row it touched,
+        // including this one; it's still untouched functionally (no score, no auto-added fields).
+        expect(live).toEqual({ client: null, supportsTemperature: false, isLive: true, family: 'gemini-flash-live-preview' });
       });
     });
 
@@ -413,88 +415,101 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
      * live there at all).
      */
     describe('2026-08-19 — quality/cost meter scores', () => {
-      // 2026-09-22: AA Intelligence Index v4.3.2, read live off each model's
-      // artificialanalysis.ai page. Canonical variants, not runtime effort settings.
+      // Regenerated 2026-10-07 from the registry after the automated model-catalog refresh
+      // (PR #3276): scores are now un-rounded decimals from the Artificial Analysis API (v2) or the
+      // v4.3.2 pages, with the snapshot date in each source string. These values were copied from
+      // the registry, NOT independently re-checked against artificialanalysis.ai.
       const AA_V42: [string, number, string][] = [
-        ['openrouter/anthropic/claude-opus-5.5', 58, 'Claude Opus 5.5, Adaptive Reasoning, Max Effort'],
-        ['openrouter/anthropic/claude-fable-5.1', 53, 'Claude Fable 5.1, Adaptive Reasoning, Max Effort'],
-        ['openrouter/openai/gpt-6-astra', 53, 'GPT-6 Astra, max'],
-        ['anthropic.claude-opus-5', 51, 'Claude Opus 5, Adaptive Reasoning, Max Effort'],
-        ['openrouter/openai/gpt-6-sol', 48, 'GPT-6 Sol, max'],
-        ['openrouter/openai/gpt-5.6-sol', 47, 'GPT-5.6 Sol, max'],
-        ['openrouter/x-ai/grok-4.7', 46, 'Grok 4.7, xhigh'],
-        ['openrouter/x-ai/grok-4.6', 44, 'Grok 4.6, high'],
-        ['openrouter/moonshotai/kimi-k3', 44, 'Kimi K3, max'],
-        ['openrouter/openai/gpt-5.6-terra', 42, 'GPT-5.6 Terra, max'],
-        ['anthropic.claude-opus-4-8', 42, 'Claude Opus 4.8, Adaptive Reasoning, Max Effort'],
-        ['gemini-3.8-flash', 41, 'Gemini 3.8 Flash, high'],
-        ['openrouter/qwen/qwen3.8-max', 40, 'Qwen3.8 Max, reasoning'],
-        ['gpt-5.4', 39, 'GPT-5.4, xhigh'],
-        ['gemini-3.7-flash', 39, 'Gemini 3.7 Flash, high'],
-        ['gpt-5.5', 38, 'GPT-5.5, xhigh'],
-        ['openrouter/openai/gpt-5.6-luna', 38, 'GPT-5.6 Luna, max'],
-        ['anthropic.claude-sonnet-5', 38, 'Claude Sonnet 5, Adaptive Reasoning, Max Effort'],
-        ['openrouter/openai/gpt-6-luna', 37, 'GPT-6 Luna, max'],
-        ['openrouter/deepseek/deepseek-v4-pro', 36, 'DeepSeek V4 Pro 0813, Reasoning, Max Effort'],
-        ['openrouter/deepseek/deepseek-v4-flash', 35, 'DeepSeek V4 Flash 0731, Reasoning, Max Effort'],
-        ['openrouter/qwen/qwen3.8-27b', 34, 'Qwen3.8 27B, xhigh'],
-        ['openrouter/z-ai/glm-5.2', 34, 'GLM 5.2, max'],
-        ['gemini-3.5-flash', 33, 'Gemini 3.5 Flash'],
-        ['gemini-3.1-pro-preview', 30, 'Gemini 3.1 Pro Preview, reasoning'],
-        ['anthropic.claude-sonnet-4-6', 30, 'Claude Sonnet 4.6, Adaptive Reasoning, Max Effort'],
-        ['openrouter/moonshotai/kimi-k2.7-code', 26, 'Kimi K2.7 Code, reasoning'],
-        ['anthropic.claude-opus-4-6-v1', 26, 'Claude Opus 4.6, Non-reasoning, High Effort'],
-        ['gpt-5.4-nano', 21, 'GPT-5.4 Nano, xhigh'],
-        ['anthropic.claude-sonnet-4-5-20250929-v1:0', 19, 'Claude Sonnet 4.5, Non-reasoning'],
-        ['gemini-3-flash-preview', 18, 'Gemini 3 Flash Preview, Non-reasoning'],
-        ['gemini-3.1-flash-lite', 16, 'Gemini 3.1 Flash Lite'],
-        ['openrouter/z-ai/glm-4.7-flash', 15, 'GLM 4.7 Flash, reasoning'],
-        ['anthropic.claude-haiku-4-5-20251001-v1:0', 15, 'Claude Haiku 4.5, Non-reasoning'],
-        ['openrouter/mistralai/mistral-small-2603', 11, 'Mistral Small 4, reasoning'],
-        ['openrouter/openai/gpt-4o-mini', 7, 'GPT-4o Mini, non-reasoning'],
+        ["openrouter/anthropic/claude-opus-5.5", 57.6, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-opus-5-5 (https://artificialanalysis.ai/)"],
+        ["openrouter/anthropic/claude-sonnet-5.5", 56, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-sonnet-5-5 (https://artificialanalysis.ai/)"],
+        ["openrouter/anthropic/claude-fable-5.1", 53.4, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-fable-5-1 (https://artificialanalysis.ai/)"],
+        ["openrouter/openai/gpt-6-astra", 52.7, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gpt-6-astra (https://artificialanalysis.ai/)"],
+        ["openrouter/openai/gpt-6.1-sol", 51.8, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gpt-6-1-sol (https://artificialanalysis.ai/)"],
+        ["anthropic.claude-opus-5", 50.8, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-opus-5 (https://artificialanalysis.ai/)"],
+        ["openrouter/openai/gpt-6-sol", 47.6, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gpt-6-sol (https://artificialanalysis.ai/)"],
+        ["openrouter/openai/gpt-5.6-sol", 47, "Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, GPT-5.6 Sol, max"],
+        ["openrouter/x-ai/grok-4.7", 46.4, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, grok-4-7 (https://artificialanalysis.ai/)"],
+        ["openrouter/z-ai/glm-5.3", 44.8, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, glm-5-3 (https://artificialanalysis.ai/)"],
+        ["openrouter/x-ai/grok-4.6", 44.3, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, grok-4-6 (https://artificialanalysis.ai/)"],
+        ["openrouter/moonshotai/kimi-k3", 44, "Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Kimi K3, max"],
+        ["openrouter/openai/gpt-5.6-terra", 42.1, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gpt-5-6-terra (https://artificialanalysis.ai/)"],
+        ["anthropic.claude-opus-4-8", 41.8, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-opus-4-8 (https://artificialanalysis.ai/)"],
+        ["openrouter/z-ai/glm-5.3-flash", 41.8, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, glm-5-3-flash (https://artificialanalysis.ai/)"],
+        ["gemini-3.8-flash", 40.9, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gemini-3-8-flash (https://artificialanalysis.ai/)"],
+        ["openrouter/qwen/qwen3.8-max", 40, "Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Qwen3.8 Max, reasoning"],
+        ["openrouter/deepseek/deepseek-v4.1-flash", 39.5, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, deepseek-v4-1-flash (https://artificialanalysis.ai/)"],
+        ["gemini-3.7-flash", 39.1, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gemini-3-7-flash (https://artificialanalysis.ai/)"],
+        ["gpt-5.4", 39, "Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, GPT-5.4, xhigh"],
+        ["gpt-5.5", 38.4, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gpt-5-5 (https://artificialanalysis.ai/)"],
+        ["anthropic.claude-sonnet-5", 38.2, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-sonnet-5 (https://artificialanalysis.ai/)"],
+        ["openrouter/openai/gpt-6-luna", 38.1, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gpt-6-luna (https://artificialanalysis.ai/)"],
+        ["openrouter/openai/gpt-5.6-luna", 37.3, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gpt-5-6-luna (https://artificialanalysis.ai/)"],
+        ["openrouter/deepseek/deepseek-v4-pro-0813", 36, "Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-10-07, DeepSeek V4 Pro 0813 (Max), Reasoning (https://artificialanalysis.ai/models/deepseek-v4-pro)"],
+        ["openrouter/deepseek/deepseek-v4-flash", 34.3, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, deepseek-v4-flash (https://artificialanalysis.ai/)"],
+        ["openrouter/qwen/qwen3.8-27b", 34, "Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Qwen3.8 27B, xhigh"],
+        ["openrouter/z-ai/glm-5.2", 33.7, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, glm-5-2 (https://artificialanalysis.ai/)"],
+        ["gemini-3.5-flash", 32.6, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gemini-3-5-flash (https://artificialanalysis.ai/)"],
+        ["openrouter/deepseek/deepseek-v4-pro", 30, "Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-10-07, DeepSeek V4 Pro 0424 (Max), Reasoning (https://artificialanalysis.ai/models/deepseek-v4-pro-0424)"],
+        ["gemini-3.1-pro-preview", 29.7, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gemini-3-1-pro-preview (https://artificialanalysis.ai/)"],
+        ["anthropic.claude-opus-4-6-v1", 26.4, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-opus-4-6 (https://artificialanalysis.ai/)"],
+        ["openrouter/moonshotai/kimi-k2.7-code", 26, "Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Kimi K2.7 Code, reasoning"],
+        ["anthropic.claude-sonnet-4-6", 24.7, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-sonnet-4-6 (https://artificialanalysis.ai/)"],
+        ["openrouter/google/gemini-3.5-flash-lite", 22.2, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gemini-3-5-flash-lite (https://artificialanalysis.ai/)"],
+        ["gpt-5.4-nano", 20.7, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gpt-5-4-nano (https://artificialanalysis.ai/)"],
+        ["anthropic.claude-sonnet-4-5-20250929-v1:0", 19, "Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Claude Sonnet 4.5, Non-reasoning"],
+        ["gemini-3-flash-preview", 17.9, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gemini-3-flash (https://artificialanalysis.ai/)"],
+        ["gemini-3.1-flash-lite", 15.6, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gemini-3-1-flash-lite-preview (https://artificialanalysis.ai/)"],
+        ["anthropic.claude-haiku-4-5-20251001-v1:0", 15, "Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Claude Haiku 4.5, Non-reasoning"],
+        ["openrouter/z-ai/glm-4.7-flash", 14.9, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, glm-4-7-flash (https://artificialanalysis.ai/)"],
+        ["openrouter/mistralai/mistral-small-2603", 11, "Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Mistral Small 4, reasoning"],
+        ["openrouter/openai/gpt-4o-mini", 6.7, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gpt-4o-mini (https://artificialanalysis.ai/)"],
       ];
       const SCORED_IDS = AA_V42.map(([id]) => id);
 
-      it.each(AA_V42)('ENG-1786: %s reports its v4.3.2 score and canonical variant', async (id, score, variant) => {
+      it.each(AA_V42)('ENG-1786: %s reports its current Artificial Analysis score and source', async (id, score, source) => {
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
         const info = models.find((model) => model.id === id)!;
         expect(info.qualityScore).toBe(score);
-        expect(info.qualityScoreSource).toBe(`Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, ${variant}`);
+        expect(info.qualityScoreSource).toBe(source);
       });
 
-      it('every scored registry row uses the v4.3.2 / 2026-09-22 snapshot', () => {
+      it('every scored registry row cites an Artificial Analysis snapshot', () => {
         const registry = (agentModeService as any).llmModels;
         const scoredIds = Object.keys(registry).filter((id) => typeof registry[id].qualityScore === 'number');
         expect(scoredIds.sort()).toEqual([...SCORED_IDS].sort());
         for (const id of scoredIds) {
-          expect(registry[id].qualityScoreSource).toMatch(/^Artificial Analysis Intelligence Index v4\.3\.2, snapshot 2026-09-22, .+/);
+          expect(registry[id].qualityScoreSource).toMatch(/^Artificial Analysis Intelligence Index( v4\.3\.2|, API v2), snapshot 2026-(09-22|10-07), .+/);
         }
       });
 
-      it('v4.3.2 order at the top: Opus 5.5 (58) > Fable 5.1 = Astra (53) > Opus 5 (51)', async () => {
+      it('current order at the top: Opus 5.5 (57.6) > Sonnet 5.5 (56, admin-only) > Fable 5.1 (53.4) > Astra (52.7) > Opus 5 (50.8)', async () => {
+        // Updated 2026-10-07 after the automated model-catalog refresh (PR #3276) replaced the
+        // hand-typed v4.3.2 scores with live API v2 decimals; Astra and Fable 5.1 are no longer
+        // tied, and the auto-added, admin-only Sonnet 5.5 now scores between Opus 5.5 and Fable 5.1.
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
         const quality = (id: string) => models.find((model) => model.id === id)!.qualityScore!;
-        expect(quality('openrouter/anthropic/claude-opus-5.5')).toBe(58);
-        expect(quality('openrouter/anthropic/claude-fable-5.1')).toBe(53);
-        expect(quality('openrouter/openai/gpt-6-astra')).toBe(53);
-        expect(quality('anthropic.claude-opus-5')).toBe(51);
-        expect(models.filter((model) => model.qualityScore! > 53).map((model) => model.id))
-          .toEqual(['openrouter/anthropic/claude-opus-5.5']);
+        expect(quality('openrouter/anthropic/claude-opus-5.5')).toBe(57.6);
+        expect(quality('openrouter/anthropic/claude-sonnet-5.5')).toBe(56);
+        expect(quality('openrouter/anthropic/claude-fable-5.1')).toBe(53.4);
+        expect(quality('openrouter/openai/gpt-6-astra')).toBe(52.7);
+        expect(quality('anthropic.claude-opus-5')).toBe(50.8);
+        expect(models.filter((model) => model.qualityScore! > 53).map((model) => model.id).sort())
+          .toEqual(['openrouter/anthropic/claude-fable-5.1', 'openrouter/anthropic/claude-opus-5.5', 'openrouter/anthropic/claude-sonnet-5.5'].sort());
       });
 
       it.each<[string | undefined, string[]]>([
         ['gpt5-chat', ['gpt-5.5']],
-        ['gpt5-nano', ['gpt-5.4-nano', 'openrouter/openai/gpt-4o-mini']],
+        ['gpt5-nano', ['gpt-5.4-nano', 'openrouter/openai/gpt-4o-mini', 'openrouter/openai/gpt-5.6-luna']],
         ['gemini-flash', ['gemini-3.5-flash', 'gemini-3.7-flash']],
         ['claude-opus', ['anthropic.claude-opus-5']],
-        ['claude-sonnet', []],
+        // 2026-10-07: the catalog refresh added auto-added Claude Sonnet 5.5 (adminOnly) above it,
+        // which now dominates the legacy anthropic.claude-sonnet-5 row on cost+quality.
+        ['claude-sonnet', ['anthropic.claude-sonnet-5']],
         ['claude-fable', []],
-        // GPT-6 Sol ("Strong reasoning at half the price of GPT-5.6 Sol") was added
-        // alongside modelSupersession.ts's name-inferred product-line dominance —
-        // neither Sol variant carries an explicit `family`, but both infer to the
-        // same "sol" line, and GPT-6 Sol genuinely dominates (cheaper, equal-or-
-        // better quality). No longer an empty family-less bucket.
-        [undefined, ['openrouter/openai/gpt-5.6-sol']],
+        // 2026-10-07: GPT-6 Sol and GPT-5.6 Sol both now carry an explicit `family: "gpt-sol"`
+        // in the registry (previously inferred, per the comment this replaces), so their
+        // dominance no longer falls into the family-less (`undefined`) bucket this test checks.
+        [undefined, []],
       ])('ENG-1786: %s keeps its baseline dominance-only legacy rows', async (family, expected) => {
         // Baseline includes ENG-1784 bands and ENG-1781 Luna pricing.
         // Static legacy rows remain covered by the existing legacy tests.
@@ -512,7 +527,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(info).toBeDefined();
         expect(info!.qualityScore).toBeGreaterThanOrEqual(0);
         expect(info!.qualityScore).toBeLessThanOrEqual(100);
-        expect(Number.isInteger(info!.qualityScore)).toBe(true);
+        expect(typeof info!.qualityScore).toBe('number');
         expect(info!.qualityScoreSource).toEqual(expect.any(String));
         expect(info!.costScore).toBeGreaterThanOrEqual(0);
         expect(info!.costScore).toBeLessThanOrEqual(100);
@@ -527,7 +542,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       it('pins Claude Opus 5 at the real AA-sourced quality / MODEL_PRICING-derived cost values', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(false);
         const info = models.find((m) => m.id === 'anthropic.claude-opus-5')!;
-        expect(info.qualityScore).toBe(51);
+        expect(info.qualityScore).toBe(50.8);
         expect(info.costScore).toBe(70); // $5/$25 blended 75:25 -> $10.00/1M, log-normalized
         // 70 was the top of the old 64–70 "pro" band; ENG-1784 (2026-09-05)
         // re-cut Flagship to ≥64 precisely so Opus 5 sits with GPT-5.6 Sol.
@@ -537,7 +552,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       it('pins GPT-4o Mini (the cheapest, weakest scored model) at the real values', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(false);
         const info = models.find((m) => m.id === 'openrouter/openai/gpt-4o-mini')!;
-        expect(info.qualityScore).toBe(7);
+        expect(info.qualityScore).toBe(6.7);
         expect(info.costScore).toBe(22);
         expect(info.tier).toBe('ultra_cheap'); // 22 falls in the <=30 "ultra_cheap" cost band
       });
@@ -550,8 +565,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         const opus5 = (agentModeService as any).llmModels['anthropic.claude-opus-5'];
         const opus48 = (agentModeService as any).llmModels['anthropic.claude-opus-4-8'];
         const opus46 = (agentModeService as any).llmModels['anthropic.claude-opus-4-6-v1'];
-        expect(opus48.qualityScore).toBe(42);
-        expect(opus46.qualityScore).toBe(26);
+        expect(opus48.qualityScore).toBe(41.8);
+        expect(opus46.qualityScore).toBe(26.4);
         expect(opus5.qualityScore).toBeGreaterThan(opus48.qualityScore);
         expect(opus48.qualityScore).toBeGreaterThan(opus46.qualityScore);
       });
@@ -618,9 +633,15 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         return models.find((m) => m.id === id)!.qualityTier;
       };
 
-      it('puts Claude Fable 5.1 and GPT-6 Astra in the Flagship quality tier', async () => {
+      it('puts Claude Fable 5.1 in the Flagship quality tier', async () => {
         expect(await qualityTierOf('openrouter/anthropic/claude-fable-5.1')).toBe('ultra_premium');
-        expect(await qualityTierOf('openrouter/openai/gpt-6-astra')).toBe('ultra_premium');
+      });
+
+      // 2026-10-07: Astra's raw-decimal score (52.7) is now just under the 53 Flagship
+      // threshold — it moved to Pro, not Flagship. Was tied with Fable 5.1 at the hand-typed
+      // integer 53; the refresh broke the tie.
+      it('puts GPT-6 Astra in the Pro quality tier, just under the Flagship threshold', async () => {
+        expect(await qualityTierOf('openrouter/openai/gpt-6-astra')).toBe('pro');
       });
 
       it('puts Claude Opus 5 and GPT-5.6 Sol in the Pro quality tier', async () => {
@@ -635,9 +656,14 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       // On v4.3.2 GPT-5.6 Luna (38) ties Sonnet 5 (38); ties resolve to the
       // higher band per Harsha 2026-09-06, so Luna is Medium now. Haiku stays Cheap.
-      it('puts Claude Haiku 4.5 in Cheap and GPT-5.6 Luna (tied with Sonnet 5) in Medium', async () => {
+      it('puts Claude Haiku 4.5 in Cheap', async () => {
         expect(await qualityTierOf('anthropic.claude-haiku-4-5-20251001-v1:0')).toBe('cheap');
-        expect(await qualityTierOf('openrouter/openai/gpt-5.6-luna')).toBe('medium');
+      });
+
+      // 2026-10-07: GPT-5.6 Luna's raw-decimal score (37.3) is now just under the 38 Medium
+      // threshold — it moved to Cheap, no longer tied with Claude Sonnet 5 (38.2, still Medium).
+      it('puts GPT-5.6 Luna in Cheap, just under the Medium threshold', async () => {
+        expect(await qualityTierOf('openrouter/openai/gpt-5.6-luna')).toBe('cheap');
       });
 
       // The quality axis is independent of the cost axis: Opus 5/Sol are
@@ -686,7 +712,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       it('carries a sourced Artificial Analysis quality score', () => {
         const config = (agentModeService as any).llmModels[ASTRA];
-        expect(config.qualityScore).toBe(53);
+        expect(config.qualityScore).toBe(52.7);
         expect(config.qualityScoreSource).toMatch(/Artificial Analysis/);
       });
 
@@ -705,10 +731,11 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       // Astra is stronger than Sol on v4.2 (55 vs 51), but these distinct
       // product lines must not auto-retire each other.
-      // Inferred Astra and Sol families remain distinct across generations.
+      // 2026-10-07: both now carry an explicit `family` ("gpt-astra" / "gpt-sol") rather than
+      // one being undefined-and-inferred — still two distinct lines, so Astra stays current.
       it('keeps Astra current while GPT-6 Sol supersedes GPT-5.6 Sol (AC3)', async () => {
         const config = (agentModeService as any).llmModels[ASTRA];
-        expect(config.family).toBeUndefined();
+        expect(config.family).toBe('gpt-astra');
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
         expect(models.find((m) => m.id === ASTRA)!.legacy).toBeUndefined();
         expect(models.find((m) => m.id === 'openrouter/openai/gpt-5.6-sol')!.legacy).toBe(true); // Cheaper GPT-6 Sol supersedes it.
@@ -1109,7 +1136,12 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       // Pin default_model to a known valid key — env var may point to a
       // placeholder not in llmModels, which would make the ordering untestable.
       const originalDefault = (agentModeService as any).default_model;
-      const validDefault = Object.keys((agentModeService as any).llmModels)[0];
+      // Pick a non-adminOnly key: getSupportedModels() defaults to isAdmin=false, and
+      // 2026-10-07's auto-added, admin-gated rows (e.g. the registry's literal first key
+      // today) are filtered out for a non-admin caller, so they can never legitimately be
+      // models[0] here.
+      const registry = (agentModeService as any).llmModels;
+      const validDefault = Object.keys(registry).find((id) => !registry[id].adminOnly)!;
       (agentModeService as any).default_model = validDefault;
       try {
         const models = await agentModeService.getSupportedModels();
@@ -1127,7 +1159,12 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       // Pin default_model to a known valid key — same reason as above.
       const originalDefault = (agentModeService as any).default_model;
-      const validDefault = Object.keys((agentModeService as any).llmModels)[0];
+      // Pick a non-adminOnly key: getSupportedModels() defaults to isAdmin=false, and
+      // 2026-10-07's auto-added, admin-gated rows (e.g. the registry's literal first key
+      // today) are filtered out for a non-admin caller, so they can never legitimately be
+      // models[0] here.
+      const registry = (agentModeService as any).llmModels;
+      const validDefault = Object.keys(registry).find((id) => !registry[id].adminOnly)!;
       (agentModeService as any).default_model = validDefault;
       try {
         const models = await agentModeService.getSupportedModels();
