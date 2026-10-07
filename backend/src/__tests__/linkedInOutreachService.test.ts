@@ -2071,37 +2071,6 @@ describe('LinkedInOutreachService', () => {
 
         expect(await linkedInOutreachService.resolveAccountId('user-1', { verifiedOnly: true })).toBe('own-live');
       });
-
-      it('ownOnly never borrows the shared pool, even when the pool is live and the user has no account', async () => {
-        mockGetAccountsByUserId.mockResolvedValue([]);
-        pool();
-        (probeSpy = jest.spyOn(linkedInOutreachService, 'probeAccountSession')).mockResolvedValue('connected');
-
-        expect(await linkedInOutreachService.resolveAccountId('user-1', { ownOnly: true })).toBeNull();
-        expect(mockGetSetting).not.toHaveBeenCalled();
-        // while the default still falls back to the pool
-        expect(await linkedInOutreachService.resolveAccountId('user-1')).toBe('site-live');
-      });
-
-      it('ownOnly never uses the pool when every own account is dead', async () => {
-        mockGetAccountsByUserId.mockResolvedValue([{ platform: 'unipile', account_id: 'own-dead' }]);
-        pool();
-        (probeSpy = jest.spyOn(linkedInOutreachService, 'probeAccountSession'))
-          .mockImplementation(async (id: string) => (id === 'site-live' ? 'connected' : 'disconnected'));
-
-        expect(await linkedInOutreachService.resolveAccountId('user-1', { ownOnly: true })).toBeNull();
-      });
-
-      it('ownOnly keeps live-first own selection: skips a dead first account for a live second one', async () => {
-        mockGetAccountsByUserId.mockResolvedValue([
-          { platform: 'unipile', account_id: 'own-dead' },
-          { platform: 'unipile', account_id: 'own-live' },
-        ]);
-        (probeSpy = jest.spyOn(linkedInOutreachService, 'probeAccountSession'))
-          .mockImplementation(async (id: string) => (id === 'own-live' ? 'connected' : 'disconnected'));
-
-        expect(await linkedInOutreachService.resolveAccountId('user-1', { ownOnly: true })).toBe('own-live');
-      });
     });
 
     it('returns site-wide account_id when user has no account but site-wide accounts are configured', async () => {

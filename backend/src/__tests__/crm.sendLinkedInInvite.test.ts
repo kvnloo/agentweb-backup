@@ -303,6 +303,28 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
 
   // ─── Note-quota hold / decision gate (ENG-213) ───────────────────────────────
 
+  // ENG-2205: an unreachable Unipile (credential fetch / gateway) is a handled 503, not a 500 that
+  // echoes an internal message — same as send-linkedin-message.
+  it.each([
+    ['credentials failure', new Error('Failed to fetch Unipile credentials from Secrets Manager')],
+    ['gateway 502', new Error('<html><head><title>502 Bad Gateway</title></head></html>')],
+  ])('returns 503 (no raw message, nothing recorded) on %s', async (_label, err) => {
+    mockSendInvitation.mockRejectedValue(err);
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: {} } as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'linkedin_unavailable' }));
+    expect(JSON.stringify((res.json as jest.Mock).mock.calls)).not.toMatch(/Secrets Manager|Bad Gateway/);
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
+  it('keeps a plain 500 for a non-infrastructure invite error', async () => {
+    mockSendInvitation.mockRejectedValue(new Error('something unrelated broke'));
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: {} } as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(500);
+  });
+
   it('holds (does not send) and returns a decision gate when the note quota is spent', async () => {
     const held: any = new Error('LinkedIn note quota reached — the personalized note could not be attached.');
     held.noteQuotaExceeded = true;

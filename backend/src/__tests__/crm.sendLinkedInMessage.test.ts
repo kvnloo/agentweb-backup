@@ -284,12 +284,12 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message', () =
     );
   });
 
-  // ENG-2205 follow-up: same untrusted-accountId hole as send-linkedin-invite, and this route
-  // additionally fell back to the SHARED POOL account when no accountId was supplied.
-  it('auto-resolves from the user\'s OWN accounts only — never the shared pool', async () => {
+  // ENG-2205 follow-up: a client-supplied accountId is untrusted (same hole as send-linkedin-invite).
+  // Auto-resolution is deliberately UNCHANGED: own account first, then the shared pool for users without one.
+  it('auto-resolves exactly as before when no account is supplied (own account, else the shared pool) and skips the ownership check', async () => {
     const res = makeRes();
     await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { message: 'Hello!' } } as any, res as any);
-    expect(mockResolveAccountId).toHaveBeenCalledWith('test-user-id', { ownOnly: true });
+    expect(mockResolveAccountId).toHaveBeenCalledWith('test-user-id');
     expect(mockResolveLinkedInAccountForWrite).not.toHaveBeenCalled();
     expect(mockSendMessage).toHaveBeenCalledWith('unipile-acct-1', expect.any(String), true, 'Hello!');
   });
