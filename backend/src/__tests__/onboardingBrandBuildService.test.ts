@@ -406,6 +406,94 @@ describe("onboardingBrandBuildService", () => {
       );
     });
 
+    // The client-side timeout calls /brand-build/fail then /start, which
+    // reclaims the axis while the first run's Emma session is still going. That
+    // run's trigger then carries on after its (refused) session returns.
+    describe("a run reclaimed while its session was still going", () => {
+      const OURS = "2026-04-24T11:59:00.000Z";
+      const NEWER = "2026-04-24T12:05:00.000Z";
+      const market = {
+        icp: [{ title: "Stale ICP", description: "d", valueProposition: "v", buyerPersonas: ["p"] }],
+        competitors: [{ name: "Stale Co", description: "d" }],
+      };
+      const entrance = {
+        userId: "u1",
+        productDomain: "https://acme.com",
+        brandBuildStatus: "building",
+        brandBuildStartedAt: OURS,
+      };
+      // triggerBrandBuildForUser also fires an unrelated fire-and-forget Slack
+      // Connect provisioning write at its start; only count writes that belong
+      // to the brand build itself.
+      const buildWrites = () =>
+        userDb.updateUser.mock.calls.filter(
+          ([, patch]: any) => !Object.keys(patch).every((k) => k.startsWith("slackConnect")),
+        );
+      const deps = () => ({
+        createChatSession: jest.fn().mockResolvedValue({ sessionId: "s1" }),
+        generateSessionResponse: jest.fn().mockResolvedValue({}),
+        ensureBrandLogo: async () => ({ persisted: true, logoUrl: null, reason: "test" }),
+        expectedStartedAt: OURS,
+      });
+
+      it("skips every post-session write once it sees a newer claim: no mirror, no failure, no logo step", async () => {
+        const ensureBrandLogo = jest.fn();
+        // The reads a real run would make if it did NOT stop at the check, so
+        // that removing the check makes this test fail instead of passing
+        // because the mocks ran dry.
+        const newer = { ...entrance, brandBuildStartedAt: NEWER, brandBuildStatus: "ready", marketStrategy: market };
+        userDb.getUserById
+          .mockResolvedValueOnce(entrance)
+          .mockResolvedValueOnce(newer)
+          .mockResolvedValueOnce(newer)
+          .mockResolvedValueOnce(newer);
+        userDb.updateUser.mockResolvedValue({});
+
+        await triggerBrandBuildForUser("u1", { ...deps(), ensureBrandLogo });
+
+        expect(buildWrites()).toHaveLength(0);
+        expect(ensureBrandLogo).not.toHaveBeenCalled();
+      });
+
+      it("conditions the mirror write on its own claim and drops it quietly when a reclaim lands first", async () => {
+        const conditionalFailure = Object.assign(new Error("cond"), { code: "ConditionalCheckFailedException" });
+        userDb.getUserById
+          .mockResolvedValueOnce(entrance)
+          .mockResolvedValueOnce({ ...entrance }) // still ours at the check
+          .mockResolvedValueOnce({ ...entrance, marketStrategy: market }); // post-populate read
+        // Reject only the mirror write (the first updateUser call is the
+        // unrelated Slack Connect provisioning write).
+        userDb.updateUser.mockImplementation(async (_id: string, patch: any) => {
+          if (patch.icpResult) throw conditionalFailure;
+          return {};
+        });
+
+        await triggerBrandBuildForUser("u1", deps());
+
+        // Exactly one brand-build write was attempted (the mirror), and nothing
+        // after it: no final-status failure write either.
+        expect(buildWrites()).toHaveLength(1);
+        const [, patch, options] = buildWrites()[0];
+        expect(patch.icpResult).toBeTruthy();
+        expect(options.condition.values[":brandBuildOwnerStartedAt"]).toBe(OURS);
+      });
+
+      it("a run that still owns the claim mirrors as before, with the condition", async () => {
+        userDb.getUserById
+          .mockResolvedValueOnce(entrance)
+          .mockResolvedValueOnce({ ...entrance })
+          .mockResolvedValueOnce({ ...entrance, brandBuildStatus: "ready", marketStrategy: market })
+          .mockResolvedValueOnce({ ...entrance, brandBuildStatus: "ready" });
+        userDb.updateUser.mockResolvedValue({});
+
+        await triggerBrandBuildForUser("u1", deps());
+
+        const mirror = userDb.updateUser.mock.calls.find(([, p]: any) => p.icpResult);
+        expect(mirror).toBeTruthy();
+        expect(mirror[2].condition.values[":brandBuildOwnerStartedAt"]).toBe(OURS);
+      });
+    });
+
     it("mirrors marketStrategy → icpResult + competitorResult and flips statuses on the happy path", async () => {
       const builtMarketStrategy = {
         businessOverview: "Acme makes rockets",
