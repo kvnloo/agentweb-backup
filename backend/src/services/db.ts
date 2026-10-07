@@ -1,6 +1,7 @@
 import type { LeadNotificationsConfig, LeadOrigin } from './leadNotificationConfig';
 import { writeWithEvaluationGuard } from './evaluationPersistence';
 import AWS from "aws-sdk";
+import { buildAwsHttpOptions } from "../utils/awsHttpOptions";
 import { assertMemoryContentWithinLimit } from '../utils/memoryContentLimit';
 import dotenv from "dotenv";
 import path from "path";
@@ -43,6 +44,8 @@ const CLAIM_STALE_MS = 5 * 60 * 1000;
 // Configure AWS SDK
 AWS.config.update({
   region: process.env.AWS_REGION || "us-west-2",
+  // ENG-749 #3: reuse TLS connections — aws-sdk v2 opens a fresh socket per call by default.
+  httpOptions: buildAwsHttpOptions(),
   // Leave the SDK's normal credential-provider chain intact when explicit
   // credentials are not configured. Supplying empty strings here masks valid
   // shared-profile / instance-role credentials used by migration scripts.
@@ -3307,6 +3310,8 @@ export const taskDb = {
           name: task.name,
           knowledgeBaseSize: size,
           knowledgeBaseType: task.knowledgeBaseType || 'private',
+          // ENG-427: keep the signed URL so list_knowledge_base_files can link private KBs
+          knowledgeBase: task.knowledgeBase || null,
           knowledgeBaseFiles: task.knowledgeBaseFiles || [],
           knowledgeBaseUpdatedAt: task.knowledgeBaseUpdatedAt || task.updatedAt || task.createdAt,
           // Include additional fields that might be useful

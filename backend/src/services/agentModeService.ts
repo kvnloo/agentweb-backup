@@ -55,6 +55,7 @@ import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
 import {
   normalizeOpenRouterResponseMetadata,
   normalizeOpenRouterErrorMetadata,
+  resolveServedChainModel,
 } from './agentMode/openRouterMetadata';
 import {
   assertOpenRouterToolsSupported,
@@ -2782,6 +2783,12 @@ export class AgentModeService {
       ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
     });
     // Fire-and-forget usage metering; it must never break an LLM call.
+    // ENG-1345: when OpenRouter served one of `fallbackModels`, meter the model
+    // that actually answered, not the primary we asked for first.
+    const meteredModel = resolveServedChainModel(
+      (res as any)?.model,
+      paramChain.map(m => ({ modelId: m.modelId, upstreamModel: m.upstreamModel })),
+    ) ?? model;
     // ENG-1816 F1: routed through recordLlmUsage, which decides funding ABOVE this
     // fire-and-forget funnel — see funding/recordLlmUsage.ts for why. Branch on
     // RunFunding.route, never on usage.is_byok below: that flag also fires for
@@ -2795,7 +2802,7 @@ export class AgentModeService {
           userId: usageContext?.userId,
           billingUserId: usageContext?.billingUserId,
           sessionId: usageContext?.sessionId,
-          model,
+          model: meteredModel,
           provider: providerLabel,
           feature: usageContext?.feature || 'agent_task',
           eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
@@ -9910,6 +9917,7 @@ export class AgentModeService {
     status?: string;
     limit?: number;
     cursor?: string;
+    includeAllFields?: boolean;
   } = {}): Promise<any> {
     return leadsImpl.getLeads(listId, userId, options);
   }
@@ -12484,7 +12492,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const withBudget = (r: any) => {
         if (!budgetFields) return r;
         const { budget_message, error, ...rest } = budgetFields;
-        const out: any = { ...r, ...rest, message: `${r.message} — ${budget_message}` };
+        const out: any = {
+          ...r, ...rest,
+          success: r.success && rest.budget_verification === 'CONFIRMED',
+          message: rest.budget_verification === 'CONFIRMED' ? `${r.message} — ${budget_message}` : budget_message,
+        };
         if (error && !r.error) out.error = error;
         else if (error) out.budget_error = error;
         return out;
@@ -12582,8 +12594,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         (v: number) => normalizeMetaMoney(v, money.currency, 'minor').description
       );
       return {
-        success: true,
-        message: `Ad set updated successfully${money.confirmation} — ${budget_message}`,
+        success: verdict.budget_verification === 'CONFIRMED',
+        message: verdict.budget_verification === 'CONFIRMED'
+          ? `Ad set updated successfully${money.confirmation} — ${budget_message}` : budget_message,
         ...verdict,
       };
     } catch (error: any) {
@@ -17366,8 +17379,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // delegating wrapper — real callers beyond tools.ts: routes/emmaApi.ts's
   // POST /social-post handler, and many direct real-instance calls in
   // agentModeService.socialTools.test.ts.
-  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any): Promise<any> {
-    return linkedinImpl.postOnConnectedAccount(userId, accountId, content, mediaUrls, platform, toolContext);
+  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean }): Promise<any> {
+    return linkedinImpl.postOnConnectedAccount(userId, accountId, content, mediaUrls, platform, toolContext, options);
   }
 
   /**
