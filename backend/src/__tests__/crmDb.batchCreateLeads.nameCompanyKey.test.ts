@@ -257,5 +257,5 @@ it('notifies only persisted batch rows, leaving DynamoDB unprocessed rows resuma
   // (one shared routing lookup for the whole import), not the per-lead
   // dispatchLeadCreated that createLead's single-insert path uses.
   expect(dispatchLeadsCreated).toHaveBeenCalledTimes(1);
-  expect(dispatchLeadsCreated).toHaveBeenCalledWith('list-1', [result.created[0].leadId]);
+  expect(dispatchLeadsCreated).toHaveBeenCalledWith('list-1', [result.created[0].leadId], undefined);
 });

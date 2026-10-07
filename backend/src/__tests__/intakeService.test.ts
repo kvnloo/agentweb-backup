@@ -1333,3 +1333,99 @@ describe('intakeService.fileAutoIssue — alert-class clustering (ENG-358)', () 
     expect(r).toMatchObject({ deduped: true });
   });
 });
+
+
+// ENG-1335: live-but-differently-worded canonicals. Regression corpus: ENG-1334 (new filing) vs
+// ENG-1165 (open canonical) share no distinctive title tokens but the same substantive ask.
+describe('fileUserIssue — bug, ENG-1335 occurrence ladder + semantic grouping', () => {
+  const ENG_1165 = {
+    identifier: 'ENG-1165', issueId: 'uuid-1165',
+    title: "Make 'blocked by external auth / awaiting user input' a neutral EXCLUDED scoring state, like the Slack-suggestion exception",
+    description: 'add a neutral terminal state (e.g. blocked_external / awaiting_user_input) that the judges can assign instead of a low goalCompletion',
+  };
+  const ENG_1334_REPORT = {
+    type: 'bug' as const,
+    title: 'Add a neutral awaiting-user-input scoring state so judges stop docking goalCompletion',
+    description: 'REPEAT REQUEST — sixth window. When the user simply has not replied, judges dock goalCompletion; score it neutral instead.',
+    userEmail: 'rep@e.com',
+  };
+  const realFlag = process.env.FEATUREBASE_INTAKE;
+  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; });
+  beforeEach(() => {
+    jest.clearAllMocks();
+    process.env.FEATUREBASE_INTAKE = 'true';
+    linear.listOpenBugCanonicals.mockResolvedValue([ENG_1165]);
+    fb.createTicket.mockResolvedValue({ id: 'tk', number: 42, url: 'https://fb/t/42' });
+    fb.findTicketByMarker = jest.fn().mockResolvedValue(null);
+  });
+  const reportComments = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ body: `[reporter-ticket #${i + 1} u${i}@e.com] Affected user: u${i}`, createdAt: '' }));
+
+  it('AC1: a judged match attaches as ONE comment and creates ZERO issues', async () => {
+    dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-1165', title: ENG_1165.title, description: ENG_1165.description });
+    linear.getIssueCommentsDetailed.mockResolvedValue(reportComments(1));
+    const r = await fileUserIssue(ENG_1334_REPORT);
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(linear.addIssueComment).toHaveBeenCalledTimes(1);
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-1165', expect.stringContaining('score it neutral instead'));
+    expect(r.deduped).toBe(true);
+  });
+
+  it('AC1: the judge is shown the ENG-1334 report alongside the open ENG-1165 canonical', async () => {
+    dedup.findDuplicate.mockResolvedValue(null);
+    linear.createInternalLinearIssue.mockResolvedValue({ id: 'new', identifier: 'ENG-9', url: 'lin' });
+    await fileUserIssue(ENG_1334_REPORT);
+    const [input, cands] = dedup.findDuplicate.mock.calls[0];
+    expect(input).toMatchObject({ title: ENG_1334_REPORT.title, description: ENG_1334_REPORT.description });
+    expect(cands).toEqual([{ ref: 'ENG-1165', title: ENG_1165.title, description: ENG_1165.description }]);
+  });
+
+  it('AC2: the occurrence count increments and is visible on the canonical', async () => {
+    dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-1165', title: '', description: '' });
+    linear.getIssueCommentsDetailed.mockResolvedValue(reportComments(4));
+    await fileUserIssue(ENG_1334_REPORT);
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-1165', expect.stringContaining('Occurrences: 5 reports on this canonical.'));
+  });
+
+  it('AC3: 2nd report raises to at least Medium (3); never lowers a more urgent funnel tier', async () => {
+    dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-1165', title: '', description: '' });
+    linear.getIssueCommentsDetailed.mockResolvedValue(reportComments(1));
+    await fileUserIssue(ENG_1334_REPORT);
+    expect(linear.raiseIssueTriage).toHaveBeenCalledWith('uuid-1165', expect.objectContaining({ priority: 3 }));
+  });
+
+  it('AC3: 3rd+ report raises to at least High (2)', async () => {
+    dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-1165', title: '', description: '' });
+    linear.getIssueCommentsDetailed.mockResolvedValue(reportComments(2));
+    await fileUserIssue(ENG_1334_REPORT);
+    expect(linear.raiseIssueTriage).toHaveBeenCalledWith('uuid-1165', expect.objectContaining({ priority: 2 }));
+  });
+
+  it('AC3: unattributed telemetry notes count as reports too', async () => {
+    dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-1165', title: '', description: '' });
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: 'Surfaced via telemetry/satisfaction-report review — affected user could not be resolved', createdAt: '' },
+      { body: 'unrelated human comment', createdAt: '' },
+      { body: '[reporter-ticket #3 a@e.com] Affected user: a', createdAt: '' },
+    ]);
+    await fileUserIssue(ENG_1334_REPORT);
+    expect(linear.raiseIssueTriage).toHaveBeenCalledWith('uuid-1165', expect.objectContaining({ priority: 2 }));
+  });
+
+  it('comment-read failure never blocks the filing (falls back to occurrence 2)', async () => {
+    dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-1165', title: '', description: '' });
+    linear.getIssueCommentsDetailed.mockRejectedValue(new Error('linear down'));
+    const r = await fileUserIssue(ENG_1334_REPORT);
+    expect(r.deduped).toBe(true);
+    expect(linear.raiseIssueTriage).toHaveBeenCalledWith('uuid-1165', expect.objectContaining({ priority: 3 }));
+  });
+
+  it('AC4: a publish-refusal report the judge does not match files its own canonical (no over-attach)', async () => {
+    dedup.findDuplicate.mockResolvedValue(null);
+    linear.createInternalLinearIssue.mockResolvedValue({ id: 'uuid-new', identifier: 'ENG-999', url: 'lin' });
+    await fileUserIssue({ ...ENG_1334_REPORT, title: 'Scheduled run publish gate vs judge rubric', description: 'agent correctly withholds publish under approval setting, judge docks it' });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(linear.addIssueComment).not.toHaveBeenCalledWith('uuid-1165', expect.anything());
+    expect(linear.raiseIssueTriage).not.toHaveBeenCalled();
+  });
+});

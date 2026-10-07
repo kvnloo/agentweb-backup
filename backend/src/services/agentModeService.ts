@@ -6398,6 +6398,10 @@ export class AgentModeService {
     'save_org_memory',
     'delete_org_memory',
 
+    // Org notification preferences use the same org-settings authorization.
+    'get_lead_notification_settings',
+    'update_lead_notification_settings',
+
     // Scheduled Chat Management
     'list_scheduled_chats',
     'manage_scheduled_chat',
@@ -12488,7 +12492,11 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
       const withBudget = (r: any) => {
         if (!budgetFields) return r;
         const { budget_message, error, ...rest } = budgetFields;
-        const out: any = { ...r, ...rest, message: `${r.message} — ${budget_message}` };
+        const out: any = {
+          ...r, ...rest,
+          success: r.success && rest.budget_verification === 'CONFIRMED',
+          message: rest.budget_verification === 'CONFIRMED' ? `${r.message} — ${budget_message}` : budget_message,
+        };
         if (error && !r.error) out.error = error;
         else if (error) out.budget_error = error;
         return out;
@@ -12586,8 +12594,9 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         (v: number) => normalizeMetaMoney(v, money.currency, 'minor').description
       );
       return {
-        success: true,
-        message: `Ad set updated successfully${money.confirmation} — ${budget_message}`,
+        success: verdict.budget_verification === 'CONFIRMED',
+        message: verdict.budget_verification === 'CONFIRMED'
+          ? `Ad set updated successfully${money.confirmation} — ${budget_message}` : budget_message,
         ...verdict,
       };
     } catch (error: any) {
@@ -17370,8 +17379,8 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
   // delegating wrapper — real callers beyond tools.ts: routes/emmaApi.ts's
   // POST /social-post handler, and many direct real-instance calls in
   // agentModeService.socialTools.test.ts.
-  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any): Promise<any> {
-    return linkedinImpl.postOnConnectedAccount(userId, accountId, content, mediaUrls, platform, toolContext);
+  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean }): Promise<any> {
+    return linkedinImpl.postOnConnectedAccount(userId, accountId, content, mediaUrls, platform, toolContext, options);
   }
 
   /**
