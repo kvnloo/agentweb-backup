@@ -182,9 +182,14 @@ function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: L
     lead.subscriptionState === 'trialing' ||
     lead.subscriptionState === 'canceled' ||
     (lead.subscriptionState === 'past_due' && (lead.lifecycle === 'paying' || lead.lifecycle === 'at_risk'));
+  // An open deal only PROMOTES a cold lead. Against a stored paying/trialing/at_risk/churned
+  // state it is weak evidence (the deal's contact may simply not be linked to the account that
+  // holds the subscription, e.g. an upsell on a differently-addressed contact), and letting it
+  // win would downgrade a real customer to in_deal. Mirrors routes/sequences.ts's gate.
   const hasCurrentOpenDeal =
     Array.isArray(lead.openDealStages) &&
-    lead.openDealStages.some((stage) => !['won', 'lost'].includes(String(stage).toLowerCase()));
+    lead.openDealStages.some((stage) => !['won', 'lost'].includes(String(stage).toLowerCase())) &&
+    (lead.lifecycle === 'unknown' || lead.lifecycle === 'inbox' || lead.lifecycle === 'signed_up');
   const provesSignup =
     lead.hasUserRecord === true &&
     (lead.lifecycle === 'unknown' || lead.lifecycle === 'inbox');

@@ -259,6 +259,28 @@ describe('askCrm — ENG-2155 live lifecycle precedence', () => {
     expect(result.items[0].lifecycle).toBe('paying');
   });
 
+  it.each(['paying', 'trialing', 'at_risk'] as const)(
+    'does not let an open deal downgrade a stored %s customer to in_deal', async stored => {
+      const result = await askCrm('is Dealcase at acme', 'u1', makeDeps([
+        lead({ firstName: 'Dealcase', company: 'Acme', lifecycle: stored, openDealStages: ['Negotiation'] }),
+      ]));
+      expect(result.items[0].lifecycle).toBe(stored);
+    });
+
+  it('still lets an open deal promote a stored signed_up lead to in_deal', async () => {
+    const result = await askCrm('is Promocase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Promocase', company: 'Acme', lifecycle: 'signed_up', hasUserRecord: true, openDealStages: ['Proposal'] }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('in_deal');
+  });
+
+  it('still lets a live active subscription win over an open deal on a stored inbox lead', async () => {
+    const result = await askCrm('is Subwins at acme', 'u1', makeDeps([
+      lead({ firstName: 'Subwins', company: 'Acme', lifecycle: 'inbox', subscriptionState: 'active', openDealStages: ['Proposal'] }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('paying');
+  });
+
   it('keeps a live active subscriber paying despite 60+ days without a login', async () => {
     const result = await askCrm('is Annualcase at acme', 'u1', makeDeps([
       lead({ firstName: 'Annualcase', company: 'Acme', lifecycle: 'inbox', subscriptionState: 'active', hasUserRecord: true, lastActivityAt: '2026-01-01T00:00:00Z' }),
