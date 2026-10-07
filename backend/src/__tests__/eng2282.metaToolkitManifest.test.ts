@@ -103,6 +103,36 @@ describe('ENG-2282 Meta Toolkit manifest', () => {
     expect(agentModeService.launchRetargetingCampaign).not.toHaveBeenCalled();
   });
 
+  it('sources the manifest + default dispatcher from the Meta-only module, never the full Emma registry', async () => {
+    let isolated: any;
+    let metaTools: any;
+    let emmaRegistryModule: any;
+    jest.isolateModules(() => {
+      jest.doMock('../emma/tools', () => {
+        throw new Error('ENG-2282: full Emma tool registry must not be imported');
+      });
+      isolated = require('../mcp/metaToolkitManifest');
+      metaTools = require('../emma/metaTools');
+      emmaRegistryModule = require('../emma/registry');
+    });
+    expect(emmaRegistryModule.emmaToolRegistry.getToolNames()).toEqual([]);
+    expect(metaTools.metaToolRegistry.getToolNames()).toEqual([...META_TOOLKIT_V1_TOOL_NAMES]);
+    expect(isolated.getMetaToolkitManifest().map((d: any) => d.name)).toEqual([...META_TOOLKIT_V1_TOOL_NAMES]);
+
+    const args = { entity_type: 'CAMPAIGN', action: 'CREATE', account_id: 'act_1', params: { name: 'x' } };
+    await isolated.executeMetaToolkitCall('call_meta_marketing_api', args, ctx);
+    expect(agentModeService.callMetaMarketingApi).toHaveBeenCalledWith(
+      'user-1', 'CAMPAIGN', 'CREATE', 'act_1', undefined, undefined, undefined, { name: 'x' }, 's-1',
+    );
+  });
+
+  it('Emma registers the same Meta handler objects (single source, no fork)', () => {
+    const { metaToolRegistry } = require('../emma/metaTools');
+    for (const name of META_TOOLKIT_V1_TOOL_NAMES) {
+      expect(emmaToolRegistry.getTool(name)).toBe(metaToolRegistry.getTool(name));
+    }
+  });
+
   it('allows reads', async () => {
     await executeMetaToolkitCall('list_meta_ads_campaigns', {}, ctx);
     expect(agentModeService.listMetaAdsCampaignsNew).toHaveBeenCalledWith('user-1');
