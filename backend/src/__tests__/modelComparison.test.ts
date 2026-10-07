@@ -29,6 +29,7 @@ import {
   selectCompareResult,
   signSelectToken,
   verifySelectToken,
+  isSameServedModel,
 } from '../services/agentMode/modelComparison';
 import type { ChatMessage } from '../services/chatbotService';
 
@@ -38,23 +39,23 @@ const OWNER = { userId: 'user-1', isAdmin: false };
 const OTHER = { userId: 'user-2', isAdmin: false };
 const ADMIN = { userId: 'admin-1', isAdmin: true };
 
-const flags = { adminOnly: false, internalOnly: false };
-const REGISTRY: Record<string, { name: string; provider: string; isLive: boolean; adminOnly: boolean; internalOnly: boolean }> = {
+const flags = { internalOnly: false };
+const REGISTRY: Record<string, { name: string; provider: string; isLive: boolean; internalOnly: boolean }> = {
   'gpt-5.5': { name: 'GPT-5.5', provider: 'openai', isLive: false, ...flags },
   'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', provider: 'google', isLive: false, ...flags },
   'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', provider: 'anthropic', isLive: false, ...flags },
   'claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', provider: 'anthropic', isLive: false, ...flags },
   'live-voice': { name: 'Live', provider: 'google', isLive: true, ...flags },
   'unpriced-model': { name: 'Unpriced', provider: 'other', isLive: false, ...flags },
-  'admin-only-model': { name: 'Admin only', provider: 'other', isLive: false, adminOnly: true, internalOnly: false },
-  'internal-only-model': { name: 'Internal only', provider: 'other', isLive: false, adminOnly: false, internalOnly: true },
+  'internal-only-model': { name: 'Internal only', provider: 'other', isLive: false, internalOnly: true },
 };
 const ALIASES: Record<string, string> = { 'gpt-5-legacy': 'gpt-5.5' };
 const UNPRICED = new Set(['unpriced-model']);
 
-const ok = (text: string) => ({
+/** A gateway response. With `model` it reports `up/<model>` as having answered (what a real gateway does). */
+const ok = (text: string, model?: string) => ({
   id: 'gen-upstream-123',
-  model: 'openai/gpt-5.5',
+  ...(model ? { model: `up/${model}` } : {}),
   choices: [{ message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
   usage: { prompt_tokens: 11, completion_tokens: 22, total_tokens: 33, cost: 0.0123 },
 });
@@ -74,7 +75,7 @@ function session(over: Partial<CompareSession> = {}): CompareSession {
 
 function makeDeps(over: Partial<CompareDeps> = {}, sess: CompareSession | null = session()) {
   let clock = NOW;
-  const callLLM = jest.fn(async (model: string, _messages?: unknown, _options?: unknown) => ok(`answer from ${model}`));
+  const callLLM = jest.fn(async (model: string, _messages?: unknown, _options?: unknown) => ok(`answer from ${model}`, model));
   const deps: CompareDeps = {
     isAcceptingWork: () => true,
     isFeatureEnabled: async () => true,
@@ -85,6 +86,7 @@ function makeDeps(over: Partial<CompareDeps> = {}, sess: CompareSession | null =
     resolveModel: jest.fn(async ({ requestedModel }) => ({ effectiveModel: requestedModel, modelSelection: 'honored' })),
     getModelInfo: (m) => (Object.prototype.hasOwnProperty.call(REGISTRY, m) ? REGISTRY[m] : null), // mirrors agentModeService.getModelCompareInfo
     isPriced: (m) => !UNPRICED.has(m),
+    servedModelMatches: (m, served) => isSameServedModel(`up/${m}`, served),
     resolveBillingUserId: async (u) => `bill-${u}`,
     callLLM,
     getSecret: () => SECRET,
@@ -408,15 +410,28 @@ describe('POST /compare model rejection (never substituted)', () => {
     expect(callLLM.mock.calls.map((c) => c[0])).toEqual(['anthropic.claude-opus-4-8', 'gpt-5.5']);
   });
 
-  it('adminOnly is refused to a non-admin and allowed to an admin; internalOnly is refused to everyone', async () => {
+  it('has no role logic: an admin and a non-admin get the same result for the same models; internalOnly is refused to everyone', async () => {
     const { deps, callLLM } = makeDeps();
-    const nonAdmin = await run(deps, body({ models: ['admin-only-model', 'gpt-5.5'] }), OWNER);
-    expect(res(nonAdmin).results.map((r: any) => [r.status, r.errorCode])).toEqual([['rejected', 'model_unavailable'], ['ok', undefined]]);
-    const admin = await run(deps, body({ models: ['admin-only-model', 'gpt-5.5'] }), ADMIN);
-    expect(res(admin).results.map((r: any) => r.status)).toEqual(['ok', 'ok']);
-    const internal = await run(deps, body({ models: ['internal-only-model', 'gpt-5.5'] }), ADMIN);
-    expect(res(internal).results.map((r: any) => [r.status, r.errorCode])).toEqual([['rejected', 'model_unavailable'], ['ok', undefined]]);
+    const asUser = await run(deps, body({ models: ['internal-only-model', 'anthropic.claude-opus-4-8', 'gpt-5.5'] }), OWNER);
+    const asAdmin = await run(deps, body({ models: ['internal-only-model', 'anthropic.claude-opus-4-8', 'gpt-5.5'] }), ADMIN);
+    const shape = (o: any) => res(o).results.map((r: any) => [r.model, r.status, r.errorCode]);
+    expect(shape(asUser)).toEqual(shape(asAdmin));
+    expect(shape(asUser)).toEqual([['internal-only-model', 'rejected', 'model_unavailable'], ['anthropic.claude-opus-4-8', 'ok', undefined], ['gpt-5.5', 'ok', undefined]]);
     expect(callLLM.mock.calls.map((c) => c[0])).not.toContain('internal-only-model');
+  });
+
+  it('whether a model is allowed is decided ONLY by the policy resolver: a model it does not honour is rejected, never swapped, for any caller', async () => {
+    const resolveModel = jest.fn(async ({ requestedModel }: { requestedModel: string }) => (
+      requestedModel === 'claude-sonnet-4-6'
+        ? { effectiveModel: 'gpt-5.5', modelSelection: 'corrected' }
+        : { effectiveModel: requestedModel, modelSelection: 'honored' }
+    ));
+    const { deps, callLLM } = makeDeps({ resolveModel });
+    for (const who of [OWNER, ADMIN]) {
+      const out = await run(deps, body({ models: ['claude-sonnet-4-6', 'gpt-5.5'] }), who);
+      expect(res(out).results.map((r: any) => [r.status, r.errorCode])).toEqual([['rejected', 'model_unavailable'], ['ok', undefined]]);
+    }
+    expect(callLLM.mock.calls.every((c) => c[0] === 'gpt-5.5')).toBe(true);
   });
 
   it('a throwing policy resolver fails closed to model_unavailable (no call)', async () => {
@@ -883,5 +898,58 @@ describe('POST /compare/select', () => {
     expect(out.status).toBe(503);
     expect(res(out).code).toBe('model_compare_disabled');
     noWrites(deps, appendMessages);
+  });
+});
+
+
+describe('only the selected model may answer (served-model verification)', () => {
+  const answeredBy = (served: unknown, text = 'an answer') => async () => ({ model: served, choices: [{ message: { content: text }, finish_reason: 'stop' }] });
+  const gptServedAs = (served: unknown, text?: string) =>
+    makeDeps({ callLLM: jest.fn(async (m: string) => (m === 'gpt-5.5' ? answeredBy(served, text)() : ok(`answer from ${m}`, m))) as any });
+
+  it('accepts the selected model: exact id (any case) or a dated snapshot of it', async () => {
+    for (const served of ['up/gpt-5.5', 'UP/GPT-5.5', 'up/gpt-5.5-20260301', 'up/gpt-5.5-2026-03-01']) {
+      const { deps } = gptServedAs(served);
+      const out = await run(deps, body());
+      expect(res(out).results[0]).toMatchObject({ model: 'gpt-5.5', status: 'ok' });
+      expect(typeof res(out).results[0].selectToken).toBe('string');
+    }
+  });
+
+  it('a different model answering is an error: not shown, not signed, and logged with both ids', async () => {
+    const log = jest.fn();
+    const { deps } = makeDeps({ log, callLLM: jest.fn(async (m: string) => (m === 'gpt-5.5' ? answeredBy('up/gemini-3.5-flash', 'I am actually Gemini')() : ok(`answer from ${m}`, m))) as any });
+    const out = await run(deps, body());
+    const [wrong, fine] = res(out).results;
+    expect(wrong).toMatchObject({ model: 'gpt-5.5', status: 'error', errorCode: 'model_mismatch' });
+    expect(wrong.content).toBeUndefined();
+    expect(wrong.selectToken).toBeUndefined();
+    expect(JSON.stringify(res(out))).not.toContain('I am actually Gemini');
+    expect(fine.status).toBe('ok');
+    expect(log).toHaveBeenCalledWith('ModelCompare: a different model answered than the one selected', { requested: 'gpt-5.5', served: 'up/gemini-3.5-flash' });
+  });
+
+  it.each(['up/gpt-5.5-pro', 'up/gpt-5.5-mini', 'up/gpt-5.5:thinking', 'up/gpt-5.5-preview', 'other/gpt-5.5', 'up/gpt-5'])(
+    'a lookalike is a DIFFERENT model and is discarded: %s', async (served) => {
+      const { deps } = gptServedAs(served);
+      const out = await run(deps, body());
+      expect(res(out).results[0]).toMatchObject({ status: 'error', errorCode: 'model_mismatch' });
+      expect(res(out).results[0].selectToken).toBeUndefined();
+    });
+
+  it('isSameServedModel: exact / dated only; empty and non-strings never match', () => {
+    expect(isSameServedModel('openai/gpt-5.5', 'openai/gpt-5.5')).toBe(true);
+    expect(isSameServedModel('openai/gpt-5.5', 'openai/gpt-5.5-20260301')).toBe(true);
+    expect(isSameServedModel('anthropic/claude-opus-4.8', 'anthropic/claude-opus-4.8-2026-03-01')).toBe(true);
+    for (const bad of ['openai/gpt-5.5-pro', 'openai/gpt-5.5-2026', 'openai/gpt-5.5-20260301-x', 'openai/gpt-5.5:free', '', '  ', 5, null, undefined, {}]) {
+      expect(isSameServedModel('openai/gpt-5.5', bad)).toBe(false);
+    }
+    expect(isSameServedModel('', 'openai/gpt-5.5')).toBe(false);
+  });
+
+  it('an unreported served model (no `model` field) is accepted: the gateway always sets it, and a missing field proves nothing either way', async () => {
+    const { deps } = makeDeps({ callLLM: jest.fn(async (m: string) => ok(`answer from ${m}`)) as any });
+    const out = await run(deps, body());
+    expect(res(out).results.map((r: any) => r.status)).toEqual(['ok', 'ok']);
   });
 });

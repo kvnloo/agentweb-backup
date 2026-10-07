@@ -79,6 +79,7 @@ export type CompareErrorCode =
   | 'model_unpriced'
   | 'model_live_unsupported'
   | 'output_limit'
+  | 'model_mismatch'
   | 'empty_response';
 
 export interface CompareResult {
@@ -125,8 +126,7 @@ export interface CompareModelInfo {
   name: string;
   provider: string;
   isLive: boolean;
-  /** Registry flags: the only model-level entitlement gates (there is deliberately no name-based rule). */
-  adminOnly: boolean;
+  /** Internal models (e.g. research agents) are not chat models for anyone. */
   internalOnly: boolean;
 }
 
@@ -151,6 +151,11 @@ export interface CompareDeps {
   resolveModel(input: { userId: string; requestedModel: string }): Promise<CompareModelDecision>;
   getModelInfo(model: string): CompareModelInfo | null;
   isPriced(model: string): boolean;
+  /**
+   * Did the model the gateway reports as having answered correspond to the one that was requested?
+   * Only the selected model may ever answer a comparison column.
+   */
+  servedModelMatches(requestedCanonical: string, served: unknown): boolean;
   /** Resolves a billing owner id for metering (org members pool onto the owner). */
   resolveBillingUserId(userId: string): Promise<string>;
   callLLM(model: string, messages: Array<{ role: string; content: string }>, options: CompareCallOptions): Promise<unknown>;
@@ -374,6 +379,22 @@ function extractText(response: unknown): { text: string; finishReason: string | 
   return { text: '', finishReason };
 }
 
+/**
+ * Is `served` (the model the gateway says answered) the SAME model as `upstreamModel` (the gateway id we
+ * requested)? Strict on purpose: exact id, or that id plus a date snapshot suffix (`-20260301`,
+ * `-2026-03-01`). A longer name is a DIFFERENT model (`gpt-5.5-pro` is not `gpt-5.5`), as is any
+ * `:variant`; so metering's tolerant prefix matcher (which accepts any `-suffix`) is deliberately not used.
+ */
+export function isSameServedModel(upstreamModel: string, served: unknown): boolean {
+  if (typeof served !== 'string') return false;
+  const want = upstreamModel.trim().toLowerCase();
+  const got = served.trim().toLowerCase();
+  if (!want || !got) return false;
+  if (got === want) return true;
+  if (!got.startsWith(`${want}-`)) return false;
+  return /^\d{4}-?\d{2}-?\d{2}$/.test(got.slice(want.length + 1));
+}
+
 function mapCallError(error: unknown): { errorCode: CompareErrorCode; errorClass: string } {
   let errorClass = 'unknown';
   try {
@@ -544,10 +565,10 @@ async function classifyCandidate(
   const candidate: Candidate = { requested, canonical, info };
   if (!info) return { ...candidate, rejection: 'model_unavailable' };
   if (info.isLive) return { ...candidate, rejection: 'model_live_unsupported' };
-  // Entitlement is the registry's flags, never the model's name: a name-based "opus" deny contradicted
-  // the public catalog (ENG-744) and was ruled stale in ENG-2028. Defence in depth: the usage-policy
-  // resolver below already excludes these for the session owner.
-  if (info.internalOnly || (info.adminOnly && !user.isAdmin)) return { ...candidate, rejection: 'model_unavailable' };
+  // Compare has NO role logic: every user and admin may compare any model they can select. Who can
+  // select what is decided in one place only (the registry + usage-policy resolver below), never by
+  // the model's name (a name-based "opus" deny was ruled stale in ENG-2028) and never here.
+  if (info.internalOnly) return { ...candidate, rejection: 'model_unavailable' };
 
   let decision: CompareModelDecision;
   try {
@@ -593,6 +614,14 @@ async function runOne(
     };
     const response = await deps.callLLM(candidate.canonical, messages, options);
     const latencyMs = Math.max(0, deps.now() - started);
+    // The selected model must be the ONLY one that answers. The request names no fallback chain, so the
+    // gateway should serve exactly it; verify what it reports and discard anything else rather than
+    // label another model's answer with the selected model's name (or sign it for "Continue").
+    const served = (response as { model?: unknown } | null | undefined)?.model;
+    if (typeof served === 'string' && served.trim() !== '' && !deps.servedModelMatches(candidate.canonical, served)) {
+      deps.log('ModelCompare: a different model answered than the one selected', { requested: candidate.canonical, served });
+      return { status: 'error', errorCode: 'model_mismatch', latencyMs };
+    }
     const { text, finishReason } = extractText(response);
     // A `length` stop is a truncated answer (possibly all reasoning, no text): never offer
     // it for "Continue", whether or not any text came back.

@@ -17,6 +17,7 @@ import { settingsService } from '../services/settingsService';
 import { checkTokenUsage, resolveBillingUserId } from '../services/tokenUsageService';
 import { buildUsageBlockCopy } from '../utils/usageBlockCopy';
 import { getModelPrice } from '../utils/llmPricing';
+import { resolveOpenRouterUpstreamModelId } from '../utils/openRouterGatewayContract';
 import { isCronEnabled } from '../utils/instanceState';
 import { resolveRunFunding, withRunFunding, type RunFunding } from '../services/funding/runFunding';
 import {
@@ -27,6 +28,7 @@ import {
 import {
   compareModels,
   CompareDeps,
+  isSameServedModel,
   CompareSession,
   MODEL_COMPARE_ENABLED_SETTING,
   newCompareId,
@@ -86,6 +88,15 @@ function compareDeps(): CompareDeps {
     resolveModel: (input) => resolveEffectiveModelForUser(input),
     getModelInfo: (model) => agentModeService.getModelCompareInfo(model),
     isPriced: (model) => getModelPrice(model) !== null,
+    servedModelMatches: (requested, served) => {
+      // Strict (exact or dated snapshot of the same id); fail closed if the id has no gateway
+      // mapping (callLLM would already have refused it).
+      try {
+        return isSameServedModel(resolveOpenRouterUpstreamModelId(requested), served);
+      } catch {
+        return false;
+      }
+    },
     resolveBillingUserId,
     callLLM: async (model, messages, options) => {
       const runFunding = await fundingFor(options.usageContext.userId);

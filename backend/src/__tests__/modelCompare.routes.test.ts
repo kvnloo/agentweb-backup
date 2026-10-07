@@ -42,7 +42,7 @@ jest.mock('../services/chatbotService', () => ({
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     normalizeModelId: (m: string) => m,
-    getModelCompareInfo: (m: string) => ({ name: m, provider: 'other', isLive: false, adminOnly: false, internalOnly: false }),
+    getModelCompareInfo: (m: string) => ({ name: m, provider: 'other', isLive: false, internalOnly: false }),
     callLLM: (...a: unknown[]) => mockCallLLM(...a),
   },
 }));
@@ -128,6 +128,22 @@ describe('POST /compare', () => {
     expect(out.status).toBe(200);
     expect(seen).toHaveLength(2);
     expect(seen).toEqual([{ route: 'agentweb', ownerUserId: 'owner' }, { route: 'agentweb', ownerUserId: 'owner' }]);
+  });
+
+  it('uses the REAL served-model matcher: a dated variant of the selected model passes, another model answering is discarded', async () => {
+    mockCallLLM.mockImplementation(async (model: string) => ({
+      // gpt-5.5 -> served by Gemini instead; gemini-3.5-flash -> dated variant of itself
+      model: model === 'gpt-5.5' ? 'google/gemini-3.5-flash' : 'google/gemini-3.5-flash-20260301',
+      choices: [{ message: { content: `from ${model}` }, finish_reason: 'stop' }],
+    }));
+    const out = await request(app).post('/api/agent-mode/compare').set('Authorization', bearer('owner')).send(validBody);
+    expect(out.status).toBe(200);
+    const [first, second] = out.body.results;
+    expect(first).toMatchObject({ model: 'gpt-5.5', status: 'error', errorCode: 'model_mismatch' });
+    expect(first.content).toBeUndefined();
+    expect(first.selectToken).toBeUndefined();
+    expect(second).toMatchObject({ model: 'gemini-3.5-flash', status: 'ok' });
+    expect(typeof second.selectToken).toBe('string');
   });
 
   it('403 for a non-owner, 404 for a missing session', async () => {
