@@ -3310,6 +3310,8 @@ export const taskDb = {
           name: task.name,
           knowledgeBaseSize: size,
           knowledgeBaseType: task.knowledgeBaseType || 'private',
+          // ENG-427: keep the signed URL so list_knowledge_base_files can link private KBs
+          knowledgeBase: task.knowledgeBase || null,
           knowledgeBaseFiles: task.knowledgeBaseFiles || [],
           knowledgeBaseUpdatedAt: task.knowledgeBaseUpdatedAt || task.updatedAt || task.createdAt,
           // Include additional fields that might be useful

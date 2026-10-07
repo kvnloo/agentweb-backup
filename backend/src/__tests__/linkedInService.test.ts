@@ -378,6 +378,13 @@ describe('LinkedInService', () => {
   });
 
   describe('createPost', () => {
+    it('ENG-428: saves as DRAFT when draft option is set', async () => {
+      mockClient.post.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:share:draft1' } });
+      const result = await service.createPost('token', 'urn:li:person:123', 'Draft me', undefined, undefined, { draft: true });
+      expect(mockClient.post.mock.calls[0][1].lifecycleState).toBe('DRAFT');
+      expect(result).toBe('urn:li:share:draft1');
+    });
+
     it('should create a post with correct payload', async () => {
       mockClient.post.mockResolvedValue({
         data: {},

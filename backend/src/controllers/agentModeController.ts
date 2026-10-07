@@ -13436,6 +13436,13 @@ export const agentModeController = {
     try {
       const user = req.user as User;
       if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
+      // ENG-1805: a test run admitted after shutdown drain starts fails at worker
+      // dispatch ("Worker is draining") and is recorded as a failed run with no retry.
+      // Refuse before creating a session or run record; the caller retries on the
+      // replacement instance (same contract as A-019 for interactive turns).
+      if (!isCronEnabled()) {
+        return res.status(503).json({ error: 'Instance draining — retry on new instance' });
+      }
       const { scheduleId } = req.params;
 
       // Verify schedule exists and belongs to user

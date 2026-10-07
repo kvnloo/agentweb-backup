@@ -16,6 +16,7 @@ import { mcpToolRegistry } from './registry';
 import { jsonResult } from './toolHelpers';
 import { WORKFLOW_TOOL_NAMES } from './workflowTools';
 import { LANDING_WORKFLOW_TOOL_NAMES } from './landingWorkflowTools';
+import { PUBLISH_WORKFLOW_TOOL_NAMES } from './publishWorkflowTools';
 
 export const SEARCH_TOOL_NAME = 'emma_search_tools';
 
@@ -34,6 +35,7 @@ export function listedToolNames(): string[] {
   return [
     ...(WORKFLOW_TOOL_NAMES ?? []),
     ...(LANDING_WORKFLOW_TOOL_NAMES ?? []),
+    ...(PUBLISH_WORKFLOW_TOOL_NAMES ?? []),
     ...SESSION_TOOL_NAMES,
     SEARCH_TOOL_NAME,
   ];

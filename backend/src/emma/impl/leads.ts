@@ -533,6 +533,10 @@ export async function getLeads(listId: string, userId: string, options: {
     status?: string;
     limit?: number;
     cursor?: string;
+    // ENG-425: export callers (CSV) need the full row; without this they fan
+    // out one get_lead_details call per lead. Off by default so the model's
+    // compact browse rows (and token budget) are unchanged.
+    includeAllFields?: boolean;
   } = {}): Promise<any> {
     try {
       const { crmDb } = await import('../../services/db');
@@ -622,6 +626,27 @@ export async function getLeads(listId: string, userId: string, options: {
 
       const nextCursor = cursor ? Buffer.from(JSON.stringify(cursor)).toString('base64') : undefined;
 
+      // ENG-425: full export fields. Same card-revenue boundary as
+      // getLeadDetails (ENG-1388) — org-shared lists must not leak Enigma
+      // card revenue to a non-allowlisted caller through the bulk path.
+      let fullFieldProjector: ((lead: any) => Record<string, any>) | null = null;
+      if (options.includeAllFields) {
+        const { sanitizeEnrichmentMetadataForResponse, stripCardRevenueKeys, shouldHideCardRevenueForViewer } = await import('../../utils/enrichmentMetadataPresentation');
+        const hide = shouldHideCardRevenueForViewer(userId);
+        fullFieldProjector = (lead: any) => {
+          const meta = sanitizeEnrichmentMetadataForResponse(lead.enrichmentMetadata as Record<string, any> | undefined);
+          return {
+            listId: lead.listId || listId,
+            notes: lead.notes || '',
+            linkedin: lead.linkedin || '',
+            customFields: hide ? (stripCardRevenueKeys(lead.customFields) ?? {}) : (lead.customFields || {}),
+            ...(meta ? { enrichmentMetadata: hide ? stripCardRevenueKeys(meta) : meta } : {}),
+            createdAt: lead.createdAt || null,
+            updatedAt: lead.updatedAt || null,
+          };
+        };
+      }
+
       return {
         success: true,
         // ENG-1207: same contract as searchLeads — a truncated page must not be
@@ -651,6 +676,7 @@ export async function getLeads(listId: string, userId: string, options: {
           // the detail path. Spread last so it can only add keys, never shadow
           // an existing one; absent attribution adds nothing at all.
           ...projectLeadAttribution(lead),
+          ...(fullFieldProjector ? fullFieldProjector(lead) : {}),
         })),
         matchCount: matchingLeads.length,
         listName: list.name,
