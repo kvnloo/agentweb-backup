@@ -295,6 +295,40 @@ describe('POST /generate (fail-loud)', () => {
     expect(res.body).toMatchObject({ effectiveModel: DEFAULT_MODEL });
   });
 
+  describe('configured default differs from the code constant (agent_mode_default_model set)', () => {
+    const CONFIGURED = 'gemini-3.5-flash'; // what getDefaultModel() (the setting) returns; DEFAULT_MODEL is the code constant
+    beforeEach(() => { mockAgentModeService.getDefaultModel.mockResolvedValue(CONFIGURED); });
+    afterEach(() => { mockAgentModeService.getDefaultModel.mockResolvedValue(DEFAULT_MODEL); });
+
+    it('stored retired + no request model runs on the configured default and is reported corrected, not honored', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(baseSession(UNSERVED) as any);
+      const res = makeRes();
+      await agentModeController.generateResponse(generateReq({}), res);
+      expect(res.statusCode).toBe(200);
+      expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: CONFIGURED }), expect.anything());
+      expect(res.body).toMatchObject({ effectiveModel: CONFIGURED, modelSelection: 'corrected' });
+      expect(res.body.modelSelectionReason).not.toBe('requested_model_allowed');
+    });
+
+    it('no stored model + no request model gets the configured default, like a brand-new session', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(baseSession() as any);
+      const res = makeRes();
+      await agentModeController.generateResponse(generateReq({}), res);
+      expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: CONFIGURED }), expect.anything());
+    });
+
+    it('resolver: silent-swap retired id falls to the configured default as corrected', async () => {
+      const decision = await resolveEffectiveModelForUser({ userId: OWNER, requestedModel: UNSERVED, allowSilentSwap: true });
+      expect(decision).toMatchObject({ effectiveModel: CONFIGURED, modelSelection: 'corrected' });
+    });
+
+    it('explicit retired id still 422s', async () => {
+      const res = makeRes();
+      await agentModeController.generateResponse(generateReq({ llmModel: UNSERVED }), res);
+      expect(res.statusCode).toBe(422);
+    });
+  });
+
   it('a STORED internalOnly model with no request llmModel runs on the default, never the stored one', async () => {
     mockChatbotDb.getChatSession.mockResolvedValue(baseSession(INTERNAL_ONLY) as any);
     const res = makeRes();

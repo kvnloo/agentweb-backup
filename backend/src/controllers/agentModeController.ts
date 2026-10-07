@@ -453,7 +453,13 @@ export async function resolveEffectiveModelForUser(input: {
   }
   const decision = selectPolicyModel({
     usageMode: usage.mode.usageMode,
-    requestedModel: requestedResolution?.model || input.requestedModel,
+    // A silently-swappable request that is not served (retired stored model) must NOT be
+    // replaced by resolveGenerationModel's code-constant fallback: that constant is not the
+    // configured default and would be labelled 'honored'. Keep the unserved id so
+    // selectPolicyModel corrects it to the configured default (same as a new session).
+    requestedModel: input.allowSilentSwap && requestedResolution?.fellBack
+      ? input.requestedModel
+      : (requestedResolution?.model || input.requestedModel),
     backupModel: backupResolution?.fellBack ? null : (backupResolution?.model || input.backupModel),
     backupSource: input.backupSource,
     systemDefaultModel,
@@ -9491,7 +9497,7 @@ export const agentModeController = {
       try {
         preflightDecision = await resolveEffectiveModelForUser({
           userId: session.userId,
-          requestedModel: llmModel || session.llmModel || agentModeService.default_model,
+          requestedModel: llmModel || session.llmModel || null,
           backupModel: llmBackupModel,
           backupSource: llmBackupModel ? 'user' : null,
           allowSilentSwap: !explicitModelSelection,
@@ -9720,7 +9726,7 @@ export const agentModeController = {
         if (usageStatus.usagePolicyVersion) {
           modelPolicyDecision = await resolveEffectiveModelForUser({
             userId: session.userId,
-            requestedModel: llmModel || session.llmModel || agentModeService.default_model,
+            requestedModel: llmModel || session.llmModel || null,
             backupModel: llmBackupModel,
             backupSource: llmBackupModel ? 'user' : null,
           }).catch((modelError) => {
@@ -9799,7 +9805,7 @@ export const agentModeController = {
         // or the request), so reuse its decision when it resolved cleanly.
         modelPolicyDecision = preflightDecision ?? await resolveEffectiveModelForUser({
           userId: session.userId,
-          requestedModel: llmModel || session.llmModel || agentModeService.default_model,
+          requestedModel: llmModel || session.llmModel || null,
           backupModel: llmBackupModel,
           backupSource: llmBackupModel ? 'user' : null,
           allowSilentSwap: !explicitModelSelection,
