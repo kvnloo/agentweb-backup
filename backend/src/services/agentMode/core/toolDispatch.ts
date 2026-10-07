@@ -254,9 +254,18 @@ export function seedSearchCallCountFromHistory(
 }
 
 /** A tool-result outcome from the gateway, normalized into the loop's union shape. */
-/** Org-settings writes a share-link visitor (who runs as the owner) must never reach. */
+/**
+ * Owner-scoped tools a share-link visitor (who runs as the owner's userId) must never reach:
+ * org settings reads/writes and org/personal memory writes. Memory written here is injected
+ * into later owner/org sessions, so a visitor could otherwise poison or delete it.
+ */
 export const SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS: ReadonlySet<string> = new Set([
+  'get_lead_notification_settings',
   'update_lead_notification_settings',
+  'save_org_memory',
+  'delete_org_memory',
+  'save_memory',
+  'delete_memory',
 ]);
 
 export interface ToolExecOutcome {
@@ -772,7 +781,7 @@ export async function executePreparedTools(
       // A share-link visitor runs under the owner's userId, so owner-only org-settings
       // writes must be refused here rather than by the tool's own role check.
       if (isInteractiveShare && SHARED_SESSION_BLOCKED_ORG_SETTINGS_TOOLS.has(toolCall.function.name)) {
-        const errorMsg = `Tool "${toolCall.function.name}" changes organization settings and is not available in shared sessions. The org owner or an admin can change it in Agent Mode in their own session.`;
+        const errorMsg = `Tool "${toolCall.function.name}" acts on the owner's organization settings or memory and is not available in shared sessions. The owner can use it in Agent Mode in their own session.`;
         appendPreflightToolFailure(toolCall, functionArgs, errorMsg, JSON.stringify({ error: errorMsg }));
         continue;
       }
