@@ -2374,10 +2374,16 @@ export class AgentModeService {
    * ENG-55: registry facts the model-compare feature needs (display name, lab, live
    * flag) without exposing the registry. Null for ids that are not registry keys.
    */
-  getModelCompareInfo(modelId: string): { name: string; provider: string; isLive: boolean } | null {
+  getModelCompareInfo(modelId: string): { name: string; provider: string; isLive: boolean; adminOnly: boolean; internalOnly: boolean } | null {
     if (!Object.prototype.hasOwnProperty.call(this.llmModels, modelId)) return null;
     const config = this.llmModels[modelId];
-    return { name: config.name ?? modelId, provider: config.provider ?? 'other', isLive: config.isLive === true };
+    return {
+      name: config.name ?? modelId,
+      provider: config.provider ?? 'other',
+      isLive: config.isLive === true,
+      adminOnly: config.adminOnly === true,
+      internalOnly: config.internalOnly === true,
+    };
   }
 
   /**

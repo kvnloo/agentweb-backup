@@ -84,7 +84,6 @@ function compareDeps(): CompareDeps {
     buildUsageBlock: (month) => buildUsageBlockCopy({ month }),
     normalizeModelId: (model) => agentModeService.normalizeModelId(model),
     resolveModel: (input) => resolveEffectiveModelForUser(input),
-    isModelSelectableBy: (model, isAdmin) => agentModeService.isModelSelectableBy(model, isAdmin),
     getModelInfo: (model) => agentModeService.getModelCompareInfo(model),
     isPriced: (model) => getModelPrice(model) !== null,
     resolveBillingUserId,

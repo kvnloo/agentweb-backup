@@ -42,8 +42,7 @@ jest.mock('../services/chatbotService', () => ({
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     normalizeModelId: (m: string) => m,
-    isModelSelectableBy: () => true,
-    getModelCompareInfo: (m: string) => ({ name: m, provider: 'other', isLive: false }),
+    getModelCompareInfo: (m: string) => ({ name: m, provider: 'other', isLive: false, adminOnly: false, internalOnly: false }),
     callLLM: (...a: unknown[]) => mockCallLLM(...a),
   },
 }));

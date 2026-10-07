@@ -38,13 +38,16 @@ const OWNER = { userId: 'user-1', isAdmin: false };
 const OTHER = { userId: 'user-2', isAdmin: false };
 const ADMIN = { userId: 'admin-1', isAdmin: true };
 
-const REGISTRY: Record<string, { name: string; provider: string; isLive: boolean }> = {
-  'gpt-5.5': { name: 'GPT-5.5', provider: 'openai', isLive: false },
-  'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', provider: 'google', isLive: false },
-  'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', provider: 'anthropic', isLive: false },
-  'claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', provider: 'anthropic', isLive: false },
-  'live-voice': { name: 'Live', provider: 'google', isLive: true },
-  'unpriced-model': { name: 'Unpriced', provider: 'other', isLive: false },
+const flags = { adminOnly: false, internalOnly: false };
+const REGISTRY: Record<string, { name: string; provider: string; isLive: boolean; adminOnly: boolean; internalOnly: boolean }> = {
+  'gpt-5.5': { name: 'GPT-5.5', provider: 'openai', isLive: false, ...flags },
+  'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', provider: 'google', isLive: false, ...flags },
+  'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', provider: 'anthropic', isLive: false, ...flags },
+  'claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', provider: 'anthropic', isLive: false, ...flags },
+  'live-voice': { name: 'Live', provider: 'google', isLive: true, ...flags },
+  'unpriced-model': { name: 'Unpriced', provider: 'other', isLive: false, ...flags },
+  'admin-only-model': { name: 'Admin only', provider: 'other', isLive: false, adminOnly: true, internalOnly: false },
+  'internal-only-model': { name: 'Internal only', provider: 'other', isLive: false, adminOnly: false, internalOnly: true },
 };
 const ALIASES: Record<string, string> = { 'gpt-5-legacy': 'gpt-5.5' };
 const UNPRICED = new Set(['unpriced-model']);
@@ -80,7 +83,6 @@ function makeDeps(over: Partial<CompareDeps> = {}, sess: CompareSession | null =
     buildUsageBlock: () => ({ message: 'Usage paused until reset' }),
     normalizeModelId: (m) => ALIASES[m] ?? m,
     resolveModel: jest.fn(async ({ requestedModel }) => ({ effectiveModel: requestedModel, modelSelection: 'honored' })),
-    isModelSelectableBy: (m, isAdmin) => !(m.includes('opus') && !isAdmin),
     getModelInfo: (m) => (Object.prototype.hasOwnProperty.call(REGISTRY, m) ? REGISTRY[m] : null), // mirrors agentModeService.getModelCompareInfo
     isPriced: (m) => !UNPRICED.has(m),
     resolveBillingUserId: async (u) => `bill-${u}`,
@@ -390,16 +392,31 @@ describe('POST /compare model rejection (never substituted)', () => {
     expect(callLLM).not.toHaveBeenCalled();
   });
 
-  it('unknown id, live model, unpriced model and non-selectable (opus for non-admin) are rejected with the right code', async () => {
+  it('unknown id, live model and unpriced model are rejected with the right code and never called', async () => {
     const { deps, callLLM } = makeDeps();
     const unknown = await run(deps, body({ models: ['not-a-model', 'live-voice'] }));
     expect(res(unknown).results.map((r: any) => [r.status, r.errorCode])).toEqual([['rejected', 'model_unavailable'], ['rejected', 'model_live_unsupported']]);
-    const mixed = await run(deps, body({ models: ['unpriced-model', 'anthropic.claude-opus-4-8', 'gpt-5.5'] }));
-    expect(res(mixed).results.map((r: any) => r.errorCode)).toEqual(['model_unpriced', 'model_unavailable', undefined]);
+    const mixed = await run(deps, body({ models: ['unpriced-model', 'gpt-5.5'] }));
+    expect(res(mixed).results.map((r: any) => r.errorCode)).toEqual(['model_unpriced', undefined]);
     expect(callLLM.mock.calls.map((c) => c[0])).toEqual(['gpt-5.5']);
-    // an admin may compare the opus model
-    const admin = await run(deps, body({ models: ['anthropic.claude-opus-4-8', 'gpt-5.5'] }), ADMIN);
-    expect(res(admin).results[0].status).toBe('ok');
+  });
+
+  it('entitlement is the registry flags, not the model name: a non-admin MAY compare an Opus model (ENG-744/ENG-2028)', async () => {
+    const { deps, callLLM } = makeDeps();
+    const out = await run(deps, body({ models: ['anthropic.claude-opus-4-8', 'gpt-5.5'] }), OWNER);
+    expect(res(out).results.map((r: any) => r.status)).toEqual(['ok', 'ok']);
+    expect(callLLM.mock.calls.map((c) => c[0])).toEqual(['anthropic.claude-opus-4-8', 'gpt-5.5']);
+  });
+
+  it('adminOnly is refused to a non-admin and allowed to an admin; internalOnly is refused to everyone', async () => {
+    const { deps, callLLM } = makeDeps();
+    const nonAdmin = await run(deps, body({ models: ['admin-only-model', 'gpt-5.5'] }), OWNER);
+    expect(res(nonAdmin).results.map((r: any) => [r.status, r.errorCode])).toEqual([['rejected', 'model_unavailable'], ['ok', undefined]]);
+    const admin = await run(deps, body({ models: ['admin-only-model', 'gpt-5.5'] }), ADMIN);
+    expect(res(admin).results.map((r: any) => r.status)).toEqual(['ok', 'ok']);
+    const internal = await run(deps, body({ models: ['internal-only-model', 'gpt-5.5'] }), ADMIN);
+    expect(res(internal).results.map((r: any) => [r.status, r.errorCode])).toEqual([['rejected', 'model_unavailable'], ['ok', undefined]]);
+    expect(callLLM.mock.calls.map((c) => c[0])).not.toContain('internal-only-model');
   });
 
   it('a throwing policy resolver fails closed to model_unavailable (no call)', async () => {

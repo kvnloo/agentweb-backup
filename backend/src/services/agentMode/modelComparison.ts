@@ -125,6 +125,9 @@ export interface CompareModelInfo {
   name: string;
   provider: string;
   isLive: boolean;
+  /** Registry flags: the only model-level entitlement gates (there is deliberately no name-based rule). */
+  adminOnly: boolean;
+  internalOnly: boolean;
 }
 
 export interface CompareModelDecision {
@@ -146,7 +149,6 @@ export interface CompareDeps {
   buildUsageBlock(month: string | null | undefined): { message: string };
   normalizeModelId(model: string): string;
   resolveModel(input: { userId: string; requestedModel: string }): Promise<CompareModelDecision>;
-  isModelSelectableBy(model: string, isAdmin: boolean): boolean;
   getModelInfo(model: string): CompareModelInfo | null;
   isPriced(model: string): boolean;
   /** Resolves a billing owner id for metering (org members pool onto the owner). */
@@ -542,7 +544,10 @@ async function classifyCandidate(
   const candidate: Candidate = { requested, canonical, info };
   if (!info) return { ...candidate, rejection: 'model_unavailable' };
   if (info.isLive) return { ...candidate, rejection: 'model_live_unsupported' };
-  if (!deps.isModelSelectableBy(canonical, user.isAdmin)) return { ...candidate, rejection: 'model_unavailable' };
+  // Entitlement is the registry's flags, never the model's name: a name-based "opus" deny contradicted
+  // the public catalog (ENG-744) and was ruled stale in ENG-2028. Defence in depth: the usage-policy
+  // resolver below already excludes these for the session owner.
+  if (info.internalOnly || (info.adminOnly && !user.isAdmin)) return { ...candidate, rejection: 'model_unavailable' };
 
   let decision: CompareModelDecision;
   try {
