@@ -1,4 +1,4 @@
-import { byokCoverage, detectFrontier, parseEndpointProviders, renderCoverage } from '../frontierMonitor';
+import { byokCoverage, detectFrontier, parseEndpointProviders, renderCoverage, renderPrBody } from '../frontierMonitor';
 import { refreshModelCatalog } from '../modelCatalogRefresh';
 import { LLMModelConfig } from '../llmModelRegistry';
 
@@ -74,5 +74,22 @@ describe('frontier monitor acceptance and boundary invariants', () => {
     expect(coverage).toHaveLength(3);
     expect(request).toHaveBeenCalledTimes(2);
     expect(renderCoverage(coverage, '2026-09-24')).toContain('does not verify configured BYOK keys');
+  });
+});
+
+describe('renderPrBody', () => {
+  it('puts warning-sign reports in the PR body up front so a reviewer cannot miss them', () => {
+    const outlier = '⚠️ PRICE OUTLIER: openrouter/x/y blended $0.338/M is 3.6x its closest "z" family sibling ($0.093/M) — verify before merging.';
+    const body = renderPrBody(['Artificial Analysis skipped: key missing', outlier]);
+    expect(body).toContain('## Review before merging');
+    expect(body).toContain(`- ${outlier}`);
+    expect(body.indexOf(outlier)).toBeLessThan(body.indexOf('<details>'));
+    expect(body).toContain('- Artificial Analysis skipped: key missing');
+  });
+  it('omits both sections when there is nothing to report', () => {
+    const body = renderPrBody([]);
+    expect(body).not.toContain('Review before merging');
+    expect(body).not.toContain('<details>');
+    expect(body).toContain('Rollback: revert this PR.');
   });
 });
