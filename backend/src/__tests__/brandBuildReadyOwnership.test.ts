@@ -39,13 +39,16 @@ jest.mock('../services/agentMode/brandLogo', () => ({
   downloadBrandLogoToS3: jest.fn(),
 }));
 
-import { updateBrandGuidelines } from '../emma/impl/brandMarketStrategy';
+import { updateBrandGuidelines, updateMarketStrategy } from '../emma/impl/brandMarketStrategy';
 import {
   brandBuildOwnershipCondition,
   brandBuildSessionPageIdentifier,
-  isBrandBuildSessionSuperseded,
+  BRAND_BUILD_SESSION_LIFETIME_MS,
+  isClaimSuperseded,
   parseBrandBuildSessionClaim,
+  shouldRefuseBrandBuildSessionWrite,
 } from '../services/brandBuildSessionMarker';
+import { toolResultError, ToolResultPolicyBlockedError } from '../utils/toolResultError';
 const { userDb } = require('../services/db');
 
 const T1 = '2026-10-07T10:00:00.000Z'; // original (zombie) run's claim
@@ -129,11 +132,35 @@ describe('brand-build session marker', () => {
     expect(/\|scheduleId:([a-f0-9-]+)\s*$/.test(id)).toBe(false); // extractScheduleId
   });
 
-  it('only calls a session superseded when both claims are known and differ', () => {
-    expect(isBrandBuildSessionSuperseded(T1, T2)).toBe(true);
-    expect(isBrandBuildSessionSuperseded(T2, T2)).toBe(false);
-    expect(isBrandBuildSessionSuperseded(undefined, T2)).toBe(false); // not a brand-build session
-    expect(isBrandBuildSessionSuperseded(T1, undefined)).toBe(false); // cannot prove it
+  it('isClaimSuperseded needs both claims known and different', () => {
+    expect(isClaimSuperseded(T1, T2)).toBe(true);
+    expect(isClaimSuperseded(T2, T2)).toBe(false);
+    expect(isClaimSuperseded(undefined, T2)).toBe(false);
+    expect(isClaimSuperseded(T1, undefined)).toBe(false);
+  });
+
+  describe('shouldRefuseBrandBuildSessionWrite (a zombie is bounded; an old reopened chat is not)', () => {
+    const justAfterT1 = Date.parse(T1) + 60_000;
+    const longAfterT1 = Date.parse(T1) + BRAND_BUILD_SESSION_LIFETIME_MS + 1_000;
+
+    it('refuses a superseded session while its claim is recent enough that the session may still be running', () => {
+      expect(shouldRefuseBrandBuildSessionWrite(T1, { startedAt: T2, status: 'ready' }, justAfterT1)).toBe(true);
+    });
+
+    it('refuses a superseded session whenever a newer build is in flight, however old the session', () => {
+      expect(shouldRefuseBrandBuildSessionWrite(T1, { startedAt: T2, status: 'building' }, longAfterT1)).toBe(true);
+    });
+
+    it('lets an old brand-build chat, reopened long after with no build in flight, behave like ordinary chat', () => {
+      expect(shouldRefuseBrandBuildSessionWrite(T1, { startedAt: T2, status: 'ready' }, longAfterT1)).toBe(false);
+      expect(shouldRefuseBrandBuildSessionWrite(T1, { startedAt: T2, status: 'failed' }, longAfterT1)).toBe(false);
+    });
+
+    it('never refuses the current claim, an unmarked session, or an unparseable marker', () => {
+      expect(shouldRefuseBrandBuildSessionWrite(T2, { startedAt: T2, status: 'building' }, justAfterT1)).toBe(false);
+      expect(shouldRefuseBrandBuildSessionWrite(undefined, { startedAt: T2, status: 'building' }, justAfterT1)).toBe(false);
+      expect(shouldRefuseBrandBuildSessionWrite('garbage', { startedAt: T2, status: 'ready' }, justAfterT1)).toBe(false);
+    });
   });
 });
 
@@ -152,6 +179,28 @@ describe('update_brand_guidelines from a brand-build session', () => {
     expect(record.brandGuidelines).toEqual(ORIGINAL_GUIDELINES);
     expect(record.brandBuildStatus).toBe('building');
     expect(readyMetrics()).toHaveLength(0);
+  });
+
+  it('the refusal reaches the model as a deliberate policy block that carries the stop instruction in `error`', async () => {
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(T1));
+
+    const result = await updateBrandGuidelines({ brandData: { brandName: 'Zombie Brand' } }, 'u1', {
+      sessionId: 'sess-zombie',
+    });
+
+    // Run it through the same conversion the tool dispatcher applies. Before
+    // this shape, `error` ("Superseded brand build") won over `message`, so the
+    // model was never told to stop and was invited to retry with new arguments.
+    const err = toolResultError(result);
+    expect(err).toBeInstanceOf(ToolResultPolicyBlockedError); // not counted as a tool malfunction
+    expect(err!.message).toMatch(/do not retry/i);
+    expect(err!.message).toMatch(/end your turn/i);
+  });
+
+  it('looks the session up with a consistent read, so a session created moments ago is visible', async () => {
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(T2));
+    await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1', { sessionId: 'sess-owner' });
+    expect(mockGetChatSessionRecord).toHaveBeenCalledWith('sess-owner', true);
   });
 
   it("the owning session writes its guidelines and flips ready, both conditioned on its claim", async () => {
@@ -257,5 +306,116 @@ describe('update_brand_guidelines from sessions that are NOT brand-build session
 
     expect(result.success).toBe(true);
     expect(mockGetChatSessionRecord).not.toHaveBeenCalled();
+  });
+});
+
+describe('an old brand-build chat reopened long after (ordinary chat again)', () => {
+  it('may still update brand guidelines, unconditionally, once no build is in flight and the claim is old', async () => {
+    const OLD = new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString();
+    record.brandBuildStatus = 'ready';
+    record.brandBuildStartedAt = new Date().toISOString(); // a later build finished
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(OLD));
+
+    const result = await updateBrandGuidelines({ brandData: { brandName: 'Renamed' } }, 'u1', {
+      sessionId: 'old-chat',
+    });
+
+    expect(result.success).toBe(true);
+    expect(record.brandGuidelines.brandData.brandName).toBe('Renamed');
+    for (const [, , options] of guidelinesWrites()) expect(options).toBeUndefined();
+  });
+
+  it('is refused while a newer build is in flight', async () => {
+    const OLD = new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString();
+    record.brandBuildStatus = 'building';
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(OLD));
+
+    const result = await updateBrandGuidelines({ brandData: { brandName: 'Renamed' } }, 'u1', {
+      sessionId: 'old-chat',
+    });
+
+    expect(result).toMatchObject({ success: false, superseded: true });
+    expect(record.brandGuidelines).toEqual(ORIGINAL_GUIDELINES);
+  });
+});
+
+describe('org members (brand data lives on the org record, which has no claim to condition on)', () => {
+  const org = { orgId: 'org1', ownerUserId: 'u1', brandGuidelines: { brandData: { brandName: 'Org Brand' }, attachments: [] } };
+
+  beforeEach(() => {
+    record.orgId = 'org1';
+    record.orgRole = 'owner';
+    const { orgDb } = require('../services/db');
+    orgDb.getOrgById.mockResolvedValue(org);
+    orgDb.updateOrg.mockReset();
+    orgDb.updateOrg.mockResolvedValue({});
+    userDb.getUserByEmailConsistent = jest.fn(async () => JSON.parse(JSON.stringify(record)));
+  });
+
+  it('a superseded session is refused before any org write', async () => {
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(T1));
+    const result = await updateBrandGuidelines({ brandData: { brandName: 'Zombie' } }, 'u1', { sessionId: 'z' });
+    expect(result).toMatchObject({ success: false, superseded: true });
+    expect(require('../services/db').orgDb.updateOrg).not.toHaveBeenCalled();
+  });
+
+  it('a reclaim landing after the check but before the org write is caught by the consistent re-read', async () => {
+    mockGetChatSessionRecord.mockImplementation(async () => {
+      // reclaim lands while the hook is still working, after it read the user
+      record.brandBuildStartedAt = '2026-10-07T10:09:00.000Z';
+      return brandBuildSession(T2);
+    });
+    const result = await updateBrandGuidelines({ brandData: { brandName: 'Zombie' } }, 'u1', { sessionId: 'z' });
+    expect(result).toMatchObject({ success: false, superseded: true });
+    expect(require('../services/db').orgDb.updateOrg).not.toHaveBeenCalled();
+  });
+
+  it('the owning session still writes the org brand', async () => {
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(T2));
+    const result = await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1', { sessionId: 'o' });
+    expect(result.success).toBe(true);
+    expect(require('../services/db').orgDb.updateOrg).toHaveBeenCalled();
+  });
+});
+
+describe('update_market_strategy gets the same guard', () => {
+  const strategy = { businessOverview: 'Zombie overview' };
+
+  it('a superseded brand-build session cannot overwrite the market strategy', async () => {
+    record.marketStrategy = { businessOverview: 'Newer run overview', competitors: [], icp: [] };
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(T1));
+
+    const result = await updateMarketStrategy(strategy, 'u1', { sessionId: 'z' });
+
+    expect(result).toMatchObject({ success: false, superseded: true });
+    expect(record.marketStrategy.businessOverview).toBe('Newer run overview');
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+  });
+
+  it('a reclaim landing after the check rejects the conditioned write', async () => {
+    record.marketStrategy = { businessOverview: 'Newer run overview', competitors: [], icp: [] };
+    mockGetChatSessionRecord.mockImplementation(async () => {
+      record.brandBuildStartedAt = '2026-10-07T10:09:00.000Z';
+      return brandBuildSession(T2);
+    });
+
+    const result = await updateMarketStrategy(strategy, 'u1', { sessionId: 'z' });
+
+    expect(result).toMatchObject({ success: false, superseded: true });
+    expect(record.marketStrategy.businessOverview).toBe('Newer run overview');
+  });
+
+  it('the owning session writes, conditioned on its claim', async () => {
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(T2));
+    const result = await updateMarketStrategy(strategy, 'u1', { sessionId: 'o' });
+    expect(result.success).toBe(true);
+    expect(userDb.updateUser.mock.calls[0][2].condition).toEqual(brandBuildOwnershipCondition(T2));
+  });
+
+  it('ordinary sessions and callers with no session id are unchanged', async () => {
+    mockGetChatSessionRecord.mockResolvedValue({ sessionId: 'x', pageIdentifier: 'agent-mode' });
+    expect((await updateMarketStrategy(strategy, 'u1', { sessionId: 'x' })).success).toBe(true);
+    expect((await updateMarketStrategy(strategy, 'u1')).success).toBe(true);
+    for (const [, , options] of userDb.updateUser.mock.calls) expect(options).toBeUndefined();
   });
 });

@@ -96,9 +96,14 @@ describe('brand/market-strategy cluster delegates to emma/impl/brandMarketStrate
     mockBrandMarketStrategy.updateMarketStrategy.mockResolvedValue(expected);
     const args = { businessOverview: 'We sell widgets.' };
 
-    const result = await emmaToolRegistry.getTool('update_market_strategy')!.execute(args, { userId: 'u1' });
+    const result = await emmaToolRegistry
+      .getTool('update_market_strategy')!
+      .execute(args, { userId: 'u1', sessionId: 's1' });
 
-    expect(mockBrandMarketStrategy.updateMarketStrategy).toHaveBeenCalledWith(args, 'u1');
+    // The session id lets a superseded brand-build session be refused (ENG-2308).
+    expect(mockBrandMarketStrategy.updateMarketStrategy).toHaveBeenCalledWith(args, 'u1', {
+      sessionId: 's1',
+    });
     expect(result).toBe(expected);
   });
 
