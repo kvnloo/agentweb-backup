@@ -64,7 +64,7 @@ import { userDb } from '../services/db';
  *
  *  A. `agentModeService.createMetaAdsAdSet` resolves bid strategy as
  *     `args.bid_strategy || 'LOWEST_COST_WITHOUT_CAP'`, and the model-facing
- *     AD_SET CREATE contract in `emma/tools.ts` never lists bid_strategy as
+ *     AD_SET CREATE contract in `emma/metaTools.ts` never lists bid_strategy as
  *     writable on create. So the model omits it and the silent default lands.
  *
  *  B. Dayparting has no representation anywhere in the backend. A caller asking
