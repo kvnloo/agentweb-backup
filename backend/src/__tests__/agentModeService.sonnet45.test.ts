@@ -86,19 +86,21 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(models).toContain('anthropic.claude-sonnet-4-6');
     });
 
-    it('should include Claude Opus 4.6 in the supported models for admins', async () => {
-      const models = await agentModeService.getSupportedModels(true);
+    // Every user and admin selects from the same catalog: Opus 4.6 was the last adminOnly model.
+    it.each([true, false])('includes Claude Opus 4.6 in the supported models (isAdmin=%s)', async (isAdmin) => {
+      const models = await agentModeService.getSupportedModels(isAdmin);
       expect(models).toContain('anthropic.claude-opus-4-6-v1');
     });
 
-    it('should NOT include Claude Opus 4.6 in the supported models for non-admins', async () => {
-      const models = await agentModeService.getSupportedModels(false);
-      expect(models).not.toContain('anthropic.claude-opus-4-6-v1');
+    it('includes Claude Opus 4.6 by default (no admin flag)', async () => {
+      const models = await agentModeService.getSupportedModels();
+      expect(models).toContain('anthropic.claude-opus-4-6-v1');
     });
 
-    it('should NOT include Claude Opus 4.6 by default (non-admin)', async () => {
-      const models = await agentModeService.getSupportedModels();
-      expect(models).not.toContain('anthropic.claude-opus-4-6-v1');
+    it('the admin catalog and the user catalog are identical: no model is role-gated', async () => {
+      expect(await agentModeService.getSupportedModels(false)).toEqual(await agentModeService.getSupportedModels(true));
+      const gated = Object.entries((agentModeService as any).llmModels).filter(([, m]: [string, any]) => m.adminOnly === true).map(([id]) => id);
+      expect(gated).toEqual([]);
     });
 
     it('should include Claude Opus 4.8 in the supported models for admins', async () => {
@@ -371,9 +373,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
      * 2026-08-19 — every OpenRouter entry opened to everyone. Harsha: "i'm
      * fine to include open source / open router stuff for all users not
      * just isadmin." Was `adminOnly: true` on each (gated as
-     * unproven-in-our-stack); removed. Does NOT touch adminOnly gates
-     * elsewhere in the registry that exist for unrelated reasons (e.g.
-     * anthropic.claude-opus-4-6-v1, still Bedrock-Claude-tier-gated).
+     * unproven-in-our-stack); removed. Opus 4.6 (formerly kept adminOnly as
+     * "Bedrock-Claude-tier-gated") was opened afterwards: every user and admin
+     * selects from one catalog.
      */
     describe('2026-08-19 — OpenRouter models opened to everyone (no longer adminOnly)', () => {
       const OPENROUTER_IDS = [
@@ -401,8 +403,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(models).toContain(id);
       });
 
-      it('does NOT touch an adminOnly gate that exists for a non-OpenRouter reason', () => {
-        expect((agentModeService as any).llmModels['anthropic.claude-opus-4-6-v1'].adminOnly).toBe(true);
+      it('Opus 4.6, the last adminOnly model, is open to everyone too', () => {
+        expect((agentModeService as any).llmModels['anthropic.claude-opus-4-6-v1'].adminOnly).toBeUndefined();
       });
     });
 
