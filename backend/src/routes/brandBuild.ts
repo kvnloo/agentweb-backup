@@ -176,8 +176,14 @@ router.post("/brand-build/start", authenticateToken, async (req, res) => {
     void triggerBrandBuildForUser(userId).catch((e) => {
       console.error("[brandBuild] background trigger crashed", e);
     });
-    const user = await userDb.getUserById(userId);
-    return res.json({ status: snapshot(user || (patch as any)) });
+    // Return the snapshot built from the patch we just persisted — do NOT
+    // read back via getUserById here (ENG-2308 review follow-up, mirrors
+    // icp/competitor/creative-dir/ad-copy's own fix for the same issue):
+    // UserIdIndex is eventually consistent, and a stale GSI read right
+    // after this write can return the pre-update row (e.g. no
+    // brandBuildStatus, or a stale ready/failed from a previous attempt),
+    // telling the FE to stop polling for a build that is in fact running.
+    return res.json({ status: snapshot(patch) });
   } catch (err) {
     console.error("[brandBuild] start failed", err);
     return res.status(500).json({ message: "Failed to start brand build" });
