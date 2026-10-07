@@ -34,12 +34,15 @@ it('can re-enable disabled settings and accepts an empty selection', async () =>
   org.leadNotifications.enabled = false;
   expect(await update({ leadTypes: [], enabled: true })).toMatchObject({ enabled: true, leadTypes: [] });
 });
+it('treats null optional enabled/mentions as omitted', async () => {
+  expect(await update({ leadTypes: ['form_fill'], enabled: null, mentions: null })).toMatchObject({ leadTypes: ['form_fill'], enabled: true, mentions: ['U123'] });
+});
 it.each([
   {}, { leadTypes: 'linkedin' }, { leadTypes: ['unknown'] }, { leadTypes: [null] },
   { leadTypes: ['linkedin', 'linkedin'] }, { leadTypes: null },
   { leadTypes: [], enabled: 'true' }, { leadTypes: [], mentions: ['<!channel>'] },
   { leadTypes: [], mentions: [123] }, { leadTypes: [], mentions: 'U123' },
-  { leadTypes: [], mentions: null }, { leadTypes: [], mentions: Array(51).fill('U123') },
+{ leadTypes: [], mentions: Array(51).fill('U123') },
   { leadTypes: [], orgId: 'org-b' }, { leadTypes: [], userId: 'victim' },
   { leadTypes: [], slackChannelId: 'COTHER' }, null, [],
 ])('rejects invalid or scope-changing arguments %j', async args => {

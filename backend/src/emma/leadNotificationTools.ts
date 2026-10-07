@@ -72,6 +72,9 @@ emmaToolRegistry.register({
   },
   execute: async (args: unknown, context?: any) => {
     validateArgs(args, ['leadTypes', 'enabled', 'mentions']);
+    // Models often send null for omitted optionals; treat null as "not provided".
+    if (args.enabled === null) delete args.enabled;
+    if (args.mentions === null) delete args.mentions;
     if (!isLeadTypes(args.leadTypes) || (args.enabled !== undefined && typeof args.enabled !== 'boolean')) {
       throw new Error('Invalid lead types or enabled flag');
     }
