@@ -329,7 +329,8 @@ describe('ENG-838/ENG-842 — ad set bid strategy and dayparting must not silent
   describe('A — the model-facing contract lists every field the handler accepts', () => {
     it('documents bid_strategy on AD_SET CREATE so the model knows it is writable', () => {
       const toolsSrc = fs.readFileSync(
-        path.join(__dirname, '..', 'emma', 'tools.ts'),
+        // The Meta tool definitions moved out of emma/tools.ts into emma/metaTools.ts (ENG-2282).
+        path.join(__dirname, '..', 'emma', 'metaTools.ts'),
         'utf8'
       );
       const lines = toolsSrc.split('\n');
