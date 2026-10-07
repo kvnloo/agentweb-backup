@@ -313,7 +313,8 @@ export function buildCompareMessages(history: readonly ChatMessage[] | undefined
  * preflight so no model is billed for a result that could never be continued.
  */
 function sessionNotStartedOutcome(history: readonly ChatMessage[] | undefined): ServiceOutcome | null {
-  if (!history || history.length === 0 || history[0].role !== 'system') {
+  // A fresh sidebar chat already has its system message but no turn yet: require a user turn too.
+  if (!history || history.length === 0 || history[0].role !== 'system' || !history.some((m) => m.role === 'user')) {
     return fail(409, 'Send a message in this chat before continuing from a comparison.', 'compare_session_not_started');
   }
   return null;
@@ -381,18 +382,38 @@ function extractText(response: unknown): { text: string; finishReason: string | 
 
 /**
  * Is `served` (the model the gateway says answered) the SAME model as `upstreamModel` (the gateway id we
- * requested)? Strict on purpose: exact id, or that id plus a date snapshot suffix (`-20260301`,
- * `-2026-03-01`). A longer name is a DIFFERENT model (`gpt-5.5-pro` is not `gpt-5.5`), as is any
- * `:variant`; so metering's tolerant prefix matcher (which accepts any `-suffix`) is deliberately not used.
+ * requested)? OpenRouter reports its CANONICAL slug, which is dated (`openai/gpt-5.5` ->
+ * `openai/gpt-5.5-20260423`) and for some Claude models also reordered (`anthropic/claude-opus-4.8` ->
+ * `anthropic/claude-4.8-opus-20260528`). So: same vendor prefix, trailing date dropped, and the remaining
+ * `-` tokens compared as an order-insensitive multiset (a version like `4.8` is one atom, so 4.6 != 6.4).
+ * A longer or different name is a DIFFERENT model (`gpt-5.5-pro`, `gpt-5.5-mini`, `gpt-5`), as is any
+ * `:variant` or other vendor. Metering's tolerant prefix matcher is deliberately not used.
  */
 export function isSameServedModel(upstreamModel: string, served: unknown): boolean {
-  if (typeof served !== 'string') return false;
-  const want = upstreamModel.trim().toLowerCase();
-  const got = served.trim().toLowerCase();
-  if (!want || !got) return false;
-  if (got === want) return true;
-  if (!got.startsWith(`${want}-`)) return false;
-  return /^\d{4}-?\d{2}-?\d{2}$/.test(got.slice(want.length + 1));
+  if (typeof served !== 'string' || typeof upstreamModel !== 'string') return false;
+  const want = splitServedModel(upstreamModel);
+  const got = splitServedModel(served);
+  if (!want || !got || want.vendor !== got.vendor || want.tokens.length !== got.tokens.length) return false;
+  const counts = new Map<string, number>();
+  for (const t of want.tokens) counts.set(t, (counts.get(t) ?? 0) + 1);
+  for (const t of got.tokens) {
+    const n = counts.get(t);
+    if (!n) return false;
+    counts.set(t, n - 1);
+  }
+  return true;
+}
+
+function splitServedModel(id: string): { vendor: string; tokens: string[] } | null {
+  const trimmed = id.trim().toLowerCase();
+  const slash = trimmed.indexOf('/');
+  if (slash <= 0) return null;
+  const vendor = trimmed.slice(0, slash);
+  const name = trimmed.slice(slash + 1).replace(/-(?:\d{4}-\d{2}-\d{2}|\d{8})$/, '');
+  if (!name || name.includes(':') || name.includes('/')) return null;
+  const tokens = name.split('-');
+  if (tokens.some((t) => t.length === 0)) return null;
+  return { vendor, tokens };
 }
 
 function mapCallError(error: unknown): { errorCode: CompareErrorCode; errorClass: string } {
@@ -677,6 +698,26 @@ export function validateSelectRequest(body: unknown): { ok: true; value: Validat
 }
 
 export async function selectCompareResult(
+  deps: SelectDeps,
+  input: { user: CompareUser; body: unknown },
+): Promise<ServiceOutcome> {
+  // Any unexpected throw (session read, settings read, anything before the lock) must be observable and
+  // JSON, never the global handler's generic 500. Class and a truncated message only, never content.
+  try {
+    return await selectCompareResultInner(deps, input);
+  } catch (error) {
+    let message = '';
+    try {
+      message = String((error as Error)?.message ?? '').slice(0, 200);
+    } catch {
+      /* keep empty */
+    }
+    deps.log('ModelCompare: select failed unexpectedly', { errorClass: safeClass(error), message });
+    return fail(500, 'Failed to continue from this answer', 'select_failed');
+  }
+}
+
+async function selectCompareResultInner(
   deps: SelectDeps,
   input: { user: CompareUser; body: unknown },
 ): Promise<ServiceOutcome> {

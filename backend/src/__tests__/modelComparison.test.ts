@@ -527,6 +527,7 @@ describe('POST /compare truncation, preflight, parallel policy, slot release', (
   it.each([
     ['empty history', []],
     ['first message is not the system prompt', [{ role: 'user', content: 'hi' }]],
+    ['fresh sidebar chat: system message only, no user turn yet', [{ role: 'system', content: 'SYS' }]],
   ])('409 compare_session_not_started preflight (%s): no usage check, no model call', async (_n, messages) => {
     const { deps, callLLM } = makeDeps({}, session({ messages: messages as any }));
     const out = await run(deps, body());
@@ -952,6 +953,23 @@ describe('POST /compare/select', () => {
     expect(appendMessages).toHaveBeenCalledTimes(1);
   });
 
+  it('409 compare_session_not_started when the session has only the system message (no user turn)', async () => {
+    const { deps, appendMessages } = makeSelect({}, session({ messages: [{ role: 'system', content: 'SYS' }] }));
+    const out = await go(deps, sel());
+    expect(out.status).toBe(409);
+    expect(res(out).code).toBe('compare_session_not_started');
+    expect(appendMessages).not.toHaveBeenCalled();
+  });
+
+  it('any unexpected throw becomes a logged JSON 500 select_failed (no content in the log), not a generic 500', async () => {
+    const { deps } = makeSelect({ getSession: jest.fn(async () => { throw new Error('ddb exploded'); }) });
+    const out = await go(deps, sel());
+    expect(out.status).toBe(500);
+    expect(res(out).code).toBe('select_failed');
+    expect(deps.log).toHaveBeenCalledWith('ModelCompare: select failed unexpectedly', expect.objectContaining({ message: 'ddb exploded' }));
+    expect(JSON.stringify((deps.log as jest.Mock).mock.calls)).not.toContain('the chosen answer');
+  });
+
   it('409 compare_session_not_started when the session has no system prompt message yet (would hide the turn from context)', async () => {
     const { deps, appendMessages } = makeSelect({}, session({ messages: [] }));
     const out = await go(deps, sel());
@@ -1020,13 +1038,47 @@ describe('only the selected model may answer (served-model verification)', () =>
       expect(res(out).results[0].selectToken).toBeUndefined();
     });
 
-  it('isSameServedModel: exact / dated only; empty and non-strings never match', () => {
+  // (requested gateway id, canonical_slug) pairs copied from OpenRouter's public catalog (/api/v1/models).
+  // The three Claude 4.x entries are REORDERED by the gateway (claude-opus-4.8 -> claude-4.8-opus-...).
+  const REAL_SLUG_PAIRS: Array<[string, string]> = [
+    ['openai/gpt-5.5', 'openai/gpt-5.5-20260423'],
+    ['openai/gpt-5.5-pro', 'openai/gpt-5.5-pro-20260423'],
+    ['openai/gpt-5', 'openai/gpt-5-2025-08-07'],
+    ['google/gemini-3.5-flash', 'google/gemini-3.5-flash-20260519'],
+    ['anthropic/claude-opus-5', 'anthropic/claude-opus-5-20260723'],
+    ['anthropic/claude-sonnet-5', 'anthropic/claude-sonnet-5-20260630'],
+    ['anthropic/claude-opus-4.8', 'anthropic/claude-4.8-opus-20260528'],
+    ['anthropic/claude-opus-4.6', 'anthropic/claude-4.6-opus-20260205'],
+    ['anthropic/claude-sonnet-4.6', 'anthropic/claude-4.6-sonnet-20260217'],
+    ['anthropic/claude-opus-4.5', 'anthropic/claude-4.5-opus-20251124'],
+    ['anthropic/claude-haiku-4.5', 'anthropic/claude-4.5-haiku-20251001'],
+    ['anthropic/claude-sonnet-4.5', 'anthropic/claude-4.5-sonnet-20250929'],
+    ['deepseek/deepseek-v4-flash', 'deepseek/deepseek-v4-flash-20260423'],
+    ['qwen/qwen3-max', 'qwen/qwen3-max'],
+    ['moonshotai/kimi-k2', 'moonshotai/kimi-k2'],
+    ['mistralai/mistral-large', 'mistralai/mistral-large'],
+  ];
+
+  it.each(REAL_SLUG_PAIRS)('isSameServedModel accepts the real canonical slug: %s -> %s', (id, slug) => {
+    expect(isSameServedModel(id, slug)).toBe(true);
+    expect(isSameServedModel(id, slug.toUpperCase())).toBe(true);
+  });
+
+  it('isSameServedModel: exact and ISO-dated forms match; lookalikes, variants and other vendors do not; non-strings never match', () => {
     expect(isSameServedModel('openai/gpt-5.5', 'openai/gpt-5.5')).toBe(true);
-    expect(isSameServedModel('openai/gpt-5.5', 'openai/gpt-5.5-20260301')).toBe(true);
     expect(isSameServedModel('anthropic/claude-opus-4.8', 'anthropic/claude-opus-4.8-2026-03-01')).toBe(true);
-    for (const bad of ['openai/gpt-5.5-pro', 'openai/gpt-5.5-2026', 'openai/gpt-5.5-20260301-x', 'openai/gpt-5.5:free', '', '  ', 5, null, undefined, {}]) {
+    for (const bad of [
+      'openai/gpt-5.5-pro', 'openai/gpt-5.5-mini', 'openai/gpt-5', 'openai/gpt-5.5-pro-20260423', 'openai/gpt-5.5-2026',
+      'openai/gpt-5.5-20260301-x', 'openai/gpt-5.5:free', 'openai/gpt-5.5-20260301:free', 'azure/gpt-5.5', 'gpt-5.5', 'openai/',
+      '', '  ', 5, null, undefined, {},
+    ]) {
       expect(isSameServedModel('openai/gpt-5.5', bad)).toBe(false);
     }
+    // version atoms are not split: 4.6 is not 6.4, and a different tier or version is a different model
+    expect(isSameServedModel('anthropic/claude-opus-4.6', 'anthropic/claude-6.4-opus-20260205')).toBe(false);
+    expect(isSameServedModel('anthropic/claude-opus-4.8', 'anthropic/claude-4.6-opus-20260205')).toBe(false);
+    expect(isSameServedModel('anthropic/claude-opus-4.8', 'anthropic/claude-4.8-sonnet-20260528')).toBe(false);
+    expect(isSameServedModel('anthropic/claude-opus-4.8', 'anthropic/claude-4.8-opus-mini-20260528')).toBe(false);
     expect(isSameServedModel('', 'openai/gpt-5.5')).toBe(false);
   });
 

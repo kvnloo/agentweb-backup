@@ -76,7 +76,7 @@ app.use(express.json());
 app.use('/api/agent-mode', agentModeRoutes);
 
 const validBody = { sessionId: 's-1', prompt: 'hi', models: ['gpt-5.5', 'gemini-3.5-flash'] };
-const ownedSession = { sessionId: 's-1', userId: 'owner', messages: [{ role: 'system', content: 'SYS' }] };
+const ownedSession = { sessionId: 's-1', userId: 'owner', messages: [{ role: 'system', content: 'SYS' }, { role: 'user', content: 'first turn' }, { role: 'assistant', content: 'first reply' }] };
 
 beforeAll(() => { process.env.JWT_SECRET = GOOD_SECRET; });
 beforeEach(() => {
@@ -204,7 +204,7 @@ describe('compare -> select round trip over HTTP', () => {
     const compare = await request(app).post('/api/agent-mode/compare').set('Authorization', bearer('owner')).send(validBody);
     const pick = compare.body.results[1];
     mockAddMessages.mockImplementation(async (_id: string, msgs: any[]) => ({
-      messages: [{ role: 'system', content: 'SYS' }, ...msgs.map((m, i) => ({ ...m, messageIndex: 1 + i }))],
+      messages: [...ownedSession.messages, ...msgs.map((m, i) => ({ ...m, messageIndex: 3 + i }))],
     }));
     const select = await request(app).post('/api/agent-mode/compare/select').set('Authorization', bearer('owner')).send({
       sessionId: 's-1', compareId: compare.body.compareId, prompt: compare.body.prompt, model: pick.model,
