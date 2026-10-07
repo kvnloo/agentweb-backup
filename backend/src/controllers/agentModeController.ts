@@ -15279,9 +15279,15 @@ export const agentModeController = {
       }
       const canonicalModel = resolution.model;
 
-      // Block non-admins from using opus models
-      if (canonicalModel.includes('opus') && !user.isAdmin) {
-        return res.status(403).json({ error: 'Opus models are not available for your account' });
+      // ENG-2293: the allow-list check above accepts ANY registered model,
+      // including adminOnly auto-added entries the picker UI already hides —
+      // this was the only other gate, and it only ever checked for "opus", so
+      // a non-admin who named one of those ids directly still got a 200 and
+      // ran their session on it. isModelSelectableBy is the single source of
+      // truth for "can this user pick this model" (adminOnly + opus + the
+      // internal/live exclusions); use it instead of re-deriving a subset here.
+      if (!agentModeService.isModelSelectableBy(canonicalModel, !!user.isAdmin)) {
+        return res.status(403).json({ error: 'This model is not available for your account' });
       }
 
       // Get the session to verify ownership
@@ -15328,9 +15334,11 @@ export const agentModeController = {
       }
       const canonicalModel = resolution.model;
 
-      // Shared sessions are non-admin; block opus models
-      if (canonicalModel.includes('opus')) {
-        return res.status(403).json({ error: 'Opus models are not available for shared sessions' });
+      // ENG-2293: same gate as updateSessionLlmModel, same reasoning — shared
+      // viewers are always non-admin, so this also now blocks adminOnly
+      // auto-added models, not just opus.
+      if (!agentModeService.isModelSelectableBy(canonicalModel, false)) {
+        return res.status(403).json({ error: 'This model is not available for shared sessions' });
       }
 
       // Get the session to verify the conversable token
