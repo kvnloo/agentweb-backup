@@ -48,8 +48,6 @@ export interface ResolveAccountOptions {
    * against an unproven account.
    */
   verifiedOnly?: boolean;
-  /** Never fall back to the site-wide shared pool — the user's own accounts only. */
-  ownOnly?: boolean;
 }
 
 export class LinkedInOutreachService {
@@ -1726,32 +1724,28 @@ export class LinkedInOutreachService {
       }
     } catch { /* ignore */ }
 
-    // 2. Site-wide accounts — verify each one is still connected before returning.
-    //    Skipped entirely for ownOnly callers: those act on the user's behalf and must
-    //    never borrow the shared pool.
+    // 2. Site-wide accounts — verify each one is still connected before returning
     let sharedUnknown: string | null = null;
-    if (!opts?.ownOnly) {
-      try {
-        const { settingsService } = await import('./settingsService');
-        const setting = await settingsService.getSetting('site-wide-unipile-accounts');
-        if (setting?.settingValue) {
-          const siteAccounts = JSON.parse(setting.settingValue);
-          const enabled = (siteAccounts as any[]).filter((a) => a.enabled !== false);
-          // Shuffle so load is distributed across accounts
-          const shuffled = enabled.sort(() => Math.random() - 0.5);
-          for (const account of shuffled) {
-            const state = await this.probeAccountSession(account.account_id);
-            if (state === 'connected') {
-              return { accountId: account.account_id, usedSharedAccount: true };
-            }
-            if (state === 'unknown' && !sharedUnknown) {
-              sharedUnknown = account.account_id;
-            }
-            this.log(`Site-wide account ${account.account_id} (${account.account_name}) is ${state} — skipping`);
+    try {
+      const { settingsService } = await import('./settingsService');
+      const setting = await settingsService.getSetting('site-wide-unipile-accounts');
+      if (setting?.settingValue) {
+        const siteAccounts = JSON.parse(setting.settingValue);
+        const enabled = (siteAccounts as any[]).filter((a) => a.enabled !== false);
+        // Shuffle so load is distributed across accounts
+        const shuffled = enabled.sort(() => Math.random() - 0.5);
+        for (const account of shuffled) {
+          const state = await this.probeAccountSession(account.account_id);
+          if (state === 'connected') {
+            return { accountId: account.account_id, usedSharedAccount: true };
           }
+          if (state === 'unknown' && !sharedUnknown) {
+            sharedUnknown = account.account_id;
+          }
+          this.log(`Site-wide account ${account.account_id} (${account.account_name}) is ${state} — skipping`);
         }
-      } catch { /* ignore parse errors or settings fetch failures */ }
-    }
+      }
+    } catch { /* ignore parse errors or settings fetch failures */ }
 
     // 3. Nothing came back definitively connected. Prefer an unverifiable own
     //    account over an unverifiable shared one — still the user's own account

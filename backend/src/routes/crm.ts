@@ -5033,14 +5033,10 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
     }
 
     const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
-    // Use the caller-specified account (user's configured default) if provided, otherwise
-    // auto-resolve from the user's OWN accounts. Never the site-wide shared pool — a message
-    // must be sent from a LinkedIn sender the user actually connected, not borrowed from a
-    // shared account whose connections are not theirs (ENG-2205 follow-up; same policy as
-    // send-linkedin-invite).
+    // Use the caller-specified account (user's configured default) if provided, otherwise auto-resolve
     const accountId = (requestedAccountId && typeof requestedAccountId === 'string')
       ? requestedAccountId
-      : await linkedInOutreachService.resolveAccountId(userId, { ownOnly: true });
+      : await linkedInOutreachService.resolveAccountId(userId);
     if (!accountId) {
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
     }
@@ -5251,6 +5247,11 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     return res.json({ success: true, linkedInInviteSentAt: sentAt, noteDropped });
   } catch (error: any) {
     console.error('Error sending LinkedIn invite:', error);
+    // Same infrastructure handling as send-linkedin-message: an unreachable Unipile (credential
+    // fetch, gateway/5xx, timeout) is a handled 503, never a 500 echoing an internal message.
+    if (isLinkedInInfraError(error)) {
+      return res.status(503).json({ message: LINKEDIN_UNAVAILABLE_MESSAGE, code: 'linkedin_unavailable' });
+    }
     return res.status(500).json({ message: error.message || 'Failed to send LinkedIn invite' });
   }
 });
