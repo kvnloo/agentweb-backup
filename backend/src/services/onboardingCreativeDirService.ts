@@ -219,9 +219,26 @@ export async function generateCreativeDirectionForUser(
  * competitor result out of the persisted state, runs the LLM, and patches
  * the User with the result.
  */
+/**
+ * Restate "the `running` record is still the one THIS run claimed" as a
+ * DynamoDB condition (ENG-2308 review follow-up, confirmed by direct
+ * reproduction — see onboardingIcpService's `icpOwnershipCondition` for
+ * the full reasoning, identical here).
+ */
+function creativeDirOwnershipCondition(expectedStartedAt: string) {
+  return {
+    expression: "#creativeDirStartedAt = :creativeDirOwnerStartedAt",
+    names: { "#creativeDirStartedAt": "creativeDirStartedAt" },
+    values: { ":creativeDirOwnerStartedAt": expectedStartedAt },
+  };
+}
+
 export async function triggerCreativeDirForUser(
   userId: string,
-  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
+  deps: {
+    llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
+    expectedStartedAt?: string;
+  } = {}
 ): Promise<void> {
   const user = await userDb.getUserById(userId);
   if (!user) return;
@@ -250,14 +267,46 @@ export async function triggerCreativeDirForUser(
       // User is no longer in `running` (stale completion) — drop silently.
       return;
     }
-    await userDb.updateUser(userId, patch as any);
+    if (deps.expectedStartedAt) {
+      try {
+        await userDb.updateUser(userId, patch as any, {
+          condition: creativeDirOwnershipCondition(deps.expectedStartedAt),
+        });
+      } catch (condErr: any) {
+        if (condErr?.code === "ConditionalCheckFailedException") {
+          console.warn(
+            "[onboardingCreativeDirService] dropping stale completion — a newer claim owns the axis",
+            { userId },
+          );
+          return;
+        }
+        throw condErr;
+      }
+    } else {
+      await userDb.updateUser(userId, patch as any);
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const current = await userDb.getUserById(userId);
-    await userDb.updateUser(
-      userId,
-      creativeDirFailedPatch((current as any) || {}, msg) as any
-    );
+    const failedPatch = creativeDirFailedPatch((current as any) || {}, msg);
+    if (deps.expectedStartedAt) {
+      try {
+        await userDb.updateUser(userId, failedPatch as any, {
+          condition: creativeDirOwnershipCondition(deps.expectedStartedAt),
+        });
+      } catch (condErr: any) {
+        if (condErr?.code === "ConditionalCheckFailedException") {
+          console.warn(
+            "[onboardingCreativeDirService] dropping stale failure — a newer claim owns the axis",
+            { userId },
+          );
+          return;
+        }
+        throw condErr;
+      }
+    } else {
+      await userDb.updateUser(userId, failedPatch as any);
+    }
     console.error("[onboardingCreativeDirService] generation failed", {
       userId,
       err: msg,
@@ -368,6 +417,9 @@ export async function startCreativeDirForUser(
   }
   const patch = await claimCreativeDirRun(userId);
   if (!patch) return null;
-  void triggerCreativeDirForUser(userId, deps);
+  void triggerCreativeDirForUser(userId, {
+    ...deps,
+    expectedStartedAt: patch.creativeDirStartedAt,
+  });
   return patch;
 }

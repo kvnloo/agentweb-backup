@@ -474,11 +474,31 @@ export async function generateCompetitorStrategyForUser(
  * `running`) and produced a 100% onboarding ad-gen failure rate. See
  * Notion `34d09247-c951-81e4-af97-df1e869bc8aa` for the full diagnosis.
  */
+/**
+ * Restate "the `running` record is still the one THIS run claimed" as a
+ * DynamoDB condition (ENG-2308 review follow-up, confirmed by direct
+ * reproduction — see onboardingIcpService's `icpOwnershipCondition` for
+ * the full reasoning, identical here). The stale-claim escape hatch lets a
+ * second claim reclaim the axis while the first claimant is merely slow,
+ * not crashed; `competitorReadyPatch` only checks `competitorStatus ===
+ * "running"`, not WHICH run's `running` it is, so a reclaimed run's zombie
+ * completion can otherwise overwrite — or be overwritten by, silently
+ * dropping the real result — the reclaiming run's own completion.
+ */
+function competitorOwnershipCondition(expectedStartedAt: string) {
+  return {
+    expression: "#competitorStartedAt = :competitorOwnerStartedAt",
+    names: { "#competitorStartedAt": "competitorStartedAt" },
+    values: { ":competitorOwnerStartedAt": expectedStartedAt },
+  };
+}
+
 export async function triggerCompetitorStrategyForUser(
   userId: string,
   deps: {
     llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
     webSearchFn?: WebSearchFn;
+    expectedStartedAt?: string;
   } = {},
 ): Promise<void> {
   const user = await userDb.getUserById(userId);
@@ -508,7 +528,24 @@ export async function triggerCompetitorStrategyForUser(
     const current = await userDb.getUserById(userId);
     const patch = competitorReadyPatch((current as any) || {}, result);
     if (!patch) return;
-    await userDb.updateUser(userId, patch as any);
+    if (deps.expectedStartedAt) {
+      try {
+        await userDb.updateUser(userId, patch as any, {
+          condition: competitorOwnershipCondition(deps.expectedStartedAt),
+        });
+      } catch (condErr: any) {
+        if (condErr?.code === "ConditionalCheckFailedException") {
+          console.warn(
+            "[onboardingCompetitorService] dropping stale completion — a newer claim owns the axis",
+            { userId },
+          );
+          return;
+        }
+        throw condErr;
+      }
+    } else {
+      await userDb.updateUser(userId, patch as any);
+    }
 
     // Mirror to marketStrategy.competitors[] so the main account sees the
     // competitors onboarding generated. See companion mirror in
@@ -517,10 +554,25 @@ export async function triggerCompetitorStrategyForUser(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const current = await userDb.getUserById(userId);
-    await userDb.updateUser(
-      userId,
-      competitorFailedPatch((current as any) || {}, msg) as any,
-    );
+    const failedPatch = competitorFailedPatch((current as any) || {}, msg);
+    if (deps.expectedStartedAt) {
+      try {
+        await userDb.updateUser(userId, failedPatch as any, {
+          condition: competitorOwnershipCondition(deps.expectedStartedAt),
+        });
+      } catch (condErr: any) {
+        if (condErr?.code === "ConditionalCheckFailedException") {
+          console.warn(
+            "[onboardingCompetitorService] dropping stale failure — a newer claim owns the axis",
+            { userId },
+          );
+          return;
+        }
+        throw condErr;
+      }
+    } else {
+      await userDb.updateUser(userId, failedPatch as any);
+    }
     console.error("[onboardingCompetitorService] generation failed", {
       userId,
       err: msg,
@@ -638,6 +690,9 @@ export async function startCompetitorStrategyForUser(
   }
   const patch = await claimCompetitorRun(userId);
   if (!patch) return null;
-  void triggerCompetitorStrategyForUser(userId, deps);
+  void triggerCompetitorStrategyForUser(userId, {
+    ...deps,
+    expectedStartedAt: patch.competitorStartedAt,
+  });
   return patch;
 }

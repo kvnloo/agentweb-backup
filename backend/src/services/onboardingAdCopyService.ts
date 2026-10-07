@@ -315,9 +315,59 @@ export async function generateAdCopyForUser(
  * If images aren't ready, fails the run with a clear error so the UI can
  * render the "waiting for images" state.
  */
+/**
+ * Restate "the `running` record is still the one THIS run claimed" as a
+ * DynamoDB condition (ENG-2308 review follow-up, confirmed by direct
+ * reproduction — see onboardingIcpService's `icpOwnershipCondition` for
+ * the full reasoning, identical here).
+ */
+function adCopyOwnershipCondition(expectedStartedAt: string) {
+  return {
+    expression: "#adCopyStartedAt = :adCopyOwnerStartedAt",
+    names: { "#adCopyStartedAt": "adCopyStartedAt" },
+    values: { ":adCopyOwnerStartedAt": expectedStartedAt },
+  };
+}
+
+/**
+ * Write a patch on behalf of THIS claimed run only, dropping it silently
+ * (instead of writing) when a later reclaim already owns the axis. No-ops
+ * to a plain unconditional write when the caller has no claim identity
+ * (backward compatible with direct callers/tests that bypass the claim).
+ */
+async function writeIfStillOurs(
+  userId: string,
+  patch: Record<string, unknown>,
+  expectedStartedAt: string | undefined,
+  logLabel: string,
+): Promise<boolean> {
+  if (!expectedStartedAt) {
+    await userDb.updateUser(userId, patch as any);
+    return true;
+  }
+  try {
+    await userDb.updateUser(userId, patch as any, {
+      condition: adCopyOwnershipCondition(expectedStartedAt),
+    });
+    return true;
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") {
+      console.warn(
+        `[onboardingAdCopyService] dropping stale ${logLabel} — a newer claim owns the axis`,
+        { userId },
+      );
+      return false;
+    }
+    throw err;
+  }
+}
+
 export async function triggerAdCopyForUser(
   userId: string,
-  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
+  deps: {
+    llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
+    expectedStartedAt?: string;
+  } = {}
 ): Promise<void> {
   const user = await userDb.getUserById(userId);
   if (!user) return;
@@ -337,9 +387,11 @@ export async function triggerAdCopyForUser(
         ? `image generation not ready (status=${adImageStatus})`
         : "image generation completed with no variants";
     const current = await userDb.getUserById(userId);
-    await userDb.updateUser(
+    await writeIfStillOurs(
       userId,
-      adCopyFailedPatch((current as any) || {}, reason) as any
+      adCopyFailedPatch((current as any) || {}, reason) as any,
+      deps.expectedStartedAt,
+      "gated-by-image-step failure",
     );
     console.error("[onboardingAdCopyService] gated by image step", {
       userId,
@@ -403,7 +455,13 @@ export async function triggerAdCopyForUser(
       // Stale completion — drop silently.
       return;
     }
-    await userDb.updateUser(userId, patch as any);
+    const wrote = await writeIfStillOurs(
+      userId,
+      patch as any,
+      deps.expectedStartedAt,
+      "completion",
+    );
+    if (!wrote) return;
     // ENG-2192: advisory rubric verdicts on the stored copy, with each variant's image when it
     // has one (inert unless CREATIVE_RUBRIC_JUDGE_ENABLED + sample rate). Not awaited; never throws.
     const { adCopyCompletedAt, adCopyResult } = patch;
@@ -422,9 +480,11 @@ export async function triggerAdCopyForUser(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const current = await userDb.getUserById(userId);
-    await userDb.updateUser(
+    await writeIfStillOurs(
       userId,
-      adCopyFailedPatch((current as any) || {}, msg) as any
+      adCopyFailedPatch((current as any) || {}, msg) as any,
+      deps.expectedStartedAt,
+      "failure",
     );
     console.error("[onboardingAdCopyService] generation failed", {
       userId,
@@ -527,6 +587,9 @@ export async function startAdCopyForUser(
   }
   const patch = await claimAdCopyRun(userId);
   if (!patch) return null;
-  void triggerAdCopyForUser(userId, deps);
+  void triggerAdCopyForUser(userId, {
+    ...deps,
+    expectedStartedAt: patch.adCopyStartedAt,
+  });
   return patch;
 }

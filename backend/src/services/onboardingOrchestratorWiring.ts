@@ -163,7 +163,12 @@ async function runIcp(userId: string): Promise<unknown> {
     const current = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
     return current?.icpResult ?? null;
   }
-  await triggerIcpDiscoveryForUser(userId);
+  // expectedStartedAt: this invocation's own claim, so a later reclaim's
+  // zombie completion can't be mistaken for a terminal state WE published
+  // (ENG-2308 review follow-up).
+  await triggerIcpDiscoveryForUser(userId, {
+    expectedStartedAt: (claimed as { icpStartedAt?: string }).icpStartedAt,
+  });
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
   throwIfStepFailed(user, "icp", startedAtMs, "ICP discovery failed");
   return user?.icpResult ?? null;
@@ -181,7 +186,9 @@ async function runCompetitor(userId: string): Promise<unknown> {
     const current = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
     return current?.competitorResult ?? null;
   }
-  await triggerCompetitorStrategyForUser(userId);
+  await triggerCompetitorStrategyForUser(userId, {
+    expectedStartedAt: (claimed as { competitorStartedAt?: string }).competitorStartedAt,
+  });
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
   throwIfStepFailed(user, "competitor", startedAtMs, "competitor strategy failed");
   return user?.competitorResult ?? null;
@@ -199,7 +206,9 @@ async function runCreativeDir(userId: string): Promise<unknown> {
     const current = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
     return current?.creativeDirResult ?? null;
   }
-  await triggerCreativeDirForUser(userId);
+  await triggerCreativeDirForUser(userId, {
+    expectedStartedAt: (claimed as { creativeDirStartedAt?: string }).creativeDirStartedAt,
+  });
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
   throwIfStepFailed(user, "creativeDir", startedAtMs, "creative direction failed");
   return user?.creativeDirResult ?? null;
@@ -247,7 +256,9 @@ async function runAdCopy(userId: string): Promise<unknown> {
     const current = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
     return current?.adCopyResult ?? null;
   }
-  await triggerAdCopyForUser(userId);
+  await triggerAdCopyForUser(userId, {
+    expectedStartedAt: (claimed as { adCopyStartedAt?: string }).adCopyStartedAt,
+  });
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
   throwIfStepFailed(user, "adCopy", startedAtMs, "ad copy generation failed");
   return user?.adCopyResult ?? null;
