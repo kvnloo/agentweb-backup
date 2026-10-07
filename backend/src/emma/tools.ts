@@ -7,7 +7,8 @@ import type { AdPlatform } from '../utils/adUtm';
 import { metaAdReadPort, googleAdReadPort, linkedInAdReadPort } from '../services/adUtmAuditAdapters';
 import { accountMemoryDb, orgMemoryDb, userDb } from '../services/db';
 import { crmDb } from '../services/db';
-import { askCrm, AskCrmLead } from '../services/askCrmService';
+import { askCrm } from '../services/askCrmService';
+import { createAskCrmLeadLoader, USER_LOOKUP_BUDGET } from '../services/askCrmLeadLoader';
 import { getAccountSummary } from '../services/accountSummaryService';
 import { dealDb, DealAuthError, DealNotFoundError, DEAL_STAGES, type DealStage } from '../services/dealDb';
 import { contactEventsDb, normalizeContactId } from '../services/contactEventsDb';
@@ -3740,7 +3741,7 @@ emmaToolRegistry.register({
         },
         load_limit: {
           type: 'number',
-          description: 'Max number of leads to scan across the user\'s lists (default 500). Rarely needed — only raise if the user has tons of lists.'
+          description: 'Max number of leads to scan across the user\'s lists (default 500, hard cap 500 — every scanned lead also gets a live account/deal lookup, bounded at this same number, so raising it has no effect).'
         }
       },
       required: ['question']
@@ -3753,46 +3754,20 @@ emmaToolRegistry.register({
     }
 
     const resultLimit = Math.min(Math.max(args.limit ?? 10, 1), 25);
-    const loadLimit = Math.max(args.load_limit ?? 500, 1);
+    // Capped at USER_LOOKUP_BUDGET, not just floored: scanning more leads than the
+    // loader can enrich would silently return some leads live-corrected and others
+    // still frozen on their stored value, with nothing distinguishing which is which.
+    const loadLimit = Math.min(Math.max(args.load_limit ?? 500, 1), USER_LOOKUP_BUDGET);
 
-    // Lazy lead iteration across all of the user's lists. We flatten into the
-    // AskCrmLead shape so askCrm doesn't have to know about the underlying
-    // storage layout.
-    const loadLeadsForUser = async (uid: string, opts: { limit: number }): Promise<AskCrmLead[]> => {
-      const lists = excludeSessionLists(await crmDb.getLeadListsForUser(uid)); // ENG-2311: session rows would eat the load cap
-      const out: AskCrmLead[] = [];
-      for (const list of lists as any[]) {
-        if (out.length >= opts.limit) break;
-        const remaining = opts.limit - out.length;
-        const page = await crmDb.getLeadsByListId(list.listId, Math.min(remaining, 200));
-        const items: any[] = (page && (page as any).items) || [];
-        for (const it of items) {
-          out.push({
-            leadId: it.leadId,
-            listId: it.listId,
-            email: it.email || null,
-            // ENG-2082: without this the phone never reaches askCrm, so its projection and
-            // its specific_contact haystack stay blind to phone-only leads.
-            phone: it.phone || null,
-            firstName: it.firstName || null,
-            lastName: it.lastName || null,
-            company: it.company || null,
-            title: it.title || null,
-            status: it.status || null,
-            dealValue: typeof it.dealValue === 'number' ? it.dealValue : null,
-            lifecycle: it.lifecycle || null,
-            heatScore: typeof it.heatScore === 'number' ? it.heatScore : null,
-            healthScore: typeof it.healthScore === 'number' ? it.healthScore : null,
-            isICP: typeof it.isICP === 'boolean' ? it.isICP : null,
-            lastEngagementAt: it.lastEngagementAt || null,
-            openDealStages: Array.isArray(it.openDealStages) ? it.openDealStages : null,
-            contactStatus: it.contactStatus || null,
-          });
-          if (out.length >= opts.limit) break;
-        }
-      }
-      return out;
-    };
+    // Live account/deal enrichment is centralized in a tested loader so its
+    // authorization and partial-read semantics cannot drift from ask_crm.
+    const loadLeadsForUser = createAskCrmLeadLoader({
+      getLeadListsForUser: (uid) => crmDb.getLeadListsForUser(uid),
+      getLeadsByListId: (listId, limit) => crmDb.getLeadsByListId(listId, limit),
+      getUserById: (uid) => userDb.getUserById(uid),
+      getUserByEmail: (email) => userDb.getUserByEmail(email),
+      getDealsByOwner: (uid, opts) => dealDb.getDealsByOwner(uid, opts),
+    });
 
     try {
       const answer = await askCrm(
