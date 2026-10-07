@@ -157,6 +157,63 @@ describe("onboardingBrandBuildService", () => {
       expect(lastCall[1].brandBuildError).toMatch(/companyUrl/i);
     });
 
+    // ENG-2308 review follow-up, confirmed by direct reproduction (same
+    // reasoning as onboardingIcpService's icpOwnershipCondition tests):
+    // the round-3 stale-claim escape hatch lets a reclaim supersede a
+    // merely-slow (not crashed) run. buildFailedPatch's own write is
+    // unconditional by design ("allowed from any state so watchdogs can
+    // flip stale runs") — the FAILURE WRITE SITE here must condition on
+    // this run's own claim so a zombie failure can't stomp a reclaiming
+    // run's state. (The `ready` transition is written by Emma's
+    // update_brand_guidelines tool-call hook, out of scope for this fix.)
+    it("conditions the failure write on this run's own brandBuildStartedAt when expectedStartedAt is provided", async () => {
+      userDb.getUserById.mockResolvedValueOnce({
+        userId: "u1",
+        brandBuildStatus: "building",
+        brandBuildStartedAt: "2026-04-24T11:59:00.000Z",
+      });
+
+      await triggerBrandBuildForUser("u1", {
+        createChatSession: jest.fn(),
+        generateSessionResponse: jest.fn(),
+        expectedStartedAt: "2026-04-24T11:59:00.000Z",
+      });
+
+      const lastCall =
+        userDb.updateUser.mock.calls[userDb.updateUser.mock.calls.length - 1];
+      expect(lastCall[2]?.condition?.expression).toBe(
+        "#brandBuildStartedAt = :brandBuildOwnerStartedAt",
+      );
+      expect(lastCall[2]?.condition?.values?.[":brandBuildOwnerStartedAt"]).toBe(
+        "2026-04-24T11:59:00.000Z",
+      );
+    });
+
+    it("drops the failure silently when a reclaim has superseded this run (ConditionalCheckFailedException)", async () => {
+      userDb.getUserById.mockResolvedValueOnce({
+        userId: "u1",
+        brandBuildStatus: "building",
+        // A reclaim's fresh startedAt — different from the stale
+        // expectedStartedAt this (zombie) run was given below.
+        brandBuildStartedAt: "2026-04-24T12:05:00.000Z",
+      });
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+
+      await expect(
+        triggerBrandBuildForUser("u1", {
+          createChatSession: jest.fn(),
+          generateSessionResponse: jest.fn(),
+          expectedStartedAt: "2026-04-24T11:59:00.000Z",
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    });
+
     it("marks the build failed when chat-session creation throws", async () => {
       userDb.getUserById
         .mockResolvedValueOnce({

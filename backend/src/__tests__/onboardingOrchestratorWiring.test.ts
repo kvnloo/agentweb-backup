@@ -237,7 +237,10 @@ describe("reconcileForUser", () => {
       // so assert on the call args loosely rather than the exact 1-arg
       // shape this mock happens to supply (undefined, since this test's
       // claim mocks return `{}`).
-      expect(triggerBrandBuild).toHaveBeenCalledWith("u2");
+      expect(triggerBrandBuild).toHaveBeenCalledWith(
+        "u2",
+        expect.objectContaining({ expectedStartedAt: undefined }),
+      );
       expect(triggerIcp).toHaveBeenCalledWith(
         "u2",
         expect.objectContaining({ expectedStartedAt: undefined }),
