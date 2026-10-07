@@ -103,5 +103,19 @@ describe('ask_crm production lead loader', () => {
 
     expect(leads).toHaveLength(1);
     expect(leads[0].openDealStages).toEqual(['Proposal']);
+    expect(leads[0].liveOpenDealStages).toEqual(['Proposal']);
+  });
+
+  it('keeps liveOpenDealStages to the live query only, never the stored stages', async () => {
+    const d = deps({
+      getLeadsByListId: jest.fn().mockResolvedValue({
+        items: [{ leadId: 'lead-1', listId: 'list-1', email: 'a@example.com', lifecycle: 'churned', openDealStages: ['Negotiation'] }],
+      }),
+      getDealsByOwner: jest.fn().mockResolvedValue([]),
+    });
+    const leads = await createAskCrmLeadLoader(d)('owner', { limit: 10 });
+
+    expect(leads[0].openDealStages).toEqual(['Negotiation']);
+    expect(leads[0].liveOpenDealStages).toBeNull();
   });
 });

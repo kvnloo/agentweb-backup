@@ -40,6 +40,8 @@ export interface AskCrmLead {
   lastActivityAt?: string | null;
   lastUsageAt?: string | null;
   openDealStages?: string[] | null;
+  /** Open stages from this read's live deal query ONLY (never the stored, stale-prone openDealStages). */
+  liveOpenDealStages?: string[] | null;
   contactStatus?: 'active' | 'do-not-contact' | 'unsubscribed' | null;
   primaryPOCName?: string | null;
 }
@@ -231,7 +233,7 @@ function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: L
     now
   );
 
-  const lifecycle =
+  const gated =
     !lead.lifecycle ||
     subscriptionIsDefinitive ||
     hasCurrentOpenDeal ||
@@ -239,6 +241,19 @@ function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: L
     provesChurn
       ? computedLifecycle
       : lead.lifecycle;
+
+  // Win-back: a lead that reads as churned (stored, or computed from a canceled subscription /
+  // 60+ days idle) but has an open deal in THIS read's live deal query is being actively
+  // worked, so report in_deal. Only liveOpenDealStages counts: the stored openDealStages can be
+  // stale, and an open deal never overrides a live active/trialing subscription. If the deal
+  // query misses the deal (it is bounded, and deals without a heatScore are invisible to it,
+  // ENG-2340) this simply does not fire and the lead stays churned.
+  const hasLiveOpenDeal =
+    Array.isArray(lead.liveOpenDealStages) &&
+    lead.liveOpenDealStages.some((stage) => !['won', 'lost'].includes(String(stage).toLowerCase()));
+  const winBack =
+    hasLiveOpenDeal && !hasLiveSubscription && (lead.lifecycle === 'churned' || gated === 'churned');
+  const lifecycle: LifecycleStage = winBack ? 'in_deal' : gated;
 
   return { heat, lifecycle };
 }

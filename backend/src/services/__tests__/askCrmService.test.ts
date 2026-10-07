@@ -281,6 +281,34 @@ describe('askCrm — ENG-2155 live lifecycle precedence', () => {
     expect(result.items[0].lifecycle).toBe('paying');
   });
 
+  describe('win-back: a live open deal on a churned-looking lead', () => {
+    const live = { liveOpenDealStages: ['Negotiation'], openDealStages: ['Negotiation'] };
+    const life = async (name: string, l: Partial<AskCrmLead>) =>
+      (await askCrm(`is ${name} at acme`, 'u1', makeDeps([lead({ firstName: name, company: 'Acme', ...l })]))).items[0].lifecycle;
+
+    it('reports in_deal for a stored churned lead', async () => {
+      expect(await life('Wbstored', { lifecycle: 'churned', ...live })).toBe('in_deal');
+    });
+    it('reports in_deal for a stored paying lead whose subscription was canceled', async () => {
+      expect(await life('Wbcancel', { lifecycle: 'paying', subscriptionState: 'canceled', ...live })).toBe('in_deal');
+    });
+    it('reports in_deal for a cold lead that is 60+ days idle', async () => {
+      expect(await life('Wbidle', { lifecycle: 'inbox', lastActivityAt: '2026-01-01T00:00:00Z', ...live })).toBe('in_deal');
+    });
+    it('stays churned when the only deal evidence is stored (possibly stale), not live', async () => {
+      expect(await life('Wbstale', { lifecycle: 'churned', openDealStages: ['Negotiation'] })).toBe('churned');
+    });
+    it('stays churned when the live deal is closed', async () => {
+      expect(await life('Wbclosed', { lifecycle: 'churned', liveOpenDealStages: ['Won'] })).toBe('churned');
+    });
+    it('does not override a live active subscription', async () => {
+      expect(await life('Wbsub', { lifecycle: 'churned', subscriptionState: 'active', hasUserRecord: true, ...live })).toBe('paying');
+    });
+    it('does not change a healthy stored paying lead that has an upsell deal', async () => {
+      expect(await life('Wbupsell', { lifecycle: 'paying', ...live })).toBe('paying');
+    });
+  });
+
   it('keeps a live active subscriber paying despite 60+ days without a login', async () => {
     const result = await askCrm('is Annualcase at acme', 'u1', makeDeps([
       lead({ firstName: 'Annualcase', company: 'Acme', lifecycle: 'inbox', subscriptionState: 'active', hasUserRecord: true, lastActivityAt: '2026-01-01T00:00:00Z' }),

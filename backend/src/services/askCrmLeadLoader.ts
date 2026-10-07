@@ -267,6 +267,7 @@ export function createAskCrmLeadLoader(deps: AskCrmLeadLoaderDeps) {
             }
           : {}),
         openDealStages: mergedOpen.length ? mergedOpen : lead.openDealStages,
+        liveOpenDealStages: liveOpen.length ? liveOpen : null,
       };
     });
   };
