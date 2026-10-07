@@ -29,10 +29,11 @@ export interface RunBackendCallbacks {
   socketEmit: (room: string, event: string, payload: any) => void;
   isCancelled: () => boolean;
   /**
-   * ENG-1816 F3: typed event sink. The caller owns it (and the runId); every backend emits
-   * into this one emitter so no backend needs its own parallel event path. Optional so
-   * existing callers are unchanged. Emit through `emitBestEffort`, never `emitter.emit`
-   * directly: a sink failure must not reach a live turn.
+   * ENG-2104 F3: typed event sink for TERMINAL events (attempt-finished, finish). The caller
+   * owns it: its runId, its sequence numbers, and one emitter per run (do not reuse one across
+   * runs, seq would interleave). Optional so existing callers are unchanged. Emit through
+   * `emitBestEffort`, never `emitter.emit` directly: a sink failure must not reach a live turn.
+   * Not yet the whole stream: see `emitTerminal`.
    */
   emitter?: RunEmitter;
 }
@@ -55,48 +56,35 @@ export class EmmaLoopBackend implements RunBackend {
   ): Promise<GenerateMarketingResponseResult> {
     let result: GenerateMarketingResponseResult;
     try {
-      result = await this.generate(params, onProgress, socketEmit, isCancelled);
+      result = await agentModeService.generateMarketingResponse(
+        params.messageContent,
+        params.sessionHistory,
+        params.userId,
+        params.llmModel,
+        params.sessionId,
+        params.mockMode,
+        onProgress,
+        socketEmit,
+        params.isInteractiveShare,
+        isCancelled,
+        params.excludeTools,
+        params.screenshotUrl,
+        params.isDelegatedAccess,
+        params.persistIncrementally,
+        params.turnStartMs,
+        params.publishAuthorizationOverride,
+        params.approvedRevisionImageSources,
+        params.requireWorkPlanDisposition,
+        params.isUnattendedRun,
+      );
     } catch (error) {
-      emitAttemptFinished(emitter, 'failed');
+      emitTerminal(emitter, "failed");
       throw error;
     }
-    let outcome: AttemptOutcome = 'completed';
-    try {
-      if (isCancelled()) outcome = 'cancelled';
-    } catch {
-      // A throwing isCancelled must not turn a finished run into a failure.
-    }
-    emitAttemptFinished(emitter, outcome, result.toolCalls?.length);
+    // The loop records its own stop in the result (`wasCancelled`); reading `isCancelled()`
+    // here instead would mislabel a run that finished and was then stopped during tail work.
+    emitTerminal(emitter, result.cancelled === true ? "cancelled" : "completed", result.toolCalls?.length);
     return result;
-  }
-
-  private generate(
-    params: GenerateMarketingResponseParams,
-    onProgress: RunBackendCallbacks["onProgress"],
-    socketEmit: RunBackendCallbacks["socketEmit"],
-    isCancelled: RunBackendCallbacks["isCancelled"],
-  ): Promise<GenerateMarketingResponseResult> {
-    return agentModeService.generateMarketingResponse(
-      params.messageContent,
-      params.sessionHistory,
-      params.userId,
-      params.llmModel,
-      params.sessionId,
-      params.mockMode,
-      onProgress,
-      socketEmit,
-      params.isInteractiveShare,
-      isCancelled,
-      params.excludeTools,
-      params.screenshotUrl,
-      params.isDelegatedAccess,
-      params.persistIncrementally,
-      params.turnStartMs,
-      params.publishAuthorizationOverride,
-      params.approvedRevisionImageSources,
-      params.requireWorkPlanDisposition,
-      params.isUnattendedRun,
-    );
   }
 }
 
@@ -107,12 +95,16 @@ const FINISH_REASON: Record<AttemptOutcome, FinishReason> = {
 };
 
 /**
- * Terminal events, mirroring the agent_run_completed / agent_run_failed lifecycle in
- * agentModeService.ts. `cancelled` is derived from `isCancelled()` after the run
- * resolves; how the loop exits on cancellation was not independently verified, so treat
- * that mapping as best-effort until B4 consumes it.
+ * Terminal events only, mirroring the agent_run_completed / agent_run_failed lifecycle in
+ * agentModeService.ts. The loop's own stream (text, tools, approvals) is NOT routed through
+ * this emitter: `generateMarketingResponse` still builds its own internal RunEmitter (with a
+ * different runId) that only forwards legacy progress. Unifying the two is left on ENG-2104.
+ *
+ * `attempt-finished` and `finish` are emitted separately on purpose: today an attempt is the
+ * whole run, but once real retry/fallback exists `attempt-finished` fires per attempt while
+ * `finish` stays once per run.
  */
-function emitAttemptFinished(emitter: RunEmitter | undefined, outcome: AttemptOutcome, toolCalls?: number): void {
+function emitTerminal(emitter: RunEmitter | undefined, outcome: AttemptOutcome, toolCalls?: number): void {
   emitBestEffort(emitter, { type: "attempt-finished", outcome, ...(toolCalls !== undefined ? { toolCalls } : {}) });
   emitBestEffort(emitter, { type: "finish", reason: FINISH_REASON[outcome] });
 }

@@ -11,26 +11,19 @@ export type FinishReason = 'stop' | 'length' | 'content-filter' | 'error' | 'can
 /** Outcome of one attempt at a run. Mirrors the run telemetry lifecycle (agent_run_completed / agent_run_failed). */
 export type AttemptOutcome = 'completed' | 'failed' | 'cancelled';
 
-/**
- * Part types ENG-2104 (F3) names but that are deliberately NOT yet in `StreamPart`.
- * Their payload shapes would be guesses until a real emitter and consumer exist, and a
- * guessed shape is worse than none. Each needs one of:
- *  - an ambient emitter, so code outside a backend's own turn loop (`recordLlmUsage`,
- *    the approval deck) can reach the run's emitter: usage-observed, funding-changed,
+/*
+ * ENG-2104 (F3) also names these parts, deliberately NOT in `StreamPart` yet because their
+ * payload shapes would be guesses until an emitter and consumer exist: route-selected,
+ * route-unavailable, funding-changed, usage-observed, approval-requested, checkpoint, paused.
+ * Each needs one of:
+ *  - an ambient emitter, so code outside a backend's own turn loop (`recordLlmUsage`, the
+ *    approval deck) can reach the run's emitter: usage-observed, funding-changed,
  *    approval-requested;
  *  - a real decision to report: route-selected / route-unavailable (every run resolves
  *    route 'agentweb' today), paused (no pause mechanism exists);
  *  - a defined persistence point: checkpoint.
  * Add each to `StreamPart` together with its first emitter.
  */
-export type PlannedStreamPartType =
-  | 'route-selected'
-  | 'route-unavailable'
-  | 'funding-changed'
-  | 'usage-observed'
-  | 'approval-requested'
-  | 'checkpoint'
-  | 'paused';
 
 export type StreamPart =
   | { type: 'text-delta'; text: string }
@@ -39,7 +32,8 @@ export type StreamPart =
   | { type: 'tool-approval-request'; toolCallId: string; toolName: string; input: unknown }
   | { type: 'finish'; reason: FinishReason }
   /**
-   * One attempt at the run ended. Today an attempt is the whole run, so this fires once
+   * One attempt at the run ended. `toolCalls` is set for completed/cancelled and omitted for
+   * failed (the loop's partial count is unavailable when it throws). Today an attempt is the whole run, so this fires once
    * per run (1:1 with `finish`). Whoever wires real retry / fallback (decideFallback,
    * Track A/B) must revisit this: it should then fire once per attempt, not per run.
    */
@@ -96,6 +90,6 @@ export function emitBestEffort(emitter: RunEmitter | undefined, part: StreamPart
   try {
     emitter.emit(part);
   } catch (err) {
-    console.error('[agent-mode] run event emit failed (swallowed):', err);
+    console.error('[agent-mode] run event emit failed (swallowed):', err instanceof Error ? err.message : String(err));
   }
 }

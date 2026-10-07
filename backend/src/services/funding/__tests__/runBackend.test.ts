@@ -103,6 +103,9 @@ describe('EmmaLoopBackend terminal events (ENG-2104 F3)', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    // clearAllMocks keeps implementations, so reset the default a previous test may have replaced.
+    mockGenerate.mockReset();
+    mockGenerate.mockResolvedValue({ content: 'ok', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] });
     jest.spyOn(console, 'error').mockImplementation(() => {});
   });
   afterEach(() => jest.restoreAllMocks());
@@ -135,17 +138,27 @@ describe('EmmaLoopBackend terminal events (ENG-2104 F3)', () => {
     ]);
   });
 
-  it('reports cancelled when isCancelled() is true once the run resolves', async () => {
-    mockGenerate.mockResolvedValue({ content: '', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] });
+  it('reports cancelled from the loop\'s own result.cancelled, not from isCancelled()', async () => {
+    mockGenerate.mockResolvedValue({ content: '', cancelled: true, toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] });
     const events: RunEvent[] = [];
     const emitter = new RunEmitter('run-1', (e) => events.push(e));
 
-    await new EmmaLoopBackend().run(FULL_PARAMS, callbacks({ emitter, isCancelled: () => true }));
+    await new EmmaLoopBackend().run(FULL_PARAMS, callbacks({ emitter, isCancelled: () => false }));
 
     expect(parts(events)).toEqual([
       { type: 'attempt-finished', outcome: 'cancelled', toolCalls: 0 },
       { type: 'finish', reason: 'cancelled' },
     ]);
+  });
+
+  it('a run that finished and was stopped only during tail work stays completed', async () => {
+    mockGenerate.mockResolvedValue({ content: 'full answer', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] });
+    const events: RunEvent[] = [];
+    const emitter = new RunEmitter('run-1', (e) => events.push(e));
+
+    await new EmmaLoopBackend().run(FULL_PARAMS, callbacks({ emitter, isCancelled: () => true }));
+
+    expect(parts(events)[0]).toEqual({ type: 'attempt-finished', outcome: 'completed', toolCalls: 0 });
   });
 
   it('a throwing sink never reaches the turn: the result is still returned unchanged', async () => {
@@ -163,13 +176,6 @@ describe('EmmaLoopBackend terminal events (ENG-2104 F3)', () => {
     const emitter = new RunEmitter('run-1', () => { throw new Error('sink down'); });
 
     await expect(new EmmaLoopBackend().run(FULL_PARAMS, callbacks({ emitter }))).rejects.toBe(boom);
-  });
-
-  it('a throwing isCancelled does not fail a finished run', async () => {
-    const result = { content: 'ok', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] };
-    mockGenerate.mockResolvedValue(result);
-
-    await expect(new EmmaLoopBackend().run(FULL_PARAMS, callbacks({ isCancelled: () => { throw new Error('x'); } }))).resolves.toBe(result);
   });
 
   it('works unchanged with no emitter, and still hands the same callbacks to generateMarketingResponse', async () => {
