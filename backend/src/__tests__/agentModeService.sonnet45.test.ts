@@ -449,7 +449,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         ["openrouter/qwen/qwen3.8-27b", 34, "Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Qwen3.8 27B, xhigh"],
         ["openrouter/z-ai/glm-5.2", 33.7, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, glm-5-2 (https://artificialanalysis.ai/)"],
         ["gemini-3.5-flash", 32.6, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gemini-3-5-flash (https://artificialanalysis.ai/)"],
-        ["openrouter/deepseek/deepseek-v4-pro", 30, "Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-10-07, DeepSeek V4 Pro 0424 (Max), Reasoning (https://artificialanalysis.ai/models/deepseek-v4-pro-0424)"],
+        ["openrouter/deepseek/deepseek-v4-pro", 30.4, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, deepseek-v4-pro-0424 (https://artificialanalysis.ai/)"],
         ["gemini-3.1-pro-preview", 29.7, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, gemini-3-1-pro-preview (https://artificialanalysis.ai/)"],
         ["anthropic.claude-opus-4-6-v1", 26.4, "Artificial Analysis Intelligence Index, API v2, snapshot 2026-10-07, claude-opus-4-6 (https://artificialanalysis.ai/)"],
         ["openrouter/moonshotai/kimi-k2.7-code", 26, "Artificial Analysis Intelligence Index v4.3.2, snapshot 2026-09-22, Kimi K2.7 Code, reasoning"],
