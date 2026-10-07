@@ -209,8 +209,10 @@ function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: L
       hasUserRecord: lead.hasUserRecord ?? undefined,
       subscriptionState: lead.subscriptionState ?? undefined,
       lastActivityAt: lead.lastActivityAt ?? undefined,
-      lastUsageAt: lead.lastUsageAt ?? undefined,
-      healthScore: lead.healthScore ?? undefined,
+      // lastUsageAt/healthScore deliberately NOT passed: computeLifecycle's Rule 2 would
+      // turn a stale stored value into at_risk whenever ANY other gate branch fires
+      // (e.g. a live active subscription), re-opening the hole the removed provesRisk
+      // branch closed. See the comment above on why they are not live signals.
       currentLifecycle: lead.lifecycle ?? undefined,
       openDealStages: lead.openDealStages ?? undefined,
     } as LifecycleSignals,

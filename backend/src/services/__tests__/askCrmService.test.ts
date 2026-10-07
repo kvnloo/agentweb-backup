@@ -259,6 +259,13 @@ describe('askCrm — ENG-2155 live lifecycle precedence', () => {
     expect(result.items[0].lifecycle).toBe('paying');
   });
 
+  it('does not let a stale health score leak in through a different gate branch (live active sub)', async () => {
+    const result = await askCrm('is Leakcase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Leakcase', company: 'Acme', lifecycle: 'paying', subscriptionState: 'active', healthScore: 20, lastUsageAt: '2026-03-01T00:00:00Z' }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('paying');
+  });
+
   it('does not let a stale stored usage timestamp alone move a stored paying customer to at_risk', async () => {
     const result = await askCrm('is Usagecase at acme', 'u1', makeDeps([
       lead({ firstName: 'Usagecase', company: 'Acme', lifecycle: 'paying', lastUsageAt: '2026-03-01T00:00:00Z' }),
