@@ -8,6 +8,12 @@ describe('isLinkedInInfraError (ENG-2205)', () => {
     ['SERVER_ERROR classification', Object.assign(new Error('x'), { structuredError: { classification: 'SERVER_ERROR' } })],
     ['TIMEOUT_ERROR classification', Object.assign(new Error('x'), { structuredError: { classification: 'TIMEOUT_ERROR' } })],
     ['isTimeout flag', Object.assign(new Error('x'), { isTimeout: true })],
+    ['DNS failure (EAI_AGAIN)', new Error('getaddrinfo EAI_AGAIN api.unipile.com')],
+    ['broken pipe', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })],
+    ['undici terminated', new Error('terminated')],
+    ['undici code on cause', Object.assign(new Error('x'), { cause: { code: 'UND_ERR_SOCKET' } })],
+    ['transport code on cause', Object.assign(new Error('x'), { cause: { code: 'ECONNRESET' } })],
+    ['AbortError', Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })],
   ])('treats %s as infrastructure', (_l, err) => expect(isLinkedInInfraError(err)).toBe(true));
 
   it.each([
@@ -15,6 +21,8 @@ describe('isLinkedInInfraError (ENG-2205)', () => {
     ['rate limit', Object.assign(new Error('Unipile rate limited'), { structuredError: { classification: 'RATE_LIMIT_ERROR' } })],
     ['not found', Object.assign(new Error('Resource not found.'), { structuredError: { classification: 'NOT_FOUND' } })],
     ['auth error', Object.assign(new Error('Disconnected account'), { structuredError: { classification: 'AUTH_ERROR' } })],
+    ['a message that merely contains "terminated"', new Error('Account terminated by LinkedIn')],
+    ['numeric status code (not a transport code)', Object.assign(new Error('x'), { code: 404 })],
     ['undefined', undefined],
   ])('does NOT treat %s as infrastructure', (_l, err) => expect(isLinkedInInfraError(err)).toBe(false));
 

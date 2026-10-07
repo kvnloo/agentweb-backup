@@ -72,6 +72,11 @@ jest.mock('../cron/linkedInConnectionSyncCron', () => ({
   syncConnectionsForAccount: (...args: any[]) => mockSyncConnectionsForAccount(...args),
 }));
 
+const mockResolveLinkedInAccountForWrite = jest.fn().mockResolvedValue({ ownerUserId: 'test-user-id' });
+jest.mock('../services/agentMode/linkedInDailyVolumeGate', () => ({
+  resolveLinkedInAccountForWrite: (...args: any[]) => mockResolveLinkedInAccountForWrite(...args),
+}));
+
 jest.mock('../services/agentModeService', () => ({ agentModeService: {} }));
 jest.mock('../utils/llmService', () => ({ createLLMService: jest.fn() }));
 jest.mock('../services/settingsService', () => ({ settingsService: {} }));
@@ -276,6 +281,36 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message', () =
     expect(res.json).toHaveBeenCalledWith(
       expect.objectContaining({ message: expect.stringContaining('Cannot send message:') }),
     );
+  });
+
+  // ENG-2205 follow-up: same untrusted-accountId hole as send-linkedin-invite, and this route
+  // additionally fell back to the SHARED POOL account when no accountId was supplied.
+  it('auto-resolves from the user\'s OWN accounts only — never the shared pool', async () => {
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { message: 'Hello!' } } as any, res as any);
+    expect(mockResolveAccountId).toHaveBeenCalledWith('test-user-id', { ownOnly: true });
+    expect(mockResolveLinkedInAccountForWrite).not.toHaveBeenCalled();
+    expect(mockSendMessage).toHaveBeenCalledWith('unipile-acct-1', expect.any(String), true, 'Hello!');
+  });
+
+  it('refuses with 403 and sends nothing when the caller-specified account is not theirs', async () => {
+    mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { message: 'Hello!', accountId: 'someone-elses-acct' } } as any, res as any);
+    expect(mockResolveLinkedInAccountForWrite).toHaveBeenCalledWith('test-user-id', 'someone-elses-acct');
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(res.json).toHaveBeenCalledWith({ message: 'That LinkedIn account is not connected to your user.' });
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(mockAddLinkedInMessageEvent).not.toHaveBeenCalled();
+  });
+
+  it('sends from a caller-specified account the user owns or shares (portal default-account path)', async () => {
+    mockResolveLinkedInAccountForWrite.mockResolvedValue({ ownerUserId: 'test-user-id' });
+    const res = makeRes();
+    await handler!({ user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: { message: 'Hello!', accountId: 'my-default-acct' } } as any, res as any);
+    expect(mockSendMessage).toHaveBeenCalledWith('my-default-acct', 'https://www.linkedin.com/in/john-doe', true, 'Hello!');
+    expect(mockResolveAccountId).not.toHaveBeenCalled();
+    expect(res.status).not.toHaveBeenCalled();
   });
 
   it('sends message and records engagement on happy path', async () => {

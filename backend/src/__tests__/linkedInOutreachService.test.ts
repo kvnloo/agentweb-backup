@@ -2046,6 +2046,64 @@ describe('LinkedInOutreachService', () => {
       probeSpy.mockRestore();
     });
 
+    describe('options (ENG-2205 follow-up)', () => {
+      let probeSpy: jest.SpyInstance | undefined;
+      // Restore so the probe mock never leaks into the tests that follow this block.
+      afterEach(() => { probeSpy?.mockRestore(); probeSpy = undefined; });
+
+      const pool = () => mockGetSetting.mockResolvedValue({
+        settingValue: JSON.stringify([{ account_id: 'site-live', enabled: true }]),
+      });
+
+      it('verifiedOnly returns null when the only candidate is indeterminate (pre-ENG-2205 behavior)', async () => {
+        mockGetAccountsByUserId.mockResolvedValue([{ platform: 'unipile', account_id: 'own-unverifiable' }]);
+        pool();
+        (probeSpy = jest.spyOn(linkedInOutreachService, 'probeAccountSession')).mockResolvedValue('unknown');
+
+        expect(await linkedInOutreachService.resolveAccountId('user-1', { verifiedOnly: true })).toBeNull();
+        // and the default (no option) is unchanged: it still hands back the unverified own account
+        expect(await linkedInOutreachService.resolveAccountId('user-1')).toBe('own-unverifiable');
+      });
+
+      it('verifiedOnly still returns a proven-connected account', async () => {
+        mockGetAccountsByUserId.mockResolvedValue([{ platform: 'unipile', account_id: 'own-live' }]);
+        (probeSpy = jest.spyOn(linkedInOutreachService, 'probeAccountSession')).mockResolvedValue('connected');
+
+        expect(await linkedInOutreachService.resolveAccountId('user-1', { verifiedOnly: true })).toBe('own-live');
+      });
+
+      it('ownOnly never borrows the shared pool, even when the pool is live and the user has no account', async () => {
+        mockGetAccountsByUserId.mockResolvedValue([]);
+        pool();
+        (probeSpy = jest.spyOn(linkedInOutreachService, 'probeAccountSession')).mockResolvedValue('connected');
+
+        expect(await linkedInOutreachService.resolveAccountId('user-1', { ownOnly: true })).toBeNull();
+        expect(mockGetSetting).not.toHaveBeenCalled();
+        // while the default still falls back to the pool
+        expect(await linkedInOutreachService.resolveAccountId('user-1')).toBe('site-live');
+      });
+
+      it('ownOnly never uses the pool when every own account is dead', async () => {
+        mockGetAccountsByUserId.mockResolvedValue([{ platform: 'unipile', account_id: 'own-dead' }]);
+        pool();
+        (probeSpy = jest.spyOn(linkedInOutreachService, 'probeAccountSession'))
+          .mockImplementation(async (id: string) => (id === 'site-live' ? 'connected' : 'disconnected'));
+
+        expect(await linkedInOutreachService.resolveAccountId('user-1', { ownOnly: true })).toBeNull();
+      });
+
+      it('ownOnly keeps live-first own selection: skips a dead first account for a live second one', async () => {
+        mockGetAccountsByUserId.mockResolvedValue([
+          { platform: 'unipile', account_id: 'own-dead' },
+          { platform: 'unipile', account_id: 'own-live' },
+        ]);
+        (probeSpy = jest.spyOn(linkedInOutreachService, 'probeAccountSession'))
+          .mockImplementation(async (id: string) => (id === 'own-live' ? 'connected' : 'disconnected'));
+
+        expect(await linkedInOutreachService.resolveAccountId('user-1', { ownOnly: true })).toBe('own-live');
+      });
+    });
+
     it('returns site-wide account_id when user has no account but site-wide accounts are configured', async () => {
       mockGetAccountsByUserId.mockResolvedValue([]);
       mockGetSetting.mockResolvedValue({
@@ -2514,8 +2572,12 @@ describe('LinkedInOutreachService', () => {
       expect(linkedInOutreachService.probeAccountSession).not.toHaveBeenCalled();
     });
 
-    it('returns an indeterminate site-wide account rather than null when Unipile itself is erroring (ENG-2205)', async () => {
-      mockGetAccountsByUserId.mockResolvedValue([]);
+    // ENG-2205 deliberately did NOT change enrichment: the false "connect your account"
+    // diagnosis never applied here (a null just means no LinkedIn data), and handing back an
+    // unproven account made every lead run a real failing call. An indeterminate probe must
+    // keep resolving to null exactly as it did before.
+    it('returns null (not an unverified account) when every probe is indeterminate — unchanged behavior', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([{ platform: 'unipile', account_id: 'own-unverifiable' }]);
       mockGetSetting.mockResolvedValue({
         settingValue: JSON.stringify([{ account_id: 'site-unverifiable', enabled: true }]),
       });
@@ -2523,21 +2585,7 @@ describe('LinkedInOutreachService', () => {
 
       const result = await linkedInOutreachService.resolveAccountIdForEnrichment('user-9');
 
-      expect(result).toBe('site-unverifiable');
-    });
-
-    it('prefers an indeterminate OWN account over an indeterminate site-wide account', async () => {
-      mockGetAccountsByUserId.mockResolvedValue([
-        { platform: 'unipile', account_id: 'own-unverifiable' },
-      ]);
-      mockGetSetting.mockResolvedValue({
-        settingValue: JSON.stringify([{ account_id: 'site-unverifiable', enabled: true }]),
-      });
-      jest.spyOn(linkedInOutreachService, 'probeAccountSession').mockResolvedValue('unknown');
-
-      const result = await linkedInOutreachService.resolveAccountIdForEnrichment('user-10');
-
-      expect(result).toBe('own-unverifiable');
+      expect(result).toBeNull();
     });
   });
 });

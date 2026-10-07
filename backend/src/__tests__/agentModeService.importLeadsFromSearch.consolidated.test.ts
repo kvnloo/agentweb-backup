@@ -899,7 +899,9 @@ describe('AgentModeService.importLeadsFromSearch — top-up loop', () => {
 
     const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 10 });
 
-    expect(result.searchError).toContain('LinkedIn connectivity check timed out');
+    // Infrastructure failures are reported to the agent as a generic, retry-shaped message —
+    // never the raw internal text.
+    expect(result.searchError).toBe('LinkedIn is temporarily unavailable. Please try again in a few minutes.');
     expect(mockClearStatusCache).not.toHaveBeenCalled();
     expect(mockRecordUnipileAccountHealth).not.toHaveBeenCalled();
   });
