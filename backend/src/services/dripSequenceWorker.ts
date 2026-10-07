@@ -28,6 +28,8 @@ import { v4 as uuidv4 } from 'uuid';
 // socialEngagementExecutor.ts's INSTANCE_ID, used for log correlation only.
 const INSTANCE_ID = uuidv4();
 
+const PINNED_ACCOUNT_SNOOZE_MS = 30 * 60 * 1000;
+
 /** A LinkedIn step pins an account the sequence owner no longer owns or shares. */
 export class PinnedLinkedInAccountNotConnectedError extends Error {
   constructor(stepNumber: number, userId: string) {
@@ -83,8 +85,10 @@ export async function processDueEnrollments(): Promise<{
         console.log(`[dripWorker] Snoozed enrollment ${enrollment.enrollmentId} until ${retryAt} (not yet connected)`);
       } else if (err instanceof PinnedLinkedInAccountNotConnectedError) {
         // A config problem the owner has to fix (re-pick or reconnect the account). Retrying every 5-minute
-        // tick cannot succeed and only burns claims and log noise, so back off like the not-connected case.
-        const retryAt = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
+        // tick cannot succeed and only burns claims and log noise, so back off. Deliberately SHORT (30 min,
+        // not the 6h used for 'not yet connected'): editing a sequence does not reset an enrollment's
+        // nextSendAt, so a long snooze would delay sending long after the user has fixed the step.
+        const retryAt = new Date(Date.now() + PINNED_ACCOUNT_SNOOZE_MS).toISOString();
         await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, retryAt).catch(() => {});
         console.log(`[dripWorker] Snoozed enrollment ${enrollment.enrollmentId} until ${retryAt} (pinned LinkedIn account not connected)`);
       } else if (err instanceof SenderDailyLimitExceededError) {

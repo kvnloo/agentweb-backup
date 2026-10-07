@@ -276,7 +276,10 @@ describe('a pinned LinkedIn account must belong to the sequence owner (ENG-2205)
     expect(stats.errors).toBe(1);
     expect(mockDb.snoozeEnrollment).toHaveBeenCalledTimes(1);
     const retryAt = new Date(mockDb.snoozeEnrollment.mock.calls[0][1]).getTime();
-    expect(retryAt - Date.now()).toBeGreaterThan(5 * 60 * 60 * 1000); // ~6h, not the next 5-minute tick
+    // Backed off (well past the next 5-minute tick) but short, so a fixed step resumes soon: editing a
+    // sequence does not reset nextSendAt.
+    expect(retryAt - Date.now()).toBeGreaterThan(20 * 60 * 1000);
+    expect(retryAt - Date.now()).toBeLessThan(40 * 60 * 1000);
     expect(mockDb.releaseEnrollmentClaim).not.toHaveBeenCalled();
   });
 
