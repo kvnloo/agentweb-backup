@@ -39,7 +39,7 @@ import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/fi
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { resolveRunFunding } from '../services/funding/runFunding';
-import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
+import { isContextLimitError, isProviderNoEndpointsError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
@@ -10174,6 +10174,16 @@ export const agentModeController = {
           return;
         }
 
+        if (isProviderNoEndpointsError(error)) {
+          res.status(503).json({
+            error: 'Model provider unavailable',
+            message: 'The selected model has no available provider right now. Please try again, or pick a different model from the selector above.',
+            code: 'PROVIDER_UNAVAILABLE',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
         if (isContextLimitError(error)) {
           const user = req.user as User;
           const sessionId = req.body?.sessionId;
@@ -11336,6 +11346,16 @@ export const agentModeController = {
             error: 'Server is restarting',
             message: 'The server is restarting. Please try again in a moment.',
             code: 'SERVER_RESTARTING',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
+        if (isProviderNoEndpointsError(error)) {
+          res.status(503).json({
+            error: 'Model provider unavailable',
+            message: 'The selected model has no available provider right now. Please try again, or pick a different model from the selector above.',
+            code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
           });
           return;
@@ -14440,6 +14460,16 @@ export const agentModeController = {
             error: 'Server is restarting',
             message: 'The server is restarting. Please try again in a moment.',
             code: 'SERVER_RESTARTING',
+            suggestion: 'wait_and_retry'
+          });
+          return;
+        }
+
+        if (isProviderNoEndpointsError(error)) {
+          res.status(503).json({
+            error: 'Model provider unavailable',
+            message: 'The selected model has no available provider right now. Please try again, or pick a different model from the selector above.',
+            code: 'PROVIDER_UNAVAILABLE',
             suggestion: 'wait_and_retry'
           });
           return;

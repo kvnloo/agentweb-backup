@@ -101,6 +101,23 @@ export function isWorkerShutdownError(error: unknown): boolean {
   return false;
 }
 
+/**
+ * ENG-2293 (Opslane finding on PR #3276): `require_parameters: true` means a
+ * single requested parameter unsupported by every eligible provider leaves no
+ * routable endpoint at all — OpenRouter's 404 reads literally "No endpoints
+ * found that can handle the requested parameters" (see
+ * openRouterRequestParams.ts, same failure class as ENG-199). That's a
+ * provider-routing condition, not an unknown server error, and deserves its
+ * own handled, user-readable outcome instead of falling through to a generic
+ * 500.
+ */
+export function isProviderNoEndpointsError(error: unknown): boolean {
+  if (!error) return false;
+  const message = error instanceof Error ? error.message : String(error);
+  const originalMessage = (error as any)?.originalMessage || '';
+  return message.includes('No endpoints found') || originalMessage.includes('No endpoints found');
+}
+
 const TRANSIENT_STATUS_CODES = [429, 500, 502, 503, 504];
 
 // Bedrock also returns ModelTimeoutException with a 500-class status — treat any
