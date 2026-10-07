@@ -1,4 +1,4 @@
-import { RunEmitter, RunEvent, StreamPart } from '../streamEvents';
+import { RunEmitter, RunEvent, StreamPart, emitBestEffort } from '../streamEvents';
 
 describe('RunEmitter', () => {
   it('emits a versioned run envelope with a stable sequence', () => {
@@ -74,5 +74,25 @@ describe('RunEmitter', () => {
     emitter.emit({ type: 'finish', reason: 'error' });
 
     expect(events[0]).toMatchObject({ runId: 'run-1', seq: 1 });
+  });
+});
+
+describe('emitBestEffort (ENG-2104)', () => {
+  it('does nothing without an emitter', () => {
+    expect(() => emitBestEffort(undefined, { type: 'finish', reason: 'stop' })).not.toThrow();
+  });
+
+  it('emits through a healthy emitter', () => {
+    const events: RunEvent[] = [];
+    emitBestEffort(new RunEmitter('run-1', (e) => events.push(e)), { type: 'attempt-finished', outcome: 'completed' });
+    expect(events[0].part).toEqual({ type: 'attempt-finished', outcome: 'completed' });
+  });
+
+  it('swallows a throwing sink, unlike RunEmitter.emit itself', () => {
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const emitter = new RunEmitter('run-1', () => { throw new Error('sink unavailable'); });
+    expect(() => emitter.emit({ type: 'finish', reason: 'stop' })).toThrow('sink unavailable');
+    expect(() => emitBestEffort(emitter, { type: 'finish', reason: 'stop' })).not.toThrow();
+    spy.mockRestore();
   });
 });
