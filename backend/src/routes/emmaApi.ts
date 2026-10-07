@@ -339,7 +339,7 @@ router.post('/post-on-account', async (req: Request, res: Response) => {
     const toolContext = buildScheduledPublishContext(req);
     const result = await svc.postOnConnectedAccount(
       userId(req), req.body.account_id, req.body.content, req.body.media_urls || [],
-      undefined, toolContext
+      undefined, toolContext, req.body.save_as_draft === true ? { saveAsDraft: true } : undefined
     );
     res.json(result);
   } catch (err: any) {
