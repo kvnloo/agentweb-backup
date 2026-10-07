@@ -102,6 +102,35 @@ export interface BrandBuildDeps {
     userId: string,
     companyUrl: string,
   ) => Promise<{ persisted: boolean; logoUrl: string | null; reason: string }>;
+  /**
+   * The `brandBuildStartedAt` THIS run's own `claimBrandBuildRun` minted
+   * (ENG-2308 review follow-up). Conditions `persistFailure`'s writes on
+   * it so a reclaimed, merely-slow run's zombie failure can't stomp a
+   * reclaiming run's own in-progress or already-completed state — same
+   * ownership-token pattern applied to icp/competitor/creativeDir/adCopy.
+   * Optional for backward compatibility with direct callers/tests that
+   * bypass the claim; only `startBrandBuildForUser`-equivalent callers
+   * that hold a fresh claim should pass it. The `ready` transition itself
+   * is written by Emma's `update_brand_guidelines` tool-call hook in
+   * agentModeService, not here, so this only covers the failure paths —
+   * see the docstring on `claimBrandBuildRun` for why the ready path is
+   * out of scope for this fix.
+   */
+  expectedStartedAt?: string;
+}
+
+/**
+ * Restate "the `building` record is still the one THIS run claimed" as a
+ * DynamoDB condition (ENG-2308 review follow-up, confirmed by direct
+ * reproduction — see onboardingIcpService's `icpOwnershipCondition` for
+ * the full reasoning, identical here).
+ */
+function brandBuildOwnershipCondition(expectedStartedAt: string) {
+  return {
+    expression: "#brandBuildStartedAt = :brandBuildOwnerStartedAt",
+    names: { "#brandBuildStartedAt": "brandBuildStartedAt" },
+    values: { ":brandBuildOwnerStartedAt": expectedStartedAt },
+  };
 }
 
 function buildBrandPrompt(input: {
@@ -400,6 +429,7 @@ export async function triggerBrandBuildForUser(
       user,
       "no companyUrl on User record — cannot brand-build",
       now(),
+      deps.expectedStartedAt,
     );
     return;
   }
@@ -445,6 +475,7 @@ export async function triggerBrandBuildForUser(
       user,
       `failed to create Emma session: ${e?.message ?? String(e)}`,
       now(),
+      deps.expectedStartedAt,
     );
     return;
   }
@@ -464,6 +495,7 @@ export async function triggerBrandBuildForUser(
       (await userDb.getUserById(userId)) || user,
       `Emma session failed: ${e?.message ?? String(e)}`,
       now(),
+      deps.expectedStartedAt,
     );
     return;
   }
@@ -507,6 +539,7 @@ export async function triggerBrandBuildForUser(
       finalUser || updated,
       `Emma finished but did not call update_brand_guidelines (final brandBuildStatus=${finalStatus ?? "unset"})`,
       now(),
+      deps.expectedStartedAt,
     );
     return;
   }
@@ -576,9 +609,30 @@ async function persistFailure(
   current: any,
   message: string,
   now: Date,
+  expectedStartedAt?: string,
 ): Promise<void> {
   const patch = buildFailedPatch(current || {}, message, now);
-  await userDb.updateUser(userId, patch as any);
+  if (expectedStartedAt) {
+    try {
+      await userDb.updateUser(userId, patch as any, {
+        condition: brandBuildOwnershipCondition(expectedStartedAt),
+      });
+    } catch (err: any) {
+      if (err?.code === "ConditionalCheckFailedException") {
+        // A reclaim superseded THIS run while it was failing. Reporting
+        // our failure here would stomp whatever the reclaiming run has
+        // since done — drop it, the reclaiming run owns the axis's fate.
+        console.warn(
+          "[onboardingBrandBuildService] dropping stale failure — a newer claim owns the axis",
+          { userId },
+        );
+        return;
+      }
+      throw err;
+    }
+  } else {
+    await userDb.updateUser(userId, patch as any);
+  }
   // ENG-848: ONE durable row per outcome.
   //
   // This used to call logCompletionMetric AND write its own OnboardingMetrics

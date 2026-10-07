@@ -173,7 +173,12 @@ router.post("/brand-build/start", authenticateToken, async (req, res) => {
     }
     // Fire-and-forget background work; route returns immediately so the UI
     // can poll /status without holding an HTTP connection open for ~30s.
-    void triggerBrandBuildForUser(userId).catch((e) => {
+    // expectedStartedAt: this claim's own startedAt, so a later reclaim's
+    // zombie failure write can't stomp a terminal state WE or the
+    // reclaiming run have since published (ENG-2308 review follow-up).
+    void triggerBrandBuildForUser(userId, {
+      expectedStartedAt: patch.brandBuildStartedAt,
+    }).catch((e) => {
       console.error("[brandBuild] background trigger crashed", e);
     });
     // Return the snapshot built from the patch we just persisted — do NOT

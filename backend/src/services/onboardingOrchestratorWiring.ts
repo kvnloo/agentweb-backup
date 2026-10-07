@@ -148,7 +148,13 @@ async function runBrandDna(userId: string): Promise<unknown> {
     const current = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
     return current?.brandGuidelines ?? null;
   }
-  await triggerBrandBuildForUser(userId);
+  // expectedStartedAt: this invocation's own claim, so a later reclaim's
+  // zombie FAILURE write can't stomp a terminal state WE or the reclaiming
+  // run have since published (ENG-2308 review follow-up). The ready
+  // transition itself is written by Emma's tool-call hook, out of scope.
+  await triggerBrandBuildForUser(userId, {
+    expectedStartedAt: (claimed as { brandBuildStartedAt?: string }).brandBuildStartedAt,
+  });
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
   throwIfStepFailed(user, "brandBuild", startedAtMs, "brand build failed");
   return user?.brandGuidelines ?? null;
