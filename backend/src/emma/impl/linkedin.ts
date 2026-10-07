@@ -246,6 +246,7 @@ import {
   resolveLinkedInAccountForWrite,
   resolveLinkedInAccountFromList,
   setDailyInviteCap,
+  DailyInviteCapNotOwnerError,
   type ResolvedLinkedInAccount,
 } from '../../services/agentMode/linkedInDailyVolumeGate';
 import {
@@ -2241,11 +2242,20 @@ export async function linkedinOutreach(
         // for an unattended/scheduled run (there's no one to ask).
         // Writes through the account OWNER's record, not necessarily the
         // caller's — see linkedInDailyVolumeGate.ts's module doc comment.
-        const clampedCap = await setDailyInviteCap(
-          resolvedLinkedInAccount!,
-          account_id,
-          args.daily_invite_cap,
-        );
+        let clampedCap: number;
+        try {
+          clampedCap = await setDailyInviteCap(
+            resolvedLinkedInAccount!,
+            account_id,
+            args.daily_invite_cap,
+            userId,
+          );
+        } catch (err) {
+          if (err instanceof DailyInviteCapNotOwnerError) {
+            return { success: false, error: err.message };
+          }
+          throw err;
+        }
         return {
           success: true,
           data: {
