@@ -561,6 +561,8 @@ async function classifyCandidate(
   requested: string,
   canonical: string,
 ): Promise<Candidate> {
+  // Entitlement is evaluated for the SESSION OWNER (`ownerId`), not the caller: an admin comparing
+  // inside someone else's session gets the owner's model set. Consistent with /generate.
   const info = deps.getModelInfo(canonical);
   const candidate: Candidate = { requested, canonical, info };
   if (!info) return { ...candidate, rejection: 'model_unavailable' };
@@ -773,17 +775,25 @@ export async function selectCompareResult(
   }
 }
 
+/** Most recent messages scanned when looking for an already-persisted selection (replay). */
+const REPLAY_SCAN_MAX_MESSAGES = 500;
+
 function findPersistedPair(history: readonly ChatMessage[], req: ValidatedSelectRequest): ChatMessage[] | null {
-  if (history.length < 2) return null;
-  const user = history[history.length - 2];
-  const assistant = history[history.length - 1];
+  // Scan the history newest-first (bounded, O(n)): a late replay must be recognised even after
+  // further turns were appended. The timestamp >= issuedAt guard keeps an identical earlier turn
+  // that predates the comparison from being mistaken for a replay.
   const issuedIso = new Date(req.issuedAt).toISOString();
-  const after = (m: ChatMessage) => typeof m.timestamp === 'string' && m.timestamp >= issuedIso;
-  if (
-    user.role === 'user' && user.content === req.prompt && after(user)
-    && assistant.role === 'assistant' && assistant.content === req.content && assistant.llm === req.model
-  ) {
-    return [user, assistant];
+  const lowest = Math.max(1, history.length - REPLAY_SCAN_MAX_MESSAGES);
+  for (let i = history.length - 1; i >= lowest; i--) {
+    const assistant = history[i];
+    const user = history[i - 1];
+    if (
+      user.role === 'user' && user.content === req.prompt
+      && typeof user.timestamp === 'string' && user.timestamp >= issuedIso
+      && assistant.role === 'assistant' && assistant.content === req.content && assistant.llm === req.model
+    ) {
+      return [user, assistant];
+    }
   }
   return null;
 }

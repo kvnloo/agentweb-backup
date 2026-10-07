@@ -441,6 +441,46 @@ describe('POST /compare model rejection (never substituted)', () => {
     expect(callLLM).not.toHaveBeenCalled();
   });
 
+  // Local test double with the same shape as ModelUnavailableError (services/agentMode/modelUnavailable.ts,
+  // which lives on another branch, #3339). The service treats ANY thrown resolver error as a rejection
+  // (fail closed), so this pins that contract for the real error's shape.
+  class ModelUnavailableErrorDouble extends Error {
+    readonly code = 'model_unavailable' as const;
+    constructor(readonly requestedModel: string, readonly reason: 'not_served' | 'not_selectable') {
+      super(`model ${requestedModel} unavailable: ${reason}`);
+      this.name = 'ModelUnavailableError';
+    }
+  }
+
+  it.each(['not_served', 'not_selectable'] as const)(
+    'a resolver throwing a ModelUnavailableError (%s) rejects only that column; the others still run',
+    async (reason) => {
+      const resolveModel = jest.fn(async ({ requestedModel }: { requestedModel: string }) => {
+        if (requestedModel === 'gemini-3.5-flash') throw new ModelUnavailableErrorDouble(requestedModel, reason);
+        return { effectiveModel: requestedModel, modelSelection: 'honored' };
+      });
+      const { deps, callLLM } = makeDeps({ resolveModel });
+      const out = await run(deps, body());
+      expect(out.status).toBe(200);
+      expect(res(out).results[0]).toMatchObject({ model: 'gpt-5.5', status: 'ok' });
+      expect(res(out).results[1]).toMatchObject({ model: 'gemini-3.5-flash', status: 'rejected', errorCode: 'model_unavailable', latencyMs: 0 });
+      expect(res(out).results[1].selectToken).toBeUndefined();
+      expect(callLLM.mock.calls.map((c) => c[0])).toEqual(['gpt-5.5']);
+    },
+  );
+
+  it('a paused (blocked) decision still refuses the whole request with 429 even when another column throws ModelUnavailableError', async () => {
+    const resolveModel = jest.fn(async ({ requestedModel }: { requestedModel: string }) => {
+      if (requestedModel === 'gemini-3.5-flash') throw new ModelUnavailableErrorDouble(requestedModel, 'not_served');
+      return { effectiveModel: null, modelSelection: 'blocked' };
+    });
+    const { deps, callLLM } = makeDeps({ resolveModel });
+    const out = await run(deps, body());
+    expect(out.status).toBe(429);
+    expect(res(out).code).toBe('usage_paused');
+    expect(callLLM).not.toHaveBeenCalled();
+  });
+
   it('all models rejected is still a 200', async () => {
     const { deps } = makeDeps();
     expect((await run(deps, body({ models: ['nope-1', 'nope-2'] }))).status).toBe(200);
@@ -852,6 +892,49 @@ describe('POST /compare/select', () => {
     expect(res(out).messages.map((m: any) => m.messageIndex)).toEqual([1, 2]);
     expect(appendMessages).not.toHaveBeenCalled();
     expect(deps.release).toHaveBeenCalled();
+  });
+
+  it('late replay after further turns were appended returns the persisted pair, appends nothing and does not rewind the model', async () => {
+    const payload = sel();
+    const stamp = new Date(NOW).toISOString();
+    const later = new Date(NOW + 60_000).toISOString();
+    const persisted = session({
+      messages: [
+        { role: 'system', content: 'SYS' },
+        { role: 'user', content: payload.prompt, timestamp: stamp, messageIndex: 1 },
+        { role: 'assistant', content: payload.content, llm: 'gpt-5.5', timestamp: stamp, messageIndex: 2 },
+        { role: 'user', content: 'a later question', timestamp: later, messageIndex: 3 },
+        { role: 'assistant', content: 'a later answer', llm: 'gemini-3.5-flash', timestamp: later, messageIndex: 4 },
+      ],
+    });
+    const { deps, appendMessages } = makeSelect({}, persisted);
+    const out = await go(deps, payload);
+    expect(out.status).toBe(200);
+    expect(res(out).replayed).toBe(true);
+    expect(res(out).messages.map((m: any) => m.messageIndex)).toEqual([1, 2]);
+    expect(appendMessages).not.toHaveBeenCalled();
+    expect(deps.updateSessionModel).not.toHaveBeenCalled();
+  });
+
+  it('a pair with a different llm or content is not a replay', async () => {
+    const payload = sel();
+    const stamp = new Date(NOW).toISOString();
+    for (const [content, llm] of [['the chosen answer', 'gemini-3.5-flash'], ['some other answer', 'gpt-5.5']]) {
+      const persisted = session({
+        messages: [
+          { role: 'system', content: 'SYS' },
+          { role: 'user', content: payload.prompt, timestamp: stamp },
+          { role: 'assistant', content, llm, timestamp: stamp },
+          { role: 'user', content: 'later', timestamp: stamp },
+          { role: 'assistant', content: 'later answer', llm: 'gpt-5.5', timestamp: stamp },
+        ],
+      });
+      const { deps, appendMessages } = makeSelect({}, persisted);
+      const out = await go(deps, payload);
+      expect(out.status).toBe(200);
+      expect(res(out).replayed).toBeUndefined();
+      expect(appendMessages).toHaveBeenCalledTimes(1);
+    }
   });
 
   it('an identical earlier turn that predates the comparison is not mistaken for a replay', async () => {
