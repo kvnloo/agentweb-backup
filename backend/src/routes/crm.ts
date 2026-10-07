@@ -2128,7 +2128,7 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     // ENG-2311: session lists are telemetry — no CRM push, sequence enrolment or paid
     // email validation for their rows. Flag only added when true (other lists unchanged).
     const suppressSideEffects = suppressLeadSideEffects(list);
-    const lead = await crmDb.createLead(listId, suppressSideEffects ? { ...leadData, suppressSideEffects: true } : leadData);
+    const lead = await crmDb.createLead(listId, suppressSideEffects ? { ...leadData, suppressSideEffects: true } : leadData, 'manual');
 
     if (!suppressSideEffects) void Promise.allSettled([
       externalCrmSyncService.autoSyncLead(userId, listId, lead, 'hubspot', 'created'),
@@ -2214,7 +2214,7 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
       return normalized;
     });
 
-    const result = await crmDb.batchCreateLeads(listId, normalizedLeads);
+    const result = await crmDb.batchCreateLeads(listId, normalizedLeads, { origin: 'enrichment_import' });
 
     // Auto-enroll new leads into any sequences watching this list (fire-and-forget)
     if (result.newCount > 0 && !suppressLeadSideEffects(list)) {
@@ -3242,7 +3242,7 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
     const leads = records.map((record) => projectRecordWithMapping(record, columnMapping));
 
     // Batch create leads
-    const results = await crmDb.batchCreateLeads(listId, leads);
+    const results = await crmDb.batchCreateLeads(listId, leads, { origin: 'enrichment_import' });
 
     if (results.newCount > 0 && !suppressLeadSideEffects(list)) {
       void autoEnrollListIntoSequences(userId, listId);
@@ -3827,7 +3827,7 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
 
       for (let i = 0; i < leads.length; i += leadBatchSize) {
         const batch = leads.slice(i, i + leadBatchSize);
-        const results = await crmDb.batchCreateLeads(listId, batch);
+        const results = await crmDb.batchCreateLeads(listId, batch, { origin: 'enrichment_import' });
 
         connectionsSuccessCount += results.successCount;
         connectionsErrorCount += results.errorCount;
@@ -6647,7 +6647,7 @@ router.post('/sync-subscribers', async (req: Request, res: Response) => {
     });
 
     // Batch create/merge leads (always force update)
-    const results = await crmDb.batchCreateLeads(leadList.listId, leads);
+    const results = await crmDb.batchCreateLeads(leadList.listId, leads, { origin: 'integration' });
 
     const syncAnonymizedSkipped = results.anonymizedSkipped || 0;
     res.json({
