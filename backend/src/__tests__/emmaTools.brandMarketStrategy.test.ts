@@ -58,14 +58,20 @@ describe('brand/market-strategy cluster delegates to emma/impl/brandMarketStrate
     expect(result).toBe(expected);
   });
 
-  it('update_brand_guidelines forwards args and userId, and returns the result unchanged', async () => {
+  it('update_brand_guidelines forwards args, userId and the calling sessionId, and returns the result unchanged', async () => {
     const expected = { success: true, updatedFields: ['brandData'] };
     mockBrandMarketStrategy.updateBrandGuidelines.mockResolvedValue(expected);
     const args = { brandData: { brandName: 'Acme' }, refreshMarketStrategy: true };
 
-    const result = await emmaToolRegistry.getTool('update_brand_guidelines')!.execute(args, { userId: 'u1' });
+    const result = await emmaToolRegistry
+      .getTool('update_brand_guidelines')!
+      .execute(args, { userId: 'u1', sessionId: 's1' });
 
-    expect(mockBrandMarketStrategy.updateBrandGuidelines).toHaveBeenCalledWith(args, 'u1');
+    // The session id lets the brand-build `ready` flip complete only the
+    // claim its session was started under (ENG-2308).
+    expect(mockBrandMarketStrategy.updateBrandGuidelines).toHaveBeenCalledWith(args, 'u1', {
+      sessionId: 's1',
+    });
     expect(result).toBe(expected);
   });
 

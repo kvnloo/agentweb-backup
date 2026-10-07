@@ -903,7 +903,7 @@ describe("reconcileForUser", () => {
 });
 
 describe("runAdImage — lost start-claim race (ENG-2308)", () => {
-  it("skips the worker and returns the current adImageResult without throwing when claimAdImageRun loses the race", async () => {
+  it("skips the worker and signals StepClaimLostError (no stale result) when claimAdImageRun loses the race", async () => {
     await jest.isolateModulesAsync(async () => {
       const triggerAdImage = jest.fn();
       const claimAdImageRunMock = jest.fn(async () => null);
@@ -925,16 +925,15 @@ describe("runAdImage — lost start-claim race (ENG-2308)", () => {
       }));
 
       const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
-      const result = await PRODUCTION_DAG.adImage.runner({ userId: "u1" });
-
+      // A lost claim must neither run the worker nor report a result: the
+      // winner records the real outcome (a stale output here used to be
+      // stamped "ready" by reconcile() and unblock downstream steps early).
+      await expect(
+        PRODUCTION_DAG.adImage.runner({ userId: "u1" }),
+      ).rejects.toMatchObject({ name: "StepClaimLostError", step: "adImage" });
       expect(claimAdImageRunMock).toHaveBeenCalledWith("u1");
-      // Must NOT launch a second worker when the claim is already owned
-      // elsewhere — that is exactly the duplicate-Gemini-call bug ENG-2308
-      // closes for this axis.
+      // Must NOT launch a second worker when the claim is owned elsewhere.
       expect(triggerAdImage).not.toHaveBeenCalled();
-      expect(result).toEqual({
-        variants: [{ id: "v1", imageUrl: "https://x/1.png", prompt: "p" }],
-      });
     });
   });
 });
@@ -951,7 +950,7 @@ describe("runAdImage — lost start-claim race (ENG-2308)", () => {
 // pre-existing runAdImage above), and must skip the trigger — not run it a
 // second time — when that claim is already owned elsewhere.
 describe("runBrandDna/runIcp/runCompetitor/runCreativeDir/runAdCopy — claim-before-trigger (ENG-2308)", () => {
-  it("runBrandDna skips triggerBrandBuildForUser and returns the current brandGuidelines when claimBrandBuildRun loses the race", async () => {
+  it("runBrandDna skips triggerBrandBuildForUser and signals StepClaimLostError (no stale brandGuidelines) when claimBrandBuildRun loses the race", async () => {
     await jest.isolateModulesAsync(async () => {
       const triggerBrandBuild = jest.fn();
       const claimBrandBuildRunMock = jest.fn(async () => null);
@@ -972,15 +971,19 @@ describe("runBrandDna/runIcp/runCompetitor/runCreativeDir/runAdCopy — claim-be
       }));
 
       const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
-      const result = await PRODUCTION_DAG.brandDna.runner({ userId: "u1" });
-
+      // A lost claim must neither run the worker nor report a result: the
+      // winner records the real outcome (a stale output here used to be
+      // stamped "ready" by reconcile() and unblock downstream steps early).
+      await expect(
+        PRODUCTION_DAG.brandDna.runner({ userId: "u1" }),
+      ).rejects.toMatchObject({ name: "StepClaimLostError", step: "brandDna" });
       expect(claimBrandBuildRunMock).toHaveBeenCalledWith("u1");
+      // Must NOT launch a second worker when the claim is owned elsewhere.
       expect(triggerBrandBuild).not.toHaveBeenCalled();
-      expect(result).toEqual({ brandData: { brandName: "Owned Elsewhere" } });
     });
   });
 
-  it("runIcp skips triggerIcpDiscoveryForUser and returns the current icpResult when claimIcpRun loses the race", async () => {
+  it("runIcp skips triggerIcpDiscoveryForUser and signals StepClaimLostError (no stale icpResult) when claimIcpRun loses the race", async () => {
     await jest.isolateModulesAsync(async () => {
       const triggerIcp = jest.fn();
       const claimIcpRunMock = jest.fn(async () => null);
@@ -1001,15 +1004,19 @@ describe("runBrandDna/runIcp/runCompetitor/runCreativeDir/runAdCopy — claim-be
       }));
 
       const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
-      const result = await PRODUCTION_DAG.icp.runner({ userId: "u1" });
-
+      // A lost claim must neither run the worker nor report a result: the
+      // winner records the real outcome (a stale output here used to be
+      // stamped "ready" by reconcile() and unblock downstream steps early).
+      await expect(
+        PRODUCTION_DAG.icp.runner({ userId: "u1" }),
+      ).rejects.toMatchObject({ name: "StepClaimLostError", step: "icp" });
       expect(claimIcpRunMock).toHaveBeenCalledWith("u1");
+      // Must NOT launch a second worker when the claim is owned elsewhere.
       expect(triggerIcp).not.toHaveBeenCalled();
-      expect(result).toEqual([{ name: "Owned Elsewhere" }]);
     });
   });
 
-  it("runCompetitor skips triggerCompetitorStrategyForUser and returns the current competitorResult when claimCompetitorRun loses the race", async () => {
+  it("runCompetitor skips triggerCompetitorStrategyForUser and signals StepClaimLostError (no stale competitorResult) when claimCompetitorRun loses the race", async () => {
     await jest.isolateModulesAsync(async () => {
       const triggerCompetitor = jest.fn();
       const claimCompetitorRunMock = jest.fn(async () => null);
@@ -1030,15 +1037,19 @@ describe("runBrandDna/runIcp/runCompetitor/runCreativeDir/runAdCopy — claim-be
       }));
 
       const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
-      const result = await PRODUCTION_DAG.competitor.runner({ userId: "u1" });
-
+      // A lost claim must neither run the worker nor report a result: the
+      // winner records the real outcome (a stale output here used to be
+      // stamped "ready" by reconcile() and unblock downstream steps early).
+      await expect(
+        PRODUCTION_DAG.competitor.runner({ userId: "u1" }),
+      ).rejects.toMatchObject({ name: "StepClaimLostError", step: "competitor" });
       expect(claimCompetitorRunMock).toHaveBeenCalledWith("u1");
+      // Must NOT launch a second worker when the claim is owned elsewhere.
       expect(triggerCompetitor).not.toHaveBeenCalled();
-      expect(result).toEqual({ per_icp: [{ icp_id: "Owned Elsewhere" }] });
     });
   });
 
-  it("runCreativeDir skips triggerCreativeDirForUser and returns the current creativeDirResult when claimCreativeDirRun loses the race", async () => {
+  it("runCreativeDir skips triggerCreativeDirForUser and signals StepClaimLostError (no stale creativeDirResult) when claimCreativeDirRun loses the race", async () => {
     await jest.isolateModulesAsync(async () => {
       const triggerCreativeDir = jest.fn();
       const claimCreativeDirRunMock = jest.fn(async () => null);
@@ -1059,15 +1070,19 @@ describe("runBrandDna/runIcp/runCompetitor/runCreativeDir/runAdCopy — claim-be
       }));
 
       const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
-      const result = await PRODUCTION_DAG.creativeDir.runner({ userId: "u1" });
-
+      // A lost claim must neither run the worker nor report a result: the
+      // winner records the real outcome (a stale output here used to be
+      // stamped "ready" by reconcile() and unblock downstream steps early).
+      await expect(
+        PRODUCTION_DAG.creativeDir.runner({ userId: "u1" }),
+      ).rejects.toMatchObject({ name: "StepClaimLostError", step: "creativeDir" });
       expect(claimCreativeDirRunMock).toHaveBeenCalledWith("u1");
+      // Must NOT launch a second worker when the claim is owned elsewhere.
       expect(triggerCreativeDir).not.toHaveBeenCalled();
-      expect(result).toEqual({ concepts: ["Owned Elsewhere"] });
     });
   });
 
-  it("runAdCopy skips triggerAdCopyForUser and returns the current adCopyResult when claimAdCopyRun loses the race", async () => {
+  it("runAdCopy skips triggerAdCopyForUser and signals StepClaimLostError (no stale adCopyResult) when claimAdCopyRun loses the race", async () => {
     await jest.isolateModulesAsync(async () => {
       const triggerAdCopy = jest.fn();
       const claimAdCopyRunMock = jest.fn(async () => null);
@@ -1088,11 +1103,15 @@ describe("runBrandDna/runIcp/runCompetitor/runCreativeDir/runAdCopy — claim-be
       }));
 
       const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
-      const result = await PRODUCTION_DAG.adCopy.runner({ userId: "u1" });
-
+      // A lost claim must neither run the worker nor report a result: the
+      // winner records the real outcome (a stale output here used to be
+      // stamped "ready" by reconcile() and unblock downstream steps early).
+      await expect(
+        PRODUCTION_DAG.adCopy.runner({ userId: "u1" }),
+      ).rejects.toMatchObject({ name: "StepClaimLostError", step: "adCopy" });
       expect(claimAdCopyRunMock).toHaveBeenCalledWith("u1");
+      // Must NOT launch a second worker when the claim is owned elsewhere.
       expect(triggerAdCopy).not.toHaveBeenCalled();
-      expect(result).toEqual({ variants: [{ id: "v1", headline: "Owned Elsewhere" }] });
     });
   });
 });

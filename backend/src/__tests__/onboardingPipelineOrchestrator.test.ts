@@ -13,6 +13,7 @@ import {
   DEFAULT_DAG,
   OnboardingPipelineOrchestrator,
   OrchestratorUser,
+  StepClaimLostError,
   StepName,
   UserSteps,
   _resetRateLimitState,
@@ -497,6 +498,40 @@ describe("OnboardingPipelineOrchestrator.reconcile()", () => {
     // Persisted state for `a` was NOT overwritten with the stale output.
     expect(store.user.steps?.a?.output).toBeNull();
     expect(store.user.steps?.a?.generation).toBe(99);
+  });
+
+  // ENG-2308: a runner that loses the per-axis claim (e.g. to another backend
+  // instance's reconcile pass) must neither fail nor complete the step. Before
+  // StepClaimLostError the loser returned stale output, reconcile() stamped
+  // the step `ready` with it, and the SAME pass then fired the downstream
+  // step for real on empty upstream context.
+  it("a runner that loses its claim is skipped: step stays running, not ready/failed, downstream stays gated", async () => {
+    const runA = jest.fn(async () => {
+      throw new StepClaimLostError("a");
+    });
+    const runB = jest.fn(async () => "B-output");
+    const { dag } = makeAtoBDag({ runA, runB });
+    const { getUser, updateUserSteps, store } = buildStore({
+      useEagerPipeline: true,
+    });
+    const orch = new OnboardingPipelineOrchestrator({
+      dag,
+      getUser,
+      updateUserSteps,
+      isEnabledGlobally: () => true,
+    });
+    const report = await orch.reconcile("u1");
+
+    expect(runA).toHaveBeenCalledTimes(1);
+    expect(runB).not.toHaveBeenCalled();
+    expect(store.user.steps?.a?.status).toBe("running");
+    expect(report.fired.find((f) => f.step === "a")).toBeUndefined();
+    expect(report.skipped.find((s) => s.step === "a")?.reason).toMatch(
+      /claim held by another run/,
+    );
+    expect(report.skipped.find((s) => s.step === "b")?.reason).toMatch(
+      /upstream a not ready/,
+    );
   });
 
   it("runner failure persists status=failed with reason and gates downstream", async () => {
