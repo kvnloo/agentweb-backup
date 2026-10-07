@@ -306,15 +306,17 @@ export function buildCompareMessages(history: readonly ChatMessage[] | undefined
 }
 
 /**
- * /compare/select appends a user+assistant pair; buildMarketingContext assumes message 0
- * is the system prompt (startIdx = 1) and /generate only writes it for a session with no
- * user turn. Appending to a session without one would hide the turn from every later
- * turn's context. Shared by both routes so they cannot drift; /compare uses it as a
- * preflight so no model is billed for a result that could never be continued.
+ * /compare/select appends a user+assistant pair; buildMarketingContext slices off message 0
+ * (startIdx = 1) and /generate only writes the system prompt for a session with no user
+ * turn. A started chat is therefore one with at least one user turn, wherever the system
+ * message sits (a skill-started chat has an assistant welcome at 0 and the system message at
+ * 1, and real turns work fine there). Appending to a session without a user turn would hide
+ * the pair from later context. Shared by both routes so they cannot drift; /compare uses it
+ * as a preflight so no model is billed for a result that could never be continued.
  */
 function sessionNotStartedOutcome(history: readonly ChatMessage[] | undefined): ServiceOutcome | null {
   // A fresh sidebar chat already has its system message but no turn yet: require a user turn too.
-  if (!history || history.length === 0 || history[0].role !== 'system' || !history.some((m) => m.role === 'user')) {
+  if (!history || !history.some((m) => m.role === 'user')) {
     return fail(409, 'Send a message in this chat before continuing from a comparison.', 'compare_session_not_started');
   }
   return null;
@@ -819,6 +821,13 @@ async function selectCompareResultInner(
       return { status: 200, body: { messages: replay, llmModel: req.model, replayed: true } };
     }
 
+    // A comparison yields at most one pair: a different column of the same comparison (same signed
+    // prompt, persisted at/after its issuedAt) must not append a second pair or override the choice.
+    // A later comparison with the same prompt has a later issuedAt and is unaffected.
+    if (hasResolvedComparison(history, req)) {
+      return fail(409, 'An answer from this comparison was already added to the chat.', 'compare_already_selected');
+    }
+
     if (history.length + 2 > deps.maxSessionMessages) {
       return fail(409, 'This session has reached its message limit. Start a new session to continue.', 'SESSION_MESSAGE_LIMIT_EXCEEDED');
     }
@@ -862,6 +871,17 @@ async function selectCompareResultInner(
 
 /** Most recent messages scanned when looking for an already-persisted selection (replay). */
 const REPLAY_SCAN_MAX_MESSAGES = 500;
+
+function hasResolvedComparison(history: readonly ChatMessage[], req: ValidatedSelectRequest): boolean {
+  const lowest = Math.max(0, history.length - REPLAY_SCAN_MAX_MESSAGES);
+  for (let i = history.length - 1; i >= lowest; i--) {
+    const m = history[i];
+    if (m.role !== 'user' || m.content !== req.prompt || typeof m.timestamp !== 'string') continue;
+    const at = Date.parse(m.timestamp);
+    if (Number.isFinite(at) && at >= req.issuedAt) return true;
+  }
+  return false;
+}
 
 function findPersistedPair(history: readonly ChatMessage[], req: ValidatedSelectRequest): ChatMessage[] | null {
   // Scan the history newest-first (bounded, O(n)): a late replay must be recognised even after

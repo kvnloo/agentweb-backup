@@ -504,6 +504,13 @@ describe('POST /compare is read-only for the session', () => {
   });
 });
 
+const SKILL_HISTORY = [
+  { role: 'assistant', content: 'Welcome to the skill', metadata: { kind: 'skill-welcome' } },
+  { role: 'system', content: 'SKILL SYS' },
+  { role: 'user', content: 'Write a hero headline for my SaaS.' },
+  { role: 'assistant', content: 'Here is a headline.' },
+];
+
 describe('POST /compare truncation, preflight, parallel policy, slot release', () => {
   it("finish_reason 'length' is output_limit with no selectToken, even with text or without", async () => {
     const lengthWith = { choices: [{ message: { content: 'half a sent' }, finish_reason: 'length' }] };
@@ -526,7 +533,6 @@ describe('POST /compare truncation, preflight, parallel policy, slot release', (
 
   it.each([
     ['empty history', []],
-    ['first message is not the system prompt', [{ role: 'user', content: 'hi' }]],
     ['fresh sidebar chat: system message only, no user turn yet', [{ role: 'system', content: 'SYS' }]],
   ])('409 compare_session_not_started preflight (%s): no usage check, no model call', async (_n, messages) => {
     const { deps, callLLM } = makeDeps({}, session({ messages: messages as any }));
@@ -536,6 +542,34 @@ describe('POST /compare truncation, preflight, parallel policy, slot release', (
     expect(deps.checkUsage).not.toHaveBeenCalled();
     expect(deps.resolveModel).not.toHaveBeenCalled();
     expect(callLLM).not.toHaveBeenCalled();
+  });
+
+  it('skill-started chat (assistant welcome at 0, system at 1) compares: system prompt once, real turns in order', async () => {
+    const { deps, callLLM } = makeDeps({}, session({ messages: [
+  { role: 'assistant', content: 'Welcome to the skill', metadata: { kind: 'skill-welcome' } },
+  { role: 'system', content: 'SKILL SYS' },
+  { role: 'user', content: 'Write a hero headline for my SaaS.' },
+  { role: 'assistant', content: 'Here is a headline.' },
+] as any }));
+    const out = await run(deps, body());
+    expect(out.status).toBe(200);
+    expect(callLLM).toHaveBeenCalledTimes(2);
+    const sent = callLLM.mock.calls[0][1] as Array<{ role: string; content: string }>;
+    expect(sent.filter((m) => m.role === 'system')).toHaveLength(1);
+    expect(sent[0].role).toBe('system');
+    expect(sent.map((m) => m.content).join('|')).not.toContain('SKILL SYS');
+    expect(sent.slice(1).map((m) => [m.role, m.content.split('\n\n')[0]])).toEqual([
+      ['user', 'Write a hero headline for my SaaS.'],
+      ['assistant', 'Here is a headline.'],
+      ['user', 'Compare these'],
+    ]);
+  });
+
+  it('a started chat with no system message at all still compares (degrades to user/assistant turns)', async () => {
+    const { deps, callLLM } = makeDeps({}, session({ messages: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'yo' }] as any }));
+    expect((await run(deps, body())).status).toBe(200);
+    const sent = callLLM.mock.calls[0][1] as Array<{ role: string }>;
+    expect(sent.map((m) => m.role)).toEqual(['system', 'user', 'assistant', 'user']);
   });
 
   it('a paused decision on the 3rd model yields 429 and ZERO callLLM invocations', async () => {
@@ -917,7 +951,7 @@ describe('POST /compare/select', () => {
     expect(deps.updateSessionModel).not.toHaveBeenCalled();
   });
 
-  it('a pair with a different llm or content is not a replay', async () => {
+  it('a pair with a different llm or content is not a replay: the comparison is already resolved (409)', async () => {
     const payload = sel();
     const stamp = new Date(NOW).toISOString();
     for (const [content, llm] of [['the chosen answer', 'gemini-3.5-flash'], ['some other answer', 'gpt-5.5']]) {
@@ -932,9 +966,11 @@ describe('POST /compare/select', () => {
       });
       const { deps, appendMessages } = makeSelect({}, persisted);
       const out = await go(deps, payload);
-      expect(out.status).toBe(200);
-      expect(res(out).replayed).toBeUndefined();
-      expect(appendMessages).toHaveBeenCalledTimes(1);
+      expect(out.status).toBe(409);
+      expect(res(out).code).toBe('compare_already_selected');
+      expect(appendMessages).not.toHaveBeenCalled();
+      expect(deps.updateSessionModel).not.toHaveBeenCalled();
+      expect(deps.release).toHaveBeenCalledWith('s-1');
     }
   });
 
@@ -950,6 +986,74 @@ describe('POST /compare/select', () => {
     });
     const { deps, appendMessages } = makeSelect({}, persisted);
     expect((await go(deps, payload)).status).toBe(200);
+    expect(appendMessages).toHaveBeenCalledTimes(1);
+  });
+
+  describe('one pair per compareId', () => {
+    const OTHER_ID = '99999999-2222-4333-8444-555555555555';
+    const colA = () => sel({ model: 'gpt-5.5', content: 'answer A' });
+    const colB = () => sel({ model: 'gemini-3.5-flash', content: 'answer B' });
+
+    it('selecting a second column after the first is 409 compare_already_selected: no write, no model change, claim released', async () => {
+      const store: ChatMessage[] = [...session().messages!];
+      const { deps, appendMessages } = makeSelect({
+        getSession: jest.fn(async () => session({ messages: [...store] })),
+        appendMessages: jest.fn(async (_id: string, msgs: ChatMessage[]) => { store.push(...msgs); return { messages: [...store] }; }) as any,
+      });
+      expect((await go(deps, colA())).status).toBe(200);
+      const writes = (deps.appendMessages as jest.Mock).mock.calls.length;
+      (deps.updateSessionModel as jest.Mock).mockClear();
+      (deps.release as jest.Mock).mockClear();
+      const out = await go(deps, colB());
+      expect(out.status).toBe(409);
+      expect(res(out).code).toBe('compare_already_selected');
+      expect((deps.appendMessages as jest.Mock).mock.calls).toHaveLength(writes);
+      expect(store).toHaveLength(5);
+      expect(deps.updateSessionModel).not.toHaveBeenCalled();
+      expect(deps.tryClaim).toHaveBeenCalledTimes(2);
+      expect(deps.release).toHaveBeenCalledWith('s-1');
+      void appendMessages;
+    });
+
+    it('a NEW comparison (later issuedAt) with the SAME prompt after an earlier selection succeeds', async () => {
+      const first = colA();
+      const earlier = new Date(first.issuedAt + 100).toISOString();
+      const persisted = session({ messages: [
+        ...session().messages!,
+        { role: 'user', content: first.prompt, timestamp: earlier },
+        { role: 'assistant', content: 'answer A', llm: 'gpt-5.5', timestamp: earlier },
+      ] });
+      const second = sel({ compareId: OTHER_ID, model: 'gemini-3.5-flash', content: 'answer B', issuedAt: first.issuedAt + 500 });
+      const { deps, appendMessages } = makeSelect({}, persisted);
+      const out = await go(deps, second);
+      expect(out.status).toBe(200);
+      expect(res(out).replayed).toBeUndefined();
+      expect(appendMessages).toHaveBeenCalledTimes(1);
+      expect(deps.updateSessionModel).toHaveBeenCalledWith('s-1', 'gemini-3.5-flash');
+    });
+
+    it('an exact replay of the same selection is still 200 replayed:true', async () => {
+      const a = colA();
+      const stamp = new Date(NOW).toISOString();
+      const persisted = session({ messages: [
+        ...session().messages!,
+        { role: 'user', content: a.prompt, timestamp: stamp },
+        { role: 'assistant', content: 'answer A', llm: 'gpt-5.5', timestamp: stamp },
+      ] });
+      const { deps, appendMessages } = makeSelect({}, persisted);
+      const out = await go(deps, a);
+      expect(out.status).toBe(200);
+      expect(res(out).replayed).toBe(true);
+      expect(appendMessages).not.toHaveBeenCalled();
+      expect(deps.updateSessionModel).not.toHaveBeenCalled();
+      expect(deps.release).toHaveBeenCalledWith('s-1');
+    });
+  });
+
+  it('select works on a skill-started chat (assistant welcome at 0, system at 1) and appends after the real turns', async () => {
+    const { deps, appendMessages } = makeSelect({}, session({ messages: SKILL_HISTORY as any }));
+    const out = await go(deps, sel());
+    expect(out.status).toBe(200);
     expect(appendMessages).toHaveBeenCalledTimes(1);
   });
 
