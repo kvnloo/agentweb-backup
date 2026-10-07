@@ -31,6 +31,7 @@ import { populateEmptyBrandGuidelines } from './brandGuidelinesPopulation';
 import { userDb } from "./db";
 import {
   buildFailedPatch,
+  buildStartPatch,
   logCompletionMetric,
 } from "./brandBuildStatusService";
 import { logStepMetric } from "./onboardingMetricsService";
@@ -300,6 +301,67 @@ function defaultDeps(): {
     generateSessionResponse: (sessionId, userMessage, userId, llmModel) =>
       cronJobRegistry.track('onboardingBrandBuildAgentTurn', generateSessionResponse(sessionId, userMessage, userId, llmModel)),
   };
+}
+
+/**
+ * Guards the non-building -> `building` transition with a DynamoDB
+ * ConditionExpression (ENG-2308 follow-up), same shape as the per-step
+ * axes' `claim<Axis>Run` functions. Also allows a fresh claim once the
+ * in-flight run has exceeded `BRAND_BUILD_TIMEOUT_MS`, matching the
+ * snapshot's own `timedOut` flag.
+ */
+function brandBuildStartClaimCondition(now: Date = new Date()) {
+  const staleBefore = new Date(now.getTime() - BRAND_BUILD_TIMEOUT_MS).toISOString();
+  return {
+    expression:
+      "attribute_not_exists(#brandBuildStatus) OR #brandBuildStatus <> :building OR #brandBuildStartedAt <= :staleBefore",
+    names: {
+      "#brandBuildStatus": "brandBuildStatus",
+      "#brandBuildStartedAt": "brandBuildStartedAt",
+    },
+    values: { ":building": "building", ":staleBefore": staleBefore },
+  };
+}
+
+/**
+ * Claim the brand-dna axis for a new run: atomically flip `brandBuildStatus`
+ * to `building` (or no-op, returning `null`, if someone else already holds
+ * the claim). Every entry point that wants to run a brand build must go
+ * through here — both `/brand-build/start` and the eager-pipeline
+ * orchestrator's `runBrandDna` (`onboardingOrchestratorWiring.ts`).
+ *
+ * `runBrandDna` needed this (ENG-2308 follow-up, caught live): it used to
+ * call `triggerBrandBuildForUser` directly, with nothing ever flipping
+ * `brandBuildStatus` to `building` first on a pure orchestrator-driven
+ * cascade (the normal case for brandDna — it has no deps, so it's the
+ * very first thing an eager-pipeline user's reconcile pass ever fires,
+ * with no reason `/brand-build/start` would have been hit separately).
+ * The `update_brand_guidelines` tool-call hook
+ * (`emma/impl/brandMarketStrategy.ts`) only flips `brandBuildStatus` to
+ * `ready` "if we were building" — without a prior claim, Emma's session
+ * ran for real, called the tool for real, and the flip to `ready` was
+ * silently skipped, so `triggerBrandBuildForUser`'s own final check saw
+ * `brandBuildStatus` still unset and reported "Emma finished but did not
+ * call update_brand_guidelines" — a false negative, not a real Emma
+ * failure. Confirmed live: this is the exact failure observed before this
+ * fix, on every attempt that didn't happen to also call
+ * `/brand-build/start` manually first.
+ */
+export async function claimBrandBuildRun(
+  userId: string,
+): Promise<ReturnType<typeof buildStartPatch> | null> {
+  const patch = buildStartPatch();
+  try {
+    await userDb.updateUser(userId, patch as any, {
+      condition: brandBuildStartClaimCondition(),
+    });
+  } catch (err: any) {
+    if (err?.code === "ConditionalCheckFailedException") {
+      return null;
+    }
+    throw err;
+  }
+  return patch;
 }
 
 /**

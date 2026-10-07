@@ -24,11 +24,13 @@ import { userDb } from "../services/db";
 import {
   buildAutoFailPatchIfStuck,
   buildFailedPatch,
-  buildStartPatch,
   logCompletionMetric,
   snapshot,
 } from "../services/brandBuildStatusService";
-import { triggerBrandBuildForUser } from "../services/onboardingBrandBuildService";
+import {
+  claimBrandBuildRun,
+  triggerBrandBuildForUser,
+} from "../services/onboardingBrandBuildService";
 
 const router = express.Router();
 
@@ -129,19 +131,25 @@ router.post("/brand-build/start", authenticateToken, async (req, res) => {
       });
     }
 
-    const patch: Record<string, unknown> = {
-      ...buildStartPatch(),
-      ...inputPatch,
-    };
-    await userDb.updateUser(userId, patch as any);
-    // Fire-and-forget background work; route returns immediately so the UI
-    // can poll /status without holding an HTTP connection open for ~30s.
-    //
+    // Persist any supplied companyUrl/companyName/goal up front, regardless
+    // of which branch below claims the axis — the claim's own patch only
+    // carries the status fields (see `claimBrandBuildRun`), not these.
+    if (Object.keys(inputPatch).length > 0) {
+      await userDb.updateUser(userId, inputPatch as any);
+    }
+
     // Eager DAG sub-task 2: when the user is on `useEagerPipeline`, the
-    // orchestrator owns step ordering (its `brandDna` runner delegates to
-    // triggerBrandBuildForUser), so we kick reconcile instead of
-    // calling the legacy trigger directly. For everyone else, the legacy
-    // trigger is the source of truth.
+    // orchestrator owns step ordering — its `brandDna` runner claims this
+    // SAME axis itself (via `claimBrandBuildRun`) when it actually fires
+    // the step, inside the SAME reconcile pass we're about to kick off.
+    //
+    // Checked BEFORE claiming here (ENG-2308 fix-of-a-fix, caught live —
+    // same shape as the icp/competitor/creativeDir/adCopy/adImage
+    // pre-claim bug): claiming in this route first would always win an
+    // instant before handing off to reconcileForUser, permanently
+    // starving runBrandDna's own claim moments later — so the real Emma
+    // session never actually ran, and triggerBrandBuildForUser's own
+    // "did Emma call update_brand_guidelines" check saw a false negative.
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const {
       isEagerPipelineActiveFor,
@@ -152,11 +160,22 @@ router.post("/brand-build/start", authenticateToken, async (req, res) => {
       void reconcileForUser(userId).catch((e: unknown) => {
         console.error("[brandBuild] background reconcile crashed", e);
       });
-    } else {
-      void triggerBrandBuildForUser(userId).catch((e) => {
-        console.error("[brandBuild] background trigger crashed", e);
-      });
+      return res.json({ status: snapshot((current as any) || {}) });
     }
+
+    const patch = await claimBrandBuildRun(userId);
+    if (!patch) {
+      // Lost the race — another concurrent /brand-build/start already
+      // claimed it. Same idempotent posture as the alreadyInFlight branch
+      // above; just surface whatever is currently persisted.
+      const refreshed = await userDb.getUserById(userId);
+      return res.json({ status: snapshot(refreshed || (current as any) || {}) });
+    }
+    // Fire-and-forget background work; route returns immediately so the UI
+    // can poll /status without holding an HTTP connection open for ~30s.
+    void triggerBrandBuildForUser(userId).catch((e) => {
+      console.error("[brandBuild] background trigger crashed", e);
+    });
     const user = await userDb.getUserById(userId);
     return res.json({ status: snapshot(user || (patch as any)) });
   } catch (err) {

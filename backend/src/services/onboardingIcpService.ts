@@ -977,15 +977,29 @@ function icpStartClaimCondition(now: Date = new Date()) {
 }
 
 /**
- * Synchronous entry point for routes — flips status to `running` and
- * launches background work. Returns the persisted start patch once it has
- * landed so the route can return the running snapshot, or `null` if a
- * concurrent call already claimed this run (ENG-2308) — callers must NOT
- * launch a second background generation in that case.
+ * Claim the icp axis for a new run: atomically flip `icpStatus` to
+ * `running` (or no-op, returning `null`, if someone else already holds
+ * the claim). Every entry point that wants to run ICP generation must go
+ * through here — both `/icp/start` (via `startIcpDiscoveryForUser`) and
+ * the eager-pipeline orchestrator's `runIcp` (`onboardingOrchestratorWiring.ts`).
+ *
+ * `runIcp` needed this split out (ENG-2308 follow-up, caught live): it
+ * used to call `triggerIcpDiscoveryForUser` directly, with nothing ever
+ * flipping `icpStatus` to `running` first on a pure orchestrator-driven
+ * cascade (one where `/icp/start`'s own route was never separately hit).
+ * `icpReadyPatch` requires `current.icpStatus === 'running'` to persist a
+ * result — without it, `triggerIcpDiscoveryForUser` ran the real LLM call,
+ * then silently dropped the result (returned without writing or
+ * throwing), and the orchestrator recorded the step `ready` with a `null`
+ * output anyway, since nothing threw. `shouldFire`'s hash-match then never
+ * re-fires it. Confirmed live: ICP only ever "worked" in testing because
+ * the test happened to call `/icp/start` manually first, which flipped the
+ * field as an incidental side effect of a completely different call path
+ * — not because the orchestrator's own cascade could make it succeed on
+ * its own.
  */
-export async function startIcpDiscoveryForUser(
+export async function claimIcpRun(
   userId: string,
-  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {},
 ): Promise<ICPStatusFields | null> {
   const patch = icpStartPatch();
   try {
@@ -994,17 +1008,36 @@ export async function startIcpDiscoveryForUser(
     });
   } catch (err: any) {
     if (err?.code === "ConditionalCheckFailedException") {
-      // Lost the race — another concurrent /icp/start already claimed it.
       return null;
     }
     throw err;
   }
-  // Eager DAG sub-task 2: kick the orchestrator. No-op for users not on
-  // `useEagerPipeline`; for opted-in users the orchestrator drives the
-  // ICP runner (which delegates to triggerIcpDiscoveryForUser), so we
-  // do NOT invoke the legacy trigger directly to avoid running the
-  // step twice in parallel. For everyone else, the legacy trigger is
-  // the source of truth.
+  return patch;
+}
+
+/**
+ * Synchronous entry point for routes — flips status to `running` and
+ * launches background work. Returns the persisted start patch once it has
+ * landed so the route can return the running snapshot, or `null` if a
+ * concurrent call already claimed this run (ENG-2308) — callers must NOT
+ * launch a second background generation in that case.
+ *
+ * Checks eager-pipeline status BEFORE claiming (ENG-2308 fix-of-a-fix,
+ * caught live): the orchestrator's `runIcp` claims this SAME axis itself
+ * (via `claimIcpRun`) when it actually fires the step. If this function
+ * also claimed before checking eager status, it would win the claim an
+ * instant before handing off to `reconcileForUser` — and since `runIcp`'s
+ * own claim attempt happens inside that SAME reconcile pass, moments
+ * later, it would always lose to this function's own prior write,
+ * permanently starving the real trigger. Exactly the same shape as the
+ * ad-image pre-claim bug (`startAdImageGenerationForUser`) — this mirrors
+ * that fix: skip claiming entirely on the eager branch, leaving
+ * `claimIcpRun` as the sole claimant there.
+ */
+export async function startIcpDiscoveryForUser(
+  userId: string,
+  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {},
+): Promise<ICPStatusFields | null> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const {
     isEagerPipelineActiveFor,
@@ -1015,8 +1048,10 @@ export async function startIcpDiscoveryForUser(
     | null;
   if (isEagerPipelineActiveFor(current)) {
     void reconcileForUser(userId);
-    return patch;
+    return null;
   }
+  const patch = await claimIcpRun(userId);
+  if (!patch) return null;
   // Intentionally not awaited — the route returns immediately.
   // Errors inside triggerIcpDiscoveryForUser are caught + persisted there.
   void triggerIcpDiscoveryForUser(userId, deps);

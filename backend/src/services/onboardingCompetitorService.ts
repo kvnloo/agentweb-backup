@@ -572,17 +572,24 @@ function competitorStartClaimCondition(now: Date = new Date()) {
 }
 
 /**
- * Synchronous entry point for routes. Flips status to `running` and
- * launches background work. Returns the persisted start patch, or `null`
- * if a concurrent caller already claimed this run (ENG-2308) — callers
- * must NOT launch a second background generation in that case.
+ * Claim the competitor axis for a new run: atomically flip
+ * `competitorStatus` to `running` (or no-op, returning `null`, if someone
+ * else already holds the claim). Every entry point that wants to run
+ * competitor research must go through here — both `/competitor/start`
+ * (via `startCompetitorStrategyForUser`) and the eager-pipeline
+ * orchestrator's `runCompetitor` (`onboardingOrchestratorWiring.ts`).
+ *
+ * `runCompetitor` needed this split out (ENG-2308 follow-up, caught
+ * live): it used to call `triggerCompetitorStrategyForUser` directly, with
+ * nothing ever flipping `competitorStatus` to `running` first on a pure
+ * orchestrator-driven cascade. `competitorReadyPatch` requires
+ * `current.competitorStatus === 'running'` to persist a result — without
+ * it, the trigger ran for real then silently dropped its result, and the
+ * orchestrator recorded the step `ready` with a `null` output anyway,
+ * since nothing threw.
  */
-export async function startCompetitorStrategyForUser(
+export async function claimCompetitorRun(
   userId: string,
-  deps: {
-    llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
-    webSearchFn?: WebSearchFn;
-  } = {},
 ): Promise<CompetitorStatusFields | null> {
   const patch = competitorStartPatch();
   try {
@@ -591,13 +598,32 @@ export async function startCompetitorStrategyForUser(
     });
   } catch (err: any) {
     if (err?.code === "ConditionalCheckFailedException") {
-      // Lost the race — another concurrent start already claimed it.
       return null;
     }
     throw err;
   }
-  // Eager DAG sub-task 2: orchestrator owns step ordering for opted-in
-  // users; cheap no-op gated inside the orchestrator for everyone else.
+  return patch;
+}
+
+/**
+ * Synchronous entry point for routes. Flips status to `running` and
+ * launches background work. Returns the persisted start patch, or `null`
+ * if a concurrent caller already claimed this run (ENG-2308) — callers
+ * must NOT launch a second background generation in that case.
+ *
+ * Checks eager-pipeline status BEFORE claiming (ENG-2308 fix-of-a-fix,
+ * caught live) — same reasoning as `startIcpDiscoveryForUser`'s docstring:
+ * the orchestrator's `runCompetitor` claims this SAME axis itself when it
+ * fires the step, inside the SAME reconcile pass this function would hand
+ * off to. Claiming here too would always win first and starve it.
+ */
+export async function startCompetitorStrategyForUser(
+  userId: string,
+  deps: {
+    llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
+    webSearchFn?: WebSearchFn;
+  } = {},
+): Promise<CompetitorStatusFields | null> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const {
     isEagerPipelineActiveFor,
@@ -608,8 +634,10 @@ export async function startCompetitorStrategyForUser(
     | null;
   if (isEagerPipelineActiveFor(current)) {
     void reconcileForUser(userId);
-    return patch;
+    return null;
   }
+  const patch = await claimCompetitorRun(userId);
+  if (!patch) return null;
   void triggerCompetitorStrategyForUser(userId, deps);
   return patch;
 }

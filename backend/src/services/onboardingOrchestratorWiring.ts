@@ -106,10 +106,48 @@ function throwIfStepFailed(
   );
 }
 
+/**
+ * Every runner below claims its axis (atomic ConditionExpression, flips the
+ * legacy `<axis>Status` field to its in-flight value) BEFORE calling the
+ * legacy trigger function, mirroring `runAdImage`'s pre-existing pattern.
+ *
+ * ENG-2308 follow-up, caught live: these runners used to call
+ * `trigger<Axis>ForUser` directly. Each trigger's own completion logic
+ * (`<axis>ReadyPatch` / the `update_brand_guidelines` tool-call hook for
+ * brandDna) requires the legacy status field to already be `running` (or
+ * `building`) before it will persist a result — a precondition normally
+ * satisfied by the `/axis/start` ROUTE (`start<Axis>ForUser`), which claims
+ * first and only then either triggers directly or hands off to
+ * `reconcileForUser`. A pure orchestrator-driven cascade — the whole point
+ * of "eager" pipeline, firing once and letting every downstream step run on
+ * its own — never went through that route for any step beyond whichever
+ * one's `/axis/start` happened to be called to kick the cascade off in the
+ * first place. So the trigger ran for real, produced a real result, and
+ * then silently dropped it (the completion function returned null, the
+ * trigger returned without writing or throwing), while the orchestrator
+ * recorded the step `ready` with a `null` output anyway — and
+ * `shouldFire`'s hash-match means a later reconcile pass never retries it.
+ * Confirmed live end to end: brandDna, icp, and competitor each "worked" in
+ * earlier testing only because the test happened to also call that axis's
+ * own `/start` route manually; creativeDir (never called directly) failed
+ * on every attempt, which then starved adImage (its own gate reads the
+ * never-set legacy `creativeDirStatus` field).
+ */
+
 async function runBrandDna(userId: string): Promise<unknown> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { triggerBrandBuildForUser } = require("./onboardingBrandBuildService");
+  const {
+    claimBrandBuildRun,
+    triggerBrandBuildForUser,
+  } = require("./onboardingBrandBuildService");
   const startedAtMs = Date.now();
+  const claimed = await claimBrandBuildRun(userId);
+  if (!claimed) {
+    // Lost the claim to a concurrent caller (e.g. /brand-build/start
+    // itself, mid-flight). Don't run a second Emma session.
+    const current = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
+    return current?.brandGuidelines ?? null;
+  }
   await triggerBrandBuildForUser(userId);
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
   throwIfStepFailed(user, "brandBuild", startedAtMs, "brand build failed");
@@ -118,8 +156,13 @@ async function runBrandDna(userId: string): Promise<unknown> {
 
 async function runIcp(userId: string): Promise<unknown> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { triggerIcpDiscoveryForUser } = require("./onboardingIcpService");
+  const { claimIcpRun, triggerIcpDiscoveryForUser } = require("./onboardingIcpService");
   const startedAtMs = Date.now();
+  const claimed = await claimIcpRun(userId);
+  if (!claimed) {
+    const current = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
+    return current?.icpResult ?? null;
+  }
   await triggerIcpDiscoveryForUser(userId);
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
   throwIfStepFailed(user, "icp", startedAtMs, "ICP discovery failed");
@@ -129,9 +172,15 @@ async function runIcp(userId: string): Promise<unknown> {
 async function runCompetitor(userId: string): Promise<unknown> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const {
+    claimCompetitorRun,
     triggerCompetitorStrategyForUser,
   } = require("./onboardingCompetitorService");
   const startedAtMs = Date.now();
+  const claimed = await claimCompetitorRun(userId);
+  if (!claimed) {
+    const current = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
+    return current?.competitorResult ?? null;
+  }
   await triggerCompetitorStrategyForUser(userId);
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
   throwIfStepFailed(user, "competitor", startedAtMs, "competitor strategy failed");
@@ -140,8 +189,16 @@ async function runCompetitor(userId: string): Promise<unknown> {
 
 async function runCreativeDir(userId: string): Promise<unknown> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { triggerCreativeDirForUser } = require("./onboardingCreativeDirService");
+  const {
+    claimCreativeDirRun,
+    triggerCreativeDirForUser,
+  } = require("./onboardingCreativeDirService");
   const startedAtMs = Date.now();
+  const claimed = await claimCreativeDirRun(userId);
+  if (!claimed) {
+    const current = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
+    return current?.creativeDirResult ?? null;
+  }
   await triggerCreativeDirForUser(userId);
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
   throwIfStepFailed(user, "creativeDir", startedAtMs, "creative direction failed");
@@ -183,8 +240,13 @@ async function runAdImage(userId: string): Promise<unknown> {
 
 async function runAdCopy(userId: string): Promise<unknown> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { triggerAdCopyForUser } = require("./onboardingAdCopyService");
+  const { claimAdCopyRun, triggerAdCopyForUser } = require("./onboardingAdCopyService");
   const startedAtMs = Date.now();
+  const claimed = await claimAdCopyRun(userId);
+  if (!claimed) {
+    const current = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
+    return current?.adCopyResult ?? null;
+  }
   await triggerAdCopyForUser(userId);
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
   throwIfStepFailed(user, "adCopy", startedAtMs, "ad copy generation failed");

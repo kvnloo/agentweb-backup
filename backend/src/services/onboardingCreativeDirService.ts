@@ -303,14 +303,26 @@ function creativeDirStartClaimCondition(now: Date = new Date()) {
 }
 
 /**
- * Synchronous entry point for routes — flips status to `running` and
- * launches background work. Returns the persisted start patch, or `null`
- * if a concurrent caller already claimed this run (ENG-2308) — callers
- * must NOT launch a second background generation in that case.
+ * Claim the creative-dir axis for a new run: atomically flip
+ * `creativeDirStatus` to `running` (or no-op, returning `null`, if someone
+ * else already holds the claim). Every entry point that wants to run
+ * creative-direction generation must go through here — both
+ * `/creative-dir/start` (via `startCreativeDirForUser`) and the
+ * eager-pipeline orchestrator's `runCreativeDir`
+ * (`onboardingOrchestratorWiring.ts`).
+ *
+ * `runCreativeDir` needed this split out (ENG-2308 follow-up, caught
+ * live): it used to call `triggerCreativeDirForUser` directly, with
+ * nothing ever flipping `creativeDirStatus` to `running` first on a pure
+ * orchestrator-driven cascade. `creativeDirReadyPatch` requires
+ * `current.creativeDirStatus === 'running'` to persist a result — without
+ * it, the trigger ran for real then silently dropped its result, and the
+ * orchestrator recorded the step `ready` with a `null` output anyway,
+ * since nothing threw — which then made `adImage` fail downstream (its own
+ * gate reads the never-set legacy `creativeDirStatus` field directly).
  */
-export async function startCreativeDirForUser(
+export async function claimCreativeDirRun(
   userId: string,
-  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
 ): Promise<CreativeDirStatusFields | null> {
   const patch = creativeDirStartPatch();
   try {
@@ -323,8 +335,25 @@ export async function startCreativeDirForUser(
     }
     throw err;
   }
-  // Eager DAG sub-task 2: orchestrator owns step ordering for opted-in
-  // users; cheap no-op gated inside the orchestrator for everyone else.
+  return patch;
+}
+
+/**
+ * Synchronous entry point for routes — flips status to `running` and
+ * launches background work. Returns the persisted start patch, or `null`
+ * if a concurrent caller already claimed this run (ENG-2308) — callers
+ * must NOT launch a second background generation in that case.
+ *
+ * Checks eager-pipeline status BEFORE claiming (ENG-2308 fix-of-a-fix,
+ * caught live) — same reasoning as `startIcpDiscoveryForUser`'s docstring:
+ * the orchestrator's `runCreativeDir` claims this SAME axis itself when it
+ * fires the step, inside the SAME reconcile pass this function would hand
+ * off to. Claiming here too would always win first and starve it.
+ */
+export async function startCreativeDirForUser(
+  userId: string,
+  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
+): Promise<CreativeDirStatusFields | null> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const {
     isEagerPipelineActiveFor,
@@ -335,8 +364,10 @@ export async function startCreativeDirForUser(
     | null;
   if (isEagerPipelineActiveFor(current)) {
     void reconcileForUser(userId);
-    return patch;
+    return null;
   }
+  const patch = await claimCreativeDirRun(userId);
+  if (!patch) return null;
   void triggerCreativeDirForUser(userId, deps);
   return patch;
 }

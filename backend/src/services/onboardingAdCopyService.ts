@@ -465,14 +465,23 @@ function adCopyStartClaimCondition(now: Date = new Date()) {
 }
 
 /**
- * Synchronous entry point for routes — flips status to `running` and
- * launches background work. Returns the persisted start patch, or `null`
- * if a concurrent caller already claimed this run (ENG-2308) — callers
- * must NOT launch a second background generation in that case.
+ * Claim the ad-copy axis for a new run: atomically flip `adCopyStatus` to
+ * `running` (or no-op, returning `null`, if someone else already holds
+ * the claim). Every entry point that wants to run ad-copy generation must
+ * go through here — both `/ad-copy/start` (via `startAdCopyForUser`) and
+ * the eager-pipeline orchestrator's `runAdCopy`
+ * (`onboardingOrchestratorWiring.ts`).
+ *
+ * `runAdCopy` needed this split out (ENG-2308 follow-up, caught live): it
+ * used to call `triggerAdCopyForUser` directly, with nothing ever flipping
+ * `adCopyStatus` to `running` first on a pure orchestrator-driven cascade.
+ * `adCopyReadyPatch` requires `current.adCopyStatus === 'running'` to
+ * persist a result — without it, the trigger ran for real then silently
+ * dropped its result, and the orchestrator recorded the step `ready` with
+ * a `null` output anyway, since nothing threw.
  */
-export async function startAdCopyForUser(
+export async function claimAdCopyRun(
   userId: string,
-  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
 ): Promise<AdCopyStatusFields | null> {
   const patch = adCopyStartPatch();
   try {
@@ -485,8 +494,25 @@ export async function startAdCopyForUser(
     }
     throw err;
   }
-  // Eager DAG sub-task 2: orchestrator owns step ordering for opted-in
-  // users; cheap no-op gated inside the orchestrator for everyone else.
+  return patch;
+}
+
+/**
+ * Synchronous entry point for routes — flips status to `running` and
+ * launches background work. Returns the persisted start patch, or `null`
+ * if a concurrent caller already claimed this run (ENG-2308) — callers
+ * must NOT launch a second background generation in that case.
+ *
+ * Checks eager-pipeline status BEFORE claiming (ENG-2308 fix-of-a-fix,
+ * caught live) — same reasoning as `startIcpDiscoveryForUser`'s docstring:
+ * the orchestrator's `runAdCopy` claims this SAME axis itself when it
+ * fires the step, inside the SAME reconcile pass this function would hand
+ * off to. Claiming here too would always win first and starve it.
+ */
+export async function startAdCopyForUser(
+  userId: string,
+  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {}
+): Promise<AdCopyStatusFields | null> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const {
     isEagerPipelineActiveFor,
@@ -497,8 +523,10 @@ export async function startAdCopyForUser(
     | null;
   if (isEagerPipelineActiveFor(current)) {
     void reconcileForUser(userId);
-    return patch;
+    return null;
   }
+  const patch = await claimAdCopyRun(userId);
+  if (!patch) return null;
   void triggerAdCopyForUser(userId, deps);
   return patch;
 }
