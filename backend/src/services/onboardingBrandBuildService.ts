@@ -38,6 +38,7 @@ import { logStepMetric } from "./onboardingMetricsService";
 import {
   brandBuildOwnershipCondition,
   brandBuildSessionPageIdentifier,
+  isBrandBuildSessionSuperseded,
 } from "./brandBuildSessionMarker";
 
 const BRAND_BUILD_MODEL = "anthropic.claude-sonnet-4-6";
@@ -507,6 +508,23 @@ export async function triggerBrandBuildForUser(
   // ready-patch hook in agentModeService) and marketStrategy. Re-read the
   // user record and mirror marketStrategy → icpResult/competitorResult so
   // downstream UI + services hydrate.
+  //
+  // A run that was reclaimed while its session was still going (the client-side
+  // timeout calls /brand-build/fail then /start, which reclaims immediately)
+  // must not carry on and write for a build it no longer owns: its session was
+  // already refused by the update_brand_guidelines hook, and the writes below
+  // would otherwise mirror stale results over the newer run's.
+  if (deps.expectedStartedAt) {
+    const latest = (await userDb.getUserById(userId)) as any;
+    if (isBrandBuildSessionSuperseded(deps.expectedStartedAt, latest?.brandBuildStartedAt)) {
+      console.warn("[onboardingBrandBuildService] run superseded while its session ran; skipping post-session writes", {
+        userId,
+        ours: deps.expectedStartedAt,
+        current: latest?.brandBuildStartedAt,
+      });
+      return;
+    }
+  }
   await populateEmptyBrandGuidelines(userId);
   const updated = (await userDb.getUserById(userId)) as any;
   if (!updated) return;
@@ -527,7 +545,22 @@ export async function triggerBrandBuildForUser(
     mirrorPatch.competitorCompletedAt = now().toISOString();
   }
   if (Object.keys(mirrorPatch).length > 0) {
-    await userDb.updateUser(userId, mirrorPatch as any);
+    if (deps.expectedStartedAt) {
+      try {
+        await userDb.updateUser(userId, mirrorPatch as any, {
+          condition: brandBuildOwnershipCondition(deps.expectedStartedAt),
+        });
+      } catch (err: any) {
+        if (err?.code === "ConditionalCheckFailedException") {
+          // Reclaimed since the check above: the newer run owns these fields.
+          console.warn("[onboardingBrandBuildService] dropping stale mirror write: a newer claim owns the build", { userId });
+          return;
+        }
+        throw err;
+      }
+    } else {
+      await userDb.updateUser(userId, mirrorPatch as any);
+    }
   }
 
   // brandBuildStatus is flipped to ready by the agentModeService hook when
