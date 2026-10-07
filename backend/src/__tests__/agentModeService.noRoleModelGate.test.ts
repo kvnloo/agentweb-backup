@@ -96,7 +96,7 @@ describe('ENG-2028 PATCH llm-model for non-admins (real registry)', () => {
     expect(live).toBeDefined(); // the registry always carries a live voice model
     expect(agentModeService.resolveGenerationModel(live as string).fellBack).toBe(false);
     const a = makeRes();
-    await agentModeController.updateSessionLlmModel(patch(live) as any, a);
+    await agentModeController.updateSessionLlmModel(patch(live as string) as any, a);
     expect(a.status).toHaveBeenCalledWith(403);
     expect(mockDb.updateSessionLlmModel).not.toHaveBeenCalled();
   });
