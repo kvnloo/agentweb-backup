@@ -314,3 +314,26 @@ describe('reconcileModelMentionAck', () => {
     expect(out).toMatch(/can't be selected on your account/i);
   });
 });
+
+describe('findModelMention — a dot between two words is not a vendor abbreviation (ENG-2293 Opslane finding, run 151)', () => {
+  // The Z.ai exemption must stay narrow: a single-letter prefix ("Z.ai"), not
+  // any letter-dot-letter. "CSV.Opus 5" is a typo for "CSV. Opus 5" — a real
+  // sentence end with the space dropped — and must not turn the next
+  // sentence's model name into a request.
+  const idx = buildModelMentionIndex([
+    ...CATALOG,
+    { id: 'openrouter/z-ai/glm-5.3', name: 'Z.ai: GLM 5.3', family: 'glm' },
+  ]);
+
+  it.each([
+    'Use the CSV.Opus 5 wrote the last one',
+    'Try the draft.Gemini 3.1 Flash Lite made it',
+  ])('stays silent when a spaceless sentence end precedes the model name: %p', (text) => {
+    expect(findModelMention(text, idx)).toBeNull();
+  });
+
+  it('still reads Z.ai as one vendor name', () => {
+    expect(findModelMention('switch to Z.ai: GLM 5.3', idx)?.modelId).toBe('openrouter/z-ai/glm-5.3');
+    expect(findModelMention('What does it mean to use Z.ai: GLM 5.3?', idx)).toBeNull();
+  });
+});

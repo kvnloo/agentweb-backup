@@ -115,13 +115,12 @@ interface Token {
  * was read as a REQUEST for that model. Caught by CodeRabbit on PR #2707 and
  * reproduced before fixing; pinned by tests below.
  *
- * A dot flanked by digits with no whitespace is a decimal point. A dot
- * flanked by letters with no whitespace (ENG-2293 Opslane finding on PR
- * #3276: "Z.ai", a real auto-added vendor name) is the same kind of
- * abbreviation, not a sentence end — a genuine sentence-ending period is
- * always followed by whitespace before the next sentence starts, so `gap`
- * being exactly "." (no space either side) already rules out that case for
- * both. Anything else — including "3. 7" and the "3.7. Use..." that ends a
+ * A dot flanked by digits with no whitespace is a decimal point. A dot after a
+ * SINGLE letter with no whitespace (ENG-2293 Opslane finding on PR #3276:
+ * "Z.ai", a real auto-added vendor name) is a vendor abbreviation. It must stay
+ * that narrow: people do drop the space after a real sentence end ("the
+ * CSV.Opus 5 wrote it"), and a general letter-dot-letter rule let that read
+ * as a request for Opus 5 (Opslane run 151). Anything else — including "3. 7" and the "3.7. Use..." that ends a
  * real sentence — is a break.
  */
 function isSentenceBreak(gap: string, previousToken: Token | undefined, nextChar: string): boolean {
@@ -132,7 +131,7 @@ function isSentenceBreak(gap: string, previousToken: Token | undefined, nextChar
     && !!previousToken
     && (
       (/\d$/.test(previousToken.text) && /^\d/.test(nextChar))
-      || (/[a-z]$/i.test(previousToken.text) && /^[a-z]/i.test(nextChar))
+      || (previousToken.text.length === 1 && /^[a-z]$/i.test(previousToken.text) && /^[a-z]/i.test(nextChar))
     );
   return !isAbbreviationPoint;
 }
@@ -151,16 +150,14 @@ function isSentenceBreak(gap: string, previousToken: Token | undefined, nextChar
  * Same failure, different character class (ENG-2293 Opslane finding on PR
  * #3276): "What does it mean to use Z.ai: GLM 5.3?" was read as a request
  * because the dot inside the vendor name "Z.ai" stopped the scan before it
- * ever reached the real "?". A letter-period-letter dot is never a real
- * sentence boundary either — a genuine one is always followed by whitespace,
- * not directly by another letter — so stripping it here is the same fix for
- * the same reason, just a different trigger.
+ * ever reached the real "?". Only a dot after a single letter is stripped,
+ * matching `isSentenceBreak` (a longer word before the dot is a sentence end).
  *
  * Used only to answer a yes/no question about the text; never for offsets or
  * for anything the customer sees.
  */
 function stripVersionDots(text: string): string {
-  return text.replace(/(\d)\.(?=\d)/g, '$1').replace(/([A-Za-z])\.(?=[A-Za-z])/g, '$1');
+  return text.replace(/(\d)\.(?=\d)/g, '$1').replace(/\b([A-Za-z])\.(?=[A-Za-z])/g, '$1');
 }
 
 function tokenize(text: string): Token[] {
