@@ -397,6 +397,96 @@ describe("onboardingIcpService", () => {
       expect(writtenPatch.icpResult).toHaveLength(5);
     });
 
+    // ENG-2308 review follow-up, confirmed by direct reproduction against
+    // the real icpStartPatch/icpReadyPatch functions: the stale-claim
+    // escape hatch lets a reclaim supersede a merely-slow (not crashed)
+    // run. icpReadyPatch's own guard only checks icpStatus === "running",
+    // not WHICH run's "running" it is — without an ownership check on the
+    // WRITE itself, this run's zombie completion can land after a
+    // reclaim's own completion and silently clobber it.
+    it("conditions the completion write on this run's own icpStartedAt when expectedStartedAt is provided", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1" })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "running",
+          icpStartedAt: "2026-04-24T11:59:00.000Z",
+        });
+      userDb.updateUser.mockResolvedValue({});
+
+      const llm = new FakeLlm({ icps: fivePersonas });
+      await triggerIcpDiscoveryForUser("user-1", {
+        llm: llm as any,
+        expectedStartedAt: "2026-04-24T11:59:00.000Z",
+      });
+
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toBe(
+        "#icpStartedAt = :icpOwnerStartedAt",
+      );
+      expect(options?.condition?.values?.[":icpOwnerStartedAt"]).toBe(
+        "2026-04-24T11:59:00.000Z",
+      );
+    });
+
+    it("drops the completion silently when a reclaim has superseded this run (ConditionalCheckFailedException), without mirroring or cascading", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1" })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "running",
+          // A reclaim's fresh startedAt — different from the stale
+          // expectedStartedAt this (zombie) run was given below.
+          icpStartedAt: "2026-04-24T12:05:00.000Z",
+        });
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+
+      const llm = new FakeLlm({ icps: fivePersonas });
+      await expect(
+        triggerIcpDiscoveryForUser("user-1", {
+          llm: llm as any,
+          expectedStartedAt: "2026-04-24T11:59:00.000Z",
+        }),
+      ).resolves.toBeUndefined();
+
+      // Exactly one write attempt (the one that lost ownership) — no
+      // second write, no mirror-to-marketStrategy call.
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    });
+
+    it("conditions the failure-path write on this run's own icpStartedAt and drops it silently when superseded", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({ userId: "user-1" })
+        // Re-read inside the catch block, after the LLM throws.
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "running",
+          icpStartedAt: "2026-04-24T12:05:00.000Z",
+        });
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+
+      const llm = new FakeLlm(null, new Error("bedrock exploded"));
+      await expect(
+        triggerIcpDiscoveryForUser("user-1", {
+          llm: llm as any,
+          expectedStartedAt: "2026-04-24T11:59:00.000Z",
+        }),
+      ).resolves.toBeUndefined();
+
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.values?.[":icpOwnerStartedAt"]).toBe(
+        "2026-04-24T11:59:00.000Z",
+      );
+    });
+
     it("adds uploaded strategic context to ICP generation when user brand fields are sparse", async () => {
       userDb.getUserById
         .mockResolvedValueOnce({

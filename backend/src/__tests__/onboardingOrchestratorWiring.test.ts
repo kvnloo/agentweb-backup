@@ -230,15 +230,33 @@ describe("reconcileForUser", () => {
       expect(report).not.toBeNull();
       expect(report.gatedBy).toBeNull();
 
-      // Every legacy trigger fired exactly once.
+      // Every legacy trigger fired exactly once. icp/competitor/creativeDir/
+      // adCopy now also receive an `expectedStartedAt` (ENG-2308 review
+      // follow-up — the ownership token threaded through so a later
+      // reclaim's zombie completion can't be mistaken for THIS run's own),
+      // so assert on the call args loosely rather than the exact 1-arg
+      // shape this mock happens to supply (undefined, since this test's
+      // claim mocks return `{}`).
       expect(triggerBrandBuild).toHaveBeenCalledWith("u2");
-      expect(triggerIcp).toHaveBeenCalledWith("u2");
-      expect(triggerCompetitor).toHaveBeenCalledWith("u2");
-      expect(triggerCreativeDir).toHaveBeenCalledWith("u2");
+      expect(triggerIcp).toHaveBeenCalledWith(
+        "u2",
+        expect.objectContaining({ expectedStartedAt: undefined }),
+      );
+      expect(triggerCompetitor).toHaveBeenCalledWith(
+        "u2",
+        expect.objectContaining({ expectedStartedAt: undefined }),
+      );
+      expect(triggerCreativeDir).toHaveBeenCalledWith(
+        "u2",
+        expect.objectContaining({ expectedStartedAt: undefined }),
+      );
       expect(triggerAdImage).toHaveBeenCalledWith("u2", {
         run: { runId: "adimg_test-run", startedAt: "2026-08-04T00:00:00.000Z" },
       });
-      expect(triggerAdCopy).toHaveBeenCalledWith("u2");
+      expect(triggerAdCopy).toHaveBeenCalledWith(
+        "u2",
+        expect.objectContaining({ expectedStartedAt: undefined }),
+      );
 
       // Every step ended in `ready` and stamped its output back to
       // User.steps via updateUserSteps.
@@ -367,7 +385,10 @@ describe("reconcileForUser", () => {
       // dependent — the Epic deliberately splits image and copy into
       // independent axes so one failing does not block the other. It must
       // still run and still succeed.
-      expect(triggerAdCopy).toHaveBeenCalledWith("u-eng792");
+      expect(triggerAdCopy).toHaveBeenCalledWith(
+        "u-eng792",
+        expect.objectContaining({ expectedStartedAt: undefined }),
+      );
       expect(fired.find((f) => f.step === "adCopy")?.status).toBe("ready");
     });
   });

@@ -353,6 +353,74 @@ describe("onboardingCompetitorService", () => {
       expect(patch.competitorResult.per_icp).toHaveLength(2);
     });
 
+    // ENG-2308 review follow-up, confirmed by direct reproduction (same
+    // reasoning as onboardingIcpService's icpOwnershipCondition tests): the
+    // stale-claim escape hatch lets a reclaim supersede a merely-slow run;
+    // competitorReadyPatch's own guard only checks status, not WHICH run's
+    // "running" it is, so the completion WRITE itself must be conditioned
+    // on this run's own competitorStartedAt.
+    it("conditions the completion write on this run's own competitorStartedAt when expectedStartedAt is provided", async () => {
+      const personas = [samplePersona(1), samplePersona(2)];
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "ready",
+          icpResult: personas,
+        })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          competitorStatus: "running",
+          competitorStartedAt: "2026-04-24T11:59:00.000Z",
+        });
+      userDb.updateUser.mockResolvedValue({});
+      const llm = new FakeLlm([
+        sampleCompetitorResp(1),
+        sampleCompetitorResp(2),
+      ]);
+      await triggerCompetitorStrategyForUser("user-1", {
+        llm: llm as any,
+        expectedStartedAt: "2026-04-24T11:59:00.000Z",
+      } as any);
+
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toBe(
+        "#competitorStartedAt = :competitorOwnerStartedAt",
+      );
+      expect(options?.condition?.values?.[":competitorOwnerStartedAt"]).toBe(
+        "2026-04-24T11:59:00.000Z",
+      );
+    });
+
+    it("drops the completion silently when a reclaim has superseded this run (ConditionalCheckFailedException)", async () => {
+      const personas = [samplePersona(1)];
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          icpStatus: "ready",
+          icpResult: personas,
+        })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          competitorStatus: "running",
+          competitorStartedAt: "2026-04-24T12:05:00.000Z",
+        });
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+      const llm = new FakeLlm([sampleCompetitorResp(1)]);
+
+      await expect(
+        triggerCompetitorStrategyForUser("user-1", {
+          llm: llm as any,
+          expectedStartedAt: "2026-04-24T11:59:00.000Z",
+        } as any),
+      ).resolves.toBeUndefined();
+
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    });
+
     it("no-ops (does NOT mark failed) when icpStatus is 'running' — gated by icp step", async () => {
       const personas = [samplePersona(1)];
       userDb.getUserById.mockResolvedValueOnce({

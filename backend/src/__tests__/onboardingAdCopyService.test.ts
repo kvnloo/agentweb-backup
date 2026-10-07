@@ -597,6 +597,70 @@ describe("onboardingAdCopyService", () => {
       expect(written.adCopyResult.variants).toHaveLength(3);
     });
 
+    // ENG-2308 review follow-up, confirmed by direct reproduction (same
+    // reasoning as onboardingIcpService's icpOwnershipCondition tests).
+    it("conditions the completion write on this run's own adCopyStartedAt when expectedStartedAt is provided", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          adImageStatus: "ready",
+          adImageResult: { variants: threeImages },
+          icpResult: [onePersona],
+          creativeDirResult: creativeDir,
+        })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          adCopyStatus: "running",
+          adCopyStartedAt: "2026-04-24T11:59:00.000Z",
+        });
+      userDb.updateUser.mockResolvedValue({});
+
+      const llm = new FakeLlm(buildVariantResponse);
+      await triggerAdCopyForUser("user-1", {
+        llm: llm as any,
+        expectedStartedAt: "2026-04-24T11:59:00.000Z",
+      });
+
+      const options = userDb.updateUser.mock.calls[0][2];
+      expect(options?.condition?.expression).toBe(
+        "#adCopyStartedAt = :adCopyOwnerStartedAt",
+      );
+      expect(options?.condition?.values?.[":adCopyOwnerStartedAt"]).toBe(
+        "2026-04-24T11:59:00.000Z",
+      );
+    });
+
+    it("drops the completion silently when a reclaim has superseded this run (ConditionalCheckFailedException)", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          adImageStatus: "ready",
+          adImageResult: { variants: threeImages },
+          icpResult: [onePersona],
+          creativeDirResult: creativeDir,
+        })
+        .mockResolvedValueOnce({
+          userId: "user-1",
+          adCopyStatus: "running",
+          adCopyStartedAt: "2026-04-24T12:05:00.000Z",
+        });
+      const conditionalFailure = Object.assign(
+        new Error("The conditional request failed"),
+        { code: "ConditionalCheckFailedException" },
+      );
+      userDb.updateUser.mockRejectedValueOnce(conditionalFailure);
+      const llm = new FakeLlm(buildVariantResponse);
+
+      await expect(
+        triggerAdCopyForUser("user-1", {
+          llm: llm as any,
+          expectedStartedAt: "2026-04-24T11:59:00.000Z",
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+    });
+
     it("drops the ready patch silently when user is no longer running", async () => {
       userDb.getUserById
         .mockResolvedValueOnce({
