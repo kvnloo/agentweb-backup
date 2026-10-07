@@ -8,12 +8,42 @@
 
 export type FinishReason = 'stop' | 'length' | 'content-filter' | 'error' | 'cancelled';
 
+/** Outcome of one attempt at a run. Mirrors the run telemetry lifecycle (agent_run_completed / agent_run_failed). */
+export type AttemptOutcome = 'completed' | 'failed' | 'cancelled';
+
+/**
+ * Part types ENG-2104 (F3) names but that are deliberately NOT yet in `StreamPart`.
+ * Their payload shapes would be guesses until a real emitter and consumer exist, and a
+ * guessed shape is worse than none. Each needs one of:
+ *  - an ambient emitter, so code outside a backend's own turn loop (`recordLlmUsage`,
+ *    the approval deck) can reach the run's emitter: usage-observed, funding-changed,
+ *    approval-requested;
+ *  - a real decision to report: route-selected / route-unavailable (every run resolves
+ *    route 'agentweb' today), paused (no pause mechanism exists);
+ *  - a defined persistence point: checkpoint.
+ * Add each to `StreamPart` together with its first emitter.
+ */
+export type PlannedStreamPartType =
+  | 'route-selected'
+  | 'route-unavailable'
+  | 'funding-changed'
+  | 'usage-observed'
+  | 'approval-requested'
+  | 'checkpoint'
+  | 'paused';
+
 export type StreamPart =
   | { type: 'text-delta'; text: string }
   | { type: 'tool-input-available'; toolCallId: string; toolName: string; input: unknown }
   | { type: 'tool-output-available'; toolCallId: string; output: unknown }
   | { type: 'tool-approval-request'; toolCallId: string; toolName: string; input: unknown }
-  | { type: 'finish'; reason: FinishReason };
+  | { type: 'finish'; reason: FinishReason }
+  /**
+   * One attempt at the run ended. Today an attempt is the whole run, so this fires once
+   * per run (1:1 with `finish`). Whoever wires real retry / fallback (decideFallback,
+   * Track A/B) must revisit this: it should then fire once per attempt, not per run.
+   */
+  | { type: 'attempt-finished'; outcome: AttemptOutcome; toolCalls?: number };
 
 export interface RunEvent<P extends StreamPart = StreamPart> {
   v: 1;
@@ -52,5 +82,20 @@ export class RunEmitter {
   /** Transitional adapter for an untouched legacy onProgress call site. */
   emitLegacy(progress: LegacyProgress): void {
     this.legacySink?.(progress);
+  }
+}
+
+/**
+ * Emit a part without ever letting a failure reach the caller. `RunEmitter.emit()`
+ * deliberately throws when its sink throws (see streamEvents.test.ts), so any call made
+ * from inside a live turn must go through this. Same best-effort idiom as
+ * recordAgentModeDuplicateSuppression in agentModeService.ts.
+ */
+export function emitBestEffort(emitter: RunEmitter | undefined, part: StreamPart): void {
+  if (!emitter) return;
+  try {
+    emitter.emit(part);
+  } catch (err) {
+    console.error('[agent-mode] run event emit failed (swallowed):', err);
   }
 }
