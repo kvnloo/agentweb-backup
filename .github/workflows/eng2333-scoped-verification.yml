@@ -1,0 +1,43 @@
+name: ENG-2333 scoped semantic verification
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths: ['.github/workflows/eng2333-scoped-verification.yml']
+permissions:
+  contents: read
+jobs:
+  scoped-typescript:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 5fe57fed96166e24e34622958a12fe45ed91413f
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --ignore-scripts
+        working-directory: backend
+      - name: Semantic TypeScript diagnostics for inventory root
+        working-directory: backend
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
+        run: |
+          node <<'NODE'
+          const ts = require('typescript');
+          const path = require('path');
+          const base = process.cwd();
+          const root = path.join(base, 'src/__tests__/mcp.publicToolInventory.test.ts');
+          const config = ts.readConfigFile(path.join(base, 'tsconfig.json'), ts.sys.readFile);
+          if(config.error) throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, '\n'));
+          const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, base);
+          const options = {...parsed.options, noEmit:true, skipLibCheck:true, types:['jest','node']};
+          const program = ts.createProgram([root], options);
+          const source = program.getSourceFile(root);
+          if(!source) throw new Error('Missing inventory root');
+          const diagnostics = [...program.getOptionsDiagnostics(), ...program.getSyntacticDiagnostics(source), ...program.getSemanticDiagnostics(source)];
+          console.log(ts.formatDiagnosticsWithColorAndContext(diagnostics, {getCanonicalFileName:x=>x,getCurrentDirectory:()=>base,getNewLine:()=> '\n'}));
+          console.log(JSON.stringify({validatedCommit:'5fe57fed96166e24e34622958a12fe45ed91413f',rootFiles:program.getRootFileNames(),scopedSemanticDiagnostics:diagnostics.length}));
+          process.exitCode = diagnostics.length ? 1 : 0;
+          NODE
