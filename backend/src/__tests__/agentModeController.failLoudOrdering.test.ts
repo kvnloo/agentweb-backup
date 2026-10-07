@@ -227,10 +227,9 @@ describe('/generate validates the model before ANY session mutation', () => {
     assertSessionUntouched();
   });
 
-  it('deck cancel + unserved stored model: 422, deck not cleared', async () => {
-    mockChatbotDb.getChatSession.mockResolvedValue(sessionWithPending(UNSERVED) as any);
+  it('deck cancel + unserved request model: 422, deck not cleared', async () => {
     const res = makeRes();
-    await agentModeController.generateResponse(generateReq({ deckCancel: { deckId: 'deck-1' } }), res);
+    await agentModeController.generateResponse(generateReq({ llmModel: UNSERVED, deckCancel: { deckId: 'deck-1' } }), res);
     expect(res.statusCode).toBe(422);
     assertSessionUntouched();
   });

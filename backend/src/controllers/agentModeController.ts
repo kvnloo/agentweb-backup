@@ -73,7 +73,7 @@ import {
   markRunTerminal,
   IDEM_TTL_INTERACTIVE_S,
 } from '../services/agentMode/runStore';
-import { ModelUnavailableError, buildModelUnavailableBody, buildSharedModelUnavailableBody, isModelUnavailableError, sanitizeModelLabel } from '../services/agentMode/modelUnavailable';
+import { ModelUnavailableError, buildModelUnavailableBody, isModelUnavailableError, sanitizeModelLabel } from '../services/agentMode/modelUnavailable';
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
 // ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
 // on existing report/run envelopes. No surface parses or re-ranks on its own.
@@ -428,6 +428,17 @@ export async function resolveEffectiveModelForUser(input: {
   ) {
     throw new ModelUnavailableError(input.requestedModel as string, 'not_served');
   }
+  // A live-voice model cannot serve a text chat: callLLM would throw late (500, user
+  // message already saved). Refuse an explicit pick up front.
+  if (
+    !input.allowSilentSwap
+    && requestedResolution
+    && usage.mode.usageMode !== 'paused'
+    && typeof agentModeService.isLiveModel === 'function'
+    && agentModeService.isLiveModel(requestedResolution.model)
+  ) {
+    throw new ModelUnavailableError(input.requestedModel as string, 'not_selectable');
+  }
   const decision = selectPolicyModel({
     usageMode: usage.mode.usageMode,
     requestedModel: requestedResolution?.model || input.requestedModel,
@@ -455,19 +466,6 @@ function modelUnavailableBody(err: ModelUnavailableError) {
     ? agentModeService.getModelDisplayName(err.requestedModel)
     : undefined;
   return buildModelUnavailableBody(err, displayName);
-}
-
-/**
- * Strict check of a session's STORED model for the entry points where a person
- * picked it (shared/conversable chat, verified-generate). Pure and synchronous
- * (no settings reads), so it is cheap to run before any write. System-assigned
- * flows (Slack, work-plan launch, GTM, ...) deliberately do not call this.
- */
-function storedModelUnavailable(storedModel: string | null | undefined): ModelUnavailableError | null {
-  if (!storedModel || typeof agentModeService.resolveGenerationModel !== 'function') return null;
-  return agentModeService.resolveGenerationModel(storedModel).fellBack
-    ? new ModelUnavailableError(storedModel, 'not_served')
-    : null;
 }
 
 async function resolveScheduleBackup(input: {
@@ -9031,7 +9029,9 @@ export const agentModeController = {
     try {
       const authReq = req as AuthenticatedRequest;
       const user = authReq.user as User;
-      const { portalType: requestedPortalType = 'agent', pageIdentifier: requestedPageIdentifier = 'agent-mode', sessionType, idempotencyKey, llmModel: requestedLlmModel } = req.body;
+      const { portalType: requestedPortalType = 'agent', pageIdentifier: requestedPageIdentifier = 'agent-mode', sessionType, idempotencyKey, llmModel: rawRequestedLlmModel } = req.body;
+      // A padded id is trimmed; blank counts as NO selection (like '').
+      const requestedLlmModel = typeof rawRequestedLlmModel === 'string' ? rawRequestedLlmModel.trim() : rawRequestedLlmModel;
       const skillId = req.params?.skillId;
       const portalType = skillId ? 'agent' : requestedPortalType;
       let skill;
@@ -9400,8 +9400,10 @@ export const agentModeController = {
       }
 
       const user = req.user as User;
-      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer, deckAnswer, deckCancel, clientId } = req.body;
+      const { sessionId, llmModel: rawLlmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer, deckAnswer, deckCancel, clientId } = req.body;
       let { userMessage } = req.body;
+      // A padded id is trimmed; blank counts as NO selection (like '').
+      const llmModel = typeof rawLlmModel === 'string' ? rawLlmModel.trim() : rawLlmModel;
 
       // If the request contains audio, transcribe it to text first
       if (audioInput?.data && !userMessage) {
@@ -9440,14 +9442,12 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
 
-      // A STORED model on an interactive session is treated as a selection even when
-      // it was the auto-assigned default: if it was retired the picker shows it as
-      // 'Unavailable' and one pick fixes the session, so failing loudly here is
-      // recoverable. System-assigned flows (Slack, work-plan launch, GTM, onboarding,
-      // approval inbox) have no picker, so they never reach this check and keep the
-      // resolveFallbackModel safety net. We do NOT exempt `default_model` here: the
-      // stale STORED default is a different id from the current one, so that
-      // exemption would not help; and no persisted "user picked" flag exists.
+      // EXPLICIT = the REQUEST carries a model. A model merely STORED on the session is
+      // never explicit: the system stamps the configured default into session.llmModel
+      // (Slack, work-plan launch, GTM, onboarding...), no persisted flag can tell that
+      // from a user's pick (and none is added), so a retired/not-selectable stored model
+      // falls back to the current default exactly as before. The portal always sends the
+      // picker value, so portal users still get the loud 422 + 'Unavailable' badge.
       //
       // FAIL-LOUD pre-flight: validate an explicit model BEFORE anything below
       // mutates the session (work-plan input answer, approval-deck answer/cancel
@@ -9457,7 +9457,7 @@ export const agentModeController = {
       // and an exhausted allowance falls through to the 429 below).
       // The decision is kept and reused at the dispatch site below (one resolver
       // pass per turn: it costs several uncached settings reads).
-      const explicitModelSelection = Boolean(llmModel || session.llmModel);
+      const explicitModelSelection = Boolean(llmModel);
       let preflightDecision: EffectiveModelPolicyDecision | undefined;
       try {
         preflightDecision = await resolveEffectiveModelForUser({
@@ -11028,25 +11028,7 @@ export const agentModeController = {
 
       try {
 
-      // FAIL-LOUD pre-flight, ahead of every write below (work-plan input answer,
-      // deck answer/cancel): an unserved owner model must not consume the visitor's
-      // pending state with no turn run. The decision is reused at dispatch (one
-      // resolver pass). A usage-blocked owner keeps the 429 further down.
       const defaultModel = await agentModeService.getDefaultModel();
-      let sharedPreflightDecision: EffectiveModelPolicyDecision | undefined;
-      try {
-        sharedPreflightDecision = await resolveEffectiveModelForUser({
-          userId: session.userId,
-          requestedModel: session.llmModel || defaultModel,
-          allowSilentSwap: !session.llmModel, // no stored model: a misconfigured default keeps the old safety net
-        });
-      } catch (modelError) {
-        if (!isModelUnavailableError(modelError)) throw modelError;
-        // The visitor chose nothing, so the body names no model.
-        if ((await checkTokenUsage(session.userId)).allowed) {
-          return res.status(422).json(buildSharedModelUnavailableBody());
-        }
-      }
 
       if (workPlanInputAnswer) {
         try {
@@ -11191,19 +11173,13 @@ export const agentModeController = {
       // The anonymous caller cannot choose the model, but the owner's stored
       // preference is still subject to the same current cost policy as every
       // authenticated, scheduled, and MCP dispatch.
-      let modelPolicyDecision: EffectiveModelPolicyDecision;
-      try {
-        modelPolicyDecision = sharedPreflightDecision ?? await resolveEffectiveModelForUser({
-          userId: session.userId,
-          requestedModel: session.llmModel || defaultModel,
-          allowSilentSwap: !session.llmModel,
-        });
-      } catch (modelError) {
-        if (!isModelUnavailableError(modelError)) throw modelError;
-        // FAIL-LOUD: the owner's stored model is not served; nothing was sent
-        // to another model. The visitor chose nothing, so the body names no model.
-        return res.status(422).json(buildSharedModelUnavailableBody());
-      }
+      // The visitor selects nothing, so a stored model that is retired or not
+      // selectable falls back to the current default (allowSilentSwap) and never throws.
+      const modelPolicyDecision: EffectiveModelPolicyDecision = await resolveEffectiveModelForUser({
+        userId: session.userId,
+        requestedModel: session.llmModel || defaultModel,
+        allowSilentSwap: true,
+      });
       if (!modelPolicyDecision.effectiveModel) {
         // Runtime always exposes this method. The guard preserves older
         // controller test doubles that intentionally mock only their subject.
@@ -14572,15 +14548,16 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
-      // FAIL-LOUD, before any write: a retired stored model is a 422, not a silent swap.
-      const storedModelError = storedModelUnavailable(session.llmModel);
-      if (storedModelError) {
-        return res.status(422).json(buildSharedModelUnavailableBody());
-      }
-
       // Use session's llmModel if available, otherwise use default
       const defaultModel = await agentModeService.getDefaultModel();
-      const modelToUse = session.llmModel || defaultModel;
+      // The visitor selects nothing: a stored model that is retired or not selectable
+      // falls back to the current default (allowSilentSwap never throws).
+      const conversablePolicy = await resolveEffectiveModelForUser({
+        userId: session.userId,
+        requestedModel: session.llmModel || defaultModel,
+        allowSilentSwap: true,
+      });
+      const modelToUse = conversablePolicy.effectiveModel || session.llmModel || defaultModel;
 
       // Cancel generation immediately when the client disconnects
       req.on('close', () => {
@@ -15348,10 +15325,18 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Access denied to this session' });
       }
 
-      // FAIL-LOUD, before any write: a retired stored model is a 422, not a silent swap.
-      const storedModelError = storedModelUnavailable(session.llmModel);
-      if (storedModelError) {
-        return res.status(422).json(modelUnavailableBody(storedModelError));
+      // A STORED model is not an explicit selection: when it is retired or not
+      // selectable by the owner, store the current default instead (as /generate
+      // does) so runVerifiedChat, which reads the session, never runs the stored one.
+      if (session.llmModel) {
+        const storedPolicy = await resolveEffectiveModelForUser({
+          userId: session.userId,
+          requestedModel: session.llmModel,
+          allowSilentSwap: true,
+        });
+        if (storedPolicy.modelSelection === 'corrected' && storedPolicy.effectiveModel) {
+          await chatbotDb.updateSessionLlmModel(sessionId, storedPolicy.effectiveModel, toStoredModelPolicyDecision(storedPolicy));
+        }
       }
 
       // Track if client disconnected (user navigated away)

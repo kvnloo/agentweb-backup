@@ -41,8 +41,10 @@ export function sanitizeModelLabel(raw: string): string {
     .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, '')
     .trim();
   if (!cleaned) return 'unknown model';
-  return cleaned.length > MAX_MODEL_LABEL_CHARS
-    ? `${cleaned.slice(0, MAX_MODEL_LABEL_CHARS - 1)}…`
+  // Truncate by code points: slicing UTF-16 units can split a surrogate pair.
+  const points = Array.from(cleaned);
+  return points.length > MAX_MODEL_LABEL_CHARS
+    ? `${points.slice(0, MAX_MODEL_LABEL_CHARS - 1).join('')}…`
     : cleaned;
 }
 
@@ -61,23 +63,5 @@ export function buildModelUnavailableBody(err: ModelUnavailableError, displayNam
     code: 'model_unavailable',
     requestedModel: sanitizeModelLabel(err.requestedModel),
     reason: err.reason,
-  };
-}
-
-export interface SharedModelUnavailableBody {
-  error: string;
-  code: 'model_unavailable';
-}
-
-/**
- * Body for ANONYMOUS / share-link visitors. They selected nothing, and the
- * owner's stored model must not be disclosed to them, so there is no model id,
- * name or "you selected" wording here.
- */
-// Takes no argument on purpose: nothing about the error (model id, name, `reason`) may reach an anonymous visitor; `reason` would reveal that the owner's model is internal/admin-only.
-export function buildSharedModelUnavailableBody(): SharedModelUnavailableBody {
-  return {
-    error: "This shared conversation can't continue right now because its model is no longer available. Ask the person who shared it to choose another model.",
-    code: 'model_unavailable',
   };
 }

@@ -2364,6 +2364,11 @@ export class AgentModeService {
     return this.llmModels[modelId].name;
   }
 
+  /** True for a live-voice registry model (never valid for a text chat). Own-property check. */
+  isLiveModel(modelId: string): boolean {
+    return Boolean(modelId && Object.prototype.hasOwnProperty.call(this.llmModels, modelId) && this.llmModels[modelId].isLive);
+  }
+
   /**
    * Would the model picker accept this id for this user? The single source of
    * truth for "can this user pick this model" — internal/live exclusion and the

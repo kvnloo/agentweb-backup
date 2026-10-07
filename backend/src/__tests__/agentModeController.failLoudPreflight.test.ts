@@ -36,6 +36,7 @@ jest.mock('../services/generateMarketingResponseWorkerService', () => ({
   },
 }));
 
+const DEFAULT_MODEL = 'gpt-5-chat-2';
 const UNSERVED = 'retired-model-9';
 
 jest.mock('../services/agentModeService', () => ({
@@ -125,7 +126,6 @@ const mockAlert = sendAgentModeOncallAlert as jest.Mock;
 const OWNER = 'user-owner';
 const SESSION_ID = 'session-1';
 const MESSAGE = 'hello';
-const SHARED_MESSAGE = "This shared conversation can't continue right now because its model is no longer available. Ask the person who shared it to choose another model.";
 
 const session = (llmModel?: string) => ({
   sessionId: SESSION_ID, userId: OWNER, sessionType: 'regular', title: 'Chat', messages: [],
@@ -142,14 +142,6 @@ const makeRes = () => {
   return res as Response & { statusCode: number; body: any };
 };
 
-const expectZeroWrites = () => {
-  expect(mockChatbotDb.addMessageToSession).not.toHaveBeenCalled();
-  expect(mockChatbotDb.addMessagesToSession).not.toHaveBeenCalled();
-  expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
-  expect(mockChatbotDb.updateSessionTitle).not.toHaveBeenCalled();
-  expect(mockWorker.runInWorker).not.toHaveBeenCalled();
-  expect(incrementUserTokenUsage).not.toHaveBeenCalled();
-};
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -184,8 +176,8 @@ describe('generateSessionResponse (system-assigned flows keep the fallback)', ()
   });
 });
 
-describe('conversable generate', () => {
-  it('422s with the shared body and leaks no model id or name', async () => {
+describe('conversable generate (visitor selects nothing)', () => {
+  it('a stored retired model falls back to the default: no 422, runs', async () => {
     mockChatbotDb.getChatSession.mockResolvedValue(session(UNSERVED) as any);
     const res = makeRes();
     await agentModeController.generateConversableResponse({
@@ -195,43 +187,42 @@ describe('conversable generate', () => {
       on: jest.fn(),
     } as unknown as Request, res);
 
-    expect(res.statusCode).toBe(422);
-    expect(res.body).toEqual({ error: SHARED_MESSAGE, code: 'model_unavailable' });
-    expect(JSON.stringify(res.body)).not.toContain(UNSERVED);
-    expect(res.body.error.length).toBeGreaterThan(0);
-    expectZeroWrites();
+    expect(res.statusCode).not.toBe(422);
+    expect(res.body).toMatchObject({ content: 'OK' });
   });
 
-  it('happy path unchanged', async () => {
+  it('a stored internalOnly model runs on the default, never the stored one', async () => {
     const res = makeRes();
     await agentModeController.generateConversableResponse({
       params: { shareId: SESSION_ID },
       body: { userMessage: MESSAGE, attachments: [] },
-      conversableSession: session('gpt-5.5'),
+      conversableSession: session('internal-judge-1'),
       on: jest.fn(),
     } as unknown as Request, res);
-    expect(res.body).toMatchObject({ content: 'OK' });
+    expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: DEFAULT_MODEL }), expect.anything());
   });
 });
 
-describe('verifiedGenerate', () => {
+describe('verifiedGenerate (stored model is not a selection)', () => {
   const verifiedReq = () => ({
     user: { userId: OWNER },
     body: { sessionId: SESSION_ID, startingMessage: 'do the thing', requiredFunctions: [], keywords: [], attachments: [] },
     on: jest.fn(),
   } as unknown as Request);
 
-  it('422s with the normal body (no retry, no oncall alert, no 500) for an unserved stored model', async () => {
-    mockChatbotDb.getChatSession.mockResolvedValue(session(UNSERVED) as any);
+  it.each([UNSERVED, 'internal-judge-1'])('a stored %s model runs on the default: no 422, no 500, never the stored model', async (stored) => {
+    mockChatbotDb.getChatSession.mockResolvedValue(session(stored) as any);
     const res = makeRes();
     await agentModeController.verifiedGenerate(verifiedReq(), res);
 
-    expect(res.statusCode).toBe(422);
-    expect(res.body).toMatchObject({ code: 'model_unavailable', requestedModel: UNSERVED, reason: 'not_served' });
-    expect(res.body.error).toContain(UNSERVED);
+    expect(res.statusCode).not.toBe(422);
+    expect(res.statusCode).not.toBe(500);
     expect(mockAlert).not.toHaveBeenCalled();
-    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
-    expect(mockChatbotDb.addMessageToSession).not.toHaveBeenCalled();
-    expect(activeSessionGenerations.has(SESSION_ID)).toBe(false);
+  });
+
+  it('a stored internalOnly model is replaced by the default before the run reads the session', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(session('internal-judge-1') as any);
+    await agentModeController.verifiedGenerate(verifiedReq(), makeRes());
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, DEFAULT_MODEL, expect.anything());
   });
 });

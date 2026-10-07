@@ -54,12 +54,13 @@ jest.mock('../services/agentModeService', () => ({
     getSupportedModels: jest.fn(async () => ['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5']),
     // Mirrors the real behaviour: unknown ids fall back to the default, registry ids pass.
     resolveGenerationModel: jest.fn((model: string) => {
-      const registry = new Set(['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5', 'internal-judge-1', 'legacy-old-alias-target']);
+      const registry = new Set(['gpt-5-chat-2', 'gemini-3.5-flash', 'gpt-5.5', 'internal-judge-1', 'legacy-old-alias-target', 'live-voice-1']);
       const normalized = model === 'legacy-old-alias' ? 'legacy-old-alias-target' : model;
       return registry.has(normalized)
         ? { model: normalized, fellBack: false, requestedModel: model }
         : { model: 'gpt-5-chat-2', fellBack: true, requestedModel: model };
     }),
+    isLiveModel: jest.fn((id: string) => id === 'live-voice-1'),
     getModelDisplayName: jest.fn((id: string) => (id === 'gpt-5.5' ? 'GPT-5.5' : undefined)),
     generateSessionTitle: jest.fn().mockResolvedValue('Test Title'),
     getMarketingSystemPrompt: jest.fn().mockResolvedValue('System prompt'),
@@ -137,7 +138,6 @@ const FULL_CHOICE = { usageMode: 'full_choice', admissionAllowed: true, reason: 
 
 const MESSAGE = 'Please draft the launch email';
 
-const SHARED_MESSAGE = "This shared conversation can't continue right now because its model is no longer available. Ask the person who shared it to choose another model.";
 
 const expectedMessage = (label: string) =>
   `The model you selected (${label}) isn't available right now, so nothing was sent to a different model. Choose another model and try again.`;
@@ -282,14 +282,55 @@ describe('POST /generate (fail-loud)', () => {
     expect(second.body.code).toBe('model_unavailable');
   });
 
-  it('422s when the STORED session model is unserved and the body has no llmModel; stored model untouched', async () => {
+  it('a STORED retired model with NO request llmModel is not an explicit selection: runs on the default', async () => {
     mockChatbotDb.getChatSession.mockResolvedValue(baseSession(UNSERVED) as any);
     const res = makeRes();
     await agentModeController.generateResponse(generateReq({}), res);
 
+    expect(res.statusCode).toBe(200);
+    expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: DEFAULT_MODEL }), expect.anything());
+    expect(res.body).toMatchObject({ effectiveModel: DEFAULT_MODEL });
+  });
+
+  it('a STORED internalOnly model with no request llmModel runs on the default, never the stored one', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(baseSession(INTERNAL_ONLY) as any);
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({}), res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: DEFAULT_MODEL }), expect.anything());
+  });
+
+  it('trims a padded request llmModel and runs on it', async () => {
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: ' gpt-5.5\n' }), res);
+    expect(res.statusCode).toBe(200);
+    expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: 'gpt-5.5' }), expect.anything());
+  });
+
+  it('a whitespace-only request llmModel counts as NO selection (stored retired model falls back, no 422)', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(baseSession(UNSERVED) as any);
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: '   ' }), res);
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('422 not_selectable for an explicit LIVE voice model, before the user message is persisted', async () => {
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: 'live-voice-1' }), res);
     expect(res.statusCode).toBe(422);
-    expect(res.body).toMatchObject({ code: 'model_unavailable', requestedModel: UNSERVED, reason: 'not_served' });
+    expect(res.body).toMatchObject({ code: 'model_unavailable', reason: 'not_selectable', requestedModel: 'live-voice-1' });
     assertNothingRan();
+  });
+
+  it('keeps the user backup model through the pre-flight decision (reported and stored unchanged)', async () => {
+    const res = makeRes();
+    await agentModeController.generateResponse(generateReq({ llmModel: 'gpt-5.5', llmBackupModel: 'gemini-3.5-flash' }), res);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ backupModel: 'gemini-3.5-flash', backupSource: 'user' });
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
+      SESSION_ID, 'gpt-5.5', expect.objectContaining({ backupModel: 'gemini-3.5-flash' }),
+    );
   });
 
   it('422 not_selectable for an internalOnly id', async () => {
@@ -360,53 +401,22 @@ describe('POST /generate (fail-loud)', () => {
   });
 });
 
-describe('shared generate (fail-loud)', () => {
-  it('422s when the owner\'s stored model is unserved, with no model named to the anonymous visitor', async () => {
+describe('shared generate (anonymous visitors select nothing)', () => {
+  it.each([UNSERVED, INTERNAL_ONLY])('a stored %s owner model falls back to the default, no 422', async (stored) => {
     mockChatbotDb.getChatSession.mockResolvedValue({
-      ...baseSession(UNSERVED),
+      ...baseSession(stored),
       interactiveShareMetadata: { isActive: true, token: 'tok', sharedAt: '2026-07-01T00:00:00Z' },
     } as any);
-    const req = {
-      params: { shareId: SESSION_ID },
-      query: { conversable: 'tok' },
-      body: { userMessage: MESSAGE, attachments: [] },
-      on: jest.fn(),
-    } as unknown as Request;
-    const res = makeRes();
-    await agentModeController.generateSharedResponse(req, res);
-
-    expect(res.statusCode).toBe(422);
-    expect(res.body).toEqual({
-      error: SHARED_MESSAGE,
-      code: 'model_unavailable',
-    });
-    expect(JSON.stringify(res.body)).not.toContain(UNSERVED);
-    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
-    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
-    expect(activeSessionGenerations.has(SESSION_ID)).toBe(false);
-  });
-
-  it('a deck answer with an unserved owner model 422s WITHOUT touching deck/session state', async () => {
-    mockChatbotDb.getChatSession.mockResolvedValue({
-      ...baseSession(UNSERVED),
-      pendingApprovalDeck: { deckId: 'deck-1' },
-      interactiveShareMetadata: { isActive: true, token: 'tok', sharedAt: '2026-07-01T00:00:00Z' },
-    } as any);
-    (mockAgentModeService as any).submitApprovalDeckAnswers = jest.fn();
-    (mockChatbotDb as any).updateSessionApprovalDeck = jest.fn();
     const res = makeRes();
     await agentModeController.generateSharedResponse({
       params: { shareId: SESSION_ID },
       query: { conversable: 'tok' },
-      body: { userMessage: MESSAGE, attachments: [], deckAnswer: { deckId: 'deck-1', answers: [] } },
+      body: { userMessage: MESSAGE, attachments: [] },
       on: jest.fn(),
     } as unknown as Request, res);
 
-    expect(res.statusCode).toBe(422);
-    expect((mockAgentModeService as any).submitApprovalDeckAnswers).not.toHaveBeenCalled();
-    expect((mockChatbotDb as any).updateSessionApprovalDeck).not.toHaveBeenCalled();
-    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
-    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+    expect(res.statusCode).not.toBe(422);
+    expect(mockWorker.runInWorker).toHaveBeenCalledWith(expect.objectContaining({ llmModel: DEFAULT_MODEL }), expect.anything());
   });
 });
 
@@ -421,6 +431,25 @@ describe('createSession (fail-loud)', () => {
     expect(res.body).toMatchObject({ code: 'model_unavailable', requestedModel: UNSERVED, reason: 'not_served' });
     expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
     expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+  });
+
+  it('trims a padded requestedLlmModel; blank counts as no selection', async () => {
+    const padded = makeRes();
+    await agentModeController.createSession(createReq({ portalType: 'agent', llmModel: ' gpt-5.5' }), padded);
+    expect(padded.statusCode).toBe(201);
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(SESSION_ID, 'gpt-5.5', expect.anything());
+
+    const blank = makeRes();
+    await agentModeController.createSession(createReq({ portalType: 'agent', llmModel: '   ' }), blank);
+    expect(blank.statusCode).toBe(201);
+  });
+
+  it('422 not_selectable for an explicit LIVE voice model and creates no session', async () => {
+    const res = makeRes();
+    await agentModeController.createSession(createReq({ portalType: 'agent', llmModel: 'live-voice-1' }), res);
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toMatchObject({ reason: 'not_selectable' });
+    expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
   });
 
   it('creates normally for a served model and for no model (default)', async () => {
@@ -445,6 +474,14 @@ describe('createSession (fail-loud)', () => {
 });
 
 describe('buildModelUnavailableBody (single message producer)', () => {
+  it('truncates by code points: never leaves a lone surrogate, keeps the 120 cap and ellipsis', () => {
+    const label = buildModelUnavailableBody(new ModelUnavailableError('😀'.repeat(130), 'not_served')).requestedModel;
+    expect(Array.from(label)).toHaveLength(120);
+    expect(label.endsWith('…')).toBe(true);
+    expect(label).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+    expect(buildModelUnavailableBody(new ModelUnavailableError('gpt-5.5', 'not_served')).requestedModel).toBe('gpt-5.5');
+  });
+
   it('uses the display name when given, else the raw id', () => {
     const err = new ModelUnavailableError('gpt-5.5', 'not_selectable');
     expect(buildModelUnavailableBody(err, 'GPT-5.5').error).toBe(expectedMessage('GPT-5.5'));
