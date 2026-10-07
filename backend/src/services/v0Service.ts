@@ -6400,7 +6400,7 @@ export async function iterateLandingPage(
       // Adopt it. Re-sending here is the double-apply bug: the user would get their
       // instruction twice and be charged twice.
       console.log(`[V0 SERVICE] iterate: edit already applied (${pending!.baseVersionId} → ${baseVersionId}), adopting`);
-      return await finishIteration(id, record, baseVersionId);
+      return await finishIteration(id, record, baseVersionId, messageHash);
     }
 
     // ENG-1728: the base this edit is anchored to. For a retry of a recorded edit it is the
@@ -6412,18 +6412,32 @@ export async function iterateLandingPage(
       // the send left a crash window: v0 had the message, the record did not, so the retry
       // read the post-edit version as its base, the usage guard skipped the already-sent
       // message, and the retry waited for a version no send would ever create.
+      //
+      // The write is conditional on the EXISTING pendingIteration (ENG-1728 gap 2): one active
+      // edit per page. A distinct edit racing it is rejected here, before v0 is called, rather
+      // than overwriting the winner's recorded base. A marker older than the iteration budget
+      // belongs to a request that can no longer be waiting on it, so it may be superseded.
       const nowIso = new Date().toISOString();
-      await dynamodb
-        .update({
-          TableName: TABLE_NAME,
-          Key: { id },
-          UpdateExpression: "SET pendingIteration = :p, updatedAt = :now",
-          ExpressionAttributeValues: {
-            ":p": { baseVersionId, messageHash, startedAt: nowIso, unsent: true },
-            ":now": nowIso,
-          },
-        })
-        .promise();
+      try {
+        await dynamodb
+          .update({
+            TableName: TABLE_NAME,
+            Key: { id },
+            UpdateExpression: "SET pendingIteration = :p, updatedAt = :now",
+            ConditionExpression: "attribute_not_exists(pendingIteration) OR pendingIteration.startedAt < :staleBefore",
+            ExpressionAttributeValues: {
+              ":p": { baseVersionId, messageHash, startedAt: nowIso, unsent: true },
+              ":now": nowIso,
+              ":staleBefore": new Date(Date.now() - V0_GENERATION_BUDGET_MS).toISOString(),
+            },
+          })
+          .promise();
+      } catch (err: any) {
+        if (err?.code !== "ConditionalCheckFailedException") throw err;
+        const busy: any = new Error("Another edit to this landing page is still in progress — retry once it finishes");
+        busy.code = "ITERATION_IN_PROGRESS";
+        throw busy;
+      }
     }
 
     // A recorded edit without `unsent` is known to be with v0: resume the wait, never re-send.
@@ -6452,18 +6466,27 @@ export async function iterateLandingPage(
 
       // Stamp the send the instant v0 accepts (or the guard confirms a prior send), BEFORE
       // the wait — if the wait dies, the retry must know the message is already with v0.
+      // Conditional on still owning the marker: if a stale-takeover replaced it meanwhile, our
+      // message is already with v0, so keep waiting — but never overwrite the other edit's base.
       const sentIso = new Date().toISOString();
-      await dynamodb
-        .update({
-          TableName: TABLE_NAME,
-          Key: { id },
-          UpdateExpression: "SET pendingIteration = :p, updatedAt = :now",
-          ExpressionAttributeValues: {
-            ":p": { baseVersionId: anchorBaseVersionId, messageHash, startedAt: isSameEdit ? pending!.startedAt : sentIso },
-            ":now": sentIso,
-          },
-        })
-        .promise();
+      try {
+        await dynamodb
+          .update({
+            TableName: TABLE_NAME,
+            Key: { id },
+            UpdateExpression: "SET pendingIteration = :p, updatedAt = :now",
+            ConditionExpression: "pendingIteration.messageHash = :h",
+            ExpressionAttributeValues: {
+              ":p": { baseVersionId: anchorBaseVersionId, messageHash, startedAt: isSameEdit ? pending!.startedAt : sentIso },
+              ":now": sentIso,
+              ":h": messageHash,
+            },
+          })
+          .promise();
+      } catch (err: any) {
+        if (err?.code !== "ConditionalCheckFailedException") throw err;
+        console.warn(`[V0 SERVICE] iterate: pendingIteration now belongs to another edit — not overwriting it`);
+      }
     }
 
     // Do not return until v0 publishes a version that is NOT the one we started from. This is
@@ -6476,7 +6499,7 @@ export async function iterateLandingPage(
       { deadline, afterVersionId: anchorBaseVersionId }
     );
 
-    return await finishIteration(id, record, newVersionId);
+    return await finishIteration(id, record, newVersionId, messageHash);
   } catch (error: any) {
     console.error("[V0 SERVICE] Iteration failed:", error);
     // Deliberately NOT flipping the record to `failed`: the page is still live at its URL, and
@@ -6493,7 +6516,8 @@ export async function iterateLandingPage(
 async function finishIteration(
   id: string,
   record: GeneratedLandingPage,
-  versionId: string
+  versionId: string,
+  messageHash: string
 ): Promise<GeneratedLandingPage> {
   // `draft` == "has an undeployed version ready", which is now exactly true. It is also what
   // makes the edit reachable: deployLandingPage accepts `draft` and refuses `deployed`, which
@@ -6502,20 +6526,33 @@ async function finishIteration(
   const iterations = (record.iterations || 0) + 1;
   const nowIso = new Date().toISOString();
 
-  await dynamodb
-    .update({
-      TableName: TABLE_NAME,
-      Key: { id },
-      UpdateExpression:
-        "SET #status = :status, iterations = :iterations, updatedAt = :updatedAt REMOVE pendingIteration",
-      ExpressionAttributeNames: { "#status": "status" },
-      ExpressionAttributeValues: {
-        ":status": newStatus,
-        ":iterations": iterations,
-        ":updatedAt": nowIso,
-      },
-    })
-    .promise();
+  const values = { ":status": newStatus, ":iterations": iterations, ":updatedAt": nowIso };
+  try {
+    // Only clear the marker if it is still OURS (or already gone) — never another edit's (ENG-1728).
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression:
+          "SET #status = :status, iterations = :iterations, updatedAt = :updatedAt REMOVE pendingIteration",
+        ConditionExpression: "attribute_not_exists(pendingIteration) OR pendingIteration.messageHash = :h",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: { ...values, ":h": messageHash },
+      })
+      .promise();
+  } catch (err: any) {
+    if (err?.code !== "ConditionalCheckFailedException") throw err;
+    // Another edit is active: still count ours and make it deployable, leave its marker alone.
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "SET #status = :status, iterations = :iterations, updatedAt = :updatedAt",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: values,
+      })
+      .promise();
+  }
 
   console.log(`[V0 SERVICE] iterate: version ${versionId} ready — page is deployable`);
   return { ...record, status: newStatus, iterations, updatedAt: nowIso, pendingIteration: undefined };

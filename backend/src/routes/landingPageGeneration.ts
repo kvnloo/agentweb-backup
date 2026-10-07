@@ -772,7 +772,7 @@ router.post("/generated/:id/iterate", rateLimiter, async (req, res: Response) =>
     res.json(result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error iterating:", error);
-    const status = error.message?.includes("not found") ? 404 : 500;
+    const status = error.code === "ITERATION_IN_PROGRESS" ? 409 : error.message?.includes("not found") ? 404 : 500;
     res.status(status).json({ error: error.message || "Failed to iterate" });
   }
 });
