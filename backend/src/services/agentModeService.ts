@@ -2021,11 +2021,34 @@ export class AgentModeService {
     return null;
   }
 
+  /** Bad configured-default values already warned about (once per process each). */
+  private warnedUnusableDefaults = new Set<string>();
+
+  /** Selectable by a non-admin through the picker: served, not internalOnly/adminOnly/live. */
+  private isPubliclySelectable(modelId: string): boolean {
+    const config = this.llmModels[modelId];
+    return Boolean(config) && !config.internalOnly && !config.adminOnly && !config.isLive;
+  }
+
   async getDefaultModel(): Promise<string> {
-    return (
-      (await this.resolveConfiguredModel(this.defaultModelSettingName, 'default')) ??
-      this.default_model
-    );
+    const configured = await this.resolveConfiguredModel(this.defaultModelSettingName, 'default');
+    if (!configured) return this.default_model;
+    // The default stands in for every user, so it must be one the picker offers a
+    // non-admin (the same rules getSupportedModels(false) applies). Otherwise the
+    // usage policy rejects it ("system default model is not supported") and a turn
+    // with no stored/request model fails. Fall back to the code constant -- but only
+    // when that constant is itself usable; otherwise keep the existing behaviour.
+    if (!this.isPubliclySelectable(configured) && this.isPubliclySelectable(this.default_model)) {
+      if (!this.warnedUnusableDefaults.has(configured)) {
+        this.warnedUnusableDefaults.add(configured);
+        console.warn(
+          `AgentMode: ${this.defaultModelSettingName} "${configured}" is internal-only, admin-only, or a live-voice model ` +
+            `and cannot serve users; using "${this.default_model}" instead. Fix the AW-Settings row.`
+        );
+      }
+      return this.default_model;
+    }
+    return configured;
   }
 
   async getReportsModel(): Promise<string> {
