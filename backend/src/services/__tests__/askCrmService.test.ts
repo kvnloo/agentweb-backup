@@ -245,18 +245,25 @@ describe('askCrm — ENG-2155 live lifecycle precedence', () => {
     expect(result.items[0].lifecycle).toBe('churned');
   });
 
-  it('lets a low health score move a stored paying customer to at_risk', async () => {
+  // healthScore/lastUsageAt are NOT live signals: askCrmLeadLoader.ts never merges
+  // either one (healthScore is written once, historic-only, by
+  // scripts/backfill-crm-scores.ts and never refreshed; lastUsageAt is never
+  // persisted onto a lead row outside that same one-time script). A gate branch
+  // that trusted them alone would downgrade a stored "paying" off a snapshot with
+  // zero live evidence behind it — exactly what this gate exists to prevent. These
+  // two guard against reintroducing that.
+  it('does not let a stale stored health score alone move a stored paying customer to at_risk', async () => {
     const result = await askCrm('is Healthcase at acme', 'u1', makeDeps([
       lead({ firstName: 'Healthcase', company: 'Acme', lifecycle: 'paying', healthScore: 20 }),
     ]));
-    expect(result.items[0].lifecycle).toBe('at_risk');
+    expect(result.items[0].lifecycle).toBe('paying');
   });
 
-  it('lets 30+ days of no usage move a stored paying customer to at_risk', async () => {
+  it('does not let a stale stored usage timestamp alone move a stored paying customer to at_risk', async () => {
     const result = await askCrm('is Usagecase at acme', 'u1', makeDeps([
       lead({ firstName: 'Usagecase', company: 'Acme', lifecycle: 'paying', lastUsageAt: '2026-03-01T00:00:00Z' }),
     ]));
-    expect(result.items[0].lifecycle).toBe('at_risk');
+    expect(result.items[0].lifecycle).toBe('paying');
   });
 
   it('does not downgrade stored paying from a healthy score and recent usage alone', async () => {
