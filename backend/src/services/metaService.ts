@@ -15,8 +15,8 @@ import { buildUtmSpec, readUtmKeys, utmQueryString, mergeUtmIntoQueryString, utm
 // Keep an explicit allow-list: a new/unknown currency must never imply offset 100.
 const META_CURRENCY_OFFSETS = new Map<string, number>([
   ...'TWD JPY KRW CLP COP CRC HUF ISK IDR PYG VND'.split(' ').map(code => [code, 1] as [string, number]),
-  ...('AED ARS AUD BDT BOB BRL CAD CHF CNY CZK DKK DZD EGP EUR GBP GTQ HKD HNL ' +
-    'ILS INR KES LKR MOP MXN MYR NGN NIO NOK NZD PEN PHP PKR PLN QAR RON SAR SEK SGD THB TRY UAH USD UYU ZAR')
+  ...('AED ARS AUD BDT BGN BHD BOB BRL CAD CHF CNY CZK DKK DZD EGP EUR FBZ GBP GTQ HKD HNL HRK ' +
+    'ILS INR JOD KES LKR LTL LVL MOP MXN MYR NGN NIO NOK NZD PEN PHP PKR PLN QAR RON RSD RUB SAR SEK SGD SKK THB TRY UAH USD UYU VEF VES ZAR')
     .split(' ').map(code => [code, 100] as [string, number]),
 ]);
 

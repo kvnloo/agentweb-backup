@@ -233,7 +233,7 @@
  * it still calls `agentModeService.linkedinManagePost` for the unrelated
  * sibling-method-spy reason documented in the FOLLOW-UP section above.
  */
-import { linkedInOutreachService } from '../../services/linkedInOutreachService';
+import { linkedInOutreachService, isProvenDisconnectError } from '../../services/linkedInOutreachService';
 import {
   isAnonymizedIdentifier,
   usablePublicIdentifier,
@@ -409,7 +409,7 @@ function linkedInPublicIdFromUrl(url: string | undefined | null): string | null 
 }
 
 // Post on connected account helper
-export async function postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any): Promise<any> {
+export async function postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any, options?: { saveAsDraft?: boolean }): Promise<any> {
   console.log('[AgentMode] postOnConnectedAccount called:', {
     userId,
     accountId,
@@ -510,10 +510,21 @@ export async function postOnConnectedAccount(userId: string, accountId: string |
     // decision taken before that work began. Hand the same re-check down so those
     // adapters can run it immediately before their irreversible request; adapters
     // that commit straight away (X) need nothing and ignore it.
-    const result = await adapter.createPost(
-      account, content, mediaUrls, ownerUserId,
-      toolContext?.assertPublishStillAuthorized
-    );
+    // ENG-428: save-as-draft is a LinkedIn-only capability; refuse it elsewhere
+    // rather than silently publishing what the caller asked to keep private.
+    const saveAsDraft = options?.saveAsDraft === true;
+    if (saveAsDraft && account.platform !== 'linkedin') {
+      return { success: false, message: `save_as_draft is only supported for LinkedIn accounts, not ${account.platform}. Nothing was posted.` };
+    }
+    const result = saveAsDraft
+      ? await (adapter as any).createPost(
+        account, content, mediaUrls, ownerUserId,
+        toolContext?.assertPublishStillAuthorized, { draft: true }
+      )
+      : await adapter.createPost(
+        account, content, mediaUrls, ownerUserId,
+        toolContext?.assertPublishStillAuthorized
+      );
 
     // An adapter that abandoned the post on a withdrawn consent reports it as a
     // refusal, not a platform failure — the run was stopped deliberately.
@@ -546,7 +557,8 @@ export async function postOnConnectedAccount(userId: string, accountId: string |
       success: true,
       message: result.message,
       post_id: result.postId,
-      post_url: result.postUrl
+      post_url: result.postUrl,
+      ...(saveAsDraft ? { draft: true } : {})
     };
   } catch (error: any) {
     const message = error?.message?.includes('access token expired')
@@ -1191,9 +1203,13 @@ export async function linkedinOutreach(
     // depend on which of the two paths happened to observe the dead session first
     // (ENG-1197).
     const { recordUnipileAccountHealth } = await import('../../services/linkedInConnectionHealth');
+    // ENG-2205: ownerUserId must be omitted for a site-wide pool account — its
+    // owner lookup can never resolve the global fallback pool under an
+    // unrelated caller's userId, so a truthy-but-wrong value here silently
+    // no-ops instead of reaching the dedicated ownerless/oncall alert branch.
     await recordUnipileAccountHealth({
       accountId: account_id,
-      ownerUserId: userId,
+      ownerUserId: usedSharedAccount ? undefined : userId,
       state: 'disconnected',
     });
     return withRouting(linkedInDisconnectedResponse());
@@ -2256,7 +2272,12 @@ export async function linkedinOutreach(
     }
 
     const structuredError = (error as any).structuredError;
-    if (structuredError?.code === 'errors/disconnected_account' || structuredError?.classification === 'AUTH_ERROR') {
+    // ENG-2205: uses the shared isProvenDisconnectError predicate rather than
+    // this inline check — the inline version (kept here as `structuredError`
+    // for the fallback below) treats any AUTH_ERROR as proof of death, but
+    // handleError classifies a bare 403 as AUTH_ERROR too, and a 403 is a
+    // permission/plan restriction, not a dead session.
+    if (isProvenDisconnectError(error)) {
       // A session can die between the preflight above and this call (or inside the
       // probe's 10-minute cache window), so the reactive path stays as the backstop.
       // Both return the identical response via one helper.
@@ -2265,12 +2286,12 @@ export async function linkedinOutreach(
       // learned a session was dead told the model and nobody else, so an unattended
       // scheduled run discovered the outage, no-opped, and left no trace anything
       // was wrong. Recording it is what gives the owner an alert and lets the next
-      // run skip instead of repeating the discovery. A no-op for shared accounts,
-      // which this user doesn't own.
+      // run skip instead of repeating the discovery. ownerUserId is omitted for a
+      // shared account — see the identical comment on the preflight call above.
       const { recordUnipileAccountHealth } = await import('../../services/linkedInConnectionHealth');
       await recordUnipileAccountHealth({
         accountId: account_id,
-        ownerUserId: userId,
+        ownerUserId: usedSharedAccount ? undefined : userId,
         state: 'disconnected',
       });
       return withRouting(linkedInDisconnectedResponse());
