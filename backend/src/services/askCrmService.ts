@@ -188,7 +188,9 @@ function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: L
   const provesSignup =
     lead.hasUserRecord === true &&
     (lead.lifecycle === 'unknown' || lead.lifecycle === 'inbox');
-  const provesChurn = (ageDays(lead.lastActivityAt) ?? 0) > 60;
+  const hasLiveSubscription =
+    lead.subscriptionState === 'active' || lead.subscriptionState === 'trialing';
+  const provesChurn = !hasLiveSubscription && (ageDays(lead.lastActivityAt) ?? 0) > 60;
   // No provesRisk gate: healthScore/lastUsageAt are NOT live signals today.
   // askCrmLeadLoader.ts never merges either one — healthScore is written once,
   // historic-only, by scripts/backfill-crm-scores.ts (never refreshed after;
@@ -208,7 +210,12 @@ function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: L
       phone: lead.phone ?? undefined,
       hasUserRecord: lead.hasUserRecord ?? undefined,
       subscriptionState: lead.subscriptionState ?? undefined,
-      lastActivityAt: lead.lastActivityAt ?? undefined,
+      // Deliberate deviation from computeLifecycle's Rule 1 ordering, ask_crm only: a live
+      // active/trialing subscription outranks "no login in 60 days". lastActivityAt is built
+      // from login/engagement timestamps, which an annual or API-only subscriber may never
+      // produce, so honoring the inactivity rule would report a paying customer as churned.
+      // A canceled subscription still churns via Rule 1's subscription check.
+      lastActivityAt: hasLiveSubscription ? undefined : lead.lastActivityAt ?? undefined,
       // lastUsageAt/healthScore deliberately NOT passed: computeLifecycle's Rule 2 would
       // turn a stale stored value into at_risk whenever ANY other gate branch fires
       // (e.g. a live active subscription), re-opening the hole the removed provesRisk

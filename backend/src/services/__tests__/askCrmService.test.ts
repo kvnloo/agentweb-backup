@@ -259,6 +259,27 @@ describe('askCrm — ENG-2155 live lifecycle precedence', () => {
     expect(result.items[0].lifecycle).toBe('paying');
   });
 
+  it('keeps a live active subscriber paying despite 60+ days without a login', async () => {
+    const result = await askCrm('is Annualcase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Annualcase', company: 'Acme', lifecycle: 'inbox', subscriptionState: 'active', hasUserRecord: true, lastActivityAt: '2026-01-01T00:00:00Z' }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('paying');
+  });
+
+  it('keeps a live trialing subscriber trialing despite 60+ days without a login', async () => {
+    const result = await askCrm('is Trialcase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Trialcase', company: 'Acme', lifecycle: 'inbox', subscriptionState: 'trialing', hasUserRecord: true, lastActivityAt: '2026-01-01T00:00:00Z' }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('trialing');
+  });
+
+  it('still churns a canceled subscription', async () => {
+    const result = await askCrm('is Cancelcase at acme', 'u1', makeDeps([
+      lead({ firstName: 'Cancelcase', company: 'Acme', lifecycle: 'paying', subscriptionState: 'canceled', lastActivityAt: '2026-04-01T00:00:00Z' }),
+    ]));
+    expect(result.items[0].lifecycle).toBe('churned');
+  });
+
   it('does not let a stale health score leak in through a different gate branch (live active sub)', async () => {
     const result = await askCrm('is Leakcase at acme', 'u1', makeDeps([
       lead({ firstName: 'Leakcase', company: 'Acme', lifecycle: 'paying', subscriptionState: 'active', healthScore: 20, lastUsageAt: '2026-03-01T00:00:00Z' }),
