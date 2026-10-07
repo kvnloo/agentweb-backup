@@ -771,10 +771,15 @@ describe("reconcileForUser", () => {
       });
       const triggerIcp = jest.fn(async () => undefined);
 
+      // Stateful store: a real pass persists `steps`, which is what makes the
+      // follow-up pass (see the coalescing test below) a hash-deduped no-op.
+      const concurrentUser: Record<string, any> = { userId: "u-concurrent" };
       jest.doMock("../services/db", () => ({
         userDb: {
-          getUserById: jest.fn().mockResolvedValue({ userId: "u-concurrent" }),
-          updateUser: jest.fn().mockResolvedValue(undefined),
+          getUserById: jest.fn(async () => ({ ...concurrentUser })),
+          updateUser: jest.fn(async (_id: string, patch: Record<string, any>) => {
+            Object.assign(concurrentUser, patch);
+          }),
         },
       }));
       jest.doMock("../services/onboardingIcpService", () => ({
@@ -833,8 +838,73 @@ describe("reconcileForUser", () => {
       // one in-flight pass.
       expect(claimIcpRunMock).toHaveBeenCalledTimes(1);
       expect(triggerIcp).toHaveBeenCalledTimes(1);
+      // Both callers share the same result. (It is the last pass's report: the
+      // hash-deduped follow-up pass, so its `fired` is empty; that icp ran once
+      // is what the claim/trigger counts above prove.)
       expect(reportA).toBe(reportB);
-      expect(reportA?.fired.some((f: { step: string }) => f.step === "icp")).toBe(true);
+    });
+  });
+
+  // Finding C of the third review: a request that arrives while a pass is
+  // walking must not be lost. A walk only revisits steps AHEAD of its position,
+  // so an upstream change made after the walk passed a step needs another pass.
+  it("runs exactly one follow-up pass for requests that arrived mid-walk, and none when nothing arrived", async () => {
+    process.env.EAGER_ONBOARDING_PIPELINE_ENABLED = "true";
+
+    await jest.isolateModulesAsync(async () => {
+      let releaseBrand: (() => void) | undefined;
+      const brandGate = new Promise<void>((r) => { releaseBrand = r; });
+      const user: Record<string, any> = { userId: "u-coalesce", companyUrl: "https://a.test" };
+      const getUserById = jest.fn(async () => ({ ...user }));
+      jest.doMock("../services/db", () => ({
+        userDb: {
+          getUserById,
+          updateUser: jest.fn(async (_id: string, patch: Record<string, any>) => { Object.assign(user, patch); }),
+        },
+      }));
+      const triggerBrand = jest.fn(async () => { await brandGate; user.brandGuidelines = { v: 1 }; });
+      jest.doMock("../services/onboardingBrandBuildService", () => ({
+        claimBrandBuildRun: jest.fn(async () => ({ brandBuildStartedAt: "s" })),
+        triggerBrandBuildForUser: triggerBrand,
+      }));
+      for (const [mod, claim, trig] of [
+        ["onboardingIcpService", "claimIcpRun", "triggerIcpDiscoveryForUser"],
+        ["onboardingCompetitorService", "claimCompetitorRun", "triggerCompetitorStrategyForUser"],
+        ["onboardingCreativeDirService", "claimCreativeDirRun", "triggerCreativeDirForUser"],
+        ["onboardingAdCopyService", "claimAdCopyRun", "triggerAdCopyForUser"],
+      ] as const) {
+        jest.doMock(`../services/${mod}`, () => ({ [claim]: jest.fn(async () => ({})), [trig]: jest.fn(async () => undefined) }));
+      }
+      jest.doMock("../services/onboardingAdImageService", () => ({
+        claimAdImageRun: jest.fn(async () => ({ runId: "r", startedAt: "s" })),
+        triggerAdImageGenerationForUser: jest.fn(async () => undefined),
+      }));
+
+      const { reconcileForUser, _resetOrchestratorForTests } = require("../services/onboardingOrchestratorWiring");
+      _resetOrchestratorForTests();
+      require("../services/onboardingPipelineOrchestrator")._resetRateLimitState();
+
+      const first = reconcileForUser("u-coalesce");
+      await new Promise((r) => setImmediate(r)); // first pass is now parked inside brandDna
+      // Two more requests arrive mid-walk. They share the in-flight promise...
+      const second = reconcileForUser("u-coalesce");
+      const third = reconcileForUser("u-coalesce");
+      // ...and the user changes an upstream input after the walk passed brandDna's inputs.
+      user.companyUrl = "https://changed.test";
+      releaseBrand!();
+      await Promise.all([first, second, third]);
+
+      // brandDna fired once for the first pass, and once more in the single
+      // follow-up pass because its input hash changed; two requests coalesced
+      // into ONE extra pass, not two.
+      expect(triggerBrand).toHaveBeenCalledTimes(2);
+
+      // With nothing arriving mid-walk there is no follow-up pass.
+      const before = getUserById.mock.calls.length;
+      await reconcileForUser("u-coalesce");
+      const oneQuietPass = getUserById.mock.calls.length - before;
+      expect(oneQuietPass).toBeGreaterThan(0);
+      expect(triggerBrand).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -902,217 +972,135 @@ describe("reconcileForUser", () => {
   });
 });
 
-describe("runAdImage — lost start-claim race (ENG-2308)", () => {
-  it("skips the worker and signals StepClaimLostError (no stale result) when claimAdImageRun loses the race", async () => {
-    await jest.isolateModulesAsync(async () => {
-      const triggerAdImage = jest.fn();
-      const claimAdImageRunMock = jest.fn(async () => null);
+// ENG-2308: a runner that loses the per-axis claim (to another backend
+// instance's reconcile pass, a legacy route, /icp/regenerate-one) must not run
+// a second worker, must not report the other run's stale placeholder as a
+// result, and must not strand the step at `running` (nothing re-fires it, and
+// a winner that is not the orchestrator never updates User.steps). It joins the
+// other run: waits for it to leave the in-flight state, then adopts its real
+// outcome. Table-driven over all six runners.
+const AXIS_CASES = [
+  { step: "adImage", prefix: "adImage", inFlight: "running", resultField: "adImageResult", mod: "onboardingAdImageService", claim: "claimAdImageRun", trigger: "triggerAdImageGenerationForUser" },
+  { step: "brandDna", prefix: "brandBuild", inFlight: "building", resultField: "brandGuidelines", mod: "onboardingBrandBuildService", claim: "claimBrandBuildRun", trigger: "triggerBrandBuildForUser" },
+  { step: "icp", prefix: "icp", inFlight: "running", resultField: "icpResult", mod: "onboardingIcpService", claim: "claimIcpRun", trigger: "triggerIcpDiscoveryForUser" },
+  { step: "competitor", prefix: "competitor", inFlight: "running", resultField: "competitorResult", mod: "onboardingCompetitorService", claim: "claimCompetitorRun", trigger: "triggerCompetitorStrategyForUser" },
+  { step: "creativeDir", prefix: "creativeDir", inFlight: "running", resultField: "creativeDirResult", mod: "onboardingCreativeDirService", claim: "claimCreativeDirRun", trigger: "triggerCreativeDirForUser" },
+  { step: "adCopy", prefix: "adCopy", inFlight: "running", resultField: "adCopyResult", mod: "onboardingAdCopyService", claim: "claimAdCopyRun", trigger: "triggerAdCopyForUser" },
+] as const;
 
-      jest.doMock("../services/db", () => ({
-        userDb: {
-          getUserById: jest.fn().mockResolvedValue({
-            userId: "u1",
-            adImageStatus: "running",
-            // Owned by whichever concurrent caller actually won the claim.
-            adImageResult: { variants: [{ id: "v1", imageUrl: "https://x/1.png", prompt: "p" }] },
-          }),
-          updateUser: jest.fn().mockResolvedValue(undefined),
-        },
-      }));
-      jest.doMock("../services/onboardingAdImageService", () => ({
-        claimAdImageRun: claimAdImageRunMock,
-        triggerAdImageGenerationForUser: triggerAdImage,
-      }));
+type AxisCase = (typeof AXIS_CASES)[number];
 
-      const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
-      // A lost claim must neither run the worker nor report a result: the
-      // winner records the real outcome (a stale output here used to be
-      // stamped "ready" by reconcile() and unblock downstream steps early).
-      await expect(
-        PRODUCTION_DAG.adImage.runner({ userId: "u1" }),
-      ).rejects.toMatchObject({ name: "StepClaimLostError", step: "adImage" });
-      expect(claimAdImageRunMock).toHaveBeenCalledWith("u1");
-      // Must NOT launch a second worker when the claim is owned elsewhere.
-      expect(triggerAdImage).not.toHaveBeenCalled();
+/** Runs `fn` with only this axis's service mocked, and a scripted sequence of user reads. */
+async function withAxis(
+  c: AxisCase,
+  opts: { claim: unknown; reads: Array<Record<string, unknown>> },
+  fn: (ctx: {
+    runner: (a: { userId: string }) => Promise<unknown>;
+    claimMock: jest.Mock;
+    triggerMock: jest.Mock;
+    getUserById: jest.Mock;
+    setPoll: (ms: number) => void;
+  }) => Promise<void>,
+) {
+  await jest.isolateModulesAsync(async () => {
+    const triggerMock = jest.fn(async () => undefined);
+    const claimMock = jest.fn(async () => opts.claim);
+    const getUserById = jest.fn();
+    opts.reads.forEach((r, idx) =>
+      idx === opts.reads.length - 1
+        ? getUserById.mockResolvedValue(r)
+        : getUserById.mockResolvedValueOnce(r),
+    );
+    jest.doMock("../services/db", () => ({
+      userDb: { getUserById, updateUser: jest.fn().mockResolvedValue(undefined) },
+    }));
+    jest.doMock(`../services/${c.mod}`, () => ({ [c.claim]: claimMock, [c.trigger]: triggerMock }));
+    const wiring = require("../services/onboardingOrchestratorWiring");
+    wiring._setJoinPollMsForTests(1);
+    await fn({
+      runner: (a) => wiring.PRODUCTION_DAG[c.step].runner(a),
+      claimMock,
+      triggerMock,
+      getUserById,
+      setPoll: wiring._setJoinPollMsForTests,
     });
   });
-});
+}
 
-// ENG-2308 follow-up, caught live against a real preview + real DynamoDB:
-// runBrandDna/runIcp/runCompetitor/runCreativeDir/runAdCopy used to call
-// their trigger function directly, with nothing ever flipping the legacy
-// `<axis>Status` field to its in-flight value first. Each trigger's own
-// completion logic requires that in-flight value as a precondition to
-// persist a result — without it, the trigger ran for real then silently
-// dropped its result, and the orchestrator recorded the step "ready" with
-// a null output anyway, since nothing threw. These tests lock in the fix:
-// each runner now claims its own axis first (same pattern as the
-// pre-existing runAdImage above), and must skip the trigger — not run it a
-// second time — when that claim is already owned elsewhere.
-describe("runBrandDna/runIcp/runCompetitor/runCreativeDir/runAdCopy — claim-before-trigger (ENG-2308)", () => {
-  it("runBrandDna skips triggerBrandBuildForUser and signals StepClaimLostError (no stale brandGuidelines) when claimBrandBuildRun loses the race", async () => {
-    await jest.isolateModulesAsync(async () => {
-      const triggerBrandBuild = jest.fn();
-      const claimBrandBuildRunMock = jest.fn(async () => null);
+describe.each(AXIS_CASES)("lost start-claim race — $step (ENG-2308)", (c) => {
+  const other = `${c.prefix}StartedAt`;
+  const inflight = { userId: "u1", [`${c.prefix}Status`]: c.inFlight, [other]: "2026-10-07T10:00:00.000Z", [c.resultField]: "STALE-PLACEHOLDER" };
 
-      jest.doMock("../services/db", () => ({
-        userDb: {
-          getUserById: jest.fn().mockResolvedValue({
-            userId: "u1",
-            brandBuildStatus: "building",
-            brandGuidelines: { brandData: { brandName: "Owned Elsewhere" } },
-          }),
-          updateUser: jest.fn().mockResolvedValue(undefined),
-        },
-      }));
-      jest.doMock("../services/onboardingBrandBuildService", () => ({
-        claimBrandBuildRun: claimBrandBuildRunMock,
-        triggerBrandBuildForUser: triggerBrandBuild,
-      }));
-
-      const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
-      // A lost claim must neither run the worker nor report a result: the
-      // winner records the real outcome (a stale output here used to be
-      // stamped "ready" by reconcile() and unblock downstream steps early).
-      await expect(
-        PRODUCTION_DAG.brandDna.runner({ userId: "u1" }),
-      ).rejects.toMatchObject({ name: "StepClaimLostError", step: "brandDna" });
-      expect(claimBrandBuildRunMock).toHaveBeenCalledWith("u1");
-      // Must NOT launch a second worker when the claim is owned elsewhere.
-      expect(triggerBrandBuild).not.toHaveBeenCalled();
-    });
+  it("does not launch a worker; joins the in-flight run and adopts its REAL result", async () => {
+    const real = { real: c.step };
+    await withAxis(
+      c,
+      { claim: null, reads: [inflight, inflight, { userId: "u1", [`${c.prefix}Status`]: "ready", [other]: "2026-10-07T10:00:00.000Z", [c.resultField]: real }] },
+      async ({ runner, claimMock, triggerMock, getUserById }) => {
+        const result = await runner({ userId: "u1" });
+        expect(claimMock).toHaveBeenCalledWith("u1");
+        // Must NOT launch a second worker when the claim is owned elsewhere.
+        expect(triggerMock).not.toHaveBeenCalled();
+        // The stale placeholder must never be reported as the step's output.
+        expect(result).toEqual(real);
+        expect(getUserById.mock.calls.length).toBeGreaterThanOrEqual(3);
+      },
+    );
   });
 
-  it("runIcp skips triggerIcpDiscoveryForUser and signals StepClaimLostError (no stale icpResult) when claimIcpRun loses the race", async () => {
-    await jest.isolateModulesAsync(async () => {
-      const triggerIcp = jest.fn();
-      const claimIcpRunMock = jest.fn(async () => null);
+  it("adopts the other run's FAILURE (step is recorded failed, retryable) instead of reporting ready", async () => {
+    await withAxis(
+      c,
+      { claim: null, reads: [inflight, { userId: "u1", [`${c.prefix}Status`]: "failed", [`${c.prefix}CompletedAt`]: new Date(Date.now() + 60_000).toISOString(), [`${c.prefix}Error`]: "winner blew up" }] },
+      async ({ runner }) => {
+        await expect(runner({ userId: "u1" })).rejects.toThrow("winner blew up");
+      },
+    );
+  });
 
-      jest.doMock("../services/db", () => ({
-        userDb: {
-          getUserById: jest.fn().mockResolvedValue({
-            userId: "u1",
-            icpStatus: "running",
-            icpResult: [{ name: "Owned Elsewhere" }],
-          }),
-          updateUser: jest.fn().mockResolvedValue(undefined),
-        },
-      }));
-      jest.doMock("../services/onboardingIcpService", () => ({
-        claimIcpRun: claimIcpRunMock,
-        triggerIcpDiscoveryForUser: triggerIcp,
-      }));
-
-      const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
-      // A lost claim must neither run the worker nor report a result: the
-      // winner records the real outcome (a stale output here used to be
-      // stamped "ready" by reconcile() and unblock downstream steps early).
-      await expect(
-        PRODUCTION_DAG.icp.runner({ userId: "u1" }),
-      ).rejects.toMatchObject({ name: "StepClaimLostError", step: "icp" });
-      expect(claimIcpRunMock).toHaveBeenCalledWith("u1");
-      // Must NOT launch a second worker when the claim is owned elsewhere.
-      expect(triggerIcp).not.toHaveBeenCalled();
+  it("throws an ordinary error (step recorded failed, NOT stranded running) if the other run outlives the axis timeout", async () => {
+    await withAxis(c, { claim: null, reads: [inflight] }, async ({ runner }) => {
+      const realNow = Date.now.bind(Date);
+      let offset = 0;
+      const spy = jest.spyOn(Date, "now").mockImplementation(() => realNow() + offset);
+      // Each poll advances the clock by a big step so the deadline passes quickly.
+      const origSetTimeout = global.setTimeout;
+      jest.spyOn(global, "setTimeout").mockImplementation(((fn: () => void) => {
+        offset += 60_000;
+        return origSetTimeout(fn, 0);
+      }) as any);
+      await expect(runner({ userId: "u1" })).rejects.toThrow(/still held by another run/);
+      spy.mockRestore();
+      (global.setTimeout as any).mockRestore?.();
     });
   });
 
-  it("runCompetitor skips triggerCompetitorStrategyForUser and signals StepClaimLostError (no stale competitorResult) when claimCompetitorRun loses the race", async () => {
-    await jest.isolateModulesAsync(async () => {
-      const triggerCompetitor = jest.fn();
-      const claimCompetitorRunMock = jest.fn(async () => null);
-
-      jest.doMock("../services/db", () => ({
-        userDb: {
-          getUserById: jest.fn().mockResolvedValue({
-            userId: "u1",
-            competitorStatus: "running",
-            competitorResult: { per_icp: [{ icp_id: "Owned Elsewhere" }] },
-          }),
-          updateUser: jest.fn().mockResolvedValue(undefined),
-        },
-      }));
-      jest.doMock("../services/onboardingCompetitorService", () => ({
-        claimCompetitorRun: claimCompetitorRunMock,
-        triggerCompetitorStrategyForUser: triggerCompetitor,
-      }));
-
-      const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
-      // A lost claim must neither run the worker nor report a result: the
-      // winner records the real outcome (a stale output here used to be
-      // stamped "ready" by reconcile() and unblock downstream steps early).
-      await expect(
-        PRODUCTION_DAG.competitor.runner({ userId: "u1" }),
-      ).rejects.toMatchObject({ name: "StepClaimLostError", step: "competitor" });
-      expect(claimCompetitorRunMock).toHaveBeenCalledWith("u1");
-      // Must NOT launch a second worker when the claim is owned elsewhere.
-      expect(triggerCompetitor).not.toHaveBeenCalled();
-    });
+  it("after its OWN trigger, a dropped completion (another run now owns the axis) is joined, not reported stale", async () => {
+    const real = { real: `${c.step}-newer` };
+    const own = "2026-10-07T09:00:00.000Z";
+    const ownClaim = { [`${c.prefix}StartedAt`]: own, ...(c.step === "adImage" ? { runId: "r", startedAt: own } : {}) };
+    await withAxis(
+      c,
+      { claim: ownClaim, reads: [inflight /* a reclaim superseded us */, { userId: "u1", [`${c.prefix}Status`]: "ready", [other]: "2026-10-07T10:00:00.000Z", [c.resultField]: real }] },
+      async ({ runner, triggerMock }) => {
+        const result = await runner({ userId: "u1" });
+        expect(triggerMock).toHaveBeenCalledTimes(1);
+        expect(result).toEqual(real);
+      },
+    );
   });
 
-  it("runCreativeDir skips triggerCreativeDirForUser and signals StepClaimLostError (no stale creativeDirResult) when claimCreativeDirRun loses the race", async () => {
-    await jest.isolateModulesAsync(async () => {
-      const triggerCreativeDir = jest.fn();
-      const claimCreativeDirRunMock = jest.fn(async () => null);
-
-      jest.doMock("../services/db", () => ({
-        userDb: {
-          getUserById: jest.fn().mockResolvedValue({
-            userId: "u1",
-            creativeDirStatus: "running",
-            creativeDirResult: { concepts: ["Owned Elsewhere"] },
-          }),
-          updateUser: jest.fn().mockResolvedValue(undefined),
-        },
-      }));
-      jest.doMock("../services/onboardingCreativeDirService", () => ({
-        claimCreativeDirRun: claimCreativeDirRunMock,
-        triggerCreativeDirForUser: triggerCreativeDir,
-      }));
-
-      const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
-      // A lost claim must neither run the worker nor report a result: the
-      // winner records the real outcome (a stale output here used to be
-      // stamped "ready" by reconcile() and unblock downstream steps early).
-      await expect(
-        PRODUCTION_DAG.creativeDir.runner({ userId: "u1" }),
-      ).rejects.toMatchObject({ name: "StepClaimLostError", step: "creativeDir" });
-      expect(claimCreativeDirRunMock).toHaveBeenCalledWith("u1");
-      // Must NOT launch a second worker when the claim is owned elsewhere.
-      expect(triggerCreativeDir).not.toHaveBeenCalled();
-    });
-  });
-
-  it("runAdCopy skips triggerAdCopyForUser and signals StepClaimLostError (no stale adCopyResult) when claimAdCopyRun loses the race", async () => {
-    await jest.isolateModulesAsync(async () => {
-      const triggerAdCopy = jest.fn();
-      const claimAdCopyRunMock = jest.fn(async () => null);
-
-      jest.doMock("../services/db", () => ({
-        userDb: {
-          getUserById: jest.fn().mockResolvedValue({
-            userId: "u1",
-            adCopyStatus: "running",
-            adCopyResult: { variants: [{ id: "v1", headline: "Owned Elsewhere" }] },
-          }),
-          updateUser: jest.fn().mockResolvedValue(undefined),
-        },
-      }));
-      jest.doMock("../services/onboardingAdCopyService", () => ({
-        claimAdCopyRun: claimAdCopyRunMock,
-        triggerAdCopyForUser: triggerAdCopy,
-      }));
-
-      const { PRODUCTION_DAG } = require("../services/onboardingOrchestratorWiring");
-      // A lost claim must neither run the worker nor report a result: the
-      // winner records the real outcome (a stale output here used to be
-      // stamped "ready" by reconcile() and unblock downstream steps early).
-      await expect(
-        PRODUCTION_DAG.adCopy.runner({ userId: "u1" }),
-      ).rejects.toMatchObject({ name: "StepClaimLostError", step: "adCopy" });
-      expect(claimAdCopyRunMock).toHaveBeenCalledWith("u1");
-      // Must NOT launch a second worker when the claim is owned elsewhere.
-      expect(triggerAdCopy).not.toHaveBeenCalled();
-    });
+  it("returns the record's result at once when the axis is in flight under OUR OWN claim (trigger gated, nothing else running)", async () => {
+    const own = "2026-10-07T09:00:00.000Z";
+    const ownClaim = { [`${c.prefix}StartedAt`]: own, ...(c.step === "adImage" ? { runId: "r", startedAt: own } : {}) };
+    await withAxis(
+      c,
+      { claim: ownClaim, reads: [{ userId: "u1", [`${c.prefix}Status`]: c.inFlight, [other]: own, [c.resultField]: "OWN-CURRENT" }] },
+      async ({ runner, getUserById }) => {
+        expect(await runner({ userId: "u1" })).toBe("OWN-CURRENT");
+        expect(getUserById).toHaveBeenCalledTimes(1);
+      },
+    );
   });
 });
 

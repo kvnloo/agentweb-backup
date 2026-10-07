@@ -27,9 +27,9 @@ jest.mock('../services/db', () => ({
   orgDb: { getOrgById: jest.fn(), updateOrg: jest.fn() },
 }));
 
-const mockGetChatSession = jest.fn();
+const mockGetChatSession = jest.fn(); // chatbotDb.getChatSessionRecord
 jest.mock('../services/chatbotService', () => ({
-  chatbotDb: { getChatSession: (...a: unknown[]) => mockGetChatSession(...a) },
+  chatbotDb: { getChatSessionRecord: (...a: unknown[]) => mockGetChatSession(...a) },
 }));
 
 jest.mock('../services/agentMode/brandLogo', () => ({
@@ -160,6 +160,26 @@ describe('update_brand_guidelines ready flip is owned by its brand-build session
 
     expect(record.brandBuildStatus).toBe('building');
     expect(readyMetrics()).toHaveLength(0);
+  });
+
+  it('reads the session with the lightweight consistent read', async () => {
+    mockGetChatSession.mockResolvedValue({ sessionId: 'sess-owner', createdAt: T2_SESSION });
+    await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1', { sessionId: 'sess-owner' });
+    expect(mockGetChatSession).toHaveBeenCalledWith('sess-owner', true);
+  });
+
+  it('falls back to claim-only ownership when the session lookup throws: the owner still completes, a superseded claim is still rejected', async () => {
+    mockGetChatSession.mockRejectedValue(new Error('dynamo hiccup'));
+    await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1', { sessionId: 'sess-x' });
+    expect(record.brandBuildStatus).toBe('ready');
+
+    record.brandBuildStatus = 'building';
+    mockGetChatSession.mockImplementation(async () => {
+      record.brandBuildStartedAt = '2026-10-07T10:09:00.000Z';
+      throw new Error('dynamo hiccup');
+    });
+    await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1', { sessionId: 'sess-x' });
+    expect(record.brandBuildStatus).toBe('building');
   });
 
   it('keeps the unconditional flip for a call with no session id (REST / direct service calls)', async () => {
