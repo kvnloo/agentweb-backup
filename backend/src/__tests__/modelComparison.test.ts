@@ -1032,6 +1032,53 @@ describe('POST /compare/select', () => {
       expect(deps.updateSessionModel).toHaveBeenCalledWith('s-1', 'gemini-3.5-flash');
     });
 
+    describe('select instance clock behind the compare instance (issuedAt in the future)', () => {
+      const SKEW = 5000;
+      const setup = () => {
+        const store: ChatMessage[] = [...session().messages!];
+        const clock = { t: NOW };
+        const { deps } = makeSelect({
+          getSession: jest.fn(async () => session({ messages: [...store] })),
+          appendMessages: jest.fn(async (_id: string, msgs: ChatMessage[]) => { store.push(...msgs); return { messages: [...store] }; }) as any,
+        }, session(), clock);
+        return { store, deps, clock };
+      };
+      const ahead = (over: Record<string, unknown> = {}) => sel({ issuedAt: NOW + SKEW, ...over });
+
+      it('a second column of the same compare is 409 and exactly one pair is persisted', async () => {
+        const { store, deps } = setup();
+        const a = ahead({ model: 'gpt-5.5', content: 'answer A' });
+        expect((await go(deps, a)).status).toBe(200);
+        const out = await go(deps, ahead({ model: 'gemini-3.5-flash', content: 'answer B' }));
+        expect(out.status).toBe(409);
+        expect(res(out).code).toBe('compare_already_selected');
+        expect(store).toHaveLength(5);
+        // stamps never precede issuedAt and stay ordered
+        expect(Date.parse(store[3].timestamp as string)).toBeGreaterThanOrEqual(NOW + SKEW);
+        expect(Date.parse(store[4].timestamp as string)).toBeGreaterThanOrEqual(Date.parse(store[3].timestamp as string));
+      });
+
+      it('an exact replay is 200 replayed:true with one pair', async () => {
+        const { store, deps } = setup();
+        const a = ahead({ model: 'gpt-5.5', content: 'answer A' });
+        expect((await go(deps, a)).status).toBe(200);
+        const out = await go(deps, a);
+        expect(out.status).toBe(200);
+        expect(res(out).replayed).toBe(true);
+        expect(store).toHaveLength(5);
+      });
+
+      it('a NEW compare with the same prompt and a later issuedAt still succeeds', async () => {
+        const { store, deps, clock } = setup();
+        expect((await go(deps, ahead({ model: 'gpt-5.5', content: 'answer A' }))).status).toBe(200);
+        clock.t = NOW + SKEW + 10_000;
+        const out = await go(deps, sel({ compareId: OTHER_ID, issuedAt: NOW + SKEW + 5000, model: 'gemini-3.5-flash', content: 'answer B' }));
+        expect(out.status).toBe(200);
+        expect(res(out).replayed).toBeUndefined();
+        expect(store).toHaveLength(7);
+      });
+    });
+
     it('an exact replay of the same selection is still 200 replayed:true', async () => {
       const a = colA();
       const stamp = new Date(NOW).toISOString();

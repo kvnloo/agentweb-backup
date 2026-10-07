@@ -832,7 +832,9 @@ async function selectCompareResultInner(
       return fail(409, 'This session has reached its message limit. Start a new session to continue.', 'SESSION_MESSAGE_LIMIT_EXCEEDED');
     }
 
-    const stamp = new Date(now).toISOString();
+    // Never stamp before the comparison's issuedAt: a select instance whose clock lags the compare
+    // instance would otherwise persist a stamp the >= issuedAt guards (409 / replay) cannot see.
+    const stamp = new Date(Math.max(now, req.issuedAt)).toISOString();
     // Same shapes /generate persists for a normal turn (user: generateSessionResponse's
     // userMessageObj; assistant: the loop's responseMessage with `llm`), minus usage —
     // the per-call usage was already metered when the comparison ran.
