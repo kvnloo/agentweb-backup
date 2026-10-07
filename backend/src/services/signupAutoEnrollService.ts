@@ -209,7 +209,7 @@ export async function enrollSignupIntoFoundersList(
       tenantId: FOUNDERS_USERID,
       accountOwnerUserId: FOUNDERS_USERID,
       ...(Object.keys(attributionFields).length > 0 && { customFields: attributionFields }),
-    });
+    }, 'integration');
 
     return {
       enrolled: true,

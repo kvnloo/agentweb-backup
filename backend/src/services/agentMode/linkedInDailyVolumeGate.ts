@@ -40,6 +40,7 @@ import { getAccountsWithOwnerIncludingOrgShared, updateAccountConfig } from '../
 import {
   PACED_WRITE_ACTIONS,
   dailyInviteAbsoluteMax,
+  dailyVolumeClassFor,
   reserveDailyVolumeSlot,
   reserveWriteSlot,
   type DailyVolumeState,
@@ -182,6 +183,12 @@ export async function paceLinkedInWrite(
     };
   }
 
+  // ENG-1594: maintenance writes (cancel/accept-invitation) carry no daily
+  // volume class, so there is no reservation to commit. Skipping the durable
+  // write keeps them governed by the hourly/burst pacer only and means a
+  // connected_accounts persistence failure can never refuse them.
+  if (dailyVolumeClassFor(action) === null) return { refusal: null };
+
   // Both checks passed — NOW durably commit the daily reservation against the
   // account OWNER's record. The callback runs again from fresh config on every
   // CAS retry, so concurrent writers cannot lose a reservation. Failing closed
@@ -239,6 +246,14 @@ export async function paceLinkedInWrite(
   return { refusal: null };
 }
 
+/** Thrown when a non-owner (e.g. an org-shared member) tries to change the cap. */
+export class DailyInviteCapNotOwnerError extends Error {
+  constructor(accountId: string) {
+    super(`Only the owner of LinkedIn account ${accountId} can change its daily invite cap. Ask the account owner to change it in Settings.`);
+    this.name = 'DailyInviteCapNotOwnerError';
+  }
+}
+
 /**
  * Persist a self-reported daily invite cap for an account (the `linkedin_outreach`
  * action `set-daily-invite-cap`). Writes through the account OWNER's record —
@@ -248,7 +263,13 @@ export async function setDailyInviteCap(
   account: ResolvedLinkedInAccount,
   accountId: string,
   cap: unknown,
+  callerUserId: string,
 ): Promise<number> {
+  // ENG-1594: org-shared USE of an account does not grant authority over its
+  // safety config. Only the account owner may change its daily invite cap.
+  if (!callerUserId || callerUserId !== account.ownerUserId) {
+    throw new DailyInviteCapNotOwnerError(accountId);
+  }
   const parsedCap = typeof cap === 'number' ? cap : Number(cap);
   if (!Number.isFinite(parsedCap) || !Number.isInteger(parsedCap) || parsedCap < 0) {
     throw new Error('daily_invite_cap must be a non-negative integer for set-daily-invite-cap');

@@ -704,7 +704,7 @@ describe('CRM Routes', () => {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
-      expect(crmDb.createLead).toHaveBeenCalledWith('list1', mockRequest.body);
+      expect(crmDb.createLead).toHaveBeenCalledWith('list1', mockRequest.body, 'manual');
       expect(mockResponse.status).toHaveBeenCalledWith(201);
       expect(mockResponse.json).toHaveBeenCalledWith(mockLead);
     });
@@ -781,7 +781,7 @@ describe('CRM Routes', () => {
           lastTouch: expect.objectContaining({
             utm: expect.objectContaining({ source: 'meta' }),
           }),
-        })
+        }), 'manual'
       );
       // Envelope stripped so createLead doesn't see an unknown `attribution` key
       const call = (crmDb.createLead as jest.Mock).mock.calls[0][1];
@@ -2308,7 +2308,7 @@ describe('CRM Routes', () => {
       }
 
       expect(crmDb.createLeadList).not.toHaveBeenCalled();
-      expect(crmDb.batchCreateLeads).toHaveBeenCalledWith('existing-list', expect.any(Array));
+      expect(crmDb.batchCreateLeads).toHaveBeenCalledWith('existing-list', expect.any(Array), { origin: 'integration' });
     });
 
     it('should return 400 if no subscribers to sync', async () => {
