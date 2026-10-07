@@ -15299,7 +15299,7 @@ export const agentModeController = {
       // this was the only other gate, and it only ever checked for "opus", so
       // a non-admin who named one of those ids directly still got a 200 and
       // ran their session on it. isModelSelectableBy is the single source of
-      // truth for "can this user pick this model" (adminOnly + opus + the
+      // truth for "can this user pick this model" (adminOnly + the
       // internal/live exclusions); use it instead of re-deriving a subset here.
       if (!agentModeService.isModelSelectableBy(canonicalModel, !!user.isAdmin)) {
         return res.status(403).json({ error: 'This model is not available for your account' });
