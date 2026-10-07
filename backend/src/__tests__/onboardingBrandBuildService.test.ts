@@ -214,6 +214,49 @@ describe("onboardingBrandBuildService", () => {
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
     });
 
+    // ENG-2308 review follow-up: the update_brand_guidelines hook identifies a
+    // superseded ("zombie") brand-build session by the claim named in its
+    // pageIdentifier, so the build MUST create its session with that marker.
+    it("creates the Emma session with a pageIdentifier naming this run's claim", async () => {
+      const CLAIM = "2026-04-24T11:59:00.000Z";
+      userDb.getUserById.mockResolvedValue({
+        userId: "u1",
+        productDomain: "https://acme.com",
+        brandBuildStatus: "building",
+        brandBuildStartedAt: CLAIM,
+      });
+      const createChatSession = jest.fn().mockResolvedValue({ sessionId: "s1" });
+
+      await triggerBrandBuildForUser("u1", {
+        createChatSession,
+        generateSessionResponse: jest.fn().mockResolvedValue(undefined),
+        ensureBrandLogo: async () => ({ persisted: true, logoUrl: null, reason: "test" }),
+        expectedStartedAt: CLAIM,
+      });
+
+      expect(createChatSession).toHaveBeenCalledWith("u1", {
+        pageIdentifier: `brand-build|claim:${CLAIM}`,
+      });
+    });
+
+    it("keeps the default session identifier when the caller holds no claim", async () => {
+      userDb.getUserById.mockResolvedValue({
+        userId: "u1",
+        productDomain: "https://acme.com",
+        brandBuildStatus: "building",
+        brandBuildStartedAt: new Date().toISOString(),
+      });
+      const createChatSession = jest.fn().mockResolvedValue({ sessionId: "s1" });
+
+      await triggerBrandBuildForUser("u1", {
+        createChatSession,
+        generateSessionResponse: jest.fn().mockResolvedValue(undefined),
+        ensureBrandLogo: async () => ({ persisted: true, logoUrl: null, reason: "test" }),
+      });
+
+      expect(createChatSession).toHaveBeenCalledWith("u1", undefined);
+    });
+
     it("marks the build failed when chat-session creation throws", async () => {
       userDb.getUserById
         .mockResolvedValueOnce({

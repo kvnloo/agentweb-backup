@@ -1,17 +1,19 @@
 /**
- * ENG-2308 review follow-up: the `update_brand_guidelines` hook's
- * `building -> ready` flip must only complete the claim its Emma session
- * belongs to.
+ * ENG-2308 review follow-up: `update_brand_guidelines` calls made from a
+ * brand-build Emma session may only act for the claim that session belongs to.
  *
- * `withTimeout` does not abort the Emma session, so a brand build that timed
- * out (and was then retried, reclaiming the axis) leaves a live "zombie"
- * session. Before this fix its late `update_brand_guidelines` call saw the
- * RECLAIMING run's `building` status and flipped it to `ready` early.
+ * `withTimeout` does not abort a brand build's Emma session, so a build that
+ * timed out and was retried leaves a live "zombie" session. Before this fix its
+ * late call overwrote the RECLAIMING run's brand guidelines and flipped its
+ * status to `ready`.
  *
- * The agent loop runs in a forked worker process, so ownership cannot live in
- * an in-process map (a first attempt did, and a live run showed the worker
- * never saw it). It is derived from the session's own `createdAt` instead: a
- * brand build creates its session after it claims the axis.
+ * A brand-build session names its claim in its `pageIdentifier`
+ * (`brand-build|claim:<brandBuildStartedAt>`). The hook compares that to the
+ * build's CURRENT `brandBuildStartedAt`. Sessions with no marker (ordinary chat,
+ * REST saves) are not brand-build sessions and keep the original behavior.
+ * (An earlier attempt kept the link in an in-process map and then in a
+ * createdAt age rule; the first never worked across the forked agent worker and
+ * the second wrongly blocked ordinary sessions.)
  *
  * These drive the real `updateBrandGuidelines` hook against an in-memory user
  * record whose `updateUser` enforces the DynamoDB ownership condition.
@@ -27,9 +29,9 @@ jest.mock('../services/db', () => ({
   orgDb: { getOrgById: jest.fn(), updateOrg: jest.fn() },
 }));
 
-const mockGetChatSession = jest.fn(); // chatbotDb.getChatSessionRecord
+const mockGetChatSessionRecord = jest.fn();
 jest.mock('../services/chatbotService', () => ({
-  chatbotDb: { getChatSessionRecord: (...a: unknown[]) => mockGetChatSession(...a) },
+  chatbotDb: { getChatSessionRecord: (...a: unknown[]) => mockGetChatSessionRecord(...a) },
 }));
 
 jest.mock('../services/agentMode/brandLogo', () => ({
@@ -39,15 +41,15 @@ jest.mock('../services/agentMode/brandLogo', () => ({
 
 import { updateBrandGuidelines } from '../emma/impl/brandMarketStrategy';
 import {
-  BRAND_BUILD_SESSION_SKEW_TOLERANCE_MS,
-  sessionMayCompleteBrandBuild,
-} from '../services/onboardingBrandBuildService';
+  brandBuildOwnershipCondition,
+  brandBuildSessionPageIdentifier,
+  isBrandBuildSessionSuperseded,
+  parseBrandBuildSessionClaim,
+} from '../services/brandBuildSessionMarker';
 const { userDb } = require('../services/db');
 
 const T1 = '2026-10-07T10:00:00.000Z'; // original (zombie) run's claim
-const T1_SESSION = '2026-10-07T10:00:01.000Z'; // its Emma session, created just after
-const T2 = '2026-10-07T10:06:00.000Z'; // reclaiming run's claim
-const T2_SESSION = '2026-10-07T10:06:01.000Z'; // the reclaiming run's own session
+const T2 = '2026-10-07T10:06:00.000Z'; // reclaiming run's claim (the current one)
 
 let record: Record<string, any>;
 
@@ -57,9 +59,20 @@ function conditionalFailure() {
   });
 }
 
+const brandBuildSession = (claim: string) => ({
+  sessionId: 's',
+  pageIdentifier: brandBuildSessionPageIdentifier(claim),
+});
+
 function readyFlips() {
   return userDb.updateUser.mock.calls.filter(
     ([, patch]: [string, Record<string, unknown>]) => patch.brandBuildStatus === 'ready',
+  );
+}
+
+function guidelinesWrites() {
+  return userDb.updateUser.mock.calls.filter(
+    ([, patch]: [string, Record<string, unknown>]) => 'brandGuidelines' in patch,
   );
 }
 
@@ -68,6 +81,8 @@ function readyMetrics() {
     ([row]) => (row as { status?: string }).status === 'ready',
   );
 }
+
+const ORIGINAL_GUIDELINES = { brandData: { brandName: 'Newer Run Brand' }, attachments: [] };
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -78,10 +93,10 @@ beforeEach(() => {
     email: 'u1@example.com',
     brandBuildStatus: 'building',
     brandBuildStartedAt: T2,
-    brandGuidelines: { brandData: {}, attachments: [] },
+    brandGuidelines: JSON.parse(JSON.stringify(ORIGINAL_GUIDELINES)),
   };
-  mockGetChatSession.mockReset();
-  userDb.getUserById.mockImplementation(async () => ({ ...record }));
+  mockGetChatSessionRecord.mockReset();
+  userDb.getUserById.mockImplementation(async () => JSON.parse(JSON.stringify(record)));
   userDb.updateUser.mockImplementation(
     async (_id: string, patch: Record<string, any>, options?: any) => {
       const owner = options?.condition?.values?.[':brandBuildOwnerStartedAt'];
@@ -97,96 +112,150 @@ afterEach(() => {
   jest.restoreAllMocks();
 });
 
-describe('sessionMayCompleteBrandBuild', () => {
-  it('allows a session created after the claim', () => {
-    expect(sessionMayCompleteBrandBuild(T2_SESSION, T2)).toBe(true);
+describe('brand-build session marker', () => {
+  it('round-trips a claim through the pageIdentifier', () => {
+    expect(parseBrandBuildSessionClaim(brandBuildSessionPageIdentifier(T1))).toBe(T1);
   });
 
-  it('rejects a session created before the claim, well outside the skew tolerance', () => {
-    expect(sessionMayCompleteBrandBuild(T1_SESSION, T2)).toBe(false);
+  it('does not treat any other pageIdentifier as a brand-build session', () => {
+    for (const other of ['agent-mode', 'crm-email-draft', 'slack-thread', 'Daily post|scheduleId:abc-123', '', undefined, null]) {
+      expect(parseBrandBuildSessionClaim(other as any)).toBeUndefined();
+    }
   });
 
-  it('absorbs small cross-instance clock skew', () => {
-    const skewed = new Date(Date.parse(T2) - BRAND_BUILD_SESSION_SKEW_TOLERANCE_MS + 1).toISOString();
-    expect(sessionMayCompleteBrandBuild(skewed, T2)).toBe(true);
-    const tooOld = new Date(Date.parse(T2) - BRAND_BUILD_SESSION_SKEW_TOLERANCE_MS - 1).toISOString();
-    expect(sessionMayCompleteBrandBuild(tooOld, T2)).toBe(false);
+  it('does not collide with the identifier shapes other code parses', () => {
+    const id = brandBuildSessionPageIdentifier(T1);
+    expect(id.toLowerCase()).not.toContain('slack'); // agentModeService treats 'slack' ids specially
+    expect(/\|scheduleId:([a-f0-9-]+)\s*$/.test(id)).toBe(false); // extractScheduleId
   });
 
-  it('allows (keeps old behavior) when it cannot prove the session predates the claim', () => {
-    expect(sessionMayCompleteBrandBuild(undefined, T2)).toBe(true);
-    expect(sessionMayCompleteBrandBuild('not-a-date', T2)).toBe(true);
-    expect(sessionMayCompleteBrandBuild(T1_SESSION, undefined)).toBe(true);
+  it('only calls a session superseded when both claims are known and differ', () => {
+    expect(isBrandBuildSessionSuperseded(T1, T2)).toBe(true);
+    expect(isBrandBuildSessionSuperseded(T2, T2)).toBe(false);
+    expect(isBrandBuildSessionSuperseded(undefined, T2)).toBe(false); // not a brand-build session
+    expect(isBrandBuildSessionSuperseded(T1, undefined)).toBe(false); // cannot prove it
   });
 });
 
-describe('update_brand_guidelines ready flip is owned by its brand-build session', () => {
-  it("drops a zombie session's ready flip when a reclaim has since started: the newer run stays `building`", async () => {
-    mockGetChatSession.mockResolvedValue({ sessionId: 'sess-zombie', createdAt: T1_SESSION });
+describe('update_brand_guidelines from a brand-build session', () => {
+  it('a superseded session writes NOTHING: no guidelines overwrite, no status flip, no metric, and is told to stop', async () => {
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(T1));
 
-    await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1', {
+    const result = await updateBrandGuidelines({ brandData: { brandName: 'Zombie Brand' } }, 'u1', {
       sessionId: 'sess-zombie',
     });
 
+    expect(result).toMatchObject({ success: false, superseded: true });
+    expect(result.message).toMatch(/do not retry/i);
+    // The gap the review found: the newer run's guidelines must survive intact.
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+    expect(record.brandGuidelines).toEqual(ORIGINAL_GUIDELINES);
     expect(record.brandBuildStatus).toBe('building');
-    expect(record.brandBuildStartedAt).toBe(T2);
-    expect(readyFlips()).toHaveLength(0);
     expect(readyMetrics()).toHaveLength(0);
   });
 
-  it('still completes the build when the session belongs to the current claim', async () => {
-    mockGetChatSession.mockResolvedValue({ sessionId: 'sess-owner', createdAt: T2_SESSION });
+  it("the owning session writes its guidelines and flips ready, both conditioned on its claim", async () => {
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(T2));
 
-    await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1', {
+    const result = await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1', {
       sessionId: 'sess-owner',
     });
 
+    expect(result.success).toBe(true);
     expect(record.brandBuildStatus).toBe('ready');
+    expect(record.brandGuidelines.brandData.brandName).toBe('Acme');
     expect(readyMetrics().length).toBeGreaterThan(0);
-    // The flip is conditioned on the claim the ownership check was judged against.
-    expect(readyFlips()[0][2].condition.values[':brandBuildOwnerStartedAt']).toBe(T2);
+    for (const [, , options] of [...guidelinesWrites(), ...readyFlips()]) {
+      expect(options.condition).toEqual(brandBuildOwnershipCondition(T2));
+    }
+    expect(guidelinesWrites().length).toBeGreaterThan(0);
+    expect(readyFlips()).toHaveLength(1);
   });
 
-  it('drops the flip atomically when a reclaim lands between the ownership check and the write', async () => {
-    mockGetChatSession.mockImplementation(async () => {
+  it('a reclaim landing AFTER the ownership check is caught atomically: the guidelines write is rejected, nothing is overwritten', async () => {
+    mockGetChatSessionRecord.mockImplementation(async () => {
       // The reclaim happens while the hook is looking the session up.
       record.brandBuildStartedAt = '2026-10-07T10:09:00.000Z';
-      return { sessionId: 'sess-owner', createdAt: T2_SESSION };
+      return brandBuildSession(T2);
     });
+    // user was read before the lookup, so the hook still believes T2 is current.
 
-    await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1', {
+    const result = await updateBrandGuidelines({ brandData: { brandName: 'Zombie Brand' } }, 'u1', {
       sessionId: 'sess-owner',
     });
 
+    expect(result).toMatchObject({ success: false, superseded: true });
+    expect(record.brandGuidelines).toEqual(ORIGINAL_GUIDELINES);
     expect(record.brandBuildStatus).toBe('building');
     expect(readyMetrics()).toHaveLength(0);
   });
 
-  it('reads the session with the lightweight consistent read', async () => {
-    mockGetChatSession.mockResolvedValue({ sessionId: 'sess-owner', createdAt: T2_SESSION });
-    await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1', { sessionId: 'sess-owner' });
-    expect(mockGetChatSession).toHaveBeenCalledWith('sess-owner', true);
-  });
-
-  it('falls back to claim-only ownership when the session lookup throws: the owner still completes, a superseded claim is still rejected', async () => {
-    mockGetChatSession.mockRejectedValue(new Error('dynamo hiccup'));
-    await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1', { sessionId: 'sess-x' });
-    expect(record.brandBuildStatus).toBe('ready');
-
-    record.brandBuildStatus = 'building';
-    mockGetChatSession.mockImplementation(async () => {
-      record.brandBuildStartedAt = '2026-10-07T10:09:00.000Z';
-      throw new Error('dynamo hiccup');
+  it('a reclaim landing between the guidelines write and the ready flip drops only the flip', async () => {
+    mockGetChatSessionRecord.mockResolvedValue(brandBuildSession(T2));
+    const realImpl = userDb.updateUser.getMockImplementation();
+    userDb.updateUser.mockImplementation(async (id: string, patch: any, options?: any) => {
+      const out = await realImpl(id, patch, options);
+      if ('brandGuidelines' in patch) record.brandBuildStartedAt = '2026-10-07T10:09:00.000Z';
+      return out;
     });
-    await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1', { sessionId: 'sess-x' });
+
+    const result = await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1', {
+      sessionId: 'sess-owner',
+    });
+
+    expect(result.success).toBe(true);
     expect(record.brandBuildStatus).toBe('building');
+    expect(readyMetrics()).toHaveLength(0);
+  });
+});
+
+describe('update_brand_guidelines from sessions that are NOT brand-build sessions keeps the original behavior', () => {
+  it('an ordinary chat session, even one that predates the build, still completes it mid-build (no ownership condition)', async () => {
+    mockGetChatSessionRecord.mockResolvedValue({
+      sessionId: 'ordinary',
+      pageIdentifier: 'agent-mode',
+      createdAt: '2026-10-07T09:00:00.000Z', // long before the T2 claim
+    });
+
+    const result = await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1', {
+      sessionId: 'ordinary',
+    });
+
+    expect(result.success).toBe(true);
+    expect(record.brandBuildStatus).toBe('ready');
+    for (const [, , options] of [...guidelinesWrites(), ...readyFlips()]) {
+      expect(options).toBeUndefined();
+    }
   });
 
-  it('keeps the unconditional flip for a call with no session id (REST / direct service calls)', async () => {
-    await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1');
+  it('a call with no session id (REST / direct service calls) is unconditional and does no session lookup', async () => {
+    const result = await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1');
 
+    expect(result.success).toBe(true);
     expect(record.brandBuildStatus).toBe('ready');
-    expect(mockGetChatSession).not.toHaveBeenCalled();
-    expect(readyFlips()[0][2]).toBeUndefined();
+    expect(mockGetChatSessionRecord).not.toHaveBeenCalled();
+  });
+
+  it('a failed session lookup is treated as an ordinary session instead of failing the update', async () => {
+    mockGetChatSessionRecord.mockRejectedValue(new Error('dynamo hiccup'));
+
+    const result = await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1', {
+      sessionId: 'sess-x',
+    });
+
+    expect(result.success).toBe(true);
+    expect(record.brandBuildStatus).toBe('ready');
+  });
+
+  it('skips the session lookup entirely for a user who has never had a brand build', async () => {
+    delete record.brandBuildStartedAt;
+    delete record.brandBuildStatus;
+
+    const result = await updateBrandGuidelines({ brandData: { brandName: 'Acme' } }, 'u1', {
+      sessionId: 'sess-y',
+    });
+
+    expect(result.success).toBe(true);
+    expect(mockGetChatSessionRecord).not.toHaveBeenCalled();
   });
 });
