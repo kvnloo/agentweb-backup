@@ -144,3 +144,27 @@ export function renderCoverage(coverage: Awaited<ReturnType<typeof byokCoverage>
     ...coverage.map(r => `| ${[r.id, r.upstream ?? '—', r.providers.join(', ') || '—', r.byok.join(', ') || '—', r.status].map(cell).join(' | ')} |`), '',
   ].join('\n');
 }
+
+/**
+ * PR body for the daily refresh PR. Reviewer warnings (price outliers, price
+ * drift, unmatched scores) used to exist only in the run's GITHUB_STEP_SUMMARY,
+ * so a reviewer reading the PR never saw them. Lines starting with the warning
+ * sign are surfaced up front; everything else sits in a collapsed block.
+ */
+export function renderPrBody(reports: readonly string[]): string {
+  const warnings = reports.filter(r => r.startsWith('⚠️'));
+  const rest = reports.filter(r => !r.startsWith('⚠️'));
+  return [
+    'Daily frontier detection using OpenRouter release dates and the Artificial Analysis top 10.',
+    'Auto-add validated text/tool models in tracked families or top-N models from tracked providers.',
+    'Include advertised cloud BYOK endpoint coverage; credentials and quota are not verified.',
+    'Missing AA credentials preserve existing scores. Inspect the model-catalog-plan artifact for unmatched scores, proposed prices, and supersession.',
+    '',
+    'New entries are marked auto-added and admin-only: customers cannot see or select them until a human reviews capabilities, pricing and descriptions and removes `adminOnly`. Existing Azure BYOK pricing is preserved.',
+    'No database writes or changes to saved model selections. Rollback: revert this PR.',
+    'Complexity: extends the existing registry and price book; no new runtime service or storage.',
+    '',
+    ...(warnings.length ? ['## Review before merging', '', ...warnings.map(w => `- ${w}`), ''] : []),
+    ...(rest.length ? ['<details><summary>Other monitor notes</summary>', '', ...rest.map(r => `- ${r}`), '', '</details>', ''] : []),
+  ].join('\n');
+}

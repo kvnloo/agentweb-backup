@@ -58,6 +58,8 @@ describe('ENG-2277 currency-aware Meta money writes', () => {
   });
 
   it.each(['daily_budget', 'lifetime_budget', 'bid_amount'])('normalizes and describes ad-set %s', async field => {
+    // ENG-2343: read-back must echo the field actually written so ENG-2278's confirmation can succeed.
+    meta.getAdSet.mockResolvedValue({ [field]: '300', bid_strategy: 'LOWEST_COST_WITHOUT_CAP' });
     const result = await service.updateMetaAdsAdSet('user', 'adset', { [field]: 300 });
     expect(meta.updateAdSet.mock.calls[0][2][field]).toBe(300);
     expect(result.message).toContain(`${field}: 300 (= NT$300.00)`);
