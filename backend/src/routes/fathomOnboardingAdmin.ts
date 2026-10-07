@@ -1,6 +1,10 @@
 import express from 'express';
 import { userDb } from '../services/db';
-import { ingestFathomOnboardingRecording } from '../services/fathomOnboardingIngestionService';
+import {
+  applyFathomOnboardingReviewAction,
+  FathomOnboardingReviewError,
+  ingestFathomOnboardingRecording,
+} from '../services/fathomOnboardingIngestionService';
 
 const router = express.Router();
 
@@ -92,5 +96,25 @@ router.get('/users/:userId', async (req, res) => {
     return res.status(500).json({ error: 'Failed to load Fathom onboarding ingestions' });
   }
 });
+
+for (const action of ['discard', 'rollback'] as const) {
+  router.post(`/users/:userId/ingestions/:recordingId/${action}`, async (req: any, res) => {
+    try {
+      const ingestion = await applyFathomOnboardingReviewAction({
+        userId: req.params.userId,
+        recordingId: req.params.recordingId,
+        action,
+        actorUserId: req.user.userId,
+      });
+      return res.json({ ingestion });
+    } catch (error: any) {
+      if (error instanceof FathomOnboardingReviewError) {
+        return res.status(error.statusCode).json({ error: error.message });
+      }
+      console.error(`[fathomOnboardingAdmin] ${action} failed:`, error?.message);
+      return res.status(500).json({ error: `Failed to ${action} Fathom onboarding ingestion` });
+    }
+  });
+}
 
 export default router;

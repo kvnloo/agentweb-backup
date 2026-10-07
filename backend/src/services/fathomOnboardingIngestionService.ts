@@ -5,7 +5,7 @@ import { getFathomAccessToken } from './fathomTokenService';
 
 type Confidence = 'manual' | 'high' | 'medium' | 'low';
 type MatchStatus = 'matched' | 'needs_review';
-type IngestionStatus = 'needs_review' | 'reviewed' | 'failed';
+type IngestionStatus = 'needs_review' | 'reviewed' | 'discarded' | 'failed';
 type ExtractionState = 'auto_extracted' | 'human_reviewed';
 type AutomationMode = 'manual' | 'auto_draft';
 type FathomCallClassification = 'onboarding' | 'prospect' | 'customer' | 'internal' | 'personal' | 'ignore' | 'unknown';
@@ -570,4 +570,94 @@ export async function ingestFathomOnboardingRecording(
   }
 
   return { ...next, target, memoryIds, orgMemoryIds };
+}
+
+export type FathomOnboardingReviewAction = 'discard' | 'rollback';
+
+interface ReviewActionDeps {
+  userDb: Pick<typeof userDb, 'getUserById' | 'updateUser'>;
+  accountMemoryDb: Pick<typeof accountMemoryDb, 'deleteMemory'>;
+  orgMemoryDb: Pick<typeof orgMemoryDb, 'deleteMemory'>;
+  now: () => string;
+}
+
+export class FathomOnboardingReviewError extends Error {
+  constructor(public readonly statusCode: number, message: string) {
+    super(message);
+  }
+}
+
+/**
+ * ENG-270: admin discard / rollback of a generated onboarding artifact.
+ *
+ * - discard: a needs_review item is marked discarded; a draft account it created
+ *   stays disabled and is flagged fathomDraftStatus=discarded. Reviewed items must
+ *   be rolled back first so approved memories are never orphaned.
+ * - rollback: a reviewed item returns to needs_review and the account/org memories
+ *   written by its approval are removed (only the ids recorded on the ledger entry).
+ *
+ * Both are idempotent: repeating the action on an already-transitioned item is a no-op.
+ */
+export async function applyFathomOnboardingReviewAction(
+  input: { userId: string; recordingId: string; action: FathomOnboardingReviewAction; actorUserId: string },
+  injectedDeps?: Partial<ReviewActionDeps>,
+): Promise<FathomOnboardingIngestion> {
+  const deps: ReviewActionDeps = {
+    userDb,
+    accountMemoryDb,
+    orgMemoryDb,
+    now: () => new Date().toISOString(),
+    ...injectedDeps,
+  } as ReviewActionDeps;
+
+  const user = await deps.userDb.getUserById(input.userId);
+  if (!user) throw new FathomOnboardingReviewError(404, 'User not found');
+  const ledger = Array.isArray((user as any).fathomOnboardingIngestions)
+    ? ((user as any).fathomOnboardingIngestions as FathomOnboardingIngestion[])
+    : [];
+  const item = ledger.find((entry) => String(entry.recordingId) === String(input.recordingId));
+  if (!item) throw new FathomOnboardingReviewError(404, 'Ingestion not found');
+
+  const now = deps.now();
+  let next: FathomOnboardingIngestion;
+
+  if (input.action === 'discard') {
+    if (item.status === 'discarded') return item;
+    if (item.status === 'reviewed') {
+      throw new FathomOnboardingReviewError(409, 'Reviewed ingestion must be rolled back before it can be discarded.');
+    }
+    next = { ...item, status: 'discarded', updatedAt: now };
+    if (item.draftUserId) {
+      const draft = await deps.userDb.getUserById(item.draftUserId);
+      if ((draft as any)?.fathomDraftAccount === true) {
+        await deps.userDb.updateUser(item.draftUserId, { fathomDraftStatus: 'discarded', isActive: false } as any);
+      }
+    }
+  } else {
+    if (item.status !== 'reviewed') return item;
+    const targetUserId = item.targetUserId || input.userId;
+    for (const memoryId of item.memoryIds || []) {
+      await deps.accountMemoryDb.deleteMemory(targetUserId, memoryId);
+    }
+    if ((item.orgMemoryIds || []).length > 0) {
+      const target = targetUserId === input.userId ? user : await deps.userDb.getUserById(targetUserId);
+      if (target?.orgId) {
+        for (const memoryId of item.orgMemoryIds) {
+          await deps.orgMemoryDb.deleteMemory(target.orgId, memoryId);
+        }
+      }
+    }
+    next = {
+      ...item,
+      status: 'needs_review',
+      extractionState: 'auto_extracted',
+      memoryIds: [],
+      orgMemoryIds: [],
+      updatedAt: now,
+    };
+  }
+
+  const updated = ledger.map((entry) => (entry === item ? next : entry));
+  await deps.userDb.updateUser(input.userId, { fathomOnboardingIngestions: updated } as any);
+  return next;
 }
