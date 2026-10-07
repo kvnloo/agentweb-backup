@@ -6,7 +6,7 @@
  *      OAuth access token, the same two mechanisms the MCP transport accepts),
  *   2. resolve the caller's connected Meta ad account (own or org-shared, same visibility
  *      Emma uses) and refuse a foreign account or a revoked/expired connection,
- *   3. execute through executeMetaToolkitCall (all ENG-2046 write guards stay in the path),
+ *   3. execute through executeMetaToolkitCall (ENG-2268 refuses all external v1 writes),
  *   4. emit exactly ONE usage event per successful call via recordMcpToolUse.
  *
  * Storage: reuses agent API keys, MCP OAuth tokens, connected accounts and MCP usage events
