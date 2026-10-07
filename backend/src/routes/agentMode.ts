@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest, requireAdmin } from '../middleware/auth';
 import { requireScheduledChatsServiceSecret } from '../middleware/serviceAuth';
 import { agentModeController } from '../controllers/agentModeController';
+import { compareModelsHandler, selectCompareResultHandler } from '../controllers/modelCompareController';
 import { chatbotDb } from '../services/chatbotService';
 import { synthesizeSpeech } from '../services/voiceService';
 import multer from 'multer';
@@ -214,6 +215,14 @@ router.post('/tts', authenticateToken, asyncHandler(async (req: Request, res: Re
 // POST /api/agent-mode/generate
 // Generate AI response for marketing conversation
 router.post('/generate', asyncHandler(agentModeController.generateResponse));
+
+// POST /api/agent-mode/compare
+// ENG-55: one prompt to 2-4 models as tool-less completions; read-only for the session.
+router.post('/compare', asyncHandlerAuth(compareModelsHandler));
+
+// POST /api/agent-mode/compare/select
+// ENG-55: "Continue with this answer" — persists the chosen answer as a normal turn.
+router.post('/compare/select', asyncHandlerAuth(selectCompareResultHandler));
 
 // POST /api/agent-mode/verified-generate
 // Generate response with verification that required functions are called minimum number of times

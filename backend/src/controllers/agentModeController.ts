@@ -368,7 +368,7 @@ async function isUserAdmin(userId: string): Promise<boolean> {
  * The caller's model id is only a preference; current cost state and the
  * admin-managed policy decide what can actually reach the provider.
  */
-async function resolveEffectiveModelForUser(input: {
+export async function resolveEffectiveModelForUser(input: {
   userId: string;
   requestedModel?: string | null;
   backupModel?: string | null;
