@@ -462,7 +462,11 @@ export async function updateMarketStrategy(updateData: any, userId: string, opts
   }
 
   // Update user's brand guidelines (supports both brandData and attachments)
-export async function updateBrandGuidelines(updateData: any, userId: string): Promise<any> {
+export async function updateBrandGuidelines(
+  updateData: any,
+  userId: string,
+  opts: { sessionId?: string } = {},
+): Promise<any> {
     try {
       const { userDb, orgDb } = await import('../../services/db');
       const { canEditItem } = await import('../../services/orgShareService');
@@ -797,8 +801,31 @@ export async function updateBrandGuidelines(updateData: any, userId: string): Pr
       try {
         const readyPatch = buildReadyPatch(user as any);
         if (readyPatch) {
-          await userDb.updateUser(userId, readyPatch);
-          logCompletionMetric(userId, "ready", readyPatch.brandBuildDurationMs ?? 0);
+          // A brand-build Emma session may only complete the claim it was
+          // started under (ENG-2308): a timed-out session keeps running, and
+          // would otherwise flip a LATER run's `building` to `ready`.
+          // Sessions this process did not start as a brand build keep the
+          // unconditional flip.
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const brandBuild = require('../../services/onboardingBrandBuildService');
+          const claim = brandBuild.getBrandBuildSessionClaim(userId, opts.sessionId);
+          let landed = true;
+          if (claim) {
+            try {
+              await userDb.updateUser(userId, readyPatch, {
+                condition: brandBuild.brandBuildReadyOwnershipCondition(claim.startedAt),
+              });
+            } catch (condErr: any) {
+              if (condErr?.code !== 'ConditionalCheckFailedException') throw condErr;
+              landed = false;
+              console.warn('[brandBuild] dropping stale ready flip: a newer claim owns the build', { userId });
+            }
+          } else {
+            await userDb.updateUser(userId, readyPatch);
+          }
+          if (landed) {
+            logCompletionMetric(userId, "ready", readyPatch.brandBuildDurationMs ?? 0);
+          }
         }
       } catch (e) {
         console.warn("[brandBuild] ready-patch failed (agentMode path)", e);

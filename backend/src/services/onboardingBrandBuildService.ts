@@ -109,12 +109,11 @@ export interface BrandBuildDeps {
    * reclaiming run's own in-progress or already-completed state — same
    * ownership-token pattern applied to icp/competitor/creativeDir/adCopy.
    * Optional for backward compatibility with direct callers/tests that
-   * bypass the claim; only `startBrandBuildForUser`-equivalent callers
-   * that hold a fresh claim should pass it. The `ready` transition itself
-   * is written by Emma's `update_brand_guidelines` tool-call hook in
-   * agentModeService, not here, so this only covers the failure paths —
-   * see the docstring on `claimBrandBuildRun` for why the ready path is
-   * out of scope for this fix.
+   * bypass the claim; only callers that hold a fresh claim should pass it.
+   * It also registers the Emma session under this claim so the
+   * `update_brand_guidelines` hook, which writes the `ready` transition,
+   * can only complete the claim its session was started under (see
+   * `brandBuildSessionClaims`).
    */
   expectedStartedAt?: string;
 }
@@ -131,6 +130,70 @@ function brandBuildOwnershipCondition(expectedStartedAt: string) {
     names: { "#brandBuildStartedAt": "brandBuildStartedAt" },
     values: { ":brandBuildOwnerStartedAt": expectedStartedAt },
   };
+}
+
+/**
+ * Which claim each brand-build Emma session belongs to (ENG-2308 review
+ * follow-up). `withTimeout` does not abort the Emma session, so a run that
+ * timed out (and whose user then retried, reclaiming the axis) leaves a live
+ * "zombie" session that can still call `update_brand_guidelines` later. The
+ * tool's `building -> ready` hook only checked `brandBuildStatus === "building"`,
+ * which is true for the RECLAIMING run's `building`, so the zombie flipped the
+ * newer run to `ready` early (and the newer run's own flip was then dropped).
+ *
+ * The hook has a `sessionId` in its tool context but no way to know which
+ * claim that session serves, and persisting the link would mean a new field on
+ * the user/session record. Emma's tool calls run in the same process as
+ * `triggerBrandBuildForUser`, so an in-process map is enough; entries expire
+ * so it cannot grow without bound.
+ */
+const BRAND_BUILD_SESSION_TTL_MS = 60 * 60 * 1000;
+const brandBuildSessionClaims = new Map<
+  string,
+  { userId: string; startedAt: string; registeredAtMs: number }
+>();
+
+function registerBrandBuildSession(
+  userId: string,
+  sessionId: string,
+  startedAt: string,
+  nowMs: number = Date.now(),
+): void {
+  for (const [id, entry] of brandBuildSessionClaims) {
+    if (nowMs - entry.registeredAtMs > BRAND_BUILD_SESSION_TTL_MS) {
+      brandBuildSessionClaims.delete(id);
+    }
+  }
+  brandBuildSessionClaims.set(sessionId, { userId, startedAt, registeredAtMs: nowMs });
+}
+
+/**
+ * The claim a brand-build Emma session was started under, or `undefined` for
+ * any session this process did not start as a brand build (ordinary chat,
+ * REST saves, another instance), which keep the unconditional behavior.
+ */
+export function getBrandBuildSessionClaim(
+  userId: string,
+  sessionId: string | undefined,
+): { startedAt: string } | undefined {
+  if (!sessionId) return undefined;
+  const entry = brandBuildSessionClaims.get(sessionId);
+  if (!entry || entry.userId !== userId) return undefined;
+  return { startedAt: entry.startedAt };
+}
+
+/**
+ * DynamoDB condition for the `building -> ready` flip, keyed on the claim the
+ * flipping session was started under. Exported for the
+ * `update_brand_guidelines` hook.
+ */
+export function brandBuildReadyOwnershipCondition(startedAt: string) {
+  return brandBuildOwnershipCondition(startedAt);
+}
+
+/** Test-only. */
+export function _resetBrandBuildSessionClaimsForTests(): void {
+  brandBuildSessionClaims.clear();
 }
 
 function buildBrandPrompt(input: {
@@ -469,6 +532,9 @@ export async function triggerBrandBuildForUser(
   try {
     const session = await createChatSession(userId);
     sessionId = session.sessionId;
+    if (deps.expectedStartedAt) {
+      registerBrandBuildSession(userId, sessionId, deps.expectedStartedAt);
+    }
   } catch (e: any) {
     await persistFailure(
       userId,
