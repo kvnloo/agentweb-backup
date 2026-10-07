@@ -138,7 +138,7 @@ describe('mirrorLinkedInInviteToCrm', () => {
       userId: 'user_1',
       leadId: expect.stringMatching(/^lead_li_[0-9a-f]+$/),
       failIfExists: true,
-    }));
+    }), 'linkedin');
     // Engagement appended through the unified CAS path (4th opts arg present).
     expect(addLeadEngagement).toHaveBeenCalledWith(LIST, 'lead_new_1', expect.objectContaining({
       eventType: 'linkedin.invite.sent',
@@ -403,7 +403,7 @@ describe('mirrorLinkedInInviteToCrm', () => {
       });
 
       expect(res).toEqual({ leadId: 'lead_new_1', listId: LIST, created: true, engagementLogged: true });
-      expect(createLead).toHaveBeenCalledWith(LIST, expect.objectContaining({ linkedin: PROFILE }));
+      expect(createLead).toHaveBeenCalledWith(LIST, expect.objectContaining({ linkedin: PROFILE }), 'linkedin');
     });
 
     it('accepts a leadId whose URL matches only after canonicalization', async () => {
@@ -604,7 +604,7 @@ describe('mirrorLinkedInInviteToCrm', () => {
         listId: LIST, linkedinUrl: PROFILE, searchListIds: [OTHER],
       });
       expect(res?.listId).toBe(LIST);
-      expect(createLead).toHaveBeenCalledWith(LIST, expect.anything());
+      expect(createLead).toHaveBeenCalledWith(LIST, expect.anything(), 'linkedin');
     });
 
     it('bounds the cross-list search so a huge account cannot fan out', async () => {
