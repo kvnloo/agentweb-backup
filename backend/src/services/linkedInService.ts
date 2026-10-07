@@ -645,16 +645,18 @@ export class LinkedInService {
     authorUrn: string,
     text: string,
     imageUrns?: string[],
-    assertStillAuthorized?: () => Promise<{ success: false; error: string } | null>
+    assertStillAuthorized?: () => Promise<{ success: false; error: string } | null>,
+    options?: { draft?: boolean }
   ): Promise<string> {
     return this.safeRequest(async () => {
-      console.log('[LinkedIn] createPost called for author:', authorUrn);
+      console.log('[LinkedIn] createPost called for author:', authorUrn, options?.draft ? '(draft)' : '');
 
       const payload: any = {
         author: authorUrn,
         commentary: this.escapeLinkedInLittle(text),
         visibility: 'PUBLIC',
-        lifecycleState: 'PUBLISHED',
+        // ENG-428: a draft is created on LinkedIn but never enters the feed.
+        lifecycleState: options?.draft ? 'DRAFT' : 'PUBLISHED',
         distribution: {
           feedDistribution: 'MAIN_FEED'
         }
