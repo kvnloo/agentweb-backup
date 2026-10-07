@@ -189,12 +189,18 @@ function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: L
     lead.hasUserRecord === true &&
     (lead.lifecycle === 'unknown' || lead.lifecycle === 'inbox');
   const provesChurn = (ageDays(lead.lastActivityAt) ?? 0) > 60;
-  const provesRisk =
-    (lead.lifecycle === 'paying' || lead.lifecycle === 'at_risk') &&
-    (
-      (typeof lead.healthScore === 'number' && lead.healthScore < 40) ||
-      (ageDays(lead.lastUsageAt) ?? 0) > 30
-    );
+  // No provesRisk gate: healthScore/lastUsageAt are NOT live signals today.
+  // askCrmLeadLoader.ts never merges either one — healthScore is written once,
+  // historic-only, by scripts/backfill-crm-scores.ts (never refreshed after;
+  // contactSyncService's would-be live recompute hooks, loadSignals/
+  // persistScores, are never wired with real deps anywhere in production —
+  // see stripeController.ts's own "once D2 ships" comment), and lastUsageAt is
+  // never persisted onto a lead row at all outside that same one-time script.
+  // Letting a gate branch here recompute off those fields would authorize
+  // exactly the failure this whole gate exists to prevent: a stale,
+  // potentially years-old snapshot silently downgrading a stronger stored
+  // lifecycle, with zero live evidence behind it. Revisit once the loader
+  // actually live-merges a health/usage signal.
 
   const computedLifecycle = computeLifecycle(
     {
@@ -216,8 +222,7 @@ function deriveScores(lead: AskCrmLead, now: Date): { heat: number; lifecycle: L
     subscriptionIsDefinitive ||
     hasCurrentOpenDeal ||
     provesSignup ||
-    provesChurn ||
-    provesRisk
+    provesChurn
       ? computedLifecycle
       : lead.lifecycle;
 

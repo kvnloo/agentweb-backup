@@ -172,6 +172,14 @@ async function lookupUsers(
 
 export function createAskCrmLeadLoader(deps: AskCrmLeadLoaderDeps) {
   return async (userId: string, opts: { limit: number }): Promise<AskCrmLead[]> => {
+    // Clamped here, not just trusted from the caller: USER_LOOKUP_BUDGET also
+    // bounds the user-lookup step below (uniqueEmails.slice), so a caller that
+    // ever passes a larger limit than this would otherwise load MORE leads
+    // than can be enriched, with no signal on which ones silently fell back to
+    // stored-only data. This loader is exported precisely so that invariant
+    // can't drift per-caller (see USER_LOOKUP_BUDGET's own comment) — so it
+    // has to hold here, not only in today's one caller (emma/tools.ts).
+    const limit = Math.min(opts.limit, USER_LOOKUP_BUDGET);
     const rawLists = await deps.getLeadListsForUser(userId);
     const lists = excludeSessionLists(
       Array.isArray(rawLists)
@@ -181,18 +189,18 @@ export function createAskCrmLeadLoader(deps: AskCrmLeadLoaderDeps) {
 
     const leads: AskCrmLead[] = [];
     for (const list of lists) {
-      if (leads.length >= opts.limit) break;
+      if (leads.length >= limit) break;
       const listId = stringValue(list.listId);
       if (!listId) continue;
       const page = record(await deps.getLeadsByListId(
         listId,
-        Math.min(opts.limit - leads.length, 200),
+        Math.min(limit - leads.length, 200),
       ));
       const items = Array.isArray(page?.items) ? page!.items : [];
       for (const item of items) {
         const lead = normalizeLead(item, listId);
         if (lead) leads.push(lead);
-        if (leads.length >= opts.limit) break;
+        if (leads.length >= limit) break;
       }
     }
 
