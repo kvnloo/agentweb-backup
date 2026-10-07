@@ -227,7 +227,16 @@ export function buildModelMentionIndex(
     // through to the shorter, already-registered "claude sonnet 5" and
     // silently matched the wrong, pre-existing sibling model instead.
     let vendorRun = 0;
-    while (vendorRun < nameTokens.length && VENDOR_TOKENS.has(nameTokens[vendorRun])) vendorRun++;
+    while (vendorRun < nameTokens.length) {
+      if (VENDOR_TOKENS.has(nameTokens[vendorRun])) { vendorRun++; continue; }
+      // "Z.ai" tokenizes to "z" + "ai" (the dot is a token separator, same as
+      // everywhere else in this file), so it never matches the combined "zai"
+      // entry above and the strip loop stopped at position 0 — "GLM 5.3" and
+      // "GLM 5.3 Flash" (the Z.ai-branded auto-added entries) were unreachable
+      // by their bare family name. Treat the pair as that one vendor token.
+      if (nameTokens[vendorRun] === 'z' && nameTokens[vendorRun + 1] === 'ai') { vendorRun += 2; continue; }
+      break;
+    }
     for (let strippedStart = 1; strippedStart <= vendorRun; strippedStart++) {
       const stripped = nameTokens.slice(strippedStart);
       if (stripped.some((t) => !isVersionToken(t))) register(stripped, entry.id);

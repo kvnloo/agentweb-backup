@@ -211,6 +211,28 @@ describe('findModelMention — vendor name with an internal dot (ENG-2293 Opslan
   });
 });
 
+describe('findModelMention — Z.ai vendor-prefix stripping (ENG-2293 fresh-eyes review finding)', () => {
+  // "Z.ai" tokenizes to "z" + "ai" (the dot is a token separator, same as
+  // everywhere else here), so it never matched the combined "zai" entry in
+  // VENDOR_TOKENS and the strip loop stopped at position 0 — the bare family
+  // name people actually type ("GLM 5.3") was unreachable; only the fully
+  // vendor-prefixed form worked.
+  const glmCatalog = [
+    ...CATALOG,
+    { id: 'openrouter/z-ai/glm-5.3', name: 'Z.ai: GLM 5.3', family: 'glm' },
+    { id: 'openrouter/z-ai/glm-5.3-flash', name: 'Z.ai: GLM 5.3 Flash', family: 'glm-flash' },
+  ];
+  const glmIndex = buildModelMentionIndex(glmCatalog);
+
+  it('resolves the bare family name with no vendor prefix', () => {
+    expect(findModelMention('switch to GLM 5.3', glmIndex)?.modelId).toBe('openrouter/z-ai/glm-5.3');
+  });
+
+  it('distinguishes the bare family name from its Flash sibling', () => {
+    expect(findModelMention('switch to GLM 5.3 Flash', glmIndex)?.modelId).toBe('openrouter/z-ai/glm-5.3-flash');
+  });
+});
+
 describe('buildModelMentionAck', () => {
   const mention = { modelId: OPUS_5, matchedText: 'Opus 5' };
 
