@@ -108,25 +108,6 @@ export type Runner<I = unknown, O = unknown> = (
   ctx: RunnerContext<I>,
 ) => Promise<O>;
 
-/**
- * Thrown by a runner that lost the per-axis claim to another in-flight run
- * (ENG-2308). The step is NOT failed and NOT ready: someone else owns it and
- * will record the real outcome. `reconcile()` skips it and leaves the step
- * `running`, so downstream steps stay gated on the winner's completion.
- *
- * Without this, a losing runner returned whatever stale output was on the
- * record and `reconcile()` stamped the step `ready` with it, which let the
- * same pass fire the NEXT step for real on empty upstream context. The
- * claim itself is a DynamoDB condition, so this holds across backend
- * instances, unlike the in-process per-user reconcile dedup.
- */
-export class StepClaimLostError extends Error {
-  constructor(public readonly step: string) {
-    super(`claim for step "${step}" is held by another run`);
-    this.name = "StepClaimLostError";
-  }
-}
-
 export interface RunnerContext<I> {
   userId: string;
   inputs: I;
@@ -595,13 +576,6 @@ export class OnboardingPipelineOrchestrator {
         await this.deps.updateUserSteps(userId, workingSteps);
         report.fired.push({ step, generation, status: "ready" });
       } catch (err) {
-        if (err instanceof StepClaimLostError) {
-          report.skipped.push({
-            step,
-            reason: "claim held by another run",
-          });
-          continue;
-        }
         const reason = err instanceof Error ? err.message : String(err);
         const failedRecord: StepRecord<unknown> = {
           output: prev?.output ?? null,

@@ -41,9 +41,14 @@ import {
   type StepName,
   type UserSteps,
   DEFAULT_DAG,
-  StepClaimLostError,
 } from "./onboardingPipelineOrchestrator";
 import { userDb } from "./db";
+import { BRAND_BUILD_TIMEOUT_MS } from "./brandBuildStatusService";
+import { ICP_TIMEOUT_MS } from "./icpStatusService";
+import { COMPETITOR_TIMEOUT_MS } from "./competitorStatusService";
+import { CREATIVE_DIR_TIMEOUT_MS } from "./creativeDirStatusService";
+import { AD_IMAGE_TIMEOUT_MS } from "./adImageStatusService";
+import { AD_COPY_TIMEOUT_MS } from "./adCopyStatusService";
 
 // ──────────────────────────────────────────────────────────────────────
 // Runners — delegate to the legacy `triggerXForUser` services.
@@ -108,6 +113,82 @@ function throwIfStepFailed(
 }
 
 /**
+ * What a runner does once its own trigger has returned, or once it lost the
+ * claim: settle on the axis's real outcome (ENG-2308).
+ *
+ * If ANOTHER run holds the axis (status in flight with a `<axis>StartedAt`
+ * that is not ours) the runner must neither report that run's stale
+ * placeholder as a result (reconcile() would stamp the step `ready` and fire
+ * downstream steps on empty context) nor return early and leave the step
+ * `running` (nothing re-fires a step stuck at `running`, and a winner that is
+ * not the orchestrator, e.g. a legacy route or `/icp/regenerate-one`, never
+ * updates `User.steps`). It joins instead: it waits for that run to leave the
+ * in-flight state, then adopts its real result or failure. If the other run is
+ * still going after the axis's own timeout, it throws an ordinary error, so
+ * the step is recorded `failed` and the next reconcile retries it (by then the
+ * stale-claim escape hatch applies).
+ *
+ * A status that is in flight under OUR OWN startedAt means our trigger
+ * returned without finishing (e.g. gated on an upstream step); that keeps the
+ * previous behavior and returns the record's current result.
+ */
+interface AxisSpec {
+  /** Field prefix on the user record: `${prefix}Status`, `${prefix}StartedAt`. */
+  prefix: string;
+  inFlight: "running" | "building";
+  resultField: string;
+  timeoutMs: number;
+  failMessage: string;
+}
+
+const JOIN_GRACE_MS = 15_000;
+let joinPollMs = 3_000;
+
+/** Test-only: shrink the join poll interval so tests need not wait seconds. */
+export function _setJoinPollMsForTests(ms: number): void {
+  joinPollMs = ms;
+}
+
+async function settleAxis(
+  userId: string,
+  spec: AxisSpec,
+  ownStartedAt: string | undefined,
+  startedAtMs: number,
+): Promise<unknown> {
+  const deadline = Date.now() + spec.timeoutMs + JOIN_GRACE_MS;
+  for (;;) {
+    const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
+    const heldByAnother =
+      user?.[`${spec.prefix}Status`] === spec.inFlight &&
+      // `ownStartedAt === undefined` means we hold no claim (lost it), so any
+      // in-flight run is someone else's.
+      (ownStartedAt === undefined ||
+        user?.[`${spec.prefix}StartedAt`] !== ownStartedAt);
+    if (!heldByAnother) {
+      throwIfStepFailed(user, spec.prefix, startedAtMs, spec.failMessage);
+      return user?.[spec.resultField] ?? null;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `${spec.prefix} is still held by another run after ${Math.round(
+          (spec.timeoutMs + JOIN_GRACE_MS) / 1000,
+        )}s`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, joinPollMs));
+  }
+}
+
+const AXES = {
+  brandDna: { prefix: "brandBuild", inFlight: "building", resultField: "brandGuidelines", timeoutMs: BRAND_BUILD_TIMEOUT_MS, failMessage: "brand build failed" },
+  icp: { prefix: "icp", inFlight: "running", resultField: "icpResult", timeoutMs: ICP_TIMEOUT_MS, failMessage: "ICP discovery failed" },
+  competitor: { prefix: "competitor", inFlight: "running", resultField: "competitorResult", timeoutMs: COMPETITOR_TIMEOUT_MS, failMessage: "competitor strategy failed" },
+  creativeDir: { prefix: "creativeDir", inFlight: "running", resultField: "creativeDirResult", timeoutMs: CREATIVE_DIR_TIMEOUT_MS, failMessage: "creative direction failed" },
+  adImage: { prefix: "adImage", inFlight: "running", resultField: "adImageResult", timeoutMs: AD_IMAGE_TIMEOUT_MS, failMessage: "ad image generation failed" },
+  adCopy: { prefix: "adCopy", inFlight: "running", resultField: "adCopyResult", timeoutMs: AD_COPY_TIMEOUT_MS, failMessage: "ad copy generation failed" },
+} as const satisfies Record<string, AxisSpec>;
+
+/**
  * Every runner below claims its axis (atomic ConditionExpression, flips the
  * legacy `<axis>Status` field to its in-flight value) BEFORE calling the
  * legacy trigger function, mirroring `runAdImage`'s pre-existing pattern.
@@ -145,9 +226,8 @@ async function runBrandDna(userId: string): Promise<unknown> {
   const claimed = await claimBrandBuildRun(userId);
   if (!claimed) {
     // Lost the claim to a concurrent caller (another instance's pass, or a
-    // legacy route mid-flight). Don't run a second Emma session, and don't
-    // report a result either: the winner records the real outcome.
-    throw new StepClaimLostError("brandDna");
+    // legacy route mid-flight). Don't run a second Emma session: join it.
+    return settleAxis(userId, AXES.brandDna, undefined, startedAtMs);
   }
   // expectedStartedAt: this invocation's own claim, so a later reclaim's
   // zombie failure write, and a zombie Emma session's `ready` flip in the
@@ -156,9 +236,12 @@ async function runBrandDna(userId: string): Promise<unknown> {
   await triggerBrandBuildForUser(userId, {
     expectedStartedAt: (claimed as { brandBuildStartedAt?: string }).brandBuildStartedAt,
   });
-  const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
-  throwIfStepFailed(user, "brandBuild", startedAtMs, "brand build failed");
-  return user?.brandGuidelines ?? null;
+  return settleAxis(
+    userId,
+    AXES.brandDna,
+    (claimed as { brandBuildStartedAt?: string }).brandBuildStartedAt,
+    startedAtMs,
+  );
 }
 
 async function runIcp(userId: string): Promise<unknown> {
@@ -167,7 +250,7 @@ async function runIcp(userId: string): Promise<unknown> {
   const startedAtMs = Date.now();
   const claimed = await claimIcpRun(userId);
   if (!claimed) {
-    throw new StepClaimLostError("icp");
+    return settleAxis(userId, AXES.icp, undefined, startedAtMs);
   }
   // expectedStartedAt: this invocation's own claim, so a later reclaim's
   // zombie completion can't be mistaken for a terminal state WE published
@@ -175,9 +258,7 @@ async function runIcp(userId: string): Promise<unknown> {
   await triggerIcpDiscoveryForUser(userId, {
     expectedStartedAt: (claimed as { icpStartedAt?: string }).icpStartedAt,
   });
-  const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
-  throwIfStepFailed(user, "icp", startedAtMs, "ICP discovery failed");
-  return user?.icpResult ?? null;
+  return settleAxis(userId, AXES.icp, (claimed as { icpStartedAt?: string }).icpStartedAt, startedAtMs);
 }
 
 async function runCompetitor(userId: string): Promise<unknown> {
@@ -189,14 +270,17 @@ async function runCompetitor(userId: string): Promise<unknown> {
   const startedAtMs = Date.now();
   const claimed = await claimCompetitorRun(userId);
   if (!claimed) {
-    throw new StepClaimLostError("competitor");
+    return settleAxis(userId, AXES.competitor, undefined, startedAtMs);
   }
   await triggerCompetitorStrategyForUser(userId, {
     expectedStartedAt: (claimed as { competitorStartedAt?: string }).competitorStartedAt,
   });
-  const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
-  throwIfStepFailed(user, "competitor", startedAtMs, "competitor strategy failed");
-  return user?.competitorResult ?? null;
+  return settleAxis(
+    userId,
+    AXES.competitor,
+    (claimed as { competitorStartedAt?: string }).competitorStartedAt,
+    startedAtMs,
+  );
 }
 
 async function runCreativeDir(userId: string): Promise<unknown> {
@@ -208,14 +292,17 @@ async function runCreativeDir(userId: string): Promise<unknown> {
   const startedAtMs = Date.now();
   const claimed = await claimCreativeDirRun(userId);
   if (!claimed) {
-    throw new StepClaimLostError("creativeDir");
+    return settleAxis(userId, AXES.creativeDir, undefined, startedAtMs);
   }
   await triggerCreativeDirForUser(userId, {
     expectedStartedAt: (claimed as { creativeDirStartedAt?: string }).creativeDirStartedAt,
   });
-  const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
-  throwIfStepFailed(user, "creativeDir", startedAtMs, "creative direction failed");
-  return user?.creativeDirResult ?? null;
+  return settleAxis(
+    userId,
+    AXES.creativeDir,
+    (claimed as { creativeDirStartedAt?: string }).creativeDirStartedAt,
+    startedAtMs,
+  );
 }
 
 async function runAdImage(userId: string): Promise<unknown> {
@@ -234,17 +321,15 @@ async function runAdImage(userId: string): Promise<unknown> {
   const run = await claimAdImageRun(userId);
   if (!run) {
     // Lost the claim (ENG-2308): another run owns a `running` ad-image axis.
-    // Skip rather than report: the winner records the real outcome.
-    throw new StepClaimLostError("adImage");
+    // Join it rather than launch a second worker or report a stale result.
+    return settleAxis(userId, AXES.adImage, undefined, startedAtMs);
   }
   await triggerAdImageGenerationForUser(userId, { run });
-  const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
   // Covers all three ad-image gates: missing logo, unfetchable logo, and
   // every variant failing. Note this does NOT gate ad copy — adCopy deps on
   // creativeDir, not adImage, so the two stay independent axes by design
   // (see adImageStatusService). What it fixes is the step record itself.
-  throwIfStepFailed(user, "adImage", startedAtMs, "ad image generation failed");
-  return user?.adImageResult ?? null;
+  return settleAxis(userId, AXES.adImage, (run as { startedAt?: string }).startedAt, startedAtMs);
 }
 
 async function runAdCopy(userId: string): Promise<unknown> {
@@ -253,14 +338,17 @@ async function runAdCopy(userId: string): Promise<unknown> {
   const startedAtMs = Date.now();
   const claimed = await claimAdCopyRun(userId);
   if (!claimed) {
-    throw new StepClaimLostError("adCopy");
+    return settleAxis(userId, AXES.adCopy, undefined, startedAtMs);
   }
   await triggerAdCopyForUser(userId, {
     expectedStartedAt: (claimed as { adCopyStartedAt?: string }).adCopyStartedAt,
   });
-  const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
-  throwIfStepFailed(user, "adCopy", startedAtMs, "ad copy generation failed");
-  return user?.adCopyResult ?? null;
+  return settleAxis(
+    userId,
+    AXES.adCopy,
+    (claimed as { adCopyStartedAt?: string }).adCopyStartedAt,
+    startedAtMs,
+  );
 }
 
 /**
@@ -348,6 +436,7 @@ function getOrchestrator(): OnboardingPipelineOrchestrator {
 export function _resetOrchestratorForTests(): void {
   _orchestrator = null;
   _inFlightReconciles.clear();
+  _reconcileRequestedWhileRunning.clear();
 }
 
 /**
@@ -385,6 +474,29 @@ export function _resetOrchestratorForTests(): void {
  * instances reconciling the same user at the same instant.
  */
 const _inFlightReconciles = new Map<string, Promise<ReconcileReport | null>>();
+/**
+ * Users that asked for a reconcile while a pass was already walking. A walk
+ * only revisits steps AHEAD of its current position, so a request that arrives
+ * after the walk has passed a step (say an upstream output changed) would be
+ * lost if we simply handed back the in-flight promise. Instead we remember
+ * that someone asked and run exactly one more pass once the current one ends;
+ * that pass is hash-deduped, so it is cheap when nothing changed.
+ */
+const _reconcileRequestedWhileRunning = new Set<string>();
+
+async function runReconcilePass(userId: string): Promise<ReconcileReport | null> {
+  try {
+    return await getOrchestrator().reconcile(userId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // eslint-disable-next-line no-console
+    console.error("[onboardingOrchestratorWiring] reconcile failed", {
+      userId,
+      err: msg,
+    });
+    return null;
+  }
+}
 
 /**
  * Drive the eager DAG forward for `userId`. Cheap no-op when neither the
@@ -397,20 +509,18 @@ export async function reconcileForUser(
   userId: string,
 ): Promise<ReconcileReport | null> {
   const existing = _inFlightReconciles.get(userId);
-  if (existing) return existing;
+  if (existing) {
+    _reconcileRequestedWhileRunning.add(userId);
+    return existing;
+  }
 
   const run = (async () => {
-    try {
-      return await getOrchestrator().reconcile(userId);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      // eslint-disable-next-line no-console
-      console.error("[onboardingOrchestratorWiring] reconcile failed", {
-        userId,
-        err: msg,
-      });
-      return null;
-    }
+    let report: ReconcileReport | null;
+    do {
+      _reconcileRequestedWhileRunning.delete(userId);
+      report = await runReconcilePass(userId);
+    } while (_reconcileRequestedWhileRunning.has(userId));
+    return report;
   })();
 
   _inFlightReconciles.set(userId, run);
@@ -418,6 +528,7 @@ export async function reconcileForUser(
     return await run;
   } finally {
     _inFlightReconciles.delete(userId);
+    _reconcileRequestedWhileRunning.delete(userId);
   }
 }
 

@@ -814,8 +814,23 @@ export async function updateBrandGuidelines(
           if (opts.sessionId && observedStartedAt) {
             // eslint-disable-next-line @typescript-eslint/no-var-requires
             const { chatbotDb } = require('../../services/chatbotService');
-            const session = await chatbotDb.getChatSession(opts.sessionId);
-            owned = brandBuild.sessionMayCompleteBrandBuild(session?.createdAt, observedStartedAt);
+            // Only createdAt is needed; getChatSessionRecord skips the message
+            // history load and migration side effects of getChatSession, and
+            // the consistent read sees a session created moments ago.
+            let sessionCreatedAt: string | undefined;
+            try {
+              const session = await chatbotDb.getChatSessionRecord(opts.sessionId, true);
+              sessionCreatedAt = session?.createdAt;
+            } catch (lookupErr: any) {
+              // Cannot prove the session is stale: allow, exactly as when
+              // createdAt is missing. The write below is still conditioned on
+              // brandBuildStartedAt, so a superseded claim is still rejected.
+              console.warn('[brandBuild] session lookup failed; falling back to claim-only ownership', {
+                userId,
+                error: lookupErr?.message ?? String(lookupErr),
+              });
+            }
+            owned = brandBuild.sessionMayCompleteBrandBuild(sessionCreatedAt, observedStartedAt);
           }
           let landed = false;
           if (!owned) {
