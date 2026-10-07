@@ -2371,6 +2371,21 @@ export class AgentModeService {
   }
 
   /**
+   * ENG-55: registry facts the model-compare feature needs (display name, lab, live
+   * flag) without exposing the registry. Null for ids that are not registry keys.
+   */
+  getModelCompareInfo(modelId: string): { name: string; provider: string; isLive: boolean; internalOnly: boolean } | null {
+    if (!Object.prototype.hasOwnProperty.call(this.llmModels, modelId)) return null;
+    const config = this.llmModels[modelId];
+    return {
+      name: config.name ?? modelId,
+      provider: config.provider ?? 'other',
+      isLive: config.isLive === true,
+      internalOnly: config.internalOnly === true,
+    };
+  }
+
+  /**
    * Same entitlement/ordering as getSupportedModels, decorated with tier + description
    * for the model-picker UI. Excludes live-voice models (isLive) — they are never
    * selectable through the HTTP generate picker (see callLLM's isLive guard).
