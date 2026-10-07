@@ -161,6 +161,56 @@ describe('findModelMention', () => {
   });
 });
 
+describe('findModelMention — auto-added double vendor-prefix (ENG-2293 Opslane finding)', () => {
+  // Shaped exactly like modelCatalogRefresh.ts's auto-added entries: the
+  // OpenRouter-sourced name is "<Vendor>: <Family> <Version>" (two leading
+  // vendor/family tokens), unlike a hand-curated entry's "<Family> <Version>"
+  // (one). A single-strip vendor alias left the longer entry unreachable and
+  // let the shorter sibling's "sonnet 5" key silently swallow the first two
+  // tokens of "Sonnet 5.5".
+  const sonnet55Catalog = [
+    ...CATALOG,
+    { id: 'openrouter/anthropic/claude-sonnet-5.5', name: 'Anthropic: Claude Sonnet 5.5', family: 'claude-sonnet' },
+  ];
+  const sonnet55Index = buildModelMentionIndex(sonnet55Catalog);
+  const SONNET_5 = 'anthropic.claude-sonnet-5';
+  const SONNET_5_5 = 'openrouter/anthropic/claude-sonnet-5.5';
+
+  it.each([
+    ['use Sonnet 5.5 for this', SONNET_5_5],
+    ['switch to Claude Sonnet 5.5', SONNET_5_5],
+    ['use Sonnet 5 for this', SONNET_5],
+    ['switch to Claude Sonnet 5', SONNET_5],
+  ])('reads %p as a request for the correct, distinct model', (text, expected) => {
+    expect(findModelMention(text, sonnet55Index)?.modelId).toBe(expected);
+  });
+});
+
+describe('findModelMention — vendor name with an internal dot (ENG-2293 Opslane finding)', () => {
+  // "Z.ai" is a real auto-added vendor name (modelCatalogRefresh.ts's
+  // PROVIDERS map). Its internal dot is not a sentence boundary, but
+  // EXPLANATORY_QUESTION_PATTERN's [^.!]* scan can't tell the difference and
+  // stops dead on it, same failure as a version dot — so the real trailing
+  // "?" is never reached and the question is misread as a request.
+  const glmCatalog = [
+    ...CATALOG,
+    { id: 'openrouter/z-ai/glm-5.3', name: 'Z.ai: GLM 5.3', family: 'glm' },
+  ];
+  const glmIndex = buildModelMentionIndex(glmCatalog);
+
+  it.each([
+    'What does it mean to use Z.ai: GLM 5.3?',
+    'What would it cost to use Z.ai: GLM 5.3?',
+    'Why would I switch to Z.ai: GLM 5.3?',
+  ])('stays silent on the explanatory question %p', (text) => {
+    expect(findModelMention(text, glmIndex)).toBeNull();
+  });
+
+  it('still fires on a genuine request naming the same model', () => {
+    expect(findModelMention('use Z.ai: GLM 5.3 for this', glmIndex)?.modelId).toBe('openrouter/z-ai/glm-5.3');
+  });
+});
+
 describe('buildModelMentionAck', () => {
   const mention = { modelId: OPUS_5, matchedText: 'Opus 5' };
 

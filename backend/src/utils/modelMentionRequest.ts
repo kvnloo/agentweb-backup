@@ -115,23 +115,31 @@ interface Token {
  * was read as a REQUEST for that model. Caught by CodeRabbit on PR #2707 and
  * reproduced before fixing; pinned by tests below.
  *
- * A dot flanked by digits with no whitespace is a decimal point. Anything else
- * — including "3. 7" and the "3.7. Use..." that ends a real sentence — is a
- * break.
+ * A dot flanked by digits with no whitespace is a decimal point. A dot
+ * flanked by letters with no whitespace (ENG-2293 Opslane finding on PR
+ * #3276: "Z.ai", a real auto-added vendor name) is the same kind of
+ * abbreviation, not a sentence end — a genuine sentence-ending period is
+ * always followed by whitespace before the next sentence starts, so `gap`
+ * being exactly "." (no space either side) already rules out that case for
+ * both. Anything else — including "3. 7" and the "3.7. Use..." that ends a
+ * real sentence — is a break.
  */
 function isSentenceBreak(gap: string, previousToken: Token | undefined, nextChar: string): boolean {
   if (/[!?\n]/.test(gap)) return true;
   if (!gap.includes('.')) return false;
-  const isDecimalPoint =
+  const isAbbreviationPoint =
     gap === '.'
     && !!previousToken
-    && /\d$/.test(previousToken.text)
-    && /^\d/.test(nextChar);
-  return !isDecimalPoint;
+    && (
+      (/\d$/.test(previousToken.text) && /^\d/.test(nextChar))
+      || (/[a-z]$/i.test(previousToken.text) && /^[a-z]/i.test(nextChar))
+    );
+  return !isAbbreviationPoint;
 }
 
 /**
- * Remove the dot from a dotted version ("3.7" -> "37") for guard matching only.
+ * Remove the dot from a dotted version ("3.7" -> "37") and from a dotted
+ * vendor abbreviation ("Z.ai" -> "Zai"), for guard matching only.
  *
  * `EXPLANATORY_QUESTION_PATTERN` (ENG-1565) spans `[^.!]*` between its opening
  * phrase and the "?", deliberately, so it cannot reach across a sentence. A
@@ -140,11 +148,19 @@ function isSentenceBreak(gap: string, previousToken: Token | undefined, nextChar
  * fix and was still read as a request. Fixing it here rather than widening the
  * shared pattern keeps ENG-1565's detector untouched.
  *
+ * Same failure, different character class (ENG-2293 Opslane finding on PR
+ * #3276): "What does it mean to use Z.ai: GLM 5.3?" was read as a request
+ * because the dot inside the vendor name "Z.ai" stopped the scan before it
+ * ever reached the real "?". A letter-period-letter dot is never a real
+ * sentence boundary either — a genuine one is always followed by whitespace,
+ * not directly by another letter — so stripping it here is the same fix for
+ * the same reason, just a different trigger.
+ *
  * Used only to answer a yes/no question about the text; never for offsets or
  * for anything the customer sees.
  */
 function stripVersionDots(text: string): string {
-  return text.replace(/(\d)\.(?=\d)/g, '$1');
+  return text.replace(/(\d)\.(?=\d)/g, '$1').replace(/([A-Za-z])\.(?=[A-Za-z])/g, '$1');
 }
 
 function tokenize(text: string): Token[] {
@@ -201,8 +217,19 @@ export function buildModelMentionIndex(
 
     const nameTokens = tokenize(displayLabel).map((t) => t.text);
     register(nameTokens, entry.id);
-    if (nameTokens.length > 0 && VENDOR_TOKENS.has(nameTokens[0])) {
-      const stripped = nameTokens.slice(1);
+    // Register an alias at EVERY leading-vendor-token strip depth, not just
+    // the deepest one: an auto-added entry's name is "<Vendor>: <Family>
+    // <Version>" (e.g. "Anthropic: Claude Sonnet 5.5"), two vendor tokens
+    // deep, while a hand-curated entry is just "<Family> <Version>" (e.g.
+    // "Claude Sonnet 5"), one deep. Registering only the fully-stripped alias
+    // ("sonnet 5 5") left the natural middle form ("Claude Sonnet 5.5",
+    // company name dropped but family name kept) unregistered, so it fell
+    // through to the shorter, already-registered "claude sonnet 5" and
+    // silently matched the wrong, pre-existing sibling model instead.
+    let vendorRun = 0;
+    while (vendorRun < nameTokens.length && VENDOR_TOKENS.has(nameTokens[vendorRun])) vendorRun++;
+    for (let strippedStart = 1; strippedStart <= vendorRun; strippedStart++) {
+      const stripped = nameTokens.slice(strippedStart);
       if (stripped.some((t) => !isVersionToken(t))) register(stripped, entry.id);
     }
   }
