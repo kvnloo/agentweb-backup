@@ -803,25 +803,39 @@ export async function updateBrandGuidelines(
         if (readyPatch) {
           // A brand-build Emma session may only complete the claim it was
           // started under (ENG-2308): a timed-out session keeps running, and
-          // would otherwise flip a LATER run's `building` to `ready`.
-          // Sessions this process did not start as a brand build keep the
-          // unconditional flip.
+          // would otherwise flip a LATER run's `building` to `ready`. The
+          // session's own createdAt tells us which claim it belongs to (see
+          // sessionMayCompleteBrandBuild); a call with no session id (REST,
+          // direct service calls) keeps the unconditional flip.
           // eslint-disable-next-line @typescript-eslint/no-var-requires
           const brandBuild = require('../../services/onboardingBrandBuildService');
-          const claim = brandBuild.getBrandBuildSessionClaim(userId, opts.sessionId);
-          let landed = true;
-          if (claim) {
+          const observedStartedAt: string | undefined = (user as any).brandBuildStartedAt;
+          let owned = true;
+          if (opts.sessionId && observedStartedAt) {
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const { chatbotDb } = require('../../services/chatbotService');
+            const session = await chatbotDb.getChatSession(opts.sessionId);
+            owned = brandBuild.sessionMayCompleteBrandBuild(session?.createdAt, observedStartedAt);
+          }
+          let landed = false;
+          if (!owned) {
+            console.warn('[brandBuild] dropping stale ready flip: session predates the current build claim', {
+              userId,
+              sessionId: opts.sessionId,
+            });
+          } else if (opts.sessionId && observedStartedAt) {
             try {
               await userDb.updateUser(userId, readyPatch, {
-                condition: brandBuild.brandBuildReadyOwnershipCondition(claim.startedAt),
+                condition: brandBuild.brandBuildReadyOwnershipCondition(observedStartedAt),
               });
+              landed = true;
             } catch (condErr: any) {
               if (condErr?.code !== 'ConditionalCheckFailedException') throw condErr;
-              landed = false;
               console.warn('[brandBuild] dropping stale ready flip: a newer claim owns the build', { userId });
             }
           } else {
             await userDb.updateUser(userId, readyPatch);
+            landed = true;
           }
           if (landed) {
             logCompletionMetric(userId, "ready", readyPatch.brandBuildDurationMs ?? 0);

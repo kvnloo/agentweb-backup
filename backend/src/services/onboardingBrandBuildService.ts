@@ -110,10 +110,9 @@ export interface BrandBuildDeps {
    * ownership-token pattern applied to icp/competitor/creativeDir/adCopy.
    * Optional for backward compatibility with direct callers/tests that
    * bypass the claim; only callers that hold a fresh claim should pass it.
-   * It also registers the Emma session under this claim so the
-   * `update_brand_guidelines` hook, which writes the `ready` transition,
-   * can only complete the claim its session was started under (see
-   * `brandBuildSessionClaims`).
+   * The `ready` transition is written by the `update_brand_guidelines`
+   * hook, which judges ownership from the session's own `createdAt` (see
+   * `sessionMayCompleteBrandBuild`).
    */
   expectedStartedAt?: string;
 }
@@ -133,67 +132,48 @@ function brandBuildOwnershipCondition(expectedStartedAt: string) {
 }
 
 /**
- * Which claim each brand-build Emma session belongs to (ENG-2308 review
- * follow-up). `withTimeout` does not abort the Emma session, so a run that
- * timed out (and whose user then retried, reclaiming the axis) leaves a live
- * "zombie" session that can still call `update_brand_guidelines` later. The
- * tool's `building -> ready` hook only checked `brandBuildStatus === "building"`,
- * which is true for the RECLAIMING run's `building`, so the zombie flipped the
- * newer run to `ready` early (and the newer run's own flip was then dropped).
+ * Whether an `update_brand_guidelines` call from chat session `sessionId` may
+ * complete the CURRENT brand build (ENG-2308 review follow-up).
  *
- * The hook has a `sessionId` in its tool context but no way to know which
- * claim that session serves, and persisting the link would mean a new field on
- * the user/session record. Emma's tool calls run in the same process as
- * `triggerBrandBuildForUser`, so an in-process map is enough; entries expire
- * so it cannot grow without bound.
+ * `withTimeout` does not abort the Emma session, so a build that timed out and
+ * was retried leaves a live "zombie" session that can still call the tool
+ * later. The hook only checked `brandBuildStatus === "building"`, which is true
+ * for the RECLAIMING run's `building`, so the zombie flipped the newer run to
+ * `ready` early and the newer run's own flip was then dropped.
+ *
+ * Ownership is derived from data that already exists, so it needs no new
+ * persisted field and works across processes (the agent loop runs in a forked
+ * worker, so an in-process session registry cannot see the build): a brand
+ * build creates its session AFTER it claims the axis, so a session belongs to
+ * the current claim only if it was created at or after `brandBuildStartedAt`.
+ * A zombie from an older claim was created before the reclaiming claim started.
+ *
+ * `toleranceMs` absorbs clock skew between instances. A zombie is always at
+ * least a full stale window (or a user-driven retry) older than the claim that
+ * superseded it, far more than the tolerance.
  */
-const BRAND_BUILD_SESSION_TTL_MS = 60 * 60 * 1000;
-const brandBuildSessionClaims = new Map<
-  string,
-  { userId: string; startedAt: string; registeredAtMs: number }
->();
+export const BRAND_BUILD_SESSION_SKEW_TOLERANCE_MS = 5_000;
 
-function registerBrandBuildSession(
-  userId: string,
-  sessionId: string,
-  startedAt: string,
-  nowMs: number = Date.now(),
-): void {
-  for (const [id, entry] of brandBuildSessionClaims) {
-    if (nowMs - entry.registeredAtMs > BRAND_BUILD_SESSION_TTL_MS) {
-      brandBuildSessionClaims.delete(id);
-    }
-  }
-  brandBuildSessionClaims.set(sessionId, { userId, startedAt, registeredAtMs: nowMs });
+export function sessionMayCompleteBrandBuild(
+  sessionCreatedAt: string | undefined,
+  brandBuildStartedAt: string | undefined,
+  toleranceMs: number = BRAND_BUILD_SESSION_SKEW_TOLERANCE_MS,
+): boolean {
+  const created = sessionCreatedAt ? Date.parse(sessionCreatedAt) : NaN;
+  const started = brandBuildStartedAt ? Date.parse(brandBuildStartedAt) : NaN;
+  // Cannot prove the session predates the claim: keep the pre-existing
+  // behavior (allow) rather than strand a real build in `building`.
+  if (!Number.isFinite(created) || !Number.isFinite(started)) return true;
+  return created >= started - toleranceMs;
 }
 
 /**
- * The claim a brand-build Emma session was started under, or `undefined` for
- * any session this process did not start as a brand build (ordinary chat,
- * REST saves, another instance), which keep the unconditional behavior.
- */
-export function getBrandBuildSessionClaim(
-  userId: string,
-  sessionId: string | undefined,
-): { startedAt: string } | undefined {
-  if (!sessionId) return undefined;
-  const entry = brandBuildSessionClaims.get(sessionId);
-  if (!entry || entry.userId !== userId) return undefined;
-  return { startedAt: entry.startedAt };
-}
-
-/**
- * DynamoDB condition for the `building -> ready` flip, keyed on the claim the
- * flipping session was started under. Exported for the
+ * DynamoDB condition for the `building -> ready` flip: the build must still be
+ * the claim the ownership rule above was judged against. Exported for the
  * `update_brand_guidelines` hook.
  */
-export function brandBuildReadyOwnershipCondition(startedAt: string) {
-  return brandBuildOwnershipCondition(startedAt);
-}
-
-/** Test-only. */
-export function _resetBrandBuildSessionClaimsForTests(): void {
-  brandBuildSessionClaims.clear();
+export function brandBuildReadyOwnershipCondition(observedStartedAt: string) {
+  return brandBuildOwnershipCondition(observedStartedAt);
 }
 
 function buildBrandPrompt(input: {
@@ -532,9 +512,6 @@ export async function triggerBrandBuildForUser(
   try {
     const session = await createChatSession(userId);
     sessionId = session.sessionId;
-    if (deps.expectedStartedAt) {
-      registerBrandBuildSession(userId, sessionId, deps.expectedStartedAt);
-    }
   } catch (e: any) {
     await persistFailure(
       userId,
