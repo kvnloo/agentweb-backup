@@ -113,9 +113,18 @@ export function isWorkerShutdownError(error: unknown): boolean {
  */
 export function isProviderNoEndpointsError(error: unknown): boolean {
   if (!error) return false;
-  const message = error instanceof Error ? error.message : String(error);
-  const originalMessage = (error as any)?.originalMessage || '';
-  return message.includes('No endpoints found') || originalMessage.includes('No endpoints found');
+  const e = error as any;
+  const text = [error instanceof Error ? error.message : String(error), e.originalMessage, e.originalError?.message]
+    .filter((part): part is string => typeof part === 'string')
+    .join(' ')
+    .toLowerCase();
+  // Primary signal: OpenRouter's own wording, case-insensitive and tolerant of
+  // "found"/"available". Fallback for a reworded message: a 404 whose text still
+  // names the unmet "requested parameters". A bare 404 deliberately does NOT
+  // match — that could be a wrong slug or URL, which must stay a loud 500.
+  if (/no (?:allowed )?endpoints? (?:found|available)/.test(text)) return true;
+  const is404 = e.status === 404 || e.code === 404 || e.originalError?.status === 404;
+  return is404 && text.includes('requested parameters');
 }
 
 const TRANSIENT_STATUS_CODES = [429, 500, 502, 503, 504];

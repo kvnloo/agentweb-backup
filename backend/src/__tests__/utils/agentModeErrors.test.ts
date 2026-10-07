@@ -170,6 +170,34 @@ describe('agentModeErrors utils', () => {
       expect(isProviderNoEndpointsError(new Error('high demand'))).toBe(false);
       expect(isProviderNoEndpointsError('ordinary failure')).toBe(false);
     });
+
+    it('should tolerate case and "available" wording drift', () => {
+      expect(isProviderNoEndpointsError(new Error('no endpoints found'))).toBe(true);
+      expect(isProviderNoEndpointsError(new Error('No endpoints available for this model'))).toBe(true);
+    });
+
+    it('should find the message on the nested original error', () => {
+      const wrapped: any = new Error('Unknown Error');
+      wrapped.originalError = new Error('404 No endpoints found that can handle the requested parameters');
+      expect(isProviderNoEndpointsError(wrapped)).toBe(true);
+    });
+
+    it('should match a reworded 404 that still names the requested parameters', () => {
+      const wrapped: any = new Error('Unknown Error');
+      wrapped.status = 404;
+      wrapped.originalMessage = 'No routable provider for the requested parameters';
+      expect(isProviderNoEndpointsError(wrapped)).toBe(true);
+    });
+
+    it('should NOT treat a bare 404 as a routing failure (wrong slug/URL must stay loud)', () => {
+      const wrapped: any = new Error('Unknown Error');
+      wrapped.status = 404;
+      wrapped.originalMessage = 'Not Found';
+      expect(isProviderNoEndpointsError(wrapped)).toBe(false);
+      const wording: any = new Error('Unknown Error');
+      wording.originalMessage = 'the requested parameters were invalid';
+      expect(isProviderNoEndpointsError(wording)).toBe(false);
+    });
   });
 
   describe('isTransientLLMError', () => {
