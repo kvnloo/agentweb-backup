@@ -364,6 +364,7 @@ export async function searchProspectsPreview(
     // leak their raw internal message — the route maps search_unavailable to a
     // friendly 503 with retry/skip guidance.
     if (isLinkedInInfraError(err)) {
+      console.warn("[outreachProspectPreview] LinkedIn search unavailable (infrastructure):", err?.message);
       return { ok: false, error: "search_unavailable" };
     }
     return {

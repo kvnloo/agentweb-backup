@@ -40,6 +40,18 @@ export function isProvenDisconnectError(error: any): boolean {
   );
 }
 
+export interface ResolveAccountOptions {
+  /**
+   * Only return an account whose session was PROVEN live. An indeterminate account is
+   * never handed back, so the result is null exactly as before ENG-2205. For callers that
+   * can gracefully skip LinkedIn (e.g. CRM enrichment) instead of running a real call
+   * against an unproven account.
+   */
+  verifiedOnly?: boolean;
+  /** Never fall back to the site-wide shared pool — the user's own accounts only. */
+  ownOnly?: boolean;
+}
+
 export class LinkedInOutreachService {
   private client: UnipileClient | null = null;
   // Cached to avoid a Secrets Manager round-trip on every method call
@@ -1663,8 +1675,8 @@ export class LinkedInOutreachService {
    * 2. Falls back to a randomly-selected site-wide Unipile account configured in settings.
    * Returns null if no account can be found.
    */
-  async resolveAccountId(userId: string): Promise<string | null> {
-    const { accountId } = await this.resolveAccountIdWithSource(userId);
+  async resolveAccountId(userId: string, opts?: ResolveAccountOptions): Promise<string | null> {
+    const { accountId } = await this.resolveAccountIdWithSource(userId, opts);
     return accountId;
   }
 
@@ -1675,7 +1687,7 @@ export class LinkedInOutreachService {
    * (network_distance, dedup-against-pending-invites) need this to avoid
    * silently presenting another account's network as the user's own (ENG-1198).
    */
-  async resolveAccountIdWithSource(userId: string): Promise<{ accountId: string | null; usedSharedAccount: boolean }> {
+  async resolveAccountIdWithSource(userId: string, opts?: ResolveAccountOptions): Promise<{ accountId: string | null; usedSharedAccount: boolean }> {
     // 1. User's own accounts — try ALL of them and return the first whose LinkedIn
     //    session is still live. A single disconnected account must not shadow a
     //    working one, nor force a needless fall-through to the shared site-wide
@@ -1714,33 +1726,39 @@ export class LinkedInOutreachService {
       }
     } catch { /* ignore */ }
 
-    // 2. Site-wide accounts — verify each one is still connected before returning
+    // 2. Site-wide accounts — verify each one is still connected before returning.
+    //    Skipped entirely for ownOnly callers: those act on the user's behalf and must
+    //    never borrow the shared pool.
     let sharedUnknown: string | null = null;
-    try {
-      const { settingsService } = await import('./settingsService');
-      const setting = await settingsService.getSetting('site-wide-unipile-accounts');
-      if (setting?.settingValue) {
-        const siteAccounts = JSON.parse(setting.settingValue);
-        const enabled = (siteAccounts as any[]).filter((a) => a.enabled !== false);
-        // Shuffle so load is distributed across accounts
-        const shuffled = enabled.sort(() => Math.random() - 0.5);
-        for (const account of shuffled) {
-          const state = await this.probeAccountSession(account.account_id);
-          if (state === 'connected') {
-            return { accountId: account.account_id, usedSharedAccount: true };
+    if (!opts?.ownOnly) {
+      try {
+        const { settingsService } = await import('./settingsService');
+        const setting = await settingsService.getSetting('site-wide-unipile-accounts');
+        if (setting?.settingValue) {
+          const siteAccounts = JSON.parse(setting.settingValue);
+          const enabled = (siteAccounts as any[]).filter((a) => a.enabled !== false);
+          // Shuffle so load is distributed across accounts
+          const shuffled = enabled.sort(() => Math.random() - 0.5);
+          for (const account of shuffled) {
+            const state = await this.probeAccountSession(account.account_id);
+            if (state === 'connected') {
+              return { accountId: account.account_id, usedSharedAccount: true };
+            }
+            if (state === 'unknown' && !sharedUnknown) {
+              sharedUnknown = account.account_id;
+            }
+            this.log(`Site-wide account ${account.account_id} (${account.account_name}) is ${state} — skipping`);
           }
-          if (state === 'unknown' && !sharedUnknown) {
-            sharedUnknown = account.account_id;
-          }
-          this.log(`Site-wide account ${account.account_id} (${account.account_name}) is ${state} — skipping`);
         }
-      }
-    } catch { /* ignore parse errors or settings fetch failures */ }
+      } catch { /* ignore parse errors or settings fetch failures */ }
+    }
 
     // 3. Nothing came back definitively connected. Prefer an unverifiable own
     //    account over an unverifiable shared one — still the user's own account
     //    first — rather than returning null and blaming a missing connection
-    //    that was never the actual fault.
+    //    that was never the actual fault. verifiedOnly callers opt out: they have a
+    //    graceful "skip" path and must not run a real call against an unproven account.
+    if (opts?.verifiedOnly) return { accountId: null, usedSharedAccount: false };
     if (ownUnknown) return { accountId: ownUnknown, usedSharedAccount: false };
     if (sharedUnknown) return { accountId: sharedUnknown, usedSharedAccount: true };
 
@@ -1808,13 +1826,7 @@ export class LinkedInOutreachService {
       return accountId;
     };
 
-    // 1. User's own accounts — try all, first live one wins. Uses the tri-state
-    //    probeAccountSession, not the binary isAccountConnected (ENG-2205): an
-    //    indeterminate probe (Unipile-side 5xx/timeout, not a dead session) must
-    //    not be discarded the same way a proven-dead one is, or a Unipile outage
-    //    collapses enrichment's whole account pool to null exactly like it did
-    //    for resolveAccountIdWithSource.
-    let ownUnknown: string | null = null;
+    // 1. User's own accounts — try all, first live one wins
     try {
       const { getAccountsByUserId } = await import('./connectedAccountsDb');
       const accounts = await getAccountsByUserId(userId);
@@ -1822,18 +1834,13 @@ export class LinkedInOutreachService {
       for (const account of userAccounts) {
         if (!account.account_id) continue;
         if (skip && skipAccountIds!.has(account.account_id)) continue;
-        const state = await this.probeAccountSession(account.account_id);
-        if (state === 'connected') {
+        if (await this.isAccountConnected(account.account_id)) {
           return setCache(account.account_id);
-        }
-        if (state === 'unknown' && !ownUnknown) {
-          ownUnknown = account.account_id;
         }
       }
     } catch { /* ignore */ }
 
     // 2. Site-wide accounts (last resort) — verify connectivity before returning
-    let sharedUnknown: string | null = null;
     try {
       const { settingsService } = await import('./settingsService');
       const setting = await settingsService.getSetting('site-wide-unipile-accounts');
@@ -1843,22 +1850,13 @@ export class LinkedInOutreachService {
         const shuffled = enabled.sort(() => Math.random() - 0.5);
         for (const account of shuffled) {
           if (skip && skipAccountIds!.has(account.account_id)) continue;
-          const state = await this.probeAccountSession(account.account_id);
-          if (state === 'connected') {
+          if (await this.isAccountConnected(account.account_id)) {
             return setCache(account.account_id);
           }
-          if (state === 'unknown' && !sharedUnknown) {
-            sharedUnknown = account.account_id;
-          }
-          this.log(`Site-wide account ${account.account_id} (${account.account_name}) is ${state} — skipping`);
+          this.log(`Site-wide account ${account.account_id} (${account.account_name}) is disconnected — skipping`);
         }
       }
     } catch { /* ignore */ }
-
-    // 3. Nothing came back definitively connected — prefer an unverifiable own
-    //    account over an unverifiable shared one rather than returning null.
-    if (ownUnknown) return setCache(ownUnknown);
-    if (sharedUnknown) return setCache(sharedUnknown);
 
     return null;
   }

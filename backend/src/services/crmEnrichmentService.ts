@@ -271,7 +271,11 @@ export class CrmEnrichmentService {
 
   private async resolveLinkedInAccountId(userId: string): Promise<string | null> {
     const { linkedInOutreachService } = await import('./linkedInOutreachService');
-    return linkedInOutreachService.resolveAccountId(userId);
+    // verifiedOnly: an account that was only indeterminate (e.g. a Unipile outage) must come
+    // back null so enrichment skips the LinkedIn source with its warning and keeps its
+    // normal parallelism — exactly as before ENG-2205 — instead of running every lead's
+    // lookup against an unproven account.
+    return linkedInOutreachService.resolveAccountId(userId, { verifiedOnly: true });
   }
 
   // Logical models are resolved by AgentMode and sent through OpenRouter, which

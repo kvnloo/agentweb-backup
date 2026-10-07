@@ -24,6 +24,7 @@ import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { suppressLeadSideEffects } from '../utils/sessionList';
+import { isLinkedInInfraError, LINKEDIN_UNAVAILABLE_MESSAGE } from '../utils/linkedInInfraError';
 import { isValidLeadLifecycle, LEAD_LIFECYCLES, isLeadListType, type LeadListType } from '../utils/leadSchema';
 import { requiredChannels, leadIsReachable, enrollmentIdentity, enrollmentIdentityCandidates } from '../utils/leadReachability';
 import { isEligibleGroupEmailRecipient } from '../utils/groupEmailRecipientValidation';
@@ -4989,7 +4990,6 @@ router.post('/lists/:listId/sync-linkedin-connections', async (req: Request, res
     return res.json({ synced: synced.length, syncedAt: new Date().toISOString() });
   } catch (error: any) {
     console.error('Error syncing LinkedIn connections for list:', error);
-    const { isLinkedInInfraError, LINKEDIN_UNAVAILABLE_MESSAGE } = await import('../utils/linkedInInfraError');
     if (isLinkedInInfraError(error)) {
       return res.status(503).json({ message: LINKEDIN_UNAVAILABLE_MESSAGE, code: 'linkedin_unavailable' });
     }
@@ -5033,12 +5033,24 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
     }
 
     const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
-    // Use the caller-specified account (user's configured default) if provided, otherwise auto-resolve
+    // Use the caller-specified account (user's configured default) if provided, otherwise
+    // auto-resolve from the user's OWN accounts. Never the site-wide shared pool — a message
+    // must be sent from a LinkedIn sender the user actually connected, not borrowed from a
+    // shared account whose connections are not theirs (ENG-2205 follow-up; same policy as
+    // send-linkedin-invite).
     const accountId = (requestedAccountId && typeof requestedAccountId === 'string')
       ? requestedAccountId
-      : await linkedInOutreachService.resolveAccountId(userId);
+      : await linkedInOutreachService.resolveAccountId(userId, { ownOnly: true });
     if (!accountId) {
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
+    }
+    // A client-supplied accountId is untrusted: it must be the caller's own account or one
+    // shared with their org — the same check withdraw/accept-invitation already apply.
+    if (requestedAccountId && typeof requestedAccountId === 'string') {
+      const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+      if (!(await resolveLinkedInAccountForWrite(userId, accountId))) {
+        return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+      }
     }
 
     // ENG-1026: cross-check the live profile's identity against the lead before
@@ -5078,7 +5090,6 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
     if (error.message?.startsWith('Cannot send message:')) {
       return res.status(400).json({ message: error.message });
     }
-    const { isLinkedInInfraError, LINKEDIN_UNAVAILABLE_MESSAGE } = await import('../utils/linkedInInfraError');
     if (isLinkedInInfraError(error)) {
       return res.status(503).json({ message: LINKEDIN_UNAVAILABLE_MESSAGE, code: 'linkedin_unavailable' });
     }
@@ -5128,6 +5139,14 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
       : ((list as any).linkedInAccountId || await linkedInOutreachService.resolveUserOwnedAccountId(userId));
     if (!accountId) {
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
+    }
+    // A client-supplied accountId is untrusted: it must be the caller's own account or one
+    // shared with their org — the same check withdraw/accept-invitation already apply.
+    if (requestedAccountId && typeof requestedAccountId === 'string') {
+      const { resolveLinkedInAccountForWrite } = await import('../services/agentMode/linkedInDailyVolumeGate');
+      if (!(await resolveLinkedInAccountForWrite(userId, accountId))) {
+        return res.status(403).json({ message: 'That LinkedIn account is not connected to your user.' });
+      }
     }
 
     // ENG-1026: cross-check the live profile's identity against the lead before

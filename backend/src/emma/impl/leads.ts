@@ -209,6 +209,7 @@ import type { AgentModeService } from '../../services/agentModeService';
 import type { GatewayTaskClass } from '../../utils/openRouterGatewayContract';
 import type { LLMUsageContext } from '../../utils/llmService';
 import { matchLifecyclePresenceFilter } from '../../utils/lifecycleFilterSemantics';
+import { isLinkedInInfraError, LINKEDIN_UNAVAILABLE_MESSAGE } from '../../utils/linkedInInfraError';
 
 export async function getLeadLists(userId: string): Promise<any> {
     try {
@@ -3146,7 +3147,9 @@ export async function importLeadsFromSearch(
         cursor: lastFetchCursor ?? undefined,
       });
     } catch (e: any) {
-      searchError = e?.message ? String(e.message) : String(e);
+      searchError = isLinkedInInfraError(e)
+        ? LINKEDIN_UNAVAILABLE_MESSAGE
+        : (e?.message ? String(e.message) : String(e));
       // ENG-2205: resolveAccountId can now hand back an account whose probe was
       // merely indeterminate (not proven dead — see linkedInOutreachService's
       // probeAccountSession), so a real failure here is the backstop that proves

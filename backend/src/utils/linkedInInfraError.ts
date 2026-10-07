@@ -10,11 +10,19 @@
 export const LINKEDIN_UNAVAILABLE_MESSAGE =
   'LinkedIn is temporarily unavailable. Please try again in a few minutes.';
 
+const TRANSPORT_CODE = /^(ECONNRESET|ETIMEDOUT|ENOTFOUND|ECONNREFUSED|EAI_AGAIN|EPIPE|EHOSTUNREACH|ENETUNREACH)$/;
+
 export function isLinkedInInfraError(error: any): boolean {
   const msg = String(error?.message ?? '');
   if (/Failed to fetch Unipile credentials/i.test(msg)) return true;
   if (/<html|502 Bad Gateway|503 Service|504 Gateway/i.test(msg)) return true;
-  if (/ECONNRESET|ETIMEDOUT|ENOTFOUND|ECONNREFUSED|fetch failed|socket hang up/i.test(msg)) return true;
+  if (/ECONNRESET|ETIMEDOUT|ENOTFOUND|ECONNREFUSED|EAI_AGAIN|EPIPE|EHOSTUNREACH|ENETUNREACH|fetch failed|socket hang up/i.test(msg)) return true;
+  // undici surfaces a dropped connection as a bare "terminated" with the real code on .cause.
+  if (msg.trim().toLowerCase() === 'terminated') return true;
+  if (error?.name === 'AbortError') return true;
+  for (const code of [error?.code, error?.cause?.code]) {
+    if (typeof code === 'string' && (TRANSPORT_CODE.test(code) || code.startsWith('UND_ERR_'))) return true;
+  }
   const classification = error?.structuredError?.classification;
   if (classification === 'TIMEOUT_ERROR' || classification === 'SERVER_ERROR') return true;
   return error?.isTimeout === true;
