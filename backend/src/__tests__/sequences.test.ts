@@ -356,6 +356,53 @@ describe('POST / - create sequence', () => {
       const res = await request(app).put('/seq_1').send({ steps: [liStep('my-acct')] });
       expect(res.status).toBe(200);
     });
+
+    // A pin already stored on the caller's own sequence must not block an unrelated edit just because the
+    // account was disconnected since (it no longer resolves). Sending is still blocked: the drip worker
+    // re-checks the pin at send time.
+    describe('PUT with a pin already stored on the sequence', () => {
+      const storedWith = (pin: string, userId = 'user-123') => ({
+        ...mockSequence,
+        userId,
+        steps: [{ stepId: 's1', stepNumber: 1, name: 'DM', channel: 'linkedin', delayDays: 0, messageText: 'hi', linkedInAccountId: pin }],
+      });
+
+      it('saves an unrelated edit when the stored pin no longer resolves (account since disconnected)', async () => {
+        mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+        dripSequenceDb.getSequence.mockResolvedValueOnce(storedWith('disconnected-acct'));
+        (dripSequenceDb.updateSequence as jest.Mock).mockClear();
+        const res = await request(app).put('/seq_1').send({ name: 'Renamed', steps: [liStep('disconnected-acct')] });
+        expect(res.status).toBe(200);
+        expect(dripSequenceDb.updateSequence).toHaveBeenCalled();
+        expect(mockResolveLinkedInAccountForWrite).not.toHaveBeenCalled();
+      });
+
+      it('still refuses CHANGING a step to a different account the caller does not own', async () => {
+        mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+        dripSequenceDb.getSequence.mockResolvedValueOnce(storedWith('disconnected-acct'));
+        (dripSequenceDb.updateSequence as jest.Mock).mockClear();
+        const res = await request(app).put('/seq_1').send({ steps: [liStep('pool-or-foreign-acct')] });
+        expect(res.status).toBe(403);
+        expect(dripSequenceDb.updateSequence).not.toHaveBeenCalled();
+      });
+
+      it('does not trust pins stored on someone else\'s sequence', async () => {
+        mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+        dripSequenceDb.getSequence.mockResolvedValueOnce(storedWith('pool-or-foreign-acct', 'other-user'));
+        (dripSequenceDb.updateSequence as jest.Mock).mockClear();
+        const res = await request(app).put('/seq_1').send({ steps: [liStep('pool-or-foreign-acct')] });
+        expect(res.status).toBe(403);
+        expect(dripSequenceDb.updateSequence).not.toHaveBeenCalled();
+      });
+
+      it('POST stays strict: there is no stored pin to exempt', async () => {
+        mockResolveLinkedInAccountForWrite.mockResolvedValue(null);
+        (dripSequenceDb.createSequence as jest.Mock).mockClear();
+        const res = await request(app).post('/').send({ name: 'Seq', steps: [liStep('disconnected-acct')] });
+        expect(res.status).toBe(403);
+        expect(dripSequenceDb.createSequence).not.toHaveBeenCalled();
+      });
+    });
   });
 
   it('passes through all optional fields', async () => {
