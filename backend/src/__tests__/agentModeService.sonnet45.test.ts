@@ -1043,13 +1043,15 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gemini-3.5-flash'].maxTools).toBe(128);
     });
 
-    it('should return only anthropic non-opus models from getReportsModelOptions for non-admins', async () => {
+    // ENG-2028: flipped. The name-based Opus exclusion is gone; only the registry
+    // adminOnly flag filters, so non-admins now get the Opus anthropic models too.
+    it('should return only anthropic models (including opus) from getReportsModelOptions for non-admins', async () => {
       const reportsModels = await agentModeService.getReportsModelOptions(false);
       expect(reportsModels.length).toBeGreaterThan(0);
       reportsModels.forEach(model => {
         expect(model).toMatch(/^anthropic\./);
-        expect(model).not.toContain('opus');
       });
+      expect(reportsModels).toContain('anthropic.claude-opus-5');
     });
 
     it('should include opus in getReportsModelOptions for admins', async () => {
@@ -1057,9 +1059,10 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(reportsModels).toContain('anthropic.claude-opus-4-6-v1');
     });
 
-    it('should NOT include opus in getReportsModelOptions by default (non-admin)', async () => {
+    // ENG-2028: flipped (Opus 4.6 is no longer adminOnly; no name-based deny).
+    it('should include opus in getReportsModelOptions by default (non-admin)', async () => {
       const reportsModels = await agentModeService.getReportsModelOptions();
-      expect(reportsModels).not.toContain('anthropic.claude-opus-4-6-v1');
+      expect(reportsModels).toContain('anthropic.claude-opus-4-6-v1');
     });
 
     it('should return only anthropic models from getReportsModelOptions', async () => {
