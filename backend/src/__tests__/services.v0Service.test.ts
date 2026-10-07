@@ -2818,13 +2818,15 @@ describe("v0Service - iterateLandingPage", () => {
     mockChatsGetById.mockReset();
   });
 
-  it("a DIFFERENT message still sends — the guard must not swallow a genuine second edit", async () => {
+  it("a DIFFERENT message still sends once the earlier edit's marker is stale — the guard must not swallow a genuine second edit", async () => {
+    // ENG-1728: while the earlier edit is ACTIVE a distinct edit is rejected (see the race test
+    // below); a marker older than the iteration budget can no longer be waited on and is superseded.
     mockGet.mockReturnValue(
       iterRecord({
         pendingIteration: {
           baseVersionId: "v_base",
           messageHash: hashV0Prompt("Add testimonials"),
-          startedAt: new Date().toISOString(),
+          startedAt: new Date(Date.now() - 21 * 60 * 1000).toISOString(),
         },
       })
     );
@@ -2917,6 +2919,65 @@ describe("v0Service - iterateLandingPage", () => {
     expect(mockChatsSendMessage).toHaveBeenCalledTimes(1);
     expect(result.iterations).toBe(1);
     mockChatsGetById.mockReset();
+  });
+
+  it("ENG-1728: a DIFFERENT edit racing an active iteration is rejected before v0 is called", async () => {
+    // Two distinct edits on one page both read the record before either wrote pendingIteration.
+    // The loser's pre-send write must be conditional on the EXISTING pendingIteration so DynamoDB
+    // rejects it; an unconditional write would overwrite the winner's base and both would send.
+    mockGet.mockReturnValue(iterRecord());
+    mockChatsGetById.mockResolvedValue({ latestVersion: { id: "v_base", status: "completed" } });
+    const conditionFailed: any = new Error("The conditional request failed");
+    conditionFailed.code = "ConditionalCheckFailedException";
+    mockUpdate.mockReturnValueOnce({ promise: () => Promise.reject(conditionFailed) });
+
+    await expect(iterateLandingPage("page-1", "user-1", "Edit B: make the hero blue")).rejects.toMatchObject({
+      code: "ITERATION_IN_PROGRESS",
+    });
+
+    expect(mockChatsSendMessage).not.toHaveBeenCalled();
+    const preSend = mockUpdate.mock.calls[0][0];
+    expect(preSend.ExpressionAttributeValues[":p"].unsent).toBe(true);
+    expect(preSend.ConditionExpression).toMatch(/pendingIteration/);
+    mockChatsGetById.mockReset();
+  });
+
+  it("ENG-1728: finishing an iteration never clears ANOTHER edit's active pendingIteration", async () => {
+    // Our edit landed, but by the time we finish, a different edit owns pendingIteration.
+    // Removing it would erase that edit's recorded base — its retry would then re-send.
+    const ours = hashV0Prompt("Add testimonials");
+    mockGet.mockReturnValue(
+      iterRecord({
+        pendingIteration: { baseVersionId: "v_base", messageHash: ours, startedAt: new Date().toISOString() },
+      })
+    );
+    mockChatsGetById.mockResolvedValue({ latestVersion: { id: "v_new", status: "completed" } });
+    const conditionFailed: any = new Error("The conditional request failed");
+    conditionFailed.code = "ConditionalCheckFailedException";
+    mockUpdate.mockImplementation((params: any) => ({
+      promise: () =>
+        /REMOVE pendingIteration/.test(params.UpdateExpression) ? Promise.reject(conditionFailed) : Promise.resolve(),
+    }));
+
+    try {
+      const result = await iterateLandingPage("page-1", "user-1", "Add testimonials");
+      expect(result.iterations).toBe(1);
+      expect(result.status).toBe("draft");
+      const clears = mockUpdate.mock.calls.filter((c: any) => /REMOVE pendingIteration/.test(c[0].UpdateExpression));
+      expect(clears.length).toBeGreaterThan(0);
+      for (const [params] of clears) {
+        expect(params.ConditionExpression).toMatch(/pendingIteration/);
+        expect(params.ExpressionAttributeValues[":h"]).toBe(ours);
+      }
+      // The iteration is still counted and made deployable, without touching the other edit's marker.
+      const counted = mockUpdate.mock.calls.find(
+        (c: any) => !/REMOVE/.test(c[0].UpdateExpression) && c[0].ExpressionAttributeValues?.[":iterations"] === 1
+      );
+      expect(counted).toBeDefined();
+    } finally {
+      mockUpdate.mockImplementation(() => ({ promise: () => Promise.resolve() }));
+      mockChatsGetById.mockReset();
+    }
   });
 
   it("a failed iteration leaves the page's status alone — the live page must not be marked failed", async () => {
