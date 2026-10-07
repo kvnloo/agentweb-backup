@@ -67,6 +67,11 @@ jest.mock('../services/linkedInOutreachService', () => ({
   },
 }));
 
+const mockSyncConnectionsForAccount = jest.fn();
+jest.mock('../cron/linkedInConnectionSyncCron', () => ({
+  syncConnectionsForAccount: (...args: any[]) => mockSyncConnectionsForAccount(...args),
+}));
+
 jest.mock('../services/agentModeService', () => ({ agentModeService: {} }));
 jest.mock('../utils/llmService', () => ({ createLLMService: jest.fn() }));
 jest.mock('../services/settingsService', () => ({ settingsService: {} }));
@@ -408,5 +413,74 @@ describe('send-linkedin-message identity cross-check (ENG-1026)', () => {
     await handler!(makeReq() as any, res as any);
     expect(mockSendMessage).toHaveBeenCalledTimes(1);
     expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+});
+
+
+// ENG-2205: resolveAccountId can now return an account whose probe was only
+// indeterminate, so the real call below it is the backstop. An infrastructure
+// failure there (Unipile credentials / gateway 5xx / timeout) must surface as a
+// handled 503 — never a 500 echoing the raw internal message.
+describe('LinkedIn routes: infrastructure failures are handled, not raw 500s (ENG-2205)', () => {
+  const sendHandler = findHandler(router, '/lists/:listId/leads/:leadId/send-linkedin-message', 'post');
+  const syncHandler = findHandler(router, '/lists/:listId/sync-linkedin-connections', 'post');
+  const CREDS = new Error('Failed to fetch Unipile credentials from Secrets Manager');
+  const GATEWAY = new Error('<html><head><title>502 Bad Gateway</title></head></html>');
+  const sendReq = () => ({
+    user: { userId: 'test-user-id' },
+    params: { listId: 'list-123', leadId: 'lead-456' },
+    body: { message: 'Hello!' },
+  });
+  const syncReq = () => ({ user: { userId: 'test-user-id' }, params: { listId: 'list-123' }, body: {} });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetLeadListById.mockResolvedValue(OWNED_LIST);
+    mockGetLeadById.mockResolvedValue(LEAD_WITH_LINKEDIN);
+    mockResolveAccountId.mockResolvedValue('unindeterminate-acct');
+    mockGetLinkedInProfile.mockResolvedValue(null);
+  });
+
+  it.each([['credentials failure', CREDS], ['gateway 502', GATEWAY]])(
+    'send-linkedin-message returns 503 (no raw message, nothing recorded) on %s',
+    async (_label, err) => {
+      mockSendMessage.mockRejectedValue(err);
+      const res = makeRes();
+      await sendHandler!(sendReq() as any, res as any);
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'linkedin_unavailable' }));
+      expect(JSON.stringify((res.json as jest.Mock).mock.calls)).not.toMatch(/Secrets Manager|Bad Gateway/);
+      expect(mockAddLinkedInMessageEvent).not.toHaveBeenCalled();
+    },
+  );
+
+  it('send-linkedin-message keeps a plain 500 for a non-infrastructure error', async () => {
+    mockSendMessage.mockRejectedValue(new Error('something unrelated broke'));
+    const res = makeRes();
+    await sendHandler!(sendReq() as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(500);
+  });
+
+  it.each([['credentials failure', CREDS], ['gateway 502', GATEWAY]])(
+    'sync-linkedin-connections returns 503 (no raw message) on %s',
+    async (_label, err) => {
+      mockSyncConnectionsForAccount.mockRejectedValue(err);
+      const res = makeRes();
+      await syncHandler!(syncReq() as any, res as any);
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'linkedin_unavailable' }));
+      expect(JSON.stringify((res.json as jest.Mock).mock.calls)).not.toMatch(/Secrets Manager|Bad Gateway/);
+    },
+  );
+
+  it('sync-linkedin-connections still succeeds and still 400s with no account', async () => {
+    mockSyncConnectionsForAccount.mockResolvedValue([1, 2]);
+    let res = makeRes();
+    await syncHandler!(syncReq() as any, res as any);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ synced: 2 }));
+    mockResolveAccountId.mockResolvedValue(null);
+    res = makeRes();
+    await syncHandler!(syncReq() as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(400);
   });
 });
