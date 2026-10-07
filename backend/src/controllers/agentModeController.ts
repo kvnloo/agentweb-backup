@@ -15222,6 +15222,21 @@ export const agentModeController = {
           code: 'SESSION_BUSY',
         });
       }
+
+      // ENG-2293: same handled outcome as the other three generate-response
+      // chains (generateResponse, generateSharedResponse,
+      // generateConversableResponse) — this one calls an LLM via
+      // runVerifiedChat too, and was missed when those three were fixed, so
+      // it still fell through to the generic 500 + oncall alert below.
+      if (isProviderNoEndpointsError(error)) {
+        return res.status(503).json({
+          error: 'Model provider unavailable',
+          message: 'The selected model has no available provider right now. Please try again, or pick a different model from the selector above.',
+          code: 'PROVIDER_UNAVAILABLE',
+          suggestion: 'wait_and_retry',
+        });
+      }
+
       console.error('AgentMode: Verified generate error:', error);
       const sessionId = req.body?.sessionId;
       const user = req.user as User;
