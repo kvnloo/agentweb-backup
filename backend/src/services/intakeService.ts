@@ -739,7 +739,23 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
     open.find((i) => norm(i.title) === norm(p.title));
   if (match) {
     try {
-      await addIssueComment(match.issueId, [`Recurred on ${new Date().toISOString().slice(0, 10)}.`, ...contextLines(p.notionContext)].join('\n'));
+      const recurBody = [`Recurred on ${new Date().toISOString().slice(0, 10)}.`, ...contextLines(p.notionContext)].join('\n');
+      // ENG-2066: an hourly re-fire with byte-identical context (same day, same facts) adds no
+      // information — it buried ENG-2066 under ~20 identical comments in two days. Post only when
+      // this day's occurrence carries something new. Fails open: a comment-read error still posts.
+      let prior: { body: string }[] = [];
+      try {
+        const { getIssueCommentsDetailed } = await import('./linearService');
+        prior = (await getIssueCommentsDetailed(match.issueId)) || [];
+      } catch {
+        prior = []; // fail open
+      }
+      // Linear stores "- " bullets as "* ", so compare line-by-line with the bullet marker stripped.
+      const canon = (s: string) =>
+        (s || '').split('\n').map((l) => l.trim().replace(/^[-*]\s+/, '')).filter(Boolean).join('\n');
+      const target = canon(recurBody);
+      const alreadyPosted = (prior || []).some((c) => canon(c.body) === target);
+      if (!alreadyPosted) await addIssueComment(match.issueId, recurBody);
     } catch (e) {
       console.warn('[intake] auto recur-comment failed:', e instanceof Error ? e.message : e);
     }
